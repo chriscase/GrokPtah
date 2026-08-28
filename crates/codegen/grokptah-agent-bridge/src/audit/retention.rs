@@ -12,40 +12,60 @@
 
 use chrono::Utc;
 
+use super::authority::{AuditCapability, AuthorityGrant, AuthoritySource};
 use super::documents::*;
 use super::files;
 use super::keys::sha256_hex;
 use super::ledger::{AuditEntryInput, AuditLedger, CrashPoint};
 use super::{AuditError, AuditResult, PoisonReason, RefuseReason};
 
+/// What entitles this deletion. There is no third option and no default:
+/// every call must say which one it is relying on.
+#[derive(Debug, Clone)]
+pub enum RetentionBasis {
+    /// A seal **this ledger issued and re-verified**, which must be found in
+    /// the manifest's seal registry and must have actually carried the exact
+    /// range being deleted. A caller-supplied id is a lookup key, never a
+    /// claim: an unknown id, or one whose export withheld or holed the range,
+    /// is refused.
+    ExportedUnder { seal_id: String },
+    /// A verified single-use capability grant for
+    /// [`AuditCapability::RetainUnexported`]. This is the only way to destroy
+    /// the last copy of a range, and the grant id and its source are recorded
+    /// permanently in the tombstone.
+    Grant(Box<AuthorityGrant>),
+}
+
 #[derive(Debug, Clone)]
 pub struct RetentionRequest {
     pub generation_id: String,
-    /// Seal id of a verified export that already preserved this range.
-    pub export_seal_id: Option<String>,
-    /// Operator override for retaining a generation that was never exported.
-    /// Recorded permanently in the tombstone.
-    pub allow_unexported: bool,
+    pub basis: RetentionBasis,
     pub reason: RetentionReason,
 }
 
 impl RetentionRequest {
-    pub fn new(generation_id: impl Into<String>) -> Self {
+    /// Retain a generation a verified export already carried.
+    pub fn exported_under(generation_id: impl Into<String>, seal_id: impl Into<String>) -> Self {
         Self {
             generation_id: generation_id.into(),
-            export_seal_id: None,
-            allow_unexported: false,
+            basis: RetentionBasis::ExportedUnder {
+                seal_id: seal_id.into(),
+            },
             reason: RetentionReason::OperatorRetention,
         }
     }
 
-    pub fn with_export_seal(mut self, seal_id: impl Into<String>) -> Self {
-        self.export_seal_id = Some(seal_id.into());
-        self
+    /// Retain a generation no export ever carried, under a verified grant.
+    pub fn under_grant(generation_id: impl Into<String>, grant: AuthorityGrant) -> Self {
+        Self {
+            generation_id: generation_id.into(),
+            basis: RetentionBasis::Grant(Box::new(grant)),
+            reason: RetentionReason::OperatorRetention,
+        }
     }
 
-    pub fn allow_unexported(mut self) -> Self {
-        self.allow_unexported = true;
+    pub fn with_reason(mut self, reason: RetentionReason) -> Self {
+        self.reason = reason;
         self
     }
 }
@@ -58,8 +78,12 @@ pub struct RetentionReceipt {
     pub entry_count: u64,
     pub bytes_removed: u64,
     pub retention_epoch: u64,
+    /// The seal that carried this range, when the basis was an export.
     pub export_seal_id: Option<String>,
+    /// `true` only when the deletion destroyed the last copy of the range.
     pub allow_unexported: bool,
+    pub authority_grant_id: Option<String>,
+    pub authority_source: Option<AuthoritySource>,
 }
 
 impl AuditLedger {
@@ -96,10 +120,6 @@ impl AuditLedger {
         if descriptor.index >= active.index {
             return Err(AuditError::Refused(RefuseReason::GenerationIsActive));
         }
-        if request.export_seal_id.is_none() && !request.allow_unexported {
-            return Err(AuditError::Refused(RefuseReason::GenerationUnexported));
-        }
-
         // T1: verify completely before promising anything about these bytes.
         let journal = Self::journal_path(self.root(), &descriptor.generation_id);
         let bytes = files::read_bytes(&journal)?;
@@ -126,6 +146,39 @@ impl AuditLedger {
             return Err(AuditError::Poisoned(PoisonReason::ChainDiscontinuity));
         }
 
+        // T1b: establish the authority *after* verifying, so a seal is matched
+        // against facts this transaction just re-established rather than
+        // against the descriptor's own claims about itself.
+        let seal_match = match &request.basis {
+            RetentionBasis::ExportedUnder { seal_id } => {
+                let seal = manifest
+                    .seals
+                    .iter()
+                    .find(|seal| &seal.seal_id == seal_id)
+                    .ok_or(AuditError::Refused(RefuseReason::ExportSealUnknown))?;
+                // Carrying the *range* is the claim. A seal whose coverage
+                // withheld or holed this generation proves nothing about it,
+                // and `carried` never records those elements at all.
+                let carried = seal
+                    .carried
+                    .iter()
+                    .find(|range| range.generation_id == descriptor.generation_id)
+                    .ok_or(AuditError::Refused(RefuseReason::ExportSealDoesNotCover))?;
+                if carried.first_seq != descriptor.first_seq
+                    || carried.last_seq != verification.last_seq
+                    || carried.final_tag != verification.final_tag
+                    || carried.journal_sha256 != journal_sha256
+                    || carried.entry_count != verification.entry_count
+                {
+                    // The bytes changed since the export, so the export is not
+                    // a copy of what is about to be deleted.
+                    return Err(AuditError::Refused(RefuseReason::ExportSealDoesNotCover));
+                }
+                Some(seal_id.clone())
+            }
+            RetentionBasis::Grant(_) => None,
+        };
+
         // T2: intent before the effect boundary.
         tx.append(
             AuditEntryInput::new(
@@ -141,6 +194,18 @@ impl AuditLedger {
 
         // T3: commit the tombstone. Bytes are still on disk after this returns.
         let mut manifest = tx.manifest_clone();
+        // The grant is spent in the same manifest write that commits the
+        // tombstone: never spent without the deletion, never deleted with the
+        // grant still spendable.
+        let consumed = match &request.basis {
+            RetentionBasis::Grant(grant) => Some(tx.stage_authority(
+                &mut manifest,
+                grant,
+                AuditCapability::RetainUnexported,
+                &descriptor.generation_id,
+            )?),
+            RetentionBasis::ExportedUnder { .. } => None,
+        };
         manifest.retention_epoch = manifest.retention_epoch.saturating_add(1);
         let retention_epoch = manifest.retention_epoch;
         let now = Utc::now();
@@ -157,8 +222,10 @@ impl AuditLedger {
             key_id: descriptor.key_id.clone(),
             retention_epoch,
             reason: request.reason,
-            export_seal_id: request.export_seal_id.clone(),
-            allow_unexported: request.allow_unexported,
+            export_seal_id: seal_match.clone(),
+            allow_unexported: consumed.is_some(),
+            authority_grant_id: consumed.as_ref().map(|c| c.grant_id.clone()),
+            authority_source: consumed.as_ref().map(|c| c.source),
             committed_at: now,
             removed_at: None,
         });
@@ -212,8 +279,10 @@ impl AuditLedger {
             entry_count: descriptor.entry_count,
             bytes_removed: descriptor.journal_bytes,
             retention_epoch,
-            export_seal_id: request.export_seal_id,
-            allow_unexported: request.allow_unexported,
+            export_seal_id: seal_match,
+            allow_unexported: consumed.is_some(),
+            authority_grant_id: consumed.as_ref().map(|c| c.grant_id.clone()),
+            authority_source: consumed.map(|c| c.source),
         })
     }
 }

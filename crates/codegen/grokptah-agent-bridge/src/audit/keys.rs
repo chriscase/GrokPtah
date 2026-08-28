@@ -25,6 +25,7 @@ const LABEL_KEY_ID: &[u8] = b"grokptah-audit.v2/keyid";
 const LABEL_INSTALL_ID: &[u8] = b"grokptah-audit.v2/install-id";
 const LABEL_GENESIS: &[u8] = b"grokptah-audit.v2/genesis";
 const LABEL_IMPORT_SEAL: &[u8] = b"grokptah-audit.v2/import-seal";
+const LABEL_AUTHORITY: &[u8] = b"grokptah-audit.v2/authority";
 
 pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     let mut normalized = [0u8; BLOCK];
@@ -70,6 +71,7 @@ pub struct AuditKeys {
     anchor: [u8; 32],
     seal: [u8; 32],
     actor: [u8; 32],
+    authority: [u8; 32],
     key_id: String,
     installation_id: String,
 }
@@ -95,6 +97,7 @@ impl AuditKeys {
             anchor: hmac_sha256(installation_key, LABEL_ANCHOR),
             seal: hmac_sha256(installation_key, LABEL_SEAL),
             actor: hmac_sha256(installation_key, LABEL_ACTOR),
+            authority: hmac_sha256(installation_key, LABEL_AUTHORITY),
             key_id,
             installation_id,
         }
@@ -160,6 +163,15 @@ impl AuditKeys {
 
     pub(crate) fn seal_mac(&self, payload: &[u8]) -> String {
         hex32(&hmac_sha256(&self.seal, payload))
+    }
+
+    /// Tag over a capability grant.
+    ///
+    /// Its own subkey: a grant must not be verifiable by anything that can
+    /// produce a seal, an anchor or a chain tag, so a captured tag from one
+    /// document class can never be replayed as authority for another.
+    pub(crate) fn authority_mac(&self, payload: &[u8]) -> String {
+        hex32(&hmac_sha256(&self.authority, payload))
     }
 
     /// Keyed, truncated digest for an actor / request / scope identifier.

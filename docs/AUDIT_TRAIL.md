@@ -191,11 +191,23 @@ each append it checks that the durable anchor still matches the in-memory tail.
 
 ## Retention
 
-The only path that deletes bytes. It requires a **sealed, non-current** generation,
-an operator authorization, and either an export seal covering the range or an
-explicit `allow_unexported` override that is itself recorded permanently. The
-target is verified completely first — you may not tombstone evidence you cannot
-currently vouch for.
+The only path that deletes bytes. It requires a **sealed, non-current**
+generation, a completed verification of the target, and one of exactly two
+bases — there is no third option and no default:
+
+| Basis | What it proves | What it needs |
+| --- | --- | --- |
+| `RetentionRequest::exported_under(gen, seal_id)` | a verified export already carried these exact bytes | a seal **this ledger issued and re-verified**, found in `manifest.seals`, whose `carried` entry matches the generation's `firstSeq`, `lastSeq`, `finalTag`, `journalSha256` and `entryCount` as re-established inside the retention transaction |
+| `RetentionRequest::under_grant(gen, grant)` | an operator accepted destroying the last copy | a verified single-use [capability grant](#capability-authority) for `RetainUnexported`, bound to that generation |
+
+A caller-supplied seal id is a **lookup key, never a claim**. An unknown id is
+`export_seal_unknown`; an id whose export withheld the range, holed it, or
+carried a shorter prefix of it is `export_seal_does_not_cover`. A public export
+withholds imported v1 bytes, so its seal records nothing about them at all and
+cannot authorize deleting them.
+
+The target is verified completely first — you may not tombstone evidence you
+cannot currently vouch for.
 
 `T1 verify → T2 intent → T3 commit tombstone → T4 remove bytes → T5 mark removed → T6 outcome`
 
@@ -228,8 +240,11 @@ The verifier enforces the separation in both directions: a public export that
 carries an unauthenticated generation is refused, and so is a raw export that
 claims to withhold one. Relabelling one as the other fails the seal MAC.
 
-`OrchStore::export_audit` is the public scope; `export_audit_privileged_raw` is
-the other, and its name is the warning.
+`OrchStore::export_audit` is the public scope. `export_audit_privileged_raw`
+requires a verified single-use grant for `PrivilegedRawExport`: naming a
+different scope is not authority, the grant is. The grant is spent **before a
+single byte is copied**, so a crash leaves the grant spent and no export rather
+than a live grant beside a written privileged export.
 
 ### Format
 
@@ -249,7 +264,89 @@ live ledger and re-verified before a path-free receipt is returned.
 `verify_export` accepts both v1 and v2, so exports taken before generations
 existed stay verifiable.
 
-Export never rotates, truncates, deletes, or advances the manifest epoch.
+### What an export commits
+
+Export never rotates, truncates, deletes, or changes a journal byte, a
+tombstone or a chain tag. It does commit two **additive** facts to the manifest:
+
+- the **seal** it issued, recorded only after an independent reader verified
+  the written copy from disk. Without this registry, "this range was already
+  exported" would be an unverifiable claim made by whoever wanted the range
+  deleted. Only ranges the export actually *carried* are recorded — never a
+  withheld or holed element.
+- for a privileged raw export, the **grant** it spent.
+
+A failed `record_seal` removes the destination, so an export that returns an
+error never leaves a directory behind whose seal id would look like retention
+authority it does not carry. A crash between the verified copy and the seal
+commit simply leaves no seal: the range stays undeletable until it is exported
+again, which is the safe direction.
+
+The registry keeps the 64 most recent seals. Forgetting one only ever makes
+retention *more* conservative.
+
+## Capability authority
+
+Two operations are not ordinary ledger use: a **privileged raw export**, which
+carries unredacted legacy bytes, and **retention of a generation no verified
+export ever carried**, which destroys the last copy of a range. Before this
+existed, the first was reachable by naming a different scope and the second by
+setting a bare `allow_unexported` bool — so the authority for a deletion was
+the deletion's own request.
+
+Both now require an `AuthorityGrant`, which is:
+
+- **authenticated** under its own key domain (`grokptah-audit.v2/authority`),
+  so a captured seal, anchor or chain tag can never be replayed as authority;
+- **bound** to one capability, one keyed subject digest, one installation and
+  one key id;
+- **expiring** — 300 s, and a grant claiming a longer life is rejected even if
+  it verifies;
+- **single use** — the spent `grantId` is recorded in the same manifest write
+  that commits the effect, so there is no window in which a grant is spent
+  without the effect, or the effect happened with the grant still spendable;
+- **journaled** — issuing *and refusing* a grant both append a chained record,
+  so a denied attempt to delete unexported history is as visible as a granted
+  one.
+
+Grants come from an `AuditAuthorityProvider`. The default is `DeniedAuthority`:
+**a host that installs no provider can do neither operation at all.** The host
+installs `LocalOperatorAuthority` only when `GROKPTAH_AUDIT_OPERATOR` names
+capabilities explicitly (`privileged_raw_export`, `retain_unexported`, comma
+separated), so a host that needs raw preservation exports does not thereby gain
+the ability to delete history. An unrecognised value grants nothing.
+
+> **This is a structural and evidentiary boundary, not an authenticated
+> principal boundary.** There is no principal authority in the codebase yet
+> (#460/#461), so the only source a shipped build can assert is
+> `AuthoritySource::LocalOperator` — an operator act on the host, not a
+> verified identity. Every grant and every tombstone written under one records
+> that source permanently, so an operator-asserted deletion can never later be
+> read as a principal-authorized one. When #460/#461 land they supply a
+> provider that returns `AuthoritySource::Principal`; nothing else changes.
+
+## Accepted-but-not-journaled entries
+
+`OrchStore::append_audit` returns only after a durable append.
+`OrchStore::enqueue_audit` hands the entry to a writer thread and returns
+before it is journaled — that is the point of the queue. "Accepted" therefore
+cannot mean "durable", and it no longer pretends to: it means **the entry's
+loss would be visible**.
+
+A durable, authenticated `pending.json` marker is written and fsynced *before*
+`enqueue_audit` returns, on the transition out of idle, and removed once the
+queue drains through a durable append. One marker covers a whole burst, so a
+busy writer pays for it once.
+
+Finding a marker at open means a crash happened with entries in flight. Between
+zero and the queue capacity of them are gone and **nothing on disk can narrow
+that**, so recovery records the bound (`maxLostEntries`) rather than a number
+that would read as certainty, journals it under
+`reason: "accepted_not_journaled"` with an uncertain outcome, and only then
+clears the marker. A crash in that window re-reports the same uncertainty,
+which over-states doubt; clearing first would lose the evidence entirely.
+`get_capacity` surfaces it as `acceptedNotJournaledEpisodes` and
+`maxAcceptedNotJournaled`.
 
 ## Migration from v1
 
@@ -287,8 +384,20 @@ are read-only inputs and are never moved or truncated, so nothing can be lost.
   closed, but the shipped default is still `LocalFile`: no caller passes
   keychain or environment material yet. There is also no versioned key rotation
   — a changed installation key is *rejected*, not rolled over.
-- **Retention authority is unauthenticated.** `allow_unexported` is an argument,
-  not a proven operator identity.
+- **Capability authority has no authenticated principal behind it.** Grants
+  are verified, single-use, subject-bound, expiring and journaled, and the
+  default provider grants nothing — but `AuthoritySource::LocalOperator` is a
+  process-level operator assertion, not a proven identity. Anything that can
+  set `GROKPTAH_AUDIT_OPERATOR` in the host's environment can assert it.
+  Closing this needs #460/#461; the source is recorded permanently so the
+  distinction is never lost.
+- **The raw `AuditLedger` API is reachable in-process.** Any code inside the
+  bridge that holds the ledger handle can call `issue_authority`. The boundary
+  is structural and evidentiary — nothing happens without a chained record —
+  not a sandbox.
+- **Queued entries are bounded-uncertain, not durable.** `enqueue_audit`
+  guarantees that loss is *visible*, not that it does not happen. Call sites
+  needing a durable append use `append_audit`.
 
 - **Joint rollback.** Restoring the manifest, every anchor and every journal to
   the same earlier moment satisfies every invariant above, and the ledger opens

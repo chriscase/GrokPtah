@@ -6,6 +6,9 @@ use std::sync::Arc;
 use chrono::Utc;
 use parking_lot::Mutex;
 
+use super::authority::{
+    AuditAuthorityProvider, AuditCapability, AuthorityGrant, AuthorityRequest, DeniedAuthority,
+};
 use super::documents::*;
 use super::files;
 use super::import::{
@@ -109,9 +112,20 @@ pub struct AuditLedgerOptions {
     /// Directory holding legacy v1 `audit.jsonl` / `audit.jsonl.1`. Imported
     /// only when this root has never committed a manifest.
     pub legacy_v1_dir: Option<PathBuf>,
+    /// Decides whether the two destructive/exposing capabilities may be
+    /// granted on this host. Defaults to [`DeniedAuthority`]: a host that
+    /// installs nothing can neither take a privileged raw export nor delete
+    /// an unexported generation.
+    pub authority: Option<Arc<dyn AuditAuthorityProvider>>,
 }
 
 /// What recovery actually did, so an operator never has to infer it.
+/// Most recent export seals kept in the manifest.
+const MAX_TRACKED_SEALS: usize = 64;
+/// Most recent spent grant ids kept for replay rejection. A grant lives for
+/// [`super::MAX_GRANT_TTL_SECONDS`], so this window covers every live one.
+const MAX_CONSUMED_GRANTS: usize = 256;
+
 #[derive(Debug, Clone, Default)]
 pub struct RecoverySummary {
     pub adopted_tail_entries: u64,
@@ -165,6 +179,12 @@ struct LiveTail {
     intent_tracking_overflowed: bool,
 }
 
+/// In-flight accounting behind the durable pending marker.
+#[derive(Debug, Default)]
+struct PendingState {
+    in_flight: u64,
+}
+
 struct Inner {
     manifest: Manifest,
     live: LiveTail,
@@ -177,7 +197,14 @@ pub struct AuditLedger {
     root: PathBuf,
     keys: Arc<AuditKeys>,
     witness: Arc<dyn AuditWitness>,
+    authority: Arc<dyn AuditAuthorityProvider>,
     inner: Mutex<Inner>,
+    /// Accepted-but-not-journaled accounting for async producer queues.
+    ///
+    /// Its own lock, never nested inside `inner`: `note_accepted` must be able
+    /// to make the marker durable while a structural transaction is running,
+    /// and it takes `inner` only for a snapshot.
+    pending: Mutex<PendingState>,
     /// Serializes structural mutations (rotation, retention, export copy)
     /// against each other. `inner` alone is not enough: those transactions
     /// span several file operations, and a rotation that released `inner`
@@ -244,6 +271,49 @@ impl<'a> StructuralTx<'a> {
         self.ledger.write_manifest(&mut manifest, Some(expected))?;
         self.guard.manifest = manifest;
         Ok(())
+    }
+
+    /// Verify a capability grant and stage its consumption into `manifest`.
+    ///
+    /// Staging rather than committing is deliberate: the caller folds the
+    /// consumption into the *same* manifest write that commits the effect, so
+    /// there is no window in which a grant is spent but the effect did not
+    /// happen, or the effect happened and the grant is still spendable.
+    pub(crate) fn stage_authority(
+        &self,
+        manifest: &mut Manifest,
+        grant: &AuthorityGrant,
+        capability: AuditCapability,
+        subject: &str,
+    ) -> AuditResult<ConsumedGrant> {
+        let expected = self.ledger.subject_digest(capability, subject);
+        grant.check(self.ledger.keys(), capability, &expected)?;
+        // Replay is checked against the manifest this transaction holds, so a
+        // second spend cannot slip between the check and the commit.
+        if manifest
+            .consumed_grants
+            .iter()
+            .any(|spent| spent.grant_id == grant.grant_id())
+        {
+            return Err(AuditError::Refused(RefuseReason::AuthorityAlreadyConsumed));
+        }
+        let consumed = ConsumedGrant {
+            grant_id: grant.grant_id().to_string(),
+            capability,
+            source: grant.source(),
+            consumed_at: Utc::now(),
+        };
+        manifest.consumed_grants.push(consumed.clone());
+        // Bounded: grants expire in minutes, so keeping the most recent window
+        // is enough to make replay impossible while a grant is still live.
+        let overflow = manifest
+            .consumed_grants
+            .len()
+            .saturating_sub(MAX_CONSUMED_GRANTS);
+        if overflow > 0 {
+            manifest.consumed_grants.drain(..overflow);
+        }
+        Ok(consumed)
     }
 
     pub(crate) fn cut(&self, point: CrashPoint) -> AuditResult<()> {
@@ -320,6 +390,9 @@ impl AuditLedger {
         let witness: Arc<dyn AuditWitness> = options
             .witness
             .unwrap_or_else(|| Arc::new(UnwitnessedBoundary));
+        let authority: Arc<dyn AuditAuthorityProvider> = options
+            .authority
+            .unwrap_or_else(|| Arc::new(DeniedAuthority));
         let root = root.as_ref().to_path_buf();
         files::create_private_dir_all(&root)?;
         files::reject_symlink(&root)?;
@@ -344,6 +417,8 @@ impl AuditLedger {
             root,
             keys,
             witness,
+            authority,
+            pending: Mutex::new(PendingState::default()),
             inner: Mutex::new(Inner {
                 live: LiveTail {
                     generation_id: manifest.active_generation_id.clone(),
@@ -439,6 +514,10 @@ impl AuditLedger {
         self.root.join("gap.json")
     }
 
+    fn pending_path(&self) -> PathBuf {
+        self.root.join("pending.json")
+    }
+
     fn legacy_divergence_path(&self) -> PathBuf {
         self.root.join("legacy-divergence.json")
     }
@@ -449,6 +528,8 @@ impl AuditLedger {
     /// set, a permanently diverged v1 file appended one uncertain record on
     /// every single open, forever.
     pub fn record_legacy_divergence_once(&self, digest: &str) -> AuditResult<bool> {
+        // Serialised against other divergence recorders by the inner lock.
+        let _guard = self.inner.lock();
         let path = self.legacy_divergence_path();
         let mut file = if path.exists() {
             let bytes = files::read_bytes(&path)?;
@@ -466,6 +547,7 @@ impl AuditLedger {
             generation_id: digest.to_string(),
             after_seq: 0,
             lost_entries: 0,
+            max_lost_entries: None,
             reason: EntryReason::LegacyWrittenAfterCutover,
             recorded_at: Utc::now(),
             journaled: true,
@@ -781,6 +863,8 @@ impl AuditLedger {
             global_last_seq_floor: next_first_seq.saturating_sub(1),
             generations,
             tombstones: Vec::new(),
+            seals: Vec::new(),
+            consumed_grants: Vec::new(),
             created_at: now,
             updated_at: now,
             mac: String::new(),
@@ -972,6 +1056,34 @@ impl AuditLedger {
             guard.recovery.durable_gaps = gap.gaps;
         }
 
+        // A pending marker means entries were accepted by an async queue and
+        // their journaling was never proven. The exact count is unknowable --
+        // between zero and the queue capacity -- so the bound is recorded
+        // rather than a number that would read as certainty.
+        //
+        // The gap file is written before the marker is cleared. A crash in
+        // that window re-reports the same uncertainty on the next open, which
+        // over-states doubt; clearing first would lose the evidence entirely.
+        if self.pending_path().exists() {
+            let bytes = files::read_bytes(&self.pending_path())?;
+            let marker: PendingMarker = serde_json::from_slice(&bytes)
+                .map_err(|_| AuditError::Poisoned(PoisonReason::GapMacMismatch))?;
+            marker.verify(&self.keys)?;
+            guard.recovery.durable_gaps.push(GapRecord {
+                generation_id: marker.generation_id.clone(),
+                after_seq: marker.after_seq,
+                lost_entries: 0,
+                max_lost_entries: Some(marker.queue_capacity),
+                reason: EntryReason::AcceptedNotJournaled,
+                recorded_at: Utc::now(),
+                journaled: false,
+            });
+            self.write_gap_file_locked(&guard)?;
+            std::fs::remove_file(self.pending_path())
+                .map_err(|error| AuditError::Io(format!("clear pending marker: {error}")))?;
+            files::fsync_dir(&self.root)?;
+        }
+
         // Active generation: verify from the chain base and adopt any
         // authenticated tail the anchor does not yet cover.
         let active = guard.manifest.active()?.clone();
@@ -1059,18 +1171,22 @@ impl AuditLedger {
             )?;
         }
         for gap in ungapped {
+            // Each gap keeps its own reason: an entry accepted-but-unproven is
+            // not the same loss as one the producer knows it dropped, and
+            // flattening both into one reason would hide the difference.
             self.append_internal(
                 AuditEntryInput::new(
                     "audit.recovery",
                     EntryPhase::Outcome,
                     EntryOutcome::Uncertain,
                 )
-                .with_reason(EntryReason::RecoveryDroppedEntries),
+                .with_reason(gap.reason),
                 Some(RecoveryEvidence {
                     bytes: 0,
                     sha256: String::new(),
                     at_offset: gap.after_seq,
                     lost_entries: gap.lost_entries,
+                    max_lost_entries: gap.max_lost_entries,
                 }),
             )?;
         }
@@ -1095,6 +1211,7 @@ impl AuditLedger {
                     sha256: String::new(),
                     at_offset: 0,
                     lost_entries: 1,
+                    max_lost_entries: None,
                 }),
                 Some(digest),
             )?;
@@ -1115,9 +1232,17 @@ impl AuditLedger {
         for gap in guard.recovery.durable_gaps.iter_mut() {
             gap.journaled = true;
         }
+        // The lock is held across the whole read-modify-write. Releasing it
+        // before the atomic write let an older snapshot commit after a newer
+        // one and erase loss evidence.
+        self.write_gap_file_locked(&guard)
+    }
+
+    /// Persist the gap set. The caller must hold the inner lock, so two
+    /// concurrent recorders cannot serialise their writes out of order.
+    fn write_gap_file_locked(&self, guard: &Inner) -> AuditResult<()> {
         let mut file = GapFile::new();
         file.gaps = guard.recovery.durable_gaps.clone();
-        drop(guard);
         file.seal(&self.keys)?;
         let bytes = serde_json::to_vec(&file)
             .map_err(|error| AuditError::Io(format!("serialize gap file: {error}")))?;
@@ -1236,6 +1361,7 @@ pub(crate) fn scan_journal_at(
                 sha256: sha256_hex(trailing),
                 at_offset: offset,
                 lost_entries: 1,
+                max_lost_entries: None,
             })
         } else {
             None
@@ -1403,27 +1529,24 @@ impl AuditLedger {
         if lost_entries == 0 {
             return Ok(());
         }
-        let (generation_id, after_seq) = {
-            let guard = self.inner.lock();
-            (guard.live.generation_id.clone(), guard.live.last_seq)
-        };
-        let mut file = GapFile::new();
-        {
+        // Record and persist under one lock: a concurrent recorder must not be
+        // able to commit a snapshot that predates ours and drop our evidence.
+        let after_seq = {
             let mut guard = self.inner.lock();
+            let generation_id = guard.live.generation_id.clone();
+            let after_seq = guard.live.last_seq;
             guard.recovery.durable_gaps.push(GapRecord {
                 generation_id,
                 after_seq,
                 lost_entries,
+                max_lost_entries: None,
                 reason: EntryReason::RecoveryDroppedEntries,
                 recorded_at: Utc::now(),
                 journaled: false,
             });
-            file.gaps = guard.recovery.durable_gaps.clone();
-        }
-        file.seal(&self.keys)?;
-        let bytes = serde_json::to_vec(&file)
-            .map_err(|error| AuditError::Io(format!("serialize gap file: {error}")))?;
-        files::atomic_write(&self.gap_path(), &bytes)?;
+            self.write_gap_file_locked(&guard)?;
+            after_seq
+        };
 
         self.append_internal(
             AuditEntryInput::new("audit.gap", EntryPhase::Outcome, EntryOutcome::Uncertain)
@@ -1433,6 +1556,7 @@ impl AuditLedger {
                 sha256: String::new(),
                 at_offset: after_seq,
                 lost_entries,
+                max_lost_entries: None,
             }),
         )?;
         self.mark_gaps_journaled()
@@ -1671,12 +1795,152 @@ impl AuditLedger {
         }
     }
 
-    pub(crate) fn manifest_snapshot(&self) -> Manifest {
-        self.inner.lock().manifest.clone()
+    // ------------------------------------------------------------ authority
+
+    /// Bind a grant to exactly one capability and subject.
+    ///
+    /// Keyed, so a subject never appears in the clear, and capability-prefixed,
+    /// so a grant taken for one capability cannot match another's subject.
+    pub(crate) fn subject_digest(&self, capability: AuditCapability, subject: &str) -> String {
+        self.keys
+            .opaque_digest(&format!("{}\u{1f}{}", capability.as_str(), subject))
     }
 
-    pub(crate) fn open_intents(&self) -> u64 {
-        self.inner.lock().live.open_intent_ids.len() as u64
+    /// Ask this host's authority provider for a capability.
+    ///
+    /// The issuing itself is journaled before the grant is returned, so a
+    /// privileged raw export or an unexported deletion always leaves a
+    /// permanent, chained record of the decision that allowed it -- including
+    /// the ones whose effect later fails or is never attempted.
+    pub fn issue_authority(
+        &self,
+        capability: AuditCapability,
+        subject: &str,
+    ) -> AuditResult<AuthorityGrant> {
+        if let Some(poison) = self.is_poisoned() {
+            return Err(AuditError::Poisoned(poison));
+        }
+        let digest = self.subject_digest(capability, subject);
+        let request = AuthorityRequest {
+            capability,
+            subject: digest.clone(),
+            installation_id: self.keys.installation_id().to_string(),
+        };
+        let Some(source) = self.authority.authorize(&request) else {
+            // Journal the refusal too: a denied attempt to delete unexported
+            // history is exactly as interesting as a granted one.
+            self.append_with_producer_digest(
+                AuditEntryInput::new(
+                    "audit.authority",
+                    EntryPhase::Outcome,
+                    EntryOutcome::Rejected,
+                )
+                .with_reason(EntryReason::AuthorityGranted)
+                .with_code(capability.as_str()),
+                None,
+                Some(digest),
+            )?;
+            return Err(AuditError::Refused(RefuseReason::AuthorityUnavailable));
+        };
+        let grant_id = format!(
+            "grant-{}",
+            &self.keys.opaque_digest(&uuid::Uuid::new_v4().to_string())[..24]
+        );
+        let grant =
+            AuthorityGrant::issue(&self.keys, grant_id, capability, source, digest.clone())?;
+        // An `Outcome`, not an `Intent`: issuing a grant is a completed
+        // decision, and recording it as an intent would leave an intent no
+        // outcome ever closes -- which would then block every export and
+        // rotation for the life of the process.
+        self.append_with_producer_digest(
+            AuditEntryInput::new(
+                "audit.authority",
+                EntryPhase::Outcome,
+                EntryOutcome::Accepted,
+            )
+            .with_reason(EntryReason::AuthorityGranted)
+            .with_code(capability.as_str()),
+            None,
+            Some(digest),
+        )?;
+        Ok(grant)
+    }
+
+    // ----------------------------------------------------------------- seals
+
+    /// Record a seal this ledger issued **and independently re-verified**.
+    ///
+    /// Retention reads this registry rather than trusting a caller-supplied
+    /// seal id. Only ranges the export actually carried are recorded: a
+    /// withheld or holed element is not evidence that anything was preserved.
+    pub(crate) fn record_seal(&self, record: SealRecord) -> AuditResult<()> {
+        let mut tx = self.structural_tx();
+        let mut manifest = tx.manifest_clone();
+        manifest.seals.push(record);
+        let overflow = manifest.seals.len().saturating_sub(MAX_TRACKED_SEALS);
+        if overflow > 0 {
+            // Forgetting a seal only ever makes retention *more* conservative:
+            // the range stops being deletable until it is exported again.
+            manifest.seals.drain(..overflow);
+        }
+        tx.commit_manifest(manifest)
+    }
+
+    // --------------------------------------------------------------- pending
+
+    /// Record that one entry was accepted by an async producer queue and is
+    /// not yet journaled. Returns only once that fact is durable.
+    ///
+    /// `queue_capacity` bounds how many entries can be in flight at once, and
+    /// is the number recovery reports as the upper bound on loss. One marker
+    /// covers a whole burst: it is written on the transition out of idle and
+    /// removed when the queue drains, so a busy writer pays for it once.
+    pub fn note_accepted(&self, queue_capacity: u64) -> AuditResult<()> {
+        let mut pending = self.pending.lock();
+        if pending.in_flight == 0 {
+            let (generation_id, after_seq) = {
+                let guard = self.inner.lock();
+                (guard.live.generation_id.clone(), guard.live.last_seq)
+            };
+            let mut marker = PendingMarker::new(generation_id, after_seq, queue_capacity);
+            marker.seal(&self.keys)?;
+            let bytes = serde_json::to_vec(&marker)
+                .map_err(|error| AuditError::Io(format!("serialize pending marker: {error}")))?;
+            files::atomic_write(&self.pending_path(), &bytes)?;
+        }
+        pending.in_flight = pending.in_flight.saturating_add(1);
+        Ok(())
+    }
+
+    /// Record that one accepted entry reached a durable append, or was durably
+    /// accounted for as a gap. Clears the marker once nothing is in flight.
+    pub fn note_settled(&self) -> AuditResult<()> {
+        let mut pending = self.pending.lock();
+        if pending.in_flight == 0 {
+            // Nothing is in flight, so there is no marker of ours to clear.
+            // Clearing on an unbalanced call would erase evidence belonging to
+            // a burst this settle never accounted for.
+            return Ok(());
+        }
+        pending.in_flight -= 1;
+        if pending.in_flight == 0 {
+            let path = self.pending_path();
+            if path.exists() {
+                std::fs::remove_file(&path)
+                    .map_err(|error| AuditError::Io(format!("clear pending marker: {error}")))?;
+                files::fsync_dir(&self.root)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Test/operator observation of the in-flight count.
+    pub fn in_flight(&self) -> u64 {
+        self.pending.lock().in_flight
+    }
+
+    pub(crate) fn manifest_snapshot(&self) -> Manifest {
+        self.inner.lock().manifest.clone()
     }
 
     pub(crate) fn is_poisoned(&self) -> Option<PoisonReason> {

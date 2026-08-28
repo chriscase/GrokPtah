@@ -13,8 +13,9 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use tempfile::TempDir;
 
+use super::authority::{AuditCapability, AuthorityGrant, AuthoritySource, LocalOperatorAuthority};
 use super::documents::*;
-use super::export::{verify_export, ExportFormat, ExportScope};
+use super::export::{verify_export, ExportFormat};
 use super::ledger::{AuditEntryInput, AuditLedger, AuditLedgerOptions, CrashPoint};
 use super::retention::RetentionRequest;
 use super::witness::{AuditWitness, WitnessBeacon, WitnessState, WitnessVerdict};
@@ -51,6 +52,55 @@ fn fresh(root: &Path) -> AuditLedger {
             .expect("append");
     }
     ledger
+}
+
+/// A ledger on a host where an operator is present for both capabilities.
+///
+/// The default provider grants nothing, so every test that deletes an
+/// unexported generation or takes a raw export has to say so explicitly --
+/// which is the point of the boundary.
+fn open_with_operator(root: &Path) -> AuditResult<AuditLedger> {
+    AuditLedger::open_with_options(
+        root,
+        keys(),
+        AuditLedgerOptions {
+            authority: Some(Arc::new(LocalOperatorAuthority::new([
+                AuditCapability::PrivilegedRawExport,
+                AuditCapability::RetainUnexported,
+            ]))),
+            ..Default::default()
+        },
+    )
+}
+
+fn operator_ledger(root: &Path) -> AuditLedger {
+    open_with_operator(root).expect("ledger opens")
+}
+
+/// Five committed entries in generation 1, on an operator host.
+fn fresh_with_operator(root: &Path) -> AuditLedger {
+    let ledger = operator_ledger(root);
+    for index in 0..5 {
+        ledger
+            .append(entry(&format!("op.{index}")))
+            .expect("append");
+    }
+    ledger
+}
+
+fn retain_grant(ledger: &AuditLedger, generation_id: &str) -> AuthorityGrant {
+    ledger
+        .issue_authority(AuditCapability::RetainUnexported, generation_id)
+        .expect("operator grant")
+}
+
+fn raw_export_grant(ledger: &AuditLedger) -> AuthorityGrant {
+    ledger
+        .issue_authority(
+            AuditCapability::PrivilegedRawExport,
+            super::authority::PRIVILEGED_RAW_EXPORT_SUBJECT,
+        )
+        .expect("operator grant")
 }
 
 fn journal_of(root: &Path, generation: &str) -> PathBuf {
@@ -510,29 +560,78 @@ fn retention_refuses_the_active_generation() {
     let dir = TempDir::new().unwrap();
     let ledger = fresh(dir.path());
     let error = ledger
-        .retain(RetentionRequest::new("g-000001").with_export_seal("seal-x"))
+        .retain(RetentionRequest::exported_under("g-000001", "seal-x"))
         .unwrap_err();
     assert_eq!(refusal_of(error), RefuseReason::GenerationIsActive);
 }
 
 #[test]
-fn retention_refuses_an_unexported_generation_without_an_override() {
+fn retention_refuses_a_seal_this_ledger_never_issued() {
     let dir = TempDir::new().unwrap();
     let ledger = fresh(dir.path());
     ledger.rotate(RotationReason::Bytes).unwrap();
+    // A caller-supplied seal id is a lookup key, never a claim. Before the
+    // registry existed, any non-empty string was accepted as proof of export.
     assert_eq!(
         refusal_of(
             ledger
-                .retain(RetentionRequest::new("g-000001"))
+                .retain(RetentionRequest::exported_under(
+                    "g-000001",
+                    "seal-that-never-existed"
+                ))
                 .unwrap_err()
         ),
-        RefuseReason::GenerationUnexported
+        RefuseReason::ExportSealUnknown
     );
-    // The override is allowed, and is recorded permanently in the tombstone.
-    ledger
-        .retain(RetentionRequest::new("g-000001").allow_unexported())
+    assert!(ledger.manifest_snapshot().tombstones.is_empty());
+}
+
+#[test]
+fn deleting_an_unexported_generation_needs_an_operator_host() {
+    let dir = TempDir::new().unwrap();
+    let ledger = fresh(dir.path());
+    ledger.rotate(RotationReason::Bytes).unwrap();
+    // The default provider grants nothing, so the last copy of a range cannot
+    // be destroyed at all on a host that never said an operator was present.
+    assert_eq!(
+        refusal_of(
+            ledger
+                .issue_authority(AuditCapability::RetainUnexported, "g-000001")
+                .unwrap_err()
+        ),
+        RefuseReason::AuthorityUnavailable
+    );
+    assert!(ledger.manifest_snapshot().tombstones.is_empty());
+}
+
+#[test]
+fn an_unexported_deletion_records_the_grant_that_allowed_it() {
+    let dir = TempDir::new().unwrap();
+    let ledger = fresh_with_operator(dir.path());
+    ledger.rotate(RotationReason::Bytes).unwrap();
+    let grant = retain_grant(&ledger, "g-000001");
+    let grant_id = grant.grant_id().to_string();
+    let receipt = ledger
+        .retain(RetentionRequest::under_grant("g-000001", grant))
         .unwrap();
-    assert!(ledger.manifest_snapshot().tombstones[0].allow_unexported);
+
+    let tombstone = ledger.manifest_snapshot().tombstones[0].clone();
+    assert!(tombstone.allow_unexported);
+    assert_eq!(
+        tombstone.authority_grant_id.as_deref(),
+        Some(grant_id.as_str())
+    );
+    // Permanently honest about what stood behind it: an operator act on this
+    // host, not a verified principal (#460/#461).
+    assert_eq!(
+        tombstone.authority_source,
+        Some(AuthoritySource::LocalOperator)
+    );
+    assert_eq!(
+        receipt.authority_grant_id.as_deref(),
+        Some(grant_id.as_str())
+    );
+    assert!(receipt.export_seal_id.is_none());
 }
 
 #[test]
@@ -543,14 +642,13 @@ fn tombstone_first_retention_keeps_the_chain_across_the_hole() {
     ledger.rotate(RotationReason::Bytes).unwrap();
     ledger.append(entry("post")).unwrap();
     let receipt = ledger
-        .export(
-            &export_dir.path().join("out"),
-            ExportFormat::Auto,
-            ExportScope::Public,
-        )
+        .export(&export_dir.path().join("out"), ExportFormat::Auto)
         .unwrap();
     ledger
-        .retain(RetentionRequest::new("g-000001").with_export_seal(&receipt.seal_id))
+        .retain(RetentionRequest::exported_under(
+            "g-000001",
+            &receipt.seal_id,
+        ))
         .unwrap();
     drop(ledger);
 
@@ -575,12 +673,15 @@ fn tombstone_first_retention_keeps_the_chain_across_the_hole() {
 #[test]
 fn crash_cut_t3_resumes_removal_at_open() {
     let dir = TempDir::new().unwrap();
-    let ledger = fresh(dir.path());
+    let ledger = fresh_with_operator(dir.path());
     ledger.rotate(RotationReason::Bytes).unwrap();
     ledger.append(entry("post")).unwrap();
     let ledger = ledger.with_crash_at(CrashPoint::T3Committed);
     assert!(ledger
-        .retain(RetentionRequest::new("g-000001").allow_unexported())
+        .retain(RetentionRequest::under_grant(
+            "g-000001",
+            retain_grant(&ledger, "g-000001")
+        ))
         .is_err());
     assert!(
         AuditLedger::generation_dir(dir.path(), "g-000001").exists(),
@@ -605,12 +706,15 @@ fn crash_cut_t3_resumes_removal_at_open() {
 #[test]
 fn crash_cut_t4_converges_without_loss() {
     let dir = TempDir::new().unwrap();
-    let ledger = fresh(dir.path());
+    let ledger = fresh_with_operator(dir.path());
     ledger.rotate(RotationReason::Bytes).unwrap();
     ledger.append(entry("post")).unwrap();
     let ledger = ledger.with_crash_at(CrashPoint::T4Removed);
     assert!(ledger
-        .retain(RetentionRequest::new("g-000001").allow_unexported())
+        .retain(RetentionRequest::under_grant(
+            "g-000001",
+            retain_grant(&ledger, "g-000001")
+        ))
         .is_err());
     drop(ledger);
 
@@ -629,7 +733,7 @@ fn retention_refuses_a_sealed_generation_whose_bytes_changed() {
     use std::io::Write;
 
     let dir = TempDir::new().unwrap();
-    let ledger = fresh(dir.path());
+    let ledger = fresh_with_operator(dir.path());
     ledger.rotate(RotationReason::Bytes).unwrap();
     let mut file = std::fs::OpenOptions::new()
         .append(true)
@@ -639,7 +743,10 @@ fn retention_refuses_a_sealed_generation_whose_bytes_changed() {
     file.sync_all().unwrap();
 
     let error = ledger
-        .retain(RetentionRequest::new("g-000001").allow_unexported())
+        .retain(RetentionRequest::under_grant(
+            "g-000001",
+            retain_grant(&ledger, "g-000001"),
+        ))
         .unwrap_err();
     assert_eq!(poison_of(error), PoisonReason::SealedGenerationChanged);
     assert!(
@@ -656,29 +763,17 @@ fn never_rotated_ledger_exports_as_v1_and_v2() {
     let out = TempDir::new().unwrap();
     let ledger = fresh(dir.path());
     let v1 = ledger
-        .export(
-            &out.path().join("v1"),
-            ExportFormat::V1,
-            ExportScope::Public,
-        )
+        .export(&out.path().join("v1"), ExportFormat::V1)
         .unwrap();
     let v2 = ledger
-        .export(
-            &out.path().join("v2"),
-            ExportFormat::V2,
-            ExportScope::Public,
-        )
+        .export(&out.path().join("v2"), ExportFormat::V2)
         .unwrap();
     assert!(v1.schema.ends_with(".v1") && v1.complete);
     assert!(v2.schema.ends_with(".v2") && v2.complete);
     assert_eq!(v1.global_last_seq, 5);
     // Auto picks v1 for a never-rotated, fully authenticated ledger.
     let auto = ledger
-        .export(
-            &out.path().join("auto"),
-            ExportFormat::Auto,
-            ExportScope::Public,
-        )
+        .export(&out.path().join("auto"), ExportFormat::Auto)
         .unwrap();
     assert!(auto.schema.ends_with(".v1"));
 }
@@ -692,21 +787,13 @@ fn multi_generation_refuses_v1_and_auto_selects_v2() {
     assert_eq!(
         refusal_of(
             ledger
-                .export(
-                    &out.path().join("v1"),
-                    ExportFormat::V1,
-                    ExportScope::Public
-                )
+                .export(&out.path().join("v1"), ExportFormat::V1)
                 .unwrap_err()
         ),
         RefuseReason::ExportV1IncompatibleMultiGeneration
     );
     let auto = ledger
-        .export(
-            &out.path().join("auto"),
-            ExportFormat::Auto,
-            ExportScope::Public,
-        )
+        .export(&out.path().join("auto"), ExportFormat::Auto)
         .unwrap();
     assert!(auto.schema.ends_with(".v2"));
     assert!(auto.complete);
@@ -717,17 +804,18 @@ fn multi_generation_refuses_v1_and_auto_selects_v2() {
 fn export_after_retention_is_incomplete_with_an_explicit_hole() {
     let dir = TempDir::new().unwrap();
     let out = TempDir::new().unwrap();
-    let ledger = fresh(dir.path());
+    let ledger = fresh_with_operator(dir.path());
     ledger.rotate(RotationReason::Bytes).unwrap();
     ledger.append(entry("post")).unwrap();
     ledger
-        .retain(RetentionRequest::new("g-000001").allow_unexported())
+        .retain(RetentionRequest::under_grant(
+            "g-000001",
+            retain_grant(&ledger, "g-000001"),
+        ))
         .unwrap();
 
     let dest = out.path().join("after");
-    let receipt = ledger
-        .export(&dest, ExportFormat::Auto, ExportScope::Public)
-        .unwrap();
+    let receipt = ledger.export(&dest, ExportFormat::Auto).unwrap();
     assert!(
         !receipt.complete,
         "a retained hole must never be reported as complete"
@@ -751,17 +839,26 @@ fn export_never_rotates_truncates_or_deletes() {
     let before = std::fs::read(&path).unwrap();
     let epoch = ledger.manifest_snapshot().manifest_epoch;
 
-    ledger
-        .export(
-            &out.path().join("out"),
-            ExportFormat::Auto,
-            ExportScope::Public,
-        )
+    let receipt = ledger
+        .export(&out.path().join("out"), ExportFormat::Auto)
         .unwrap();
 
-    assert_eq!(std::fs::read(&path).unwrap(), before);
-    assert_eq!(ledger.manifest_snapshot().manifest_epoch, epoch);
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "history was rewritten"
+    );
     assert_eq!(ledger.manifest_snapshot().generations.len(), 1);
+    // The manifest *does* advance, by exactly one additive fact: the seal this
+    // export issued and re-verified. Retention consults that registry instead
+    // of trusting a caller-supplied seal id, so recording it is what makes
+    // "this range was exported" checkable at all. No generation, journal byte,
+    // tombstone or chain tag changes.
+    let after = ledger.manifest_snapshot();
+    assert_eq!(after.manifest_epoch, epoch + 1);
+    assert_eq!(after.seals.len(), 1);
+    assert_eq!(after.seals[0].seal_id, receipt.seal_id);
+    assert!(after.tombstones.is_empty());
 }
 
 #[test]
@@ -772,11 +869,7 @@ fn export_into_an_existing_directory_is_refused() {
     let dest = out.path().join("occupied");
     std::fs::create_dir_all(&dest).unwrap();
     assert_eq!(
-        refusal_of(
-            ledger
-                .export(&dest, ExportFormat::Auto, ExportScope::Public)
-                .unwrap_err()
-        ),
+        refusal_of(ledger.export(&dest, ExportFormat::Auto).unwrap_err()),
         RefuseReason::ExportDestinationExists
     );
 }
@@ -873,11 +966,7 @@ fn witness_outage_is_fail_soft_and_receipt_honest() {
     // ...and must not silently upgrade into an implied guarantee.
     assert_eq!(ledger.status().witness_state, WitnessState::Unverified);
     let receipt = ledger
-        .export(
-            &out.path().join("out"),
-            ExportFormat::Auto,
-            ExportScope::Public,
-        )
+        .export(&out.path().join("out"), ExportFormat::Auto)
         .unwrap();
     assert_eq!(receipt.witness_state, WitnessState::Unverified);
 }
@@ -953,6 +1042,22 @@ fn open_with_legacy(root: &Path, legacy: &Path) -> AuditResult<AuditLedger> {
         keys(),
         AuditLedgerOptions {
             legacy_v1_dir: Some(legacy.to_path_buf()),
+            ..AuditLedgerOptions::default()
+        },
+    )
+}
+
+/// The same, on a host where an operator is present for both capabilities.
+fn open_with_legacy_operator(root: &Path, legacy: &Path) -> AuditResult<AuditLedger> {
+    AuditLedger::open_with_options(
+        root,
+        keys(),
+        AuditLedgerOptions {
+            legacy_v1_dir: Some(legacy.to_path_buf()),
+            authority: Some(Arc::new(LocalOperatorAuthority::new([
+                AuditCapability::PrivilegedRawExport,
+                AuditCapability::RetainUnexported,
+            ]))),
             ..AuditLedgerOptions::default()
         },
     )
@@ -1051,17 +1156,13 @@ fn imported_ledger_refuses_v1_export_and_labels_unauthenticated_in_v2() {
     let dir = TempDir::new().unwrap();
     let out = TempDir::new().unwrap();
     let legacy = legacy_v1_dir(dir.path(), "{\"a\":1}\n", "{\"b\":2}\n");
-    let ledger = open_with_legacy(&dir.path().join("audit"), &legacy).unwrap();
+    let ledger = open_with_legacy_operator(&dir.path().join("audit"), &legacy).unwrap();
 
     // A v1 document cannot say "unauthenticated origin", so refuse to emit one.
     assert_eq!(
         refusal_of(
             ledger
-                .export(
-                    &out.path().join("v1"),
-                    ExportFormat::V1,
-                    ExportScope::Public
-                )
+                .export(&out.path().join("v1"), ExportFormat::V1)
                 .unwrap_err()
         ),
         RefuseReason::ExportV1IncompatibleMultiGeneration
@@ -1069,9 +1170,7 @@ fn imported_ledger_refuses_v1_export_and_labels_unauthenticated_in_v2() {
     // A public export withholds the imported generations rather than carrying
     // them: preserved verbatim means never redacted to the v2 rules.
     let dest = out.path().join("v2");
-    let receipt = ledger
-        .export(&dest, ExportFormat::Auto, ExportScope::Public)
-        .unwrap();
+    let receipt = ledger.export(&dest, ExportFormat::Auto).unwrap();
     assert!(receipt.schema.ends_with(".v2"));
     assert_eq!(receipt.unauthenticated_generations, 0);
     assert_eq!(receipt.withheld, 2);
@@ -1083,10 +1182,10 @@ fn imported_ledger_refuses_v1_export_and_labels_unauthenticated_in_v2() {
     // Privileged raw preservation is the only scope that carries them, and it
     // declares that it does.
     let raw = ledger
-        .export(
+        .export_privileged_raw(
             &out.path().join("raw"),
             ExportFormat::Auto,
-            ExportScope::PrivilegedRaw,
+            &raw_export_grant(&ledger),
         )
         .unwrap();
     assert_eq!(raw.unauthenticated_generations, 2);
@@ -1100,9 +1199,7 @@ fn v1_export_verifies_with_the_v2_verifier() {
     let out = TempDir::new().unwrap();
     let ledger = fresh(dir.path());
     let dest = out.path().join("v1");
-    let receipt = ledger
-        .export(&dest, ExportFormat::V1, ExportScope::Public)
-        .unwrap();
+    let receipt = ledger.export(&dest, ExportFormat::V1).unwrap();
     drop(ledger);
 
     // Backward read: the current verifier still accepts a v1 export.
@@ -1294,9 +1391,7 @@ fn a_failed_export_leaves_no_partial_destination() {
     file.sync_all().unwrap();
 
     let dest = out.path().join("partial");
-    assert!(ledger
-        .export(&dest, ExportFormat::Auto, ExportScope::Public)
-        .is_err());
+    assert!(ledger.export(&dest, ExportFormat::Auto).is_err());
     assert!(
         !dest.exists(),
         "a refused export must not leave a directory that could pass for a sealed one"
@@ -1422,17 +1517,20 @@ fn concurrent_appends_during_a_rotation_never_strand_an_entry() {
 #[test]
 fn a_rotation_racing_a_retention_never_drops_a_generation_or_regresses_the_epoch() {
     let dir = TempDir::new().unwrap();
-    let ledger = Arc::new(opened(dir.path()));
+    let ledger = Arc::new(operator_ledger(dir.path()));
     ledger.append(entry("first")).unwrap();
     ledger.rotate(RotationReason::Operator).unwrap();
     ledger.append(entry("second")).unwrap();
     ledger.rotate(RotationReason::Operator).unwrap();
     ledger.append(entry("third")).unwrap();
+    // Taken before the race: issuing a grant appends, and the point of the
+    // test is the rotation/retention overlap, not the issuing.
+    let grant = retain_grant(&ledger, "g-000001");
     let epoch_before = ledger.manifest_snapshot().manifest_epoch;
 
     let retainer = Arc::clone(&ledger);
     let retention = std::thread::spawn(move || {
-        retainer.retain(RetentionRequest::new("g-000001").allow_unexported())
+        retainer.retain(RetentionRequest::under_grant("g-000001", grant))
     });
     let rotator = Arc::clone(&ledger);
     let rotation = std::thread::spawn(move || rotator.rotate(RotationReason::Operator));
@@ -1538,4 +1636,530 @@ fn a_failed_append_still_leaves_durable_evidence_on_disk() {
         recorded.gaps.iter().all(|g| !g.journaled),
         "an unjournaled loss must stay marked unjournaled"
     );
+}
+
+// ------------------------------------------- accepted-but-not-journaled (P0)
+
+#[test]
+fn entries_accepted_by_a_queue_but_never_journaled_are_reported_as_bounded_uncertainty() {
+    let dir = TempDir::new().unwrap();
+    {
+        let ledger = fresh(dir.path());
+        // An async producer queue accepted three entries. Before this marker
+        // existed, `enqueue_audit` returned "accepted" for entries that lived
+        // only in memory, and a crash here left no trace of them at all.
+        for _ in 0..3 {
+            ledger.note_accepted(256).unwrap();
+        }
+        assert!(dir.path().join("pending.json").is_file());
+        // The process dies: nothing settles, nothing is appended.
+    }
+
+    let ledger = opened(dir.path());
+    let gaps = ledger.status().recovery.durable_gaps;
+    let pending: Vec<_> = gaps
+        .iter()
+        .filter(|gap| gap.reason == EntryReason::AcceptedNotJournaled)
+        .collect();
+    assert_eq!(pending.len(), 1, "one marker, one bounded gap");
+    // Nothing is *known* lost, and up to a full queue may be. Reporting a bare
+    // zero would read as "nothing was lost"; reporting 256 would invent losses.
+    assert_eq!(pending[0].lost_entries, 0);
+    assert_eq!(pending[0].max_lost_entries, Some(256));
+    assert!(
+        !dir.path().join("pending.json").exists(),
+        "the marker is consumed once it has become durable evidence"
+    );
+
+    // The uncertainty is chained into the journal, not only in the gap file.
+    let journal = std::fs::read_to_string(journal_of(dir.path(), "g-000001")).unwrap();
+    assert!(
+        journal.contains("accepted_not_journaled"),
+        "the loss must be journaled under its own reason"
+    );
+    ledger.verify_all().unwrap();
+}
+
+#[test]
+fn a_settled_queue_leaves_no_marker_and_no_uncertainty() {
+    let dir = TempDir::new().unwrap();
+    {
+        let ledger = fresh(dir.path());
+        ledger.note_accepted(256).unwrap();
+        ledger.note_accepted(256).unwrap();
+        assert_eq!(ledger.in_flight(), 2);
+        ledger.append(entry("queued.one")).unwrap();
+        ledger.note_settled().unwrap();
+        assert!(
+            dir.path().join("pending.json").is_file(),
+            "one entry is still in flight"
+        );
+        ledger.append(entry("queued.two")).unwrap();
+        ledger.note_settled().unwrap();
+        assert_eq!(ledger.in_flight(), 0);
+        assert!(!dir.path().join("pending.json").exists());
+    }
+    let ledger = opened(dir.path());
+    assert!(ledger
+        .status()
+        .recovery
+        .durable_gaps
+        .iter()
+        .all(|gap| gap.reason != EntryReason::AcceptedNotJournaled));
+}
+
+#[test]
+fn a_consumed_pending_marker_is_not_reported_again_on_the_next_open() {
+    let dir = TempDir::new().unwrap();
+    {
+        let ledger = fresh(dir.path());
+        ledger.note_accepted(64).unwrap();
+    }
+    let first = opened(dir.path());
+    let reported = |ledger: &AuditLedger| {
+        ledger
+            .status()
+            .recovery
+            .durable_gaps
+            .iter()
+            .filter(|gap| gap.reason == EntryReason::AcceptedNotJournaled)
+            .count()
+    };
+    assert_eq!(reported(&first), 1);
+    drop(first);
+
+    // The gap is permanent evidence, but the *marker* is gone, so a restart
+    // does not manufacture a second episode of uncertainty.
+    let second = opened(dir.path());
+    assert_eq!(reported(&second), 1);
+    let journal = std::fs::read_to_string(journal_of(dir.path(), "g-000001")).unwrap();
+    assert_eq!(
+        journal.matches("accepted_not_journaled").count(),
+        1,
+        "the same loss must not be re-journaled on every open"
+    );
+}
+
+// ------------------------------------------------ export seal authority (P0)
+
+#[test]
+fn retention_refuses_a_seal_whose_export_withheld_the_range() {
+    let dir = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    let legacy = TempDir::new().unwrap();
+    std::fs::write(
+        legacy.path().join("audit.jsonl"),
+        "{\"tool\":\"legacy\",\"detail\":\"/home/someone/secret/path\"}\n",
+    )
+    .unwrap();
+    let ledger = AuditLedger::open_with_options(
+        dir.path(),
+        keys(),
+        AuditLedgerOptions {
+            legacy_v1_dir: Some(legacy.path().to_path_buf()),
+            ..Default::default()
+        },
+    )
+    .expect("ledger with imported legacy bytes");
+    ledger.append(entry("post.import")).unwrap();
+    ledger.rotate(RotationReason::Operator).unwrap();
+    ledger.append(entry("after")).unwrap();
+
+    // A public export withholds the imported generation: it copies none of its
+    // bytes. Treating that seal as proof the range was preserved would let the
+    // only copy be deleted on the strength of an export that never had it.
+    let receipt = ledger
+        .export(&out.path().join("public"), ExportFormat::Auto)
+        .unwrap();
+    assert!(receipt.withheld >= 1);
+    assert_eq!(
+        refusal_of(
+            ledger
+                .retain(RetentionRequest::exported_under(
+                    "g-000001",
+                    &receipt.seal_id
+                ))
+                .unwrap_err()
+        ),
+        RefuseReason::ExportSealDoesNotCover
+    );
+    assert!(ledger.manifest_snapshot().tombstones.is_empty());
+}
+
+#[test]
+fn retention_accepts_only_the_exact_range_a_seal_carried() {
+    let dir = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    let ledger = fresh(dir.path());
+    ledger.rotate(RotationReason::Operator).unwrap();
+    ledger.append(entry("second.generation")).unwrap();
+
+    // Taken while g-000002 is still active, so the export carries a *prefix*
+    // of it: two entries, not the four it will hold by the time retention runs.
+    let seal = ledger
+        .export(&out.path().join("prefix"), ExportFormat::Auto)
+        .unwrap();
+    ledger.append(entry("after.the.export")).unwrap();
+    ledger.rotate(RotationReason::Operator).unwrap();
+    ledger.append(entry("third.generation")).unwrap();
+
+    assert_eq!(
+        refusal_of(
+            ledger
+                .retain(RetentionRequest::exported_under("g-000002", &seal.seal_id))
+                .unwrap_err()
+        ),
+        RefuseReason::ExportSealDoesNotCover,
+        "an export of a shorter prefix is not a copy of what would be deleted"
+    );
+    // g-000001 was already sealed when the export ran, so its bytes are
+    // byte-identical to what the export carried.
+    ledger
+        .retain(RetentionRequest::exported_under("g-000001", &seal.seal_id))
+        .expect("the exact range this seal carried");
+}
+
+// ------------------------------------------------- capability authority (P0)
+
+#[test]
+fn a_raw_export_needs_an_operator_host() {
+    let dir = TempDir::new().unwrap();
+    let ledger = fresh(dir.path());
+    // The default provider grants nothing, so unredacted bytes cannot leave.
+    assert_eq!(
+        refusal_of(
+            ledger
+                .issue_authority(
+                    AuditCapability::PrivilegedRawExport,
+                    super::authority::PRIVILEGED_RAW_EXPORT_SUBJECT
+                )
+                .unwrap_err()
+        ),
+        RefuseReason::AuthorityUnavailable
+    );
+    // The refusal is itself journaled: a denied attempt to take unredacted
+    // history out of the ledger is exactly as interesting as a granted one.
+    let journal = std::fs::read_to_string(journal_of(dir.path(), "g-000001")).unwrap();
+    assert!(journal.contains("privileged_raw_export"));
+}
+
+#[test]
+fn an_operator_host_grants_only_the_capabilities_it_named() {
+    let dir = TempDir::new().unwrap();
+    let ledger = AuditLedger::open_with_options(
+        dir.path(),
+        keys(),
+        AuditLedgerOptions {
+            authority: Some(Arc::new(LocalOperatorAuthority::new([
+                AuditCapability::PrivilegedRawExport,
+            ]))),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    ledger.append(entry("first")).unwrap();
+    ledger
+        .issue_authority(
+            AuditCapability::PrivilegedRawExport,
+            super::authority::PRIVILEGED_RAW_EXPORT_SUBJECT,
+        )
+        .expect("the named capability");
+    assert_eq!(
+        refusal_of(
+            ledger
+                .issue_authority(AuditCapability::RetainUnexported, "g-000001")
+                .unwrap_err()
+        ),
+        RefuseReason::AuthorityUnavailable,
+        "a host that needs raw exports must not thereby gain deletion"
+    );
+}
+
+#[test]
+fn a_forged_grant_is_refused() {
+    let dir = TempDir::new().unwrap();
+    let ledger = fresh_with_operator(dir.path());
+    ledger.rotate(RotationReason::Operator).unwrap();
+    ledger.append(entry("after")).unwrap();
+
+    let grant = retain_grant(&ledger, "g-000001");
+    // Re-issued from the same fields under a key the ledger does not have.
+    let forged: AuthorityGrant =
+        serde_json::from_value(json_with_mac(&grant, "0".repeat(64))).unwrap();
+    assert_eq!(
+        refusal_of(
+            ledger
+                .retain(RetentionRequest::under_grant("g-000001", forged))
+                .unwrap_err()
+        ),
+        RefuseReason::AuthorityInvalid
+    );
+    // The real one still works, so the refusal was about the tag, not the shape.
+    ledger
+        .retain(RetentionRequest::under_grant("g-000001", grant))
+        .expect("a genuine grant");
+    assert_eq!(ledger.manifest_snapshot().tombstones.len(), 1);
+}
+
+#[test]
+fn a_grant_is_single_use() {
+    let dir = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    let ledger = fresh_with_operator(dir.path());
+
+    // Privileged raw export is where a replay is actually reachable: retention
+    // tombstones its subject, so a second use there is caught one check
+    // earlier. This exercises the same consumed-grant check directly.
+    let grant = raw_export_grant(&ledger);
+    let replay = grant.clone();
+    ledger
+        .export_privileged_raw(&out.path().join("first"), ExportFormat::Auto, &grant)
+        .expect("first use");
+    assert_eq!(
+        refusal_of(
+            ledger
+                .export_privileged_raw(&out.path().join("second"), ExportFormat::Auto, &replay)
+                .unwrap_err()
+        ),
+        RefuseReason::AuthorityAlreadyConsumed,
+        "a captured grant must authorize nothing a second time, even in its TTL"
+    );
+    assert!(
+        !out.path().join("second").exists(),
+        "a refused export leaves no destination behind"
+    );
+}
+
+#[test]
+fn a_grant_is_bound_to_the_generation_it_names() {
+    let dir = TempDir::new().unwrap();
+    let ledger = fresh_with_operator(dir.path());
+    ledger.rotate(RotationReason::Operator).unwrap();
+    ledger.append(entry("second")).unwrap();
+    ledger.rotate(RotationReason::Operator).unwrap();
+    ledger.append(entry("third")).unwrap();
+
+    let grant = retain_grant(&ledger, "g-000001");
+    assert_eq!(
+        refusal_of(
+            ledger
+                .retain(RetentionRequest::under_grant("g-000002", grant))
+                .unwrap_err()
+        ),
+        RefuseReason::AuthorityScopeMismatch
+    );
+    assert!(ledger.manifest_snapshot().tombstones.is_empty());
+}
+
+#[test]
+fn a_capability_grant_cannot_be_spent_on_another_capability() {
+    let dir = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    let ledger = fresh_with_operator(dir.path());
+    ledger.rotate(RotationReason::Operator).unwrap();
+    ledger.append(entry("second")).unwrap();
+
+    // Minted for a deletion, presented for an export of unredacted bytes.
+    let deletion = retain_grant(&ledger, "g-000001");
+    assert_eq!(
+        refusal_of(
+            ledger
+                .export_privileged_raw(&out.path().join("raw"), ExportFormat::Auto, &deletion)
+                .unwrap_err()
+        ),
+        RefuseReason::AuthorityScopeMismatch
+    );
+    // Unspent, so the capability it *was* minted for still works.
+    ledger
+        .retain(RetentionRequest::under_grant("g-000001", deletion))
+        .expect("the capability it was minted for");
+}
+
+#[test]
+fn a_spent_grant_id_is_recorded_in_the_manifest() {
+    let dir = TempDir::new().unwrap();
+    let ledger = fresh_with_operator(dir.path());
+    ledger.rotate(RotationReason::Operator).unwrap();
+    ledger.append(entry("second")).unwrap();
+
+    let grant = retain_grant(&ledger, "g-000001");
+    let replay = grant.clone();
+    ledger
+        .retain(RetentionRequest::under_grant("g-000001", grant))
+        .expect("first use");
+    let manifest = ledger.manifest_snapshot();
+    assert_eq!(manifest.consumed_grants.len(), 1);
+    assert_eq!(
+        manifest.consumed_grants[0].grant_id,
+        replay.grant_id(),
+        "the spent id is recorded in the same manifest write as the tombstone"
+    );
+    assert_eq!(
+        manifest.consumed_grants[0].source,
+        AuthoritySource::LocalOperator
+    );
+}
+
+#[test]
+fn a_grant_from_another_installation_is_refused() {
+    let dir = TempDir::new().unwrap();
+    let other = TempDir::new().unwrap();
+    let ledger = fresh_with_operator(dir.path());
+    ledger.rotate(RotationReason::Operator).unwrap();
+    ledger.append(entry("after")).unwrap();
+
+    let foreign = AuditLedger::open_with_options(
+        other.path(),
+        foreign_keys(),
+        AuditLedgerOptions {
+            authority: Some(Arc::new(LocalOperatorAuthority::new([
+                AuditCapability::RetainUnexported,
+            ]))),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    foreign.append(entry("first")).unwrap();
+    let stolen = foreign
+        .issue_authority(AuditCapability::RetainUnexported, "g-000001")
+        .unwrap();
+    assert_eq!(
+        refusal_of(
+            ledger
+                .retain(RetentionRequest::under_grant("g-000001", stolen))
+                .unwrap_err()
+        ),
+        RefuseReason::AuthorityInvalid,
+        "a grant minted elsewhere authorizes nothing here"
+    );
+}
+
+// ------------------------------------------------------- concurrency (P0/P1)
+
+#[test]
+fn concurrent_drop_recorders_never_erase_each_others_evidence() {
+    let dir = TempDir::new().unwrap();
+    let ledger = Arc::new(fresh(dir.path()));
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let recorder = Arc::clone(&ledger);
+        handles.push(std::thread::spawn(move || {
+            for _ in 0..4 {
+                recorder.record_dropped(1).expect("record a drop");
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    // Read-modify-write of the gap file runs under one lock. Releasing it
+    // before the atomic write let an older snapshot land after a newer one and
+    // silently erase the losses in between.
+    let recorded: super::documents::GapFile =
+        serde_json::from_slice(&std::fs::read(dir.path().join("gap.json")).unwrap()).unwrap();
+    recorded.verify(&keys()).expect("authenticated");
+    assert_eq!(
+        recorded
+            .gaps
+            .iter()
+            .map(|gap| gap.lost_entries)
+            .sum::<u64>(),
+        32,
+        "every recorded loss must survive concurrent recorders"
+    );
+    ledger.verify_all().unwrap();
+}
+
+#[test]
+fn export_completeness_is_decided_inside_the_structural_barrier() {
+    let dir = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    let observed = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&observed);
+    let ledger = AuditLedger::open(dir.path(), keys())
+        .unwrap()
+        .with_structural_observer(Arc::new(move |ledger: &AuditLedger| {
+            // Checking poisoned/open-intent state before taking the barrier let
+            // an intent open in the check-to-lock window, after which the
+            // export would claim a completeness that was no longer true.
+            assert!(
+                !ledger.inner_is_unlocked(),
+                "the export decided completeness without holding the barrier"
+            );
+            flag.store(true, Ordering::SeqCst);
+        }));
+    ledger.append(entry("first")).unwrap();
+    let receipt = ledger
+        .export(&out.path().join("sealed"), ExportFormat::Auto)
+        .unwrap();
+    assert!(receipt.complete);
+    assert!(
+        observed.load(Ordering::SeqCst),
+        "the barrier was never taken"
+    );
+}
+
+#[test]
+fn a_concurrent_intent_never_yields_a_falsely_complete_export() {
+    let dir = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    let ledger = Arc::new(fresh(dir.path()));
+    let writer = Arc::clone(&ledger);
+    let stop = Arc::new(AtomicBool::new(false));
+    let halt = Arc::clone(&stop);
+    let churn = std::thread::spawn(move || {
+        let mut round = 0u32;
+        while !halt.load(Ordering::SeqCst) {
+            let producer = format!("intent-{round}");
+            writer
+                .append(
+                    AuditEntryInput::new("race.op", EntryPhase::Intent, EntryOutcome::Accepted)
+                        .with_producer(&producer),
+                )
+                .expect("intent");
+            writer
+                .append(
+                    AuditEntryInput::new("race.op", EntryPhase::Outcome, EntryOutcome::Accepted)
+                        .with_producer(&producer),
+                )
+                .expect("outcome");
+            round = round.wrapping_add(1);
+        }
+    });
+
+    let mut complete = 0usize;
+    for round in 0..60 {
+        let dest = out.path().join(format!("export-{round}"));
+        match ledger.export(&dest, ExportFormat::Auto) {
+            Ok(receipt) => {
+                // A complete export must tile every sequence the ledger had
+                // committed when the barrier was taken -- no hole, no short
+                // range, and it must still verify standalone.
+                let verified = verify_export(&dest, &keys()).expect("export verifies");
+                assert_eq!(verified.complete, receipt.complete);
+                if receipt.complete {
+                    assert_eq!(receipt.global_first_seq, 1);
+                    complete += 1;
+                }
+            }
+            // The only legal refusal here: an intent was open at the barrier.
+            Err(error) => assert_eq!(
+                refusal_of(error),
+                RefuseReason::OpenIntentsPresent,
+                "an export must refuse rather than misreport"
+            ),
+        }
+    }
+    stop.store(true, Ordering::SeqCst);
+    churn.join().unwrap();
+    assert!(complete > 0, "no export ever completed");
+    ledger.verify_all().unwrap();
+}
+
+/// Re-serialize a grant with a substituted tag, to forge one without the key.
+fn json_with_mac(grant: &AuthorityGrant, mac: String) -> serde_json::Value {
+    let mut value = serde_json::to_value(grant).expect("serialize grant");
+    value["mac"] = serde_json::Value::String(mac);
+    value
 }

@@ -7,6 +7,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use super::authority::{AuditCapability, AuthoritySource};
 use super::canon::canonical_bytes_without_mac;
 use super::keys::AuditKeys;
 use super::{AuditError, AuditResult, PoisonReason};
@@ -14,6 +15,8 @@ use super::{AuditError, AuditResult, PoisonReason};
 pub const MANIFEST_SCHEMA: &str = "grokptah-audit-manifest.v2";
 pub const ANCHOR_SCHEMA: &str = "grokptah-audit-anchor.v2";
 pub const GAP_SCHEMA: &str = "grokptah-audit-gap.v2";
+pub const PENDING_SCHEMA: &str = "grokptah-audit-pending.v2";
+pub const GRANT_SCHEMA: &str = "grokptah-audit-grant.v2";
 pub const EXPORT_SCHEMA_V1: &str = "grokptah-audit-export.v1";
 pub const EXPORT_SCHEMA_V2: &str = "grokptah-audit-export.v2";
 pub const MANIFEST_VERSION: u32 = 2;
@@ -91,6 +94,12 @@ pub enum EntryReason {
     /// the retired ledger. Recorded, never repaired.
     LegacyWrittenAfterCutover,
     HostShutdown,
+    /// Entries were accepted by the async queue but their journaling was
+    /// never proven. Recorded on the next open; never silently dropped.
+    AcceptedNotJournaled,
+    /// A capability grant was issued or spent. Always journaled, so a
+    /// privileged export or an unexported deletion is never invisible.
+    AuthorityGranted,
     Unauthenticated,
     ForbiddenScope,
     WorkspaceMismatch,
@@ -158,6 +167,11 @@ pub struct RecoveryEvidence {
     pub at_offset: u64,
     /// Number of entries known to be missing, when known.
     pub lost_entries: u64,
+    /// Upper bound when the exact count cannot be known. Absent on evidence
+    /// whose count is exact, so records written before this field existed
+    /// still canonicalize to identical bytes.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub max_lost_entries: Option<u64>,
 }
 
 /// One journal line. `gen` and `seq` are inside the MAC input, which is what
@@ -270,11 +284,60 @@ pub struct Tombstone {
     pub reason: RetentionReason,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub export_seal_id: Option<String>,
+    /// `true` only when a verified [`crate::audit::AuthorityGrant`] for
+    /// `RetainUnexported` was consumed. Never a caller-set flag.
     pub allow_unexported: bool,
+    /// The single-use grant that authorized deleting an unexported range.
+    /// Permanent: nobody can later claim the deletion was routine.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub authority_grant_id: Option<String>,
+    /// How that grant was asserted. `LocalOperator` says plainly that no
+    /// authenticated principal stood behind it (#460/#461).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub authority_source: Option<AuthoritySource>,
     pub committed_at: DateTime<Utc>,
     /// `None` between the tombstone commit and byte removal.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub removed_at: Option<DateTime<Utc>>,
+}
+
+/// One range an export actually carried.
+///
+/// Withheld and hole coverage elements are deliberately absent: an export that
+/// did not carry the bytes is not evidence that the bytes were preserved, and
+/// so cannot authorize deleting them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SealedRange {
+    pub generation_id: String,
+    pub first_seq: u64,
+    pub last_seq: u64,
+    pub final_tag: String,
+    pub journal_sha256: String,
+    pub entry_count: u64,
+}
+
+/// A seal this ledger issued and then re-verified from the written copy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SealRecord {
+    pub seal_id: String,
+    pub schema: String,
+    /// `false` for a public export. A public export withholds unauthenticated
+    /// legacy bytes, but every range it *does* carry is carried in full.
+    pub contains_unauthenticated_legacy: bool,
+    pub sealed_at: DateTime<Utc>,
+    pub carried: Vec<SealedRange>,
+}
+
+/// A capability grant that has been spent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConsumedGrant {
+    pub grant_id: String,
+    pub capability: AuditCapability,
+    pub source: AuthoritySource,
+    pub consumed_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -293,6 +356,18 @@ pub struct Manifest {
     pub global_last_seq_floor: u64,
     pub generations: Vec<GenerationDescriptor>,
     pub tombstones: Vec<Tombstone>,
+    /// Seals of exports this ledger issued *and independently re-verified*.
+    /// Retention consults this registry instead of trusting a caller-supplied
+    /// seal id, so "it was exported" is a fact the ledger already established.
+    ///
+    /// Skipped when empty so a manifest written before the registry existed
+    /// still produces identical canonical bytes and verifies unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seals: Vec<SealRecord>,
+    /// Grant ids already spent. A capability grant is single-use: replaying a
+    /// captured one authorizes nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub consumed_grants: Vec<ConsumedGrant>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub mac: String,
@@ -398,10 +473,72 @@ pub struct GapRecord {
     pub generation_id: String,
     pub after_seq: u64,
     pub lost_entries: u64,
+    /// Upper bound when the exact count cannot be known.
+    ///
+    /// A crash with entries queued but not yet journaled loses between zero
+    /// and the queue capacity of them, and nothing on disk can narrow that.
+    /// Recording the bound is honest; recording `lostEntries: 0` alone would
+    /// read as "nothing was lost".
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub max_lost_entries: Option<u64>,
     pub reason: EntryReason,
     pub recorded_at: DateTime<Utc>,
     /// `true` once the loss has also been written into the chained journal.
     pub journaled: bool,
+}
+
+/// Durable marker that entries were accepted by an async producer queue and
+/// have not been proven journaled.
+///
+/// Written before the accepting call returns and removed only once the queue
+/// has drained through a durable append. Its presence at open means a crash
+/// happened while entries were in flight: between zero and `queue_capacity` of
+/// them are gone, and no on-disk state can narrow that. Recording the bound is
+/// the honest answer; the alternative was returning "accepted" for an entry
+/// that existed only in memory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PendingMarker {
+    pub schema: String,
+    pub generation_id: String,
+    /// `live.last_seq` when the marker was written.
+    pub after_seq: u64,
+    /// Bound on how many entries can be in flight at once.
+    pub queue_capacity: u64,
+    pub opened_at: DateTime<Utc>,
+    pub mac: String,
+}
+
+impl PendingMarker {
+    pub(crate) fn new(generation_id: String, after_seq: u64, queue_capacity: u64) -> Self {
+        Self {
+            schema: PENDING_SCHEMA.to_string(),
+            generation_id,
+            after_seq,
+            queue_capacity,
+            opened_at: Utc::now(),
+            mac: String::new(),
+        }
+    }
+
+    pub(crate) fn seal(&mut self, keys: &AuditKeys) -> AuditResult<()> {
+        self.mac = String::new();
+        let payload = canonical_bytes_without_mac(&*self)?;
+        self.mac = keys.anchor_mac(&payload);
+        Ok(())
+    }
+
+    pub(crate) fn verify(&self, keys: &AuditKeys) -> AuditResult<()> {
+        if self.schema != PENDING_SCHEMA {
+            return Err(AuditError::Poisoned(PoisonReason::GapMacMismatch));
+        }
+        let payload = canonical_bytes_without_mac(self)?;
+        let expected = keys.anchor_mac(&payload);
+        if !crate::orchestration::constant_time_eq(expected.as_bytes(), self.mac.as_bytes()) {
+            return Err(AuditError::Poisoned(PoisonReason::GapMacMismatch));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

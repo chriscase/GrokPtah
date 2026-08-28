@@ -13,9 +13,10 @@ use parking_lot::Mutex;
 use uuid::Uuid;
 
 use crate::audit::{
-    AuditEntryInput, AuditKeyCustody, AuditLedger, AuditLedgerOptions, AuditStatus, AuditWitness,
-    EntryOutcome, EntryPhase, EntryReason, ExportFormat, ExportReceipt, ExportScope,
-    GenerationVerification, RetentionReceipt, RetentionRequest, RotationReason,
+    AuditAuthorityProvider, AuditCapability, AuditEntryInput, AuditKeyCustody, AuditLedger,
+    AuditLedgerOptions, AuditStatus, AuditWitness, AuthorityGrant, EntryOutcome, EntryPhase,
+    EntryReason, ExportFormat, ExportReceipt, GenerationVerification, RetentionReceipt,
+    RetentionRequest, RotationReason,
 };
 
 use super::audit_bridge;
@@ -51,6 +52,10 @@ use super::{assemble_continuation_context, ContinuationContext, ContinuationInpu
 pub struct OrchStore {
     inner: Arc<OrchStoreInner>,
 }
+
+/// Bound on entries accepted by [`OrchStore::enqueue_audit`] but not yet
+/// journaled. Also the upper bound recovery reports for a crash mid-queue.
+const AUDIT_QUEUE_CAPACITY: usize = 256;
 
 struct OrchStoreInner {
     root: PathBuf,
@@ -213,10 +218,27 @@ impl OrchStore {
     /// the headless service passes [`AuditKeyCustody::Environment`], and an
     /// external consumer supplies its own bytes. Every one of them fails closed
     /// when the required material is missing or unsafe.
+    ///
+    /// No capability authority is installed, so this store can neither take a
+    /// privileged raw export nor delete an unexported generation.
     pub fn open_with_audit(
         root: impl AsRef<Path>,
         custody: AuditKeyCustody,
         witness: Option<Arc<dyn AuditWitness>>,
+    ) -> anyhow::Result<Self> {
+        Self::open_with_audit_authority(root, custody, witness, None)
+    }
+
+    /// Open with an explicit capability authority provider.
+    ///
+    /// The provider decides whether the two operations that can destroy or
+    /// expose history are available on this host. Passing `None` keeps the
+    /// fail-closed default: neither is.
+    pub fn open_with_audit_authority(
+        root: impl AsRef<Path>,
+        custody: AuditKeyCustody,
+        witness: Option<Arc<dyn AuditWitness>>,
+        authority: Option<Arc<dyn AuditAuthorityProvider>>,
     ) -> anyhow::Result<Self> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(root.join("runs"))?;
@@ -273,13 +295,14 @@ impl OrchStore {
             AuditLedgerOptions {
                 witness,
                 legacy_v1_dir: Some(legacy_v1.clone()),
+                authority,
             },
         )
         .map_err(|error| anyhow::anyhow!("audit ledger: {}", error.code()))?;
         let audit = Arc::new(audit);
         note_legacy_v1_state(&audit, &legacy_v1)?;
 
-        let (audit_tx, audit_rx) = sync_channel::<AuditEntry>(256);
+        let (audit_tx, audit_rx) = sync_channel::<AuditEntry>(AUDIT_QUEUE_CAPACITY);
         let writer_error = last_audit_error.clone();
         let writer_audit = audit.clone();
         let audit_join = std::thread::Builder::new()
@@ -291,6 +314,13 @@ impl OrchStore {
                         // `Io` message can name a path.
                         *writer_error.lock() = Some(error.code().to_string());
                         let _ = writer_audit.record_dropped(1);
+                    }
+                    // Settle after the append is durable (or after the loss is
+                    // durably recorded as a gap), never before: the pending
+                    // marker is what turns a crash mid-queue into recorded
+                    // uncertainty instead of a silently vanished entry.
+                    if let Err(error) = writer_audit.note_settled() {
+                        *writer_error.lock() = Some(error.code().to_string());
                     }
                 }
             })?;
@@ -5049,6 +5079,14 @@ impl OrchStore {
     /// A refused enqueue is durable evidence, not a lost line: the drop is
     /// recorded in the authenticated gap file so it survives restart, which the
     /// v1 ledger's in-memory `last_audit_error` did not.
+    ///
+    /// An *accepted* enqueue is not a promise that the entry is journaled --
+    /// the whole point of the queue is that it is not yet. It is a promise
+    /// that its loss would be visible: the durable pending marker is written
+    /// before this returns, so a crash while entries are in flight is reported
+    /// at the next open as bounded uncertainty rather than leaving no trace at
+    /// all. Call sites that need the stronger guarantee use
+    /// [`Self::append_audit`], which returns only after a durable append.
     pub fn enqueue_audit(&self, entry: AuditEntry) -> anyhow::Result<()> {
         let sender = self.inner.audit_writer.tx.lock();
         let Some(sender) = sender.as_ref() else {
@@ -5056,6 +5094,14 @@ impl OrchStore {
             let _ = self.inner.audit.record_dropped(1);
             return Err(anyhow::anyhow!("audit writer is stopped"));
         };
+        // Durable *before* the entry can be taken by the writer, so the marker
+        // can never trail the work it accounts for.
+        if let Err(error) = self.inner.audit.note_accepted(AUDIT_QUEUE_CAPACITY as u64) {
+            let code = error.code();
+            *self.inner.last_audit_error.lock() = Some(code.to_string());
+            let _ = self.inner.audit.record_dropped(1);
+            return Err(anyhow::anyhow!("audit pending marker: {code}"));
+        }
         sender.try_send(entry).map_err(|error| {
             let code = match error {
                 TrySendError::Full(_) => "audit_writer_queue_full",
@@ -5063,6 +5109,8 @@ impl OrchStore {
             };
             *self.inner.last_audit_error.lock() = Some(code.into());
             let _ = self.inner.audit.record_dropped(1);
+            // The entry never entered the queue, so it is not in flight.
+            let _ = self.inner.audit.note_settled();
             anyhow::anyhow!(code)
         })
     }
@@ -5111,8 +5159,23 @@ impl OrchStore {
     pub fn export_audit(&self, dest: &Path, format: ExportFormat) -> anyhow::Result<ExportReceipt> {
         self.inner
             .audit
-            .export(dest, format, ExportScope::Public)
+            .export(dest, format)
             .map_err(|error| anyhow::anyhow!("audit export: {}", error.code()))
+    }
+
+    /// Ask this host's authority provider for a capability grant.
+    ///
+    /// Fails closed when no provider is installed. The request and its outcome
+    /// are journaled either way.
+    pub fn request_audit_authority(
+        &self,
+        capability: AuditCapability,
+        subject: &str,
+    ) -> anyhow::Result<AuthorityGrant> {
+        self.inner
+            .audit
+            .issue_authority(capability, subject)
+            .map_err(|error| anyhow::anyhow!("audit authority: {}", error.code()))
     }
 
     /// Sealed **privileged raw preservation** export.
@@ -5123,10 +5186,11 @@ impl OrchStore {
         &self,
         dest: &Path,
         format: ExportFormat,
+        grant: &AuthorityGrant,
     ) -> anyhow::Result<ExportReceipt> {
         self.inner
             .audit
-            .export(dest, format, ExportScope::PrivilegedRaw)
+            .export_privileged_raw(dest, format, grant)
             .map_err(|error| anyhow::anyhow!("audit export: {}", error.code()))
     }
 

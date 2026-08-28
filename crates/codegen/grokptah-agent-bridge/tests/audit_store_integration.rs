@@ -9,8 +9,9 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use grokptah_agent_bridge::audit::{
-    verify_export, AuditKeyCustody, AuditWitness, ExportFormat, ExportScope, RetentionRequest,
-    RotationReason, WitnessBeacon, WitnessState, WitnessVerdict,
+    verify_export, AuditCapability, AuditKeyCustody, AuditWitness, AuthorityGrant, AuthoritySource,
+    ExportFormat, ExportScope, LocalOperatorAuthority, RetentionRequest, RotationReason,
+    WitnessBeacon, WitnessState, WitnessVerdict,
 };
 use grokptah_agent_bridge::orchestration::{AuditEntry, AuditPhase, OrchStore};
 use tempfile::TempDir;
@@ -30,6 +31,35 @@ fn entry(tool: &str, outcome: &str) -> AuditEntry {
         intent_id: None,
         phase: AuditPhase::Outcome,
     }
+}
+
+/// A store on a host where an operator is present for both audit capabilities.
+///
+/// `OrchStore::open` installs no authority provider, so the two operations that
+/// destroy or expose history are unreachable there. Every test that needs one
+/// has to say so, which is the boundary working.
+fn open_operator_store(root: &Path) -> OrchStore {
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let custody = AuditKeyCustody::local_file_for(&root);
+    OrchStore::open_with_audit_authority(
+        &root,
+        custody,
+        None,
+        Some(Arc::new(LocalOperatorAuthority::new([
+            AuditCapability::PrivilegedRawExport,
+            AuditCapability::RetainUnexported,
+        ]))),
+    )
+    .expect("operator store opens")
+}
+
+fn raw_grant(store: &OrchStore) -> AuthorityGrant {
+    store
+        .request_audit_authority(
+            AuditCapability::PrivilegedRawExport,
+            grokptah_agent_bridge::audit::PRIVILEGED_RAW_EXPORT_SUBJECT,
+        )
+        .expect("operator grant")
 }
 
 /// `OrchStore` intentionally has no `Debug`, so take the error side directly.
@@ -455,9 +485,16 @@ fn a_migrated_store_refuses_lossy_v1_emission() {
     assert_eq!(receipt.unauthenticated_generations, 0);
     assert_eq!(receipt.withheld, 2);
     assert!(!receipt.complete);
-    // The privileged raw scope is the only one that carries them.
+    // The privileged raw scope is the only one that carries them, and it is
+    // reachable only with a verified grant from an operator host.
+    drop(store);
+    let store = open_operator_store(dir.path());
     let raw = store
-        .export_audit_privileged_raw(&out.path().join("raw"), ExportFormat::Auto)
+        .export_audit_privileged_raw(
+            &out.path().join("raw"),
+            ExportFormat::Auto,
+            &raw_grant(&store),
+        )
         .unwrap();
     assert_eq!(raw.unauthenticated_generations, 2);
     assert!(raw.contains_unauthenticated_legacy);
@@ -467,12 +504,15 @@ fn a_migrated_store_refuses_lossy_v1_emission() {
 fn store_retention_refuses_the_active_generation_and_tombstones_the_rest() {
     let dir = TempDir::new().unwrap();
     let out = TempDir::new().unwrap();
-    let store = OrchStore::open(dir.path()).unwrap();
+    let store = open_operator_store(dir.path());
     store.append_audit(&entry("first", "accepted")).unwrap();
 
     let active = store.audit_status().active_generation_id;
+    let grant = store
+        .request_audit_authority(AuditCapability::RetainUnexported, &active)
+        .unwrap();
     let error = store
-        .retain_audit_generation(RetentionRequest::new(&active).allow_unexported())
+        .retain_audit_generation(RetentionRequest::under_grant(&active, grant))
         .unwrap_err();
     assert!(
         format!("{error:#}").contains("generation_is_active"),
@@ -487,7 +527,7 @@ fn store_retention_refuses_the_active_generation_and_tombstones_the_rest() {
     let dest = out.path().join("sealed");
     let receipt = store.export_audit(&dest, ExportFormat::Auto).unwrap();
     store
-        .retain_audit_generation(RetentionRequest::new(&active).with_export_seal(&receipt.seal_id))
+        .retain_audit_generation(RetentionRequest::exported_under(&active, &receipt.seal_id))
         .unwrap();
 
     let status = store.audit_status();
@@ -949,11 +989,11 @@ fn a_privileged_raw_export_carries_legacy_bytes_and_declares_that_it_does() {
     let dir = TempDir::new().unwrap();
     let out = TempDir::new().unwrap();
     seed_tainted_legacy_v1(dir.path());
-    let store = OrchStore::open(dir.path()).unwrap();
+    let store = open_operator_store(dir.path());
 
     let dest = out.path().join("raw");
     let receipt = store
-        .export_audit_privileged_raw(&dest, ExportFormat::Auto)
+        .export_audit_privileged_raw(&dest, ExportFormat::Auto, &raw_grant(&store))
         .unwrap();
     assert_eq!(receipt.scope, ExportScope::PrivilegedRaw);
     assert!(
@@ -990,10 +1030,10 @@ fn a_public_export_manifest_that_claims_to_carry_legacy_bytes_is_refused() {
     let dir = TempDir::new().unwrap();
     let out = TempDir::new().unwrap();
     seed_tainted_legacy_v1(dir.path());
-    let store = OrchStore::open(dir.path()).unwrap();
+    let store = open_operator_store(dir.path());
     let dest = out.path().join("raw");
     store
-        .export_audit_privileged_raw(&dest, ExportFormat::Auto)
+        .export_audit_privileged_raw(&dest, ExportFormat::Auto, &raw_grant(&store))
         .unwrap();
 
     // Relabel a raw export as public without re-sealing: the MAC catches it.
@@ -1082,4 +1122,217 @@ fn environment_key_custody_opens_the_same_ledger_across_restarts() {
         "{error:#}"
     );
     std::env::remove_var(var);
+}
+
+// ------------------------------ capability authority at the shipped surface
+
+#[test]
+fn the_default_store_cannot_take_a_privileged_raw_export() {
+    let dir = TempDir::new().unwrap();
+    seed_tainted_legacy_v1(dir.path());
+    let store = OrchStore::open(dir.path()).unwrap();
+
+    // `OrchStore::open` installs no authority provider, so unredacted legacy
+    // bytes cannot leave this host at all. Before the grant existed, naming a
+    // different export scope was the whole boundary.
+    let error = store
+        .request_audit_authority(
+            AuditCapability::PrivilegedRawExport,
+            grokptah_agent_bridge::audit::PRIVILEGED_RAW_EXPORT_SUBJECT,
+        )
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("authority_unavailable"),
+        "{error:#}"
+    );
+    // Only a stable code reaches the caller: no path, no key, no scope.
+    assert!(!format!("{error:#}").contains(&dir.path().display().to_string()));
+}
+
+#[test]
+fn the_default_store_cannot_delete_an_unexported_generation() {
+    let dir = TempDir::new().unwrap();
+    let store = OrchStore::open(dir.path()).unwrap();
+    store.append_audit(&entry("first", "accepted")).unwrap();
+    let active = store.audit_status().active_generation_id;
+    store.rotate_audit(RotationReason::Operator).unwrap();
+    store.append_audit(&entry("second", "accepted")).unwrap();
+
+    let error = store
+        .request_audit_authority(AuditCapability::RetainUnexported, &active)
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("authority_unavailable"),
+        "{error:#}"
+    );
+    // And there is no other way in: a seal id the store never issued is not
+    // authority either.
+    let error = store
+        .retain_audit_generation(RetentionRequest::exported_under(&active, "seal-invented"))
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("export_seal_unknown"),
+        "{error:#}"
+    );
+    assert_eq!(store.audit_status().tombstones, 0);
+    assert!(audit_root(dir.path())
+        .join("generations")
+        .join(&active)
+        .exists());
+}
+
+#[test]
+fn an_operator_store_records_the_grant_behind_an_unexported_deletion() {
+    let dir = TempDir::new().unwrap();
+    let store = open_operator_store(dir.path());
+    store.append_audit(&entry("first", "accepted")).unwrap();
+    let active = store.audit_status().active_generation_id;
+    store.rotate_audit(RotationReason::Operator).unwrap();
+    store.append_audit(&entry("second", "accepted")).unwrap();
+
+    let grant = store
+        .request_audit_authority(AuditCapability::RetainUnexported, &active)
+        .unwrap();
+    let grant_id = grant.grant_id().to_string();
+    let receipt = store
+        .retain_audit_generation(RetentionRequest::under_grant(&active, grant))
+        .unwrap();
+    assert!(receipt.allow_unexported);
+    assert_eq!(
+        receipt.authority_grant_id.as_deref(),
+        Some(grant_id.as_str())
+    );
+    // Honest about what stood behind it: an operator act on this host, not an
+    // authenticated principal (#460/#461).
+    assert_eq!(
+        receipt.authority_source,
+        Some(AuthoritySource::LocalOperator)
+    );
+
+    // The decision survives restart in the tombstone, not just the receipt.
+    drop(store);
+    let store = open_operator_store(dir.path());
+    assert_eq!(store.audit_status().tombstones, 1);
+    store.verify_audit().unwrap();
+}
+
+#[test]
+fn a_store_export_seal_is_registered_and_then_authorizes_exactly_its_range() {
+    let dir = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    let store = OrchStore::open(dir.path()).unwrap();
+    store.append_audit(&entry("first", "accepted")).unwrap();
+    let first = store.audit_status().active_generation_id;
+    store.rotate_audit(RotationReason::Operator).unwrap();
+    store.append_audit(&entry("second", "accepted")).unwrap();
+
+    let receipt = store
+        .export_audit(&out.path().join("sealed"), ExportFormat::Auto)
+        .unwrap();
+    // A seal id one character away from the real one is not the real one.
+    let error = store
+        .retain_audit_generation(RetentionRequest::exported_under(
+            &first,
+            format!("{}x", receipt.seal_id),
+        ))
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("export_seal_unknown"),
+        "{error:#}"
+    );
+    assert_eq!(store.audit_status().tombstones, 0);
+
+    // The seal the store issued and re-verified does work, and needs no
+    // operator authority: these bytes were preserved.
+    store
+        .retain_audit_generation(RetentionRequest::exported_under(&first, &receipt.seal_id))
+        .unwrap();
+    assert_eq!(store.audit_status().tombstones, 1);
+    store.verify_audit().unwrap();
+}
+
+// -------------------------------------- durable acceptance for queued events
+
+#[test]
+fn a_drained_audit_queue_leaves_no_uncertainty_behind() {
+    let dir = TempDir::new().unwrap();
+    {
+        let store = OrchStore::open(dir.path()).unwrap();
+        for index in 0..20 {
+            store
+                .enqueue_audit(entry(&format!("queued.{index}"), "accepted"))
+                .expect("enqueue");
+        }
+        // Drop drains the writer and joins it before returning.
+    }
+    // No marker survives a clean shutdown, so the next open reports nothing.
+    assert!(!audit_root(dir.path()).join("pending.json").exists());
+
+    let store = OrchStore::open(dir.path()).unwrap();
+    let gaps = store.audit_status().recovery.durable_gaps;
+    assert!(
+        gaps.is_empty(),
+        "a drained queue must not look like a loss: {gaps:?}"
+    );
+    store.verify_audit().unwrap();
+}
+
+#[test]
+fn accepting_a_queued_entry_writes_a_durable_marker_before_it_returns() {
+    let dir = TempDir::new().unwrap();
+    let store = OrchStore::open(dir.path()).unwrap();
+    // The marker is what makes "accepted" honest: the entry is not journaled
+    // yet, but its loss would be visible. Before it existed, `enqueue_audit`
+    // returned accepted for an entry that lived only in memory.
+    let marker = audit_root(dir.path()).join("pending.json");
+    store
+        .enqueue_audit(entry("queued.durable", "accepted"))
+        .unwrap();
+    // Either the marker is still on disk, or the writer already drained it --
+    // never a state where the entry was accepted and nothing recorded it.
+    let observed = marker.exists();
+    drop(store);
+    assert!(
+        !marker.exists(),
+        "the marker must be cleared once the queue drains"
+    );
+    let store = OrchStore::open(dir.path()).unwrap();
+    assert!(
+        store.audit_status().recovery.durable_gaps.is_empty(),
+        "a drained entry is not a loss (marker seen: {observed})"
+    );
+    // The entry itself landed in the chained journal.
+    let status = store.audit_status();
+    assert!(status.global_last_seq >= 1);
+    store.verify_audit().unwrap();
+}
+
+#[test]
+fn a_seal_registry_survives_restart_and_still_authorizes_its_range() {
+    let dir = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    let seal_id = {
+        let store = OrchStore::open(dir.path()).unwrap();
+        store.append_audit(&entry("first", "accepted")).unwrap();
+        store.rotate_audit(RotationReason::Operator).unwrap();
+        store.append_audit(&entry("second", "accepted")).unwrap();
+        store
+            .export_audit(&out.path().join("sealed"), ExportFormat::Auto)
+            .unwrap()
+            .seal_id
+    };
+
+    // The registry lives inside the MAC'd manifest, so a manifest carrying
+    // seals has to keep verifying across a restart -- if the canonical bytes
+    // and the tag disagreed, this open would fail closed instead.
+    let store = OrchStore::open(dir.path()).unwrap();
+    store.verify_audit().unwrap();
+    let first = store
+        .audit_status()
+        .active_generation_id
+        .replace("g-000002", "g-000001");
+    store
+        .retain_audit_generation(RetentionRequest::exported_under(&first, &seal_id))
+        .expect("a seal issued before the restart still authorizes its range");
+    assert_eq!(store.audit_status().tombstones, 1);
 }

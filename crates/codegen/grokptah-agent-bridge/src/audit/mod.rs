@@ -44,6 +44,7 @@
 //! [`witness::UnwitnessedBoundary`] reports honestly rather than implying a
 //! guarantee that does not exist.
 
+pub mod authority;
 mod canon;
 pub mod documents;
 mod export;
@@ -57,10 +58,15 @@ pub mod witness;
 #[cfg(test)]
 mod tests;
 
+pub use authority::{
+    AuditAuthorityProvider, AuditCapability, AuthorityGrant, AuthorityRequest, AuthoritySource,
+    DeniedAuthority, LocalOperatorAuthority, MAX_GRANT_TTL_SECONDS, PRIVILEGED_RAW_EXPORT_SUBJECT,
+};
 pub use documents::{
-    sanitize_code, sanitize_op, Anchor, AuditRecord, EntryOutcome, EntryPhase, EntryReason,
-    GapRecord, GenerationDescriptor, GenerationState, Manifest, RecoveryEvidence, RetentionReason,
-    RotationReason, SequenceOrigin, Tombstone, MAX_CODE_BYTES, MAX_LINE_BYTES,
+    sanitize_code, sanitize_op, Anchor, AuditRecord, ConsumedGrant, EntryOutcome, EntryPhase,
+    EntryReason, GapRecord, GenerationDescriptor, GenerationState, Manifest, RecoveryEvidence,
+    RetentionReason, RotationReason, SealRecord, SealedRange, SequenceOrigin, Tombstone,
+    MAX_CODE_BYTES, MAX_LINE_BYTES,
 };
 pub use export::{
     verify_export, CoverageElement, CoverageKind, ExportFormat, ExportManifest, ExportReceipt,
@@ -162,10 +168,27 @@ pub enum RefuseReason {
     GenerationUnknown,
     GenerationIsActive,
     GenerationTombstoned,
+    /// No verified export ever carried this range, and no capability grant
+    /// authorized deleting it anyway.
     GenerationUnexported,
+    /// The named export seal is not one this ledger issued and re-verified.
+    ExportSealUnknown,
+    /// The named seal exists but never carried the range being deleted --
+    /// it was withheld, or it is a hole, or it covers a different range.
+    ExportSealDoesNotCover,
     ExportDestinationExists,
     ExportV1IncompatibleMultiGeneration,
     EntryTooLarge,
+    /// No authority provider granted the capability. The default provider
+    /// grants nothing, so this is what an unconfigured host always sees.
+    AuthorityUnavailable,
+    /// The grant did not verify, or names another installation or key.
+    AuthorityInvalid,
+    /// The grant is for another capability or another subject.
+    AuthorityScopeMismatch,
+    AuthorityExpired,
+    /// Single use: this grant id was already spent.
+    AuthorityAlreadyConsumed,
 }
 
 impl RefuseReason {
@@ -176,9 +199,16 @@ impl RefuseReason {
             Self::GenerationIsActive => "generation_is_active",
             Self::GenerationTombstoned => "generation_tombstoned",
             Self::GenerationUnexported => "generation_unexported",
+            Self::ExportSealUnknown => "export_seal_unknown",
+            Self::ExportSealDoesNotCover => "export_seal_does_not_cover",
             Self::ExportDestinationExists => "export_destination_exists",
             Self::ExportV1IncompatibleMultiGeneration => "export_v1_incompatible_multi_generation",
             Self::EntryTooLarge => "entry_too_large",
+            Self::AuthorityUnavailable => "authority_unavailable",
+            Self::AuthorityInvalid => "authority_invalid",
+            Self::AuthorityScopeMismatch => "authority_scope_mismatch",
+            Self::AuthorityExpired => "authority_expired",
+            Self::AuthorityAlreadyConsumed => "authority_already_consumed",
         }
     }
 }

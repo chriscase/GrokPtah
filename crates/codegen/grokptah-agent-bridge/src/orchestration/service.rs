@@ -5030,6 +5030,23 @@ impl OrchestrationService {
                     "recoveredDroppedEntries": audit.recovery.durable_gaps.len(),
                     "recoveredTornTail": audit.recovery.torn_tail.is_some(),
                     "closedInterruptedIntents": audit.recovery.closed_intents,
+                    // Entries a producer queue accepted whose journaling was
+                    // never proven. The exact count is unknowable, so the
+                    // bound is what is reported rather than a number that
+                    // would read as certainty.
+                    "acceptedNotJournaledEpisodes": audit
+                        .recovery
+                        .durable_gaps
+                        .iter()
+                        .filter(|gap| gap.reason == crate::audit::EntryReason::AcceptedNotJournaled)
+                        .count(),
+                    "maxAcceptedNotJournaled": audit
+                        .recovery
+                        .durable_gaps
+                        .iter()
+                        .filter(|gap| gap.reason == crate::audit::EntryReason::AcceptedNotJournaled)
+                        .filter_map(|gap| gap.max_lost_entries)
+                        .sum::<u64>(),
                 },
                 "runPersistenceError": run_error,
                 "workloadSupervisorError": workload_supervisor_error,

@@ -5,8 +5,16 @@
 //! for anything a v1 document cannot honestly represent, and `auto` never
 //! produces a misleading answer in either direction.
 //!
-//! Export never rotates, never truncates, never deletes, and never advances the
-//! manifest epoch. Producing an export is not permission to delete anything.
+//! Export never rotates, never truncates, never deletes, and never changes a
+//! journal byte, a tombstone or a chain tag. It does commit two additive facts
+//! to the manifest: the seal it issued once an independent reader has verified
+//! the written copy, and -- for a privileged raw export -- the single-use grant
+//! it spent. Without the first, "this range was already exported" would be an
+//! unverifiable claim made by whoever wanted the range deleted.
+//!
+//! Producing an export is still not permission to delete anything: retention
+//! matches a seal against the exact range it carried, and a public export that
+//! withheld a range records nothing about it at all.
 
 use std::path::Path;
 
@@ -14,6 +22,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::authority::{AuditCapability, AuthorityGrant, PRIVILEGED_RAW_EXPORT_SUBJECT};
 use super::canon::canonical_bytes_without_mac;
 use super::documents::*;
 use super::files;
@@ -166,23 +175,63 @@ pub struct ExportVerification {
 }
 
 impl AuditLedger {
-    pub fn export(
+    /// Redacted public export. Needs no capability: it carries nothing that
+    /// was not written under the v2 privacy rules.
+    pub fn export(&self, dest: &Path, format: ExportFormat) -> AuditResult<ExportReceipt> {
+        self.export_scoped(dest, format, ExportScope::Public, None)
+    }
+
+    /// Privileged raw preservation export.
+    ///
+    /// Carries imported v1 bytes verbatim -- workspace paths, free-text
+    /// `detail`, IO strings and provider material that were never redacted --
+    /// so it requires a verified single-use grant. Naming a different scope is
+    /// not authority; the grant is.
+    pub fn export_privileged_raw(
+        &self,
+        dest: &Path,
+        format: ExportFormat,
+        grant: &AuthorityGrant,
+    ) -> AuditResult<ExportReceipt> {
+        self.export_scoped(dest, format, ExportScope::PrivilegedRaw, Some(grant))
+    }
+
+    fn export_scoped(
         &self,
         dest: &Path,
         format: ExportFormat,
         scope: ExportScope,
+        grant: Option<&AuthorityGrant>,
     ) -> AuditResult<ExportReceipt> {
-        if let Some(poison) = self.is_poisoned() {
-            return Err(AuditError::Poisoned(poison));
-        }
-        if self.open_intents() != 0 {
-            return Err(AuditError::Refused(RefuseReason::OpenIntentsPresent));
-        }
         if dest.exists() {
             return Err(AuditError::Refused(RefuseReason::ExportDestinationExists));
         }
 
-        let tx = self.structural_tx();
+        // Take the barrier *before* the completeness checks. Checking first let
+        // an intent open in the check-to-lock window, and the export would then
+        // claim a completeness that was no longer true.
+        let mut tx = self.structural_tx();
+        if let Some(poison) = tx.poisoned() {
+            return Err(AuditError::Poisoned(poison));
+        }
+        if tx.open_intents() != 0 {
+            return Err(AuditError::Refused(RefuseReason::OpenIntentsPresent));
+        }
+        // Spend the grant *before* a single byte is copied. A crash after this
+        // leaves the grant spent and no export, which is the safe direction;
+        // spending it afterwards would leave a live grant beside a written
+        // privileged export.
+        if scope == ExportScope::PrivilegedRaw {
+            let grant = grant.ok_or(AuditError::Refused(RefuseReason::AuthorityUnavailable))?;
+            let mut staged = tx.manifest_clone();
+            tx.stage_authority(
+                &mut staged,
+                grant,
+                AuditCapability::PrivilegedRawExport,
+                PRIVILEGED_RAW_EXPORT_SUBJECT,
+            )?;
+            tx.commit_manifest(staged)?;
+        }
         let manifest = tx.manifest_clone();
         let multi = manifest.generations.len() > 1 || !manifest.tombstones.is_empty();
         let unauthenticated = manifest
@@ -368,6 +417,40 @@ impl AuditLedger {
                 return Err(error);
             }
         };
+
+        // The seal enters the registry only now: after the copy was written
+        // *and* re-verified from disk by a reader holding no ledger state.
+        // Recording it earlier would let a failed export leave behind a seal
+        // that authorizes deleting a range nothing preserved. A crash between
+        // the verified copy and this commit simply leaves no seal, so the
+        // range stays undeletable until it is exported again.
+        let registered = self.record_seal(SealRecord {
+            seal_id: export.seal_id.clone(),
+            schema: export.schema.clone(),
+            contains_unauthenticated_legacy: export.contains_unauthenticated_legacy,
+            sealed_at: export.exported_at,
+            carried: export
+                .coverage
+                .iter()
+                .filter(|element| element.kind == CoverageKind::Generation)
+                .map(|element| SealedRange {
+                    generation_id: element.generation_id.clone(),
+                    first_seq: element.first_seq,
+                    last_seq: element.last_seq,
+                    final_tag: element.final_tag.clone(),
+                    journal_sha256: element.journal_sha256.clone(),
+                    entry_count: element.entry_count,
+                })
+                .collect(),
+        });
+        if let Err(error) = registered {
+            // Same contract as every other failure here: an export that
+            // returns an error leaves no destination behind. A copy the ledger
+            // cannot vouch for is worse than no copy, because its seal id
+            // would look like retention authority it does not carry.
+            let _ = std::fs::remove_dir_all(dest);
+            return Err(error);
+        }
 
         Ok(ExportReceipt {
             seal_id: export.seal_id,
