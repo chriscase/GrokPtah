@@ -8,6 +8,7 @@ mod auth_store;
 pub mod certification;
 mod completion;
 mod computer_agent;
+pub mod computer_profile;
 pub mod computer_use;
 mod discover;
 pub mod eval_oracle;
@@ -107,6 +108,11 @@ pub use completion::{
     CompletionUsage,
 };
 pub use computer_agent::{ComputerAgentEligibility, ComputerAgentProposal};
+pub use computer_profile::{
+    classify_objective, classify_task, project_adaptive, AdaptiveController, AdaptiveProfile,
+    AdaptiveProfileProjection, AdaptiveRunState, CapabilityEvidence, ProfileReason, ReplayError,
+    ReplayEvent, ReplayEventKind, ReplaySummary, ReplayVerifier, TaskPolicy, TaskRisk,
+};
 pub use computer_use::{
     canonical_workspace_string, project_run_at, ActionClass, ActionGrant, ActionGrantSummary,
     ActionOutcome, ActionOutcomeSummary, ComputerAction, ComputerAuditEntry, ComputerBackend,
