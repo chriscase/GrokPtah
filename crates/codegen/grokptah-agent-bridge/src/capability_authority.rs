@@ -402,6 +402,7 @@ impl CapabilityAuthority {
         if expires_at <= now {
             bail!("canonical capability envelope is expired");
         }
+        let incarnation = state.process_nonce.clone();
         state.envelopes.insert(
             envelope_id.to_string(),
             CanonicalEffectEnvelope {
@@ -410,7 +411,7 @@ impl CapabilityAuthority {
                 capability,
                 snapshot,
                 principal_id: principal_id.to_string(),
-                incarnation: state.process_nonce.clone(),
+                incarnation,
                 auth_generation,
                 policy_generation: policy_generation.to_string(),
                 allowed_operations,
