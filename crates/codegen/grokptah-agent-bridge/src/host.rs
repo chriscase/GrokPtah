@@ -828,8 +828,10 @@ impl AgentHost {
         let runtime_home_context = Arc::new(runtime_home.install());
         let provider_attempt_root = runtime_home.orchestration_root().join("provider-attempts");
         let provider_attempt_store = match crate::host_authority::initialize(&provider_attempt_root)
-            .and_then(|_| xai_provider_attempt::ProviderAttemptStore::open(&provider_attempt_root))
-        {
+            .and_then(|_| {
+                xai_provider_attempt::ProviderAttemptStore::open(&provider_attempt_root)
+                    .map_err(|error| anyhow!(error.to_string()))
+            }) {
             Ok(store) => Some(store),
             Err(error) => {
                 eprintln!("[grokptah] provider-attempt ledger unavailable: {error}");
