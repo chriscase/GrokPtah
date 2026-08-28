@@ -1943,15 +1943,11 @@ mod tests {
         let context =
             AttemptContext::from_host_ledger(store.clone(), "single-lease-operation", scope)
                 .unwrap();
-        let second_context =
-            AttemptContext::from_host_ledger(store.clone(), "second-operation", scope).unwrap();
-        let mut permit = context.begin("xai", b"one-use", true).unwrap();
         assert_eq!(
-            second_context
-                .begin("xai", b"second-use", true)
-                .unwrap_err(),
+            AttemptContext::from_host_ledger(store.clone(), "second-operation", scope).unwrap_err(),
             AttemptError::EffectLeaseAlreadyUsed
         );
+        let mut permit = context.begin("xai", b"one-use", true).unwrap();
         DeterministicFakeTransport::default()
             .send(&mut permit, FakeTransportOutcome::BeforePossibleWrite)
             .unwrap();
