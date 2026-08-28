@@ -84,6 +84,18 @@ async fn rotation_and_reincarnation_fence_session_work_and_queue_resources() {
         .await
         .unwrap();
     let entry_id = queue["entry"]["id"].as_str().unwrap().to_string();
+    let run = orch
+        .submit_task(
+            &primary,
+            "run-477",
+            session_id,
+            workspace_path,
+            "bounded offline run".into(),
+            None,
+        )
+        .await
+        .unwrap();
+    let run_id = run["runId"].as_str().unwrap().to_string();
 
     // Explicit same-incarnation secret rotation is the continuity path.
     orch.set_token("rotated-secret-477".into());
@@ -93,6 +105,24 @@ async fn rotation_and_reincarnation_fence_session_work_and_queue_resources() {
         .get_work_scoped(&rotated, session_id, workspace_path, &work_id)
         .is_ok());
     assert!(orch.get_queue(&rotated, session_id, workspace_path).is_ok());
+    assert!(orch
+        .get_run_scoped(&rotated, session_id, workspace_path, &run_id)
+        .is_ok());
+
+    // Removing a credential and adding the same textual id back is a new
+    // incarnation, not a secret rotation.
+    orch.set_token(String::new());
+    orch.set_token("readded-secret-477".into());
+    let readded = orch.auth_header(Some("Bearer readded-secret-477")).unwrap();
+    assert_ne!(primary.actor_handle(), readded.actor_handle());
+    for result in [
+        orch.list_sessions(&readded),
+        orch.get_work_scoped(&readded, session_id, workspace_path, &work_id),
+        orch.get_queue(&readded, session_id, workspace_path),
+        orch.get_run_scoped(&readded, session_id, workspace_path, &run_id),
+    ] {
+        assert_eq!(result.unwrap_err().code, OrchErrorCode::Unauthenticated);
+    }
 
     // A named credential replacement receives a new incarnation, even when
     // its textual id is unchanged. It cannot inherit the old ledger entries.
@@ -110,6 +140,7 @@ async fn rotation_and_reincarnation_fence_session_work_and_queue_resources() {
         orch.list_sessions(&replacement),
         orch.get_work_scoped(&replacement, session_id, workspace_path, &work_id),
         orch.get_queue(&replacement, session_id, workspace_path),
+        orch.get_run_scoped(&replacement, session_id, workspace_path, &run_id),
     ] {
         assert_eq!(
             result.unwrap_err().code,
