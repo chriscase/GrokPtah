@@ -555,12 +555,12 @@ struct ReadinessSnapshot {
 }
 
 fn readiness_snapshot(state: &AppState) -> ReadinessSnapshot {
+    // The probe still reads capacity without a bearer credential, exactly as
+    // before; it now does so through a context the service itself issues so the
+    // context is bound to the current epoch instead of being fabricated here.
     let payload = state
         .orch
-        .get_capacity(&AuthContext {
-            token_id: "health-probe".into(),
-            owner_id: "health-probe".into(),
-        })
+        .get_capacity(&state.orch.health_probe_context())
         .unwrap_or_else(|error| json!({"health": {"serviceError": error.message}}));
     let health = payload.get("health").cloned().unwrap_or_else(|| json!({}));
     let ready = [

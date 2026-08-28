@@ -142,7 +142,7 @@ pub use orchestration::{
     is_recognized_test_command, merge_bounds, prompt_preview, safe_id_filename,
     ActivationDisposition, ActivationRecord, AgentAuthorityPolicy, AgentContinuationPlan,
     AgentLaneAssociation, AgentMemoryPolicy, AgentModelSpec, AgentRecord, AgentResumePlan,
-    AgentRuntimeState, AgentSpec, AgentState, AuthContext, AuthCredential,
+    AgentRuntimeState, AgentSpec, AgentState, AuthContext, AuthCredential, AuthEpoch,
     ContinuationAssemblyFailure, ContinuationCheckpoint, ContinuationContext, ContinuationFidelity,
     ContinuationInputSnapshot, ContinuationMemoryFact, ContinuationMemoryInput,
     ContinuationMemoryScope, ContinuationOmission, ContinuationReason, ContinuationReasonCode,
