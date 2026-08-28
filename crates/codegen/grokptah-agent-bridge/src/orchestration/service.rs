@@ -1762,7 +1762,9 @@ impl OrchestrationService {
         auth: &AuthContext,
         session_id: Uuid,
     ) -> Result<(), OrchError> {
-        self.verify_resource_binding(auth, format!("session:{session_id}"))
+        self.auth_registry
+            .lock()
+            .verify_resource_binding(&format!("session:{session_id}"), auth)
     }
 
     fn ensure_run_binding(&self, auth: &AuthContext, run_id: &str) -> Result<(), OrchError> {
