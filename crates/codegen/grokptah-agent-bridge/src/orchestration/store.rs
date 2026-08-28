@@ -44,7 +44,34 @@ pub struct OrchStore {
     inner: Arc<OrchStoreInner>,
 }
 
+impl OrchStore {
+    /// The authority every durable effect through this handle must pass.
+    pub(crate) fn lease(&self) -> crate::host_runtime::WriteLease {
+        self.inner.write_lease.lock().clone()
+    }
+
+    /// Bind this handle (and every clone of it) to the runtime that owns its
+    /// home. Called by the host when it adopts a store it did not open.
+    pub(crate) fn bind_lifecycle(&self, lifecycle: &Arc<crate::host_runtime::HostLifecycle>) {
+        self.inner.write_lease.lock().bind(lifecycle);
+    }
+
+    /// Whether this handle is bound to a runtime. An unbound handle may still
+    /// write, but only while no runtime and no process owns its home.
+    pub fn is_lease_bound(&self) -> bool {
+        self.inner.write_lease.lock().is_bound()
+    }
+}
+
 struct OrchStoreInner {
+    /// Durable-write authority for this handle (#455).
+    ///
+    /// It lives in the shared inner, so every clone of this store — a service
+    /// handle, a supervisor's copy, whatever a caller kept from `store()` —
+    /// carries the same authority and fails closed together once the runtime
+    /// that owns the home stops. Binding travels with the handle instead of
+    /// living at a call site someone has to remember.
+    write_lease: Arc<Mutex<crate::host_runtime::WriteLease>>,
     root: PathBuf,
     _store_lock: fs::File,
     lock: Mutex<()>,
@@ -205,12 +232,20 @@ impl OrchStore {
         let audit_root = root.clone();
         let writer_error = last_audit_error.clone();
         let writer_lock = audit_file_lock.clone();
+        // The audit writer runs on its own thread and outlives any single
+        // call, so it carries the same lease every other durable effect does.
+        // The lease is shared, so rebinding the store rebinds the writer.
+        let write_lease = Arc::new(Mutex::new(crate::host_runtime::WriteLease::for_store_root(
+            &root,
+        )));
+        let writer_lease = write_lease.clone();
         let audit_join = std::thread::Builder::new()
             .name("grokptah-orchestration-audit".into())
             .spawn(move || {
                 while let Ok(entry) = audit_rx.recv() {
                     let _guard = writer_lock.lock();
-                    let result = append_audit_entry(&audit_root, &entry);
+                    let lease = writer_lease.lock().clone();
+                    let result = append_audit_entry(&lease, &audit_root, &entry);
                     if let Err(error) = result {
                         *writer_error.lock() = Some(error.to_string());
                     }
@@ -218,6 +253,10 @@ impl OrchStore {
             })?;
         let store = Self {
             inner: Arc::new(OrchStoreInner {
+                // Bound to whichever runtime owns this home at open time. A
+                // store opened outside any runtime stays unbound and may only
+                // write while the home is genuinely unowned.
+                write_lease,
                 root,
                 _store_lock: store_lock,
                 lock: Mutex::new(()),
@@ -424,7 +463,7 @@ impl OrchStore {
         let result = self
             .run_path(&run.run_id)
             .map_err(|e| anyhow::anyhow!(e.to_string()))
-            .and_then(|path| atomic_write_json(&path, run));
+            .and_then(|path| atomic_write_json(&self.lease(), &path, run));
         *self.inner.last_run_error.lock() = result.as_ref().err().map(ToString::to_string);
         result
     }
@@ -488,8 +527,8 @@ impl OrchStore {
             activated_agent: agent.clone(),
             prior_run: None,
         };
-        atomic_write_json(&intent_path, &intent)?;
-        if let Err(error) = atomic_write_json(&run_path, run) {
+        atomic_write_json(&self.lease(), &intent_path, &intent)?;
+        if let Err(error) = atomic_write_json(&self.lease(), &run_path, run) {
             let run_rollback = match fs::symlink_metadata(&run_path) {
                 Ok(_) => remove_file_durable(&run_path),
                 Err(metadata_error) if metadata_error.kind() == std::io::ErrorKind::NotFound => {
@@ -504,7 +543,7 @@ impl OrchStore {
             }
             return Err(error.context("persist Agent activation Run"));
         }
-        if let Err(error) = atomic_write_json(&agent_path, &agent) {
+        if let Err(error) = atomic_write_json(&self.lease(), &agent_path, &agent) {
             if remove_file_durable(&run_path).is_err() {
                 return Err(error.context(
                     "persist Agent activation; durable recovery intent requires restart",
@@ -601,8 +640,8 @@ impl OrchStore {
             activated_agent: agent.clone(),
             prior_run: Some(prior_run.clone()),
         };
-        atomic_write_json(&intent_path, &intent)?;
-        if let Err(error) = atomic_write_json(&run_path, &run) {
+        atomic_write_json(&self.lease(), &intent_path, &intent)?;
+        if let Err(error) = atomic_write_json(&self.lease(), &run_path, &run) {
             if remove_file_durable(&intent_path).is_err() {
                 return Err(
                     error.context("promote queued Run; durable recovery intent requires restart")
@@ -610,8 +649,8 @@ impl OrchStore {
             }
             return Err(error.context("promote queued Run"));
         }
-        if let Err(error) = atomic_write_json(&agent_path, &agent) {
-            if atomic_write_json(&run_path, &prior_run).is_err()
+        if let Err(error) = atomic_write_json(&self.lease(), &agent_path, &agent) {
+            if atomic_write_json(&self.lease(), &run_path, &prior_run).is_err()
                 || remove_file_durable(&intent_path).is_err()
             {
                 return Err(error
@@ -683,7 +722,7 @@ impl OrchStore {
         let path = self
             .run_path(run_id)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        if let Err(error) = atomic_write_json(&path, &run) {
+        if let Err(error) = atomic_write_json(&self.lease(), &path, &run) {
             *self.inner.last_run_error.lock() = Some(error.to_string());
             return Err(error);
         }
@@ -734,7 +773,7 @@ impl OrchStore {
         let path = self
             .work_item_path(&item.work_id)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        atomic_write_json(&path, item)
+        atomic_write_json(&self.lease(), &path, item)
     }
 
     fn load_work_attempt_unlocked(&self, attempt_id: &str) -> anyhow::Result<Option<WorkAttempt>> {
@@ -759,7 +798,7 @@ impl OrchStore {
         let path = self
             .work_attempt_path(&attempt.attempt_id)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        atomic_write_json(&path, attempt)
+        atomic_write_json(&self.lease(), &path, attempt)
     }
 
     fn list_work_items_unlocked(&self) -> anyhow::Result<Vec<WorkItem>> {
@@ -864,7 +903,7 @@ impl OrchStore {
             root_work: root_work.clone(),
         };
         let intent_path = self.manager_creation_intent_path(&plan.plan_id)?;
-        atomic_write_json(&intent_path, &intent)
+        atomic_write_json(&self.lease(), &intent_path, &intent)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         self.commit_manager_creation_intent_unlocked(&intent)?;
         remove_file_durable(&intent_path)
@@ -972,7 +1011,7 @@ impl OrchStore {
     fn save_manager_plan_unlocked(&self, plan: &ManagerPlan) -> Result<(), OrchError> {
         plan.validate()?;
         let path = self.manager_plan_path(&plan.plan_id)?;
-        atomic_write_json(&path, plan)
+        atomic_write_json(&self.lease(), &path, plan)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
     }
 
@@ -1057,6 +1096,7 @@ impl OrchStore {
     ) -> Result<(), OrchError> {
         decision.validate()?;
         atomic_write_json(
+            &self.lease(),
             &self.manager_decision_path(&decision.decision_id)?,
             decision,
         )
@@ -1293,7 +1333,7 @@ impl OrchStore {
     fn save_routine_unlocked(&self, routine: &RoutineRecord) -> Result<(), OrchError> {
         routine.validate()?;
         let path = self.routine_path(&routine.routine_id)?;
-        atomic_write_json(&path, routine)
+        atomic_write_json(&self.lease(), &path, routine)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
     }
 
@@ -1752,7 +1792,7 @@ impl OrchStore {
 
     fn persist_routine_intent_unlocked(&self, intent: &RoutineFireIntent) -> Result<(), OrchError> {
         let path = self.routine_intent_path(&intent.activation.activation_id)?;
-        atomic_write_json(&path, intent)
+        atomic_write_json(&self.lease(), &path, intent)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
     }
 
@@ -1765,12 +1805,12 @@ impl OrchStore {
             &intent.activation.routine_id,
             &intent.activation.activation_id,
         )?;
-        atomic_write_json(&path, &intent.activation)
+        atomic_write_json(&self.lease(), &path, &intent.activation)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         if let Some(dedupe) = &intent.dedupe {
             let dedupe_path =
                 self.routine_dedupe_path(&intent.activation.routine_id, &dedupe.dedupe_key)?;
-            atomic_write_json(&dedupe_path, dedupe)
+            atomic_write_json(&self.lease(), &dedupe_path, dedupe)
                 .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         }
         Ok(())
@@ -2381,7 +2421,7 @@ impl OrchStore {
 
     fn save_work_decision_unlocked(&self, decision: &WorkDecision) -> Result<(), OrchError> {
         let path = self.work_decision_path(&decision.work_id, &decision.decision_id)?;
-        atomic_write_json(&path, decision)
+        atomic_write_json(&self.lease(), &path, decision)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
     }
 
@@ -2458,7 +2498,7 @@ impl OrchStore {
     ) -> Result<WorkerPresence, OrchError> {
         let presence = WorkerPresence::new(agent_id, credential_id, host_kind, now);
         let path = self.worker_presence_path(agent_id)?;
-        atomic_write_json(&path, &presence)
+        atomic_write_json(&self.lease(), &path, &presence)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         Ok(presence)
     }
@@ -2622,7 +2662,7 @@ impl OrchStore {
         let seq = self.next_message_seq_unlocked()?;
         message.seq = seq;
         let path = self.message_path(&message.message_id)?;
-        atomic_write_json(&path, &message)
+        atomic_write_json(&self.lease(), &path, &message)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         self.prune_messages_unlocked()?;
         Ok(message.clone())
@@ -2686,7 +2726,7 @@ impl OrchStore {
         if message.acked_at.is_none() {
             message.acked_at = Some(now);
             message.acked_by = Some(actor_id.to_string());
-            atomic_write_json(&self.message_path(message_id)?, &message)
+            atomic_write_json(&self.lease(), &self.message_path(message_id)?, &message)
                 .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         }
         Ok(message)
@@ -2812,6 +2852,10 @@ impl OrchStore {
             0
         };
         let next = current + 1;
+        let _write = self
+            .lease()
+            .begin("advancing the durable message sequence")
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         fs::write(&path, next.to_string())
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         Ok(next)
@@ -2883,7 +2927,7 @@ impl OrchStore {
         intent: &ManagedExecutionIntent,
     ) -> Result<(), OrchError> {
         let path = self.managed_intent_path(&intent.intent_id)?;
-        atomic_write_json(&path, intent)
+        atomic_write_json(&self.lease(), &path, intent)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
     }
 
@@ -3397,7 +3441,7 @@ impl OrchStore {
         now: chrono::DateTime<Utc>,
     ) -> Result<(), OrchError> {
         let path = self.managed_finalization_path(&record.intent_id)?;
-        atomic_write_json(&path, record)
+        atomic_write_json(&self.lease(), &path, record)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         if stage == ManagedFinalizationStage::AfterJournal {
             return Ok(());
@@ -3449,7 +3493,13 @@ impl OrchStore {
                 self.save_managed_intent_unlocked(&intent)?;
             }
         }
-        let _ = fs::remove_file(path);
+        if self
+            .lease()
+            .begin("clearing a managed finalization intent")
+            .is_ok()
+        {
+            let _ = fs::remove_file(path);
+        }
         Ok(())
     }
 
@@ -4145,7 +4195,7 @@ impl OrchStore {
             }
         }
         self.save_agent_spec_unlocked(&agent.agent_id, agent.current_spec()?)?;
-        atomic_write_json(&path, &agent)
+        atomic_write_json(&self.lease(), &path, &agent)
     }
 
     pub fn load_agent(&self, agent_id: &str) -> anyhow::Result<Option<AgentRecord>> {
@@ -4170,7 +4220,7 @@ impl OrchStore {
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         self.save_agent_spec_unlocked(&agent.agent_id, agent.current_spec()?)?;
         if migrated {
-            atomic_write_json(&path, &agent)?;
+            atomic_write_json(&self.lease(), &path, &agent)?;
         }
         Ok(Some(agent))
     }
@@ -4196,7 +4246,7 @@ impl OrchStore {
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?;
             self.save_agent_spec_unlocked(&agent.agent_id, agent.current_spec()?)?;
             if migrated {
-                atomic_write_json(&path, &agent)?;
+                atomic_write_json(&self.lease(), &path, &agent)?;
             }
             out.push(agent);
         }
@@ -4260,7 +4310,7 @@ impl OrchStore {
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         agent.updated_at = Utc::now();
         self.save_agent_spec_unlocked(&agent.agent_id, agent.current_spec()?)?;
-        atomic_write_json(&path, &agent)?;
+        atomic_write_json(&self.lease(), &path, &agent)?;
         Ok(Some(agent))
     }
 
@@ -4283,7 +4333,7 @@ impl OrchStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        atomic_write_json(&path, spec)
+        atomic_write_json(&self.lease(), &path, spec)
     }
 
     pub fn load_agent_spec(
@@ -4402,7 +4452,7 @@ impl OrchStore {
         agent
             .validate()
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        atomic_write_json(&path, &agent)?;
+        atomic_write_json(&self.lease(), &path, &agent)?;
         Ok(Some(agent))
     }
 
@@ -4417,7 +4467,7 @@ impl OrchStore {
         let path = self
             .checkpoint_path(&checkpoint.checkpoint_id)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        atomic_write_json(&path, checkpoint)
+        atomic_write_json(&self.lease(), &path, checkpoint)
     }
 
     pub fn load_checkpoint(
@@ -4594,6 +4644,9 @@ impl OrchStore {
     /// ledgers. This never recursively deletes anything and is safe to call
     /// while the store is live because it shares the store mutex.
     pub fn prune_retention(&self, policy: RetentionPolicy) -> anyhow::Result<RetentionReport> {
+        // Retention deletes durable evidence, so it is held for the whole pass
+        // rather than re-authorized per file (#455).
+        let _write = self.lease().begin("pruning durable retention")?;
         anyhow::ensure!(
             policy.max_terminal_runs > 0,
             "retention must preserve at least one terminal run"
@@ -4776,11 +4829,12 @@ impl OrchStore {
             .finalization_path(&candidate.run_id)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         let result = (|| -> anyhow::Result<()> {
-            atomic_write_json(&intent_path, &final_run)?;
+            atomic_write_json(&self.lease(), &intent_path, &final_run)?;
+            let _write = self.lease().begin("committing run finalization")?;
             if let Some(corrupt) = &corrupt_target {
                 fs::rename(&run_path, corrupt)?;
             }
-            atomic_write_json(&run_path, &final_run)?;
+            atomic_write_json(&self.lease(), &run_path, &final_run)?;
             fs::remove_file(&intent_path)?;
             Ok(())
         })();
@@ -4793,7 +4847,7 @@ impl OrchStore {
         let path = self
             .idemp_path(&receipt.request_id)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        atomic_write_json(&path, receipt)
+        atomic_write_json(&self.lease(), &path, receipt)
     }
 
     pub fn load_idempotency(&self, request_id: &str) -> anyhow::Result<Option<IdempotencyReceipt>> {
@@ -4949,13 +5003,13 @@ impl OrchStore {
             created_at: Utc::now(),
             status: status.into(),
         };
-        atomic_write_json(&path, &receipt)
+        atomic_write_json(&self.lease(), &path, &receipt)
             .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))
     }
 
     pub fn append_audit(&self, entry: &AuditEntry) -> anyhow::Result<()> {
         let _guard = self.inner.audit_file_lock.lock();
-        let result = append_audit_entry(&self.inner.root, entry);
+        let result = append_audit_entry(&self.lease(), &self.inner.root, entry);
         if let Err(error) = &result {
             *self.inner.last_audit_error.lock() = Some(error.to_string());
         }
@@ -5089,8 +5143,8 @@ impl OrchStore {
                     "Agent activation recovery conflicts with another active Run"
                 );
             }
-            atomic_write_json(&run_path, &intent.run)?;
-            atomic_write_json(&agent_path, &intent.activated_agent)?;
+            atomic_write_json(&self.lease(), &run_path, &intent.run)?;
+            atomic_write_json(&self.lease(), &agent_path, &intent.activated_agent)?;
             remove_file_durable(&path)?;
             recovered += 1;
         }
@@ -5136,7 +5190,7 @@ impl OrchStore {
                 "mutation was interrupted before its durable receipt completed; use a new request_id",
             ));
             receipt.created_at = Utc::now();
-            atomic_write_json(&path, &receipt)?;
+            atomic_write_json(&self.lease(), &path, &receipt)?;
             changed += 1;
         }
         Ok(changed)
@@ -5233,8 +5287,14 @@ fn merge_run_observations(target: &mut RunRecord, current: &RunRecord) {
     }
 }
 
-fn append_audit_entry(root: &Path, entry: &AuditEntry) -> anyhow::Result<()> {
+fn append_audit_entry(
+    lease: &crate::host_runtime::WriteLease,
+    root: &Path,
+    entry: &AuditEntry,
+) -> anyhow::Result<()> {
     use std::io::Write;
+
+    let _write = lease.begin("appending to the durable audit ledger")?;
 
     let path = root.join("audit").join("audit.jsonl");
     if fs::metadata(&path)
@@ -5283,7 +5343,14 @@ pub(crate) fn workspaces_match(left: &str, right: &str) -> bool {
     }
 }
 
-fn atomic_write_json<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
+/// Every durable effect in this store funnels through here, so the authority
+/// check cannot be forgotten at a call site (#455).
+fn atomic_write_json<T: serde::Serialize>(
+    lease: &crate::host_runtime::WriteLease,
+    path: &Path,
+    value: &T,
+) -> anyhow::Result<()> {
+    let _write = lease.begin("writing the durable orchestration ledger")?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -6117,7 +6184,7 @@ mod tests {
 
         let restart_candidate = terminal_run("restart-final");
         let intent = store.finalization_path(&restart_candidate.run_id).unwrap();
-        atomic_write_json(&intent, &restart_candidate).unwrap();
+        atomic_write_json(&store.lease(), &intent, &restart_candidate).unwrap();
         drop(store);
 
         let reopened = OrchStore::open(d.path()).unwrap();
@@ -6355,8 +6422,14 @@ mod tests {
                 activated_agent: activated,
                 prior_run: Some(prior_run.clone()),
             };
-            atomic_write_json(&store.agent_activation_path(run_id).unwrap(), &intent).unwrap();
-            atomic_write_json(&store.run_path(run_id).unwrap(), &prior_run).unwrap();
+            atomic_write_json(
+                &store.lease(),
+                &store.agent_activation_path(run_id).unwrap(),
+                &intent,
+            )
+            .unwrap();
+            atomic_write_json(&store.lease(), &store.run_path(run_id).unwrap(), &prior_run)
+                .unwrap();
             // Simulated crash after the promotion intent but before replacing
             // the queued Run or activating its Agent.
         }

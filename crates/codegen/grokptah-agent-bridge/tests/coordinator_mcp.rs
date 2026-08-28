@@ -25,7 +25,8 @@ async fn independent_worker_recovers_assignment_and_messages() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host.start().unwrap();
     let lane = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(lane.id, workspace.path()).unwrap();
@@ -495,7 +496,8 @@ async fn coordinator_identity_and_scope_are_enforced() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host.start().unwrap();
     let lane_a = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(lane_a.id, workspace_a.path()).unwrap();

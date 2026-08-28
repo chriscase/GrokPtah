@@ -35,7 +35,8 @@ fn started_host() -> grokptah_agent_bridge::HostRuntime {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host.start().expect("start");
     host
 }

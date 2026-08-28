@@ -53,7 +53,8 @@ fn started_host(workspace: &Path) -> HostRuntime {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host.start().unwrap();
     host.set_project_cwd(workspace).unwrap();
     host
@@ -294,7 +295,8 @@ async fn memory_write_uses_the_permission_gate_and_honors_user_denial() {
     let host = AgentHost::create(HostConfig {
         always_approve: false,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     let mut events = host.take_event_receiver().unwrap();
     host.start().unwrap();
     host.set_project_cwd(workspace.path()).unwrap();

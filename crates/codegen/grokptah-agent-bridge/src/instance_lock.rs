@@ -60,6 +60,32 @@ impl InstanceLock {
     }
 }
 
+/// Whether **any** process — including this one, through another file
+/// description — currently holds the advisory lock for this home.
+///
+/// Read-only: it never truncates or rewrites the lock file, so probing cannot
+/// clobber the live owner's pid stamp. `flock` is per open-file-description,
+/// so a second descriptor in this process conflicts exactly as another
+/// process's would, which is what makes this a usable ownership token rather
+/// than a same-process no-op.
+///
+/// A `false` return means the home was unowned at the instant of the probe.
+/// Callers must treat it as "no owner to defer to", never as authority to
+/// hold across later writes.
+pub fn instance_lock_is_held(lock_path: &std::path::Path) -> bool {
+    let Ok(file) = OpenOptions::new().read(true).write(true).open(lock_path) else {
+        // No lock file means no owner has ever prepared this home.
+        return false;
+    };
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            let _ = file.unlock();
+            false
+        }
+        Err(_) => true,
+    }
+}
+
 impl Drop for InstanceLock {
     fn drop(&mut self) {
         let _ = self._file.unlock();

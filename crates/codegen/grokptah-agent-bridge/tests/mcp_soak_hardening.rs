@@ -94,7 +94,8 @@ async fn soak_bootstrap_capacity_429_and_timeout_504() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host.start().unwrap();
     host.set_project_cwd(ws.path()).unwrap();
 
@@ -187,7 +188,8 @@ async fn soak_desktop_bootstrap_node_campaign() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host.start().unwrap();
     host.set_project_cwd(ws.path()).unwrap();
 
@@ -393,7 +395,8 @@ async fn soak_desktop_bootstrap_node_campaign() {
     let host2 = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host2.start().unwrap();
     host2.set_project_cwd(ws.path()).unwrap();
     let recovered_session = Uuid::parse_str(&session_ids[0]).unwrap();
@@ -484,7 +487,8 @@ fn soak_restart_recovery_matrix() {
         let host = AgentHost::create(HostConfig {
             always_approve: true,
             ..HostConfig::default()
-        });
+        })
+        .expect("acquire the GrokPtah instance lock");
         host.start().unwrap();
         host.set_project_cwd(ws.path()).unwrap();
         let session = host.session_new_kind(SessionKind::Build).unwrap();
@@ -605,7 +609,8 @@ fn soak_restart_recovery_matrix() {
     let host2 = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host2.start().unwrap();
     let queued = host2.session_queue_list(session_id).unwrap();
     assert!(!queued.is_empty());

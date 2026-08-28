@@ -7352,12 +7352,32 @@ impl OrchestrationService {
                     }
                 }
             }
+            // Bounded: a finalization that cannot be persisted must not spin
+            // forever. Once the host has sealed durable writes, retrying can
+            // never succeed — the run stays non-terminal and the replacement
+            // process recovers it as interrupted, which is the documented
+            // durable-recovery path (#455).
+            const MAX_FINALIZATION_ATTEMPTS: u32 = 8;
             let mut attempt = 0u32;
             loop {
                 let error = match store.persist_finalization(&candidate) {
                     Ok(_) => break,
                     Err(error) => error.to_string(),
                 };
+                if !host.can_write_durably() {
+                    eprintln!(
+                        "[grokptah] run {rid} finalization abandoned: the host released \
+                         durable-write authority ({error}); recovery will mark it interrupted"
+                    );
+                    break;
+                }
+                if attempt >= MAX_FINALIZATION_ATTEMPTS {
+                    eprintln!(
+                        "[grokptah] run {rid} finalization gave up after \
+                         {MAX_FINALIZATION_ATTEMPTS} attempts: {error}"
+                    );
+                    break;
+                }
                 if attempt == 0 {
                     let entry = AuditEntry {
                         ts: Utc::now(),

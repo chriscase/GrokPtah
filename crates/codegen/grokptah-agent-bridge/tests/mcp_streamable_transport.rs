@@ -38,7 +38,8 @@ fn setup() -> (
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host.start().unwrap();
     host.set_project_cwd(ws.path()).unwrap();
     let orch = OrchestrationService::new(
@@ -2000,7 +2001,8 @@ async fn mcp_isolated_run_review_approval_and_restart_promotion() {
     let host2 = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host2.start().unwrap();
     let orch2 = OrchestrationService::new(
         host2.clone(),
@@ -2577,7 +2579,8 @@ async fn live_desktop_bootstrap_node_smoke() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host.start().unwrap();
     host.set_project_cwd(ws.path()).unwrap();
     let session = host.session_new_kind(SessionKind::Build).unwrap();
@@ -2726,7 +2729,8 @@ async fn live_computer_reads_node_smoke() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host.start().unwrap();
     host.set_project_cwd(ws.path()).unwrap();
     let session = host.session_new_kind(SessionKind::Build).unwrap();

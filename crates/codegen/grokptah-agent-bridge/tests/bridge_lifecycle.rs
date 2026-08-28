@@ -181,7 +181,8 @@ async fn drain_until_turn_complete(
 #[tokio::test]
 async fn start_stop_and_status() {
     let _iso = IsolatedHome::install();
-    let host = AgentHost::create(HostConfig::default());
+    let host =
+        AgentHost::create(HostConfig::default()).expect("acquire the GrokPtah instance lock");
     assert!(!host.status().running);
     host.start().unwrap();
     assert!(host.status().running);
@@ -197,7 +198,8 @@ async fn session_lifecycle_prompt_streams_message() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("hello.txt"), "hello grokptah").unwrap();
 
-    let host = AgentHost::create(HostConfig::default());
+    let host =
+        AgentHost::create(HostConfig::default()).expect("acquire the GrokPtah instance lock");
     let mut rx = host.take_event_receiver().expect("event rx");
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
@@ -272,7 +274,8 @@ async fn session_lifecycle_prompt_streams_message() {
     );
     drop(host);
 
-    let restored_host = AgentHost::create(HostConfig::default());
+    let restored_host =
+        AgentHost::create(HostConfig::default()).expect("acquire the GrokPtah instance lock");
     let restored = restored_host
         .session_completion_history(session.id)
         .unwrap();
@@ -303,7 +306,8 @@ async fn compatible_model_completes_a_multi_round_edit_and_test_task() {
     let _iso = CompatibleHome::install(&format!("http://{address}/v1"));
     let workspace = tempfile::tempdir().unwrap();
 
-    let host = AgentHost::create(HostConfig::default());
+    let host =
+        AgentHost::create(HostConfig::default()).expect("acquire the GrokPtah instance lock");
     let mut events = host.take_event_receiver().unwrap();
     host.start().unwrap();
     host.set_project_cwd(workspace.path()).unwrap();
@@ -349,7 +353,8 @@ async fn offline_write_emits_file_edit() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     let mut rx = host.take_event_receiver().expect("event rx");
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
@@ -378,7 +383,8 @@ async fn permission_request_round_trip_allow() {
     let host = AgentHost::create(HostConfig {
         always_approve: false,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     let mut rx = host.take_event_receiver().unwrap();
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
@@ -465,7 +471,8 @@ async fn permission_request_round_trip_allow() {
 async fn permission_deny_skips_tool() {
     let _iso = IsolatedHome::install();
     let dir = tempfile::tempdir().unwrap();
-    let host = AgentHost::create(HostConfig::default());
+    let host =
+        AgentHost::create(HostConfig::default()).expect("acquire the GrokPtah instance lock");
     let mut rx = host.take_event_receiver().unwrap();
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
@@ -529,7 +536,8 @@ async fn cancel_kills_real_shell_child_not_only_sleep_stub() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     let mut rx = host.take_event_receiver().unwrap();
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
@@ -592,7 +600,8 @@ async fn shell_streams_output_without_reexec_event() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     let mut rx = host.take_event_receiver().unwrap();
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
@@ -632,7 +641,8 @@ async fn fork_rewind_compact_sessions() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     let mut rx = host.take_event_receiver().unwrap();
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
@@ -695,7 +705,8 @@ async fn session_set_cwd_updates_session_and_host_project() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host.start().unwrap();
     host.set_project_cwd(dir_a.path()).unwrap();
     let s = host.session_new().unwrap();
@@ -727,7 +738,8 @@ async fn write_tool_records_edit_and_plugins_install_to_disk() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     let mut rx = host.take_event_receiver().unwrap();
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
@@ -753,7 +765,8 @@ async fn plan_mode_emits_plan_update() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     let mut rx = host.take_event_receiver().unwrap();
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
@@ -788,7 +801,8 @@ async fn plan_mode_emits_plan_update() {
 async fn slash_context_and_model_work_offline() {
     let _iso = IsolatedHome::install();
     let dir = tempfile::tempdir().unwrap();
-    let host = AgentHost::create(HostConfig::default());
+    let host =
+        AgentHost::create(HostConfig::default()).expect("acquire the GrokPtah instance lock");
     let mut rx = host.take_event_receiver().unwrap();
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
@@ -838,7 +852,8 @@ async fn hook_denies_write_file() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     let mut rx = host.take_event_receiver().unwrap();
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
@@ -876,7 +891,8 @@ async fn explore_slash_spawns_subagent() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     let mut rx = host.take_event_receiver().unwrap();
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
@@ -906,7 +922,8 @@ async fn sandbox_readonly_blocks_write() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     let mut rx = host.take_event_receiver().unwrap();
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
@@ -935,7 +952,8 @@ async fn isolated_home_does_not_touch_user_sessions_dir() {
     {
         let _iso = IsolatedHome::install();
         let dir = tempfile::tempdir().unwrap();
-        let host = AgentHost::create(HostConfig::default());
+        let host =
+            AgentHost::create(HostConfig::default()).expect("acquire the GrokPtah instance lock");
         host.start().unwrap();
         host.set_project_cwd(dir.path()).unwrap();
         let _ = host.session_new().unwrap();
@@ -958,7 +976,8 @@ async fn always_allow_scopes_to_tool_not_global() {
     let host = AgentHost::create(HostConfig {
         always_approve: false,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     let mut rx = host.take_event_receiver().unwrap();
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
@@ -1092,7 +1111,8 @@ async fn turn_busy_clears_when_guard_drops_after_panic() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
     let session = host.session_new().unwrap();
@@ -1126,7 +1146,8 @@ async fn multi_turn_wire_includes_prior_tool_output() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
     let session = host.session_new().unwrap();
@@ -1169,7 +1190,8 @@ async fn read_file_truncate_survives_cjk_over_cap() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
     let session = host.session_new().unwrap();
@@ -1189,7 +1211,8 @@ async fn read_file_truncate_survives_cjk_over_cap() {
 fn turn_busy_guard_clears_on_panic_unwind() {
     let _iso = IsolatedHome::install();
     let dir = tempfile::tempdir().unwrap();
-    let host = AgentHost::create(HostConfig::default());
+    let host =
+        AgentHost::create(HostConfig::default()).expect("acquire the GrokPtah instance lock");
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
     let session = host.session_new().unwrap();
@@ -1224,7 +1247,8 @@ async fn deny_rule_blocks_shell_without_prompt() {
     let host = AgentHost::create(HostConfig {
         always_approve: false,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
     host.set_allow_deny_rules(vec![], vec!["Shell(*)".into()]);
@@ -1264,7 +1288,8 @@ async fn allow_rule_suppresses_shell_prompt() {
     let host = AgentHost::create(HostConfig {
         always_approve: false,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
     host.set_allow_deny_rules(vec!["Shell(*)".into()], vec![]);
@@ -1305,7 +1330,8 @@ async fn shell_exit_code_and_failure_status_reach_session_events() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     let mut rx = host.take_event_receiver().unwrap();
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
@@ -1361,7 +1387,8 @@ async fn cancelled_shell_is_distinct_from_nonzero_exit() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     let mut rx = host.take_event_receiver().unwrap();
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
@@ -1411,7 +1438,8 @@ async fn cancelled_shell_is_distinct_from_nonzero_exit() {
 async fn bridge_prompt_queue_mutates_reorders_and_drains_authoritatively() {
     let _iso = IsolatedHome::install();
     let dir = tempfile::tempdir().unwrap();
-    let host = AgentHost::create(HostConfig::default());
+    let host =
+        AgentHost::create(HostConfig::default()).expect("acquire the GrokPtah instance lock");
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
     let session = host.session_new().unwrap();
@@ -1468,7 +1496,8 @@ async fn steer_now_injects_once_without_cancelling_active_turn() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     let mut rx = host.take_event_receiver().unwrap();
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
@@ -1563,7 +1592,8 @@ async fn clear_queue_accounts_for_accepted_steering_instead_of_reporting_empty()
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     let mut rx = host.take_event_receiver().unwrap();
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
@@ -1652,7 +1682,8 @@ async fn stale_run_next_is_rejected_without_cancelling_the_active_turn() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     let mut rx = host.take_event_receiver().unwrap();
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
@@ -1733,7 +1764,8 @@ async fn run_next_cannot_cancel_a_turn_that_started_after_the_one_it_observed() 
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     let mut rx = host.take_event_receiver().unwrap();
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
@@ -1805,7 +1837,8 @@ async fn a_drain_reserves_the_turn_so_a_racing_writer_cannot_lose_the_prompt() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
     let session = host.session_new().unwrap();
@@ -1842,7 +1875,8 @@ async fn a_drain_reserves_the_turn_so_a_racing_writer_cannot_lose_the_prompt() {
 async fn restoring_an_unstarted_drain_returns_the_prompts_and_frees_the_turn() {
     let _iso = IsolatedHome::install();
     let dir = tempfile::tempdir().unwrap();
-    let host = AgentHost::create(HostConfig::default());
+    let host =
+        AgentHost::create(HostConfig::default()).expect("acquire the GrokPtah instance lock");
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
     let session = host.session_new().unwrap();
@@ -1889,7 +1923,8 @@ async fn restoring_an_unstarted_drain_returns_the_prompts_and_frees_the_turn() {
 async fn an_abandoned_drain_reservation_does_not_wedge_the_session() {
     let _iso = IsolatedHome::install();
     let dir = tempfile::tempdir().unwrap();
-    let host = AgentHost::create(HostConfig::default());
+    let host =
+        AgentHost::create(HostConfig::default()).expect("acquire the GrokPtah instance lock");
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
     let session = host.session_new().unwrap();
@@ -1930,7 +1965,8 @@ async fn an_abandoned_drain_reservation_does_not_wedge_the_session() {
 async fn steer_at_idle_boundary_is_preserved_as_run_next_queue_entry() {
     let _iso = IsolatedHome::install();
     let dir = tempfile::tempdir().unwrap();
-    let host = AgentHost::create(HostConfig::default());
+    let host =
+        AgentHost::create(HostConfig::default()).expect("acquire the GrokPtah instance lock");
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
     let session = host.session_new().unwrap();
@@ -1956,7 +1992,8 @@ async fn concurrent_sessions_shells_do_not_kill_each_other() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
     let a = host.session_new().unwrap();
@@ -1991,7 +2028,8 @@ async fn concurrent_sessions_shells_do_not_kill_each_other() {
 #[test]
 fn permission_mode_and_always_approve_stay_coherent() {
     let _iso = IsolatedHome::install();
-    let host = AgentHost::create(HostConfig::default());
+    let host =
+        AgentHost::create(HostConfig::default()).expect("acquire the GrokPtah instance lock");
     host.start().unwrap();
 
     host.set_always_approve(true);
@@ -2025,7 +2063,8 @@ async fn rewind_files_isolated_per_session() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
     let sa = host.session_new().unwrap();
@@ -2065,7 +2104,8 @@ async fn session_load_blocks_missing_cwd_without_rebinding() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
     let s = host.session_new().unwrap();
@@ -2098,7 +2138,8 @@ async fn missing_build_workspace_blocks_prompt_until_explicit_rebind() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host.start().unwrap();
     host.set_project_cwd(live.path()).unwrap();
     let session = host.session_new().unwrap();

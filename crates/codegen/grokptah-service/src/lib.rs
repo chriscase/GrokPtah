@@ -343,8 +343,10 @@ pub async fn start_service(config: ServiceConfig) -> Result<ServiceHandle> {
     }
 
     let runtime = match config.runtime_home.clone() {
-        Some(home) => AgentHost::create_with_runtime_home(HostConfig::default(), home),
-        None => AgentHost::create(HostConfig::default()),
+        Some(home) => AgentHost::create_with_runtime_home(HostConfig::default(), home)
+            .expect("acquire the GrokPtah instance lock"),
+        None => AgentHost::create(HostConfig::default())
+            .expect("acquire the GrokPtah instance lock"),
     };
     runtime.start().context("start GrokPtah agent host")?;
     let store: OrchStore = runtime

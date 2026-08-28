@@ -1054,7 +1054,8 @@ mod tests {
     fn test_host(dir: &std::path::Path) -> grokptah_agent_bridge::HostRuntime {
         let _guard = grokptah_agent_bridge::home_override_serial();
         grokptah_agent_bridge::set_grokptah_home_override(Some(dir.join(".grokptah")));
-        let host = grokptah_agent_bridge::AgentHost::create(Default::default());
+        let host = grokptah_agent_bridge::AgentHost::create(Default::default())
+            .expect("acquire the GrokPtah instance lock");
         grokptah_agent_bridge::set_grokptah_home_override(None);
         host
     }

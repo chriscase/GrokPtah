@@ -57,29 +57,55 @@ static CURRENT_OWNERS: std::sync::LazyLock<
     Mutex<HashMap<PathBuf, std::sync::Weak<HostLifecycle>>>,
 > = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Registry key for a home.
+///
+/// `RuntimeHome::from_path` canonicalizes, but `grokptah_home()` returns the
+/// configured path verbatim. On any home reached through a symlink — macOS
+/// `/var` → `/private/var`, a symlinked `$HOME` — those two differ, so a
+/// registration keyed on one would never be found by a lookup keyed on the
+/// other and every ambient write would fall through to unowned authority.
+/// Both sides go through here so they always agree.
+fn owner_key(lock_path: &std::path::Path) -> PathBuf {
+    let (Some(parent), Some(name)) = (lock_path.parent(), lock_path.file_name()) else {
+        return lock_path.to_path_buf();
+    };
+    match dunce::canonicalize(parent) {
+        Ok(canonical) => canonical.join(name),
+        // The home may not exist yet; the verbatim path is then already the
+        // only key either side can produce.
+        Err(_) => lock_path.to_path_buf(),
+    }
+}
+
+/// The live runtime that owns `home_lock_path`, if any.
+fn registered_owner(home_lock_path: &std::path::Path) -> Option<Arc<HostLifecycle>> {
+    let mut owners = CURRENT_OWNERS.lock();
+    // Opportunistically drop entries whose runtime is fully gone.
+    owners.retain(|_, weak| weak.strong_count() > 0);
+    owners
+        .get(home_lock_path)
+        .and_then(std::sync::Weak::upgrade)
+}
+
 /// Mint durable-write authority for the process-wide runtime home.
 ///
 /// * A live runtime owns this home → its authority, serialized against its
 ///   seal, so the write can never race the owner or outlive it.
 /// * A runtime owns it but has sealed or closed → `None`. It is handing the
 ///   home over, and an ambient write now could land beside a replacement's.
-/// * No runtime owns this home → an unowned authority. There is no second
-///   writer to race, so refusing here would only strand legitimate work (a
-///   library user, or a lazy credential migration in a process with no host).
+/// * No runtime is registered here, but the OS instance lock is held → `None`.
+///   Another process owns this home; registry absence is not authority.
+/// * No runtime is registered and the lock is free → `None` as well.
 ///
+/// The last case deserves a note: a process with no host runtime has no
+/// authority to grant itself, and a lock that is free *now* says nothing about
+/// the instant of the write. Production therefore never mints from absence —
 /// `None` means "skip this durable write", never "write anyway".
 pub(crate) fn current_durable_write(operation: &str) -> Option<DurableWriteGuard> {
-    let lock_path = crate::discover::grokptah_home().join(".instance.lock");
-    let owner = {
-        let mut owners = CURRENT_OWNERS.lock();
-        // Opportunistically drop entries whose runtime is fully gone.
-        owners.retain(|_, weak| weak.strong_count() > 0);
-        owners.get(&lock_path).and_then(std::sync::Weak::upgrade)
-    };
-    match owner {
-        Some(owner) => owner.begin_durable_write(operation).ok(),
-        None => Some(DurableWriteGuard::unowned(&lock_path)),
-    }
+    let lock_path = owner_key(&crate::discover::grokptah_home().join(".instance.lock"));
+    registered_owner(&lock_path)?
+        .begin_durable_write(operation)
+        .ok()
 }
 
 /// Lifecycle phase of one host process runtime.
@@ -157,6 +183,15 @@ pub(crate) struct HostLifecycle {
     in_flight_writes: parking_lot::Mutex<usize>,
     writes_drained: parking_lot::Condvar,
     writes_sealed: std::sync::atomic::AtomicBool,
+    /// The one thread allowed to write after the seal: the runtime performing
+    /// its own final flush.
+    ///
+    /// The flush is a write, and it necessarily happens after the seal — that
+    /// is the whole point of sealing first. Rather than a global "flush is
+    /// open" flag, which would also let a stale handle through for the
+    /// duration, the window is scoped to the exact thread doing the flush. No
+    /// other caller, stale or live, can be inside it.
+    owner_flush_thread: parking_lot::Mutex<Option<std::thread::ThreadId>>,
 }
 
 /// Proof that the runtime holding it still owns durable-write authority for its
@@ -175,23 +210,18 @@ pub(crate) struct DurableWriteGuard {
 }
 
 impl DurableWriteGuard {
-    /// Authority for a home no host runtime owns.
+    /// Authority for crate tests that drive the store modules directly, with
+    /// no host runtime in the picture.
     ///
-    /// Minted only by [`current_durable_write`] after it has established that
-    /// there is no live owner to race, and by crate tests that drive the store
-    /// modules directly. It carries no lifecycle, so it can never re-authorize
-    /// a home some runtime does own — that path always returns the owner's
-    /// guard instead.
-    pub(crate) fn unowned(lock_path: &std::path::Path) -> Self {
-        Self {
-            lifecycle: HostLifecycle::build(None, lock_path.to_path_buf()),
-            counted: false,
-        }
-    }
-
+    /// Deliberately **not** reachable from production code: there is no
+    /// `unowned` path outside `cfg(test)`, because absence of a registered
+    /// owner is never authority to write a home (#455).
     #[cfg(test)]
     pub(crate) fn unowned_for_test() -> Self {
-        Self::unowned(std::path::Path::new("/nonexistent/.instance.lock"))
+        Self {
+            lifecycle: HostLifecycle::build(None, PathBuf::from("/nonexistent/.instance.lock")),
+            counted: false,
+        }
     }
 
     /// The owning runtime's own write, at a point where it is the only possible
@@ -231,7 +261,7 @@ impl HostLifecycle {
         if lifecycle.acquired_process_lock {
             CURRENT_OWNERS
                 .lock()
-                .insert(lifecycle.lock_path.clone(), Arc::downgrade(&lifecycle));
+                .insert(owner_key(&lifecycle.lock_path), Arc::downgrade(&lifecycle));
         }
         lifecycle
     }
@@ -248,6 +278,7 @@ impl HostLifecycle {
             in_flight_writes: parking_lot::Mutex::new(0),
             writes_drained: parking_lot::Condvar::new(),
             writes_sealed: std::sync::atomic::AtomicBool::new(false),
+            owner_flush_thread: parking_lot::Mutex::new(None),
         })
     }
 
@@ -273,11 +304,6 @@ impl HostLifecycle {
             phase.label(),
             self.lock_path.display()
         )
-    }
-
-    /// Whether this process acquired the single-instance lock at startup.
-    pub(crate) fn acquired_process_lock(&self) -> bool {
-        self.acquired_process_lock
     }
 
     /// Whether the advisory OS lock is still held right now.
@@ -352,6 +378,14 @@ impl HostLifecycle {
     ) -> Result<DurableWriteGuard> {
         // One mutex orders begin against seal: a guard is either counted before
         // the seal takes effect, or refused after it.
+        // The runtime's own final flush runs after the seal, on one known
+        // thread, and is uncounted so it cannot make the seal wait on itself.
+        if self.is_owner_flush_thread() {
+            return Ok(DurableWriteGuard {
+                lifecycle: self.clone(),
+                counted: false,
+            });
+        }
         let mut in_flight = self.in_flight_writes.lock();
         if self.writes_sealed.load(Ordering::Acquire) {
             bail!(
@@ -360,7 +394,21 @@ impl HostLifecycle {
                 self.lock_path.display()
             );
         }
-        self.ensure_open(operation)?;
+        // Quiescing deliberately still permits writes. New *admissions* are
+        // refused at `ensure_session_accepts_new_work`, but work already in
+        // flight has to be able to finish writing — that is precisely why the
+        // seal comes after the join rather than before it. Refusing here would
+        // strand every in-flight finalization and make the join time out, which
+        // then retains the lock for a shutdown that was in fact orderly.
+        //
+        // The write-refusing states are sealed and closed, and a stale handle
+        // from a previous runtime is always both.
+        if self.phase() == HostPhase::Closed {
+            bail!(
+                "GrokPtah host runtime for {} is closed; {operation} is refused",
+                self.lock_path.display()
+            );
+        }
         *in_flight += 1;
         Ok(DurableWriteGuard {
             lifecycle: self.clone(),
@@ -371,6 +419,19 @@ impl HostLifecycle {
     /// Whether durable writes are sealed for this runtime.
     pub(crate) fn durable_writes_sealed(&self) -> bool {
         self.writes_sealed.load(Ordering::Acquire)
+    }
+
+    fn is_owner_flush_thread(&self) -> bool {
+        *self.owner_flush_thread.lock() == Some(std::thread::current().id())
+    }
+
+    /// Open the post-seal flush window for the calling thread only.
+    fn open_owner_flush(&self) {
+        *self.owner_flush_thread.lock() = Some(std::thread::current().id());
+    }
+
+    fn close_owner_flush(&self) {
+        *self.owner_flush_thread.lock() = None;
     }
 
     /// Durable writes running right now.
@@ -535,6 +596,96 @@ impl HostShutdownReport {
     }
 }
 
+/// The durable-write authority a **store handle** carries.
+///
+/// `OrchStore`, `ComputerStore` and the event journal are cloneable handles on
+/// shared durable state, and a clone can outlive the runtime that opened it —
+/// an unjoined supervisor, a service handle, a `store()` accessor a caller kept.
+/// Binding the lease into the handle is what makes those stale effects fail:
+/// the check travels with the clone instead of living at a call site someone
+/// has to remember.
+///
+/// A lease resolves its authority at every write, never once at open:
+///
+/// * bound to a live lifecycle → that runtime's authority, refused once it is
+///   quiescing, closed, or sealed;
+/// * bound to a lifecycle that is gone → refused; the handle is stale by
+///   definition;
+/// * unbound, but a runtime is registered for this home now → refused; the
+///   handle was opened outside the owner that holds the home;
+/// * unbound, and the OS instance lock is held → refused; another process owns
+///   this home and registry absence is not authority;
+/// * unbound and the home is genuinely unowned → allowed. This is the library
+///   and test path, and it is the only case where a write proceeds without a
+///   runtime.
+#[derive(Clone)]
+pub(crate) struct WriteLease {
+    home_lock_path: PathBuf,
+    bound: Option<std::sync::Weak<HostLifecycle>>,
+}
+
+impl WriteLease {
+    /// A lease for a durable root, bound to whichever runtime owns the home
+    /// containing it at open time.
+    ///
+    /// `root` is a store directory inside the home (`…/.grokptah/orchestration`),
+    /// so the home is its parent; a root that is the home itself resolves to
+    /// the same key through canonicalization.
+    pub(crate) fn for_store_root(root: &std::path::Path) -> Self {
+        let home = root.parent().unwrap_or(root);
+        let home_lock_path = owner_key(&home.join(".instance.lock"));
+        let bound = registered_owner(&home_lock_path).map(|owner| Arc::downgrade(&owner));
+        Self {
+            home_lock_path,
+            bound,
+        }
+    }
+
+    /// Bind (or rebind) this lease to the runtime that owns it. Used when a
+    /// host installs a store it did not open itself.
+    pub(crate) fn bind(&mut self, lifecycle: &Arc<HostLifecycle>) {
+        self.bound = Some(Arc::downgrade(lifecycle));
+    }
+
+    pub(crate) fn is_bound(&self) -> bool {
+        self.bound.is_some()
+    }
+
+    /// Authorize one durable effect through this handle, or fail closed.
+    pub(crate) fn begin(&self, operation: &str) -> Result<DurableWriteGuard> {
+        if let Some(bound) = self.bound.as_ref() {
+            let Some(lifecycle) = bound.upgrade() else {
+                bail!(
+                    "{operation} is refused: this durable handle outlived the GrokPtah runtime \
+                     that opened {}",
+                    self.home_lock_path.display()
+                );
+            };
+            return lifecycle.begin_durable_write(operation);
+        }
+        if let Some(owner) = registered_owner(&self.home_lock_path) {
+            // Somebody owns the home this handle was opened outside of. Do not
+            // borrow their authority — the handle is not theirs.
+            let _ = owner;
+            bail!(
+                "{operation} is refused: this durable handle is not bound to the GrokPtah \
+                 runtime that now owns {}",
+                self.home_lock_path.display()
+            );
+        }
+        if crate::instance_lock::instance_lock_is_held(&self.home_lock_path) {
+            bail!(
+                "{operation} is refused: another process holds the single-instance lock for {}",
+                self.home_lock_path.display()
+            );
+        }
+        Ok(DurableWriteGuard {
+            lifecycle: HostLifecycle::build(None, self.home_lock_path.clone()),
+            counted: false,
+        })
+    }
+}
+
 /// A token that can *mint* durable-write authority, without holding any.
 ///
 /// Long-running operations that only write at the end — a provider discovery
@@ -666,6 +817,11 @@ impl HostRuntime {
         name: impl Into<String>,
         hook: ShutdownHook,
     ) -> anyhow::Result<()> {
+        // Registration takes the same gate shutdown seals before draining, and
+        // re-checks the phase under it. A hook is therefore either registered
+        // before the drain (and runs) or refused after it (and never silently
+        // dropped) — there is no window in between (#455).
+        let _admission = self.lifecycle.spawn_gate.read();
         self.lifecycle.ensure_open("registering a shutdown hook")?;
         self.hooks.lock().push((name.into(), hook));
         Ok(())
@@ -780,14 +936,15 @@ impl HostRuntime {
             .is_err();
         let supervised_tasks_remaining = self.lifecycle.tasks().len();
 
-        // 4. Seal durable-write authority. After this no handle — stale or not
-        //    — can mutate this home again.
-        // The seal can block for up to its timeout, so it runs on the blocking
-        // pool. If that pool is gone — the runtime is itself being torn down —
-        // fall back to sealing inline rather than reporting "not sealed": a
-        // false negative here would retain the lock and refuse the next launch
-        // for a reason that has nothing to do with a live writer. The seal is
-        // idempotent, so running it twice is safe.
+        // 4. Seal durable-write authority. After this no handle — stale or
+        //    not — can mutate this home again.
+        //
+        //    The seal can block for up to its timeout, so it runs on the
+        //    blocking pool. If that pool is gone — the runtime is itself being
+        //    torn down — fall back to sealing inline rather than reporting
+        //    "not sealed": a false negative here would retain the lock and
+        //    refuse the next launch for a reason that has nothing to do with a
+        //    live writer. The seal is idempotent, so running it twice is safe.
         let write_seal_timeout = self.write_seal_timeout;
         let lifecycle = self.lifecycle.clone();
         let durable_writes_sealed = match tokio::task::spawn_blocking(move || {
@@ -800,16 +957,7 @@ impl HostRuntime {
         };
         let durable_writes_in_flight = self.lifecycle.in_flight_durable_writes();
 
-        // 5. Flush durable state and run teardown hooks. The flush runs under
-        //    the seal because it is this runtime's own last write.
-        let mut flush_errors = self.handle.flush_durable_state();
-        let hooks: Vec<(String, ShutdownHook)> = self.hooks.lock().drain(..).collect();
-        let hooks_run = hooks.len();
-        for (name, hook) in hooks {
-            if let Err(error) = hook() {
-                flush_errors.push(format!("shutdown hook {name} failed: {error:#}"));
-            }
-        }
+        let mut flush_errors = Vec::new();
         if join_timed_out {
             flush_errors.push(format!(
                 "{supervised_tasks_remaining} supervised task(s) did not finish within {:?}",
@@ -818,15 +966,52 @@ impl HostRuntime {
         }
         if !durable_writes_sealed {
             flush_errors.push(format!(
-                "{durable_writes_in_flight} durable write(s) still in progress after {:?}; \
-                 the instance lock is retained so no replacement process can write this home",
-                write_seal_timeout
+                "{durable_writes_in_flight} durable write(s) still in progress after \
+                 {write_seal_timeout:?}"
+            ));
+        }
+
+        // 5. Flush durable state and run teardown hooks — but only under a
+        //    seal that actually holds. Writing while another writer is still
+        //    live is exactly the corruption this seam exists to prevent, so a
+        //    failed seal skips the flush rather than racing it.
+        let hooks: Vec<(String, ShutdownHook)> = {
+            let _sealed = self.lifecycle.spawn_gate.write();
+            self.hooks.lock().drain(..).collect()
+        };
+        let hooks_run = if durable_writes_sealed {
+            hooks.len()
+        } else {
+            0
+        };
+        if durable_writes_sealed {
+            self.lifecycle.open_owner_flush();
+            let _ = self.handle.stop();
+            flush_errors.extend(self.handle.flush_durable_state());
+            for (name, hook) in hooks {
+                if let Err(error) = hook() {
+                    flush_errors.push(format!("shutdown hook {name} failed: {error:#}"));
+                }
+            }
+            self.lifecycle.close_owner_flush();
+        } else {
+            flush_errors.push(format!(
+                "durable flush and {} shutdown hook(s) were skipped: the durable-write seal \
+                 did not hold, so writing now could race a live writer",
+                hooks.len()
             ));
         }
 
         // 6. Stale handles must fail closed before the lock can be re-acquired.
         self.lifecycle.mark_closed();
-        let process_lock_released = durable_writes_sealed && self.lifecycle.release_process_lock();
+
+        // The lock is released only when every guarantee held. Anything
+        // uncertain — an unjoined task that could still act, an unsealed
+        // writer, a failed flush or a lost audit record — retains it: refusing
+        // a replacement is always safer than handing it a home this process
+        // may still be writing.
+        let release_is_safe = durable_writes_sealed && !join_timed_out && flush_errors.is_empty();
+        let process_lock_released = release_is_safe && self.lifecycle.release_process_lock();
         let process_lock_held_after = self.lifecycle.process_lock_held();
 
         let report = HostShutdownReport {
@@ -841,7 +1026,7 @@ impl HostRuntime {
             hooks_run,
             process_lock_released,
             process_lock_held_after,
-            process_lock_retained_for_safety: !durable_writes_sealed && process_lock_held_after,
+            process_lock_retained_for_safety: !release_is_safe && process_lock_held_after,
             lock_file_present: self.lifecycle.lock_path().exists(),
             phase: self.lifecycle.phase(),
         };
@@ -1088,8 +1273,12 @@ mod tests {
         std::fs::create_dir_all(&home).unwrap();
         crate::discover::set_grokptah_home_override(Some(home.clone()));
 
-        // No owner: an ambient write is safe, because nothing can race it.
-        assert!(current_durable_write("no owner").is_some());
+        // No registered owner is never authority: a process with no runtime
+        // has none to grant itself (#455).
+        assert!(
+            current_durable_write("no owner").is_none(),
+            "registry absence must never mint authority"
+        );
 
         let first = lifecycle(&home);
         assert!(
@@ -1112,6 +1301,19 @@ mod tests {
         // A replacement registers and becomes the authority.
         let second = lifecycle(&home);
         assert!(current_durable_write("replacement owner").is_some());
+
+        // The same home reached through a symlink must resolve to the same
+        // owner. Without one canonical identity the registry key and the
+        // lookup key diverge — which is exactly how macOS `/var` versus
+        // `/private/var` fell through to unowned authority.
+        let alias_root = dir.path().join("alias");
+        std::os::unix::fs::symlink(dir.path(), &alias_root).unwrap();
+        crate::discover::set_grokptah_home_override(Some(alias_root.join(".grokptah")));
+        assert!(
+            current_durable_write("owner reached through a path alias").is_some(),
+            "a symlinked home must resolve to the same owner, not to unowned authority"
+        );
+        crate::discover::set_grokptah_home_override(Some(home.clone()));
         second.mark_closed();
         second.release_process_lock();
         drop(first);
@@ -1125,7 +1327,7 @@ mod tests {
     fn release_is_exactly_once() {
         let dir = tempfile::tempdir().unwrap();
         let lifecycle = lifecycle(dir.path());
-        assert!(lifecycle.acquired_process_lock());
+        assert!(lifecycle.acquired_process_lock);
         assert!(lifecycle.process_lock_held());
         assert!(lifecycle.release_process_lock());
         assert!(!lifecycle.release_process_lock());
@@ -1133,7 +1335,7 @@ mod tests {
         assert!(dir.path().join(".instance.lock").is_file());
 
         let never_owned = HostLifecycle::new(None, dir.path().join(".instance.lock"));
-        assert!(!never_owned.acquired_process_lock());
+        assert!(!never_owned.acquired_process_lock);
         assert!(!never_owned.release_process_lock());
     }
 }
