@@ -11270,11 +11270,16 @@ mod computer_agent_host_tests {
                 capability: host
                     .capability_authority
                     .issue(
-                        &crate::capability_authority::CapabilitySnapshot::from_parts(
-                            crate::capability_authority::CapabilityKind::ComputerUse,
+                        &crate::capability_authority::CapabilitySnapshot::provider(
                             "test-owner",
+                            "xai",
                             "test-run",
-                            ["route-a"],
+                            "https://example.invalid",
+                            "test-run",
+                            "test-dialect",
+                            "test-credential",
+                            &crate::gateway_config::ModelCapabilities::default(),
+                            "test-policy",
                         )
                         .unwrap(),
                         Utc::now(),

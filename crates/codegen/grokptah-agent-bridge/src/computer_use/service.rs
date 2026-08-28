@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::json;
@@ -247,7 +247,7 @@ impl ComputerUseService {
             .store
             .update_run(run_id, |run| {
                 ensure_version(run, expected_version)?;
-                let capability = self.require_run_capability(run)?;
+                let _capability = self.require_run_capability(run)?;
                 self.consume_durable_lease("authorize", &payload)?;
                 if run.control_disposition == ComputerControlDisposition::OperatorTakeover {
                     return Err(ComputerError::new(
@@ -288,7 +288,7 @@ impl ComputerUseService {
             .store
             .update_run(run_id, |run| {
                 ensure_version(run, expected_version)?;
-                let capability = self.require_run_capability(run)?;
+                let _capability = self.require_run_capability(run)?;
                 self.consume_durable_lease("observe", &payload)?;
                 let now = Utc::now();
                 if self.policy.run_limit_reached(run, now) {
@@ -469,7 +469,7 @@ impl ComputerUseService {
                     Ok(capability) => capability,
                     Err(error) => {
                         self.fail_inflight(run_id, "act", &error)?;
-                        self.finish_mutation(request_id, &Err(error.clone()))?;
+                        self.finish_mutation::<ActionOutcome>(request_id, &Err(error.clone()))?;
                         return Err(error);
                     }
                 };

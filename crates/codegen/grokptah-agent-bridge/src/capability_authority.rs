@@ -76,7 +76,7 @@ impl CapabilitySnapshot {
         Self::from_parts(
             CapabilityKind::Provider,
             principal,
-            format!("{provider_id}:{model_id}"),
+            model_id,
             [
                 base_url,
                 wire_model_id,
@@ -100,7 +100,7 @@ impl CapabilitySnapshot {
         Self::from_parts(
             CapabilityKind::ComputerUse,
             principal,
-            format!("{}:{}", target.len(), backend.len()),
+            "computer-use",
             [
                 std::str::from_utf8(&target).unwrap_or_default(),
                 std::str::from_utf8(&backend).unwrap_or_default(),
@@ -430,15 +430,15 @@ mod tests {
     fn revoked_restart_and_foreign_authority_fail_closed() {
         let authority = CapabilityAuthority::new(true);
         let now = Utc::now();
-        let snapshot = snapshot("stable");
+        let stable = snapshot("stable");
         let capability = authority
-            .issue(&snapshot, now, DEFAULT_CAPABILITY_TTL)
+            .issue(&stable, now, DEFAULT_CAPABILITY_TTL)
             .unwrap();
-        authority.revoke(&snapshot).unwrap();
-        assert!(authority.revalidate(&capability, &snapshot, now).is_err());
+        authority.revoke(&stable).unwrap();
+        assert!(authority.revalidate(&capability, &stable, now).is_err());
 
         let restarted = CapabilityAuthority::new(true);
-        assert!(restarted.revalidate(&capability, &snapshot, now).is_err());
+        assert!(restarted.revalidate(&capability, &stable, now).is_err());
 
         authority.disable_for_test();
         assert!(authority
