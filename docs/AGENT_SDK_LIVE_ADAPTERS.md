@@ -513,7 +513,7 @@ authority.
 | SDK feature matrix (default / none / fake / conformance) | clean |
 | Reference consumer `fmt` / `clippy` / `test` | clean; 8 tests |
 | Bridge strict clippy, the exact CI command | clean apart from the two macOS-gated `computer_use` findings present at base |
-| Bridge `cargo test --locked --no-fail-fast -- --test-threads=1` | 720 passed; the 2 pre-existing failures below |
+| Bridge `cargo test --locked --no-fail-fast -- --test-threads=1` | 725 passed; the pre-existing failures below |
 | `sdk_live_conformance` (2 battery drivers + 9 focused) | 11 passed |
 | Live service + Desktop battery matrices | 15 passed / 0 failed / 11 skipped each, agreeing |
 
