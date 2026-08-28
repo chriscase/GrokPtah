@@ -11411,48 +11411,50 @@ mod tests {
 
     #[test]
     fn failed_new_session_never_publishes_a_visible_or_active_ghost() {
-        let (_home, host) = empty_test_host();
-        let before = host.workspace_ui_state();
-        crate::session_store::set_test_persistence_failure(Some("chrome"));
+        for boundary in ["transcript", "meta", "chrome"] {
+            let (_home, host) = empty_test_host();
+            let before = host.workspace_ui_state();
+            crate::session_store::set_test_persistence_failure(Some(boundary));
 
-        let error = host
-            .session_new_kind(SessionKind::Build)
-            .expect_err("blocked chrome commit must fail");
-        crate::session_store::set_test_persistence_failure(None);
+            let error = host
+                .session_new_kind(SessionKind::Build)
+                .expect_err("blocked durable boundary must fail");
+            crate::session_store::set_test_persistence_failure(None);
 
-        assert!(
-            error.to_string().contains("persistence") || error.to_string().contains("boundary")
-        );
-        let after = host.workspace_ui_state();
-        assert_eq!(after.sessions.len(), before.sessions.len());
-        assert_eq!(
-            after
-                .sessions
-                .iter()
-                .map(|session| session.id)
-                .collect::<Vec<_>>(),
-            before
-                .sessions
-                .iter()
-                .map(|session| session.id)
-                .collect::<Vec<_>>()
-        );
-        assert_eq!(after.open_tab_ids, before.open_tab_ids);
-        assert_eq!(after.active_session, before.active_session);
-        assert_eq!(after.active_lane_id, before.active_lane_id);
-        assert!(host.list_all_sessions().is_empty());
-        let session_entries = std::fs::read_dir(crate::session_store::sessions_root())
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter(|entry| entry.path().is_dir())
-            .collect::<Vec<_>>();
-        assert!(
-            session_entries.is_empty(),
-            "failed creation left session files"
-        );
-        assert!(!crate::discover::grokptah_home()
-            .join("session-create-intent.json")
-            .exists());
+            assert!(
+                error.to_string().contains("persistence") || error.to_string().contains("boundary")
+            );
+            let after = host.workspace_ui_state();
+            assert_eq!(after.sessions.len(), before.sessions.len());
+            assert_eq!(
+                after
+                    .sessions
+                    .iter()
+                    .map(|session| session.id)
+                    .collect::<Vec<_>>(),
+                before
+                    .sessions
+                    .iter()
+                    .map(|session| session.id)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(after.open_tab_ids, before.open_tab_ids);
+            assert_eq!(after.active_session, before.active_session);
+            assert_eq!(after.active_lane_id, before.active_lane_id);
+            assert!(host.list_all_sessions().is_empty());
+            let session_entries = std::fs::read_dir(crate::session_store::sessions_root())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().is_dir())
+                .collect::<Vec<_>>();
+            assert!(
+                session_entries.is_empty(),
+                "{boundary} failure left session files"
+            );
+            assert!(!crate::discover::grokptah_home()
+                .join("session-create-intent.json")
+                .exists());
+        }
     }
 
     fn usage_test_run(run_id: &str, max_total_tokens: Option<u64>) -> RunRecord {
