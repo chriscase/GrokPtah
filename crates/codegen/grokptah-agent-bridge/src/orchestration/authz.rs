@@ -26,6 +26,7 @@ const AUTHORITY_FILE: &str = "auth-authority.json";
 const MAX_AUTH_ID_BYTES: usize = 128;
 const MAX_AUTH_OWNER_BYTES: usize = 128;
 const EFFECT_LEASE_TTL: Duration = Duration::from_secs(30);
+const LOCAL_DESKTOP_CREDENTIAL_ID: &str = "desktop-local";
 
 /// Host-issued opaque principal identity.
 ///
@@ -298,6 +299,59 @@ pub(crate) struct AuthRegistry {
 }
 
 impl AuthRegistry {
+    /// Open the same durable #477 authority used by the control plane and
+    /// ensure that the local Desktop has one host-issued credential identity.
+    /// No bearer token is created or persisted for this record.
+    pub(crate) fn open_local_desktop(root: &Path) -> Result<Self, OrchError> {
+        let mut registry = Self::open(root, &[], "primary")?;
+        if !registry
+            .state
+            .credentials
+            .iter()
+            .any(|record| record.credential_id == LOCAL_DESKTOP_CREDENTIAL_ID)
+        {
+            let generation = registry.allocate_generation()?;
+            registry.state.credentials.push(new_stored_credential(
+                LOCAL_DESKTOP_CREDENTIAL_ID,
+                "primary",
+                generation,
+            ));
+            registry.persist()?;
+        }
+        Ok(registry)
+    }
+
+    pub(crate) fn local_desktop_context(&self) -> Result<AuthContext, OrchError> {
+        let record = self
+            .state
+            .credentials
+            .iter()
+            .find(|record| record.credential_id == LOCAL_DESKTOP_CREDENTIAL_ID)
+            .ok_or_else(stale_authority)?;
+        let principal = decode_fixed_hex(&record.principal).ok_or_else(|| {
+            OrchError::new(
+                OrchErrorCode::Internal,
+                "durable local Desktop principal is invalid",
+            )
+        })?;
+        let incarnation = decode_fixed_hex(&record.incarnation).ok_or_else(|| {
+            OrchError::new(
+                OrchErrorCode::Internal,
+                "durable local Desktop incarnation is invalid",
+            )
+        })?;
+        Ok(AuthContext {
+            stamp: AuthorityStamp {
+                principal: PrincipalRef(principal),
+                incarnation: CredentialIncarnation(incarnation),
+                generation: AuthenticationGeneration(record.generation),
+                credential_id: LOCAL_DESKTOP_CREDENTIAL_ID.into(),
+                owner_id: record.owner_id.clone(),
+            },
+            delegation: None,
+        })
+    }
+
     pub(crate) fn unavailable(root: &Path, error: impl Into<String>) -> Self {
         Self {
             root: root.to_path_buf(),
@@ -336,7 +390,13 @@ impl AuthRegistry {
             state,
             durable_error: None,
         };
-        let changed = registry.reconcile(credentials, owner_id)?;
+        let changed = if credentials.is_empty() && existed {
+            // A Desktop bootstrap has no control-plane bearer material. It
+            // must observe existing durable identities, not revoke them.
+            false
+        } else {
+            registry.reconcile(credentials, owner_id)?
+        };
         if changed || !existed {
             registry.persist()?;
         }
@@ -385,7 +445,7 @@ impl AuthRegistry {
             .credentials
             .iter()
             .any(|record| record.owner_id != owner_id);
-        let mut next = Vec::with_capacity(credentials.len());
+        let mut next = Vec::with_capacity(credentials.len().saturating_add(1));
         for credential in credentials {
             let existing = if owner_changed {
                 None
@@ -407,6 +467,14 @@ impl AuthRegistry {
                 }
             };
             next.push(record);
+        }
+        if let Some(local) = self
+            .state
+            .credentials
+            .iter()
+            .find(|record| record.credential_id == LOCAL_DESKTOP_CREDENTIAL_ID)
+        {
+            next.push(local.clone());
         }
         if next.len() != self.state.credentials.len()
             || next != self.state.credentials
@@ -929,6 +997,26 @@ mod tests {
         assert!(registry
             .authenticate(Some("Bearer unknown"), &credentials)
             .is_err());
+    }
+
+    #[test]
+    fn local_desktop_context_is_durable_without_a_bearer_token() {
+        let root = tempdir().unwrap();
+        let first = AuthRegistry::open_local_desktop(root.path()).unwrap();
+        let first_context = first.local_desktop_context().unwrap();
+        assert_eq!(first_context.credential_id(), LOCAL_DESKTOP_CREDENTIAL_ID);
+        assert_eq!(first_context.owner_id(), "primary");
+
+        let second = AuthRegistry::open_local_desktop(root.path()).unwrap();
+        let second_context = second.local_desktop_context().unwrap();
+        assert_eq!(first_context, second_context);
+
+        let primary = AuthCredential::new("primary", "control").unwrap();
+        let with_control = AuthRegistry::open(root.path(), &[primary], "primary").unwrap();
+        assert_eq!(
+            with_control.local_desktop_context().unwrap(),
+            first_context
+        );
     }
 
     #[test]

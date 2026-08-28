@@ -805,6 +805,15 @@ impl AgentHost {
                 None
             }
         };
+        // Desktop authority is local and durable, but it is still issued by
+        // the canonical #477 registry. A control-plane bearer token is not a
+        // prerequisite for local Computer Use.
+        let local_auth_context = if instance_lock.is_some() {
+            crate::orchestration::local_desktop_auth_context(&runtime_home.orchestration_root())
+                .ok()
+        } else {
+            None
+        };
         let mut event_tx = crate::event_bus::EventBus::new(
             config
                 .event_bus_capacity
@@ -952,7 +961,7 @@ impl AgentHost {
             run_usage_trackers: Arc::new(Mutex::new(HashMap::new())),
             provider_observation: config.provider_observation,
             capability_authority: Arc::new(CapabilityAuthority::new(instance_lock.is_some())),
-            canonical_auth_context: Arc::new(Mutex::new(None)),
+            canonical_auth_context: Arc::new(Mutex::new(local_auth_context)),
             _instance_lock: instance_lock,
             runtime_home,
             _runtime_home_context: runtime_home_context,
@@ -974,6 +983,7 @@ impl AgentHostHandle {
         &self,
         auth_context: crate::orchestration::AuthContext,
     ) {
+        self.invalidate_computer_agent_authority();
         *self.canonical_auth_context.lock() = Some(auth_context);
     }
 
