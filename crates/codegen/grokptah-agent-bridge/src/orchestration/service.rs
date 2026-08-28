@@ -1772,7 +1772,6 @@ impl OrchestrationService {
                                 | "incarnation"
                                 | "credentialincarnation"
                                 | "authgeneration"
-                                | "generation"
                                 | "secret"
                                 | "secretkey"
                                 | "leasehash"
@@ -5115,7 +5114,6 @@ impl OrchestrationService {
             ));
         }
         serde_json::to_value(plan)
-            .map(|value| self.public_projection(value))
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
     }
 
