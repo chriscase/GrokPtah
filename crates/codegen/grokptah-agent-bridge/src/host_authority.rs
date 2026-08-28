@@ -67,7 +67,7 @@ pub(crate) fn assemble(
         .map_err(|error| anyhow!("canonical auth authority unavailable: {error}"))?
         .ok_or_else(|| anyhow!("canonical auth authority is unavailable"))?;
     let identity = credentials.qualification_identity_fingerprint();
-    let principal = principal_ref(session_id, agent_id, &identity, store.clone())?;
+    let principal = principal_ref(agent_id, &identity, store.clone())?;
     let capability = capability_lease(agent_id, store, effect_scope.clone(), turn_generation)?;
     let (revoked_effect_lease_ids, mut issued_effect_lease_ids) =
         match fs::read(authority_path(attempt_root, &effect_scope)) {
@@ -124,7 +124,7 @@ pub(crate) fn refresh(
         .map_err(|error| anyhow!("canonical auth authority unavailable: {error}"))?
         .ok_or_else(|| anyhow!("canonical auth authority is unavailable"))?;
     let identity = credentials.qualification_identity_fingerprint();
-    let principal = principal_ref(session_id, agent_id, &identity, store.clone())?;
+    let principal = principal_ref(agent_id, &identity, store.clone())?;
     current.principal_incarnation = principal.incarnation;
     current.auth_generation = principal.auth_generation.0;
     current.capability_generation =
@@ -183,7 +183,6 @@ pub(crate) fn write_verified_reconciliation(
 }
 
 fn principal_ref(
-    session_id: Uuid,
     agent_id: Option<&str>,
     credential_identity: &str,
     store: Option<OrchStore>,
@@ -196,12 +195,11 @@ fn principal_ref(
         if !agent.state.is_active_identity() {
             return Err(anyhow!("terminal Agent authority cannot send"));
         }
-        let owner = agent
+        agent
             .owner_principal_id
-            .ok_or_else(|| anyhow!("canonical Agent principal incarnation is unavailable"))?;
-        format!("{agent_id}:{owner}")
+            .unwrap_or_else(|| credential_identity.to_owned())
     } else {
-        format!("{session_id}:{credential_identity}")
+        credential_identity.to_owned()
     };
     Ok(PrincipalRef {
         incarnation,

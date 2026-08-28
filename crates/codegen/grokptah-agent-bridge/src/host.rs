@@ -1464,29 +1464,15 @@ impl AgentHostHandle {
             bail!("persistent agents are available only for Build sessions");
         }
         let store = self.ensure_orchestration_store()?;
-        let credentials = crate::auth_store::resolve_wire_credentials_for_model(&model)
-            .ok()
-            .flatten();
-        let principal_owner = credentials.map(|credentials| {
-            let credential_identity = credentials.qualification_identity_fingerprint();
-            credentials
-                .principal_id
-                .or(credentials.user_id)
-                .unwrap_or(credential_identity)
-        });
         let workspace = cwd.display().to_string();
         let agent_id = existing_id
             .clone()
             .unwrap_or_else(|| format!("agent-{session_id}"));
         let now = Utc::now();
         let mut agent = match store.load_agent(&agent_id)? {
-            Some(mut agent) => {
+            Some(agent) => {
                 if !agent.known_lane_ids().contains(&session_id) || agent.workspace != workspace {
                     bail!("session is bound to a different persistent agent workspace");
-                }
-                if agent.owner_principal_id.is_none() && principal_owner.is_some() {
-                    agent.owner_principal_id = principal_owner.clone();
-                    store.save_agent(&agent)?;
                 }
                 agent
             }
@@ -1499,7 +1485,7 @@ impl AgentHostHandle {
                     .map_err(|error| anyhow!(error.to_string()))?;
                 AgentRecord {
                     agent_id: agent_id.clone(),
-                    owner_principal_id: principal_owner,
+                    owner_principal_id: None,
                     session_id,
                     lane_ids: vec![session_id],
                     lane_associations: vec![AgentLaneAssociation {
