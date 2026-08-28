@@ -982,12 +982,13 @@ impl AgentHostHandle {
             .map(|tracker| tracker.run_id().to_owned())
             .unwrap_or_else(|| format!("desktop-chat-{session_id}"));
         let host = self.clone();
-        Ok(ProviderAttemptContext::new(
+        ProviderAttemptContext::new(
             store,
             operation_id,
             authority,
             Arc::new(move || host.current_provider_authority(session_id).ok()),
-        ))
+        )
+        .map_err(|error| anyhow!("construct provider attempt context: {error}"))
     }
 
     fn current_provider_authority(

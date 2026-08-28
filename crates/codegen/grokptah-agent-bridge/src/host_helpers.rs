@@ -25,61 +25,7 @@ use crate::session::{Session, SessionKind, TranscriptEntry};
 use crate::types::EffortLevel;
 use sha2::{Digest, Sha256};
 
-/// Host-owned admission context for one logical provider operation. The
-/// durable ledger allocates one request identity before the first physical
-/// send; the revalidator closes the admission gap after waits and immediately
-/// before the socket call.
-#[derive(Clone)]
-pub(crate) struct ProviderAttemptContext {
-    store: xai_provider_attempt::ProviderAttemptStore,
-    operation_id: String,
-    authority: xai_provider_attempt::AuthorityBinding,
-    revalidate: Arc<dyn Fn() -> Option<xai_provider_attempt::AuthorityBinding> + Send + Sync>,
-}
-
-impl ProviderAttemptContext {
-    pub(crate) fn new(
-        store: xai_provider_attempt::ProviderAttemptStore,
-        operation_id: String,
-        authority: xai_provider_attempt::AuthorityBinding,
-        revalidate: Arc<dyn Fn() -> Option<xai_provider_attempt::AuthorityBinding> + Send + Sync>,
-    ) -> Self {
-        Self {
-            store,
-            operation_id,
-            authority,
-            revalidate,
-        }
-    }
-
-    fn begin(
-        &self,
-        provider_id: &str,
-        body: &[u8],
-        supports_idempotency: bool,
-    ) -> Result<xai_provider_attempt::PhysicalSendPermit> {
-        let spec = xai_provider_attempt::AttemptSpec::new(
-            self.operation_id.clone(),
-            provider_id.to_owned(),
-            xai_provider_attempt::AttemptSpec::fingerprint_bytes(body),
-            supports_idempotency,
-            self.authority.clone(),
-        )
-        .map_err(|error| anyhow!("provider attempt intent rejected: {error}"))?;
-        let attempt = self
-            .store
-            .create(spec)
-            .map_err(|error| anyhow!("persist provider attempt intent: {error}"))?;
-        attempt
-            .admit(&self.authority)
-            .map_err(|error| anyhow!("admit provider attempt: {error}"))?;
-        let current =
-            (self.revalidate)().ok_or_else(|| anyhow!("provider authority unavailable"))?;
-        attempt
-            .begin_send(&current)
-            .map_err(|error| anyhow!("begin physical provider send: {error}"))
-    }
-}
+type ProviderAttemptContext = xai_provider_attempt::AttemptContext;
 
 pub(crate) fn push_assistant(host: &AgentHostHandle, session_id: Uuid, text: &str) {
     let mut g = host.inner.lock();
@@ -3036,7 +2982,8 @@ pub async fn replay_xai_provider_contract_on_loopback(
         "provider-contract-replay".into(),
         attempt_authority.clone(),
         Arc::new(move || Some(attempt_authority.clone())),
-    );
+    )
+    .map_err(|error| anyhow!("create provider contract context: {error}"))?;
     let step = call_provider_agent_step(
         credentials,
         target,
@@ -3123,6 +3070,7 @@ mod compatible_stream_tests {
             authority.clone(),
             Arc::new(move || Some(authority.clone())),
         )
+        .unwrap()
     }
 
     fn install_compatible_profile(home: &std::path::Path, base_url: &str) -> String {
