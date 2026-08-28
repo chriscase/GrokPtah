@@ -396,6 +396,8 @@ impl ComputerUseService {
         observation_id: &str,
         action: ComputerAction,
     ) -> ComputerResult<ActionOutcome> {
+        #[cfg(test)]
+        eprintln!("act: start {run_id}");
         validate_id("run_id", run_id)?;
         validate_id("observation_id", observation_id)?;
         action.validate(&ComputerUseLimits::ceiling())?;
@@ -408,14 +410,22 @@ impl ComputerUseService {
         if let Some(replayed) = self.begin_mutation(request_id, "act", &payload)? {
             return replayed;
         }
+        #[cfg(test)]
+        eprintln!("act: claimed {run_id}");
 
         let mut budget_error = None;
         let prepared = self
             .store
             .update_run(run_id, |run| {
                 ensure_version(run, expected_version)?;
+                #[cfg(test)]
+                eprintln!("act: checking capability {run_id}");
                 let _capability = self.require_run_capability(run)?;
+                #[cfg(test)]
+                eprintln!("act: capability okay {run_id}");
                 self.consume_durable_lease("act", &payload)?;
+                #[cfg(test)]
+                eprintln!("act: durable okay {run_id}");
                 let now = Utc::now();
                 if self.policy.run_limit_reached(run, now) {
                     let error = run_limit_error();
@@ -463,6 +473,8 @@ impl ComputerUseService {
                 Ok(())
             })
             .and_then(|run| run.ok_or_else(unknown_run));
+        #[cfg(test)]
+        eprintln!("act: prepared {run_id}");
 
         let result = match (prepared, budget_error) {
             (Ok(_), Some(error)) => Err(error),
@@ -480,6 +492,8 @@ impl ComputerUseService {
                         return Err(error);
                     }
                 };
+                #[cfg(test)]
+                eprintln!("act: effect capability {run_id}");
                 let lease = match self.effect_lease(&capability, &prepared, "computer.input") {
                     Ok(lease) => lease,
                     Err(error) => {
@@ -488,12 +502,18 @@ impl ComputerUseService {
                         return Err(error);
                     }
                 };
+                #[cfg(test)]
+                eprintln!("act: lease issued {run_id}");
                 let outcome =
                     match self
                         .capability_authority
                         .consume(lease, &capability.snapshot, Utc::now())
                     {
-                        Ok(_) => self.backend.act(run_id, &observation, &action).await,
+                        Ok(_) => {
+                            #[cfg(test)]
+                            eprintln!("act: backend {run_id}");
+                            self.backend.act(run_id, &observation, &action).await
+                        }
                         Err(error) => {
                             self.fail_inflight(
                                 run_id,
