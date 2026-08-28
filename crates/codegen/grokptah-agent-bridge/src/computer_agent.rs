@@ -8,12 +8,14 @@ use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-use crate::capability_authority::CapabilitySnapshot;
+use crate::capability_authority::{CapabilityAuthority, CapabilitySnapshot};
 use crate::computer_use::{
     ComputerAction, ComputerObservation, ComputerUseLimits, SemanticAction, SimulatorBackend,
 };
 use crate::gateway_config::{CapabilitySource, ComputerUseTier};
-use crate::host_helpers::{call_xai_agent_step, resolve_model_target, AgentStep, AgentToolCall};
+use crate::host_helpers::{
+    call_xai_agent_step_observed_with_authority, resolve_model_target, AgentStep, AgentToolCall,
+};
 use crate::types::EffortLevel;
 
 const QUALIFICATION_TOOL: &str = "ptah_computer_qualification_action";
@@ -126,6 +128,9 @@ pub(crate) async fn qualify_semantic_model(
     model: &str,
     effort: EffortLevel,
     cancel: &CancellationToken,
+    authority: &CapabilityAuthority,
+    principal: &str,
+    policy_digest: &str,
 ) -> Result<()> {
     let simulator = SimulatorBackend::new();
     let target = SimulatorBackend::demo_target();
@@ -147,7 +152,7 @@ pub(crate) async fn qualify_semantic_model(
         }),
     ];
     let first_call = one_tool_call(
-        call_xai_agent_step(
+        call_xai_agent_step_observed_with_authority(
             credentials,
             model,
             effort,
@@ -155,6 +160,10 @@ pub(crate) async fn qualify_semantic_model(
             &qualification_tools(),
             true,
             cancel,
+            None,
+            authority,
+            principal,
+            policy_digest,
             |_| {},
             |_| {},
         )
@@ -196,7 +205,7 @@ pub(crate) async fn qualify_semantic_model(
         }),
     ];
     let recovery_call = one_tool_call(
-        call_xai_agent_step(
+        call_xai_agent_step_observed_with_authority(
             credentials,
             model,
             effort,
@@ -204,6 +213,10 @@ pub(crate) async fn qualify_semantic_model(
             &qualification_tools(),
             true,
             cancel,
+            None,
+            authority,
+            principal,
+            policy_digest,
             |_| {},
             |_| {},
         )
