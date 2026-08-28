@@ -184,8 +184,16 @@ struct ComputerProbeArguments {
 }
 
 pub async fn qualify_provider_model(
+    _provider_id: &str,
+    _model_id: &str,
+) -> Result<ProviderQualificationReport> {
+    bail!("host provider-attempt admission is required for provider qualification")
+}
+
+pub(crate) async fn qualify_provider_model_admitted(
     provider_id: &str,
     model_id: &str,
+    provider_attempt: &xai_provider_attempt::AttemptContext,
 ) -> Result<ProviderQualificationReport> {
     if model_id.trim().is_empty() {
         bail!("model id is required");
@@ -259,6 +267,7 @@ pub async fn qualify_provider_model(
             "stream": false
         }),
         false,
+        provider_attempt,
     )
     .await;
     let basic_generation = match basic_value.as_ref() {
@@ -290,6 +299,7 @@ pub async fn qualify_provider_model(
             "stream": false
         }),
         true,
+        provider_attempt,
     )
     .await;
     let native_call = tool_value
@@ -328,6 +338,7 @@ pub async fn qualify_provider_model(
                 "stream": false
             }),
             false,
+            provider_attempt,
         )
         .await
     } else {
@@ -341,17 +352,30 @@ pub async fn qualify_provider_model(
         Err(error) => QualificationCheck::fail(safe_probe_error(error)),
     };
 
-    let streaming =
-        match streaming_probe(&client, &profile.base_url, &mut credentials, &wire_model_id).await {
-            Ok(true) => QualificationCheck::pass("SSE deltas preserved the synthetic marker"),
-            Ok(false) => QualificationCheck::fail("Stream completed without the marker"),
-            Err(error) => QualificationCheck::fail(safe_probe_error(&error)),
-        };
+    let streaming = match streaming_probe(
+        &client,
+        &profile.base_url,
+        &mut credentials,
+        &wire_model_id,
+        provider_attempt,
+    )
+    .await
+    {
+        Ok(true) => QualificationCheck::pass("SSE deltas preserved the synthetic marker"),
+        Ok(false) => QualificationCheck::fail("Stream completed without the marker"),
+        Err(error) => QualificationCheck::fail(safe_probe_error(&error)),
+    };
     let coding_ready =
         basic_generation.passed() && native_tool_call.passed() && tool_result_continuation.passed();
     let (semantic_observation, stale_observation_recovery, computer_use_tier) = if coding_ready {
-        match computer_semantic_probe(&client, &profile.base_url, &mut credentials, &wire_model_id)
-            .await
+        match computer_semantic_probe(
+            &client,
+            &profile.base_url,
+            &mut credentials,
+            &wire_model_id,
+            provider_attempt,
+        )
+        .await
         {
             Ok(result) => result,
             Err(error) => (
@@ -422,6 +446,7 @@ async fn computer_semantic_probe(
     base_url: &str,
     credentials: &mut QualificationCredentials,
     model_id: &str,
+    provider_attempt: &xai_provider_attempt::AttemptContext,
 ) -> Result<(QualificationCheck, QualificationCheck, ComputerUseTier)> {
     let simulator = SimulatorBackend::new();
     let target = SimulatorBackend::demo_target();
@@ -452,6 +477,7 @@ async fn computer_semantic_probe(
             "stream": false
         }),
         true,
+        provider_attempt,
     )
     .await;
     let first_call = first_value
@@ -522,6 +548,7 @@ async fn computer_semantic_probe(
             "stream": false
         }),
         true,
+        provider_attempt,
     )
     .await;
     let recovered = recovery_value
@@ -683,10 +710,22 @@ async fn completion(
     credentials: &mut QualificationCredentials,
     mut body: serde_json::Value,
     allow_tool_choice_fallback: bool,
+    provider_attempt: &xai_provider_attempt::AttemptContext,
 ) -> Result<serde_json::Value> {
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let mut removed_tool_choice = false;
     let mut transient_retries = 0_u32;
+    let request_bytes =
+        serde_json::to_vec(&body).context("serialize provider qualification request")?;
+    let mut permit = Some(
+        provider_attempt
+            .begin("provider-qualification", &request_bytes, true)
+            .map_err(|error| anyhow!("admit provider qualification: {error}"))?,
+    );
+    let idempotency_key = permit
+        .as_ref()
+        .map(|permit| permit.idempotency_key().to_owned())
+        .ok_or_else(|| anyhow!("provider qualification permit is unavailable"))?;
     for _attempt in 0..5 {
         let mut request = client
             .post(&url)
@@ -695,13 +734,37 @@ async fn completion(
         if let Some(credentials) = credentials.current() {
             request = crate::auth_store::apply_auth_headers(request, credentials, base_url);
         }
-        let response = request
+        let permit_ref = permit
+            .as_ref()
+            .ok_or_else(|| anyhow!("provider qualification permit is unavailable"))?;
+        provider_attempt
+            .revalidate_before_physical_write(permit_ref)
+            .map_err(|error| {
+                anyhow!("provider authority changed before qualification send: {error}")
+            })?;
+        let response = match request
+            .header(
+                xai_provider_attempt::IDEMPOTENCY_KEY_HEADER,
+                &idempotency_key,
+            )
+            .header("x-grok-req-id", &idempotency_key)
             .json(&body)
             .send()
             .await
-            .map_err(classify_transport)?;
+        {
+            Ok(response) => response,
+            Err(error) => {
+                if let Some(mut permit) = permit.take() {
+                    let _ = provider_attempt.transport_after_possible_write(&mut permit);
+                }
+                return Err(classify_transport(error));
+            }
+        };
         let status = response.status();
         if status.is_redirection() {
+            if let Some(mut permit) = permit.take() {
+                let _ = provider_attempt.semantic_rejection(&mut permit, status.as_u16());
+            }
             bail!("provider redirect refused");
         }
         if status == reqwest::StatusCode::UNAUTHORIZED
@@ -717,15 +780,41 @@ async fn completion(
             continue;
         }
         if (status.as_u16() == 429 || status.is_server_error()) && transient_retries < 3 {
+            if status.is_server_error() {
+                if let Some(mut permit) = permit.take() {
+                    let _ = provider_attempt.transport_after_possible_write(&mut permit);
+                }
+                bail!(
+                    "provider request became uncertain after HTTP {}",
+                    status.as_u16()
+                );
+            }
             tokio::time::sleep(Duration::from_millis(100 * (1 << transient_retries))).await;
             transient_retries += 1;
             continue;
         }
         if !status.is_success() {
+            if let Some(mut permit) = permit.take() {
+                let _ = provider_attempt.semantic_rejection(&mut permit, status.as_u16());
+            }
             bail!("provider request failed (HTTP {})", status.as_u16());
         }
+        provider_attempt
+            .mark_response_started(
+                permit
+                    .as_mut()
+                    .ok_or_else(|| anyhow!("provider qualification permit is unavailable"))?,
+            )
+            .map_err(|error| anyhow!("record qualification response start: {error}"))?;
         let raw = read_body(response).await?;
-        return serde_json::from_str(&raw).context("provider returned malformed JSON");
+        let value = serde_json::from_str(&raw).context("provider returned malformed JSON")?;
+        let mut permit = permit
+            .take()
+            .ok_or_else(|| anyhow!("provider qualification permit is unavailable"))?;
+        provider_attempt
+            .settle_http_response(&mut permit, status.as_u16(), raw.as_bytes())
+            .map_err(|error| anyhow!("settle qualification provider attempt: {error}"))?;
+        return Ok(value);
     }
     bail!("provider request failed after bounded fallback")
 }
@@ -735,6 +824,7 @@ async fn streaming_probe(
     base_url: &str,
     credentials: &mut QualificationCredentials,
     model_id: &str,
+    provider_attempt: &xai_provider_attempt::AttemptContext,
 ) -> Result<bool> {
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let body = serde_json::json!({
@@ -745,6 +835,16 @@ async fn streaming_probe(
         }],
         "stream": true
     });
+    let request_bytes = serde_json::to_vec(&body).context("serialize provider stream request")?;
+    let mut permit = Some(
+        provider_attempt
+            .begin("provider-qualification-stream", &request_bytes, true)
+            .map_err(|error| anyhow!("admit provider stream qualification: {error}"))?,
+    );
+    let idempotency_key = permit
+        .as_ref()
+        .map(|permit| permit.idempotency_key().to_owned())
+        .ok_or_else(|| anyhow!("provider stream permit is unavailable"))?;
     let response = loop {
         let mut request = client
             .post(&url)
@@ -753,11 +853,30 @@ async fn streaming_probe(
         if let Some(current) = credentials.current() {
             request = crate::auth_store::apply_auth_headers(request, current, base_url);
         }
-        let response = request
+        let permit_ref = permit
+            .as_ref()
+            .ok_or_else(|| anyhow!("provider stream permit is unavailable"))?;
+        provider_attempt
+            .revalidate_before_physical_write(permit_ref)
+            .map_err(|error| anyhow!("provider authority changed before stream send: {error}"))?;
+        let response = match request
+            .header(
+                xai_provider_attempt::IDEMPOTENCY_KEY_HEADER,
+                &idempotency_key,
+            )
+            .header("x-grok-req-id", &idempotency_key)
             .json(&body)
             .send()
             .await
-            .map_err(classify_transport)?;
+        {
+            Ok(response) => response,
+            Err(error) => {
+                if let Some(mut permit) = permit.take() {
+                    let _ = provider_attempt.transport_after_possible_write(&mut permit);
+                }
+                return Err(classify_transport(error));
+            }
+        };
         if response.status() == reqwest::StatusCode::UNAUTHORIZED
             && credentials.refresh_after_unauthorized().await?
         {
@@ -766,6 +885,14 @@ async fn streaming_probe(
         break response;
     };
     if !response.status().is_success() {
+        if let Some(mut permit) = permit.take() {
+            if response.status().is_server_error() {
+                let _ = provider_attempt.transport_after_possible_write(&mut permit);
+            } else {
+                let _ =
+                    provider_attempt.semantic_rejection(&mut permit, response.status().as_u16());
+            }
+        }
         bail!(
             "provider stream failed (HTTP {})",
             response.status().as_u16()
@@ -778,8 +905,29 @@ async fn streaming_probe(
         .unwrap_or_default()
         .to_ascii_lowercase();
     if content_type.contains("application/json") {
+        provider_attempt
+            .mark_response_started(
+                permit
+                    .as_mut()
+                    .ok_or_else(|| anyhow!("provider stream permit is unavailable"))?,
+            )
+            .map_err(|error| anyhow!("record qualification stream response start: {error}"))?;
+        let raw = read_body(response).await?;
+        let mut permit = permit
+            .take()
+            .ok_or_else(|| anyhow!("provider stream permit is unavailable"))?;
+        provider_attempt
+            .settle_http_response(&mut permit, 200, raw.as_bytes())
+            .map_err(|error| anyhow!("settle qualification stream attempt: {error}"))?;
         return Ok(false);
     }
+    provider_attempt
+        .mark_response_started(
+            permit
+                .as_mut()
+                .ok_or_else(|| anyhow!("provider stream permit is unavailable"))?,
+        )
+        .map_err(|error| anyhow!("record qualification stream response start: {error}"))?;
     let mut decoder = crate::sse::SseLineDecoder::new();
     let mut full_body = crate::sse::BoundedBodyAccumulator::new();
     let mut content = String::new();
@@ -795,7 +943,13 @@ async fn streaming_probe(
     if let Some(line) = decoder.finish()? {
         done |= apply_stream_probe_line(&line, &mut content)?;
     }
-    full_body.finish()?;
+    let raw = full_body.finish()?;
+    let mut permit = permit
+        .take()
+        .ok_or_else(|| anyhow!("provider stream permit is unavailable"))?;
+    provider_attempt
+        .settle_http_response(&mut permit, 200, raw.as_bytes())
+        .map_err(|error| anyhow!("settle qualification stream attempt: {error}"))?;
     Ok(done && content.contains(GENERATION_MARKER))
 }
 
@@ -848,6 +1002,7 @@ mod tests {
     use axum::routing::post;
     use axum::{Json, Router};
     use bytes::Bytes;
+    use uuid::Uuid;
 
     #[derive(Clone)]
     struct GatewayState {
@@ -1079,6 +1234,33 @@ mod tests {
         crate::gateway_config::save(&config).unwrap();
     }
 
+    fn qualification_attempt_context() -> xai_provider_attempt::AttemptContext {
+        let scope = format!("qualification-scope-{}", Uuid::new_v4());
+        let root = std::env::temp_dir().join(format!("grokptah-qualification-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("canonical-authorities")).unwrap();
+        std::fs::write(
+            root.join("canonical-authorities")
+                .join(format!("{scope}.json")),
+            serde_json::json!({
+                "principalIncarnation": "qualification-principal",
+                "authGeneration": 1,
+                "capabilityGeneration": 1,
+                "effectLeaseId": format!("qualification-lease-{}", Uuid::new_v4()),
+                "effectScope": scope,
+                "revokedEffectLeaseIds": [],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = xai_provider_attempt::ProviderAttemptStore::open(root).unwrap();
+        xai_provider_attempt::AttemptContext::from_host_ledger(
+            store,
+            format!("qualification-operation-{}", Uuid::new_v4()),
+            scope,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn prose_cannot_qualify_as_a_native_tool_call() {
         let value = serde_json::json!({
@@ -1200,9 +1382,11 @@ mod tests {
                 let previous_key = std::env::var_os("XAI_API_KEY");
                 unsafe { std::env::set_var("XAI_API_KEY", "must-not-leak") };
 
-                let error = qualify_provider_model("attacker", "grok-4.5")
-                    .await
-                    .unwrap_err();
+                let provider_attempt = qualification_attempt_context();
+                let error =
+                    qualify_provider_model_admitted("attacker", "grok-4.5", &provider_attempt)
+                        .await
+                        .unwrap_err();
                 assert!(error.to_string().contains("unknown provider profile"));
                 assert_eq!(request_count.load(Ordering::SeqCst), 0);
 
@@ -1230,6 +1414,7 @@ mod tests {
         .unwrap();
         credentials.forced_refresh_override = Some(wire_credentials("xai", "fresh-token", true));
         let client = reqwest::Client::new();
+        let provider_attempt = qualification_attempt_context();
 
         let value = completion(
             &client,
@@ -1241,6 +1426,7 @@ mod tests {
                 "stream": false
             }),
             false,
+            &provider_attempt,
         )
         .await
         .unwrap();
@@ -1265,6 +1451,7 @@ mod tests {
         refreshed.principal_id = Some("user-b".into());
         let mut credentials = QualificationCredentials::new(Some(initial), &profile).unwrap();
         credentials.forced_refresh_override = Some(refreshed);
+        let provider_attempt = qualification_attempt_context();
 
         let error = completion(
             &reqwest::Client::new(),
@@ -1276,6 +1463,7 @@ mod tests {
                 "stream": false
             }),
             false,
+            &provider_attempt,
         )
         .await
         .unwrap_err();
@@ -1305,9 +1493,14 @@ mod tests {
                 let temp = tempfile::tempdir().unwrap();
                 install_profile(temp.path(), &base_url, "qualified");
 
-                let report = qualify_provider_model("qualified", "cheap-code-model")
-                    .await
-                    .unwrap();
+                let provider_attempt = qualification_attempt_context();
+                let report = qualify_provider_model_admitted(
+                    "qualified",
+                    "cheap-code-model",
+                    &provider_attempt,
+                )
+                .await
+                .unwrap();
                 assert!(report.coding_ready);
                 assert_eq!(report.computer_use_tier, ComputerUseTier::SemanticAct);
                 assert_eq!(
@@ -1376,7 +1569,10 @@ mod tests {
                 );
                 assert!(unqualified.models[0].capabilities.tools);
 
-                let report = qualify_provider_model("xai", "grok-4.5").await.unwrap();
+                let provider_attempt = qualification_attempt_context();
+                let report = qualify_provider_model_admitted("xai", "grok-4.5", &provider_attempt)
+                    .await
+                    .unwrap();
                 assert!(report.coding_ready);
                 assert_eq!(report.provider_id, "xai");
                 assert_eq!(report.computer_use_tier, ComputerUseTier::SemanticAct);
@@ -1476,9 +1672,14 @@ mod tests {
                 let temp = tempfile::tempdir().unwrap();
                 install_profile(temp.path(), &base_url, "discussion-only");
 
-                let report = qualify_provider_model("discussion-only", "cheap-code-model")
-                    .await
-                    .unwrap();
+                let provider_attempt = qualification_attempt_context();
+                let report = qualify_provider_model_admitted(
+                    "discussion-only",
+                    "cheap-code-model",
+                    &provider_attempt,
+                )
+                .await
+                .unwrap();
                 assert!(!report.coding_ready);
                 assert_eq!(report.computer_use_tier, ComputerUseTier::None);
                 assert_eq!(report.basic_generation.status, QualificationStatus::Pass);
@@ -1511,6 +1712,7 @@ mod tests {
         })
         .await;
         let client = reqwest::Client::new();
+        let provider_attempt = qualification_attempt_context();
         let profile =
             crate::gateway_config::ProviderProfile::openai_compatible("test", "Test", &base_url);
         let mut credentials = QualificationCredentials::new(None, &profile).unwrap();
@@ -1524,6 +1726,7 @@ mod tests {
                 "stream": false
             }),
             false,
+            &provider_attempt,
         )
         .await
         .unwrap();
@@ -1551,6 +1754,7 @@ mod tests {
                 "stream": false
             }),
             false,
+            &qualification_attempt_context(),
         )
         .await
         .unwrap_err();

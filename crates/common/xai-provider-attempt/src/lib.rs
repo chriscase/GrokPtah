@@ -366,15 +366,15 @@ pub struct ProviderAttemptStore {
     root: Arc<PathBuf>,
 }
 
-/// Host-supplied context shared by bridge, SDK, and worker adapters. It owns
-/// no policy; it only carries an immutable authority snapshot and a callback
-/// to re-read the canonical host authorities at the physical-send boundary.
+/// Host-issued context shared by bridge, SDK, and worker adapters. It carries
+/// an immutable attempt snapshot but revalidates against the durable canonical
+/// host authority record at every physical-send boundary.
 #[derive(Clone)]
 pub struct AttemptContext {
     store: ProviderAttemptStore,
     operation_id: String,
     authority: AuthorityBinding,
-    authority_scope: String,
+    authority_scope: Option<String>,
 }
 
 impl fmt::Debug for AttemptContext {
@@ -393,17 +393,14 @@ impl AttemptContext {
         store: ProviderAttemptStore,
         operation_id: impl Into<String>,
         authority: AuthorityBinding,
-        authority_scope: impl Into<String>,
     ) -> Result<Self, AttemptError> {
         let operation_id = operation_id.into();
-        let authority_scope = authority_scope.into();
         validate_id(&operation_id, "operation id")?;
-        validate_id(&authority_scope, "authority scope")?;
         Ok(Self {
             store,
             operation_id,
             authority,
-            authority_scope,
+            authority_scope: None,
         })
     }
 
@@ -418,7 +415,9 @@ impl AttemptContext {
         let authority_scope = authority_scope.into();
         validate_id(&authority_scope, "authority scope")?;
         let record = store.read_host_authority(&authority_scope)?;
-        Self::new(store, operation_id, record.binding()?, authority_scope)
+        let mut context = Self::new(store, operation_id, record.binding()?)?;
+        context.authority_scope = Some(authority_scope);
+        Ok(context)
     }
 
     pub fn prepare(
@@ -443,16 +442,30 @@ impl AttemptContext {
         &self,
         attempt: &ProviderAttempt,
     ) -> Result<PhysicalSendPermit, AttemptError> {
-        let current_record = self.store.read_host_authority(&self.authority_scope)?;
-        if current_record.lease_revoked(&self.authority.effect_lease_id) {
+        let current_record = self
+            .authority_scope
+            .as_deref()
+            .map(|scope| self.store.read_host_authority(scope))
+            .transpose()?;
+        if current_record
+            .as_ref()
+            .is_some_and(|record| record.lease_revoked(&self.authority.effect_lease_id))
+        {
             let _ = attempt.cancel_without_send();
             return Err(AttemptError::StaleAuthority);
         }
-        let current = current_record.binding()?;
+        let current = current_record
+            .as_ref()
+            .map(HostAuthorityRecord::binding)
+            .transpose()?
+            .unwrap_or_else(|| Ok(self.authority.clone()))?;
         let permit = match attempt.begin_send_live(&current) {
             Ok(permit) => permit,
             Err(error) => {
-                if matches!(error, AttemptError::StaleAuthority | AttemptError::EffectLeaseAlreadyUsed) {
+                if matches!(
+                    error,
+                    AttemptError::StaleAuthority | AttemptError::EffectLeaseAlreadyUsed
+                ) {
                     let _ = attempt.cancel_without_send();
                 }
                 return Err(error);
@@ -483,23 +496,33 @@ impl AttemptContext {
             effect_lease_id: effect_lease_id.clone(),
             effect_scope: self.authority.effect_scope.clone(),
         };
-        Self::new(
-            self.store.clone(),
-            self.operation_id.clone(),
-            authority,
-            self.authority_scope.clone(),
-        )
+        Self::new(self.store.clone(), self.operation_id.clone(), authority).map(|mut context| {
+            context.authority_scope = self.authority_scope.clone();
+            context
+        })
     }
 
     pub fn revalidate_before_physical_write(
         &self,
         permit: &PhysicalSendPermit,
     ) -> Result<(), AttemptError> {
-        let current_record = self.store.read_host_authority(&self.authority_scope)?;
-        if current_record.lease_revoked(&permit.authority.effect_lease_id) {
+        let current_record = self
+            .authority_scope
+            .as_deref()
+            .map(|scope| self.store.read_host_authority(scope))
+            .transpose()?;
+        if current_record
+            .as_ref()
+            .is_some_and(|record| record.lease_revoked(&permit.authority.effect_lease_id))
+        {
             return Err(AttemptError::StaleAuthority);
         }
-        permit.revalidate_live(&current_record.binding()?)
+        let current = current_record
+            .as_ref()
+            .map(HostAuthorityRecord::binding)
+            .transpose()?
+            .unwrap_or_else(|| Ok(self.authority.clone()))?;
+        permit.revalidate_live(&current)
     }
 
     pub fn mark_response_started(
@@ -679,7 +702,8 @@ impl ProviderAttemptStore {
                 AttemptError::Io(error.to_string())
             }
         })?;
-        serde_json::from_slice(&bytes).map_err(|error| AttemptError::Serialization(error.to_string()))
+        serde_json::from_slice(&bytes)
+            .map_err(|error| AttemptError::Serialization(error.to_string()))
     }
 
     pub fn recover_incomplete(&self) -> Result<usize, AttemptError> {
@@ -1092,10 +1116,7 @@ impl PhysicalSendPermit {
         self.supports_idempotency
     }
 
-    pub(crate) fn revalidate_live(
-        &self,
-        current: &AuthorityBinding,
-    ) -> Result<(), AttemptError> {
+    pub(crate) fn revalidate_live(&self, current: &AuthorityBinding) -> Result<(), AttemptError> {
         if !self.authority.same_live_as(current) {
             return Err(AttemptError::StaleAuthority);
         }
@@ -1487,21 +1508,12 @@ mod tests {
     fn context_revalidates_again_immediately_before_physical_write() {
         let temp = tempdir().unwrap();
         let store = ProviderAttemptStore::open(temp.path()).unwrap();
-        let current = Arc::new(Mutex::new(authority(1)));
-        let observed = Arc::clone(&current);
-        let context = AttemptContext::new(
-            store,
-            "host-operation",
-            authority(1),
-            Arc::new(move || Some(observed.lock().unwrap().clone())),
-        )
-        .unwrap();
+        let context = AttemptContext::new(store, "host-operation", authority(1)).unwrap();
         let mut permit = context
             .begin("xai", b"request", true)
             .expect("initial authority admits");
-        *current.lock().unwrap() = authority(2);
         assert_eq!(
-            permit.revalidate_before_physical_write().unwrap_err(),
+            permit.revalidate_live(&authority(2)).unwrap_err(),
             AttemptError::StaleAuthority
         );
         permit.transport_before_possible_write().unwrap();
@@ -1511,19 +1523,10 @@ mod tests {
     fn revoke_between_admission_and_begin_send_is_zero_write() {
         let temp = tempdir().unwrap();
         let store = ProviderAttemptStore::open(temp.path()).unwrap();
-        let current = Arc::new(Mutex::new(authority(1)));
-        let observed = Arc::clone(&current);
-        let context = AttemptContext::new(
-            store.clone(),
-            "revoke-operation",
-            authority(1),
-            Arc::new(move || Some(observed.lock().unwrap().clone())),
-        )
-        .unwrap();
+        let context = AttemptContext::new(store.clone(), "revoke-operation", authority(1)).unwrap();
         let attempt = context.prepare("xai", b"request", true).unwrap();
-        *current.lock().unwrap() = authority(2);
         assert_eq!(
-            context.begin_send(&attempt).unwrap_err(),
+            attempt.begin_send(&authority(2)).unwrap_err(),
             AttemptError::StaleAuthority
         );
         assert_eq!(attempt.state().unwrap(), SendState::Cancelled);
@@ -1538,20 +1541,9 @@ mod tests {
     fn cloned_or_replayed_effect_lease_cannot_be_used_by_another_attempt() {
         let temp = tempdir().unwrap();
         let store = ProviderAttemptStore::open(temp.path()).unwrap();
-        let first_context = AttemptContext::new(
-            store.clone(),
-            "lease-round-one",
-            authority(1),
-            Arc::new(|| Some(authority(1))),
-        )
-        .unwrap();
-        let second_context = AttemptContext::new(
-            store,
-            "lease-round-two",
-            authority(1),
-            Arc::new(|| Some(authority(1))),
-        )
-        .unwrap();
+        let first_context =
+            AttemptContext::new(store.clone(), "lease-round-one", authority(1)).unwrap();
+        let second_context = AttemptContext::new(store, "lease-round-two", authority(1)).unwrap();
         let first = first_context.begin("xai", b"round-one", true).unwrap();
         let second = second_context.prepare("xai", b"round-two", true).unwrap();
         assert_eq!(
@@ -1566,20 +1558,9 @@ mod tests {
     fn distinct_effect_leases_allow_legitimate_sequential_tool_rounds() {
         let temp = tempdir().unwrap();
         let store = ProviderAttemptStore::open(temp.path()).unwrap();
-        let first_context = AttemptContext::new(
-            store.clone(),
-            "tool-round-one",
-            authority(1),
-            Arc::new(|| Some(authority(1))),
-        )
-        .unwrap();
-        let second_context = AttemptContext::new(
-            store,
-            "tool-round-two",
-            authority(2),
-            Arc::new(|| Some(authority(2))),
-        )
-        .unwrap();
+        let first_context =
+            AttemptContext::new(store.clone(), "tool-round-one", authority(1)).unwrap();
+        let second_context = AttemptContext::new(store, "tool-round-two", authority(2)).unwrap();
         let mut first = first_context.begin("xai", b"tool-one", true).unwrap();
         first.mark_response_started().unwrap();
         first.settle_http_response(200, b"tool-one-result").unwrap();
@@ -1694,14 +1675,9 @@ mod tests {
         let temp = tempdir().unwrap();
         let store = ProviderAttemptStore::open(temp.path()).unwrap();
         let binding = authority(1);
-        let live = binding.clone();
-        let context = AttemptContext::new(
-            store.clone(),
-            "reconciliation-operation",
-            binding.clone(),
-            Arc::new(move || Some(live.clone())),
-        )
-        .unwrap();
+        let context =
+            AttemptContext::new(store.clone(), "reconciliation-operation", binding.clone())
+                .unwrap();
         let mut permit = context.begin("xai", b"request", true).unwrap();
         permit.transport_after_possible_write().unwrap();
         let attempt = store.load(permit.attempt_id()).unwrap().unwrap();

@@ -292,9 +292,8 @@ pub struct SamplingClient {
     bearer_resolver: Option<crate::config::SharedBearerResolver>,
     /// Per-request header injection (OTel traceparent).
     header_injector: Option<crate::config::SharedHeaderInjector>,
-    /// Host-owned durable authority. None is retained for legacy construction
-    /// and test-only clients; production callers that send provider traffic
-    /// must install this context before invoking a method.
+    /// Host-issued durable authority. `None` is a fail-closed configuration
+    /// state: no credential-bearing provider request may be sent.
     provider_attempt: Option<xai_provider_attempt::AttemptContext>,
 }
 
@@ -710,10 +709,11 @@ impl SamplingClient {
         context: Option<&xai_provider_attempt::AttemptContext>,
         permit: &mut Option<xai_provider_attempt::PhysicalSendPermit>,
         status: reqwest::StatusCode,
+        response_bytes: &[u8],
     ) -> Result<()> {
         if let (Some(context), Some(mut permit)) = (context, permit.take()) {
             context
-                .settle_http_response(&mut permit, status.as_u16(), b"provider-response")
+                .settle_http_response(&mut permit, status.as_u16(), response_bytes)
                 .map_err(|error| SamplingError::Auth(format!("provider settlement: {error}")))?;
         }
         Ok(())
@@ -918,7 +918,11 @@ impl SamplingClient {
         Ok(request)
     }
 
-    async fn handle_response(&self, response: reqwest::Response) -> Result<ChatCompletionResponse> {
+    async fn handle_response(
+        &self,
+        response: reqwest::Response,
+        mut permit: Option<xai_provider_attempt::PhysicalSendPermit>,
+    ) -> Result<ChatCompletionResponse> {
         let status = response.status();
         let model_metadata = extract_model_metadata(response.headers());
         let retry_after_secs = extract_retry_after(response.headers());
@@ -952,6 +956,7 @@ impl SamplingClient {
             );
             SamplingError::Serialization(e)
         })?;
+        Self::settle_response(self.provider_attempt.as_ref(), &mut permit, status, &bytes)?;
         Ok(completion)
     }
 
@@ -1014,13 +1019,7 @@ impl SamplingClient {
         } else {
             Self::mark_response_started(self.provider_attempt.as_ref(), &mut permit)?;
         }
-        let status = response.status();
-        self.handle_response(response).await.and_then(|result| {
-            if status.is_success() {
-                Self::settle_response(self.provider_attempt.as_ref(), &mut permit, status)?;
-            }
-            Ok(result)
-        })
+        self.handle_response(response, permit).await
     }
 
     /// Start a streaming chat completion request. Returns a stream of typed chunks.
@@ -1190,6 +1189,7 @@ impl SamplingClient {
         // when the HTTP/2 connection drops and h2 keeps producing errors.
         let mut permit = permit;
         let attempt_context = self.provider_attempt.clone();
+        let mut response_evidence = Vec::new();
         let chunks = event_stream
             .scan(false, move |had_transport_error, event_res| {
                 if *had_transport_error {
@@ -1198,6 +1198,10 @@ impl SamplingClient {
                 let item = match event_res {
                     Ok(event) => {
                         let data = &event.data;
+                        if response_evidence.len().saturating_add(data.len()) > 4 * 1024 * 1024 {
+                            return std::future::ready(None);
+                        }
+                        response_evidence.extend_from_slice(data.as_bytes());
                         if data == "[DONE]" {
                             if let (Some(context), Some(mut permit)) =
                                 (attempt_context.as_ref(), permit.take())
@@ -1205,7 +1209,7 @@ impl SamplingClient {
                                 let _ = context.settle_http_response(
                                     &mut permit,
                                     200,
-                                    b"sampler-stream",
+                                    &response_evidence,
                                 );
                             }
                             return std::future::ready(None);
@@ -1406,7 +1410,7 @@ impl SamplingClient {
             );
             SamplingError::Serialization(e)
         })?;
-        Self::settle_response(self.provider_attempt.as_ref(), &mut permit, status)?;
+        Self::settle_response(self.provider_attempt.as_ref(), &mut permit, status, &bytes)?;
         Ok(response_obj)
     }
 
@@ -1623,6 +1627,7 @@ impl SamplingClient {
         // below), while an outer `None` still ends it.
         let mut permit = permit;
         let attempt_context = self.provider_attempt.clone();
+        let mut response_evidence = Vec::new();
         let events = event_stream
             .scan(false, move |had_transport_error, event_res| {
                 if *had_transport_error {
@@ -1631,6 +1636,10 @@ impl SamplingClient {
                 let item = match event_res {
                     Ok(event) => {
                         let data = &event.data;
+                        if response_evidence.len().saturating_add(data.len()) > 4 * 1024 * 1024 {
+                            return std::future::ready(None);
+                        }
+                        response_evidence.extend_from_slice(data.as_bytes());
                         if data == "[DONE]" {
                             if let (Some(context), Some(mut permit)) =
                                 (attempt_context.as_ref(), permit.take())
@@ -1638,7 +1647,7 @@ impl SamplingClient {
                                 let _ = context.settle_http_response(
                                     &mut permit,
                                     200,
-                                    b"sampler-stream",
+                                    &response_evidence,
                                 );
                             }
                             return std::future::ready(None);
@@ -1822,7 +1831,7 @@ impl SamplingClient {
                 );
                 SamplingError::Serialization(e)
             })?;
-        Self::settle_response(self.provider_attempt.as_ref(), &mut permit, status)?;
+        Self::settle_response(self.provider_attempt.as_ref(), &mut permit, status, &bytes)?;
         Ok(response_obj)
     }
 
@@ -1997,6 +2006,7 @@ impl SamplingClient {
         // error (same pattern as `chat_completion_stream`).
         let mut permit = permit;
         let attempt_context = self.provider_attempt.clone();
+        let mut response_evidence = Vec::new();
         let events = event_stream
             .scan(false, move |had_transport_error, event_res| {
                 if *had_transport_error {
@@ -2005,6 +2015,10 @@ impl SamplingClient {
                 let item = match event_res {
                     Ok(event) => {
                         let data = &event.data;
+                        if response_evidence.len().saturating_add(data.len()) > 4 * 1024 * 1024 {
+                            return std::future::ready(None);
+                        }
+                        response_evidence.extend_from_slice(data.as_bytes());
                         if data == "[DONE]" {
                             if let (Some(context), Some(mut permit)) =
                                 (attempt_context.as_ref(), permit.take())
@@ -2012,7 +2026,7 @@ impl SamplingClient {
                                 let _ = context.settle_http_response(
                                     &mut permit,
                                     200,
-                                    b"sampler-stream",
+                                    &response_evidence,
                                 );
                             }
                             return std::future::ready(None);

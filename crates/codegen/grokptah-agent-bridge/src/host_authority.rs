@@ -50,8 +50,7 @@ pub(crate) fn assemble(
         .ok_or_else(|| anyhow!("canonical auth authority is unavailable"))?;
     let identity = credentials.qualification_identity_fingerprint();
     let principal = principal_ref(session_id, agent_id, &identity, store.clone())?;
-    let capability =
-        capability_lease(agent_id, store, effect_scope.clone(), turn_generation)?;
+    let capability = capability_lease(agent_id, store, effect_scope.clone(), turn_generation)?;
     write_authority(
         attempt_root,
         &AuthorityRecord {
@@ -117,7 +116,8 @@ fn capability_lease(
 }
 
 fn authority_path(root: &Path, scope: &str) -> PathBuf {
-    root.join("canonical-authorities").join(format!("{scope}.json"))
+    root.join("canonical-authorities")
+        .join(format!("{scope}.json"))
 }
 
 fn write_authority(root: &Path, record: &AuthorityRecord, scope: &str) -> Result<()> {

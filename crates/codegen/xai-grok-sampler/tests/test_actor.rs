@@ -29,6 +29,8 @@ use xai_grok_sampling_types::{
 };
 use xai_grok_test_support::{SseEvent, sse};
 
+mod support;
+
 // ---------------------------------------------------------------------------
 // Mock server harness
 // ---------------------------------------------------------------------------
@@ -69,7 +71,7 @@ impl MockServer {
 // ---------------------------------------------------------------------------
 
 fn test_config(base_url: String, model: &str) -> SamplerConfig {
-    SamplerConfig {
+    let mut config = SamplerConfig {
         api_key: Some("test-key".into()),
         base_url,
         model: model.into(),
@@ -98,7 +100,10 @@ fn test_config(base_url: String, model: &str) -> SamplerConfig {
         compaction_at_tokens: None,
         doom_loop_recovery: None,
         header_injector: None,
-    }
+        provider_attempt: None,
+    };
+    config.provider_attempt = Some(support::test_provider_attempt_context());
+    config
 }
 
 fn user_request(text: &str) -> ConversationRequest {

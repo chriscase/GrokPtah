@@ -1010,12 +1010,8 @@ impl AgentHostHandle {
             .get(&session_id)
             .map(|tracker| tracker.run_id().to_owned())
             .unwrap_or_else(|| format!("desktop-chat-{session_id}"));
-        ProviderAttemptContext::from_host_ledger(
-            store,
-            operation_id,
-            effect_scope,
-        )
-        .map_err(|error| anyhow!("construct provider attempt context: {error}"))
+        ProviderAttemptContext::from_host_ledger(store, operation_id, effect_scope)
+            .map_err(|error| anyhow!("construct provider attempt context: {error}"))
     }
 
     pub fn take_event_receiver(&self) -> Option<crate::event_bus::EventReceiver> {
@@ -5829,7 +5825,18 @@ impl AgentHostHandle {
         provider_id: &str,
         model_id: &str,
     ) -> Result<crate::provider_qualification::ProviderQualificationReport> {
-        crate::provider_qualification::qualify_provider_model(provider_id, model_id).await
+        let session_id = self
+            .inner
+            .lock()
+            .active_session
+            .ok_or_else(|| anyhow!("provider qualification requires an active Lane"))?;
+        let provider_attempt = self.provider_attempt_context(session_id)?;
+        crate::provider_qualification::qualify_provider_model_admitted(
+            provider_id,
+            model_id,
+            &provider_attempt,
+        )
+        .await
     }
 
     pub fn delete_provider_profile(&self, provider_id: &str) -> Result<()> {
