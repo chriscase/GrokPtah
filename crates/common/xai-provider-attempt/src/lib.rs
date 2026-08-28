@@ -58,9 +58,12 @@ impl SendState {
 #[serde(rename_all = "camelCase")]
 pub struct AuthorityBinding {
     principal_incarnation: String,
+    #[serde(alias = "principalGeneration")]
     auth_generation: u64,
     capability_generation: u64,
+    #[serde(alias = "effectLease")]
     effect_lease_id: String,
+    #[serde(default = "legacy_effect_scope")]
     effect_scope: String,
 }
 
@@ -105,6 +108,10 @@ impl fmt::Debug for AuthorityBinding {
             .field("effect_scope", &"[redacted]")
             .finish()
     }
+}
+
+fn legacy_effect_scope() -> String {
+    "legacy-effect-scope".into()
 }
 
 /// Host-owned immutable input used to create an attempt.
@@ -294,6 +301,9 @@ impl fmt::Debug for ReconciliationEvidence {
 }
 
 impl ReconciliationEvidence {
+    #[allow(dead_code)]
+    // Reserved for the in-process trusted operator/provider evidence adapter;
+    // no downstream crate can invoke this constructor.
     pub(crate) fn from_verified(
         operator_id: impl Into<String>,
         provider_request_id: impl Into<String>,
