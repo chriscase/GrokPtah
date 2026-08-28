@@ -65,9 +65,11 @@ Keys are derived from one installation key and an authenticated custody epoch
 by domain-separated HMAC (`chain`, `manifest`, `anchor`, `seal`, `actor`).
 Retired epochs stay in a private key ring so old generations remain verifiable.
 Packaged desktop and headless service modes require a private owner/mode/link
-count checked file; external consumers must inject held key material. There is
-no environment-variable, provider-credential, path disclosure, or unsafe-mode
-fallback.
+count checked file; file custody owns rotation and stores only derived epoch
+bundles outside the audit directory. External consumers must inject an
+`AuditKeyProvider` that owns retrieval and rotation; the ledger refuses
+rotation without that callback. There is no environment-variable,
+provider-credential, path disclosure, or unsafe-mode fallback.
 
 ## Continuity rules
 
@@ -121,9 +123,10 @@ shared `OrchStore` custody boundary.
 
 The only path that deletes bytes. It requires a **sealed, non-current,
 authenticated** generation and either an authenticated export seal covering the
-range or an explicit local policy override that is recorded permanently. The
-target is verified completely first — imported, unverified, or otherwise
-unverifiable evidence is rejected.
+range or a sealed operator authority that is recorded permanently. There is no
+public boolean override; absent a sealed authority the unexported request is
+rejected. The target is verified completely first — imported, unverified, or
+otherwise unverifiable evidence is rejected.
 
 `T1 verify → T2 intent → T3 commit tombstone → T4 remove bytes → T5 mark removed → T6 outcome`
 
@@ -198,6 +201,15 @@ provider payload. Gap, recovery, generation, and shutdown housekeeping uses
 `AuditHousekeepingInput`, a separate outcome-only type that cannot add or close
 a producer intent.
 
+Computer Use mutation construction requires `ComputerUseService::new_with_audit_store`;
+there is no production constructor that silently runs without the canonical
+ledger. Each mutation receipt advances through
+`Claimed → IntentRecorded → EffectCommitted → OutcomeRecorded → terminal`.
+The receipt and its affected run id are reconciled against the keyed audit
+intent after restart. A crash before the outcome is durably recorded becomes
+uncertain and is never redispatched; a completed outcome is replayed only from
+the staged receipt.
+
 ## Operator recovery
 
 1. Stop every owner of the orchestration home and take a byte-preserving copy
@@ -246,3 +258,8 @@ queue, Computer Use, or shutdown outcomes for explicit reconciliation.
   proves this store boundary. Full host clone quiescence remains owned by the
   separate #455 lifecycle work; this change does not claim to implement or
   qualify that host runtime.
+- **Computer Use effect truth.** A backend response after dispatch does not
+  prove external effect state across a process crash. The reconciler therefore
+  preserves `uncertain` rather than querying or retrying a provider/backend.
+- **Qualification.** The deterministic simulator and desktop test matrix do
+  not qualify native hardware, packaging, or a production provider.
