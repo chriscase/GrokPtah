@@ -1511,7 +1511,7 @@ mod tests {
             AttemptError::EffectLeaseAlreadyUsed
         );
         assert_eq!(second.state().unwrap(), SendState::Cancelled);
-        assert_eq!(first.state().unwrap(), SendState::Sending);
+        assert_eq!(first.attempt.state().unwrap(), SendState::Sending);
     }
 
     #[test]
