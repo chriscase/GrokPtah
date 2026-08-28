@@ -1248,7 +1248,7 @@ impl AgentHostHandle {
             .begin_turn(controller.revision())
             .map_err(|error| anyhow!(error.to_string()))?;
         self.persist_adaptive_state(
-            &store,
+            store,
             session_id,
             run_id,
             expected_version,
@@ -1494,7 +1494,7 @@ impl AgentHostHandle {
             .record_completed()
             .map_err(|error| anyhow!(error.to_string()))?;
         self.persist_adaptive_state(
-            &store,
+            store,
             session_id,
             run_id,
             expected_version,
