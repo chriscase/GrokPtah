@@ -56,6 +56,10 @@ async fn independent_worker_recovers_assignment_and_messages() {
         AuthCredential::new("worker", "worker-token-307").unwrap(),
     ])
     .unwrap();
+    assert!(
+        orch.auth_header(Some("Bearer worker-token-307")).is_ok(),
+        "named worker credential must authenticate after host installation"
+    );
     let server = start_control_server(orch.clone(), 0).await.unwrap();
     let mut coordinator =
         McpControlClient::new(format!("http://{}", server.addr), "coord-token-307");
