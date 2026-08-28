@@ -670,7 +670,7 @@ check. When the host tool lands, the adapter change is one method body.
 | Piece | Where |
 |---|---|
 | `IdempotencyReceipt { request_id, scope, payload_hash, run_id, tool, response, error, created_at, status }` | `orchestration/types.rs` |
-| Storage: one JSON file per receipt, named `<scope>-<request_id>.json` | `<GROKPTAH_HOME>/…/idempotency/*.json` |
+| Storage: one JSON file per receipt, named `<scope>-<sha256(request_id)>.json` | `<GROKPTAH_HOME>/…/idempotency/*.json` |
 | Retention: newest 1,000 settled, expire at 7 days; pending and unknown preserved; receipts on a live run retained | `orchestration/store.rs`, `RetentionPolicy` |
 | Reads | `load_idempotency(scope, request_id)`, `list_idempotency_for_run(scope, run_id, …)` |
 | Writers, to stay private | `save_idempotency`, `claim_idempotency`, `complete_idempotency`, `fail_idempotency`, `finish_idempotency` |

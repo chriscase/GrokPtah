@@ -120,9 +120,9 @@ async fn workload_protocol_is_idempotent_scoped_and_lane_archive_safe() {
         .unwrap();
     assert_eq!(claim_replay.structured["attempt"]["attemptId"], attempt_id);
     assert_eq!(claim_replay.structured["leaseToken"], lease_token);
-    // Receipts are stored under `<scope>-<request_id>.json`: the key is chosen
-    // by the caller, so it names a request only within the principal that
-    // chose it. Find the file by its key rather than pinning the layout, and
+    // Receipts are stored under `<scope>-<sha256(request_id)>.json`: the key is
+    // chosen by the caller, so it names a request only within the principal
+    // that chose it. Find the file by its key rather than pinning the layout, and
     // assert the scope prefix is actually there — a bare `<request_id>.json`
     // would mean the namespace went back to being global.
     let receipt_suffix = format!(

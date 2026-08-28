@@ -5142,7 +5142,6 @@ impl OrchStore {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     fn finish_idempotency(
         &self,
         scope: &IdempotencyScope,
@@ -6212,7 +6211,8 @@ mod tests {
 
         // Same key, different payload. The old namespace answered `conflict`,
         // which told the second caller the key was taken.
-        let fresh = OrchStore::open(tempdir().unwrap().path().to_path_buf()).unwrap();
+        let other_home = tempdir().unwrap();
+        let fresh = OrchStore::open(other_home.path()).unwrap();
         fresh
             .claim_idempotency(&first, "t", "shared-key", "hash-a")
             .unwrap();
@@ -6372,7 +6372,13 @@ mod tests {
     fn a_legacy_unscoped_receipt_is_unreachable() {
         let d = tempdir().unwrap();
         let store = OrchStore::open(d.path()).unwrap();
-        let legacy = d.path().join("idempotency").join("legacy-key.json");
+        // At the exact name the pre-scoping code would have written: the id is
+        // hashed by `safe_id_filename`, so a hand-written "legacy-key.json"
+        // would not be the file that scheme produced.
+        let legacy = d
+            .path()
+            .join("idempotency")
+            .join(format!("{}.json", safe_id_filename("legacy-key").unwrap()));
         std::fs::write(
             &legacy,
             serde_json::json!({

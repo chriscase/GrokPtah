@@ -136,9 +136,10 @@ and no browser or cross-product safety is claimed. `publish = false` stands.
 
 Reported in review, confirmed in code, and the most serious of the three: the
 receipt namespace had no principal in it at all. `idemp_path(request_id)`
-resolved to `<root>/idempotency/<request_id>.json` and `IdempotencyReceipt`
-carried no owner field, so every caller on a host shared one namespace for a
-value **the caller chooses**.
+resolved to `<root>/idempotency/<sha256(request_id)>.json` and
+`IdempotencyReceipt` carried no owner field. Hashing the id keeps it off the
+filesystem; it does not make the namespace anyone's. Every caller on a host
+shared one, for a value **the caller chooses**.
 
 Three consequences, all reachable by a second credential simply picking a key:
 

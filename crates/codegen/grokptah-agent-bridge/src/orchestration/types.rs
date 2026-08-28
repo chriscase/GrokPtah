@@ -1485,7 +1485,7 @@ pub(crate) fn hex_decode(text: &str) -> Option<Vec<u8>> {
             _ => None,
         }
     }
-    if text.len() % 2 != 0 {
+    if !text.len().is_multiple_of(2) {
         return None;
     }
     let mut out = Vec::with_capacity(text.len() / 2);
