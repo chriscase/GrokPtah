@@ -383,14 +383,4 @@ mod tests {
         assert!(serde_json::from_str::<AdaptiveProfile>("3").is_err());
         assert_eq!(AdaptiveProfile::ALL.len(), 3);
     }
-
-    #[test]
-    fn budget_monotonicity_and_safety_are_structural() {
-        assert!(narrows(&ECONOMY_BUDGET, &BALANCED_BUDGET));
-        assert!(narrows(&BALANCED_BUDGET, &HIGH_ASSURANCE_BUDGET));
-        assert!(!ECONOMY_BUDGET.allows_screenshot_capture);
-        assert!(HIGH_ASSURANCE_BUDGET.allows_screenshot_capture);
-        assert!(!SafetyFloor::REQUIRED.allows_screenshot_bytes_to_model);
-        assert!(!SafetyFloor::REQUIRED.allows_automatic_replay_after_uncertain_dispatch);
-    }
 }

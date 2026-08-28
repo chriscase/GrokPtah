@@ -39,6 +39,7 @@ pub struct RenderedObservation {
 pub(crate) struct ProposalOutcome {
     pub proposal: ComputerAgentProposal,
     pub rendered: RenderedObservation,
+    pub confidence_permille: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,6 +109,8 @@ struct ProposalArguments {
     y: Option<f64>,
     #[serde(default)]
     button: Option<String>,
+    #[serde(default)]
+    confidence_permille: Option<u16>,
     summary: String,
 }
 
@@ -283,7 +286,9 @@ pub fn render_computer_observation(
 ) -> (serde_json::Value, RenderedObservation) {
     let rendered =
         match if profile.requires_independent_verifier() && observation.screenshot.is_some() {
-            VisualGroundingAdapter.render(observation, profile.budget(), None)
+            VisualGroundingAdapter
+                .render(observation, profile.budget(), None)
+                .or_else(|_| SemanticHeadlessAdapter.render(observation, profile.budget(), None))
         } else {
             SemanticHeadlessAdapter.render(observation, profile.budget(), None)
         } {
@@ -497,6 +502,12 @@ fn proposal_from_arguments(
         bail!("model proposal is bound to a stale observation");
     }
     validate_summary(&arguments.summary)?;
+    if arguments
+        .confidence_permille
+        .is_some_and(|confidence| confidence > 1_000)
+    {
+        bail!("model confidence must be between 0 and 1000");
+    }
     if arguments.action_type == "complete" {
         if arguments.element_id.is_some()
             || arguments.text.is_some()
@@ -735,6 +746,7 @@ fn proposal_tools() -> serde_json::Value {
                     "x": {"type": "number", "minimum": 0},
                     "y": {"type": "number", "minimum": 0},
                     "button": {"type": "string", "enum": ["primary", "secondary"]},
+                    "confidence_permille": {"type": "integer", "minimum": 0, "maximum": 1000},
                     "summary": {"type": "string", "maxLength": 512}
                 },
                 "required": ["observation_id", "action_type", "summary"],

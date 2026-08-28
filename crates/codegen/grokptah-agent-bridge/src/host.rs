@@ -1184,6 +1184,8 @@ impl AgentHostHandle {
                     .map_err(|error| anyhow!(error.to_string()))?;
                 if controller.state().capability_snapshot_reference
                     != evidence.capability_snapshot_reference()
+                    || controller.state().principal_generation_reference
+                        != evidence.principal_generation_reference()
                 {
                     let transition = controller.apply_signal(RuntimeSignal::CapabilityRevoked);
                     self.persist_adaptive_state(
@@ -1222,6 +1224,26 @@ impl AgentHostHandle {
             },
         };
 
+        if let Some(signal) = controller.observe_frame(
+            crate::computer_profile::ObservationFingerprint::of(observation),
+        ) {
+            let transition = controller.apply_signal(signal);
+            self.persist_adaptive_state(
+                &store,
+                session_id,
+                run_id,
+                expected_version,
+                &controller,
+                "stationarity",
+            )?;
+            return Err(anyhow!(match transition {
+                crate::computer_profile::ProfileTransition::Escalate { .. } => {
+                    "the Computer surface stopped changing; adaptive policy escalated and requires a fresh observation"
+                }
+                crate::computer_profile::ProfileTransition::Stop(stop) => stop.operator_message(),
+            }));
+        }
+
         let permit = controller
             .begin_turn(controller.revision())
             .map_err(|error| anyhow!(error.to_string()))?;
@@ -1234,6 +1256,22 @@ impl AgentHostHandle {
             "turn_started",
         )?;
 
+        let (_operation_id, cancel, _guard) = match self.begin_computer_agent_operation(session_id)
+        {
+            Ok(operation) => operation,
+            Err(error) => {
+                controller.abort_turn(false);
+                self.persist_adaptive_state(
+                    &store,
+                    session_id,
+                    run_id,
+                    expected_version,
+                    &controller,
+                    "turn_not_started",
+                )?;
+                return Err(error);
+            }
+        };
         let mut request_hasher = Sha256::new();
         request_hasher.update(run_id.as_bytes());
         request_hasher.update([0]);
@@ -1243,21 +1281,44 @@ impl AgentHostHandle {
         request_hasher.update([0]);
         request_hasher.update(permit.profile.as_str().as_bytes());
         let request_digest = format!("{:x}", request_hasher.finalize());
-        let receipt = authority
-            .provider_attempt(crate::computer_profile::ProviderAttemptRequest {
+        let receipt =
+            match authority.provider_attempt(crate::computer_profile::ProviderAttemptRequest {
                 principal: snapshot.principal(),
                 capability: snapshot.capability(),
                 session_id,
                 run_id: run_id.to_string(),
                 route_fingerprint: resolved.route_fingerprint.clone(),
                 request_digest,
-            })
-            .map_err(|error| anyhow!(error.to_string()))?;
-        receipt
-            .validate()
-            .map_err(|error| anyhow!(error.to_string()))?;
+            }) {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    controller.abort_turn(false);
+                    controller.apply_signal(RuntimeSignal::AuthorityUnavailable);
+                    self.persist_adaptive_state(
+                        &store,
+                        session_id,
+                        run_id,
+                        expected_version,
+                        &controller,
+                        "provider_attempt_unavailable",
+                    )?;
+                    return Err(anyhow!(error.to_string()));
+                }
+            };
+        if let Err(error) = receipt.validate() {
+            controller.abort_turn(false);
+            controller.apply_signal(RuntimeSignal::AuthorityUnavailable);
+            self.persist_adaptive_state(
+                &store,
+                session_id,
+                run_id,
+                expected_version,
+                &controller,
+                "provider_receipt_invalid",
+            )?;
+            return Err(anyhow!(error.to_string()));
+        }
 
-        let (_operation_id, cancel, _guard) = self.begin_computer_agent_operation(session_id)?;
         let outcome = propose_semantic_action_with_profile(
             &credentials,
             &model,
@@ -1270,9 +1331,36 @@ impl AgentHostHandle {
         .await;
         match outcome {
             Ok(outcome) => {
-                authority
-                    .validate_snapshot(&snapshot)
-                    .map_err(|error| anyhow!(error.to_string()))?;
+                if let Err(error) = authority.validate_snapshot(&snapshot) {
+                    controller.abort_turn(true);
+                    controller.apply_signal(RuntimeSignal::CapabilityRevoked);
+                    self.persist_adaptive_state(
+                        &store,
+                        session_id,
+                        run_id,
+                        expected_version,
+                        &controller,
+                        "capability_revoked",
+                    )?;
+                    return Err(anyhow!(error.to_string()));
+                }
+                if let Err(error) = self.ensure_computer_route_unchanged(
+                    session_id,
+                    &model,
+                    &resolved.route_fingerprint,
+                ) {
+                    controller.abort_turn(true);
+                    controller.apply_signal(RuntimeSignal::CapabilityRevoked);
+                    self.persist_adaptive_state(
+                        &store,
+                        session_id,
+                        run_id,
+                        expected_version,
+                        &controller,
+                        "route_changed",
+                    )?;
+                    return Err(error);
+                }
                 if cancel.is_cancelled() {
                     controller.abort_turn(true);
                     self.persist_adaptive_state(
@@ -1285,12 +1373,31 @@ impl AgentHostHandle {
                     )?;
                     bail!("Computer model proposal was cancelled");
                 }
-                controller.record_usable_answer();
                 controller.finish_turn(
                     outcome.rendered.bytes,
                     outcome.rendered.truncated,
                     Some(&receipt),
                 );
+                if AdaptivePolicyEngine::is_low_confidence(outcome.confidence_permille) {
+                    let transition = controller.apply_signal(RuntimeSignal::LowConfidence);
+                    self.persist_adaptive_state(
+                        &store,
+                        session_id,
+                        run_id,
+                        expected_version,
+                        &controller,
+                        "low_confidence",
+                    )?;
+                    return Err(anyhow!(match transition {
+                        crate::computer_profile::ProfileTransition::Escalate { .. } => {
+                            "the model confidence was below the shared safety floor; adaptive policy escalated"
+                        }
+                        crate::computer_profile::ProfileTransition::Stop(stop) => {
+                            stop.operator_message()
+                        }
+                    }));
+                }
+                controller.record_usable_answer();
                 self.persist_adaptive_state(
                     &store,
                     session_id,
@@ -1344,6 +1451,74 @@ impl AgentHostHandle {
             bail!("Computer Run is not available to this session");
         }
         Ok(())
+    }
+
+    /// Record a host-confirmed completion before the Computer Run lifecycle
+    /// transition revokes its grant. Completion is never inferred from model
+    /// prose; callers invoke this only after the existing host-side completion
+    /// gate has accepted the exact current frame.
+    pub fn complete_computer_adaptive_run(
+        &self,
+        session_id: Uuid,
+        run_id: &str,
+        expected_version: u64,
+    ) -> Result<()> {
+        let store = self.ensure_computer_store()?;
+        let Some(run) = store
+            .load_run(run_id)?
+            .filter(|run| run.owner_session_id == session_id && run.version == expected_version)
+        else {
+            bail!("Computer Run is not available to this session");
+        };
+        let Some(state) = run.adaptive else {
+            return Ok(());
+        };
+        let mut controller =
+            AdaptiveController::from_state(state).map_err(|error| anyhow!(error.to_string()))?;
+        controller
+            .record_completed()
+            .map_err(|error| anyhow!(error.to_string()))?;
+        self.persist_adaptive_state(
+            &store,
+            session_id,
+            run_id,
+            expected_version,
+            &controller,
+            "completed",
+        )
+    }
+
+    /// Record a manual stop/takeover as a terminal adaptive outcome before the
+    /// lifecycle service revokes the grant. This preserves evidence without
+    /// allowing a later run to inherit it.
+    pub fn stop_computer_adaptive_run(
+        &self,
+        session_id: Uuid,
+        run_id: &str,
+        expected_version: u64,
+        signal: RuntimeSignal,
+    ) -> Result<()> {
+        let store = self.ensure_computer_store()?;
+        let Some(run) = store
+            .load_run(run_id)?
+            .filter(|run| run.owner_session_id == session_id && run.version == expected_version)
+        else {
+            bail!("Computer Run is not available to this session");
+        };
+        let Some(state) = run.adaptive else {
+            return Ok(());
+        };
+        let mut controller =
+            AdaptiveController::from_state(state).map_err(|error| anyhow!(error.to_string()))?;
+        controller.apply_signal(signal);
+        self.persist_adaptive_state(
+            &store,
+            session_id,
+            run_id,
+            expected_version,
+            &controller,
+            "stopped",
+        )
     }
 
     /// Local Stop/Take over cancellation. It does not share the Build-turn

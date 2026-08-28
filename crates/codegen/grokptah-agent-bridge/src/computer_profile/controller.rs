@@ -20,7 +20,7 @@ pub const ADAPTIVE_STATE_SCHEMA_VERSION: u32 = 1;
 const MAX_ESCALATIONS: usize = 32;
 const MAX_OBSERVATION_DIGESTS: usize = 4;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AdaptiveSpend {
     pub model_calls: u32,
@@ -30,20 +30,6 @@ pub struct AdaptiveSpend {
     pub completion_tokens: Option<u64>,
     pub provider_attempts: u32,
     pub provider_latency_millis: u64,
-}
-
-impl Default for AdaptiveSpend {
-    fn default() -> Self {
-        Self {
-            model_calls: 0,
-            observation_bytes: 0,
-            screenshot_bytes: 0,
-            prompt_tokens: None,
-            completion_tokens: None,
-            provider_attempts: 0,
-            provider_latency_millis: 0,
-        }
-    }
 }
 
 impl AdaptiveSpend {
@@ -101,6 +87,7 @@ pub struct AdaptiveRunState {
     pub decision_reason: ProfileReason,
     pub risk: super::risk::TaskRisk,
     pub capability_ceiling: AdaptiveProfile,
+    pub principal_generation_reference: Option<String>,
     pub capability_snapshot_reference: Option<String>,
     pub evidence: CapabilityEvidence,
     pub escalations: Vec<EscalationRecord>,
@@ -217,6 +204,7 @@ impl AdaptiveController {
                 decision_reason: decision.reason,
                 risk: decision.risk,
                 capability_ceiling: decision.ceiling,
+                principal_generation_reference: decision.evidence.principal_generation_reference(),
                 capability_snapshot_reference: decision.capability_snapshot_reference,
                 evidence: decision.evidence,
                 escalations: Vec::new(),
@@ -375,9 +363,9 @@ impl AdaptiveController {
         self.state.observation_truncated = truncated;
         if let Some(receipt) = receipt {
             self.state.spend.record_provider_attempt(
-                receipt.prompt_tokens,
-                receipt.completion_tokens,
-                receipt.latency_millis,
+                receipt.prompt_tokens(),
+                receipt.completion_tokens(),
+                receipt.latency_millis(),
             );
         }
         self.state.revision = self.state.revision.saturating_add(1);

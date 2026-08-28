@@ -7,7 +7,6 @@
 
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 const MAX_REFERENCE_BYTES: usize = 128;
@@ -89,14 +88,13 @@ impl CapabilityGenerationRef {
 
 /// Authenticated provider-attempt receipt from #478. The adaptive layer may
 /// record usage only from this receipt; it never estimates or derives cost.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ProviderAttemptReceipt {
-    pub attempt_id: String,
-    pub provider_acknowledged: bool,
-    pub prompt_tokens: Option<u64>,
-    pub completion_tokens: Option<u64>,
-    pub latency_millis: u64,
+    attempt_id: String,
+    provider_acknowledged: bool,
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    latency_millis: u64,
 }
 
 impl ProviderAttemptReceipt {
@@ -106,6 +104,31 @@ impl ProviderAttemptReceipt {
             return Err(AuthorityFailure::InvalidReceipt);
         }
         Ok(())
+    }
+
+    pub(crate) fn prompt_tokens(&self) -> Option<u64> {
+        self.prompt_tokens
+    }
+
+    pub(crate) fn completion_tokens(&self) -> Option<u64> {
+        self.completion_tokens
+    }
+
+    pub(crate) fn latency_millis(&self) -> u64 {
+        self.latency_millis
+    }
+}
+
+impl fmt::Debug for ProviderAttemptReceipt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderAttemptReceipt")
+            .field("attempt_id", &"[opaque]")
+            .field("provider_acknowledged", &self.provider_acknowledged)
+            .field("prompt_tokens", &self.prompt_tokens)
+            .field("completion_tokens", &self.completion_tokens)
+            .field("latency_millis", &self.latency_millis)
+            .finish()
     }
 }
 
@@ -140,6 +163,10 @@ impl AdaptiveAuthoritySnapshot {
 
     pub(crate) fn capability_reference(&self) -> &str {
         self.capability.as_str()
+    }
+
+    pub(crate) fn principal_reference(&self) -> &str {
+        self.principal.as_str()
     }
 
     pub(crate) fn principal(&self) -> PrincipalGenerationRef {
