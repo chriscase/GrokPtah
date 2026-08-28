@@ -5061,6 +5061,17 @@ impl OrchStore {
         self.inner.last_audit_error.lock().clone()
     }
 
+    /// Record that producer entries were dropped before reaching the ledger.
+    ///
+    /// Written to the authenticated gap file first, so the evidence survives a
+    /// restart even when the journal itself is unwritable.
+    pub fn record_dropped_audit(&self, lost_entries: u64) -> anyhow::Result<()> {
+        self.inner
+            .audit
+            .record_dropped(lost_entries)
+            .map_err(|error| anyhow::anyhow!("audit gap: {}", error.code()))
+    }
+
     /// Operator projection of the audit authority. Carries no path, no key,
     /// and no journal content.
     pub fn audit_status(&self) -> AuditStatus {

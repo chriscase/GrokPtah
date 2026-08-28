@@ -700,3 +700,107 @@ fn two_processes_share_one_home_without_duplicate_sequences() {
     // Two shutdowns and two appends, all distinct sequences, chain intact.
     assert_eq!(store.verify_audit().unwrap()[0].entry_count, after);
 }
+
+// ------------------------------------------------- store-level crash cuts
+//
+// The ledger's own six injected crash cuts are covered by the donor lib tests.
+// These reproduce the observable on-disk states against the real `OrchStore`,
+// which is the only way an integration test can reach them.
+
+#[test]
+fn an_empty_orphan_generation_is_kept_and_reused_by_the_store() {
+    let dir = TempDir::new().unwrap();
+    let store = OrchStore::open(dir.path()).unwrap();
+    store.append_audit(&entry("before", "accepted")).unwrap();
+    let active = store.audit_status().active_generation_id;
+    drop(store);
+
+    // Crash cut R2: the next generation was prepared, the manifest was not
+    // committed. The manifest is the authority, so the old generation reopens
+    // and the orphan is kept for an idempotent retry.
+    let orphan = audit_root(dir.path()).join("generations").join("g-000002");
+    std::fs::create_dir_all(&orphan).unwrap();
+    std::fs::write(orphan.join("journal.jsonl"), b"").unwrap();
+
+    let store = OrchStore::open(dir.path()).unwrap();
+    assert_eq!(store.audit_status().active_generation_id, active);
+    assert!(orphan.exists(), "an orphan generation is never deleted");
+    // The retry succeeds over the orphan.
+    assert_eq!(
+        store.rotate_audit(RotationReason::Operator).unwrap(),
+        "g-000002"
+    );
+    store.verify_audit().unwrap();
+}
+
+#[test]
+fn a_non_empty_orphan_generation_fails_the_store_open() {
+    let dir = TempDir::new().unwrap();
+    let store = OrchStore::open(dir.path()).unwrap();
+    store.append_audit(&entry("before", "accepted")).unwrap();
+    drop(store);
+
+    // Unreachable before the manifest commit, so it means tampering.
+    let orphan = audit_root(dir.path()).join("generations").join("g-000002");
+    std::fs::create_dir_all(&orphan).unwrap();
+    std::fs::write(orphan.join("journal.jsonl"), b"{}\n").unwrap();
+
+    let error = open_error(OrchStore::open(dir.path()));
+    assert!(
+        format!("{error:#}").contains("orphan_generation_not_empty"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn a_torn_tail_in_the_store_journal_is_recovered_and_recorded() {
+    use std::io::Write;
+
+    let dir = TempDir::new().unwrap();
+    let store = OrchStore::open(dir.path()).unwrap();
+    for index in 0..3 {
+        store
+            .append_audit(&entry(&format!("op.{index}"), "accepted"))
+            .unwrap();
+    }
+    let generation = store.audit_status().active_generation_id;
+    drop(store);
+
+    // A crash mid-write leaves an unterminated trailing run.
+    let torn = b"{\"v\":2,\"gen\":\"g-0000";
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(journal_of(dir.path(), &generation))
+        .unwrap();
+    file.write_all(torn).unwrap();
+    file.sync_all().unwrap();
+
+    let store = OrchStore::open(dir.path()).unwrap();
+    let status = store.audit_status();
+    let evidence = status
+        .recovery
+        .torn_tail
+        .expect("a torn tail must be surfaced, never silently dropped");
+    assert_eq!(evidence.bytes, torn.len() as u64, "byte-exact evidence");
+    let body = read_journal(dir.path(), &generation);
+    assert!(body.contains("recovery_torn_tail"));
+    assert!(store.audit_status().poisoned.is_none());
+    store.verify_audit().unwrap();
+}
+
+#[test]
+fn a_dropped_producer_entry_survives_restart_as_durable_evidence() {
+    let dir = TempDir::new().unwrap();
+    let store = OrchStore::open(dir.path()).unwrap();
+    store.append_audit(&entry("first", "accepted")).unwrap();
+    // The v1 ledger kept this only in process memory, so a restart erased the
+    // evidence that evidence had been lost.
+    store.record_dropped_audit(3).unwrap();
+    drop(store);
+
+    let store = OrchStore::open(dir.path()).unwrap();
+    let gaps = store.audit_status().recovery.durable_gaps;
+    assert_eq!(gaps.len(), 1);
+    assert_eq!(gaps[0].lost_entries, 3);
+    assert!(gaps[0].journaled);
+}
