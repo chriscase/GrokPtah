@@ -475,9 +475,11 @@ mod tests {
             token_id: "operator-1".into(),
             owner_id: "owner-1".into(),
         };
-        let receipt =
-            crate::host::VerifiedProviderReceipt::from_provider_response("request-1", None::<String>)
-                .unwrap();
+        let receipt = crate::host::VerifiedProviderReceipt::from_provider_response(
+            "request-1",
+            None::<String>,
+        )
+        .unwrap();
 
         write_verified_reconciliation(root.path(), "attempt-1", &operator, &receipt).unwrap();
 
