@@ -463,6 +463,35 @@ impl ProviderAttemptStore {
         failure: Option<String>,
         settlement: Option<&ProviderSettlement>,
     ) -> Result<(), AttemptError> {
+        self.transition_internal(
+            attempt_id,
+            expected_authority,
+            to,
+            failure,
+            settlement,
+            false,
+        )
+    }
+
+    fn transition_reconciled(
+        &self,
+        attempt_id: &str,
+        to: SendState,
+        failure: Option<String>,
+        settlement: Option<&ProviderSettlement>,
+    ) -> Result<(), AttemptError> {
+        self.transition_internal(attempt_id, None, to, failure, settlement, true)
+    }
+
+    fn transition_internal(
+        &self,
+        attempt_id: &str,
+        expected_authority: Option<&AuthorityBinding>,
+        to: SendState,
+        failure: Option<String>,
+        settlement: Option<&ProviderSettlement>,
+        explicit_reconciliation: bool,
+    ) -> Result<(), AttemptError> {
         self.with_locked_record(attempt_id, |record| {
             let mut record = record.ok_or(AttemptError::MissingAttempt)?;
             if let Some(expected) = expected_authority {
@@ -470,7 +499,11 @@ impl ProviderAttemptStore {
                     return Err(AttemptError::StaleAuthority);
                 }
             }
-            if !valid_transition(record.state, to) {
+            if !valid_transition(record.state, to)
+                && !(explicit_reconciliation
+                    && record.state == SendState::Uncertain
+                    && matches!(to, SendState::Admitted | SendState::Settled))
+            {
                 return Err(AttemptError::InvalidTransition {
                     from: record.state,
                     to,
@@ -603,16 +636,14 @@ impl ProviderAttempt {
             });
         }
         match truth {
-            ProviderTruth::NotApplied => self.store.transition(
+            ProviderTruth::NotApplied => self.store.transition_reconciled(
                 &self.attempt_id,
-                None,
                 SendState::Admitted,
                 Some("explicit_reconciliation_not_applied".into()),
                 None,
             ),
-            ProviderTruth::Applied(settlement) => self.store.transition(
+            ProviderTruth::Applied(settlement) => self.store.transition_reconciled(
                 &self.attempt_id,
-                None,
                 SendState::Settled,
                 Some("explicit_reconciliation_applied".into()),
                 Some(&settlement),
