@@ -83,17 +83,19 @@ impl IsolatedPreflight {
     pub fn inspect_production() -> IsolatedResult<Self> {
         let root = std::env::var_os("GROKPTAH_ISOLATED_VISUAL_ARTIFACT_ROOT")
             .map(std::path::PathBuf::from);
+        Self::inspect(root.as_deref())
+    }
+
+    /// Inspect an artifact root against host-pinned canonical identity.
+    /// Missing env pins cannot be replaced by artifact self-description.
+    pub fn inspect(artifact_root: Option<&Path>) -> IsolatedResult<Self> {
         let expected_helper = ExpectedHelper::from_canonical_contract(None).ok();
         let expected_image = ExpectedGuestImage::from_canonical_contract().ok();
         Self::inspect_with_expected(
-            root.as_deref(),
+            artifact_root,
             expected_helper.as_ref(),
             expected_image.as_ref(),
         )
-    }
-
-    pub fn inspect(artifact_root: Option<&Path>) -> IsolatedResult<Self> {
-        Self::inspect_with_expected(artifact_root, None, None)
     }
 
     pub fn inspect_with_expected(
@@ -422,5 +424,56 @@ mod tests {
             ..receipt
         };
         assert!(preflight.observe_virtualization_launch(&receipt).is_err());
+    }
+
+    #[test]
+    fn canonical_env_pins_admit_guest_image_without_self_description() {
+        let dir = tempdir().unwrap();
+        let observation = write_guest_image_claim(dir.path(), b"guest-bytes").unwrap();
+        let preflight = IsolatedPreflight::inspect(Some(dir.path())).unwrap();
+        assert!(!preflight.image_admitted);
+        assert!(preflight
+            .deny_reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("canonical guest-image identity is not pinned"));
+
+        let digest_key = crate::packaged_authority::ISOLATED_GUEST_IMAGE_DIGEST_ENV;
+        let provenance_key = crate::packaged_authority::ISOLATED_GUEST_IMAGE_PROVENANCE_ENV;
+        let auth_key = crate::packaged_authority::ISOLATED_GUEST_IMAGE_AUTHORIZATION_ENV;
+        let previous = [
+            (
+                digest_key,
+                std::env::var(digest_key).ok(),
+                observation.digest.clone(),
+            ),
+            (
+                provenance_key,
+                std::env::var(provenance_key).ok(),
+                observation.provenance.clone(),
+            ),
+            (
+                auth_key,
+                std::env::var(auth_key).ok(),
+                observation.authorization_digest.clone(),
+            ),
+        ];
+        for (key, _, value) in &previous {
+            std::env::set_var(key, value);
+        }
+        let pinned = IsolatedPreflight::inspect(Some(dir.path())).unwrap();
+        for (key, previous, _) in previous {
+            match previous {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        assert!(pinned.image_admitted);
+        assert!(!pinned.helper_admitted);
+        assert!(!pinned.allowed_to_launch);
+        assert_eq!(
+            pinned.evidence_class,
+            IsolatedEvidenceClass::SimulatorIneligible
+        );
     }
 }

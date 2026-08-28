@@ -9,9 +9,8 @@ use super::helper_authority::{
     CleanupReceipt, EffectDisposition, HelperCrashCut, HelperSupervisor, HelperWorld,
 };
 use super::package_identity::{
-    ComputerExecutorIdentity, EligibilityInput, ExecutorKind, PackagedEligibility, SigningClass,
-    APP_BUNDLE_ID, APP_VERSION, HELPER_BUNDLE_ID, HELPER_VERSION,
-    PACKAGE_AUTHORITY_EVIDENCE_SCHEMA,
+    EligibilityInput, ExecutorKind, PackagedEligibility, SigningClass, APP_BUNDLE_ID, APP_VERSION,
+    HELPER_BUNDLE_ID, HELPER_VERSION, PACKAGE_AUTHORITY_EVIDENCE_SCHEMA,
 };
 use super::platform::ComputerPermissionStatus;
 use super::types::{ComputerAction, ComputerErrorCode, Sensitivity};
@@ -427,18 +426,8 @@ fn deny_without_injection(
 fn launched(world: HelperWorld) -> (HelperSupervisor, super::helper_authority::HelperLease) {
     let supervisor = HelperSupervisor::new(world);
     let lease = supervisor
-        .launch(
-            "run-oracle-1",
-            "grant-oracle-1",
-            "observation-oracle-1",
-            1,
-            1,
-            ComputerExecutorIdentity::attested_packaged_helper(
-                SigningClass::NotarizedDeveloperId,
-                Some("TEAMID1234"),
-            ),
-        )
-        .expect("helper launch");
+        .attach_synthetic_oracle_session("run-oracle-1", "grant-oracle-1", "observation-oracle-1")
+        .expect("synthetic oracle session");
     (supervisor, lease)
 }
 

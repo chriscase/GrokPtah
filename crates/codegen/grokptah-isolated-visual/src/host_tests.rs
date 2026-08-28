@@ -675,6 +675,73 @@ fn create_packaged_guest_requires_admitted_identity() {
 }
 
 #[test]
+fn host_open_uses_canonical_env_pins_for_guest_image() {
+    let dir = tempdir().unwrap();
+    let observation = write_guest_image_claim(dir.path(), b"guest-bytes").unwrap();
+    let clock = clock();
+    let store = ContentAddressedStore::new();
+    let unpinned = IsolatedVisualHost::open_with_artifacts(
+        dir.path().join("host-unpinned"),
+        clock.clone(),
+        HermeticResolver::new(store.clone()),
+        Some(dir.path()),
+    )
+    .unwrap();
+    assert!(!unpinned.preflight().image_admitted);
+    assert!(unpinned
+        .preflight()
+        .deny_reason
+        .as_deref()
+        .unwrap_or("")
+        .contains("canonical guest-image identity is not pinned"));
+    drop(unpinned);
+
+    let digest_key = crate::packaged_authority::ISOLATED_GUEST_IMAGE_DIGEST_ENV;
+    let provenance_key = crate::packaged_authority::ISOLATED_GUEST_IMAGE_PROVENANCE_ENV;
+    let auth_key = crate::packaged_authority::ISOLATED_GUEST_IMAGE_AUTHORIZATION_ENV;
+    let previous = [
+        (
+            digest_key,
+            std::env::var(digest_key).ok(),
+            observation.digest.clone(),
+        ),
+        (
+            provenance_key,
+            std::env::var(provenance_key).ok(),
+            observation.provenance.clone(),
+        ),
+        (
+            auth_key,
+            std::env::var(auth_key).ok(),
+            observation.authorization_digest.clone(),
+        ),
+    ];
+    for (key, _, value) in &previous {
+        std::env::set_var(key, value);
+    }
+    let pinned = IsolatedVisualHost::open_with_artifacts(
+        dir.path().join("host-pinned"),
+        clock,
+        HermeticResolver::new(store),
+        Some(dir.path()),
+    )
+    .unwrap();
+    for (key, previous, _) in previous {
+        match previous {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+    }
+    assert!(pinned.preflight().image_admitted);
+    assert!(!pinned.preflight().helper_admitted);
+    assert!(pinned.preflight().fail_closed_launch().is_err());
+    assert_eq!(
+        pinned.preflight().evidence_class,
+        IsolatedEvidenceClass::SimulatorIneligible
+    );
+}
+
+#[test]
 fn planted_codesign_display_cannot_create_packaged_guest() {
     let dir = tempdir().unwrap();
     write_planted_codesign_display(dir.path(), "TEAMID1234").unwrap();

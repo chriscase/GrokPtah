@@ -14,12 +14,19 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use grokptah_isolated_visual::{
+    admit_packaged_helper, inspect_artifact_root, ExpectedHelper, PackagedHelperObservation,
+};
+
+use super::isolated_visual::map_isolated_error;
 use super::package_identity::{ComputerExecutorIdentity, ExecutorKind};
 use super::platform::ComputerPermissionStatus;
 use super::types::{
     validate_id, ComputerAction, ComputerError, ComputerErrorCode, ComputerResult, ComputerTarget,
     Sensitivity,
 };
+
+const PACKAGED_HELPER_BUNDLE_ENV: &str = "GROKPTAH_PACKAGED_HELPER_BUNDLE";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -223,14 +230,7 @@ impl HelperSupervisor {
         validate_id("run_id", run_id)?;
         validate_id("grant_id", grant_id)?;
         validate_id("observation_id", observation_id)?;
-        if executor.kind != ExecutorKind::PackagedHelper
-            || !executor.signing_class.counts_as_packaged_release()
-        {
-            return Err(ComputerError::new(
-                ComputerErrorCode::Unauthorized,
-                "helper launch requires an attested notarized packaged helper identity",
-            ));
-        }
+        let _admitted = admit_executor_launch(&executor)?;
         inner.session = None;
         inner.world.helper_alive = true;
         inner.world.temp_artifacts = 1;
@@ -244,6 +244,39 @@ impl HelperSupervisor {
             observation_id: observation_id.to_string(),
             grant_id: grant_id.to_string(),
             executor,
+        };
+        lease.validate()?;
+        inner.session = Some(lease.clone());
+        Ok(lease)
+    }
+
+    /// Synthetic Computer Use dispatch oracle. This is not packaged admission
+    /// and does not inspect codesign or mint a helper session from an artifact.
+    pub(crate) fn attach_synthetic_oracle_session(
+        &self,
+        run_id: &str,
+        grant_id: &str,
+        observation_id: &str,
+    ) -> ComputerResult<HelperLease> {
+        let mut inner = self.inner.lock().expect("helper supervisor");
+        validate_id("run_id", run_id)?;
+        validate_id("grant_id", grant_id)?;
+        validate_id("observation_id", observation_id)?;
+        inner.session = None;
+        inner.world.helper_alive = true;
+        inner.world.temp_artifacts = 1;
+        let lease = HelperLease {
+            lease_id: Uuid::new_v4().to_string(),
+            run_id: run_id.to_string(),
+            target: inner.world.target.clone(),
+            authority_epoch: 1,
+            lease_revision: 1,
+            observation_generation: 1,
+            observation_id: observation_id.to_string(),
+            grant_id: grant_id.to_string(),
+            executor: ComputerExecutorIdentity::in_process_host(
+                super::package_identity::SigningClass::Unsigned,
+            ),
         };
         lease.validate()?;
         inner.session = Some(lease.clone());
@@ -426,6 +459,47 @@ impl HelperSupervisorInner {
     }
 }
 
+fn admit_executor_launch(
+    executor: &ComputerExecutorIdentity,
+) -> ComputerResult<PackagedHelperObservation> {
+    if executor.kind != ExecutorKind::PackagedHelper
+        || !executor.signing_class.counts_as_packaged_release()
+    {
+        return Err(ComputerError::new(
+            ComputerErrorCode::Unauthorized,
+            "helper launch requires an attested notarized packaged helper identity",
+        ));
+    }
+    let root = std::env::var_os(PACKAGED_HELPER_BUNDLE_ENV)
+        .or_else(|| std::env::var_os("GROKPTAH_ISOLATED_VISUAL_ARTIFACT_ROOT"))
+        .ok_or_else(|| {
+            ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "packaged helper bundle is not configured for cryptographic inspect",
+            )
+        })?;
+    let (helper, _) = inspect_artifact_root(Path::new(&root)).map_err(map_isolated_error)?;
+    let helper = helper.ok_or_else(|| {
+        ComputerError::new(
+            ComputerErrorCode::Unauthorized,
+            "packaged helper bundle was not observed",
+        )
+    })?;
+    let expected = ExpectedHelper::from_canonical_contract(executor.team_id.as_deref())
+        .map_err(map_isolated_error)?;
+    admit_packaged_helper(&helper, &expected).map_err(map_isolated_error)?;
+    if executor.helper_bundle_id != helper.bundle_id
+        || executor.team_id.as_deref() != Some(helper.team_id.as_str())
+        || executor.signing_class != helper.signing_class
+    {
+        return Err(ComputerError::new(
+            ComputerErrorCode::Unauthorized,
+            "executor identity does not match the inspected packaged helper",
+        ));
+    }
+    Ok(helper)
+}
+
 fn intent_digest(dispatch_id: &str, lease: &HelperLease, action: &ComputerAction) -> String {
     let payload = serde_json::json!({
         "dispatchId": dispatch_id,
@@ -512,16 +586,10 @@ mod tests {
     fn lease_and_supervisor(world: HelperWorld) -> (HelperSupervisor, HelperLease) {
         let supervisor = HelperSupervisor::new(world);
         let lease = supervisor
-            .launch(
+            .attach_synthetic_oracle_session(
                 "run-fixture-1",
                 "grant-fixture-1",
                 "observation-fixture-1",
-                1,
-                1,
-                ComputerExecutorIdentity::attested_packaged_helper(
-                    SigningClass::NotarizedDeveloperId,
-                    Some("TEAMID1234"),
-                ),
             )
             .unwrap();
         (supervisor, lease)
@@ -681,16 +749,10 @@ mod tests {
             Some(dir.path().to_path_buf()),
         );
         let lease = supervisor
-            .launch(
+            .attach_synthetic_oracle_session(
                 "run-fixture-1",
                 "grant-fixture-1",
                 "observation-fixture-1",
-                1,
-                1,
-                ComputerExecutorIdentity::attested_packaged_helper(
-                    SigningClass::NotarizedDeveloperId,
-                    Some("TEAMID1234"),
-                ),
             )
             .unwrap();
         supervisor
@@ -716,5 +778,66 @@ mod tests {
             .unwrap();
         assert_eq!(replay.disposition, EffectDisposition::Verified);
         assert_eq!(reloaded.injection_count(), 0);
+    }
+
+    #[test]
+    fn attested_identity_without_codesign_inspect_cannot_launch() {
+        let supervisor = HelperSupervisor::new(HelperWorld::granted_demo());
+        let error = supervisor
+            .launch(
+                "run-fixture-1",
+                "grant-fixture-1",
+                "observation-fixture-1",
+                1,
+                1,
+                ComputerExecutorIdentity::attested_packaged_helper(
+                    SigningClass::NotarizedDeveloperId,
+                    Some("TEAMID1234"),
+                ),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ComputerErrorCode::Unauthorized);
+        assert!(!supervisor.world().helper_alive);
+        assert_eq!(supervisor.injection_count(), 0);
+    }
+
+    #[test]
+    fn planted_codesign_display_cannot_launch_helper() {
+        let dir = tempfile::tempdir().unwrap();
+        grokptah_isolated_visual::write_planted_codesign_display(dir.path(), "TEAMID1234").unwrap();
+        let previous_bundle = std::env::var(PACKAGED_HELPER_BUNDLE_ENV).ok();
+        let previous_team = std::env::var("GROKPTAH_PACKAGED_HELPER_TEAM_ID").ok();
+        let previous_digest = std::env::var("GROKPTAH_PACKAGED_HELPER_EXECUTABLE_DIGEST").ok();
+        std::env::set_var(PACKAGED_HELPER_BUNDLE_ENV, dir.path());
+        std::env::set_var("GROKPTAH_PACKAGED_HELPER_TEAM_ID", "TEAMID1234");
+        std::env::set_var("GROKPTAH_PACKAGED_HELPER_EXECUTABLE_DIGEST", "a".repeat(64));
+        let supervisor = HelperSupervisor::new(HelperWorld::granted_demo());
+        let error = supervisor
+            .launch(
+                "run-fixture-1",
+                "grant-fixture-1",
+                "observation-fixture-1",
+                1,
+                1,
+                ComputerExecutorIdentity::attested_packaged_helper(
+                    SigningClass::NotarizedDeveloperId,
+                    Some("TEAMID1234"),
+                ),
+            )
+            .unwrap_err();
+        match previous_bundle {
+            Some(value) => std::env::set_var(PACKAGED_HELPER_BUNDLE_ENV, value),
+            None => std::env::remove_var(PACKAGED_HELPER_BUNDLE_ENV),
+        }
+        match previous_team {
+            Some(value) => std::env::set_var("GROKPTAH_PACKAGED_HELPER_TEAM_ID", value),
+            None => std::env::remove_var("GROKPTAH_PACKAGED_HELPER_TEAM_ID"),
+        }
+        match previous_digest {
+            Some(value) => std::env::set_var("GROKPTAH_PACKAGED_HELPER_EXECUTABLE_DIGEST", value),
+            None => std::env::remove_var("GROKPTAH_PACKAGED_HELPER_EXECUTABLE_DIGEST"),
+        }
+        assert_eq!(error.code, ComputerErrorCode::Unauthorized);
+        assert_eq!(supervisor.injection_count(), 0);
     }
 }
