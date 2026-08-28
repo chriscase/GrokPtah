@@ -8,6 +8,7 @@ desktop/node_modules/
 desktop/dist/
 desktop/src-tauri/target/
 crates/codegen/grokptah-agent-bridge/target/
+crates/codegen/grokptah-isolated-visual/target/
 evals/certification-lab/target/
 
 # Eval fixture build outputs
