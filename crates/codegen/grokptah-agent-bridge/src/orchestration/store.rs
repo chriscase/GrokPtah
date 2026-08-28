@@ -5004,6 +5004,18 @@ impl OrchStore {
             .map_err(|error| anyhow::anyhow!("audit persistence failed: {}", error.code()))
     }
 
+    pub fn append_audit_housekeeping(
+        &self,
+        input: crate::audit::AuditHousekeepingInput,
+        recovery: Option<crate::audit::RecoveryEvidence>,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .audit
+            .append_housekeeping(input, recovery)
+            .map(|_| ())
+            .map_err(|error| anyhow::anyhow!("audit persistence failed: {}", error.code()))
+    }
+
     pub fn enqueue_audit(&self, entry: AuditEntry) -> anyhow::Result<()> {
         // v2 is the sole authority and appends synchronously. There is no
         // second in-memory queue whose overflow could disappear at shutdown.

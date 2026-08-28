@@ -5,7 +5,10 @@ use std::sync::Arc;
 use std::thread;
 
 use chrono::Utc;
-use grokptah_agent_bridge::audit::{AuditKeyCustody, AuditKeys, ExportFormat, RetentionRequest};
+use grokptah_agent_bridge::audit::{
+    AuditEntryInput, AuditHousekeepingInput, AuditKeyCustody, AuditKeys, EntryOutcome, EntryPhase,
+    ExportFormat, RetentionRequest,
+};
 use grokptah_agent_bridge::orchestration::AuditEntry;
 use grokptah_agent_bridge::OrchStore;
 use tempfile::TempDir;
@@ -258,6 +261,53 @@ fn real_store_concurrent_append_preserves_exact_sequence() {
     }
     assert_eq!(store.audit_status().global_last_seq, 200);
     assert_eq!(store.verify_audit().unwrap(), 1);
+}
+
+#[test]
+fn real_store_reversed_intents_reject_wrong_outcomes_and_preserve_housekeeping_state() {
+    let temp = TempDir::new().unwrap();
+    let store = OrchStore::open(temp.path()).unwrap();
+    for intent in ["real-intent-a", "real-intent-b"] {
+        store
+            .append_audit_input(
+                AuditEntryInput::new(intent, EntryPhase::Intent, EntryOutcome::Accepted)
+                    .with_intent_id(intent),
+            )
+            .unwrap();
+    }
+    store
+        .append_audit_housekeeping(
+            AuditHousekeepingInput::new("real-housekeeping", EntryOutcome::Uncertain),
+            None,
+        )
+        .unwrap();
+    assert!(store
+        .append_audit_input(
+            AuditEntryInput::new("wrong", EntryPhase::Outcome, EntryOutcome::Accepted)
+                .with_intent_id("wrong"),
+        )
+        .is_err());
+    assert!(store
+        .append_audit_input(AuditEntryInput::new(
+            "missing",
+            EntryPhase::Outcome,
+            EntryOutcome::Accepted,
+        ))
+        .is_err());
+    assert_eq!(store.audit_status().open_intents, 2);
+    for intent in ["real-intent-b", "real-intent-a"] {
+        store
+            .append_audit_input(
+                AuditEntryInput::new(intent, EntryPhase::Outcome, EntryOutcome::Accepted)
+                    .with_intent_id(intent),
+            )
+            .unwrap();
+    }
+    assert_eq!(store.audit_status().open_intents, 0);
+    store.rotate_audit().unwrap();
+    store
+        .export_audit(&temp.path().join("intent-export"), ExportFormat::V2)
+        .unwrap();
 }
 
 #[test]
