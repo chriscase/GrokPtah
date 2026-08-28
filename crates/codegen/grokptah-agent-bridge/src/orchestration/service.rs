@@ -4887,7 +4887,17 @@ impl OrchestrationService {
         }
         let response = match self
             .host
-            .resume_agent_with_request_id(session_id, prompt, max_rounds, Some(request_id.into()))
+            .resume_agent_with_request_id_for_principal(
+                session_id,
+                prompt,
+                max_rounds,
+                Some(request_id.into()),
+                // The continuation Run the host is about to create is this
+                // caller's work. Stamp it through the same normalization run
+                // ownership is checked against, so the coordinator owns the
+                // Run it just created instead of it landing on the desktop.
+                Some(Self::client_principal(auth)),
+            )
             .await
         {
             Ok(response) => response,
