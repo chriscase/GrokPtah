@@ -718,13 +718,14 @@ async fn control_secret_redacted_on_shared_host_bus() {
         .queue_prompt(&auth, token, session.id, ws.path(), "/yolo".into(), false,)
         .await
         .is_err());
-    let audit_path = home.path().join("orch/audit/audit.jsonl");
-    for _ in 0..100 {
-        if audit_path.is_file() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    let audit_store = host.ensure_orchestration_store().unwrap();
+    let audit_status = audit_store.audit_status();
+    let audit_path = audit_store
+        .root()
+        .join("audit")
+        .join("generations")
+        .join(audit_status.active_generation_id)
+        .join("journal.jsonl");
     let audit = std::fs::read_to_string(audit_path).unwrap();
     assert!(!audit.contains(token), "control token leaked into audit");
     let accepted = orch
