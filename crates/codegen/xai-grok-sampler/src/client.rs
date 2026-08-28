@@ -730,6 +730,25 @@ impl SamplingClient {
         }
     }
 
+    fn revalidate_permit(
+        permit: &mut Option<xai_provider_attempt::PhysicalSendPermit>,
+    ) -> Result<()> {
+        let Some(permit_ref) = permit.as_ref() else {
+            return Err(SamplingError::Auth(
+                "provider attempt permit is unavailable".into(),
+            ));
+        };
+        if let Err(error) = permit_ref.revalidate_before_physical_write() {
+            if let Some(mut permit) = permit.take() {
+                let _ = permit.transport_before_possible_write();
+            }
+            return Err(SamplingError::Auth(format!(
+                "provider authority changed before physical send: {error}"
+            )));
+        }
+        Ok(())
+    }
+
     fn mark_response_started(
         permit: &mut Option<xai_provider_attempt::PhysicalSendPermit>,
     ) -> Result<()> {
@@ -1025,6 +1044,7 @@ impl SamplingClient {
         )?;
         let http_request = http_request.json(&payload);
 
+        Self::revalidate_permit(&mut permit)?;
         let response = http_request.send().await.map_err(|e| {
             // Log at debug level; errors are surfaced to the caller.
             tracing::debug!("HTTP request failed: {}", e);
@@ -1117,6 +1137,7 @@ impl SamplingClient {
         );
         Self::log_request_headers(&built_request, "chat/completions");
 
+        Self::revalidate_permit(&mut permit)?;
         let response = self.http.execute(built_request).await.map_err(|e| {
             tracing::debug!("HTTP request failed: {}", e);
             record_stream_request_failure(&e);
@@ -1349,6 +1370,7 @@ impl SamplingClient {
         let (http_request, mut permit) = self.authorize_request(http_request, &request_bytes)?;
         let http_request = http_request.json(&request_body);
 
+        Self::revalidate_permit(&mut permit)?;
         let response = http_request.send().await.map_err(|e| {
             tracing::debug!("HTTP request failed: {}", e);
             Self::mark_transport_ambiguous(permit.take());
@@ -1534,6 +1556,7 @@ impl SamplingClient {
         );
         Self::log_request_headers(&built_request, "responses");
 
+        Self::revalidate_permit(&mut permit)?;
         let response = self.http.execute(built_request).await.map_err(|e| {
             tracing::debug!("HTTP request failed: {}", e);
             record_stream_request_failure(&e);
@@ -1747,6 +1770,7 @@ impl SamplingClient {
         )?;
         let http_request = http_request.json(&request.inner);
 
+        Self::revalidate_permit(&mut permit)?;
         let response = http_request.send().await.map_err(|e| {
             tracing::debug!("HTTP request failed: {}", e);
             Self::mark_transport_ambiguous(permit.take());
@@ -1893,6 +1917,7 @@ impl SamplingClient {
         );
         Self::log_request_headers(&built_request, "messages");
 
+        Self::revalidate_permit(&mut permit)?;
         let response = self.http.execute(built_request).await.map_err(|e| {
             tracing::debug!("HTTP request failed: {}", e);
             record_stream_request_failure(&e);
