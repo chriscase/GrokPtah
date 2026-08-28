@@ -1683,7 +1683,7 @@ mod tests {
             .effect_leases
             .get_mut(&lease.lease_id)
             .unwrap()
-            .expires_at_unix_ms = 0;
+            .expires_at_unix_ms = 1;
         std::fs::write(&authority, serde_json::to_vec_pretty(&durable).unwrap()).unwrap();
 
         registry
