@@ -5766,8 +5766,8 @@ impl OrchestrationService {
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
-        self.verify_session_binding(auth, session_id)?;
         let run = self.authorize_run_request(session_id, workspace, run_id)?;
+        self.verify_session_binding(auth, session_id)?;
         self.verify_resource_or_session_binding(auth, format!("run:{run_id}"), session_id)?;
         self.run_value(run)
     }
@@ -5798,8 +5798,8 @@ impl OrchestrationService {
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
-        self.verify_session_binding(auth, session_id)?;
         let run = self.authorize_run_request(session_id, workspace, run_id)?;
+        self.verify_session_binding(auth, session_id)?;
         self.verify_resource_or_session_binding(auth, format!("run:{run_id}"), session_id)?;
         self.progress_value(run)
     }
@@ -5864,8 +5864,8 @@ impl OrchestrationService {
         limit: usize,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
-        self.verify_session_binding(auth, session_id)?;
         let run = self.authorize_run_request(session_id, workspace, run_id)?;
+        self.verify_session_binding(auth, session_id)?;
         self.verify_resource_or_session_binding(auth, format!("run:{run_id}"), session_id)?;
         self.events_for_run(run, after_seq, limit)
     }
@@ -5882,8 +5882,8 @@ impl OrchestrationService {
         limit: usize,
     ) -> Result<(LiveRunScope, JournalPage), OrchError> {
         self.require_current_auth(auth)?;
-        self.verify_session_binding(auth, session_id)?;
         let run = self.authorize_run_request(session_id, workspace, run_id)?;
+        self.verify_session_binding(auth, session_id)?;
         self.verify_resource_or_session_binding(auth, format!("run:{run_id}"), session_id)?;
         let Some(start_seq) = run.start_seq else {
             return Err(OrchError::new(
@@ -6112,8 +6112,8 @@ impl OrchestrationService {
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
-        self.verify_session_binding(auth, session_id)?;
         let run = self.authorize_run_request(session_id, workspace, run_id)?;
+        self.verify_session_binding(auth, session_id)?;
         self.verify_resource_or_session_binding(auth, format!("run:{run_id}"), session_id)?;
         self.changes_for_run(run)
     }
@@ -6157,8 +6157,8 @@ impl OrchestrationService {
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
-        self.verify_session_binding(auth, session_id)?;
         let run = self.authorize_run_request(session_id, workspace, run_id)?;
+        self.verify_session_binding(auth, session_id)?;
         self.verify_resource_or_session_binding(auth, format!("run:{run_id}"), session_id)?;
         self.test_results_for_run(run)
     }
@@ -6248,8 +6248,8 @@ impl OrchestrationService {
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
-        self.verify_session_binding(auth, session_id)?;
         let run = self.authorize_run_request(session_id, workspace, run_id)?;
+        self.verify_session_binding(auth, session_id)?;
         self.verify_resource_or_session_binding(auth, format!("run:{run_id}"), session_id)?;
         self.handoff_for_run(run)
     }
