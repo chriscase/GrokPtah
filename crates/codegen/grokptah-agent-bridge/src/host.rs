@@ -11825,6 +11825,29 @@ mod tests {
         )
     }
 
+    #[test]
+    fn local_desktop_principal_bootstraps_without_control_plane() {
+        let lock = home_override_serial();
+        let tmp = tempfile::tempdir().expect("local authority home");
+        set_grokptah_home_override(Some(tmp.path().join(".grokptah")));
+        let host = AgentHost::create(HostConfig::default());
+        host.start().expect("start host");
+        let session = host
+            .session_new_kind(SessionKind::Build)
+            .expect("create local Build session");
+        host.session_set_cwd(session.id, tmp.path())
+            .expect("bind local workspace");
+        host.ensure_session_agent(session.id)
+            .expect("bind local Agent");
+        assert!(
+            host.capability_principal(session.id).is_ok(),
+            "local Desktop authority must not depend on a control-plane bearer"
+        );
+        host.stop().expect("stop host");
+        set_grokptah_home_override(None);
+        drop(lock);
+    }
+
     fn usage_test_run(run_id: &str, max_total_tokens: Option<u64>) -> RunRecord {
         let now = Utc::now();
         RunRecord {
