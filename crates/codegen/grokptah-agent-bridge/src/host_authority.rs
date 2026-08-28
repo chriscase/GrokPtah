@@ -12,32 +12,41 @@ use crate::orchestration::OrchStore;
 pub(crate) fn assemble(
     session_id: Uuid,
     agent_id: Option<&str>,
+    model: &str,
     turn_generation: u64,
     store: Option<OrchStore>,
     effect_lease_id: String,
     effect_scope: String,
 ) -> Result<xai_provider_attempt::CanonicalHostAuthority> {
+    let credentials = crate::auth_store::resolve_wire_credentials_for_model(model)
+        .map_err(|error| anyhow!("canonical auth authority unavailable: {error}"))?
+        .ok_or_else(|| anyhow!("canonical auth authority is unavailable"))?;
+    let credential_identity = credentials.qualification_identity_fingerprint();
     let (principal_incarnation, capability_generation) = if let Some(agent_id) = agent_id {
         let agent = store
             .and_then(|store| store.load_agent(agent_id).ok().flatten())
             .ok_or_else(|| anyhow!("canonical Agent authority is unavailable"))?;
         let owner = agent
             .owner_principal_id
-            .ok_or_else(|| anyhow!("canonical principal authority is unavailable"))?;
+            .unwrap_or_else(|| format!("credential-{credential_identity}"));
         let capability_generation = agent
             .spec
             .as_ref()
             .map(|spec| spec.revision)
             .ok_or_else(|| anyhow!("canonical capability authority is unavailable"))?;
         (
-            format!("agent-{owner}-{agent_id}"),
+            format!("agent-{owner}-{agent_id}-auth-{credential_identity}"),
             capability_generation.max(1),
         )
     } else {
-        // Ephemeral desktop Lanes have no durable Agent owner. The host's
-        // monotonic turn generation is their principal/auth incarnation and
-        // capability generation; it is never reused within this host.
-        (format!("lane-{session_id}"), turn_generation.max(1))
+        // A non-Agent Lane still binds to the live credential principal. API
+        // key and legacy records use the one-way credential identity digest;
+        // OAuth refresh preserves this digest while principal rotation does
+        // not.
+        (
+            format!("lane-{session_id}-auth-{credential_identity}"),
+            turn_generation.max(1),
+        )
     };
 
     xai_provider_attempt::CanonicalHostAuthority::from_trusted_host_adapter(

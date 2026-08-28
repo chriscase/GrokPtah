@@ -1010,7 +1010,7 @@ impl AgentHostHandle {
         effect_lease_id: String,
         effect_scope: String,
     ) -> Result<xai_provider_attempt::CanonicalHostAuthority> {
-        let (agent_id, turn_generation) = {
+        let (agent_id, model, turn_generation) = {
             let inner = self.inner.lock();
             let session = inner
                 .sessions
@@ -1018,6 +1018,7 @@ impl AgentHostHandle {
                 .ok_or_else(|| anyhow!("unknown session"))?;
             (
                 session.agent_id.clone(),
+                session.model.clone(),
                 inner
                     .turn_generations
                     .get(&session_id)
@@ -1028,6 +1029,7 @@ impl AgentHostHandle {
         crate::host_authority::assemble(
             session_id,
             agent_id.as_deref(),
+            &model,
             turn_generation,
             self.orchestration_store.lock().clone(),
             effect_lease_id,
