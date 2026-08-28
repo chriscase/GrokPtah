@@ -588,8 +588,17 @@ impl DesktopComputerUse {
                 {
                     return Err("The Computer Run changed while the model was responding".into());
                 }
+                let store = self
+                    .store
+                    .as_ref()
+                    .ok_or_else(|| self.initialization_error())?;
                 self.host
-                    .complete_computer_adaptive_run(owner_session_id, run_id, expected_version)
+                    .complete_computer_adaptive_run_using_store(
+                        store,
+                        owner_session_id,
+                        run_id,
+                        expected_version,
+                    )
                     .map_err(|error| error.to_string())?;
                 service
                     .complete(&Uuid::new_v4().to_string(), run_id, expected_version)
@@ -675,8 +684,13 @@ impl DesktopComputerUse {
     ) -> Result<ComputerCockpitSnapshot, String> {
         self.clear_pending_for_owner(owner_session_id)?;
         let (service, _) = self.owned_service(owner_session_id, run_id)?;
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| self.initialization_error())?;
         self.host
-            .stop_computer_adaptive_run(
+            .stop_computer_adaptive_run_using_store(
+                store,
                 owner_session_id,
                 run_id,
                 expected_version,
@@ -702,8 +716,13 @@ impl DesktopComputerUse {
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "Computer Run is not available".to_string())?
             .version;
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| self.initialization_error())?;
         self.host
-            .stop_computer_adaptive_run(
+            .stop_computer_adaptive_run_using_store(
+                store,
                 owner_session_id,
                 run_id,
                 expected_version,

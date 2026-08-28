@@ -1464,6 +1464,21 @@ impl AgentHostHandle {
         expected_version: u64,
     ) -> Result<()> {
         let store = self.ensure_computer_store()?;
+        self.complete_computer_adaptive_run_using_store(
+            &store,
+            session_id,
+            run_id,
+            expected_version,
+        )
+    }
+
+    pub fn complete_computer_adaptive_run_using_store(
+        &self,
+        store: &crate::computer_use::ComputerStore,
+        session_id: Uuid,
+        run_id: &str,
+        expected_version: u64,
+    ) -> Result<()> {
         let Some(run) = store
             .load_run(run_id)?
             .filter(|run| run.owner_session_id == session_id && run.version == expected_version)
@@ -1499,6 +1514,23 @@ impl AgentHostHandle {
         signal: RuntimeSignal,
     ) -> Result<()> {
         let store = self.ensure_computer_store()?;
+        self.stop_computer_adaptive_run_using_store(
+            &store,
+            session_id,
+            run_id,
+            expected_version,
+            signal,
+        )
+    }
+
+    pub fn stop_computer_adaptive_run_using_store(
+        &self,
+        store: &crate::computer_use::ComputerStore,
+        session_id: Uuid,
+        run_id: &str,
+        expected_version: u64,
+        signal: RuntimeSignal,
+    ) -> Result<()> {
         let Some(run) = store
             .load_run(run_id)?
             .filter(|run| run.owner_session_id == session_id && run.version == expected_version)
