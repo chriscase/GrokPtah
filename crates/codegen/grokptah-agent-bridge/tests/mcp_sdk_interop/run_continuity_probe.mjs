@@ -245,8 +245,13 @@ async function nextFrame(reader, pending = "") {
 async function waitForRecovery(reader) {
   let buffer = "";
   let frames = 0;
+  const deadline = Date.now() + 30_000;
   while (frames++ < 20_000) {
-    const next = await nextFrame(reader, buffer);
+    const next = await Promise.race([
+      nextFrame(reader, buffer),
+      new Promise((resolve) => setTimeout(() => resolve(null), Math.max(1, deadline - Date.now()))),
+    ]);
+    if (!next) throw new Error("SSE recovery notification timed out");
     buffer = next.buffer;
     if (next.body?.method === "notifications/ptah_recovery") return next;
   }
