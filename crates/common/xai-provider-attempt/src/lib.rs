@@ -789,16 +789,13 @@ impl ProviderAttemptStore {
     ) -> Result<(), AttemptError> {
         self.with_locked_record(attempt_id, |record| {
             let mut record = record.ok_or(AttemptError::MissingAttempt)?;
-            if let Some(expected) = expected_authority {
-                if !record.authority.same_as(expected) {
-                    return Err(AttemptError::StaleAuthority);
-                }
+            if expected_authority.is_some_and(|expected| !record.authority.same_as(expected)) {
+                return Err(AttemptError::StaleAuthority);
             }
-            if !valid_transition(record.state, to)
-                && !(explicit_reconciliation
-                    && record.state == SendState::Uncertain
-                    && matches!(to, SendState::Admitted | SendState::Settled))
-            {
+            let is_explicit_reopen = explicit_reconciliation
+                && record.state == SendState::Uncertain
+                && matches!(to, SendState::Admitted | SendState::Settled);
+            if !(valid_transition(record.state, to) || is_explicit_reopen) {
                 return Err(AttemptError::InvalidTransition {
                     from: record.state,
                     to,
