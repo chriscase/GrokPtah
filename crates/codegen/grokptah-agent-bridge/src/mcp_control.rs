@@ -1859,7 +1859,10 @@ fn tool_input_schema(name: &str) -> Value {
         }
     });
     match name {
-        "ptah_list_sessions" | "ptah_list_persistent_agents" | "ptah_get_capacity" => json!({
+        "ptah_list_sessions"
+        | "ptah_list_persistent_agents"
+        | "ptah_get_capacity"
+        | "ptah_get_host_info" => json!({
             "type": "object",
             "properties": {},
             "additionalProperties": false
@@ -2737,6 +2740,10 @@ async fn dispatch_tool(
             let args: CreateSessionArgs = parse_value(args)?;
             orch.create_session_idempotent(auth, &args.workspace, args.title, args.request_id)
                 .await
+        }
+        "ptah_get_host_info" => {
+            let _: EmptyArgs = parse_value(args)?;
+            orch.host_info(auth)
         }
         "ptah_list_persistent_agents" => {
             let _: EmptyArgs = parse_value(args)?;

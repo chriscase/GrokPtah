@@ -1486,6 +1486,15 @@ impl PublicReceipt {
     }
 }
 
+/// The public capability contract this runtime implements.
+///
+/// Bump the **major** when an existing field, tool, error code, or capability
+/// identifier is removed or reshaped; bump the **minor** for additive changes
+/// — a new tool, a new optional field, a new word in an existing vocabulary.
+/// Consumers negotiate against this and refuse a major they do not implement.
+pub const PUBLIC_CONTRACT_MAJOR: u32 = 1;
+pub const PUBLIC_CONTRACT_MINOR: u32 = 2;
+
 pub const CONTROL_TOOLS: &[&str] = &[
     "ptah_list_sessions",
     "ptah_create_session",
@@ -1497,6 +1506,7 @@ pub const CONTROL_TOOLS: &[&str] = &[
     "ptah_get_progress",
     "ptah_get_events",
     "ptah_list_receipts",
+    "ptah_get_host_info",
     "ptah_get_changes",
     "ptah_get_test_results",
     "ptah_get_handoff",

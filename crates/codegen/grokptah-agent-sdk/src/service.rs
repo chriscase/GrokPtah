@@ -286,9 +286,12 @@ impl MutationAuthority {
 
 /// Non-secret identity of the host this adapter is pointed at.
 ///
-/// The control plane exposes no version tool, so the embedder supplies this
-/// from whatever it used to connect. It is advertised verbatim in the
-/// capability document and is useful only for correlating a bug report.
+/// Supplied by the embedder as a fallback, but no longer the source of truth:
+/// a host that advertises `ptah_get_host_info` states its own product,
+/// version, and contract, and [`connect`](ServiceControlPlane::connect)
+/// prefers what the host says over what the embedder guessed. An asserted
+/// version nobody checked is worse than no version at all, because a consumer
+/// will act on it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceHostInfo {
     pub product: Label,
@@ -314,6 +317,7 @@ mod tools {
     pub const GET_RUN: &str = "ptah_get_run";
     pub const GET_EVENTS: &str = "ptah_get_events";
     pub const LIST_RECEIPTS: &str = "ptah_list_receipts";
+    pub const HOST_INFO: &str = "ptah_get_host_info";
     pub const GET_TEST_RESULTS: &str = "ptah_get_test_results";
     pub const STEER: &str = "ptah_steer";
     pub const CANCEL: &str = "ptah_cancel";
@@ -327,6 +331,7 @@ mod tools {
         GET_RUN,
         GET_EVENTS,
         LIST_RECEIPTS,
+        HOST_INFO,
         GET_TEST_RESULTS,
         STEER,
         CANCEL,
@@ -913,16 +918,54 @@ impl<T: McpTransport> AgentControlPlane for ServiceControlPlane<T> {
             },
         });
 
-        Ok(CapabilityDocument::new(
-            HostDescriptor {
-                kind: HostKind::Service,
-                product: self.host.product.clone(),
-                host_version: self.host.host_version.clone(),
-            },
-            Utc::now(),
-            self.limits,
-            offered,
-        ))
+        // Prefer what the host says about itself. The embedder's guess is a
+        // fallback, and a document that asserts an unverified version is worse
+        // than one that admits it does not know: a consumer acts on it.
+        let (host_descriptor, contract) = match advertised.contains(tools::HOST_INFO) {
+            false => (
+                HostDescriptor {
+                    kind: HostKind::Service,
+                    product: self.host.product.clone(),
+                    host_version: self.host.host_version.clone(),
+                },
+                None,
+            ),
+            true => {
+                let body = self.call(tools::HOST_INFO, json!({})).await?;
+                let label = |key: &str, fallback: &Label| {
+                    body.get(key)
+                        .and_then(Value::as_str)
+                        .and_then(|raw| Label::new(raw).ok())
+                        .unwrap_or_else(|| fallback.clone())
+                };
+                let contract = match (
+                    body.get("contractMajor").and_then(Value::as_u64),
+                    body.get("contractMinor").and_then(Value::as_u64),
+                ) {
+                    (Some(major), Some(minor)) => Some(ContractVersion::new(
+                        major.min(u32::MAX as u64) as u32,
+                        minor.min(u32::MAX as u64) as u32,
+                    )),
+                    // A host that advertises the tool but omits the version is
+                    // not assumed compatible.
+                    _ => None,
+                };
+                (
+                    HostDescriptor {
+                        kind: HostKind::Service,
+                        product: label("product", &self.host.product),
+                        host_version: label("hostVersion", &self.host.host_version),
+                    },
+                    contract,
+                )
+            }
+        };
+
+        let document = CapabilityDocument::new(host_descriptor, Utc::now(), self.limits, offered);
+        Ok(match contract {
+            Some(contract) => document.with_host_contract(contract),
+            None => document,
+        })
     }
 
     /// Create a Build session on an already-reported workspace.

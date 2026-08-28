@@ -27,9 +27,9 @@ use super::routine::{
     ROUTINE_SCHEMA_VERSION,
 };
 use super::types::{
-    hex_sha256, safe_id_filename, AgentRecord, AgentSpec, AgentState, AuditEntry, ContinuationCheckpoint,
-    IdempotencyReceipt, OrchError, OrchErrorCode, PromotionState, RunBounds, RunRecord, RunState,
-    RunStopCause,
+    hex_sha256, safe_id_filename, AgentRecord, AgentSpec, AgentState, AuditEntry,
+    ContinuationCheckpoint, IdempotencyReceipt, OrchError, OrchErrorCode, PromotionState,
+    RunBounds, RunRecord, RunState, RunStopCause,
 };
 use super::worker::{WorkerHostKind, WorkerPresence, WorkerProjection};
 use super::workload::{
@@ -4864,7 +4864,9 @@ impl OrchStore {
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
             // A home that has never recorded a receipt is empty, not broken.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((found, false)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((found, false))
+            }
             Err(error) => return Err(error.into()),
         };
         for entry in entries {

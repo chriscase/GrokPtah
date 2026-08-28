@@ -36,8 +36,7 @@ use super::routine::{
     WorkTemplate,
 };
 use super::store::{
-    IdempotencyClaim, OrchStore, DEFAULT_IDEMPOTENCY_RECEIPT_AGE,
-    DEFAULT_MAX_IDEMPOTENCY_RECEIPTS,
+    IdempotencyClaim, OrchStore, DEFAULT_IDEMPOTENCY_RECEIPT_AGE, DEFAULT_MAX_IDEMPOTENCY_RECEIPTS,
 };
 use super::supervisor::{
     ManagerSupervisorReport, ManagerSupervisorStatus, RoutineSupervisor, RoutineSupervisorStatus,
@@ -2011,7 +2010,9 @@ impl OrchestrationService {
         title: Option<String>,
         request_id: Option<String>,
     ) -> Result<serde_json::Value, OrchError> {
-        let Some(request_id) = request_id.map(|id| id.trim().to_string()).filter(|id| !id.is_empty())
+        let Some(request_id) = request_id
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
         else {
             return self.create_session(auth, workspace, title);
         };
@@ -5179,6 +5180,27 @@ impl OrchestrationService {
         )
     }
 
+    /// Non-secret identity and contract version of this host.
+    ///
+    /// Previously an embedder had to tell the SDK what it was talking to,
+    /// which meant the capability document asserted a version nobody had
+    /// checked. The host states it itself now, so a consumer can refuse a
+    /// major it does not implement instead of discovering the mismatch one
+    /// malformed response at a time.
+    ///
+    /// Deliberately unauthenticated in content: product name, host version,
+    /// and contract major/minor. No build paths, no feature flags, no
+    /// deployment topology — a version endpoint is not a reconnaissance
+    /// surface.
+    pub fn host_info(&self, _auth: &AuthContext) -> Result<serde_json::Value, OrchError> {
+        Ok(json!({
+            "product": "GrokPtah",
+            "hostVersion": env!("CARGO_PKG_VERSION"),
+            "contractMajor": PUBLIC_CONTRACT_MAJOR,
+            "contractMinor": PUBLIC_CONTRACT_MINOR,
+        }))
+    }
+
     /// Durable receipts for one run, redacted and bounded.
     ///
     /// Gated by exactly the same `authorize_run_request` fence every other
@@ -5243,10 +5265,13 @@ impl OrchestrationService {
                 recorded_at: receipt.created_at,
             });
         }
-        let next_cursor = has_more
-            .then(|| items.last())
-            .flatten()
-            .map(|last| format!("{}:{}", last.recorded_at.timestamp_millis(), last.request_id));
+        let next_cursor = has_more.then(|| items.last()).flatten().map(|last| {
+            format!(
+                "{}:{}",
+                last.recorded_at.timestamp_millis(),
+                last.request_id
+            )
+        });
 
         Ok(json!({
             "items": items,

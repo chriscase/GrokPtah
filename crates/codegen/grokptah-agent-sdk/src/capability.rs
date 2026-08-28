@@ -329,6 +329,19 @@ impl CapabilityDocument {
         }
     }
 
+    /// Record the contract version the **host** declared.
+    ///
+    /// Without this the document carries the consumer's own
+    /// [`CONTRACT_VERSION`], so `negotiate` compares this build against itself
+    /// and always agrees — a negotiation that cannot fail is not a
+    /// negotiation. An adapter that can learn the host's version must set it
+    /// here; one that cannot leaves the default and is honest that the value
+    /// is an assumption.
+    pub fn with_host_contract(mut self, contract_version: ContractVersion) -> Self {
+        self.contract_version = contract_version;
+        self
+    }
+
     pub fn get(&self, id: &CapabilityId) -> Option<&CapabilityDescriptor> {
         self.capabilities.get(id.as_wire())
     }

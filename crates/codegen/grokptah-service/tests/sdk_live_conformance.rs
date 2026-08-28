@@ -65,12 +65,13 @@ impl LiveTransport {
 
     async fn rpc(&self, method: &str, params: Value) -> Result<Value, TransportFault> {
         let mut client = self.client.lock().await;
-        let (_status, body) = client
-            .rpc_raw("2.0", method, params, true)
-            .await
-            .map_err(|error| TransportFault::Unreachable {
-                detail: error.to_string(),
-            })?;
+        let (_status, body) =
+            client
+                .rpc_raw("2.0", method, params, true)
+                .await
+                .map_err(|error| TransportFault::Unreachable {
+                    detail: error.to_string(),
+                })?;
         if let Some(error) = body.get("error") {
             // The status code is not consulted: the host's typed code is the
             // authority, and a 410 carrying `cursor_expired` must map the same
@@ -186,7 +187,11 @@ impl Harness for LiveHarness {
 
 // ── The battery ───────────────────────────────────────────────────────────
 
-async fn live_harness(env: &ServiceEnv, addr: std::net::SocketAddr, host: AgentHostHandle) -> LiveHarness {
+async fn live_harness(
+    env: &ServiceEnv,
+    addr: std::net::SocketAddr,
+    host: AgentHostHandle,
+) -> LiveHarness {
     // One session is created through the raw client so the host has something
     // to report. The adapter then *learns* the workspace from that report —
     // it is never told a path.
@@ -225,7 +230,10 @@ async fn the_versioned_battery_runs_against_a_real_service_process() {
 
     // The matrix is the deliverable. Print it whole so a reviewer sees every
     // skip and its stated reason rather than a bare pass count.
-    println!("\n=== live service adapter matrix ===\n{}", report.summary());
+    println!(
+        "\n=== live service adapter matrix ===\n{}",
+        report.summary()
+    );
     for check in &report.checks {
         let outcome = match &check.outcome {
             CheckOutcome::Passed => "PASS".to_string(),
@@ -266,7 +274,10 @@ async fn the_live_host_serves_redacted_receipts() {
         .list_tools()
         .await
         .expect("tools/list");
-    println!("host advertises ptah_list_receipts: {}", advertised.iter().any(|t| t == "ptah_list_receipts"));
+    println!(
+        "host advertises ptah_list_receipts: {}",
+        advertised.iter().any(|t| t == "ptah_list_receipts")
+    );
 
     let accepted = harness
         .plane
@@ -288,10 +299,18 @@ async fn the_live_host_serves_redacted_receipts() {
         run_id: accepted.run_id.clone(),
     };
 
-    match harness.plane.list_receipts(selector, PageRequest::new()).await {
+    match harness
+        .plane
+        .list_receipts(selector, PageRequest::new())
+        .await
+    {
         Err(error) => panic!("live receipt listing failed: {error:?}"),
         Ok(page) => {
-            println!("live receipts: {} item(s), retention {:?}", page.items.len(), page.retention);
+            println!(
+                "live receipts: {} item(s), retention {:?}",
+                page.items.len(),
+                page.retention
+            );
             let encoded = serde_json::to_string(&page).expect("serialize");
             assert!(
                 !encoded.contains("LIVE-SECRET-PROMPT-do-not-echo"),
@@ -301,7 +320,9 @@ async fn the_live_host_serves_redacted_receipts() {
                 assert!(!encoded.contains(absent), "`{absent}` leaked: {encoded}");
             }
             assert!(
-                page.items.iter().all(|r| r.payload_digest.as_str().len() == AttemptDigest::BYTES * 2),
+                page.items
+                    .iter()
+                    .all(|r| r.payload_digest.as_str().len() == AttemptDigest::BYTES * 2),
                 "host digest is not the advertised width"
             );
         }
@@ -347,7 +368,10 @@ async fn the_versioned_battery_runs_against_the_desktop_embedded_control_server(
     let harness = live_harness(&env, server.addr, host).await;
     let report = conformance::run_battery(&harness).await;
 
-    println!("\n=== desktop embedded adapter matrix ===\n{}", report.summary());
+    println!(
+        "\n=== desktop embedded adapter matrix ===\n{}",
+        report.summary()
+    );
     for check in &report.checks {
         let outcome = match &check.outcome {
             CheckOutcome::Passed => "PASS".to_string(),
@@ -374,4 +398,34 @@ async fn the_versioned_battery_runs_against_the_desktop_embedded_control_server(
     std::env::remove_var("GROKPTAH_CONTROL_PORT");
     std::env::remove_var("GROKPTAH_CONTROL_WORKSPACES");
     server.stop();
+}
+
+#[tokio::test]
+async fn the_live_host_states_its_own_contract_version() {
+    let env = ServiceEnv::new();
+    let service = start_isolated(&env, vec![env.workspace_path()], 4).await;
+    let harness = live_harness(&env, service.addr, service.host()).await;
+
+    // The embedder's guess is deliberately wrong, so a document that still
+    // carries it would fail this rather than quietly asserting a fiction.
+    let connected = harness.plane.connect().await.expect("connect");
+
+    assert_eq!(connected.document.host.product.as_str(), "GrokPtah");
+    assert_ne!(
+        connected.document.host.host_version.as_str(),
+        "unknown",
+        "host version must come from the host, not the embedder default"
+    );
+    assert_eq!(
+        connected.document.contract_version, CONTRACT_VERSION,
+        "this host and this build implement the same contract"
+    );
+    assert!(!connected.negotiated.degraded);
+    println!(
+        "live host: {} {} contract {}",
+        connected.document.host.product,
+        connected.document.host.host_version,
+        connected.document.contract_version
+    );
+    service.stop_and_wait().await;
 }
