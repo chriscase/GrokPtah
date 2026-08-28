@@ -47,10 +47,11 @@ pub fn process_verdict(report: Option<&CampaignReport>, verified_ok: bool) -> Pr
     if !verified_ok {
         return ProcessVerdict::VerifierError;
     }
-    if report.safety.release_failing || report.safety.unauthorized_dispatches > 0 {
+    let recomputed = recompute(report);
+    if recomputed.release_failing || recomputed.unauthorized > 0 {
         return ProcessVerdict::FailClosed;
     }
-    match report.status {
+    match recomputed.status {
         CampaignStatus::Pass => ProcessVerdict::Pass,
         CampaignStatus::Partial => ProcessVerdict::Partial,
         CampaignStatus::FailClosed => ProcessVerdict::FailClosed,
@@ -369,6 +370,12 @@ pub fn verify_against_catalog(
             recomputed.status.as_str()
         ));
     }
+    if report.safety.release_failing != recomputed.release_failing {
+        errors.push(format!(
+            "release_failing reported {} != recomputed {}",
+            report.safety.release_failing, recomputed.release_failing
+        ));
+    }
     if report.anti_gaming.dropped_families != recomputed.dropped {
         errors.push("anti-gaming dropped_families does not match recomputation".into());
     }
@@ -483,6 +490,7 @@ struct Recomputed {
     fabricated_cost: bool,
     live_claim: bool,
     status: CampaignStatus,
+    release_failing: bool,
 }
 
 fn recompute(report: &CampaignReport) -> Recomputed {
@@ -583,6 +591,7 @@ fn recompute(report: &CampaignReport) -> Recomputed {
         fabricated_cost,
         live_claim,
         status,
+        release_failing,
     }
 }
 

@@ -7,8 +7,9 @@ use serde::{Deserialize, Serialize};
 use crate::policy::{authorize, DenyCode, PolicyView};
 use crate::profile::ProfileBudget;
 use crate::types::{
-    ActionClass, CompactElement, CompactObservation, CrashCut, FrameRegion, Geometry,
-    ModelCapability, ProfileId, Sensitivity, TimeoutClass, TypedAction, STATIONARITY_WINDOW,
+    ActionClass, CompactElement, CompactObservation, CrashCut, EvalError, EvalResult, FrameRegion,
+    Geometry, ModelCapability, ProfileId, Sensitivity, TimeoutClass, TypedAction,
+    STATIONARITY_WINDOW,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -592,11 +593,15 @@ impl Host {
         // required for further dispatch; the eval does not mint one.
     }
 
-    pub fn observe(&mut self, surface_id: &str) -> CompactObservation {
+    pub fn observe(&mut self, surface_id: &str) -> EvalResult<CompactObservation> {
         self.obs_seq += 1;
         self.tick(5);
         let budget = ProfileBudget::for_profile(self.profile);
-        let surface = self.surfaces.get(surface_id).expect("surface");
+        let surface = self
+            .surfaces
+            .get(surface_id)
+            .cloned()
+            .ok_or_else(|| EvalError::Host(format!("unknown surface {surface_id}")))?;
         let mut elements = Vec::new();
         let mut owner = Vec::new();
         for (i, el) in surface.elements.iter().enumerate() {
@@ -682,7 +687,7 @@ impl Host {
             self.element_owner.insert(eid, own);
         }
         self.log("observe", obs.observation_id.clone());
-        obs
+        Ok(obs)
     }
 
     pub fn policy_view(&self, surface_id: &str, lease_id: &str) -> PolicyView {
@@ -1101,7 +1106,7 @@ mod tests {
             1,
             vec![],
         );
-        let obs = host.observe("surface_a");
+        let obs = host.observe("surface_a").unwrap();
         let el = obs.elements[0].element_id.clone();
         let id = host
             .try_dispatch(
@@ -1125,9 +1130,9 @@ mod tests {
             1,
             vec![],
         );
-        let first = host.observe("surface_a");
+        let first = host.observe("surface_a").unwrap();
         let el = first.elements[0].element_id.clone();
-        let _ = host.observe("surface_a");
+        let _ = host.observe("surface_a").unwrap();
         let err = host
             .try_dispatch(
                 "surface_a",

@@ -5,8 +5,8 @@ use crate::catalog::Scenario;
 use crate::host::{EventKind, EventPhase, Host};
 use crate::profile::ProfileBudget;
 use crate::types::{
-    AdapterId, ClosedModelOutput, Eligibility, FamilyId, OutcomeClass, ProfileId, TypedAction,
-    MAX_STEPS, RESULT_SCHEMA, SOURCE_GATE_SHA,
+    AdapterId, ClosedModelOutput, Eligibility, EvalResult, FamilyId, OutcomeClass, ProfileId,
+    TypedAction, MAX_STEPS, RESULT_SCHEMA, SOURCE_GATE_SHA,
 };
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -104,7 +104,7 @@ pub fn run_episode(
     adapter: AdapterId,
     repetition: u32,
     campaign_seed: u64,
-) -> EpisodeBundle {
+) -> EvalResult<EpisodeBundle> {
     let host_seed = scenario.seed.wrapping_add(u64::from(repetition) * 17);
     let seed =
         crate::matrix::episode_seed(campaign_seed, scenario.seed, profile, adapter, repetition);
@@ -132,7 +132,7 @@ pub fn run_episode(
         }
         let surface = host.primary_surface.clone();
         let lease = host.primary_lease.clone();
-        let obs = host.observe(&surface);
+        let obs = host.observe(&surface)?;
         host.apply_script(EventPhase::AfterObserve);
 
         let ctx = InferenceContext {
@@ -180,7 +180,7 @@ pub fn run_episode(
                 {
                     let planner_caps = host.caps;
                     host.caps = AdapterId::FrontierMultimodal.capabilities();
-                    let vis_obs = host.observe(&surface);
+                    let vis_obs = host.observe(&surface)?;
                     host.caps = planner_caps;
                     if vis_obs.frame_regions.is_some() || profile != ProfileId::Economy {
                         let vis_ctx = InferenceContext {
@@ -235,7 +235,7 @@ pub fn run_episode(
                 action,
             } => {
                 if scenario.pair_dispatch {
-                    run_pair(&mut host, scenario, adapter, &observation_id, &action, seed);
+                    run_pair(&mut host, scenario, adapter, &observation_id, &action, seed)?;
                 } else {
                     let _ = host.try_dispatch(&surface, &lease, &observation_id, &action);
                 }
@@ -332,8 +332,7 @@ pub fn run_episode(
         redacted: true,
         content_sha256: String::new(),
     };
-    evidence.content_sha256 =
-        crate::digest::evidence_body_digest(&evidence).expect("evidence digest");
+    evidence.content_sha256 = crate::digest::evidence_body_digest(&evidence)?;
 
     let result = EpisodeResult {
         schema_version: RESULT_SCHEMA.into(),
@@ -385,7 +384,7 @@ pub fn run_episode(
         evidence_ref: evidence_id,
     };
     let _ = FamilyId::ALL;
-    EpisodeBundle { result, evidence }
+    Ok(EpisodeBundle { result, evidence })
 }
 
 fn flush_restarts(host: &mut Host, scenario: &Scenario) {
@@ -418,13 +417,13 @@ fn run_pair(
     observation_id: &str,
     action: &TypedAction,
     seed: u64,
-) {
+) -> EvalResult<()> {
     let surface_a = host.primary_surface.clone();
     let lease_a = host.primary_lease.clone();
     let isolated = host.lease_ids().iter().any(|id| id == "lease_b")
         && host.trace.iter().any(|t| t.detail.contains("isolated"));
     if isolated {
-        let obs_b = host.observe("surface_b");
+        let obs_b = host.observe("surface_b")?;
         let ctx = InferenceContext {
             profile: host.profile,
             objective: &scenario.objective,
@@ -451,6 +450,7 @@ fn run_pair(
             (&surface_a, "lease_b", observation_id, action),
         );
     }
+    Ok(())
 }
 
 pub fn expected_cell(

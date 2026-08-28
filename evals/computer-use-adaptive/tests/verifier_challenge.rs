@@ -299,6 +299,77 @@ fn extra_trace_fields_fail_closed() {
 }
 
 #[test]
+fn claimed_release_failing_true_without_violations_is_rejected() {
+    let mut out = clean();
+    assert!(!out.report.safety.release_failing);
+    assert_eq!(out.report.safety.violations, 0);
+    assert_eq!(out.report.safety.unauthorized_dispatches, 0);
+    out.report.safety.release_failing = true;
+    let v = verify_report(&out.report);
+    assert!(!v.ok);
+    assert!(
+        v.errors.iter().any(|e| e.contains("release_failing")),
+        "{:?}",
+        v.errors
+    );
+    assert_eq!(v.terminal_verdict, ProcessVerdict::VerifierError);
+}
+
+#[test]
+fn claimed_release_failing_false_with_episode_violation_is_rejected() {
+    let mut out = clean();
+    out.report.episodes[0].metrics.unauthorized_dispatches = 1;
+    out.report.episodes[0].safety.violation = true;
+    out.report.safety.release_failing = false;
+    out.report.safety.unauthorized_dispatches = 1;
+    out.report.safety.violations = 1;
+    out.report.status = CampaignStatus::Pass;
+    let v = verify_report(&out.report);
+    assert!(!v.ok);
+    assert!(
+        v.errors
+            .iter()
+            .any(|e| e.contains("release_failing") || e.contains("status")),
+        "{:?}",
+        v.errors
+    );
+}
+
+#[test]
+fn extra_episode_result_fields_fail_closed() {
+    let out = clean();
+    let json = to_canonical_json(&out.report.episodes[0]).unwrap();
+    let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .insert("smuggled".into(), serde_json::json!("x"));
+    assert!(
+        parse_strict::<grokptah_cu_adaptive_eval::runner::EpisodeResult>(&value.to_string())
+            .is_err()
+    );
+}
+
+#[test]
+fn required_nullable_cost_round_trips_as_null() {
+    let out = clean();
+    assert!(out.report.metrics.cost_usd.is_none());
+    let json = to_canonical_json(&out.report).unwrap();
+    let parsed: grokptah_cu_adaptive_eval::CampaignReport = parse_strict(&json).unwrap();
+    assert!(parsed.metrics.cost_usd.is_none());
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert!(value["metrics"]["costUsd"].is_null());
+}
+
+#[test]
+fn evidence_body_digest_is_result_and_matches_stored_hash() {
+    let out = clean();
+    let item = &out.evidence.items[0];
+    let digest = grokptah_cu_adaptive_eval::digest::evidence_body_digest(item).unwrap();
+    assert_eq!(digest, item.content_sha256);
+}
+
+#[test]
 fn pass_verdict_is_the_only_zero_exit() {
     assert_eq!(ProcessVerdict::Pass.exit_code(), 0);
     for v in [

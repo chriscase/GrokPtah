@@ -20,6 +20,12 @@
 | Verifier | **ok**, independent matrix reconstruction; 0 errors |
 | Live / packaged macOS | **not claimed** |
 
+Evaluator residuals closed on this head: `release_failing` is independently
+recomputed and a disagreeing claim is `VERIFIER_ERROR`; evidence digesting and
+unknown-surface observe return `Result` (no run-path `expect`/`panic`);
+deny-unknown-fields and nullable `costUsd` remain required. Synthetic PASS is
+still not live, VM, or production-runtime qualification.
+
 ### Schema compatibility / migration
 
 - Report now requires `campaignDigest`, `metrics.observationCount`, `metrics.actionCount`, and `liveContinuation.receipts` (empty array on synthetic runs).
