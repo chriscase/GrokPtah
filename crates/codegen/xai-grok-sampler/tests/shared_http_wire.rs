@@ -67,6 +67,26 @@ async fn shared_client_keeps_per_config_headers_isolated() {
     assert!(!heads[0].contains("token-b") && !heads[0].contains("isolated-b"));
     assert!(heads[1].contains("Bearer token-b") && heads[1].contains("isolated-b"));
     assert!(!heads[1].contains("token-a") && !heads[1].contains("isolated-a"));
+    for head in heads.iter() {
+        let idempotency = head
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("idempotency-key")
+                    .then_some(value.trim())
+            })
+            .expect("guarded sampler request must carry Idempotency-Key");
+        let request_id = head
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("x-grok-req-id")
+                    .then_some(value.trim())
+            })
+            .expect("guarded sampler request must carry x-grok-req-id");
+        assert_eq!(idempotency, request_id);
+        assert!(idempotency.starts_with("grokptah-"));
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
