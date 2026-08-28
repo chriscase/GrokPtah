@@ -979,33 +979,6 @@ impl ProviderAttempt {
         )
     }
 
-    /// Persist `Sending` and return the only physical-send permit. Call this
-    /// immediately before constructing/executing a provider request.
-    pub(crate) fn begin_send(
-        &self,
-        current_authority: &AuthorityBinding,
-    ) -> Result<PhysicalSendPermit, AttemptError> {
-        self.store.transition(
-            &self.attempt_id,
-            Some(current_authority),
-            SendState::Sending,
-            None,
-            None,
-        )?;
-        let record = self
-            .store
-            .read_record(&self.attempt_id)?
-            .ok_or(AttemptError::MissingAttempt)?;
-        Ok(PhysicalSendPermit {
-            attempt: self.clone(),
-            provider_request_id: record.provider_request_id,
-            provider_request_key: record.provider_request_key,
-            supports_idempotency: record.supports_idempotency,
-            authority: record.authority,
-            completed: false,
-        })
-    }
-
     pub(crate) fn begin_send_live(
         &self,
         current_authority: &AuthorityBinding,
@@ -1474,7 +1447,7 @@ mod tests {
         let (_temp, store, attempt) = prepared();
         let binding = authority(1);
         attempt.admit(&binding).unwrap();
-        let mut permit = attempt.begin_send(&binding).unwrap();
+        let mut permit = attempt.begin_send_live(&binding).unwrap();
         let key = permit.idempotency_key().to_owned();
         assert!(permit.supports_idempotency());
         permit.transport_after_possible_write().unwrap();
@@ -1487,7 +1460,7 @@ mod tests {
         reopened
             .reconcile(&auth, ProviderTruth::NotApplied)
             .unwrap();
-        let reopened_permit = reopened.begin_send(&binding).unwrap();
+        let reopened_permit = reopened.begin_send_live(&binding).unwrap();
         assert_eq!(reopened_permit.idempotency_key(), key);
     }
 
@@ -1498,7 +1471,7 @@ mod tests {
         attempt.admit(&binding).unwrap();
         let stale = authority(2);
         assert_eq!(
-            attempt.begin_send(&stale).unwrap_err(),
+            attempt.begin_send_live(&stale).unwrap_err(),
             AttemptError::StaleAuthority
         );
         assert_eq!(attempt.state().unwrap(), SendState::Admitted);
@@ -1526,7 +1499,7 @@ mod tests {
         let context = AttemptContext::new(store.clone(), "revoke-operation", authority(1)).unwrap();
         let attempt = context.prepare("xai", b"request", true).unwrap();
         assert_eq!(
-            attempt.begin_send(&authority(2)).unwrap_err(),
+            attempt.begin_send_live(&authority(2)).unwrap_err(),
             AttemptError::StaleAuthority
         );
         assert_eq!(attempt.state().unwrap(), SendState::Cancelled);
@@ -1578,7 +1551,7 @@ mod tests {
         let (_temp, _store, attempt) = prepared();
         let binding = authority(1);
         attempt.admit(&binding).unwrap();
-        let mut permit = attempt.begin_send(&binding).unwrap();
+        let mut permit = attempt.begin_send_live(&binding).unwrap();
         permit
             .semantic_rejection(422)
             .expect("semantic response is a terminal failure");
@@ -1591,7 +1564,7 @@ mod tests {
         let binding = authority(1);
         attempt.admit(&binding).unwrap();
         let transport = DeterministicFakeTransport::default();
-        let mut permit = attempt.begin_send(&binding).unwrap();
+        let mut permit = attempt.begin_send_live(&binding).unwrap();
         transport.start_stream(&mut permit).unwrap();
         assert_eq!(attempt.state().unwrap(), SendState::Responding);
         transport.settle_stream(&mut permit).unwrap();
@@ -1605,7 +1578,7 @@ mod tests {
         let binding = authority(1);
         attempt.admit(&binding).unwrap();
         let transport = DeterministicFakeTransport::default();
-        let mut permit = attempt.begin_send(&binding).unwrap();
+        let mut permit = attempt.begin_send_live(&binding).unwrap();
         transport.start_stream(&mut permit).unwrap();
         assert_eq!(attempt.state().unwrap(), SendState::Responding);
         drop(permit);
@@ -1618,7 +1591,7 @@ mod tests {
         let (_temp, store, attempt) = prepared();
         let binding = authority(1);
         attempt.admit(&binding).unwrap();
-        let mut permit = attempt.begin_send(&binding).unwrap();
+        let mut permit = attempt.begin_send_live(&binding).unwrap();
         let transport = DeterministicFakeTransport::default();
         transport
             .send(&mut permit, FakeTransportOutcome::AfterPossibleWrite)
@@ -1630,7 +1603,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            reopened.begin_send(&binding).unwrap_err(),
+            reopened.begin_send_live(&binding).unwrap_err(),
             AttemptError::InvalidTransition {
                 from: SendState::Uncertain,
                 to: SendState::Sending
@@ -1644,7 +1617,7 @@ mod tests {
         let (_temp, store_a, attempt) = prepared();
         let binding = authority(1);
         attempt.admit(&binding).unwrap();
-        let permit = attempt.begin_send(&binding).unwrap();
+        let permit = attempt.begin_send_live(&binding).unwrap();
         std::mem::forget(permit);
         let store_b = ProviderAttemptStore::open(store_a.root.as_path()).unwrap();
         let reopened = store_b.load(attempt.attempt_id()).unwrap().unwrap();
@@ -1658,7 +1631,7 @@ mod tests {
         let (_temp, _store, attempt) = prepared();
         let binding = authority(1);
         attempt.admit(&binding).unwrap();
-        let mut permit = attempt.begin_send(&binding).unwrap();
+        let mut permit = attempt.begin_send_live(&binding).unwrap();
         permit.transport_after_possible_write().unwrap();
         assert_eq!(
             attempt.reconcile(
@@ -1700,7 +1673,7 @@ mod tests {
         let (_temp, _store, attempt) = prepared();
         let binding = authority(1);
         attempt.admit(&binding).unwrap();
-        let mut permit = attempt.begin_send(&binding).unwrap();
+        let mut permit = attempt.begin_send_live(&binding).unwrap();
         permit.mark_response_started().unwrap();
         let wrong = ProviderSettlement::new("opaque-wrong", "provider-effect").unwrap();
         assert_eq!(
@@ -1716,7 +1689,7 @@ mod tests {
         let binding = authority(1);
         attempt.admit(&binding).unwrap();
         let transport = DeterministicFakeTransport::default();
-        let mut permit = attempt.begin_send(&binding).unwrap();
+        let mut permit = attempt.begin_send_live(&binding).unwrap();
         transport
             .send(&mut permit, FakeTransportOutcome::BeforePossibleWrite)
             .unwrap();
