@@ -3,6 +3,8 @@ use std::sync::Arc;
 
 use base64::Engine;
 use chrono::{Duration, Utc};
+#[cfg(target_os = "macos")]
+use grokptah_agent_bridge::MacOsObservationPlatform;
 use grokptah_agent_bridge::{
     canonical_workspace_string, ActionClass, ActionGrant, AgentHostHandle, ComputerAction,
     ComputerAgentProposal, ComputerCapabilities, ComputerError, ComputerObservation,
