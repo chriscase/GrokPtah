@@ -12960,6 +12960,8 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+        host.preinstall_canonical_capability_policy(lane_id)
+            .expect("explicit policy revision must rebind tool envelopes");
         let offline = TestEnvOverride::set("GROKPTAH_AGENT_OFFLINE", "1");
         let outcome = host.session_prompt(lane_id, "run sleep 5".into()).await;
         drop(offline);
