@@ -169,6 +169,10 @@ impl CapabilityEvidence {
             .map(|authority| authority.capability_reference().to_string())
     }
 
+    pub fn may_propose(&self) -> bool {
+        self.model.may_propose() && (self.authority.is_some() || self.model.synthetic_only)
+    }
+
     pub(crate) fn principal_generation_reference(&self) -> Option<String> {
         self.authority
             .as_ref()
@@ -178,7 +182,7 @@ impl CapabilityEvidence {
     /// The highest profile the evidence can honestly support. This is a
     /// ceiling, not a selection.
     pub fn ceiling(&self) -> AdaptiveProfile {
-        if !self.model.may_propose() {
+        if !self.may_propose() {
             return AdaptiveProfile::Economy;
         }
         if self.model.synthetic_only || self.model.is_text_oriented() {

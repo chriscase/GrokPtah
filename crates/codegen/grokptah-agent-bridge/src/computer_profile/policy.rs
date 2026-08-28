@@ -231,7 +231,7 @@ impl AdaptivePolicyEngine {
     /// risk. Capability evidence can only cap this choice.
     pub fn select(&self, evidence: &CapabilityEvidence, policy: TaskPolicy) -> PolicyOutcome {
         let ceiling = evidence.ceiling();
-        if !evidence.model.may_propose() {
+        if !evidence.may_propose() {
             return PolicyOutcome::Stop(PolicyStop {
                 reason: ProfileReason::ModelNotQualified,
                 profile: AdaptiveProfile::Economy,
@@ -334,7 +334,7 @@ mod tests {
     use crate::gateway_config::ComputerUseTier;
 
     fn evidence(image: bool, verifier: bool, isolated: bool) -> CapabilityEvidence {
-        CapabilityEvidence::new(
+        CapabilityEvidence::with_authority(
             ModelCapabilityEvidence {
                 tools: true,
                 image_input: image,
@@ -355,6 +355,11 @@ mod tests {
                 independent_verifier: verifier,
                 isolated_guest: isolated,
             },
+            super::super::authority::AdaptiveAuthoritySnapshot::issued(
+                "test-principal-generation",
+                "test-capability-generation",
+            )
+            .unwrap(),
         )
     }
 

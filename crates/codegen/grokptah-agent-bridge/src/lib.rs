@@ -113,11 +113,12 @@ pub use computer_agent::{
     RenderedObservation,
 };
 pub use computer_profile::{
-    classify_objective, classify_task, project_adaptive, AdaptiveController, AdaptivePolicyEngine,
-    AdaptiveProfile, AdaptiveProfileProjection, AdaptiveRunState, CapabilityAttribution,
-    CapabilityEvidence, HostCapabilityEvidence, ModelCapabilityEvidence, ObservationFingerprint,
-    PolicyOutcome, ProfileReason, ProfileTransition, ReplayError, ReplayEvent, ReplayEventKind,
-    ReplaySummary, ReplayVerifier, RuntimeSignal, SafetyFloor, TaskPolicy, TaskRisk, TerminalKind,
+    classify_objective, classify_task, project_adaptive, AdaptiveController, AdaptiveEvidenceEvent,
+    AdaptiveEvidenceKind, AdaptivePolicyEngine, AdaptiveProfile, AdaptiveProfileProjection,
+    AdaptiveRunState, CapabilityAttribution, CapabilityEvidence, HostCapabilityEvidence,
+    ModelCapabilityEvidence, ObservationFingerprint, PolicyOutcome, ProfileReason,
+    ProfileTransition, ReplayError, ReplayEvent, ReplayEventKind, ReplaySummary, ReplayVerifier,
+    RuntimeSignal, SafetyFloor, TaskPolicy, TaskRisk, TerminalKind,
 };
 pub use computer_use::{
     canonical_workspace_string, project_run_at, ActionClass, ActionGrant, ActionGrantSummary,
