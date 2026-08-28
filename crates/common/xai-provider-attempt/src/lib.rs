@@ -879,6 +879,7 @@ impl ProviderAttemptStore {
             return Err(AttemptError::StaleAuthority);
         }
         self.cleanup_orphaned_lease_claims_locked()?;
+        fs::create_dir_all(self.root.join("lease-claims"))?;
         let claim_path = self.lease_claim_path(lease_id);
         let mut claim = match OpenOptions::new()
             .create_new(true)
