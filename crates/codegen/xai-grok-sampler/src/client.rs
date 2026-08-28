@@ -557,6 +557,10 @@ impl SamplingClient {
         self
     }
 
+    pub(crate) fn provider_attempt_is_configured(&self) -> bool {
+        self.provider_attempt.is_some()
+    }
+
     /// The configured API backend for this client.
     pub fn api_backend(&self) -> ApiBackend {
         self.defaults.api_backend.clone()
@@ -954,7 +958,13 @@ impl SamplingClient {
             // Log at debug level; errors are surfaced to the caller.
             tracing::debug!("HTTP request failed: {}", e);
             Self::mark_transport_ambiguous(permit.take());
-            e
+            if self.provider_attempt.is_some() {
+                SamplingError::Auth(
+                    "provider attempt is uncertain; explicit reconciliation is required".into(),
+                )
+            } else {
+                SamplingError::Http(e)
+            }
         })?;
 
         if !response.status().is_success() {
@@ -1040,7 +1050,13 @@ impl SamplingClient {
             tracing::debug!("HTTP request failed: {}", e);
             record_stream_request_failure(&e);
             Self::mark_transport_ambiguous(permit.take());
-            e
+            if self.provider_attempt.is_some() {
+                SamplingError::Auth(
+                    "provider attempt is uncertain; explicit reconciliation is required".into(),
+                )
+            } else {
+                SamplingError::Http(e)
+            }
         })?;
 
         let status = response.status();
@@ -1269,7 +1285,13 @@ impl SamplingClient {
         let response = http_request.send().await.map_err(|e| {
             tracing::debug!("HTTP request failed: {}", e);
             Self::mark_transport_ambiguous(permit.take());
-            e
+            if self.provider_attempt.is_some() {
+                SamplingError::Auth(
+                    "provider attempt is uncertain; explicit reconciliation is required".into(),
+                )
+            } else {
+                SamplingError::Http(e)
+            }
         })?;
 
         let status = response.status();
@@ -1446,7 +1468,13 @@ impl SamplingClient {
             tracing::debug!("HTTP request failed: {}", e);
             record_stream_request_failure(&e);
             Self::mark_transport_ambiguous(permit.take());
-            e
+            if self.provider_attempt.is_some() {
+                SamplingError::Auth(
+                    "provider attempt is uncertain; explicit reconciliation is required".into(),
+                )
+            } else {
+                SamplingError::Http(e)
+            }
         })?;
 
         let status = response.status();
@@ -1652,7 +1680,13 @@ impl SamplingClient {
         let response = http_request.send().await.map_err(|e| {
             tracing::debug!("HTTP request failed: {}", e);
             Self::mark_transport_ambiguous(permit.take());
-            e
+            if self.provider_attempt.is_some() {
+                SamplingError::Auth(
+                    "provider attempt is uncertain; explicit reconciliation is required".into(),
+                )
+            } else {
+                SamplingError::Http(e)
+            }
         })?;
 
         let status = response.status();
@@ -1793,7 +1827,13 @@ impl SamplingClient {
             tracing::debug!("HTTP request failed: {}", e);
             record_stream_request_failure(&e);
             Self::mark_transport_ambiguous(permit.take());
-            e
+            if self.provider_attempt.is_some() {
+                SamplingError::Auth(
+                    "provider attempt is uncertain; explicit reconciliation is required".into(),
+                )
+            } else {
+                SamplingError::Http(e)
+            }
         })?;
 
         let status = response.status();
