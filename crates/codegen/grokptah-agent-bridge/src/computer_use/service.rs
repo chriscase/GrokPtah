@@ -1991,6 +1991,7 @@ mod tests {
         .await
         .expect("action must reach the backend before cancellation");
         eprintln!("cancel-race: backend entered");
+        tokio::task::yield_now().await;
 
         let cancelled = tokio::time::timeout(
             std::time::Duration::from_secs(2),
