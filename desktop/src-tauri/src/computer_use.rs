@@ -1080,6 +1080,20 @@ mod tests {
             .unwrap();
         host.set_project_cwd(dir).unwrap();
         host.session_set_cwd(session.id, dir).unwrap();
+        let store = host.ensure_orchestration_store().unwrap();
+        let _authority_service = grokptah_agent_bridge::OrchestrationService::new(
+            host.clone(),
+            host.event_bus(),
+            store,
+            grokptah_agent_bridge::OrchestrationConfig {
+                bearer_token: "desktop-computer-authority".into(),
+                allowlist: grokptah_agent_bridge::WorkspaceAllowlist::new(
+                    [dir.to_path_buf()],
+                ),
+                max_concurrent_runs: 1,
+                bounds: grokptah_agent_bridge::RunBounds::default(),
+            },
+        );
         host.ensure_session_agent(session.id).unwrap();
         grokptah_agent_bridge::set_grokptah_home_override(None);
         (host, session.id)
