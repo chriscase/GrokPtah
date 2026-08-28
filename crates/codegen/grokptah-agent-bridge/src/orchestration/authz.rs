@@ -916,10 +916,29 @@ impl WorkspaceAllowlist {
     }
 
     pub fn contains(&self, workspace: &Path) -> bool {
-        let Ok(c) = canonical_workspace(workspace) else {
+        let Ok(c) = self.resolve_claimed(workspace) else {
             return false;
         };
         self.roots.iter().any(|r| r == &c)
+    }
+
+    pub(crate) fn resolve_claimed(&self, workspace: &Path) -> Result<PathBuf, OrchError> {
+        let Some(value) = workspace.to_str() else {
+            return canonical_workspace(workspace);
+        };
+        if let Some(handle) = value.strip_prefix("workspace_") {
+            let resolved = self.roots.iter().find(|root| {
+                workspace_handle(&root.display().to_string()).strip_prefix("workspace_")
+                    == Some(handle)
+            });
+            return resolved.cloned().ok_or_else(|| {
+                OrchError::new(
+                    OrchErrorCode::WorkspaceMismatch,
+                    "workspace handle is not allowlisted",
+                )
+            });
+        }
+        canonical_workspace(workspace)
     }
 
     pub fn roots(&self) -> &[PathBuf] {
@@ -962,7 +981,7 @@ pub fn require_workspace_match(
     session_cwd: Option<&Path>,
     claimed: &Path,
 ) -> Result<PathBuf, OrchError> {
-    let claimed_c = canonical_workspace(claimed)?;
+    let claimed_c = allowlist.resolve_claimed(claimed)?;
     if !allowlist.contains(&claimed_c) {
         return Err(OrchError::new(
             OrchErrorCode::WorkspaceMismatch,
@@ -994,6 +1013,20 @@ fn hex_sha256(bytes: &[u8]) -> String {
         let _ = write!(out, "{byte:02x}");
     }
     out
+}
+
+fn workspace_handle(workspace: &str) -> String {
+    let digest = {
+        use sha2::{Digest, Sha256};
+        let encoded = serde_json::to_string(workspace).unwrap_or_default();
+        Sha256::digest(encoded.as_bytes())
+    };
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    format!("workspace_{}", &hex[..32])
 }
 
 #[cfg(test)]

@@ -800,6 +800,7 @@ impl RemoteServiceClient {
         workspace: String,
         title: Option<String>,
     ) -> Result<RemoteSessionTarget> {
+        let requested_workspace = workspace.clone();
         let mut args = json!({"workspace": workspace});
         if let Some(title) = title {
             args["title"] = json!(title);
@@ -807,6 +808,9 @@ impl RemoteServiceClient {
         let value = self.call_tool("ptah_create_session", args).await?;
         let mut session: RemoteSessionTarget =
             serde_json::from_value(value).context("decode remote session creation")?;
+        // The caller already supplied this local scope. The wire response
+        // deliberately carries only an opaque workspace handle.
+        session.workspace = requested_workspace;
         session.runtime_target = runtime_target_for_base_url(&self.base_url);
         session.runtime_connection = RuntimeConnectionState::Connected;
         Ok(session)

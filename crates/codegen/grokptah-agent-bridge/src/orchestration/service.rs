@@ -2265,13 +2265,13 @@ impl OrchestrationService {
             None => summary,
         };
         self.ensure_session_binding(auth, summary.id)?;
-        Ok(json!({
+        Ok(self.public_projection(json!({
             "sessionId": summary.id,
             "title": summary.title,
             "workspace": summary.cwd,
             "updatedAt": summary.updated_at,
             "busy": false,
-        }))
+        })))
     }
 
     /// List durable agent identities whose workspaces are visible to this
@@ -5738,7 +5738,7 @@ impl OrchestrationService {
         workspace: &Path,
     ) -> Result<String, OrchError> {
         let allowlist = self.config.lock().allowlist.clone();
-        let claimed = super::authz::canonical_workspace(workspace)?;
+        let claimed = allowlist.resolve_claimed(workspace)?;
         if !allowlist.contains(&claimed) {
             return Err(OrchError::new(
                 OrchErrorCode::WorkspaceMismatch,
