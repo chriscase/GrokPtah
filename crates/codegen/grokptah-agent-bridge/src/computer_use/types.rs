@@ -429,6 +429,7 @@ pub struct ComputerExecutionEnvelope {
     action_digest: String,
     adaptive_revision: Option<u64>,
     profile: Option<crate::computer_profile::AdaptiveProfile>,
+    risk: Option<crate::computer_profile::TaskRisk>,
     objective_digest: Option<String>,
     principal_generation_reference: Option<String>,
     capability_snapshot_reference: Option<String>,
@@ -456,6 +457,7 @@ impl ComputerExecutionEnvelope {
         let (
             adaptive_revision,
             profile,
+            risk,
             objective_digest,
             principal_generation_reference,
             capability_snapshot_reference,
@@ -465,13 +467,14 @@ impl ComputerExecutionEnvelope {
             Some(adaptive) => (
                 Some(adaptive.revision),
                 Some(adaptive.profile),
+                Some(adaptive.risk),
                 adaptive.objective_digest.clone(),
                 adaptive.principal_generation_reference.clone(),
                 adaptive.capability_snapshot_reference.clone(),
                 adaptive.provider_attempt_reference.clone(),
                 adaptive.effect_authority_bound,
             ),
-            None => (None, None, None, None, None, None, false),
+            None => (None, None, None, None, None, None, None, false),
         };
         let token = Uuid::new_v4().to_string();
         Ok(Self {
@@ -516,6 +519,10 @@ impl ComputerExecutionEnvelope {
 
     pub(crate) fn profile(&self) -> Option<crate::computer_profile::AdaptiveProfile> {
         self.profile
+    }
+
+    pub(crate) fn risk(&self) -> Option<crate::computer_profile::TaskRisk> {
+        self.risk
     }
 
     pub(crate) fn objective_digest(&self) -> Option<&str> {

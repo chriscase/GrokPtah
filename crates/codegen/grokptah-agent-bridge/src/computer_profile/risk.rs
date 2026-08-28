@@ -188,6 +188,15 @@ pub fn classify_objective(objective: &str) -> TaskRisk {
 
 pub fn classify_task(objective: &str, observation: &ComputerObservation) -> TaskRisk {
     let text_risk = classify_objective(objective);
+    let hard_denied = observation.sensitivity.is_hard_denied()
+        || observation.target.sensitivity.is_hard_denied()
+        || observation
+            .elements
+            .iter()
+            .any(|element| element.sensitivity.is_hard_denied());
+    if hard_denied {
+        return TaskRisk::Destructive;
+    }
     let sensitive = observation.sensitivity == Sensitivity::Potential
         || observation.target.sensitivity == Sensitivity::Potential
         || observation

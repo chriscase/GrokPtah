@@ -144,6 +144,35 @@ fn profile_transitions_are_bounded_and_explicit() {
 }
 
 #[test]
+fn same_objective_rechecks_new_destructive_observation_before_provider_work() {
+    let objective = "Review the form";
+    let routine = observation();
+    assert_eq!(
+        grokptah_agent_bridge::classify_task(objective, &routine),
+        grokptah_agent_bridge::TaskRisk::Routine
+    );
+
+    let mut destructive = routine.clone();
+    destructive.target.sensitivity = Sensitivity::SystemRestricted;
+    assert_eq!(
+        grokptah_agent_bridge::classify_task(objective, &destructive),
+        grokptah_agent_bridge::TaskRisk::Destructive
+    );
+
+    let mut controller = AdaptiveController::new("run-1", offline_decision());
+    assert!(controller
+        .enforce_risk_floor(grokptah_agent_bridge::TaskRisk::Routine)
+        .is_none());
+    let transition = controller.enforce_risk_floor(grokptah_agent_bridge::TaskRisk::Destructive);
+    assert!(matches!(transition, Some(ProfileTransition::Stop(_))));
+    assert_eq!(
+        controller.terminal().map(|terminal| terminal.reason),
+        Some(ProfileReason::DestructiveIntent)
+    );
+    assert!(controller.begin_turn(controller.revision()).is_err());
+}
+
+#[test]
 fn unknown_and_malformed_profiles_fail_closed_without_alias_output() {
     assert!(serde_json::from_str::<AdaptiveProfile>("\"economy\"").is_ok());
     assert!(serde_json::from_str::<AdaptiveProfile>("\"efficient\"").is_ok());

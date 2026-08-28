@@ -186,6 +186,8 @@ impl AdaptiveRunState {
             && self.spend.model_calls <= self.profile.budget().max_model_calls
             && self.spend.observation_bytes <= MAX_ADAPTIVE_OBSERVATION_BYTES
             && self.spend.provider_attempts <= self.spend.model_calls
+            && (self.spend.provider_attempts == 0 || self.provider_attempt_reference.is_some())
+            && (self.provider_attempt_reference.is_none() || self.spend.provider_attempts > 0)
             && (!self.turn_in_flight || self.terminal.is_none())
             && self.terminal.as_ref().is_none_or(|terminal| {
                 !self.turn_in_flight
@@ -463,6 +465,23 @@ impl AdaptiveController {
 
     pub(crate) fn raise_risk(&mut self, risk: super::risk::TaskRisk) {
         self.state.risk = self.state.risk.max(risk);
+    }
+
+    /// Re-evaluate the observed risk on every turn. Risk can only rise; a
+    /// newly revealed consequential/destructive surface never gets a weaker
+    /// profile merely because the objective digest stayed the same.
+    pub(crate) fn enforce_risk_floor(
+        &mut self,
+        observed_risk: super::risk::TaskRisk,
+    ) -> Option<ProfileTransition> {
+        let prior_risk = self.state.risk;
+        self.raise_risk(observed_risk);
+        let required = super::policy::AdaptivePolicyEngine::risk_floor(self.state.risk);
+        if observed_risk > prior_risk || self.state.profile < required {
+            Some(self.apply_signal(RuntimeSignal::DestructiveIntentDetected))
+        } else {
+            None
+        }
     }
 
     pub(crate) fn objective_digest(&self) -> Option<&str> {

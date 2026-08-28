@@ -219,6 +219,19 @@ impl ComputerUseService {
             })?;
         self.policy
             .authorize_action(&run, observation, action, Utc::now())?;
+        if run.adaptive.as_ref().is_some_and(|adaptive| {
+            !adaptive.effect_authority_bound
+                || adaptive.objective_digest.is_none()
+                || adaptive.principal_generation_reference.is_none()
+                || adaptive.capability_snapshot_reference.is_none()
+                || adaptive.effect_lease_reference.is_none()
+                || adaptive.provider_attempt_reference.is_none()
+        }) {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "adaptive approval lacks canonical effect-time authority",
+            ));
+        }
         ComputerExecutionEnvelope::issue(&run, observation_id, action)
     }
 
@@ -252,6 +265,7 @@ impl ComputerUseService {
             if !envelope.effect_authority_bound()
                 || adaptive.revision != envelope.adaptive_revision().unwrap_or_default()
                 || adaptive.profile != envelope.profile().unwrap_or_default()
+                || adaptive.risk != envelope.risk().unwrap_or_default()
                 || adaptive.objective_digest.as_deref() != envelope.objective_digest()
                 || adaptive.principal_generation_reference.as_deref()
                     != envelope.principal_generation_reference()
