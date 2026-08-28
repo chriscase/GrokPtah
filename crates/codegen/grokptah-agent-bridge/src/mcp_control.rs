@@ -3924,6 +3924,7 @@ mod tests {
         host.session_set_cwd(session_a.id, ws_a.path()).unwrap();
         let session_b = host.session_new_kind(crate::SessionKind::Build).unwrap();
         host.session_set_cwd(session_b.id, ws_b.path()).unwrap();
+        host.ensure_session_agent(session_a.id).unwrap();
 
         let canon_a = canonical_workspace_string(ws_a.path()).unwrap();
         let canon_b = canonical_workspace_string(ws_b.path()).unwrap();
@@ -4278,6 +4279,7 @@ mod tests {
         host.set_project_cwd(ws.path()).unwrap();
         let session = host.session_new_kind(crate::SessionKind::Build).unwrap();
         host.session_set_cwd(session.id, ws.path()).unwrap();
+        host.ensure_session_agent(session.id).unwrap();
 
         let canon = canonical_workspace_string(ws.path()).unwrap();
         let store = host.ensure_computer_store().unwrap();
@@ -4385,6 +4387,7 @@ mod tests {
         host.set_project_cwd(ws.path()).unwrap();
         let session = host.session_new_kind(crate::SessionKind::Build).unwrap();
         host.session_set_cwd(session.id, ws.path()).unwrap();
+        host.ensure_session_agent(session.id).unwrap();
         let canon = canonical_workspace_string(ws.path()).unwrap();
 
         // First lifetime: a live authorized run, then every store handle is

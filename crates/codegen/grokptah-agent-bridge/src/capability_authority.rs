@@ -130,6 +130,7 @@ impl CapabilitySnapshot {
         principal: &str,
         backend: &ComputerCapabilities,
         policy_digest: &str,
+        auth_generation: u64,
     ) -> Result<Self> {
         let backend = serde_json::to_vec(backend)?;
         let scope = format!("computer-use-service:{policy_digest}");
@@ -140,6 +141,7 @@ impl CapabilitySnapshot {
             [
                 std::str::from_utf8(&backend).unwrap_or_default(),
                 policy_digest,
+                &auth_generation.to_string(),
             ],
         )
     }
@@ -196,16 +198,14 @@ struct CurrentGeneration {
 #[derive(Debug)]
 struct AuthorityState {
     process_nonce: String,
-    auth_generation: u64,
     enabled: bool,
     next_generation: u64,
     next_attempt: u64,
     current: HashMap<CapabilityKey, CurrentGeneration>,
     envelopes: HashMap<String, CanonicalEffectEnvelope>,
+    active_auth_generations: HashMap<String, u64>,
     consumed_leases: HashSet<String>,
 }
-
-const INITIAL_AUTH_GENERATION: u64 = 1;
 
 /// A host-installed authority envelope. Request fields can select an allowed
 /// operation and exact resource, but they cannot mint or widen this envelope.
@@ -248,12 +248,12 @@ impl CapabilityAuthority {
         Self {
             state: Arc::new(Mutex::new(AuthorityState {
                 process_nonce: Uuid::new_v4().to_string(),
-                auth_generation: INITIAL_AUTH_GENERATION,
                 enabled,
                 next_generation: 0,
                 next_attempt: 0,
                 current: HashMap::new(),
                 envelopes: HashMap::new(),
+                active_auth_generations: HashMap::new(),
                 consumed_leases: HashSet::new(),
             })),
         }
@@ -382,11 +382,30 @@ impl CapabilityAuthority {
             || resource_scope.len() > 256
             || policy_generation.trim().is_empty()
             || snapshot.key.principal != principal_id
-            || auth_generation != state.auth_generation
+            || auth_generation == 0
         {
             bail!("canonical capability envelope is invalid or foreign");
         }
-        validate_capability_locked(&state, &capability, &snapshot, now)?;
+        let previous_auth_generation = state
+            .active_auth_generations
+            .insert(principal_id.to_string(), auth_generation);
+        if previous_auth_generation.is_some_and(|previous| previous != auth_generation) {
+            state.current.retain(|key, _| key.principal != principal_id);
+            state
+                .envelopes
+                .retain(|_, envelope| envelope.principal_id != principal_id);
+        }
+        if let Err(error) = validate_capability_locked(&state, &capability, &snapshot, now) {
+            if previous_auth_generation.is_none() {
+                state.active_auth_generations.remove(principal_id);
+            } else {
+                state.active_auth_generations.insert(
+                    principal_id.to_string(),
+                    previous_auth_generation.unwrap_or(auth_generation),
+                );
+            }
+            return Err(error);
+        }
         let allowed_operations = allowed_operations
             .into_iter()
             .map(Into::into)
@@ -592,9 +611,11 @@ impl CapabilityAuthority {
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("capability authority is unavailable"))?;
-        state.auth_generation = auth_generation;
         state.current.clear();
         state.envelopes.clear();
+        for generation in state.active_auth_generations.values_mut() {
+            *generation = auth_generation;
+        }
         Ok(())
     }
 
@@ -675,7 +696,8 @@ fn validate_envelope_locked(
 ) -> Result<()> {
     if envelope.principal_id != envelope.snapshot.key.principal
         || envelope.incarnation != state.process_nonce
-        || envelope.auth_generation != state.auth_generation
+        || state.active_auth_generations.get(&envelope.principal_id)
+            != Some(&envelope.auth_generation)
         || envelope.capability_generation != envelope.capability.generation
         || envelope.policy_generation.trim().is_empty()
         || now >= envelope.expires_at
@@ -782,6 +804,7 @@ mod tests {
                 pointer_fallback: false,
             },
             "policy-v1",
+            1,
         )
         .unwrap();
         let capability = authority
@@ -793,7 +816,7 @@ mod tests {
                 capability,
                 snapshot.clone(),
                 TEST_PRINCIPAL_ID,
-                INITIAL_AUTH_GENERATION,
+                1,
                 "policy-v1",
                 ["allowed"],
                 "resource-1",
@@ -842,7 +865,7 @@ mod tests {
                 capability,
                 snapshot,
                 TEST_PRINCIPAL_ID,
-                INITIAL_AUTH_GENERATION,
+                1,
                 "policy-v1",
                 ["act"],
                 "resource-1",
@@ -876,7 +899,7 @@ mod tests {
                 capability,
                 foreign,
                 "different-principal",
-                INITIAL_AUTH_GENERATION,
+                1,
                 "policy-v1",
                 ["act"],
                 "resource-1",
@@ -899,7 +922,7 @@ mod tests {
                 capability,
                 original.clone(),
                 TEST_PRINCIPAL_ID,
-                INITIAL_AUTH_GENERATION,
+                1,
                 "policy-v1",
                 ["act"],
                 "resource-1",

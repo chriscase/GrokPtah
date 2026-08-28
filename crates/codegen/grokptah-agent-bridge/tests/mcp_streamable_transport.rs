@@ -2228,6 +2228,7 @@ async fn live_computer_reads_node_smoke() {
     host.set_project_cwd(ws.path()).unwrap();
     let session = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(session.id, ws.path()).unwrap();
+    host.ensure_session_agent(session.id).unwrap();
     let other_session = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(other_session.id, ws_other.path())
         .unwrap();

@@ -134,12 +134,14 @@ impl ComputerUseService {
             principal.id(),
             &self.backend.capabilities(),
             POLICY_GENERATION,
+            principal.auth_generation(),
         )
         .map_err(|error| ComputerError::new(ComputerErrorCode::Internal, error.to_string()))?;
         let action_snapshot = CapabilitySnapshot::computer_use_service(
             principal.id(),
             &self.backend.capabilities(),
             ACTION_POLICY_GENERATION,
+            principal.auth_generation(),
         )
         .map_err(|error| ComputerError::new(ComputerErrorCode::Internal, error.to_string()))?;
         let service_capability = self

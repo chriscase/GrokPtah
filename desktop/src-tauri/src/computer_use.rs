@@ -1088,6 +1088,9 @@ mod tests {
         let session = host
             .session_new_kind(grokptah_agent_bridge::SessionKind::Build)
             .unwrap();
+        host.set_project_cwd(dir.path()).unwrap();
+        host.session_set_cwd(session.id, dir.path()).unwrap();
+        host.ensure_session_agent(session.id).unwrap();
         let principal = host.capability_principal(session.id).unwrap();
         let simulator = Arc::new(ComputerUseService::new_with_authority_and_principal(
             Arc::new(SimulatorBackend::new()),
@@ -1418,6 +1421,11 @@ mod tests {
             .session_new_kind(grokptah_agent_bridge::SessionKind::Build)
             .unwrap()
             .id;
+        desktop
+            .host
+            .session_set_cwd(second_owner, std::path::Path::new("."))
+            .unwrap();
+        desktop.host.ensure_session_agent(second_owner).unwrap();
         let candidate = desktop.list_targets().await.unwrap().remove(0);
         let second = desktop
             .start_native(second_owner, &candidate.selection_token, NATIVE_TEST_APP_ID)

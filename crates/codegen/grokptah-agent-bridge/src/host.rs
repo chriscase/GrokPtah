@@ -967,8 +967,26 @@ impl AgentHostHandle {
     /// This object is accepted only by host-owned adapters and is never a wire
     /// projection.
     pub fn capability_principal(&self, session_id: Uuid) -> Result<CapabilityPrincipal> {
-        let (principal, _) = self.computer_capability_identity(session_id)?;
-        CapabilityPrincipal::new(principal, 1)
+        let (principal, policy_digest) = self.canonical_computer_identity(session_id)?;
+        let (model, _) = self.selected_computer_model(session_id)?;
+        let credential_fingerprint = crate::auth_store::resolve_wire_credentials_for_model(&model)
+            .map_err(anyhow::Error::msg)?
+            .map(|credentials| credentials.qualification_identity_fingerprint())
+            .unwrap_or_else(|| "anonymous".into());
+        let authentication_material = crate::orchestration::hash_payload(&serde_json::json!({
+            "principal": principal,
+            "policy": policy_digest,
+            "credential": credential_fingerprint,
+        }));
+        let auth_generation = u64::from_str_radix(
+            authentication_material
+                .get(..16)
+                .ok_or_else(|| anyhow!("canonical authentication generation is malformed"))?,
+            16,
+        )
+        .map_err(|_| anyhow!("canonical authentication generation is malformed"))?
+        .max(1);
+        CapabilityPrincipal::new(principal, auth_generation)
             .map_err(|error| anyhow!("invalid canonical capability principal: {error}"))
     }
 
@@ -1338,6 +1356,33 @@ impl AgentHostHandle {
             "allow_rules": allow_rules,
             "deny_rules": deny_rules,
         }));
+        Ok((principal, policy_digest))
+    }
+
+    fn canonical_computer_identity(&self, session_id: Uuid) -> Result<(String, String)> {
+        let agent_id = {
+            let inner = self.inner.lock();
+            inner
+                .sessions
+                .get(&session_id)
+                .ok_or_else(|| anyhow!("unknown session"))?
+                .agent_id
+                .clone()
+                .ok_or_else(|| anyhow!("canonical Agent principal is unavailable"))?
+        };
+        let store = self
+            .orchestration_store
+            .lock()
+            .clone()
+            .ok_or_else(|| anyhow!("canonical Agent store is unavailable"))?;
+        let agent = store
+            .load_agent(&agent_id)?
+            .ok_or_else(|| anyhow!("canonical Agent record is unavailable"))?;
+        let spec = agent.current_spec()?;
+        let principal = agent.owner_principal_id.clone().unwrap_or(agent.agent_id);
+        let policy_digest = crate::orchestration::hash_payload(
+            &serde_json::to_value(spec).map_err(|error| anyhow!(error.to_string()))?,
+        );
         Ok((principal, policy_digest))
     }
 
