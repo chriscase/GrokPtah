@@ -298,7 +298,14 @@ pub(crate) fn initialize(root: &Path) -> Result<()> {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             return Err(anyhow!("canonical authority signing key is a symlink"));
         }
-        Ok(_) => {}
+        Ok(metadata) => {
+            #[cfg(unix)]
+            if std::os::unix::fs::PermissionsExt::mode(&metadata.permissions()) & 0o077 != 0 {
+                return Err(anyhow!(
+                    "canonical authority signing key permissions are too broad"
+                ));
+            }
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             if directory.join(AUTHORITY_PUBLIC_KEY_FILE).exists() {
                 return Err(anyhow!("canonical authority signing key is unavailable"));
@@ -402,28 +409,22 @@ fn signing_key(root: &Path) -> Result<SigningKey> {
     if metadata.file_type().is_symlink() {
         return Err(anyhow!("canonical authority signing key is a symlink"));
     }
+    #[cfg(unix)]
+    if std::os::unix::fs::PermissionsExt::mode(&metadata.permissions()) & 0o077 != 0 {
+        return Err(anyhow!(
+            "canonical authority signing key permissions are too broad"
+        ));
+    }
     let bytes = fs::read(&key_path)?;
     let seed: [u8; 32] = bytes
         .as_slice()
         .try_into()
         .map_err(|_| anyhow!("canonical authority signing key is invalid"))?;
     let key = SigningKey::from_bytes(&seed);
-    let public_key_path = directory.join(AUTHORITY_PUBLIC_KEY_FILE);
     let public_key = key.verifying_key().to_bytes();
-    match fs::read(&public_key_path) {
-        Ok(existing) if existing == public_key => {}
-        Ok(_) => return Err(anyhow!("canonical authority public key mismatch")),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let mut file = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&public_key_path)?;
-            file.write_all(&public_key)?;
-            set_private_permissions(&file)?;
-            file.sync_all()?;
-        }
-        Err(error) => return Err(error.into()),
-    };
+    if read_public_key(root)?.to_bytes() != public_key {
+        return Err(anyhow!("canonical authority public key mismatch"));
+    }
     Ok(key)
 }
 
@@ -483,6 +484,22 @@ mod tests {
         let path = root.path().join("reconciliation/attempt-1.json");
         let metadata = fs::symlink_metadata(path).unwrap();
         assert_eq!(metadata.permissions().mode() & 0o077, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initialize_rejects_a_world_readable_signing_key() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        initialize(root.path()).unwrap();
+        let key_path = root
+            .path()
+            .join("canonical-authorities/.authority-signing-key");
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let error = initialize(root.path()).unwrap_err();
+        assert!(error.to_string().contains("signing key permissions"));
     }
 }
 
