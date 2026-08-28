@@ -4995,6 +4995,13 @@ impl OrchStore {
             .map_err(|error| anyhow::anyhow!("audit key rotation failed: {}", error.code()))
     }
 
+    pub fn rotate_audit(&self) -> anyhow::Result<String> {
+        self.inner
+            .audit
+            .rotate(crate::audit::RotationReason::Operator)
+            .map_err(|error| anyhow::anyhow!("audit rotation failed: {}", error.code()))
+    }
+
     pub fn verify_audit(&self) -> anyhow::Result<usize> {
         self.inner
             .audit

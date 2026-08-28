@@ -764,6 +764,32 @@ impl AuditLedger {
     fn recover(&self) -> AuditResult<()> {
         let mut guard = self.inner.lock();
 
+        // If the manifest commit completed but cleanup did not, the committed
+        // manifest is authoritative. Verify the marker names only, then clear
+        // the staging marker; never infer a manifest from a marker.
+        let bootstrap = bootstrap_path(&self.root);
+        if bootstrap.exists() {
+            files::reject_symlink(&bootstrap)?;
+            let bytes = files::read_bytes(&bootstrap)?;
+            let marker: BootstrapMarker = serde_json::from_slice(&bytes)
+                .map_err(|_| AuditError::Poisoned(PoisonReason::ManifestUnknownSchema))?;
+            marker.verify(&self.keys())?;
+            if !marker.generation_ids.iter().all(|id| {
+                guard
+                    .manifest
+                    .generations
+                    .iter()
+                    .any(|generation| generation.generation_id == *id)
+            }) {
+                return Err(AuditError::Poisoned(
+                    PoisonReason::ManifestAbsentWithGenerations,
+                ));
+            }
+            std::fs::remove_file(&bootstrap)
+                .map_err(|error| AuditError::Io(format!("clear committed bootstrap: {error}")))?;
+            files::fsync_dir(&self.root)?;
+        }
+
         // Interrupted retention removal (crash cut T3): the committed manifest
         // is the authorization, so resuming is the only legal deletion path.
         loop {
