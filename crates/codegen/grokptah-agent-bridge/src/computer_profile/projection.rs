@@ -5,6 +5,7 @@
 //! digests, credentials, paths, raw policy documents, or provider diagnostics.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::capability::{CapabilityAttribution, CapabilityEvidence};
 use super::controller::{AdaptiveController, AdaptiveSpend, EscalationRecord, TerminalOutcome};
@@ -28,8 +29,10 @@ pub struct CapabilityEvidenceProjection {
     pub host_independent_verifier: bool,
     pub host_isolated_guest: bool,
     pub ceiling: AdaptiveProfile,
-    /// Opaque reference from the canonical #458 capability generation.
-    pub capability_snapshot_reference: Option<String>,
+    /// Non-reversible correlation id derived from the canonical #458
+    /// capability generation; the raw generation reference never leaves the
+    /// durable host boundary.
+    pub capability_snapshot_id: Option<String>,
 }
 
 impl CapabilityEvidenceProjection {
@@ -47,7 +50,12 @@ impl CapabilityEvidenceProjection {
             host_independent_verifier: evidence.host.independent_verifier,
             host_isolated_guest: evidence.host.isolated_guest,
             ceiling: evidence.ceiling(),
-            capability_snapshot_reference: evidence.capability_snapshot_reference(),
+            capability_snapshot_id: evidence.capability_snapshot_reference().map(|reference| {
+                let mut hasher = Sha256::new();
+                hasher.update(b"grokptah.adaptive.capability-projection.v1\0");
+                hasher.update(reference.as_bytes());
+                format!("capability-id-{:x}", hasher.finalize())
+            }),
         }
     }
 }

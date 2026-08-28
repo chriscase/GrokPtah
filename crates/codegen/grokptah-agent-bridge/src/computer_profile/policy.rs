@@ -133,6 +133,7 @@ pub enum RuntimeSignal {
     CapabilityRevoked,
     BudgetExhausted,
     DestructiveIntentDetected,
+    ConsequentialIntentDetected,
     AuthorityUnavailable,
     ProviderUncertain,
 }
@@ -152,6 +153,7 @@ impl RuntimeSignal {
             Self::CapabilityRevoked => ProfileReason::CapabilityRevoked,
             Self::BudgetExhausted => ProfileReason::BudgetExhausted,
             Self::DestructiveIntentDetected => ProfileReason::DestructiveIntent,
+            Self::ConsequentialIntentDetected => ProfileReason::ConsequentialIntent,
             Self::AuthorityUnavailable => ProfileReason::AuthorityUnavailable,
             Self::ProviderUncertain => ProfileReason::ProviderUncertain,
         }
@@ -411,6 +413,7 @@ mod tests {
             RuntimeSignal::CapabilityRevoked,
             RuntimeSignal::BudgetExhausted,
             RuntimeSignal::DestructiveIntentDetected,
+            RuntimeSignal::ConsequentialIntentDetected,
             RuntimeSignal::AuthorityUnavailable,
             RuntimeSignal::ProviderUncertain,
         ];
