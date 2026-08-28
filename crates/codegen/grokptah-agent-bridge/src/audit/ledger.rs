@@ -548,7 +548,19 @@ impl AuditLedger {
         let bytes = files::read_bytes(&path)?;
         let manifest: Manifest = serde_json::from_slice(&bytes)
             .map_err(|_| AuditError::Poisoned(PoisonReason::ManifestUnknownSchema))?;
-        manifest.verify(keys)?;
+        if let Err(error) = manifest.verify(keys) {
+            // Distinguish "wrong key for this installation" from "these bytes
+            // were altered", so an operator who rotated custody is not told
+            // their ledger was tampered with. The hint comes from
+            // unauthenticated bytes, so it changes the reason code and nothing
+            // else: both fail closed identically.
+            if error.poison_reason() == Some(PoisonReason::ManifestMacMismatch)
+                && manifest.key_id != keys.key_id()
+            {
+                return Err(AuditError::Poisoned(PoisonReason::KeyMismatch));
+            }
+            return Err(error);
+        }
         Ok(Some(manifest))
     }
 

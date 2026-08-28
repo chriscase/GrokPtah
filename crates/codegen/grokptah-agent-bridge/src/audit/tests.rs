@@ -394,7 +394,9 @@ fn wrong_installation_key_is_rejected() {
     let dir = TempDir::new().unwrap();
     drop(fresh(dir.path()));
     let error = AuditLedger::open(dir.path(), foreign_keys()).unwrap_err();
-    assert_eq!(poison_of(error), PoisonReason::ManifestMacMismatch);
+    // A different installation key is reported as a key mismatch rather than
+    // as tampering; both fail closed identically.
+    assert_eq!(poison_of(error), PoisonReason::KeyMismatch);
 }
 
 #[test]

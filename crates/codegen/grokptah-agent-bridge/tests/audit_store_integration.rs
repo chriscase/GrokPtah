@@ -335,7 +335,7 @@ fn a_wrong_key_fails_closed_and_leaks_no_path_or_key_material() {
         None,
     ));
     let message = format!("{error:#}");
-    assert!(message.contains("manifest_mac_mismatch"), "{message}");
+    assert!(message.contains("key_mismatch"), "{message}");
     assert!(!message.contains('/'), "no path may appear: {message}");
     assert!(
         !message.to_lowercase().contains("key ") && !message.contains("audit.key"),
@@ -1040,4 +1040,46 @@ fn legacy_divergence_after_the_cutover_is_recorded_once_not_on_every_open() {
         vec![1, 1, 1],
         "the same divergence must be recorded once, not on every open"
     );
+}
+
+#[test]
+fn environment_key_custody_opens_the_same_ledger_across_restarts() {
+    let dir = TempDir::new().unwrap();
+    let var = "GROKPTAH_AUDIT_KEY_ENV_CUSTODY_TEST";
+    let material = "a".repeat(64);
+    std::env::set_var(var, &material);
+
+    let custody = AuditKeyCustody::Environment { var: var.into() };
+    let store = OrchStore::open_with_audit(dir.path(), custody.clone(), None).unwrap();
+    store
+        .append_audit(&entry("under-env-custody", "accepted"))
+        .unwrap();
+    let before = store.audit_status().global_last_seq;
+    drop(store);
+
+    // The same environment key reopens the same authenticated ledger.
+    let store = OrchStore::open_with_audit(dir.path(), custody, None).unwrap();
+    assert!(store.audit_status().global_last_seq >= before);
+    store.verify_audit().unwrap();
+    // No key file is created for this mode.
+    assert!(!dir.path().join("audit.key").exists());
+    drop(store);
+
+    // A different key is a key mismatch, not silent re-initialisation.
+    let other = AuditKeyCustody::Provided(b"an-entirely-different-installation".to_vec());
+    let error = open_error(OrchStore::open_with_audit(dir.path(), other, None));
+    assert!(format!("{error:#}").contains("key_mismatch"), "{error:#}");
+
+    // Malformed material fails closed rather than being coerced.
+    std::env::set_var(var, "not-hex");
+    let error = open_error(OrchStore::open_with_audit(
+        dir.path(),
+        AuditKeyCustody::Environment { var: var.into() },
+        None,
+    ));
+    assert!(
+        format!("{error:#}").contains("key_unavailable"),
+        "{error:#}"
+    );
+    std::env::remove_var(var);
 }

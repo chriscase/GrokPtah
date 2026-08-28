@@ -29,6 +29,7 @@ use crate::types::AuthState;
 const SERVICE: &str = "grokptah-desktop";
 const ACCOUNT_API_KEY: &str = "xai-api-key";
 const ACCOUNT_DISPLAY: &str = "display-name";
+const ACCOUNT_AUDIT_KEY: &str = "audit-chain-key-v2";
 const PROVIDER_KEYCHAIN_PREFIX: &str = "keychain:";
 const OIDC_DISCOVERY_PATH: &str = "/.well-known/openid-configuration";
 const REFRESH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -36,6 +37,42 @@ const REFRESH_OPERATION_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_REFRESH_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_REFRESH_TOKEN_BYTES: usize = 32 * 1024;
 const MAX_REFRESH_EXPIRES_SECONDS: u64 = 24 * 60 * 60;
+
+/// Installation key for the durable audit ledger, held in the OS keychain.
+///
+/// Created on first use. Returns `None` when the keychain is unavailable or
+/// refuses; the caller then falls back to a private key file rather than
+/// running with an audit nobody can authenticate.
+pub(crate) fn audit_chain_key() -> Option<Vec<u8>> {
+    let entry = Entry::new(SERVICE, ACCOUNT_AUDIT_KEY).ok()?;
+    match entry.get_password() {
+        Ok(stored) => {
+            let trimmed = stored.trim();
+            if trimmed.len() != 64 || !trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return None;
+            }
+            let mut material = Vec::with_capacity(32);
+            for pair in trimmed.as_bytes().chunks_exact(2) {
+                let hi = (pair[0] as char).to_digit(16)? as u8;
+                let lo = (pair[1] as char).to_digit(16)? as u8;
+                material.push((hi << 4) | lo);
+            }
+            Some(material)
+        }
+        Err(keyring::Error::NoEntry) => {
+            let mut material = [0u8; 32];
+            material[..16].copy_from_slice(Uuid::new_v4().as_bytes());
+            material[16..].copy_from_slice(Uuid::new_v4().as_bytes());
+            let mut encoded = String::with_capacity(64);
+            for byte in material {
+                encoded.push_str(&format!("{byte:02x}"));
+            }
+            entry.set_password(&encoded).ok()?;
+            Some(material.to_vec())
+        }
+        Err(_) => None,
+    }
+}
 
 pub(crate) fn xai_keychain_api_key_state() -> crate::live_attestation::KeychainApiKeyState {
     let Ok(entry) = Entry::new(SERVICE, ACCOUNT_API_KEY) else {

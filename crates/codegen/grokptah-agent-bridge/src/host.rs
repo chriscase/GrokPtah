@@ -1,5 +1,6 @@
 //! In-process agent host — the shipped runtime desktop uses.
 
+use crate::audit::AuditKeyCustody;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1200,7 +1201,8 @@ impl AgentHostHandle {
         if let Some(existing) = store.as_ref() {
             return Ok(existing.clone());
         }
-        let opened = OrchStore::open(self.runtime_home.orchestration_root())?;
+        let root = self.runtime_home.orchestration_root();
+        let opened = OrchStore::open_with_audit(&root, audit_key_custody(&root), None)?;
         *store = Some(opened.clone());
         Ok(opened)
     }
@@ -12521,4 +12523,35 @@ mod tests {
         assert_eq!(runs[0].stop_cause, Some(RunStopCause::DurationLimit));
         assert_eq!(runs[0].bounds.max_duration_ms, 50);
     }
+}
+
+/// Select audit key custody for this deployment (#462).
+///
+/// Every mode fails closed inside the ledger when its material is missing or
+/// unsafe; this only chooses which one applies.
+///
+/// The OS keychain is opt-in rather than the default because writing a new
+/// keychain item can block on an interactive prompt, which would hang a
+/// headless or packaged-build environment. Until that is validated on a real
+/// packaged host, the default stays the private key file beside the ledger.
+fn audit_key_custody(orchestration_root: &std::path::Path) -> AuditKeyCustody {
+    const KEY_ENV: &str = "GROKPTAH_AUDIT_KEY";
+    const KEYCHAIN_ENV: &str = "GROKPTAH_AUDIT_KEYCHAIN";
+
+    // Headless service: an operator-managed key in the environment.
+    if std::env::var_os(KEY_ENV).is_some() {
+        return AuditKeyCustody::Environment {
+            var: KEY_ENV.to_string(),
+        };
+    }
+    // Packaged desktop, opt-in: the OS keychain.
+    if std::env::var(KEYCHAIN_ENV).is_ok_and(|value| value == "1") {
+        if let Some(material) = crate::auth_store::audit_chain_key() {
+            return AuditKeyCustody::Provided(material);
+        }
+        // Refusing here would take the host down over a keychain that merely
+        // declined; the private file is still an authenticated ledger.
+        eprintln!("[grokptah] audit keychain custody unavailable; using the private key file");
+    }
+    AuditKeyCustody::local_file_for(orchestration_root)
 }

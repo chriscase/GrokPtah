@@ -105,6 +105,10 @@ pub enum PoisonReason {
     SymlinkedPath,
     ConcurrentWriter,
     KeyUnavailable,
+    /// The manifest names a different installation key than the one supplied.
+    /// A *diagnostic* only: it is derived from unauthenticated bytes, so it
+    /// fails closed exactly like a MAC mismatch and proves nothing on its own.
+    KeyMismatch,
     RollbackDetected,
     PartialPersistence,
 }
@@ -138,6 +142,7 @@ impl PoisonReason {
             Self::SymlinkedPath => "symlinked_path",
             Self::ConcurrentWriter => "concurrent_writer",
             Self::KeyUnavailable => "key_unavailable",
+            Self::KeyMismatch => "key_mismatch",
             Self::RollbackDetected => "rollback_detected",
             Self::PartialPersistence => "partial_persistence",
         }
