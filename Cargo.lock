@@ -14221,6 +14221,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "xai-provider-attempt"
+version = "0.1.0"
+dependencies = [
+ "fs2",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
 name = "xai-ratatui-inline"
 version = "0.1.0"
 dependencies = [

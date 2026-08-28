@@ -42,9 +42,7 @@ impl ProviderAttemptContext {
         store: xai_provider_attempt::ProviderAttemptStore,
         operation_id: String,
         authority: xai_provider_attempt::AuthorityBinding,
-        revalidate: Arc<
-            dyn Fn() -> Option<xai_provider_attempt::AuthorityBinding> + Send + Sync,
-        >,
+        revalidate: Arc<dyn Fn() -> Option<xai_provider_attempt::AuthorityBinding> + Send + Sync>,
     ) -> Self {
         Self {
             store,
@@ -75,7 +73,8 @@ impl ProviderAttemptContext {
         attempt
             .admit(&self.authority)
             .map_err(|error| anyhow!("admit provider attempt: {error}"))?;
-        let current = (self.revalidate)().ok_or_else(|| anyhow!("provider authority unavailable"))?;
+        let current =
+            (self.revalidate)().ok_or_else(|| anyhow!("provider authority unavailable"))?;
         attempt
             .begin_send(&current)
             .map_err(|error| anyhow!("begin physical provider send: {error}"))
@@ -2586,11 +2585,7 @@ where
                     usage.as_ref(),
                 );
             }
-            settle_provider_http_response(
-                &mut physical_permit,
-                status.as_u16(),
-                raw.as_bytes(),
-            )?;
+            settle_provider_http_response(&mut physical_permit, status.as_u16(), raw.as_bytes())?;
             return Ok(step);
         }
         if content_type.contains("application/json") {
@@ -2653,11 +2648,7 @@ where
                     usage.as_ref(),
                 );
             }
-            settle_provider_http_response(
-                &mut physical_permit,
-                status.as_u16(),
-                raw.as_bytes(),
-            )?;
+            settle_provider_http_response(&mut physical_permit, status.as_u16(), raw.as_bytes())?;
             return Ok(step);
         }
 
@@ -3029,10 +3020,8 @@ pub async fn replay_xai_provider_contract_on_loopback(
     };
     let mut deltas = Vec::new();
     let mut thought_deltas = Vec::new();
-    let attempt_root = std::env::temp_dir().join(format!(
-        "grokptah-provider-contract-{}",
-        Uuid::new_v4()
-    ));
+    let attempt_root =
+        std::env::temp_dir().join(format!("grokptah-provider-contract-{}", Uuid::new_v4()));
     let attempt_store = xai_provider_attempt::ProviderAttemptStore::open(&attempt_root)
         .map_err(|error| anyhow!("open provider contract attempt ledger: {error}"))?;
     let attempt_authority = xai_provider_attempt::AuthorityBinding::new(
@@ -3119,10 +3108,7 @@ mod compatible_stream_tests {
     }
 
     fn provider_attempt_context() -> ProviderAttemptContext {
-        let root = std::env::temp_dir().join(format!(
-            "grokptah-provider-test-{}",
-            Uuid::new_v4()
-        ));
+        let root = std::env::temp_dir().join(format!("grokptah-provider-test-{}", Uuid::new_v4()));
         let store = xai_provider_attempt::ProviderAttemptStore::open(root).unwrap();
         let authority = xai_provider_attempt::AuthorityBinding::new(
             "provider-test",
@@ -4042,11 +4028,7 @@ pub(crate) async fn call_xai_chat(
     // chat/completions shape
     if let Some(content) = v["choices"][0]["message"]["content"].as_str() {
         if !content.is_empty() {
-            settle_provider_http_response(
-                &mut physical_permit,
-                200,
-                raw.as_bytes(),
-            )?;
+            settle_provider_http_response(&mut physical_permit, 200, raw.as_bytes())?;
             return Ok(ChatReply {
                 text: content.to_string(),
                 usage,
@@ -4056,11 +4038,7 @@ pub(crate) async fn call_xai_chat(
     // responses API fallback (some catalog models use this backend)
     if let Some(content) = v["output_text"].as_str() {
         if !content.is_empty() {
-            settle_provider_http_response(
-                &mut physical_permit,
-                200,
-                raw.as_bytes(),
-            )?;
+            settle_provider_http_response(&mut physical_permit, 200, raw.as_bytes())?;
             return Ok(ChatReply {
                 text: content.to_string(),
                 usage,
@@ -4075,11 +4053,7 @@ pub(crate) async fn call_xai_chat(
             }
         }
         if !parts.is_empty() {
-                settle_provider_http_response(
-                    &mut physical_permit,
-                    200,
-                    raw.as_bytes(),
-                )?;
+            settle_provider_http_response(&mut physical_permit, 200, raw.as_bytes())?;
             return Ok(ChatReply {
                 text: parts.join(""),
                 usage,

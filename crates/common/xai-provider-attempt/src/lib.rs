@@ -250,7 +250,10 @@ impl fmt::Display for AttemptError {
                 write!(f, "invalid provider-attempt transition {from:?} -> {to:?}")
             }
             Self::NotExplicitlyAuthorized => {
-                write!(f, "uncertain provider attempt requires explicit reconciliation")
+                write!(
+                    f,
+                    "uncertain provider attempt requires explicit reconciliation"
+                )
             }
             Self::SettlementDoesNotMatch => write!(f, "provider settlement does not match attempt"),
             Self::InvalidProviderEffect => write!(f, "provider effect proof is invalid"),
@@ -401,12 +404,10 @@ impl ProviderAttemptStore {
 
     pub fn load(&self, attempt_id: &str) -> Result<Option<ProviderAttempt>, AttemptError> {
         validate_id(attempt_id, "attempt id")?;
-        Ok(self
-            .read_record(attempt_id)?
-            .map(|_| ProviderAttempt {
-                store: self.clone(),
-                attempt_id: attempt_id.to_owned(),
-            }))
+        Ok(self.read_record(attempt_id)?.map(|_| ProviderAttempt {
+            store: self.clone(),
+            attempt_id: attempt_id.to_owned(),
+        }))
     }
 
     pub fn projection(&self, attempt_id: &str) -> Result<Option<AttemptProjection>, AttemptError> {
@@ -774,10 +775,7 @@ impl PhysicalSendPermit {
         if !(200..=299).contains(&status_code) {
             return Err(AttemptError::InvalidProviderEffect);
         }
-        let effect_id = format!(
-            "http-response-{}",
-            hex(&Sha256::digest(response_bytes))
-        );
+        let effect_id = format!("http-response-{}", hex(&Sha256::digest(response_bytes)));
         self.settle(ProviderSettlement::new(
             self.provider_request_id.clone(),
             effect_id,
@@ -1041,7 +1039,11 @@ mod tests {
             "Bearer",
             "grokptah-",
         ] {
-            assert!(!json.to_ascii_lowercase().contains(&forbidden.to_ascii_lowercase()));
+            assert!(
+                !json
+                    .to_ascii_lowercase()
+                    .contains(&forbidden.to_ascii_lowercase())
+            );
         }
     }
 
@@ -1154,7 +1156,10 @@ mod tests {
         let mut permit = attempt.begin_send(&binding).unwrap();
         permit.transport_after_possible_write().unwrap();
         assert_eq!(
-            attempt.reconcile(&ReconciliationAuthorization::new("operator-1").unwrap(), ProviderTruth::NotApplied),
+            attempt.reconcile(
+                &ReconciliationAuthorization::new("operator-1").unwrap(),
+                ProviderTruth::NotApplied
+            ),
             Ok(())
         );
         assert_eq!(attempt.state().unwrap(), SendState::Admitted);
