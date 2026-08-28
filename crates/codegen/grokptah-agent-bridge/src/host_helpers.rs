@@ -9,7 +9,7 @@ use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::capability_authority::{CapabilityAuthority, CapabilitySnapshot};
+use crate::capability_authority::{CapabilityAuthority, CapabilityPrincipal, CapabilitySnapshot};
 use crate::events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 use crate::host::AgentHostHandle;
 use crate::local_tools;
@@ -3020,6 +3020,8 @@ where
 /// credentials this helper can send.
 #[doc(hidden)]
 pub async fn replay_xai_provider_contract_on_loopback(
+    authority: &CapabilityAuthority,
+    principal: &CapabilityPrincipal,
     base_url: &str,
     model: &str,
     messages: &[serde_json::Value],
@@ -3078,7 +3080,6 @@ pub async fn replay_xai_provider_contract_on_loopback(
     };
     let mut deltas = Vec::new();
     let mut thought_deltas = Vec::new();
-    let authority = CapabilityAuthority::new(true);
     let step = call_provider_agent_step(
         credentials,
         target,
@@ -3090,9 +3091,9 @@ pub async fn replay_xai_provider_contract_on_loopback(
         &CancellationToken::new(),
         None,
         None,
-        Some(&authority),
-        Some("provider-contract-loopback"),
-        Some("provider-contract-loopback"),
+        Some(authority),
+        Some(principal.id()),
+        Some(principal.policy_generation()),
         |delta| deltas.push(delta.to_string()),
         |delta| thought_deltas.push(delta.to_string()),
     )

@@ -3,11 +3,11 @@
 use std::path::{Component, Path, PathBuf};
 
 use grokptah_agent_bridge::{
-    public_xai_endpoint_fingerprint, replay_xai_provider_contract_on_loopback, ArtifactReference,
-    AttemptDisposition, CampaignActuals, CampaignBudgets, CampaignIdentity, CertificationCheck,
-    CredentialMethodClass, PersistentAgentCapture, ProviderAttemptEvidence, ProviderDialectClass,
-    ProviderIdentity, ProviderRouteClass, StreamFraming, UsageEvidence,
-    PERSISTENT_AGENT_CAPTURE_SCHEMA,
+    public_xai_endpoint_fingerprint, replay_xai_provider_contract_on_loopback, AgentHost,
+    ArtifactReference, AttemptDisposition, CampaignActuals, CampaignBudgets, CampaignIdentity,
+    CertificationCheck, CredentialMethodClass, HostConfig, PersistentAgentCapture,
+    ProviderAttemptEvidence, ProviderDialectClass, ProviderIdentity, ProviderRouteClass,
+    RuntimeHome, SessionKind, StreamFraming, UsageEvidence, PERSISTENT_AGENT_CAPTURE_SCHEMA,
 };
 use grokptah_test_gateway::{split_at, MockGateway, Response, Step};
 use serde::Deserialize;
@@ -104,6 +104,29 @@ fn sha256(bytes: &[u8]) -> String {
         .collect()
 }
 
+fn canonical_replay_context() -> (
+    tempfile::TempDir,
+    grokptah_agent_bridge::AgentHostHandle,
+    grokptah_agent_bridge::CapabilityPrincipal,
+) {
+    let runtime_dir = tempfile::tempdir().expect("replay runtime");
+    let runtime =
+        RuntimeHome::from_path(runtime_dir.path().join("grokptah")).expect("runtime home");
+    let host = AgentHost::create_with_runtime_home(HostConfig::default(), runtime);
+    host.start().expect("host start");
+    let workspace = std::env::current_dir().expect("workspace");
+    let session = host
+        .session_new_kind(SessionKind::Build)
+        .expect("replay session");
+    host.set_project_cwd(&workspace).expect("project cwd");
+    host.session_set_cwd(session.id, &workspace)
+        .expect("session cwd");
+    host.ensure_session_agent(session.id)
+        .expect("canonical Agent");
+    let principal = host.capability_principal(session.id).expect("principal");
+    (runtime_dir, host, principal)
+}
+
 #[tokio::test]
 async fn synthetic_xai_fixture_replays_through_the_production_provider_path() {
     let (fixture, response) = load_fixture();
@@ -117,7 +140,11 @@ async fn synthetic_xai_fixture_replays_through_the_production_provider_path() {
         {"role": "user", "content": "Return the fixture marker."}
     ]);
     let tools = serde_json::json!([]);
+    let (_runtime, host, principal) = canonical_replay_context();
+    let authority = host.capability_authority();
     let replay = replay_xai_provider_contract_on_loopback(
+        authority.as_ref(),
+        &principal,
         &format!("{}/v1", gateway.base_url()),
         "grok-fixture",
         messages.as_array().unwrap(),
@@ -178,7 +205,11 @@ async fn production_provider_path_rejects_a_fixture_without_its_terminal_marker(
         &[1, truncated.len() - 1],
     )))])
     .await;
+    let (_runtime, host, principal) = canonical_replay_context();
+    let authority = host.capability_authority();
     let error = replay_xai_provider_contract_on_loopback(
+        authority.as_ref(),
+        &principal,
         &format!("{}/v1", gateway.base_url()),
         "grok-fixture",
         &[serde_json::json!({"role": "user", "content": "synthetic"})],
@@ -191,7 +222,11 @@ async fn production_provider_path_rejects_a_fixture_without_its_terminal_marker(
 
 #[tokio::test]
 async fn provider_contract_replay_refuses_non_loopback_authority() {
+    let (_runtime, host, principal) = canonical_replay_context();
+    let authority = host.capability_authority();
     let error = replay_xai_provider_contract_on_loopback(
+        authority.as_ref(),
+        &principal,
         "https://api.x.ai/v1",
         "grok-fixture",
         &[serde_json::json!({"role": "user", "content": "synthetic"})],

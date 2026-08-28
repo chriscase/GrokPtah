@@ -986,7 +986,7 @@ impl AgentHostHandle {
         )
         .map_err(|_| anyhow!("canonical authentication generation is malformed"))?
         .max(1);
-        CapabilityPrincipal::new(principal, auth_generation)
+        CapabilityPrincipal::new(principal, auth_generation, policy_digest)
             .map_err(|error| anyhow!("invalid canonical capability principal: {error}"))
     }
 

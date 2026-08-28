@@ -28,6 +28,7 @@ const MAX_EFFECT_LEASE_TTL: Duration = Duration::seconds(30);
 pub struct CapabilityPrincipal {
     id: String,
     auth_generation: u64,
+    policy_generation: String,
 }
 
 impl std::fmt::Debug for CapabilityPrincipal {
@@ -41,13 +42,18 @@ impl std::fmt::Debug for CapabilityPrincipal {
 }
 
 impl CapabilityPrincipal {
-    pub(crate) fn new(id: String, auth_generation: u64) -> Result<Self> {
-        if id.trim().is_empty() || auth_generation == 0 {
+    pub(crate) fn new(id: String, auth_generation: u64, policy_generation: String) -> Result<Self> {
+        if id.trim().is_empty()
+            || auth_generation == 0
+            || policy_generation.trim().is_empty()
+            || policy_generation.len() > 256
+        {
             bail!("canonical capability principal is invalid");
         }
         Ok(Self {
             id,
             auth_generation,
+            policy_generation,
         })
     }
 
@@ -57,6 +63,10 @@ impl CapabilityPrincipal {
 
     pub(crate) fn auth_generation(&self) -> u64 {
         self.auth_generation
+    }
+
+    pub(crate) fn policy_generation(&self) -> &str {
+        &self.policy_generation
     }
 }
 

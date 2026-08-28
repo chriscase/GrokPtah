@@ -27,8 +27,6 @@ use parking_lot::Mutex;
 const SERVICE_ENVELOPE_ID: &str = "computer-service-envelope-v1";
 const RUN_ENVELOPE_PREFIX: &str = "computer-run-envelope:";
 const SETTLEMENT_ENVELOPE_PREFIX: &str = "computer-settlement-envelope:";
-const POLICY_GENERATION: &str = "computer-use-policy.v1";
-const ACTION_POLICY_GENERATION: &str = "computer-use-action-policy.v1";
 
 const RUN_OPERATIONS: &[&str] = &[
     "authorize",
@@ -130,17 +128,20 @@ impl ComputerUseService {
                 ));
             }
         }
+        let service_policy_generation =
+            format!("{}:computer-service", principal.policy_generation());
+        let action_policy_generation = format!("{}:computer-action", principal.policy_generation());
         let service_snapshot = CapabilitySnapshot::computer_use_service(
             principal.id(),
             &self.backend.capabilities(),
-            POLICY_GENERATION,
+            &service_policy_generation,
             principal.auth_generation(),
         )
         .map_err(|error| ComputerError::new(ComputerErrorCode::Internal, error.to_string()))?;
         let action_snapshot = CapabilitySnapshot::computer_use_service(
             principal.id(),
             &self.backend.capabilities(),
-            ACTION_POLICY_GENERATION,
+            &action_policy_generation,
             principal.auth_generation(),
         )
         .map_err(|error| ComputerError::new(ComputerErrorCode::Internal, error.to_string()))?;
@@ -161,7 +162,7 @@ impl ComputerUseService {
                 service_snapshot.clone(),
                 principal.id(),
                 principal.auth_generation(),
-                POLICY_GENERATION,
+                &service_policy_generation,
                 RUN_OPERATIONS
                     .iter()
                     .copied()
@@ -1099,6 +1100,7 @@ impl ComputerUseService {
                 "canonical Computer Use principal is unavailable",
             )
         })?;
+        let action_policy_generation = format!("{}:computer-action", principal.policy_generation());
         let action_guard = self.action_capability.lock();
         let action = action_guard.as_ref().ok_or_else(|| {
             ComputerError::new(
@@ -1115,7 +1117,7 @@ impl ComputerUseService {
                 action.snapshot.clone(),
                 principal.id(),
                 principal.auth_generation(),
-                ACTION_POLICY_GENERATION,
+                &action_policy_generation,
                 RUN_OPERATIONS.iter().copied(),
                 &run.run_id,
                 Utc::now(),
@@ -1130,7 +1132,7 @@ impl ComputerUseService {
                 action.snapshot.clone(),
                 principal.id(),
                 principal.auth_generation(),
-                ACTION_POLICY_GENERATION,
+                &action_policy_generation,
                 SETTLEMENT_OPERATIONS.iter().copied(),
                 &run.run_id,
                 Utc::now(),
@@ -1674,7 +1676,9 @@ mod tests {
 
     fn install_test_policy(service: &ComputerUseService) {
         service
-            .install_host_policy(CapabilityPrincipal::new("test-agent".into(), 1).unwrap())
+            .install_host_policy(
+                CapabilityPrincipal::new("test-agent".into(), 7, "test-policy".into()).unwrap(),
+            )
             .unwrap();
     }
 
