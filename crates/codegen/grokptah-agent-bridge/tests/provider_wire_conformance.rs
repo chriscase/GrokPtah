@@ -131,7 +131,7 @@ fn replay_credential_fingerprint() -> String {
     field(&mut digest, "user", Some("synthetic-user"));
     field(&mut digest, "team", Some("synthetic-team"));
     field(&mut digest, "scope", None);
-    format!("v1-sha256:{digest:x}")
+    format!("v1-sha256:{:x}", digest.finalize())
 }
 
 fn install_replay_provider_envelope(
