@@ -1607,6 +1607,19 @@ impl AgentHostHandle {
                 }
             }
         };
+        let mut owner_binding_changed = false;
+        if let Some(auth_context) = self.canonical_auth_context.lock().clone() {
+            match agent.owner_principal_id.as_deref() {
+                None => {
+                    agent.owner_principal_id = Some(auth_context.owner_id().to_string());
+                    owner_binding_changed = true;
+                }
+                Some(owner) if owner != auth_context.owner_id() => {
+                    bail!("canonical Agent principal binding is foreign");
+                }
+                Some(_) => {}
+            }
+        }
         let was_associated = agent.known_lane_ids().contains(&session_id);
         let mut association_changed = false;
         if !agent.lane_ids.contains(&session_id) {
@@ -1624,7 +1637,7 @@ impl AgentHostHandle {
             });
             association_changed = true;
         }
-        if association_changed {
+        if association_changed || owner_binding_changed {
             agent.updated_at = now;
             store.save_agent(&agent)?;
         }
@@ -1644,6 +1657,12 @@ impl AgentHostHandle {
             if let Err(error) = session_store::save_session_meta(&session) {
                 bail!("failed to persist session agent binding: {error:#}");
             }
+        }
+        if owner_binding_changed || existing_id.is_none() {
+            // Agent publication is the explicit host-policy boundary. If a
+            // provider route is unavailable, the tool/provider paths remain
+            // fail-closed rather than issuing from the next request.
+            let _ = self.preinstall_canonical_capability_policy(session_id);
         }
         Ok(agent)
     }
@@ -11772,13 +11791,6 @@ mod tests {
         let session = host
             .session_new_kind(SessionKind::Build)
             .expect("create build session");
-        let agent = host
-            .ensure_session_agent(session.id)
-            .expect("create canonical Agent");
-        host.ensure_orchestration_store()
-            .expect("open orchestration store")
-            .claim_agent_owner(&agent.agent_id, "primary")
-            .expect("bind canonical Agent owner");
         let _authority_service = crate::orchestration::OrchestrationService::new(
             host.clone(),
             host.event_bus(),
