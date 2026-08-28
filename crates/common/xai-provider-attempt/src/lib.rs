@@ -1610,7 +1610,7 @@ mod tests {
             auth_generation: binding.auth_generation,
             capability_generation: binding.capability_generation,
             effect_lease_id: binding.effect_lease_id.clone(),
-            effect_scope: binding.effect_scope.clone(),
+            effect_scope: scope.into(),
             revoked_effect_lease_ids: Vec::new(),
             issued_effect_lease_ids,
         };
