@@ -166,7 +166,7 @@ fn real_store_retention_requires_a_verified_export_and_keeps_tombstone() {
             "private",
         ))
         .unwrap();
-    store.rotate_audit().unwrap();
+    store.rotate_audit_key().unwrap();
     let destination = temp.path().join("retention-export");
     let receipt = store.export_audit(&destination, ExportFormat::V2).unwrap();
 
