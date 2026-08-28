@@ -95,7 +95,6 @@ pub enum EntryReason {
     InvalidRequest,
     Conflict,
     Internal,
-    Unauthenticated,
 }
 
 /// Byte-exact evidence for a recovery that changed the journal.
