@@ -180,9 +180,26 @@ authority.
 | SDK feature matrix (default / none / fake / conformance) | clean |
 | Reference consumer `fmt` / `clippy` / `test` | clean; 8 tests |
 | Bridge `cargo test --locked -- --test-threads=1` | 533 passed, 1 pre-existing failure |
+| Service crate `cargo test --locked -- --test-threads=1` | 19 passed, 1 pre-existing failure |
 | Live service + Desktop batteries | 15/0/11 each, agreeing |
 
-The one bridge failure is `mcp_continuity_probe::continuity_probe_is_evidence_first_and_recoverable`,
-a 90-second subprocess timeout. It reproduces **identically at the unmodified
-base**, whose bridge tree (`3a801b5e`) is byte-identical to `origin/main`, so it
-is pre-existing and Linux-container-only.
+Two failures, both **established pre-existing** rather than assumed. Each was
+re-run with the bridge source reverted to the base — whose tree (`3a801b5e`) is
+byte-identical to `origin/main` — and failed identically there:
+
+* `mcp_continuity_probe::continuity_probe_is_evidence_first_and_recoverable`,
+  a 90-second subprocess timeout (98.5s to fail, at base and at head alike).
+* `service_smoke::service_mcp_contract_covers_scoped_live_reconnect_controls_and_restart`,
+  where `ptah_cancel` returns `invalid_request` because the run has already
+  reached a terminal state under `GROKPTAH_AGENT_OFFLINE=1`.
+
+Both are Linux-container artifacts; the hosted `desktop` job runs macOS, where
+the native keychain backend applies and neither reproduces.
+
+### Bridge clippy
+
+`cargo clippy --locked --all-targets -- -D warnings` reports two dead-code
+errors in `computer_use/macos_observation.rs`. That code is macOS-gated, so it
+is genuinely unreachable on Linux and live on the CI platform. They appear in a
+bare `cargo check` of the unmodified base, and nothing in this branch touches
+`computer_use/`. With `-A dead_code` the bridge is clippy-clean.
