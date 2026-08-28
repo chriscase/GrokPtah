@@ -380,7 +380,7 @@ fn read_public_key(root: &Path) -> Result<ed25519_dalek::VerifyingKey> {
         .try_into()
         .map_err(|_| anyhow!("canonical authority public key is invalid"))?;
     ed25519_dalek::VerifyingKey::from_bytes(&bytes)
-        .map_err(|_| anyhow!("canonical authority public key is invalid").into())
+        .map_err(|_| anyhow!("canonical authority public key is invalid"))
 }
 
 fn set_private_permissions(file: &File) -> Result<()> {
@@ -397,7 +397,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn decode_hex(value: &str) -> Option<Vec<u8>> {
-    if value.len() % 2 != 0 {
+    if !value.len().is_multiple_of(2) {
         return None;
     }
     value
