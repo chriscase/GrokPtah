@@ -22,6 +22,9 @@ pub(crate) fn assemble(
         .map_err(|error| anyhow!("canonical auth authority unavailable: {error}"))?
         .ok_or_else(|| anyhow!("canonical auth authority is unavailable"))?;
     let credential_identity = credentials.qualification_identity_fingerprint();
+    let auth_generation = u64::from_str_radix(&credential_identity[..16], 16)
+        .unwrap_or(1)
+        .max(1);
     let (principal_incarnation, capability_generation) = if let Some(agent_id) = agent_id {
         let agent = store
             .and_then(|store| store.load_agent(agent_id).ok().flatten())
@@ -51,7 +54,7 @@ pub(crate) fn assemble(
 
     xai_provider_attempt::CanonicalHostAuthority::from_trusted_host_adapter(
         principal_incarnation,
-        turn_generation.max(1),
+        auth_generation,
         capability_generation,
         effect_lease_id,
         effect_scope,
