@@ -1335,6 +1335,7 @@ dependencies = [
  "tower",
  "uuid",
  "walkdir",
+ "xai-provider-attempt",
 ]
 
 [[package]]
@@ -5346,6 +5347,17 @@ dependencies = [
  "libc",
  "once_cell",
  "pkg-config",
+]
+
+[[package]]
+name = "xai-provider-attempt"
+version = "0.1.0"
+dependencies = [
+ "fs2",
+ "serde",
+ "serde_json",
+ "sha2",
+ "uuid",
 ]
 
 [[package]]
