@@ -447,7 +447,7 @@ impl AttemptContext {
         validate_id(&operation_id, "operation id")?;
         let authority_scope = authority_scope.into();
         validate_id(&authority_scope, "authority scope")?;
-        let (record, lease_id) = store.select_host_lease(&authority_scope, &operation_id)?;
+        let (record, lease_id) = store.select_host_lease(&authority_scope)?;
         let mut context = Self::new(store, operation_id, record.binding_for_lease(&lease_id)?)?;
         context.authority_scope = Some(authority_scope);
         Ok(context)
@@ -525,7 +525,7 @@ impl AttemptContext {
             .authority_scope
             .as_deref()
             .ok_or(AttemptError::InvalidAuthority)?;
-        let (_record, lease_id) = self.store.select_host_lease(scope, &self.operation_id)?;
+        let (_record, lease_id) = self.store.select_host_lease(scope)?;
         let authority = self.authority.with_effect_lease(lease_id)?;
         Self::new(self.store.clone(), self.operation_id.clone(), authority).map(|mut context| {
             context.authority_scope = self.authority_scope.clone();
@@ -739,7 +739,6 @@ impl ProviderAttemptStore {
             self.claim_lease_locked(
                 &record.authority.effect_scope,
                 &record.authority.effect_lease_id,
-                &record.operation_id,
                 &record.attempt_id,
             )?;
             Ok((Some(record), ()))
@@ -838,9 +837,7 @@ impl ProviderAttemptStore {
     fn select_host_lease(
         &self,
         authority_scope: &str,
-        operation_id: &str,
     ) -> Result<(HostAuthorityRecord, String), AttemptError> {
-        validate_id(operation_id, "operation id")?;
         let lock_path = self.root.join(".provider-attempts.lock");
         let lock = OpenOptions::new()
             .create(true)
@@ -863,7 +860,6 @@ impl ProviderAttemptStore {
         &self,
         authority_scope: &str,
         lease_id: &str,
-        _operation_id: &str,
         attempt_id: &str,
     ) -> Result<(), AttemptError> {
         let authority_path = self.authority_path(authority_scope);
@@ -1917,7 +1913,9 @@ mod tests {
             AttemptContext::from_host_ledger(store.clone(), "second-operation", scope).unwrap();
         let mut permit = context.begin("xai", b"one-use", true).unwrap();
         assert_eq!(
-            second_context.begin("xai", b"second-use", true).unwrap_err(),
+            second_context
+                .begin("xai", b"second-use", true)
+                .unwrap_err(),
             AttemptError::EffectLeaseAlreadyUsed
         );
         DeterministicFakeTransport::default()
@@ -1934,17 +1932,13 @@ mod tests {
         write_host_snapshot(temp.path(), scope, &authority(1));
         fs::create_dir_all(store.root.join("lease-claims")).unwrap();
         fs::write(
-            store
-                .root
-                .join("lease-claims")
-                .join("lease-1.claim"),
+            store.root.join("lease-claims").join("lease-1.claim"),
             "orphan-operation",
         )
         .unwrap();
 
         let context =
-            AttemptContext::from_host_ledger(store.clone(), "recovered-operation", scope)
-                .unwrap();
+            AttemptContext::from_host_ledger(store.clone(), "recovered-operation", scope).unwrap();
         assert!(
             !store
                 .root
