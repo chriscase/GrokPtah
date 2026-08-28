@@ -180,6 +180,41 @@ async fn rotation_and_reincarnation_fence_session_work_and_queue_resources() {
     set_grokptah_home_override(None);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_and_foreign_run_denials_are_byte_identical() {
+    let (_home, _env, host, orch, session_id, workspace) = setup();
+    let primary = orch.auth_header(Some("Bearer primary-secret-477")).unwrap();
+    let foreign_session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(foreign_session.id, workspace.path())
+        .unwrap();
+    let foreign = orch
+        .submit_task(
+            &primary,
+            "foreign-run-477",
+            foreign_session.id,
+            workspace.path(),
+            "foreign run".into(),
+            None,
+        )
+        .await
+        .unwrap();
+    let foreign_run_id = foreign["runId"].as_str().unwrap();
+    let unknown = orch
+        .get_run_scoped(&primary, session_id, workspace.path(), "unknown-run-477")
+        .unwrap_err();
+    let foreign = orch
+        .get_run_scoped(&primary, session_id, workspace.path(), foreign_run_id)
+        .unwrap_err();
+    assert_eq!(
+        serde_json::to_vec(&unknown).unwrap(),
+        serde_json::to_vec(&foreign).unwrap(),
+        "unknown and foreign run reads must not form an existence oracle"
+    );
+    orch.stop_background_tasks().await;
+    host.stop().unwrap();
+    set_grokptah_home_override(None);
+}
+
 fn workspace_path_string(path: &std::path::Path) -> String {
     path.display().to_string()
 }
