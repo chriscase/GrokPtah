@@ -117,6 +117,7 @@ impl ComputerUseService {
                 .ok()?;
             Some(RunCapability {
                 envelope_id: SERVICE_ENVELOPE_ID.into(),
+                settlement_envelope_id: SERVICE_ENVELOPE_ID.into(),
                 snapshot,
                 capability,
             })
