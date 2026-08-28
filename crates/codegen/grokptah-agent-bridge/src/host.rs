@@ -2886,7 +2886,7 @@ impl AgentHostHandle {
             eprintln!("[grokptah] transcript rewrite failed: {e:#}");
             return;
         }
-        let g = self.inner.lock();
+        let mut g = self.inner.lock();
         if let Some(s) = g.sessions.get_mut(&id) {
             s.persisted_len = s.transcript.len();
             s.transcript_loaded = true;
@@ -3125,7 +3125,7 @@ impl AgentHostHandle {
         if !g.open_tab_ids.contains(&id) {
             g.open_tab_ids.push(id);
         }
-        g.sessions.insert(id, staged.session);
+        g.sessions.insert(id, staged.session.clone());
         Ok(summary)
     }
 
