@@ -1146,6 +1146,38 @@ fn committed_bootstrap_marker_is_removed_without_replaying_import() {
 }
 
 #[test]
+fn migration_crash_cuts_before_each_phase_converge_from_legacy_inputs() {
+    for staged_count in 0..=2 {
+        let dir = TempDir::new().unwrap();
+        let legacy = legacy_v1_dir(dir.path(), "{\"old\":1}\n", "{\"new\":2}\n");
+        let root = dir.path().join("audit");
+        std::fs::create_dir_all(root.join("generations")).unwrap();
+        let ids = vec![
+            "g-000001".to_string(),
+            "g-000002".to_string(),
+            "g-000003".to_string(),
+        ];
+        let marker = super::import::BootstrapMarker::new(ids.clone(), &keys()).unwrap();
+        std::fs::write(
+            super::import::bootstrap_path(&root),
+            serde_json::to_vec(&marker).unwrap(),
+        )
+        .unwrap();
+        for id in ids.iter().take(staged_count) {
+            std::fs::create_dir_all(root.join("generations").join(id)).unwrap();
+        }
+
+        let ledger = open_with_legacy(&root, &legacy).unwrap();
+        assert_eq!(ledger.status().imported_generations, 2);
+        assert!(!super::import::bootstrap_path(&root).exists());
+        assert_eq!(
+            std::fs::read(legacy.join("audit.jsonl")).unwrap(),
+            b"{\"new\":2}\n"
+        );
+    }
+}
+
+#[test]
 fn unterminated_legacy_line_is_counted_without_changing_legacy_bytes() {
     let dir = TempDir::new().unwrap();
     let legacy = legacy_v1_dir(dir.path(), "{\"a\":1}", "{\"b\":2}\n");
@@ -1159,6 +1191,42 @@ fn unterminated_legacy_line_is_counted_without_changing_legacy_bytes() {
         b"{\"a\":1}"
     );
     assert!(ledger.verify_all().is_ok());
+}
+
+#[test]
+fn intent_and_outcome_share_one_opaque_producer_identity() {
+    let dir = TempDir::new().unwrap();
+    let ledger = opened(dir.path());
+    ledger
+        .append(
+            AuditEntryInput::new(
+                "provider_attempt",
+                EntryPhase::Intent,
+                EntryOutcome::Accepted,
+            )
+            .with_intent_id("producer-intent-42")
+            .with_request("request-secret"),
+        )
+        .unwrap();
+    ledger
+        .append(
+            AuditEntryInput::new(
+                "provider_attempt",
+                EntryPhase::Outcome,
+                EntryOutcome::Uncertain,
+            )
+            .with_intent_id("producer-intent-42")
+            .with_request("request-secret"),
+        )
+        .unwrap();
+    let path = journal_of(dir.path(), "g-000001");
+    let body = std::fs::read_to_string(path).unwrap();
+    assert!(body.contains("\"phase\":\"intent\""));
+    assert!(body.contains("\"phase\":\"outcome\""));
+    assert!(!body.contains("producer-intent-42"));
+    assert!(!body.contains("request-secret"));
+    drop(ledger);
+    assert!(opened(dir.path()).verify_all().is_ok());
 }
 
 #[test]

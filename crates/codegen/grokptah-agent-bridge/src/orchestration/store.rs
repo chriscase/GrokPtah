@@ -161,6 +161,9 @@ impl OrchStore {
         custody: AuditKeyCustody,
     ) -> anyhow::Result<Self> {
         let root = root.as_ref().to_path_buf();
+        if root.exists() && fs::symlink_metadata(&root)?.file_type().is_symlink() {
+            anyhow::bail!("orchestration store root is a symlink");
+        }
         fs::create_dir_all(root.join("runs"))?;
         fs::create_dir_all(root.join("agents"))?;
         fs::create_dir_all(root.join("agent-specs"))?;
