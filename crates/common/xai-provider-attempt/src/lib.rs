@@ -321,12 +321,21 @@ impl ReconciliationAuthorization {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct StoredReconciliation {
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReconciliationPayload {
+    attempt_id: String,
     operator_id: String,
     provider_request_id: String,
     provider_effect_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoredReconciliation {
+    #[serde(flatten)]
+    payload: ReconciliationPayload,
+    signature: String,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -605,22 +614,44 @@ impl AttemptContext {
             .root
             .join("reconciliation")
             .join(format!("{}.json", attempt.attempt_id()));
-        let bytes = fs::read(path).map_err(|error| {
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 AttemptError::NotExplicitlyAuthorized
             } else {
                 AttemptError::Io(error.to_string())
             }
         })?;
-        let record: StoredReconciliation = serde_json::from_slice(&bytes)
-            .map_err(|error| AttemptError::Serialization(error.to_string()))?;
-        if record.provider_request_id != attempt.provider_request_id()? {
+        if metadata.file_type().is_symlink() {
             return Err(AttemptError::NotExplicitlyAuthorized);
         }
-        let authorization = ReconciliationAuthorization::new(record.operator_id)?;
-        let truth = match record.provider_effect_id {
+        #[cfg(unix)]
+        if std::os::unix::fs::PermissionsExt::mode(&metadata.permissions()) & 0o077 != 0 {
+            return Err(AttemptError::NotExplicitlyAuthorized);
+        }
+        let bytes = fs::read(path)?;
+        let record: StoredReconciliation = serde_json::from_slice(&bytes)
+            .map_err(|error| AttemptError::Serialization(error.to_string()))?;
+        let payload = serde_json::to_vec(&record.payload)
+            .map_err(|error| AttemptError::Serialization(error.to_string()))?;
+        let public_key = self
+            .read_authority_public_key()
+            .map_err(|_| AttemptError::NotExplicitlyAuthorized)?;
+        let signature_bytes =
+            unhex(&record.signature).ok_or(AttemptError::NotExplicitlyAuthorized)?;
+        let signature = Signature::from_slice(&signature_bytes)
+            .map_err(|_| AttemptError::NotExplicitlyAuthorized)?;
+        public_key
+            .verify(&payload, &signature)
+            .map_err(|_| AttemptError::NotExplicitlyAuthorized)?;
+        if record.payload.attempt_id != attempt.attempt_id()
+            || record.payload.provider_request_id != attempt.provider_request_id()?
+        {
+            return Err(AttemptError::NotExplicitlyAuthorized);
+        }
+        let authorization = ReconciliationAuthorization::new(record.payload.operator_id)?;
+        let truth = match record.payload.provider_effect_id {
             Some(effect_id) => ProviderTruth::Applied(ProviderSettlement::new(
-                record.provider_request_id,
+                record.payload.provider_request_id,
                 effect_id,
             )?),
             None => ProviderTruth::NotApplied,
@@ -756,6 +787,19 @@ impl ProviderAttemptStore {
         let bytes = fs::read(&path)?;
         let record: HostAuthorityRecord = serde_json::from_slice(&bytes)
             .map_err(|error| AttemptError::Serialization(error.to_string()))?;
+        let public_key = self.read_authority_public_key()?;
+        let signature_bytes = unhex(&record.signature).ok_or(AttemptError::InvalidAuthority)?;
+        let signature =
+            Signature::from_slice(&signature_bytes).map_err(|_| AttemptError::InvalidAuthority)?;
+        let payload = serde_json::to_vec(&record.payload)
+            .map_err(|error| AttemptError::Serialization(error.to_string()))?;
+        public_key
+            .verify(&payload, &signature)
+            .map_err(|_| AttemptError::InvalidAuthority)?;
+        Ok(record)
+    }
+
+    fn read_authority_public_key(&self) -> Result<VerifyingKey, AttemptError> {
         let public_key_path = self
             .root
             .join("canonical-authorities")
@@ -775,17 +819,7 @@ impl ProviderAttemptStore {
             .as_slice()
             .try_into()
             .map_err(|_| AttemptError::InvalidAuthority)?;
-        let public_key = VerifyingKey::from_bytes(&public_key_array)
-            .map_err(|_| AttemptError::InvalidAuthority)?;
-        let signature_bytes = unhex(&record.signature).ok_or(AttemptError::InvalidAuthority)?;
-        let signature =
-            Signature::from_slice(&signature_bytes).map_err(|_| AttemptError::InvalidAuthority)?;
-        let payload = serde_json::to_vec(&record.payload)
-            .map_err(|error| AttemptError::Serialization(error.to_string()))?;
-        public_key
-            .verify(&payload, &signature)
-            .map_err(|_| AttemptError::InvalidAuthority)?;
-        Ok(record)
+        VerifyingKey::from_bytes(&public_key_array).map_err(|_| AttemptError::InvalidAuthority)
     }
 
     fn authority_path(&self, authority_scope: &str) -> PathBuf {
@@ -1635,6 +1669,41 @@ mod tests {
         .unwrap();
     }
 
+    fn write_reconciliation(
+        root: &Path,
+        attempt_id: &str,
+        operator_id: &str,
+        provider_request_id: &str,
+        provider_effect_id: Option<&str>,
+        signed: bool,
+    ) {
+        use ed25519_dalek::{Signer, SigningKey};
+        let payload = ReconciliationPayload {
+            attempt_id: attempt_id.into(),
+            operator_id: operator_id.into(),
+            provider_request_id: provider_request_id.into(),
+            provider_effect_id: provider_effect_id.map(str::to_owned),
+        };
+        let mut record = serde_json::json!({
+            "attemptId": payload.attempt_id,
+            "operatorId": payload.operator_id,
+            "providerRequestId": payload.provider_request_id,
+            "providerEffectId": payload.provider_effect_id,
+        });
+        if signed {
+            let signing_key = SigningKey::from_bytes(&[7; 32]);
+            let signature = signing_key.sign(&serde_json::to_vec(&payload).unwrap());
+            record["signature"] = serde_json::Value::String(hex(signature.to_bytes().as_slice()));
+        }
+        let path = root
+            .join("reconciliation")
+            .join(format!("{attempt_id}.json"));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
     #[test]
     fn state_transition_matrix_is_monotonic() {
         let all = [
@@ -2001,37 +2070,38 @@ mod tests {
         let mut permit = context.begin("xai", b"request", true).unwrap();
         permit.transport_after_possible_write().unwrap();
         let attempt = store.load(permit.attempt_id()).unwrap().unwrap();
-        fs::create_dir_all(store.root.join("reconciliation")).unwrap();
-        fs::write(
-            store
-                .root
-                .join("reconciliation")
-                .join(format!("{}.json", attempt.attempt_id())),
-            serde_json::json!({
-                "operatorId": "operator-1",
-                "providerRequestId": "opaque-wrong",
-                "providerEffectId": null,
-            })
-            .to_string(),
-        )
-        .unwrap();
+        write_reconciliation(
+            &store.root,
+            attempt.attempt_id(),
+            "operator-1",
+            "opaque-wrong",
+            None,
+            false,
+        );
         assert_eq!(
             context.reconcile_from_host_ledger(&attempt),
             Err(AttemptError::NotExplicitlyAuthorized)
         );
-        fs::write(
-            store
-                .root
-                .join("reconciliation")
-                .join(format!("{}.json", attempt.attempt_id())),
-            serde_json::json!({
-                "operatorId": "operator-1",
-                "providerRequestId": attempt.provider_request_id().unwrap(),
-                "providerEffectId": null,
-            })
-            .to_string(),
-        )
-        .unwrap();
+        write_reconciliation(
+            &store.root,
+            attempt.attempt_id(),
+            "operator-1",
+            "opaque-wrong",
+            None,
+            true,
+        );
+        assert_eq!(
+            context.reconcile_from_host_ledger(&attempt),
+            Err(AttemptError::NotExplicitlyAuthorized)
+        );
+        write_reconciliation(
+            &store.root,
+            attempt.attempt_id(),
+            "operator-1",
+            &attempt.provider_request_id().unwrap(),
+            None,
+            true,
+        );
         context.reconcile_from_host_ledger(&attempt).unwrap();
         assert_eq!(attempt.state().unwrap(), SendState::Admitted);
     }

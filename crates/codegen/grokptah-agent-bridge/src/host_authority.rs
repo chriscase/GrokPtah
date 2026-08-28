@@ -4,7 +4,7 @@
 //! identity and capability lease into a durable authority snapshot consumed
 //! by `xai-provider-attempt`.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -61,9 +61,18 @@ struct CapabilityEffectLease {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct VerifiedReconciliation {
+    attempt_id: String,
     operator_id: String,
     provider_request_id: String,
     provider_effect_id: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SignedVerifiedReconciliation {
+    #[serde(flatten)]
+    payload: VerifiedReconciliation,
+    signature: String,
 }
 
 pub(crate) fn assemble(
@@ -177,11 +186,18 @@ pub(crate) fn write_verified_reconciliation(
         .write(true)
         .open(&temporary)?;
     let record = VerifiedReconciliation {
+        attempt_id: attempt_id.into(),
         operator_id: operator.token_id.clone(),
         provider_request_id: receipt.provider_request_id().into(),
         provider_effect_id: receipt.provider_effect_id().map(str::to_owned),
     };
-    file.write_all(&serde_json::to_vec(&record)?)?;
+    let signing_key = signing_key(attempt_root)?;
+    let payload = serde_json::to_vec(&record)?;
+    let signature = signing_key.sign(&payload);
+    file.write_all(&serde_json::to_vec(&SignedVerifiedReconciliation {
+        payload: record,
+        signature: hex(signature.to_bytes().as_slice()),
+    })?)?;
     file.sync_all()?;
     drop(file);
     fs::rename(temporary, directory.join(format!("{attempt_id}.json")))?;
