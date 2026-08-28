@@ -22,6 +22,51 @@ pub(crate) const DEFAULT_CAPABILITY_TTL: Duration = Duration::minutes(15);
 const MAX_CAPABILITY_TTL: Duration = Duration::hours(1);
 const MAX_EFFECT_LEASE_TTL: Duration = Duration::seconds(30);
 
+/// Opaque principal/auth-generation input supplied by the canonical host seam.
+/// Callers cannot construct or deserialize this identity.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CapabilityPrincipal {
+    id: String,
+    auth_generation: u64,
+}
+
+impl std::fmt::Debug for CapabilityPrincipal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CapabilityPrincipal")
+            .field("id", &"[opaque]")
+            .field("auth_generation", &"[opaque]")
+            .finish()
+    }
+}
+
+impl CapabilityPrincipal {
+    pub(crate) fn new(id: String, auth_generation: u64) -> Result<Self> {
+        if id.trim().is_empty() || auth_generation == 0 {
+            bail!("canonical capability principal is invalid");
+        }
+        Ok(Self {
+            id,
+            auth_generation,
+        })
+    }
+
+    pub(crate) fn host_default() -> Self {
+        Self {
+            id: "host-principal".into(),
+            auth_generation: 1,
+        }
+    }
+
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub(crate) fn auth_generation(&self) -> u64 {
+        self.auth_generation
+    }
+}
+
 /// The effect family to which a host-issued generation is bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum CapabilityKind {
@@ -158,7 +203,6 @@ struct CurrentGeneration {
 #[derive(Debug)]
 struct AuthorityState {
     process_nonce: String,
-    principal_id: String,
     auth_generation: u64,
     enabled: bool,
     next_generation: u64,
@@ -168,7 +212,6 @@ struct AuthorityState {
     consumed_leases: HashSet<String>,
 }
 
-const SERVICE_PRINCIPAL_ID: &str = "host-principal";
 const INITIAL_AUTH_GENERATION: u64 = 1;
 
 /// A host-installed authority envelope. Request fields can select an allowed
@@ -212,7 +255,6 @@ impl CapabilityAuthority {
         Self {
             state: Arc::new(Mutex::new(AuthorityState {
                 process_nonce: Uuid::new_v4().to_string(),
-                principal_id: SERVICE_PRINCIPAL_ID.into(),
                 auth_generation: INITIAL_AUTH_GENERATION,
                 enabled,
                 next_generation: 0,
@@ -346,7 +388,7 @@ impl CapabilityAuthority {
             || resource_scope.trim().is_empty()
             || resource_scope.len() > 256
             || policy_generation.trim().is_empty()
-            || principal_id != state.principal_id
+            || snapshot.key.principal != principal_id
             || auth_generation != state.auth_generation
         {
             bail!("canonical capability envelope is invalid or foreign");
@@ -638,7 +680,7 @@ fn validate_envelope_locked(
     envelope: &CanonicalEffectEnvelope,
     now: DateTime<Utc>,
 ) -> Result<()> {
-    if envelope.principal_id != state.principal_id
+    if envelope.principal_id != envelope.snapshot.key.principal
         || envelope.incarnation != state.process_nonce
         || envelope.auth_generation != state.auth_generation
         || envelope.capability_generation != envelope.capability.generation

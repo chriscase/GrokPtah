@@ -12,7 +12,9 @@ use tokio::sync::{oneshot, Notify};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::capability_authority::{CapabilityAuthority, CapabilitySnapshot, HostCapability};
+use crate::capability_authority::{
+    CapabilityAuthority, CapabilityPrincipal, CapabilitySnapshot, HostCapability,
+};
 use crate::completion::{
     build_evidence, enrich_terminal_handoff, observe_updates, CompletionObservations,
     CompletionUsage,
@@ -959,6 +961,15 @@ impl AgentHostHandle {
     /// Callers cannot construct, deserialize, or inspect its generations.
     pub fn capability_authority(&self) -> Arc<CapabilityAuthority> {
         self.capability_authority.clone()
+    }
+
+    /// Return the opaque principal generation from the canonical Agent seam.
+    /// This object is accepted only by host-owned adapters and is never a wire
+    /// projection.
+    pub fn capability_principal(&self, session_id: Uuid) -> Result<CapabilityPrincipal> {
+        let (principal, _) = self.computer_capability_identity(session_id)?;
+        CapabilityPrincipal::new(principal, 1)
+            .map_err(|error| anyhow!("invalid canonical capability principal: {error}"))
     }
     /// The validated durable root owned by this host process.
     pub fn runtime_home(&self) -> crate::discover::RuntimeHome {

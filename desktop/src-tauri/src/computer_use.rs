@@ -197,10 +197,15 @@ impl DesktopComputerUse {
             .bind_target(selection_token)
             .await
             .map_err(|error| error.to_string())?;
-        let service = ComputerUseService::new_with_authority(
+        let principal = self
+            .host
+            .capability_principal(owner_session_id)
+            .map_err(|error| error.to_string())?;
+        let service = ComputerUseService::new_with_authority_and_principal(
             backend,
             store,
             self.host.capability_authority(),
+            principal,
         );
         let limits = ComputerUseLimits {
             max_actions: 1,
@@ -392,10 +397,15 @@ impl DesktopComputerUse {
             .store
             .clone()
             .ok_or_else(|| self.initialization_error())?;
-        let service = Arc::new(ComputerUseService::new_with_authority(
+        let principal = self
+            .host
+            .capability_principal(owner_session_id)
+            .map_err(|error| error.to_string())?;
+        let service = Arc::new(ComputerUseService::new_with_authority_and_principal(
             backend,
             store,
             self.host.capability_authority(),
+            principal,
         ));
         let limits = ComputerUseLimits {
             max_actions: 8,

@@ -19,15 +19,14 @@ use super::types::{
     ComputerResult, ComputerRun, ComputerRunState, ComputerTarget, ComputerUseLimits,
 };
 use crate::capability_authority::{
-    CapabilityAuthority, CapabilitySnapshot, ConsumedEffect, EffectLease, HostCapability,
+    CapabilityAuthority, CapabilityPrincipal, CapabilitySnapshot, ConsumedEffect, EffectLease,
+    HostCapability,
 };
 use parking_lot::Mutex;
 
 const SERVICE_ENVELOPE_ID: &str = "computer-service-envelope-v1";
 const RUN_ENVELOPE_PREFIX: &str = "computer-run-envelope:";
 const SETTLEMENT_ENVELOPE_PREFIX: &str = "computer-settlement-envelope:";
-const SERVICE_PRINCIPAL_ID: &str = "host-principal";
-const AUTH_GENERATION: u64 = 1;
 const POLICY_GENERATION: &str = "computer-use-policy.v1";
 const ACTION_POLICY_GENERATION: &str = "computer-use-action-policy.v1";
 
@@ -50,6 +49,7 @@ pub struct ComputerUseService {
     store: ComputerStore,
     policy: ComputerPolicy,
     capability_authority: Arc<CapabilityAuthority>,
+    principal: CapabilityPrincipal,
     service_capability: Option<RunCapability>,
     action_capability: Option<RunCapability>,
     run_capabilities: Mutex<std::collections::HashMap<String, RunCapability>>,
@@ -87,8 +87,23 @@ impl ComputerUseService {
         store: ComputerStore,
         capability_authority: Arc<CapabilityAuthority>,
     ) -> Self {
+        Self::new_with_authority_and_principal(
+            backend,
+            store,
+            capability_authority,
+            CapabilityPrincipal::host_default(),
+        )
+    }
+
+    /// Construct a service bound to the canonical host principal seam.
+    pub fn new_with_authority_and_principal(
+        backend: Arc<dyn ComputerBackend>,
+        store: ComputerStore,
+        capability_authority: Arc<CapabilityAuthority>,
+        principal: CapabilityPrincipal,
+    ) -> Self {
         let service_capability = CapabilitySnapshot::computer_use_service(
-            SERVICE_PRINCIPAL_ID,
+            principal.id(),
             &backend.capabilities(),
             POLICY_GENERATION,
         )
@@ -106,8 +121,8 @@ impl ComputerUseService {
                     SERVICE_ENVELOPE_ID,
                     capability.clone(),
                     snapshot.clone(),
-                    SERVICE_PRINCIPAL_ID,
-                    AUTH_GENERATION,
+                    principal.id(),
+                    principal.auth_generation(),
                     POLICY_GENERATION,
                     RUN_OPERATIONS
                         .iter()
@@ -125,7 +140,7 @@ impl ComputerUseService {
             })
         });
         let action_capability = CapabilitySnapshot::computer_use_service(
-            SERVICE_PRINCIPAL_ID,
+            principal.id(),
             &backend.capabilities(),
             "computer-use-action-policy.v1",
         )
@@ -150,6 +165,7 @@ impl ComputerUseService {
             store,
             policy: ComputerPolicy,
             capability_authority,
+            principal,
             service_capability,
             action_capability,
             run_capabilities: Mutex::new(std::collections::HashMap::new()),
@@ -1064,8 +1080,8 @@ impl ComputerUseService {
                 &envelope_id,
                 action.capability.clone(),
                 action.snapshot.clone(),
-                SERVICE_PRINCIPAL_ID,
-                AUTH_GENERATION,
+                self.principal.id(),
+                self.principal.auth_generation(),
                 ACTION_POLICY_GENERATION,
                 RUN_OPERATIONS.iter().copied(),
                 &run.run_id,
@@ -1079,8 +1095,8 @@ impl ComputerUseService {
                 &settlement_envelope_id,
                 action.capability.clone(),
                 action.snapshot.clone(),
-                SERVICE_PRINCIPAL_ID,
-                AUTH_GENERATION,
+                self.principal.id(),
+                self.principal.auth_generation(),
                 ACTION_POLICY_GENERATION,
                 SETTLEMENT_OPERATIONS.iter().copied(),
                 &run.run_id,
