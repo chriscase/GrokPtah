@@ -6157,6 +6157,8 @@ mod tests {
         let next_generation = store.rotate_audit_key().unwrap();
         assert_eq!(next_generation, "g-000002");
         assert_ne!(store.audit_status().key_id, old_key_id);
+        let custody = crate::audit::AuditKeyCustody::headless_service(d.path()).unwrap();
+        assert_eq!(custody.all_keys().len(), 2);
         store
             .append_audit(&AuditEntry {
                 ts: Utc::now(),
