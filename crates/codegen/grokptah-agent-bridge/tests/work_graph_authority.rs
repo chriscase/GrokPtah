@@ -12,8 +12,8 @@ use std::sync::{Arc, Barrier};
 
 use chrono::{Duration, Utc};
 use grokptah_agent_bridge::orchestration::{
-    evaluate_admission, evaluate_quorum, review_subject_digest, AdmissionBlock, DependencyStates,
-    OrchStore, QuorumOutcome, ReviewReceipt, ReviewVerdict, WorkReviewPolicy,
+    evaluate_admission, evaluate_quorum, review_subject_digest, AdmissionBlock, BlockProvenance,
+    DependencyStates, OrchStore, QuorumOutcome, ReviewReceipt, ReviewVerdict, WorkReviewPolicy,
 };
 use grokptah_agent_bridge::orchestration::{WorkDependency, WorkItem, WorkPolicy, WorkState};
 use uuid::Uuid;
@@ -327,8 +327,11 @@ fn a_reconciled_dependency_wait_reports_the_wait_not_merely_unclaimable() {
     let dir = tempfile::tempdir().expect("tempdir");
     let scope = Scope::new(dir.path(), "eval");
     let mut item = scope.item(&["dep"]);
-    // This is the canonical persisted encoding of "waiting".
+    // This is the canonical persisted encoding of "waiting": reconciliation
+    // stamps its own holds `Derived`, and the evaluator reads through them to
+    // the reason the item is actually waiting.
     item.state = WorkState::Blocked;
+    item.block_provenance = Some(BlockProvenance::Derived);
     let block = evaluate_admission(
         &item,
         &states(&[("dep", Some(WorkState::Running))]),
@@ -338,6 +341,22 @@ fn a_reconciled_dependency_wait_reports_the_wait_not_merely_unclaimable() {
     );
     assert_eq!(block, AdmissionBlock::DependenciesPending);
     assert!(!block.needs_operator_attention());
+
+    // A hold with no provenance is ambiguous, and ambiguity fails closed: it
+    // may be a legacy record whose migration could not be written, and reading
+    // it as derived would let dependencies becoming ready release a hold a
+    // human placed.
+    item.block_provenance = None;
+    assert_eq!(
+        evaluate_admission(
+            &item,
+            &states(&[("dep", Some(WorkState::Running))]),
+            &[],
+            None,
+            Utc::now(),
+        ),
+        AdmissionBlock::ManuallyBlocked
+    );
 }
 
 #[test]
@@ -471,23 +490,50 @@ fn a_review_gated_item_cannot_be_claimed_and_mints_no_attempt() {
         WorkState::Queued,
         "the gate does not change the persisted state; admission is what refuses"
     );
+    // With no executor bound the gate has nothing to approve, and that is the
+    // reason reported: `Unassigned` work is claimable by any in-scope worker,
+    // so an approval cast here would name no one.
     assert_eq!(
         store
             .admission_block_at(&item.work_id, Utc::now())
             .expect("admission"),
-        AdmissionBlock::ReviewPending
+        AdmissionBlock::ExecutorUnbound
     );
 
     let error = store
         .claim_work(&item.work_id, "worker", None)
         .expect_err("a gated item must not be claimable");
-    assert!(error.to_string().contains("review_pending"), "{error}");
+    assert!(error.to_string().contains("executor_unbound"), "{error}");
     assert!(
         store
             .list_work_attempts(Some(&item.work_id))
             .expect("attempts")
             .is_empty(),
         "a refused claim must not leave an attempt behind"
+    );
+
+    // Binding an executor moves the reason to the gate itself, and the item is
+    // still not claimable: assignment is not approval.
+    store
+        .assign_work(&item.work_id, Some("worker".into()), None)
+        .expect("assign");
+    assert_eq!(
+        store
+            .admission_block_at(&item.work_id, Utc::now())
+            .expect("admission"),
+        AdmissionBlock::ExecutorUnbound,
+        "an assignment whose agent record does not resolve is still unbound"
+    );
+    let error = store
+        .claim_work(&item.work_id, "worker", None)
+        .expect_err("assignment alone must not open the gate");
+    assert!(error.to_string().contains("executor_unbound"), "{error}");
+    assert!(
+        store
+            .list_work_attempts(Some(&item.work_id))
+            .expect("attempts")
+            .is_empty(),
+        "and still mints no attempt"
     );
 }
 

@@ -405,6 +405,10 @@ pub struct ExecutionIdentity {
     pub agent_id: String,
     pub agent_spec_revision: u64,
     pub model_selection_key: String,
+    /// Owning principal of the executing agent. An agent re-homed to a
+    /// different owner is a different executing authority even when its
+    /// specification is unchanged.
+    pub owner_principal_id: Option<String>,
 }
 
 /// Digest of everything a reviewer is actually agreeing to.
@@ -675,6 +679,11 @@ pub enum AdmissionBlock {
     /// A human or coordinator blocked this item explicitly. Reconciliation
     /// never clears it and never overwrites its reason.
     ManuallyBlocked,
+    /// The item carries a review gate but names no accepted executor, so there
+    /// is nothing for a quorum to approve. `Unassigned` and `Declined` work is
+    /// claimable by any in-scope worker, so approving it would approve *no
+    /// executor* and let whichever worker claimed first become one.
+    ExecutorUnbound,
 }
 
 impl AdmissionBlock {
@@ -697,6 +706,7 @@ impl AdmissionBlock {
                 | Self::AttemptsExhausted
                 | Self::DeadlineExceeded
                 | Self::ManuallyBlocked
+                | Self::ExecutorUnbound
         )
     }
 
@@ -718,6 +728,7 @@ impl AdmissionBlock {
             Self::Cancelled => "cancelled",
             Self::Container => "container",
             Self::ManuallyBlocked => "manually_blocked",
+            Self::ExecutorUnbound => "executor_unbound",
         }
     }
 }
@@ -727,6 +738,18 @@ impl AdmissionBlock {
 /// `None` means unresolvable — unknown, or outside the scope. The two are not
 /// distinguished, here or anywhere a caller can observe.
 pub type DependencyStates = BTreeMap<String, Option<WorkState>>;
+
+/// True when the item names an executor that has accepted the assignment.
+///
+/// `Offered` is not enough (the offer may still be declined), and `Unassigned`
+/// or `Declined` work is claimable by any in-scope worker.
+pub fn has_accepted_executor(item: &WorkItem) -> bool {
+    item.assignment_status == super::workload::AssignmentStatus::Accepted
+        && item
+            .assigned_agent_id
+            .as_deref()
+            .is_some_and(|agent| !agent.trim().is_empty())
+}
 
 /// The single admission evaluator.
 ///
@@ -740,15 +763,6 @@ pub fn evaluate_admission(
     execution: Option<&ExecutionIdentity>,
     now: DateTime<Utc>,
 ) -> AdmissionBlock {
-    // An explicit block outranks everything except a settled outcome: a human
-    // who stopped this item is not overruled by dependencies becoming ready.
-    if item.state == WorkState::Blocked
-        && item
-            .block_provenance
-            .is_some_and(BlockProvenance::is_manual)
-    {
-        return AdmissionBlock::ManuallyBlocked;
-    }
     match item.state {
         WorkState::Succeeded => return AdmissionBlock::Succeeded,
         WorkState::Failed => {
@@ -762,8 +776,23 @@ pub fn evaluate_admission(
         WorkState::Cancelled => return AdmissionBlock::Cancelled,
         _ => {}
     }
+    // A container is never executable whatever holds it, and `Container` is
+    // the more informative answer than any hold placed on it.
     if item.is_container {
         return AdmissionBlock::Container;
+    }
+    // An explicit block outranks everything below: a human who stopped this
+    // item is not overruled by dependencies becoming ready.
+    //
+    // Ambiguous provenance fails closed. `OrchStore::open` stamps every legacy
+    // `Blocked` record as manual before reconciliation can see it, so `None`
+    // here means that migration could not write the record. Reading it as
+    // derived would let an upgrade silently re-queue -- and then execute --
+    // work a human had stopped.
+    if item.state == WorkState::Blocked
+        && item.block_provenance.is_none_or(BlockProvenance::is_manual)
+    {
+        return AdmissionBlock::ManuallyBlocked;
     }
     if item.deadline.is_some_and(|deadline| deadline <= now) {
         return AdmissionBlock::DeadlineExceeded;
@@ -797,6 +826,13 @@ pub fn evaluate_admission(
     }
 
     if let Some(policy) = item.review.as_ref() {
+        // A gate can only approve a named executor. Without an accepted
+        // assignment the subject would record "no executor", and the ledger
+        // lets any in-scope worker claim `Unassigned` or `Declined` work --
+        // so the approved authority and the running one would differ.
+        if !has_accepted_executor(item) || execution.is_none() {
+            return AdmissionBlock::ExecutorUnbound;
+        }
         let subject = review_subject_digest(item, execution);
         return match evaluate_quorum(policy, receipts, &subject) {
             Ok(QuorumOutcome::Met) => AdmissionBlock::Admissible,
