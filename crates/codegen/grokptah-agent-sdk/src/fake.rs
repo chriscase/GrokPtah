@@ -566,6 +566,33 @@ impl FakeControlPlane {
         );
     }
 
+    /// Record an unsettled receipt at an exact instant.
+    ///
+    /// Test support for the one case a wall clock cannot produce on demand:
+    /// two receipts inside a single millisecond whose sub-millisecond order is
+    /// the inverse of their request-id order. That is the shape a paged walk
+    /// loses when the ordering key and the cursor key disagree on precision.
+    pub fn strand_receipt_at(
+        &self,
+        request_id: &RequestId,
+        operation: OperationClass,
+        run_id: &RunId,
+        recorded_at: DateTime<Utc>,
+    ) {
+        let mut state = self.lock();
+        state.receipts.insert(
+            request_id.as_str().to_string(),
+            Receipt {
+                payload_hash: "0".repeat(64),
+                response: serde_json::Value::Null,
+                operation,
+                status: ReceiptStatus::Pending,
+                run_id: Some(run_id.as_str().to_string()),
+                recorded_at,
+            },
+        );
+    }
+
     /// The session this host's own account owns.
     pub fn seeded_session(&self) -> Option<SessionView> {
         let state = self.lock();
@@ -1322,10 +1349,18 @@ impl AgentControlPlane for FakeControlPlane {
                 recorded_at: receipt.recorded_at,
             });
         }
-        // `(recorded_at, request_id)` — chronological, tie-broken, so two
-        // receipts written in the same millisecond cannot swap pages.
+        // Order on exactly the key the cursor encodes.
+        //
+        // Sorting by the full `recorded_at` while the cursor carries only
+        // milliseconds is not a cosmetic mismatch — it is the same defect the
+        // host had. Two receipts inside one millisecond whose sub-millisecond
+        // order is the *inverse* of their request-id order straddle the page
+        // boundary in opposite directions, and the second is skipped on
+        // resume. Truncating here makes the comparison the pager performs and
+        // the comparison the ordering performs the same comparison.
         items.sort_by(|a, b| {
-            (a.recorded_at, a.request_id.as_str()).cmp(&(b.recorded_at, b.request_id.as_str()))
+            (a.recorded_at.timestamp_millis(), a.request_id.as_str())
+                .cmp(&(b.recorded_at.timestamp_millis(), b.request_id.as_str()))
         });
 
         let has_more = items.len() > limit;

@@ -901,9 +901,12 @@ impl ReceiptPage {
 /// encoding a live host uses, and a consumer that learned to build one from
 /// this would break against every real host.
 pub fn receipt_cursor(receipt: &ReceiptView) -> Cursor {
+    // No clamping. The encoded value must be *exactly* the comparison key —
+    // a cursor that says `0` for a receipt whose key is negative filters that
+    // receipt out of its own resume.
     Cursor::from_opaque(format!(
         "{}:{}",
-        receipt.recorded_at.timestamp_millis().max(0),
+        receipt.recorded_at.timestamp_millis(),
         receipt.request_id
     ))
 }

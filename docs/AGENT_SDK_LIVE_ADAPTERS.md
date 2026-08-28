@@ -322,7 +322,7 @@ exists for — with the original code preserved as a detail for diagnosis.
 `creating_a_session_twice_under_one_key_yields_one_session` proves the live
 path: two calls, one session, and the session count rises by exactly one.
 
-### F-5 — Receipt ordering and its cursor disagreed on precision (fixed)
+### F-5 — Receipt ordering and its cursor disagreed on precision (fixed, twice)
 
 Ordering compared the full `created_at`; the cursor carried only milliseconds.
 Two receipts inside one millisecond whose sub-millisecond order is the inverse
@@ -330,6 +330,25 @@ of their request-id order straddled the page boundary in opposite directions,
 and the second was skipped on resume. Both now use the same truncated key, and
 `same_millisecond_receipts_with_inverse_ids_are_never_skipped` builds exactly
 that pair and walks it one page at a time.
+
+**The same defect was still in the SDK's fake, and the first fix missed it.**
+Review had asked for it explicitly — "make the fake receipt adapter sort by the
+exact `(timestamp_millis, request_id)` cursor key" — and only the host was
+fixed. `FakeControlPlane::list_receipts` compared `(recorded_at, request_id)` at
+full `DateTime` precision while `receipt_cursor` encoded milliseconds, so the
+in-process adapter every consumer tests against silently dropped a receipt on
+exactly the pair the host had been fixed for. `same_millisecond_receipts_with_inverse_ids_survive_a_walk`
+pins it, with the instants written rather than taken from a wall clock, and was
+confirmed to fail against the old ordering (`req-a was skipped by the walk:
+["req-b", "req-0001"]`).
+
+`receipt_cursor` also clamped negative milliseconds to zero while the
+comparison key did not, so a pre-epoch receipt's own cursor would have filtered
+it out of its own resume. The clamp is gone: the encoded value is exactly the
+comparison key.
+
+A fake that pages differently from the host is worse than no fake — it teaches
+a consumer a resume protocol that loses data against the real thing.
 
 ### F-1 — An existence oracle on every run read (fixed)
 
@@ -509,7 +528,7 @@ authority.
 
 | Check | Result |
 |---|---|
-| SDK `fmt` / `clippy -D warnings` / `test --locked` | clean; 125 tests |
+| SDK `fmt` / `clippy -D warnings` / `test --locked` | clean; 126 tests |
 | SDK feature matrix (default / none / fake / conformance) | clean |
 | Reference consumer `fmt` / `clippy` / `test` | clean; 8 tests |
 | Bridge strict clippy, the exact CI command | clean apart from the two macOS-gated `computer_use` findings present at base |

@@ -413,18 +413,93 @@ async fn multi_page_listing_is_deterministic_and_resumable() {
         .collect();
     assert_eq!(at_once, walked, "paged and unpaged order must agree");
 
-    // And that order is chronological, tie-broken by request id.
-    let keys: Vec<(chrono::DateTime<chrono::Utc>, String)> = whole
+    // And that order is chronological, tie-broken by request id — on the
+    // *millisecond* key, which is the one the cursor carries. Asserting the
+    // full-precision key here would pass while the pager used a coarser one.
+    let keys: Vec<(i64, String)> = whole
         .items
         .iter()
-        .map(|receipt| (receipt.recorded_at, receipt.request_id.as_str().to_string()))
+        .map(|receipt| {
+            (
+                receipt.recorded_at.timestamp_millis(),
+                receipt.request_id.as_str().to_string(),
+            )
+        })
         .collect();
     let mut sorted = keys.clone();
     sorted.sort();
     assert_eq!(
         keys, sorted,
-        "listing is not in (recordedAt, requestId) order"
+        "listing is not in (recordedAt millis, requestId) order"
     );
+}
+
+/// Two receipts in one millisecond, ordered the opposite way underneath, must
+/// both survive a paged walk.
+///
+/// This is the precision mismatch the host had and the fake still had after it
+/// was fixed there: ordering compared the full `recorded_at` while the cursor
+/// carried only milliseconds, so a pair whose sub-millisecond order is the
+/// inverse of their request-id order straddles the page boundary in opposite
+/// directions and the second is dropped on resume. A wall clock will not
+/// produce that pair on demand, so the instants are pinned.
+#[tokio::test]
+async fn same_millisecond_receipts_with_inverse_ids_survive_a_walk() {
+    use chrono::TimeZone;
+
+    let plane = plane();
+    let (_session, selector) = completed_run(&plane).await;
+
+    // One millisecond, two receipts. `req-a` sorts first by id and *last* by
+    // sub-millisecond instant — the disagreement that loses one of them.
+    let base = chrono::Utc
+        .timestamp_millis_opt(1_700_000_000_000)
+        .single()
+        .expect("a valid instant");
+    let first = RequestId::new("req-a").expect("valid id");
+    let second = RequestId::new("req-b").expect("valid id");
+    plane.strand_receipt_at(
+        &first,
+        OperationClass::Cancel,
+        &selector.run_id,
+        base + chrono::Duration::nanoseconds(900_000),
+    );
+    plane.strand_receipt_at(
+        &second,
+        OperationClass::Cancel,
+        &selector.run_id,
+        base + chrono::Duration::nanoseconds(100_000),
+    );
+
+    let observer = ObserverHandle::new(plane);
+    let mut walked: Vec<String> = Vec::new();
+    let mut request = PageRequest::new().limit(1);
+    loop {
+        let page = observer
+            .list_receipts(selector.clone(), request.clone())
+            .await
+            .expect("page");
+        walked.extend(
+            page.items
+                .iter()
+                .map(|receipt| receipt.request_id.as_str().to_string()),
+        );
+        match page.next_cursor {
+            None => break,
+            Some(cursor) => request = PageRequest::new().after(cursor).limit(1),
+        }
+    }
+
+    for id in ["req-a", "req-b"] {
+        assert!(
+            walked.iter().any(|seen| seen == id),
+            "{id} was skipped by the walk: {walked:?}"
+        );
+    }
+    let mut unique = walked.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), walked.len(), "resume duplicated: {walked:?}");
 }
 
 #[tokio::test]
