@@ -5484,9 +5484,11 @@ fn note_legacy_v1_state(audit: &AuditLedger, legacy_dir: &Path) -> anyhow::Resul
         .filter(|generation| !generation.origin_authenticated)
         .filter_map(|generation| generation.journal_sha256.clone())
         .collect();
-    if imported.is_empty() {
-        return Ok(());
-    }
+    // No early return on an empty import set. A cutover that found no v1
+    // ledger imported nothing, and skipping the scan in that case meant a v1
+    // file created *afterwards* -- an older binary writing to the retired
+    // ledger -- was never noticed at all. With no imports, every nonempty v1
+    // file is divergent, which is exactly the right answer.
     for name in ["audit.jsonl", "audit.jsonl.1"] {
         let path = legacy_dir.join(name);
         let Ok(bytes) = fs::read(&path) else { continue };

@@ -264,6 +264,18 @@ live ledger and re-verified before a path-free receipt is returned.
 `verify_export` accepts both v1 and v2, so exports taken before generations
 existed stay verifiable.
 
+### What a verifier checks
+
+`verify_export` re-derives everything from the sealed export manifest: its MAC,
+that coverage tiles `globalFirstSeq..globalLastSeq` exactly, that the chain
+stitches across holes, each carried journal's digest and length, and a full
+chain scan of each carried generation. For a v2 export it also authenticates
+the **copied ledger manifest** and cross-checks its installation, key,
+manifest epoch, retention epoch and first sequence against the seal — that file
+was previously carried unauthenticated, so a substituted one could misdescribe
+generations, tombstones and retention to anyone who trusted the directory as a
+whole.
+
 ### What an export commits
 
 Export never rotates, truncates, deletes, or changes a journal byte, a
@@ -348,6 +360,14 @@ which over-states doubt; clearing first would lose the evidence entirely.
 `get_capacity` surfaces it as `acceptedNotJournaledEpisodes` and
 `maxAcceptedNotJournaled`.
 
+## Counter exhaustion
+
+Sequence, manifest epoch, retention epoch and generation index all fail closed
+at `u64::MAX`/`u32::MAX` with `sequence_exhausted` rather than saturating.
+A saturated sequence would reissue one authenticated position to two different
+entries, and a saturated manifest epoch would stop being a compare-and-swap,
+so both writers could believe they won.
+
 ## Migration from v1
 
 On the first open of a root that has never committed a manifest, an optional
@@ -406,17 +426,25 @@ are read-only inputs and are never moved or truncated, so nothing can be lost.
   default is `UnwitnessedBoundary`, and every export receipt states its
   `witnessState`. A witness that cannot be reached is fail-soft for operation
   and never upgrades into an implied guarantee.
-- **Boot verification is bounded.** The active generation's tail beyond the
-  anchor is always verified. Sealed generations are verified on export, on
-  retention, and on explicit `verify_all`, not at every start — so tampering
-  with a sealed generation is detected at those points, not necessarily at the
-  next boot.
+- **Boot verification is two-tier, not absent.** The active generation's tail
+  beyond the anchor is fully chain-verified at every open. Every sealed,
+  non-tombstoned generation is checked at open against the byte length and
+  SHA-256 the authenticated manifest recorded for it, so tampering with sealed
+  history fails the open rather than surviving until someone happens to export
+  or retain. That is a streaming digest per sealed journal, not a full chain
+  replay: `verify_all` remains the per-entry HMAC check, and export and
+  retention still run it on the ranges they touch.
 - **Key loss.** Losing a retired chain key makes old generations unverifiable.
   It does not delete them, and the ledger reports "unverifiable" rather than
   anything softer.
 - **Filesystem access.** An operator who can delete the audit directory can
   still do so. Only an external append-only sink or a witness makes that
   detectable.
+- **Async producers are not causally ordered against synchronous ones.** A
+  queued entry can still be journaled after a synchronous shutdown, recovery
+  or retention record that was issued later in real time. The pending marker
+  makes *loss* visible; it does not impose an ordering. Export and rotation can
+  likewise snapshot while entries are in flight.
 - **Interrupted intents are closed in aggregate.** Recovery states the exact
   number of intents left open and marks the outcome uncertain. Per-intent
   correlation needs producer-supplied intent ids and is not implemented here.

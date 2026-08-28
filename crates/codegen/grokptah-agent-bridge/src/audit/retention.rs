@@ -206,7 +206,10 @@ impl AuditLedger {
             )?),
             RetentionBasis::ExportedUnder { .. } => None,
         };
-        manifest.retention_epoch = manifest.retention_epoch.saturating_add(1);
+        manifest.retention_epoch = manifest
+            .retention_epoch
+            .checked_add(1)
+            .ok_or(AuditError::Poisoned(PoisonReason::SequenceExhausted))?;
         let retention_epoch = manifest.retention_epoch;
         let now = Utc::now();
         manifest.tombstones.push(Tombstone {

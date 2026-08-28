@@ -127,3 +127,29 @@ pub(crate) fn reject_symlink(path: &Path) -> AuditResult<()> {
     }
     Ok(())
 }
+
+/// Byte length and SHA-256 of a file, streamed.
+///
+/// Used by open-time sealed-generation checks, which must not depend on the
+/// journal fitting comfortably in memory.
+pub(crate) fn size_and_digest(path: &Path) -> AuditResult<(u64, String)> {
+    use sha2::{Digest, Sha256};
+
+    reject_symlink(path)?;
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| AuditError::Io(format!("open for digest: {error}")))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        let read = std::io::Read::read(&mut file, &mut buffer)
+            .map_err(|error| AuditError::Io(format!("read for digest: {error}")))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        total += read as u64;
+    }
+    let digest: [u8; 32] = hasher.finalize().into();
+    Ok((total, super::keys::hex32(&digest)))
+}

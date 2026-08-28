@@ -495,6 +495,30 @@ pub fn verify_export(dir: &Path, keys: &AuditKeys) -> AuditResult<ExportVerifica
         }
     }
 
+    // The copied ledger manifest is evidence too, and it was going
+    // unauthenticated: a v2 export carries `manifest.json`, and nothing here
+    // checked its MAC or that it describes the same ledger this seal covers.
+    // A swapped-in manifest could have misdescribed generations, tombstones
+    // and retention epochs to a reader who trusted the directory as a whole.
+    if export.schema == EXPORT_SCHEMA_V2 {
+        let path = dir.join("manifest.json");
+        files::reject_symlink(&path)?;
+        let bytes = files::read_bytes(&path)?;
+        let carried: Manifest = serde_json::from_slice(&bytes)
+            .map_err(|_| AuditError::Poisoned(PoisonReason::ManifestUnknownSchema))?;
+        carried.verify(keys)?;
+        if carried.installation_id != export.installation_id
+            || carried.key_id != export.key_id
+            || carried.manifest_epoch != export.manifest_epoch
+            || carried.retention_epoch != export.retention_epoch
+            || carried.global_first_seq != export.global_first_seq
+        {
+            // Authentic, but describing a different ledger or a different
+            // moment than the seal claims.
+            return Err(AuditError::Poisoned(PoisonReason::ExportCoverageInvalid));
+        }
+    }
+
     let mut expected_seq = export.global_first_seq;
     let mut generations_verified = 0usize;
     let mut holes = 0usize;

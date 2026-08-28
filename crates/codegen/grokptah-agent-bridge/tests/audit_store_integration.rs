@@ -1336,3 +1336,37 @@ fn a_seal_registry_survives_restart_and_still_authorizes_its_range() {
         .expect("a seal issued before the restart still authorizes its range");
     assert_eq!(store.audit_status().tombstones, 1);
 }
+
+#[test]
+fn a_v1_ledger_created_after_a_clean_cutover_is_recorded_as_divergent() {
+    let dir = TempDir::new().unwrap();
+    // A cutover with no legacy ledger at all: nothing to import.
+    {
+        let store = OrchStore::open(dir.path()).unwrap();
+        assert_eq!(store.audit_status().imported_generations, 0);
+        store.append_audit(&entry("first", "accepted")).unwrap();
+    }
+
+    // An older binary then writes to the retired v1 ledger. The divergence
+    // scan used to return early whenever the import set was empty, so this
+    // case -- a clean v2 install followed by a late v1 file -- was never
+    // noticed at all.
+    std::fs::write(
+        legacy_dir(dir.path()).join("audit.jsonl"),
+        "{\"tool\":\"stale-binary\",\"outcome\":\"accepted\"}\n",
+    )
+    .unwrap();
+
+    let store = OrchStore::open(dir.path()).unwrap();
+    let journal = read_journal(dir.path(), &store.audit_status().active_generation_id);
+    assert!(
+        journal.contains("legacy_written_after_cutover"),
+        "a late v1 write must be recorded as uncertain, not ignored"
+    );
+    assert!(audit_root(dir.path())
+        .join("legacy-divergence.json")
+        .is_file());
+    // Recorded, never repaired: the v1 bytes are left exactly as found.
+    assert!(legacy_dir(dir.path()).join("audit.jsonl").exists());
+    store.verify_audit().unwrap();
+}

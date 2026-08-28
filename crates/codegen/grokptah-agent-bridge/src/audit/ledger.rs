@@ -455,6 +455,21 @@ impl AuditLedger {
         self
     }
 
+    /// Test-only: drive the live sequence to an arbitrary value, so
+    /// exhaustion can be exercised without writing 2^64 entries.
+    #[cfg(test)]
+    pub(crate) fn force_last_seq_for_test(&self, seq: u64) -> AuditResult<()> {
+        // The durable anchor moves with the in-memory tail. Desynchronising
+        // them would trip the concurrent-writer guard instead, which would
+        // make this a test of the wrong invariant.
+        let live = {
+            let mut guard = self.inner.lock();
+            guard.live.last_seq = seq;
+            guard.live.clone()
+        };
+        self.write_anchor(&live)
+    }
+
     /// Test-only: is the inner state lock currently free?
     #[cfg(test)]
     pub(crate) fn inner_is_unlocked(&self) -> bool {
@@ -660,7 +675,12 @@ impl AuditLedger {
                 return Err(AuditError::Poisoned(PoisonReason::ConcurrentWriter));
             }
         }
-        manifest.manifest_epoch = manifest.manifest_epoch.saturating_add(1);
+        // Same reasoning as the sequence: a saturated epoch stops being a
+        // compare-and-swap, so two writers could both believe they won.
+        manifest.manifest_epoch = manifest
+            .manifest_epoch
+            .checked_add(1)
+            .ok_or(AuditError::Poisoned(PoisonReason::SequenceExhausted))?;
         manifest.updated_at = Utc::now();
         manifest.seal(&self.keys)?;
         let bytes = serde_json::to_vec(manifest)
@@ -1084,6 +1104,33 @@ impl AuditLedger {
             files::fsync_dir(&self.root)?;
         }
 
+        // Every sealed, non-tombstoned generation is checked against the
+        // digest the authenticated manifest recorded for it. Verifying only
+        // the active journal at open let a tampered *sealed* generation reopen
+        // with a healthy status and stay healthy until someone happened to
+        // export, retain, or call `verify_all`.
+        //
+        // A streaming SHA-256 per sealed journal, not a full chain replay:
+        // the digest lives inside the manifest MAC, so any byte change is
+        // caught, and boot cost stays linear in bytes read rather than in
+        // per-entry HMAC and JSON parsing. `verify_all` remains the full
+        // chain check.
+        for descriptor in &guard.manifest.generations {
+            if descriptor.state != GenerationState::Sealed {
+                continue;
+            }
+            let Some(expected) = descriptor.journal_sha256.as_deref() else {
+                // A sealed generation with no recorded digest cannot be
+                // vouched for, and a sealed generation is never rewritten.
+                return Err(AuditError::Poisoned(PoisonReason::SealedGenerationChanged));
+            };
+            let path = Self::journal_path(&self.root, &descriptor.generation_id);
+            let (bytes, digest) = files::size_and_digest(&path)?;
+            if bytes != descriptor.journal_bytes || digest != expected {
+                return Err(AuditError::Poisoned(PoisonReason::SealedGenerationChanged));
+            }
+        }
+
         // Active generation: verify from the chain base and adopt any
         // authenticated tail the anchor does not yet cover.
         let active = guard.manifest.active()?.clone();
@@ -1431,10 +1478,17 @@ impl AuditLedger {
             return Err(AuditError::Poisoned(PoisonReason::ConcurrentWriter));
         }
         let live = guard.live.clone();
+        // Exhaustion fails closed. `saturating_add` at u64::MAX would have
+        // reissued the same sequence forever, so two different entries would
+        // share one authenticated position in the chain.
+        let next_seq = live
+            .last_seq
+            .checked_add(1)
+            .ok_or(AuditError::Poisoned(PoisonReason::SequenceExhausted))?;
         let mut record = AuditRecord {
             v: RECORD_VERSION,
             generation: live.generation_id.clone(),
-            seq: live.last_seq.saturating_add(1),
+            seq: next_seq,
             ts: Utc::now(),
             op: sanitize_op(&entry.op),
             phase: entry.phase,
@@ -1612,7 +1666,10 @@ impl AuditLedger {
         tx.cut(CrashPoint::R1Frozen)?;
 
         // R2: prepare the next generation on disk. No manifest change yet.
-        let next_index = outgoing.index.saturating_add(1);
+        let next_index = outgoing
+            .index
+            .checked_add(1)
+            .ok_or(AuditError::Poisoned(PoisonReason::SequenceExhausted))?;
         let next_id = generation_id(next_index);
         let next_dir = Self::generation_dir(&self.root, &next_id);
         if !next_dir.exists() {

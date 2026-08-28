@@ -117,6 +117,9 @@ pub enum PoisonReason {
     KeyMismatch,
     RollbackDetected,
     PartialPersistence,
+    /// A monotonic counter reached its maximum. Failing closed is mandatory:
+    /// a saturated sequence or epoch would reuse an authenticated position.
+    SequenceExhausted,
 }
 
 impl PoisonReason {
@@ -151,6 +154,7 @@ impl PoisonReason {
             Self::KeyMismatch => "key_mismatch",
             Self::RollbackDetected => "rollback_detected",
             Self::PartialPersistence => "partial_persistence",
+            Self::SequenceExhausted => "sequence_exhausted",
         }
     }
 }

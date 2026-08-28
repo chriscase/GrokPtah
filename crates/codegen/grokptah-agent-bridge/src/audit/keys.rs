@@ -241,6 +241,12 @@ fn write_private_key(path: &Path, material: &[u8; 32]) -> AuditResult<()> {
         .map_err(|error| AuditError::Io(format!("audit key write: {error}")))?;
     file.sync_all()
         .map_err(|error| AuditError::Io(format!("audit key sync: {error}")))?;
+    // The key's *bytes* being durable is not enough: a crash can lose the
+    // directory entry, and a ledger whose key file vanished is a manifest MAC
+    // mismatch on the next open, not a recoverable miss.
+    if let Some(parent) = path.parent() {
+        super::files::fsync_dir(parent)?;
+    }
     Ok(())
 }
 

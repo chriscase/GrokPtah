@@ -2163,3 +2163,140 @@ fn json_with_mac(grant: &AuthorityGrant, mac: String) -> serde_json::Value {
     value["mac"] = serde_json::Value::String(mac);
     value
 }
+
+// -------------------------------- sealed-history verification at reopen (P0)
+
+#[test]
+fn tampering_with_a_sealed_generation_is_caught_at_the_next_open() {
+    let dir = TempDir::new().unwrap();
+    {
+        let ledger = fresh(dir.path());
+        ledger.rotate(RotationReason::Operator).unwrap();
+        ledger.append(entry("after.rotate")).unwrap();
+    }
+    // g-000001 is sealed. Rewrite one of its committed lines: before this
+    // check, only the *active* journal was verified at open, so a tampered
+    // sealed generation reopened with a healthy status and stayed healthy
+    // until someone happened to export, retain, or call verify_all.
+    let path = journal_of(dir.path(), "g-000001");
+    let mut lines = read_lines(&path);
+    lines[2] = lines[2].replace("op.2", "op.X");
+    write_lines(&path, &lines);
+
+    assert_eq!(
+        poison_of(open(dir.path()).unwrap_err()),
+        PoisonReason::SealedGenerationChanged
+    );
+}
+
+#[test]
+fn truncating_a_sealed_generation_is_caught_at_the_next_open() {
+    let dir = TempDir::new().unwrap();
+    {
+        let ledger = fresh(dir.path());
+        ledger.rotate(RotationReason::Operator).unwrap();
+        ledger.append(entry("after.rotate")).unwrap();
+    }
+    let path = journal_of(dir.path(), "g-000001");
+    let mut lines = read_lines(&path);
+    lines.truncate(lines.len() - 1);
+    write_lines(&path, &lines);
+
+    // Dropping whole entries changes both the length and the digest, and the
+    // digest lives inside the manifest MAC.
+    assert_eq!(
+        poison_of(open(dir.path()).unwrap_err()),
+        PoisonReason::SealedGenerationChanged
+    );
+}
+
+#[test]
+fn an_untouched_sealed_generation_still_opens_cleanly() {
+    let dir = TempDir::new().unwrap();
+    {
+        let ledger = fresh(dir.path());
+        ledger.rotate(RotationReason::Operator).unwrap();
+        ledger.append(entry("after.rotate")).unwrap();
+        ledger.rotate(RotationReason::Operator).unwrap();
+        ledger.append(entry("third")).unwrap();
+    }
+    // The check must not be a boot-time false positive generator.
+    let ledger = opened(dir.path());
+    assert!(ledger.status().poisoned.is_none());
+    ledger.verify_all().unwrap();
+}
+
+#[test]
+fn a_tombstoned_generation_is_not_expected_to_be_on_disk_at_open() {
+    let dir = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    {
+        let ledger = fresh(dir.path());
+        ledger.rotate(RotationReason::Operator).unwrap();
+        ledger.append(entry("after")).unwrap();
+        let receipt = ledger
+            .export(&out.path().join("sealed"), ExportFormat::Auto)
+            .unwrap();
+        ledger
+            .retain(RetentionRequest::exported_under(
+                "g-000001",
+                &receipt.seal_id,
+            ))
+            .unwrap();
+    }
+    // The sealed-generation sweep must skip tombstoned ranges: their bytes are
+    // gone by authorized deletion, which is not tampering.
+    let ledger = opened(dir.path());
+    assert!(ledger.status().poisoned.is_none());
+    assert_eq!(ledger.status().tombstones, 1);
+}
+
+// ------------------------------------------------- counter exhaustion (P1)
+
+#[test]
+fn a_sequence_at_its_maximum_fails_closed_instead_of_reusing_a_position() {
+    let dir = TempDir::new().unwrap();
+    let ledger = fresh(dir.path());
+    // Drive the live tail to u64::MAX. Saturating arithmetic would have
+    // reissued MAX forever, giving two different entries one authenticated
+    // position in the chain.
+    ledger.force_last_seq_for_test(u64::MAX).unwrap();
+    assert_eq!(
+        poison_of(ledger.append(entry("overflow")).unwrap_err()),
+        PoisonReason::SequenceExhausted
+    );
+}
+
+// ------------------------------------- export manifest authentication (P1)
+
+#[test]
+fn a_substituted_manifest_inside_an_export_is_refused() {
+    let dir = TempDir::new().unwrap();
+    let other = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    let ledger = fresh(dir.path());
+    ledger.rotate(RotationReason::Operator).unwrap();
+    ledger.append(entry("after")).unwrap();
+    let dest = out.path().join("sealed");
+    ledger.export(&dest, ExportFormat::Auto).unwrap();
+    verify_export(&dest, &keys()).expect("the untouched export verifies");
+
+    // A manifest authentic under a *different* installation key.
+    let foreign =
+        AuditLedger::open_with_options(other.path(), foreign_keys(), AuditLedgerOptions::default())
+            .unwrap();
+    foreign.append(entry("elsewhere")).unwrap();
+    std::fs::copy(
+        AuditLedger::manifest_path(other.path()),
+        dest.join("manifest.json"),
+    )
+    .unwrap();
+
+    // The copied ledger manifest was previously carried unauthenticated, so a
+    // swapped one could misdescribe generations, tombstones and retention to
+    // anyone who trusted the export directory as a whole.
+    assert!(
+        verify_export(&dest, &keys()).is_err(),
+        "a substituted manifest must not verify"
+    );
+}
