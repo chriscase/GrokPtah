@@ -337,14 +337,6 @@ impl std::fmt::Debug for EffectLease {
     }
 }
 
-/// A newly created binding held by a multi-file session transaction. Existing
-/// bindings are never removed if a later publication step fails.
-pub(crate) struct ResourceBindingReservation {
-    resource: String,
-    digest: String,
-    inserted: bool,
-}
-
 #[derive(Clone)]
 pub(crate) struct SessionBindingReservation {
     transaction_id: String,
@@ -710,6 +702,7 @@ impl AuthRegistry {
     /// Replace a credential identity rather than rotating its secret. A
     /// replacement receives a fresh principal and incarnation even when its
     /// textual credential id is unchanged.
+    #[allow(dead_code)]
     pub(crate) fn replace_credential(
         &mut self,
         credential_id: &str,
@@ -792,7 +785,11 @@ impl AuthRegistry {
                     .credentials
                     .iter()
                     .find(|record| record.credential_id == credential.id)
-                    .filter(|_| constant_time_eq(token.as_bytes(), credential.token.as_bytes()))
+                    .filter(|record| {
+                        constant_time_eq(token.as_bytes(), credential.token.as_bytes())
+                            && (record.credential_fingerprint.is_empty()
+                                || record.credential_fingerprint == credential_fingerprint(token))
+                    })
                     .map(|record| (credential, record))
             }) else {
                 return Err(OrchError::new(
@@ -878,6 +875,7 @@ impl AuthRegistry {
         })
     }
 
+    #[allow(dead_code)]
     pub(crate) fn migrate_resource_bindings(
         &mut self,
         resources: &[String],
@@ -940,54 +938,6 @@ impl AuthRegistry {
                 Some(existing) if existing == &digest => Ok(()),
                 _ => Err(stale_authority()),
             }
-        })
-    }
-
-    pub(crate) fn begin_resource_binding(
-        &mut self,
-        resource: &str,
-        auth: &AuthContext,
-    ) -> Result<ResourceBindingReservation, OrchError> {
-        if resource.is_empty() || resource.len() > 512 {
-            return Err(OrchError::new(
-                OrchErrorCode::InvalidRequest,
-                "authority resource key is empty or exceeds its bound",
-            ));
-        }
-        let resource = resource.to_string();
-        let digest = auth.binding_digest();
-        let inserted = self.transactional(|state| {
-            require_current_state(state, auth)?;
-            match state.bindings.get(&resource) {
-                Some(existing) if existing == &digest => Ok(false),
-                Some(_) => Err(stale_authority()),
-                None => {
-                    state.bindings.insert(resource.clone(), digest.clone());
-                    Ok(true)
-                }
-            }
-        })?;
-        Ok(ResourceBindingReservation {
-            resource,
-            digest,
-            inserted,
-        })
-    }
-
-    pub(crate) fn rollback_resource_binding(
-        &mut self,
-        reservation: ResourceBindingReservation,
-    ) -> Result<(), OrchError> {
-        if !reservation.inserted {
-            return Ok(());
-        }
-        self.transactional(|state| match state.bindings.get(&reservation.resource) {
-            Some(existing) if existing == &reservation.digest => {
-                state.bindings.remove(&reservation.resource);
-                Ok(())
-            }
-            None => Ok(()),
-            Some(_) => Err(stale_authority()),
         })
     }
 
@@ -1921,6 +1871,64 @@ mod tests {
     }
 
     #[test]
+    fn policy_rotation_revokes_cached_contexts_and_effect_leases() {
+        let root = tempdir().unwrap();
+        let credential = AuthCredential::new("primary", "secret").unwrap();
+        let mut registry =
+            AuthRegistry::open(root.path(), std::slice::from_ref(&credential), "owner").unwrap();
+        let auth = registry
+            .authenticate(Some("Bearer secret"), std::slice::from_ref(&credential))
+            .unwrap();
+        registry
+            .ensure_resource_binding("run:policy", &auth)
+            .unwrap();
+        let lease = registry
+            .mint_effect_lease(&auth, "provider:policy")
+            .unwrap();
+
+        registry.rotate_policy_generation().unwrap();
+        assert!(registry.require_current(&auth).is_err());
+        assert!(registry
+            .consume_effect_lease(&auth, &lease, "provider:policy")
+            .is_err());
+
+        let fresh = registry
+            .authenticate(Some("Bearer secret"), std::slice::from_ref(&credential))
+            .unwrap();
+        assert!(registry.require_current(&fresh).is_ok());
+        assert!(registry
+            .ensure_resource_binding("run:policy", &fresh)
+            .is_ok());
+    }
+
+    #[test]
+    fn pending_session_binding_recovery_commits_or_discards_by_session_truth() {
+        let root = tempdir().unwrap();
+        let credential = AuthCredential::new("primary", "secret").unwrap();
+        let mut registry =
+            AuthRegistry::open(root.path(), std::slice::from_ref(&credential), "owner").unwrap();
+        let auth = registry
+            .authenticate(Some("Bearer secret"), std::slice::from_ref(&credential))
+            .unwrap();
+        let committed = Uuid::new_v4();
+        let discarded = Uuid::new_v4();
+        let committed_reservation = registry.begin_session_binding(committed, &auth).unwrap();
+        let discarded_reservation = registry.begin_session_binding(discarded, &auth).unwrap();
+        assert!(committed_reservation.inserted);
+        assert!(discarded_reservation.inserted);
+
+        registry
+            .recover_pending_session_bindings(&std::collections::HashSet::from([committed]))
+            .unwrap();
+        assert!(registry
+            .verify_resource_binding(&format!("session:{committed}"), &auth)
+            .is_ok());
+        assert!(registry
+            .verify_resource_binding(&format!("session:{discarded}"), &auth)
+            .is_err());
+    }
+
+    #[test]
     fn credential_replacement_gets_a_new_incarnation_and_cannot_read_old_binding() {
         let root = tempdir().unwrap();
         let old = AuthCredential::new("laptop", "old-secret").unwrap();
@@ -2060,7 +2068,7 @@ mod tests {
             .unwrap();
         let path = root.path().join(AUTHORITY_FILE);
         let before = std::fs::read(&path).unwrap();
-        std::fs::create_dir_all(root.path().join("auth-authority.json.tmp")).unwrap();
+        set_test_authority_fault(Some("write"));
 
         assert!(registry
             .ensure_resource_binding("run:rollback", &auth)
@@ -2068,7 +2076,6 @@ mod tests {
         assert!(!registry.state.bindings.contains_key("run:rollback"));
         assert_eq!(std::fs::read(&path).unwrap(), before);
 
-        std::fs::remove_dir_all(root.path().join("auth-authority.json.tmp")).unwrap();
         registry
             .ensure_resource_binding("run:rollback", &auth)
             .unwrap();

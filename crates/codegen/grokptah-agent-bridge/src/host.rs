@@ -11645,6 +11645,29 @@ mod tests {
         assert_eq!(session.title, "final service title");
         assert_eq!(session.cwd, workspace.path().display().to_string());
         assert_eq!(host.list_sessions().len(), 1);
+
+        let unbound = host.session_new_kind(SessionKind::Build).unwrap();
+        let authority_path = crate::discover::grokptah_home()
+            .join("orchestration")
+            .join("auth-authority.json");
+        let bindings_before = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(&authority_path).unwrap(),
+        )
+        .unwrap()["bindings"]
+            .clone();
+        let listed = service.list_sessions(&auth).unwrap();
+        assert_eq!(listed["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            listed["sessions"][0]["sessionId"].as_str(),
+            Some(session_id.to_string().as_str())
+        );
+        let bindings_after = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(&authority_path).unwrap(),
+        )
+        .unwrap()["bindings"]
+            .clone();
+        assert_eq!(bindings_after, bindings_before);
+        assert_ne!(unbound.id, session_id);
     }
 
     #[test]
