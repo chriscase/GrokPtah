@@ -765,12 +765,7 @@ mod tests {
                 independent_verifier: true,
                 isolated_guest: true,
             },
-            super::super::authority_seam::HostIssuedBinding::from_host_issued(
-                "test-principal-generation".into(),
-                "test-capability-generation".into(),
-                "test-effect-lease".into(),
-            )
-            .unwrap(),
+            super::super::authority_seam::test_binding(),
         );
         let PolicyOutcome::Proceed(decision) = AdaptivePolicyEngine.select(
             &evidence,

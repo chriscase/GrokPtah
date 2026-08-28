@@ -111,6 +111,16 @@ impl HostIssuedBinding {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn test_binding() -> HostIssuedBinding {
+    HostIssuedBinding::from_host_issued(
+        "test-principal-generation".into(),
+        "test-capability-generation".into(),
+        "test-effect-lease".into(),
+    )
+    .expect("test authority binding")
+}
+
 /// Token passed back to the authority adapter. Its content is not inspectable
 /// by the adaptive policy and cannot be serialized by this crate.
 #[derive(Clone, PartialEq, Eq)]
