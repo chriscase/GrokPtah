@@ -212,7 +212,10 @@ impl AuditLedger {
         }
 
         files::create_private_dir_new(dest)?;
-        let copy_result = (|| -> AuditResult<()> {
+        // Everything after the destination is created runs inside one fallible
+        // scope: a failed export must never leave a half-written directory that
+        // could be mistaken for a sealed one.
+        let sealed = (|| -> AuditResult<(ExportManifest, ExportVerification)> {
             for element in &coverage {
                 if element.kind == CoverageKind::Hole {
                     continue;
@@ -225,9 +228,6 @@ impl AuditLedger {
                     files::create_private_dir_all(&target)?;
                     target
                 };
-                if schema == EXPORT_SCHEMA_V1 {
-                    files::create_private_dir_all(&target)?;
-                }
                 for name in ["journal.jsonl", "anchor.json"] {
                     let bytes = files::read_bytes(&source.join(name))?;
                     files::atomic_write(&target.join(name), &bytes)?;
@@ -237,51 +237,56 @@ impl AuditLedger {
                 let bytes = files::read_bytes(&Self::manifest_path(self.root()))?;
                 files::atomic_write(&dest.join("manifest.json"), &bytes)?;
             }
-            Ok(())
+
+            let complete = coverage.iter().all(|c| c.kind == CoverageKind::Generation);
+            let seal_id = format!(
+                "seal-{}",
+                &self.keys().opaque_digest(&format!("{}", Uuid::new_v4()))[..32]
+            );
+            let mut export = ExportManifest {
+                schema: schema.to_string(),
+                seal_id: seal_id.clone(),
+                installation_id: manifest.installation_id.clone(),
+                key_id: manifest.key_id.clone(),
+                manifest_epoch: manifest.manifest_epoch,
+                retention_epoch: manifest.retention_epoch,
+                global_first_seq: manifest.global_first_seq,
+                global_last_seq,
+                witness_state: self.witness_state(),
+                complete,
+                coverage,
+                exported_at: Utc::now(),
+                mac: String::new(),
+            };
+            export.seal(self.keys())?;
+            let bytes = serde_json::to_vec(&export)
+                .map_err(|error| AuditError::Io(format!("serialize export manifest: {error}")))?;
+            files::atomic_write(&dest.join("export-manifest.json"), &bytes)?;
+            files::fsync_dir(dest)?;
+
+            // Independent re-verification: reopen the copy with a fresh reader
+            // that shares no state with the live ledger, and only then let a
+            // receipt be returned.
+            let verification = verify_export(dest, self.keys())?;
+            if verification.seal_id != seal_id || verification.complete != complete {
+                return Err(AuditError::Poisoned(PoisonReason::ExportMacMismatch));
+            }
+            Ok((export, verification))
         })();
-        if let Err(error) = copy_result {
-            // Only a destination this call created is ever cleaned up.
-            let _ = std::fs::remove_dir_all(dest);
-            return Err(error);
-        }
 
-        let complete = coverage.iter().all(|c| c.kind == CoverageKind::Generation);
-        let seal_id = format!(
-            "seal-{}",
-            &self.keys().opaque_digest(&format!("{}", Uuid::new_v4()))[..32]
-        );
-        let mut export = ExportManifest {
-            schema: schema.to_string(),
-            seal_id: seal_id.clone(),
-            installation_id: manifest.installation_id.clone(),
-            key_id: manifest.key_id.clone(),
-            manifest_epoch: manifest.manifest_epoch,
-            retention_epoch: manifest.retention_epoch,
-            global_first_seq: manifest.global_first_seq,
-            global_last_seq,
-            witness_state: self.witness_state(),
-            complete,
-            coverage,
-            exported_at: Utc::now(),
-            mac: String::new(),
+        let (export, verification) = match sealed {
+            Ok(sealed) => sealed,
+            Err(error) => {
+                // Only a destination this call created is ever removed.
+                let _ = std::fs::remove_dir_all(dest);
+                return Err(error);
+            }
         };
-        export.seal(self.keys())?;
-        let bytes = serde_json::to_vec(&export)
-            .map_err(|error| AuditError::Io(format!("serialize export manifest: {error}")))?;
-        files::atomic_write(&dest.join("export-manifest.json"), &bytes)?;
-        files::fsync_dir(dest)?;
-
-        // Independent re-verification: reopen the copy with a fresh reader that
-        // shares no state with the live ledger, and only then return a receipt.
-        let verification = verify_export(dest, self.keys())?;
-        if verification.seal_id != seal_id || verification.complete != complete {
-            return Err(AuditError::Poisoned(PoisonReason::ExportMacMismatch));
-        }
 
         Ok(ExportReceipt {
-            seal_id,
+            seal_id: export.seal_id,
             schema: export.schema,
-            complete,
+            complete: export.complete,
             generations_exported: verification.generations_verified,
             holes: verification.holes,
             global_first_seq: export.global_first_seq,

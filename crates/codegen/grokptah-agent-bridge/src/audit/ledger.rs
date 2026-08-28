@@ -1049,6 +1049,15 @@ impl AuditLedger {
         if let Some(reason) = guard.poisoned {
             return Err(AuditError::Poisoned(reason));
         }
+        // Single-writer discipline comes from the process-wide `InstanceLock`,
+        // which this ledger relies on rather than adding a second lock. Detect a
+        // violation instead of interleaving two chains into one journal: in the
+        // healthy case the durable anchor always equals the in-memory tail.
+        let on_disk = self.load_anchor(&guard.live.generation_id)?;
+        if on_disk.last_seq != guard.live.last_seq {
+            guard.poisoned = Some(PoisonReason::ConcurrentWriter);
+            return Err(AuditError::Poisoned(PoisonReason::ConcurrentWriter));
+        }
         let live = guard.live.clone();
         let mut record = AuditRecord {
             v: RECORD_VERSION,

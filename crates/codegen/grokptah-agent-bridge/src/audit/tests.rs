@@ -1168,3 +1168,73 @@ fn audit_files_are_private() {
         );
     }
 }
+
+#[test]
+fn a_second_writer_advancing_the_anchor_is_detected() {
+    // Two handles on one root stand in for the second process that the
+    // process-wide InstanceLock exists to prevent. The ledger must notice
+    // rather than interleave two chains into one journal.
+    let dir = TempDir::new().unwrap();
+    let first = fresh(dir.path());
+    let second = opened(dir.path());
+    second.append(entry("from-the-other-writer")).unwrap();
+    assert_eq!(
+        poison_of(first.append(entry("from-the-first-writer")).unwrap_err()),
+        PoisonReason::ConcurrentWriter
+    );
+    assert_eq!(
+        first.status().poisoned,
+        Some(PoisonReason::ConcurrentWriter)
+    );
+}
+
+#[test]
+fn installation_key_file_is_private_and_stable() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("keys").join("chain.key");
+    let first = AuditKeys::load_or_create_file(&path).unwrap();
+    let second = AuditKeys::load_or_create_file(&path).unwrap();
+    assert_eq!(first.key_id(), second.key_id());
+    assert_eq!(first.installation_id(), second.installation_id());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // A key another user could read fails closed rather than being repaired.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            poison_of(AuditKeys::load_or_create_file(&path).unwrap_err()),
+            PoisonReason::KeyUnavailable
+        );
+    }
+}
+
+#[test]
+fn a_failed_export_leaves_no_partial_destination() {
+    use std::io::Write;
+
+    let dir = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    let ledger = fresh(dir.path());
+    ledger.rotate(RotationReason::Bytes).unwrap();
+
+    // Corrupt a sealed generation so the export's own verification refuses it.
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(journal_of(dir.path(), "g-000001"))
+        .unwrap();
+    file.write_all(b"{}\n").unwrap();
+    file.sync_all().unwrap();
+
+    let dest = out.path().join("partial");
+    assert!(ledger.export(&dest, ExportFormat::Auto).is_err());
+    assert!(
+        !dest.exists(),
+        "a refused export must not leave a directory that could pass for a sealed one"
+    );
+}
