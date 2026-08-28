@@ -765,7 +765,7 @@ async fn completion(
             )
             .map_err(|error| anyhow!("admit provider qualification: {error}"))?,
     );
-    let idempotency_key = permit
+    let mut idempotency_key = permit
         .as_ref()
         .map(|permit| permit.idempotency_key().to_owned())
         .ok_or_else(|| anyhow!("provider qualification permit is unavailable"))?;
