@@ -2138,6 +2138,9 @@ impl OrchestrationService {
         self.require_current_auth(auth)?;
         let allowlist = self.config.lock().allowlist.clone();
         let sessions = self.host.list_sessions_by_kind(SessionKind::Build, false);
+        for session in &sessions {
+            self.ensure_session_binding(auth, session.id)?;
+        }
         let rows: Vec<serde_json::Value> = sessions
             .into_iter()
             .filter(|s| {
@@ -2159,7 +2162,7 @@ impl OrchestrationService {
                 })
             })
             .collect();
-        Ok(json!({ "sessions": rows }))
+        Ok(self.public_projection(json!({ "sessions": rows })))
     }
 
     /// Create an allowlisted Build session for a remote coordinator.
