@@ -1030,7 +1030,7 @@ mod tests {
             assert_eq!(transition, ProfileTransition::Escalate { from, to, reason });
             assert_eq!(controller.profile(), to);
             assert_eq!(controller.risk(), risk);
-            assert!(!controller.state().terminal.is_some());
+            assert!(controller.state().terminal.is_none());
         }
     }
 

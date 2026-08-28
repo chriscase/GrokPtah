@@ -1422,15 +1422,18 @@ impl OrchestrationService {
     /// This is separate from `Drop` because an async service shutdown must
     /// wait for the supervisor task to release its store handle.
     pub async fn stop_background_tasks(&self) {
-        if let Some(watcher) = self.scheduler_watcher.lock().take() {
+        let scheduler_watcher = { self.scheduler_watcher.lock().take() };
+        if let Some(watcher) = scheduler_watcher {
             watcher.abort();
             let _ = watcher.await;
         }
-        if let Some(watcher) = self.manager_supervisor_watcher.lock().take() {
+        let manager_supervisor_watcher = { self.manager_supervisor_watcher.lock().take() };
+        if let Some(watcher) = manager_supervisor_watcher {
             watcher.abort();
             let _ = watcher.await;
         }
-        if let Some(watcher) = self.native_executor_watcher.lock().take() {
+        let native_executor_watcher = { self.native_executor_watcher.lock().take() };
+        if let Some(watcher) = native_executor_watcher {
             watcher.abort();
             let _ = watcher.await;
         }
