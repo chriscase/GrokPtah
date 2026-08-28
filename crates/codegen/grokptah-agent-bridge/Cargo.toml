@@ -29,7 +29,7 @@ dirs = "6"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 bytes = "1"
 sha2 = "0.10"
-xai-provider-attempt = { path = "../../common/xai-provider-attempt" }
+xai-provider-attempt = { path = "../../common/xai-provider-attempt", features = ["trusted-host-adapter"] }
 
 keyring = { version = "3", features = ["apple-native", "sync-secret-service", "windows-native"] }
 open = "5"

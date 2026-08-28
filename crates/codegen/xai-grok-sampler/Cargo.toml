@@ -8,7 +8,7 @@ description = "Actor-based sampling/inference layer for xAI grok (HTTP streaming
 [dependencies]
 # Internal
 xai-grok-sampling-types = { path = "../xai-grok-sampling-types" }
-xai-provider-attempt = { path = "../../common/xai-provider-attempt" }
+xai-provider-attempt = { path = "../../common/xai-provider-attempt", features = ["trusted-host-adapter"] }
 xai-grok-version = { workspace = true }
 
 # External

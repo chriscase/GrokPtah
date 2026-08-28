@@ -1,4 +1,17 @@
 fn main() {
+    let _ = xai_provider_attempt::CanonicalHostAuthority::from_trusted_host_adapter(
+        "forged-principal",
+        1,
+        1,
+        "forged-lease",
+        "forged-scope",
+    );
+    let _ = xai_provider_attempt::AttemptContext::from_host_authority(
+        todo!(),
+        "forged-operation",
+        todo!(),
+        todo!(),
+    );
     let _authority = xai_provider_attempt::CanonicalHostAuthority {
         principal_incarnation: "forged-principal".into(),
         auth_generation: 1,

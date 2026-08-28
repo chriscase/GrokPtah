@@ -216,6 +216,7 @@ impl CanonicalHostAuthority {
     /// #477 principal/incarnation/auth authority and #458 capability/effect
     /// lease authority; the token's fields cannot be constructed downstream.
     #[doc(hidden)]
+    #[cfg(feature = "trusted-host-adapter")]
     pub fn from_trusted_host_adapter(
         principal_incarnation: impl Into<String>,
         auth_generation: u64,
@@ -410,6 +411,7 @@ impl AttemptContext {
     /// snapshot. Raw `AuthorityBinding` construction is crate-private; all
     /// cross-crate adapters must enter through this boundary and provide the
     /// same live snapshot callback for the final send check.
+    #[cfg(feature = "trusted-host-adapter")]
     pub fn from_host_authority(
         store: ProviderAttemptStore,
         operation_id: impl Into<String>,
@@ -1456,6 +1458,33 @@ mod tests {
             AttemptError::StaleAuthority
         );
         permit.transport_before_possible_write().unwrap();
+    }
+
+    #[test]
+    fn revoke_between_admission_and_begin_send_is_zero_write() {
+        let temp = tempdir().unwrap();
+        let store = ProviderAttemptStore::open(temp.path()).unwrap();
+        let current = Arc::new(Mutex::new(authority(1)));
+        let observed = Arc::clone(&current);
+        let context = AttemptContext::new(
+            store.clone(),
+            "revoke-operation",
+            authority(1),
+            Arc::new(move || Some(observed.lock().unwrap().clone())),
+        )
+        .unwrap();
+        let attempt = context.prepare("xai", b"request", true).unwrap();
+        *current.lock().unwrap() = authority(2);
+        assert_eq!(
+            context.begin_send(&attempt).unwrap_err(),
+            AttemptError::StaleAuthority
+        );
+        assert_eq!(attempt.state().unwrap(), SendState::Cancelled);
+        assert!(
+            DeterministicFakeTransport::default()
+                .request_ids()
+                .is_empty()
+        );
     }
 
     #[test]
