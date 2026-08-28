@@ -1128,6 +1128,7 @@ mod tests {
         action_entered: Notify,
         release_action: Notify,
         action_calls: AtomicUsize,
+        action_release_requested: std::sync::atomic::AtomicBool,
     }
 
     #[derive(Debug)]
@@ -1230,11 +1231,17 @@ mod tests {
         ) -> ComputerResult<ActionOutcome> {
             self.action_calls.fetch_add(1, Ordering::SeqCst);
             self.action_entered.notify_one();
-            self.release_action.notified().await;
+            if !self
+                .action_release_requested
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                self.release_action.notified().await;
+            }
             self.inner.act(run_id, observation, action).await
         }
 
         async fn cancel(&self, run_id: &str) -> ComputerResult<()> {
+            self.action_release_requested.store(true, Ordering::SeqCst);
             self.release_action.notify_waiters();
             self.inner.cancel(run_id).await
         }
