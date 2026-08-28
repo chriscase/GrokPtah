@@ -1387,7 +1387,7 @@ async fn run_watcher(
                             let update = RemoteRunEvent {
                                 run_id: event.run_id,
                                 session_id: event.session_id,
-                                workspace: event.workspace,
+                                workspace: scope.workspace.clone(),
                                 seq: event.seq,
                                 ts: event.ts,
                                 update: event.update,
@@ -1409,7 +1409,7 @@ async fn run_watcher(
                                         RemoteRunRecovery {
                                             run_id: recovery.run_id,
                                             session_id: recovery.session_id,
-                                            workspace: recovery.workspace,
+                                            workspace: scope.workspace.clone(),
                                             after_seq: cursor,
                                             reason: format!(
                                                 "{}; durable cursor is no longer retained",
@@ -1425,7 +1425,7 @@ async fn run_watcher(
                                         RemoteRunRecovery {
                                             run_id: recovery.run_id,
                                             session_id: recovery.session_id,
-                                            workspace: recovery.workspace,
+                                            workspace: scope.workspace.clone(),
                                             after_seq: cursor,
                                             reason: format!(
                                                 "{}; durable replay failed: {error}",
