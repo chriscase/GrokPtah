@@ -4089,4 +4089,24 @@ mod tests {
             Err(DiagnosticCode::ServiceNotReady)
         );
     }
+
+    #[test]
+    fn identity_probe_requires_an_opaque_workspace_handle() {
+        assert!(is_opaque_workspace_handle(
+            "workspace_0123456789abcdef0123456789abcdef",
+            "/disposable/workspace"
+        ));
+        assert!(!is_opaque_workspace_handle(
+            "/disposable/workspace",
+            "/disposable/workspace"
+        ));
+        assert!(!is_opaque_workspace_handle(
+            "workspace_not-a-digest",
+            "/disposable/workspace"
+        ));
+        assert!(!is_opaque_workspace_handle(
+            "workspace_0123456789abcdef0123456789abcde",
+            "/disposable/workspace"
+        ));
+    }
 }

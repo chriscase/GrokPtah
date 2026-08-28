@@ -1404,6 +1404,124 @@ mod tests {
     }
 
     #[test]
+    fn cloned_effect_leases_have_one_durable_winner() {
+        let root = tempdir().unwrap();
+        let credential = AuthCredential::new("primary", "secret").unwrap();
+        let mut registry =
+            AuthRegistry::open(root.path(), std::slice::from_ref(&credential), "owner").unwrap();
+        let auth = registry
+            .authenticate(Some("Bearer secret"), std::slice::from_ref(&credential))
+            .unwrap();
+        let lease = registry
+            .mint_effect_lease(&auth, "provider:run-race")
+            .unwrap();
+        let detached = EffectLease {
+            lease_id: lease.lease_id.clone(),
+            binding: lease.binding.clone(),
+            scope: lease.scope.clone(),
+            expires_at: lease.expires_at,
+            expires_at_unix_ms: lease.expires_at_unix_ms,
+            consumed: Arc::new(AtomicBool::new(false)),
+        };
+        let first = Arc::new(std::sync::Mutex::new(
+            AuthRegistry::open(root.path(), std::slice::from_ref(&credential), "owner").unwrap(),
+        ));
+        let second = Arc::new(std::sync::Mutex::new(
+            AuthRegistry::open(root.path(), std::slice::from_ref(&credential), "owner").unwrap(),
+        ));
+        let mut threads = Vec::new();
+        for candidate in [lease, detached] {
+            let registry = if threads.is_empty() {
+                Arc::clone(&first)
+            } else {
+                Arc::clone(&second)
+            };
+            let auth = auth.clone();
+            threads.push(std::thread::spawn(move || {
+                registry
+                    .lock()
+                    .unwrap()
+                    .consume_effect_lease(&auth, &candidate, "provider:run-race")
+                    .is_ok()
+            }));
+        }
+        let winners = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .filter(|won| *won)
+            .count();
+        assert_eq!(winners, 1, "a one-shot effect may have one winner");
+        let durable: StoredAuthority = serde_json::from_str(
+            &std::fs::read_to_string(root.path().join(AUTHORITY_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            durable
+                .effect_leases
+                .values()
+                .filter(|lease| lease.consumed)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn failed_binding_save_keeps_memory_and_disk_at_the_previous_truth() {
+        let root = tempdir().unwrap();
+        let credential = AuthCredential::new("primary", "secret").unwrap();
+        let mut registry =
+            AuthRegistry::open(root.path(), std::slice::from_ref(&credential), "owner").unwrap();
+        let auth = registry
+            .authenticate(Some("Bearer secret"), std::slice::from_ref(&credential))
+            .unwrap();
+        let path = root.path().join(AUTHORITY_FILE);
+        let before = std::fs::read(&path).unwrap();
+        std::fs::create_dir_all(root.path().join("auth-authority.json.tmp")).unwrap();
+
+        assert!(registry
+            .ensure_resource_binding("run:rollback", &auth)
+            .is_err());
+        assert!(!registry.state.bindings.contains_key("run:rollback"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        std::fs::remove_dir_all(root.path().join("auth-authority.json.tmp")).unwrap();
+        registry
+            .ensure_resource_binding("run:rollback", &auth)
+            .unwrap();
+        let reopened =
+            AuthRegistry::open(root.path(), std::slice::from_ref(&credential), "owner").unwrap();
+        assert!(reopened.state.bindings.contains_key("run:rollback"));
+    }
+
+    #[test]
+    fn a_rotated_generation_wins_against_a_stale_cross_process_effect() {
+        let root = tempdir().unwrap();
+        let credential = AuthCredential::new("primary", "secret").unwrap();
+        let mut first =
+            AuthRegistry::open(root.path(), std::slice::from_ref(&credential), "owner").unwrap();
+        let mut second =
+            AuthRegistry::open(root.path(), std::slice::from_ref(&credential), "owner").unwrap();
+        let auth = first
+            .authenticate(Some("Bearer secret"), std::slice::from_ref(&credential))
+            .unwrap();
+        let lease = first
+            .mint_effect_lease(&auth, "provider:rotation-race")
+            .unwrap();
+        second.rotate_generation("primary").unwrap();
+        assert!(first
+            .consume_effect_lease(&auth, &lease, "provider:rotation-race")
+            .is_err());
+        let durable: StoredAuthority = serde_json::from_str(
+            &std::fs::read_to_string(root.path().join(AUTHORITY_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert!(durable
+            .effect_leases
+            .values()
+            .all(|stored_lease| !stored_lease.consumed));
+    }
+
+    #[test]
     fn delegated_authority_is_limited_to_the_exact_host_scope() {
         let root = tempdir().unwrap();
         let credential = AuthCredential::new("primary", "secret").unwrap();

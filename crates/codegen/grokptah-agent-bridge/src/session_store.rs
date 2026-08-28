@@ -25,6 +25,8 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
@@ -38,6 +40,29 @@ use crate::types::{EffortLevel, SubagentIsolationPreference};
 
 const STORE_VERSION: u32 = 2;
 const SESSION_CREATION_INTENT_FILE: &str = "session-create-intent.json";
+
+#[cfg(test)]
+static TEST_PERSISTENCE_FAILURE: AtomicU8 = AtomicU8::new(0);
+
+#[cfg(test)]
+pub(crate) fn set_test_persistence_failure(point: Option<&str>) {
+    let value = match point {
+        None => 0,
+        Some("transcript") => 1,
+        Some("meta") => 2,
+        Some("chrome") => 3,
+        Some(other) => panic!("unknown persistence failure point: {other}"),
+    };
+    TEST_PERSISTENCE_FAILURE.store(value, Ordering::Release);
+}
+
+#[cfg(test)]
+fn fail_test_persistence(point: u8) -> Result<()> {
+    if TEST_PERSISTENCE_FAILURE.load(Ordering::Acquire) == point {
+        bail!("injected persistence failure at boundary {point}");
+    }
+    Ok(())
+}
 
 // ── Workspace chrome (always small) ─────────────────────────────────────────
 
@@ -253,6 +278,8 @@ pub fn save_session_meta(session: &Session) -> Result<()> {
     let dir = session_dir(session.id);
     fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
     let meta = SessionMeta::from_session(session);
+    #[cfg(test)]
+    fail_test_persistence(2)?;
     atomic_write_json(&meta_path(session.id), &meta)
 }
 
@@ -279,7 +306,11 @@ pub fn create_session_durable(session: &Session, next_chrome: &WorkspaceChrome) 
     atomic_write_json(&intent_path, &intent)?;
 
     let result = (|| {
+        #[cfg(test)]
+        fail_test_persistence(1)?;
         rewrite_transcript(session)?;
+        #[cfg(test)]
+        fail_test_persistence(3)?;
         save_chrome(next_chrome)?;
         Ok(())
     })();
@@ -292,6 +323,7 @@ pub fn create_session_durable(session: &Session, next_chrome: &WorkspaceChrome) 
                     "{error:#}; session creation rollback failed: {rollback_error:#}"
                 ));
             }
+            remove_file_durable(&intent_path).context("remove failed session creation intent")?;
             Err(error)
         }
     }
@@ -884,6 +916,97 @@ mod tests {
         session.transcript_loaded = false;
         load_transcript(&mut session).unwrap();
         assert_eq!(session.transcript.len(), 2);
+
+        set_grokptah_home_override(None);
+    }
+
+    #[test]
+    fn new_session_rolls_back_at_each_durable_boundary() {
+        for boundary in ["transcript", "meta", "chrome"] {
+            let _g = home_override_serial();
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path().join(".grokptah");
+            std::fs::create_dir_all(home.join("sessions")).unwrap();
+            set_grokptah_home_override(Some(home));
+
+            let prior = WorkspaceChrome::default();
+            save_chrome(&prior).unwrap();
+            let before = std::fs::read(chrome_path()).unwrap();
+            let session = Session::new(tmp.path().to_path_buf(), "m".into(), EffortLevel::Medium);
+            let next = WorkspaceChrome {
+                active_session: Some(session.id),
+                open_tab_ids: vec![session.id],
+                ..prior
+            };
+
+            set_test_persistence_failure(Some(boundary));
+            assert!(create_session_durable(&session, &next).is_err());
+            set_test_persistence_failure(None);
+
+            assert!(
+                !session_dir(session.id).exists(),
+                "{boundary} left a session"
+            );
+            assert_eq!(std::fs::read(chrome_path()).unwrap(), before);
+            assert!(!grokptah_home().join(SESSION_CREATION_INTENT_FILE).exists());
+            set_grokptah_home_override(None);
+        }
+    }
+
+    #[test]
+    fn restart_recovery_removes_phantom_session_but_keeps_committed_session() {
+        let _g = home_override_serial();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join(".grokptah");
+        std::fs::create_dir_all(home.join("sessions")).unwrap();
+        set_grokptah_home_override(Some(home));
+        let prior = WorkspaceChrome::default();
+        save_chrome(&prior).unwrap();
+        let prior_bytes = std::fs::read(chrome_path()).unwrap();
+
+        let phantom = Session::new(tmp.path().to_path_buf(), "m".into(), EffortLevel::Medium);
+        let phantom_next = WorkspaceChrome {
+            active_session: Some(phantom.id),
+            open_tab_ids: vec![phantom.id],
+            ..prior.clone()
+        };
+        let phantom_intent = SessionCreationIntent {
+            session_id: phantom.id,
+            prior_chrome: Some(prior_bytes.clone()),
+            next_chrome: phantom_next,
+        };
+        atomic_write_json(
+            &grokptah_home().join(SESSION_CREATION_INTENT_FILE),
+            &phantom_intent,
+        )
+        .unwrap();
+        rewrite_transcript(&phantom).unwrap();
+        let (_, loaded) = load_workspace().unwrap();
+        assert!(!loaded.contains_key(&phantom.id));
+        assert!(!session_dir(phantom.id).exists());
+        assert_eq!(std::fs::read(chrome_path()).unwrap(), prior_bytes);
+
+        let committed = Session::new(tmp.path().to_path_buf(), "m".into(), EffortLevel::Medium);
+        let committed_next = WorkspaceChrome {
+            active_session: Some(committed.id),
+            open_tab_ids: vec![committed.id],
+            ..prior
+        };
+        rewrite_transcript(&committed).unwrap();
+        save_chrome(&committed_next).unwrap();
+        let committed_intent = SessionCreationIntent {
+            session_id: committed.id,
+            prior_chrome: Some(std::fs::read(chrome_path()).unwrap()),
+            next_chrome: committed_next,
+        };
+        atomic_write_json(
+            &grokptah_home().join(SESSION_CREATION_INTENT_FILE),
+            &committed_intent,
+        )
+        .unwrap();
+        let (_, loaded) = load_workspace().unwrap();
+        assert!(loaded.contains_key(&committed.id));
+        assert!(!grokptah_home().join(SESSION_CREATION_INTENT_FILE).exists());
 
         set_grokptah_home_override(None);
     }
