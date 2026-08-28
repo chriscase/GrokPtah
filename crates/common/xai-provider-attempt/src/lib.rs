@@ -215,7 +215,7 @@ struct HostAuthorityPayload {
 /// assembler. Its signature is verified before any authority value is used.
 /// This type is intentionally private: downstream crates can only obtain an
 /// `AttemptContext` by reading a valid host-owned record.
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct HostAuthorityRecord {
     #[serde(flatten)]
