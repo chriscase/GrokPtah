@@ -283,7 +283,7 @@ impl AuditLedger {
                 }
             }
         };
-        Self::check_structure(&manifest, &selected_key)?;
+        Self::check_structure(&manifest, &selected_key, &keys)?;
 
         let ledger = Self {
             root,
@@ -665,7 +665,11 @@ impl AuditLedger {
 
     // --------------------------------------------------------- invariants
 
-    fn check_structure(manifest: &Manifest, keys: &AuditKeys) -> AuditResult<()> {
+    fn check_structure(
+        manifest: &Manifest,
+        keys: &AuditKeys,
+        keyring: &[Arc<AuditKeys>],
+    ) -> AuditResult<()> {
         if manifest.generations.is_empty() {
             return Err(AuditError::Poisoned(PoisonReason::ActiveGenerationInvalid));
         }
@@ -692,7 +696,11 @@ impl AuditLedger {
         {
             return Err(AuditError::Poisoned(PoisonReason::ActiveGenerationInvalid));
         }
-        let genesis = keys.genesis_tag();
+        let first_key = keyring
+            .iter()
+            .find(|key| key.key_id() == manifest.generations[0].key_id)
+            .ok_or(AuditError::Poisoned(PoisonReason::KeyUnavailable))?;
+        let genesis = first_key.genesis_tag();
         for (position, generation) in manifest.generations.iter().enumerate() {
             if !valid_generation_id(&generation.generation_id) {
                 return Err(AuditError::Poisoned(PoisonReason::ActiveGenerationInvalid));
