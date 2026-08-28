@@ -203,10 +203,7 @@ pub fn save_session_subagents(id: Uuid, list: &[crate::types::SubagentInfo]) -> 
         .cloned()
         .collect();
     let path = subagents_path(id);
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, serde_json::to_vec_pretty(&filtered)?)?;
-    fs::rename(&tmp, &path)?;
-    Ok(())
+    atomic_write_json(&path, &filtered)
 }
 
 pub fn load_session_subagents(id: Uuid) -> Vec<crate::types::SubagentInfo> {
@@ -534,9 +531,10 @@ fn list_session_metas() -> Result<Vec<SessionMeta>> {
             Ok(m) => out.push(m),
             Err(e) => {
                 eprintln!(
-                    "[grokptah] skip corrupt session meta {}: {e}",
+                    "[grokptah] quarantine corrupt session meta {}: {e}",
                     meta_p.display()
                 );
+                let _ = crate::durable_fs::quarantine(&entry.path(), "corrupt-session-meta");
             }
         }
     }
@@ -552,30 +550,8 @@ pub fn load_all_metas() -> Result<HashMap<Uuid, Session>> {
 }
 
 fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension("json.tmp");
-    let raw = serde_json::to_string_pretty(value)?;
-    {
-        let mut f = File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
-        f.write_all(raw.as_bytes())
-            .with_context(|| format!("write {}", tmp.display()))?;
-        f.flush()?;
-        let _ = f.sync_all();
-    }
-    if let Some(parent) = path.parent() {
-        if let Ok(dirf) = File::open(parent) {
-            let _ = dirf.sync_all();
-        }
-    }
-    fs::rename(&tmp, path).with_context(|| format!("rename {}", path.display()))?;
-    if let Some(parent) = path.parent() {
-        if let Ok(dirf) = File::open(parent) {
-            let _ = dirf.sync_all();
-        }
-    }
-    Ok(())
+    crate::durable_fs::atomic_write_json(path, value)
+        .map_err(|error| anyhow::anyhow!(error.message))
 }
 
 /// Migrate monolithic v1 workspace.json → v2 layout.

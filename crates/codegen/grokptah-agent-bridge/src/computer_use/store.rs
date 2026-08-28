@@ -538,14 +538,8 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> anyhow::Result<T> {
 }
 
 fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
-    let tmp = path.with_extension("json.tmp");
-    let mut file = fs::File::create(&tmp)?;
-    file.write_all(&serde_json::to_vec_pretty(value)?)?;
-    file.sync_all()?;
-    fs::rename(&tmp, path)?;
-    #[cfg(unix)]
-    fs::File::open(path.parent().expect("record path has parent"))?.sync_all()?;
-    Ok(())
+    crate::durable_fs::atomic_write_json(path, value)
+        .map_err(|error| anyhow::anyhow!(error.message))
 }
 
 fn write_json_exclusive<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {

@@ -5,11 +5,13 @@
 
 mod agents_personas;
 mod auth_store;
+mod canonical_authority;
 pub mod certification;
 mod completion;
 mod computer_agent;
 pub mod computer_use;
 mod discover;
+mod durable_fs;
 pub mod eval_oracle;
 pub mod eval_report;
 pub mod event_bus;
@@ -146,16 +148,16 @@ pub use orchestration::{
     ContinuationAssemblyFailure, ContinuationCheckpoint, ContinuationContext, ContinuationFidelity,
     ContinuationInputSnapshot, ContinuationMemoryFact, ContinuationMemoryInput,
     ContinuationMemoryScope, ContinuationOmission, ContinuationReason, ContinuationReasonCode,
-    ContinuationRunInput, ContinuationTestInput, ContinuationWorkloadRef, FakeClock,
-    ManagedExecutionPolicy, MissedRunPolicy, NativeExecutorStatus, OrchStore, OrchestrationConfig,
-    OrchestrationService, PromotionState, RetentionPolicy, RetentionReport,
-    RoutineConcurrencyPolicy, RoutineLifecycle, RoutineRecord, RoutineRetryPolicy, RoutineSnapshot,
-    RoutineTrigger, RunApproval, RunBounds, RunExecution, RunExecutionMode, RunRecord, RunState,
-    RunStopCause, WorkAttemptView, WorkDecision, WorkItem, WorkItemSnapshot, WorkMessage,
-    WorkPolicy, WorkTemplate, WorkerProjection, WorkloadReconciliationReport, WorkloadSupervisor,
-    WorkloadSupervisorStatus, WorkspaceAllowlist, AGENT_SPEC_SCHEMA_VERSION,
-    CONTINUATION_ASSEMBLER_VERSION, CONTINUATION_SCHEMA_VERSION, CONTROL_TOOLS,
-    DEFAULT_AGENT_TOOL_IDS, DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS,
+    ContinuationRunInput, ContinuationTestInput, ContinuationWorkloadRef, FakeClock, HostAuthority,
+    IssuedAuth, ManagedExecutionPolicy, MissedRunPolicy, NativeExecutorStatus, OrchStore,
+    OrchestrationConfig, OrchestrationService, PromotionState, PublicActorHandle, ResourceKind,
+    RetentionPolicy, RetentionReport, RoutineConcurrencyPolicy, RoutineLifecycle, RoutineRecord,
+    RoutineRetryPolicy, RoutineSnapshot, RoutineTrigger, RunApproval, RunBounds, RunExecution,
+    RunExecutionMode, RunRecord, RunState, RunStopCause, WorkAttemptView, WorkDecision, WorkItem,
+    WorkItemSnapshot, WorkMessage, WorkPolicy, WorkTemplate, WorkerProjection,
+    WorkloadReconciliationReport, WorkloadSupervisor, WorkloadSupervisorStatus, WorkspaceAllowlist,
+    AGENT_SPEC_SCHEMA_VERSION, CONTINUATION_ASSEMBLER_VERSION, CONTINUATION_SCHEMA_VERSION,
+    CONTROL_TOOLS, DEFAULT_AGENT_TOOL_IDS, DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS,
     DEFAULT_WORKLOAD_RECONCILIATION_INTERVAL, FORBIDDEN_TOOLS, MAX_AGENT_CONTEXT_BYTES,
     ROUTINE_SCHEMA_VERSION,
 };
