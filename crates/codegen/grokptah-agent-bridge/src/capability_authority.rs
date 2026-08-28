@@ -696,6 +696,8 @@ fn validate_envelope_locked(
 mod tests {
     use super::*;
 
+    const TEST_PRINCIPAL_ID: &str = "host-principal";
+
     fn snapshot(value: &str) -> CapabilitySnapshot {
         CapabilitySnapshot::from_parts(CapabilityKind::ComputerUse, "agent-owner", "run-1", [value])
             .unwrap()
@@ -772,7 +774,7 @@ mod tests {
         let authority = CapabilityAuthority::new(true);
         let now = Utc::now();
         let snapshot = CapabilitySnapshot::computer_use_service(
-            SERVICE_PRINCIPAL_ID,
+            TEST_PRINCIPAL_ID,
             &ComputerCapabilities {
                 backend_id: "test".into(),
                 observe: true,
@@ -792,7 +794,7 @@ mod tests {
                 "envelope",
                 capability,
                 snapshot.clone(),
-                SERVICE_PRINCIPAL_ID,
+                TEST_PRINCIPAL_ID,
                 INITIAL_AUTH_GENERATION,
                 "policy-v1",
                 ["allowed"],
@@ -841,7 +843,7 @@ mod tests {
                 "rotation-envelope",
                 capability,
                 snapshot,
-                SERVICE_PRINCIPAL_ID,
+                TEST_PRINCIPAL_ID,
                 INITIAL_AUTH_GENERATION,
                 "policy-v1",
                 ["act"],
@@ -875,7 +877,7 @@ mod tests {
                 "downgrade-envelope",
                 capability,
                 original.clone(),
-                SERVICE_PRINCIPAL_ID,
+                TEST_PRINCIPAL_ID,
                 INITIAL_AUTH_GENERATION,
                 "policy-v1",
                 ["act"],
