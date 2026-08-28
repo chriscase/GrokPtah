@@ -71,7 +71,7 @@ pub use types::{
     RunExecutionMode, RunProgress, RunPurpose, RunRecord, RunState, RunStopCause, RunStopDetail,
     RunStopDetailKind, TestObservation, AGENT_SPEC_SCHEMA_VERSION, CONTROL_TOOLS,
     DEFAULT_AGENT_TOOL_IDS, DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS, FORBIDDEN_TOOLS,
-    MAX_AGENT_CONTEXT_BYTES,
+    MAX_AGENT_CONTEXT_BYTES, PROGRESS_PROJECTION_SCHEMA_VERSION,
 };
 pub use worker::{
     reject_privilege_amplification, MeasuredCapability, WorkerHostKind, WorkerLivenessState,

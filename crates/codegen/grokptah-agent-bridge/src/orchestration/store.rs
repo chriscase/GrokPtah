@@ -420,6 +420,16 @@ impl OrchStore {
     }
 
     pub fn save_run(&self, run: &RunRecord) -> anyhow::Result<()> {
+        // The cross-field invariant is restored here rather than enforced by
+        // refusal, so a cancel or interrupt on a run that had stopped for
+        // stationarity still writes. What remains after normalization must be
+        // well formed: a zero repeat count or an unattributed detail is a caller
+        // bug, not a transition, and is refused.
+        let mut run = run.clone();
+        run.normalize_stop_detail();
+        run.validate_stop_detail()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let run = &run;
         let _g = self.inner.lock.lock();
         let result = self
             .run_path(&run.run_id)
@@ -667,7 +677,13 @@ impl OrchStore {
             return Ok(None);
         }
         let text = fs::read_to_string(&path)?;
-        Ok(Some(serde_json::from_str(&text)?))
+        let run: RunRecord = serde_json::from_str(&text)?;
+        // Durable data is not automatically trustworthy: a record whose stop
+        // detail violates the contract is refused rather than handed to a
+        // caller that would render it as fact.
+        run.validate_stop_detail()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        Ok(Some(run))
     }
 
     /// Atomically read, mutate, and replace a run record.
@@ -680,6 +696,11 @@ impl OrchStore {
             return Ok(None);
         };
         update(&mut run)?;
+        // Same normalization as `save_run`: a closure that moves the cause off
+        // stationarity drops the detail with it.
+        run.normalize_stop_detail();
+        run.validate_stop_detail()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         let path = self
             .run_path(run_id)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
@@ -704,7 +725,11 @@ impl OrchStore {
             }
             if let Ok(text) = fs::read_to_string(e.path()) {
                 if let Ok(r) = serde_json::from_str::<RunRecord>(&text) {
-                    out.push(r);
+                    // Same rule as the single-record read: a record carrying a
+                    // malformed stop detail is omitted, never listed as fact.
+                    if r.validate_stop_detail().is_ok() {
+                        out.push(r);
+                    }
                 }
             }
         }

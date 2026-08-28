@@ -64,6 +64,17 @@ pub enum RunStopCause {
     Failed,
 }
 
+/// Wire version of the redacted progress/status projection.
+///
+/// 1 — the historical shape: carried `promptPreview` (the user's own prompt
+///     text) and had no stop detail.
+/// 2 — `promptPreview` removed, `stopDetail` added.
+///
+/// Emitted as `schemaVersion` so a consumer can tell the two apart instead of
+/// inferring it from a missing field. Bump this whenever the projection's shape
+/// changes, and update `desktop/src/lib/protocol.ts` in the same change.
+pub const PROGRESS_PROJECTION_SCHEMA_VERSION: u32 = 2;
+
 /// Which flavour of a host-decided stop fired.
 ///
 /// This is a qualifier on [`RunStopCause`], never a replacement for it. The
@@ -108,10 +119,6 @@ pub struct RunStopDetail {
     /// Bounded tool name only. Never arguments.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
-    /// Hex SHA-256 over content-free observation features. Present only for an
-    /// inert repeat, where an unchanged observation is the evidence.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub observation_digest: Option<String>,
 }
 
 impl RunStopDetail {
@@ -120,7 +127,6 @@ impl RunStopDetail {
             kind,
             repeats,
             tool: None,
-            observation_digest: None,
         }
     }
 
@@ -133,26 +139,20 @@ impl RunStopDetail {
         self
     }
 
-    pub fn with_observation_digest(mut self, digest: impl Into<String>) -> Self {
-        self.observation_digest = Some(digest.into());
-        self
-    }
-
-    /// Reject anything that could smuggle content onto the read surface.
+    /// Reject anything that could smuggle content onto the read surface, or
+    /// assert a repeat count that never happened.
     pub fn validate(&self) -> Result<(), OrchError> {
+        if self.repeats == 0 {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "stop detail repeats must be greater than zero",
+            ));
+        }
         if let Some(tool) = self.tool.as_deref() {
             if tool.is_empty() || tool.len() > MAX_STOP_DETAIL_TOOL_BYTES {
                 return Err(OrchError::new(
                     OrchErrorCode::InvalidRequest,
                     "stop detail tool label is empty or exceeds its bound",
-                ));
-            }
-        }
-        if let Some(digest) = self.observation_digest.as_deref() {
-            if digest.len() != 64 || !digest.chars().all(|c| c.is_ascii_hexdigit()) {
-                return Err(OrchError::new(
-                    OrchErrorCode::InvalidRequest,
-                    "stop detail observation digest must be hex sha256",
                 ));
             }
         }
@@ -605,6 +605,59 @@ impl RunRecord {
             self.stop_cause = Some(RunStopCause::TokenAccountingUnavailable);
         }
         true
+    }
+}
+
+impl RunRecord {
+    /// Restore the cross-field invariant by construction.
+    ///
+    /// A detail qualifies a stationarity stop and means nothing without one, so
+    /// when the cause moves to anything else — a later cancel, an interrupt, a
+    /// budget stop — the detail is no longer true of the record and is dropped.
+    ///
+    /// This is deliberately a normalization on the write path rather than a
+    /// refusal. Refusing would make the record unwritable the moment a run that
+    /// had stopped for stationarity was cancelled, which strands the run and
+    /// breaks cancel: an invariant that can deadlock a legitimate transition is
+    /// the wrong invariant. Reads still verify strictly, so durable data that is
+    /// inconsistent — which now means tampered, not merely stale — fails closed.
+    ///
+    /// Returns whether anything was dropped.
+    pub fn normalize_stop_detail(&mut self) -> bool {
+        if self.stop_detail.is_some() && self.stop_cause != Some(RunStopCause::Stationarity) {
+            self.stop_detail = None;
+            return true;
+        }
+        false
+    }
+
+    /// Cross-field contract for the stop detail.
+    ///
+    /// A detail is a qualifier on a stationarity stop and means nothing without
+    /// one, so a record carrying a detail under any other cause — or under no
+    /// cause at all — is malformed and is refused rather than displayed. Kept
+    /// separate from the record's other invariants so store and projection can
+    /// both call it on exactly the same rule.
+    pub fn validate_stop_detail(&self) -> Result<(), OrchError> {
+        let Some(detail) = self.stop_detail.as_ref() else {
+            return Ok(());
+        };
+        detail.validate()?;
+        if self.stop_cause != Some(RunStopCause::Stationarity) {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "stop detail is only valid on a stationarity stop",
+            ));
+        }
+        // Kind-specific: an inert repeat and an identical-call run are both
+        // attributed to a tool, so an unattributed one is not reportable.
+        if detail.tool.is_none() {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "stop detail must name the tool the repeats were observed on",
+            ));
+        }
+        Ok(())
     }
 }
 

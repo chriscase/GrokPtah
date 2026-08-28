@@ -30,13 +30,13 @@ use crate::host_helpers::{
     coding_agent_tools, count_cargo_test_failures, emit_message, emit_thought,
     filter_tools_batch_edit_only, filter_tools_edit_and_shell, filter_tools_edit_only,
     is_incomplete_stop_message, is_round_limit_stop_message, is_true_noop_tool_step,
-    multi_failure_partial_edit_coaching, normalize_sandbox_profile, offline_plan_steps,
-    parse_effort_arg, post_cargo_failure_skip_message, propose_plan_with_model, push_assistant,
-    push_thought, push_tool, recovery_round_limit_stop_message, resolve_turn_max_rounds,
-    round_limit_stop_message, round_observation_digest, sandbox_blocks_shell, sandbox_is_readonly,
-    should_auto_cargo_reverify_after_edit, should_skip_tool_after_cargo_failure,
-    surface_rate_limit_or_error, tool_kind, tool_step_signature, tool_web_fetch, AgentStep,
-    IdenticalToolCallRun, McpToolIndex,
+    is_witnessed_wait_step, multi_failure_partial_edit_coaching, normalize_sandbox_profile,
+    offline_plan_steps, parse_effort_arg, post_cargo_failure_skip_message, propose_plan_with_model,
+    push_assistant, push_thought, push_tool, recovery_round_limit_stop_message,
+    resolve_turn_max_rounds, round_limit_stop_message, round_observation_digest,
+    sandbox_blocks_shell, sandbox_is_readonly, should_auto_cargo_reverify_after_edit,
+    should_skip_tool_after_cargo_failure, surface_rate_limit_or_error, tool_kind,
+    tool_step_signature, tool_web_fetch, AgentStep, IdenticalToolCallRun, McpToolIndex,
 };
 use crate::lane::LaneSummary;
 use crate::local_tools;
@@ -8533,16 +8533,14 @@ impl AgentHostHandle {
                 // and still gets the full budget it has today.
                 if let Some((run_len, tool_name)) = identical_tool_calls.inert_stop_info() {
                     let msg = action_inert_repeat_stop_message(run_len, &tool_name);
-                    let mut detail = RunStopDetail::new(RunStopDetailKind::InertRepeat, run_len)
-                        .with_tool(tool_name.clone());
-                    if let Some(digest) = identical_tool_calls.observation_digest() {
-                        detail = detail.with_observation_digest(digest);
-                    }
                     self.mark_run_stop_detailed(
                         session_id,
                         RunStopCause::Stationarity,
                         "stationarity",
-                        Some(detail),
+                        Some(
+                            RunStopDetail::new(RunStopDetailKind::InertRepeat, run_len)
+                                .with_tool(tool_name.clone()),
+                        ),
                     )?;
                     let _ = event_tx.send(SessionUpdate::AgentProgress {
                         session_id,
@@ -9095,7 +9093,15 @@ impl AgentHostHandle {
                     // The tool results for this round are already in the wire
                     // context here, so the same call returning the same result
                     // is detectable without waiting another boundary.
-                    if let Some(observation) = round_observation_digest(&messages) {
+                    //
+                    // A witnessed wait is exempt: a poll against work owned by
+                    // something else legitimately returns the same answer while
+                    // that work runs, and the deadline that owns it decides when
+                    // it ends. It stays bounded by the identical-call ceiling,
+                    // the round budget, and the duration budget.
+                    if is_witnessed_wait_step(&tool_calls) {
+                        identical_tool_calls.observe_witnessed_wait();
+                    } else if let Some(observation) = round_observation_digest(&messages) {
                         identical_tool_calls.observe_outcome(observation);
                     }
                     // Usage belongs to the model boundary that produced these

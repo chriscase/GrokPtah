@@ -70,6 +70,66 @@ export type DurableRunStopCause =
   | "interrupted"
   | "failed";
 
+/// Which flavour of stationarity stop fired. Qualifies `stopCause`, never
+/// replaces it.
+export type RunStopDetailKind = "identical_calls" | "true_noop" | "inert_repeat";
+
+/** Structured qualifier for a host-decided stationarity stop.
+ *
+ * Counters, an enum and a bounded tool name only — no prompt, model response,
+ * tool arguments, path or payload. Present only when `stopCause` is
+ * `"stationarity"`.
+ */
+export interface RunStopDetail {
+  kind: RunStopDetailKind;
+  /** Consecutive repeats observed when the stop fired. Always > 0. */
+  repeats: number;
+  /** Bounded tool name only. Never arguments. */
+  tool?: string | null;
+}
+
+/** Wire version of the redacted progress/status projection.
+ *
+ * 1 — historical shape: carried `promptPreview`, no stop detail.
+ * 2 — `promptPreview` removed, `stopDetail` added.
+ */
+export const PROGRESS_PROJECTION_SCHEMA_VERSION = 2;
+
+/** Redacted lifecycle/status projection returned by `ptah_get_progress`.
+ *
+ * Deliberately carries no user or model content. Consumers needing the prompt
+ * preview read the full record via `ptah_get_run` / `ptah_list_runs`.
+ */
+export interface RunProgressProjection {
+  schemaVersion: number;
+  runId: string;
+  sessionId: string;
+  state: DurableRunState;
+  queuePosition?: number | null;
+  busy: boolean;
+  startSeq?: number | null;
+  endSeq?: number | null;
+  progress?: {
+    round: number;
+    maxRounds: number;
+    lastTool?: string | null;
+    detail: string;
+    updatedAt: string;
+  } | null;
+  createdAt: string;
+  updatedAt: string;
+  terminalResult?: string | null;
+  stopCause?: DurableRunStopCause | null;
+  stopDetail?: RunStopDetail | null;
+  bounds: {
+    maxPromptBytes: number;
+    maxRounds: number;
+    maxDurationMs: number;
+    maxTotalTokens?: number | null;
+  };
+  errorCode?: string | null;
+}
+
 export type PersistentAgentState =
   | "active"
   | "waiting"
@@ -530,6 +590,7 @@ export interface DurableRun {
   finalResponse?: string | null;
   errorCode?: string | null;
   stopCause?: DurableRunStopCause | null;
+  stopDetail?: RunStopDetail | null;
   aggregates: {
     changes: Array<{ path: string; summary: string }>;
     tests: Array<{

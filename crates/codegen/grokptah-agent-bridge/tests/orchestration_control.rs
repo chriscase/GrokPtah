@@ -2654,9 +2654,7 @@ async fn the_progress_projection_is_redacted_and_reports_the_stop_detail() {
         .update_run(&run_id, |run| {
             run.stop_cause = Some(RunStopCause::Stationarity);
             run.stop_detail = Some(
-                RunStopDetail::new(RunStopDetailKind::InertRepeat, 4)
-                    .with_tool("get_task_output")
-                    .with_observation_digest("c".repeat(64)),
+                RunStopDetail::new(RunStopDetailKind::InertRepeat, 4).with_tool("get_task_output"),
             );
             Ok(())
         })
@@ -2675,6 +2673,9 @@ async fn the_progress_projection_is_redacted_and_reports_the_stop_detail() {
     }
 
     // What it does carry is the structured, operator-readable stop.
+    // The projection is versioned, so a consumer can tell shape 2 (redacted,
+    // with stopDetail) from the historical shape 1 that carried promptPreview.
+    assert_eq!(progress["schemaVersion"], 2);
     assert_eq!(progress["stopCause"], "stationarity");
     assert_eq!(progress["stopDetail"]["kind"], "inert_repeat");
     assert_eq!(progress["stopDetail"]["repeats"], 4);

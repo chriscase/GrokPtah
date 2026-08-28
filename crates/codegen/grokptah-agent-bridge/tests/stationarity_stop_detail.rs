@@ -56,9 +56,7 @@ fn run_with(run_id: &str, stop: Option<(RunStopCause, RunStopDetail)>) -> RunRec
 fn a_stop_detail_survives_a_store_restart() {
     let dir = tempdir().unwrap();
     let root = dir.path().join("orch");
-    let detail = RunStopDetail::new(RunStopDetailKind::InertRepeat, 4)
-        .with_tool("get_task_output")
-        .with_observation_digest("a".repeat(64));
+    let detail = RunStopDetail::new(RunStopDetailKind::InertRepeat, 4).with_tool("get_task_output");
 
     {
         let store = OrchStore::open(&root).unwrap();
@@ -147,18 +145,14 @@ fn a_budget_exhaustion_stop_is_not_labelled_stationary() {
 
 /// Bounds are enforced so nothing can smuggle content onto the read surface.
 #[test]
-fn a_stop_detail_rejects_oversized_or_malformed_evidence() {
-    let ok = RunStopDetail::new(RunStopDetailKind::InertRepeat, 4)
-        .with_tool("run_terminal_cmd")
-        .with_observation_digest("0".repeat(64));
+fn a_stop_detail_rejects_malformed_evidence() {
+    let ok = RunStopDetail::new(RunStopDetailKind::InertRepeat, 4).with_tool("run_terminal_cmd");
     assert!(ok.validate().is_ok());
 
-    // A non-hex or wrong-length digest is refused rather than displayed.
-    for bad in ["", "xyz", &"f".repeat(63), &"g".repeat(64)] {
-        let detail = RunStopDetail::new(RunStopDetailKind::InertRepeat, 4)
-            .with_observation_digest(bad.to_string());
-        assert!(detail.validate().is_err(), "accepted bad digest {bad:?}");
-    }
+    // A stop that reports zero repeats is claiming something that did not
+    // happen, so it is refused rather than displayed.
+    let zero = RunStopDetail::new(RunStopDetailKind::InertRepeat, 0).with_tool("run_terminal_cmd");
+    assert!(zero.validate().is_err(), "accepted repeats == 0");
 
     // An over-long tool label is truncated at construction, so it can never
     // become a channel for arguments or paths.
@@ -168,12 +162,129 @@ fn a_stop_detail_rejects_oversized_or_malformed_evidence() {
     assert!(detail.tool.as_deref().unwrap().len() <= 128);
 }
 
+/// The cross-field invariant is restored on write, so a later lifecycle
+/// transition can never strand a run, and nothing inconsistent reaches disk.
+#[test]
+fn a_detail_is_dropped_when_the_cause_moves_off_stationarity() {
+    let dir = tempdir().unwrap();
+    let store = OrchStore::open(dir.path().join("orch")).unwrap();
+
+    // A detail attached to a budget stop means nothing: it qualifies
+    // stationarity. Writing is allowed, but the detail does not survive.
+    let mut run = run_with("run-mismatch", None);
+    run.stop_cause = Some(RunStopCause::RoundLimit);
+    run.stop_detail = Some(RunStopDetail::new(RunStopDetailKind::InertRepeat, 4).with_tool("poll"));
+    store.save_run(&run).expect("write must not be refused");
+    let loaded = store.load_run("run-mismatch").unwrap().unwrap();
+    assert_eq!(loaded.stop_cause, Some(RunStopCause::RoundLimit));
+    assert!(loaded.stop_detail.is_none(), "detail outlived its cause");
+
+    // Same for a detail with no cause at all.
+    let mut orphan = run_with("run-orphan", None);
+    orphan.stop_cause = None;
+    orphan.stop_detail =
+        Some(RunStopDetail::new(RunStopDetailKind::InertRepeat, 4).with_tool("poll"));
+    store.save_run(&orphan).unwrap();
+    assert!(store
+        .load_run("run-orphan")
+        .unwrap()
+        .unwrap()
+        .stop_detail
+        .is_none());
+}
+
+/// Normalization restores the invariant; it does not excuse a malformed detail
+/// that survives it.
+#[test]
+fn a_malformed_detail_under_the_right_cause_is_still_refused() {
+    let dir = tempdir().unwrap();
+    let store = OrchStore::open(dir.path().join("orch")).unwrap();
+
+    // Unattributed: nothing to show an operator, so not reportable.
+    let mut unattributed = run_with("run-unattributed", None);
+    unattributed.stop_cause = Some(RunStopCause::Stationarity);
+    unattributed.stop_detail = Some(RunStopDetail::new(RunStopDetailKind::InertRepeat, 4));
+    assert!(store.save_run(&unattributed).is_err());
+
+    // Zero repeats claims something that did not happen.
+    let mut zero = run_with("run-zero", None);
+    zero.stop_cause = Some(RunStopCause::Stationarity);
+    zero.stop_detail =
+        Some(RunStopDetail::new(RunStopDetailKind::InertRepeat, 0).with_tool("poll"));
+    assert!(store.save_run(&zero).is_err());
+}
+
+/// A run that stopped for stationarity and is then cancelled must still be
+/// writable. An invariant that can deadlock a legitimate transition is the
+/// wrong invariant; this is the regression test for that.
+#[test]
+fn cancelling_a_stationarity_stopped_run_still_writes() {
+    let dir = tempdir().unwrap();
+    let store = OrchStore::open(dir.path().join("orch")).unwrap();
+    let detail = RunStopDetail::new(RunStopDetailKind::InertRepeat, 4).with_tool("task_output");
+    store
+        .save_run(&run_with(
+            "run-cancel",
+            Some((RunStopCause::Stationarity, detail)),
+        ))
+        .unwrap();
+
+    let updated = store
+        .update_run("run-cancel", |run| {
+            run.state = RunState::Cancelled;
+            run.stop_cause = Some(RunStopCause::Cancelled);
+            Ok(())
+        })
+        .expect("cancel must not be blocked by a stale stop detail")
+        .expect("run present");
+    assert_eq!(updated.stop_cause, Some(RunStopCause::Cancelled));
+    assert!(updated.stop_detail.is_none());
+}
+
+/// Durable data is not automatically trusted: a record tampered with after the
+/// write path fails closed on read instead of being rendered as fact.
+#[test]
+fn malformed_durable_data_fails_closed_on_read() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("orch");
+    let store = OrchStore::open(&root).unwrap();
+
+    let detail = RunStopDetail::new(RunStopDetailKind::InertRepeat, 4).with_tool("poll");
+    store
+        .save_run(&run_with(
+            "run-tamper",
+            Some((RunStopCause::Stationarity, detail)),
+        ))
+        .unwrap();
+    assert!(store.load_run("run-tamper").unwrap().is_some());
+
+    // Rewrite the record on disk with a cause the detail may not accompany.
+    let path = std::fs::read_dir(root.join("runs"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        .expect("run file");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let tampered = text.replace("\"stationarity\"", "\"round_limit\"");
+    assert_ne!(tampered, text, "fixture did not actually tamper anything");
+    std::fs::write(&path, tampered).unwrap();
+
+    assert!(
+        store.load_run("run-tamper").is_err(),
+        "a tampered stop detail must be refused, not returned"
+    );
+    assert!(
+        store.list_runs().unwrap().is_empty(),
+        "a tampered record must not be listed either"
+    );
+}
+
 /// The detail carries no prompt, path, argument, or payload material.
 #[test]
 fn a_stop_detail_carries_no_content() {
-    let detail = RunStopDetail::new(RunStopDetailKind::InertRepeat, 4)
-        .with_tool("run_terminal_cmd")
-        .with_observation_digest("b".repeat(64));
+    let detail =
+        RunStopDetail::new(RunStopDetailKind::InertRepeat, 4).with_tool("run_terminal_cmd");
     let encoded = serde_json::to_string(&detail).unwrap();
     for leak in [
         "SENSITIVE-USER-PROMPT",
@@ -196,7 +307,7 @@ fn a_stop_detail_carries_no_content() {
     // Exactly these four and nothing else: any new key would be a new channel.
     assert_eq!(
         keys,
-        vec!["kind", "observationDigest", "repeats", "tool"],
+        vec!["kind", "repeats", "tool"],
         "stop detail gained an unexpected field"
     );
 }

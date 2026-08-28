@@ -5052,9 +5052,14 @@ impl OrchestrationService {
     /// is host-authored template text (`"Model step 3/24"`, `` "Tool `x`" ``),
     /// never model prose or tool output.
     fn progress_value(&self, mut run: RunRecord) -> Result<serde_json::Value, OrchError> {
+        // The projection is a read surface, so it re-checks the contract rather
+        // than trusting whatever reached it. A malformed detail is refused here
+        // too, not rendered.
+        run.validate_stop_detail()?;
         self.refresh_queue_position(&mut run);
         let busy = self.host.session_busy(run.session_id);
         Ok(json!({
+            "schemaVersion": PROGRESS_PROJECTION_SCHEMA_VERSION,
             "runId": run.run_id,
             "sessionId": run.session_id,
             "state": run.state,

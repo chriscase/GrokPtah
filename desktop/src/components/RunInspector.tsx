@@ -79,6 +79,25 @@ function stopCauseLabel(run: DurableRun): string | null {
   return run.stopCause.replace(/_/g, " ");
 }
 
+/** Operator-readable gloss for a stationarity stop.
+ *
+ * The three kinds mean genuinely different things, and an operator should not
+ * have to read the stop prose to tell them apart: an identical-call run is a
+ * model repeating a request, while an inert repeat is that request also coming
+ * back with the same answer every time.
+ */
+function stopDetailLabel(run: DurableRun): string | null {
+  const detail = run.stopDetail;
+  if (!detail) return null;
+  const what =
+    detail.kind === "inert_repeat"
+      ? `${detail.repeats} identical calls that each returned the same result`
+      : detail.kind === "true_noop"
+        ? `${detail.repeats} true no-op calls`
+        : `${detail.repeats} identical calls`;
+  return detail.tool ? `${what} (\`${detail.tool}\`)` : what;
+}
+
 function runOriginLabel(run: DurableRun): string {
   if (run.clientId === "mcp") return "MCP coordinator";
   if (run.clientId === "desktop") return "Desktop";
@@ -440,6 +459,7 @@ export function RunInspector({
             const requiresDurableApproval = run.clientId === "mcp";
             const tokens = tokenLabel(run);
             const stopCause = stopCauseLabel(run);
+            const stopDetail = stopDetailLabel(run);
             return (
               <article className={`run-card state-${run.state}`} key={run.runId}>
                 <div className="run-card-heading">
@@ -497,6 +517,7 @@ export function RunInspector({
                 {stopCause && (
                   <div className="run-callout" role="status">
                     Stop cause: {stopCause}
+                    {stopDetail && <div className="run-stop-detail">{stopDetail}</div>}
                   </div>
                 )}
                 {run.state === "interrupted" && (
