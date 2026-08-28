@@ -67,10 +67,10 @@ pub use export::{
     ExportVerification, WithheldReason,
 };
 pub use keys::{AuditKeyCustody, AuditKeyMode, AuditKeyProvider, AuditKeys};
+pub(crate) use ledger::AuditEntryInput;
 pub(crate) use ledger::AuditIntentState;
 #[cfg(test)]
 pub(crate) use ledger::CrashPoint;
-pub(crate) use ledger::{AuditEntryInput, AuditHousekeepingInput};
 pub use ledger::{
     AuditLedger, AuditLedgerOptions, AuditStatus, GenerationVerification, RecoverySummary,
     MAX_GENERATION_BYTES,

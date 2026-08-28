@@ -1238,11 +1238,12 @@ mod tests {
             MutationCrashPoint::AfterReceiptComplete,
         ] {
             let dir = tempdir().unwrap();
+            let owner = Uuid::new_v4();
             {
                 let service = audited_service_at(dir.path()).with_crash_at(point);
                 let result = service.create_run(
                     "mutation-crash",
-                    Uuid::new_v4(),
+                    owner,
                     None,
                     SimulatorBackend::demo_target(),
                     ComputerUseLimits::default(),
@@ -1258,7 +1259,7 @@ mod tests {
             );
             let replay = service.create_run(
                 "mutation-crash",
-                Uuid::new_v4(),
+                owner,
                 None,
                 SimulatorBackend::demo_target(),
                 ComputerUseLimits::default(),
