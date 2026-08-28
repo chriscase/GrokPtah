@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+#[cfg(test)]
 use parking_lot::Mutex;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -16,7 +17,7 @@ use super::projection::{
     not_available, project_events, project_run_at, ComputerRunCapacity, ComputerRunEventPage,
     ComputerRunProjection,
 };
-use super::store::{ComputerStore, MutationClaim, MutationStage};
+use super::store::{ComputerStore, MutationClaim};
 use super::types::{
     validate_id, ActionGrant, ActionOutcome, ComputerAction, ComputerBackend,
     ComputerControlDisposition, ComputerError, ComputerErrorCode, ComputerObservation,

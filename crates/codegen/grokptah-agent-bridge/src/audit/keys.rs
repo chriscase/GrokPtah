@@ -8,6 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -101,9 +102,8 @@ pub struct AuditKeyCustody {
 
 impl std::fmt::Debug for AuditKeyCustody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let key_id = self
-            .provider
-            .keyring()
+        let keyring = self.provider.keyring();
+        let key_id = keyring
             .first()
             .map(|key| key.key_id())
             .unwrap_or("unavailable");
