@@ -11,7 +11,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-use crate::orchestration::OrchStore;
+use crate::orchestration::{authz::AuthContext, OrchStore};
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -23,6 +23,8 @@ struct AuthorityRecord {
     effect_scope: String,
     #[serde(default)]
     revoked_effect_lease_ids: Vec<String>,
+    #[serde(default)]
+    issued_effect_lease_ids: Vec<String>,
 }
 
 struct PrincipalRef {
@@ -34,6 +36,14 @@ struct CapabilityEffectLease {
     generation: u64,
     lease_id: String,
     scope: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VerifiedReconciliation {
+    operator_id: String,
+    provider_request_id: String,
+    provider_effect_id: Option<String>,
 }
 
 pub(crate) fn assemble(
@@ -51,18 +61,117 @@ pub(crate) fn assemble(
     let identity = credentials.qualification_identity_fingerprint();
     let principal = principal_ref(session_id, agent_id, &identity, store.clone())?;
     let capability = capability_lease(agent_id, store, effect_scope.clone(), turn_generation)?;
+    let (revoked_effect_lease_ids, mut issued_effect_lease_ids) =
+        match fs::read(authority_path(attempt_root, &effect_scope)) {
+            Ok(bytes) => {
+                let record = serde_json::from_slice::<AuthorityRecord>(&bytes)?;
+                (
+                    record.revoked_effect_lease_ids,
+                    record.issued_effect_lease_ids,
+                )
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (Vec::new(), Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+    let lease_id = capability.lease_id;
+    issued_effect_lease_ids.push(lease_id.clone());
     write_authority(
         attempt_root,
         &AuthorityRecord {
             principal_incarnation: principal.incarnation,
             auth_generation: principal.auth_generation,
             capability_generation: capability.generation,
-            effect_lease_id: capability.lease_id,
+            effect_lease_id: lease_id,
             effect_scope: capability.scope,
-            revoked_effect_lease_ids: Vec::new(),
+            revoked_effect_lease_ids,
+            issued_effect_lease_ids,
         },
         &effect_scope,
     )
+}
+
+pub(crate) fn refresh(
+    session_id: Uuid,
+    agent_id: Option<&str>,
+    model: &str,
+    turn_generation: u64,
+    store: Option<OrchStore>,
+    attempt_root: &Path,
+    effect_scope: &str,
+    rotate_capability: bool,
+) -> Result<()> {
+    let path = authority_path(attempt_root, effect_scope);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut current: AuthorityRecord = serde_json::from_slice(&bytes)?;
+    let credentials = crate::auth_store::resolve_wire_credentials_for_model(model)
+        .map_err(|error| anyhow!("canonical auth authority unavailable: {error}"))?
+        .ok_or_else(|| anyhow!("canonical auth authority is unavailable"))?;
+    let identity = credentials.qualification_identity_fingerprint();
+    let principal = principal_ref(session_id, agent_id, &identity, store.clone())?;
+    current.principal_incarnation = principal.incarnation;
+    current.auth_generation = principal.auth_generation;
+    current.capability_generation =
+        current
+            .capability_generation
+            .max(capability_generation(agent_id, store, turn_generation)?);
+    if rotate_capability {
+        current.capability_generation = current.capability_generation.saturating_add(1);
+    }
+    write_authority(attempt_root, &current, effect_scope)
+}
+
+pub(crate) fn revoke_scope(attempt_root: &Path, effect_scope: &str) -> Result<()> {
+    let path = authority_path(attempt_root, effect_scope);
+    let bytes = fs::read(path)?;
+    let mut current: AuthorityRecord = serde_json::from_slice(&bytes)?;
+    let issued = current.issued_effect_lease_ids.clone();
+    for lease in issued.into_iter().chain([current.effect_lease_id.clone()]) {
+        if !current
+            .revoked_effect_lease_ids
+            .iter()
+            .any(|item| item == &lease)
+        {
+            current.revoked_effect_lease_ids.push(lease);
+        }
+    }
+    write_authority(attempt_root, &current, effect_scope)
+}
+
+pub(crate) fn write_verified_reconciliation(
+    attempt_root: &Path,
+    attempt_id: &str,
+    operator: &AuthContext,
+    provider_request_id: &str,
+    provider_effect_id: Option<&str>,
+) -> Result<()> {
+    if operator.token_id.trim().is_empty()
+        || attempt_id.trim().is_empty()
+        || provider_request_id.trim().is_empty()
+        || provider_effect_id.is_some_and(|effect| effect.trim().is_empty())
+    {
+        return Err(anyhow!("verified reconciliation fields are incomplete"));
+    }
+    let directory = attempt_root.join("reconciliation");
+    fs::create_dir_all(&directory)?;
+    let temporary = directory.join(format!(".{attempt_id}.{}.tmp", Uuid::new_v4()));
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)?;
+    let record = VerifiedReconciliation {
+        operator_id: operator.token_id.clone(),
+        provider_request_id: provider_request_id.into(),
+        provider_effect_id: provider_effect_id.map(str::to_owned),
+    };
+    file.write_all(&serde_json::to_vec(&record)?)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(temporary, directory.join(format!("{attempt_id}.json")))?;
+    Ok(())
 }
 
 fn principal_ref(
@@ -92,7 +201,20 @@ fn capability_lease(
     scope: String,
     turn_generation: u64,
 ) -> Result<CapabilityEffectLease> {
-    let generation = if let Some(agent_id) = agent_id {
+    let generation = capability_generation(agent_id, store, turn_generation)?;
+    Ok(CapabilityEffectLease {
+        generation,
+        lease_id: format!("effect-lease-{}", Uuid::new_v4()),
+        scope,
+    })
+}
+
+fn capability_generation(
+    agent_id: Option<&str>,
+    store: Option<OrchStore>,
+    turn_generation: u64,
+) -> Result<u64> {
+    if let Some(agent_id) = agent_id {
         let store = store.ok_or_else(|| anyhow!("canonical Agent authority is unavailable"))?;
         let agent = store
             .load_agent(agent_id)?
@@ -100,19 +222,14 @@ fn capability_lease(
         if !agent.state.is_active_identity() {
             return Err(anyhow!("terminal Agent authority cannot send"));
         }
-        agent
+        Ok(agent
             .spec
             .as_ref()
             .map(|spec| spec.revision.max(1))
-            .ok_or_else(|| anyhow!("canonical capability authority is unavailable"))?
+            .ok_or_else(|| anyhow!("canonical capability authority is unavailable"))?)
     } else {
-        turn_generation.max(1)
-    };
-    Ok(CapabilityEffectLease {
-        generation,
-        lease_id: format!("effect-lease-{}", Uuid::new_v4()),
-        scope,
-    })
+        Ok(turn_generation.max(1))
+    }
 }
 
 fn authority_path(root: &Path, scope: &str) -> PathBuf {
@@ -155,6 +272,7 @@ pub(crate) fn write_snapshot(
             effect_lease_id: effect_lease_id.into(),
             effect_scope: scope.into(),
             revoked_effect_lease_ids: Vec::new(),
+            issued_effect_lease_ids: vec![effect_lease_id.into()],
         },
         scope,
     )

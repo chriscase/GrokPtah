@@ -1014,6 +1014,66 @@ impl AgentHostHandle {
             .map_err(|error| anyhow!("construct provider attempt context: {error}"))
     }
 
+    fn refresh_provider_authorities(&self) {
+        let Some(_store) = self.provider_attempt_store.as_ref() else {
+            return;
+        };
+        let sessions = {
+            let inner = self.inner.lock();
+            inner
+                .sessions
+                .iter()
+                .map(|(session_id, session)| {
+                    (
+                        *session_id,
+                        session.agent_id.clone(),
+                        session.model.clone(),
+                        inner.turn_generations.get(session_id).copied().unwrap_or(1),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let root = self
+            .runtime_home
+            .orchestration_root()
+            .join("provider-attempts");
+        let store = self.orchestration_store.lock().clone();
+        for (session_id, agent_id, model, turn_generation) in sessions {
+            let scope = format!("effect-scope-{session_id}");
+            let _ = crate::host_authority::refresh(
+                session_id,
+                agent_id.as_deref(),
+                &model,
+                turn_generation,
+                store.clone(),
+                &root,
+                &scope,
+                true,
+            );
+        }
+    }
+
+    fn revoke_provider_authorities(&self) {
+        let Some(_store) = self.provider_attempt_store.as_ref() else {
+            return;
+        };
+        let session_ids = self
+            .inner
+            .lock()
+            .sessions
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        let root = self
+            .runtime_home
+            .orchestration_root()
+            .join("provider-attempts");
+        for session_id in session_ids {
+            let scope = format!("effect-scope-{session_id}");
+            let _ = crate::host_authority::revoke_scope(&root, &scope);
+        }
+    }
+
     pub fn take_event_receiver(&self) -> Option<crate::event_bus::EventReceiver> {
         self.event_rx_factory.lock().take()
     }
@@ -4210,6 +4270,7 @@ impl AgentHostHandle {
             self.invalidate_computer_agent_authority();
         }
         self.inner.lock().model = model;
+        self.refresh_provider_authorities();
         self.persist_chrome();
     }
 
@@ -4353,11 +4414,13 @@ impl AgentHostHandle {
             "default".into()
         };
         drop(g);
+        self.refresh_provider_authorities();
         self.persist_chrome();
     }
 
     pub fn set_sandbox(&self, profile: String) {
         self.inner.lock().sandbox_profile = normalize_sandbox_profile(&profile).to_string();
+        self.refresh_provider_authorities();
         self.persist_chrome();
     }
 
@@ -4385,6 +4448,7 @@ impl AgentHostHandle {
         };
         g.always_approve = bypass;
         drop(g);
+        self.refresh_provider_authorities();
         self.persist_chrome();
     }
 
@@ -4392,6 +4456,8 @@ impl AgentHostHandle {
         let mut g = self.inner.lock();
         g.allow_rules = allow;
         g.deny_rules = deny;
+        drop(g);
+        self.refresh_provider_authorities();
     }
 
     fn session_agent_spec(&self, session_id: Uuid) -> Result<Option<AgentSpec>> {
@@ -4714,6 +4780,7 @@ impl AgentHostHandle {
         let state =
             crate::auth_store::store_api_key(&api_key, &display_name).map_err(|e| anyhow!(e))?;
         self.inner.lock().auth = state.clone();
+        self.refresh_provider_authorities();
         Ok(state)
     }
 
@@ -4722,6 +4789,7 @@ impl AgentHostHandle {
     }
 
     pub fn sign_out(&self) -> AuthState {
+        self.revoke_provider_authorities();
         let state = crate::auth_store::clear_credentials();
         self.inner.lock().auth = state.clone();
         state

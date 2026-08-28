@@ -274,37 +274,12 @@ impl ReconciliationAuthorization {
     }
 }
 
-/// Opaque evidence minted by the trusted operator + provider reconciliation
-/// adapter. Downstream crates cannot construct or implement the old
-/// caller-assertable reconciliation authority.
-pub struct ReconciliationEvidence {
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredReconciliation {
     operator_id: String,
     provider_request_id: String,
-}
-
-impl fmt::Debug for ReconciliationEvidence {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("ReconciliationEvidence([redacted])")
-    }
-}
-
-impl ReconciliationEvidence {
-    #[allow(dead_code)]
-    // Reserved for the in-process trusted operator/provider evidence adapter;
-    // no downstream crate can invoke this constructor.
-    pub(crate) fn from_verified(
-        operator_id: impl Into<String>,
-        provider_request_id: impl Into<String>,
-    ) -> Result<Self, AttemptError> {
-        let operator_id = operator_id.into();
-        let provider_request_id = provider_request_id.into();
-        validate_id(&operator_id, "operator id")?;
-        validate_id(&provider_request_id, "provider request id")?;
-        Ok(Self {
-            operator_id,
-            provider_request_id,
-        })
-    }
+    provider_effect_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -570,21 +545,40 @@ impl AttemptContext {
         permit.cancel_after_possible_write()
     }
 
-    /// Reopen an uncertain attempt only after both live operator authority and
-    /// verified provider non-application are observed by the host adapter.
-    /// There is deliberately no public API that accepts a caller-created
-    /// settlement proof.
-    pub fn reconcile_not_applied(
+    /// Reopen an uncertain attempt only after a trusted host adapter has
+    /// durably recorded authenticated operator authority and verified provider
+    /// truth. The public API accepts no caller-created authorization or
+    /// provider result.
+    pub fn reconcile_from_host_ledger(
         &self,
         attempt: &ProviderAttempt,
-        evidence: &ReconciliationEvidence,
     ) -> Result<(), AttemptError> {
-        let provider_request_id = attempt.provider_request_id()?;
-        if evidence.provider_request_id != provider_request_id {
+        let path = self
+            .store
+            .root
+            .join("reconciliation")
+            .join(format!("{}.json", attempt.attempt_id()));
+        let bytes = fs::read(path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                AttemptError::NotExplicitlyAuthorized
+            } else {
+                AttemptError::Io(error.to_string())
+            }
+        })?;
+        let record: StoredReconciliation = serde_json::from_slice(&bytes)
+            .map_err(|error| AttemptError::Serialization(error.to_string()))?;
+        if record.provider_request_id != attempt.provider_request_id()? {
             return Err(AttemptError::NotExplicitlyAuthorized);
         }
-        let authorization = ReconciliationAuthorization::new(&evidence.operator_id)?;
-        attempt.reconcile(&authorization, ProviderTruth::NotApplied)
+        let authorization = ReconciliationAuthorization::new(record.operator_id)?;
+        let truth = match record.provider_effect_id {
+            Some(effect_id) => ProviderTruth::Applied(ProviderSettlement::new(
+                record.provider_request_id,
+                effect_id,
+            )?),
+            None => ProviderTruth::NotApplied,
+        };
+        attempt.reconcile(&authorization, truth)
     }
 }
 
@@ -1368,6 +1362,24 @@ mod tests {
         (temp, store, attempt)
     }
 
+    fn write_host_snapshot(root: &Path, scope: &str, binding: &AuthorityBinding) {
+        fs::create_dir_all(root.join("canonical-authorities")).unwrap();
+        fs::write(
+            root.join("canonical-authorities")
+                .join(format!("{scope}.json")),
+            serde_json::json!({
+                "principalIncarnation": binding.principal_incarnation,
+                "authGeneration": binding.auth_generation,
+                "capabilityGeneration": binding.capability_generation,
+                "effectLeaseId": binding.effect_lease_id,
+                "effectScope": binding.effect_scope,
+                "revokedEffectLeaseIds": [],
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn state_transition_matrix_is_monotonic() {
         let all = [
@@ -1496,10 +1508,14 @@ mod tests {
     fn revoke_between_admission_and_begin_send_is_zero_write() {
         let temp = tempdir().unwrap();
         let store = ProviderAttemptStore::open(temp.path()).unwrap();
+        let scope = "revoke-scope";
+        write_host_snapshot(temp.path(), scope, &authority(1));
         let context = AttemptContext::new(store.clone(), "revoke-operation", authority(1)).unwrap();
         let attempt = context.prepare("xai", b"request", true).unwrap();
+        write_host_snapshot(temp.path(), scope, &authority(2));
+        let context = AttemptContext::from_host_ledger(store, "revoke-operation", scope).unwrap();
         assert_eq!(
-            attempt.begin_send_live(&authority(2)).unwrap_err(),
+            context.begin_send(&attempt).unwrap_err(),
             AttemptError::StaleAuthority
         );
         assert_eq!(attempt.state().unwrap(), SendState::Cancelled);
@@ -1654,17 +1670,38 @@ mod tests {
         let mut permit = context.begin("xai", b"request", true).unwrap();
         permit.transport_after_possible_write().unwrap();
         let attempt = store.load(permit.attempt_id()).unwrap().unwrap();
-        let denied = ReconciliationEvidence::from_verified("operator-1", "opaque-wrong").unwrap();
-        assert_eq!(
-            context.reconcile_not_applied(&attempt, &denied),
-            Err(AttemptError::NotExplicitlyAuthorized)
-        );
-        let approved = ReconciliationEvidence::from_verified(
-            "operator-1",
-            attempt.provider_request_id().unwrap(),
+        fs::create_dir_all(store.root.join("reconciliation")).unwrap();
+        fs::write(
+            store
+                .root
+                .join("reconciliation")
+                .join(format!("{}.json", attempt.attempt_id())),
+            serde_json::json!({
+                "operatorId": "operator-1",
+                "providerRequestId": "opaque-wrong",
+                "providerEffectId": null,
+            })
+            .to_string(),
         )
         .unwrap();
-        context.reconcile_not_applied(&attempt, &approved).unwrap();
+        assert_eq!(
+            context.reconcile_from_host_ledger(&attempt),
+            Err(AttemptError::NotExplicitlyAuthorized)
+        );
+        fs::write(
+            store
+                .root
+                .join("reconciliation")
+                .join(format!("{}.json", attempt.attempt_id())),
+            serde_json::json!({
+                "operatorId": "operator-1",
+                "providerRequestId": attempt.provider_request_id().unwrap(),
+                "providerEffectId": null,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        context.reconcile_from_host_ledger(&attempt).unwrap();
         assert_eq!(attempt.state().unwrap(), SendState::Admitted);
     }
 
