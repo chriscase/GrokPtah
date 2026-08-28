@@ -1403,7 +1403,11 @@ mod tests {
             .unwrap();
         assert_eq!(desktop.native_services.lock().unwrap().len(), 1);
 
-        let second_owner = Uuid::new_v4();
+        let second_owner = desktop
+            .host
+            .session_new_kind(grokptah_agent_bridge::SessionKind::Build)
+            .unwrap()
+            .id;
         let candidate = desktop.list_targets().await.unwrap().remove(0);
         let second = desktop
             .start_native(second_owner, &candidate.selection_token, NATIVE_TEST_APP_ID)
