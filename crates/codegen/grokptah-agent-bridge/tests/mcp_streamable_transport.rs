@@ -284,6 +284,85 @@ async fn unauthenticated_and_oversized_fail_closed() {
 
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
+async fn loopback_host_and_origin_policy_and_public_probe_projection_fail_closed() {
+    let (_home, _lock, _host, _ws, orch) = setup();
+    let srv = start_control_server(orch.clone(), 0).await.unwrap();
+    let client = reqwest::Client::new();
+    let health_url = format!("http://{}/health", srv.addr);
+    let ready_url = format!("http://{}/ready", srv.addr);
+
+    let hostile_host = client
+        .get(&health_url)
+        .header("Host", "attacker.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(hostile_host.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let hostile_origin = client
+        .get(&health_url)
+        .header("Origin", "https://attacker.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(hostile_origin.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let null_origin = client
+        .get(&ready_url)
+        .header("Origin", "null")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(null_origin.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let port = srv.addr.port();
+    let allowed = client
+        .get(&health_url)
+        .header("Host", format!("localhost:{port}"))
+        .header("Origin", format!("http://localhost:{port}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(allowed.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = allowed.json().await.unwrap();
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["status"], "alive");
+    assert_eq!(body["authoritative"], false);
+    assert!(body.get("ready").is_none());
+    assert!(body.get("capacity").is_none());
+    let public_body = body.to_string().to_ascii_lowercase();
+    for needle in [
+        "capacity",
+        "credential",
+        "error",
+        "path",
+        "persistence",
+        "secret",
+        "session",
+        "supervisor",
+        "token",
+        "workspace",
+    ] {
+        assert!(
+            !public_body.contains(needle),
+            "public probe leaked {needle}: {body}"
+        );
+    }
+
+    let ready = client.get(&ready_url).send().await.unwrap();
+    assert_eq!(ready.status(), reqwest::StatusCode::OK);
+    let ready_body: serde_json::Value = ready.json().await.unwrap();
+    assert_eq!(ready_body["status"], "alive");
+    assert_eq!(ready_body["authoritative"], false);
+    assert!(ready_body.get("ready").is_none());
+    assert!(ready_body.get("capacity").is_none());
+
+    srv.stop();
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn notification_returns_accepted_without_result_body() {
     let (_home, _lock, _host, _ws, orch) = setup();
     let srv = start_control_server(orch.clone(), 0).await.unwrap();
@@ -680,11 +759,9 @@ async fn session_map_hard_capped_under_initialize_spam() {
         .await
         .unwrap();
     let h: serde_json::Value = health.json().await.unwrap();
-    let n = h["sessions"].as_u64().unwrap();
-    assert!(
-        n <= 256,
-        "session map grew unbounded under initialize spam: {n}"
-    );
+    assert_eq!(h["status"], "alive");
+    assert_eq!(h["authoritative"], false);
+    assert!(h.get("sessions").is_none());
     // Oldest session should have been LRU-evicted.
     let stale = http
         .post(&url)
@@ -728,10 +805,9 @@ async fn binds_loopback_only() {
     assert_eq!(health.status(), 200);
     let h: serde_json::Value = health.json().await.unwrap();
     assert_eq!(h["ok"], true);
-    assert!(
-        h["maxConcurrent"].as_u64().unwrap() >= 1,
-        "health must advertise concurrency bound"
-    );
+    assert_eq!(h["status"], "alive");
+    assert_eq!(h["authoritative"], false);
+    assert!(h.get("maxConcurrent").is_none());
     srv.stop();
     set_grokptah_home_override(None);
 }

@@ -340,12 +340,15 @@ async function runCapacity429Mode() {
   sampleResources("capacity429_start");
   const health = await fetch(`${base}/health`);
   const hj = await health.json();
-  record("loopbackHealth", health.status === 200 && hj.ok === true, {
-    maxConcurrent: hj.maxConcurrent,
-  });
-  record("loweredCapacityConfigured", Number(hj.maxConcurrent) === 2, {
-    maxConcurrent: hj.maxConcurrent,
-  });
+  record(
+    "loopbackHealth",
+    health.status === 200 &&
+      hj.ok === true &&
+      hj.status === "alive" &&
+      hj.authoritative === false &&
+      hj.capacity === undefined,
+    hj
+  );
   // Hold 2 permits (inject ~400ms, timeout 5s) then overflow must 429.
   const holders = [1, 2].map((id) =>
     mcpFetch("tools/list", {}, { id, timeoutMs: 8000 }).catch((e) => ({
@@ -372,7 +375,15 @@ async function runCapacityTimeoutMode() {
   sampleResources("timeout_start");
   const health = await fetch(`${base}/health`);
   const hj = await health.json();
-  record("loopbackHealth", health.status === 200 && hj.ok === true, hj);
+  record(
+    "loopbackHealth",
+    health.status === 200 &&
+      hj.ok === true &&
+      hj.status === "alive" &&
+      hj.authoritative === false &&
+      hj.capacity === undefined,
+    hj
+  );
   // inject 500ms > request timeout 80ms → 504 timeout
   const timed = await mcpFetch("tools/list", {}, { id: 100, timeoutMs: 5000 }).catch((e) => ({
     status: 0,
@@ -400,7 +411,15 @@ async function runFullMode() {
 
   const health = await fetch(`${base}/health`);
   const hj = await health.json();
-  record("loopbackHealth", health.status === 200 && hj.ok === true, hj);
+  record(
+    "loopbackHealth",
+    health.status === 200 &&
+      hj.ok === true &&
+      hj.status === "alive" &&
+      hj.authoritative === false &&
+      hj.capacity === undefined,
+    hj
+  );
   record(
     "loopbackOnlyBind",
     ["127.0.0.1", "localhost"].includes(new URL(base).hostname),

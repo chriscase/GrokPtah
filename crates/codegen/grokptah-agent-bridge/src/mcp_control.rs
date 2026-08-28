@@ -15,8 +15,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::extract::{DefaultBodyLimit, Query, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::extract::{DefaultBodyLimit, Extension, Query, State};
+use axum::http::{uri::Authority, HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -97,6 +97,10 @@ struct AppState {
     max_concurrent: usize,
     live_streams: Arc<Semaphore>,
     health_requires_auth: bool,
+    /// Loopback listeners are reachable by browser code, so reject rebinding
+    /// requests before authentication or handler dispatch. Remote listeners
+    /// have an explicit deployment policy and retain their existing behavior.
+    enforce_loopback_origin_policy: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -445,6 +449,8 @@ pub async fn start_control_server_with_bind(
     if !addr.ip().is_loopback() && !health_requires_auth {
         anyhow::bail!("non-loopback control listeners require authenticated health probes");
     }
+    let listener = TcpListener::bind(addr).await?;
+    let bound_addr = listener.local_addr()?;
     let cancel = tokio_util::sync::CancellationToken::new();
     let max_concurrent = limits.max_concurrent.max(1);
     let state = AppState {
@@ -459,6 +465,7 @@ pub async fn start_control_server_with_bind(
         max_concurrent,
         live_streams: Arc::new(Semaphore::new(MAX_LIVE_STREAMS)),
         health_requires_auth,
+        enforce_loopback_origin_policy: bound_addr.ip().is_loopback(),
     };
     let app = Router::new()
         .route("/health", get(health_handler))
@@ -480,8 +487,7 @@ pub async fn start_control_server_with_bind(
         ))
         .with_state(state.clone());
 
-    let listener = TcpListener::bind(addr).await?;
-    let addr = listener.local_addr()?;
+    let addr = bound_addr;
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let token = String::new();
     let cancel_serve = cancel.clone();
@@ -513,9 +519,19 @@ pub async fn start_control_server_with_bind(
 /// only the limited read — never orchestration mutations.
 async fn authenticate_request(
     State(state): State<AppState>,
-    request: axum::extract::Request,
+    mut request: axum::extract::Request,
     next: Next,
 ) -> Response {
+    if state.enforce_loopback_origin_policy && !loopback_request_allowed(&request) {
+        return json_err(
+            None,
+            StatusCode::BAD_REQUEST,
+            &OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "request host or origin is not allowed for the loopback service",
+            ),
+        );
+    }
     // Health/readiness are unauthenticated only for loopback listeners. A
     // service explicitly exposed beyond the host must authenticate probes too.
     if matches!(request.uri().path(), "/health" | "/ready") && !state.health_requires_auth {
@@ -526,13 +542,25 @@ async fn authenticate_request(
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
     match state.orch.auth_header(auth_header) {
-        Ok(_) => next.run(request).await,
+        Ok(auth) => {
+            request.extensions_mut().insert(auth);
+            next.run(request).await
+        }
         Err(error) => json_err(None, StatusCode::UNAUTHORIZED, &error),
     }
 }
 
-async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let readiness = readiness_snapshot(&state);
+async fn health_handler(
+    State(state): State<AppState>,
+    auth: Option<Extension<AuthContext>>,
+) -> impl IntoResponse {
+    // Loopback probes intentionally receive only a process-liveness answer.
+    // In particular, do not manufacture an AuthContext to expose capacity,
+    // persistence errors, or supervisor diagnostics to browser callers.
+    let Some(Extension(auth)) = auth else {
+        return Json(public_probe_payload());
+    };
+    let readiness = readiness_snapshot(&state, &auth);
     Json(json!({
         "ok": true,
         "ready": readiness.ready,
@@ -554,13 +582,10 @@ struct ReadinessSnapshot {
     payload: Value,
 }
 
-fn readiness_snapshot(state: &AppState) -> ReadinessSnapshot {
+fn readiness_snapshot(state: &AppState, auth: &AuthContext) -> ReadinessSnapshot {
     let payload = state
         .orch
-        .get_capacity(&AuthContext {
-            token_id: "health-probe".into(),
-            owner_id: "health-probe".into(),
-        })
+        .get_capacity(auth)
         .unwrap_or_else(|error| json!({"health": {"serviceError": error.message}}));
     let health = payload.get("health").cloned().unwrap_or_else(|| json!({}));
     let ready = [
@@ -578,8 +603,14 @@ fn readiness_snapshot(state: &AppState) -> ReadinessSnapshot {
     ReadinessSnapshot { ready, payload }
 }
 
-async fn ready_handler(State(state): State<AppState>) -> Response {
-    let snapshot = readiness_snapshot(&state);
+async fn ready_handler(
+    State(state): State<AppState>,
+    auth: Option<Extension<AuthContext>>,
+) -> Response {
+    let Some(Extension(auth)) = auth else {
+        return (StatusCode::OK, Json(public_probe_payload())).into_response();
+    };
+    let snapshot = readiness_snapshot(&state, &auth);
     let status = if snapshot.ready {
         StatusCode::OK
     } else {
@@ -594,6 +625,60 @@ async fn ready_handler(State(state): State<AppState>) -> Response {
         })),
     )
         .into_response()
+}
+
+fn public_probe_payload() -> Value {
+    json!({
+        "ok": true,
+        "status": "alive",
+        "authoritative": false,
+        "service": "grokptah-control",
+        "transport": "mcp-streamable-http",
+    })
+}
+
+fn loopback_request_allowed(request: &axum::extract::Request) -> bool {
+    request
+        .headers()
+        .get(axum::http::header::HOST)
+        .is_none_or(loopback_host_header)
+        && request
+            .headers()
+            .get(axum::http::header::ORIGIN)
+            .is_none_or(loopback_origin_header)
+}
+
+fn loopback_host_header(value: &HeaderValue) -> bool {
+    value
+        .to_str()
+        .ok()
+        .and_then(|raw| raw.parse::<Authority>().ok())
+        .is_some_and(|authority| is_loopback_host(authority.host()))
+}
+
+fn loopback_origin_header(value: &HeaderValue) -> bool {
+    let Ok(raw) = value.to_str() else {
+        return false;
+    };
+    let Ok(origin) = raw.parse::<Uri>() else {
+        return false;
+    };
+    let Some(scheme) = origin.scheme_str() else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return false;
+    }
+    origin
+        .authority()
+        .is_some_and(|authority| is_loopback_host(authority.host()))
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 async fn fail_closed_fallback() -> impl IntoResponse {

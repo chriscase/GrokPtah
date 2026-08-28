@@ -159,7 +159,11 @@ try {
   const healthJson = await health.json();
   record(
     "healthAndCapacity",
-    health.status === 200 && healthJson.ok === true && typeof healthJson.maxConcurrent === "number",
+    health.status === 200 &&
+      healthJson.ok === true &&
+      healthJson.status === "alive" &&
+      healthJson.authoritative === false &&
+      healthJson.capacity === undefined,
     healthJson
   );
 

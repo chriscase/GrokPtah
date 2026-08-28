@@ -101,7 +101,11 @@ try {
   const health = await fetch(`${base}/health`);
   const hj = await health.json();
   checks.loopbackHealth =
-    health.status === 200 && hj.ok === true && typeof hj.maxConcurrent === "number";
+    health.status === 200 &&
+    hj.ok === true &&
+    hj.status === "alive" &&
+    hj.authoritative === false &&
+    hj.capacity === undefined;
 
   // Auth-before-body: malformed body without token → 401
   const unauthMal = await fetch(endpoint, {

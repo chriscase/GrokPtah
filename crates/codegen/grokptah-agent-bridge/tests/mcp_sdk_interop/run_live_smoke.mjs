@@ -143,8 +143,13 @@ try {
   const hj = await health.json();
   record(
     "loopbackHealth",
-    health.status === 200 && hj.ok === true && typeof hj.maxConcurrent === "number",
-    { maxConcurrent: hj.maxConcurrent, sessions: hj.sessions }
+    health.status === 200 &&
+      hj.ok === true &&
+      hj.status === "alive" &&
+      hj.authoritative === false &&
+      hj.capacity === undefined &&
+      hj.sessions === undefined,
+    hj
   );
   // Addr must be loopback (client connected to 127.0.0.1).
   const hostPart = new URL(base).hostname;

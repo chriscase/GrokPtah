@@ -161,6 +161,7 @@ event has been delivered.
 | Paths | `POST/GET/DELETE /mcp` (Streamable HTTP); `POST /` legacy alias; `GET /health` |
 | Auth | `Authorization: Bearer <token>` on every `/mcp` request |
 | Auth order | Middleware authenticates **before** body work / tool dispatch |
+| Loopback request policy | Host must be loopback (or absent); Origin must be absent or loopback |
 | Body limit | **256 KiB** (`DefaultBodyLimit` + handler check) |
 | Concurrent MCP requests | Default **32** → HTTP **429** + JSON-RPC error `data.code=capacity_exhausted` |
 | Request timeout | Default **120 s** → HTTP **504** + `data.code=timeout` |
@@ -168,12 +169,19 @@ event has been delivered.
 | Protocol versions | `2025-11-25`, `2025-06-18`, `2025-03-26`, `2024-11-05`, `2024-10-07` |
 | Content | JSON responses preferred; scoped GET may open a bounded SSE run stream |
 
-### Health (unauthenticated, loopback)
+### Health/readiness (unauthenticated, loopback)
 
 ```http
 GET /health
-→ 200 {"ok":true,"transport":"mcp-streamable-http","maxConcurrent":32,"maxLiveStreams":32,"sessions":N,...}
+→ 200 {"ok":true,"status":"alive","authoritative":false,"transport":"mcp-streamable-http",...}
 ```
+
+Loopback probes intentionally expose only a closed, non-authoritative
+liveness envelope; they do not assert a `ready` value. They never include host-wide capacity or session
+telemetry, persistence/supervisor errors, or filesystem details. `/ready` has
+the same projection for unauthenticated loopback callers. Deployments that
+need an authoritative readiness result must bind remotely with authenticated
+health probes.
 
 ### Lifecycle
 

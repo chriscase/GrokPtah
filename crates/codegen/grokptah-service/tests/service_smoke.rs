@@ -52,18 +52,10 @@ async fn standalone_service_exposes_authenticated_mcp_and_readiness() {
     let readiness = reqwest::get(format!("{base}/ready")).await.unwrap();
     assert_eq!(readiness.status(), reqwest::StatusCode::OK);
     let readiness_json: serde_json::Value = readiness.json().await.unwrap();
-    assert_eq!(readiness_json["ready"], true);
-    assert_eq!(
-        readiness_json["capacity"]["health"]["workloadSupervisor"]["enabled"],
-        true
-    );
-    assert!(
-        readiness_json["capacity"]["health"]["workloadSupervisor"]["lastSuccessAt"].is_string()
-    );
-    assert_eq!(
-        readiness_json["capacity"]["health"]["routineSupervisor"]["enabled"],
-        true
-    );
+    assert_eq!(readiness_json["ok"], true);
+    assert_eq!(readiness_json["status"], "alive");
+    assert_eq!(readiness_json["authoritative"], false);
+    assert!(readiness_json.get("capacity").is_none());
 
     let mut client = McpControlClient::new(base, "standalone-service-token");
     client.initialize().await.unwrap();
