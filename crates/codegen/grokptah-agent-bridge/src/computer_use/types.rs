@@ -29,6 +29,14 @@ pub enum ComputerErrorCode {
     Conflict,
     Pending,
     UncertainOutcome,
+    /// A completion was proposed without a host-issued action receipt that
+    /// verifies the exact current frame (#456).
+    UnverifiedCompletion,
+    /// Model output tried to reach an application seam without a sealed
+    /// capability minted by the strict normalizer (#457).
+    UnsealedProposal,
+    /// The same normalized proposal was presented twice for one run.
+    DuplicateProposal,
     Interrupted,
     BackendUnavailable,
     BackendFailure,
@@ -643,6 +651,12 @@ pub struct ComputerRun {
     pub current_observation: Option<ComputerObservation>,
     pub grant: Option<ActionGrant>,
     pub last_outcome: Option<ActionOutcome>,
+    /// Host-issued evidence for the most recent dispatch, bound to the frame
+    /// it was authorized against and to at most one verifying frame (#456).
+    /// `None` on records written before receipts existed, which fails closed:
+    /// a legacy record can never authorize a completion.
+    #[serde(default)]
+    pub last_receipt: Option<super::receipt::ActionReceipt>,
     pub audit: Vec<ComputerAuditEntry>,
     pub last_error: Option<ComputerError>,
 }
@@ -679,6 +693,7 @@ impl ComputerRun {
             current_observation: None,
             grant: None,
             last_outcome: None,
+            last_receipt: None,
             audit: Vec::new(),
             last_error: None,
         })

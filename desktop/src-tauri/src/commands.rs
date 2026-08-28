@@ -906,14 +906,16 @@ pub async fn computer_use_cockpit_propose_agent_action(
         expected_version,
         &observation_id,
     )?;
-    let proposal = state
+    // `raw` is untrusted provider output. It gains authority only inside
+    // `apply_model_proposal`, which seals it against the live run (#457).
+    let raw = state
         .host
         .propose_computer_action(owner, &objective, &observation)
         .await
         .map_err(map_err)?;
     state
         .computer_use
-        .apply_model_proposal(owner, &run_id, expected_version, &observation_id, proposal)
+        .apply_model_proposal(owner, &run_id, expected_version, &observation_id, raw)
         .await
 }
 

@@ -21,7 +21,11 @@ struct LiveProof {
     qualification_source: String,
     qualification_ms: u128,
     proposal_ms: u128,
-    proposal: grokptah_agent_bridge::ComputerAgentProposal,
+    /// Raw, untrusted provider output. This proof exercises the model call
+    /// only. The bytes carry no authority and were never sealed against a live
+    /// run, so nothing here could stage or complete anything (#457).
+    raw_proposal: grokptah_agent_bridge::RawModelProposal,
+    proposal_sealed: bool,
     action_executed: bool,
 }
 
@@ -64,7 +68,7 @@ async fn main() -> Result<()> {
         .await
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let proposal_started = Instant::now();
-    let proposal = host
+    let raw_proposal = host
         .propose_computer_action(
             session.id,
             "Enter Ada Lovelace in the visible Name field. Do not submit yet.",
@@ -81,7 +85,8 @@ async fn main() -> Result<()> {
             qualification_source: eligibility.source,
             qualification_ms,
             proposal_ms,
-            proposal,
+            raw_proposal,
+            proposal_sealed: false,
             action_executed: false,
         })?
     );

@@ -995,6 +995,31 @@ export interface ComputerRun {
     summary: string;
     expectedPostconditionMet?: boolean | null;
   } | null;
+  /**
+   * Host-issued evidence for the most recent dispatch (#456). Present only
+   * while a receipt is alive; any new observation, authority change, or
+   * restart clears it. `verification.state === "verified"` with a `frame`
+   * equal to the current observation is the only thing that permits a model
+   * completion, so absence here means completion is refused.
+   */
+  lastReceipt?: {
+    receiptVersion: number;
+    receiptId: string;
+    runId: string;
+    dispatchFrame: { observationId: string; sequence: number };
+    actionFingerprint: string;
+    actionClass: string;
+    controlEpoch: number;
+    dispatchedAt: string;
+    outcome: { summary: string; expectedPostconditionMet?: boolean | null };
+    verification:
+      | { state: "pending" }
+      | {
+          state: "verified";
+          frame: { observationId: string; sequence: number };
+          verifiedAt: string;
+        };
+  } | null;
   lastError?: { code: string; message: string } | null;
   audit: Array<{
     sequence: number;

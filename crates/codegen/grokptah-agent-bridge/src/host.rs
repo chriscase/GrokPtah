@@ -18,7 +18,7 @@ use crate::completion::{
 };
 use crate::computer_agent::{
     propose_semantic_action, qualify_semantic_model, resolve_computer_eligibility,
-    ComputerAgentEligibility, ComputerAgentProposal,
+    ComputerAgentEligibility,
 };
 use crate::event_bus::{session_id_of, JournalPage};
 use crate::events::{SessionUpdate, ToolCallKind, ToolCallStatus};
@@ -1048,13 +1048,17 @@ impl AgentHostHandle {
     }
 
     /// Ask the selected, qualified model for one bounded semantic proposal.
-    /// This method cannot dispatch an OS action.
+    ///
+    /// Returns the provider's **raw, untrusted** tool arguments. It cannot
+    /// dispatch an OS action and it cannot stage one: the bytes carry no
+    /// authority until [`crate::computer_agent::accept_model_proposal`] seals
+    /// them against a live run (#457).
     pub async fn propose_computer_action(
         &self,
         session_id: Uuid,
         objective: &str,
         observation: &crate::computer_use::ComputerObservation,
-    ) -> Result<ComputerAgentProposal> {
+    ) -> Result<crate::computer_agent::RawModelProposal> {
         let (_operation_id, cancel, _guard) = self.begin_computer_agent_operation(session_id)?;
         let (model, effort) = self.selected_computer_model(session_id)?;
         let credentials = crate::auth_store::resolve_wire_credentials_for_model(&model)

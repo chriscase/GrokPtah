@@ -4,12 +4,13 @@ use std::sync::Arc;
 use base64::Engine;
 use chrono::{Duration, Utc};
 use grokptah_agent_bridge::{
-    canonical_workspace_string, ActionClass, ActionGrant, AgentHostHandle, ComputerAction,
-    ComputerAgentProposal, ComputerCapabilities, ComputerError, ComputerObservation,
-    ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
+    accept_model_proposal, canonical_workspace_string, AcceptedIntent, AcceptedModelProposal,
+    ActionClass, ActionGrant, AgentHostHandle, ComputerAction, ComputerCapabilities, ComputerError,
+    ComputerObservation, ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
     ComputerPlatformStatus, ComputerRun, ComputerRunProjection, ComputerRunState,
     ComputerTargetCandidate, ComputerUseLimits, ComputerUseService, GrantIssuer,
-    MacOsObservationPlatform, SemanticAction, SimulatorBackend,
+    MacOsObservationPlatform, ModelProposalContext, RawModelProposal, SemanticAction,
+    SimulatorBackend,
 };
 use serde::Serialize;
 use tokio::sync::Mutex;
@@ -74,7 +75,17 @@ pub struct DesktopComputerUse {
     native_services: std::sync::Mutex<HashMap<String, Arc<ComputerUseService>>>,
     simulator_operation: Mutex<()>,
     pending_approval: std::sync::Mutex<Option<PendingComputerApproval>>,
+    /// Fingerprints of proposals already applied, newest last.
+    ///
+    /// In-memory and bounded on purpose: it exists to reject a repeated
+    /// proposal inside one live session, not to be a second durable ledger.
+    /// Losing it on restart is safe because restart recovery strands every run
+    /// and its completion evidence anyway.
+    applied_proposals: std::sync::Mutex<std::collections::VecDeque<String>>,
 }
+
+/// Ceiling for the in-memory duplicate-proposal registry.
+const MAX_TRACKED_PROPOSALS: usize = 512;
 
 impl DesktopComputerUse {
     pub fn new(host: &AgentHostHandle) -> Self {
@@ -106,6 +117,7 @@ impl DesktopComputerUse {
             native_services: std::sync::Mutex::new(HashMap::new()),
             simulator_operation: Mutex::new(()),
             pending_approval: std::sync::Mutex::new(None),
+            applied_proposals: std::sync::Mutex::new(std::collections::VecDeque::new()),
         }
     }
 
@@ -539,27 +551,97 @@ impl DesktopComputerUse {
             })
     }
 
+    /// Normalize untrusted model output against the live run and apply the
+    /// sealed result. This is the only entry point that takes model bytes.
+    ///
+    /// The bytes carry no authority. They become an
+    /// [`AcceptedModelProposal`] only by surviving the strict normalizer
+    /// against a context read from the live record, and that capability is then
+    /// re-validated against the record again before anything is staged or
+    /// completed — both under one operation lock, so nothing can move between
+    /// the two checks (#457).
     pub async fn apply_model_proposal(
         &self,
         owner_session_id: Uuid,
         run_id: &str,
         expected_version: u64,
         observation_id: &str,
-        proposal: ComputerAgentProposal,
+        raw: RawModelProposal,
     ) -> Result<ComputerAgentProposalResult, String> {
         let _guard = self.simulator_operation.lock().await;
-        if proposal.observation_id() != observation_id {
-            return Err("The model proposal does not match the requested observation".into());
+        let (service, run) = self.owned_service(owner_session_id, run_id)?;
+        if run.version != expected_version {
+            return Err("The Computer Run changed while the model was responding".into());
         }
-        match proposal {
-            ComputerAgentProposal::Action {
-                action, summary, ..
-            } => {
+        if run
+            .current_observation
+            .as_ref()
+            .map(|observation| observation.observation_id.as_str())
+            != Some(observation_id)
+        {
+            return Err("The model proposal does not match the current observation".into());
+        }
+        let context =
+            ModelProposalContext::from_run(&run, owner_session_id, service.capabilities())
+                .map_err(|error| self.refuse(&service, run_id, error))?;
+        let accepted = accept_model_proposal(&context, &raw)
+            .map_err(|error| self.refuse(&service, run_id, error))?;
+        self.apply_accepted_locked(owner_session_id, &service, accepted)
+    }
+
+    /// Journal a typed model-boundary refusal, then surface it to the caller.
+    fn refuse(
+        &self,
+        service: &Arc<ComputerUseService>,
+        run_id: &str,
+        error: ComputerError,
+    ) -> String {
+        service.record_proposal_refusal(run_id, "apply_model_proposal", &error);
+        error.to_string()
+    }
+
+    /// Apply an already-sealed proposal. The SDK/embedding seam.
+    ///
+    /// A caller can reach this only with a capability the normalizer minted,
+    /// so there is no path here from raw bytes or from a deserialized value.
+    pub async fn apply_accepted_proposal(
+        &self,
+        owner_session_id: Uuid,
+        accepted: AcceptedModelProposal,
+    ) -> Result<ComputerAgentProposalResult, String> {
+        let _guard = self.simulator_operation.lock().await;
+        let run_id = accepted.run_id().to_string();
+        let (service, _run) = self.owned_service(owner_session_id, &run_id)?;
+        self.apply_accepted_locked(owner_session_id, &service, accepted)
+    }
+
+    /// Spend one sealed capability. Callers must already hold
+    /// `simulator_operation`, which is what makes the re-validation below
+    /// atomic with the mutation it guards.
+    fn apply_accepted_locked(
+        &self,
+        owner_session_id: Uuid,
+        service: &Arc<ComputerUseService>,
+        accepted: AcceptedModelProposal,
+    ) -> Result<ComputerAgentProposalResult, String> {
+        // Re-read the record: the context the seal was minted against is a
+        // snapshot, and only the live record decides whether it still holds.
+        let run = owned_run(service, owner_session_id, accepted.run_id())?;
+        accepted
+            .authorize_against(&run, owner_session_id)
+            .map_err(|error| self.refuse(service, &run.run_id, error))?;
+        self.claim_proposal(accepted.proposal_fingerprint())?;
+
+        let summary = accepted.summary().to_string();
+        let observation_id = accepted.observation_id().to_string();
+        let run_version = run.version;
+        match accepted.into_intent() {
+            AcceptedIntent::Action { action, .. } => {
                 let snapshot = self.stage_action_locked(
                     owner_session_id,
-                    run_id,
-                    expected_version,
-                    observation_id,
+                    &run.run_id,
+                    run_version,
+                    &observation_id,
                     action,
                 )?;
                 Ok(ComputerAgentProposalResult {
@@ -568,21 +650,15 @@ impl DesktopComputerUse {
                     completed: false,
                 })
             }
-            ComputerAgentProposal::Complete { summary, .. } => {
-                let (service, run) = self.owned_service(owner_session_id, run_id)?;
-                if run.version != expected_version
-                    || run.state != ComputerRunState::Ready
-                    || run
-                        .current_observation
-                        .as_ref()
-                        .map(|observation| observation.observation_id.as_str())
-                        != Some(observation_id)
-                {
-                    return Err("The Computer Run changed while the model was responding".into());
-                }
+            AcceptedIntent::Complete { evidence } => {
                 service
-                    .complete(&Uuid::new_v4().to_string(), run_id, expected_version)
-                    .map_err(|error| error.to_string())?;
+                    .complete_verified(
+                        &Uuid::new_v4().to_string(),
+                        &run.run_id,
+                        run_version,
+                        &evidence,
+                    )
+                    .map_err(|error| self.refuse(service, &run.run_id, error))?;
                 Ok(ComputerAgentProposalResult {
                     snapshot: self.cockpit_snapshot(owner_session_id)?,
                     summary,
@@ -590,6 +666,24 @@ impl DesktopComputerUse {
                 })
             }
         }
+    }
+
+    /// Record a normalized proposal fingerprint, refusing a repeat.
+    fn claim_proposal(&self, fingerprint: &str) -> Result<(), String> {
+        let mut applied = self
+            .applied_proposals
+            .lock()
+            .map_err(|_| "Computer Use proposal state is unavailable".to_string())?;
+        if applied.iter().any(|seen| seen == fingerprint) {
+            return Err(
+                "This Computer proposal was already applied for the current observation".into(),
+            );
+        }
+        if applied.len() >= MAX_TRACKED_PROPOSALS {
+            applied.pop_front();
+        }
+        applied.push_back(fingerprint.to_string());
+        Ok(())
     }
 
     pub async fn approve_simulator_action(
@@ -630,6 +724,20 @@ impl DesktopComputerUse {
             .await;
         self.clear_pending_for_owner(owner_session_id)?;
         result.map_err(|error| error.to_string())?;
+        // Capture the one host-issued frame that verifies this dispatch. It
+        // both restores a current observation for the next model turn and is
+        // the only thing that can turn the run's action receipt into
+        // completion evidence, for that frame and no other (#456).
+        //
+        // A failure here is deliberately not fatal to the approval: the action
+        // already happened. The receipt simply stays unverified, so completion
+        // remains impossible until a later dispatch earns its own frame.
+        let acted = owned_run(&service, owner_session_id, &pending.run_id)?;
+        if acted.state == ComputerRunState::Ready {
+            let _ = service
+                .observe_postcondition(&Uuid::new_v4().to_string(), &pending.run_id, acted.version)
+                .await;
+        }
         self.cockpit_snapshot(owner_session_id)
     }
 
@@ -902,7 +1010,9 @@ mod tests {
 
     use async_trait::async_trait;
     use grokptah_agent_bridge::computer_use::{ObservationGeometry, SemanticElement, Sensitivity};
-    use grokptah_agent_bridge::{ActionOutcome, ComputerBackend, ComputerStore, ComputerTarget};
+    use grokptah_agent_bridge::{
+        ActionOutcome, ComputerBackend, ComputerErrorCode, ComputerStore, ComputerTarget,
+    };
 
     use super::*;
 
@@ -1083,6 +1193,7 @@ mod tests {
                 native_services: std::sync::Mutex::new(HashMap::new()),
                 simulator_operation: Mutex::new(()),
                 pending_approval: std::sync::Mutex::new(None),
+                applied_proposals: std::sync::Mutex::new(std::collections::VecDeque::new()),
             },
         )
     }
@@ -1172,6 +1283,10 @@ mod tests {
         assert!(refreshed.run.unwrap().current_observation.is_some());
     }
 
+    fn raw(value: serde_json::Value) -> RawModelProposal {
+        RawModelProposal::new(value.to_string())
+    }
+
     #[tokio::test]
     async fn model_proposal_is_revalidated_and_staged_without_dispatch() {
         let (_dir, desktop) = test_desktop();
@@ -1189,14 +1304,13 @@ mod tests {
                 &run.run_id,
                 run.version,
                 &observation.observation_id,
-                ComputerAgentProposal::Action {
-                    observation_id: observation.observation_id.clone(),
-                    action: ComputerAction::SetValue {
-                        element_id: format!("{}-name", observation.observation_id),
-                        text: "Ada Lovelace".into(),
-                    },
-                    summary: "Enter the visible name".into(),
-                },
+                raw(serde_json::json!({
+                    "observation_id": observation.observation_id,
+                    "action_type": "set_value",
+                    "element_id": format!("{}-name", observation.observation_id),
+                    "text": "Ada Lovelace",
+                    "summary": "Enter the visible name"
+                })),
             )
             .await
             .unwrap();
@@ -1210,18 +1324,21 @@ mod tests {
                 &run.run_id,
                 run.version,
                 "stale-observation",
-                ComputerAgentProposal::Action {
-                    observation_id: "stale-observation".into(),
-                    action: ComputerAction::ActivateTarget,
-                    summary: "stale".into(),
-                },
+                raw(serde_json::json!({
+                    "observation_id": "stale-observation",
+                    "action_type": "activate_target",
+                    "summary": "stale"
+                })),
             )
             .await;
         assert!(stale.is_err());
     }
 
+    /// #457: the public application seam used to accept a fabricated
+    /// `complete` on a fresh run with no dispatch behind it. It must now fail
+    /// closed, and leave the run exactly where it was.
     #[tokio::test]
-    async fn model_completion_only_revokes_authority_on_exact_current_frame() {
+    async fn fabricated_model_completion_cannot_terminate_a_run() {
         let (_dir, desktop) = test_desktop();
         let owner = Uuid::new_v4();
         let target = SimulatorBackend::demo_target();
@@ -1231,27 +1348,130 @@ mod tests {
             .unwrap();
         let run = started.run.unwrap();
         let observation = run.current_observation.as_ref().unwrap();
-        let result = desktop
+        let error = desktop
             .apply_model_proposal(
                 owner,
                 &run.run_id,
                 run.version,
                 &observation.observation_id,
-                ComputerAgentProposal::Complete {
-                    observation_id: observation.observation_id.clone(),
-                    summary: "The visible objective is complete".into(),
+                raw(serde_json::json!({
+                    "observation_id": observation.observation_id,
+                    "action_type": "complete",
+                    "summary": "The visible objective is complete"
+                })),
+            )
+            .await
+            .expect_err("a fresh run has no completion evidence");
+        assert!(
+            error.contains("UnverifiedCompletion"),
+            "expected a typed completion refusal, got: {error}"
+        );
+
+        let after = desktop.cockpit_snapshot(owner).unwrap().run.unwrap();
+        assert_eq!(after.state, ComputerRunState::Ready);
+        assert_eq!(after.action_count, 0);
+        assert!(after.last_receipt.is_none());
+        assert!(after
+            .grant
+            .as_ref()
+            .is_some_and(|grant| grant.revoked_at.is_none()));
+        // The refusal is journaled with its typed code on the run's own stream.
+        assert!(after
+            .audit
+            .iter()
+            .any(|entry| entry.disposition == "refused"
+                && entry.error_code == Some(ComputerErrorCode::UnverifiedCompletion)));
+    }
+
+    /// #457: a repeated normalized proposal for one frame is refused, so a
+    /// retried or replayed model turn cannot stage the same action twice.
+    #[tokio::test]
+    async fn a_repeated_model_proposal_is_refused() {
+        let (_dir, desktop) = test_desktop();
+        let owner = Uuid::new_v4();
+        let target = SimulatorBackend::demo_target();
+        let started = desktop
+            .start_simulator(owner, &target.app_id)
+            .await
+            .unwrap();
+        let run = started.run.unwrap();
+        let observation = run.current_observation.as_ref().unwrap();
+        let proposal = serde_json::json!({
+            "observation_id": observation.observation_id,
+            "action_type": "set_value",
+            "element_id": format!("{}-name", observation.observation_id),
+            "text": "Ada Lovelace",
+            "summary": "Enter the visible name"
+        });
+        desktop
+            .apply_model_proposal(
+                owner,
+                &run.run_id,
+                run.version,
+                &observation.observation_id,
+                raw(proposal.clone()),
+            )
+            .await
+            .unwrap();
+        desktop.discard_simulator_approval(owner).unwrap();
+        let repeated = desktop
+            .apply_model_proposal(
+                owner,
+                &run.run_id,
+                run.version,
+                &observation.observation_id,
+                raw(proposal),
+            )
+            .await;
+        assert!(repeated.is_err(), "a duplicate proposal must be refused");
+    }
+
+    /// #456: an approved dispatch is followed by the one host-issued frame
+    /// that verifies it. Under the desktop's single-use grant the run pauses
+    /// first, so no evidence survives and completion stays unreachable without
+    /// a fresh operator authorization.
+    #[tokio::test]
+    async fn an_exhausted_grant_leaves_no_completion_evidence() {
+        let (_dir, desktop) = test_desktop();
+        let owner = Uuid::new_v4();
+        let target = SimulatorBackend::demo_target();
+        let started = desktop
+            .start_simulator(owner, &target.app_id)
+            .await
+            .unwrap();
+        let run = started.run.unwrap();
+        let observation = run.current_observation.as_ref().unwrap().clone();
+        desktop
+            .stage_simulator_action(
+                owner,
+                &run.run_id,
+                run.version,
+                &observation.observation_id,
+                ComputerAction::SetValue {
+                    element_id: format!("{}-name", observation.observation_id),
+                    text: "Ada Lovelace".into(),
                 },
             )
             .await
             .unwrap();
-        assert!(result.completed);
-        let completed = result.snapshot.run.unwrap();
-        assert_eq!(completed.state, ComputerRunState::Completed);
-        assert!(completed
-            .grant
-            .as_ref()
-            .is_some_and(|grant| grant.revoked_at.is_some()));
-        assert_eq!(completed.action_count, 0);
+        let approval = desktop
+            .cockpit_snapshot(owner)
+            .unwrap()
+            .pending_approval
+            .unwrap();
+        let acted = desktop
+            .approve_simulator_action(owner, &approval.approval_id, &Uuid::new_v4().to_string())
+            .await
+            .unwrap()
+            .run
+            .unwrap();
+        assert_eq!(acted.action_count, 1);
+        assert_eq!(acted.state, ComputerRunState::Paused);
+        assert!(
+            acted.last_receipt.is_none(),
+            "an exhausted grant revokes authority and strands its evidence"
+        );
+        assert!(acted.current_observation.is_none());
     }
 
     #[tokio::test]

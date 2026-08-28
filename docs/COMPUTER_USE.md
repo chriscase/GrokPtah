@@ -23,6 +23,53 @@ failure, target changes, or exhausted limits. Secure and system-restricted surfa
 even when a grant exists. Pointer fallback and key chords require separate action classes; a
 semantic-action grant cannot silently expand into raw input control.
 
+## Model-output boundary and completion proof (#456, #457)
+
+Untrusted model output has exactly one way into a run, and success has exactly one way out.
+
+**Sealed proposals.** `propose_computer_action` returns `RawModelProposal`: the provider's bytes,
+carrying no authority. `accept_model_proposal` is the only function that turns those bytes into an
+`AcceptedModelProposal`, and only against a `ModelProposalContext` derived from the live record. The
+accepted capability has private fields, no `Deserialize`, no public constructor, and is not `Clone`,
+so nothing outside the boundary can mint or copy one. The authority-free `ComputerAgentProposal` is
+`Serialize`-only and reaches no application seam, so a deserialized value cannot stage or complete.
+
+The seal is not a secret. It carries no key or MAC. Unforgeability comes from module privacy, and
+freshness comes from re-validating every bound identity against the live run when the capability is
+spent: run ID, owner session, run version, authority (control) epoch, observation ID and sequence,
+the accepted action's fingerprint, grant classes, backend capabilities, the observation's advertised
+per-element actions, element enablement and sensitivity, the normalized proposal fingerprint used to
+reject duplicates, and — for a completion — the host-issued receipt. Seals are versioned and
+time-bounded; both halves run under one operation lock, so nothing can move between them.
+
+The normalizer parses model arguments under a reader that rejects duplicate JSON keys (which
+`serde_json` would otherwise resolve last-key-wins, letting one payload mean two things), unknown
+keys, trailing content, prose, and oversized payloads. Pointer, key-chord, and wait actions remain
+operator-only regardless of grant or backend capability.
+
+**Current-frame completion proof.** A dispatch mints an `ActionReceipt` bound to the frame it was
+authorized against, the accepted action's fingerprint, a host-minted receipt identity, the authority
+epoch, and the backend's outcome. The receipt starts unverified. It acquires evidence only through
+`observe_postcondition`, the single frame the host captures immediately after a dispatch, in the
+same epoch, and only when the outcome was positive and any re-checkable expectation holds on that
+frame. `complete_verified` is the only route to `completed`; there is no unguarded completion entry
+point, and operators end runs through cancellation, which claims nothing about success.
+
+Any ordinary observation, pause, takeover, cancellation, limit, in-flight failure, new grant, or
+restart recovery clears the receipt outright. So a positive outcome can never authorize a completion
+against a frame it did not verify — the #456 dispatch → re-observe → complete sequence returns a
+typed `UnverifiedCompletion` and mutates nothing.
+
+Refusals are journaled onto the run's existing durable event stream via
+`record_proposal_refusal`, carrying the typed `ComputerErrorCode` and the operation only — no model
+text and no observed content. That reuses the existing projection seam rather than adding a second
+ledger; richer audit integration is [#462](https://github.com/chriscase/GrokPtah/issues/462).
+
+Semantic element IDs are ephemeral per observation, so a postcondition expectation is only
+*checkable* when the verifying frame happens to reuse the same ID. When it does, a mismatch destroys
+the receipt. When it does not, the proof rests on the host-issued dispatch → verifying-frame chain,
+which is why that chain is limited to exactly one frame.
+
 ## Foundation (#268)
 
 `grokptah-agent-bridge::computer_use` provides:
@@ -196,7 +243,11 @@ packaging requirements, and disposable smoke fixture.
 - no MCP Computer Run surface;
 - no raw arbitrary keyboard, pointer, coordinate fallback, clipboard, AppleScript, or shell endpoint;
 - no background or unattended grant;
-- no cross-application target switching inside a run.
+- no cross-application target switching inside a run;
+- no semantic re-verification of a postcondition across frames beyond the single host-issued
+  verifying frame, and no cross-frame element identity (element IDs are ephemeral);
+- no durable duplicate-proposal registry: duplicate rejection is in-memory and per-session, which is
+  safe because restart recovery strands every run and its evidence anyway.
 
 ## Delivery sequence
 

@@ -12,12 +12,30 @@ use super::projection::{
     not_available, project_events, project_run_at, ComputerRunCapacity, ComputerRunEventPage,
     ComputerRunProjection,
 };
+use super::receipt::{ActionReceipt, CompletionProof, FrameIdentity};
 use super::store::{ComputerStore, MutationClaim};
 use super::types::{
     validate_id, ActionGrant, ActionOutcome, ComputerAction, ComputerBackend,
     ComputerControlDisposition, ComputerError, ComputerErrorCode, ComputerObservation,
     ComputerResult, ComputerRun, ComputerRunState, ComputerTarget, ComputerUseLimits,
 };
+
+/// Why the host is capturing a frame.
+///
+/// This is a host decision, never a caller or model decision: only
+/// [`ObservationMode::Postcondition`] can attach the single verifying frame to
+/// a pending action receipt, and it is reachable solely through
+/// [`ComputerUseService::observe_postcondition`] immediately after a dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObservationMode {
+    /// An ordinary frame. It replaces the current observation and destroys any
+    /// receipt, so a positive outcome cannot travel to a frame it never
+    /// verified (#456).
+    Fresh,
+    /// The one frame the host captures to verify the dispatch that just
+    /// committed. It verifies a pending receipt, or destroys it.
+    Postcondition,
+}
 
 pub struct ComputerUseService {
     backend: Arc<dyn ComputerBackend>,
@@ -221,6 +239,10 @@ impl ComputerUseService {
                 }
                 self.policy.authorize_grant(run, &grant, Utc::now())?;
                 run.grant = Some(grant.clone());
+                // A newly issued grant is a fresh authority: completion
+                // evidence minted under the previous grant cannot survive
+                // into it.
+                run.last_receipt = None;
                 run.last_error = None;
                 run.transition(ComputerRunState::Ready)?;
                 run.set_control_disposition(ComputerControlDisposition::AgentOwned);
@@ -240,6 +262,42 @@ impl ComputerUseService {
         request_id: &str,
         run_id: &str,
         expected_version: u64,
+    ) -> ComputerResult<ComputerObservation> {
+        self.observe_in_mode(request_id, run_id, expected_version, ObservationMode::Fresh)
+            .await
+    }
+
+    /// Capture the single host-issued frame that verifies the dispatch that
+    /// just committed, and bind the run's action receipt to it (#456).
+    ///
+    /// This is the only way a receipt ever becomes completion evidence. It
+    /// verifies nothing unless the receipt is still pending, the authority
+    /// epoch is unchanged since dispatch, the backend reported the expected
+    /// postcondition met, and any re-checkable expectation holds on this exact
+    /// frame; otherwise the receipt is destroyed and the frame is kept as an
+    /// ordinary observation. It never fails a caller for lack of a receipt, so
+    /// the desktop can always use it as the post-dispatch refresh.
+    pub async fn observe_postcondition(
+        &self,
+        request_id: &str,
+        run_id: &str,
+        expected_version: u64,
+    ) -> ComputerResult<ComputerObservation> {
+        self.observe_in_mode(
+            request_id,
+            run_id,
+            expected_version,
+            ObservationMode::Postcondition,
+        )
+        .await
+    }
+
+    async fn observe_in_mode(
+        &self,
+        request_id: &str,
+        run_id: &str,
+        expected_version: u64,
+        mode: ObservationMode,
     ) -> ComputerResult<ComputerObservation> {
         validate_id("run_id", run_id)?;
         let payload = json!({ "runId": run_id, "expectedVersion": expected_version });
@@ -294,13 +352,15 @@ impl ComputerUseService {
                         .and_then(|()| self.policy.authorize_observation_exposure(&observation))
                         .map(|()| observation);
                         match validated {
-                            Ok(observation) => match self.commit_observation(run_id, observation) {
-                                Ok(observation) => Ok(observation),
-                                Err(error) => {
-                                    self.fail_inflight(run_id, "observe", &error)?;
-                                    Err(error)
+                            Ok(observation) => {
+                                match self.commit_observation(run_id, observation, mode) {
+                                    Ok(observation) => Ok(observation),
+                                    Err(error) => {
+                                        self.fail_inflight(run_id, "observe", &error)?;
+                                        Err(error)
+                                    }
                                 }
-                            },
+                            }
                             Err(error) => {
                                 self.fail_inflight(run_id, "observe", &error)?;
                                 Err(error)
@@ -404,11 +464,20 @@ impl ComputerUseService {
                     .clone()
                     .expect("prepared action has an observation");
                 let control_epoch = prepared.control_epoch;
+                // Receipt identity is host-minted before the backend is asked to
+                // act, so no backend, caller, or model can choose or predict the
+                // identity that later authorizes a completion.
+                let receipt_id = format!("receipt-{}", Uuid::new_v4());
                 let outcome = self.backend.act(run_id, &observation, &action).await;
                 match outcome {
-                    Ok(outcome) => {
-                        self.commit_action(run_id, &action, &observation, control_epoch, outcome)
-                    }
+                    Ok(outcome) => self.commit_action(
+                        run_id,
+                        &receipt_id,
+                        &action,
+                        &observation,
+                        control_epoch,
+                        outcome,
+                    ),
                     Err(error) => {
                         self.fail_inflight(run_id, "act", &error)?;
                         Err(error)
@@ -528,14 +597,32 @@ impl ComputerUseService {
         result
     }
 
-    pub fn complete(
+    /// Terminate a run as successfully completed.
+    ///
+    /// There is deliberately no unguarded completion entry point. Success is
+    /// the one outcome a model benefits from fabricating, so the only way to
+    /// reach [`ComputerRunState::Completed`] is to present a
+    /// [`CompletionProof`] that the live run still backs with a host-issued
+    /// receipt verifying the exact current frame (#456). Operators end a run
+    /// through [`Self::cancel`], which claims nothing about success.
+    ///
+    /// The evidence is re-validated inside the same atomic store mutation that
+    /// performs the transition, so a frame, receipt, or authority change that
+    /// lands between capture and application refuses the completion instead of
+    /// racing it.
+    pub fn complete_verified(
         &self,
         request_id: &str,
         run_id: &str,
         expected_version: u64,
+        evidence: &CompletionProof,
     ) -> ComputerResult<ComputerRun> {
         validate_id("run_id", run_id)?;
-        let payload = json!({ "runId": run_id, "expectedVersion": expected_version });
+        let payload = json!({
+            "runId": run_id,
+            "expectedVersion": expected_version,
+            "evidence": evidence,
+        });
         if let Some(replayed) = self.begin_mutation(request_id, "complete", &payload)? {
             return replayed;
         }
@@ -543,9 +630,17 @@ impl ComputerUseService {
             .store
             .update_run(run_id, |run| {
                 ensure_version(run, expected_version)?;
+                self.policy
+                    .authorize_completion(run, evidence, Utc::now())?;
                 run.transition(ComputerRunState::Completed)?;
                 revoke_authority(run);
-                run.record_audit("complete", "completed", None, None, None);
+                run.record_audit(
+                    "complete",
+                    "completed",
+                    None,
+                    Some(evidence.frame.observation_id.clone()),
+                    None,
+                );
                 Ok(())
             })
             .and_then(|run| run.ok_or_else(unknown_run));
@@ -560,6 +655,7 @@ impl ComputerUseService {
         &self,
         run_id: &str,
         observation: ComputerObservation,
+        mode: ObservationMode,
     ) -> ComputerResult<ComputerObservation> {
         let evidence_bytes = observation
             .screenshot
@@ -604,12 +700,31 @@ impl ComputerUseService {
                     return Ok(());
                 }
                 run.evidence_bytes = run.evidence_bytes.saturating_add(evidence_bytes);
+                // A new frame is always the point at which prior completion
+                // evidence either earns this exact frame or dies. There is no
+                // path that leaves a receipt bound to an older frame alive
+                // across an observation (#456).
+                let verified = match (mode, run.last_receipt.take()) {
+                    (ObservationMode::Postcondition, Some(mut receipt)) => {
+                        if receipt.verify_with(&observation, run.control_epoch) {
+                            run.last_receipt = Some(receipt);
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    _ => false,
+                };
                 run.current_observation = Some(observation.clone());
                 run.last_error = None;
                 run.transition(ComputerRunState::Ready)?;
                 run.record_audit(
                     "observe",
-                    "completed",
+                    if verified {
+                        "completed_postcondition_verified"
+                    } else {
+                        "completed"
+                    },
                     None,
                     Some(observation.observation_id.clone()),
                     None,
@@ -626,6 +741,7 @@ impl ComputerUseService {
     fn commit_action(
         &self,
         run_id: &str,
+        receipt_id: &str,
         action: &ComputerAction,
         observation: &ComputerObservation,
         control_epoch: u64,
@@ -640,6 +756,7 @@ impl ComputerUseService {
                         "action completed after the run was cancelled or superseded",
                     );
                     run.last_error = Some(error.clone());
+                    run.last_receipt = None;
                     run.record_audit(
                         "act",
                         "uncertain_outcome",
@@ -657,6 +774,18 @@ impl ComputerUseService {
                     }
                 }
                 run.last_outcome = Some(outcome.clone());
+                // The receipt records which frame this outcome actually
+                // belongs to. It starts pending: only the host's own
+                // postcondition observation can turn it into completion
+                // evidence, and only for that one frame (#456).
+                run.last_receipt = Some(ActionReceipt::mint(
+                    receipt_id.to_string(),
+                    run_id,
+                    FrameIdentity::of(observation),
+                    action,
+                    control_epoch,
+                    outcome.clone(),
+                ));
                 run.current_observation = None;
                 run.last_error = None;
                 let grant_exhausted = run
@@ -719,6 +848,28 @@ impl ComputerUseService {
             Ok(())
         })?;
         Ok(())
+    }
+
+    /// Journal a typed refusal that happened above the service, in the model
+    /// boundary, onto the run's existing durable audit stream.
+    ///
+    /// This is the narrow adapter the model boundary needs and nothing more.
+    /// It writes the same [`super::types::ComputerAuditEntry`] shape every
+    /// other refusal writes, so the refusal reaches operators and SDK consumers
+    /// through the existing [`super::projection::ComputerRunEventPage`] seam
+    /// rather than a second ledger. Full audit-v2 integration is #462 and is
+    /// deliberately not attempted here.
+    ///
+    /// It records only the typed code and the operation: no message, no model
+    /// text, and no observed content, so nothing secret or attacker-authored
+    /// enters the durable record. It never changes run state, version,
+    /// authority, or evidence.
+    pub fn record_proposal_refusal(&self, run_id: &str, operation: &str, error: &ComputerError) {
+        let _ = self.store.update_run(run_id, |run| {
+            run.updated_at = Utc::now();
+            run.record_audit(operation, "refused", None, None, Some(error.code));
+            Ok(())
+        });
     }
 
     fn record_denial(
@@ -806,6 +957,11 @@ fn revoke_authority(run: &mut ComputerRun) {
         grant.revoked_at.get_or_insert_with(Utc::now);
     }
     run.current_observation = None;
+    // Every authority revision — pause, takeover, stop, limit, in-flight
+    // failure — invalidates completion evidence along with the frame it was
+    // bound to. Dropping the receipt here means no revocation path can leave a
+    // usable proof behind (#456).
+    run.last_receipt = None;
 }
 
 fn unknown_run() -> ComputerError {
