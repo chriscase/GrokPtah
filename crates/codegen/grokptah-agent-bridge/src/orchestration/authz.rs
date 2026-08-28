@@ -235,6 +235,8 @@ struct StoredCredential {
 struct StoredAuthority {
     schema_version: u32,
     next_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner_id: Option<String>,
     credentials: Vec<StoredCredential>,
     /// Resource bindings are opaque digests. Keeping this ledger separate
     /// from public record serde prevents internal authority fields from
@@ -248,6 +250,7 @@ impl Default for StoredAuthority {
         Self {
             schema_version: AUTHORITY_SCHEMA_VERSION,
             next_generation: 1,
+            owner_id: None,
             credentials: Vec::new(),
             bindings: BTreeMap::new(),
         }
@@ -303,12 +306,22 @@ impl AuthRegistry {
             }
             (StoredAuthority::default(), false)
         };
+        let effective_owner = state
+            .owner_id
+            .clone()
+            .or_else(|| {
+                state
+                    .credentials
+                    .first()
+                    .map(|record| record.owner_id.clone())
+            })
+            .unwrap_or_else(|| owner_id.trim().to_string());
         let mut registry = Self {
             root: root.to_path_buf(),
             state,
             durable_error: None,
         };
-        let changed = registry.reconcile(credentials, owner_id)?;
+        let changed = registry.reconcile(credentials, &effective_owner)?;
         if changed || !existed {
             registry.persist()?;
         }
@@ -381,7 +394,12 @@ impl AuthRegistry {
             || owner_changed
         {
             changed = true;
+            self.state.owner_id = Some(owner_id.to_string());
             self.state.credentials = next;
+        }
+        if self.state.owner_id.as_deref() != Some(owner_id) {
+            self.state.owner_id = Some(owner_id.to_string());
+            changed = true;
         }
         Ok(changed)
     }
@@ -419,8 +437,9 @@ impl AuthRegistry {
 
     pub(crate) fn change_owner(&mut self, owner_id: &str) -> Result<(), OrchError> {
         validate_owner(owner_id)?;
+        self.state.owner_id = Some(owner_id.to_string());
         if self.state.credentials.is_empty() {
-            return Ok(());
+            return self.persist();
         }
         let old = std::mem::take(&mut self.state.credentials);
         let mut replacement = Vec::with_capacity(old.len());
@@ -624,6 +643,19 @@ impl AuthRegistry {
         self.persist()
     }
 
+    pub(crate) fn owner_id(&self) -> &str {
+        self.state
+            .owner_id
+            .as_deref()
+            .or_else(|| {
+                self.state
+                    .credentials
+                    .first()
+                    .map(|record| record.owner_id.as_str())
+            })
+            .unwrap_or("primary")
+    }
+
     pub(crate) fn revoke(&mut self, credential_id: &str) -> Result<(), OrchError> {
         let old_len = self.state.credentials.len();
         self.state
@@ -690,6 +722,16 @@ fn validate_stored_authority(state: &StoredAuthority) -> Result<(), OrchError> {
         return Err(OrchError::new(
             OrchErrorCode::Internal,
             "durable auth authority schema is invalid",
+        ));
+    }
+    if state
+        .owner_id
+        .as_deref()
+        .is_some_and(|owner| validate_owner(owner).is_err())
+    {
+        return Err(OrchError::new(
+            OrchErrorCode::Internal,
+            "durable auth owner is invalid",
         ));
     }
     let mut ids = std::collections::HashSet::new();
@@ -1035,11 +1077,12 @@ mod tests {
         drop(registry);
 
         let reopened =
-            AuthRegistry::open(root.path(), std::slice::from_ref(&credential), "owner-b").unwrap();
+            AuthRegistry::open(root.path(), std::slice::from_ref(&credential), "primary").unwrap();
         assert!(reopened.require_current(&old_auth).is_err());
         let new_auth = reopened
             .authenticate(Some("Bearer secret"), std::slice::from_ref(&credential))
             .unwrap();
+        assert_eq!(new_auth.owner_id(), "owner-b");
         assert!(reopened.require_current(&new_auth).is_ok());
     }
 

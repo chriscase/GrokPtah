@@ -262,6 +262,7 @@ impl OrchestrationService {
         };
         let auth_registry = AuthRegistry::open(store.root(), &auth_credentials, "primary")
             .unwrap_or_else(|error| AuthRegistry::unavailable(store.root(), error.to_string()));
+        let initial_owner_id = auth_registry.owner_id().to_string();
         let workload_supervisor =
             WorkloadSupervisor::start(store.clone(), DEFAULT_WORKLOAD_RECONCILIATION_INTERVAL);
         let routine_supervisor =
@@ -272,7 +273,7 @@ impl OrchestrationService {
             store,
             config: Mutex::new(config),
             auth_credentials: Mutex::new(auth_credentials),
-            agent_owner_id: Mutex::new("primary".into()),
+            agent_owner_id: Mutex::new(initial_owner_id),
             auth_registry: Mutex::new(auth_registry),
             self_ref: self_ref.clone(),
             pending_admissions: Mutex::new(AdmissionQueueState::default()),
