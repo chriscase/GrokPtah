@@ -127,6 +127,21 @@ fn canonical_replay_context() -> (
     (runtime_dir, host, principal)
 }
 
+#[test]
+fn replay_boundary_has_no_local_authority_root() {
+    let source =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/host_helpers.rs"))
+            .expect("host helper source");
+    let replay = source
+        .split("pub async fn replay_xai_provider_contract_on_loopback")
+        .nth(1)
+        .and_then(|body| body.split("#[cfg(test)]").next())
+        .expect("replay function body");
+    assert!(!replay.contains("CapabilityAuthority::new"));
+    assert!(!replay.contains("CapabilityPrincipal::new"));
+    assert!(!replay.contains("Some(\"provider-contract-loopback\")"));
+}
+
 #[tokio::test]
 async fn synthetic_xai_fixture_replays_through_the_production_provider_path() {
     let (fixture, response) = load_fixture();

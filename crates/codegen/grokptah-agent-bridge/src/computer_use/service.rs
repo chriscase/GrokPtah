@@ -1701,6 +1701,19 @@ mod tests {
         assert_eq!(error.code, ComputerErrorCode::Unauthorized);
     }
 
+    #[test]
+    fn durable_lease_source_has_no_request_derived_issuance() {
+        let source = include_str!("service.rs");
+        let body = source
+            .split("fn consume_durable_lease")
+            .nth(1)
+            .and_then(|body| body.split("fn record_denial").next())
+            .expect("durable lease implementation");
+        assert!(body.contains("lease_from_envelope"));
+        assert!(!body.contains(".issue("));
+        assert!(!body.contains("CapabilitySnapshot::durable"));
+    }
+
     fn grant(run: &ComputerRun) -> ActionGrant {
         let now = Utc::now();
         ActionGrant {
