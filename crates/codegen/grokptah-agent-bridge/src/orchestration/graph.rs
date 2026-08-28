@@ -36,6 +36,9 @@ use super::workload::{WorkItem, WorkState};
 pub const MAX_GRAPH_SCOPE_ITEMS: usize = 4_096;
 /// Maximum dependency edges considered across one validation pass.
 pub const MAX_GRAPH_EDGES: usize = 16_384;
+/// Maximum ledger files examined while collecting one scope. Bounds the work a
+/// single validation can do on an installation far larger than the scope.
+pub const MAX_GRAPH_SCAN_FILES: usize = 65_536;
 /// Maximum reviewers one quorum may name.
 pub const MAX_QUORUM_REVIEWERS: usize = 16;
 /// Maximum bytes in a reviewer or principal identity.
@@ -61,16 +64,77 @@ fn exhausted(message: impl Into<String>) -> OrchError {
 pub struct GraphScope<'a> {
     pub session_id: uuid::Uuid,
     pub workspace: &'a str,
+    /// The principal that owns the work. Two principals sharing one session
+    /// and workspace are still distinct scopes, so neither can use dependency
+    /// declaration to probe for the other's work.
+    ///
+    /// Delegation is deliberately *not* modelled: there is no delegation
+    /// authority on this spine yet, so a delegated principal is treated as a
+    /// separate scope rather than being widened into its delegator's. That
+    /// fails closed; widening lands with the principal/delegation authority.
+    pub principal: &'a str,
 }
 
 impl GraphScope<'_> {
+    /// The scope one item belongs to.
+    pub fn of(item: &WorkItem) -> GraphScope<'_> {
+        GraphScope {
+            session_id: item.session_id,
+            workspace: item.workspace.as_str(),
+            principal: item.created_by.as_str(),
+        }
+    }
+
     /// True when `item` belongs to this scope.
     ///
     /// Workspace comparison is delegated to the ledger's own canonicalizing
     /// comparison so a symlinked or non-normalized path cannot straddle scopes.
     pub fn contains(&self, item: &WorkItem) -> bool {
         item.session_id == self.session_id
+            && item.created_by == self.principal
             && super::store::workspaces_match(&item.workspace, self.workspace)
+    }
+}
+
+/// An authenticated principal, as verified by the host.
+///
+/// The inner identity is private and the type can only be built inside this
+/// crate from an already-authenticated context, so no caller outside the
+/// bridge can present a reviewer identity of its own choosing. This is a
+/// deliberately narrow stand-in: the canonical principal authority, with
+/// generations and delegation, is being built in #460. Until it assembles,
+/// every path that needs a verified principal fails closed for external
+/// callers rather than trusting a string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedPrincipal {
+    owner_id: String,
+    token_id: String,
+}
+
+impl VerifiedPrincipal {
+    /// Build from an authenticated control-plane context. Crate-private on
+    /// purpose: an external caller has no way to construct one.
+    pub(crate) fn from_auth(auth: &super::authz::AuthContext) -> Result<Self, OrchError> {
+        let principal = Self {
+            owner_id: auth.owner_id.clone(),
+            token_id: auth.token_id.clone(),
+        };
+        validate_identity(&principal.owner_id, "principal owner")?;
+        validate_identity(&principal.token_id, "principal token")?;
+        Ok(principal)
+    }
+
+    pub fn owner_id(&self) -> &str {
+        &self.owner_id
+    }
+
+    pub fn token_id(&self) -> &str {
+        &self.token_id
+    }
+
+    /// True when this principal *is* the named reviewer.
+    pub fn is(&self, reviewer_id: &str) -> bool {
+        self.owner_id == reviewer_id || self.token_id == reviewer_id
     }
 }
 
@@ -100,7 +164,9 @@ pub fn validate_scoped_dependency_graph(
             "work item does not belong to the requested scope",
         ));
     }
-    if scope_items.len() > MAX_GRAPH_SCOPE_ITEMS {
+    // The candidate counts toward the ceiling: a scope exactly at the limit
+    // must not be pushed one over by the very write being validated.
+    if scope_items.len().saturating_add(1) > MAX_GRAPH_SCOPE_ITEMS {
         return Err(exhausted(format!(
             "scope holds more than {MAX_GRAPH_SCOPE_ITEMS} work items; \
              dependency validation is refused rather than unbounded"
@@ -300,6 +366,41 @@ pub struct WorkReviewPolicy {
     pub policy_revision: u64,
 }
 
+/// Digest of everything a reviewer is actually agreeing to.
+///
+/// The Work item's ordinary `revision` cannot serve as the review subject:
+/// recording a receipt bumps it, so every verdict would invalidate the one
+/// before it. This digest covers only the fields that define *what is being
+/// reviewed* — never the revision, the state, the receipts, or any
+/// reconciliation-derived field — so it is stable while verdicts accumulate
+/// and changes the moment the subject itself is edited.
+pub fn review_subject_digest(item: &WorkItem) -> String {
+    let dependencies: Vec<serde_json::Value> = item
+        .dependencies
+        .iter()
+        .map(|dependency| {
+            serde_json::json!({
+                "workId": dependency.work_id,
+                "requiredState": dependency.required_state,
+            })
+        })
+        .collect();
+    super::types::hash_payload(&serde_json::json!({
+        "workId": item.work_id,
+        "kind": item.kind,
+        "objective": item.objective,
+        "sessionId": item.session_id,
+        "workspace": item.workspace,
+        "createdBy": item.created_by,
+        "parentWorkId": item.parent_work_id,
+        "isContainer": item.is_container,
+        "deadline": item.deadline,
+        "dependencies": dependencies,
+        "policy": item.policy,
+        "review": item.review,
+    }))
+}
+
 impl WorkReviewPolicy {
     pub fn validate(&self) -> Result<(), OrchError> {
         if self.reviewers.is_empty() || self.reviewers.len() > MAX_QUORUM_REVIEWERS {
@@ -360,7 +461,14 @@ pub struct ReviewReceipt {
     /// Owner identity of that principal.
     pub principal_owner_id: String,
     pub verdict: ReviewVerdict,
-    /// Work revision the verdict was cast against.
+    /// Digest of the exact subject the reviewer agreed to. A receipt whose
+    /// digest no longer matches the item is not counted, so editing the
+    /// objective, dependencies, policy, or gate silently invalidates every
+    /// verdict cast against the old subject rather than carrying them over.
+    pub subject_digest: String,
+    /// Work revision at the moment the verdict was cast. Recorded for the
+    /// audit trail only: it is *not* the review subject, because recording a
+    /// receipt bumps the revision.
     pub work_revision: u64,
     /// Review policy revision in force when it was cast.
     pub policy_revision: u64,
@@ -377,6 +485,11 @@ impl ReviewReceipt {
         validate_identity(&self.reviewer_id, "reviewer")?;
         validate_identity(&self.principal_token_id, "principal token")?;
         validate_identity(&self.principal_owner_id, "principal owner")?;
+        if self.subject_digest.len() != 64
+            || !self.subject_digest.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            return Err(invalid("review receipt subject digest is invalid"));
+        }
         if self.work_revision == 0 || self.policy_revision == 0 {
             return Err(invalid("review receipt revisions must be >= 1"));
         }
@@ -389,10 +502,14 @@ impl ReviewReceipt {
         Ok(())
     }
 
-    /// True when this receipt counts toward `policy`.
-    pub fn counts_for(&self, policy: &WorkReviewPolicy) -> bool {
+    /// True when this receipt counts toward `policy` for `subject_digest`.
+    ///
+    /// The subject check is what stops a receipt from surviving an arbitrary
+    /// later mutation of the work it approved.
+    pub fn counts_for(&self, policy: &WorkReviewPolicy, subject_digest: &str) -> bool {
         self.revoked_at.is_none()
             && self.policy_revision == policy.policy_revision
+            && self.subject_digest == subject_digest
             && policy.names(&self.reviewer_id)
     }
 }
@@ -415,11 +532,12 @@ pub enum QuorumOutcome {
 pub fn evaluate_quorum(
     policy: &WorkReviewPolicy,
     receipts: &[ReviewReceipt],
+    subject_digest: &str,
 ) -> Result<QuorumOutcome, OrchError> {
     policy.validate()?;
     let mut latest: BTreeMap<&str, &ReviewReceipt> = BTreeMap::new();
     for receipt in receipts {
-        if !receipt.counts_for(policy) {
+        if !receipt.counts_for(policy, subject_digest) {
             continue;
         }
         latest
@@ -495,6 +613,9 @@ pub enum AdmissionBlock {
     Cancelled,
     /// A container item is not itself executed.
     Container,
+    /// A human or coordinator blocked this item explicitly. Reconciliation
+    /// never clears it and never overwrites its reason.
+    ManuallyBlocked,
 }
 
 impl AdmissionBlock {
@@ -516,6 +637,7 @@ impl AdmissionBlock {
                 | Self::ReviewUnreachable
                 | Self::AttemptsExhausted
                 | Self::DeadlineExceeded
+                | Self::ManuallyBlocked
         )
     }
 
@@ -536,7 +658,44 @@ impl AdmissionBlock {
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
             Self::Container => "container",
+            Self::ManuallyBlocked => "manually_blocked",
         }
+    }
+}
+
+/// Every reason string this module writes.
+///
+/// Reconciliation must be able to tell a reason it wrote itself from one a
+/// human supplied, because it may overwrite the former and must never touch
+/// the latter.
+const DERIVED_REASONS: &[&str] = &[
+    "admissible",
+    "dependencies_pending",
+    "dependency_unsatisfiable",
+    "dependency_unresolved",
+    "review_pending",
+    "review_unreachable",
+    "attempt_active",
+    "awaiting_input",
+    "awaiting_approval",
+    "attempts_exhausted",
+    "deadline_exceeded",
+    "succeeded",
+    "failed",
+    "cancelled",
+    "container",
+    "manually_blocked",
+];
+
+/// True when `reason` is absent or was written by this module.
+///
+/// A reason that is neither is a human or coordinator explanation: it is the
+/// evidence that a `Blocked` state was chosen deliberately rather than derived
+/// from dependencies, so it is never overwritten and never auto-cleared.
+pub fn is_derived_reason(reason: Option<&str>) -> bool {
+    match reason {
+        None => true,
+        Some(reason) => DERIVED_REASONS.contains(&reason),
     }
 }
 
@@ -557,6 +716,14 @@ pub fn evaluate_admission(
     receipts: &[ReviewReceipt],
     now: DateTime<Utc>,
 ) -> AdmissionBlock {
+    // An explicit block outranks everything except a settled outcome: a human
+    // who stopped this item is not overruled by dependencies becoming ready.
+    if item.state == WorkState::Blocked
+        && !is_derived_reason(item.blocked_reason.as_deref())
+        && !item.state.is_terminal()
+    {
+        return AdmissionBlock::ManuallyBlocked;
+    }
     match item.state {
         WorkState::Succeeded => return AdmissionBlock::Succeeded,
         WorkState::Failed => {
@@ -605,7 +772,8 @@ pub fn evaluate_admission(
     }
 
     if let Some(policy) = item.review.as_ref() {
-        return match evaluate_quorum(policy, receipts) {
+        let subject = review_subject_digest(item);
+        return match evaluate_quorum(policy, receipts, &subject) {
             Ok(QuorumOutcome::Met) => AdmissionBlock::Admissible,
             Ok(QuorumOutcome::Pending) => AdmissionBlock::ReviewPending,
             Ok(QuorumOutcome::Unreachable) => AdmissionBlock::ReviewUnreachable,

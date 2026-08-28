@@ -74,8 +74,15 @@ async fn dependency_declaration_is_scope_bound_and_reveals_nothing_foreign() {
         .unwrap()
         .to_string();
 
+    // The public projection reports the same admission decision the claim path
+    // enforces, so a client is never shown a queued item it would be refused.
+    assert_eq!(
+        anchor.structured["admission"], "admissible",
+        "the projection must carry the canonical admission decision"
+    );
+
     // The owning session may depend on it.
-    client
+    let in_scope = client
         .call_tool(
             "ptah_create_work",
             json!({
@@ -89,6 +96,10 @@ async fn dependency_declaration_is_scope_bound_and_reveals_nothing_foreign() {
         )
         .await
         .expect("an in-scope dependency is accepted");
+    let dependent_id = in_scope.structured["work"]["workId"]
+        .as_str()
+        .expect("work id")
+        .to_string();
 
     // The second session may not, and must not be able to tell the anchor
     // apart from an id that was never issued.
@@ -137,6 +148,20 @@ async fn dependency_declaration_is_scope_bound_and_reveals_nothing_foreign() {
         !foreign_text.contains(&anchor_id),
         "the refusal must not echo another scope's work id: {foreign_text}"
     );
+
+    // A dependent that is waiting reports the wait rather than looking ready.
+    let dependent = client
+        .call_tool(
+            "ptah_get_work",
+            json!({
+                "session_id": first.id,
+                "workspace": workspace_text,
+                "work_id": dependent_id,
+            }),
+        )
+        .await
+        .expect("read the dependent");
+    assert_eq!(dependent.structured["admission"], "dependencies_pending");
 
     server.stop();
     set_grokptah_home_override(None);

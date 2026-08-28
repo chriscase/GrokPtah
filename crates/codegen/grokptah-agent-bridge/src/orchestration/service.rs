@@ -2098,9 +2098,19 @@ impl OrchestrationService {
         } else {
             Vec::new()
         };
+        // The public projection reports the same admission decision the claim
+        // path enforces, so a client is never shown a queued item it would in
+        // fact be refused. Resolved through the store so there is exactly one
+        // answer.
+        let admission = self
+            .store
+            .admission_block_at(&item.work_id, Utc::now())
+            .ok()
+            .map(|block| block.as_str());
         Ok(json!({
             "work": item,
             "attempts": attempts,
+            "admission": admission,
         }))
     }
 
@@ -2802,6 +2812,107 @@ impl OrchestrationService {
         }
         response["leaseToken"] = serde_json::Value::String(lease_token);
         Ok(response)
+    }
+
+    /// Record a review verdict as the authenticated principal.
+    ///
+    /// The reviewer identity is derived from the authenticated context, never
+    /// from a caller-supplied string: `VerifiedPrincipal` cannot be built
+    /// outside this crate. Scope authorization is the same session/workspace
+    /// check every other work mutation passes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_work_review_verdict_scoped(
+        &self,
+        auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        work_id: &str,
+        reviewer_id: &str,
+        verdict: super::graph::ReviewVerdict,
+        expected_revision: Option<u64>,
+    ) -> Result<serde_json::Value, OrchError> {
+        let claimed = self.authorize_work_scope(session_id, workspace)?;
+        let principal = super::graph::VerifiedPrincipal::from_auth(auth)?;
+        let (item, block) = self.store.record_review_verdict(
+            work_id,
+            &principal,
+            reviewer_id,
+            verdict,
+            expected_revision,
+            Utc::now(),
+        )?;
+        self.require_work_in_scope(&item, session_id, &claimed)?;
+        self.audit(
+            "ptah_record_work_review_verdict",
+            None,
+            Some(session_id),
+            Some(&claimed),
+            "ok",
+            None,
+            &format!("work {} is {}", item.work_id, block.as_str()),
+        );
+        Ok(json!({ "work": item, "admission": block }))
+    }
+
+    /// Withdraw the authenticated principal's own review verdict.
+    pub fn revoke_work_review_verdict_scoped(
+        &self,
+        auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        work_id: &str,
+        reviewer_id: &str,
+        expected_revision: Option<u64>,
+    ) -> Result<serde_json::Value, OrchError> {
+        let claimed = self.authorize_work_scope(session_id, workspace)?;
+        let principal = super::graph::VerifiedPrincipal::from_auth(auth)?;
+        let (item, block) = self.store.revoke_review_verdict(
+            work_id,
+            &principal,
+            reviewer_id,
+            expected_revision,
+            Utc::now(),
+        )?;
+        self.require_work_in_scope(&item, session_id, &claimed)?;
+        self.audit(
+            "ptah_revoke_work_review_verdict",
+            None,
+            Some(session_id),
+            Some(&claimed),
+            "ok",
+            None,
+            &format!("work {} is {}", item.work_id, block.as_str()),
+        );
+        Ok(json!({ "work": item, "admission": block }))
+    }
+
+    fn authorize_work_scope(
+        &self,
+        session_id: Uuid,
+        workspace: &Path,
+    ) -> Result<String, OrchError> {
+        let session = self.require_build_session(session_id)?;
+        let cwd = (!session.cwd.is_empty()).then(|| PathBuf::from(&session.cwd));
+        let allowlist = self.config.lock().allowlist.clone();
+        let claimed = require_workspace_match(&allowlist, cwd.as_deref(), workspace)?;
+        Ok(claimed.display().to_string())
+    }
+
+    fn require_work_in_scope(
+        &self,
+        item: &super::workload::WorkItem,
+        session_id: Uuid,
+        claimed: &str,
+    ) -> Result<(), OrchError> {
+        if item.session_id != session_id
+            || !super::store::workspaces_match(&item.workspace, claimed)
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::WorkspaceMismatch,
+                "work item does not belong to the requested scope",
+            ));
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]

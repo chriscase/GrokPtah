@@ -728,6 +728,19 @@ impl OrchStore {
         Ok(Some(item))
     }
 
+    /// Raw persistence with no invariant checks.
+    ///
+    /// Only the operations that legitimately mutate the review gate use this;
+    /// everything else goes through `save_work_item_unlocked`.
+    fn write_work_item_unlocked(&self, item: &WorkItem) -> anyhow::Result<()> {
+        item.validate()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let path = self
+            .work_item_path(&item.work_id)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        atomic_write_json(&path, item)
+    }
+
     fn save_work_item_unlocked(&self, item: &WorkItem) -> anyhow::Result<()> {
         item.validate()
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
@@ -742,21 +755,49 @@ impl OrchStore {
         // (which reconciliation performs for every item on every pass) skip
         // the scope read entirely, so the invariant costs nothing on the hot
         // path.
+        let previous = self.load_work_item_unlocked(&item.work_id)?;
+
+        // The review gate is not editable through the generic save path. A
+        // caller that could replace the policy or drop receipts here could
+        // approve its own work by rewriting the record, so gate mutation is
+        // confined to the dedicated verdict operations.
+        if let Some(stored) = previous.as_ref() {
+            if stored.review != item.review {
+                return Err(anyhow::anyhow!(
+                    "the review gate cannot be changed through a generic work save"
+                ));
+            }
+            if stored.review_receipts != item.review_receipts {
+                return Err(anyhow::anyhow!(
+                    "review receipts cannot be changed through a generic work save"
+                ));
+            }
+        } else if !item.review_receipts.is_empty() {
+            return Err(anyhow::anyhow!(
+                "a new work item cannot be created with review receipts"
+            ));
+        }
+
+        // Revalidate whenever the graph *or the scope it is resolved in*
+        // changes. A scope change with unchanged dependency ids silently
+        // re-points every edge at a different set of work, so it needs the
+        // same check a dependency edit does.
         if !item.dependencies.is_empty() {
-            let previous = self.load_work_item_unlocked(&item.work_id)?;
-            let changed = previous
-                .as_ref()
-                .map(|stored| stored.dependencies != item.dependencies)
-                .unwrap_or(true);
+            let changed = match previous.as_ref() {
+                None => true,
+                Some(stored) => {
+                    stored.dependencies != item.dependencies
+                        || stored.session_id != item.session_id
+                        || stored.created_by != item.created_by
+                        || !workspaces_match(&stored.workspace, &item.workspace)
+                }
+            };
             if changed {
                 self.enforce_dependency_graph_unlocked(item)
                     .map_err(|error| anyhow::anyhow!(error.to_string()))?;
             }
         }
-        let path = self
-            .work_item_path(&item.work_id)
-            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        atomic_write_json(&path, item)
+        self.write_work_item_unlocked(item)
     }
 
     /// Validate `item`'s dependency graph within its own scope.
@@ -766,26 +807,63 @@ impl OrchStore {
     /// declaration cannot report on work the caller may not observe, and a
     /// malformed graph in one scope cannot block writers in another.
     fn enforce_dependency_graph_unlocked(&self, item: &WorkItem) -> Result<(), OrchError> {
-        let scope = super::graph::GraphScope {
-            session_id: item.session_id,
-            workspace: item.workspace.as_str(),
-        };
+        let scope = super::graph::GraphScope::of(item);
+        let scoped = self.scoped_work_items_unlocked(scope, &item.work_id)?;
+        super::graph::validate_scoped_dependency_graph(&scoped, item, scope)
+    }
+
+    /// Read the work items in one scope, bounded.
+    ///
+    /// Items are deserialized one at a time and discarded immediately when out
+    /// of scope, so a large installation does not have to be materialized to
+    /// validate a small scope. Two ceilings apply: the number of files
+    /// examined, and the number of in-scope items retained. The retained bound
+    /// leaves room for the candidate itself, so a scope that is exactly at the
+    /// ceiling cannot be pushed one over by the write being validated.
+    fn scoped_work_items_unlocked(
+        &self,
+        scope: super::graph::GraphScope<'_>,
+        candidate_id: &str,
+    ) -> Result<Vec<WorkItem>, OrchError> {
+        let dir = self.inner.root.join("work-items");
         let mut scoped = Vec::new();
-        let all = self
-            .list_work_items_unlocked()
+        if !dir.is_dir() {
+            return Ok(scoped);
+        }
+        let entries = fs::read_dir(&dir)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-        for candidate in all {
-            if scope.contains(&candidate) {
-                scoped.push(candidate);
-                if scoped.len() > super::graph::MAX_GRAPH_SCOPE_ITEMS {
-                    return Err(OrchError::new(
-                        OrchErrorCode::CapacityExhausted,
-                        "scope holds too many work items for dependency validation",
-                    ));
-                }
+        let mut examined = 0usize;
+        for entry in entries {
+            let path = entry
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+                .path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            examined = examined.saturating_add(1);
+            if examined > super::graph::MAX_GRAPH_SCAN_FILES {
+                return Err(OrchError::new(
+                    OrchErrorCode::CapacityExhausted,
+                    "the work ledger is too large to validate a dependency graph against",
+                ));
+            }
+            let text = fs::read_to_string(&path)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            let stored: WorkItem = serde_json::from_str(&text)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            if stored.work_id == candidate_id || !scope.contains(&stored) {
+                continue;
+            }
+            scoped.push(stored);
+            // The candidate occupies one slot of the ceiling.
+            if scoped.len() >= super::graph::MAX_GRAPH_SCOPE_ITEMS {
+                return Err(OrchError::new(
+                    OrchErrorCode::CapacityExhausted,
+                    "scope holds too many work items for dependency validation",
+                ));
             }
         }
-        super::graph::validate_scoped_dependency_graph(&scoped, item, scope)
+        Ok(scoped)
     }
 
     fn load_work_attempt_unlocked(&self, attempt_id: &str) -> anyhow::Result<Option<WorkAttempt>> {
@@ -1874,10 +1952,7 @@ impl OrchStore {
         // by another session or workspace is treated exactly as one that does
         // not exist, so cross-scope work can neither satisfy nor reveal itself
         // through this path.
-        let scope = super::graph::GraphScope {
-            session_id: item.session_id,
-            workspace: item.workspace.as_str(),
-        };
+        let scope = super::graph::GraphScope::of(item);
         let mut dependency_states = super::graph::DependencyStates::new();
         for dependency in &item.dependencies {
             let resolved = self
@@ -1895,11 +1970,19 @@ impl OrchStore {
                 .flatten()
                 .is_some_and(|state| state == dependency.required_state)
         });
+        // A block a human or coordinator chose is evidenced by a reason this
+        // module did not write. Reconciliation never lifts it and never
+        // overwrites its explanation; only an explicit decision can.
+        let manually_blocked = item.state == WorkState::Blocked
+            && !super::graph::is_derived_reason(item.blocked_reason.as_deref());
         if !dependencies_ready && matches!(item.state, WorkState::Queued) {
             item.state = WorkState::Blocked;
             item.bump();
             self.save_work_item_unlocked(item)?;
-        } else if dependencies_ready && matches!(item.state, WorkState::Blocked) {
+        } else if dependencies_ready
+            && matches!(item.state, WorkState::Blocked)
+            && !manually_blocked
+        {
             item.state = WorkState::Queued;
             item.bump();
             self.save_work_item_unlocked(item)?;
@@ -1919,7 +2002,9 @@ impl OrchStore {
         let block =
             super::graph::evaluate_admission(item, &dependency_states, &item.review_receipts, now);
         let reason = Some(block.as_str().to_string());
-        if item.blocked_reason != reason {
+        if item.blocked_reason != reason
+            && super::graph::is_derived_reason(item.blocked_reason.as_deref())
+        {
             // Deliberately no `bump()`: the reason is a derived projection of
             // the state that was just reconciled, not an independently
             // versioned fact. Bumping for it would invalidate a caller's
@@ -1961,10 +2046,7 @@ impl OrchStore {
         item: &WorkItem,
         now: chrono::DateTime<Utc>,
     ) -> super::graph::AdmissionBlock {
-        let scope = super::graph::GraphScope {
-            session_id: item.session_id,
-            workspace: item.workspace.as_str(),
-        };
+        let scope = super::graph::GraphScope::of(item);
         let mut dependency_states = super::graph::DependencyStates::new();
         for dependency in &item.dependencies {
             let resolved = self
@@ -2095,27 +2177,32 @@ impl OrchStore {
 
     /// Record one reviewer's durable verdict against a Work item's review gate.
     ///
-    /// The receipt is attributable by construction: the authenticated
-    /// principal must *be* the reviewer the policy names, so no caller can
-    /// cast another reviewer's verdict. It binds the exact Work revision it
-    /// was cast against and the review policy revision in force, so a verdict
-    /// cannot be replayed against a later revision of either.
+    /// The reviewer identity is not accepted from the caller: it is taken from
+    /// a [`VerifiedPrincipal`], which can only be built inside this crate from
+    /// an already-authenticated context. An external caller therefore has no
+    /// way to nominate a reviewer identity of its own choosing. This is a
+    /// narrow stand-in until the canonical principal authority assembles.
     ///
-    /// The audit entry is written **before** the receipt becomes durable and
-    /// its failure fails the whole call. A verdict that cannot be audited is
-    /// not recorded: over-auditing a mutation that then fails to persist is
-    /// safe, silently admitting an unauditable one is not.
-    #[allow(clippy::too_many_arguments)]
+    /// The receipt binds the immutable review *subject* digest rather than the
+    /// ordinary work revision, because recording a receipt bumps the revision
+    /// and would otherwise invalidate the verdict before it. Editing the
+    /// subject changes the digest and silently retires every verdict cast
+    /// against the old one.
+    ///
+    /// Audit follows intent/outcome ordering: an `intent` entry is written
+    /// before anything is persisted and its failure fails the call, then the
+    /// durable outcome is recorded once persistence has actually succeeded or
+    /// failed. A crash between the two leaves a recorded intent with no
+    /// outcome, which is the honest description of what happened.
     pub fn record_review_verdict(
         &self,
         work_id: &str,
+        principal: &super::graph::VerifiedPrincipal,
         reviewer_id: &str,
         verdict: super::graph::ReviewVerdict,
-        principal_token_id: &str,
-        principal_owner_id: &str,
         expected_revision: Option<u64>,
         now: chrono::DateTime<Utc>,
-    ) -> Result<WorkItem, OrchError> {
+    ) -> Result<(WorkItem, super::graph::AdmissionBlock), OrchError> {
         let _guard = self.inner.lock.lock();
         let mut item = self
             .load_work_item_unlocked(work_id)
@@ -2138,18 +2225,17 @@ impl OrchStore {
                 "the review gate does not name this reviewer",
             ));
         }
-        // Self-attestation: a principal may only cast its own verdict.
-        if reviewer_id != principal_owner_id && reviewer_id != principal_token_id {
+        if !principal.is(reviewer_id) {
             return Err(OrchError::new(
                 OrchErrorCode::ForbiddenScope,
                 "a principal may only record its own review verdict",
             ));
         }
-        // A verdict is immutable once cast. Changing one means revoking it
-        // first, which leaves both facts in the trail.
+        let subject = super::graph::review_subject_digest(&item);
         if item.review_receipts.iter().any(|receipt| {
             receipt.reviewer_id == reviewer_id
                 && receipt.policy_revision == policy.policy_revision
+                && receipt.subject_digest == subject
                 && receipt.revoked_at.is_none()
         }) {
             return Err(OrchError::new(
@@ -2160,9 +2246,10 @@ impl OrchStore {
 
         let receipt = super::graph::ReviewReceipt {
             reviewer_id: reviewer_id.to_string(),
-            principal_token_id: principal_token_id.to_string(),
-            principal_owner_id: principal_owner_id.to_string(),
+            principal_token_id: principal.token_id().to_string(),
+            principal_owner_id: principal.owner_id().to_string(),
             verdict,
+            subject_digest: subject.clone(),
             work_revision: item.revision,
             policy_revision: policy.policy_revision,
             recorded_at: now,
@@ -2170,54 +2257,41 @@ impl OrchStore {
         };
         receipt.validate()?;
 
-        self.append_audit(&AuditEntry {
-            ts: now,
-            tool: "work_review_verdict".into(),
-            request_id: None,
-            session_id: Some(item.session_id),
-            workspace: Some(item.workspace.clone()),
-            outcome: "recorded".into(),
-            error_code: None,
-            detail: format!(
-                "work {} revision {} reviewer {} verdict {:?} policy revision {}",
-                item.work_id, item.revision, reviewer_id, verdict, policy.policy_revision
-            ),
-        })
-        .map_err(|error| {
-            OrchError::new(
-                OrchErrorCode::Internal,
-                format!("review verdict refused: audit failed: {error}"),
-            )
-        })?;
+        let detail = format!(
+            "work {} revision {} reviewer {} verdict {:?} policy revision {} subject {}",
+            item.work_id, item.revision, reviewer_id, verdict, policy.policy_revision, subject
+        );
+        self.audit_review_intent(&item, "record", &detail, now)?;
 
         item.review_receipts.push(receipt);
         item.bump_at(now);
-        self.save_work_item_unlocked(&item)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-        Ok(item)
+        let outcome = self.write_work_item_unlocked(&item);
+        self.audit_review_outcome(&item, "record", &detail, outcome.as_ref().err(), now);
+        outcome.map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+
+        let block = self.admission_block_for_unlocked(&item, now);
+        Ok((item, block))
     }
 
     /// Withdraw a reviewer's active verdict.
     ///
     /// The receipt is retained and marked revoked rather than deleted, so the
     /// gate's history remains complete and a revocation is itself auditable.
-    #[allow(clippy::too_many_arguments)]
     pub fn revoke_review_verdict(
         &self,
         work_id: &str,
+        principal: &super::graph::VerifiedPrincipal,
         reviewer_id: &str,
-        principal_token_id: &str,
-        principal_owner_id: &str,
         expected_revision: Option<u64>,
         now: chrono::DateTime<Utc>,
-    ) -> Result<WorkItem, OrchError> {
+    ) -> Result<(WorkItem, super::graph::AdmissionBlock), OrchError> {
         let _guard = self.inner.lock.lock();
         let mut item = self
             .load_work_item_unlocked(work_id)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
             .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
         Self::require_work_revision(&item, expected_revision)?;
-        if reviewer_id != principal_owner_id && reviewer_id != principal_token_id {
+        if !principal.is(reviewer_id) {
             return Err(OrchError::new(
                 OrchErrorCode::ForbiddenScope,
                 "a principal may only revoke its own review verdict",
@@ -2230,46 +2304,97 @@ impl OrchStore {
             .ok_or_else(|| {
                 OrchError::new(OrchErrorCode::Conflict, "work item has no review gate")
             })?;
-        let target = item
-            .review_receipts
-            .iter_mut()
-            .rfind(|receipt| {
-                receipt.reviewer_id == reviewer_id
-                    && receipt.policy_revision == policy_revision
-                    && receipt.revoked_at.is_none()
-            })
-            .ok_or_else(|| {
-                OrchError::new(
-                    OrchErrorCode::Conflict,
-                    "this reviewer has no active verdict to revoke",
-                )
-            })?;
-        target.revoked_at = Some(now);
+        let subject = super::graph::review_subject_digest(&item);
+        let detail = format!(
+            "work {} revision {} reviewer {} policy revision {} subject {}",
+            item.work_id, item.revision, reviewer_id, policy_revision, subject
+        );
+        {
+            let target = item
+                .review_receipts
+                .iter_mut()
+                .rfind(|receipt| {
+                    receipt.reviewer_id == reviewer_id
+                        && receipt.policy_revision == policy_revision
+                        && receipt.subject_digest == subject
+                        && receipt.revoked_at.is_none()
+                })
+                .ok_or_else(|| {
+                    OrchError::new(
+                        OrchErrorCode::Conflict,
+                        "this reviewer has no active verdict to revoke",
+                    )
+                })?;
+            target.revoked_at = Some(now);
+        }
 
+        self.audit_review_intent(&item, "revoke", &detail, now)?;
+        item.bump_at(now);
+        let outcome = self.write_work_item_unlocked(&item);
+        self.audit_review_outcome(&item, "revoke", &detail, outcome.as_ref().err(), now);
+        outcome.map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+
+        let block = self.admission_block_for_unlocked(&item, now);
+        Ok((item, block))
+    }
+
+    /// Declare what is about to be attempted. Its failure fails the call, so a
+    /// mutation that cannot be announced never happens.
+    fn audit_review_intent(
+        &self,
+        item: &WorkItem,
+        operation: &str,
+        detail: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<(), OrchError> {
         self.append_audit(&AuditEntry {
             ts: now,
             tool: "work_review_verdict".into(),
             request_id: None,
             session_id: Some(item.session_id),
             workspace: Some(item.workspace.clone()),
-            outcome: "revoked".into(),
+            outcome: format!("{operation}_intent"),
             error_code: None,
-            detail: format!(
-                "work {} revision {} reviewer {} policy revision {}",
-                item.work_id, item.revision, reviewer_id, policy_revision
-            ),
+            detail: detail.to_string(),
         })
         .map_err(|error| {
             OrchError::new(
                 OrchErrorCode::Internal,
-                format!("review revocation refused: audit failed: {error}"),
+                format!("review {operation} refused: audit intent failed: {error}"),
             )
-        })?;
+        })
+    }
 
-        item.bump_at(now);
-        self.save_work_item_unlocked(&item)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-        Ok(item)
+    /// Record what actually happened. Written only after persistence has
+    /// resolved, so a completed outcome is never claimed for a write that
+    /// failed. Its own failure is surfaced through the store's audit error
+    /// rather than rolling back a mutation that already landed.
+    fn audit_review_outcome(
+        &self,
+        item: &WorkItem,
+        operation: &str,
+        detail: &str,
+        failure: Option<&anyhow::Error>,
+        now: chrono::DateTime<Utc>,
+    ) {
+        let (outcome, error_code, detail) = match failure {
+            None => (format!("{operation}_committed"), None, detail.to_string()),
+            Some(error) => (
+                format!("{operation}_failed"),
+                Some("internal".to_string()),
+                format!("{detail}: {error}"),
+            ),
+        };
+        let _ = self.append_audit(&AuditEntry {
+            ts: now,
+            tool: "work_review_verdict".into(),
+            request_id: None,
+            session_id: Some(item.session_id),
+            workspace: Some(item.workspace.clone()),
+            outcome,
+            error_code,
+            detail,
+        });
     }
 
     /// Change the durable owner without claiming a lease. Assignment is a
@@ -4108,6 +4233,17 @@ impl OrchStore {
             return Err(OrchError::new(
                 OrchErrorCode::Conflict,
                 format!("work item is not claimable in state {:?}", item.state),
+            ));
+        }
+        // The canonical admission decision gates every lease. `Queued` alone is
+        // not permission: a review-gated item stays queued with its reason
+        // recorded, so without this check it could mint an attempt and execute
+        // before its quorum was met. This runs before any attempt exists.
+        let block = self.admission_block_for_unlocked(&item, now);
+        if !block.is_admissible() {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                format!("work item is not admissible: {}", block.as_str()),
             ));
         }
         item.assignment_status
@@ -6684,5 +6820,305 @@ mod tests {
         assert_eq!(agent.current_run_id, None);
         assert_eq!(agent.last_run_id.as_deref(), Some(run_id));
         assert!(!reopened.agent_activation_path(run_id).unwrap().exists());
+    }
+}
+
+#[cfg(test)]
+mod review_authority_tests {
+    use super::*;
+    use crate::orchestration::authz::AuthContext;
+    use crate::orchestration::graph::{
+        review_subject_digest, AdmissionBlock, ReviewVerdict, VerifiedPrincipal, WorkReviewPolicy,
+    };
+    use crate::orchestration::workload::WorkPolicy;
+    use tempfile::tempdir;
+    use uuid::Uuid;
+
+    fn principal(owner: &str) -> VerifiedPrincipal {
+        VerifiedPrincipal::from_auth(&AuthContext {
+            token_id: format!("token-of-{owner}"),
+            owner_id: owner.to_string(),
+        })
+        .expect("principal")
+    }
+
+    fn gated_item(
+        store: &OrchStore,
+        root: &std::path::Path,
+        reviewers: &[&str],
+        required: u32,
+    ) -> WorkItem {
+        let workspace = root.join("ws");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let mut item = WorkItem::new(
+            "review",
+            "synthetic objective",
+            Uuid::new_v4(),
+            workspace.display().to_string(),
+            "creator",
+            WorkPolicy::default(),
+        )
+        .expect("work item");
+        item.review = Some(WorkReviewPolicy {
+            reviewers: reviewers.iter().map(|r| (*r).to_string()).collect(),
+            required_approvals: required,
+            policy_revision: 1,
+        });
+        store.save_work_item(&item).expect("write");
+        item
+    }
+
+    #[test]
+    fn a_principal_may_only_cast_its_own_verdict() {
+        let dir = tempdir().unwrap();
+        let store = OrchStore::open(dir.path()).unwrap();
+        let item = gated_item(&store, dir.path(), &["r1", "r2"], 2);
+
+        // r2's principal attempting to cast r1's verdict.
+        let error = store
+            .record_review_verdict(
+                &item.work_id,
+                &principal("r2"),
+                "r1",
+                ReviewVerdict::Approve,
+                None,
+                Utc::now(),
+            )
+            .expect_err("impersonation must be refused");
+        assert!(error.message.contains("only record its own"), "{error}");
+
+        // A self-attested identity the gate does not name is also refused.
+        let error = store
+            .record_review_verdict(
+                &item.work_id,
+                &principal("intruder"),
+                "intruder",
+                ReviewVerdict::Approve,
+                None,
+                Utc::now(),
+            )
+            .expect_err("an unnamed reviewer must be refused");
+        assert!(error.message.contains("does not name"), "{error}");
+    }
+
+    #[test]
+    fn a_verdict_binds_the_subject_and_a_later_edit_retires_it() {
+        let dir = tempdir().unwrap();
+        let store = OrchStore::open(dir.path()).unwrap();
+        let item = gated_item(&store, dir.path(), &["r1"], 1);
+        let subject = review_subject_digest(&item);
+
+        let (updated, block) = store
+            .record_review_verdict(
+                &item.work_id,
+                &principal("r1"),
+                "r1",
+                ReviewVerdict::Approve,
+                Some(item.revision),
+                Utc::now(),
+            )
+            .expect("verdict records");
+        assert_eq!(block, AdmissionBlock::Admissible);
+        let receipt = updated.review_receipts.last().expect("receipt");
+        assert_eq!(receipt.subject_digest, subject);
+        assert_eq!(receipt.principal_owner_id, "r1");
+        assert!(updated.revision > item.revision);
+
+        // Recording bumped the revision, and the verdict still counts: the
+        // revision is not the subject.
+        assert_eq!(
+            store
+                .admission_block_at(&item.work_id, Utc::now())
+                .expect("admission"),
+            AdmissionBlock::Admissible
+        );
+
+        // Editing what was reviewed retires it. The edit goes through the
+        // generic save, which leaves the gate and receipts untouched.
+        let mut edited = updated.clone();
+        edited.objective = "a materially different objective".into();
+        edited.bump();
+        store.save_work_item(&edited).expect("subject edit");
+        assert_ne!(review_subject_digest(&edited), subject);
+        assert_eq!(
+            store
+                .admission_block_at(&item.work_id, Utc::now())
+                .expect("admission"),
+            AdmissionBlock::ReviewPending,
+            "a verdict for the old subject must not admit the new one"
+        );
+        assert!(
+            store.claim_work(&item.work_id, "worker", None).is_err(),
+            "and the edited item must not be claimable"
+        );
+    }
+
+    #[test]
+    fn a_stale_expected_revision_is_refused() {
+        let dir = tempdir().unwrap();
+        let store = OrchStore::open(dir.path()).unwrap();
+        let item = gated_item(&store, dir.path(), &["r1", "r2"], 2);
+        let before = item.revision;
+        store
+            .record_review_verdict(
+                &item.work_id,
+                &principal("r1"),
+                "r1",
+                ReviewVerdict::Approve,
+                Some(before),
+                Utc::now(),
+            )
+            .expect("first verdict");
+        let error = store
+            .record_review_verdict(
+                &item.work_id,
+                &principal("r2"),
+                "r2",
+                ReviewVerdict::Approve,
+                Some(before),
+                Utc::now(),
+            )
+            .expect_err("a stale expected revision must be refused");
+        assert_eq!(error.code, OrchErrorCode::StaleVersion);
+    }
+
+    #[test]
+    fn a_verdict_is_immutable_until_revoked_and_revocation_reopens_the_gate() {
+        let dir = tempdir().unwrap();
+        let store = OrchStore::open(dir.path()).unwrap();
+        let item = gated_item(&store, dir.path(), &["r1"], 1);
+        let now = Utc::now();
+
+        let (approved, block) = store
+            .record_review_verdict(
+                &item.work_id,
+                &principal("r1"),
+                "r1",
+                ReviewVerdict::Approve,
+                None,
+                now,
+            )
+            .expect("approve");
+        assert_eq!(block, AdmissionBlock::Admissible);
+
+        assert!(
+            store
+                .record_review_verdict(
+                    &item.work_id,
+                    &principal("r1"),
+                    "r1",
+                    ReviewVerdict::Reject,
+                    None,
+                    now
+                )
+                .is_err(),
+            "an active verdict must be revoked before it can change"
+        );
+
+        let (revoked, block) = store
+            .revoke_review_verdict(
+                &item.work_id,
+                &principal("r1"),
+                "r1",
+                Some(approved.revision),
+                now,
+            )
+            .expect("revoke");
+        assert_eq!(revoked.review_receipts.len(), 1, "the receipt is retained");
+        assert!(revoked.review_receipts[0].revoked_at.is_some());
+        assert_eq!(block, AdmissionBlock::ReviewPending);
+
+        let (_, block) = store
+            .record_review_verdict(
+                &item.work_id,
+                &principal("r1"),
+                "r1",
+                ReviewVerdict::Reject,
+                None,
+                now,
+            )
+            .expect("recast after revocation");
+        assert_eq!(block, AdmissionBlock::ReviewUnreachable);
+        assert!(store.claim_work(&item.work_id, "worker", None).is_err());
+    }
+
+    #[test]
+    fn a_terminal_item_accepts_no_verdict() {
+        let dir = tempdir().unwrap();
+        let store = OrchStore::open(dir.path()).unwrap();
+        let mut item = gated_item(&store, dir.path(), &["r1"], 1);
+        item.state = WorkState::Cancelled;
+        item.bump();
+        store.save_work_item(&item).expect("cancel");
+        let error = store
+            .record_review_verdict(
+                &item.work_id,
+                &principal("r1"),
+                "r1",
+                ReviewVerdict::Approve,
+                None,
+                Utc::now(),
+            )
+            .expect_err("a terminal item must not accept a verdict");
+        assert!(error.message.contains("terminal"), "{error}");
+    }
+
+    #[test]
+    fn a_verdict_whose_intent_cannot_be_audited_is_not_recorded() {
+        let dir = tempdir().unwrap();
+        let store = OrchStore::open(dir.path()).unwrap();
+        let item = gated_item(&store, dir.path(), &["r1"], 1);
+
+        // Occupy the audit directory path with a file so appends fail.
+        let audit_dir = dir.path().join("audit");
+        std::fs::remove_dir_all(&audit_dir).expect("remove audit dir");
+        std::fs::write(&audit_dir, b"not a directory").expect("occupy audit path");
+
+        let error = store
+            .record_review_verdict(
+                &item.work_id,
+                &principal("r1"),
+                "r1",
+                ReviewVerdict::Approve,
+                None,
+                Utc::now(),
+            )
+            .expect_err("an unauditable verdict must be refused");
+        assert!(error.message.contains("audit intent failed"), "{error}");
+
+        let stored = store
+            .load_work_item(&item.work_id)
+            .expect("load")
+            .expect("item");
+        assert!(
+            stored.review_receipts.is_empty(),
+            "no receipt may become durable when its intent could not be audited"
+        );
+    }
+
+    #[test]
+    fn a_committed_verdict_records_intent_then_outcome() {
+        let dir = tempdir().unwrap();
+        let store = OrchStore::open(dir.path()).unwrap();
+        let item = gated_item(&store, dir.path(), &["r1"], 1);
+        store
+            .record_review_verdict(
+                &item.work_id,
+                &principal("r1"),
+                "r1",
+                ReviewVerdict::Approve,
+                None,
+                Utc::now(),
+            )
+            .expect("approve");
+
+        let audit = std::fs::read_to_string(dir.path().join("audit").join("audit.jsonl"))
+            .expect("audit log");
+        let intent = audit.find("record_intent").expect("intent is recorded");
+        let committed = audit.find("record_committed").expect("outcome is recorded");
+        assert!(
+            intent < committed,
+            "intent must be written before the durable outcome"
+        );
     }
 }
