@@ -947,7 +947,11 @@ mod tests {
                     screen_recording: ComputerPermissionStatus::Granted,
                     accessibility: ComputerPermissionStatus::Granted,
                     detail: None,
-                    executor: None,
+                    // Available platform, so it answers which identity. These
+                    // fixture grants are app-bundle grants, not helper grants.
+                    executor: Some(crate::ComputerExecutorIdentity::in_process_host(
+                        crate::SigningClass::Uninspected,
+                    )),
                 }),
                 targets: Mutex::new(vec![fixture_target("com.example.demo", 42, -1200.0)]),
                 observation_identity: Mutex::new(None),
