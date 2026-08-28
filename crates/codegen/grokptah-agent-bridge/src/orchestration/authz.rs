@@ -125,7 +125,7 @@ impl AuthContext {
         let mut bytes = Vec::with_capacity(32);
         bytes.extend_from_slice(&self.stamp.principal.0);
         bytes.extend_from_slice(&self.stamp.incarnation.0);
-        PublicActorHandle(format!("actor_{}", hex_sha256(&bytes)[..32].to_string()))
+        PublicActorHandle(format!("actor_{}", &hex_sha256(&bytes)[..32]))
     }
 
     pub(crate) fn owner_id(&self) -> &str {
@@ -742,7 +742,7 @@ fn actor_handle_for_record(record: &StoredCredential) -> Option<PublicActorHandl
     bytes.extend_from_slice(&incarnation);
     Some(PublicActorHandle(format!(
         "actor_{}",
-        hex_sha256(&bytes)[..32].to_string()
+        &hex_sha256(&bytes)[..32]
     )))
 }
 
@@ -977,7 +977,8 @@ mod tests {
     fn explicit_same_incarnation_secret_rotation_preserves_actor_binding() {
         let root = tempdir().unwrap();
         let old = AuthCredential::new("primary", "old-secret").unwrap();
-        let mut registry = AuthRegistry::open(root.path(), &[old.clone()], "account-1").unwrap();
+        let mut registry =
+            AuthRegistry::open(root.path(), std::slice::from_ref(&old), "account-1").unwrap();
         let before = registry
             .authenticate(Some("Bearer old-secret"), &[old])
             .unwrap();
