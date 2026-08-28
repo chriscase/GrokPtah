@@ -1648,19 +1648,11 @@ impl OrchestrationService {
         self.ensure_resource_binding(auth, format!("session:{session_id}"))
     }
 
-    fn ensure_run_binding(
-        &self,
-        auth: &AuthContext,
-        run_id: &str,
-    ) -> Result<(), OrchError> {
+    fn ensure_run_binding(&self, auth: &AuthContext, run_id: &str) -> Result<(), OrchError> {
         self.ensure_resource_binding(auth, format!("run:{run_id}"))
     }
 
-    fn ensure_work_binding(
-        &self,
-        auth: &AuthContext,
-        work_id: &str,
-    ) -> Result<(), OrchError> {
+    fn ensure_work_binding(&self, auth: &AuthContext, work_id: &str) -> Result<(), OrchError> {
         self.ensure_resource_binding(auth, format!("work:{work_id}"))
     }
 
@@ -1699,7 +1691,10 @@ impl OrchestrationService {
         ) -> serde_json::Value {
             match value {
                 serde_json::Value::Array(values) => serde_json::Value::Array(
-                    values.into_iter().map(|value| project(value, handles)).collect(),
+                    values
+                        .into_iter()
+                        .map(|value| project(value, handles))
+                        .collect(),
                 ),
                 serde_json::Value::Object(values) => {
                     let mut projected = serde_json::Map::new();
@@ -1738,12 +1733,19 @@ impl OrchestrationService {
                         }
                         if matches!(
                             lower.as_str(),
-                            "clientid" | "actorid" | "createdby" | "reviewerid" | "claimantid"
+                            "clientid"
+                                | "actorid"
+                                | "createdby"
+                                | "reviewerid"
+                                | "claimantid"
+                                | "fromactor"
+                                | "ackedby"
                         ) {
                             let replacement = value
                                 .as_str()
-                                .and_then(|id| handles.get(id))
-                                .cloned()
+                                .filter(|value| value.starts_with("actor_"))
+                                .map(ToString::to_string)
+                                .or_else(|| value.as_str().and_then(|id| handles.get(id)).cloned())
                                 .unwrap_or_else(|| "actor_redacted".into());
                             projected.insert("actorHandle".into(), json!(replacement));
                             continue;
@@ -1970,9 +1972,12 @@ impl OrchestrationService {
                 start_seq,
             );
             match transitioned {
-                Ok(Some(run)) => {
-                    self.spawn_run(run, pending.prompt, pending.execution_mode, pending.authority)
-                }
+                Ok(Some(run)) => self.spawn_run(
+                    run,
+                    pending.prompt,
+                    pending.execution_mode,
+                    pending.authority,
+                ),
                 Ok(None) | Err(_) => {
                     self.host.release_orchestration_turn(&pending.run_id);
                     if let Err(error) = self
@@ -4375,7 +4380,14 @@ impl OrchestrationService {
                 "note": note,
                 "expectedRevision": expected_revision,
             }),
-            |store| store.approve_work(work_id, auth.actor_handle().as_str(), note, expected_revision),
+            |store| {
+                store.approve_work(
+                    work_id,
+                    auth.actor_handle().as_str(),
+                    note,
+                    expected_revision,
+                )
+            },
         )
         .await
     }
@@ -7609,9 +7621,11 @@ impl OrchestrationService {
                             return;
                         }
                     };
-                if let Err(error) =
-                    service.consume_effect_lease(&authority, &mut effect_lease, &format!("run:{rid}:provider"))
-                {
+                if let Err(error) = service.consume_effect_lease(
+                    &authority,
+                    &mut effect_lease,
+                    &format!("run:{rid}:provider"),
+                ) {
                     let _ = store.update_run(&rid, |current| {
                         current.state = RunState::Failed;
                         current.terminal_result = Some("failed".into());

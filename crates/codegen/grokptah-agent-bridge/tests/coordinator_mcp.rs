@@ -209,7 +209,10 @@ async fn independent_worker_recovers_assignment_and_messages() {
         )
         .await
         .unwrap();
-    assert_eq!(accepted.structured["decision"]["actorHandle"], primary_actor);
+    assert_eq!(
+        accepted.structured["decision"]["actorHandle"],
+        primary_actor
+    );
     assert_eq!(
         accepted.structured["decision"]["actorAgentId"],
         worker.agent_id
@@ -585,7 +588,9 @@ async fn coordinator_identity_and_scope_are_enforced() {
         .as_str()
         .unwrap()
         .to_string();
-    assert_eq!(sent.structured["message"]["fromActor"], "primary");
+    assert!(sent.structured["message"]["actorHandle"]
+        .as_str()
+        .is_some_and(|handle| handle.starts_with("actor_")));
 
     let ack_err = coordinator
         .call_tool(
