@@ -372,11 +372,11 @@ async fn two_concurrent_requests_complete_with_correct_request_ids() {
 }
 
 // ---------------------------------------------------------------------------
-// Retry on transient transport error
+// A post-send 500 is ambiguous and must not be retried.
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn retries_on_500_then_succeeds() {
+async fn ambiguous_500_is_not_retried() {
     let counter = Arc::new(AtomicU32::new(0));
     let counter_handler = Arc::clone(&counter);
     let app = Router::new().route(
@@ -403,8 +403,8 @@ async fn retries_on_500_then_succeeds() {
     );
     let server = MockServer::spawn(app).await;
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-    // Lots of retries available; backoff is jittered around 2s on first
-    // retry, so this test takes a bit to run.
+    // The durable provider-attempt authority rejects automatic replay even
+    // though the legacy sampler retry policy would retry this status.
     let cfg = test_config(server.base_url(), "test-model");
     let handle = SamplerActor::spawn(cfg, RetryPolicy::default(), event_tx);
 
@@ -417,20 +417,18 @@ async fn retries_on_500_then_succeeds() {
     let saw_retrying = events
         .iter()
         .any(|e| matches!(e, SamplingEvent::Retrying { .. }));
-    assert!(saw_retrying, "expected at least one Retrying event");
+    assert!(!saw_retrying, "ambiguous provider attempt must not retry");
 
     match events.last().unwrap() {
-        SamplingEvent::Completed { response, .. } => {
-            if let Some(a) = response.assistant() {
-                assert_eq!(a.content.as_ref(), "ok");
-            }
+        SamplingEvent::Failed { error, .. } => {
+            assert!(error.message.contains("uncertain"));
         }
-        other => panic!("expected Completed after retry, got {other:?}"),
+        other => panic!("expected Failed without retry, got {other:?}"),
     }
 
     assert!(
-        counter.load(Ordering::SeqCst) >= 2,
-        "server hit at least twice"
+        counter.load(Ordering::SeqCst) == 1,
+        "server must be hit exactly once"
     );
 }
 
