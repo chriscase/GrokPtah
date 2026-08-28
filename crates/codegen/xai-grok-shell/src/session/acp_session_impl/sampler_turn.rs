@@ -350,6 +350,7 @@ impl SessionActor {
             compaction_at_tokens: self.compaction_at_tokens.get(),
             doom_loop_recovery: self.doom_loop_recovery,
             header_injector: Some(std::sync::Arc::new(TraceContextInjector)),
+            provider_attempt: cfg.provider_attempt.clone(),
         }
     }
     /// Install auto-mode permission classifier with a live LLM side-query
