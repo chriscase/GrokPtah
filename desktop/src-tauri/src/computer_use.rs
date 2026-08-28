@@ -76,6 +76,8 @@ pub struct DesktopComputerUse {
     native_services: std::sync::Mutex<HashMap<String, Arc<ComputerUseService>>>,
     simulator_operation: Mutex<()>,
     pending_approval: std::sync::Mutex<Option<PendingComputerApproval>>,
+    #[cfg(test)]
+    _home_guard: Option<std::sync::MutexGuard<'static, ()>>,
 }
 
 impl DesktopComputerUse {
@@ -109,6 +111,8 @@ impl DesktopComputerUse {
             native_services: std::sync::Mutex::new(HashMap::new()),
             simulator_operation: Mutex::new(()),
             pending_approval: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            _home_guard: None,
         }
     }
 
@@ -1070,8 +1074,14 @@ mod tests {
     /// Host fixture with its persist directories bound under the disposable
     /// fixture directory. The process-global home override is serialized and
     /// restored so parallel tests never touch the real user home.
-    fn test_host(dir: &std::path::Path) -> (AgentHostHandle, Uuid) {
-        let _guard = grokptah_agent_bridge::home_override_serial();
+    fn test_host(
+        dir: &std::path::Path,
+    ) -> (
+        AgentHostHandle,
+        Uuid,
+        std::sync::MutexGuard<'static, ()>,
+    ) {
+        let guard = grokptah_agent_bridge::home_override_serial();
         grokptah_agent_bridge::set_grokptah_home_override(Some(dir.join(".grokptah")));
         let host = grokptah_agent_bridge::AgentHost::create(Default::default());
         host.start().unwrap();
@@ -1095,8 +1105,7 @@ mod tests {
             },
         );
         host.ensure_session_agent(session.id).unwrap();
-        grokptah_agent_bridge::set_grokptah_home_override(None);
-        (host, session.id)
+        (host, session.id, guard)
     }
 
     fn test_desktop() -> (tempfile::TempDir, DesktopComputerUse) {
@@ -1106,7 +1115,7 @@ mod tests {
         let store = ComputerStore::open(dir.path().join("computer-use")).unwrap();
         // Install policy explicitly from a live host principal; constructing a
         // service alone must not mint or install any authority.
-        let (host, session_id) = test_host(dir.path());
+        let (host, session_id, home_guard) = test_host(dir.path());
         let principal = host.capability_principal(session_id).unwrap();
         let simulator = Arc::new(ComputerUseService::new_with_authority_and_principal(
             Arc::new(SimulatorBackend::new()),
@@ -1128,6 +1137,7 @@ mod tests {
                 native_services: std::sync::Mutex::new(HashMap::new()),
                 simulator_operation: Mutex::new(()),
                 pending_approval: std::sync::Mutex::new(None),
+                _home_guard: Some(home_guard),
             },
         )
     }
