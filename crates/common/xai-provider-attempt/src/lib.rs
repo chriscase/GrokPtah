@@ -975,10 +975,16 @@ fn derive_request_key(attempt_id: &str, spec: &AttemptSpec) -> String {
         &spec.operation_id,
         &spec.provider_id,
         &spec.request_fingerprint,
+        &spec.authority.principal_incarnation,
+        &spec.authority.effect_lease,
     ] {
         hasher.update([0]);
         hasher.update(value.as_bytes());
     }
+    hasher.update([0]);
+    hasher.update(spec.authority.principal_generation.to_le_bytes());
+    hasher.update([0]);
+    hasher.update(spec.authority.capability_generation.to_le_bytes());
     format!("{REQUEST_KEY_PREFIX}{}", hex(&hasher.finalize()))
 }
 
