@@ -982,7 +982,7 @@ impl AgentHostHandle {
             .map(|tracker| tracker.run_id().to_owned())
             .unwrap_or_else(|| format!("desktop-chat-{session_id}"));
         let host = self.clone();
-        ProviderAttemptContext::new(
+        ProviderAttemptContext::from_host_authority(
             store,
             operation_id,
             authority,
@@ -994,7 +994,7 @@ impl AgentHostHandle {
     fn current_provider_authority(
         &self,
         session_id: Uuid,
-    ) -> Result<xai_provider_attempt::AuthorityBinding> {
+    ) -> Result<xai_provider_attempt::CanonicalHostAuthority> {
         let (agent_id, turn_generation) = {
             let inner = self.inner.lock();
             let session = inner
@@ -1034,13 +1034,12 @@ impl AgentHostHandle {
         } else {
             (format!("lane-{session_id}"), turn_generation.max(1))
         };
-        xai_provider_attempt::AuthorityBinding::new(
+        Ok(xai_provider_attempt::CanonicalHostAuthority {
             principal_incarnation,
-            turn_generation.max(1),
+            principal_generation: turn_generation.max(1),
             capability_generation,
-            format!("effect-lease-{session_id}-{turn_generation}"),
-        )
-        .map_err(|error| anyhow!("construct provider authority: {error}"))
+            effect_lease: format!("effect-lease-{session_id}-{turn_generation}"),
+        })
     }
 
     pub fn take_event_receiver(&self) -> Option<crate::event_bus::EventReceiver> {

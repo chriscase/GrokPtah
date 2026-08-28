@@ -1964,6 +1964,7 @@ fn record_provider_attempt(
 }
 
 fn settle_provider_http_response(
+    provider_attempt: &ProviderAttemptContext,
     permit: &mut Option<xai_provider_attempt::PhysicalSendPermit>,
     status_code: u16,
     response_bytes: &[u8],
@@ -1971,26 +1972,55 @@ fn settle_provider_http_response(
     let Some(mut permit) = permit.take() else {
         bail!("provider attempt permit was already consumed");
     };
-    permit
-        .settle_http_response(status_code, response_bytes)
+    provider_attempt
+        .settle_http_response(&mut permit, status_code, response_bytes)
         .map_err(|error| anyhow!("settle provider attempt: {error}"))
 }
 
 fn revalidate_provider_permit(
+    provider_attempt: &ProviderAttemptContext,
     permit: &mut Option<xai_provider_attempt::PhysicalSendPermit>,
 ) -> Result<()> {
     let Some(permit_ref) = permit.as_ref() else {
         bail!("provider attempt permit is unavailable");
     };
-    if let Err(error) = permit_ref.revalidate_before_physical_write() {
+    if let Err(error) = provider_attempt.revalidate_before_physical_write(permit_ref) {
         if let Some(mut permit) = permit.take() {
-            let _ = permit.transport_before_possible_write();
+            let _ = provider_attempt.transport_before_possible_write(&mut permit);
         }
         return Err(anyhow!(
             "provider authority changed before physical send: {error}"
         ));
     }
     Ok(())
+}
+
+fn mark_permit_transport_ambiguous(
+    provider_attempt: &ProviderAttemptContext,
+    permit: Option<xai_provider_attempt::PhysicalSendPermit>,
+) {
+    if let Some(mut permit) = permit {
+        let _ = provider_attempt.transport_after_possible_write(&mut permit);
+    }
+}
+
+fn mark_permit_cancelled_after_write(
+    provider_attempt: &ProviderAttemptContext,
+    permit: Option<xai_provider_attempt::PhysicalSendPermit>,
+) {
+    if let Some(mut permit) = permit {
+        let _ = provider_attempt.cancel_after_possible_write(&mut permit);
+    }
+}
+
+fn mark_permit_semantic_rejection(
+    provider_attempt: &ProviderAttemptContext,
+    permit: Option<xai_provider_attempt::PhysicalSendPermit>,
+    status_code: u16,
+) {
+    if let Some(mut permit) = permit {
+        let _ = provider_attempt.semantic_rejection(&mut permit, status_code);
+    }
 }
 
 /// Stream one chat/completions step (tools + tokens).
@@ -2178,13 +2208,11 @@ where
                     context.begin_attempt().ok().map(|attempt| (route, attempt))
                 });
 
-        revalidate_provider_permit(&mut physical_permit)?;
+        revalidate_provider_permit(provider_attempt, &mut physical_permit)?;
         let resp_result = tokio::select! {
             r = send_once(&creds).send() => r,
             _ = cancel.cancelled() => {
-                if let Some(mut permit) = physical_permit.take() {
-                    let _ = permit.cancel_after_possible_write();
-                }
+                mark_permit_cancelled_after_write(provider_attempt, physical_permit.take());
                 if let Some((route, attempt)) = observation_attempt.take() {
                     record_provider_attempt(
                         Some(attempt),
@@ -2204,9 +2232,7 @@ where
         let mut resp = match resp_result {
             Ok(r) => r,
             Err(e) => {
-                if let Some(mut permit) = physical_permit.take() {
-                    let _ = permit.transport_after_possible_write();
-                }
+                mark_permit_transport_ambiguous(provider_attempt, physical_permit.take());
                 if let Some((route, attempt)) = observation_attempt.take() {
                     record_provider_attempt(
                         Some(attempt),
@@ -2280,7 +2306,7 @@ where
                             .and_then(|(route, context)| {
                                 context.begin_attempt().ok().map(|attempt| (route, attempt))
                             });
-                    revalidate_provider_permit(&mut physical_permit)?;
+                    revalidate_provider_permit(provider_attempt, &mut physical_permit)?;
                     resp = tokio::select! {
                         r = send_once(&creds).send() => match r {
                             Ok(response) => response,
@@ -2315,9 +2341,7 @@ where
                             }
                         },
                         _ = cancel.cancelled() => {
-                            if let Some(mut permit) = physical_permit.take() {
-                                let _ = permit.cancel_after_possible_write();
-                            }
+                            mark_permit_cancelled_after_write(provider_attempt, physical_permit.take());
                             if let Some((route, attempt)) = observation_attempt.take() {
                                 record_provider_attempt(
                                     Some(attempt),
@@ -2336,9 +2360,7 @@ where
                     };
                 }
                 Err(error) => {
-                    if let Some(mut permit) = physical_permit.take() {
-                        let _ = permit.semantic_rejection(401);
-                    }
+                    mark_permit_semantic_rejection(provider_attempt, physical_permit.take(), 401);
                     bail!("HTTP 401 (OIDC refresh refused: {})", error.code());
                 }
             }
@@ -2350,9 +2372,7 @@ where
             || status == reqwest::StatusCode::REQUEST_TIMEOUT
         {
             if status.is_server_error() || status == reqwest::StatusCode::REQUEST_TIMEOUT {
-                if let Some(mut permit) = physical_permit.take() {
-                    let _ = permit.transport_after_possible_write();
-                }
+                mark_permit_transport_ambiguous(provider_attempt, physical_permit.take());
             }
             let headers = resp.headers().clone();
             let text = read_bounded_response_body(resp, cancel)
@@ -2396,9 +2416,11 @@ where
                 continue;
             }
             if status.as_u16() == 429 {
-                if let Some(mut permit) = physical_permit.take() {
-                    let _ = permit.semantic_rejection(status.as_u16());
-                }
+                mark_permit_semantic_rejection(
+                    provider_attempt,
+                    physical_permit.take(),
+                    status.as_u16(),
+                );
             }
             bail!("{}", last_err.unwrap());
         }
@@ -2463,14 +2485,18 @@ where
                 continue;
             }
             if target.dialect == crate::gateway_config::ProviderDialect::OpenAiChatCompletions {
-                if let Some(mut permit) = physical_permit.take() {
-                    let _ = permit.semantic_rejection(status.as_u16());
-                }
+                mark_permit_semantic_rejection(
+                    provider_attempt,
+                    physical_permit.take(),
+                    status.as_u16(),
+                );
                 bail!("configured provider returned HTTP {status}");
             }
-            if let Some(mut permit) = physical_permit.take() {
-                let _ = permit.semantic_rejection(status.as_u16());
-            }
+            mark_permit_semantic_rejection(
+                provider_attempt,
+                physical_permit.take(),
+                status.as_u16(),
+            );
             bail!(
                 "HTTP {status}: {}",
                 text.chars().take(800).collect::<String>()
@@ -2480,8 +2506,8 @@ where
         // Non-stream JSON body (fallback path). Some compatible gateways also
         // return this shape despite accepting `stream=true`.
         if let Some(permit) = physical_permit.as_mut() {
-            permit
-                .mark_response_started()
+            provider_attempt
+                .mark_response_started(permit)
                 .map_err(|error| anyhow!("record provider response start: {error}"))?;
         }
         let headers = resp.headers().clone();
@@ -2550,7 +2576,12 @@ where
                     usage.as_ref(),
                 );
             }
-            settle_provider_http_response(&mut physical_permit, status.as_u16(), raw.as_bytes())?;
+            settle_provider_http_response(
+                provider_attempt,
+                &mut physical_permit,
+                status.as_u16(),
+                raw.as_bytes(),
+            )?;
             return Ok(step);
         }
         if content_type.contains("application/json") {
@@ -2613,7 +2644,12 @@ where
                     usage.as_ref(),
                 );
             }
-            settle_provider_http_response(&mut physical_permit, status.as_u16(), raw.as_bytes())?;
+            settle_provider_http_response(
+                provider_attempt,
+                &mut physical_permit,
+                status.as_u16(),
+                raw.as_bytes(),
+            )?;
             return Ok(step);
         }
 
@@ -2750,6 +2786,7 @@ where
                 );
             }
             settle_provider_http_response(
+                provider_attempt,
                 &mut physical_permit,
                 status.as_u16(),
                 response_bytes.to_le_bytes().as_slice(),
@@ -2820,6 +2857,7 @@ where
                 );
             }
             settle_provider_http_response(
+                provider_attempt,
                 &mut physical_permit,
                 status.as_u16(),
                 response_bytes.to_le_bytes().as_slice(),
@@ -2848,6 +2886,7 @@ where
                 );
             }
             settle_provider_http_response(
+                provider_attempt,
                 &mut physical_permit,
                 status.as_u16(),
                 response_bytes.to_le_bytes().as_slice(),
@@ -2875,6 +2914,7 @@ where
                 );
             }
             settle_provider_http_response(
+                provider_attempt,
                 &mut physical_permit,
                 status.as_u16(),
                 response_bytes.to_le_bytes().as_slice(),
@@ -2903,6 +2943,7 @@ where
             );
         }
         settle_provider_http_response(
+            provider_attempt,
             &mut physical_permit,
             status.as_u16(),
             response_bytes.to_le_bytes().as_slice(),
@@ -2989,18 +3030,18 @@ pub async fn replay_xai_provider_contract_on_loopback(
         std::env::temp_dir().join(format!("grokptah-provider-contract-{}", Uuid::new_v4()));
     let attempt_store = xai_provider_attempt::ProviderAttemptStore::open(&attempt_root)
         .map_err(|error| anyhow!("open provider contract attempt ledger: {error}"))?;
-    let attempt_authority = xai_provider_attempt::AuthorityBinding::new(
-        "provider-contract-replay",
-        1,
-        1,
-        "provider-contract-replay-lease",
-    )
-    .map_err(|error| anyhow!("create provider contract authority: {error}"))?;
-    let provider_attempt = ProviderAttemptContext::new(
+    let attempt_authority = xai_provider_attempt::CanonicalHostAuthority {
+        principal_incarnation: "provider-contract-replay".into(),
+        principal_generation: 1,
+        capability_generation: 1,
+        effect_lease: "provider-contract-replay-lease".into(),
+    };
+    let revalidate_authority = attempt_authority.clone();
+    let provider_attempt = ProviderAttemptContext::from_host_authority(
         attempt_store,
         "provider-contract-replay",
-        attempt_authority.clone(),
-        Arc::new(move || Some(attempt_authority.clone())),
+        attempt_authority,
+        Arc::new(move || Some(revalidate_authority.clone())),
     )
     .map_err(|error| anyhow!("create provider contract context: {error}"))?;
     let step = call_provider_agent_step(
@@ -3076,18 +3117,18 @@ mod compatible_stream_tests {
     fn provider_attempt_context() -> ProviderAttemptContext {
         let root = std::env::temp_dir().join(format!("grokptah-provider-test-{}", Uuid::new_v4()));
         let store = xai_provider_attempt::ProviderAttemptStore::open(root).unwrap();
-        let authority = xai_provider_attempt::AuthorityBinding::new(
-            "provider-test",
-            1,
-            1,
-            "provider-test-lease",
-        )
-        .unwrap();
-        ProviderAttemptContext::new(
+        let authority = xai_provider_attempt::CanonicalHostAuthority {
+            principal_incarnation: "provider-test".into(),
+            principal_generation: 1,
+            capability_generation: 1,
+            effect_lease: "provider-test-lease".into(),
+        };
+        let revalidate_authority = authority.clone();
+        ProviderAttemptContext::from_host_authority(
             store,
             "provider-test-operation",
-            authority.clone(),
-            Arc::new(move || Some(authority.clone())),
+            authority,
+            Arc::new(move || Some(revalidate_authority.clone())),
         )
         .unwrap()
     }
@@ -3906,11 +3947,9 @@ pub(crate) async fn call_xai_chat(
         .json(&body)
     };
 
-    revalidate_provider_permit(&mut physical_permit)?;
+    revalidate_provider_permit(provider_attempt, &mut physical_permit)?;
     let mut resp = send_once(&creds).send().await.map_err(|e| {
-        if let Some(mut permit) = physical_permit.take() {
-            let _ = permit.transport_after_possible_write();
-        }
+        mark_permit_transport_ambiguous(provider_attempt, physical_permit.take());
         // Surface classify-able transport failures (DNS, TLS, timeout) so the
         // UI is not a vague "error sending request".
         let kind = if e.is_timeout() {
@@ -3939,11 +3978,9 @@ pub(crate) async fn call_xai_chat(
         match crate::auth_store::force_refresh(&creds).await {
             Ok(fresh) => {
                 creds = fresh;
-                revalidate_provider_permit(&mut physical_permit)?;
+                revalidate_provider_permit(provider_attempt, &mut physical_permit)?;
                 resp = send_once(&creds).send().await.map_err(|error| {
-                    if let Some(mut permit) = physical_permit.take() {
-                        let _ = permit.transport_after_possible_write();
-                    }
+                    mark_permit_transport_ambiguous(provider_attempt, physical_permit.take());
                     let class = if error.is_timeout() {
                         "timeout"
                     } else if error.is_connect() {
@@ -3955,9 +3992,7 @@ pub(crate) async fn call_xai_chat(
                 })?;
             }
             Err(error) => {
-                if let Some(mut permit) = physical_permit.take() {
-                    let _ = permit.semantic_rejection(401);
-                }
+                mark_permit_semantic_rejection(provider_attempt, physical_permit.take(), 401);
                 bail!(
                     "HTTP 401 Unauthorized (OIDC refresh refused: {}). \
                      Run `grok login` to re-authenticate.",
@@ -3970,11 +4005,13 @@ pub(crate) async fn call_xai_chat(
     if !resp.status().is_success() {
         let status = resp.status();
         if status.is_server_error() {
-            if let Some(mut permit) = physical_permit.take() {
-                let _ = permit.transport_after_possible_write();
-            }
-        } else if let Some(mut permit) = physical_permit.take() {
-            let _ = permit.semantic_rejection(status.as_u16());
+            mark_permit_transport_ambiguous(provider_attempt, physical_permit.take());
+        } else {
+            mark_permit_semantic_rejection(
+                provider_attempt,
+                physical_permit.take(),
+                status.as_u16(),
+            );
         }
         if is_compatible {
             bail!("configured provider returned HTTP {status}");
@@ -3986,8 +4023,8 @@ pub(crate) async fn call_xai_chat(
         bail!("HTTP {status}: {clipped}");
     }
     if let Some(permit) = physical_permit.as_mut() {
-        permit
-            .mark_response_started()
+        provider_attempt
+            .mark_response_started(permit)
             .map_err(|error| anyhow!("record provider response start: {error}"))?;
     }
     let raw = read_bounded_response_body(resp, &CancellationToken::new()).await?;
@@ -3997,7 +4034,12 @@ pub(crate) async fn call_xai_chat(
     // chat/completions shape
     if let Some(content) = v["choices"][0]["message"]["content"].as_str() {
         if !content.is_empty() {
-            settle_provider_http_response(&mut physical_permit, 200, raw.as_bytes())?;
+            settle_provider_http_response(
+                provider_attempt,
+                &mut physical_permit,
+                200,
+                raw.as_bytes(),
+            )?;
             return Ok(ChatReply {
                 text: content.to_string(),
                 usage,
@@ -4007,7 +4049,12 @@ pub(crate) async fn call_xai_chat(
     // responses API fallback (some catalog models use this backend)
     if let Some(content) = v["output_text"].as_str() {
         if !content.is_empty() {
-            settle_provider_http_response(&mut physical_permit, 200, raw.as_bytes())?;
+            settle_provider_http_response(
+                provider_attempt,
+                &mut physical_permit,
+                200,
+                raw.as_bytes(),
+            )?;
             return Ok(ChatReply {
                 text: content.to_string(),
                 usage,
@@ -4022,7 +4069,12 @@ pub(crate) async fn call_xai_chat(
             }
         }
         if !parts.is_empty() {
-            settle_provider_http_response(&mut physical_permit, 200, raw.as_bytes())?;
+            settle_provider_http_response(
+                provider_attempt,
+                &mut physical_permit,
+                200,
+                raw.as_bytes(),
+            )?;
             return Ok(ChatReply {
                 text: parts.join(""),
                 usage,

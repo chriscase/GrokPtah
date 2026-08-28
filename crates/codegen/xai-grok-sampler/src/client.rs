@@ -700,8 +700,8 @@ impl SamplingClient {
             .map_err(|error| {
                 SamplingError::Auth(format!("provider attempt unavailable: {error}"))
             })?;
-        if let Err(error) = permit.revalidate_before_physical_write() {
-            let _ = permit.transport_before_possible_write();
+        if let Err(error) = context.revalidate_before_physical_write(&permit) {
+            let _ = context.transport_before_possible_write(&mut permit);
             return Err(SamplingError::Auth(format!(
                 "provider authority changed before physical send: {error}"
             )));
@@ -715,32 +715,37 @@ impl SamplingClient {
         Ok((builder, Some(permit)))
     }
 
-    fn mark_transport_ambiguous(permit: Option<xai_provider_attempt::PhysicalSendPermit>) {
-        if let Some(mut permit) = permit {
-            let _ = permit.transport_after_possible_write();
+    fn mark_transport_ambiguous(
+        context: Option<&xai_provider_attempt::AttemptContext>,
+        permit: Option<xai_provider_attempt::PhysicalSendPermit>,
+    ) {
+        if let (Some(context), Some(mut permit)) = (context, permit) {
+            let _ = context.transport_after_possible_write(&mut permit);
         }
     }
 
     fn mark_semantic_rejection(
+        context: Option<&xai_provider_attempt::AttemptContext>,
         permit: Option<xai_provider_attempt::PhysicalSendPermit>,
         status: reqwest::StatusCode,
     ) {
-        if let Some(mut permit) = permit {
-            let _ = permit.semantic_rejection(status.as_u16());
+        if let (Some(context), Some(mut permit)) = (context, permit) {
+            let _ = context.semantic_rejection(&mut permit, status.as_u16());
         }
     }
 
     fn revalidate_permit(
+        context: Option<&xai_provider_attempt::AttemptContext>,
         permit: &mut Option<xai_provider_attempt::PhysicalSendPermit>,
     ) -> Result<()> {
-        let Some(permit_ref) = permit.as_ref() else {
+        let (Some(context), Some(permit_ref)) = (context, permit.as_ref()) else {
             return Err(SamplingError::Auth(
                 "provider attempt permit is unavailable".into(),
             ));
         };
-        if let Err(error) = permit_ref.revalidate_before_physical_write() {
+        if let Err(error) = context.revalidate_before_physical_write(permit_ref) {
             if let Some(mut permit) = permit.take() {
-                let _ = permit.transport_before_possible_write();
+                let _ = context.transport_before_possible_write(&mut permit);
             }
             return Err(SamplingError::Auth(format!(
                 "provider authority changed before physical send: {error}"
@@ -750,10 +755,11 @@ impl SamplingClient {
     }
 
     fn mark_response_started(
+        context: Option<&xai_provider_attempt::AttemptContext>,
         permit: &mut Option<xai_provider_attempt::PhysicalSendPermit>,
     ) -> Result<()> {
-        if let Some(permit) = permit.as_mut() {
-            permit.mark_response_started().map_err(|error| {
+        if let (Some(context), Some(permit)) = (context, permit.as_mut()) {
+            context.mark_response_started(permit).map_err(|error| {
                 SamplingError::Auth(format!("provider response state: {error}"))
             })?;
         }
@@ -761,12 +767,13 @@ impl SamplingClient {
     }
 
     fn settle_response(
+        context: Option<&xai_provider_attempt::AttemptContext>,
         permit: &mut Option<xai_provider_attempt::PhysicalSendPermit>,
         status: reqwest::StatusCode,
     ) -> Result<()> {
-        if let Some(mut permit) = permit.take() {
-            permit
-                .settle_http_response(status.as_u16(), b"provider-response")
+        if let (Some(context), Some(mut permit)) = (context, permit.take()) {
+            context
+                .settle_http_response(&mut permit, status.as_u16(), b"provider-response")
                 .map_err(|error| SamplingError::Auth(format!("provider settlement: {error}")))?;
         }
         Ok(())
@@ -1044,11 +1051,11 @@ impl SamplingClient {
         )?;
         let http_request = http_request.json(&payload);
 
-        Self::revalidate_permit(&mut permit)?;
+        Self::revalidate_permit(self.provider_attempt.as_ref(), &mut permit)?;
         let response = http_request.send().await.map_err(|e| {
             // Log at debug level; errors are surfaced to the caller.
             tracing::debug!("HTTP request failed: {}", e);
-            Self::mark_transport_ambiguous(permit.take());
+            Self::mark_transport_ambiguous(self.provider_attempt.as_ref(), permit.take());
             if self.provider_attempt.is_some() {
                 SamplingError::Auth(
                     "provider attempt is uncertain; explicit reconciliation is required".into(),
@@ -1059,14 +1066,18 @@ impl SamplingClient {
         })?;
 
         if !response.status().is_success() {
-            Self::mark_semantic_rejection(permit.take(), response.status());
+            Self::mark_semantic_rejection(
+                self.provider_attempt.as_ref(),
+                permit.take(),
+                response.status(),
+            );
         } else {
-            Self::mark_response_started(&mut permit)?;
+            Self::mark_response_started(self.provider_attempt.as_ref(), &mut permit)?;
         }
         let status = response.status();
         self.handle_response(response).await.and_then(|result| {
             if status.is_success() {
-                Self::settle_response(&mut permit, status)?;
+                Self::settle_response(self.provider_attempt.as_ref(), &mut permit, status)?;
             }
             Ok(result)
         })
@@ -1137,11 +1148,11 @@ impl SamplingClient {
         );
         Self::log_request_headers(&built_request, "chat/completions");
 
-        Self::revalidate_permit(&mut permit)?;
+        Self::revalidate_permit(self.provider_attempt.as_ref(), &mut permit)?;
         let response = self.http.execute(built_request).await.map_err(|e| {
             tracing::debug!("HTTP request failed: {}", e);
             record_stream_request_failure(&e);
-            Self::mark_transport_ambiguous(permit.take());
+            Self::mark_transport_ambiguous(self.provider_attempt.as_ref(), permit.take());
             if self.provider_attempt.is_some() {
                 SamplingError::Auth(
                     "provider attempt is uncertain; explicit reconciliation is required".into(),
@@ -1157,12 +1168,16 @@ impl SamplingClient {
         span.record("success", status.is_success());
         if !status.is_success() {
             if status.is_server_error() {
-                Self::mark_transport_ambiguous(permit.take());
+                Self::mark_transport_ambiguous(self.provider_attempt.as_ref(), permit.take());
             } else {
-                Self::mark_semantic_rejection(permit.take(), status);
+                Self::mark_semantic_rejection(
+                    self.provider_attempt.as_ref(),
+                    permit.take(),
+                    status,
+                );
             }
         } else {
-            Self::mark_response_started(&mut permit)?;
+            Self::mark_response_started(self.provider_attempt.as_ref(), &mut permit)?;
         }
         let model_metadata = extract_model_metadata(response.headers());
         let retry_after_secs = extract_retry_after(response.headers());
@@ -1234,6 +1249,7 @@ impl SamplingClient {
         // then subsequent polls return `None` -- preventing an infinite busy-loop
         // when the HTTP/2 connection drops and h2 keeps producing errors.
         let mut permit = permit;
+        let attempt_context = self.provider_attempt.clone();
         let chunks = event_stream
             .scan(false, move |had_transport_error, event_res| {
                 if *had_transport_error {
@@ -1243,8 +1259,14 @@ impl SamplingClient {
                     Ok(event) => {
                         let data = &event.data;
                         if data == "[DONE]" {
-                            if let Some(mut permit) = permit.take() {
-                                let _ = permit.settle_http_response(200, b"sampler-stream");
+                            if let (Some(context), Some(mut permit)) =
+                                (attempt_context.as_ref(), permit.take())
+                            {
+                                let _ = context.settle_http_response(
+                                    &mut permit,
+                                    200,
+                                    b"sampler-stream",
+                                );
                             }
                             return std::future::ready(None);
                         }
@@ -1370,10 +1392,10 @@ impl SamplingClient {
         let (http_request, mut permit) = self.authorize_request(http_request, &request_bytes)?;
         let http_request = http_request.json(&request_body);
 
-        Self::revalidate_permit(&mut permit)?;
+        Self::revalidate_permit(self.provider_attempt.as_ref(), &mut permit)?;
         let response = http_request.send().await.map_err(|e| {
             tracing::debug!("HTTP request failed: {}", e);
-            Self::mark_transport_ambiguous(permit.take());
+            Self::mark_transport_ambiguous(self.provider_attempt.as_ref(), permit.take());
             if self.provider_attempt.is_some() {
                 SamplingError::Auth(
                     "provider attempt is uncertain; explicit reconciliation is required".into(),
@@ -1391,9 +1413,13 @@ impl SamplingClient {
 
         if !status.is_success() {
             if status.is_server_error() {
-                Self::mark_transport_ambiguous(permit.take());
+                Self::mark_transport_ambiguous(self.provider_attempt.as_ref(), permit.take());
             } else {
-                Self::mark_semantic_rejection(permit.take(), status);
+                Self::mark_semantic_rejection(
+                    self.provider_attempt.as_ref(),
+                    permit.take(),
+                    status,
+                );
             }
             if status == reqwest::StatusCode::UNAUTHORIZED {
                 self.record_401_attribution(crate::attribution::SamplingConsumer::Responses);
@@ -1429,7 +1455,7 @@ impl SamplingClient {
                 should_retry,
             });
         }
-        Self::mark_response_started(&mut permit)?;
+        Self::mark_response_started(self.provider_attempt.as_ref(), &mut permit)?;
 
         let response_obj = serde_json::from_slice::<rs::Response>(&bytes).map_err(|e| {
             let raw_body = String::from_utf8_lossy(&bytes);
@@ -1440,7 +1466,7 @@ impl SamplingClient {
             );
             SamplingError::Serialization(e)
         })?;
-        Self::settle_response(&mut permit, status)?;
+        Self::settle_response(self.provider_attempt.as_ref(), &mut permit, status)?;
         Ok(response_obj)
     }
 
@@ -1556,11 +1582,11 @@ impl SamplingClient {
         );
         Self::log_request_headers(&built_request, "responses");
 
-        Self::revalidate_permit(&mut permit)?;
+        Self::revalidate_permit(self.provider_attempt.as_ref(), &mut permit)?;
         let response = self.http.execute(built_request).await.map_err(|e| {
             tracing::debug!("HTTP request failed: {}", e);
             record_stream_request_failure(&e);
-            Self::mark_transport_ambiguous(permit.take());
+            Self::mark_transport_ambiguous(self.provider_attempt.as_ref(), permit.take());
             if self.provider_attempt.is_some() {
                 SamplingError::Auth(
                     "provider attempt is uncertain; explicit reconciliation is required".into(),
@@ -1576,12 +1602,16 @@ impl SamplingClient {
         span.record("success", status.is_success());
         if !status.is_success() {
             if status.is_server_error() {
-                Self::mark_transport_ambiguous(permit.take());
+                Self::mark_transport_ambiguous(self.provider_attempt.as_ref(), permit.take());
             } else {
-                Self::mark_semantic_rejection(permit.take(), status);
+                Self::mark_semantic_rejection(
+                    self.provider_attempt.as_ref(),
+                    permit.take(),
+                    status,
+                );
             }
         } else {
-            Self::mark_response_started(&mut permit)?;
+            Self::mark_response_started(self.provider_attempt.as_ref(), &mut permit)?;
         }
         if !status.is_success() {
             if status == reqwest::StatusCode::UNAUTHORIZED {
@@ -1652,6 +1682,7 @@ impl SamplingClient {
         // doom-loop event without terminating the stream (`filter_map`
         // below), while an outer `None` still ends it.
         let mut permit = permit;
+        let attempt_context = self.provider_attempt.clone();
         let events = event_stream
             .scan(false, move |had_transport_error, event_res| {
                 if *had_transport_error {
@@ -1661,8 +1692,14 @@ impl SamplingClient {
                     Ok(event) => {
                         let data = &event.data;
                         if data == "[DONE]" {
-                            if let Some(mut permit) = permit.take() {
-                                let _ = permit.settle_http_response(200, b"sampler-stream");
+                            if let (Some(context), Some(mut permit)) =
+                                (attempt_context.as_ref(), permit.take())
+                            {
+                                let _ = context.settle_http_response(
+                                    &mut permit,
+                                    200,
+                                    b"sampler-stream",
+                                );
                             }
                             return std::future::ready(None);
                         }
@@ -1770,10 +1807,10 @@ impl SamplingClient {
         )?;
         let http_request = http_request.json(&request.inner);
 
-        Self::revalidate_permit(&mut permit)?;
+        Self::revalidate_permit(self.provider_attempt.as_ref(), &mut permit)?;
         let response = http_request.send().await.map_err(|e| {
             tracing::debug!("HTTP request failed: {}", e);
-            Self::mark_transport_ambiguous(permit.take());
+            Self::mark_transport_ambiguous(self.provider_attempt.as_ref(), permit.take());
             if self.provider_attempt.is_some() {
                 SamplingError::Auth(
                     "provider attempt is uncertain; explicit reconciliation is required".into(),
@@ -1791,9 +1828,13 @@ impl SamplingClient {
 
         if !status.is_success() {
             if status.is_server_error() {
-                Self::mark_transport_ambiguous(permit.take());
+                Self::mark_transport_ambiguous(self.provider_attempt.as_ref(), permit.take());
             } else {
-                Self::mark_semantic_rejection(permit.take(), status);
+                Self::mark_semantic_rejection(
+                    self.provider_attempt.as_ref(),
+                    permit.take(),
+                    status,
+                );
             }
             if status == reqwest::StatusCode::UNAUTHORIZED {
                 self.record_401_attribution(crate::attribution::SamplingConsumer::Messages);
@@ -1829,7 +1870,7 @@ impl SamplingClient {
                 should_retry,
             });
         }
-        Self::mark_response_started(&mut permit)?;
+        Self::mark_response_started(self.provider_attempt.as_ref(), &mut permit)?;
 
         let response_obj =
             serde_json::from_slice::<messages::MessagesResponse>(&bytes).map_err(|e| {
@@ -1841,7 +1882,7 @@ impl SamplingClient {
                 );
                 SamplingError::Serialization(e)
             })?;
-        Self::settle_response(&mut permit, status)?;
+        Self::settle_response(self.provider_attempt.as_ref(), &mut permit, status)?;
         Ok(response_obj)
     }
 
@@ -1917,11 +1958,11 @@ impl SamplingClient {
         );
         Self::log_request_headers(&built_request, "messages");
 
-        Self::revalidate_permit(&mut permit)?;
+        Self::revalidate_permit(self.provider_attempt.as_ref(), &mut permit)?;
         let response = self.http.execute(built_request).await.map_err(|e| {
             tracing::debug!("HTTP request failed: {}", e);
             record_stream_request_failure(&e);
-            Self::mark_transport_ambiguous(permit.take());
+            Self::mark_transport_ambiguous(self.provider_attempt.as_ref(), permit.take());
             if self.provider_attempt.is_some() {
                 SamplingError::Auth(
                     "provider attempt is uncertain; explicit reconciliation is required".into(),
@@ -1937,12 +1978,16 @@ impl SamplingClient {
         span.record("success", status.is_success());
         if !status.is_success() {
             if status.is_server_error() {
-                Self::mark_transport_ambiguous(permit.take());
+                Self::mark_transport_ambiguous(self.provider_attempt.as_ref(), permit.take());
             } else {
-                Self::mark_semantic_rejection(permit.take(), status);
+                Self::mark_semantic_rejection(
+                    self.provider_attempt.as_ref(),
+                    permit.take(),
+                    status,
+                );
             }
         } else {
-            Self::mark_response_started(&mut permit)?;
+            Self::mark_response_started(self.provider_attempt.as_ref(), &mut permit)?;
         }
         if !status.is_success() {
             if status == reqwest::StatusCode::UNAUTHORIZED {
@@ -2011,6 +2056,7 @@ impl SamplingClient {
         // Uses `scan` so transport errors terminate the stream after the first
         // error (same pattern as `chat_completion_stream`).
         let mut permit = permit;
+        let attempt_context = self.provider_attempt.clone();
         let events = event_stream
             .scan(false, move |had_transport_error, event_res| {
                 if *had_transport_error {
@@ -2020,8 +2066,14 @@ impl SamplingClient {
                     Ok(event) => {
                         let data = &event.data;
                         if data == "[DONE]" {
-                            if let Some(mut permit) = permit.take() {
-                                let _ = permit.settle_http_response(200, b"sampler-stream");
+                            if let (Some(context), Some(mut permit)) =
+                                (attempt_context.as_ref(), permit.take())
+                            {
+                                let _ = context.settle_http_response(
+                                    &mut permit,
+                                    200,
+                                    b"sampler-stream",
+                                );
                             }
                             return std::future::ready(None);
                         }

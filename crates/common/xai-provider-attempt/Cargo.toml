@@ -14,6 +14,7 @@ uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+trybuild = "1.0.120"
 
 [lints]
 workspace = true

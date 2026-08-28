@@ -64,7 +64,7 @@ pub struct AuthorityBinding {
 }
 
 impl AuthorityBinding {
-    pub fn new(
+    pub(crate) fn new(
         principal_incarnation: impl Into<String>,
         principal_generation: u64,
         capability_generation: u64,
@@ -112,7 +112,7 @@ pub struct AttemptSpec {
 }
 
 impl AttemptSpec {
-    pub fn new(
+    pub(crate) fn new(
         operation_id: impl Into<String>,
         provider_id: impl Into<String>,
         request_fingerprint: impl Into<String>,
@@ -173,6 +173,17 @@ pub struct AttemptProjection {
     pub provider_request_id: String,
 }
 
+/// Snapshot supplied by the canonical host adapter. The adapter must source
+/// these values from the live principal (#477) and capability/effect lease
+/// authorities; the ledger never accepts an `AuthorityBinding` from callers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CanonicalHostAuthority {
+    pub principal_incarnation: String,
+    pub principal_generation: u64,
+    pub capability_generation: u64,
+    pub effect_lease: String,
+}
+
 /// Provider truth supplied by an explicit operator-authorized reconciliation.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum ProviderTruth {
@@ -189,7 +200,7 @@ pub struct ProviderSettlement {
 }
 
 impl ProviderSettlement {
-    pub fn new(
+    pub(crate) fn new(
         provider_request_id: impl Into<String>,
         provider_effect_id: impl Into<String>,
     ) -> Result<Self, AttemptError> {
@@ -212,11 +223,20 @@ pub struct ReconciliationAuthorization {
 }
 
 impl ReconciliationAuthorization {
-    pub fn new(operator_id: impl Into<String>) -> Result<Self, AttemptError> {
+    fn new(operator_id: impl Into<String>) -> Result<Self, AttemptError> {
         let operator_id = operator_id.into();
         validate_id(&operator_id, "operator id")?;
         Ok(Self { operator_id })
     }
+}
+
+/// Live authority source used by the only public reconciliation entry point.
+/// Production implementations must consult the authenticated operator
+/// authority and the provider's idempotency/status lookup; a caller-supplied
+/// boolean or provider result is not a valid replacement for this source.
+pub trait ReconciliationAuthority: Send + Sync {
+    fn operator_authorized(&self, operator_id: &str, attempt_id: &str) -> bool;
+    fn provider_confirms_not_applied(&self, provider_request_id: &str) -> bool;
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -286,7 +306,7 @@ pub struct AttemptContext {
 }
 
 impl AttemptContext {
-    pub fn new(
+    pub(crate) fn new(
         store: ProviderAttemptStore,
         operation_id: impl Into<String>,
         authority: AuthorityBinding,
@@ -300,6 +320,35 @@ impl AttemptContext {
             authority,
             revalidate,
         })
+    }
+
+    /// Construct the host-owned adapter from a live canonical authority
+    /// snapshot. Raw `AuthorityBinding` construction is crate-private; all
+    /// cross-crate adapters must enter through this boundary and provide the
+    /// same live snapshot callback for the final send check.
+    pub fn from_host_authority(
+        store: ProviderAttemptStore,
+        operation_id: impl Into<String>,
+        authority: CanonicalHostAuthority,
+        revalidate: Arc<dyn Fn() -> Option<CanonicalHostAuthority> + Send + Sync>,
+    ) -> Result<Self, AttemptError> {
+        let binding = AuthorityBinding::new(
+            authority.principal_incarnation,
+            authority.principal_generation,
+            authority.capability_generation,
+            authority.effect_lease,
+        )?;
+        let revalidate = Arc::new(move || {
+            let current = revalidate()?;
+            AuthorityBinding::new(
+                current.principal_incarnation,
+                current.principal_generation,
+                current.capability_generation,
+                current.effect_lease,
+            )
+            .ok()
+        });
+        Self::new(store, operation_id, binding, revalidate)
     }
 
     pub fn begin(
@@ -326,6 +375,79 @@ impl AttemptContext {
         };
         let permit = attempt.begin_send(&current)?;
         Ok(permit.with_revalidator(self.revalidate.clone(), self.authority.clone()))
+    }
+
+    pub fn revalidate_before_physical_write(
+        &self,
+        permit: &PhysicalSendPermit,
+    ) -> Result<(), AttemptError> {
+        permit.revalidate_before_physical_write()
+    }
+
+    pub fn mark_response_started(
+        &self,
+        permit: &mut PhysicalSendPermit,
+    ) -> Result<(), AttemptError> {
+        permit.mark_response_started()
+    }
+
+    pub fn settle_http_response(
+        &self,
+        permit: &mut PhysicalSendPermit,
+        status_code: u16,
+        response_bytes: &[u8],
+    ) -> Result<(), AttemptError> {
+        permit.settle_http_response(status_code, response_bytes)
+    }
+
+    pub fn semantic_rejection(
+        &self,
+        permit: &mut PhysicalSendPermit,
+        status_code: u16,
+    ) -> Result<(), AttemptError> {
+        permit.semantic_rejection(status_code)
+    }
+
+    pub fn transport_before_possible_write(
+        &self,
+        permit: &mut PhysicalSendPermit,
+    ) -> Result<(), AttemptError> {
+        permit.transport_before_possible_write()
+    }
+
+    pub fn transport_after_possible_write(
+        &self,
+        permit: &mut PhysicalSendPermit,
+    ) -> Result<(), AttemptError> {
+        permit.transport_after_possible_write()
+    }
+
+    pub fn cancel_after_possible_write(
+        &self,
+        permit: &mut PhysicalSendPermit,
+    ) -> Result<(), AttemptError> {
+        permit.cancel_after_possible_write()
+    }
+
+    /// Reopen an uncertain attempt only after both live operator authority and
+    /// verified provider non-application are observed by the host adapter.
+    /// There is deliberately no public API that accepts a caller-created
+    /// settlement proof.
+    pub fn reconcile_not_applied(
+        &self,
+        attempt: &ProviderAttempt,
+        operator_id: &str,
+        authority: &dyn ReconciliationAuthority,
+    ) -> Result<(), AttemptError> {
+        if !authority.operator_authorized(operator_id, attempt.attempt_id()) {
+            return Err(AttemptError::NotExplicitlyAuthorized);
+        }
+        let provider_request_id = attempt.provider_request_id()?;
+        if !authority.provider_confirms_not_applied(&provider_request_id) {
+            return Err(AttemptError::NotExplicitlyAuthorized);
+        }
+        let authorization = ReconciliationAuthorization::new(operator_id)?;
+        attempt.reconcile(&authorization, ProviderTruth::NotApplied)
     }
 }
 
@@ -625,7 +747,7 @@ impl ProviderAttempt {
             .ok_or(AttemptError::MissingAttempt)
     }
 
-    pub fn admit(&self, authority: &AuthorityBinding) -> Result<(), AttemptError> {
+    pub(crate) fn admit(&self, authority: &AuthorityBinding) -> Result<(), AttemptError> {
         self.store.transition(
             &self.attempt_id,
             Some(authority),
@@ -637,7 +759,7 @@ impl ProviderAttempt {
 
     /// Persist `Sending` and return the only physical-send permit. Call this
     /// immediately before constructing/executing a provider request.
-    pub fn begin_send(
+    pub(crate) fn begin_send(
         &self,
         current_authority: &AuthorityBinding,
     ) -> Result<PhysicalSendPermit, AttemptError> {
@@ -663,7 +785,7 @@ impl ProviderAttempt {
         })
     }
 
-    pub fn cancel_without_send(&self) -> Result<(), AttemptError> {
+    pub(crate) fn cancel_without_send(&self) -> Result<(), AttemptError> {
         self.store.transition(
             &self.attempt_id,
             None,
@@ -675,7 +797,7 @@ impl ProviderAttempt {
 
     /// Reopen is only possible after explicit provider truth says no effect
     /// occurred. The persisted request key remains unchanged.
-    pub fn reconcile(
+    pub(crate) fn reconcile(
         &self,
         authorization: &ReconciliationAuthorization,
         truth: ProviderTruth,
@@ -767,7 +889,7 @@ impl PhysicalSendPermit {
     /// Re-read canonical principal/capability authority at the final
     /// physical-write boundary. A stale result is returned before the caller
     /// may invoke its HTTP transport.
-    pub fn revalidate_before_physical_write(&self) -> Result<(), AttemptError> {
+    pub(crate) fn revalidate_before_physical_write(&self) -> Result<(), AttemptError> {
         let Some(revalidate) = self.revalidate.as_ref() else {
             return Ok(());
         };
@@ -784,7 +906,7 @@ impl PhysicalSendPermit {
         Ok(())
     }
 
-    pub fn mark_response_started(&mut self) -> Result<(), AttemptError> {
+    pub(crate) fn mark_response_started(&mut self) -> Result<(), AttemptError> {
         self.attempt.store.transition(
             self.attempt.attempt_id(),
             None,
@@ -794,7 +916,7 @@ impl PhysicalSendPermit {
         )
     }
 
-    pub fn settle(&mut self, settlement: ProviderSettlement) -> Result<(), AttemptError> {
+    pub(crate) fn settle(&mut self, settlement: ProviderSettlement) -> Result<(), AttemptError> {
         self.attempt.store.transition(
             self.attempt.attempt_id(),
             None,
@@ -809,7 +931,7 @@ impl PhysicalSendPermit {
     /// Settle from an actual successful provider response without retaining
     /// its body. The digest is only an audit proof that this adapter consumed
     /// the response; it is not a fabricated provider result.
-    pub fn settle_http_response(
+    pub(crate) fn settle_http_response(
         &mut self,
         status_code: u16,
         response_bytes: &[u8],
@@ -824,7 +946,7 @@ impl PhysicalSendPermit {
         )?)
     }
 
-    pub fn semantic_rejection(&mut self, status_code: u16) -> Result<(), AttemptError> {
+    pub(crate) fn semantic_rejection(&mut self, status_code: u16) -> Result<(), AttemptError> {
         self.attempt.store.transition(
             self.attempt.attempt_id(),
             None,
@@ -836,7 +958,7 @@ impl PhysicalSendPermit {
         Ok(())
     }
 
-    pub fn transport_before_possible_write(&mut self) -> Result<(), AttemptError> {
+    pub(crate) fn transport_before_possible_write(&mut self) -> Result<(), AttemptError> {
         self.attempt.store.transition(
             self.attempt.attempt_id(),
             None,
@@ -848,7 +970,7 @@ impl PhysicalSendPermit {
         Ok(())
     }
 
-    pub fn transport_after_possible_write(&mut self) -> Result<(), AttemptError> {
+    pub(crate) fn transport_after_possible_write(&mut self) -> Result<(), AttemptError> {
         self.attempt.store.transition(
             self.attempt.attempt_id(),
             None,
@@ -860,7 +982,7 @@ impl PhysicalSendPermit {
         Ok(())
     }
 
-    pub fn cancel_after_possible_write(&mut self) -> Result<(), AttemptError> {
+    pub(crate) fn cancel_after_possible_write(&mut self) -> Result<(), AttemptError> {
         self.attempt.store.transition(
             self.attempt.attempt_id(),
             None,
@@ -1275,6 +1397,55 @@ mod tests {
             ),
             Ok(())
         );
+        assert_eq!(attempt.state().unwrap(), SendState::Admitted);
+    }
+
+    struct TestReconciliationAuthority {
+        operator: bool,
+        provider_not_applied: bool,
+    }
+
+    impl ReconciliationAuthority for TestReconciliationAuthority {
+        fn operator_authorized(&self, _operator_id: &str, _attempt_id: &str) -> bool {
+            self.operator
+        }
+
+        fn provider_confirms_not_applied(&self, _provider_request_id: &str) -> bool {
+            self.provider_not_applied
+        }
+    }
+
+    #[test]
+    fn public_reconciliation_requires_live_operator_and_provider_truth() {
+        let temp = tempdir().unwrap();
+        let store = ProviderAttemptStore::open(temp.path()).unwrap();
+        let binding = authority(1);
+        let live = binding.clone();
+        let context = AttemptContext::new(
+            store.clone(),
+            "reconciliation-operation",
+            binding.clone(),
+            Arc::new(move || Some(live.clone())),
+        )
+        .unwrap();
+        let mut permit = context.begin("xai", b"request", true).unwrap();
+        permit.transport_after_possible_write().unwrap();
+        let attempt = store.load(permit.attempt_id()).unwrap().unwrap();
+        let denied = TestReconciliationAuthority {
+            operator: false,
+            provider_not_applied: true,
+        };
+        assert_eq!(
+            context.reconcile_not_applied(&attempt, "operator-1", &denied),
+            Err(AttemptError::NotExplicitlyAuthorized)
+        );
+        let approved = TestReconciliationAuthority {
+            operator: true,
+            provider_not_applied: true,
+        };
+        context
+            .reconcile_not_applied(&attempt, "operator-1", &approved)
+            .unwrap();
         assert_eq!(attempt.state().unwrap(), SendState::Admitted);
     }
 
