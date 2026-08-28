@@ -413,8 +413,7 @@ impl AuthRegistry {
             return Err(stale_authority());
         };
         let generation = self.allocate_generation()?;
-        self.state.credentials[index] =
-            new_stored_credential(credential_id, owner_id, generation);
+        self.state.credentials[index] = new_stored_credential(credential_id, owner_id, generation);
         self.persist()
     }
 
@@ -998,8 +997,8 @@ mod tests {
     fn credential_replacement_gets_a_new_incarnation_and_cannot_read_old_binding() {
         let root = tempdir().unwrap();
         let old = AuthCredential::new("laptop", "old-secret").unwrap();
-        let mut registry = AuthRegistry::open(root.path(), std::slice::from_ref(&old), "owner")
-            .unwrap();
+        let mut registry =
+            AuthRegistry::open(root.path(), std::slice::from_ref(&old), "owner").unwrap();
         let old_auth = registry
             .authenticate(Some("Bearer old-secret"), std::slice::from_ref(&old))
             .unwrap();
@@ -1026,8 +1025,7 @@ mod tests {
         let root = tempdir().unwrap();
         let credential = AuthCredential::new("primary", "secret").unwrap();
         let mut registry =
-            AuthRegistry::open(root.path(), std::slice::from_ref(&credential), "owner-a")
-                .unwrap();
+            AuthRegistry::open(root.path(), std::slice::from_ref(&credential), "owner-a").unwrap();
         let old_auth = registry
             .authenticate(Some("Bearer secret"), std::slice::from_ref(&credential))
             .unwrap();
@@ -1065,9 +1063,12 @@ mod tests {
     fn public_debug_does_not_reveal_credential_identity_or_owner() {
         let root = tempdir().unwrap();
         let credential = AuthCredential::new("private-device", "secret").unwrap();
-        let registry =
-            AuthRegistry::open(root.path(), std::slice::from_ref(&credential), "private-owner")
-                .unwrap();
+        let registry = AuthRegistry::open(
+            root.path(),
+            std::slice::from_ref(&credential),
+            "private-owner",
+        )
+        .unwrap();
         let auth = registry
             .authenticate(Some("Bearer secret"), std::slice::from_ref(&credential))
             .unwrap();

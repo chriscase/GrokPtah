@@ -305,9 +305,7 @@ fn validate_scope(
     session_id: &uuid::Uuid,
     run_id: &str,
 ) -> anyhow::Result<()> {
-    if expected.session_id != *session_id
-        || expected.run_id != run_id
-    {
+    if expected.session_id != *session_id || expected.run_id != run_id {
         anyhow::bail!("live MCP notification scope does not match requested run");
     }
     Ok(())

@@ -153,19 +153,13 @@ impl LiveStreamState {
 
     fn queue_entry(&mut self, seq: u64, ts: String, update: SessionUpdate) {
         let terminal = matches!(&update, SessionUpdate::TurnComplete { .. });
-        let update = self.orch.public_projection(
-            serde_json::to_value(update).unwrap_or_else(|_| json!({})),
-        );
+        let update = self
+            .orch
+            .public_projection(serde_json::to_value(update).unwrap_or_else(|_| json!({})));
         self.queue_serialized_entry(seq, ts, update, terminal);
     }
 
-    fn queue_serialized_entry(
-        &mut self,
-        seq: u64,
-        ts: String,
-        update: Value,
-        terminal: bool,
-    ) {
+    fn queue_serialized_entry(&mut self, seq: u64, ts: String, update: Value, terminal: bool) {
         if seq <= self.last_seq || seq < self.start_seq {
             return;
         }
@@ -2715,7 +2709,7 @@ async fn tools_call(
     }
     let result = dispatch_tool(orch, auth, name, &call.arguments).await;
     orch.audit_transport_result(name, result.as_ref().err());
-    let body = orch.public_projection(result?) ;
+    let body = orch.public_projection(result?);
     Ok(json!({
         "content": [{ "type": "text", "text": serde_json::to_string_pretty(&body).unwrap_or_default() }],
         "structuredContent": body,
