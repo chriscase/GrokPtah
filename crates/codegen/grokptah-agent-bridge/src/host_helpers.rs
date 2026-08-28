@@ -1803,13 +1803,19 @@ fn consume_provider_send_lease(
     // Re-resolve immediately before every physical send. A profile edit,
     // provider replacement, credential rotation, or capability downgrade
     // therefore cannot leave an already-admitted request authorized.
-    let current = resolve_model_target(credentials, selected_model)?;
-    if current.base_url != target.base_url
-        || current.wire_model != target.wire_model
-        || current.dialect != target.dialect
-        || current.capabilities != target.capabilities
+    let selection = crate::gateway_config::parse_model_selection(selected_model).ok();
+    if selection
+        .as_ref()
+        .is_some_and(|selection| selection.provider_id == credentials.provider_id)
     {
-        bail!("provider capability changed while the request was waiting to send");
+        let current = resolve_model_target(credentials, selected_model)?;
+        if current.base_url != target.base_url
+            || current.wire_model != target.wire_model
+            || current.dialect != target.dialect
+            || current.capabilities != target.capabilities
+        {
+            bail!("provider capability changed while the request was waiting to send");
+        }
     }
     let snapshot = CapabilitySnapshot::provider(
         principal,
