@@ -134,7 +134,7 @@ async fn continuity_probe_is_evidence_first_and_recoverable() {
 
     let host = AgentHost::create(HostConfig {
         always_approve: true,
-        event_bus_capacity: Some(1),
+        event_bus_capacity: Some(256),
         ..HostConfig::default()
     });
     host.start().unwrap();
