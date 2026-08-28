@@ -477,18 +477,33 @@ impl SessionPromptQueue {
         })
     }
 
-    /// Hand accepted steering to the model boundary, withholding anything whose
-    /// owner is no longer authorized.
+    /// Hand accepted steering of **exactly one owner** to the model boundary.
     ///
-    /// Withheld steering stays in `steering` rather than being dropped: the
-    /// authority may be restored (a credential reinstated, a workspace put back
-    /// on the allowlist), and silently discarding accepted work would be a
-    /// worse failure than deferring it.
+    /// Steering is injected into a running turn, so the same rule as
+    /// [`Self::take_next`] applies: several principals' interjections handed to
+    /// one boundary would execute as one unit and expose each other's text. The
+    /// owner of the first deliverable interjection wins the boundary; the rest
+    /// stay queued for the next one.
+    ///
+    /// Withheld steering is never dropped: authority may be restored (a
+    /// credential reinstated, a workspace put back on the allowlist), and
+    /// silently discarding accepted work would be a worse failure than
+    /// deferring it.
     pub fn drain_steering(&mut self, gate: &DeliveryGate<'_>) -> Vec<PromptQueueEntry> {
         self.delivering.clear();
+        let batch_owner = self
+            .steering
+            .iter()
+            .find(|entry| gate.allows_owner(entry.owner_key.as_deref()))
+            .and_then(|entry| entry.owner_key.clone());
+        let Some(batch_owner) = batch_owner else {
+            return Vec::new();
+        };
         let mut withheld = VecDeque::new();
         for entry in std::mem::take(&mut self.steering) {
-            if gate.allows_owner(entry.owner_key.as_deref()) {
+            let deliverable = entry.owner_key.as_deref() == Some(batch_owner.as_str())
+                && gate.allows_owner(entry.owner_key.as_deref());
+            if deliverable {
                 self.delivering.push_back(entry);
             } else {
                 withheld.push_back(entry);
@@ -524,34 +539,51 @@ impl SessionPromptQueue {
         count
     }
 
-    /// Drain the next batch for a turn, delivering only entries whose owner is
-    /// still authorized.
+    /// Drain the next batch for a turn: entries of **exactly one owner**, whose
+    /// authority is still current.
     ///
-    /// Revalidation happens here, at the effect boundary, rather than only at
-    /// enqueue: an entry may have been queued days ago under a credential that
-    /// has since been removed, or against a workspace that has since left the
-    /// allowlist. Executing it then would be exactly the widening of authority
-    /// that rotation is supposed to prevent.
+    /// Two separate rules apply here, and conflating them was a real defect.
     ///
-    /// Unauthorized entries are stepped over rather than blocking the queue
+    /// *Authority* decides which entries are eligible at all. An entry may have
+    /// been queued days ago under a credential that has since been removed, or
+    /// against a workspace that has since left the allowlist; executing it then
+    /// would be exactly the widening of authority that rotation prevents.
+    ///
+    /// *Ownership* decides which of the eligible entries may share one model
+    /// boundary. A batch is joined into a single prompt, so mixing owners would
+    /// concatenate one principal's prompt text into another's turn and let
+    /// several principals execute as one unit with no delegation between them.
+    /// The batch is therefore restricted to the owner of the first deliverable
+    /// entry — queue order picks the owner, so no principal can starve another,
+    /// and each drain removes that owner's head entries.
+    ///
+    /// Entries of other owners are stepped over rather than blocking the queue
     /// head. That cannot reorder anything an observer relies on: no principal
     /// can see another's entries, so the only ordering any caller can observe —
     /// its own — is preserved.
     pub fn take_next(&mut self, gate: &DeliveryGate<'_>) -> PromptQueueTakeResult {
-        let deliverable: Vec<usize> = self
+        let Some(batch_owner) = self
             .queued
             .iter()
-            .enumerate()
-            .filter(|(_, entry)| gate.allows_owner(entry.owner_key.as_deref()))
-            .map(|(index, _)| index)
-            .collect();
-        if deliverable.is_empty() {
+            .find(|entry| gate.allows_owner(entry.owner_key.as_deref()))
+            .and_then(|entry| entry.owner_key.clone())
+        else {
             return PromptQueueTakeResult {
                 batch: None,
                 entries: Vec::new(),
                 reservation: None,
             };
-        }
+        };
+        let deliverable: Vec<usize> = self
+            .queued
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                entry.owner_key.as_deref() == Some(batch_owner.as_str())
+                    && gate.allows_owner(entry.owner_key.as_deref())
+            })
+            .map(|(index, _)| index)
+            .collect();
         let gates = deliverable.iter().map(|index| {
             let entry = &self.queued[*index];
             CombineGate {
@@ -686,6 +718,7 @@ mod tests {
             ["/w".to_string()],
             QueueProvenance::default(),
         )
+        .expect("valid test authority")
     }
 
     // ── Principal ownership (#461) ──────────────────────────────────────
@@ -807,7 +840,8 @@ mod tests {
             ],
             ["/w".to_string()],
             QueueProvenance::default(),
-        );
+        )
+        .expect("valid test authority");
         assert_eq!(queue.drain_steering(&gate_for(&authority)).len(), 1);
 
         let outcome = queue.clear(&actor().key());
@@ -816,6 +850,81 @@ mod tests {
             "a caller must not be told another principal has an interjection in flight"
         );
         assert!(outcome.fully_stopped());
+    }
+
+    // ── Delivery must not mix principals (#461 P0) ──────────────────────
+
+    /// An authority in which *both* test principals are live at once.
+    ///
+    /// The revocation tests deliberately take one principal away before
+    /// draining, which is exactly the case that cannot catch mixing. This is
+    /// the case that can.
+    fn two_live_authority() -> QueueAuthority {
+        QueueAuthority::control(
+            "acct",
+            [
+                "intruder".to_string(),
+                crate::queue_authority::CONTROL_PRINCIPAL.to_string(),
+            ],
+            ["/w".to_string()],
+            QueueProvenance::default(),
+        )
+        .expect("valid test authority")
+    }
+
+    #[test]
+    fn a_drain_never_mixes_two_principals_into_one_turn() {
+        let mut queue = SessionPromptQueue::default();
+        queue
+            .add("control work", "composer", false, &control_actor())
+            .unwrap();
+        queue
+            .add("intruder secret", "composer", false, &other_actor())
+            .unwrap();
+
+        let authority = two_live_authority();
+        let batch = queue
+            .take_next(&gate_for(&authority))
+            .batch
+            .expect("something is deliverable");
+
+        let owners: std::collections::BTreeSet<_> = batch
+            .entries
+            .iter()
+            .map(|entry| entry.owner_key.clone())
+            .collect();
+        assert_eq!(
+            owners.len(),
+            1,
+            "a single model boundary must carry exactly one owner, got {owners:?}"
+        );
+        assert!(
+            !(batch.text.contains("control work") && batch.text.contains("intruder secret")),
+            "one principal's prompt text must never be concatenated with another's: {:?}",
+            batch.text
+        );
+    }
+
+    #[test]
+    fn a_steering_drain_never_mixes_two_principals() {
+        let mut queue = SessionPromptQueue::default();
+        queue
+            .steer_text("control interjection".into(), true, &control_actor())
+            .unwrap();
+        queue
+            .steer_text("intruder interjection".into(), true, &other_actor())
+            .unwrap();
+
+        let authority = two_live_authority();
+        let delivered = queue.drain_steering(&gate_for(&authority));
+        let owners: std::collections::BTreeSet<_> = delivered
+            .iter()
+            .map(|entry| entry.owner_key.clone())
+            .collect();
+        assert!(
+            owners.len() <= 1,
+            "one steering boundary must carry at most one owner, got {owners:?}"
+        );
     }
 
     // ── Legacy migration (#461) ─────────────────────────────────────────

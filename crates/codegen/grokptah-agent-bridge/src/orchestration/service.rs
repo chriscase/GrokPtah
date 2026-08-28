@@ -1526,11 +1526,28 @@ impl OrchestrationService {
         )
     }
 
+    /// Suspend queue delivery for the duration of a rotation.
+    ///
+    /// A rotation advances the epoch, mutates policy state, and republishes the
+    /// host snapshot in separate critical sections, and delivery reads that
+    /// snapshot without consulting the service. A drain landing between the
+    /// mutation and the republish would otherwise execute under the
+    /// pre-rotation authority. Installing an authority that authorizes nobody
+    /// first makes the window fail closed in both directions; the republish at
+    /// the end restores the correct width.
+    fn quiesce_queue_authority(&self) {
+        self.host.set_queue_authority(QueueAuthority::quiesced());
+    }
+
     /// Republish the live queue authorization snapshot into the host.
     ///
     /// Called after every rotation so revocation reaches queue delivery. The
     /// host holds the queue; the service holds the credentials; this is the one
     /// direction that information flows between them.
+    ///
+    /// A snapshot that cannot be built (more live principals than revalidation
+    /// supports) leaves the host quiesced rather than silently restoring a
+    /// truncated authority, and the error is audited.
     fn publish_queue_authority(&self) {
         let principals: Vec<String> = self
             .auth_credentials
@@ -1552,7 +1569,7 @@ impl OrchestrationService {
             .iter()
             .map(|root| queue_authority::workspace_key(root))
             .collect();
-        self.host.set_queue_authority(QueueAuthority::control(
+        match QueueAuthority::control(
             self.agent_owner_id(),
             principals,
             workspaces,
@@ -1560,7 +1577,24 @@ impl OrchestrationService {
                 epoch: self.auth_epoch_counter(),
                 policy: self.policy_revision(),
             },
-        ));
+        ) {
+            Ok(authority) => self.host.set_queue_authority(authority),
+            Err(error) => {
+                // Leave the host quiesced: delivering under a truncated
+                // authority would silently revoke the principals past the cap
+                // while appearing to work for the rest.
+                self.host.set_queue_authority(QueueAuthority::quiesced());
+                self.audit(
+                    "auth",
+                    None,
+                    None,
+                    None,
+                    "rejected",
+                    Some(OrchErrorCode::Internal.as_str()),
+                    &format!("queue authority not published: {error}"),
+                );
+            }
+        }
     }
 
     /// Advance the epoch and policy revision together, before any policy state
@@ -1592,6 +1626,7 @@ impl OrchestrationService {
             vec![AuthCredential::new("primary", token.clone())?]
         };
         self.advance_authority()?;
+        self.quiesce_queue_authority();
         if !token.is_empty() {
             self.bus.add_control_secrets([token.clone()]);
         }
@@ -1626,6 +1661,7 @@ impl OrchestrationService {
             .token()
             .to_string();
         self.advance_authority()?;
+        self.quiesce_queue_authority();
         for credential in &credentials {
             self.bus
                 .add_control_secrets([credential.token().to_string()]);
@@ -1645,6 +1681,7 @@ impl OrchestrationService {
             ));
         }
         self.advance_authority()?;
+        self.quiesce_queue_authority();
         *self.agent_owner_id.lock() = owner_id;
         self.publish_queue_authority();
         Ok(())
@@ -1674,6 +1711,7 @@ impl OrchestrationService {
 
     pub fn set_allowlist(&self, allowlist: WorkspaceAllowlist) -> Result<(), OrchError> {
         self.advance_authority()?;
+        self.quiesce_queue_authority();
         self.config.lock().allowlist = allowlist;
         self.publish_queue_authority();
         Ok(())
@@ -5960,8 +5998,6 @@ impl OrchestrationService {
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),
             "origin": actor.origin(),
-            "ownerKey": actor.key().as_str(),
-            "cursor": actor.cursor(revision),
             "action": action,
             "disposition": disposition,
             "actionVersion": changed_entry.as_ref().map(|entry| entry.version),
@@ -5991,12 +6027,7 @@ impl OrchestrationService {
             "sessionId": session_id,
             "workspace": claimed.display().to_string(),
             "revision": snapshot.revision,
-            // A cursor only this principal can present, so a revision captured
-            // from one principal's response cannot be replayed as another's
-            // fence.
-            "cursor": actor.cursor(snapshot.revision),
             "owner": actor.origin(),
-            "ownerKey": actor.key().as_str(),
             // Legacy entries the ownership migration holds back. Reported so a
             // fail-closed migration is visible instead of looking like an empty
             // queue.
@@ -7692,8 +7723,6 @@ impl OrchestrationService {
             "sessionId": session_id,
             "workspace": claimed.display().to_string(),
             "origin": actor.origin(),
-            "ownerKey": actor.key().as_str(),
-            "cursor": actor.cursor(revision),
             "action": "queued",
             "disposition": "queued",
             "actionVersion": changed_entry.version,
@@ -7783,8 +7812,6 @@ impl OrchestrationService {
             "sessionId": session_id,
             "workspace": claimed.display().to_string(),
             "origin": actor.origin(),
-            "ownerKey": actor.key().as_str(),
-            "cursor": actor.cursor(revision),
             "action": "steer_now",
             "disposition": receipt.disposition,
             "entry": receipt.entry,
@@ -8320,6 +8347,31 @@ mod queue_authority_guards {
                 body.contains("self.publish_queue_authority();"),
                 "{rotation} must republish the queue authority so revocation reaches delivery"
             );
+            let quiesce = body
+                .find("self.quiesce_queue_authority();")
+                .unwrap_or_else(|| {
+                    panic!(
+                    "{rotation} must quiesce queue delivery before mutating policy, or a drain \
+                     can land between the mutation and the republish"
+                )
+                });
+            assert!(
+                quiesce > advance,
+                "{rotation} must quiesce only after the authority advance succeeds"
+            );
+            for mutation in [
+                "self.config.lock().bearer_token =",
+                "*self.auth_credentials.lock() =",
+                "*self.agent_owner_id.lock() =",
+                "self.config.lock().allowlist =",
+            ] {
+                if let Some(at) = body.find(mutation) {
+                    assert!(
+                        at > quiesce,
+                        "{rotation} must not apply `{mutation}` before delivery is quiesced"
+                    );
+                }
+            }
         }
     }
 

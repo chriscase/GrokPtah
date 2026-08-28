@@ -6526,12 +6526,20 @@ impl AgentHostHandle {
         };
         if let (Some(batch), Some(revision)) = (result.batch.as_ref(), revision) {
             let _ = self.persist_prompt_queue(session_id);
+            // The batch carries exactly one owner, so the receipt names that
+            // owner rather than hardcoding the local UI. Attributing another
+            // principal's delivery to `desktop` misreports who is executing.
+            let origin = batch
+                .entries
+                .first()
+                .and_then(|entry| entry.owner.clone())
+                .unwrap_or_else(|| "bridge".into());
             self.emit_prompt_queue_changed(
                 session_id,
                 revision,
                 result.entries.clone(),
                 "delivered",
-                "desktop".into(),
+                origin,
                 batch.entries.first().cloned(),
                 None,
             );
@@ -6580,7 +6588,11 @@ impl AgentHostHandle {
             revision,
             list.clone(),
             "restored",
-            "desktop".to_string(),
+            // A restore hands back whatever batch was drained, which belonged
+            // to one owner; naming the local UI would misattribute it.
+            list.first()
+                .and_then(|entry| entry.owner.clone())
+                .unwrap_or_else(|| "bridge".into()),
             list.first().cloned(),
             None,
         );

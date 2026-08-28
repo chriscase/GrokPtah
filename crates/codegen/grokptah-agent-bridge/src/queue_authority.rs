@@ -19,9 +19,11 @@
 //! * **session** — the exact session the queue belongs to,
 //! * **workspace** — the canonical workspace path.
 //!
-//! The digest is what gets compared and what gets persisted. The workspace path
-//! is an *input* to it and never leaves this module, which is what lets the
-//! stamp be projected to SDK/broker/browser consumers without exposing paths.
+//! The digest is what gets compared and what gets persisted. It is **not** a
+//! capability and is not projected to control-plane consumers: the digest is
+//! unkeyed over low-entropy inputs, so a holder of a candidate tuple can
+//! confirm it offline. Opaque projectable handles need a durable host-held key
+//! and are out of scope here.
 //!
 //! # Authority vs. provenance
 //!
@@ -96,11 +98,19 @@ pub const LOCAL_TENANT: &str = "local";
 /// that work bounded no matter what an embedder installs.
 const MAX_AUTHORIZED_PRINCIPALS: usize = 512;
 
-/// Opaque, non-reversible ownership handle.
+/// Ownership handle: a digest of the identity tuple, used for comparison.
 ///
 /// Rendered as `v1-sha256:<hex>`, matching the fingerprint idiom already used
-/// for credential identity elsewhere in the crate. It is safe to persist and to
-/// project: it discloses no path, no token, and no prompt text.
+/// for credential identity elsewhere in the crate.
+///
+/// **This is not an opaque capability and must not be projected as one.** The
+/// digest is unkeyed and its inputs are low-entropy and often guessable — a
+/// tenant, a wire principal, a session id, and an absolute workspace path — so
+/// anyone holding a candidate tuple can confirm it offline. That makes a
+/// projected handle a path oracle, not a secret. It is therefore used for
+/// storage and equality only; a handle safe to hand to SDK/broker/browser
+/// consumers needs a durable host-held key (HMAC or a sealed random id), which
+/// is new durable authority state and is deliberately not invented here.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct QueueOwnerKey(String);
 
@@ -267,44 +277,29 @@ impl QueueActor {
         mix(&mut digest, "principal", &self.principal.principal);
         format!("{:x}", digest.finalize())
     }
+}
 
-    /// Opaque read cursor binding a queue revision to this principal.
-    ///
-    /// A bare revision is a session-global counter, so it says nothing about
-    /// who read it. Handing back a cursor that only its own principal can
-    /// present means a cursor captured from one principal's response cannot be
-    /// replayed as another's fence.
-    pub fn cursor(&self, revision: u64) -> String {
-        let mut digest = Sha256::new();
-        digest.update(b"grokptah.queue.cursor.v1");
-        mix(&mut digest, "owner", self.key().as_str());
-        digest.update(revision.to_be_bytes());
-        format!("v1-sha256:{:x}", digest.finalize())
-    }
+/// Why a queue authority snapshot could not be built.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueueAuthorityError {
+    /// More live principals than revalidation is willing to recompute. Failing
+    /// closed keeps the previous authority rather than silently revoking the
+    /// principals past the cap.
+    TooManyPrincipals { count: usize, limit: usize },
+}
 
-    /// Constant-time check that `cursor` was issued to this principal at
-    /// `revision`.
-    pub fn cursor_matches(&self, cursor: &str, revision: u64) -> bool {
-        let expected = self.cursor(revision);
-        constant_time_str_eq(cursor, &expected)
+impl std::fmt::Display for QueueAuthorityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooManyPrincipals { count, limit } => write!(
+                f,
+                "queue authority carries {count} principals, above the {limit} supported"
+            ),
+        }
     }
 }
 
-/// Constant-time string comparison for equal-length inputs.
-///
-/// Cursors are fixed-width hex, so the length check leaks nothing; it exists
-/// only so the byte loop can assume equal lengths.
-fn constant_time_str_eq(a: &str, b: &str) -> bool {
-    let (a, b) = (a.as_bytes(), b.as_bytes());
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
+impl std::error::Error for QueueAuthorityError {}
 
 /// Live authorization snapshot published by the orchestration service into the
 /// host.
@@ -338,6 +333,28 @@ impl Default for QueueAuthority {
 }
 
 impl QueueAuthority {
+    /// An authority that authorizes nobody.
+    ///
+    /// Installed for the duration of a credential/allowlist rotation. The
+    /// service mutates its policy state and republishes in separate steps, and
+    /// delivery reads the host's snapshot without consulting the service, so a
+    /// drain landing between those steps would otherwise deliver under the
+    /// pre-rotation authority. Quiescing makes that window fail closed in both
+    /// directions: a rotation that narrows authority cannot leak the old width,
+    /// and one that widens it cannot grant early. A drain during the window
+    /// simply finds nothing deliverable and is retried.
+    pub fn quiesced() -> Self {
+        Self {
+            tenant: String::new(),
+            principals: BTreeSet::new(),
+            // `Some(empty)` rather than `None`: an empty allowlist authorizes
+            // nobody, whereas `None` means "no allowlist constraint" and would
+            // leave the desktop principal deliverable.
+            workspaces: Some(BTreeSet::new()),
+            provenance: QueueProvenance::default(),
+        }
+    }
+
     /// Snapshot for a configured control plane.
     ///
     /// `principals` are the wire principals of the live credentials;
@@ -349,16 +366,24 @@ impl QueueAuthority {
         principals: impl IntoIterator<Item = String>,
         workspaces: impl IntoIterator<Item = String>,
         provenance: QueueProvenance,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, QueueAuthorityError> {
+        let principals: BTreeSet<String> = principals.into_iter().collect();
+        // Truncating here would silently revoke every principal past the cap:
+        // their queued work would stop being delivered, with no error raised
+        // anywhere. Refusing to build the snapshot leaves the previously
+        // published authority in force and surfaces the misconfiguration.
+        if principals.len() > MAX_AUTHORIZED_PRINCIPALS {
+            return Err(QueueAuthorityError::TooManyPrincipals {
+                count: principals.len(),
+                limit: MAX_AUTHORIZED_PRINCIPALS,
+            });
+        }
+        Ok(Self {
             tenant: tenant.into(),
-            principals: principals
-                .into_iter()
-                .take(MAX_AUTHORIZED_PRINCIPALS)
-                .collect(),
+            principals,
             workspaces: Some(workspaces.into_iter().collect()),
             provenance,
-        }
+        })
     }
 
     pub fn provenance(&self) -> QueueProvenance {
@@ -531,28 +556,6 @@ mod tests {
     }
 
     #[test]
-    fn cursors_are_principal_bound_and_revision_bound() {
-        let laptop = QueueActor::new(
-            QueuePrincipal::control("acct", "laptop", session(), "/w"),
-            QueueProvenance::default(),
-        );
-        let ci = QueueActor::new(
-            QueuePrincipal::control("acct", "ci", session(), "/w"),
-            QueueProvenance::default(),
-        );
-        let cursor = laptop.cursor(7);
-        assert!(laptop.cursor_matches(&cursor, 7));
-        assert!(
-            !laptop.cursor_matches(&cursor, 8),
-            "a cursor must not survive a revision change"
-        );
-        assert!(
-            !ci.cursor_matches(&cursor, 7),
-            "another principal must not be able to replay a captured cursor"
-        );
-    }
-
-    #[test]
     fn authority_revokes_a_removed_credential_without_touching_others() {
         let provenance = QueueProvenance {
             epoch: 3,
@@ -566,7 +569,8 @@ mod tests {
             ["laptop".to_string(), "ci".to_string()],
             ["/w".to_string()],
             provenance,
-        );
+        )
+        .expect("valid authority");
         assert!(both.authorizes(&laptop, session(), "/w"));
         assert!(both.authorizes(&ci, session(), "/w"));
 
@@ -575,7 +579,8 @@ mod tests {
             ["laptop".to_string()],
             ["/w".to_string()],
             provenance,
-        );
+        )
+        .expect("valid authority");
         assert!(rotated.authorizes(&laptop, session(), "/w"));
         assert!(
             !rotated.authorizes(&ci, session(), "/w"),
@@ -593,7 +598,8 @@ mod tests {
             ["laptop".to_string()],
             ["/elsewhere".to_string()],
             provenance,
-        );
+        )
+        .expect("valid authority");
         assert!(!authority.authorizes(&laptop, session(), "/w"));
         assert!(
             !authority.authorizes(&desktop, session(), "/w"),
@@ -622,7 +628,8 @@ mod tests {
         let desktop = QueuePrincipal::desktop(session(), "/w").key();
         assert_ne!(impostor, desktop);
         let authority =
-            QueueAuthority::control("acct", [], ["/w".to_string()], QueueProvenance::default());
+            QueueAuthority::control("acct", [], ["/w".to_string()], QueueProvenance::default())
+                .expect("valid test authority");
         assert!(authority.authorizes(&desktop, session(), "/w"));
         assert!(!authority.authorizes(&impostor, session(), "/w"));
     }
@@ -634,7 +641,8 @@ mod tests {
             ["laptop".to_string()],
             ["/w".to_string()],
             QueueProvenance::default(),
-        );
+        )
+        .expect("valid authority");
         let gate = DeliveryGate::new(&authority, session(), "/w");
 
         let live = QueuePrincipal::control("acct", "laptop", session(), "/w").key();
@@ -656,12 +664,28 @@ mod tests {
     }
 
     #[test]
-    fn authorized_principal_list_is_bounded() {
+    fn an_oversized_principal_list_fails_closed_instead_of_truncating() {
         let many: Vec<String> = (0..(MAX_AUTHORIZED_PRINCIPALS + 64))
             .map(|i| format!("p{i}"))
             .collect();
-        let authority =
-            QueueAuthority::control("acct", many, ["/w".to_string()], QueueProvenance::default());
-        assert_eq!(authority.principals.len(), MAX_AUTHORIZED_PRINCIPALS);
+        let error =
+            QueueAuthority::control("acct", many, ["/w".to_string()], QueueProvenance::default())
+                .expect_err("an oversized principal list must be refused, not truncated");
+        assert!(matches!(
+            error,
+            QueueAuthorityError::TooManyPrincipals { .. }
+        ));
+    }
+
+    #[test]
+    fn a_quiesced_authority_authorizes_nobody() {
+        let authority = QueueAuthority::quiesced();
+        let desktop = QueuePrincipal::desktop(session(), "/w").key();
+        let control = QueuePrincipal::control("acct", "laptop", session(), "/w").key();
+        assert!(!authority.authorizes(&desktop, session(), "/w"));
+        assert!(!authority.authorizes(&control, session(), "/w"));
+        let gate = DeliveryGate::new(&authority, session(), "/w");
+        assert!(!gate.allows_owner(Some(desktop.as_str())));
+        assert!(!gate.allows_owner(Some(control.as_str())));
     }
 }

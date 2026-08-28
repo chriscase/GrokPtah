@@ -18,7 +18,6 @@ use grokptah_agent_bridge::orchestration::{
     AuthContext, AuthCredential, OrchErrorCode, OrchStore, OrchestrationConfig,
     OrchestrationService, RunBounds, WorkspaceAllowlist,
 };
-use grokptah_agent_bridge::queue_authority::{QueueActor, QueuePrincipal, QueueProvenance};
 use grokptah_agent_bridge::{
     set_grokptah_home_override, AgentHost, HostConfig, SessionKind, SessionUpdate,
 };
@@ -278,7 +277,7 @@ async fn a_principal_cannot_read_another_principals_queue() {
 }
 
 #[tokio::test]
-async fn queue_reads_never_disclose_the_workspace_path_or_tenant() {
+async fn control_plane_reads_project_no_ownership_handle_or_cursor() {
     let fx = fixture();
     let owner = fx.owner();
     queue_as(&fx, &owner, "owner-1", "plan").await;
@@ -287,26 +286,27 @@ async fn queue_reads_never_disclose_the_workspace_path_or_tenant() {
         .get_queue(&owner, fx.session, fx.workspace())
         .unwrap();
 
-    let owner_key = listed["ownerKey"].as_str().expect("ownerKey projected");
+    // An earlier revision of this change projected `ownerKey` and a derived
+    // `cursor`, and described both as opaque. They are not: the digest is
+    // unkeyed over low-entropy inputs (tenant, wire principal, session id,
+    // absolute workspace path), so anyone holding a candidate tuple can confirm
+    // one offline, and the cursor built on it is forgeable by the same party.
+    // Both were withdrawn rather than shipped as a property that does not hold.
     assert!(
-        owner_key.starts_with("v1-sha256:"),
-        "ownership must project as an opaque handle, got {owner_key}"
+        listed.get("ownerKey").is_none(),
+        "an unkeyed ownership digest must not be projected as an opaque handle"
     );
-    let workspace_text = fx.workspace().display().to_string();
     assert!(
-        !owner_key.contains(&workspace_text),
-        "the ownership handle must not disclose the workspace path"
+        listed.get("cursor").is_none(),
+        "a cursor derived from a guessable digest must not be projected as a fence"
     );
-    let entry_owner_key = listed["entries"][0]["owner_key"]
-        .as_str()
-        .expect("entries carry the ownership handle");
-    assert!(
-        !entry_owner_key.contains(&workspace_text) && entry_owner_key.starts_with("v1-sha256:"),
-        "queue entries must carry only an opaque ownership handle"
-    );
-}
 
-// ── Mutations ───────────────────────────────────────────────────────────────
+    // Scoping still holds: the caller sees its own entry and nothing else.
+    let entries = listed["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["text"], "plan");
+    assert_eq!(listed["owner"], "mcp");
+}
 
 #[tokio::test]
 async fn a_principal_cannot_edit_remove_reorder_run_or_steer_another_principals_entry() {
@@ -630,10 +630,11 @@ async fn a_request_id_is_private_to_its_principal() {
         owner_response["entry"]["id"], intruder_response["entry"]["id"],
         "a reused request id must not replay another principal's receipt"
     );
-    assert_ne!(
-        owner_response["ownerKey"], intruder_response["ownerKey"],
-        "each principal's receipt must carry its own ownership handle"
+    assert_eq!(
+        intruder_response["origin"], "intruder",
+        "each principal's receipt must be attributed to itself"
     );
+    assert_eq!(owner_response["origin"], "mcp");
 
     // The owner's own retry still replays, exactly as before.
     let replay = fx
@@ -681,59 +682,100 @@ async fn a_reused_request_id_does_not_confirm_another_principals_use() {
 }
 
 // ── Cursors ─────────────────────────────────────────────────────────────────
+//
+// A principal-bound read cursor was implemented and then withdrawn: it was
+// derived from the ownership digest, which is unkeyed over low-entropy inputs,
+// so any party able to guess the tuple could forge or validate another
+// principal's cursor. Shipping it would have asserted an unforgeability
+// property that does not hold. A real one needs a durable host-held key; see
+// the handoff notes on #461.
+
+// ── Delivery boundaries (#461 P0) ───────────────────────────────────────────
 
 #[tokio::test]
-async fn a_cursor_cannot_be_replayed_by_another_principal() {
+async fn a_delivery_boundary_carries_exactly_one_owner_end_to_end() {
     let fx = fixture();
     let owner = fx.owner();
     let intruder = fx.intruder();
-    queue_as(&fx, &owner, "owner-1", "owner work").await;
 
-    let owner_cursor = fx
-        .orch
-        .get_queue(&owner, fx.session, fx.workspace())
-        .unwrap()["cursor"]
-        .as_str()
-        .expect("owner cursor")
-        .to_string();
-    let intruder_cursor = fx
-        .orch
-        .get_queue(&intruder, fx.session, fx.workspace())
-        .unwrap()["cursor"]
-        .as_str()
-        .expect("intruder cursor")
-        .to_string();
+    // Both principals are live at the same time. This is the case the
+    // revocation test cannot reach, because that one removes a credential
+    // before draining.
+    queue_as(&fx, &owner, "owner-1", "owner confidential plan").await;
+    queue_as(&fx, &intruder, "intruder-1", "intruder confidential plan").await;
 
-    assert_ne!(
-        owner_cursor, intruder_cursor,
-        "two principals reading the same revision must not receive the same cursor"
-    );
+    let batch = fx
+        .host
+        .session_queue_take_next(fx.session)
+        .expect("drain")
+        .batch
+        .expect("something is deliverable");
 
-    // Verify the binding directly: the cursor is only valid for the principal
-    // it was issued to, at the revision it was issued at.
-    let owner_actor = QueueActor::new(
-        QueuePrincipal::control(
-            "primary",
-            "mcp",
-            fx.session,
-            grokptah_agent_bridge::queue_authority::workspace_key(fx.workspace()),
-        ),
-        QueueProvenance::default(),
-    );
-    let revision = fx
-        .orch
-        .get_queue(&owner, fx.session, fx.workspace())
-        .unwrap()["revision"]
-        .as_u64()
-        .unwrap();
-    assert!(owner_actor.cursor_matches(&owner_cursor, revision));
-    assert!(
-        !owner_actor.cursor_matches(&intruder_cursor, revision),
-        "one principal's cursor must not validate as another's"
+    let owners: std::collections::BTreeSet<_> = batch
+        .entries
+        .iter()
+        .filter_map(|entry| entry.owner.clone())
+        .collect();
+    assert_eq!(
+        owners.len(),
+        1,
+        "one model boundary must execute for exactly one principal, got {owners:?}"
     );
     assert!(
-        !owner_actor.cursor_matches(&owner_cursor, revision + 1),
-        "a cursor must not survive a revision change"
+        !(batch.text.contains("owner confidential plan")
+            && batch.text.contains("intruder confidential plan")),
+        "two principals' prompt text must never be joined into one turn: {:?}",
+        batch.text
+    );
+
+    // The other principal's work is still queued, not lost.
+    let remaining: Vec<String> = fx
+        .host
+        .session_queue_take_next(fx.session)
+        .map(|result| {
+            result
+                .batch
+                .map(|b| b.entries.iter().filter_map(|e| e.owner.clone()).collect())
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    let _ = remaining;
+}
+
+#[tokio::test]
+async fn a_delivery_event_names_the_executing_principal_not_the_desktop() {
+    let fx = fixture();
+    let owner = fx.owner();
+    queue_as(&fx, &owner, "owner-1", "control work").await;
+
+    fx.host
+        .session_queue_take_next(fx.session)
+        .expect("drain")
+        .batch
+        .expect("deliverable");
+
+    let delivered_origins: Vec<String> = fx
+        .host
+        .event_bus()
+        .read_range_all(0, None, Some(fx.session))
+        .expect("journal readable")
+        .into_iter()
+        .filter_map(|entry| match entry.update {
+            SessionUpdate::PromptQueueChanged { action, origin, .. } if action == "delivered" => {
+                Some(origin)
+            }
+            _ => None,
+        })
+        .collect();
+
+    assert!(
+        !delivered_origins.is_empty(),
+        "the drain must publish a delivery event"
+    );
+    assert!(
+        delivered_origins.iter().all(|origin| origin == "mcp"),
+        "a delivery receipt must name the principal actually executing, not the local UI: \
+         {delivered_origins:?}"
     );
 }
 
