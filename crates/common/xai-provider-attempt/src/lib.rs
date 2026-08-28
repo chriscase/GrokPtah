@@ -849,31 +849,12 @@ impl ProviderAttemptStore {
             .write(true)
             .open(lock_path)?;
         lock.lock_exclusive()?;
+        self.cleanup_orphaned_lease_claims_locked()?;
         let record = self.read_host_authority(authority_scope)?;
         let Some(lease_id) = record.unclaimed_lease(&self.root) else {
             let _ = lock.unlock();
             return Err(AttemptError::EffectLeaseAlreadyUsed);
         };
-        let directory = self.root.join("lease-claims");
-        fs::create_dir_all(&directory)?;
-        let claim_path = self.lease_claim_path(&lease_id);
-        let mut claim = match OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&claim_path)
-        {
-            Ok(claim) => claim,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let _ = lock.unlock();
-                return Err(AttemptError::EffectLeaseAlreadyUsed);
-            }
-            Err(error) => {
-                let _ = lock.unlock();
-                return Err(error.into());
-            }
-        };
-        std::io::Write::write_all(&mut claim, operation_id.as_bytes())?;
-        claim.sync_all()?;
         let _ = lock.unlock();
         Ok((record, lease_id))
     }
@@ -882,7 +863,7 @@ impl ProviderAttemptStore {
         &self,
         authority_scope: &str,
         lease_id: &str,
-        operation_id: &str,
+        _operation_id: &str,
         attempt_id: &str,
     ) -> Result<(), AttemptError> {
         let authority_path = self.authority_path(authority_scope);
@@ -901,20 +882,56 @@ impl ProviderAttemptStore {
         {
             return Err(AttemptError::StaleAuthority);
         }
+        self.cleanup_orphaned_lease_claims_locked()?;
         let claim_path = self.lease_claim_path(lease_id);
-        let owner =
-            fs::read_to_string(&claim_path).map_err(|_| AttemptError::EffectLeaseAlreadyUsed)?;
-        if owner != operation_id {
-            return Err(AttemptError::EffectLeaseAlreadyUsed);
-        }
-        let temporary = self
-            .root
-            .join(format!(".lease-claim-{}.{}.tmp", lease_id, Uuid::new_v4()));
-        let mut claim = File::create(&temporary)?;
+        let mut claim = match OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&claim_path)
+        {
+            Ok(claim) => claim,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let owner = fs::read_to_string(&claim_path)
+                    .map_err(|_| AttemptError::EffectLeaseAlreadyUsed)?;
+                if owner == attempt_id {
+                    return Ok(());
+                }
+                return Err(AttemptError::EffectLeaseAlreadyUsed);
+            }
+            Err(error) => return Err(error.into()),
+        };
         std::io::Write::write_all(&mut claim, attempt_id.as_bytes())?;
         claim.sync_all()?;
-        drop(claim);
-        fs::rename(temporary, claim_path)?;
+        Ok(())
+    }
+
+    fn cleanup_orphaned_lease_claims_locked(&self) -> Result<(), AttemptError> {
+        let directory = self.root.join("lease-claims");
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        for entry in entries {
+            let path = entry?.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("claim") {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() {
+                return Err(AttemptError::InvalidAuthority);
+            }
+            let Some(owner) = fs::read_to_string(&path)
+                .ok()
+                .filter(|owner| !owner.is_empty())
+            else {
+                fs::remove_file(path)?;
+                continue;
+            };
+            if self.read_record(&owner)?.is_none() {
+                fs::remove_file(path)?;
+            }
+        }
         Ok(())
     }
 
@@ -1896,15 +1913,49 @@ mod tests {
         let context =
             AttemptContext::from_host_ledger(store.clone(), "single-lease-operation", scope)
                 .unwrap();
+        let second_context =
+            AttemptContext::from_host_ledger(store.clone(), "second-operation", scope).unwrap();
+        let mut permit = context.begin("xai", b"one-use", true).unwrap();
         assert_eq!(
-            AttemptContext::from_host_ledger(store.clone(), "second-operation", scope).unwrap_err(),
+            second_context.begin("xai", b"second-use", true).unwrap_err(),
             AttemptError::EffectLeaseAlreadyUsed
         );
-        let mut permit = context.begin("xai", b"one-use", true).unwrap();
         DeterministicFakeTransport::default()
             .send(&mut permit, FakeTransportOutcome::BeforePossibleWrite)
             .unwrap();
         assert!(store.projection(permit.attempt_id()).unwrap().is_some());
+    }
+
+    #[test]
+    fn orphaned_context_lease_claim_is_reclaimed_before_next_admission() {
+        let temp = tempdir().unwrap();
+        let store = ProviderAttemptStore::open(temp.path()).unwrap();
+        let scope = "orphan-lease-scope";
+        write_host_snapshot(temp.path(), scope, &authority(1));
+        fs::create_dir_all(store.root.join("lease-claims")).unwrap();
+        fs::write(
+            store
+                .root
+                .join("lease-claims")
+                .join("lease-1.claim"),
+            "orphan-operation",
+        )
+        .unwrap();
+
+        let context =
+            AttemptContext::from_host_ledger(store.clone(), "recovered-operation", scope)
+                .unwrap();
+        assert!(
+            !store
+                .root
+                .join("lease-claims")
+                .join("lease-1.claim")
+                .exists()
+        );
+        let mut permit = context.begin("xai", b"recovered-request", true).unwrap();
+        permit
+            .transport_before_possible_write()
+            .expect("recovered lease admits a fresh attempt");
     }
 
     #[test]
