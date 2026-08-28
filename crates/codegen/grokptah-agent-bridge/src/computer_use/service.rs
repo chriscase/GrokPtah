@@ -1251,11 +1251,17 @@ mod tests {
         ) -> ComputerResult<ActionOutcome> {
             self.action_calls.fetch_add(1, Ordering::SeqCst);
             self.action_entered.notify_one();
-            if !self
-                .action_release_requested
-                .load(std::sync::atomic::Ordering::SeqCst)
-            {
-                self.release_action.notified().await;
+            loop {
+                if self
+                    .action_release_requested
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    break;
+                }
+                tokio::select! {
+                    _ = self.release_action.notified() => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
+                }
             }
             self.inner.act(run_id, observation, action).await
         }
