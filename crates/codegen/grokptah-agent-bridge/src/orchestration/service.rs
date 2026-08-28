@@ -1629,16 +1629,6 @@ impl OrchestrationService {
             .ensure_resource_binding(&resource.into(), auth)
     }
 
-    fn require_resource_binding(
-        &self,
-        auth: &AuthContext,
-        resource: &str,
-    ) -> Result<(), OrchError> {
-        self.auth_registry
-            .lock()
-            .require_resource_binding(resource, auth)
-    }
-
     fn ensure_session_binding(
         &self,
         auth: &AuthContext,
