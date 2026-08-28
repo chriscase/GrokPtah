@@ -557,10 +557,7 @@ struct ReadinessSnapshot {
 fn readiness_snapshot(state: &AppState) -> ReadinessSnapshot {
     let payload = state
         .orch
-        .get_capacity(&AuthContext {
-            token_id: "health-probe".into(),
-            owner_id: "health-probe".into(),
-        })
+        .capacity_for_health()
         .unwrap_or_else(|error| json!({"health": {"serviceError": error.message}}));
     let health = payload.get("health").cloned().unwrap_or_else(|| json!({}));
     let ready = [
