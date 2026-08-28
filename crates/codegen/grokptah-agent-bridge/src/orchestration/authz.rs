@@ -1060,6 +1060,31 @@ mod tests {
     }
 
     #[test]
+    fn delegated_authority_is_limited_to_the_exact_host_scope() {
+        let root = tempdir().unwrap();
+        let credential = AuthCredential::new("primary", "secret").unwrap();
+        let registry =
+            AuthRegistry::open(root.path(), std::slice::from_ref(&credential), "owner").unwrap();
+        let auth = registry
+            .authenticate(Some("Bearer secret"), std::slice::from_ref(&credential))
+            .unwrap();
+        let session_id = Uuid::new_v4();
+        let workspace = PathBuf::from("/exact/workspace");
+        let delegated = registry
+            .issue_delegation(&auth, session_id, workspace.clone(), Some("agent-1".into()))
+            .unwrap();
+        assert!(delegated
+            .require_scope(session_id, &workspace, Some("agent-1"))
+            .is_ok());
+        assert!(delegated
+            .require_scope(session_id, &workspace, Some("agent-2"))
+            .is_err());
+        assert!(delegated
+            .require_scope(Uuid::new_v4(), &workspace, Some("agent-1"))
+            .is_err());
+    }
+
+    #[test]
     fn public_debug_does_not_reveal_credential_identity_or_owner() {
         let root = tempdir().unwrap();
         let credential = AuthCredential::new("private-device", "secret").unwrap();
