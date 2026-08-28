@@ -9547,7 +9547,7 @@ impl AgentHostHandle {
                     title: "apply_patch".into(),
                     kind: ToolCallKind::Edit,
                     status: ToolCallStatus::Running,
-                    input,
+                    input: input.clone(),
                 });
                 // Best-effort path hints from patch text for pre-edit snapshots (#146).
                 for line in patch.lines() {

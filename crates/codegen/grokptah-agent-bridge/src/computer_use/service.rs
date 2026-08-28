@@ -1052,7 +1052,7 @@ impl ComputerUseService {
                 "requestId": request_id,
                 "result": match result {
                     Ok(_) => "success",
-                    Err(error) => error.code,
+                    Err(error) => &format!("{:?}", error.code),
                 },
             }),
         )?;
