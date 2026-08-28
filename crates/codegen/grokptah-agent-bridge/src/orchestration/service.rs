@@ -288,9 +288,9 @@ impl OrchestrationService {
     }
 
     fn start_manager_supervisor(&self) {
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        if tokio::runtime::Handle::try_current().is_err() {
             return;
-        };
+        }
         {
             let mut status = self.manager_supervisor.lock();
             status.enabled = true;
@@ -299,32 +299,39 @@ impl OrchestrationService {
         let service_ref = self.self_ref.clone();
         let mut events = self.host.subscribe_events();
         let wakeup = self.manager_wakeup.clone();
-        let watcher = runtime.spawn(async move {
-            let mut ticker = tokio::time::interval(DEFAULT_MANAGER_TICK_INTERVAL);
-            loop {
-                tokio::select! {
-                    _ = ticker.tick() => {
-                        let Some(service) = service_ref.upgrade() else { break; };
-                        service.drive_manager_supervisor_once().await;
-                    }
-                    update = events.recv() => {
-                        let Some(update) = update else { break; };
-                        if matches!(update,
-                            crate::events::SessionUpdate::TurnComplete { .. }
-                            | crate::events::SessionUpdate::Error { .. }
-                            | crate::events::SessionUpdate::PermissionRequired { .. }
-                        ) {
-                            let Some(service) = service_ref.upgrade() else { break; };
-                            service.drive_manager_supervisor_once().await;
+        let shutdown = self.host.shutdown_token();
+        let Ok(watcher) =
+            self.host
+                .spawn_supervised("starting the manager supervisor watcher", async move {
+                    let mut ticker = tokio::time::interval(DEFAULT_MANAGER_TICK_INTERVAL);
+                    loop {
+                        tokio::select! {
+                            _ = shutdown.cancelled() => break,
+                            _ = ticker.tick() => {
+                                let Some(service) = service_ref.upgrade() else { break; };
+                                service.drive_manager_supervisor_once().await;
+                            }
+                            update = events.recv() => {
+                                let Some(update) = update else { break; };
+                                if matches!(update,
+                                    crate::events::SessionUpdate::TurnComplete { .. }
+                                    | crate::events::SessionUpdate::Error { .. }
+                                    | crate::events::SessionUpdate::PermissionRequired { .. }
+                                ) {
+                                    let Some(service) = service_ref.upgrade() else { break; };
+                                    service.drive_manager_supervisor_once().await;
+                                }
+                            }
+                            _ = wakeup.notified() => {
+                                let Some(service) = service_ref.upgrade() else { break; };
+                                service.drive_manager_supervisor_once().await;
+                            }
                         }
                     }
-                    _ = wakeup.notified() => {
-                        let Some(service) = service_ref.upgrade() else { break; };
-                        service.drive_manager_supervisor_once().await;
-                    }
-                }
-            }
-        });
+                })
+        else {
+            return;
+        };
         *self.manager_supervisor_watcher.lock() = Some(watcher);
     }
 
@@ -835,46 +842,53 @@ impl OrchestrationService {
     }
 
     fn start_scheduler_watcher(&self) {
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        if tokio::runtime::Handle::try_current().is_err() {
             return;
-        };
+        }
         let mut events = self.host.subscribe_events();
         let wakeup = self.host.orchestration_wakeup();
         let service_ref = self.self_ref.clone();
-        let watcher = runtime.spawn(async move {
-            loop {
-                tokio::select! {
-                    update = events.recv() => {
-                        let Some(update) = update else {
-                            break;
-                        };
-                        if matches!(
-                            update,
-                            crate::events::SessionUpdate::TurnComplete { .. }
-                                | crate::events::SessionUpdate::Error { .. }
-                        ) {
+        let shutdown = self.host.shutdown_token();
+        let Ok(watcher) = self.host.spawn_supervised(
+            "starting the orchestration scheduler watcher",
+            async move {
+                loop {
+                    tokio::select! {
+                        _ = shutdown.cancelled() => break,
+                        update = events.recv() => {
+                            let Some(update) = update else {
+                                break;
+                            };
+                            if matches!(
+                                update,
+                                crate::events::SessionUpdate::TurnComplete { .. }
+                                    | crate::events::SessionUpdate::Error { .. }
+                            ) {
+                                let Some(service) = service_ref.upgrade() else {
+                                    break;
+                                };
+                                service.pump_pending();
+                            }
+                        }
+                        _ = wakeup.notified() => {
                             let Some(service) = service_ref.upgrade() else {
                                 break;
                             };
                             service.pump_pending();
                         }
                     }
-                    _ = wakeup.notified() => {
-                        let Some(service) = service_ref.upgrade() else {
-                            break;
-                        };
-                        service.pump_pending();
-                    }
                 }
-            }
-        });
+            },
+        ) else {
+            return;
+        };
         *self.scheduler_watcher.lock() = Some(watcher);
     }
 
     fn start_native_executor(&self) {
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        if tokio::runtime::Handle::try_current().is_err() {
             return;
-        };
+        }
         {
             let mut status = self.native_executor.lock();
             status.enabled = true;
@@ -883,23 +897,31 @@ impl OrchestrationService {
         }
         let service_ref = self.self_ref.clone();
         let mut events = self.host.subscribe_events();
-        let watcher = runtime.spawn(async move {
-            let mut ticker =
-                tokio::time::interval(Duration::from_millis(DEFAULT_NATIVE_EXECUTOR_INTERVAL_MS));
-            loop {
-                tokio::select! {
-                    _ = ticker.tick() => {
-                        let Some(service) = service_ref.upgrade() else { break; };
-                        service.drive_native_executor_once().await;
+        let shutdown = self.host.shutdown_token();
+        let Ok(watcher) =
+            self.host
+                .spawn_supervised("starting the native executor watcher", async move {
+                    let mut ticker = tokio::time::interval(Duration::from_millis(
+                        DEFAULT_NATIVE_EXECUTOR_INTERVAL_MS,
+                    ));
+                    loop {
+                        tokio::select! {
+                            _ = shutdown.cancelled() => break,
+                            _ = ticker.tick() => {
+                                let Some(service) = service_ref.upgrade() else { break; };
+                                service.drive_native_executor_once().await;
+                            }
+                            update = events.recv() => {
+                                let Some(update) = update else { break; };
+                                let Some(service) = service_ref.upgrade() else { break; };
+                                service.handle_native_executor_event(&update).await;
+                            }
+                        }
                     }
-                    update = events.recv() => {
-                        let Some(update) = update else { break; };
-                        let Some(service) = service_ref.upgrade() else { break; };
-                        service.handle_native_executor_event(&update).await;
-                    }
-                }
-            }
-        });
+                })
+        else {
+            return;
+        };
         *self.native_executor_watcher.lock() = Some(watcher);
     }
 
@@ -1418,11 +1440,17 @@ impl OrchestrationService {
         if let Some(mut supervisor) = supervisor {
             supervisor.stop_and_wait();
         }
-        if let Some(watcher) = self.native_executor_watcher.lock().take() {
+        // Abort *and join*: an aborted watcher has not released its store
+        // handle or its event subscription until its task has actually
+        // finished, so only the join is a barrier (#455).
+        let watchers = [
+            self.native_executor_watcher.lock().take(),
+            self.manager_supervisor_watcher.lock().take(),
+            self.scheduler_watcher.lock().take(),
+        ];
+        for watcher in watchers.into_iter().flatten() {
             watcher.abort();
-        }
-        if let Some(watcher) = self.manager_supervisor_watcher.lock().take() {
-            watcher.abort();
+            let _ = watcher.await;
         }
         self.native_executor.lock().enabled = false;
         self.manager_supervisor.lock().enabled = false;

@@ -379,7 +379,13 @@ pub async fn start_service(config: ServiceConfig) -> Result<ServiceHandle> {
     .await
     .context("bind GrokPtah service control plane")?;
     let addr = server.addr;
-    runtime.attach_control_server(server);
+    // A freshly started runtime is always Running here; a refusal would mean
+    // the runtime was shut down underneath us, and the listener must not be
+    // left serving a closed host.
+    if let Err(rejected) = runtime.attach_control_server(server) {
+        rejected.server.stop();
+        bail!("GrokPtah host runtime is {} and cannot own a control plane", rejected.phase.label());
+    }
     Ok(ServiceHandle {
         addr,
         token: config.token,

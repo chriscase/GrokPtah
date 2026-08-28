@@ -329,7 +329,11 @@ fn keychain_account_from_ref(reference: &str) -> Result<&str, String> {
 }
 
 /// Store and read back a provider secret before returning its durable reference.
-pub fn store_provider_api_key(profile_id: &str, api_key: &str) -> Result<String, String> {
+pub fn store_provider_api_key(
+    _write: &crate::host_runtime::DurableWriteGuard,
+    profile_id: &str,
+    api_key: &str,
+) -> Result<String, String> {
     let api_key = api_key.trim();
     if api_key.is_empty() {
         return Err("provider API key is empty".into());
@@ -467,7 +471,20 @@ where
         .ok_or_else(|| "provider profile disappeared during migration".to_string())?
         .credential_ref = Some(reference.clone());
     migrated.clear_legacy_fields();
-    crate::gateway_config::save(&migrated)
+    // This migration is a durable rewrite of the shared gateway config reached
+    // from a credential *read*. Persist it only under the authority of whatever
+    // runtime owns this home right now; with no live owner the in-memory
+    // migration still serves the caller and the rewrite is retried later (#455).
+    let Some(write) =
+        crate::host_runtime::current_durable_write("migrating a legacy provider credential")
+    else {
+        return Ok(Some(compatible_credentials(
+            &profile.id,
+            &reference,
+            legacy_secret,
+        )));
+    };
+    crate::gateway_config::save(&write, &migrated)
         .map_err(|error| format!("finalize provider credential migration: {error}"))?;
     *config = migrated;
     Ok(Some(compatible_credentials(
@@ -560,7 +577,15 @@ fn resolve_stored_provider_credentials(
         .ok_or_else(|| format!("unknown provider profile `{provider_id}`"))?;
 
     if let Some(credentials) =
-        migrate_legacy_provider_credential(&mut config, &profile, store_provider_api_key)?
+        migrate_legacy_provider_credential(&mut config, &profile, |profile_id, api_key| {
+            let write = crate::host_runtime::current_durable_write("storing a provider API key")
+                .ok_or_else(|| {
+                    "no live GrokPtah runtime owns this home; refusing to store a provider \
+                     credential"
+                        .to_string()
+                })?;
+            store_provider_api_key(&write, profile_id, api_key)
+        })?
     {
         return Ok(Some(credentials));
     }
@@ -1147,7 +1172,11 @@ pub fn load_auth_state() -> AuthState {
     AuthState::default()
 }
 
-pub fn store_api_key(api_key: &str, display_name: &str) -> Result<AuthState, String> {
+pub fn store_api_key(
+    _write: &crate::host_runtime::DurableWriteGuard,
+    api_key: &str,
+    display_name: &str,
+) -> Result<AuthState, String> {
     let entry = Entry::new(SERVICE, ACCOUNT_API_KEY).map_err(|e| e.to_string())?;
     entry.set_password(api_key).map_err(|e| e.to_string())?;
     if let Ok(e) = Entry::new(SERVICE, ACCOUNT_DISPLAY) {
@@ -1341,13 +1370,21 @@ mod tests {
         profile.credential_ref = Some("keychain:provider/corp-b/api-key".into());
         profile.upsert_model(ProviderModel::unqualified("model"));
         config.upsert_profile(profile).unwrap();
-        crate::gateway_config::save(&config).unwrap();
+        crate::gateway_config::save(
+            &crate::host_runtime::DurableWriteGuard::unowned_for_test(),
+            &config,
+        )
+        .unwrap();
         let error = expect_credential_error(resolve_provider_credentials("corp-a", Some("model")));
         assert!(error.contains("does not match"));
 
         let mut config = crate::gateway_config::load_for_update().unwrap();
         config.profile_mut("corp-a").unwrap().credential_ref = Some("env:XAI_API_KEY".into());
-        crate::gateway_config::save(&config).unwrap();
+        crate::gateway_config::save(
+            &crate::host_runtime::DurableWriteGuard::unowned_for_test(),
+            &config,
+        )
+        .unwrap();
         let error = expect_credential_error(resolve_provider_credentials("corp-a", Some("model")));
         assert!(error.contains("not owned"));
 
