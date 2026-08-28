@@ -1038,7 +1038,7 @@ impl AgentHostHandle {
         let credentials = crate::auth_store::resolve_wire_credentials_for_model(&model)
             .map_err(anyhow::Error::msg)?
             .ok_or_else(|| anyhow!(crate::auth_store::auth_help_message()))?;
-        let (principal, policy_digest) = self.computer_capability_identity(session_id)?;
+        let (principal, policy_digest) = self.canonical_computer_identity(session_id)?;
         let resolved =
             resolve_computer_eligibility(&credentials, &model, &principal, &policy_digest)?;
         let _ = self.capability_authority.issue(
@@ -1088,7 +1088,7 @@ impl AgentHostHandle {
         let credentials = crate::auth_store::resolve_wire_credentials_for_model(&model)
             .map_err(anyhow::Error::msg)?
             .ok_or_else(|| anyhow!(crate::auth_store::auth_help_message()))?;
-        let (principal, policy_digest) = self.computer_capability_identity(session_id)?;
+        let (principal, policy_digest) = self.canonical_computer_identity(session_id)?;
         let resolved =
             resolve_computer_eligibility(&credentials, &model, &principal, &policy_digest)?;
         if resolved.eligibility.tier >= crate::gateway_config::ComputerUseTier::SemanticAct {
@@ -1101,7 +1101,7 @@ impl AgentHostHandle {
         }
         self.clear_computer_agent_qualification(session_id, &model);
         let (capability_principal, capability_policy) =
-            self.computer_capability_identity(session_id)?;
+            self.canonical_computer_identity(session_id)?;
         qualify_semantic_model(
             &credentials,
             &model,
@@ -1164,7 +1164,7 @@ impl AgentHostHandle {
         let credentials = crate::auth_store::resolve_wire_credentials_for_model(&model)
             .map_err(anyhow::Error::msg)?
             .ok_or_else(|| anyhow!(crate::auth_store::auth_help_message()))?;
-        let (principal, policy_digest) = self.computer_capability_identity(session_id)?;
+        let (principal, policy_digest) = self.canonical_computer_identity(session_id)?;
         let resolved =
             resolve_computer_eligibility(&credentials, &model, &principal, &policy_digest)?;
         let _ = self.capability_authority.issue(
@@ -1402,7 +1402,7 @@ impl AgentHostHandle {
         let credentials = crate::auth_store::resolve_wire_credentials_for_model(&current_model)
             .map_err(anyhow::Error::msg)?
             .ok_or_else(|| anyhow!(crate::auth_store::auth_help_message()))?;
-        let (principal, policy_digest) = self.computer_capability_identity(session_id)?;
+        let (principal, policy_digest) = self.canonical_computer_identity(session_id)?;
         let current =
             resolve_computer_eligibility(&credentials, &current_model, &principal, &policy_digest)?;
         if current.capability_snapshot != *expected_capability {
