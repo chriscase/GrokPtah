@@ -55,7 +55,9 @@ Every skip is a stated limit, never a silent pass.
 
 ## 2. What running against a real host found
 
-Two divergences, neither reachable from a script written to the contract.
+Divergences found by running against a real host, plus what review found
+in the code behind it. None was reachable from a script written to the
+contract.
 
 ### F-0 — Reads were not bound to a principal (fixed, and proven)
 
@@ -130,6 +132,102 @@ set — `AuthContext` is derived per request, so a revoked credential fails at
 Bearer possession plus `with_operator_authority` remains operator-equivalent,
 and no browser or cross-product safety is claimed. `publish = false` stands.
 
+### F-6 — The idempotency key namespace was global (fixed, and proven)
+
+Reported in review, confirmed in code, and the most serious of the three: the
+receipt namespace had no principal in it at all. `idemp_path(request_id)`
+resolved to `<root>/idempotency/<request_id>.json` and `IdempotencyReceipt`
+carried no owner field, so every caller on a host shared one namespace for a
+value **the caller chooses**.
+
+Three consequences, all reachable by a second credential simply picking a key:
+
+* **Cross-principal read.** Same key, same payload hash → `Replay`, handing the
+  second caller the first caller's stored `response` verbatim.
+* **Existence oracle.** Same key, different payload → `conflict`, which
+  confirms the key is taken. That is exactly the oracle F-1 removed from run
+  reads, on a different surface.
+* **Squatting.** A caller could claim a key before its owner used it.
+
+Identity is now `(scope, request_id)`. The scope is derived from the same
+`stamped_client_id` the run fence compares — one derivation, so run ownership
+and receipt ownership cannot drift — and is stored both in the file name (as a
+fixed-width hex prefix, so a caller-chosen id cannot forge one) and inside the
+receipt, which `claim` and `finish` both check. A foreign key now looks
+*unused*: `Perform`, not `Replay` and not `conflict`.
+
+**The wire value is unchanged.** Callers still send, and receipts still report,
+exactly the `request_id` they chose; `ptah_*` argument and result schemas are
+untouched. Only where a receipt is stored, and which receipts a lookup can
+reach, are scoped — which is what #466 requires of the provider-attempt key.
+
+Host-authored work (the native executor, managed intents, in-process resume)
+claims in one named scope, `IdempotencyScope::host()`, built from the same
+`HOST_AUTHORED_CLIENT_ID` the run fence names. There is now a single definition
+of that constant.
+
+A receipt written before scoping existed carries no scope. It cannot be
+attributed to a principal, so it is served to nobody and the existing retention
+policy drains it — the same fail-closed posture as a run with no `client_id`.
+The one visible consequence, stated rather than hidden: a retry that spans the
+upgrade is treated as a new request rather than replayed.
+
+Proven at both levels. `receipts_are_scoped_per_principal` and
+`a_legacy_unscoped_receipt_is_unreachable` pin the store behaviour, including
+that the *owner's* replay still works — scoping must not cost the owner the
+guarantee the key exists for. `one_principals_idempotency_key_does_not_reach_anothers`
+drives it through the real service over HTTP with two credentials: B's create
+under A's key succeeds with a different session, and A's retry still replays A's.
+
+### F-8 — Nothing exercised a mutation that landed and lost its answer (fixed)
+
+Review's third point, and a fair one: the earlier evidence covered a restart
+and covered idempotent creation, but never the case that makes durable receipts
+worth having — the request reaches the host, **takes effect**, and the response
+never comes back. Two live checks skip precisely there
+(`faults.lost_connection_is_safely_retryable`,
+`faults.uncertain_send_is_never_auto_retried`) because the harness cannot arm
+the fault, and "skipped" was being read as "covered elsewhere". It was not.
+
+A fake cannot produce this honestly: dropping a call *before* it lands is a
+different failure with a different correct answer. So the fault is now injected
+around a real transport — `PostEffectDisconnect` makes the call, waits for the
+host to act, and only then discards the response.
+
+`a_lost_response_is_reconciled_after_a_real_restart` drives the whole sequence:
+the caller creates a session under a key and never sees the answer; the effect
+is shown to be durable *before* anything restarts, so a later failure cannot be
+blamed on the write never happening; the service process stops and a genuinely
+new one starts against the same durable home; the caller retries the same key
+and is handed the session it already has. Not a second one, and not nothing.
+The session count is asserted at each step, so both failure directions — a lost
+effect and a duplicated one — fail the test.
+
+### F-7 — The page cursor was a claim, not a check (fixed)
+
+The contract said "a cursor this host did not issue is `invalid_request`,
+never a silent restart". The host checked that the string *looked* like
+`millis:request_id` and nothing else, so the sentence was false in both
+directions: a caller could seek to a position never handed out, and a value
+documented as opaque was plainly readable and constructible.
+
+Cursors are now authenticated with the same per-home secret the attempt digest
+uses (`HMAC-SHA256`, verified here against the RFC 4231 vectors rather than
+trusted), and bound to the scope and run they were issued for. So a cursor
+cannot be forged, cannot be replayed onto another run or by another principal,
+and carries no readable structure — hex throughout, tag first at fixed width,
+so nothing in the payload can be mistaken for a delimiter. Every rejection
+reason returns the same refusal, so *why* a cursor failed is not an oracle
+either.
+
+The SDK's in-process fake keeps its own simpler encoding, and its
+documentation now says so instead of describing it as opaque: a consumer that
+learned to build a cursor from the fake would break against every real host.
+
+`a_receipt_cursor_is_authenticated_and_bound` pins the store behaviour, and
+`a_forged_receipt_cursor_is_refused_by_the_live_host` drives the real service
+over HTTP with the exact shapes the old parser accepted.
+
 ### F-4 — The SDK dropped the idempotency key it was handed (fixed)
 
 `create_session` built its arguments from the workspace and title only, so the
@@ -190,7 +288,9 @@ Each is exercised by the live battery, not asserted in prose.
 * **`ptah_list_receipts`** — durable receipts for one run, behind the same
   `authorize_run_request` fence as every other scoped read, ordered
   `(created_at, request_id)` with a matching composite cursor, bounded 1–200.
-  A cursor the host did not issue is `invalid_request`, never a silent restart.
+  A cursor the host did not issue is `invalid_request`, never a silent restart
+  — authenticated and bound to the scope and run it was issued for (F-7), so
+  that is a check rather than a claim about shape.
 * **Retention travels with the page.** The window reports the runtime's real
   policy — a **host-wide** budget of 1,000 that also exempts unsettled receipts
   and receipts of non-terminal runs. A consumer reading `maxReceipts` as a
@@ -203,9 +303,12 @@ Each is exercised by the live battery, not asserted in prose.
   (`<root>/receipt-digest.key`, 0600, created on first use) so the raw hash
   never leaves the host, and `AttemptDigest::from_host` validates what arrives
   rather than trusting it.
-* **Idempotent session creation.** `ptah_create_session` takes an optional
-  `request_id`. Absent keeps the previous behavior exactly; present makes the
-  one mutation with no request identity replayable, with key reuse a conflict.
+* **Idempotent session creation, scoped to the caller.** `ptah_create_session`
+  takes an optional `request_id`. Absent keeps the previous behavior exactly;
+  present makes the one mutation with no request identity replayable. Because
+  the key is a value the *caller* chooses, receipt identity and lookup are
+  scoped to the authenticated principal (F-6): reuse is a conflict for its
+  owner and simply unused for anyone else.
 * **`maxTotalTokens` is advertised.** `merge_bounds` always accepted it, but the
   schema omitted it under `additionalProperties: false`, so a schema-validating
   client was refused the one documented ceiling it most needed.
@@ -258,7 +361,8 @@ the only generator today; a TypeScript consumer still hand-mirrors them.
 
 **R5 — Principal binding: done here; the rest of the auth story is not.**
 Run, event, artifact and receipt reads are now principal-bound and proven
-against two live credentials (F-0). What remains, and what no consumer may
+against two live credentials (F-0), and idempotency keys are scoped to the
+principal that chose them (F-6). What remains, and what no consumer may
 assume: capability-generation revalidation (#458), a trusted broker with app
 authentication, CSRF and revocation, opaque session binding, and separately
 gated Computer Use authority. Bearer plus operator authority is still
@@ -272,6 +376,21 @@ session list and pages locally. The bound belongs at the host.
 graph and the type-level containment, not an authenticated transport, a
 restart, or a broker. It is not yet the "second real consumer" ADR-002 §7
 step 4 requires.
+
+**R8 — Legacy idempotency receipts are drained, not migrated.** Receipts
+written before F-6 carry no scope, so they are served to nobody and age out
+under the existing retention policy. A retry that spans the upgrade is treated
+as a new request rather than replayed. This is deliberate — the alternative is
+to guess an owner for a record that has none — but it is a one-time behaviour
+change and a host operator should know it happens rather than discover it.
+
+**R9 — Two live fault checks still skip.**
+`faults.lost_connection_is_safely_retryable` and
+`faults.uncertain_send_is_never_auto_retried` remain skipped in both matrices:
+the conformance harness has no way to arm a fault, and F-8 injects one around
+the transport in a dedicated test rather than through the battery. Teaching the
+`Harness` trait to arm faults would let the battery cover this on every host
+instead of one. **Not done here.**
 
 ## 6. Publication
 
@@ -299,15 +418,23 @@ authority.
 
 | Check | Result |
 |---|---|
-| SDK `fmt` / `clippy -D warnings` / `test --locked` | clean; 124 tests |
+| SDK `fmt` / `clippy -D warnings` / `test --locked` | clean; 125 tests |
 | SDK feature matrix (default / none / fake / conformance) | clean |
 | Reference consumer `fmt` / `clippy` / `test` | clean; 8 tests |
-| Bridge `cargo test --locked -- --test-threads=1` | 533 passed, 1 pre-existing failure |
-| Service crate `cargo test --locked -- --test-threads=1` | 19 passed, 1 pre-existing failure |
-| Live service + Desktop batteries | 15/0/11 each, agreeing |
-| Live focused tests (two-principal, receipts, host version, session idempotency) | 6 passed |
+| Bridge `cargo test --locked --no-fail-fast -- --test-threads=1` | 720 passed; the 2 pre-existing failures below |
+| `sdk_live_conformance` (2 battery drivers + 8 focused) | 10 passed |
+| Live service + Desktop battery matrices | 15 passed / 0 failed / 11 skipped each, agreeing |
 
-Two failures, both **established pre-existing** rather than assumed. Each was
+The bridge sweep runs with `--no-fail-fast`. Without it `cargo test` stops at
+the first failing target and never reaches the ones after it — which is how an
+earlier packet reported a clean local sweep and then went red in CI.
+
+The eight focused live tests: two-principal run reads, redacted receipts, host
+contract version, session idempotency, credential rotation across a restart,
+cross-principal idempotency keys (F-6), forged page cursors (F-7), and a
+post-effect disconnect reconciled across a real restart (F-8).
+
+The failures are **established pre-existing** rather than assumed. Each was
 re-run with the bridge source reverted to the base — whose tree (`3a801b5e`) is
 byte-identical to `origin/main` — and failed identically there:
 
@@ -315,10 +442,16 @@ byte-identical to `origin/main` — and failed identically there:
   a 90-second subprocess timeout (98.5s to fail, at base and at head alike).
 * `service_smoke::service_mcp_contract_covers_scoped_live_reconnect_controls_and_restart`,
   where `ptah_cancel` returns `invalid_request` because the run has already
-  reached a terminal state under `GROKPTAH_AGENT_OFFLINE=1`.
+  reached a terminal state under `GROKPTAH_AGENT_OFFLINE=1`. The hosted live
+  step therefore runs `--test sdk_live_conformance` only, rather than adopting
+  another lane's red.
+* `mcp_soak_hardening::soak_desktop_bootstrap_node_campaign` fails
+  intermittently on a known advisory-lock race and passes on re-run. It is
+  reported here because a failure that is only sometimes there is exactly the
+  kind that gets quietly dropped from a summary.
 
-Both are Linux-container artifacts; the hosted `desktop` job runs macOS, where
-the native keychain backend applies and neither reproduces.
+All are Linux-container artifacts; the hosted `desktop` job runs macOS, where
+the native keychain backend applies and none reproduces.
 
 ### Bridge clippy
 

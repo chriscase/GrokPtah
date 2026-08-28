@@ -22,7 +22,8 @@
 mod common;
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -84,6 +85,51 @@ impl LiveTransport {
             .ok_or_else(|| TransportFault::Malformed {
                 detail: "response carried neither `result` nor `error`".into(),
             })
+    }
+}
+
+/// A transport that lets a request through and then loses the response.
+///
+/// This is the fault that makes durable receipts worth having: the mutation
+/// reached the host and **took effect**, and the caller cannot see that it did.
+/// A fake cannot produce it honestly — dropping the call before it lands is a
+/// different failure with a different correct answer — so it is injected here
+/// around a real one.
+struct PostEffectDisconnect {
+    inner: LiveTransport,
+    /// Shared with the test, so the plane can own the transport outright while
+    /// the test still decides when the next response goes missing.
+    armed: Arc<AtomicBool>,
+}
+
+impl PostEffectDisconnect {
+    async fn connect(addr: std::net::SocketAddr) -> (Self, Arc<AtomicBool>) {
+        let armed = Arc::new(AtomicBool::new(false));
+        (
+            Self {
+                inner: LiveTransport::connect(addr).await,
+                armed: Arc::clone(&armed),
+            },
+            armed,
+        )
+    }
+}
+
+#[async_trait]
+impl McpTransport for PostEffectDisconnect {
+    async fn list_tools(&self) -> Result<Vec<String>, TransportFault> {
+        self.inner.list_tools().await
+    }
+
+    async fn call_tool(&self, tool: &str, arguments: Value) -> Result<Value, TransportFault> {
+        // The call is made first, and only then discarded: the effect is real.
+        let result = self.inner.call_tool(tool, arguments).await;
+        if self.armed.swap(false, Ordering::SeqCst) {
+            return Err(TransportFault::Unreachable {
+                detail: "connection lost after the request was sent".into(),
+            });
+        }
+        result
     }
 }
 
@@ -627,6 +673,328 @@ async fn creating_a_session_twice_under_one_key_yields_one_session() {
         after,
         before + 1,
         "exactly one session should have been created across two calls"
+    );
+
+    service.stop_and_wait().await;
+}
+
+/// A mutation that lands and then loses its response is recoverable — across
+/// a real restart, in a second process.
+///
+/// This is the case the three-valued retry disposition and the durable receipt
+/// exist for, and it cannot be produced honestly by a fake: dropping a call
+/// *before* it lands is a different failure with a different correct answer.
+/// So the fault is injected around a real transport, after the host has
+/// already acted.
+///
+/// The sequence is the real one. The caller creates a session under a key and
+/// never sees the answer. The service process stops. A new process starts
+/// against the same durable home. The caller retries the same key and must be
+/// handed **the session it already has** — not a second one, and not nothing.
+#[tokio::test]
+async fn a_lost_response_is_reconciled_after_a_real_restart() {
+    let env = ServiceEnv::new();
+    let workspace = env.workspace_path();
+
+    let config = || {
+        ServiceConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            TOKEN,
+            vec![workspace.clone()],
+            false,
+            4,
+            std::time::Duration::from_secs(8),
+        )
+        .expect("valid service config")
+        .with_runtime_home(env._home.path())
+        .expect("valid runtime home")
+    };
+
+    let service = start_service(config()).await.expect("start service");
+
+    // Learn the workspace the way a consumer does, then rebuild the plane on a
+    // transport that can lose a response after the fact.
+    let harness = live_harness(&env, service.addr, service.host()).await;
+    let workspace_ref = harness.session.workspace.clone();
+    let before = harness
+        .plane
+        .list_sessions(PageRequest::new())
+        .await
+        .expect("list before")
+        .items
+        .len();
+
+    let (faulty, armed) = PostEffectDisconnect::connect(service.addr).await;
+    let plane = ServiceControlPlane::read_only(faulty).with_operator_authority();
+    // The plane must learn the workspace through the host's own report; a ref
+    // is never carried across adapters.
+    let workspace_ref = plane
+        .list_sessions(PageRequest::new())
+        .await
+        .expect("the faulty plane lists sessions")
+        .items
+        .into_iter()
+        .find(|session| session.workspace == workspace_ref)
+        .map(|session| session.workspace)
+        .expect("the same workspace is reported to this plane");
+
+    let key = harness.next_request_id();
+    // The harness holds its own host handle, and the runtime home takes an
+    // advisory instance lock. Release it before the restart or the second
+    // process refuses to start — correctly.
+    drop(harness);
+    armed.store(true, Ordering::SeqCst);
+    let lost = plane
+        .create_session(CreateSessionRequest {
+            request_id: key.clone(),
+            workspace: workspace_ref.clone(),
+            title: Some(Label::new("created behind a lost response").unwrap()),
+        })
+        .await
+        .expect_err("the response was dropped, so the caller must see a fault");
+    armed.store(false, Ordering::SeqCst);
+
+    // The host took the key, so the create is replayable and the disposition
+    // says so. What the caller must *not* be told is that nothing happened.
+    assert!(
+        matches!(
+            lost.code,
+            SdkErrorCode::TransportUnavailable | SdkErrorCode::UncertainOutcome
+        ),
+        "a lost response must not be reported as a clean failure, got {:?}",
+        lost.code
+    );
+
+    // The effect is nevertheless durable. Prove it before restarting, so a
+    // later failure cannot be blamed on the write never having happened.
+    let after_effect = plane
+        .list_sessions(PageRequest::new())
+        .await
+        .expect("list after the lost response")
+        .items;
+    assert_eq!(
+        after_effect.len(),
+        before + 1,
+        "the mutation must have landed even though its response did not return"
+    );
+    let created: Vec<_> = after_effect
+        .iter()
+        .map(|session| session.session_id.clone())
+        .collect();
+
+    // A genuine second process against the same durable home.
+    drop(plane);
+    service.stop_and_wait().await;
+    let service = start_service(config()).await.expect("restart service");
+
+    let reconnected = ServiceControlPlane::read_only(LiveTransport::connect(service.addr).await)
+        .with_operator_authority();
+    let reconnected_workspace = reconnected
+        .list_sessions(PageRequest::new())
+        .await
+        .expect("the new process reports its sessions")
+        .items
+        .into_iter()
+        .next()
+        .expect("sessions survived the restart")
+        .workspace;
+
+    let recovered = reconnected
+        .create_session(CreateSessionRequest {
+            request_id: key.clone(),
+            workspace: reconnected_workspace,
+            title: Some(Label::new("created behind a lost response").unwrap()),
+        })
+        .await
+        .expect("retrying the key after a restart must reconcile, not fail");
+
+    assert!(
+        created.contains(&recovered.session_id),
+        "the retry minted a new session instead of replaying the durable one"
+    );
+    let after_restart = reconnected
+        .list_sessions(PageRequest::new())
+        .await
+        .expect("list after restart")
+        .items
+        .len();
+    assert_eq!(
+        after_restart,
+        before + 1,
+        "reconciliation created a second session"
+    );
+
+    service.stop_and_wait().await;
+}
+
+/// A page cursor must be one the host issued, checked rather than assumed.
+///
+/// The contract said "a cursor this host did not issue is `invalid_request`"
+/// while the host checked only that the string looked like `millis:request_id`
+/// — so a caller could seek to a position never handed out, and could read a
+/// value it was promised was opaque. The host now authenticates cursors and
+/// binds them to the scope and run they were issued for. This drives the real
+/// host over HTTP with the exact shapes the old parser accepted.
+#[tokio::test]
+async fn a_forged_receipt_cursor_is_refused_by_the_live_host() {
+    let env = ServiceEnv::new();
+    let service = start_isolated(&env, vec![env.workspace_path()], 4).await;
+    let harness = live_harness(&env, service.addr, service.host()).await;
+
+    let accepted = harness
+        .plane
+        .submit_task(TaskSubmission {
+            request_id: harness.next_request_id(),
+            session_id: harness.session.session_id.clone(),
+            workspace: harness.session.workspace.clone(),
+            prompt: "a run to hang receipts on".into(),
+            bounds: None,
+            execution_mode: ExecutionMode::Shared,
+            allow_queue: false,
+        })
+        .await
+        .expect("submit");
+
+    let selector = RunSelector {
+        session_id: harness.session.session_id.clone(),
+        workspace: harness.session.workspace.clone(),
+        run_id: accepted.run_id.clone(),
+    };
+
+    // The unpaged read works, so a refusal below is about the cursor and not
+    // about the fence.
+    harness
+        .plane
+        .list_receipts(selector.clone(), PageRequest::new())
+        .await
+        .expect("the owner lists its own receipts");
+
+    // Every one of these was accepted by the old syntax-only parser.
+    for forged in [
+        "0:anything",
+        "1700000000000:req-7",
+        "9223372036854775807:z",
+        "not-a-cursor",
+        "",
+    ] {
+        let page = PageRequest::new().after(Cursor::from_opaque(forged.to_string()));
+        match harness.plane.list_receipts(selector.clone(), page).await {
+            // An empty cursor is "no cursor" by the contract, not a forgery.
+            Ok(_) if forged.is_empty() => {}
+            Ok(_) => panic!("the host accepted a cursor it never issued: {forged:?}"),
+            Err(error) => assert_eq!(
+                error.code,
+                SdkErrorCode::InvalidRequest,
+                "a forged cursor must be invalid_request, got {:?} for {forged:?}",
+                error.code
+            ),
+        }
+    }
+
+    service.stop_and_wait().await;
+}
+
+/// One caller's idempotency key must not reach another caller's request.
+///
+/// `request_id` is chosen by the caller, so it names a request only within the
+/// principal that chose it. Before the receipt namespace was scoped, the two
+/// principals here shared one: the second caller's create either replayed the
+/// first caller's session (a straight cross-principal read) or came back
+/// `conflict`, which confirmed the key was taken and made the namespace an
+/// oracle. Both are asserted against here, against the real host, and the
+/// first caller's own retry must still replay.
+#[tokio::test]
+async fn one_principals_idempotency_key_does_not_reach_anothers() {
+    const OTHER_TOKEN: &str = "idempotency-second-principal-token-entropy";
+
+    let env = ServiceEnv::new();
+    let workspace = env.workspace_path();
+
+    let config = ServiceConfig::new(
+        "127.0.0.1:0".parse().unwrap(),
+        TOKEN,
+        vec![workspace.clone()],
+        false,
+        4,
+        std::time::Duration::from_secs(8),
+    )
+    .expect("valid service config")
+    .with_runtime_home(env._home.path())
+    .expect("valid runtime home");
+    let config = ServiceConfig {
+        client_credentials: vec![
+            grokptah_agent_bridge::orchestration::AuthCredential::new("primary", TOKEN)
+                .expect("primary credential"),
+            grokptah_agent_bridge::orchestration::AuthCredential::new("second", OTHER_TOKEN)
+                .expect("second credential"),
+        ],
+        ..config
+    };
+    let service = start_service(config).await.expect("start service");
+
+    let harness = live_harness(&env, service.addr, service.host()).await;
+
+    let mut other_client = McpControlClient::new(format!("http://{}", service.addr), OTHER_TOKEN);
+    other_client.initialize().await.expect("initialize as B");
+    let other_plane = ServiceControlPlane::read_only(LiveTransport {
+        client: Mutex::new(other_client),
+    })
+    .with_operator_authority();
+
+    // Both principals pick the same key. Nothing stops them: it is their
+    // string, not the host's.
+    let key = harness.next_request_id();
+
+    let mine = harness
+        .plane
+        .create_session(CreateSessionRequest {
+            request_id: key.clone(),
+            workspace: harness.session.workspace.clone(),
+            title: Some(Label::new("first principal").unwrap()),
+        })
+        .await
+        .expect("A creates under the shared key");
+
+    // B learns its own reference to the same allowlisted workspace. The ref is
+    // host-issued per principal, so B cannot reuse A's.
+    let b_workspace = other_plane
+        .list_sessions(PageRequest::new())
+        .await
+        .expect("B lists sessions")
+        .items
+        .into_iter()
+        .next()
+        .expect("B sees a session; the workspace is allowlisted for B as well")
+        .workspace;
+
+    let theirs = other_plane
+        .create_session(CreateSessionRequest {
+            request_id: key.clone(),
+            workspace: b_workspace,
+            title: Some(Label::new("second principal").unwrap()),
+        })
+        .await
+        .expect("B's create must succeed, not conflict on a key it never used");
+
+    assert_ne!(
+        mine.session_id, theirs.session_id,
+        "B was handed A's session; the idempotency namespace is shared"
+    );
+
+    // A's exact retry still replays A's own outcome. Scoping must not cost the
+    // owner the guarantee the key exists for.
+    let replay = harness
+        .plane
+        .create_session(CreateSessionRequest {
+            request_id: key.clone(),
+            workspace: harness.session.workspace.clone(),
+            title: Some(Label::new("first principal").unwrap()),
+        })
+        .await
+        .expect("A retries its own key");
+    assert_eq!(
+        replay.session_id, mine.session_id,
+        "the owner's retry must replay the owner's session"
     );
 
     service.stop_and_wait().await;

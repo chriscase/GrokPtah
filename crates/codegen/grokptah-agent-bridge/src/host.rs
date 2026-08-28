@@ -2130,7 +2130,16 @@ impl AgentHostHandle {
             "instructionByteLength": prompt.len(),
             "maxRounds": max_rounds,
         }));
-        match store.claim_idempotency("persistent_agent_resume", &request_id, &payload_hash)? {
+        // In-process resume is host-authored work: there is no bearer here,
+        // and the identity is the one the run fence names rather than one
+        // inferred from the absence of a caller.
+        let scope = crate::orchestration::IdempotencyScope::host();
+        match store.claim_idempotency(
+            &scope,
+            "persistent_agent_resume",
+            &request_id,
+            &payload_hash,
+        )? {
             crate::orchestration::IdempotencyClaim::Replay(Ok(value)) => value
                 .as_str()
                 .map(ToOwned::to_owned)
@@ -2146,6 +2155,7 @@ impl AgentHostHandle {
                     Ok(plan) => plan,
                     Err(error) => {
                         let _ = store.fail_idempotency(
+                            &scope,
                             "persistent_agent_resume",
                             &request_id,
                             &payload_hash,
@@ -2176,6 +2186,7 @@ impl AgentHostHandle {
                 match result {
                     Ok(response) => {
                         store.complete_idempotency(
+                            &scope,
                             "persistent_agent_resume",
                             &request_id,
                             &payload_hash,
@@ -2186,6 +2197,7 @@ impl AgentHostHandle {
                     }
                     Err(error) => {
                         let _ = store.fail_idempotency(
+                            &scope,
                             "persistent_agent_resume",
                             &request_id,
                             &payload_hash,
@@ -11951,7 +11963,10 @@ mod tests {
         assert_eq!(replay, response);
         assert_eq!(host.list_session_runs(session_id).unwrap().len(), run_count);
         let receipt = store
-            .load_idempotency("deterministic-continuation-replay")
+            .load_idempotency(
+                &crate::orchestration::IdempotencyScope::host(),
+                "deterministic-continuation-replay",
+            )
             .unwrap()
             .unwrap();
         let run_id = receipt.run_id.expect("receipt records the finite Run ID");

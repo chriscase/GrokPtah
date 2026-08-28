@@ -120,26 +120,40 @@ async fn workload_protocol_is_idempotent_scoped_and_lane_archive_safe() {
         .unwrap();
     assert_eq!(claim_replay.structured["attempt"]["attemptId"], attempt_id);
     assert_eq!(claim_replay.structured["leaseToken"], lease_token);
-    let receipt_name = format!(
-        "{}.json",
+    // Receipts are stored under `<scope>-<request_id>.json`: the key is chosen
+    // by the caller, so it names a request only within the principal that
+    // chose it. Find the file by its key rather than pinning the layout, and
+    // assert the scope prefix is actually there — a bare `<request_id>.json`
+    // would mean the namespace went back to being global.
+    let receipt_suffix = format!(
+        "-{}.json",
         grokptah_agent_bridge::safe_id_filename("work-claim-305").unwrap()
     );
-    let receipt_paths = [
-        home.path()
-            .join("orchestration")
-            .join("idempotency")
-            .join(&receipt_name),
+    let receipt_dirs = [
+        home.path().join("orchestration").join("idempotency"),
         home.path()
             .join(".grokptah")
             .join("orchestration")
-            .join("idempotency")
-            .join(&receipt_name),
+            .join("idempotency"),
     ];
-    let claim_receipt = receipt_paths
+    let receipt_path = receipt_dirs
         .iter()
-        .find_map(|path| std::fs::read_to_string(path).ok())
+        .filter_map(|dir| std::fs::read_dir(dir).ok())
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(&receipt_suffix))
+        })
         .expect("durable claim receipt");
+    let claim_receipt = std::fs::read_to_string(&receipt_path).unwrap();
     assert!(!claim_receipt.contains("leaseToken"));
+    assert!(
+        claim_receipt.contains("\"scope\""),
+        "a receipt must record the scope it was claimed in"
+    );
 
     let duplicate_claim = client
         .call_tool(

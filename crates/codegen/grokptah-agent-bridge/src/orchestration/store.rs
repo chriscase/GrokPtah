@@ -27,9 +27,10 @@ use super::routine::{
     ROUTINE_SCHEMA_VERSION,
 };
 use super::types::{
-    hex_sha256, safe_id_filename, AgentRecord, AgentSpec, AgentState, AuditEntry,
-    ContinuationCheckpoint, IdempotencyReceipt, OrchError, OrchErrorCode, PromotionState,
-    RunBounds, RunRecord, RunState, RunStopCause,
+    constant_time_eq, hex_decode, hex_encode, hex_sha256, hmac_sha256_hex, safe_id_filename,
+    AgentRecord, AgentSpec, AgentState, AuditEntry, ContinuationCheckpoint, IdempotencyReceipt,
+    IdempotencyScope, OrchError, OrchErrorCode, PromotionState, RunBounds, RunRecord, RunState,
+    RunStopCause,
 };
 use super::worker::{WorkerHostKind, WorkerPresence, WorkerProjection};
 use super::workload::{
@@ -253,13 +254,18 @@ impl OrchStore {
         Ok(self.inner.root.join("runs").join(format!("{safe}.json")))
     }
 
-    fn idemp_path(&self, request_id: &str) -> Result<PathBuf, OrchError> {
+    /// Where a receipt for `request_id` lives **in `scope`**.
+    ///
+    /// The scope prefix is fixed-width hex, so the name parses by position and
+    /// a caller-chosen `request_id` cannot forge one. A receipt written before
+    /// scoping existed has no prefix and no scoped lookup reaches it.
+    fn idemp_path(&self, scope: &IdempotencyScope, request_id: &str) -> Result<PathBuf, OrchError> {
         let safe = safe_id_filename(request_id)?;
         Ok(self
             .inner
             .root
             .join("idempotency")
-            .join(format!("{safe}.json")))
+            .join(format!("{}-{safe}.json", scope.as_str())))
     }
 
     fn finalization_path(&self, run_id: &str) -> Result<PathBuf, OrchError> {
@@ -3113,7 +3119,10 @@ impl OrchStore {
                 .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
         } else {
             let from_receipt = self
-                .load_idempotency(&intent.intent_id)
+                // Managed intents are submitted by the native executor under
+                // the host identity, and `intent_id` is host-minted, so the
+                // host scope is the only one that can hold this receipt.
+                .load_idempotency(&IdempotencyScope::host(), &intent.intent_id)
                 .ok()
                 .flatten()
                 .and_then(|receipt| receipt.run_id);
@@ -4788,10 +4797,19 @@ impl OrchStore {
         result.map(|_| final_run)
     }
 
+    /// Write a receipt into the scope it names.
+    ///
+    /// A receipt with no scope is legacy by definition and cannot be written
+    /// through this path: refusing is what keeps "unattributed" a read-only
+    /// state that retention drains rather than one new writes can re-enter.
     pub fn save_idempotency(&self, receipt: &IdempotencyReceipt) -> anyhow::Result<()> {
+        let scope = receipt
+            .scope
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("idempotency receipt has no scope"))?;
         let _g = self.inner.lock.lock();
         let path = self
-            .idemp_path(&receipt.request_id)
+            .idemp_path(&IdempotencyScope::from_stored(scope), &receipt.request_id)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         atomic_write_json(&path, receipt)
     }
@@ -4845,6 +4863,90 @@ impl OrchStore {
         Ok(hex_sha256(&hasher.finalize())[..32].to_string())
     }
 
+    /// Mint the opaque page cursor for a receipt boundary.
+    ///
+    /// The old cursor was the raw `millis:request_id` pair, and parsing it
+    /// checked only that it *looked* like one — while the contract said a
+    /// cursor this host did not issue is refused. Any caller could therefore
+    /// seek to a position the host never handed out, and consumers could parse
+    /// a shape they were promised was opaque.
+    ///
+    /// A cursor is now authenticated with the same per-home secret the attempt
+    /// digest uses, and bound to the scope and run it was issued for, so it
+    /// cannot be forged, cannot be replayed against another run, and cannot be
+    /// read as anything but bytes. Hex throughout, so the tag is fixed-width
+    /// and no delimiter can be confused with payload.
+    pub fn receipt_cursor(
+        &self,
+        scope: &IdempotencyScope,
+        run_id: &str,
+        millis: i64,
+        request_id: &str,
+    ) -> anyhow::Result<String> {
+        let payload = format!("{millis}:{request_id}");
+        let tag = self.receipt_cursor_tag(scope, run_id, &payload)?;
+        Ok(format!("{tag}{}", hex_encode(payload.as_bytes())))
+    }
+
+    /// Verify and decode a cursor this host issued.
+    ///
+    /// Every failure — wrong length, non-hex, bad tag, unparseable payload —
+    /// returns the same `None`, so a caller cannot learn *why* a cursor was
+    /// rejected and use that as an oracle. The caller sees one refusal.
+    pub fn parse_receipt_cursor(
+        &self,
+        scope: &IdempotencyScope,
+        run_id: &str,
+        raw: &str,
+    ) -> anyhow::Result<Option<(i64, String)>> {
+        const TAG_HEX: usize = 32;
+        if raw.len() <= TAG_HEX {
+            return Ok(None);
+        }
+        let (tag, body) = raw.split_at(TAG_HEX);
+        let Some(bytes) = hex_decode(body) else {
+            return Ok(None);
+        };
+        let Ok(payload) = String::from_utf8(bytes) else {
+            return Ok(None);
+        };
+        let expected = self.receipt_cursor_tag(scope, run_id, &payload)?;
+        if !constant_time_eq(tag.as_bytes(), expected.as_bytes()) {
+            return Ok(None);
+        }
+        let Some((millis, request_id)) = payload.split_once(':') else {
+            return Ok(None);
+        };
+        let Ok(millis) = millis.parse::<i64>() else {
+            return Ok(None);
+        };
+        Ok(Some((millis, request_id.to_string())))
+    }
+
+    /// The authentication tag over one cursor payload.
+    ///
+    /// HMAC-SHA256 rather than `SHA256(secret ‖ message)`: the latter is
+    /// length-extendable, and a construction that happens to be safe because of
+    /// what the surrounding format forbids is a construction that breaks when
+    /// the format changes.
+    fn receipt_cursor_tag(
+        &self,
+        scope: &IdempotencyScope,
+        run_id: &str,
+        payload: &str,
+    ) -> anyhow::Result<String> {
+        let salt = self.receipt_digest_salt()?;
+        let mut message = Vec::new();
+        message.extend_from_slice(b"receipt-cursor");
+        message.push(0);
+        message.extend_from_slice(scope.as_str().as_bytes());
+        message.push(0);
+        message.extend_from_slice(run_id.as_bytes());
+        message.push(0);
+        message.extend_from_slice(payload.as_bytes());
+        Ok(hmac_sha256_hex(&salt, &message)[..32].to_string())
+    }
+
     /// Receipts belonging to one run, ordered `(created_at, request_id)`.
     ///
     /// Ordering is total and deterministic so a paged walk yields exactly the
@@ -4855,6 +4957,7 @@ impl OrchStore {
     /// Reads only. Receipt *writers* stay private to the idempotency path.
     pub fn list_idempotency_for_run(
         &self,
+        scope: &IdempotencyScope,
         run_id: &str,
         after: Option<(i64, String)>,
         limit: usize,
@@ -4881,6 +4984,14 @@ impl OrchStore {
                 continue;
             };
             if receipt.run_id.as_deref() != Some(run_id) {
+                continue;
+            }
+            // The caller already passed the run fence to reach this listing,
+            // so a foreign receipt should not be here at all. Filtering anyway
+            // means a receipt is never served out of the scope it was claimed
+            // in even if a future caller reaches this with a wider run.
+            // Legacy receipts carry no scope and match nothing.
+            if receipt.scope.as_deref() != Some(scope.as_str()) {
                 continue;
             }
             found.push(receipt);
@@ -4910,8 +5021,12 @@ impl OrchStore {
         Ok((found, has_more))
     }
 
-    pub fn load_idempotency(&self, request_id: &str) -> anyhow::Result<Option<IdempotencyReceipt>> {
-        let path = match self.idemp_path(request_id) {
+    pub fn load_idempotency(
+        &self,
+        scope: &IdempotencyScope,
+        request_id: &str,
+    ) -> anyhow::Result<Option<IdempotencyReceipt>> {
+        let path = match self.idemp_path(scope, request_id) {
             Ok(p) => p,
             Err(_) => return Ok(None),
         };
@@ -4929,18 +5044,24 @@ impl OrchStore {
     /// - None → create pending claim (exclusive)
     pub fn claim_idempotency(
         &self,
+        scope: &IdempotencyScope,
         tool: &str,
         request_id: &str,
         payload_hash: &str,
     ) -> Result<IdempotencyClaim, OrchError> {
-        let path = self.idemp_path(request_id)?;
+        let path = self.idemp_path(scope, request_id)?;
         let _g = self.inner.lock.lock();
         if path.is_file() {
             let text = fs::read_to_string(&path)
                 .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
             let prev: IdempotencyReceipt = serde_json::from_str(&text)
                 .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
-            if prev.request_id != request_id
+            // Defence in depth. The path already separates scopes; this
+            // refuses to replay a receipt whose recorded scope is not the one
+            // being claimed, so a legacy (unscoped) receipt can never be
+            // reached even by a name that happens to collide.
+            if prev.scope.as_deref() != Some(scope.as_str())
+                || prev.request_id != request_id
                 || prev.tool != tool
                 || prev.payload_hash != payload_hash
             {
@@ -4960,6 +5081,7 @@ impl OrchStore {
 
         let pending = IdempotencyReceipt {
             request_id: request_id.into(),
+            scope: Some(scope.as_str().to_string()),
             payload_hash: payload_hash.into(),
             run_id: None,
             tool: tool.into(),
@@ -4979,6 +5101,7 @@ impl OrchStore {
 
     pub fn complete_idempotency(
         &self,
+        scope: &IdempotencyScope,
         tool: &str,
         request_id: &str,
         payload_hash: &str,
@@ -4986,6 +5109,7 @@ impl OrchStore {
         response: serde_json::Value,
     ) -> Result<(), OrchError> {
         self.finish_idempotency(
+            scope,
             tool,
             request_id,
             payload_hash,
@@ -4998,6 +5122,7 @@ impl OrchStore {
 
     pub fn fail_idempotency(
         &self,
+        scope: &IdempotencyScope,
         tool: &str,
         request_id: &str,
         payload_hash: &str,
@@ -5005,6 +5130,7 @@ impl OrchStore {
         error: OrchError,
     ) -> Result<(), OrchError> {
         self.finish_idempotency(
+            scope,
             tool,
             request_id,
             payload_hash,
@@ -5016,8 +5142,10 @@ impl OrchStore {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn finish_idempotency(
         &self,
+        scope: &IdempotencyScope,
         tool: &str,
         request_id: &str,
         payload_hash: &str,
@@ -5026,7 +5154,7 @@ impl OrchStore {
         error: Option<OrchError>,
         status: &str,
     ) -> Result<(), OrchError> {
-        let path = self.idemp_path(request_id)?;
+        let path = self.idemp_path(scope, request_id)?;
         let _g = self.inner.lock.lock();
         if !path.is_file() {
             return Err(OrchError::new(
@@ -5038,7 +5166,8 @@ impl OrchStore {
             .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
         let previous: IdempotencyReceipt = serde_json::from_str(&text)
             .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
-        if previous.request_id != request_id
+        if previous.scope.as_deref() != Some(scope.as_str())
+            || previous.request_id != request_id
             || previous.tool != tool
             || previous.payload_hash != payload_hash
         {
@@ -5055,6 +5184,7 @@ impl OrchStore {
         }
         let receipt = IdempotencyReceipt {
             request_id: request_id.into(),
+            scope: Some(scope.as_str().to_string()),
             payload_hash: payload_hash.into(),
             run_id,
             tool: tool.into(),
@@ -5447,6 +5577,29 @@ fn write_json_exclusive<T: serde::Serialize>(path: &Path, value: &T) -> std::io:
 
 #[cfg(test)]
 mod tests {
+    use super::IdempotencyScope;
+
+    /// The scope these tests claim in. One value, so a test that writes and a
+    /// test that reads are the same principal — which is the point: a
+    /// different scope must find nothing, and `receipts_are_scoped_per_principal`
+    /// asserts exactly that.
+    fn scope() -> IdempotencyScope {
+        IdempotencyScope::for_client_id("test-principal")
+    }
+
+    /// `IdempotencyClaim` carries an `OrchError` and is not `Debug`; name the
+    /// variant so a failure says which one came back.
+    fn describe(claim: &Result<IdempotencyClaim, OrchError>) -> String {
+        match claim {
+            Ok(IdempotencyClaim::Perform) => "Perform".into(),
+            Ok(IdempotencyClaim::Pending) => "Pending".into(),
+            Ok(IdempotencyClaim::Replay(Ok(value))) => format!("Replay(ok {value})"),
+            Ok(IdempotencyClaim::Replay(Err(error))) => {
+                format!("Replay(err {})", error.code.as_str())
+            }
+            Err(error) => format!("Err({})", error.code.as_str()),
+        }
+    }
 
     /// Two receipts in the same millisecond, whose sub-millisecond order is the
     /// inverse of their request-id order, must both survive a paged walk.
@@ -5478,6 +5631,7 @@ mod tests {
         for (request_id, created_at) in [("bbb", earlier_sub_ms), ("aaa", later_sub_ms)] {
             store
                 .save_idempotency(&IdempotencyReceipt {
+                    scope: Some(scope().as_str().to_string()),
                     request_id: request_id.into(),
                     payload_hash: format!("{request_id}-hash"),
                     run_id: Some("run-precision".into()),
@@ -5495,7 +5649,7 @@ mod tests {
         let mut cursor: Option<(i64, String)> = None;
         for _ in 0..8 {
             let (page, has_more) = store
-                .list_idempotency_for_run("run-precision", cursor.clone(), 1)
+                .list_idempotency_for_run(&scope(), "run-precision", cursor.clone(), 1)
                 .expect("list page");
             let Some(receipt) = page.into_iter().next() else {
                 break;
@@ -5996,18 +6150,262 @@ mod tests {
     fn idempotency_claim_exclusive() {
         let d = tempdir().unwrap();
         let store = OrchStore::open(d.path()).unwrap();
-        match store.claim_idempotency("t", "req", "h").unwrap() {
+        match store.claim_idempotency(&scope(), "t", "req", "h").unwrap() {
             IdempotencyClaim::Perform => {}
             _ => panic!("first claim should perform"),
         }
         store
-            .complete_idempotency("t", "req", "h", None, serde_json::json!({"ok": true}))
+            .complete_idempotency(
+                &scope(),
+                "t",
+                "req",
+                "h",
+                None,
+                serde_json::json!({"ok": true}),
+            )
             .unwrap();
-        match store.claim_idempotency("t", "req", "h").unwrap() {
+        match store.claim_idempotency(&scope(), "t", "req", "h").unwrap() {
             IdempotencyClaim::Replay(Ok(v)) => assert_eq!(v["ok"], true),
             _ => panic!("replay"),
         }
-        assert!(store.claim_idempotency("t", "req", "other").is_err());
+        assert!(store
+            .claim_idempotency(&scope(), "t", "req", "other")
+            .is_err());
+    }
+
+    /// One caller's idempotency key must not reach another caller's receipt.
+    ///
+    /// `request_id` is chosen by the caller, so before scoping existed the two
+    /// principals here shared one namespace and the second got three things it
+    /// should never have had: the first's stored response on a matching payload
+    /// hash, a `conflict` that confirmed the key was taken on a differing one,
+    /// and the ability to squat a key before its owner used it. Each assertion
+    /// below is one of those.
+    #[test]
+    fn receipts_are_scoped_per_principal() {
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+        let first = IdempotencyScope::for_client_id("device-a");
+        let second = IdempotencyScope::for_client_id("device-b");
+
+        assert!(matches!(
+            store.claim_idempotency(&first, "t", "shared-key", "hash-a"),
+            Ok(IdempotencyClaim::Perform)
+        ));
+        store
+            .complete_idempotency(
+                &first,
+                "t",
+                "shared-key",
+                "hash-a",
+                Some("run-a".into()),
+                serde_json::json!({"secret": "first caller only"}),
+            )
+            .unwrap();
+
+        // Same key, same payload. The old namespace replayed the first
+        // caller's response here — a straight cross-principal read.
+        match store.claim_idempotency(&second, "t", "shared-key", "hash-a") {
+            Ok(IdempotencyClaim::Perform) => {}
+            other => panic!("a foreign key must look unused, got {}", describe(&other)),
+        }
+
+        // Same key, different payload. The old namespace answered `conflict`,
+        // which told the second caller the key was taken.
+        let fresh = OrchStore::open(tempdir().unwrap().path().to_path_buf()).unwrap();
+        fresh
+            .claim_idempotency(&first, "t", "shared-key", "hash-a")
+            .unwrap();
+        match fresh.claim_idempotency(&second, "t", "shared-key", "hash-b") {
+            Ok(IdempotencyClaim::Perform) => {}
+            other => panic!(
+                "a foreign key must not report a conflict, got {}",
+                describe(&other)
+            ),
+        }
+
+        // The second caller completing its own claim leaves the first intact.
+        store
+            .complete_idempotency(
+                &second,
+                "t",
+                "shared-key",
+                "hash-a",
+                Some("run-b".into()),
+                serde_json::json!({"secret": "second caller only"}),
+            )
+            .unwrap();
+        match store
+            .claim_idempotency(&first, "t", "shared-key", "hash-a")
+            .unwrap()
+        {
+            IdempotencyClaim::Replay(Ok(value)) => {
+                assert_eq!(value["secret"], "first caller only")
+            }
+            other => panic!(
+                "the owner must still replay its own outcome, got {}",
+                describe(&Ok(other))
+            ),
+        }
+
+        // And a run-scoped listing never crosses the boundary either.
+        let (mine, _) = store
+            .list_idempotency_for_run(&first, "run-b", None, 10)
+            .unwrap();
+        assert!(
+            mine.is_empty(),
+            "a receipt must not be listed outside the scope that claimed it"
+        );
+    }
+
+    /// A page cursor must be one this host issued, and checked as such.
+    ///
+    /// The contract said "a cursor this host did not issue is
+    /// `invalid_request`" while the code checked only that the string *looked*
+    /// like `millis:request_id`. Any caller could seek to a position never
+    /// handed out, and a consumer could parse a value it was promised was
+    /// opaque. The tag closes both: it is bound to the scope and the run, so a
+    /// cursor cannot be forged, cannot be replayed onto another run, and
+    /// carries no readable structure.
+    #[test]
+    fn a_receipt_cursor_is_authenticated_and_bound() {
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+        let mine = IdempotencyScope::for_client_id("device-a");
+        let theirs = IdempotencyScope::for_client_id("device-b");
+
+        let cursor = store
+            .receipt_cursor(&mine, "run-1", 1_700_000_000_000, "req-7")
+            .unwrap();
+
+        // Round-trips for the scope and run it was issued for.
+        assert_eq!(
+            store
+                .parse_receipt_cursor(&mine, "run-1", &cursor)
+                .unwrap()
+                .unwrap(),
+            (1_700_000_000_000, "req-7".to_string())
+        );
+
+        // Opaque: the position it encodes must not be readable off the wire.
+        assert!(
+            !cursor.contains("1700000000000") && !cursor.contains("req-7"),
+            "the cursor leaks its own contents: {cursor}"
+        );
+
+        // Not transferable across runs or principals.
+        assert!(store
+            .parse_receipt_cursor(&mine, "run-2", &cursor)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .parse_receipt_cursor(&theirs, "run-1", &cursor)
+            .unwrap()
+            .is_none());
+
+        // Not forgeable. The old parser accepted every one of these.
+        for forged in [
+            "0:req-7",
+            "1700000000000:req-7",
+            "",
+            "zz",
+            &"0".repeat(64),
+            &format!("{}{}", "0".repeat(32), hex_encode(b"0:req-7")),
+        ] {
+            assert!(
+                store
+                    .parse_receipt_cursor(&mine, "run-1", forged)
+                    .unwrap()
+                    .is_none(),
+                "a forged cursor was accepted: {forged}"
+            );
+        }
+
+        // A tampered tag is refused even though the payload is genuine.
+        let (_, body) = cursor.split_at(32);
+        let tampered = format!("{}{body}", "f".repeat(32));
+        assert!(store
+            .parse_receipt_cursor(&mine, "run-1", &tampered)
+            .unwrap()
+            .is_none());
+    }
+
+    /// HMAC-SHA256 against the RFC 4231 vectors.
+    ///
+    /// The construction is written out here rather than pulled from a crate,
+    /// so it is checked against the published vectors rather than trusted.
+    #[test]
+    fn hmac_matches_the_published_vectors() {
+        assert_eq!(
+            hmac_sha256_hex(&[0x0b; 20], b"Hi There"),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+        assert_eq!(
+            hmac_sha256_hex(b"Jefe", b"what do ya want for nothing?"),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+        // A key longer than the 64-byte block is hashed first.
+        assert_eq!(
+            hmac_sha256_hex(
+                &[0xaa; 131],
+                b"Test Using Larger Than Block-Size Key - Hash Key First"
+            ),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+        );
+    }
+
+    #[test]
+    fn hex_round_trips_and_rejects_non_hex() {
+        assert_eq!(hex_decode(&hex_encode(b"0:req-7")).unwrap(), b"0:req-7");
+        assert!(hex_decode("abc").is_none(), "odd length");
+        assert!(hex_decode("zz").is_none(), "not hex");
+        assert!(hex_decode("AB").is_none(), "uppercase is not what we emit");
+    }
+
+    /// A receipt written before scoping existed is served to nobody.
+    ///
+    /// It cannot be attributed to a principal, so — exactly as with a run whose
+    /// `client_id` is absent — it is refused rather than shared, and the
+    /// existing retention policy drains it. The visible consequence is that a
+    /// retry spanning the upgrade is treated as a new request.
+    #[test]
+    fn a_legacy_unscoped_receipt_is_unreachable() {
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+        let legacy = d.path().join("idempotency").join("legacy-key.json");
+        std::fs::write(
+            &legacy,
+            serde_json::json!({
+                "requestId": "legacy-key",
+                "payloadHash": "h",
+                "runId": "run-legacy",
+                "tool": "t",
+                "response": {"secret": "written before scoping"},
+                "createdAt": Utc::now(),
+                "status": "complete",
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert!(
+            store
+                .load_idempotency(&scope(), "legacy-key")
+                .unwrap()
+                .is_none(),
+            "a scoped lookup must not reach an unscoped receipt"
+        );
+        assert!(matches!(
+            store.claim_idempotency(&scope(), "t", "legacy-key", "h"),
+            Ok(IdempotencyClaim::Perform)
+        ));
+        let (listed, _) = store
+            .list_idempotency_for_run(&scope(), "run-legacy", None, 10)
+            .unwrap();
+        assert!(
+            listed.is_empty(),
+            "an unattributed receipt must not be listed for anyone"
+        );
     }
 
     #[test]
@@ -6015,17 +6413,29 @@ mod tests {
         let d = tempdir().unwrap();
         let store = OrchStore::open(d.path()).unwrap();
         assert!(matches!(
-            store.claim_idempotency("t", "failed", "h").unwrap(),
+            store
+                .claim_idempotency(&scope(), "t", "failed", "h")
+                .unwrap(),
             IdempotencyClaim::Perform
         ));
         let error = OrchError::new(OrchErrorCode::Internal, "failed once");
         store
-            .fail_idempotency("t", "failed", "h", None, error.clone())
+            .fail_idempotency(&scope(), "t", "failed", "h", None, error.clone())
             .unwrap();
         assert!(store
-            .complete_idempotency("t", "failed", "h", None, serde_json::json!({"ok": true}))
+            .complete_idempotency(
+                &scope(),
+                "t",
+                "failed",
+                "h",
+                None,
+                serde_json::json!({"ok": true})
+            )
             .is_err());
-        match store.claim_idempotency("t", "failed", "h").unwrap() {
+        match store
+            .claim_idempotency(&scope(), "t", "failed", "h")
+            .unwrap()
+        {
             IdempotencyClaim::Replay(Err(replayed)) => {
                 assert_eq!(replayed.code.as_str(), error.code.as_str());
                 assert_eq!(replayed.message, error.message);
@@ -6075,6 +6485,7 @@ mod tests {
 
         store
             .save_idempotency(&IdempotencyReceipt {
+                scope: Some(scope().as_str().to_string()),
                 request_id: "old-receipt".into(),
                 payload_hash: "hash".into(),
                 run_id: None,
@@ -6101,7 +6512,10 @@ mod tests {
         assert!(store.load_run("retry-child").unwrap().is_some());
         assert!(store.load_run("active").unwrap().is_some());
         assert!(store.load_run("isolated-live").unwrap().is_some());
-        assert!(store.load_idempotency("old-receipt").unwrap().is_none());
+        assert!(store
+            .load_idempotency(&scope(), "old-receipt")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -6133,6 +6547,7 @@ mod tests {
         let store = OrchStore::open(d.path()).unwrap();
         store
             .save_idempotency(&IdempotencyReceipt {
+                scope: Some(scope().as_str().to_string()),
                 request_id: "unknown-status".into(),
                 payload_hash: "hash".into(),
                 run_id: None,
@@ -6159,7 +6574,10 @@ mod tests {
             .unwrap();
         assert_eq!(report.idempotency_files_removed, 0);
         assert!(report.skipped_files >= 1);
-        assert!(store.load_idempotency("unknown-status").unwrap().is_some());
+        assert!(store
+            .load_idempotency(&scope(), "unknown-status")
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -6167,13 +6585,18 @@ mod tests {
         let d = tempdir().unwrap();
         let store = OrchStore::open(d.path()).unwrap();
         assert!(matches!(
-            store.claim_idempotency("t", "orphan", "h").unwrap(),
+            store
+                .claim_idempotency(&scope(), "t", "orphan", "h")
+                .unwrap(),
             IdempotencyClaim::Perform
         ));
         drop(store);
 
         let reopened = OrchStore::open(d.path()).unwrap();
-        match reopened.claim_idempotency("t", "orphan", "h").unwrap() {
+        match reopened
+            .claim_idempotency(&scope(), "t", "orphan", "h")
+            .unwrap()
+        {
             IdempotencyClaim::Replay(Err(e)) => {
                 assert!(e.message.contains("interrupted"));
             }
@@ -6235,7 +6658,7 @@ mod tests {
     fn traversal_id_rejected() {
         let d = tempdir().unwrap();
         let store = OrchStore::open(d.path()).unwrap();
-        assert!(store.claim_idempotency("t", "../x", "h").is_err());
+        assert!(store.claim_idempotency(&scope(), "t", "../x", "h").is_err());
     }
 
     #[test]

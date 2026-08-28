@@ -884,8 +884,14 @@ impl ReceiptPage {
 ///
 /// Receipts order by `(recorded_at, request_id)`: chronological, with the
 /// request id breaking ties so two receipts written in the same millisecond
-/// cannot swap places between pages. The cursor is that pair, encoded — opaque
-/// to a consumer, stable across restarts because both halves are durable.
+/// cannot swap places between pages. The cursor is that pair, encoded.
+///
+/// **This is the in-process fake's own encoding, not a security boundary.** A
+/// real host authenticates the cursors it issues and refuses one it did not,
+/// which is why a consumer must treat a `Cursor` as bytes to hand back rather
+/// than a value to construct: the encoding here is deliberately not the
+/// encoding a live host uses, and a consumer that learned to build one from
+/// this would break against every real host.
 pub fn receipt_cursor(receipt: &ReceiptView) -> Cursor {
     Cursor::from_opaque(format!(
         "{}:{}",

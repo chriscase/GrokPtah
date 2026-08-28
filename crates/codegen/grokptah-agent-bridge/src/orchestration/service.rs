@@ -168,6 +168,7 @@ fn redact_claim_lease_token(mut response: serde_json::Value) -> serde_json::Valu
 
 struct IdempotencyLease {
     store: OrchStore,
+    scope: IdempotencyScope,
     tool: String,
     request_id: String,
     payload_hash: String,
@@ -181,6 +182,7 @@ impl IdempotencyLease {
         response: serde_json::Value,
     ) -> Result<(), OrchError> {
         self.store.complete_idempotency(
+            &self.scope,
             &self.tool,
             &self.request_id,
             &self.payload_hash,
@@ -193,6 +195,7 @@ impl IdempotencyLease {
 
     fn fail(&mut self, run_id: Option<String>, error: OrchError) -> OrchError {
         match self.store.fail_idempotency(
+            &self.scope,
             &self.tool,
             &self.request_id,
             &self.payload_hash,
@@ -220,6 +223,7 @@ impl Drop for IdempotencyLease {
         if self
             .store
             .fail_idempotency(
+                &self.scope,
                 &self.tool,
                 &self.request_id,
                 &self.payload_hash,
@@ -1768,20 +1772,32 @@ impl OrchestrationService {
         }
     }
 
+    /// Claim `request_id` **in the caller's scope**.
+    ///
+    /// `request_id` is caller-chosen, so it names a request only within the
+    /// principal that chose it. Scoping the claim is what keeps one caller's
+    /// key from replaying another's response, reporting `conflict` to reveal
+    /// that the key is taken, or being squatted before its owner uses it.
     async fn begin_idempotency(
         &self,
+        auth: &AuthContext,
         tool: &str,
         request_id: &str,
         payload_hash: &str,
         session_id: Uuid,
         workspace: &Path,
     ) -> Result<IdempotencyStart, OrchError> {
+        let scope = Self::idempotency_scope(auth);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
-            match self.store.claim_idempotency(tool, request_id, payload_hash) {
+            match self
+                .store
+                .claim_idempotency(&scope, tool, request_id, payload_hash)
+            {
                 Ok(IdempotencyClaim::Perform) => {
                     return Ok(IdempotencyStart::Perform(IdempotencyLease {
                         store: self.store.clone(),
+                        scope: scope.clone(),
                         tool: tool.into(),
                         request_id: request_id.into(),
                         payload_hash: payload_hash.into(),
@@ -1934,7 +1950,7 @@ impl OrchestrationService {
     /// authority is never *inferred* from an id being absent, unrecognized, or
     /// missing from the current credential set. Inferring it that way meant
     /// rotating a credential silently reclassified its history as shared.
-    const HOST_AUTHORED_CLIENT_ID: &'static str = "native-executor";
+    const HOST_AUTHORED_CLIENT_ID: &'static str = super::types::HOST_AUTHORED_CLIENT_ID;
 
     /// The `client_id` this credential stamps on runs it creates.
     ///
@@ -1943,6 +1959,16 @@ impl OrchestrationService {
     /// exists as one function precisely because it is used twice — once when a
     /// run is written and once when a read is authorized — and a drift between
     /// those two would silently either lock everyone out or let everyone in.
+    /// The idempotency namespace this caller's keys live in.
+    ///
+    /// Derived from the same stamped id the run fence compares, so a caller
+    /// that may read a run is exactly the caller whose receipts that run's key
+    /// can reach. Deriving it twice from two different values is how the two
+    /// fences would drift.
+    fn idempotency_scope(auth: &AuthContext) -> IdempotencyScope {
+        IdempotencyScope::for_client_id(&Self::stamped_client_id(auth))
+    }
+
     fn stamped_client_id(auth: &AuthContext) -> String {
         if auth.token_id == "primary" {
             "mcp".into()
@@ -2122,7 +2148,14 @@ impl OrchestrationService {
         }));
         let tool = "ptah_create_session";
         match self
-            .begin_idempotency(tool, &request_id, &payload_hash, Uuid::nil(), &claimed)
+            .begin_idempotency(
+                auth,
+                tool,
+                &request_id,
+                &payload_hash,
+                Uuid::nil(),
+                &claimed,
+            )
             .await?
         {
             IdempotencyStart::Replay(value) => Ok(value),
@@ -2268,6 +2301,7 @@ impl OrchestrationService {
 
     async fn begin_work_mutation(
         &self,
+        auth: &AuthContext,
         tool: &str,
         request_id: &str,
         session_id: Uuid,
@@ -2289,7 +2323,7 @@ impl OrchestrationService {
         };
         let payload_hash = hash_payload(payload);
         let start = self
-            .begin_idempotency(tool, request_id, &payload_hash, session_id, &claimed)
+            .begin_idempotency(auth, tool, request_id, &payload_hash, session_id, &claimed)
             .await?;
         Ok((claimed, start))
     }
@@ -2441,6 +2475,7 @@ impl OrchestrationService {
         });
         let (claimed, start) = self
             .begin_work_mutation(
+                auth,
                 "ptah_create_manager_plan",
                 request_id,
                 session_id,
@@ -2589,6 +2624,7 @@ impl OrchestrationService {
         });
         let (claimed, start) = self
             .begin_work_mutation(
+                auth,
                 "ptah_advance_manager_plan",
                 request_id,
                 session_id,
@@ -2694,6 +2730,7 @@ impl OrchestrationService {
         });
         let (claimed, start) = self
             .begin_work_mutation(
+                auth,
                 "ptah_tick_manager_plan",
                 request_id,
                 session_id,
@@ -2831,7 +2868,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)]
     pub async fn replan_manager_plan(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -2850,6 +2887,7 @@ impl OrchestrationService {
         });
         let (claimed, start) = self
             .begin_work_mutation(
+                auth,
                 "ptah_replan_manager_plan",
                 request_id,
                 session_id,
@@ -2994,7 +3032,7 @@ impl OrchestrationService {
             "policy": policy,
         });
         let (claimed, start) = self
-            .begin_work_mutation(tool, request_id, session_id, workspace, &payload)
+            .begin_work_mutation(auth, tool, request_id, session_id, workspace, &payload)
             .await?;
         let mut lease = match start {
             IdempotencyStart::Replay(response) => return Ok(response),
@@ -3067,7 +3105,7 @@ impl OrchestrationService {
             "agentId": agent_id,
         });
         let (claimed, start) = self
-            .begin_work_mutation(tool, request_id, session_id, workspace, &payload)
+            .begin_work_mutation(auth, tool, request_id, session_id, workspace, &payload)
             .await?;
         let mut lease = match start {
             IdempotencyStart::Replay(response) => return self.restore_claim_response(response),
@@ -3126,7 +3164,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)] // Mirrors the authenticated MCP lease-renewal contract.
     pub async fn renew_work(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -3136,6 +3174,7 @@ impl OrchestrationService {
         lease_ms: Option<u64>,
     ) -> Result<serde_json::Value, OrchError> {
         self.work_lease_mutation(
+            auth,
             "ptah_renew_work",
             request_id,
             session_id,
@@ -3150,6 +3189,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)] // Keeps the shared lease mutation boundary explicit.
     async fn work_lease_mutation<F>(
         &self,
+        auth: &AuthContext,
         tool: &str,
         request_id: &str,
         session_id: Uuid,
@@ -3168,7 +3208,7 @@ impl OrchestrationService {
             "details": details,
         });
         let (claimed, start) = self
-            .begin_work_mutation(tool, request_id, session_id, workspace, &payload)
+            .begin_work_mutation(auth, tool, request_id, session_id, workspace, &payload)
             .await?;
         let mut lease = match start {
             IdempotencyStart::Replay(response) => return Ok(response),
@@ -3219,6 +3259,7 @@ impl OrchestrationService {
         let run = self.authorize_run_request(auth, session_id, workspace, run_id)?;
         let response = self
             .work_lease_mutation(
+                auth,
                 "ptah_link_work_run",
                 request_id,
                 session_id,
@@ -3235,7 +3276,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)] // Mirrors the authenticated MCP progress-report contract.
     pub async fn report_work_progress(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -3260,6 +3301,7 @@ impl OrchestrationService {
         });
         let (claimed, start) = self
             .begin_work_mutation(
+                auth,
                 "ptah_report_work_progress",
                 request_id,
                 session_id,
@@ -3303,7 +3345,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)] // Mirrors the authenticated MCP lease-release contract.
     pub async fn release_work(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -3313,6 +3355,7 @@ impl OrchestrationService {
         reason: String,
     ) -> Result<serde_json::Value, OrchError> {
         self.work_item_attempt_mutation(
+            auth,
             "ptah_release_work",
             request_id,
             session_id,
@@ -3327,7 +3370,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)] // Mirrors the authenticated MCP completion contract.
     pub async fn complete_work(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -3337,6 +3380,7 @@ impl OrchestrationService {
         result: WorkResult,
     ) -> Result<serde_json::Value, OrchError> {
         self.work_item_attempt_mutation(
+            auth,
             "ptah_complete_work",
             request_id,
             session_id,
@@ -3351,7 +3395,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)] // Mirrors the authenticated MCP failure contract.
     pub async fn fail_work(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -3361,6 +3405,7 @@ impl OrchestrationService {
         result: WorkResult,
     ) -> Result<serde_json::Value, OrchError> {
         self.work_item_attempt_mutation(
+            auth,
             "ptah_fail_work",
             request_id,
             session_id,
@@ -3375,6 +3420,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)] // Keeps the shared attempt mutation boundary explicit.
     async fn work_item_attempt_mutation<F>(
         &self,
+        auth: &AuthContext,
         tool: &str,
         request_id: &str,
         session_id: Uuid,
@@ -3393,7 +3439,7 @@ impl OrchestrationService {
             "details": details,
         });
         let (claimed, start) = self
-            .begin_work_mutation(tool, request_id, session_id, workspace, &payload)
+            .begin_work_mutation(auth, tool, request_id, session_id, workspace, &payload)
             .await?;
         let mut lease = match start {
             IdempotencyStart::Replay(response) => return Ok(response),
@@ -3426,7 +3472,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)] // Keeps the authenticated cancellation contract revision-fenced.
     pub async fn cancel_work(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -3443,7 +3489,7 @@ impl OrchestrationService {
             "expectedRevision": expected_revision,
         });
         let (claimed, start) = self
-            .begin_work_mutation(tool, request_id, session_id, workspace, &payload)
+            .begin_work_mutation(auth, tool, request_id, session_id, workspace, &payload)
             .await?;
         let mut lease = match start {
             IdempotencyStart::Replay(response) => return Ok(response),
@@ -3484,7 +3530,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)]
     pub async fn assign_work(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -3493,6 +3539,7 @@ impl OrchestrationService {
         expected_revision: Option<u64>,
     ) -> Result<serde_json::Value, OrchError> {
         self.work_item_mutation(
+            auth,
             "ptah_assign_work",
             request_id,
             session_id,
@@ -3594,6 +3641,7 @@ impl OrchestrationService {
         });
         let (claimed, start) = self
             .begin_work_mutation(
+                auth,
                 "ptah_heartbeat_worker",
                 request_id,
                 session_id,
@@ -3656,6 +3704,7 @@ impl OrchestrationService {
         });
         let (claimed, start) = self
             .begin_work_mutation(
+                auth,
                 "ptah_offer_work",
                 request_id,
                 session_id,
@@ -3796,6 +3845,7 @@ impl OrchestrationService {
         });
         let (claimed, start) = self
             .begin_work_mutation(
+                auth,
                 "ptah_reassign_work",
                 request_id,
                 session_id,
@@ -3868,6 +3918,7 @@ impl OrchestrationService {
         expected_revision: Option<u64>,
     ) -> Result<serde_json::Value, OrchError> {
         self.work_item_mutation(
+            auth,
             "ptah_reprioritize_work",
             request_id,
             session_id,
@@ -3902,6 +3953,7 @@ impl OrchestrationService {
         expected_revision: Option<u64>,
     ) -> Result<serde_json::Value, OrchError> {
         self.work_item_mutation(
+            auth,
             "ptah_block_work",
             request_id,
             session_id,
@@ -3935,6 +3987,7 @@ impl OrchestrationService {
         expected_revision: Option<u64>,
     ) -> Result<serde_json::Value, OrchError> {
         self.work_item_mutation(
+            auth,
             "ptah_request_review",
             request_id,
             session_id,
@@ -3998,6 +4051,7 @@ impl OrchestrationService {
         });
         let (claimed, start) = self
             .begin_work_mutation(
+                auth,
                 "ptah_send_message",
                 request_id,
                 session_id,
@@ -4085,6 +4139,7 @@ impl OrchestrationService {
         });
         let (claimed, start) = self
             .begin_work_mutation(
+                auth,
                 "ptah_ack_message",
                 request_id,
                 session_id,
@@ -4170,7 +4225,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)]
     pub async fn retry_work(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -4179,6 +4234,7 @@ impl OrchestrationService {
         expected_revision: Option<u64>,
     ) -> Result<serde_json::Value, OrchError> {
         self.work_item_mutation(
+            auth,
             "ptah_retry_work",
             request_id,
             session_id,
@@ -4205,6 +4261,7 @@ impl OrchestrationService {
         expected_revision: Option<u64>,
     ) -> Result<serde_json::Value, OrchError> {
         self.work_item_attempt_mutation(
+            auth,
             "ptah_approve_work",
             request_id,
             session_id,
@@ -4350,7 +4407,7 @@ impl OrchestrationService {
             "retry": retry,
         });
         let (claimed, start) = self
-            .begin_work_mutation(tool, request_id, session_id, workspace, &payload)
+            .begin_work_mutation(auth, tool, request_id, session_id, workspace, &payload)
             .await?;
         let mut lease = match start {
             IdempotencyStart::Replay(response) => return Ok(response),
@@ -4461,7 +4518,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)]
     pub async fn set_routine_lifecycle(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -4478,7 +4535,7 @@ impl OrchestrationService {
             "expectedRevision": expected_revision,
         });
         let (claimed, start) = self
-            .begin_work_mutation(tool, request_id, session_id, workspace, &payload)
+            .begin_work_mutation(auth, tool, request_id, session_id, workspace, &payload)
             .await?;
         let mut lease = match start {
             IdempotencyStart::Replay(response) => return Ok(response),
@@ -4542,6 +4599,7 @@ impl OrchestrationService {
         });
         let (claimed, start) = self
             .begin_work_mutation(
+                auth,
                 tool,
                 request_id,
                 session_id,
@@ -4601,6 +4659,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)]
     async fn work_item_mutation<F>(
         &self,
+        auth: &AuthContext,
         tool: &str,
         request_id: &str,
         session_id: Uuid,
@@ -4619,7 +4678,7 @@ impl OrchestrationService {
             "details": details,
         });
         let (claimed, start) = self
-            .begin_work_mutation(tool, request_id, session_id, workspace, &payload)
+            .begin_work_mutation(auth, tool, request_id, session_id, workspace, &payload)
             .await?;
         let mut lease = match start {
             IdempotencyStart::Replay(response) => return Ok(response),
@@ -4688,7 +4747,7 @@ impl OrchestrationService {
             },
         });
         let (claimed, start) = self
-            .begin_work_mutation(tool, request_id, session_id, workspace, &payload)
+            .begin_work_mutation(auth, tool, request_id, session_id, workspace, &payload)
             .await?;
         let mut lease = match start {
             IdempotencyStart::Replay(response) => return Ok(response),
@@ -4958,6 +5017,7 @@ impl OrchestrationService {
         });
         let (claimed, start) = self
             .begin_work_mutation(
+                auth,
                 "ptah_authorize_work_execution",
                 request_id,
                 session_id,
@@ -5308,24 +5368,28 @@ impl OrchestrationService {
         limit: usize,
     ) -> Result<serde_json::Value, OrchError> {
         let run = self.authorize_run_request(auth, session_id, workspace, run_id)?;
+        let scope = Self::idempotency_scope(auth);
         let cursor = match after.as_deref().filter(|value| !value.is_empty()) {
             None => None,
             Some(raw) => {
                 // A cursor this host did not issue is a malformed request, not
                 // a silent restart from the beginning: restarting would hand
-                // the caller a page it has already seen and call it new.
-                let (millis, request_id) = raw.split_once(':').ok_or_else(|| {
+                // the caller a page it has already seen and call it new. The
+                // cursor is authenticated and bound to this scope and run, so
+                // "did not issue" is now checked rather than assumed from
+                // shape — and every rejection reason gives the same answer.
+                let decoded = self
+                    .store
+                    .parse_receipt_cursor(&scope, &run.run_id, raw)
+                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+                Some(decoded.ok_or_else(|| {
                     OrchError::new(OrchErrorCode::InvalidRequest, "malformed receipt cursor")
-                })?;
-                let millis: i64 = millis.parse().map_err(|_| {
-                    OrchError::new(OrchErrorCode::InvalidRequest, "malformed receipt cursor")
-                })?;
-                Some((millis, request_id.to_string()))
+                })?)
             }
         };
         let (receipts, has_more) = self
             .store
-            .list_idempotency_for_run(&run.run_id, cursor, limit)
+            .list_idempotency_for_run(&scope, &run.run_id, cursor, limit)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
 
         let mut items = Vec::with_capacity(receipts.len());
@@ -5349,13 +5413,19 @@ impl OrchestrationService {
                 recorded_at: receipt.created_at,
             });
         }
-        let next_cursor = has_more.then(|| items.last()).flatten().map(|last| {
-            format!(
-                "{}:{}",
-                last.recorded_at.timestamp_millis(),
-                last.request_id
-            )
-        });
+        let next_cursor = match has_more.then(|| items.last()).flatten() {
+            None => None,
+            Some(last) => Some(
+                self.store
+                    .receipt_cursor(
+                        &scope,
+                        &run.run_id,
+                        last.recorded_at.timestamp_millis(),
+                        &last.request_id,
+                    )
+                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+            ),
+        };
 
         Ok(json!({
             "items": items,
@@ -5922,6 +5992,7 @@ impl OrchestrationService {
 
     async fn begin_queue_mutation(
         &self,
+        auth: &AuthContext,
         tool: &str,
         request_id: &str,
         session_id: Uuid,
@@ -5943,7 +6014,7 @@ impl OrchestrationService {
         };
         let payload_hash = hash_payload(payload);
         let start = match self
-            .begin_idempotency(tool, request_id, &payload_hash, session_id, &claimed)
+            .begin_idempotency(auth, tool, request_id, &payload_hash, session_id, &claimed)
             .await
         {
             Ok(start) => start,
@@ -6030,7 +6101,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)]
     pub async fn edit_queue(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -6057,7 +6128,7 @@ impl OrchestrationService {
             "text": text,
         });
         let (claimed, start) = self
-            .begin_queue_mutation(tool, request_id, session_id, workspace, &payload)
+            .begin_queue_mutation(auth, tool, request_id, session_id, workspace, &payload)
             .await?;
         let mut lease = match start {
             IdempotencyStart::Replay(value) => return Ok(value),
@@ -6106,7 +6177,7 @@ impl OrchestrationService {
 
     pub async fn remove_queue(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -6121,7 +6192,7 @@ impl OrchestrationService {
             "expectedVersion": expected_version,
         });
         let (claimed, start) = self
-            .begin_queue_mutation(tool, request_id, session_id, workspace, &payload)
+            .begin_queue_mutation(auth, tool, request_id, session_id, workspace, &payload)
             .await?;
         let mut lease = match start {
             IdempotencyStart::Replay(value) => return Ok(value),
@@ -6170,7 +6241,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)]
     pub async fn reorder_queue(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -6190,7 +6261,7 @@ impl OrchestrationService {
             "expectedRevision": expected_revision,
         });
         let (claimed, start) = self
-            .begin_queue_mutation(tool, request_id, session_id, workspace, &payload)
+            .begin_queue_mutation(auth, tool, request_id, session_id, workspace, &payload)
             .await?;
         let mut lease = match start {
             IdempotencyStart::Replay(value) => return Ok(value),
@@ -6244,7 +6315,7 @@ impl OrchestrationService {
 
     pub async fn clear_queue(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -6255,7 +6326,7 @@ impl OrchestrationService {
             "workspace": workspace.display().to_string(),
         });
         let (claimed, start) = self
-            .begin_queue_mutation(tool, request_id, session_id, workspace, &payload)
+            .begin_queue_mutation(auth, tool, request_id, session_id, workspace, &payload)
             .await?;
         let mut lease = match start {
             IdempotencyStart::Replay(value) => return Ok(value),
@@ -6360,7 +6431,7 @@ impl OrchestrationService {
 
     pub async fn run_next_queue(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -6376,7 +6447,7 @@ impl OrchestrationService {
             "expectedVersion": expected_version,
         });
         let (claimed, start) = self
-            .begin_queue_mutation(tool, request_id, session_id, workspace, &payload)
+            .begin_queue_mutation(auth, tool, request_id, session_id, workspace, &payload)
             .await?;
         let mut lease = match start {
             IdempotencyStart::Replay(value) => return Ok(value),
@@ -6430,7 +6501,7 @@ impl OrchestrationService {
 
     pub async fn steer_queued(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -6446,7 +6517,7 @@ impl OrchestrationService {
             "expectedVersion": expected_version,
         });
         let (claimed, start) = self
-            .begin_queue_mutation(tool, request_id, session_id, workspace, &payload)
+            .begin_queue_mutation(auth, tool, request_id, session_id, workspace, &payload)
             .await?;
         let mut lease = match start {
             IdempotencyStart::Replay(value) => return Ok(value),
@@ -6607,6 +6678,7 @@ impl OrchestrationService {
         };
         let mut lease = match self
             .begin_idempotency(
+                auth,
                 tool,
                 request_id,
                 &phash,
@@ -6736,6 +6808,7 @@ impl OrchestrationService {
         let run = self.authorize_run_request(auth, session_id, workspace, run_id)?;
         let mut lease = match self
             .begin_idempotency(
+                auth,
                 tool,
                 request_id,
                 &phash,
@@ -6793,6 +6866,7 @@ impl OrchestrationService {
         }
         let mut lease = match self
             .begin_idempotency(
+                auth,
                 tool,
                 request_id,
                 &phash,
@@ -6981,7 +7055,7 @@ impl OrchestrationService {
         };
 
         let mut lease = match self
-            .begin_idempotency(tool, request_id, &phash, session_id, &claimed)
+            .begin_idempotency(auth, tool, request_id, &phash, session_id, &claimed)
             .await?
         {
             IdempotencyStart::Replay(value) => return Ok(value),
@@ -7661,7 +7735,7 @@ impl OrchestrationService {
         };
 
         let mut lease = match self
-            .begin_idempotency(tool, request_id, &phash, session_id, &claimed)
+            .begin_idempotency(auth, tool, request_id, &phash, session_id, &claimed)
             .await?
         {
             IdempotencyStart::Replay(value) => return Ok(value),
@@ -7760,7 +7834,7 @@ impl OrchestrationService {
         };
 
         let mut lease = match self
-            .begin_idempotency(tool, request_id, &phash, session_id, &claimed)
+            .begin_idempotency(auth, tool, request_id, &phash, session_id, &claimed)
             .await?
         {
             IdempotencyStart::Replay(value) => return Ok(value),
@@ -7900,7 +7974,7 @@ impl OrchestrationService {
         }
 
         let mut lease = match self
-            .begin_idempotency(tool, request_id, &phash, session_id, &claimed)
+            .begin_idempotency(auth, tool, request_id, &phash, session_id, &claimed)
             .await?
         {
             IdempotencyStart::Replay(value) => return Ok(value),

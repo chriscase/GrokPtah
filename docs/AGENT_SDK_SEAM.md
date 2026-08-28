@@ -356,6 +356,11 @@ older consumer.
 * Every mutation carries a `RequestId`. Same key + same payload replays the
   original receipt with `replayed: true`; same key + different payload is
   `conflict`. This mirrors the runtime's durable idempotency receipts.
+* A key names a request **only within the principal that chose it**. The value
+  is caller-chosen, so the host scopes receipt identity and lookup to the
+  authenticated principal: another caller's key looks unused, never replayed
+  and never `conflict`. The wire value is unchanged — only storage and reach
+  are scoped.
 * Every mutation receipt reports the `Revision` it produced. Chain from the
   receipt rather than re-reading — a re-read can observe someone else's newer
   mutation and land you back where you started.
@@ -366,8 +371,11 @@ older consumer.
   so publish order (`seq`) and commit order (`revision`) can differ; without the
   watermark a late-delivered older snapshot silently regresses a consumer's
   view. A non-advancing snapshot is `stale_observation`, not a silent no-op.
-* `Cursor` is opaque. A consumer stores and echoes it, never does arithmetic on
-  it, so a host may change its cursor encoding without a contract break. A
+* `Cursor` is opaque, and a host is expected to enforce that rather than ask
+  for it: the runtime authenticates the receipt cursors it issues and binds
+  them to the principal and run they were issued for. A consumer stores and
+  echoes a cursor, never does arithmetic on it, so a host may change its
+  encoding without a contract break. A
   cursor below the retained window is `cursor_expired` **carrying the retained
   range**, so recovery needs no second round trip.
 
@@ -661,10 +669,10 @@ check. When the host tool lands, the adapter change is one method body.
 
 | Piece | Where |
 |---|---|
-| `IdempotencyReceipt { request_id, payload_hash, run_id, tool, response, error, created_at, status }` | `orchestration/types.rs` |
-| Storage: one JSON file per receipt | `<GROKPTAH_HOME>/…/idempotency/*.json` |
+| `IdempotencyReceipt { request_id, scope, payload_hash, run_id, tool, response, error, created_at, status }` | `orchestration/types.rs` |
+| Storage: one JSON file per receipt, named `<scope>-<request_id>.json` | `<GROKPTAH_HOME>/…/idempotency/*.json` |
 | Retention: newest 1,000 settled, expire at 7 days; pending and unknown preserved; receipts on a live run retained | `orchestration/store.rs`, `RetentionPolicy` |
-| Existing reads (no listing) | `load_idempotency(request_id)` only |
+| Reads | `load_idempotency(scope, request_id)`, `list_idempotency_for_run(scope, run_id, …)` |
 | Writers, to stay private | `save_idempotency`, `claim_idempotency`, `complete_idempotency`, `fail_idempotency`, `finish_idempotency` |
 | The scope gate to reuse verbatim | `OrchestrationService::authorize_run_request` |
 
@@ -747,12 +755,16 @@ pub fn list_receipts_scoped(
 ) -> Result<serde_json::Value, OrchError>
 ```
 
-Call `self.authorize_run_request(session_id, workspace, run_id)?` **first**, so
-every denial matches every other run read. Parse `after` as `"<millis>:<request_id>"`
-and reject a malformed cursor with `invalid_request`. Project, then return:
+Call `self.authorize_run_request(auth, session_id, workspace, run_id)?`
+**first**, so every denial matches every other run read. Decode `after` with
+`OrchStore::parse_receipt_cursor`, which authenticates the cursor against the
+per-home secret and the scope and run it was issued for; anything it does not
+accept is `invalid_request`. Mint `nextCursor` with `OrchStore::receipt_cursor`
+— never by formatting the pair, or the value stops being opaque and starts
+being forgeable. Project, then return:
 
 ```json
-{ "receipts": [ … ], "nextCursor": "1767225601500:req-0001",
+{ "receipts": [ … ], "nextCursor": "<opaque, host-issued>",
   "retention": { "maxReceipts": 1000, "maxAgeDays": 7 } }
 ```
 
@@ -788,7 +800,9 @@ Mirror the shapes already proven against the fake in this crate
 * a receipt whose response and error message contain a known secret and an
   absolute path projects without either;
 * a settled receipt beyond `max_receipts` is gone while a pending one survives;
-* a malformed cursor is `invalid_request`, not a silent restart.
+* a malformed cursor is `invalid_request`, not a silent restart;
+* a *well-formed* cursor this host did not issue — including one issued for
+  another run or another principal — is refused identically.
 
 ### Then, on the SDK side — one method body
 

@@ -1228,10 +1228,79 @@ fn validate_bounded_string(value: &str, max_bytes: usize, field: &str) -> Result
     Ok(())
 }
 
+/// The namespace an idempotency key lives in.
+///
+/// `request_id` is chosen by the caller, so it cannot be an identity on its
+/// own: two principals may pick the same string, and before this type existed
+/// they shared one global namespace. That gave the second caller three things
+/// it should never have had — the first caller's stored response on a matching
+/// payload hash, a `conflict` that confirmed the key was taken on a differing
+/// one, and the ability to squat a key before its owner used it.
+///
+/// Identity is therefore `(scope, request_id)`. The wire value is untouched:
+/// callers still send, and receipts still report, exactly the `request_id`
+/// they chose. Only where the receipt is stored, and which receipts a lookup
+/// can reach, are scoped.
+///
+/// The scope is derived from the **same** value the run fence compares —
+/// `OrchestrationService::stamped_client_id` — so run ownership and receipt
+/// ownership cannot drift apart. The tenant
+/// boundary is structural: a store root belongs to one account, and every
+/// `AuthContext` this service issues carries that account's `owner_id`, so
+/// hashing the owner in as well would separate nothing the directory does not
+/// already separate while giving the two fences different keys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdempotencyScope(String);
+
+impl IdempotencyScope {
+    /// Width of the on-disk prefix. Fixed, so a stored name parses by position.
+    pub(crate) const WIDTH: usize = 16;
+
+    /// The scope of work this host authored for itself (the native executor,
+    /// managed intents, in-process resume). Named, never inferred from absence.
+    pub fn host() -> Self {
+        Self::for_client_id(HOST_AUTHORED_CLIENT_ID)
+    }
+
+    /// The scope of a caller stamped with `client_id`.
+    pub fn for_client_id(client_id: &str) -> Self {
+        use sha2::{Digest, Sha256};
+        let digest = hex_sha256(&Sha256::digest(client_id.as_bytes()));
+        Self(digest[..Self::WIDTH].to_string())
+    }
+
+    /// Re-wrap a scope value read back from a stored receipt.
+    ///
+    /// `pub(crate)` on purpose: nothing outside this crate should be able to
+    /// name a scope it was not issued, and no caller input reaches here.
+    pub(crate) fn from_stored(value: &str) -> Self {
+        Self(value.to_string())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The single identity this host authors work under.
+///
+/// Declared here because both the run fence and the idempotency scope depend
+/// on it, and a second definition is how the two would drift.
+pub const HOST_AUTHORED_CLIENT_ID: &str = "native-executor";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IdempotencyReceipt {
     pub request_id: String,
+    /// The scope this receipt was claimed in.
+    ///
+    /// `None` marks a receipt written before scoping existed. Such a receipt
+    /// cannot be attributed to any principal, so — exactly as with a run whose
+    /// `client_id` is absent — it is served to none and ages out under the
+    /// existing retention policy. The one visible consequence is that a retry
+    /// spanning the upgrade is treated as a new request rather than replayed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
     pub payload_hash: String,
     pub run_id: Option<String>,
     pub tool: String,
@@ -1392,6 +1461,88 @@ pub fn safe_id_filename(id: &str) -> Result<String, OrchError> {
     }
     use sha2::{Digest, Sha256};
     Ok(hex_sha256(&Sha256::digest(id.as_bytes())))
+}
+
+/// Lowercase hex for arbitrary bytes.
+///
+/// Same alphabet as [`hex_sha256`], but that one takes a digest and this one
+/// takes a payload; keeping them separate stops a digest being hexed twice.
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
+    hex_sha256(bytes)
+}
+
+/// Decode lowercase hex. `None` for anything that is not exactly that.
+///
+/// Strict about case on purpose. An opaque token should have exactly one
+/// representation: accepting uppercase would make two different strings decode
+/// to the same cursor, and a token that is malleable in any way invites being
+/// treated as one that can be edited.
+pub(crate) fn hex_decode(text: &str) -> Option<Vec<u8>> {
+    fn nibble(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            _ => None,
+        }
+    }
+    if text.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(text.len() / 2);
+    for pair in text.as_bytes().chunks(2) {
+        out.push(nibble(pair[0])? * 16 + nibble(pair[1])?);
+    }
+    Some(out)
+}
+
+/// HMAC-SHA256, hex encoded.
+///
+/// Written out rather than pulled in: the bridge already depends on `sha2` and
+/// nothing else here needs a MAC, so this avoids a dependency and a lockfile
+/// change for thirty lines of a fully specified construction (RFC 2104).
+pub(crate) fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    const BLOCK: usize = 64;
+
+    let mut block = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        let digest = Sha256::digest(key);
+        block[..digest.len()].copy_from_slice(&digest);
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+
+    let mut inner_pad = [0x36u8; BLOCK];
+    let mut outer_pad = [0x5cu8; BLOCK];
+    for index in 0..BLOCK {
+        inner_pad[index] ^= block[index];
+        outer_pad[index] ^= block[index];
+    }
+
+    let mut inner = Sha256::new();
+    inner.update(inner_pad);
+    inner.update(message);
+    let inner = inner.finalize();
+
+    let mut outer = Sha256::new();
+    outer.update(outer_pad);
+    outer.update(inner);
+    hex_sha256(&outer.finalize())
+}
+
+/// Compare two byte strings without leaking where they first differ.
+///
+/// A cursor tag is compared against one the host computed; a short-circuiting
+/// `==` would let a caller recover the tag a byte at a time.
+pub(crate) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut difference = 0u8;
+    for (a, b) in left.iter().zip(right.iter()) {
+        difference |= a ^ b;
+    }
+    difference == 0
 }
 
 pub(crate) fn hex_sha256(bytes: &[u8]) -> String {
