@@ -74,18 +74,44 @@ export type DurableRunStopCause =
 /// replaces it.
 export type RunStopDetailKind = "identical_calls" | "true_noop" | "inert_repeat";
 
+/** Closed, host-resolved tool identity.
+ *
+ * Never a model-supplied string. The host resolves the tool name against its
+ * own tool set before anything is persisted; anything it does not recognise —
+ * an MCP tool, a renamed tool, hostile input — arrives as `"unresolved"`, and
+ * the original text is not retained anywhere.
+ */
+export type RunStopTool =
+  | "apply_patch"
+  | "glob_files"
+  | "grep"
+  | "kill_task"
+  | "list_dir"
+  | "memory_read"
+  | "memory_write"
+  | "read_file"
+  | "run_terminal_cmd"
+  | "spawn_explore"
+  | "spawn_general_purpose"
+  | "task_output"
+  | "todo_write"
+  | "web_fetch"
+  | "write_file"
+  | "write_files"
+  | "unresolved";
+
 /** Structured qualifier for a host-decided stationarity stop.
  *
- * Counters, an enum and a bounded tool name only — no prompt, model response,
- * tool arguments, path or payload. Present only when `stopCause` is
+ * Counters, an enum and a closed tool identity only — no prompt, model
+ * response, tool arguments, path or payload. Present only when `stopCause` is
  * `"stationarity"`.
  */
 export interface RunStopDetail {
   kind: RunStopDetailKind;
   /** Consecutive repeats observed when the stop fired. Always > 0. */
   repeats: number;
-  /** Bounded tool name only. Never arguments. */
-  tool?: string | null;
+  /** Host-resolved identity. Never a model-supplied string. */
+  tool?: RunStopTool | null;
 }
 
 /** Wire version of the redacted progress/status projection.
@@ -95,12 +121,53 @@ export interface RunStopDetail {
  */
 export const PROGRESS_PROJECTION_SCHEMA_VERSION = 2;
 
+/** The historical v1 progress projection, retained so consumers can describe
+ * both shapes rather than only the current one.
+ *
+ * v1 echoed the user's own prompt and had no stop detail. It is not produced by
+ * this host any more; it exists here so a reader can narrow on `schemaVersion`
+ * and handle a v1 payload from an older peer without guessing.
+ */
+export interface RunProgressProjectionV1 {
+  schemaVersion?: 1;
+  runId: string;
+  sessionId: string;
+  state: DurableRunState;
+  promptPreview: string;
+  stopCause?: DurableRunStopCause | null;
+  bounds: {
+    maxPromptBytes: number;
+    maxRounds: number;
+    maxDurationMs: number;
+    maxTotalTokens?: number | null;
+  };
+}
+
+/** Either wire shape, discriminated by `schemaVersion`. */
+export type AnyRunProgressProjection =
+  | RunProgressProjectionV1
+  | RunProgressProjection;
+
+/** Narrow a projection of unknown vintage.
+ *
+ * v1 payloads either omit `schemaVersion` or carry 1; anything from 2 up is the
+ * redacted shape. A v1 payload is never treated as redacted, so a consumer
+ * cannot accidentally read `promptPreview` off a shape that does not carry it,
+ * or assume redaction it did not get.
+ */
+export function isRedactedProgressProjection(
+  value: AnyRunProgressProjection,
+): value is RunProgressProjection {
+  return (value.schemaVersion ?? 1) >= PROGRESS_PROJECTION_SCHEMA_VERSION;
+}
+
 /** Redacted lifecycle/status projection returned by `ptah_get_progress`.
  *
  * Deliberately carries no user or model content. Consumers needing the prompt
  * preview read the full record via `ptah_get_run` / `ptah_list_runs`.
  */
 export interface RunProgressProjection {
+  /** 1 = historical (carried `promptPreview`, no stop detail); 2 = current. */
   schemaVersion: number;
   runId: string;
   sessionId: string;

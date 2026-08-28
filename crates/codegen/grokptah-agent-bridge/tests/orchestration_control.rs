@@ -2679,10 +2679,31 @@ async fn the_progress_projection_is_redacted_and_reports_the_stop_detail() {
     assert_eq!(progress["stopCause"], "stationarity");
     assert_eq!(progress["stopDetail"]["kind"], "inert_repeat");
     assert_eq!(progress["stopDetail"]["repeats"], 4);
-    assert_eq!(progress["stopDetail"]["tool"], "get_task_output");
+    // The detail was built from the dispatch alias, but the projection carries
+    // the host-resolved identity: model-supplied spelling never reaches the
+    // wire, and both aliases converge on one label.
+    assert_eq!(progress["stopDetail"]["tool"], "task_output");
     // Lifecycle and bounds remain readable.
     assert!(progress.get("state").is_some());
     assert!(progress["bounds"]["maxRounds"].is_number());
+
+    // A hostile tool name is resolved away before it can be projected.
+    orch.store()
+        .update_run(&run_id, |run| {
+            run.stop_cause = Some(RunStopCause::Stationarity);
+            run.stop_detail = Some(
+                RunStopDetail::new(RunStopDetailKind::IdenticalCalls, 9)
+                    .with_tool("mcp__evil__leak\nAUTHORIZATION: Bearer sk-live-abc"),
+            );
+            Ok(())
+        })
+        .unwrap();
+    let hostile = orch.get_progress(&auth, &run_id).unwrap();
+    assert_eq!(hostile["stopDetail"]["tool"], "unresolved");
+    let hostile_raw = serde_json::to_string(&hostile).unwrap();
+    for leak in ["mcp__", "Bearer", "sk-live", "AUTHORIZATION"] {
+        assert!(!hostile_raw.contains(leak), "projection leaked {leak}");
+    }
 
     orch.cancel(
         &auth,

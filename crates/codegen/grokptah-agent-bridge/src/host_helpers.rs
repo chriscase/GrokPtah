@@ -575,7 +575,16 @@ pub(crate) fn is_true_noop_tool_step(tool_calls: &[AgentToolCall]) -> bool {
 pub(crate) fn tool_step_signature(tool_calls: &[AgentToolCall]) -> String {
     tool_calls
         .iter()
-        .map(|tool_call| format!("{}\u{1f}{}", tool_call.name, tool_call.arguments))
+        .map(|tool_call| {
+            // Canonical name, so alternating `task_output` and
+            // `get_task_output` produces one signature run rather than two
+            // that each reset the counter and never accumulate.
+            format!(
+                "{}\u{1f}{}",
+                canonical_tool_name(&tool_call.name),
+                tool_call.arguments
+            )
+        })
         .collect::<Vec<_>>()
         .join("\u{1e}")
 }
@@ -618,29 +627,94 @@ pub(crate) fn action_inert_repeat_stop_message(run_len: u32, tool_name: &str) ->
     )
 }
 
-/// Tools whose whole purpose is to observe work owned by something else.
+/// Canonical name for a wait/status call.
 ///
-/// A poll against a background task legitimately returns the same thing many
-/// times while that task runs. Treating an unchanged answer as evidence of a
-/// stuck model is a category error: the model is not deciding when this ends,
-/// the task's own completion or the run's deadline is. Steps using these tools
-/// are therefore exempt from the inert heuristic and remain governed by the
-/// pre-existing identical-call ceiling, the round budget, and the duration
-/// budget — the authority that already bounded them before any of this existed.
-///
-/// Deliberately a short, explicit allowlist rather than a name pattern, so a
-/// tool cannot drift into the exemption by being renamed.
-const WITNESSED_WAIT_TOOLS: &[&str] = &["task_output"];
+/// The dispatcher accepts both `task_output` and `get_task_output`. Leaving the
+/// alias unnormalized meant the two produced different call signatures, so a
+/// model alternating them never accumulated a stationarity run at all, while
+/// only one of them was eligible for the wait exemption. Normalizing before the
+/// signature, the dispatch and the witness closes both halves of that.
+pub(crate) fn canonical_tool_name(name: &str) -> &str {
+    match name {
+        "get_task_output" => "task_output",
+        other => other,
+    }
+}
 
-/// Whether a round is a witnessed wait rather than an action.
+/// Whether a call is *shaped* like a wait. Not sufficient for the exemption:
+/// the host still has to witness an authorized, active task behind it.
+pub(crate) fn is_wait_shaped_call(call: &AgentToolCall) -> bool {
+    canonical_tool_name(&call.name) == "task_output"
+}
+
+/// Typed active state of a task the host is willing to witness.
 ///
-/// Requires the round to consist solely of witnessed-wait calls: a batch that
-/// mixes a poll with real work is not a wait and must not borrow the exemption.
-pub(crate) fn is_witnessed_wait_step(tool_calls: &[AgentToolCall]) -> bool {
+/// Only states in which work is genuinely outstanding. Completed, failed,
+/// cancelled and rejected tasks are absent by construction: there is nothing
+/// left to wait for, so a poll against one is an ordinary repeated call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ActiveWaitState {
+    Queued,
+    Running,
+}
+
+impl ActiveWaitState {
+    /// Map a host task status onto an active state, or `None` when the task is
+    /// not outstanding. Exact matches only.
+    pub(crate) fn from_status(status: &str) -> Option<Self> {
+        match status {
+            "running" => Some(Self::Running),
+            "accepted" | "proposed" => Some(Self::Queued),
+            _ => None,
+        }
+    }
+}
+
+/// Host-issued evidence that a wait call named real, authorized, outstanding
+/// work.
+///
+/// Issued by the dispatcher, which is the only place that can see the task
+/// registry. The model supplies an id; everything in here is the host's answer
+/// about that id, so a wait cannot be asserted into existence by naming one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ActiveTaskWaitWitness {
+    /// The exact id the host authorized, not the id the model asked for.
+    pub(crate) task_id: String,
+    pub(crate) state: ActiveWaitState,
+    /// Session that owns the task. A poll against another session's work is
+    /// not this run's wait.
+    pub(crate) owner_session: Uuid,
+    /// Host-assigned generation for this id. A recycled id gets a new
+    /// generation, so a witness cannot be carried across identities.
+    pub(crate) generation: u64,
+    /// Absolute deadline, in run-relative milliseconds, past which the wait is
+    /// no longer witnessed and the ordinary gates resume.
+    pub(crate) deadline_ms: u64,
+}
+
+/// Longest a single wait is witnessed before the ordinary stationarity gates
+/// resume. Bounded so an abandoned task cannot confer an unlimited exemption.
+pub(crate) const WITNESSED_WAIT_DEADLINE_MS: u64 = 10 * 60 * 1000;
+
+/// Whether a round earns the wait exemption.
+///
+/// Every call in the round must be wait-shaped *and* carry a witness, all
+/// witnesses must belong to the current session, and none may be past its
+/// deadline. A round mixing a poll with real work, naming an unknown or
+/// finished task, or reaching for another session's task fails all of these and
+/// is treated as an ordinary round.
+pub(crate) fn round_is_witnessed_wait(
+    tool_calls: &[AgentToolCall],
+    witnesses: &[ActiveTaskWaitWitness],
+    session_id: Uuid,
+    elapsed_ms: u64,
+) -> bool {
     !tool_calls.is_empty()
-        && tool_calls
+        && witnesses.len() == tool_calls.len()
+        && tool_calls.iter().all(is_wait_shaped_call)
+        && witnesses
             .iter()
-            .all(|call| WITNESSED_WAIT_TOOLS.contains(&call.name.as_str()))
+            .all(|witness| witness.owner_session == session_id && elapsed_ms < witness.deadline_ms)
 }
 
 /// In-process fingerprint of a round's observations.
@@ -4529,14 +4603,31 @@ test result: FAILED. 0 passed; 3 failed; 0 ignored
         tool_call("task_output", &format!("{{\"id\":\"{id}\"}}"))
     }
 
-    /// Drive one witnessed-wait round the way the turn loop does.
-    fn wait_round(run: &mut IdenticalToolCallRun, calls: &[AgentToolCall], observed: &str) {
+    fn witness(id: &str, session: Uuid, deadline_ms: u64) -> ActiveTaskWaitWitness {
+        ActiveTaskWaitWitness {
+            task_id: id.into(),
+            state: ActiveWaitState::Running,
+            owner_session: session,
+            generation: 1,
+            deadline_ms,
+        }
+    }
+
+    /// Drive one round the way the turn loop does, with host-issued witnesses.
+    fn wait_round(
+        run: &mut IdenticalToolCallRun,
+        calls: &[AgentToolCall],
+        witnesses: &[ActiveTaskWaitWitness],
+        session: Uuid,
+        elapsed_ms: u64,
+        observed: &str,
+    ) {
         run.observe(&tool_step_signature(calls), &calls[0].name, false);
         let messages = vec![
             serde_json::json!({"role": "assistant", "content": ""}),
             tool_msg(observed),
         ];
-        if is_witnessed_wait_step(calls) {
+        if round_is_witnessed_wait(calls, witnesses, session, elapsed_ms) {
             run.observe_witnessed_wait();
         } else if let Some(digest) = round_observation_digest(&messages) {
             run.observe_outcome(digest);
@@ -4567,33 +4658,186 @@ test result: FAILED. 0 passed; 3 failed; 0 ignored
 
     #[test]
     fn a_long_unchanged_witnessed_wait_survives_past_the_inert_ceiling() {
-        // A poll against work owned by something else returns the same answer
-        // for as long as that work runs. The deadline that owns it decides when
-        // it ends, so the inert heuristic must not.
+        // A poll against work the host vouches for returns the same answer for
+        // as long as that work runs. The deadline that owns it decides when it
+        // ends, so the inert heuristic must not.
+        let session = Uuid::new_v4();
         let mut run = IdenticalToolCallRun::default();
         let calls = [wait_call("task-1")];
+        let witnesses = [witness("task-1", session, WITNESSED_WAIT_DEADLINE_MS)];
         for step in 0..(MAX_CONSECUTIVE_INERT_REPEATS * 3) {
-            wait_round(&mut run, &calls, "status: running");
+            wait_round(
+                &mut run,
+                &calls,
+                &witnesses,
+                session,
+                1_000,
+                "status: running",
+            );
             assert!(
                 run.inert_stop_info().is_none(),
                 "witnessed wait was called inert at step {step}"
             );
         }
-        // Still governed by the pre-existing ceiling, which this does not move.
         assert!(run.run_len() >= MAX_CONSECUTIVE_INERT_REPEATS * 3);
     }
 
     #[test]
-    fn a_wait_batched_with_real_work_does_not_borrow_the_exemption() {
-        // Only a round consisting solely of wait calls is a wait.
-        assert!(is_witnessed_wait_step(&[wait_call("a")]));
-        assert!(is_witnessed_wait_step(&[wait_call("a"), wait_call("b")]));
-        assert!(!is_witnessed_wait_step(&[
-            wait_call("a"),
-            tool_call("run_terminal_cmd", r#"{"command":"make"}"#),
-        ]));
-        assert!(!is_witnessed_wait_step(&[]));
-        assert!(!is_witnessed_wait_step(&[tool_call("read_file", "{}")]));
+    fn an_unwitnessed_wait_is_ordinary_work() {
+        // The whole point: the *name* buys nothing. Without a host witness —
+        // unknown id, finished task, no id at all — the round is ordinary and
+        // an unchanging result still stops it.
+        let session = Uuid::new_v4();
+        let mut run = IdenticalToolCallRun::default();
+        let calls = [wait_call("ghost")];
+        for _ in 0..MAX_CONSECUTIVE_INERT_REPEATS {
+            wait_round(
+                &mut run,
+                &calls,
+                &[],
+                session,
+                0,
+                "ERROR: unknown task/subagent id ghost",
+            );
+        }
+        assert!(
+            run.inert_stop_info().is_some(),
+            "an unwitnessed poll must not borrow the exemption"
+        );
+    }
+
+    #[test]
+    fn a_round_only_earns_the_exemption_when_the_host_vouches_for_every_call() {
+        let session = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let now = 1_000;
+        let deadline = WITNESSED_WAIT_DEADLINE_MS;
+
+        // Fully witnessed.
+        assert!(round_is_witnessed_wait(
+            &[wait_call("a")],
+            &[witness("a", session, deadline)],
+            session,
+            now
+        ));
+
+        // Empty round.
+        assert!(!round_is_witnessed_wait(&[], &[], session, now));
+
+        // No witness at all: unknown, completed, failed or malformed.
+        assert!(!round_is_witnessed_wait(
+            &[wait_call("a")],
+            &[],
+            session,
+            now
+        ));
+
+        // Partially witnessed: two polls, one vouched for.
+        assert!(!round_is_witnessed_wait(
+            &[wait_call("a"), wait_call("b")],
+            &[witness("a", session, deadline)],
+            session,
+            now
+        ));
+
+        // Mixed with real work.
+        assert!(!round_is_witnessed_wait(
+            &[
+                wait_call("a"),
+                tool_call("run_terminal_cmd", r#"{"command":"make"}"#)
+            ],
+            &[witness("a", session, deadline)],
+            session,
+            now
+        ));
+
+        // Another session's task.
+        assert!(!round_is_witnessed_wait(
+            &[wait_call("a")],
+            &[witness("a", other, deadline)],
+            session,
+            now
+        ));
+
+        // Past its deadline: the exemption is bounded.
+        assert!(!round_is_witnessed_wait(
+            &[wait_call("a")],
+            &[witness("a", session, 500)],
+            session,
+            now
+        ));
+
+        // Not wait-shaped at all.
+        assert!(!round_is_witnessed_wait(
+            &[tool_call("read_file", "{}")],
+            &[witness("a", session, deadline)],
+            session,
+            now
+        ));
+    }
+
+    #[test]
+    fn only_outstanding_task_states_are_witnessable() {
+        // The witness exists to say work is still running. A finished, failed,
+        // cancelled or rejected task has nothing left to wait for, so polling
+        // it is ordinary repeated work and must not be exempt.
+        assert_eq!(
+            ActiveWaitState::from_status("running"),
+            Some(ActiveWaitState::Running)
+        );
+        assert_eq!(
+            ActiveWaitState::from_status("accepted"),
+            Some(ActiveWaitState::Queued)
+        );
+        assert_eq!(
+            ActiveWaitState::from_status("proposed"),
+            Some(ActiveWaitState::Queued)
+        );
+        for terminal in ["done", "failed", "cancelled", "rejected"] {
+            assert!(
+                ActiveWaitState::from_status(terminal).is_none(),
+                "{terminal} is not outstanding work"
+            );
+        }
+        // Exact matches only: a near-miss status is not a state.
+        for unknown in ["Running", "running ", "", "in_progress", "RUNNING"] {
+            assert!(
+                ActiveWaitState::from_status(unknown).is_none(),
+                "{unknown:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_dispatch_alias_cannot_evade_stationarity_or_split_identity() {
+        // Both spellings normalize, so alternating them is one signature run
+        // and one tool identity rather than two that each reset.
+        assert_eq!(canonical_tool_name("get_task_output"), "task_output");
+        assert_eq!(canonical_tool_name("task_output"), "task_output");
+        assert_eq!(canonical_tool_name("read_file"), "read_file");
+        assert!(is_wait_shaped_call(&tool_call("get_task_output", "{}")));
+        assert!(is_wait_shaped_call(&tool_call("task_output", "{}")));
+
+        let alias = tool_call("get_task_output", r#"{"id":"a"}"#);
+        let canonical = tool_call("task_output", r#"{"id":"a"}"#);
+        assert_eq!(
+            tool_step_signature(std::slice::from_ref(&alias)),
+            tool_step_signature(std::slice::from_ref(&canonical)),
+            "alias alternation must not produce two signatures"
+        );
+
+        // And an alias-alternating unwitnessed poll still accumulates.
+        let session = Uuid::new_v4();
+        let mut run = IdenticalToolCallRun::default();
+        for step in 0..MAX_CONSECUTIVE_INERT_REPEATS {
+            let calls = if step % 2 == 0 {
+                [tool_call("task_output", r#"{"id":"a"}"#)]
+            } else {
+                [tool_call("get_task_output", r#"{"id":"a"}"#)]
+            };
+            wait_round(&mut run, &calls, &[], session, 0, "status: unchanged");
+        }
+        assert!(run.inert_stop_info().is_some());
     }
 
     #[test]
@@ -4615,10 +4859,12 @@ test result: FAILED. 0 passed; 3 failed; 0 ignored
         // Nothing here is stuck, and repeating the campaign must not accumulate
         // a stop across cycles.
         let mut run = IdenticalToolCallRun::default();
+        let session = Uuid::new_v4();
         let calls = [wait_call("build")];
+        let witnesses = [witness("build", session, WITNESSED_WAIT_DEADLINE_MS)];
         for cycle in 0..6 {
-            wait_round(&mut run, &calls, "status: running");
-            wait_round(&mut run, &calls, "status: running");
+            wait_round(&mut run, &calls, &witnesses, session, 10, "status: running");
+            wait_round(&mut run, &calls, &witnesses, session, 20, "status: running");
             round(
                 &mut run,
                 &format!("edit-{cycle}"),

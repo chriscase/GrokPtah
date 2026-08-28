@@ -5,8 +5,9 @@
 
 use chrono::Utc;
 use grokptah_agent_bridge::orchestration::{
-    OrchStore, RunBounds, RunRecord, RunState, RunStopCause, RunStopDetail, RunStopDetailKind,
-    WorkItem, WorkPolicy, WorkResult, WorkState,
+    safe_id_filename, OrchStore, RunBounds, RunRecord, RunState, RunStopCause, RunStopDetail,
+    RunStopDetailKind, RunStopTool, WorkItem, WorkPolicy, WorkResult, WorkState,
+    PROGRESS_PROJECTION_SCHEMA_VERSION,
 };
 use tempfile::tempdir;
 use uuid::Uuid;
@@ -153,13 +154,67 @@ fn a_stop_detail_rejects_malformed_evidence() {
     // happen, so it is refused rather than displayed.
     let zero = RunStopDetail::new(RunStopDetailKind::InertRepeat, 0).with_tool("run_terminal_cmd");
     assert!(zero.validate().is_err(), "accepted repeats == 0");
+}
 
-    // An over-long tool label is truncated at construction, so it can never
-    // become a channel for arguments or paths.
-    let long = "x".repeat(4096);
-    let detail = RunStopDetail::new(RunStopDetailKind::IdenticalCalls, 1).with_tool(long);
-    assert!(detail.validate().is_ok());
-    assert!(detail.tool.as_deref().unwrap().len() <= 128);
+/// The projected tool identity is host-resolved, so no model-controlled text
+/// can reach a durable record, a public projection, or the desktop inspector.
+#[test]
+fn a_hostile_tool_name_collapses_to_a_closed_category() {
+    let hostile = [
+        "../../etc/passwd",
+        "read_file\n\nAUTHORIZATION: Bearer sk-live-abc123",
+        "AKIAIOSFODNN7EXAMPLE",
+        "mcp__github__create_pull_request",
+        "Read File",
+        "read_file ",
+        " read_file",
+        "READ_FILE",
+        "read_file\u{0}",
+        &"x".repeat(4096),
+        "",
+    ];
+    for name in hostile {
+        let detail = RunStopDetail::new(RunStopDetailKind::IdenticalCalls, 1).with_tool(name);
+        assert_eq!(
+            detail.tool,
+            Some(RunStopTool::Unresolved),
+            "{name:?} must not resolve to a host tool"
+        );
+        // The wire form is a fixed token; the original text is gone.
+        let encoded = serde_json::to_string(&detail).unwrap();
+        assert!(encoded.contains("\"tool\":\"unresolved\""), "{encoded}");
+        for fragment in ["passwd", "Bearer", "AKIA", "mcp__", "xxxx"] {
+            assert!(!encoded.contains(fragment), "{name:?} leaked {fragment}");
+        }
+    }
+}
+
+/// Exact host names resolve, and both dispatch aliases collapse to one
+/// identity so alternating them cannot produce two different labels.
+#[test]
+fn host_tool_names_resolve_and_aliases_converge() {
+    assert_eq!(RunStopTool::resolve("read_file"), RunStopTool::ReadFile);
+    assert_eq!(
+        RunStopTool::resolve("run_terminal_cmd"),
+        RunStopTool::RunTerminalCmd
+    );
+    assert_eq!(RunStopTool::resolve("task_output"), RunStopTool::TaskOutput);
+    assert_eq!(
+        RunStopTool::resolve("get_task_output"),
+        RunStopTool::TaskOutput,
+        "the dispatch alias must not be a second identity"
+    );
+    // Every variant round-trips through its wire token.
+    for tool in [
+        RunStopTool::ApplyPatch,
+        RunStopTool::TaskOutput,
+        RunStopTool::Unresolved,
+    ] {
+        let encoded = serde_json::to_string(&tool).unwrap();
+        let decoded: RunStopTool = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, tool);
+        assert_eq!(encoded, format!("\"{}\"", tool.as_str()));
+    }
 }
 
 /// The cross-field invariant is restored on write, so a later lifecycle
@@ -413,4 +468,223 @@ fn a_stale_revision_still_fails_closed_and_leaves_the_stop_detail_intact() {
         run.state.is_terminal(),
         "manager retry must not reopen the run"
     );
+}
+
+/// The exact defect the re-review named: finalization could replace
+/// `Stationarity` with `TokenAccountingUnavailable` while keeping the
+/// stationarity detail. The record installed, then `load_run` refused it and
+/// `list_runs` silently hid it — a Run that existed but could not be read.
+#[test]
+fn a_finalization_that_overrides_the_cause_stays_readable() {
+    let dir = tempdir().unwrap();
+    let store = OrchStore::open(dir.path().join("orch")).unwrap();
+
+    let detail = RunStopDetail::new(RunStopDetailKind::InertRepeat, 4).with_tool("task_output");
+    let mut run = run_with("run-accounting", Some((RunStopCause::Stationarity, detail)));
+    // A bounded run with an unresolved provider attempt: finalization will
+    // fail closed on accounting and replace the cause.
+    run.bounds.max_total_tokens = Some(1_000);
+    run.aggregates.usage_pending_requests = 1;
+    run.aggregates.usage_complete = true;
+    store.save_run(&run).unwrap();
+
+    let mut candidate = store.load_run("run-accounting").unwrap().unwrap();
+    assert!(candidate.stop_detail.is_some(), "fixture precondition");
+    // The accounting fail-closed decision replaces the cause. Cause, code and
+    // detail move as one observation, so the stationarity detail cannot stay
+    // attached to a cause that no longer holds.
+    candidate.set_stop_observation(
+        RunStopCause::TokenAccountingUnavailable,
+        Some("max_total_tokens_usage_unavailable"),
+        None,
+    );
+    assert!(
+        candidate.stop_detail.is_none(),
+        "the override must take the detail with it"
+    );
+
+    let installed = store.persist_finalization(&candidate).unwrap();
+    assert_eq!(
+        installed.stop_cause,
+        Some(RunStopCause::TokenAccountingUnavailable)
+    );
+
+    // Persisted and readable are the same set.
+    let read_back = store
+        .load_run("run-accounting")
+        .expect("a finalized record must be readable")
+        .expect("present");
+    assert!(read_back.stop_detail.is_none());
+    assert_eq!(
+        store.list_runs().unwrap().len(),
+        1,
+        "a finalized record must not vanish from the listing"
+    );
+}
+
+/// A crash between writing a finalization intent and installing it: reopening
+/// the store replays the intent, and what it installs is readable.
+#[test]
+fn a_finalization_intent_survives_a_crash_cut_and_installs_a_readable_record() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("orch");
+    let run_id = "run-crashcut";
+
+    {
+        let store = OrchStore::open(&root).unwrap();
+        let detail =
+            RunStopDetail::new(RunStopDetailKind::TrueNoop, 4).with_tool("run_terminal_cmd");
+        store
+            .save_run(&run_with(
+                run_id,
+                Some((RunStopCause::Stationarity, detail)),
+            ))
+            .unwrap();
+    }
+
+    // Plant an intent as a crash would have left one, under the store's own
+    // sha256(id) filename scheme.
+    let safe = safe_id_filename(run_id).expect("store filename");
+    let intent_detail =
+        RunStopDetail::new(RunStopDetailKind::InertRepeat, 6).with_tool("task_output");
+    let intent = run_with(run_id, Some((RunStopCause::Stationarity, intent_detail)));
+    std::fs::write(
+        root.join("finalization").join(format!("{safe}.json")),
+        serde_json::to_string(&intent).unwrap(),
+    )
+    .unwrap();
+
+    // Reopen: recovery validates and replays the intent.
+    let store = OrchStore::open(&root).expect("recovery must accept a valid intent");
+    let recovered = store.load_run(run_id).unwrap().expect("present");
+    assert_eq!(recovered.stop_cause, Some(RunStopCause::Stationarity));
+    assert_eq!(
+        recovered.stop_detail.as_ref().map(|d| d.repeats),
+        Some(6),
+        "the intent must be the record that won"
+    );
+    assert!(!root
+        .join("finalization")
+        .join(format!("{safe}.json"))
+        .exists());
+}
+
+/// Recovery does not repair a malformed intent into existence: durable data of
+/// unknown age is validated exactly, so corruption surfaces instead of being
+/// normalized away.
+#[test]
+fn recovery_refuses_a_malformed_finalization_intent() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("orch");
+    let run_id = "run-badintent";
+    {
+        OrchStore::open(&root).unwrap();
+    }
+
+    let safe = safe_id_filename(run_id).expect("store filename");
+
+    // A detail under a cause it may not accompany: exactly what normalization
+    // would have prevented on the write path, so its presence here means the
+    // file was not written by this code.
+    let mut intent = run_with(run_id, None);
+    intent.stop_cause = Some(RunStopCause::RoundLimit);
+    intent.stop_detail =
+        Some(RunStopDetail::new(RunStopDetailKind::InertRepeat, 4).with_tool("task_output"));
+    std::fs::write(
+        root.join("finalization").join(format!("{safe}.json")),
+        serde_json::to_string(&intent).unwrap(),
+    )
+    .unwrap();
+
+    assert!(
+        OrchStore::open(&root).is_err(),
+        "a malformed recovery intent must fail closed, not be silently repaired"
+    );
+}
+
+/// Path to the shared wire fixtures the desktop tests read.
+fn fixture_path(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../desktop/src/lib/__fixtures__")
+        .join(name)
+}
+
+/// Rust is the authority for the wire shape, so the fixtures the TypeScript
+/// tests consume are generated from Rust serialization and compared here.
+///
+/// Set `UPDATE_WIRE_FIXTURES=1` to rewrite them after a deliberate change; a
+/// drift that is not deliberate fails this test instead of silently changing
+/// what desktop believes the wire looks like.
+#[test]
+fn wire_fixtures_match_rust_serialization() {
+    let detail = RunStopDetail::new(RunStopDetailKind::InertRepeat, 4).with_tool("task_output");
+    let unresolved =
+        RunStopDetail::new(RunStopDetailKind::IdenticalCalls, 16).with_tool("mcp__x__do_thing");
+
+    let v2 = serde_json::json!({
+        "schemaVersion": PROGRESS_PROJECTION_SCHEMA_VERSION,
+        "runId": "run-fixture",
+        "sessionId": "00000000-0000-4000-8000-000000000000",
+        "state": "limit_reached",
+        "queuePosition": serde_json::Value::Null,
+        "busy": false,
+        "startSeq": 1,
+        "endSeq": 9,
+        "progress": serde_json::Value::Null,
+        "createdAt": "2026-01-01T00:00:00Z",
+        "updatedAt": "2026-01-01T00:05:00Z",
+        "terminalResult": "stationarity",
+        "stopCause": "stationarity",
+        "stopDetail": detail,
+        "unresolvedToolExample": unresolved,
+        "bounds": {
+            "maxPromptBytes": 100000,
+            "maxRounds": 24,
+            "maxDurationMs": 900000,
+            "maxTotalTokens": serde_json::Value::Null,
+        },
+        "errorCode": "stationarity",
+    });
+
+    // v1 is the historical shape: it echoed the prompt and had no stop detail.
+    let v1 = serde_json::json!({
+        "schemaVersion": 1,
+        "runId": "run-fixture",
+        "sessionId": "00000000-0000-4000-8000-000000000000",
+        "state": "limit_reached",
+        "promptPreview": "the user's own prompt text",
+        "stopCause": "stationarity",
+        "bounds": {
+            "maxPromptBytes": 100000,
+            "maxRounds": 24,
+            "maxDurationMs": 900000,
+            "maxTotalTokens": serde_json::Value::Null,
+        },
+    });
+
+    for (name, value) in [
+        ("progress-projection.v1.json", &v1),
+        ("progress-projection.v2.json", &v2),
+    ] {
+        let path = fixture_path(name);
+        let rendered = format!("{}\n", serde_json::to_string_pretty(value).unwrap());
+        if std::env::var("UPDATE_WIRE_FIXTURES").is_ok() {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, &rendered).unwrap();
+            continue;
+        }
+        let committed = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("missing wire fixture {name}: {error}"));
+        assert_eq!(
+            committed, rendered,
+            "{name} drifted from Rust serialization; rerun with UPDATE_WIRE_FIXTURES=1 if intended"
+        );
+    }
+
+    // The v2 fixture must carry no prompt text at all.
+    let encoded = serde_json::to_string(&v2).unwrap();
+    assert!(!encoded.contains("promptPreview"));
+    // And the unresolved tool must be the fixed category, not the MCP name.
+    assert!(encoded.contains("\"tool\":\"unresolved\""));
+    assert!(!encoded.contains("mcp__"));
 }

@@ -25,18 +25,20 @@ use crate::events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 use crate::host_helpers::{
     action_inert_repeat_stop_message, action_stationarity_nudge, action_stationarity_stop_message,
     api_context_messages, auto_cargo_reverify_command, build_agent_messages, build_compact_summary,
-    call_xai_agent_step_observed, call_xai_chat, cargo_test_failure_coaching,
+    call_xai_agent_step_observed, call_xai_chat, canonical_tool_name, cargo_test_failure_coaching,
     cargo_test_output_failed, cargo_test_output_passed, cargo_test_reverify_coaching,
     coding_agent_tools, count_cargo_test_failures, emit_message, emit_thought,
     filter_tools_batch_edit_only, filter_tools_edit_and_shell, filter_tools_edit_only,
     is_incomplete_stop_message, is_round_limit_stop_message, is_true_noop_tool_step,
-    is_witnessed_wait_step, multi_failure_partial_edit_coaching, normalize_sandbox_profile,
+    is_wait_shaped_call, multi_failure_partial_edit_coaching, normalize_sandbox_profile,
     offline_plan_steps, parse_effort_arg, post_cargo_failure_skip_message, propose_plan_with_model,
     push_assistant, push_thought, push_tool, recovery_round_limit_stop_message,
-    resolve_turn_max_rounds, round_limit_stop_message, round_observation_digest,
-    sandbox_blocks_shell, sandbox_is_readonly, should_auto_cargo_reverify_after_edit,
-    should_skip_tool_after_cargo_failure, surface_rate_limit_or_error, tool_kind,
-    tool_step_signature, tool_web_fetch, AgentStep, IdenticalToolCallRun, McpToolIndex,
+    resolve_turn_max_rounds, round_is_witnessed_wait, round_limit_stop_message,
+    round_observation_digest, sandbox_blocks_shell, sandbox_is_readonly,
+    should_auto_cargo_reverify_after_edit, should_skip_tool_after_cargo_failure,
+    surface_rate_limit_or_error, tool_kind, tool_step_signature, tool_web_fetch,
+    ActiveTaskWaitWitness, ActiveWaitState, AgentStep, IdenticalToolCallRun, McpToolIndex,
+    WITNESSED_WAIT_DEADLINE_MS,
 };
 use crate::lane::LaneSummary;
 use crate::local_tools;
@@ -186,6 +188,14 @@ pub(crate) struct Inner {
     /// Per-subagent cancel tokens (#151/#152) — cancel one child without killing siblings.
     subagent_cancels: HashMap<String, CancellationToken>,
     background_tasks: Vec<BackgroundTask>,
+    /// Host-assigned generation per task/subagent id.
+    ///
+    /// A wait witness has to survive id recycling: if an id is retired and a
+    /// new task takes it, a witness issued for the old one must not describe
+    /// the new one. The generation is bumped whenever an id is (re)registered,
+    /// so the two are never confusable.
+    wait_generations: std::collections::HashMap<String, u64>,
+    next_wait_generation: u64,
     /// Cancel tokens for in-flight background tasks (#52).
     background_cancels: HashMap<String, CancellationToken>,
     pending_permissions: HashMap<Uuid, PendingPermission>,
@@ -916,6 +926,8 @@ impl AgentHost {
             subagents: Vec::new(),
             subagent_cancels: HashMap::new(),
             background_tasks: Vec::new(),
+            wait_generations: std::collections::HashMap::new(),
+            next_wait_generation: 1,
             background_cancels: HashMap::new(),
             pending_permissions: HashMap::new(),
             turn_cancels: HashMap::new(),
@@ -5033,6 +5045,73 @@ impl AgentHostHandle {
         self.inner.lock().background_tasks.clone()
     }
 
+    /// Current host generation for a task/subagent id, if the host has ever
+    /// registered it.
+    fn wait_generation(&self, id: &str) -> Option<u64> {
+        self.inner.lock().wait_generations.get(id).copied()
+    }
+
+    /// Issue a witness for a dispatched wait call.
+    ///
+    /// Parses the id exactly as the dispatcher does, so the witness describes
+    /// the call the host actually served. A wait with no id is a *listing*, not
+    /// a wait on anything, and gets no witness.
+    fn witness_dispatched_wait(
+        &self,
+        session_id: Uuid,
+        arguments_json: &str,
+        elapsed_ms: u64,
+    ) -> Option<ActiveTaskWaitWitness> {
+        let args: serde_json::Value = serde_json::from_str(arguments_json).ok()?;
+        let id = args
+            .get("id")
+            .or_else(|| args.get("task_id"))
+            .and_then(|value| value.as_str())?;
+        self.issue_wait_witness(session_id, id, elapsed_ms)
+    }
+
+    /// Issue a wait witness for an id, or refuse.
+    ///
+    /// This is the whole of the exemption's authority. It answers only for ids
+    /// the host has registered, whose status is still outstanding, and whose
+    /// owning session is the one asking. An unknown id, a finished or failed
+    /// task, another session's task, or an id the host never registered all
+    /// return `None`, and the round is then treated as ordinary work.
+    fn issue_wait_witness(
+        &self,
+        session_id: Uuid,
+        id: &str,
+        elapsed_ms: u64,
+    ) -> Option<ActiveTaskWaitWitness> {
+        let generation = self.wait_generation(id)?;
+        let owns = |owner: &Option<String>| {
+            owner
+                .as_deref()
+                .and_then(|value| Uuid::parse_str(value).ok())
+                .is_some_and(|owner| owner == session_id)
+        };
+        let state = if let Some(task) = self.background_tasks().into_iter().find(|t| t.id == id) {
+            if !owns(&task.session_id) {
+                return None;
+            }
+            ActiveWaitState::from_status(&task.status)?
+        } else if let Some(sub) = self.subagents().into_iter().find(|s| s.id == id) {
+            if !owns(&sub.session_id) {
+                return None;
+            }
+            ActiveWaitState::from_status(&sub.status)?
+        } else {
+            return None;
+        };
+        Some(ActiveTaskWaitWitness {
+            task_id: id.to_string(),
+            state,
+            owner_session: session_id,
+            generation,
+            deadline_ms: elapsed_ms.saturating_add(WITNESSED_WAIT_DEADLINE_MS),
+        })
+    }
+
     pub fn cancel_background_task(&self, id: &str) -> Result<()> {
         // Agent tool shells: cancel the owning turn (kills live_shells) (#52).
         let session_for_shell = {
@@ -5086,6 +5165,12 @@ impl AgentHostHandle {
         };
         {
             let mut g = self.inner.lock();
+            // Registering an id starts a new generation for it, so a witness
+            // issued against a previous task with the same id cannot describe
+            // this one.
+            let generation = g.next_wait_generation;
+            g.next_wait_generation = g.next_wait_generation.saturating_add(1);
+            g.wait_generations.insert(id.clone(), generation);
             g.background_tasks.push(t.clone());
             g.background_cancels.insert(id.clone(), cancel.clone());
         }
@@ -8491,6 +8576,9 @@ impl AgentHostHandle {
         // #168: at most one Stop-hook continue per user turn
         let mut stop_continued = false;
         let mut identical_tool_calls = IdenticalToolCallRun::default();
+        // Turn clock, so a witnessed wait has a bounded deadline rather than
+        // an open-ended exemption.
+        let turn_started = std::time::Instant::now();
         let mut test_failure_needs_edit = false;
         // Cargo failures since last successful edit while armed.
         let mut cargo_fails_since_edit: u32 = 0;
@@ -8539,7 +8627,7 @@ impl AgentHostHandle {
                         "stationarity",
                         Some(
                             RunStopDetail::new(RunStopDetailKind::InertRepeat, run_len)
-                                .with_tool(tool_name.clone()),
+                                .with_tool(&tool_name),
                         ),
                     )?;
                     let _ = event_tx.send(SessionUpdate::AgentProgress {
@@ -8564,7 +8652,7 @@ impl AgentHostHandle {
                         session_id,
                         RunStopCause::Stationarity,
                         "stationarity",
-                        Some(RunStopDetail::new(kind, run_len).with_tool(tool_name.clone())),
+                        Some(RunStopDetail::new(kind, run_len).with_tool(&tool_name)),
                     )?;
                     let _ = event_tx.send(SessionUpdate::AgentProgress {
                         session_id,
@@ -8876,6 +8964,9 @@ impl AgentHostHandle {
                     }));
 
                     let mut edited_while_needs_reverify = false;
+                    // Host-issued witnesses for this round's wait calls. Empty
+                    // unless the host itself vouches for an active task.
+                    let mut round_witnesses: Vec<ActiveTaskWaitWitness> = Vec::new();
                     for tc in &tool_calls {
                         if cancel.is_cancelled() {
                             break;
@@ -8904,17 +8995,34 @@ impl AgentHostHandle {
                             last_tool: Some(tc.name.clone()),
                             detail: format!("Tool `{}` (round {round})", tc.name),
                         });
+                        // Normalize the alias before dispatch so both spellings
+                        // take exactly one path.
+                        let dispatch_name = canonical_tool_name(&tc.name).to_string();
                         let output = self
                             .dispatch_agent_tool(
                                 session_id,
                                 cwd,
-                                &tc.name,
+                                &dispatch_name,
                                 &tc.arguments,
                                 cancel,
                                 event_tx,
                                 &mcp_index,
                             )
                             .await;
+                        // The witness is the host's answer about what that call
+                        // actually named, issued after the call settled. A wait
+                        // that failed, named nothing, named an unknown or
+                        // finished task, or reached for another session's work
+                        // yields no witness and earns no exemption.
+                        if is_wait_shaped_call(tc) && output.is_ok() {
+                            if let Some(witness) = self.witness_dispatched_wait(
+                                session_id,
+                                &tc.arguments,
+                                turn_started.elapsed().as_millis() as u64,
+                            ) {
+                                round_witnesses.push(witness);
+                            }
+                        }
                         let content = match &output {
                             Ok(s) => s.clone(),
                             Err(e) => format!("ERROR: {e}"),
@@ -9099,7 +9207,12 @@ impl AgentHostHandle {
                     // that work runs, and the deadline that owns it decides when
                     // it ends. It stays bounded by the identical-call ceiling,
                     // the round budget, and the duration budget.
-                    if is_witnessed_wait_step(&tool_calls) {
+                    if round_is_witnessed_wait(
+                        &tool_calls,
+                        &round_witnesses,
+                        session_id,
+                        turn_started.elapsed().as_millis() as u64,
+                    ) {
                         identical_tool_calls.observe_witnessed_wait();
                     } else if let Some(observation) = round_observation_digest(&messages) {
                         identical_tool_calls.observe_outcome(observation);

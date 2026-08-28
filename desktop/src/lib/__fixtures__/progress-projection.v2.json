@@ -1,0 +1,32 @@
+{
+  "bounds": {
+    "maxDurationMs": 900000,
+    "maxPromptBytes": 100000,
+    "maxRounds": 24,
+    "maxTotalTokens": null
+  },
+  "busy": false,
+  "createdAt": "2026-01-01T00:00:00Z",
+  "endSeq": 9,
+  "errorCode": "stationarity",
+  "progress": null,
+  "queuePosition": null,
+  "runId": "run-fixture",
+  "schemaVersion": 2,
+  "sessionId": "00000000-0000-4000-8000-000000000000",
+  "startSeq": 1,
+  "state": "limit_reached",
+  "stopCause": "stationarity",
+  "stopDetail": {
+    "kind": "inert_repeat",
+    "repeats": 4,
+    "tool": "task_output"
+  },
+  "terminalResult": "stationarity",
+  "unresolvedToolExample": {
+    "kind": "identical_calls",
+    "repeats": 16,
+    "tool": "unresolved"
+  },
+  "updatedAt": "2026-01-01T00:05:00Z"
+}

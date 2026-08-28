@@ -69,7 +69,7 @@ pub use types::{
     AuditEntry, ChangeRecord, ContinuationCheckpoint, ContinuationReason, IdempotencyReceipt,
     OrchError, OrchErrorCode, PromotionState, RunAggregates, RunApproval, RunBounds, RunExecution,
     RunExecutionMode, RunProgress, RunPurpose, RunRecord, RunState, RunStopCause, RunStopDetail,
-    RunStopDetailKind, TestObservation, AGENT_SPEC_SCHEMA_VERSION, CONTROL_TOOLS,
+    RunStopDetailKind, RunStopTool, TestObservation, AGENT_SPEC_SCHEMA_VERSION, CONTROL_TOOLS,
     DEFAULT_AGENT_TOOL_IDS, DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS, FORBIDDEN_TOOLS,
     MAX_AGENT_CONTEXT_BYTES, PROGRESS_PROJECTION_SCHEMA_VERSION,
 };

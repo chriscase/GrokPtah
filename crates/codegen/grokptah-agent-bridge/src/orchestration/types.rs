@@ -102,8 +102,97 @@ impl RunStopDetailKind {
     }
 }
 
-/// Maximum length of the bounded tool label carried on a stop detail.
-pub const MAX_STOP_DETAIL_TOOL_BYTES: usize = 128;
+/// Closed, host-resolved identity of the tool a stationarity stop was observed
+/// on.
+///
+/// The previous revision persisted the raw tool name as a bounded string. That
+/// name comes from the model's tool call, so a truncated-but-arbitrary string —
+/// a path, a newline, credential-shaped text, MCP prose — was persisted,
+/// projected on a public read surface, and rendered in the desktop inspector.
+/// Bounding the length does not make model-controlled text safe to display.
+///
+/// The host now resolves the name against its own tool set before anything is
+/// stored. Every variant below is a name the host itself defines; anything it
+/// does not recognise — an MCP tool, a renamed tool, a name the model invented,
+/// hostile input — collapses to [`RunStopTool::Unresolved`]. The original text
+/// is never retained, so this cannot carry a payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunStopTool {
+    ApplyPatch,
+    GlobFiles,
+    Grep,
+    KillTask,
+    ListDir,
+    MemoryRead,
+    MemoryWrite,
+    ReadFile,
+    RunTerminalCmd,
+    SpawnExplore,
+    SpawnGeneralPurpose,
+    TaskOutput,
+    TodoWrite,
+    WebFetch,
+    WriteFile,
+    WriteFiles,
+    /// The host did not resolve the call to one of its own tools. A fixed,
+    /// content-free category: it deliberately says nothing about what the name
+    /// was.
+    Unresolved,
+}
+
+impl RunStopTool {
+    /// Resolve a model-supplied tool name to a host identity.
+    ///
+    /// Exact match against the host's own tool names only. No trimming, no case
+    /// folding, no prefix matching: a near-miss is not the tool, and treating it
+    /// as one would be the same mistake as trusting the name.
+    pub fn resolve(name: &str) -> Self {
+        match name {
+            "apply_patch" => Self::ApplyPatch,
+            "glob_files" => Self::GlobFiles,
+            "grep" => Self::Grep,
+            "kill_task" => Self::KillTask,
+            "list_dir" => Self::ListDir,
+            "memory_read" => Self::MemoryRead,
+            "memory_write" => Self::MemoryWrite,
+            "read_file" => Self::ReadFile,
+            "run_terminal_cmd" => Self::RunTerminalCmd,
+            "spawn_explore" => Self::SpawnExplore,
+            "spawn_general_purpose" => Self::SpawnGeneralPurpose,
+            // Both the canonical name and the dispatch alias resolve to the
+            // same identity, so alternating them cannot produce two labels.
+            "task_output" | "get_task_output" => Self::TaskOutput,
+            "todo_write" => Self::TodoWrite,
+            "web_fetch" => Self::WebFetch,
+            "write_file" => Self::WriteFile,
+            "write_files" => Self::WriteFiles,
+            _ => Self::Unresolved,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ApplyPatch => "apply_patch",
+            Self::GlobFiles => "glob_files",
+            Self::Grep => "grep",
+            Self::KillTask => "kill_task",
+            Self::ListDir => "list_dir",
+            Self::MemoryRead => "memory_read",
+            Self::MemoryWrite => "memory_write",
+            Self::ReadFile => "read_file",
+            Self::RunTerminalCmd => "run_terminal_cmd",
+            Self::SpawnExplore => "spawn_explore",
+            Self::SpawnGeneralPurpose => "spawn_general_purpose",
+            Self::TaskOutput => "task_output",
+            Self::TodoWrite => "todo_write",
+            Self::WebFetch => "web_fetch",
+            Self::WriteFile => "write_file",
+            Self::WriteFiles => "write_files",
+            Self::Unresolved => "unresolved",
+        }
+    }
+}
 
 /// Durable, operator-readable qualifier for a host-decided stop.
 ///
@@ -116,9 +205,9 @@ pub struct RunStopDetail {
     pub kind: RunStopDetailKind,
     /// Consecutive repeats observed when the stop fired.
     pub repeats: u32,
-    /// Bounded tool name only. Never arguments.
+    /// Host-resolved tool identity. Never a model-supplied string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool: Option<String>,
+    pub tool: Option<RunStopTool>,
 }
 
 impl RunStopDetail {
@@ -130,12 +219,16 @@ impl RunStopDetail {
         }
     }
 
-    pub fn with_tool(mut self, tool: impl Into<String>) -> Self {
-        let tool = tool.into();
-        self.tool = Some(
-            crate::textutil::truncate_at_char_boundary(&tool, MAX_STOP_DETAIL_TOOL_BYTES)
-                .to_string(),
-        );
+    /// Attach the tool the repeats were observed on, resolving the
+    /// model-supplied name to a host identity first.
+    pub fn with_tool(mut self, tool: &str) -> Self {
+        self.tool = Some(RunStopTool::resolve(tool));
+        self
+    }
+
+    /// Attach an already-resolved identity.
+    pub fn with_resolved_tool(mut self, tool: RunStopTool) -> Self {
+        self.tool = Some(tool);
         self
     }
 
@@ -147,14 +240,6 @@ impl RunStopDetail {
                 OrchErrorCode::InvalidRequest,
                 "stop detail repeats must be greater than zero",
             ));
-        }
-        if let Some(tool) = self.tool.as_deref() {
-            if tool.is_empty() || tool.len() > MAX_STOP_DETAIL_TOOL_BYTES {
-                return Err(OrchError::new(
-                    OrchErrorCode::InvalidRequest,
-                    "stop detail tool label is empty or exceeds its bound",
-                ));
-            }
         }
         Ok(())
     }
@@ -601,14 +686,48 @@ impl RunRecord {
         if self.bounds.max_total_tokens.is_some() {
             let code = "max_total_tokens_usage_unavailable";
             self.terminal_result = Some(code.into());
-            self.error_code = Some(code.into());
-            self.stop_cause = Some(RunStopCause::TokenAccountingUnavailable);
+            // One observation: the accounting override replaces the cause, so
+            // any stationarity detail attached to the old cause goes with it.
+            self.set_stop_observation(RunStopCause::TokenAccountingUnavailable, Some(code), None);
         }
         true
     }
 }
 
 impl RunRecord {
+    /// Set the terminal observation as one unit.
+    ///
+    /// Cause, error code and detail are a single fact about why a Run stopped,
+    /// and every writer that moves one must move the others. Setting the cause
+    /// on its own is what let a finalization replace `Stationarity` with
+    /// `TokenAccountingUnavailable` while the stationarity detail stayed
+    /// attached — a record that installed cleanly and was then refused by
+    /// `load_run` and silently dropped from `list_runs`.
+    pub fn set_stop_observation(
+        &mut self,
+        cause: RunStopCause,
+        code: Option<&str>,
+        detail: Option<RunStopDetail>,
+    ) {
+        self.stop_cause = Some(cause);
+        if let Some(code) = code {
+            self.error_code = Some(code.to_string());
+        }
+        self.stop_detail = detail;
+        self.normalize_stop_detail();
+    }
+
+    /// The single preparation boundary every durable Run write passes through.
+    ///
+    /// Normalizes what a legitimate transition may have invalidated, then
+    /// validates the exact record that is about to be installed. Anything that
+    /// survives this is guaranteed to be readable back by `load_run`, which is
+    /// what makes "persisted" and "readable" the same set.
+    pub fn prepare_for_persist(&mut self) -> Result<(), OrchError> {
+        self.normalize_stop_detail();
+        self.validate_stop_detail()
+    }
+
     /// Restore the cross-field invariant by construction.
     ///
     /// A detail qualifies a stationarity stop and means nothing without one, so
