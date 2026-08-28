@@ -368,11 +368,9 @@ fn retry_policy(retry_eligible: bool) -> ManagedExecutionPolicy {
     }
 }
 
-fn auth() -> AuthContext {
-    AuthContext {
-        token_id: "native-token-308".into(),
-        owner_id: "primary".into(),
-    }
+fn auth(orch: &OrchestrationService) -> AuthContext {
+    orch.auth_header(Some("Bearer native-token-308"))
+        .expect("host-issued native test authority")
 }
 
 fn run_record(
@@ -514,7 +512,7 @@ async fn boot_native(
     );
     let workspace_text = workspace.path().display().to_string();
     orch.set_managed_execution(
-        &auth(),
+        &auth(&orch),
         lane.id,
         workspace.path(),
         &agent.agent_id,
@@ -615,7 +613,7 @@ async fn manager_decision_native_admission_has_durable_proposal_purpose() {
         .unwrap();
     let retry = orch
         .retry_run(
-            &auth(),
+            &auth(&orch),
             "manager-proposal-retry",
             session,
             Path::new(&workspace_text),
@@ -878,7 +876,7 @@ async fn resolve_work_input_requires_parked_scope() {
     client.initialize().await.unwrap();
     let workspace_text = workspace.path().display().to_string();
     orch.set_managed_execution(
-        &auth(),
+        &auth(&orch),
         lane.id,
         workspace.path(),
         &agent.agent_id,
@@ -1131,7 +1129,7 @@ async fn resolve_work_input_uses_real_host_pending() {
     client.initialize().await.unwrap();
     let workspace_text = workspace.path().display().to_string();
     orch.set_managed_execution(
-        &auth(),
+        &auth(&orch),
         lane.id,
         workspace.path(),
         &agent.agent_id,
@@ -1388,7 +1386,7 @@ async fn native_skips_manual_retry_without_mutating() {
     client.initialize().await.unwrap();
     let workspace_text = workspace.path().display().to_string();
     orch.set_managed_execution(
-        &auth(),
+        &auth(&orch),
         lane.id,
         workspace.path(),
         &agent.agent_id,
@@ -1589,7 +1587,7 @@ async fn resolve_work_input_fails_after_restart_without_host_pending() {
         },
     );
     let missing = orch
-        .resolve_work_input(&auth(), session, workspace.path(), req.id, true)
+        .resolve_work_input(&auth(&orch), session, workspace.path(), req.id, true)
         .unwrap_err();
     assert_eq!(
         missing.code,
