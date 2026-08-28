@@ -1969,12 +1969,9 @@ mod tests {
 
         let context =
             AttemptContext::from_host_ledger(store.clone(), "recovered-operation", scope).unwrap();
-        assert!(
-            !store
-                .root
-                .join("lease-claims")
-                .join("lease-1.claim")
-                .exists()
+        assert_eq!(
+            fs::read_to_string(store.root.join("lease-claims").join("lease-1.claim")).unwrap(),
+            "reservation:recovered-operation"
         );
         let mut permit = context.begin("xai", b"recovered-request", true).unwrap();
         permit
