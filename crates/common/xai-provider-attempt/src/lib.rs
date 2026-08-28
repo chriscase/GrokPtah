@@ -317,7 +317,13 @@ impl AttemptContext {
         )?;
         let attempt = self.store.create(spec)?;
         attempt.admit(&self.authority)?;
-        let current = (self.revalidate)().ok_or(AttemptError::InvalidAuthority)?;
+        let current = match (self.revalidate)() {
+            Some(current) => current,
+            None => {
+                let _ = attempt.cancel_without_send();
+                return Err(AttemptError::InvalidAuthority);
+            }
+        };
         let permit = attempt.begin_send(&current)?;
         Ok(permit.with_revalidator(self.revalidate.clone(), self.authority.clone()))
     }
@@ -1143,6 +1149,30 @@ mod tests {
             AttemptError::StaleAuthority
         );
         assert_eq!(attempt.state().unwrap(), SendState::Admitted);
+    }
+
+    #[test]
+    fn context_revalidates_again_immediately_before_physical_write() {
+        let temp = tempdir().unwrap();
+        let store = ProviderAttemptStore::open(temp.path()).unwrap();
+        let current = Arc::new(Mutex::new(authority(1)));
+        let observed = Arc::clone(&current);
+        let context = AttemptContext::new(
+            store,
+            "host-operation",
+            authority(1),
+            Arc::new(move || Some(observed.lock().unwrap().clone())),
+        )
+        .unwrap();
+        let mut permit = context
+            .begin("xai", b"request", true)
+            .expect("initial authority admits");
+        *current.lock().unwrap() = authority(2);
+        assert_eq!(
+            permit.revalidate_before_physical_write().unwrap_err(),
+            AttemptError::StaleAuthority
+        );
+        permit.transport_before_possible_write().unwrap();
     }
 
     #[test]
