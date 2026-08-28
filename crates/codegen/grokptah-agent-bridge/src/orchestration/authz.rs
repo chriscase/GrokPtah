@@ -1925,6 +1925,42 @@ mod tests {
     }
 
     #[test]
+    fn credential_material_rotation_survives_restart_without_reusing_old_authority() {
+        let root = tempdir().unwrap();
+        let old = AuthCredential::new("primary", "old-secret").unwrap();
+        let mut first =
+            AuthRegistry::open(root.path(), std::slice::from_ref(&old), "owner").unwrap();
+        let old_auth = first
+            .authenticate(Some("Bearer old-secret"), std::slice::from_ref(&old))
+            .unwrap();
+        first
+            .ensure_resource_binding("run:restart-rotation", &old_auth)
+            .unwrap();
+        let old_lease = first
+            .mint_effect_lease(&old_auth, "provider:restart-rotation")
+            .unwrap();
+        drop(first);
+
+        let new = AuthCredential::new("primary", "new-secret").unwrap();
+        let mut reopened =
+            AuthRegistry::open(root.path(), std::slice::from_ref(&new), "owner").unwrap();
+        assert!(reopened.require_current(&old_auth).is_err());
+        assert!(reopened
+            .authenticate(Some("Bearer old-secret"), std::slice::from_ref(&old))
+            .is_err());
+        let new_auth = reopened
+            .authenticate(Some("Bearer new-secret"), std::slice::from_ref(&new))
+            .unwrap();
+        assert!(reopened.require_current(&new_auth).is_ok());
+        assert!(reopened
+            .ensure_resource_binding("run:restart-rotation", &new_auth)
+            .is_ok());
+        assert!(reopened
+            .consume_effect_lease(&new_auth, &old_lease, "provider:restart-rotation")
+            .is_err());
+    }
+
+    #[test]
     fn policy_rotation_revokes_cached_contexts_and_effect_leases() {
         let root = tempdir().unwrap();
         let credential = AuthCredential::new("primary", "secret").unwrap();

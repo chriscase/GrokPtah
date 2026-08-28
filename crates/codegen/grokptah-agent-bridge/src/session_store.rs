@@ -216,7 +216,7 @@ fn prompt_queue_path(id: Uuid) -> PathBuf {
 /// Persist bridge-owned prompt queue entries so ordering survives restart (#196).
 pub fn save_prompt_queue(id: Uuid, queue: &crate::prompt_queue::SessionPromptQueue) -> Result<()> {
     ensure_home();
-    let _ = fs::create_dir_all(session_dir(id));
+    fs::create_dir_all(session_dir(id))?;
     let path = prompt_queue_path(id);
     let snap = queue.durable_snapshot();
     atomic_write_json(&path, &snap)
@@ -250,7 +250,7 @@ pub fn load_all_prompt_queues(
 /// Persist subagent history for a session (reopen / historical summary) (#152).
 pub fn save_session_subagents(id: Uuid, list: &[crate::types::SubagentInfo]) -> Result<()> {
     ensure_home();
-    let _ = fs::create_dir_all(session_dir(id));
+    fs::create_dir_all(session_dir(id))?;
     // Keep only rows for this session (and rows without session_id for safety).
     let filtered: Vec<_> = list
         .iter()
