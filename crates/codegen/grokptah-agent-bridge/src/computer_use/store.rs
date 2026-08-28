@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -423,23 +422,8 @@ impl ComputerStore {
 
     fn recover_interrupted(&self) -> ComputerResult<()> {
         let _guard = self.inner.lock.lock();
-        let mut protected_run_ids = HashSet::new();
-        for path in json_paths(&self.inner.root.join("receipts")).map_err(internal_error)? {
-            let receipt = self.read_receipt_path(&path)?;
-            if receipt.effect_run_id.is_some()
-                && (matches!(
-                    receipt.state,
-                    ReceiptState::Succeeded | ReceiptState::Failed
-                ) || receipt.stage == MutationStage::OutcomeRecorded)
-            {
-                protected_run_ids.insert(receipt.effect_run_id.unwrap());
-            }
-        }
         for path in json_paths(&self.inner.root.join("runs")).map_err(internal_error)? {
             let mut run = self.read_run_path(&path)?;
-            if protected_run_ids.contains(&run.run_id) {
-                continue;
-            }
             if run.state.is_terminal() {
                 continue;
             }
@@ -669,11 +653,11 @@ fn validate_receipt(receipt: &MutationReceipt) -> ComputerResult<()> {
         return Err(invalid_record());
     }
     let payload_shape_is_valid = match receipt.stage {
-        MutationStage::Claimed | MutationStage::IntentRecorded => {
-            receipt.state == ReceiptState::Claimed
-                && receipt.result.is_none()
-                && receipt.error.is_none()
-        }
+        MutationStage::Claimed | MutationStage::IntentRecorded => match receipt.state {
+            ReceiptState::Claimed => receipt.result.is_none() && receipt.error.is_none(),
+            ReceiptState::Uncertain => receipt.result.is_none() && receipt.error.is_some(),
+            ReceiptState::Succeeded | ReceiptState::Failed => false,
+        },
         MutationStage::EffectCommitted | MutationStage::OutcomeRecorded => match receipt.state {
             ReceiptState::Claimed => receipt.result.is_some() ^ receipt.error.is_some(),
             ReceiptState::Succeeded => receipt.result.is_some() && receipt.error.is_none(),

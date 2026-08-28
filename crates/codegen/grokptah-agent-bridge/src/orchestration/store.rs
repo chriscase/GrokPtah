@@ -5360,6 +5360,14 @@ fn adapt_audit_entry(entry: &AuditEntry) -> AuditEntryInput {
         // preserves correlation without claiming that separate operations in
         // one session are the same producer intent.
         input = input.with_intent_id(format!("legacy-session:{session_id}:{}", entry.tool));
+    } else {
+        // Transport/authentication producers predate request ids. Allocate a
+        // host-owned identity rather than allowing an unkeyed effect record.
+        input = input.with_intent_id(format!(
+            "legacy-event:{}:{}",
+            entry.tool,
+            entry.ts.timestamp_micros()
+        ));
     }
     if let Some(workspace) = entry.workspace.as_deref() {
         input = input.with_scope(workspace);
