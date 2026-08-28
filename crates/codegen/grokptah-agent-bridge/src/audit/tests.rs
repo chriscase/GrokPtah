@@ -15,7 +15,9 @@ use tempfile::TempDir;
 
 use super::documents::*;
 use super::export::{verify_export, ExportFormat};
-use super::ledger::{AuditEntryInput, AuditLedger, AuditLedgerOptions, CrashPoint};
+use super::ledger::{
+    AuditEntryInput, AuditHousekeepingInput, AuditLedger, AuditLedgerOptions, CrashPoint,
+};
 use super::retention::RetentionRequest;
 use super::witness::{AuditWitness, WitnessBeacon, WitnessState, WitnessVerdict};
 use super::{AuditError, AuditKeys, AuditResult, PoisonReason, RefuseReason};
@@ -30,8 +32,8 @@ fn foreign_keys() -> Arc<AuditKeys> {
     Arc::new(AuditKeys::derive(b"a-different-installation-entirely"))
 }
 
-fn entry(op: &str) -> AuditEntryInput {
-    AuditEntryInput::new(op, EntryPhase::Outcome, EntryOutcome::Accepted)
+fn entry(op: &str) -> AuditHousekeepingInput {
+    AuditHousekeepingInput::new(op, EntryOutcome::Accepted)
 }
 
 fn open(root: &Path) -> AuditResult<AuditLedger> {
@@ -47,7 +49,7 @@ fn fresh(root: &Path) -> AuditLedger {
     let ledger = opened(root);
     for index in 0..5 {
         ledger
-            .append(entry(&format!("op.{index}")))
+            .append_housekeeping(entry(&format!("op.{index}")), None)
             .expect("append");
     }
     ledger
@@ -170,7 +172,9 @@ fn seq_is_global_and_never_resets_across_rotation() {
     let ledger = fresh(dir.path());
     ledger.rotate(RotationReason::Bytes).unwrap();
     for index in 0..3 {
-        ledger.append(entry(&format!("post.{index}"))).unwrap();
+        ledger
+            .append_housekeeping(entry(&format!("post.{index}")), None)
+            .unwrap();
     }
     let manifest = ledger.manifest_snapshot();
     let first = &manifest.generations[0];
@@ -188,7 +192,7 @@ fn chain_is_continuous_across_generations() {
     let dir = TempDir::new().unwrap();
     let ledger = fresh(dir.path());
     ledger.rotate(RotationReason::Bytes).unwrap();
-    ledger.append(entry("after")).unwrap();
+    ledger.append_housekeeping(entry("after"), None).unwrap();
     let manifest = ledger.manifest_snapshot();
     let first = &manifest.generations[0];
     let second = &manifest.generations[1];
@@ -464,7 +468,7 @@ fn crash_cut_r3_reopens_the_new_generation() {
     assert_eq!(manifest.generations[0].state, GenerationState::Sealed);
     // Continues from the sealed generation; it does not reset.
     assert_eq!(ledger.status().global_last_seq, 6);
-    ledger.append(entry("after")).unwrap();
+    ledger.append_housekeeping(entry("after"), None).unwrap();
     assert_eq!(ledger.status().global_last_seq, 7);
 }
 
@@ -472,7 +476,9 @@ fn crash_cut_r3_reopens_the_new_generation() {
 fn crash_between_append_and_anchor_adopts_the_authenticated_tail() {
     let dir = TempDir::new().unwrap();
     let ledger = fresh(dir.path()).with_crash_at(CrashPoint::JournalAppendedBeforeAnchor);
-    assert!(ledger.append(entry("orphan-line")).is_err());
+    assert!(ledger
+        .append_housekeeping(entry("orphan-line"), None)
+        .is_err());
     drop(ledger);
 
     let ledger = opened(dir.path());
@@ -538,7 +544,7 @@ fn tombstone_first_retention_keeps_the_chain_across_the_hole() {
     let export_dir = TempDir::new().unwrap();
     let ledger = fresh(dir.path());
     ledger.rotate(RotationReason::Bytes).unwrap();
-    ledger.append(entry("post")).unwrap();
+    ledger.append_housekeeping(entry("post"), None).unwrap();
     let receipt = ledger
         .export(&export_dir.path().join("out"), ExportFormat::Auto)
         .unwrap();
@@ -570,7 +576,7 @@ fn crash_cut_t3_resumes_removal_at_open() {
     let dir = TempDir::new().unwrap();
     let ledger = fresh(dir.path());
     ledger.rotate(RotationReason::Bytes).unwrap();
-    ledger.append(entry("post")).unwrap();
+    ledger.append_housekeeping(entry("post"), None).unwrap();
     let ledger = ledger.with_crash_at(CrashPoint::T3Committed);
     assert!(ledger
         .retain(RetentionRequest::new("g-000001").allow_unexported())
@@ -600,7 +606,7 @@ fn crash_cut_t4_converges_without_loss() {
     let dir = TempDir::new().unwrap();
     let ledger = fresh(dir.path());
     ledger.rotate(RotationReason::Bytes).unwrap();
-    ledger.append(entry("post")).unwrap();
+    ledger.append_housekeeping(entry("post"), None).unwrap();
     let ledger = ledger.with_crash_at(CrashPoint::T4Removed);
     assert!(ledger
         .retain(RetentionRequest::new("g-000001").allow_unexported())
@@ -692,7 +698,7 @@ fn export_after_retention_is_incomplete_with_an_explicit_hole() {
     let out = TempDir::new().unwrap();
     let ledger = fresh(dir.path());
     ledger.rotate(RotationReason::Bytes).unwrap();
-    ledger.append(entry("post")).unwrap();
+    ledger.append_housekeeping(entry("post"), None).unwrap();
     ledger
         .retain(RetentionRequest::new("g-000001").allow_unexported())
         .unwrap();
@@ -796,12 +802,16 @@ fn joint_rollback_is_undetected_without_a_witness() {
     let snapshot = TempDir::new().unwrap();
     let ledger = fresh(dir.path());
     ledger.rotate(RotationReason::Bytes).unwrap();
-    ledger.append(entry("before-snapshot")).unwrap();
+    ledger
+        .append_housekeeping(entry("before-snapshot"), None)
+        .unwrap();
     drop(ledger);
 
     copy_tree(dir.path(), &snapshot.path().join("snap"));
     let ledger = opened(dir.path());
-    ledger.append(entry("after-snapshot")).unwrap();
+    ledger
+        .append_housekeeping(entry("after-snapshot"), None)
+        .unwrap();
     drop(ledger);
 
     std::fs::remove_dir_all(dir.path()).unwrap();
@@ -827,7 +837,9 @@ fn joint_rollback_is_detected_by_a_witness() {
     )
     .unwrap();
     for index in 0..3 {
-        ledger.append(entry(&format!("op.{index}"))).unwrap();
+        ledger
+            .append_housekeeping(entry(&format!("op.{index}")), None)
+            .unwrap();
     }
     ledger.rotate(RotationReason::Bytes).unwrap();
     drop(ledger);
@@ -865,7 +877,7 @@ fn witness_outage_is_fail_soft_and_receipt_honest() {
         witness.clone() as Arc<dyn AuditWitness>,
     )
     .unwrap();
-    ledger.append(entry("first")).unwrap();
+    ledger.append_housekeeping(entry("first"), None).unwrap();
     drop(ledger);
 
     witness.take_offline();
@@ -919,7 +931,9 @@ fn one_hundred_rotations_keep_sequence_exact_with_zero_gaps() {
     let ledger = opened(dir.path());
     for round in 0..100 {
         for index in 0..3 {
-            ledger.append(entry(&format!("r{round}.{index}"))).unwrap();
+            ledger
+                .append_housekeeping(entry(&format!("r{round}.{index}")), None)
+                .unwrap();
         }
         ledger.rotate(RotationReason::Bytes).unwrap();
     }
@@ -1022,7 +1036,9 @@ fn native_generation_after_import_chains_from_the_import_seal() {
     let legacy = legacy_v1_dir(dir.path(), "{\"a\":1}\n", "{\"b\":2}\n");
     let root = dir.path().join("audit");
     let ledger = open_with_legacy(&root, &legacy).unwrap();
-    ledger.append(entry("first-native")).unwrap();
+    ledger
+        .append_housekeeping(entry("first-native"), None)
+        .unwrap();
     drop(ledger);
 
     // Reopening replays the whole structure, including across the import.
@@ -1308,6 +1324,149 @@ fn intent_and_outcome_share_one_opaque_producer_identity() {
 }
 
 #[test]
+fn concurrent_intents_may_settle_in_reverse_order_without_cross_closing() {
+    let dir = TempDir::new().unwrap();
+    let ledger = opened(dir.path());
+    for intent in ["intent-a", "intent-b"] {
+        ledger
+            .append(
+                AuditEntryInput::new(intent, EntryPhase::Intent, EntryOutcome::Accepted)
+                    .with_intent_id(intent),
+            )
+            .unwrap();
+    }
+    assert_eq!(ledger.status().open_intents, 2);
+    for intent in ["intent-b", "intent-a"] {
+        ledger
+            .append(
+                AuditEntryInput::new(intent, EntryPhase::Outcome, EntryOutcome::Accepted)
+                    .with_intent_id(intent),
+            )
+            .unwrap();
+    }
+    assert_eq!(ledger.status().open_intents, 0);
+    ledger.rotate(RotationReason::Operator).unwrap();
+    ledger
+        .export(&dir.path().join("export"), ExportFormat::V2)
+        .unwrap();
+}
+
+#[test]
+fn wrong_duplicate_and_missing_intent_outcomes_are_rejected_without_state_change() {
+    let dir = TempDir::new().unwrap();
+    let ledger = opened(dir.path());
+    ledger
+        .append(
+            AuditEntryInput::new("one", EntryPhase::Intent, EntryOutcome::Accepted)
+                .with_intent_id("one"),
+        )
+        .unwrap();
+    assert_eq!(
+        refusal_of(
+            ledger
+                .append(
+                    AuditEntryInput::new("wrong", EntryPhase::Outcome, EntryOutcome::Accepted)
+                        .with_intent_id("wrong"),
+                )
+                .unwrap_err(),
+        ),
+        RefuseReason::IntentNotOpen
+    );
+    assert_eq!(
+        refusal_of(
+            ledger
+                .append(AuditEntryInput::new(
+                    "missing",
+                    EntryPhase::Outcome,
+                    EntryOutcome::Accepted,
+                ))
+                .unwrap_err(),
+        ),
+        RefuseReason::IntentIdentityRequired
+    );
+    ledger
+        .append(
+            AuditEntryInput::new("one", EntryPhase::Outcome, EntryOutcome::Accepted)
+                .with_intent_id("one"),
+        )
+        .unwrap();
+    assert_eq!(
+        refusal_of(
+            ledger
+                .append(
+                    AuditEntryInput::new("duplicate", EntryPhase::Outcome, EntryOutcome::Accepted)
+                        .with_intent_id("one"),
+                )
+                .unwrap_err(),
+        ),
+        RefuseReason::IntentNotOpen
+    );
+    assert_eq!(ledger.status().open_intents, 0);
+}
+
+#[test]
+fn housekeeping_and_gap_records_never_change_open_producer_intents() {
+    let dir = TempDir::new().unwrap();
+    let ledger = opened(dir.path());
+    for intent in ["intent-a", "intent-b"] {
+        ledger
+            .append(
+                AuditEntryInput::new(intent, EntryPhase::Intent, EntryOutcome::Accepted)
+                    .with_intent_id(intent),
+            )
+            .unwrap();
+    }
+    ledger
+        .append_housekeeping(
+            AuditHousekeepingInput::new("housekeeping", EntryOutcome::Uncertain),
+            None,
+        )
+        .unwrap();
+    ledger.record_dropped(3).unwrap();
+    assert_eq!(ledger.status().open_intents, 2);
+    for intent in ["intent-a", "intent-b"] {
+        ledger
+            .append(
+                AuditEntryInput::new(intent, EntryPhase::Outcome, EntryOutcome::Uncertain)
+                    .with_intent_id(intent),
+            )
+            .unwrap();
+    }
+    assert_eq!(ledger.status().open_intents, 0);
+}
+
+#[test]
+fn crash_adopted_reversed_outcome_replays_and_then_allows_export_and_rotation() {
+    let dir = TempDir::new().unwrap();
+    let ledger = opened(dir.path());
+    for intent in ["intent-a", "intent-b"] {
+        ledger
+            .append(
+                AuditEntryInput::new(intent, EntryPhase::Intent, EntryOutcome::Accepted)
+                    .with_intent_id(intent),
+            )
+            .unwrap();
+    }
+    let ledger = ledger.with_crash_at(CrashPoint::JournalAppendedBeforeAnchor);
+    assert!(ledger
+        .append(
+            AuditEntryInput::new("intent-b", EntryPhase::Outcome, EntryOutcome::Accepted)
+                .with_intent_id("intent-b"),
+        )
+        .is_err());
+    drop(ledger);
+
+    let ledger = opened(dir.path());
+    assert_eq!(ledger.status().recovery.adopted_tail_entries, 1);
+    assert_eq!(ledger.status().recovery.closed_intents, 1);
+    assert_eq!(ledger.status().open_intents, 0);
+    ledger
+        .export(&dir.path().join("export"), ExportFormat::V2)
+        .unwrap();
+    ledger.rotate(RotationReason::Operator).unwrap();
+}
+
+#[test]
 fn restart_closes_unfinished_intent_as_durable_uncertain_outcome() {
     let dir = TempDir::new().unwrap();
     let ledger = opened(dir.path());
@@ -1431,9 +1590,15 @@ fn a_second_writer_advancing_the_anchor_is_detected() {
     let dir = TempDir::new().unwrap();
     let first = fresh(dir.path());
     let second = opened(dir.path());
-    second.append(entry("from-the-other-writer")).unwrap();
+    second
+        .append_housekeeping(entry("from-the-other-writer"), None)
+        .unwrap();
     assert_eq!(
-        poison_of(first.append(entry("from-the-first-writer")).unwrap_err()),
+        poison_of(
+            first
+                .append_housekeeping(entry("from-the-first-writer"), None)
+                .unwrap_err(),
+        ),
         PoisonReason::ConcurrentWriter
     );
     assert_eq!(
@@ -1502,7 +1667,9 @@ fn concurrent_appends_never_issue_a_sequence_twice() {
         let ledger = Arc::clone(&ledger);
         handles.push(std::thread::spawn(move || {
             for index in 0..25 {
-                ledger.append(entry(&format!("w{worker}.{index}"))).unwrap();
+                ledger
+                    .append_housekeeping(entry(&format!("w{worker}.{index}")), None)
+                    .unwrap();
             }
         }));
     }

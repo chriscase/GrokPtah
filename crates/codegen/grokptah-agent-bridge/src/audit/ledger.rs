@@ -106,6 +106,38 @@ impl AuditEntryInput {
     }
 }
 
+/// A typed non-producer record. Housekeeping, gap, and recovery evidence is
+/// always an outcome with no producer identity and therefore can never add,
+/// remove, or otherwise alter the set of open producer intents.
+#[derive(Debug, Clone)]
+pub struct AuditHousekeepingInput {
+    pub op: String,
+    pub outcome: EntryOutcome,
+    pub reason: Option<EntryReason>,
+    pub code: Option<String>,
+}
+
+impl AuditHousekeepingInput {
+    pub fn new(op: impl Into<String>, outcome: EntryOutcome) -> Self {
+        Self {
+            op: op.into(),
+            outcome,
+            reason: None,
+            code: None,
+        }
+    }
+
+    pub fn with_reason(mut self, reason: EntryReason) -> Self {
+        self.reason = Some(reason);
+        self
+    }
+
+    pub fn with_code(mut self, code: impl Into<String>) -> Self {
+        self.code = Some(code.into());
+        self
+    }
+}
+
 /// Open-time configuration.
 #[derive(Default)]
 pub struct AuditLedgerOptions {
@@ -1086,13 +1118,9 @@ impl AuditLedger {
             {
                 continue;
             }
-            self.append_internal(
-                AuditEntryInput::new(
-                    "audit.legacy_divergence",
-                    EntryPhase::Outcome,
-                    EntryOutcome::Uncertain,
-                )
-                .with_reason(EntryReason::LegacyWrittenAfterCutover),
+            self.append_housekeeping_internal(
+                AuditHousekeepingInput::new("audit.legacy_divergence", EntryOutcome::Uncertain)
+                    .with_reason(EntryReason::LegacyWrittenAfterCutover),
                 Some(RecoveryEvidence {
                     bytes: bytes.len() as u64,
                     sha256: if bytes.is_empty() {
@@ -1148,24 +1176,16 @@ impl AuditLedger {
         };
 
         if let Some(evidence) = torn {
-            self.append_internal(
-                AuditEntryInput::new(
-                    "audit.recovery",
-                    EntryPhase::Outcome,
-                    EntryOutcome::Uncertain,
-                )
-                .with_reason(EntryReason::RecoveryTornTail),
+            self.append_housekeeping_internal(
+                AuditHousekeepingInput::new("audit.recovery", EntryOutcome::Uncertain)
+                    .with_reason(EntryReason::RecoveryTornTail),
                 Some(evidence),
             )?;
         }
         for gap in ungapped {
-            self.append_internal(
-                AuditEntryInput::new(
-                    "audit.recovery",
-                    EntryPhase::Outcome,
-                    EntryOutcome::Uncertain,
-                )
-                .with_reason(EntryReason::RecoveryDroppedEntries),
+            self.append_housekeeping_internal(
+                AuditHousekeepingInput::new("audit.recovery", EntryOutcome::Uncertain)
+                    .with_reason(EntryReason::RecoveryDroppedEntries),
                 Some(RecoveryEvidence {
                     bytes: 0,
                     sha256: String::new(),
@@ -1196,6 +1216,7 @@ impl AuditLedger {
                         at_offset: 0,
                         lost_entries: 1,
                     }),
+                    false,
                 )?;
             }
             let mut guard = self.inner.lock();
@@ -1337,6 +1358,17 @@ pub(crate) fn scan_journal_at(
             entry_count = entry_count
                 .checked_add(1)
                 .ok_or(AuditError::Poisoned(PoisonReason::SequenceExhausted))?;
+            match record.kind {
+                AuditRecordKind::Producer if record.intent.is_none() => {
+                    return Err(AuditError::Poisoned(PoisonReason::EntryMalformed));
+                }
+                AuditRecordKind::Housekeeping
+                    if record.phase != EntryPhase::Outcome || record.intent.is_some() =>
+                {
+                    return Err(AuditError::Poisoned(PoisonReason::EntryMalformed));
+                }
+                _ => {}
+            }
             match record.phase {
                 EntryPhase::Intent => {
                     if let Some(intent) = record.intent {
@@ -1397,7 +1429,7 @@ impl AuditLedger {
 
     pub fn append(&self, entry: AuditEntryInput) -> AuditResult<u64> {
         let _transaction = self.operation_lock.lock();
-        let seq = self.append_internal(entry, None)?;
+        let seq = self.append_internal(entry, None, false)?;
         let should_rotate = {
             let guard = self.inner.lock();
             guard.live.journal_bytes >= MAX_GENERATION_BYTES
@@ -1417,13 +1449,34 @@ impl AuditLedger {
         entry: AuditEntryInput,
         recovery: Option<RecoveryEvidence>,
     ) -> AuditResult<u64> {
-        self.append_internal(entry, recovery)
+        self.append_internal(entry, recovery, false)
+    }
+
+    pub fn append_housekeeping(
+        &self,
+        input: AuditHousekeepingInput,
+        recovery: Option<RecoveryEvidence>,
+    ) -> AuditResult<u64> {
+        let _transaction = self.operation_lock.lock();
+        self.append_housekeeping_internal(input, recovery)
+    }
+
+    fn append_housekeeping_internal(
+        &self,
+        input: AuditHousekeepingInput,
+        recovery: Option<RecoveryEvidence>,
+    ) -> AuditResult<u64> {
+        let mut entry = AuditEntryInput::new(input.op, EntryPhase::Outcome, input.outcome);
+        entry.reason = input.reason;
+        entry.code = input.code;
+        self.append_internal(entry, recovery, true)
     }
 
     fn append_internal(
         &self,
         entry: AuditEntryInput,
         recovery: Option<RecoveryEvidence>,
+        housekeeping: bool,
     ) -> AuditResult<u64> {
         let mut guard = self.inner.lock();
         if let Some(reason) = guard.poisoned {
@@ -1447,6 +1500,11 @@ impl AuditLedger {
         let keys = self.keys();
         let mut record = AuditRecord {
             v: RECORD_VERSION,
+            kind: if housekeeping {
+                AuditRecordKind::Housekeeping
+            } else {
+                AuditRecordKind::Producer
+            },
             generation: live.generation_id.clone(),
             seq: live
                 .last_seq
@@ -1485,7 +1543,7 @@ impl AuditLedger {
         if line.len() > MAX_LINE_BYTES {
             return Err(AuditError::Refused(RefuseReason::EntryTooLarge));
         }
-        if record.phase == EntryPhase::Intent && record.intent.is_none() {
+        if !housekeeping && record.intent.is_none() {
             return Err(AuditError::Refused(RefuseReason::IntentIdentityRequired));
         }
         if let Some(intent) = record.intent.as_ref() {
@@ -1581,8 +1639,8 @@ impl AuditLedger {
             .map_err(|error| AuditError::Io(format!("serialize gap file: {error}")))?;
         files::atomic_write(&self.gap_path(), &bytes)?;
 
-        self.append_internal(
-            AuditEntryInput::new("audit.gap", EntryPhase::Outcome, EntryOutcome::Uncertain)
+        self.append_housekeeping_internal(
+            AuditHousekeepingInput::new("audit.gap", EntryOutcome::Uncertain)
                 .with_reason(EntryReason::RecoveryDroppedEntries),
             Some(RecoveryEvidence {
                 bytes: 0,
@@ -1613,13 +1671,9 @@ impl AuditLedger {
         }
 
         // R0.5: the sealing record is the last entry of the outgoing generation.
-        self.append_internal(
-            AuditEntryInput::new(
-                "audit.generation.sealing",
-                EntryPhase::Outcome,
-                EntryOutcome::Accepted,
-            )
-            .with_reason(EntryReason::GenerationSealing),
+        self.append_housekeeping_internal(
+            AuditHousekeepingInput::new("audit.generation.sealing", EntryOutcome::Accepted)
+                .with_reason(EntryReason::GenerationSealing),
             None,
         )?;
 
@@ -1745,13 +1799,9 @@ impl AuditLedger {
         self.cut(CrashPoint::R3Committed)?;
 
         // R4: publish.
-        self.append_internal(
-            AuditEntryInput::new(
-                "audit.generation.opened",
-                EntryPhase::Outcome,
-                EntryOutcome::Accepted,
-            )
-            .with_reason(EntryReason::GenerationOpened),
+        self.append_housekeeping_internal(
+            AuditHousekeepingInput::new("audit.generation.opened", EntryOutcome::Accepted)
+                .with_reason(EntryReason::GenerationOpened),
             None,
         )?;
         Ok(next_id)

@@ -6158,7 +6158,7 @@ mod tests {
         let entry = AuditEntry {
             ts: Utc::now(),
             tool: "ptah_get_capacity".into(),
-            request_id: None,
+            request_id: Some("capacity-audit".into()),
             session_id: None,
             workspace: None,
             outcome: "accepted".into(),
@@ -6187,7 +6187,7 @@ mod tests {
             .enqueue_audit(AuditEntry {
                 ts: Utc::now(),
                 tool: "auth".into(),
-                request_id: None,
+                request_id: Some("auth-audit".into()),
                 session_id: None,
                 workspace: None,
                 outcome: "rejected".into(),

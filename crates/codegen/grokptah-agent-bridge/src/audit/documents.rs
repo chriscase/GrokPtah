@@ -76,6 +76,13 @@ pub enum EntryOutcome {
     Uncertain,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditRecordKind {
+    Producer,
+    Housekeeping,
+}
+
 /// Closed reason vocabulary. Free text never reaches the journal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -119,6 +126,7 @@ pub struct RecoveryEvidence {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AuditRecord {
     pub v: u32,
+    pub kind: AuditRecordKind,
     #[serde(rename = "gen")]
     pub generation: String,
     pub seq: u64,
