@@ -1132,7 +1132,7 @@ mod tests {
                 independent_verifier: true,
                 isolated_guest: true,
             },
-            crate::computer_profile::authority_seam::test_binding(),
+            crate::computer_profile::test_binding(),
         );
         let PolicyOutcome::Proceed(decision) = crate::computer_profile::AdaptivePolicyEngine
             .select(

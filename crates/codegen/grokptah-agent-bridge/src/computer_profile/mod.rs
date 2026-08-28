@@ -19,6 +19,8 @@ pub mod risk;
 pub(crate) use adapters::{
     AdaptiveObservationAdapter, ProviderImageInput, SemanticHeadlessAdapter, VisualGroundingAdapter,
 };
+#[cfg(test)]
+pub(crate) use authority_seam::test_binding;
 pub(crate) use authority_seam::{
     AdaptiveAuthorityAdapter, AuthorityFailure, ProviderAttemptRequest,
 };
