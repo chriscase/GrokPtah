@@ -55,7 +55,7 @@ mod worktree_gc;
 pub use agents_personas::{
     discover_agents, discover_personas, resolve_agent, resolve_persona, AgentDef, PersonaDef,
 };
-pub use capability_authority::CapabilityAuthority;
+pub use capability_authority::{CapabilityAuthority, CapabilityPrincipal};
 pub use certification::{
     public_xai_endpoint_fingerprint, scan_value_for_forbidden_data, ArtifactReference,
     AttemptDisposition, CampaignActuals, CampaignBudgets, CampaignIdentity,
