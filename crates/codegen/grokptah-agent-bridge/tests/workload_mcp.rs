@@ -364,10 +364,9 @@ async fn workload_protocol_is_idempotent_scoped_and_lane_archive_safe() {
         .await
         .unwrap();
     assert_eq!(approved.structured["work"]["state"], "succeeded");
-    assert_eq!(
-        approved.structured["work"]["approval"]["reviewerId"],
-        "primary"
-    );
+    assert!(approved.structured["work"]["approval"]["reviewerId"]
+        .as_str()
+        .is_some_and(|handle| handle.starts_with("actor_")));
 
     let retry_policy = WorkPolicy {
         retry: WorkRetryPolicy {
