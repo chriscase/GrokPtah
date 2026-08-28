@@ -6785,7 +6785,37 @@ impl OrchestrationService {
         if allow_queue && queue_ahead {
             queued = true;
         } else if let Err(e) = self.try_reserve_capacity(&run_id, session_id) {
-            if allow_queue
+            let terminal_finalization_pending = e.code == OrchErrorCode::SessionBusy
+                && self
+                    .host
+                    .orchestration_reservation_for_session(session_id)
+                    .and_then(|active_run_id| self.store.load_run(&active_run_id).ok().flatten())
+                    .is_some_and(|run| run.state.is_terminal());
+            if terminal_finalization_pending {
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    self.host.wait_for_orchestration_release(session_id),
+                )
+                .await;
+                if let Err(retry_error) = self.try_reserve_capacity(&run_id, session_id) {
+                    if allow_queue
+                        && matches!(
+                            retry_error.code,
+                            OrchErrorCode::SessionBusy | OrchErrorCode::CapacityExhausted
+                        )
+                    {
+                        queued = true;
+                    } else {
+                        return Err(self.fail_claim(
+                            &mut lease,
+                            None,
+                            session_id,
+                            &claimed,
+                            retry_error,
+                        ));
+                    }
+                }
+            } else if allow_queue
                 && matches!(
                     e.code,
                     OrchErrorCode::SessionBusy | OrchErrorCode::CapacityExhausted

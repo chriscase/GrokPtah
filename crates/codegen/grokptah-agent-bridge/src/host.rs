@@ -3330,6 +3330,20 @@ impl AgentHostHandle {
         g.turn_cancels.contains_key(&id) || g.turn_reservations.contains_key(&id)
     }
 
+    pub fn orchestration_reservation_for_session(&self, id: Uuid) -> Option<String> {
+        self.inner.lock().turn_reservations.get(&id).cloned()
+    }
+
+    pub async fn wait_for_orchestration_release(&self, id: Uuid) {
+        loop {
+            let notified = self.orchestration_wakeup.notified();
+            if !self.session_busy(id) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     pub fn reserve_orchestration_turn(&self, run_id: &str, session_id: Uuid) -> Result<()> {
         self.ensure_session_accepts_new_work(session_id)?;
         let mut g = self.inner.lock();
