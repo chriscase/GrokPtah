@@ -357,6 +357,13 @@ impl AuditLedger {
         &self.root
     }
 
+    fn custody_root(&self) -> &Path {
+        self.root
+            .parent()
+            .filter(|parent| parent.join(".audit-key").is_file())
+            .unwrap_or(&self.root)
+    }
+
     pub(crate) fn keys(&self) -> Arc<AuditKeys> {
         self.keys.read().clone()
     }
@@ -1329,7 +1336,7 @@ impl AuditLedger {
         let next_id = generation_id(next_index);
         let next_keys = if reason == RotationReason::KeyRotation {
             let next = outgoing_key.rotated();
-            next.persist_epoch(&self.root)?;
+            next.persist_epoch(self.custody_root())?;
             Arc::new(next)
         } else {
             Arc::clone(&outgoing_key)
