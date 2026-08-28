@@ -131,11 +131,6 @@ impl AuditHousekeepingInput {
         self.reason = Some(reason);
         self
     }
-
-    pub(crate) fn with_code(mut self, code: impl Into<String>) -> Self {
-        self.code = Some(code.into());
-        self
-    }
 }
 
 /// Open-time configuration.

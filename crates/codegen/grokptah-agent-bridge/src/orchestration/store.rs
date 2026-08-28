@@ -5005,18 +5005,6 @@ impl OrchStore {
             .map_err(|error| anyhow::anyhow!("audit persistence failed: {}", error.code()))
     }
 
-    pub(crate) fn append_audit_housekeeping(
-        &self,
-        input: crate::audit::AuditHousekeepingInput,
-        recovery: Option<crate::audit::RecoveryEvidence>,
-    ) -> anyhow::Result<()> {
-        self.inner
-            .audit
-            .append_housekeeping(input, recovery)
-            .map(|_| ())
-            .map_err(|error| anyhow::anyhow!("audit persistence failed: {}", error.code()))
-    }
-
     pub(crate) fn audit_intent_state(
         &self,
         intent_id: &str,

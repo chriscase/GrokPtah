@@ -668,12 +668,19 @@ fn validate_receipt(receipt: &MutationReceipt) -> ComputerResult<()> {
     {
         return Err(invalid_record());
     }
-    let payload_shape_is_valid = match receipt.state {
-        ReceiptState::Claimed => receipt.result.is_none() && receipt.error.is_none(),
-        ReceiptState::Succeeded => receipt.result.is_some() && receipt.error.is_none(),
-        ReceiptState::Failed | ReceiptState::Uncertain => {
-            receipt.result.is_none() && receipt.error.is_some()
+    let payload_shape_is_valid = match receipt.stage {
+        MutationStage::Claimed | MutationStage::IntentRecorded => {
+            receipt.state == ReceiptState::Claimed
+                && receipt.result.is_none()
+                && receipt.error.is_none()
         }
+        MutationStage::EffectCommitted | MutationStage::OutcomeRecorded => match receipt.state {
+            ReceiptState::Claimed => receipt.result.is_some() ^ receipt.error.is_some(),
+            ReceiptState::Succeeded => receipt.result.is_some() && receipt.error.is_none(),
+            ReceiptState::Failed | ReceiptState::Uncertain => {
+                receipt.result.is_none() && receipt.error.is_some()
+            }
+        },
     };
     if !payload_shape_is_valid
         || receipt
