@@ -1723,10 +1723,11 @@ impl OrchestrationService {
                             lower.as_str(),
                             "workspace" | "cwd" | "path" | "sourceworkspace" | "executionworkspace"
                         ) {
-                            let replacement = if lower == "path" {
-                                "path_redacted"
-                            } else {
-                                "workspace_redacted"
+                            let replacement = match (lower.as_str(), value.as_str()) {
+                                ("path", Some(path)) => public_path_handle(path),
+                                (_, Some(workspace)) => public_workspace_handle(workspace),
+                                ("path", None) => "path_redacted".into(),
+                                (_, None) => "workspace_redacted".into(),
                             };
                             projected.insert(key, json!(replacement));
                             continue;
@@ -6782,7 +6783,7 @@ impl OrchestrationService {
         };
         if source_fingerprint != execution.source_fingerprint
             || final_fingerprint != review.fingerprint
-            || changed_files != review.changed_files
+            || !public_changed_files_match(&changed_files, &review.changed_files)
         {
             return Err(self.fail_claim(
                 &mut lease,
@@ -6818,11 +6819,11 @@ impl OrchestrationService {
             workspace: run.workspace.clone(),
             source_fingerprint,
             final_fingerprint,
-            changed_files,
+            changed_files: review.changed_files.clone(),
             issued_at,
             expires_at: issued_at + chrono::Duration::milliseconds(ttl as i64),
         };
-        let response = json!({
+        let response = self.public_projection(json!({
             "runId": run_id,
             "sessionId": session_id,
             "approvalId": approval.approval_id,
@@ -6830,7 +6831,7 @@ impl OrchestrationService {
             "sourceFingerprint": approval.source_fingerprint,
             "finalFingerprint": approval.final_fingerprint,
             "changedFiles": approval.changed_files,
-        });
+        }));
         let updated = self.store.update_run(run_id, |current| {
             current.approval = Some(approval.clone());
             current.updated_at = Utc::now();
@@ -8290,6 +8291,23 @@ fn canonical_cmp(a: &Path, b: &Path) -> Result<(), ()> {
     } else {
         Err(())
     }
+}
+
+fn public_path_handle(path: &str) -> String {
+    format!("path_{}", &hash_payload(&json!(path))[..32])
+}
+
+fn public_workspace_handle(workspace: &str) -> String {
+    format!("workspace_{}", &hash_payload(&json!(workspace))[..32])
+}
+
+fn public_changed_files_match(candidate: &[ChangeRecord], expected: &[ChangeRecord]) -> bool {
+    candidate == expected
+        || (candidate.len() == expected.len()
+            && candidate.iter().zip(expected).all(|(candidate, expected)| {
+                candidate.path == public_path_handle(&expected.path)
+                    && candidate.summary == expected.summary
+            }))
 }
 
 /// Incrementally persist run-scoped aggregates so journal rollover cannot erase them.
