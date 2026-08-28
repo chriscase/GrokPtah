@@ -831,6 +831,18 @@ impl AgentHost {
         );
         {
             event_tx = event_tx.with_persist_dir(runtime_home.orchestration_root());
+            // Bind the journal's authority explicitly to *this* lifecycle rather
+            // than leaving it resolved by home lookup. The bind verifies the
+            // journal's canonical home is the one this runtime holds the lock
+            // for, so the journal fails closed with this runtime and can never
+            // borrow its authority for a different home (#455).
+            //
+            // The journal is under this runtime's home by construction, so this
+            // always binds; a false here would mean the home moved underneath us.
+            debug_assert!(
+                event_tx.bind_journal_lifecycle(&lifecycle),
+                "the event journal must live in the home this runtime owns"
+            );
         }
         // Keep a dedicated channel for take_event_receiver / first GUI subscriber.
         let event_rx = event_tx.subscribe();
@@ -1060,6 +1072,19 @@ impl AgentHostHandle {
         F: std::future::Future,
     {
         self.lifecycle.track_future(operation, future)
+    }
+
+    /// Cancellation token fired when the owning runtime begins shutdown.
+    /// Public so embedders and lifecycle tests can observe the same signal
+    /// supervised tasks select on.
+    pub fn shutdown_signal(&self) -> CancellationToken {
+        self.lifecycle.cancel_token()
+    }
+
+    /// Test seam: bind a store to this runtime, so a test can prove a ledger
+    /// for another home is refused (#455).
+    pub fn bind_store_for_test(&self, store: &OrchStore) -> bool {
+        store.bind_lifecycle(&self.lifecycle)
     }
 
     /// Cancellation token fired when the owning runtime begins shutdown.
@@ -1462,8 +1487,11 @@ impl AgentHostHandle {
         }
         let opened = OrchStore::open(self.runtime_home.orchestration_root())?;
         // Bind explicitly rather than relying on open-time registry lookup, so
-        // every clone of this ledger fails closed with this runtime.
-        opened.bind_lifecycle(&self.lifecycle);
+        // every clone of this ledger fails closed with this runtime. The bind
+        // verifies the ledger's home is the one this runtime owns.
+        // The ledger is under this runtime's home by construction, so this
+        // always binds; a false here would mean the home moved underneath us.
+        debug_assert!(opened.bind_lifecycle(&self.lifecycle));
         *store = Some(opened.clone());
         Ok(opened)
     }
@@ -1479,7 +1507,7 @@ impl AgentHostHandle {
             return Ok(existing.clone());
         }
         let opened = crate::computer_use::ComputerStore::open(self.runtime_home.computer_root())?;
-        opened.bind_lifecycle(&self.lifecycle);
+        debug_assert!(opened.bind_lifecycle(&self.lifecycle));
         *store = Some(opened.clone());
         Ok(opened)
     }
@@ -1489,18 +1517,32 @@ impl AgentHostHandle {
         self.computer_store.lock().clone()
     }
 
-    /// Install a store supplied by the orchestration service when the host has
-    /// not opened one yet. This keeps library/test construction and the
-    /// desktop bootstrap on one durable ledger rather than silently splitting
-    /// external and desktop run records.
-    pub(crate) fn install_orchestration_store(&self, store: OrchStore) {
+    /// Adopt a store the caller opened, if this runtime has none yet. This
+    /// keeps library/test construction and the desktop bootstrap on one
+    /// durable ledger rather than silently splitting external and desktop run
+    /// records.
+    ///
+    /// A ledger under this runtime's home is bound to its lifecycle, so every
+    /// clone of it fails closed with this runtime. A ledger rooted elsewhere
+    /// is still adopted as the process ledger but keeps the authority it
+    /// established at open, because this runtime's instance lock does not
+    /// protect that root — authority is never borrowed across homes (#455).
+    pub(crate) fn install_orchestration_store(&self, store: OrchStore) -> bool {
         let mut current = self.orchestration_store.lock();
-        if current.is_none() {
-            // A store handed in from outside becomes this runtime's, and its
-            // clones fail closed with it (#455).
-            store.bind_lifecycle(&self.lifecycle);
-            *current = Some(store);
+        if current.is_some() {
+            return false;
         }
+        if !store.bind_lifecycle(&self.lifecycle) {
+            eprintln!(
+                "[grokptah] adopting an orchestration ledger governed by {}, outside the home \
+                 this runtime owns ({}); it keeps the durable-write authority it established at \
+                 open rather than borrowing this runtime's",
+                store.authority_home_lock().display(),
+                self.lifecycle.lock_path().display()
+            );
+        }
+        *current = Some(store);
+        true
     }
 
     /// Return the already-open ledger without causing filesystem work.

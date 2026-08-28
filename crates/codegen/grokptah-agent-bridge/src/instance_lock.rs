@@ -29,20 +29,41 @@ impl InstanceLock {
     /// Acquire the lock for an explicitly selected runtime home.
     pub fn try_acquire_at(home: &RuntimeHome) -> Result<Self> {
         home.prepare()?;
-        let path = home.instance_lock_path();
+        Self::try_acquire_path(&home.instance_lock_path(), home.path())
+    }
+
+    /// Acquire the lock directly at its path, creating only the directory the
+    /// lock file itself needs.
+    ///
+    /// This is the minimal-footprint acquisition used by offline maintenance
+    /// handles: they must own the home *before* laying down any store layout,
+    /// so the only filesystem mutation that may precede authority is the
+    /// directory the lock file lives in (#455).
+    pub(crate) fn try_acquire_path(
+        path: &std::path::Path,
+        home_label: &std::path::Path,
+    ) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create runtime home {}", parent.display()))?;
+        }
+        Self::open_and_lock(path, home_label)
+    }
+
+    fn open_and_lock(path: &std::path::Path, home_label: &std::path::Path) -> Result<Self> {
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(true)
             .read(true)
             .write(true)
-            .open(&path)
+            .open(path)
             .with_context(|| format!("open instance lock {}", path.display()))?;
 
         file.try_lock_exclusive().map_err(|e| {
             anyhow::anyhow!(
                 "another GrokPtah instance is already using {} ({e}). \
                  Quit the other app (or stale build) before starting a second one.",
-                home.path().display()
+                home_label.display()
             )
         })?;
 
@@ -52,7 +73,7 @@ impl InstanceLock {
             file,
             "pid={} home={}",
             std::process::id(),
-            home.path().display()
+            home_label.display()
         );
         let _ = file.sync_all();
 

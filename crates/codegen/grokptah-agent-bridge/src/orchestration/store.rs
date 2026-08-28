@@ -52,14 +52,43 @@ impl OrchStore {
 
     /// Bind this handle (and every clone of it) to the runtime that owns its
     /// home. Called by the host when it adopts a store it did not open.
-    pub(crate) fn bind_lifecycle(&self, lifecycle: &Arc<crate::host_runtime::HostLifecycle>) {
-        self.inner.write_lease.lock().bind(lifecycle);
+    ///
+    /// Returns `false` — leaving the handle's own authority untouched — when
+    /// that runtime owns a *different* home, so a store can never borrow
+    /// authority for a home the binder does not hold. A foreign-rooted ledger
+    /// keeps the OS lock it took for its own home at open, which is a real
+    /// authority for that home and no authority at all for this one.
+    pub(crate) fn bind_lifecycle(
+        &self,
+        lifecycle: &Arc<crate::host_runtime::HostLifecycle>,
+    ) -> bool {
+        let Some(rebound) = crate::host_runtime::WriteLease::bound_to(&self.inner.root, lifecycle)
+        else {
+            return false;
+        };
+        *self.inner.write_lease.lock() = rebound;
+        true
     }
 
-    /// Whether this handle is bound to a runtime. An unbound handle may still
-    /// write, but only while no runtime and no process owns its home.
+    /// Whether this handle is bound to a live runtime rather than owning the
+    /// home's OS lock itself.
     pub fn is_lease_bound(&self) -> bool {
         self.inner.write_lease.lock().is_bound()
+    }
+
+    /// Whether this handle holds its home's single-instance lock itself, for
+    /// the whole lifetime of the handle.
+    ///
+    /// This is the negative control against a check-only probe: an offline
+    /// ledger that can write must be able to say it *holds* the lock, not that
+    /// it once observed the home to be free (#455).
+    pub fn holds_home_lock_itself(&self) -> bool {
+        self.inner.write_lease.lock().is_offline_owner()
+    }
+
+    /// The home whose single-instance lock governs this handle's writes.
+    pub fn authority_home_lock(&self) -> PathBuf {
+        self.inner.write_lease.lock().home_lock_path().to_path_buf()
     }
 }
 
@@ -188,6 +217,18 @@ impl OrchStore {
     /// Open store and convert unfinished runs to `interrupted` (crash recovery).
     pub fn open(root: impl AsRef<Path>) -> anyhow::Result<Self> {
         let root = root.as_ref().to_path_buf();
+        // Authority *before* mutation (#455). Establishing the lease either
+        // binds to the runtime that owns this home or takes the home's OS lock
+        // and keeps it; either way nothing below — not one directory, not the
+        // store lock — is created on a home this process may not write.
+        let write_lease = crate::host_runtime::WriteLease::for_store_root(&root);
+        // Bound to a name: the guard must be *held* across the layout creation
+        // and the store lock below, not merely taken and dropped. A dropped
+        // guard is a check, and a check can go stale between its answer and
+        // the mutation it was supposed to authorize (#455).
+        let _open_write = write_lease
+            .begin("opening the durable orchestration ledger")
+            .context("durable-write authority for the orchestration ledger")?;
         fs::create_dir_all(root.join("runs"))?;
         fs::create_dir_all(root.join("agents"))?;
         fs::create_dir_all(root.join("agent-specs"))?;
@@ -235,9 +276,7 @@ impl OrchStore {
         // The audit writer runs on its own thread and outlives any single
         // call, so it carries the same lease every other durable effect does.
         // The lease is shared, so rebinding the store rebinds the writer.
-        let write_lease = Arc::new(Mutex::new(crate::host_runtime::WriteLease::for_store_root(
-            &root,
-        )));
+        let write_lease = Arc::new(Mutex::new(write_lease));
         let writer_lease = write_lease.clone();
         let audit_join = std::thread::Builder::new()
             .name("grokptah-orchestration-audit".into())
@@ -530,13 +569,13 @@ impl OrchStore {
         atomic_write_json(&self.lease(), &intent_path, &intent)?;
         if let Err(error) = atomic_write_json(&self.lease(), &run_path, run) {
             let run_rollback = match fs::symlink_metadata(&run_path) {
-                Ok(_) => remove_file_durable(&run_path),
+                Ok(_) => remove_file_durable(&self.lease(), &run_path),
                 Err(metadata_error) if metadata_error.kind() == std::io::ErrorKind::NotFound => {
                     Ok(())
                 }
                 Err(metadata_error) => Err(metadata_error.into()),
             };
-            if run_rollback.is_err() || remove_file_durable(&intent_path).is_err() {
+            if run_rollback.is_err() || remove_file_durable(&self.lease(), &intent_path).is_err() {
                 return Err(error.context(
                     "persist Agent activation Run; durable recovery intent requires restart",
                 ));
@@ -544,19 +583,19 @@ impl OrchStore {
             return Err(error.context("persist Agent activation Run"));
         }
         if let Err(error) = atomic_write_json(&self.lease(), &agent_path, &agent) {
-            if remove_file_durable(&run_path).is_err() {
+            if remove_file_durable(&self.lease(), &run_path).is_err() {
                 return Err(error.context(
                     "persist Agent activation; durable recovery intent requires restart",
                 ));
             }
-            if remove_file_durable(&intent_path).is_err() {
+            if remove_file_durable(&self.lease(), &intent_path).is_err() {
                 return Err(error.context(
                     "persist Agent activation; durable recovery intent requires restart",
                 ));
             }
             return Err(error.context("persist Agent activation"));
         }
-        if let Err(error) = remove_file_durable(&intent_path) {
+        if let Err(error) = remove_file_durable(&self.lease(), &intent_path) {
             // Both authoritative records are installed. Keep the recovery
             // intent as a safe replay anchor; terminal finalization removes
             // it before replacing the Run.
@@ -642,7 +681,7 @@ impl OrchStore {
         };
         atomic_write_json(&self.lease(), &intent_path, &intent)?;
         if let Err(error) = atomic_write_json(&self.lease(), &run_path, &run) {
-            if remove_file_durable(&intent_path).is_err() {
+            if remove_file_durable(&self.lease(), &intent_path).is_err() {
                 return Err(
                     error.context("promote queued Run; durable recovery intent requires restart")
                 );
@@ -651,14 +690,14 @@ impl OrchStore {
         }
         if let Err(error) = atomic_write_json(&self.lease(), &agent_path, &agent) {
             if atomic_write_json(&self.lease(), &run_path, &prior_run).is_err()
-                || remove_file_durable(&intent_path).is_err()
+                || remove_file_durable(&self.lease(), &intent_path).is_err()
             {
                 return Err(error
                     .context("activate promoted Run; durable recovery intent requires restart"));
             }
             return Err(error.context("activate promoted Run"));
         }
-        if let Err(error) = remove_file_durable(&intent_path) {
+        if let Err(error) = remove_file_durable(&self.lease(), &intent_path) {
             *self.inner.last_run_error.lock() = Some(error.to_string());
         }
         Ok(Some(run))
@@ -906,7 +945,7 @@ impl OrchStore {
         atomic_write_json(&self.lease(), &intent_path, &intent)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         self.commit_manager_creation_intent_unlocked(&intent)?;
-        remove_file_durable(&intent_path)
+        remove_file_durable(&self.lease(), &intent_path)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
     }
 
@@ -939,7 +978,7 @@ impl OrchStore {
             intent.plan.validate()?;
             intent.root_work.validate()?;
             self.commit_manager_creation_intent_unlocked(&intent)?;
-            remove_file_durable(&path)
+            remove_file_durable(&self.lease(), &path)
                 .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         }
         Ok(())
@@ -1325,7 +1364,7 @@ impl OrchStore {
             let intent: RoutineFireIntent = serde_json::from_str(&fs::read_to_string(&path)?)?;
             self.commit_routine_intent_unlocked(&intent)
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-            remove_file_durable(&path)?;
+            remove_file_durable(&self.lease(), &path)?;
         }
         Ok(())
     }
@@ -1818,7 +1857,7 @@ impl OrchStore {
 
     fn clear_routine_intent_unlocked(&self, activation_id: &str) -> Result<(), OrchError> {
         let path = self.routine_intent_path(activation_id)?;
-        remove_file_durable(&path)
+        remove_file_durable(&self.lease(), &path)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
     }
 
@@ -1829,7 +1868,7 @@ impl OrchStore {
         }
         for activation in activations.into_iter().skip(MAX_ACTIVATION_HISTORY) {
             let path = self.routine_activation_path(routine_id, &activation.activation_id)?;
-            let _ = remove_file_durable(&path);
+            let _ = remove_file_durable(&self.lease(), &path);
         }
         // Dedupe receipts outlive activation history so a late replay cannot
         // mint a second Work item after the inspectable history window.
@@ -2907,7 +2946,7 @@ impl OrchStore {
         messages.sort_by_key(|message| message.seq);
         let drop = messages.len() - MAX_RETAINED_MESSAGES;
         for message in messages.into_iter().take(drop) {
-            let _ = remove_file_durable(&self.message_path(&message.message_id)?);
+            let _ = remove_file_durable(&self.lease(), &self.message_path(&message.message_id)?);
         }
         Ok(())
     }
@@ -3493,11 +3532,9 @@ impl OrchStore {
                 self.save_managed_intent_unlocked(&intent)?;
             }
         }
-        if self
-            .lease()
-            .begin("clearing a managed finalization intent")
-            .is_ok()
-        {
+        if let Ok(_write) = self.lease().begin("clearing a managed finalization intent") {
+            // `_write` is a binding, not a discarded temporary, so the removal
+            // below happens *under* the authority rather than after it (#455).
             let _ = fs::remove_file(path);
         }
         Ok(())
@@ -4330,9 +4367,9 @@ impl OrchStore {
             }
             return Ok(());
         }
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        // No unguarded `create_dir_all` here: `atomic_write_json` creates the
+        // parent under its own guard, so no directory appears on a home this
+        // handle may not write (#455).
         atomic_write_json(&self.lease(), &path, spec)
     }
 
@@ -4542,7 +4579,7 @@ impl OrchStore {
             }
             return Ok(());
         }
-        Ok(write_json_exclusive(&path, snapshot)?)
+        Ok(write_json_exclusive(&self.lease(), &path, snapshot)?)
     }
 
     pub fn load_continuation_input(
@@ -4599,7 +4636,7 @@ impl OrchStore {
             }
             return Ok(());
         }
-        Ok(write_json_exclusive(&path, context)?)
+        Ok(write_json_exclusive(&self.lease(), &path, context)?)
     }
 
     pub fn load_continuation_context(
@@ -4789,7 +4826,7 @@ impl OrchStore {
             // A crash or cleanup failure may leave a fully applied activation
             // intent. Remove that Running snapshot before a terminal record
             // is installed so restart recovery can never resurrect the Run.
-            remove_file_durable(&activation_path)
+            remove_file_durable(&self.lease(), &activation_path)
                 .context("retire Agent activation before Run finalization")?;
         }
         let mut final_run = candidate.clone();
@@ -4908,7 +4945,7 @@ impl OrchStore {
             created_at: Utc::now(),
             status: "pending".into(),
         };
-        match write_json_exclusive(&path, &pending) {
+        match write_json_exclusive(&self.lease(), &path, &pending) {
             Ok(()) => Ok(IdempotencyClaim::Perform),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 Ok(IdempotencyClaim::Pending)
@@ -5145,7 +5182,7 @@ impl OrchStore {
             }
             atomic_write_json(&self.lease(), &run_path, &intent.run)?;
             atomic_write_json(&self.lease(), &agent_path, &intent.activated_agent)?;
-            remove_file_durable(&path)?;
+            remove_file_durable(&self.lease(), &path)?;
             recovered += 1;
         }
         Ok(recovered)
@@ -5294,6 +5331,9 @@ fn append_audit_entry(
 ) -> anyhow::Result<()> {
     use std::io::Write;
 
+    // Covers the append *and* the rotation below: rotation renames and deletes
+    // durable evidence, so it is authorized by the same guard rather than
+    // slipping past a check that only guarded the append (#455).
     let _write = lease.begin("appending to the durable audit ledger")?;
 
     let path = root.join("audit").join("audit.jsonl");
@@ -5322,7 +5362,8 @@ pub enum IdempotencyClaim {
     Replay(Result<serde_json::Value, OrchError>),
 }
 
-fn remove_file_durable(path: &Path) -> anyhow::Result<()> {
+fn remove_file_durable(lease: &crate::host_runtime::WriteLease, path: &Path) -> anyhow::Result<()> {
+    let _write = lease.begin("removing a durable orchestration record")?;
     if path.is_file() {
         fs::remove_file(path)?;
     }
@@ -5367,7 +5408,14 @@ fn atomic_write_json<T: serde::Serialize>(
     Ok(())
 }
 
-fn write_json_exclusive<T: serde::Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
+fn write_json_exclusive<T: serde::Serialize>(
+    lease: &crate::host_runtime::WriteLease,
+    path: &Path,
+    value: &T,
+) -> std::io::Result<()> {
+    let _write = lease
+        .begin("creating a durable orchestration record")
+        .map_err(std::io::Error::other)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
