@@ -94,6 +94,14 @@ struct QualificationCredentials {
 }
 
 impl QualificationCredentials {
+    #[cfg(test)]
+    fn new(
+        current: Option<crate::auth_store::WireCredentials>,
+        profile: &crate::gateway_config::ProviderProfile,
+    ) -> Result<Self> {
+        Self::new_with_authority(current, profile, Arc::new(CapabilityAuthority::new(true)))
+    }
+
     fn new_with_authority(
         current: Option<crate::auth_store::WireCredentials>,
         profile: &crate::gateway_config::ProviderProfile,

@@ -26,7 +26,7 @@ use crate::events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 use crate::host_helpers::{
     action_stationarity_nudge, action_stationarity_stop_message, api_context_messages,
     auto_cargo_reverify_command, build_agent_messages, build_compact_summary,
-    call_xai_agent_step_observed_with_authority, call_xai_chat, call_xai_chat_with_authority,
+    call_xai_agent_step_observed_with_authority, call_xai_chat_with_authority,
     cargo_test_failure_coaching, cargo_test_output_failed, cargo_test_output_passed,
     cargo_test_reverify_coaching, coding_agent_tools, count_cargo_test_failures, emit_message,
     emit_thought, filter_tools_batch_edit_only, filter_tools_edit_and_shell,
