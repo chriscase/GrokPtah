@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::capability::{CapabilityAttribution, CapabilityEvidence};
-use super::controller::{AdaptiveController, CostLedger, EscalationRecord, TerminalOutcome};
+use super::controller::{AdaptiveController, AdaptiveSpend, EscalationRecord, TerminalOutcome};
 use super::policy::ProfileReason;
 use super::profile::{AdaptiveProfile, ObservationDetail, ProfileBudget, SafetyFloor};
 use super::risk::TaskRisk;
@@ -94,8 +94,8 @@ pub struct CostProjection {
     pub completion_tokens: Option<u64>,
 }
 
-impl From<CostLedger> for CostProjection {
-    fn from(cost: CostLedger) -> Self {
+impl From<AdaptiveSpend> for CostProjection {
+    fn from(cost: AdaptiveSpend) -> Self {
         Self {
             model_calls: cost.model_calls,
             observation_bytes: cost.observation_bytes,
@@ -192,7 +192,7 @@ pub fn project_adaptive(controller: &AdaptiveController) -> AdaptiveProfileProje
             .iter()
             .map(EscalationProjection::from)
             .collect(),
-        cost: state.cost.clone().into(),
+        cost: state.spend.clone().into(),
         stationary_repeats: state.stationary_repeats,
         observation_truncated: state.observation_truncated,
         requires_independent_verifier: state.profile.requires_independent_verifier(),

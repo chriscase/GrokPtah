@@ -1,0 +1,58 @@
+name: Computer Use adaptive verifier
+
+on:
+  pull_request:
+    paths:
+      - "crates/codegen/grokptah-agent-bridge/**"
+      - ".github/workflows/computer-use-adaptive.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  synthetic-campaign:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: "1.92.0"
+          components: rustfmt, clippy
+      - name: Install bridge system dependency
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - name: Format
+        working-directory: crates/codegen/grokptah-agent-bridge
+        run: cargo fmt --check
+      - name: Focused adaptive tests
+        working-directory: crates/codegen/grokptah-agent-bridge
+        run: cargo test --locked computer_profile -- --nocapture
+      - name: Synthetic campaign and replay verifier
+        working-directory: crates/codegen/grokptah-agent-bridge
+        run: |
+          set -euo pipefail
+          report="$(cargo run --locked --example computer_use_adaptive_campaign -- --verify)"
+          printf '%s\n' "$report" > "$RUNNER_TEMP/computer-use-adaptive-report.json"
+          python3 - "$RUNNER_TEMP/computer-use-adaptive-report.json" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          report = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          assert report["status"] == "PASS"
+          assert report["eligibility"] == "synthetic_only"
+          assert report["verified"] is True
+          assert report["episodes"] == 300
+          assert report["dispatched"] == 0
+          assert report["safetyBypasses"] == 0
+          assert report["kernelDisagreements"] == 0
+          assert report["promptTokens"] is None
+          assert report["completionTokens"] is None
+          print("adaptive synthetic campaign/replay verifier: PASS")
+          PY
+      - name: Full bridge gates
+        working-directory: crates/codegen/grokptah-agent-bridge
+        run: cargo test --locked -- --test-threads=1

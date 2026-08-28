@@ -181,7 +181,6 @@ impl CapabilityEvidence {
         if self.model.has_qualified_visual_path()
             && self.host.screenshot_capture
             && self.host.independent_verifier
-            && self.host.isolated_guest
         {
             return AdaptiveProfile::HighAssurance;
         }

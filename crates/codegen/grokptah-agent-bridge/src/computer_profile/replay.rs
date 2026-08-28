@@ -32,6 +32,7 @@ pub struct ReplayEvent {
     pub observation_digest: Option<String>,
     pub profile: AdaptiveProfile,
     pub reason: Option<ProfileReason>,
+    pub capability_snapshot_reference: Option<String>,
     pub action_digest: Option<String>,
     pub result_code: Option<String>,
     pub recovery_code: Option<String>,
@@ -109,6 +110,17 @@ impl ReplayVerifier {
             {
                 return Err(ReplayError::InvalidLatency);
             }
+            if event
+                .capability_snapshot_reference
+                .as_deref()
+                .is_some_and(|reference| !valid_reference(reference))
+                || event
+                    .action_digest
+                    .as_deref()
+                    .is_some_and(|digest| !valid_digest(Some(digest)))
+            {
+                return Err(ReplayError::InvalidDigest);
+            }
             if event.prompt_tokens.is_some() || event.completion_tokens.is_some() {
                 provider_usage_known = true;
             }
@@ -116,15 +128,12 @@ impl ReplayVerifier {
                 ReplayEventKind::Observation => {
                     observations += 1;
                     if event.observation_id.as_deref().is_none_or(str::is_empty)
-                        || !valid_digest(event.observation_digest.as_deref())
+                        || event.observation_digest.is_none()
                     {
-                        return Err(
-                            if event.observation_id.as_deref().is_none_or(str::is_empty) {
-                                ReplayError::MissingObservationEvidence
-                            } else {
-                                ReplayError::InvalidDigest
-                            },
-                        );
+                        return Err(ReplayError::MissingObservationEvidence);
+                    }
+                    if !valid_digest(event.observation_digest.as_deref()) {
+                        return Err(ReplayError::InvalidDigest);
                     }
                 }
                 ReplayEventKind::ActionProposal => {
@@ -195,6 +204,10 @@ fn valid_digest(value: Option<&str>) -> bool {
     })
 }
 
+fn valid_reference(value: &str) -> bool {
+    !value.trim().is_empty() && value.len() <= 128 && !value.contains(['\0', '/', '\\'])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,6 +220,7 @@ mod tests {
             observation_digest: Some("a".repeat(64)),
             profile: AdaptiveProfile::Economy,
             reason: Some(ProfileReason::RoutineTask),
+            capability_snapshot_reference: Some("capability-generation-1".into()),
             action_digest: Some("b".repeat(64)),
             result_code: None,
             recovery_code: None,

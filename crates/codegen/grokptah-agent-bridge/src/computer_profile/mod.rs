@@ -27,7 +27,7 @@ pub use capability::{
     CapabilityAttribution, CapabilityEvidence, HostCapabilityEvidence, ModelCapabilityEvidence,
 };
 pub use controller::{
-    AdaptiveController, AdaptiveRunState, ControllerError, CostLedger, EscalationRecord,
+    AdaptiveController, AdaptiveRunState, AdaptiveSpend, ControllerError, EscalationRecord,
     ObservationFingerprint, TerminalKind, TerminalOutcome, TurnPermit,
 };
 pub use policy::{

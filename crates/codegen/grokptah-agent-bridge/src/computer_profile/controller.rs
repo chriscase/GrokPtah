@@ -22,7 +22,7 @@ const MAX_OBSERVATION_DIGESTS: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CostLedger {
+pub struct AdaptiveSpend {
     pub model_calls: u32,
     pub observation_bytes: u64,
     pub screenshot_bytes: u64,
@@ -32,7 +32,7 @@ pub struct CostLedger {
     pub provider_latency_millis: u64,
 }
 
-impl Default for CostLedger {
+impl Default for AdaptiveSpend {
     fn default() -> Self {
         Self {
             model_calls: 0,
@@ -46,7 +46,7 @@ impl Default for CostLedger {
     }
 }
 
-impl CostLedger {
+impl AdaptiveSpend {
     fn add_optional(total: &mut Option<u64>, value: Option<u64>) {
         if let Some(value) = value {
             *total = Some(total.unwrap_or(0).saturating_add(value));
@@ -105,7 +105,7 @@ pub struct AdaptiveRunState {
     pub evidence: CapabilityEvidence,
     pub escalations: Vec<EscalationRecord>,
     pub terminal: Option<TerminalOutcome>,
-    pub cost: CostLedger,
+    pub spend: AdaptiveSpend,
     pub stationary_repeats: u32,
     pub uncertain_streak: u32,
     pub verification_failures: u32,
@@ -221,7 +221,7 @@ impl AdaptiveController {
                 evidence: decision.evidence,
                 escalations: Vec::new(),
                 terminal: None,
-                cost: CostLedger::default(),
+                spend: AdaptiveSpend::default(),
                 stationary_repeats: 0,
                 uncertain_streak: 0,
                 verification_failures: 0,
@@ -307,8 +307,8 @@ impl AdaptiveController {
         self.state.revision
     }
 
-    pub fn cost(&self) -> CostLedger {
-        self.state.cost.clone()
+    pub fn spend(&self) -> AdaptiveSpend {
+        self.state.spend.clone()
     }
 
     pub fn escalations(&self) -> &[EscalationRecord] {
@@ -334,7 +334,7 @@ impl AdaptiveController {
         if self.state.turn_in_flight {
             return Err(ControllerError::TurnInFlight);
         }
-        if self.state.cost.model_calls >= self.budget().max_model_calls {
+        if self.state.spend.model_calls >= self.budget().max_model_calls {
             let stop = self.apply_signal(RuntimeSignal::BudgetExhausted);
             return Err(ControllerError::Terminated {
                 reason: match stop {
@@ -354,7 +354,7 @@ impl AdaptiveController {
     pub fn abort_turn(&mut self, provider_attempted: bool) {
         self.state.turn_in_flight = false;
         if provider_attempted {
-            self.state.cost.model_calls = self.state.cost.model_calls.saturating_add(1);
+            self.state.spend.model_calls = self.state.spend.model_calls.saturating_add(1);
             self.state.revision = self.state.revision.saturating_add(1);
         }
     }
@@ -366,15 +366,15 @@ impl AdaptiveController {
         receipt: Option<&super::authority::ProviderAttemptReceipt>,
     ) {
         self.state.turn_in_flight = false;
-        self.state.cost.model_calls = self.state.cost.model_calls.saturating_add(1);
-        self.state.cost.observation_bytes = self
+        self.state.spend.model_calls = self.state.spend.model_calls.saturating_add(1);
+        self.state.spend.observation_bytes = self
             .state
-            .cost
+            .spend
             .observation_bytes
             .saturating_add(rendered_observation_bytes);
         self.state.observation_truncated = truncated;
         if let Some(receipt) = receipt {
-            self.state.cost.record_provider_attempt(
+            self.state.spend.record_provider_attempt(
                 receipt.prompt_tokens,
                 receipt.completion_tokens,
                 receipt.latency_millis,
@@ -614,7 +614,7 @@ mod tests {
                 reason: ProfileReason::RepeatedStationarity,
             }
         );
-        assert_eq!(controller.cost().model_calls, 0);
+        assert_eq!(controller.spend().model_calls, 0);
     }
 
     #[test]
@@ -626,7 +626,7 @@ mod tests {
             controller.terminal().map(|outcome| outcome.kind),
             Some(TerminalKind::Interrupted)
         );
-        assert_eq!(controller.cost().model_calls, 0);
+        assert_eq!(controller.spend().model_calls, 0);
         assert!(controller.begin_turn(0).is_err());
     }
 
