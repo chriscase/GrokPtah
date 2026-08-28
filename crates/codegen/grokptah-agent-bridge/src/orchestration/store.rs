@@ -5447,7 +5447,6 @@ fn write_json_exclusive<T: serde::Serialize>(path: &Path, value: &T) -> std::io:
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     /// Two receipts in the same millisecond, whose sub-millisecond order is the
     /// inverse of their request-id order, must both survive a paged walk.
