@@ -13,7 +13,7 @@ use grokptah_agent_bridge::{
     validate_computer_proposal_safety_only, ActionClass, ActionGrant, AdaptiveProfile,
     ComputerAgentProposal, ComputerObservation, ComputerPolicy, ComputerRun, ComputerRunState,
     ComputerTarget, ComputerUseLimits, GrantIssuer, ReplayEvent, ReplayEventKind, ReplayVerifier,
-    SemanticAction, TaskRisk,
+    SemanticAction,
 };
 use sha2::{Digest, Sha256};
 use uuid::Uuid;

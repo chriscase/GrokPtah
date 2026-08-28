@@ -8,8 +8,8 @@ use grokptah_agent_bridge::{
     AgentHostHandle, ComputerAction, ComputerAgentProposal, ComputerCapabilities, ComputerError,
     ComputerObservation, ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
     ComputerPlatformStatus, ComputerRun, ComputerRunProjection, ComputerRunState,
-    ComputerTargetCandidate, ComputerUseLimits, ComputerUseService, GrantIssuer,
-    MacOsObservationPlatform, SemanticAction, SimulatorBackend,
+    ComputerTargetCandidate, ComputerUseLimits, ComputerUseService, GrantIssuer, SemanticAction,
+    SimulatorBackend,
 };
 use serde::Serialize;
 use tokio::sync::Mutex;
@@ -896,7 +896,7 @@ async fn authorize_and_observe_once(
 
 #[cfg(target_os = "macos")]
 fn native_platform() -> (Option<Arc<dyn ComputerObservationPlatform>>, Option<String>) {
-    match MacOsObservationPlatform::new_native() {
+    match grokptah_agent_bridge::MacOsObservationPlatform::new_native() {
         Ok(platform) => (Some(Arc::new(platform)), None),
         Err(error) => (None, Some(error.to_string())),
     }

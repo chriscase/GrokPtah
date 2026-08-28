@@ -113,9 +113,11 @@ pub use computer_agent::{
     RenderedObservation,
 };
 pub use computer_profile::{
-    classify_objective, classify_task, project_adaptive, AdaptiveController, AdaptiveProfile,
-    AdaptiveProfileProjection, AdaptiveRunState, CapabilityEvidence, ProfileReason, ReplayError,
-    ReplayEvent, ReplayEventKind, ReplaySummary, ReplayVerifier, TaskPolicy, TaskRisk,
+    classify_objective, classify_task, project_adaptive, AdaptiveController, AdaptivePolicyEngine,
+    AdaptiveProfile, AdaptiveProfileProjection, AdaptiveRunState, CapabilityAttribution,
+    CapabilityEvidence, HostCapabilityEvidence, ModelCapabilityEvidence, PolicyOutcome,
+    ProfileReason, ProfileTransition, ReplayError, ReplayEvent, ReplayEventKind, ReplaySummary,
+    ReplayVerifier, RuntimeSignal, SafetyFloor, TaskPolicy, TaskRisk, TerminalKind,
 };
 pub use computer_use::{
     canonical_workspace_string, project_run_at, ActionClass, ActionGrant, ActionGrantSummary,
@@ -127,8 +129,8 @@ pub use computer_use::{
     ComputerRunProgress, ComputerRunProjection, ComputerRunReads, ComputerRunState,
     ComputerScopeCapacity, ComputerStore, ComputerTarget, ComputerTargetCandidate,
     ComputerTargetSummary, ComputerUseLimits, ComputerUseService, GrantIssuer,
-    MacOsObservationPlatform, ObservationSummary, SemanticAction, SimulatorBackend,
-    DEFAULT_EVENT_PAGE, MAX_EVENT_PAGE,
+    MacOsObservationPlatform, ObservationGeometry, ObservationSummary, SemanticAction,
+    SemanticElement, Sensitivity, SimulatorBackend, DEFAULT_EVENT_PAGE, MAX_EVENT_PAGE,
 };
 pub use discover::{
     grokptah_home, home_override_serial, is_project_mcp_trusted, project_has_local_mcp_servers,
