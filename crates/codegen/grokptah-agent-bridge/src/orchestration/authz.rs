@@ -343,18 +343,49 @@ impl AuthRegistry {
                 format!("serialize durable auth authority: {error}"),
             )
         })?;
-        std::fs::write(&tmp, bytes).map_err(|error| {
-            OrchError::new(
-                OrchErrorCode::Internal,
-                format!("write durable auth authority: {error}"),
-            )
-        })?;
-        std::fs::rename(&tmp, path).map_err(|error| {
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&tmp)
+                .map_err(|error| {
+                    OrchError::new(
+                        OrchErrorCode::Internal,
+                        format!("write durable auth authority: {error}"),
+                    )
+                })?;
+            file.write_all(&bytes).map_err(|error| {
+                OrchError::new(
+                    OrchErrorCode::Internal,
+                    format!("write durable auth authority: {error}"),
+                )
+            })?;
+            file.sync_all().map_err(|error| {
+                OrchError::new(
+                    OrchErrorCode::Internal,
+                    format!("flush durable auth authority: {error}"),
+                )
+            })?;
+        }
+        std::fs::rename(&tmp, &path).map_err(|error| {
             OrchError::new(
                 OrchErrorCode::Internal,
                 format!("commit durable auth authority: {error}"),
             )
-        })
+        })?;
+        if let Some(parent) = path.parent() {
+            if let Ok(directory) = std::fs::File::open(parent) {
+                directory.sync_all().map_err(|error| {
+                    OrchError::new(
+                        OrchErrorCode::Internal,
+                        format!("flush durable auth directory: {error}"),
+                    )
+                })?;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn reconcile(
