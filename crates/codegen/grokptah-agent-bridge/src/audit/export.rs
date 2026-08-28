@@ -314,12 +314,13 @@ impl AuditLedger {
         let mut file = if path.exists() {
             files::reject_symlink(&path)?;
             let bytes = files::read_bytes(&path)?;
-            serde_json::from_slice::<ExportSealFile>(&bytes)
-                .map_err(|_| AuditError::Poisoned(PoisonReason::ExportMacMismatch))?
+            let file = serde_json::from_slice::<ExportSealFile>(&bytes)
+                .map_err(|_| AuditError::Poisoned(PoisonReason::ExportMacMismatch))?;
+            file.verify(self.keys())?;
+            file
         } else {
             ExportSealFile::new()
         };
-        file.verify(self.keys())?;
         if file.seals.iter().any(|seal| seal.seal_id == export.seal_id) {
             return Err(AuditError::Poisoned(PoisonReason::ExportMacMismatch));
         }
