@@ -1300,8 +1300,12 @@ impl IdempotencyScope {
 
     /// Re-wrap a scope value read back from a stored receipt.
     ///
-    /// `pub(crate)` on purpose: nothing outside this crate should be able to
-    /// name a scope it was not issued, and no caller input reaches here.
+    /// `#[cfg(test)]`, with `save_idempotency`, its only caller. Production
+    /// code never needs to reconstruct a scope from a stored string: it
+    /// derives one from the authority it already holds. Keeping this available
+    /// outside tests would put back the string-to-scope door that `of` and
+    /// `host` exist to close.
+    #[cfg(test)]
     pub(crate) fn from_stored(value: &str) -> Self {
         Self(value.to_string())
     }

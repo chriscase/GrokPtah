@@ -4806,6 +4806,16 @@ impl OrchStore {
     /// A receipt with no scope is legacy by definition and cannot be written
     /// through this path: refusing is what keeps "unattributed" a read-only
     /// state that retention drains rather than one new writes can re-enter.
+    ///
+    /// `#[cfg(test)]` on purpose, and this is a property rather than an
+    /// accident of who happens to call it. In production a receipt can only
+    /// come into existence through `claim_idempotency` and only change through
+    /// `finish_idempotency`; that pair is what makes the claim exclusive and
+    /// the settlement single. A general "write this receipt" is precisely the
+    /// door through which one could be fabricated or overwritten, so it exists
+    /// only where a test needs a shape the claim path cannot produce — a
+    /// legacy record, a pinned instant, a stranded pending claim.
+    #[cfg(test)]
     pub(crate) fn save_idempotency(&self, receipt: &IdempotencyReceipt) -> anyhow::Result<()> {
         let scope = receipt
             .scope

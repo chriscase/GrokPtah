@@ -581,4 +581,12 @@ this branch touches `tests/common/mod.rs`, and CI runs `cargo test --locked
 errors in `computer_use/macos_observation.rs`. That code is macOS-gated, so it
 is genuinely unreachable on Linux and live on the CI platform. They appear in a
 bare `cargo check` of the unmodified base, and nothing in this branch touches
-`computer_use/`. With `-A dead_code` the bridge is clippy-clean.
+`computer_use/`.
+
+**Verify by exclusion, never by suppression.** Running the CI command with
+`-A dead_code` to step around those two is what let a hosted run go red on two
+*real* dead-code findings this branch introduced (`save_idempotency` and
+`IdempotencyScope::from_stored` became unreachable once the surface was sealed,
+and are now `#[cfg(test)]`). The check is: run the exact CI command, count the
+findings, and confirm every one of them is in `computer_use/macos_observation.rs`.
+Suppressing the category hides the ones that matter.
