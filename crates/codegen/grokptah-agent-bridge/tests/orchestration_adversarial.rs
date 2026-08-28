@@ -31,7 +31,7 @@ fn setup_home() -> (tempfile::TempDir, ProcessEnvGuard) {
     (d, guard)
 }
 
-fn started_host() -> grokptah_agent_bridge::AgentHostHandle {
+fn started_host() -> grokptah_agent_bridge::HostRuntime {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()

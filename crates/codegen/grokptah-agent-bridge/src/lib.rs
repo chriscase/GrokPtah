@@ -19,6 +19,7 @@ mod gateway_config;
 mod hooks;
 mod host;
 mod host_helpers;
+mod host_runtime;
 mod instance_lock;
 mod isolation;
 mod lane;
@@ -127,6 +128,7 @@ pub use discover::{
 pub use event_bus::{EventBus, EventReceiver, JournalEntry, JournalPage};
 pub use events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 pub use host::{AgentHost, AgentHostHandle, AgentStatus, HostConfig, WorkspaceUiState};
+pub use host_runtime::{HostPhase, HostRuntime, HostShutdownReport};
 pub use lane::{LaneSummary, RuntimeConnectionState, RuntimeTarget};
 pub use mcp_control::{
     discovered_tool_names, start_control_from_env, start_control_server, start_control_server_with,

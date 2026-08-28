@@ -10,7 +10,7 @@ use grokptah_agent_bridge::orchestration::{
     RunState, WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
-    home_override_serial, set_grokptah_home_override, AgentHost, AgentHostHandle, HostConfig,
+    home_override_serial, set_grokptah_home_override, AgentHost, HostConfig, HostRuntime,
     MemoryScope, PermissionDecision, SessionUpdate,
 };
 
@@ -49,7 +49,7 @@ impl Drop for IsolatedProcess {
     }
 }
 
-fn started_host(workspace: &Path) -> AgentHostHandle {
+fn started_host(workspace: &Path) -> HostRuntime {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()

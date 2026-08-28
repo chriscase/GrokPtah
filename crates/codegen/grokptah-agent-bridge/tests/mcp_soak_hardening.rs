@@ -372,9 +372,23 @@ async fn soak_desktop_bootstrap_node_campaign() {
     }
     assert!(replay_terminal, "restart idempotency fixture must finish");
 
-    // Simulate a real desktop process restart: stop the first server and drop
-    // its host so the next host must reopen the same durable home and ledger.
+    // Simulate a real desktop process restart. The ordered host shutdown is
+    // the production primitive (#455): it stops and joins the control plane,
+    // cancels and joins every supervised task, flushes durable state, and
+    // releases the single-instance lock exactly once — so the next host can
+    // reopen the same durable home immediately, with no retry and no delay.
     srv.stop_and_wait().await;
+    let shutdown = host.shutdown().await;
+    assert_eq!(
+        shutdown.supervised_tasks_remaining, 0,
+        "shutdown must join every supervised task before releasing the lock"
+    );
+    assert!(shutdown.process_lock_released);
+    assert!(!shutdown.process_lock_held_after);
+    assert!(
+        shutdown.lock_file_present,
+        "the instance lock file must remain on disk"
+    );
     drop(host);
     let host2 = AgentHost::create(HostConfig {
         always_approve: true,
@@ -446,6 +460,9 @@ async fn soak_desktop_bootstrap_node_campaign() {
         "offline write must leave soak_marker.txt"
     );
     srv2.stop_and_wait().await;
+    let shutdown2 = host2.shutdown().await;
+    assert!(shutdown2.process_lock_released);
+    assert!(!shutdown2.process_lock_held_after);
     drop(host2);
 
     set_grokptah_home_override(None);

@@ -101,6 +101,9 @@ struct AppState {
     /// requests before authentication or handler dispatch. Remote listeners
     /// have an explicit deployment policy and retain their existing behavior.
     enforce_loopback_origin_policy: bool,
+    /// Fired when the server stops accepting. Long-lived SSE bodies select on
+    /// it so graceful shutdown cannot hang on an open live stream (#455).
+    shutdown: tokio_util::sync::CancellationToken,
 }
 
 #[derive(Debug, Clone)]
@@ -138,6 +141,7 @@ struct LiveStreamState {
     pending: VecDeque<Bytes>,
     heartbeat: tokio::time::Interval,
     done: bool,
+    shutdown: tokio_util::sync::CancellationToken,
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
@@ -257,6 +261,17 @@ impl LiveStreamState {
                 }
                 _ = self.heartbeat.tick() => {
                     return Some(Bytes::from_static(b": grokptah-control keep-alive\n\n"));
+                }
+                // Without this arm an idle live stream keeps the graceful
+                // shutdown of the serving task open forever, so the host could
+                // never reach its join barrier (#455). The client is told to
+                // resynchronize from the durable journal, which is the same
+                // contract every other recovery path uses.
+                _ = self.shutdown.cancelled() => {
+                    self.queue_recovery(
+                        "control plane is shutting down; resynchronize from the durable journal",
+                    );
+                    continue;
                 }
             }
         }
@@ -466,6 +481,7 @@ pub async fn start_control_server_with_bind(
         live_streams: Arc::new(Semaphore::new(MAX_LIVE_STREAMS)),
         health_requires_auth,
         enforce_loopback_origin_policy: bound_addr.ip().is_loopback(),
+        shutdown: cancel.clone(),
     };
     let app = Router::new()
         .route("/health", get(health_handler))
@@ -995,6 +1011,7 @@ async fn streamable_get_handler(
         pending: VecDeque::new(),
         heartbeat: tokio::time::interval(Duration::from_secs(10)),
         done: false,
+        shutdown: state.shutdown.clone(),
         _permit: permit,
     };
     live.queue_page(page);

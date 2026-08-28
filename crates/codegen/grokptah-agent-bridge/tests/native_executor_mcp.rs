@@ -482,7 +482,7 @@ async fn boot_native(
     ProcessEnvGuard,
     tempfile::TempDir,
     tempfile::TempDir,
-    grokptah_agent_bridge::AgentHostHandle,
+    grokptah_agent_bridge::HostRuntime,
     std::sync::Arc<OrchestrationService>,
     Uuid,
     String,

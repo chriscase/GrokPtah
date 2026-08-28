@@ -13,8 +13,8 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use grokptah_agent_bridge::{
     start_control_server_with_bind, AgentHost, AgentHostHandle, AuthCredential,
-    ControlServerHandle, ControlServerLimits, HostConfig, OrchStore, OrchestrationConfig,
-    OrchestrationService, RuntimeHome, WorkspaceAllowlist,
+    ControlServerLimits, HostConfig, HostRuntime, HostShutdownReport, OrchStore,
+    OrchestrationConfig, OrchestrationService, RuntimeHome, WorkspaceAllowlist,
 };
 
 pub const SERVICE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -308,25 +308,30 @@ pub fn help_text() -> &'static str {
 pub struct ServiceHandle {
     pub addr: SocketAddr,
     pub token: String,
-    server: Option<ControlServerHandle>,
-    host: AgentHostHandle,
+    /// The single non-cloneable owner of the process instance lock and of the
+    /// task supervisor (#455). The attached control server is stopped and
+    /// joined as step 2 of the runtime's ordered shutdown.
+    runtime: HostRuntime,
 }
 
 impl ServiceHandle {
-    /// Return the process-owned host for embedding and service-level tests.
+    /// Return a *request handle* on the process-owned host for embedding and
+    /// service-level tests.
     ///
-    /// The handle remains responsible for stopping the server and host; this
-    /// accessor only exposes the shared host so callers can observe or seed
-    /// durable state without opening a second orchestration ledger.
+    /// The handle carries no process authority of its own: it can neither own
+    /// nor release the instance lock, and it fails closed once the service has
+    /// shut down. This accessor only exposes the shared host so callers can
+    /// observe or seed durable state without opening a second ledger.
     pub fn host(&self) -> AgentHostHandle {
-        self.host.clone()
+        self.runtime.handle()
     }
 
-    pub async fn stop_and_wait(mut self) {
-        if let Some(server) = self.server.take() {
-            server.stop_and_wait().await;
-        }
-        let _ = self.host.stop();
+    /// Ordered shutdown: refuse new admissions, stop HTTP/SSE acceptance and
+    /// join the serving task, cancel and join every supervised task, flush
+    /// durable state, then release the instance lock exactly once. The lock
+    /// file stays on disk.
+    pub async fn stop_and_wait(self) -> HostShutdownReport {
+        self.runtime.shutdown().await
     }
 }
 
@@ -337,17 +342,17 @@ pub async fn start_service(config: ServiceConfig) -> Result<ServiceHandle> {
         bail!("every configured workspace must exist and resolve to a directory");
     }
 
-    let host = match config.runtime_home.clone() {
+    let runtime = match config.runtime_home.clone() {
         Some(home) => AgentHost::create_with_runtime_home(HostConfig::default(), home),
         None => AgentHost::create(HostConfig::default()),
     };
-    host.start().context("start GrokPtah agent host")?;
-    let store: OrchStore = host
+    runtime.start().context("start GrokPtah agent host")?;
+    let store: OrchStore = runtime
         .ensure_orchestration_store()
         .context("open durable orchestration store")?;
     let orch = OrchestrationService::new(
-        host.clone(),
-        host.event_bus(),
+        runtime.handle(),
+        runtime.event_bus(),
         store,
         OrchestrationConfig {
             bearer_token: config.token.clone(),
@@ -373,11 +378,12 @@ pub async fn start_service(config: ServiceConfig) -> Result<ServiceHandle> {
     )
     .await
     .context("bind GrokPtah service control plane")?;
+    let addr = server.addr;
+    runtime.attach_control_server(server);
     Ok(ServiceHandle {
-        addr: server.addr,
+        addr,
         token: config.token,
-        server: Some(server),
-        host,
+        runtime,
     })
 }
 
@@ -390,7 +396,11 @@ pub async fn run_service(config: ServiceConfig) -> Result<()> {
     tokio::signal::ctrl_c()
         .await
         .context("wait for service shutdown signal")?;
-    handle.stop_and_wait().await;
+    let report = handle.stop_and_wait().await;
+    eprintln!(
+        "[grokptah-service] stopped: joined {} supervised task(s), instance lock released={}",
+        report.supervised_tasks_at_quiesce, report.process_lock_released
+    );
     Ok(())
 }
 
