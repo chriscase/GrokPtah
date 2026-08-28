@@ -8,6 +8,7 @@ import {
   emptyPromptQueueState,
   promptQueueReducer,
   queueEntriesFor,
+  type PromptQueueEntry,
   type PromptQueueState,
 } from "./promptQueue";
 
@@ -316,5 +317,31 @@ describe("terminal design system (#129)", () => {
     expect(term).toMatch(/--accent/);
     expect(term).toMatch(/Tab \{i \+ 1\}/);
     expect(term).not.toMatch(/\\x1b\[32mGrokPtah terminal/);
+  });
+});
+
+describe("queue entry ownership contract (#461)", () => {
+  it("carries an opaque ownership handle that discloses nothing", () => {
+    const entry: PromptQueueEntry = createPromptQueueEntry("do the thing", {
+      owner: "mcp",
+      owner_key: "v1-sha256:abc123",
+      owner_provenance: { epoch: 3, policy: 1 },
+    });
+    expect(entry.owner_key).toBe("v1-sha256:abc123");
+    // A handle is compared, never parsed: it is a digest over the tenant,
+    // principal, session, and workspace and reveals none of them.
+    expect(entry.owner_key?.startsWith("v1-sha256:")).toBe(true);
+    expect(entry.owner_provenance).toEqual({ epoch: 3, policy: 1 });
+  });
+
+  it("accepts legacy entries that predate principal ownership", () => {
+    // A queue persisted before #461 has no handle at all. The bridge
+    // quarantines those; the client must still be able to represent one
+    // rather than failing to parse the snapshot.
+    const legacy = createPromptQueueEntry("legacy follow-up", {
+      owner: "mcp",
+    });
+    expect(legacy.owner_key ?? null).toBeNull();
+    expect(legacy.owner_provenance ?? null).toBeNull();
   });
 });

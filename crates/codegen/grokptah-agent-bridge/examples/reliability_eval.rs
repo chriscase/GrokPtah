@@ -179,13 +179,25 @@ async fn queue_and_steering() -> Result<ScenarioResult> {
         .context("event receiver unavailable")?;
     host.set_project_cwd(dir.path())?;
     let session = host.session_new()?;
-    let first = host.session_queue_add(session.id, "first follow-up".into(), false)?[0].clone();
-    let second = host.session_queue_add(session.id, "priority follow-up".into(), true)?[1].clone();
+    let first = host.session_queue_add(
+        session.id,
+        "first follow-up".into(),
+        false,
+        &desktop_actor(&host, session.id),
+    )?[0]
+        .clone();
+    let second = host.session_queue_add(
+        session.id,
+        "priority follow-up".into(),
+        true,
+        &desktop_actor(&host, session.id),
+    )?[1]
+        .clone();
     // Queue mutators are compare-and-set, and reorder bumps the versions it
     // shifts, so re-read the version each step leaves behind.
     let version_of = |entry_id: &str| -> Result<u64> {
         Ok(host
-            .session_queue_list(session.id)?
+            .session_queue_list(session.id, &desktop_actor(&host, session.id))?
             .into_iter()
             .find(|entry| entry.id == entry_id)
             .context("queued entry vanished")?
@@ -196,9 +208,16 @@ async fn queue_and_steering() -> Result<ScenarioResult> {
         &second.id,
         0,
         version_of(&second.id)?,
-        host.session_queue_snapshot(session.id)?.revision,
+        host.session_queue_snapshot(session.id, &desktop_actor(&host, session.id))?
+            .revision,
+        &desktop_actor(&host, session.id),
     )?;
-    let run_next = host.session_queue_run_next(session.id, &first.id, version_of(&first.id)?)?;
+    let run_next = host.session_queue_run_next(
+        session.id,
+        &first.id,
+        version_of(&first.id)?,
+        &desktop_actor(&host, session.id),
+    )?;
     let drained = host.session_queue_take_next(session.id)?;
     // A drain claims the session's turn slot for the batch it removed, so the
     // turn that follows must present that reservation rather than racing for a
@@ -238,7 +257,11 @@ async fn queue_and_steering() -> Result<ScenarioResult> {
             break;
         }
     }
-    let receipt = host.session_steer(session.id, "focus on the failing test".into())?;
+    let receipt = host.session_steer(
+        session.id,
+        "focus on the failing test".into(),
+        &desktop_actor(&host, session.id),
+    )?;
     let reply = timeout(Duration::from_secs(8), runner)
         .await
         .context("steered turn timed out")??;
@@ -628,4 +651,15 @@ async fn main() -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// The desktop ownership actor for a session (#461).
+///
+/// Integration tests drive the host directly, which is the local UI's
+/// position, so the desktop principal is the identity they act under.
+fn desktop_actor(
+    host: &grokptah_agent_bridge::AgentHostHandle,
+    session_id: uuid::Uuid,
+) -> grokptah_agent_bridge::queue_authority::QueueActor {
+    host.desktop_actor(session_id).expect("session exists")
 }

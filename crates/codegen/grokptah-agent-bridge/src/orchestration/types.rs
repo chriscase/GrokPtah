@@ -1233,6 +1233,13 @@ fn validate_bounded_string(value: &str, max_bytes: usize, field: &str) -> Result
 pub struct IdempotencyReceipt {
     pub request_id: String,
     pub payload_hash: String,
+    /// Opaque per-principal namespace this receipt belongs to (#461).
+    ///
+    /// Defaults to empty so receipts written before principal scoping still
+    /// deserialize; those live in the legacy flat layout and are only ever
+    /// reachable by a caller that also passes an empty scope.
+    #[serde(default)]
+    pub scope: String,
     pub run_id: Option<String>,
     pub tool: String,
     pub response: serde_json::Value,

@@ -1352,7 +1352,11 @@ pub fn session_queue_list(
     // Returns the revision alongside the entries so the GUI can order a
     // refetch against the event stream instead of always trusting whichever
     // arrived last.
-    state.host.session_queue_snapshot(id).map_err(map_err)
+    let actor = state.host.desktop_actor(id).map_err(map_err)?;
+    state
+        .host
+        .session_queue_snapshot(id, &actor)
+        .map_err(map_err)
 }
 
 #[tauri::command]
@@ -1365,7 +1369,12 @@ pub fn session_queue_add(
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
     state
         .host
-        .session_queue_add(id, text, priority)
+        .session_queue_add(
+            id,
+            text,
+            priority,
+            &state.host.desktop_actor(id).map_err(map_err)?,
+        )
         .map_err(map_err)
 }
 
@@ -1380,7 +1389,13 @@ pub fn session_queue_edit(
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
     state
         .host
-        .session_queue_edit(id, &entry_id, version, text)
+        .session_queue_edit(
+            id,
+            &entry_id,
+            version,
+            text,
+            &state.host.desktop_actor(id).map_err(map_err)?,
+        )
         .map_err(map_err)
 }
 
@@ -1394,7 +1409,12 @@ pub fn session_queue_remove(
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
     state
         .host
-        .session_queue_remove(id, &entry_id, expected_version)
+        .session_queue_remove(
+            id,
+            &entry_id,
+            expected_version,
+            &state.host.desktop_actor(id).map_err(map_err)?,
+        )
         .map_err(map_err)
 }
 
@@ -1404,7 +1424,8 @@ pub fn session_queue_clear(
     session_id: String,
 ) -> Result<Vec<PromptQueueEntry>, String> {
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
-    state.host.session_queue_clear(id).map_err(map_err)
+    let actor = state.host.desktop_actor(id).map_err(map_err)?;
+    state.host.session_queue_clear(id, &actor).map_err(map_err)
 }
 
 #[tauri::command]
@@ -1421,8 +1442,21 @@ pub fn session_queue_move(
     // supplies the revision it computed against, exactly as a coordinator does.
     state
         .host
-        .session_queue_move(id, &entry_id, to_index, expected_version, expected_revision)
-        .map(|(entries, revision)| PromptQueueSnapshot { entries, revision })
+        .session_queue_move(
+            id,
+            &entry_id,
+            to_index,
+            expected_version,
+            expected_revision,
+            &state.host.desktop_actor(id).map_err(map_err)?,
+        )
+        .map(|(entries, revision)| PromptQueueSnapshot {
+            entries,
+            // A reorder receipt reports the caller's own view; quarantined
+            // legacy entries belong to no caller, so none are attributed here.
+            quarantined: 0,
+            revision,
+        })
         .map_err(map_err)
 }
 
@@ -1445,7 +1479,12 @@ pub fn session_queue_run_next(
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
     state
         .host
-        .session_queue_run_next(id, &entry_id, expected_version)
+        .session_queue_run_next(
+            id,
+            &entry_id,
+            expected_version,
+            &state.host.desktop_actor(id).map_err(map_err)?,
+        )
         .map_err(map_err)
 }
 
@@ -1459,7 +1498,12 @@ pub fn session_queue_steer_entry(
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
     state
         .host
-        .session_queue_steer_entry(id, &entry_id, expected_version)
+        .session_queue_steer_entry(
+            id,
+            &entry_id,
+            expected_version,
+            &state.host.desktop_actor(id).map_err(map_err)?,
+        )
         .map_err(map_err)
 }
 
@@ -1470,7 +1514,8 @@ pub fn session_steer(
     text: String,
 ) -> Result<SteeringReceipt, String> {
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
-    state.host.session_steer(id, text).map_err(map_err)
+    let actor = state.host.desktop_actor(id).map_err(map_err)?;
+    state.host.session_steer(id, text, &actor).map_err(map_err)
 }
 
 #[tauri::command]

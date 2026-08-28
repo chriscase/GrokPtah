@@ -253,13 +253,26 @@ impl OrchStore {
         Ok(self.inner.root.join("runs").join(format!("{safe}.json")))
     }
 
-    fn idemp_path(&self, request_id: &str) -> Result<PathBuf, OrchError> {
+    /// Receipt path for `request_id` inside `scope`.
+    ///
+    /// Receipts used to be keyed by `request_id` alone, which made them shared
+    /// across principals: an exact-payload collision replayed the *other*
+    /// principal's response, and a differing payload returned a `request_id
+    /// reused` conflict that confirmed the id was in use. Both were
+    /// cross-principal leaks through a path that never intended to be an
+    /// authorization boundary. The scope is an opaque digest, so the layout
+    /// discloses nothing about who owns a receipt.
+    ///
+    /// An empty scope keeps the legacy flat layout for callers that have no
+    /// principal to namespace by.
+    fn idemp_path(&self, request_id: &str, scope: &str) -> Result<PathBuf, OrchError> {
         let safe = safe_id_filename(request_id)?;
-        Ok(self
-            .inner
-            .root
-            .join("idempotency")
-            .join(format!("{safe}.json")))
+        let dir = self.inner.root.join("idempotency");
+        if scope.is_empty() {
+            return Ok(dir.join(format!("{safe}.json")));
+        }
+        let safe_scope = safe_id_filename(scope)?;
+        Ok(dir.join(safe_scope).join(format!("{safe}.json")))
     }
 
     fn finalization_path(&self, run_id: &str) -> Result<PathBuf, OrchError> {
@@ -4791,13 +4804,13 @@ impl OrchStore {
     pub fn save_idempotency(&self, receipt: &IdempotencyReceipt) -> anyhow::Result<()> {
         let _g = self.inner.lock.lock();
         let path = self
-            .idemp_path(&receipt.request_id)
+            .idemp_path(&receipt.request_id, &receipt.scope)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         atomic_write_json(&path, receipt)
     }
 
     pub fn load_idempotency(&self, request_id: &str) -> anyhow::Result<Option<IdempotencyReceipt>> {
-        let path = match self.idemp_path(request_id) {
+        let path = match self.idemp_path(request_id, "") {
             Ok(p) => p,
             Err(_) => return Ok(None),
         };
@@ -4818,17 +4831,27 @@ impl OrchStore {
         tool: &str,
         request_id: &str,
         payload_hash: &str,
+        scope: &str,
     ) -> Result<IdempotencyClaim, OrchError> {
-        let path = self.idemp_path(request_id)?;
+        let path = self.idemp_path(request_id, scope)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
+        }
         let _g = self.inner.lock.lock();
         if path.is_file() {
             let text = fs::read_to_string(&path)
                 .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
             let prev: IdempotencyReceipt = serde_json::from_str(&text)
                 .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
+            // The scope is re-checked as well as being part of the path: a
+            // receipt must never be replayed to a principal other than the one
+            // that created it, even if a future layout change made two scopes
+            // share a file.
             if prev.request_id != request_id
                 || prev.tool != tool
                 || prev.payload_hash != payload_hash
+                || prev.scope != scope
             {
                 return Err(OrchError::new(
                     OrchErrorCode::Conflict,
@@ -4847,6 +4870,7 @@ impl OrchStore {
         let pending = IdempotencyReceipt {
             request_id: request_id.into(),
             payload_hash: payload_hash.into(),
+            scope: scope.into(),
             run_id: None,
             tool: tool.into(),
             response: serde_json::Value::Null,
@@ -4868,6 +4892,7 @@ impl OrchStore {
         tool: &str,
         request_id: &str,
         payload_hash: &str,
+        scope: &str,
         run_id: Option<String>,
         response: serde_json::Value,
     ) -> Result<(), OrchError> {
@@ -4875,6 +4900,7 @@ impl OrchStore {
             tool,
             request_id,
             payload_hash,
+            scope,
             run_id,
             response,
             None,
@@ -4887,6 +4913,7 @@ impl OrchStore {
         tool: &str,
         request_id: &str,
         payload_hash: &str,
+        scope: &str,
         run_id: Option<String>,
         error: OrchError,
     ) -> Result<(), OrchError> {
@@ -4894,6 +4921,7 @@ impl OrchStore {
             tool,
             request_id,
             payload_hash,
+            scope,
             run_id,
             serde_json::Value::Null,
             Some(error),
@@ -4907,12 +4935,13 @@ impl OrchStore {
         tool: &str,
         request_id: &str,
         payload_hash: &str,
+        scope: &str,
         run_id: Option<String>,
         response: serde_json::Value,
         error: Option<OrchError>,
         status: &str,
     ) -> Result<(), OrchError> {
-        let path = self.idemp_path(request_id)?;
+        let path = self.idemp_path(request_id, scope)?;
         let _g = self.inner.lock.lock();
         if !path.is_file() {
             return Err(OrchError::new(
@@ -4927,6 +4956,7 @@ impl OrchStore {
         if previous.request_id != request_id
             || previous.tool != tool
             || previous.payload_hash != payload_hash
+            || previous.scope != scope
         {
             return Err(OrchError::new(
                 OrchErrorCode::Conflict,
@@ -4942,6 +4972,7 @@ impl OrchStore {
         let receipt = IdempotencyReceipt {
             request_id: request_id.into(),
             payload_hash: payload_hash.into(),
+            scope: scope.into(),
             run_id,
             tool: tool.into(),
             response,
@@ -5812,18 +5843,18 @@ mod tests {
     fn idempotency_claim_exclusive() {
         let d = tempdir().unwrap();
         let store = OrchStore::open(d.path()).unwrap();
-        match store.claim_idempotency("t", "req", "h").unwrap() {
+        match store.claim_idempotency("t", "req", "h", "").unwrap() {
             IdempotencyClaim::Perform => {}
             _ => panic!("first claim should perform"),
         }
         store
-            .complete_idempotency("t", "req", "h", None, serde_json::json!({"ok": true}))
+            .complete_idempotency("t", "req", "h", "", None, serde_json::json!({"ok": true}))
             .unwrap();
-        match store.claim_idempotency("t", "req", "h").unwrap() {
+        match store.claim_idempotency("t", "req", "h", "").unwrap() {
             IdempotencyClaim::Replay(Ok(v)) => assert_eq!(v["ok"], true),
             _ => panic!("replay"),
         }
-        assert!(store.claim_idempotency("t", "req", "other").is_err());
+        assert!(store.claim_idempotency("t", "req", "other", "").is_err());
     }
 
     #[test]
@@ -5831,17 +5862,24 @@ mod tests {
         let d = tempdir().unwrap();
         let store = OrchStore::open(d.path()).unwrap();
         assert!(matches!(
-            store.claim_idempotency("t", "failed", "h").unwrap(),
+            store.claim_idempotency("t", "failed", "h", "").unwrap(),
             IdempotencyClaim::Perform
         ));
         let error = OrchError::new(OrchErrorCode::Internal, "failed once");
         store
-            .fail_idempotency("t", "failed", "h", None, error.clone())
+            .fail_idempotency("t", "failed", "h", "", None, error.clone())
             .unwrap();
         assert!(store
-            .complete_idempotency("t", "failed", "h", None, serde_json::json!({"ok": true}))
+            .complete_idempotency(
+                "t",
+                "failed",
+                "h",
+                "",
+                None,
+                serde_json::json!({"ok": true})
+            )
             .is_err());
-        match store.claim_idempotency("t", "failed", "h").unwrap() {
+        match store.claim_idempotency("t", "failed", "h", "").unwrap() {
             IdempotencyClaim::Replay(Err(replayed)) => {
                 assert_eq!(replayed.code.as_str(), error.code.as_str());
                 assert_eq!(replayed.message, error.message);
@@ -5891,6 +5929,7 @@ mod tests {
 
         store
             .save_idempotency(&IdempotencyReceipt {
+                scope: String::new(),
                 request_id: "old-receipt".into(),
                 payload_hash: "hash".into(),
                 run_id: None,
@@ -5949,6 +5988,7 @@ mod tests {
         let store = OrchStore::open(d.path()).unwrap();
         store
             .save_idempotency(&IdempotencyReceipt {
+                scope: String::new(),
                 request_id: "unknown-status".into(),
                 payload_hash: "hash".into(),
                 run_id: None,
@@ -5983,13 +6023,13 @@ mod tests {
         let d = tempdir().unwrap();
         let store = OrchStore::open(d.path()).unwrap();
         assert!(matches!(
-            store.claim_idempotency("t", "orphan", "h").unwrap(),
+            store.claim_idempotency("t", "orphan", "h", "").unwrap(),
             IdempotencyClaim::Perform
         ));
         drop(store);
 
         let reopened = OrchStore::open(d.path()).unwrap();
-        match reopened.claim_idempotency("t", "orphan", "h").unwrap() {
+        match reopened.claim_idempotency("t", "orphan", "h", "").unwrap() {
             IdempotencyClaim::Replay(Err(e)) => {
                 assert!(e.message.contains("interrupted"));
             }
@@ -6051,7 +6091,7 @@ mod tests {
     fn traversal_id_rejected() {
         let d = tempdir().unwrap();
         let store = OrchStore::open(d.path()).unwrap();
-        assert!(store.claim_idempotency("t", "../x", "h").is_err());
+        assert!(store.claim_idempotency("t", "../x", "h", "").is_err());
     }
 
     #[test]

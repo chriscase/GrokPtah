@@ -1354,6 +1354,7 @@ mod tests {
             "use ctl-token-abc123 only as a test",
             "control",
             false,
+            &crate::queue_authority::QueueActor::desktop(sid, "/w"),
         )
         .unwrap();
         entry.owner = Some("ctl-token-abc123".into());
@@ -1399,9 +1400,13 @@ mod tests {
         let sid = Uuid::new_v4();
         // Comfortably past the old 4 KB cap and near MAX_PROMPT_BYTES.
         let long_text = "x".repeat(90_000);
-        let entry =
-            crate::prompt_queue::PromptQueueEntry::new(long_text.clone(), "composer", false)
-                .unwrap();
+        let entry = crate::prompt_queue::PromptQueueEntry::new(
+            long_text.clone(),
+            "composer",
+            false,
+            &crate::queue_authority::QueueActor::desktop(sid, "/w"),
+        )
+        .unwrap();
         let update = SessionUpdate::PromptQueueChanged {
             session_id: sid,
             revision: 1,
@@ -1433,7 +1438,13 @@ mod tests {
         let sid = Uuid::new_v4();
         let secret = "ctl-token-abc123".to_string();
         let text = format!("{}\nuse {secret} here", "y".repeat(20_000));
-        let entry = crate::prompt_queue::PromptQueueEntry::new(text, "composer", false).unwrap();
+        let entry = crate::prompt_queue::PromptQueueEntry::new(
+            text,
+            "composer",
+            false,
+            &crate::queue_authority::QueueActor::desktop(sid, "/w"),
+        )
+        .unwrap();
         let update = SessionUpdate::PromptQueueChanged {
             session_id: sid,
             revision: 1,

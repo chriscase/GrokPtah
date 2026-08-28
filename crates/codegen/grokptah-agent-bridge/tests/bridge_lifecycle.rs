@@ -1417,36 +1417,60 @@ async fn bridge_prompt_queue_mutates_reorders_and_drains_authoritatively() {
     let session = host.session_new().unwrap();
 
     let entries = host
-        .session_queue_add(session.id, "first".into(), false)
+        .session_queue_add(
+            session.id,
+            "first".into(),
+            false,
+            &desktop_actor(&host, session.id),
+        )
         .unwrap();
     let first = entries[0].clone();
     let entries = host
-        .session_queue_add(session.id, "second".into(), false)
+        .session_queue_add(
+            session.id,
+            "second".into(),
+            false,
+            &desktop_actor(&host, session.id),
+        )
         .unwrap();
     let second = entries[1].clone();
     let version_of = |entry_id: &str| {
-        host.session_queue_list(session.id)
+        host.session_queue_list(session.id, &desktop_actor(&host, session.id))
             .unwrap()
             .into_iter()
             .find(|entry| entry.id == entry_id)
             .expect("entry present")
             .version
     };
-    host.session_queue_edit(session.id, &first.id, first.version, "edited first".into())
-        .unwrap();
+    host.session_queue_edit(
+        session.id,
+        &first.id,
+        first.version,
+        "edited first".into(),
+        &desktop_actor(&host, session.id),
+    )
+    .unwrap();
     let (entries, _) = host
         .session_queue_move(
             session.id,
             &second.id,
             0,
             version_of(&second.id),
-            host.session_queue_snapshot(session.id).unwrap().revision,
+            host.session_queue_snapshot(session.id, &desktop_actor(&host, session.id))
+                .unwrap()
+                .revision,
+            &desktop_actor(&host, session.id),
         )
         .unwrap();
     assert_eq!(entries[0].id, second.id);
 
     let run_next = host
-        .session_queue_run_next(session.id, &first.id, version_of(&first.id))
+        .session_queue_run_next(
+            session.id,
+            &first.id,
+            version_of(&first.id),
+            &desktop_actor(&host, session.id),
+        )
         .unwrap();
     assert!(!run_next.cancelled_active);
     assert!(run_next.entries[0].priority);
@@ -1456,9 +1480,17 @@ async fn bridge_prompt_queue_mutates_reorders_and_drains_authoritatively() {
     assert_eq!(batch.text, "edited first");
     assert_eq!(drained.entries[0].id, second.id);
 
-    host.session_queue_remove(session.id, &second.id, version_of(&second.id))
-        .unwrap();
-    assert!(host.session_queue_list(session.id).unwrap().is_empty());
+    host.session_queue_remove(
+        session.id,
+        &second.id,
+        version_of(&second.id),
+        &desktop_actor(&host, session.id),
+    )
+    .unwrap();
+    assert!(host
+        .session_queue_list(session.id, &desktop_actor(&host, session.id))
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]
@@ -1489,18 +1521,28 @@ async fn steer_now_injects_once_without_cancelling_active_turn() {
     }
 
     let receipt = host
-        .session_steer(session.id, "focus on the failing test".into())
+        .session_steer(
+            session.id,
+            "focus on the failing test".into(),
+            &desktop_actor(&host, session.id),
+        )
         .unwrap();
     assert_eq!(
         receipt.disposition,
         grokptah_agent_bridge::SteeringDisposition::Pending
     );
     assert!(
-        host.session_queue_list(session.id).unwrap().is_empty(),
+        host.session_queue_list(session.id, &desktop_actor(&host, session.id))
+            .unwrap()
+            .is_empty(),
         "pending steering must not remain in the normal queue"
     );
     let second_receipt = host
-        .session_steer(session.id, "then verify the narrow regression".into())
+        .session_steer(
+            session.id,
+            "then verify the narrow regression".into(),
+            &desktop_actor(&host, session.id),
+        )
         .unwrap();
     assert_eq!(
         second_receipt.disposition,
@@ -1537,7 +1579,10 @@ async fn steer_now_injects_once_without_cancelling_active_turn() {
         )),
         "steer-now must not cancel the active turn"
     );
-    assert!(host.session_queue_list(session.id).unwrap().is_empty());
+    assert!(host
+        .session_queue_list(session.id, &desktop_actor(&host, session.id))
+        .unwrap()
+        .is_empty());
 
     let transcript = host.session_transcript(session.id).unwrap();
     assert_eq!(
@@ -1584,18 +1629,27 @@ async fn clear_queue_accounts_for_accepted_steering_instead_of_reporting_empty()
     }
 
     let receipt = host
-        .session_steer(session.id, "abandon this direction".into())
+        .session_steer(
+            session.id,
+            "abandon this direction".into(),
+            &desktop_actor(&host, session.id),
+        )
         .unwrap();
     assert_eq!(
         receipt.disposition,
         grokptah_agent_bridge::SteeringDisposition::Pending,
         "mid-turn steering should be accepted, not deferred"
     );
-    host.session_queue_add(session.id, "a follow up".into(), false)
-        .unwrap();
+    host.session_queue_add(
+        session.id,
+        "a follow up".into(),
+        false,
+        &desktop_actor(&host, session.id),
+    )
+    .unwrap();
 
     let (entries, outcome, _revision) = host
-        .session_queue_clear_with_origin_receipt(session.id, "mcp")
+        .session_queue_clear_with_actor_receipt(session.id, &desktop_actor(&host, session.id))
         .unwrap();
     assert!(entries.is_empty());
     assert_eq!(outcome.queued_cleared, 1);
@@ -1635,7 +1689,9 @@ async fn clear_queue_accounts_for_accepted_steering_instead_of_reporting_empty()
         );
     }
     assert!(
-        host.session_queue_list(session.id).unwrap().is_empty(),
+        host.session_queue_list(session.id, &desktop_actor(&host, session.id))
+            .unwrap()
+            .is_empty(),
         "cleared steering must not be deferred back into the queue"
     );
 }
@@ -1659,7 +1715,12 @@ async fn stale_run_next_is_rejected_without_cancelling_the_active_turn() {
     let session = host.session_new().unwrap();
 
     let entry = host
-        .session_queue_add(session.id, "follow up".into(), false)
+        .session_queue_add(
+            session.id,
+            "follow up".into(),
+            false,
+            &desktop_actor(&host, session.id),
+        )
         .unwrap()[0]
         .clone();
 
@@ -1678,13 +1739,20 @@ async fn stale_run_next_is_rejected_without_cancelling_the_active_turn() {
     }
 
     let stale = host
-        .session_queue_run_next(session.id, &entry.id, entry.version + 1)
+        .session_queue_run_next(
+            session.id,
+            &entry.id,
+            entry.version + 1,
+            &desktop_actor(&host, session.id),
+        )
         .expect_err("a stale run_next must fail closed");
     assert!(
         stale.to_string().contains("stale queued prompt version"),
         "expected a stale-version conflict, got: {stale}"
     );
-    let listed = host.session_queue_list(session.id).unwrap();
+    let listed = host
+        .session_queue_list(session.id, &desktop_actor(&host, session.id))
+        .unwrap();
     assert_eq!(listed.len(), 1, "a rejected run_next must not mutate");
     assert_eq!(listed[0].version, entry.version);
     assert!(!listed[0].priority, "the entry must not have been promoted");
@@ -1692,7 +1760,12 @@ async fn stale_run_next_is_rejected_without_cancelling_the_active_turn() {
     // The turn is still running, which is the point: `cancelled_active` can
     // only be true here if the rejected call left it alive.
     let promoted = host
-        .session_queue_run_next(session.id, &entry.id, entry.version)
+        .session_queue_run_next(
+            session.id,
+            &entry.id,
+            entry.version,
+            &desktop_actor(&host, session.id),
+        )
         .unwrap();
     assert!(
         promoted.cancelled_active,
@@ -1740,7 +1813,12 @@ async fn run_next_cannot_cancel_a_turn_that_started_after_the_one_it_observed() 
     let session = host.session_new().unwrap();
 
     let entry = host
-        .session_queue_add(session.id, "follow up".into(), false)
+        .session_queue_add(
+            session.id,
+            "follow up".into(),
+            false,
+            &desktop_actor(&host, session.id),
+        )
         .unwrap()[0]
         .clone();
 
@@ -1790,7 +1868,9 @@ async fn run_next_cannot_cancel_a_turn_that_started_after_the_one_it_observed() 
         "turn B must not have absorbed a cancel meant for turn A"
     );
     // The queue is untouched by the refused cancel.
-    let listed = host.session_queue_list(session.id).unwrap();
+    let listed = host
+        .session_queue_list(session.id, &desktop_actor(&host, session.id))
+        .unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].id, entry.id);
 }
@@ -1809,15 +1889,23 @@ async fn a_drain_reserves_the_turn_so_a_racing_writer_cannot_lose_the_prompt() {
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
     let session = host.session_new().unwrap();
-    host.session_queue_add(session.id, "queued work".into(), false)
-        .unwrap();
+    host.session_queue_add(
+        session.id,
+        "queued work".into(),
+        false,
+        &desktop_actor(&host, session.id),
+    )
+    .unwrap();
 
     let drained = host.session_queue_take_next(session.id).unwrap();
     let batch = drained.batch.expect("a batch was queued");
     let reservation = drained
         .reservation
         .expect("a drain that removes entries must claim the turn slot");
-    assert!(host.session_queue_list(session.id).unwrap().is_empty());
+    assert!(host
+        .session_queue_list(session.id, &desktop_actor(&host, session.id))
+        .unwrap()
+        .is_empty());
 
     // The racing writer now loses, instead of winning and stranding the batch.
     let raced = host
@@ -1846,12 +1934,22 @@ async fn restoring_an_unstarted_drain_returns_the_prompts_and_frees_the_turn() {
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
     let session = host.session_new().unwrap();
-    host.session_queue_add(session.id, "first".into(), false)
-        .unwrap();
-    host.session_queue_add(session.id, "second".into(), false)
-        .unwrap();
+    host.session_queue_add(
+        session.id,
+        "first".into(),
+        false,
+        &desktop_actor(&host, session.id),
+    )
+    .unwrap();
+    host.session_queue_add(
+        session.id,
+        "second".into(),
+        false,
+        &desktop_actor(&host, session.id),
+    )
+    .unwrap();
     let before: Vec<String> = host
-        .session_queue_list(session.id)
+        .session_queue_list(session.id, &desktop_actor(&host, session.id))
         .unwrap()
         .iter()
         .map(|entry| entry.text.clone())
@@ -1893,20 +1991,38 @@ async fn an_abandoned_drain_reservation_does_not_wedge_the_session() {
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
     let session = host.session_new().unwrap();
-    host.session_queue_add(session.id, "first".into(), false)
-        .unwrap();
-    host.session_queue_add(session.id, "second".into(), false)
-        .unwrap();
+    host.session_queue_add(
+        session.id,
+        "first".into(),
+        false,
+        &desktop_actor(&host, session.id),
+    )
+    .unwrap();
+    host.session_queue_add(
+        session.id,
+        "second".into(),
+        false,
+        &desktop_actor(&host, session.id),
+    )
+    .unwrap();
 
     // Drain once and then simply walk away, as a crashed renderer would.
     // `take_next` combines the plain prefix, so this empties the queue.
     let abandoned = host.session_queue_take_next(session.id).unwrap();
     assert!(abandoned.reservation.is_some());
-    assert!(host.session_queue_list(session.id).unwrap().is_empty());
+    assert!(host
+        .session_queue_list(session.id, &desktop_actor(&host, session.id))
+        .unwrap()
+        .is_empty());
 
     // New work arrives for a session whose turn slot is still held.
-    host.session_queue_add(session.id, "third".into(), false)
-        .unwrap();
+    host.session_queue_add(
+        session.id,
+        "third".into(),
+        false,
+        &desktop_actor(&host, session.id),
+    )
+    .unwrap();
     assert!(
         host.session_queue_take_next(session.id)
             .unwrap()
@@ -1936,7 +2052,11 @@ async fn steer_at_idle_boundary_is_preserved_as_run_next_queue_entry() {
     let session = host.session_new().unwrap();
 
     let receipt = host
-        .session_steer(session.id, "late steering text".into())
+        .session_steer(
+            session.id,
+            "late steering text".into(),
+            &desktop_actor(&host, session.id),
+        )
         .unwrap();
 
     assert_eq!(
@@ -2113,4 +2233,15 @@ async fn missing_build_workspace_blocks_prompt_until_explicit_rebind() {
 
     let rebound = host.session_set_cwd(session.id, live.path()).unwrap();
     assert_eq!(rebound.workspace_status.as_str(), "ready");
+}
+
+/// The desktop ownership actor for a session (#461).
+///
+/// Integration tests drive the host directly, which is the local UI's
+/// position, so the desktop principal is the identity they act under.
+fn desktop_actor(
+    host: &grokptah_agent_bridge::AgentHostHandle,
+    session_id: uuid::Uuid,
+) -> grokptah_agent_bridge::queue_authority::QueueActor {
+    host.desktop_actor(session_id).expect("session exists")
 }
