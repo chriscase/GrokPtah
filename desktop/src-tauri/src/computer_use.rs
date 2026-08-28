@@ -1389,7 +1389,7 @@ mod tests {
     #[tokio::test]
     async fn starting_a_native_run_prunes_terminal_native_backends() {
         let (_dir, desktop, _actions) = native_test_desktop();
-        let first_owner = Uuid::new_v4();
+        let first_owner = test_owner(&desktop);
         let candidate = desktop.list_targets().await.unwrap().remove(0);
         let first = desktop
             .start_native(first_owner, &candidate.selection_token, NATIVE_TEST_APP_ID)
