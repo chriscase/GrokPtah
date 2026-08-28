@@ -318,7 +318,8 @@ impl AttemptContext {
         let attempt = self.store.create(spec)?;
         attempt.admit(&self.authority)?;
         let current = (self.revalidate)().ok_or(AttemptError::InvalidAuthority)?;
-        attempt.begin_send(&current)
+        let permit = attempt.begin_send(&current)?;
+        Ok(permit.with_revalidator(self.revalidate.clone(), self.authority.clone()))
     }
 }
 
@@ -650,6 +651,8 @@ impl ProviderAttempt {
             provider_request_id: record.provider_request_id,
             provider_request_key: record.provider_request_key,
             supports_idempotency: record.supports_idempotency,
+            authority: record.authority,
+            revalidate: None,
             completed: false,
         })
     }
@@ -709,6 +712,8 @@ pub struct PhysicalSendPermit {
     provider_request_id: String,
     provider_request_key: String,
     supports_idempotency: bool,
+    authority: AuthorityBinding,
+    revalidate: Option<Arc<dyn Fn() -> Option<AuthorityBinding> + Send + Sync>>,
     completed: bool,
 }
 
@@ -718,6 +723,7 @@ impl fmt::Debug for PhysicalSendPermit {
             .field("attempt_id", &self.attempt.attempt_id)
             .field("provider_request_id", &self.provider_request_id)
             .field("supports_idempotency", &self.supports_idempotency)
+            .field("authority", &"[redacted]")
             .field("provider_request_key", &"[redacted]")
             .finish()
     }
@@ -740,6 +746,36 @@ impl PhysicalSendPermit {
 
     pub const fn supports_idempotency(&self) -> bool {
         self.supports_idempotency
+    }
+
+    fn with_revalidator(
+        mut self,
+        revalidate: Arc<dyn Fn() -> Option<AuthorityBinding> + Send + Sync>,
+        authority: AuthorityBinding,
+    ) -> Self {
+        self.revalidate = Some(revalidate);
+        self.authority = authority;
+        self
+    }
+
+    /// Re-read canonical principal/capability authority at the final
+    /// physical-write boundary. A stale result is returned before the caller
+    /// may invoke its HTTP transport.
+    pub fn revalidate_before_physical_write(&self) -> Result<(), AttemptError> {
+        let Some(revalidate) = self.revalidate.as_ref() else {
+            return Ok(());
+        };
+        let current = revalidate().ok_or(AttemptError::InvalidAuthority)?;
+        if !self.authority.same_as(&current) {
+            return Err(AttemptError::StaleAuthority);
+        }
+        if self.attempt.state()? != SendState::Sending {
+            return Err(AttemptError::InvalidTransition {
+                from: self.attempt.state()?,
+                to: SendState::Sending,
+            });
+        }
+        Ok(())
     }
 
     pub fn mark_response_started(&mut self) -> Result<(), AttemptError> {
@@ -918,7 +954,6 @@ fn valid_transition(from: SendState, to: SendState) -> bool {
             | (SendState::Admitted, SendState::Sending)
             | (SendState::Admitted, SendState::Cancelled)
             | (SendState::Sending, SendState::Responding)
-            | (SendState::Sending, SendState::Settled)
             | (SendState::Sending, SendState::Uncertain)
             | (SendState::Sending, SendState::Failed)
             | (SendState::Responding, SendState::Settled)
@@ -1022,7 +1057,6 @@ mod tests {
                         | (SendState::Admitted, SendState::Sending)
                         | (SendState::Admitted, SendState::Cancelled)
                         | (SendState::Sending, SendState::Responding)
-                        | (SendState::Sending, SendState::Settled)
                         | (SendState::Sending, SendState::Uncertain)
                         | (SendState::Sending, SendState::Failed)
                         | (SendState::Responding, SendState::Settled)

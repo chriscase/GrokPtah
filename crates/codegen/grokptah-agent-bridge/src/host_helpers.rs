@@ -1976,6 +1976,23 @@ fn settle_provider_http_response(
         .map_err(|error| anyhow!("settle provider attempt: {error}"))
 }
 
+fn revalidate_provider_permit(
+    permit: &mut Option<xai_provider_attempt::PhysicalSendPermit>,
+) -> Result<()> {
+    let Some(permit_ref) = permit.as_ref() else {
+        bail!("provider attempt permit is unavailable");
+    };
+    if let Err(error) = permit_ref.revalidate_before_physical_write() {
+        if let Some(mut permit) = permit.take() {
+            let _ = permit.transport_before_possible_write();
+        }
+        return Err(anyhow!(
+            "provider authority changed before physical send: {error}"
+        ));
+    }
+    Ok(())
+}
+
 /// Stream one chat/completions step (tools + tokens).
 /// Content → `on_delta`; reasoning_content → `on_thought` (#149).
 /// Cancel aborts the HTTP body read within ~one chunk.
@@ -2161,6 +2178,7 @@ where
                     context.begin_attempt().ok().map(|attempt| (route, attempt))
                 });
 
+        revalidate_provider_permit(&mut physical_permit)?;
         let resp_result = tokio::select! {
             r = send_once(&creds).send() => r,
             _ = cancel.cancelled() => {
@@ -2262,6 +2280,7 @@ where
                             .and_then(|(route, context)| {
                                 context.begin_attempt().ok().map(|attempt| (route, attempt))
                             });
+                    revalidate_provider_permit(&mut physical_permit)?;
                     resp = tokio::select! {
                         r = send_once(&creds).send() => match r {
                             Ok(response) => response,
@@ -3887,6 +3906,7 @@ pub(crate) async fn call_xai_chat(
         .json(&body)
     };
 
+    revalidate_provider_permit(&mut physical_permit)?;
     let mut resp = send_once(&creds).send().await.map_err(|e| {
         if let Some(mut permit) = physical_permit.take() {
             let _ = permit.transport_after_possible_write();
@@ -3919,6 +3939,7 @@ pub(crate) async fn call_xai_chat(
         match crate::auth_store::force_refresh(&creds).await {
             Ok(fresh) => {
                 creds = fresh;
+                revalidate_provider_permit(&mut physical_permit)?;
                 resp = send_once(&creds).send().await.map_err(|error| {
                     if let Some(mut permit) = physical_permit.take() {
                         let _ = permit.transport_after_possible_write();

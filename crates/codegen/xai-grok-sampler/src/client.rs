@@ -630,11 +630,17 @@ impl SamplingClient {
             // the context through `with_provider_attempt_context`.
             return Ok((builder, None));
         };
-        let permit = context
+        let mut permit = context
             .begin("sampler-provider", body, true)
             .map_err(|error| {
                 SamplingError::Auth(format!("provider attempt unavailable: {error}"))
             })?;
+        if let Err(error) = permit.revalidate_before_physical_write() {
+            let _ = permit.transport_before_possible_write();
+            return Err(SamplingError::Auth(format!(
+                "provider authority changed before physical send: {error}"
+            )));
+        }
         let builder = builder
             .header(
                 xai_provider_attempt::IDEMPOTENCY_KEY_HEADER,

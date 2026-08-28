@@ -88,6 +88,8 @@ pub use provider_qualification::{
     qualify_provider_model, ProviderQualificationReport, QualificationCheck, QualificationStatus,
 };
 pub use ssrf::{check_url as ssrf_check_url, SsrfDecision};
+/// Safe public projection of the host-owned provider-attempt ledger.
+pub use xai_provider_attempt::{AttemptProjection, SendState as ProviderSendState};
 
 pub use textutil::{truncate_at_char_boundary, truncate_with_marker};
 
