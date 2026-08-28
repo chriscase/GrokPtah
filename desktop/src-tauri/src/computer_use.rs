@@ -77,7 +77,7 @@ pub struct DesktopComputerUse {
     simulator_operation: Mutex<()>,
     pending_approval: std::sync::Mutex<Option<PendingComputerApproval>>,
     #[cfg(test)]
-    _home_guard: Option<parking_lot::MutexGuard<'static, ()>>,
+    _home_guard: Option<DesktopHomeGuard>,
 }
 
 impl DesktopComputerUse {
@@ -1074,15 +1074,25 @@ mod tests {
     /// Host fixture with its persist directories bound under the disposable
     /// fixture directory. The process-global home override is serialized and
     /// restored so parallel tests never touch the real user home.
-    static DESKTOP_HOME_LOCK: std::sync::OnceLock<parking_lot::Mutex<()>> =
-        std::sync::OnceLock::new();
+    static DESKTOP_HOME_LOCK: AtomicBool = AtomicBool::new(false);
 
-    fn test_host(
-        dir: &std::path::Path,
-    ) -> (AgentHostHandle, Uuid, parking_lot::MutexGuard<'static, ()>) {
-        let guard = DESKTOP_HOME_LOCK
-            .get_or_init(|| parking_lot::Mutex::new(()))
-            .lock();
+    struct DesktopHomeGuard;
+
+    impl Drop for DesktopHomeGuard {
+        fn drop(&mut self) {
+            grokptah_agent_bridge::set_grokptah_home_override(None);
+            DESKTOP_HOME_LOCK.store(false, Ordering::Release);
+        }
+    }
+
+    fn test_host(dir: &std::path::Path) -> (AgentHostHandle, Uuid, DesktopHomeGuard) {
+        while DESKTOP_HOME_LOCK
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            std::thread::yield_now();
+        }
+        let guard = DesktopHomeGuard;
         grokptah_agent_bridge::set_grokptah_home_override(Some(dir.join(".grokptah")));
         let host = grokptah_agent_bridge::AgentHost::create(Default::default());
         host.start().unwrap();
