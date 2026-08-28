@@ -1312,102 +1312,81 @@ impl AgentHostHandle {
             }
         };
         let (outcome, receipt) = settlement.into_parts();
-        match outcome {
-            Ok(outcome) => {
-                if let Err(error) = authority.validate_current(&snapshot) {
-                    controller.abort_turn(true);
-                    controller.apply_signal(RuntimeSignal::CapabilityRevoked);
-                    self.persist_adaptive_state(
-                        &store,
-                        session_id,
-                        run_id,
-                        expected_version,
-                        &controller,
-                        "capability_revoked",
-                    )?;
-                    return Err(anyhow!(error.to_string()));
-                }
-                if let Err(error) = self.ensure_computer_route_unchanged(
-                    session_id,
-                    &model,
-                    &resolved.route_fingerprint,
-                ) {
-                    controller.abort_turn(true);
-                    controller.apply_signal(RuntimeSignal::CapabilityRevoked);
-                    self.persist_adaptive_state(
-                        &store,
-                        session_id,
-                        run_id,
-                        expected_version,
-                        &controller,
-                        "route_changed",
-                    )?;
-                    return Err(error);
-                }
-                if cancel.is_cancelled() {
-                    controller.abort_turn(true);
-                    self.persist_adaptive_state(
-                        &store,
-                        session_id,
-                        run_id,
-                        expected_version,
-                        &controller,
-                        "turn_cancelled",
-                    )?;
-                    bail!("Computer model proposal was cancelled");
-                }
-                controller.finish_turn(
-                    outcome.rendered.bytes,
-                    outcome.rendered.truncated,
-                    Some(&receipt),
-                );
-                if AdaptivePolicyEngine::is_low_confidence(outcome.confidence_permille) {
-                    let transition = controller.apply_signal(RuntimeSignal::LowConfidence);
-                    self.persist_adaptive_state(
-                        &store,
-                        session_id,
-                        run_id,
-                        expected_version,
-                        &controller,
-                        "low_confidence",
-                    )?;
-                    return Err(anyhow!(match transition {
-                        crate::computer_profile::ProfileTransition::Escalate { .. } => {
-                            "the model confidence was below the shared safety floor; adaptive policy escalated"
-                        }
-                        crate::computer_profile::ProfileTransition::Stop(stop) => {
-                            stop.operator_message()
-                        }
-                    }));
-                }
-                controller.record_usable_answer();
-                controller.record_proposal(&observation.observation_id, &outcome.proposal);
-                self.persist_adaptive_state(
-                    &store,
-                    session_id,
-                    run_id,
-                    expected_version,
-                    &controller,
-                    "turn_completed",
-                )?;
-                Ok(outcome.proposal)
-            }
-            Err(error) => {
-                controller.abort_turn(true);
-                if let Some(signal) = controller.record_uncertain_answer() {
-                    controller.apply_signal(signal);
-                }
-                self.persist_adaptive_state(
-                    &store,
-                    session_id,
-                    run_id,
-                    expected_version,
-                    &controller,
-                    "turn_rejected",
-                )?;
-                Err(error).context("adaptive Computer proposal was rejected")
-            }
+        if let Err(error) = authority.validate_current(&snapshot) {
+            controller.abort_turn(true);
+            controller.apply_signal(RuntimeSignal::CapabilityRevoked);
+            self.persist_adaptive_state(
+                &store,
+                session_id,
+                run_id,
+                expected_version,
+                &controller,
+                "capability_revoked",
+            )?;
+            return Err(anyhow!(error.to_string()));
         }
+        if let Err(error) =
+            self.ensure_computer_route_unchanged(session_id, &model, &resolved.route_fingerprint)
+        {
+            controller.abort_turn(true);
+            controller.apply_signal(RuntimeSignal::CapabilityRevoked);
+            self.persist_adaptive_state(
+                &store,
+                session_id,
+                run_id,
+                expected_version,
+                &controller,
+                "route_changed",
+            )?;
+            return Err(error);
+        }
+        if cancel.is_cancelled() {
+            controller.abort_turn(true);
+            self.persist_adaptive_state(
+                &store,
+                session_id,
+                run_id,
+                expected_version,
+                &controller,
+                "turn_cancelled",
+            )?;
+            bail!("Computer model proposal was cancelled");
+        }
+        controller.finish_turn(
+            outcome.rendered.bytes,
+            outcome.rendered.truncated,
+            Some(&receipt),
+        );
+        if AdaptivePolicyEngine::is_low_confidence(outcome.confidence_permille) {
+            let transition = controller.apply_signal(RuntimeSignal::LowConfidence);
+            self.persist_adaptive_state(
+                &store,
+                session_id,
+                run_id,
+                expected_version,
+                &controller,
+                "low_confidence",
+            )?;
+            return Err(anyhow!(match transition {
+                crate::computer_profile::ProfileTransition::Escalate { .. } => {
+                    "the model confidence was below the shared safety floor; adaptive policy escalated"
+                }
+                crate::computer_profile::ProfileTransition::Stop(stop) => {
+                    stop.operator_message()
+                }
+            }));
+        }
+        controller.record_usable_answer();
+        controller.record_proposal(&observation.observation_id, &outcome.proposal);
+        self.persist_adaptive_state(
+            &store,
+            session_id,
+            run_id,
+            expected_version,
+            &controller,
+            "turn_completed",
+        )?;
+        Ok(outcome.proposal)
     }
 
     fn persist_adaptive_state(
