@@ -3224,7 +3224,6 @@ impl OrchestrationService {
                 |store| store.link_work_run(work_id, attempt_id, lease_token, &run.run_id),
             )
             .await?;
-        let _ = auth;
         Ok(response)
     }
 
