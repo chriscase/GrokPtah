@@ -2692,7 +2692,7 @@ async fn tools_call(
     }
     let result = dispatch_tool(orch, auth, name, &call.arguments).await;
     orch.audit_transport_result(name, result.as_ref().err());
-    let body = result?;
+    let body = orch.public_projection(result?) ;
     Ok(json!({
         "content": [{ "type": "text", "text": serde_json::to_string_pretty(&body).unwrap_or_default() }],
         "structuredContent": body,

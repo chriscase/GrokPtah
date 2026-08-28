@@ -508,6 +508,14 @@ impl AuthRegistry {
         }
     }
 
+    pub(crate) fn public_actor_handle(&self, credential_id: &str) -> Option<PublicActorHandle> {
+        self.state
+            .credentials
+            .iter()
+            .find(|record| record.credential_id == credential_id)
+            .and_then(actor_handle_for_record)
+    }
+
     pub(crate) fn ensure_resource_binding(
         &mut self,
         resource: &str,
@@ -704,6 +712,18 @@ fn new_stored_credential(id: &str, owner_id: &str, generation: u64) -> StoredCre
         incarnation: hex_sha256(&Uuid::new_v4().into_bytes()),
         generation,
     }
+}
+
+fn actor_handle_for_record(record: &StoredCredential) -> Option<PublicActorHandle> {
+    let principal = decode_fixed_hex(&record.principal)?;
+    let incarnation = decode_fixed_hex(&record.incarnation)?;
+    let mut bytes = Vec::with_capacity(32);
+    bytes.extend_from_slice(&principal);
+    bytes.extend_from_slice(&incarnation);
+    Some(PublicActorHandle(format!(
+        "actor_{}",
+        hex_sha256(&bytes)[..32].to_string()
+    )))
 }
 
 fn decode_fixed_hex(value: &str) -> Option<[u8; 16]> {
@@ -936,6 +956,109 @@ mod tests {
         assert!(registry
             .authenticate(Some("Bearer unknown"), &credentials)
             .is_err());
+    }
+
+    #[test]
+    fn explicit_same_incarnation_secret_rotation_preserves_actor_binding() {
+        let root = tempdir().unwrap();
+        let old = AuthCredential::new("primary", "old-secret").unwrap();
+        let mut registry = AuthRegistry::open(root.path(), &[old.clone()], "account-1").unwrap();
+        let before = registry
+            .authenticate(Some("Bearer old-secret"), &[old])
+            .unwrap();
+        let rotated = AuthCredential::new("primary", "new-secret").unwrap();
+        registry
+            .set_credentials(std::slice::from_ref(&rotated), "account-1")
+            .unwrap();
+        let after = registry
+            .authenticate(Some("Bearer new-secret"), &[rotated])
+            .unwrap();
+        assert_eq!(before.actor_handle(), after.actor_handle());
+        assert_eq!(before.binding_digest(), after.binding_digest());
+        assert!(registry.require_current(&before).is_ok());
+    }
+
+    #[test]
+    fn credential_replacement_gets_a_new_incarnation_and_cannot_read_old_binding() {
+        let root = tempdir().unwrap();
+        let old = AuthCredential::new("laptop", "old-secret").unwrap();
+        let mut registry = AuthRegistry::open(root.path(), std::slice::from_ref(&old), "owner")
+            .unwrap();
+        let old_auth = registry
+            .authenticate(Some("Bearer old-secret"), std::slice::from_ref(&old))
+            .unwrap();
+        registry.replace_credential("laptop", "owner").unwrap();
+        let replacement = AuthCredential::new("laptop", "replacement-secret").unwrap();
+        let new_auth = registry
+            .authenticate(
+                Some("Bearer replacement-secret"),
+                std::slice::from_ref(&replacement),
+            )
+            .unwrap();
+        assert_ne!(old_auth.actor_handle(), new_auth.actor_handle());
+        assert!(registry.require_current(&old_auth).is_err());
+        registry
+            .ensure_resource_binding("run:old", &new_auth)
+            .unwrap();
+        assert!(registry
+            .ensure_resource_binding("run:old", &old_auth)
+            .is_err());
+    }
+
+    #[test]
+    fn owner_change_and_restart_preserve_revocation() {
+        let root = tempdir().unwrap();
+        let credential = AuthCredential::new("primary", "secret").unwrap();
+        let mut registry =
+            AuthRegistry::open(root.path(), std::slice::from_ref(&credential), "owner-a")
+                .unwrap();
+        let old_auth = registry
+            .authenticate(Some("Bearer secret"), std::slice::from_ref(&credential))
+            .unwrap();
+        registry.change_owner("owner-b").unwrap();
+        assert!(registry.require_current(&old_auth).is_err());
+        drop(registry);
+
+        let reopened =
+            AuthRegistry::open(root.path(), std::slice::from_ref(&credential), "owner-b").unwrap();
+        assert!(reopened.require_current(&old_auth).is_err());
+        let new_auth = reopened
+            .authenticate(Some("Bearer secret"), std::slice::from_ref(&credential))
+            .unwrap();
+        assert!(reopened.require_current(&new_auth).is_ok());
+    }
+
+    #[test]
+    fn generation_barrier_invalidates_a_pre_admission_effect_lease() {
+        let root = tempdir().unwrap();
+        let credential = AuthCredential::new("primary", "secret").unwrap();
+        let mut registry =
+            AuthRegistry::open(root.path(), std::slice::from_ref(&credential), "owner").unwrap();
+        let auth = registry
+            .authenticate(Some("Bearer secret"), std::slice::from_ref(&credential))
+            .unwrap();
+        let mut lease = registry.mint_effect_lease(&auth, "provider:run-1").unwrap();
+        registry.rotate_generation("primary").unwrap();
+        assert!(registry
+            .consume_effect_lease(&auth, &mut lease, "provider:run-1")
+            .is_err());
+        assert!(!lease.consumed);
+    }
+
+    #[test]
+    fn public_debug_does_not_reveal_credential_identity_or_owner() {
+        let root = tempdir().unwrap();
+        let credential = AuthCredential::new("private-device", "secret").unwrap();
+        let registry =
+            AuthRegistry::open(root.path(), std::slice::from_ref(&credential), "private-owner")
+                .unwrap();
+        let auth = registry
+            .authenticate(Some("Bearer secret"), std::slice::from_ref(&credential))
+            .unwrap();
+        let debug = format!("{auth:?}");
+        assert!(!debug.contains("private-device"));
+        assert!(!debug.contains("private-owner"));
+        assert!(!debug.contains("secret"));
     }
 
     #[test]

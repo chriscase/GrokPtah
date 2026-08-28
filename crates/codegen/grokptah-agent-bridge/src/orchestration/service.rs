@@ -1666,6 +1666,75 @@ impl OrchestrationService {
         Ok(())
     }
 
+    /// Convert an internal response to the strict public projection. Public
+    /// callers receive opaque actor handles only; credential ids, owner keys,
+    /// generation material, and persisted lease/hash fields are host data.
+    pub(crate) fn public_projection(&self, value: serde_json::Value) -> serde_json::Value {
+        let handles = {
+            let registry = self.auth_registry.lock();
+            self.auth_credentials
+                .lock()
+                .iter()
+                .filter_map(|credential| {
+                    registry
+                        .public_actor_handle(&credential.id)
+                        .map(|handle| (credential.id.clone(), handle.as_str().to_string()))
+                })
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        fn project(
+            value: serde_json::Value,
+            handles: &std::collections::HashMap<String, String>,
+        ) -> serde_json::Value {
+            match value {
+                serde_json::Value::Array(values) => serde_json::Value::Array(
+                    values.into_iter().map(|value| project(value, handles)).collect(),
+                ),
+                serde_json::Value::Object(values) => {
+                    let mut projected = serde_json::Map::new();
+                    for (key, value) in values {
+                        let lower = key.to_ascii_lowercase();
+                        if matches!(
+                            lower.as_str(),
+                            "tokenid"
+                                | "credentialid"
+                                | "ownerid"
+                                | "ownerprincipalid"
+                                | "ownerkey"
+                                | "principalid"
+                                | "principalref"
+                                | "incarnation"
+                                | "credentialincarnation"
+                                | "authgeneration"
+                                | "generation"
+                                | "secret"
+                                | "secretkey"
+                                | "leasehash"
+                        ) {
+                            continue;
+                        }
+                        if matches!(
+                            lower.as_str(),
+                            "clientid" | "actorid" | "createdby" | "reviewerid" | "claimantid"
+                        ) {
+                            let replacement = value
+                                .as_str()
+                                .and_then(|id| handles.get(id))
+                                .cloned()
+                                .unwrap_or_else(|| "actor_redacted".into());
+                            projected.insert("actorHandle".into(), json!(replacement));
+                            continue;
+                        }
+                        projected.insert(key, project(value, handles));
+                    }
+                    serde_json::Value::Object(projected)
+                }
+                other => other,
+            }
+        }
+        project(value, &handles)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn audit(
         &self,
@@ -2239,10 +2308,10 @@ impl OrchestrationService {
         } else {
             Vec::new()
         };
-        Ok(json!({
+        Ok(self.public_projection(json!({
             "work": item,
             "attempts": attempts,
-        }))
+        })))
     }
 
     async fn begin_work_mutation(
@@ -4290,10 +4359,10 @@ impl OrchestrationService {
         } else {
             Vec::new()
         };
-        Ok(json!({
+        Ok(self.public_projection(json!({
             "routine": routine,
             "activations": activations,
-        }))
+        })))
     }
 
     pub fn list_routines_scoped(
@@ -4785,6 +4854,7 @@ impl OrchestrationService {
             ));
         }
         serde_json::to_value(plan)
+            .map(|value| self.public_projection(value))
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
     }
 
@@ -5238,6 +5308,7 @@ impl OrchestrationService {
     fn run_value(&self, mut run: RunRecord) -> Result<serde_json::Value, OrchError> {
         self.refresh_queue_position(&mut run);
         serde_json::to_value(run)
+            .map(|value| self.public_projection(value))
             .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))
     }
 
