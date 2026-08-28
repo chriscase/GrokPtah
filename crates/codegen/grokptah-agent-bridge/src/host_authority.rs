@@ -1,7 +1,7 @@
 //! Assembly of the canonical host authority used by provider sends.
 //!
 //! This is the only bridge-side adapter that turns the live Agent/Lane
-//! identity and capability revision into the opaque authority token consumed
+//! identity and capability lease into a durable authority snapshot consumed
 //! by `xai-provider-attempt`.
 
 use anyhow::{anyhow, Result};
@@ -29,7 +29,15 @@ struct AuthorityRecord {
 
 struct PrincipalRef {
     incarnation: String,
-    auth_generation: u64,
+    auth_generation: AuthenticationGeneration,
+}
+
+struct AuthenticationGeneration(u64);
+
+impl AuthenticationGeneration {
+    fn from_credential_identity(identity: &str) -> Self {
+        Self(u64::from_str_radix(&identity[..16], 16).unwrap_or(1).max(1))
+    }
 }
 
 struct CapabilityEffectLease {
@@ -53,8 +61,8 @@ pub(crate) fn assemble(
     turn_generation: u64,
     store: Option<OrchStore>,
     attempt_root: &Path,
-    effect_scope: String,
 ) -> Result<()> {
+    let effect_scope = scope(session_id);
     let credentials = crate::auth_store::resolve_wire_credentials_for_model(model)
         .map_err(|error| anyhow!("canonical auth authority unavailable: {error}"))?
         .ok_or_else(|| anyhow!("canonical auth authority is unavailable"))?;
@@ -79,7 +87,7 @@ pub(crate) fn assemble(
         attempt_root,
         &AuthorityRecord {
             principal_incarnation: principal.incarnation,
-            auth_generation: principal.auth_generation,
+            auth_generation: principal.auth_generation.0,
             capability_generation: capability.generation,
             effect_lease_id: lease_id,
             effect_scope: capability.scope,
@@ -88,6 +96,10 @@ pub(crate) fn assemble(
         },
         &effect_scope,
     )
+}
+
+pub(crate) fn scope(session_id: Uuid) -> String {
+    format!("provider-session-{session_id}")
 }
 
 pub(crate) fn refresh(
@@ -113,7 +125,7 @@ pub(crate) fn refresh(
     let identity = credentials.qualification_identity_fingerprint();
     let principal = principal_ref(session_id, agent_id, &identity, store.clone())?;
     current.principal_incarnation = principal.incarnation;
-    current.auth_generation = principal.auth_generation;
+    current.auth_generation = principal.auth_generation.0;
     current.capability_generation =
         current
             .capability_generation
@@ -175,18 +187,24 @@ fn principal_ref(
     credential_identity: &str,
     store: Option<OrchStore>,
 ) -> Result<PrincipalRef> {
-    let owner = agent_id
-        .and_then(|id| store.as_ref().and_then(|s| s.load_agent(id).ok().flatten()))
-        .and_then(|agent| agent.owner_principal_id)
-        .unwrap_or_else(|| credential_identity.to_owned());
-    let prefix = agent_id
-        .map(|id| format!("agent-{id}"))
-        .unwrap_or_else(|| format!("lane-{session_id}"));
+    let incarnation = if let Some(agent_id) = agent_id {
+        let store = store.ok_or_else(|| anyhow!("canonical Agent authority is unavailable"))?;
+        let agent = store
+            .load_agent(agent_id)?
+            .ok_or_else(|| anyhow!("canonical Agent authority is unavailable"))?;
+        if !agent.state.is_active_identity() {
+            return Err(anyhow!("terminal Agent authority cannot send"));
+        }
+        let owner = agent
+            .owner_principal_id
+            .ok_or_else(|| anyhow!("canonical Agent principal incarnation is unavailable"))?;
+        format!("{agent_id}:{owner}")
+    } else {
+        format!("{session_id}:{credential_identity}")
+    };
     Ok(PrincipalRef {
-        incarnation: format!("{prefix}-principal-{owner}"),
-        auth_generation: u64::from_str_radix(&credential_identity[..16], 16)
-            .unwrap_or(1)
-            .max(1),
+        incarnation,
+        auth_generation: AuthenticationGeneration::from_credential_identity(credential_identity),
     })
 }
 

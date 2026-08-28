@@ -1019,7 +1019,7 @@ impl AgentHostHandle {
             .provider_attempt_store
             .clone()
             .ok_or_else(|| anyhow!("provider-attempt ledger is unavailable"))?;
-        let effect_scope = format!("effect-scope-{session_id}");
+        let effect_scope = crate::host_authority::scope(session_id);
         let (agent_id, model, turn_generation) = {
             let inner = self.inner.lock();
             let session = inner
@@ -1046,7 +1046,6 @@ impl AgentHostHandle {
                 .runtime_home
                 .orchestration_root()
                 .join("provider-attempts"),
-            effect_scope.clone(),
         )?;
         let operation_id = self
             .run_usage_trackers
@@ -1083,7 +1082,7 @@ impl AgentHostHandle {
             .join("provider-attempts");
         let store = self.orchestration_store.lock().clone();
         for (session_id, agent_id, model, turn_generation) in sessions {
-            let scope = format!("effect-scope-{session_id}");
+            let scope = crate::host_authority::scope(session_id);
             let _ = crate::host_authority::refresh(
                 session_id,
                 agent_id.as_deref(),
@@ -1113,7 +1112,7 @@ impl AgentHostHandle {
             .orchestration_root()
             .join("provider-attempts");
         for session_id in session_ids {
-            let scope = format!("effect-scope-{session_id}");
+            let scope = crate::host_authority::scope(session_id);
             let _ = crate::host_authority::revoke_scope(&root, &scope);
         }
     }
