@@ -1918,12 +1918,14 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_wins_over_an_inflight_action_completion() {
+        eprintln!("cancel-race: start");
         let dir = tempdir().unwrap();
         let backend = Arc::new(BlockingBackend::default());
         let service = Arc::new(ComputerUseService::new(
             backend.clone(),
             ComputerStore::open(dir.path().join("computer-use")).unwrap(),
         ));
+        eprintln!("cancel-race: service");
         let run = service
             .create_run(
                 "create-cancel-race",
@@ -1933,13 +1935,16 @@ mod tests {
                 Default::default(),
             )
             .unwrap();
+        eprintln!("cancel-race: created");
         let run = service
             .authorize("grant-cancel-race", &run.run_id, run.version, grant(&run))
             .unwrap();
+        eprintln!("cancel-race: authorized");
         let observation = service
             .observe("observe-cancel-race", &run.run_id, run.version)
             .await
             .unwrap();
+        eprintln!("cancel-race: observed");
         let current = service.get_run(&run.run_id).unwrap().unwrap();
         let action_service = service.clone();
         let action_run_id = run.run_id.clone();
@@ -1958,6 +1963,7 @@ mod tests {
                 )
                 .await
         });
+        eprintln!("cancel-race: action spawned");
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
             backend.action_entered.notified(),
