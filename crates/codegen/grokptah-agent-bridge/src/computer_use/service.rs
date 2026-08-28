@@ -307,8 +307,6 @@ impl ComputerUseService {
             .store
             .update_run(run_id, |run| {
                 ensure_version(run, expected_version)?;
-                let _capability = self.require_run_capability(run)?;
-                self.consume_durable_lease("observe", &payload)?;
                 let now = Utc::now();
                 if self.policy.run_limit_reached(run, now) {
                     let error = run_limit_error();
@@ -320,6 +318,8 @@ impl ComputerUseService {
                     return Ok(());
                 }
                 self.policy.authorize_observation(run, now)?;
+                let _capability = self.require_run_capability(run)?;
+                self.consume_durable_lease("observe", &payload)?;
                 run.transition(ComputerRunState::Observing)?;
                 run.record_audit("observe", "started", None, None, None);
                 Ok(())
@@ -426,8 +426,6 @@ impl ComputerUseService {
             .store
             .update_run(run_id, |run| {
                 ensure_version(run, expected_version)?;
-                let _capability = self.require_run_capability(run)?;
-                self.consume_durable_lease("act", &payload)?;
                 let now = Utc::now();
                 if self.policy.run_limit_reached(run, now) {
                     let error = run_limit_error();
@@ -464,6 +462,8 @@ impl ComputerUseService {
                         "the backend does not support this action class",
                     ));
                 }
+                let _capability = self.require_run_capability(run)?;
+                self.consume_durable_lease("act", &payload)?;
                 run.transition(ComputerRunState::Acting)?;
                 run.record_audit(
                     "act",
