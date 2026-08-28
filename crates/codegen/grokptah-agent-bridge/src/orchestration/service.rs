@@ -2290,11 +2290,12 @@ impl OrchestrationService {
             .list_sessions_by_kind(SessionKind::Build, false)
             .into_iter()
             .filter(|session| {
-                !session.cwd.is_empty()
-                    && allowlist.contains(Path::new(&session.cwd))
-                    && self.verify_session_binding(auth, session.id).is_ok()
+                !session.cwd.is_empty() && allowlist.contains(Path::new(&session.cwd))
             })
             .collect::<Vec<_>>();
+        for session in &sessions {
+            self.verify_session_binding(auth, session.id)?;
+        }
         let rows: Vec<serde_json::Value> = sessions
             .into_iter()
             .map(|s| {
@@ -5365,6 +5366,13 @@ impl OrchestrationService {
             .get_persistent_agent(agent_id)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
             .unwrap_or(agent);
+        if let Ok(runs) = self.store.list_runs() {
+            for run in runs.into_iter().filter(|run| {
+                run.session_id == session_id && run.workspace == claimed.display().to_string()
+            }) {
+                self.ensure_run_binding(auth, &run.run_id)?;
+            }
+        }
         self.audit(
             tool,
             Some(request_id),

@@ -11655,11 +11655,12 @@ mod tests {
         )
         .unwrap()["bindings"]
             .clone();
-        let listed = service.list_sessions(&auth).unwrap();
-        assert_eq!(listed["sessions"].as_array().unwrap().len(), 1);
+        let list_error = service
+            .list_sessions(&auth)
+            .expect_err("an unbound allowlisted session must fail closed");
         assert_eq!(
-            listed["sessions"][0]["sessionId"].as_str(),
-            Some(session_id.to_string().as_str())
+            list_error.code,
+            crate::orchestration::OrchErrorCode::Unauthenticated
         );
         let bindings_after = serde_json::from_str::<serde_json::Value>(
             &std::fs::read_to_string(&authority_path).unwrap(),
