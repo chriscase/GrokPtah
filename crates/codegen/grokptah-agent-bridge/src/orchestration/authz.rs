@@ -31,7 +31,44 @@ const AUTHORITY_LOCK_FILE: &str = "auth-authority.lock";
 const MAX_AUTH_ID_BYTES: usize = 128;
 const MAX_AUTH_OWNER_BYTES: usize = 128;
 const MAX_EFFECT_LEASE_ID_BYTES: usize = 64;
+const MAX_EFFECT_LEASES: usize = 1_024;
 const EFFECT_LEASE_TTL: Duration = Duration::from_secs(30);
+
+#[cfg(test)]
+static TEST_AUTHORITY_FAULT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(test)]
+pub(crate) fn set_test_authority_fault(point: Option<&str>) {
+    let value = match point {
+        None => 0,
+        Some("write") => 1,
+        Some("file_sync") => 2,
+        Some("rename") => 3,
+        Some("dir_sync") => 4,
+        Some(other) => panic!("unknown authority fault point: {other}"),
+    };
+    TEST_AUTHORITY_FAULT.store(value, Ordering::Release);
+}
+
+fn authority_fault(point: &str) -> Result<(), OrchError> {
+    #[cfg(test)]
+    {
+        let value = match point {
+            "write" => 1,
+            "file_sync" => 2,
+            "rename" => 3,
+            "dir_sync" => 4,
+            _ => 0,
+        };
+        if value != 0 && TEST_AUTHORITY_FAULT.load(Ordering::Acquire) == value {
+            return Err(internal_error(format!(
+                "injected authority persistence failure at {point}"
+            )));
+        }
+    }
+    let _ = point;
+    Ok(())
+}
 
 /// Host-issued opaque principal identity.
 ///
@@ -264,6 +301,14 @@ impl std::fmt::Debug for EffectLease {
     }
 }
 
+/// A newly created binding held by a multi-file session transaction. Existing
+/// bindings are never removed if a later publication step fails.
+pub(crate) struct ResourceBindingReservation {
+    resource: String,
+    digest: String,
+    inserted: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StoredCredential {
@@ -341,7 +386,8 @@ impl AuthRegistry {
             state: StoredAuthority::default(),
             durable_error: None,
         };
-        registry.persist()
+        let _lock = registry.durable_lock()?;
+        registry.persist_state_locked(&registry.state)
     }
 
     pub(crate) fn unavailable(root: &Path, error: impl Into<String>) -> Self {
@@ -358,31 +404,15 @@ impl AuthRegistry {
         owner_id: &str,
     ) -> Result<Self, OrchError> {
         validate_owner(owner_id)?;
-        let path = root.join(AUTHORITY_FILE);
-        let (state, existed) = if path.is_file() {
-            let text = std::fs::read_to_string(&path).map_err(|error| {
-                OrchError::new(
-                    OrchErrorCode::Internal,
-                    format!("read durable auth authority: {error}"),
-                )
-            })?;
-            let state: StoredAuthority = serde_json::from_str(&text).map_err(|error| {
-                OrchError::new(
-                    OrchErrorCode::Internal,
-                    format!("parse durable auth authority: {error}"),
-                )
-            })?;
-            validate_stored_authority(&state)?;
-            (state, true)
-        } else {
-            if durable_records_exist(root) {
-                return Err(OrchError::new(
-                    OrchErrorCode::Internal,
-                    "durable auth authority is missing; refusing to resurrect stale resources",
-                ));
-            }
-            (StoredAuthority::default(), false)
+        let mut registry = Self {
+            root: root.to_path_buf(),
+            state: StoredAuthority::default(),
+            durable_error: None,
         };
+        let _lock = registry.durable_lock()?;
+        let path = root.join(AUTHORITY_FILE);
+        let existed = path.is_file();
+        let mut state = registry.read_durable_state_locked()?;
         let effective_owner = state
             .owner_id
             .clone()
@@ -393,15 +423,11 @@ impl AuthRegistry {
                     .map(|record| record.owner_id.clone())
             })
             .unwrap_or_else(|| owner_id.trim().to_string());
-        let mut registry = Self {
-            root: root.to_path_buf(),
-            state,
-            durable_error: None,
-        };
-        let changed = registry.reconcile(credentials, &effective_owner)?;
+        let changed = reconcile_state(&mut state, credentials, &effective_owner)?;
         if changed || !existed {
-            registry.persist()?;
+            registry.persist_state_locked(&state)?;
         }
+        registry.state = state;
         Ok(registry)
     }
 
@@ -474,6 +500,7 @@ impl AuthRegistry {
     fn persist_state_locked(&self, state: &StoredAuthority) -> Result<(), OrchError> {
         let path = self.root.join(AUTHORITY_FILE);
         let tmp = self.root.join("auth-authority.json.tmp");
+        authority_fault("write")?;
         let bytes = serde_json::to_vec_pretty(state).map_err(|error| {
             OrchError::new(
                 OrchErrorCode::Internal,
@@ -499,6 +526,7 @@ impl AuthRegistry {
                     format!("write durable auth authority: {error}"),
                 )
             })?;
+            authority_fault("file_sync")?;
             file.sync_all().map_err(|error| {
                 OrchError::new(
                     OrchErrorCode::Internal,
@@ -506,6 +534,22 @@ impl AuthRegistry {
                 )
             })?;
         }
+        if let Some(parent) = path.parent() {
+            let directory = std::fs::File::open(parent).map_err(|error| {
+                OrchError::new(
+                    OrchErrorCode::Internal,
+                    format!("open durable auth directory: {error}"),
+                )
+            })?;
+            authority_fault("dir_sync")?;
+            directory.sync_all().map_err(|error| {
+                OrchError::new(
+                    OrchErrorCode::Internal,
+                    format!("flush durable auth directory: {error}"),
+                )
+            })?;
+        }
+        authority_fault("rename")?;
         std::fs::rename(&tmp, &path).map_err(|error| {
             OrchError::new(
                 OrchErrorCode::Internal,
@@ -513,21 +557,21 @@ impl AuthRegistry {
             )
         })?;
         if let Some(parent) = path.parent() {
-            if let Ok(directory) = std::fs::File::open(parent) {
-                directory.sync_all().map_err(|error| {
-                    OrchError::new(
-                        OrchErrorCode::Internal,
-                        format!("flush durable auth directory: {error}"),
-                    )
-                })?;
-            }
+            let directory = std::fs::File::open(parent).map_err(|error| {
+                OrchError::new(
+                    OrchErrorCode::Internal,
+                    format!("open durable auth directory: {error}"),
+                )
+            })?;
+            authority_fault("dir_sync")?;
+            directory.sync_all().map_err(|error| {
+                OrchError::new(
+                    OrchErrorCode::Internal,
+                    format!("flush durable auth directory: {error}"),
+                )
+            })?;
         }
         Ok(())
-    }
-
-    fn persist(&self) -> Result<(), OrchError> {
-        let _lock = self.durable_lock()?;
-        self.persist_state_locked(&self.state)
     }
 
     /// Apply an authority mutation against the latest durable state while
@@ -540,6 +584,7 @@ impl AuthRegistry {
         let _lock = self.durable_lock()?;
         let mut candidate = self.read_durable_state_locked()?;
         let value = update(&mut candidate)?;
+        prune_effect_leases(&mut candidate, false)?;
         self.persist_state_locked(&candidate)?;
         self.state = candidate;
         Ok(value)
@@ -550,7 +595,13 @@ impl AuthRegistry {
         credentials: &[AuthCredential],
         owner_id: &str,
     ) -> Result<bool, OrchError> {
-        reconcile_state(&mut self.state, credentials, owner_id)
+        self.transactional(|state| reconcile_state(state, credentials, owner_id))
+    }
+
+    fn refresh_durable_state(&mut self) -> Result<(), OrchError> {
+        let _lock = self.durable_lock()?;
+        self.state = self.read_durable_state_locked()?;
+        Ok(())
     }
 
     pub(crate) fn set_credentials(
@@ -610,10 +661,11 @@ impl AuthRegistry {
     }
 
     pub(crate) fn authenticate(
-        &self,
+        &mut self,
         header: Option<&str>,
         credentials: &[AuthCredential],
     ) -> Result<AuthContext, OrchError> {
+        self.refresh_durable_state()?;
         if credentials.is_empty() || self.state.credentials.is_empty() {
             return Err(OrchError::new(
                 OrchErrorCode::Internal,
@@ -655,7 +707,8 @@ impl AuthRegistry {
         })
     }
 
-    pub(crate) fn require_current(&self, auth: &AuthContext) -> Result<(), OrchError> {
+    pub(crate) fn require_current(&mut self, auth: &AuthContext) -> Result<(), OrchError> {
+        self.refresh_durable_state()?;
         require_current_state(&self.state, auth)
     }
 
@@ -693,6 +746,54 @@ impl AuthRegistry {
         })
     }
 
+    pub(crate) fn begin_resource_binding(
+        &mut self,
+        resource: &str,
+        auth: &AuthContext,
+    ) -> Result<ResourceBindingReservation, OrchError> {
+        if resource.is_empty() || resource.len() > 512 {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "authority resource key is empty or exceeds its bound",
+            ));
+        }
+        let resource = resource.to_string();
+        let digest = auth.binding_digest();
+        let inserted = self.transactional(|state| {
+            require_current_state(state, auth)?;
+            match state.bindings.get(&resource) {
+                Some(existing) if existing == &digest => Ok(false),
+                Some(_) => Err(stale_authority()),
+                None => {
+                    state.bindings.insert(resource.clone(), digest.clone());
+                    Ok(true)
+                }
+            }
+        })?;
+        Ok(ResourceBindingReservation {
+            resource,
+            digest,
+            inserted,
+        })
+    }
+
+    pub(crate) fn rollback_resource_binding(
+        &mut self,
+        reservation: ResourceBindingReservation,
+    ) -> Result<(), OrchError> {
+        if !reservation.inserted {
+            return Ok(());
+        }
+        self.transactional(|state| match state.bindings.get(&reservation.resource) {
+            Some(existing) if existing == &reservation.digest => {
+                state.bindings.remove(&reservation.resource);
+                Ok(())
+            }
+            None => Ok(()),
+            Some(_) => Err(stale_authority()),
+        })
+    }
+
     pub(crate) fn mint_effect_lease(
         &mut self,
         auth: &AuthContext,
@@ -722,6 +823,7 @@ impl AuthRegistry {
         };
         self.transactional(|state| {
             require_current_state(state, auth)?;
+            prune_effect_leases(state, true)?;
             state.effect_leases.insert(lease_id.clone(), stored);
             Ok(())
         })?;
@@ -771,7 +873,7 @@ impl AuthRegistry {
     }
 
     pub(crate) fn issue_delegation(
-        &self,
+        &mut self,
         auth: &AuthContext,
         session_id: Uuid,
         workspace: PathBuf,
@@ -786,7 +888,7 @@ impl AuthRegistry {
     }
 
     pub(crate) fn primary_context(
-        &self,
+        &mut self,
         credentials: &[AuthCredential],
     ) -> Result<AuthContext, OrchError> {
         let primary = credentials
@@ -917,6 +1019,33 @@ fn unix_time_millis() -> u64 {
         .unwrap_or(0)
 }
 
+fn prune_effect_leases(
+    state: &mut StoredAuthority,
+    require_capacity: bool,
+) -> Result<(), OrchError> {
+    let now = unix_time_millis();
+    state
+        .effect_leases
+        .retain(|_, lease| lease.expires_at_unix_ms > now);
+    if require_capacity && state.effect_leases.len() >= MAX_EFFECT_LEASES {
+        let excess = state.effect_leases.len() - (MAX_EFFECT_LEASES - 1);
+        let consumed = state
+            .effect_leases
+            .iter()
+            .filter(|(_, lease)| lease.consumed)
+            .map(|(id, _)| id.clone())
+            .take(excess)
+            .collect::<Vec<_>>();
+        for lease_id in consumed {
+            state.effect_leases.remove(&lease_id);
+        }
+        if state.effect_leases.len() >= MAX_EFFECT_LEASES {
+            return Err(internal_error("effect lease ledger capacity is exhausted"));
+        }
+    }
+    Ok(())
+}
+
 fn internal_error(message: impl Into<String>) -> OrchError {
     OrchError::new(OrchErrorCode::Internal, message)
 }
@@ -1015,6 +1144,12 @@ fn validate_stored_authority(state: &StoredAuthority) -> Result<(), OrchError> {
                 "durable auth resource binding is invalid",
             ));
         }
+    }
+    if state.effect_leases.len() > MAX_EFFECT_LEASES {
+        return Err(OrchError::new(
+            OrchErrorCode::Internal,
+            "durable auth effect lease ledger exceeds its bound",
+        ));
     }
     for (lease_id, lease) in &state.effect_leases {
         if lease_id.is_empty()

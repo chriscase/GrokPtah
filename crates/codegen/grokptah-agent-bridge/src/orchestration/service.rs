@@ -1584,7 +1584,7 @@ impl OrchestrationService {
         agent_id: &str,
     ) -> Result<AuthContext, OrchError> {
         let credentials = self.auth_credentials.lock().clone();
-        let registry = self.auth_registry.lock();
+        let mut registry = self.auth_registry.lock();
         let primary = registry.primary_context(&credentials)?;
         registry.issue_delegation(
             &primary,
@@ -1745,7 +1745,7 @@ impl OrchestrationService {
     /// generation material, and persisted lease/hash fields are host data.
     pub(crate) fn public_projection(&self, value: serde_json::Value) -> serde_json::Value {
         let handles = {
-            let registry = self.auth_registry.lock();
+            let mut registry = self.auth_registry.lock();
             self.auth_credentials
                 .lock()
                 .iter()
@@ -2268,26 +2268,33 @@ impl OrchestrationService {
                 "workspace is not allowlisted by this service",
             ));
         }
-        let summary = self
+        let staged = self
             .host
-            .session_new_kind(SessionKind::Build)
+            .stage_session_new_kind(SessionKind::Build, claimed.clone(), title)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-        let summary = self
-            .host
-            .session_set_cwd(summary.id, &claimed)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-        let summary = match title
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            Some(title) => self
-                .host
-                .session_rename(summary.id, title.to_string())
-                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
-            None => summary,
+        let reservation = self
+            .auth_registry
+            .lock()
+            .begin_resource_binding(&format!("session:{}", staged.id()), auth)?;
+        let summary = match self.host.commit_staged_session(staged) {
+            Ok(summary) => summary,
+            Err(error) => {
+                let rollback = self
+                    .auth_registry
+                    .lock()
+                    .rollback_resource_binding(reservation);
+                if let Err(rollback_error) = rollback {
+                    return Err(OrchError::new(
+                        OrchErrorCode::Internal,
+                        format!(
+                            "session creation failed and authority rollback failed: {error:#}; \
+                             recovery required: {rollback_error}"
+                        ),
+                    ));
+                }
+                return Err(OrchError::new(OrchErrorCode::Internal, error.to_string()));
+            }
         };
-        self.ensure_session_binding(auth, summary.id)?;
         Ok(self.public_projection(json!({
             "sessionId": summary.id,
             "title": summary.title,

@@ -245,6 +245,16 @@ pub(crate) struct Inner {
     pub(crate) session_usage: HashMap<Uuid, SessionUsage>,
 }
 
+pub(crate) struct StagedSession {
+    session: Session,
+}
+
+impl StagedSession {
+    pub(crate) fn id(&self) -> Uuid {
+        self.session.id
+    }
+}
+
 impl Inner {
     /// Stamp the next commit sequence for `session_id`'s prompt queue.
     ///
@@ -2804,6 +2814,12 @@ impl AgentHostHandle {
 
     /// Persist tiny workspace chrome (tabs / project / model) only.
     pub fn persist_chrome(&self) {
+        if let Err(e) = self.persist_chrome_checked() {
+            eprintln!("[grokptah] chrome persist failed: {e:#}");
+        }
+    }
+
+    fn persist_chrome_checked(&self) -> Result<()> {
         let chrome = {
             let g = self.inner.lock();
             WorkspaceChrome {
@@ -2819,9 +2835,7 @@ impl AgentHostHandle {
                 subagent_isolation: g.subagent_isolation,
             }
         };
-        if let Err(e) = session_store::save_chrome(&chrome) {
-            eprintln!("[grokptah] chrome persist failed: {e:#}");
-        }
+        session_store::save_chrome(&chrome)
     }
 
     /// Append new transcript lines + refresh meta for one session.
@@ -2982,13 +2996,37 @@ impl AgentHostHandle {
         }
         let mcp = crate::discover::load_mcp_servers(Some(&p));
         let skills = crate::discover::discover_skills(Some(&p));
-        {
+        let previous_chrome = match std::fs::read(session_store::chrome_path()) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let (previous_project, previous_mcp, previous_skills) = {
             let mut g = self.inner.lock();
+            let previous = (
+                g.project_cwd.clone(),
+                g.mcp_servers.clone(),
+                g.skills.clone(),
+            );
             g.project_cwd = Some(p.clone());
             g.mcp_servers = mcp;
             g.skills = skills;
+            previous
+        };
+        if let Err(error) = self.persist_chrome_checked() {
+            let mut g = self.inner.lock();
+            g.project_cwd = previous_project;
+            g.mcp_servers = previous_mcp;
+            g.skills = previous_skills;
+            if let Err(rollback_error) =
+                session_store::restore_chrome_snapshot(previous_chrome.as_deref())
+            {
+                return Err(anyhow!(
+                    "{error:#}; project chrome rollback failed: {rollback_error:#}"
+                ));
+            }
+            return Err(error);
         }
-        self.persist_chrome();
         Ok(p.display().to_string())
     }
 
@@ -2996,53 +3034,82 @@ impl AgentHostHandle {
         self.session_new_kind(SessionKind::Build)
     }
 
-    pub fn session_new_kind(&self, kind: SessionKind) -> Result<SessionSummary> {
-        let summary = {
-            let mut g = self.inner.lock();
-            if !g.running {
-                bail!("agent not started");
+    pub(crate) fn stage_session_new_kind(
+        &self,
+        kind: SessionKind,
+        cwd: PathBuf,
+        title: Option<String>,
+    ) -> Result<StagedSession> {
+        if !cwd.is_dir() {
+            bail!("not a directory: {}", cwd.display());
+        }
+        let mut g = self.inner.lock();
+        if !g.running {
+            bail!("agent not started");
+        }
+        let mut session = Session::new_with_kind(cwd, g.model.clone(), g.effort, kind);
+        if let Some(title) = title.map(|value| value.trim().to_string()) {
+            if title.is_empty() {
+                bail!("title must not be empty");
             }
-            let cwd = g
-                .project_cwd
-                .clone()
-                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-            let model = g.model.clone();
-            let effort = g.effort;
-            let s = Session::new_with_kind(cwd, model, effort, kind);
-            let summary = s.summary();
-            let next_chrome = WorkspaceChrome {
-                version: 2,
-                project_cwd: g
-                    .project_cwd
-                    .as_ref()
-                    .map(|path| path.display().to_string()),
-                active_session: Some(s.id),
-                open_tab_ids: {
-                    let mut ids = g.open_tab_ids.clone();
-                    if !ids.contains(&s.id) {
-                        ids.push(s.id);
-                    }
-                    ids
-                },
-                model: g.model.clone(),
-                effort: g.effort,
-                sandbox_profile: g.sandbox_profile.clone(),
-                appearance: g.appearance.clone(),
-                always_approve: g.always_approve,
-                subagent_isolation: g.subagent_isolation,
-            };
-            // Do not publish any map or active-session state until the
-            // transcript, metadata, and chrome commit as one recoverable
-            // durable transaction.
-            session_store::create_session_durable(&s, &next_chrome)?;
-            g.active_session = Some(s.id);
-            if !g.open_tab_ids.contains(&s.id) {
-                g.open_tab_ids.push(s.id);
-            }
-            g.sessions.insert(s.id, s);
-            summary
+            session.title = title;
+            session.updated_at = Utc::now();
+        }
+        Ok(StagedSession { session })
+    }
+
+    pub(crate) fn commit_staged_session(&self, staged: StagedSession) -> Result<SessionSummary> {
+        let mut g = self.inner.lock();
+        if !g.running {
+            bail!("agent not started");
+        }
+        if g.sessions.contains_key(&staged.session.id) {
+            bail!("session id already exists");
+        }
+        let id = staged.session.id;
+        let cwd = staged.session.cwd.clone();
+        let next_chrome = WorkspaceChrome {
+            version: 2,
+            project_cwd: Some(cwd.display().to_string()),
+            active_session: Some(id),
+            open_tab_ids: {
+                let mut ids = g.open_tab_ids.clone();
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+                ids
+            },
+            model: g.model.clone(),
+            effort: g.effort,
+            sandbox_profile: g.sandbox_profile.clone(),
+            appearance: g.appearance.clone(),
+            always_approve: g.always_approve,
+            subagent_isolation: g.subagent_isolation,
         };
+        // Durable files and the chrome pointer commit before any live map is
+        // changed. A leftover intent is recovery metadata, not a second
+        // publication state.
+        session_store::create_session_durable(&staged.session, &next_chrome)?;
+        let summary = staged.session.summary();
+        g.project_cwd = Some(cwd.clone());
+        g.mcp_servers = crate::discover::load_mcp_servers(Some(&cwd));
+        g.skills = crate::discover::discover_skills(Some(&cwd));
+        g.active_session = Some(id);
+        if !g.open_tab_ids.contains(&id) {
+            g.open_tab_ids.push(id);
+        }
+        g.sessions.insert(id, staged.session);
         Ok(summary)
+    }
+
+    pub fn session_new_kind(&self, kind: SessionKind) -> Result<SessionSummary> {
+        let cwd = {
+            let g = self.inner.lock();
+            g.project_cwd
+                .clone()
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+        };
+        self.commit_staged_session(self.stage_session_new_kind(kind, cwd, None)?)
     }
 
     /// Hybrid / keyword / semantic search over chats + builds.
@@ -3452,17 +3519,21 @@ impl AgentHostHandle {
         if title.is_empty() {
             bail!("title must not be empty");
         }
-        let summary = {
+        let (before, summary) = {
             let mut g = self.inner.lock();
             let s = g
                 .sessions
                 .get_mut(&id)
                 .ok_or_else(|| anyhow!("unknown session"))?;
+            let before = s.clone();
             s.title = title;
             s.updated_at = Utc::now();
-            s.summary()
+            (before, s.summary())
         };
-        self.persist_session_meta_only(id);
+        if let Err(error) = self.persist_session_meta_only_checked(id) {
+            self.rollback_session_metadata(id, before, error)?;
+            bail!("session rename was not committed");
+        }
         Ok(summary)
     }
 
@@ -3555,17 +3626,21 @@ impl AgentHostHandle {
         if !p.is_dir() {
             bail!("not a directory: {}", p.display());
         }
-        let summary = {
+        let (before, summary) = {
             let mut g = self.inner.lock();
             let s = g
                 .sessions
                 .get_mut(&id)
                 .ok_or_else(|| anyhow!("unknown session"))?;
+            let before = s.clone();
             s.cwd = p.clone();
             s.updated_at = Utc::now();
-            s.summary()
+            (before, s.summary())
         };
-        self.persist_session_meta_only(id);
+        if let Err(error) = self.persist_session_meta_only_checked(id) {
+            self.rollback_session_metadata(id, before, error)?;
+            bail!("session cwd was not committed");
+        }
 
         // Keep host workspace + discovery in sync when this is the focused session
         // or when no project is open yet.
@@ -3574,7 +3649,10 @@ impl AgentHostHandle {
             g.active_session == Some(id) || g.project_cwd.is_none()
         };
         if should_sync {
-            let _ = self.set_project_cwd(&p);
+            if let Err(error) = self.set_project_cwd(&p) {
+                self.rollback_session_metadata(id, before, error)?;
+                bail!("session cwd was not committed");
+            }
         }
         Ok(summary)
     }
@@ -3664,16 +3742,40 @@ impl AgentHostHandle {
     }
 
     fn persist_session_meta_only(&self, id: Uuid) {
+        if let Err(error) = self.persist_session_meta_only_checked(id) {
+            eprintln!("[grokptah] meta persist failed: {error:#}");
+        }
+    }
+
+    fn persist_session_meta_only_checked(&self, id: Uuid) -> Result<()> {
         let session = {
             let g = self.inner.lock();
             match g.sessions.get(&id) {
                 Some(s) => s.clone(),
-                None => return,
+                None => bail!("unknown session"),
             }
         };
-        if let Err(e) = session_store::save_session_meta(&session) {
-            eprintln!("[grokptah] meta persist failed: {e:#}");
+        session_store::save_session_meta(&session)
+    }
+
+    fn rollback_session_metadata(
+        &self,
+        id: Uuid,
+        before: Session,
+        error: anyhow::Error,
+    ) -> Result<()> {
+        {
+            let mut g = self.inner.lock();
+            if let Some(current) = g.sessions.get_mut(&id) {
+                *current = before.clone();
+            }
         }
+        if let Err(rollback_error) = session_store::save_session_meta(&before) {
+            return Err(anyhow!(
+                "{error:#}; session metadata rollback failed: {rollback_error:#}"
+            ));
+        }
+        Err(error)
     }
 
     pub fn fork_session(&self, source: Uuid) -> Result<SessionSummary> {

@@ -51,17 +51,43 @@ pub(crate) fn set_test_persistence_failure(point: Option<&str>) {
         Some("transcript") => 1,
         Some("meta") => 2,
         Some("chrome") => 3,
+        Some("write") => 4,
+        Some("file_sync") => 5,
+        Some("rename") => 6,
+        Some("dir_sync") => 7,
+        Some("intent_remove") => 8,
         Some(other) => panic!("unknown persistence failure point: {other}"),
     };
     TEST_PERSISTENCE_FAILURE.store(value, Ordering::Release);
 }
 
 #[cfg(test)]
-fn fail_test_persistence(point: u8) -> Result<()> {
-    if TEST_PERSISTENCE_FAILURE.load(Ordering::Acquire) == point {
+fn fail_test_persistence(point: &str) -> Result<()> {
+    let value = match point {
+        "transcript" => 1,
+        "meta" => 2,
+        "chrome" => 3,
+        "write" => 4,
+        "file_sync" => 5,
+        "rename" => 6,
+        "dir_sync" => 7,
+        "intent_remove" => 8,
+        _ => 0,
+    };
+    if value != 0
+        && TEST_PERSISTENCE_FAILURE
+            .compare_exchange(value, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    {
         bail!("injected persistence failure at boundary {point}");
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionCommitStatus {
+    Committed,
+    RecoveryRequired,
 }
 
 // ── Workspace chrome (always small) ─────────────────────────────────────────
@@ -237,10 +263,7 @@ pub fn save_session_subagents(id: Uuid, list: &[crate::types::SubagentInfo]) -> 
         .cloned()
         .collect();
     let path = subagents_path(id);
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, serde_json::to_vec_pretty(&filtered)?)?;
-    fs::rename(&tmp, &path)?;
-    Ok(())
+    atomic_write_bytes(&path, &serde_json::to_vec_pretty(&filtered)?)
 }
 
 pub fn load_session_subagents(id: Uuid) -> Vec<crate::types::SubagentInfo> {
@@ -274,19 +297,29 @@ pub fn save_chrome(chrome: &WorkspaceChrome) -> Result<()> {
     atomic_write_json(&chrome_path(), &c)
 }
 
+pub(crate) fn restore_chrome_snapshot(snapshot: Option<&[u8]>) -> Result<()> {
+    match snapshot {
+        Some(bytes) => atomic_write_bytes(&chrome_path(), bytes),
+        None => remove_file_durable(&chrome_path()),
+    }
+}
+
 pub fn save_session_meta(session: &Session) -> Result<()> {
     let dir = session_dir(session.id);
     fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
     let meta = SessionMeta::from_session(session);
     #[cfg(test)]
-    fail_test_persistence(2)?;
+    fail_test_persistence("meta")?;
     atomic_write_json(&meta_path(session.id), &meta)
 }
 
 /// Persist a new session and its chrome publication as one recoverable
 /// transaction. The session is not visible to a restarted host unless both
 /// its durable files and the chrome pointer were committed.
-pub fn create_session_durable(session: &Session, next_chrome: &WorkspaceChrome) -> Result<()> {
+pub fn create_session_durable(
+    session: &Session,
+    next_chrome: &WorkspaceChrome,
+) -> Result<SessionCommitStatus> {
     ensure_home();
     let dir = session_dir(session.id);
     if dir.exists() {
@@ -307,15 +340,29 @@ pub fn create_session_durable(session: &Session, next_chrome: &WorkspaceChrome) 
 
     let result = (|| {
         #[cfg(test)]
-        fail_test_persistence(1)?;
+        fail_test_persistence("transcript")?;
         rewrite_transcript(session)?;
         #[cfg(test)]
-        fail_test_persistence(3)?;
+        fail_test_persistence("chrome")?;
         save_chrome(next_chrome)?;
         Ok(())
     })();
     match result {
-        Ok(()) => remove_file_durable(&intent_path),
+        Ok(()) => {
+            #[cfg(test)]
+            if fail_test_persistence("intent_remove").is_err() {
+                return Ok(SessionCommitStatus::RecoveryRequired);
+            }
+            match remove_file_durable(&intent_path) {
+                Ok(()) => Ok(SessionCommitStatus::Committed),
+                Err(error) => {
+                    eprintln!(
+                        "[grokptah] session creation committed; intent cleanup deferred: {error:#}"
+                    );
+                    Ok(SessionCommitStatus::RecoveryRequired)
+                }
+            }
+        }
         Err(error) => {
             let rollback = rollback_session_creation(&intent);
             if let Err(rollback_error) = rollback {
@@ -358,8 +405,10 @@ pub fn append_transcript(session: &Session, from_index: usize) -> Result<usize> 
     f.write_all(batch.as_bytes())
         .with_context(|| format!("write append {}", path.display()))?;
     f.flush()?;
-    // Durability on turn boundary (best-effort on platforms without full fsync).
-    let _ = f.sync_all();
+    #[cfg(test)]
+    fail_test_persistence("file_sync")?;
+    f.sync_all()
+        .with_context(|| format!("sync append {}", path.display()))?;
     // Keep meta.message_count in sync
     save_session_meta(session)?;
     Ok(n)
@@ -371,31 +420,14 @@ pub fn rewrite_transcript(session: &Session) -> Result<()> {
     let dir = session_dir(session.id);
     fs::create_dir_all(&dir)?;
     let path = transcript_path(session.id);
-    let tmp = path.with_extension("jsonl.tmp");
-    {
-        let mut f = File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
-        let mut batch = String::new();
-        for entry in &session.transcript {
-            let line = serde_json::to_string(entry)?;
-            batch.push_str(&line);
-            batch.push('\n');
-        }
-        f.write_all(batch.as_bytes())?;
-        f.flush()?;
-        let _ = f.sync_all();
+    let mut batch = String::new();
+    for entry in &session.transcript {
+        let line = serde_json::to_string(entry)?;
+        batch.push_str(&line);
+        batch.push('\n');
     }
-    // Sync parent dir so the rename is durable.
-    if let Some(parent) = path.parent() {
-        if let Ok(dirf) = File::open(parent) {
-            let _ = dirf.sync_all();
-        }
-    }
-    fs::rename(&tmp, &path).with_context(|| format!("rename {}", path.display()))?;
-    if let Some(parent) = path.parent() {
-        if let Ok(dirf) = File::open(parent) {
-            let _ = dirf.sync_all();
-        }
-    }
+    atomic_write_bytes(&path, batch.as_bytes())
+        .with_context(|| format!("rewrite transcript {}", path.display()))?;
     save_session_meta(session)?;
     Ok(())
 }
@@ -459,9 +491,7 @@ pub fn delete_session(id: Uuid) -> Result<()> {
     if dir.is_dir() {
         fs::remove_dir_all(&dir).with_context(|| format!("rm -rf {}", dir.display()))?;
         if let Some(parent) = dir.parent() {
-            if let Ok(dirf) = File::open(parent) {
-                let _ = dirf.sync_all();
-            }
+            sync_directory(parent)?;
         }
     }
     Ok(())
@@ -640,30 +670,8 @@ pub fn load_all_metas() -> Result<HashMap<Uuid, Session>> {
 }
 
 fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension("json.tmp");
     let raw = serde_json::to_string_pretty(value)?;
-    {
-        let mut f = File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
-        f.write_all(raw.as_bytes())
-            .with_context(|| format!("write {}", tmp.display()))?;
-        f.flush()?;
-        let _ = f.sync_all();
-    }
-    if let Some(parent) = path.parent() {
-        if let Ok(dirf) = File::open(parent) {
-            let _ = dirf.sync_all();
-        }
-    }
-    fs::rename(&tmp, path).with_context(|| format!("rename {}", path.display()))?;
-    if let Some(parent) = path.parent() {
-        if let Ok(dirf) = File::open(parent) {
-            let _ = dirf.sync_all();
-        }
-    }
-    Ok(())
+    atomic_write_bytes(path, raw.as_bytes())
 }
 
 fn remove_file_durable(path: &Path) -> Result<()> {
@@ -685,19 +693,45 @@ fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
     let tmp = path.with_extension("json.tmp");
-    {
-        let mut file = File::create(&tmp)?;
-        file.write_all(bytes)?;
-        file.flush()?;
-        file.sync_all()?;
-    }
-    fs::rename(&tmp, path)?;
-    if let Some(parent) = path.parent() {
-        if let Ok(dirf) = File::open(parent) {
-            dirf.sync_all()?;
+    let result = (|| {
+        #[cfg(test)]
+        fail_test_persistence("write")?;
+        {
+            let mut file =
+                File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+            file.write_all(bytes)
+                .with_context(|| format!("write {}", tmp.display()))?;
+            file.flush()?;
+            #[cfg(test)]
+            fail_test_persistence("file_sync")?;
+            file.sync_all()
+                .with_context(|| format!("sync {}", tmp.display()))?;
         }
+        if let Some(parent) = path.parent() {
+            sync_directory(parent)?;
+        }
+        #[cfg(test)]
+        fail_test_persistence("rename")?;
+        fs::rename(&tmp, path).with_context(|| format!("rename {}", path.display()))?;
+        if let Some(parent) = path.parent() {
+            sync_directory(parent)?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
-    Ok(())
+    result
+}
+
+fn sync_directory(path: &Path) -> Result<()> {
+    let directory =
+        File::open(path).with_context(|| format!("open directory {}", path.display()))?;
+    #[cfg(test)]
+    fail_test_persistence("dir_sync")?;
+    directory
+        .sync_all()
+        .with_context(|| format!("sync directory {}", path.display()))
 }
 
 fn rollback_session_creation(intent: &SessionCreationIntent) -> Result<()> {
@@ -738,7 +772,9 @@ fn recover_session_creation_intent() -> Result<()> {
             serde_json::to_vec(&chrome).ok() == serde_json::to_vec(&intent.next_chrome).ok()
         });
     if session_complete && chrome_complete {
-        remove_file_durable(&intent_path)?;
+        if let Err(error) = remove_file_durable(&intent_path) {
+            eprintln!("[grokptah] committed session recovery intent cleanup deferred: {error:#}");
+        }
         return Ok(());
     }
     rollback_session_creation(&intent)?;
