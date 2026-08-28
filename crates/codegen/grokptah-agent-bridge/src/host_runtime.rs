@@ -782,12 +782,22 @@ impl HostRuntime {
 
         // 4. Seal durable-write authority. After this no handle — stale or not
         //    — can mutate this home again.
+        // The seal can block for up to its timeout, so it runs on the blocking
+        // pool. If that pool is gone — the runtime is itself being torn down —
+        // fall back to sealing inline rather than reporting "not sealed": a
+        // false negative here would retain the lock and refuse the next launch
+        // for a reason that has nothing to do with a live writer. The seal is
+        // idempotent, so running it twice is safe.
         let write_seal_timeout = self.write_seal_timeout;
         let lifecycle = self.lifecycle.clone();
-        let durable_writes_sealed =
-            tokio::task::spawn_blocking(move || lifecycle.seal_durable_writes(write_seal_timeout))
-                .await
-                .unwrap_or(false);
+        let durable_writes_sealed = match tokio::task::spawn_blocking(move || {
+            lifecycle.seal_durable_writes(write_seal_timeout)
+        })
+        .await
+        {
+            Ok(sealed) => sealed,
+            Err(_) => self.lifecycle.seal_durable_writes(write_seal_timeout),
+        };
         let durable_writes_in_flight = self.lifecycle.in_flight_durable_writes();
 
         // 5. Flush durable state and run teardown hooks. The flush runs under
