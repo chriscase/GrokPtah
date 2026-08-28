@@ -102,6 +102,7 @@ pub(crate) fn scope(session_id: Uuid) -> String {
     format!("provider-session-{session_id}")
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn refresh(
     session_id: Uuid,
     agent_id: Option<&str>,
