@@ -756,7 +756,8 @@ pub struct AgentHostHandle {
     /// Adapter to the canonical #477/#458/#478 authority spine. The adaptive
     /// layer has no fallback implementation and therefore fails closed until
     /// the assembled host installs this adapter.
-    adaptive_authority: Arc<Mutex<Option<Arc<dyn crate::computer_profile::CanonicalAuthority>>>>,
+    adaptive_authority:
+        Arc<Mutex<Option<Arc<dyn crate::computer_profile::AdaptiveAuthorityAdapter>>>>,
     /// Exclusive lock on `~/.grokptah` — kept alive for the process (#119).
     _instance_lock: Option<Arc<crate::instance_lock::InstanceLock>>,
     /// Selects the durable root for legacy modules that still resolve paths
@@ -1141,10 +1142,10 @@ impl AgentHostHandle {
             .ok_or_else(|| anyhow!(crate::auth_store::auth_help_message()))?;
         let resolved = resolve_computer_eligibility(&credentials, &model)?;
         let snapshot = authority
-            .current_snapshot(session_id, run_id, &resolved.route_fingerprint)
+            .current_binding(session_id, run_id, &resolved.route_fingerprint)
             .map_err(|error| anyhow!(error.to_string()))?;
         authority
-            .validate_snapshot(&snapshot)
+            .validate_current(&snapshot)
             .map_err(|error| anyhow!(error.to_string()))?;
 
         let session_measured = self
@@ -1282,8 +1283,9 @@ impl AgentHostHandle {
         let request_digest = format!("{:x}", request_hasher.finalize());
         let receipt =
             match authority.provider_attempt(crate::computer_profile::ProviderAttemptRequest {
-                principal: snapshot.principal(),
-                capability: snapshot.capability(),
+                principal: snapshot.principal_for_request(),
+                capability: snapshot.capability_for_request(),
+                effect_lease: snapshot.effect_lease_for_request(),
                 session_id,
                 run_id: run_id.to_string(),
                 route_fingerprint: resolved.route_fingerprint.clone(),
@@ -1331,7 +1333,7 @@ impl AgentHostHandle {
         .await;
         match outcome {
             Ok(outcome) => {
-                if let Err(error) = authority.validate_snapshot(&snapshot) {
+                if let Err(error) = authority.validate_current(&snapshot) {
                     controller.abort_turn(true);
                     controller.apply_signal(RuntimeSignal::CapabilityRevoked);
                     self.persist_adaptive_state(
@@ -1732,9 +1734,9 @@ impl AgentHostHandle {
     /// is intentionally replace-once: changing the authority underneath an
     /// active run would be a generation race, so the host must restart or
     /// revoke the run before a new authority can be installed.
-    pub fn install_canonical_adaptive_authority(
+    pub(crate) fn install_adaptive_authority_adapter(
         &self,
-        authority: Arc<dyn crate::computer_profile::CanonicalAuthority>,
+        authority: Arc<dyn crate::computer_profile::AdaptiveAuthorityAdapter>,
     ) -> Result<()> {
         let mut current = self.adaptive_authority.lock();
         if current.is_some() {

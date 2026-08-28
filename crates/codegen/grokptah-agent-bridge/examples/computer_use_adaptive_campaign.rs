@@ -31,6 +31,22 @@ struct Counts {
     kernel_disagreements: usize,
 }
 
+/// Explicitly offline authority fixture. It is not exported or used by the
+/// production host; the real authority seam is absent on this exact base.
+struct SyntheticTestAuthority;
+
+impl SyntheticTestAuthority {
+    fn authorize(
+        run: &ComputerRun,
+        observation: &ComputerObservation,
+        action: &grokptah_agent_bridge::ComputerAction,
+    ) -> bool {
+        ComputerPolicy
+            .authorize_action(run, observation, action, Utc::now())
+            .is_ok()
+    }
+}
+
 fn target() -> ComputerTarget {
     ComputerTarget {
         app_id: "com.grokptah.adaptive.synthetic".into(),
@@ -237,6 +253,7 @@ fn ready_run(observation: &ComputerObservation) -> ComputerRun {
 
 fn run_campaign() -> Counts {
     let mut counts = Counts::default();
+    let _offline_authority = SyntheticTestAuthority;
     for (_, observation) in frames() {
         let run = ready_run(&observation);
         for repeat in 0..REPEATS {
@@ -283,9 +300,8 @@ fn run_campaign() -> Counts {
                     }
                     if let Ok(ComputerAgentProposal::Action { action, .. }) = proposal {
                         counts.kernel_checks += 1;
-                        let authorized = ComputerPolicy
-                            .authorize_action(&run, &observation, &action, Utc::now())
-                            .is_ok();
+                        let authorized =
+                            SyntheticTestAuthority::authorize(&run, &observation, &action);
                         if authorized {
                             counts.kernel_authorized += 1;
                         }

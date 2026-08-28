@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::authority::AdaptiveAuthoritySnapshot;
+use super::authority_seam::HostIssuedBinding;
 use super::profile::AdaptiveProfile;
 use crate::gateway_config::{CapabilitySource, ComputerUseTier, ModelCapabilities};
 
@@ -52,9 +52,9 @@ pub struct ModelCapabilityEvidence {
 }
 
 impl ModelCapabilityEvidence {
-    pub fn from_model_capabilities(
+    pub(crate) fn from_model_capabilities(
         capabilities: &ModelCapabilities,
-        authority: Option<&AdaptiveAuthoritySnapshot>,
+        authority: Option<&HostIssuedBinding>,
         session_measured: bool,
         synthetic_only: bool,
     ) -> Self {
@@ -121,7 +121,7 @@ pub struct CapabilityEvidence {
     /// Publicly safe opaque capability snapshot reference. The actual
     /// generation object is retained only in-process and is never serialized.
     #[serde(skip)]
-    pub(crate) authority: Option<AdaptiveAuthoritySnapshot>,
+    pub(crate) authority: Option<HostIssuedBinding>,
 }
 
 impl CapabilityEvidence {
@@ -136,7 +136,7 @@ impl CapabilityEvidence {
     pub(crate) fn with_authority(
         model: ModelCapabilityEvidence,
         host: HostCapabilityEvidence,
-        authority: AdaptiveAuthoritySnapshot,
+        authority: HostIssuedBinding,
     ) -> Self {
         Self {
             model,
@@ -145,7 +145,7 @@ impl CapabilityEvidence {
         }
     }
 
-    pub(crate) fn bind_authority(&mut self, authority: AdaptiveAuthoritySnapshot) {
+    pub(crate) fn bind_authority(&mut self, authority: HostIssuedBinding) {
         self.authority = Some(authority);
     }
 

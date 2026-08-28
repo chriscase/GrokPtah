@@ -374,10 +374,7 @@ impl AdaptiveController {
         &self.state.evidence
     }
 
-    pub(crate) fn bind_authority(
-        &mut self,
-        authority: super::authority::AdaptiveAuthoritySnapshot,
-    ) {
+    pub(crate) fn bind_authority(&mut self, authority: super::authority_seam::HostIssuedBinding) {
         self.state.evidence.bind_authority(authority);
     }
 
@@ -537,7 +534,7 @@ impl AdaptiveController {
         &mut self,
         rendered_observation_bytes: u64,
         truncated: bool,
-        receipt: Option<&super::authority::ProviderAttemptReceipt>,
+        receipt: Option<&super::authority_seam::ProviderAttemptEvidence>,
     ) {
         self.state.turn_in_flight = false;
         self.state.spend.model_calls = self.state.spend.model_calls.saturating_add(1);
@@ -768,9 +765,10 @@ mod tests {
                 independent_verifier: true,
                 isolated_guest: true,
             },
-            super::super::authority::AdaptiveAuthoritySnapshot::issued(
-                "test-principal-generation",
-                "test-capability-generation",
+            super::super::authority_seam::HostIssuedBinding::from_host_issued(
+                "test-principal-generation".into(),
+                "test-capability-generation".into(),
+                "test-effect-lease".into(),
             )
             .unwrap(),
         );

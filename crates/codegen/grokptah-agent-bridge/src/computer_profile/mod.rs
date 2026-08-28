@@ -7,7 +7,7 @@
 //! is absent.
 
 mod adapters;
-pub mod authority;
+mod authority_seam;
 pub mod capability;
 pub mod controller;
 pub mod policy;
@@ -19,8 +19,8 @@ pub mod risk;
 pub(crate) use adapters::{
     AdaptiveObservationAdapter, ProviderImageInput, SemanticHeadlessAdapter, VisualGroundingAdapter,
 };
-pub use authority::{
-    AdaptiveAuthoritySnapshot, AuthorityFailure, CanonicalAuthority, ProviderAttemptReceipt,
+pub(crate) use authority_seam::{
+    AdaptiveAuthorityAdapter, AuthorityFailure, HostIssuedBinding, ProviderAttemptEvidence,
     ProviderAttemptRequest,
 };
 pub use capability::{

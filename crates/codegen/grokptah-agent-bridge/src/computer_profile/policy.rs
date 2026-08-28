@@ -355,9 +355,10 @@ mod tests {
                 independent_verifier: verifier,
                 isolated_guest: isolated,
             },
-            super::super::authority::AdaptiveAuthoritySnapshot::issued(
-                "test-principal-generation",
-                "test-capability-generation",
+            super::super::authority_seam::HostIssuedBinding::from_host_issued(
+                "test-principal-generation".into(),
+                "test-capability-generation".into(),
+                "test-effect-lease".into(),
             )
             .unwrap(),
         )
