@@ -557,10 +557,7 @@ struct ReadinessSnapshot {
 fn readiness_snapshot(state: &AppState) -> ReadinessSnapshot {
     let payload = state
         .orch
-        .get_capacity(&AuthContext {
-            token_id: "health-probe".into(),
-            owner_id: "health-probe".into(),
-        })
+        .get_capacity(&state.orch.health_probe_context())
         .unwrap_or_else(|error| json!({"health": {"serviceError": error.message}}));
     let health = payload.get("health").cloned().unwrap_or_else(|| json!({}));
     let ready = [
@@ -3796,7 +3793,10 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         }
-        assert!(host.session_queue_list(session.id).unwrap().is_empty());
+        assert!(host
+            .session_queue_list(session.id, &host.desktop_actor(session.id).unwrap())
+            .unwrap()
+            .is_empty());
         srv.stop();
         set_grokptah_home_override(None);
     }

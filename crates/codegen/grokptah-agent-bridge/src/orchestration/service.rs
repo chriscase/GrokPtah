@@ -17,7 +17,7 @@ use crate::session::{SessionKind, WorkspaceStatus};
 
 use super::authz::{
     authenticate_bearer, canonical_workspace, require_workspace_match, AuthContext, AuthCredential,
-    WorkspaceAllowlist,
+    AuthEpoch, WorkspaceAllowlist,
 };
 use super::managed::{
     assemble_managed_run_input, managed_execution_eligible, select_relevant_managed_messages,
@@ -48,6 +48,7 @@ use super::workload::{
     WorkAttempt, WorkAttemptView, WorkDecision, WorkDependency, WorkItem, WorkPolicy, WorkProgress,
     WorkResult, WorkState,
 };
+use crate::queue_authority::{self, QueueActor, QueueAuthority, QueuePrincipal, QueueProvenance};
 
 /// Admission is deliberately bounded so an untrusted coordinator cannot turn
 /// queued submissions into an unbounded in-memory prompt store.
@@ -90,6 +91,25 @@ pub struct OrchestrationService {
     store: OrchStore,
     config: Mutex<OrchestrationConfig>,
     auth_credentials: Mutex<Vec<AuthCredential>>,
+    /// Current authentication/policy epoch for this service instance (#461).
+    ///
+    /// Every issued `AuthContext` is stamped with it, and every queue entry
+    /// point requires the stamp to still match. Rotating credentials or the
+    /// workspace allowlist advances it, which is what makes a context minted
+    /// before the change stop working rather than silently keep its old reach.
+    auth_epoch: Mutex<AuthEpoch>,
+    /// Monotonic policy/capability revision, advanced alongside the epoch and
+    /// recorded as queue-entry provenance.
+    policy_revision: Mutex<u64>,
+    /// Serializes whole rotations.
+    ///
+    /// A rotation quiesces queue delivery, mutates policy, then republishes.
+    /// Without this, two concurrent rotations interleave: one can publish its
+    /// final snapshot while the other is still mutating, reopening delivery
+    /// inside the window the quiesce exists to close. It also makes the
+    /// multi-lock read in `publish_queue_authority` consistent, since no other
+    /// rotation can move those inputs underneath it.
+    rotation: Mutex<()>,
     agent_owner_id: Mutex<String>,
     self_ref: Weak<OrchestrationService>,
     pending_admissions: Mutex<AdmissionQueueState>,
@@ -169,6 +189,9 @@ struct IdempotencyLease {
     tool: String,
     request_id: String,
     payload_hash: String,
+    /// Opaque per-principal namespace the claim was taken in (#461). Carried so
+    /// settling the lease addresses the same receipt the claim created.
+    scope: String,
     settled: bool,
 }
 
@@ -182,6 +205,7 @@ impl IdempotencyLease {
             &self.tool,
             &self.request_id,
             &self.payload_hash,
+            &self.scope,
             run_id,
             response,
         )?;
@@ -194,6 +218,7 @@ impl IdempotencyLease {
             &self.tool,
             &self.request_id,
             &self.payload_hash,
+            &self.scope,
             run_id,
             error.clone(),
         ) {
@@ -221,6 +246,7 @@ impl Drop for IdempotencyLease {
                 &self.tool,
                 &self.request_id,
                 &self.payload_hash,
+                &self.scope,
                 None,
                 error,
             )
@@ -264,6 +290,9 @@ impl OrchestrationService {
             bus,
             store,
             config: Mutex::new(config),
+            auth_epoch: Mutex::new(AuthEpoch::new_authority()),
+            policy_revision: Mutex::new(0),
+            rotation: Mutex::new(()),
             auth_credentials: Mutex::new(auth_credentials),
             agent_owner_id: Mutex::new("primary".into()),
             self_ref: self_ref.clone(),
@@ -281,6 +310,11 @@ impl OrchestrationService {
             native_executor_watcher: Mutex::new(None),
             join_handles: Mutex::new(Vec::new()),
         });
+        // Publish before anything can drain: a host still holding the
+        // desktop-only default would withhold every control-plane entry as
+        // unauthorized, and a host holding a *previous* service's snapshot
+        // would deliver under credentials this instance never installed.
+        service.publish_queue_authority();
         service.start_scheduler_watcher();
         service.start_native_executor();
         service.start_manager_supervisor();
@@ -1327,10 +1361,7 @@ impl OrchestrationService {
         intent.attempt_id = Some(claim.attempt.attempt_id.clone());
         intent.updated_at = Utc::now();
         self.store.save_managed_intent(&intent)?;
-        let auth = AuthContext {
-            token_id: "native-executor".into(),
-            owner_id: owner_id.to_string(),
-        };
+        let auth = self.issue_internal_context("native-executor", owner_id);
         let bounds_json = serde_json::to_value(&bounds)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         let submitted = match self
@@ -1432,24 +1463,194 @@ impl OrchestrationService {
         &self.store
     }
 
-    pub fn set_token(&self, token: String) {
-        let token = token.trim().to_string();
-        if !token.is_empty() {
-            self.bus.add_control_secrets([token.clone()]);
+    /// The single authority check every queue entry point runs first (#461).
+    ///
+    /// A context fails here when it was minted before a credential or
+    /// allowlist rotation (stale epoch), by a different service instance
+    /// (different authority), or by the `require_bearer` policy helper, which
+    /// mints a throwaway authority on purpose.
+    pub(crate) fn require_current_auth(&self, auth: &AuthContext) -> Result<(), OrchError> {
+        let current = *self.auth_epoch.lock();
+        if auth.epoch() == current {
+            return Ok(());
         }
-        self.config.lock().bearer_token = token.clone();
+        let error = OrchError::new(
+            OrchErrorCode::Unauthenticated,
+            "authentication context is no longer current; re-authenticate",
+        );
+        self.audit(
+            "auth",
+            None,
+            None,
+            None,
+            "rejected",
+            Some(error.code.as_str()),
+            "stale authentication context",
+        );
+        Err(error)
+    }
+
+    /// Wire principal for an authenticated caller.
+    ///
+    /// One definition, so queue ownership and any other principal-scoped
+    /// decision cannot drift apart. The compatibility credential keeps emitting
+    /// the established `mcp` wire value; every other named device credential is
+    /// its own principal. `mcp` therefore names exactly one credential rather
+    /// than being the shared bucket it used to be.
+    fn client_principal(auth: &AuthContext) -> String {
+        if auth.token_id == "primary" {
+            queue_authority::CONTROL_PRINCIPAL.into()
+        } else {
+            auth.token_id.clone()
+        }
+    }
+
+    /// Current policy/capability revision.
+    pub fn policy_revision(&self) -> u64 {
+        *self.policy_revision.lock()
+    }
+
+    /// Current epoch counter, for diagnostics and provenance.
+    pub fn auth_epoch_counter(&self) -> u64 {
+        self.auth_epoch.lock().counter()
+    }
+
+    /// Build the queue actor for an authenticated caller against an already
+    /// authorized workspace.
+    ///
+    /// `workspace` must be the canonical path the caller's scope check
+    /// returned, never a caller-supplied string: ownership is only meaningful
+    /// against the workspace the request was actually authorized for.
+    fn queue_actor(&self, auth: &AuthContext, session_id: Uuid, workspace: &Path) -> QueueActor {
+        QueueActor::new(
+            QueuePrincipal::control(
+                auth.owner_id.clone(),
+                Self::client_principal(auth),
+                session_id,
+                queue_authority::workspace_key(workspace),
+            ),
+            QueueProvenance {
+                epoch: self.auth_epoch_counter(),
+                policy: self.policy_revision(),
+            },
+        )
+    }
+
+    /// Suspend queue delivery for the duration of a rotation.
+    ///
+    /// A rotation advances the epoch, mutates policy state, and republishes the
+    /// host snapshot in separate critical sections, and delivery reads that
+    /// snapshot without consulting the service. A drain landing between the
+    /// mutation and the republish would otherwise execute under the
+    /// pre-rotation authority. Installing an authority that authorizes nobody
+    /// first makes the window fail closed in both directions; the republish at
+    /// the end restores the correct width.
+    fn quiesce_queue_authority(&self) {
+        self.host.set_queue_authority(QueueAuthority::quiesced());
+    }
+
+    /// Republish the live queue authorization snapshot into the host.
+    ///
+    /// Called after every rotation so revocation reaches queue delivery. The
+    /// host holds the queue; the service holds the credentials; this is the one
+    /// direction that information flows between them.
+    ///
+    /// A snapshot that cannot be built (more live principals than revalidation
+    /// supports) leaves the host quiesced rather than silently restoring a
+    /// truncated authority, and the error is audited.
+    fn publish_queue_authority(&self) {
+        let principals: Vec<String> = self
+            .auth_credentials
+            .lock()
+            .iter()
+            .map(|credential| {
+                if credential.id == "primary" {
+                    queue_authority::CONTROL_PRINCIPAL.to_string()
+                } else {
+                    credential.id.clone()
+                }
+            })
+            .collect();
+        let workspaces: Vec<String> = self
+            .config
+            .lock()
+            .allowlist
+            .roots()
+            .iter()
+            .map(|root| queue_authority::workspace_key(root))
+            .collect();
+        match QueueAuthority::control(
+            self.agent_owner_id(),
+            principals,
+            workspaces,
+            QueueProvenance {
+                epoch: self.auth_epoch_counter(),
+                policy: self.policy_revision(),
+            },
+        ) {
+            Ok(authority) => self.host.set_queue_authority(authority),
+            Err(error) => {
+                // Leave the host quiesced: delivering under a truncated
+                // authority would silently revoke the principals past the cap
+                // while appearing to work for the rest.
+                self.host.set_queue_authority(QueueAuthority::quiesced());
+                self.audit(
+                    "auth",
+                    None,
+                    None,
+                    None,
+                    "rejected",
+                    Some(OrchErrorCode::Internal.as_str()),
+                    &format!("queue authority not published: {error}"),
+                );
+            }
+        }
+    }
+
+    /// Advance the epoch and policy revision together, before any policy state
+    /// changes.
+    ///
+    /// Computing the next epoch first means an exhausted counter leaves the
+    /// previously installed credentials and allowlist exactly as they were,
+    /// rather than applying half a rotation.
+    fn advance_authority(&self) -> Result<(), OrchError> {
+        let mut epoch = self.auth_epoch.lock();
+        let next = epoch.next()?;
+        let mut policy = self.policy_revision.lock();
+        let next_policy = policy.checked_add(1).ok_or_else(|| {
+            OrchError::new(
+                OrchErrorCode::Internal,
+                "policy revision exhausted; refusing to rotate credentials or workspace policy",
+            )
+        })?;
+        *epoch = next;
+        *policy = next_policy;
+        Ok(())
+    }
+
+    pub fn set_token(&self, token: String) -> Result<(), OrchError> {
+        let _rotation = self.rotation.lock();
+        let token = token.trim().to_string();
         let credentials = if token.is_empty() {
             Vec::new()
         } else {
-            vec![AuthCredential::new("primary", token)
-                .expect("non-empty bearer token should form a primary credential")]
+            vec![AuthCredential::new("primary", token.clone())?]
         };
+        self.advance_authority()?;
+        self.quiesce_queue_authority();
+        if !token.is_empty() {
+            self.bus.add_control_secrets([token.clone()]);
+        }
+        self.config.lock().bearer_token = token;
         *self.auth_credentials.lock() = credentials;
+        self.publish_queue_authority();
+        Ok(())
     }
 
     /// Install named device/client credentials while retaining the existing
     /// primary-token configuration field for compatibility with embedders.
     pub fn set_auth_credentials(&self, credentials: Vec<AuthCredential>) -> Result<(), OrchError> {
+        let _rotation = self.rotation.lock();
         if credentials.is_empty() {
             return Err(OrchError::new(
                 OrchErrorCode::InvalidRequest,
@@ -1471,16 +1672,20 @@ impl OrchestrationService {
             .expect("primary credential was checked above")
             .token()
             .to_string();
+        self.advance_authority()?;
+        self.quiesce_queue_authority();
         for credential in &credentials {
             self.bus
                 .add_control_secrets([credential.token().to_string()]);
         }
         self.config.lock().bearer_token = primary_token;
         *self.auth_credentials.lock() = credentials;
+        self.publish_queue_authority();
         Ok(())
     }
 
     pub fn set_agent_owner_id(&self, owner_id: String) -> Result<(), OrchError> {
+        let _rotation = self.rotation.lock();
         let owner_id = owner_id.trim().to_string();
         if owner_id.is_empty() || owner_id.len() > 128 {
             return Err(OrchError::new(
@@ -1488,7 +1693,10 @@ impl OrchestrationService {
                 "Agent owner id must be between 1 and 128 bytes",
             ));
         }
+        self.advance_authority()?;
+        self.quiesce_queue_authority();
         *self.agent_owner_id.lock() = owner_id;
+        self.publish_queue_authority();
         Ok(())
     }
 
@@ -1496,8 +1704,31 @@ impl OrchestrationService {
         self.agent_owner_id.lock().clone()
     }
 
-    pub fn set_allowlist(&self, allowlist: WorkspaceAllowlist) {
+    /// Issue a context for a service-internal principal that authenticates by
+    /// construction rather than by bearer token.
+    ///
+    /// Stamped with the current epoch like any other context, so an internal
+    /// principal is invalidated by rotation exactly as a client is.
+    fn issue_internal_context(&self, token_id: &str, owner_id: &str) -> AuthContext {
+        AuthContext::issue(token_id, owner_id, *self.auth_epoch.lock())
+    }
+
+    /// Context for the unauthenticated local readiness probe.
+    ///
+    /// Preserves the probe's existing capacity-read behaviour rather than
+    /// changing it; whether the probe should authenticate at all is a separate
+    /// question and is not decided here.
+    pub(crate) fn health_probe_context(&self) -> AuthContext {
+        self.issue_internal_context("health-probe", "health-probe")
+    }
+
+    pub fn set_allowlist(&self, allowlist: WorkspaceAllowlist) -> Result<(), OrchError> {
+        let _rotation = self.rotation.lock();
+        self.advance_authority()?;
+        self.quiesce_queue_authority();
         self.config.lock().allowlist = allowlist;
+        self.publish_queue_authority();
+        Ok(())
     }
 
     pub(crate) fn audit_transport_result(&self, tool: &str, error: Option<&OrchError>) {
@@ -1517,9 +1748,14 @@ impl OrchestrationService {
     }
 
     pub fn auth_header(&self, header: Option<&str>) -> Result<AuthContext, OrchError> {
-        let credentials = self.auth_credentials.lock().clone();
-        let owner_id = self.agent_owner_id();
-        let res = authenticate_bearer(header, &credentials, &owner_id);
+        // Hold the epoch across the whole authentication so a rotation cannot
+        // interleave and stamp a revoked token with the new epoch.
+        let res = {
+            let epoch = self.auth_epoch.lock();
+            let credentials = self.auth_credentials.lock().clone();
+            let owner_id = self.agent_owner_id();
+            authenticate_bearer(header, &credentials, &owner_id, *epoch)
+        };
         if let Err(ref e) = res {
             self.audit(
                 "auth",
@@ -1766,6 +2002,7 @@ impl OrchestrationService {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn begin_idempotency(
         &self,
         tool: &str,
@@ -1773,16 +2010,21 @@ impl OrchestrationService {
         payload_hash: &str,
         session_id: Uuid,
         workspace: &Path,
+        scope: &str,
     ) -> Result<IdempotencyStart, OrchError> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
-            match self.store.claim_idempotency(tool, request_id, payload_hash) {
+            match self
+                .store
+                .claim_idempotency(tool, request_id, payload_hash, scope)
+            {
                 Ok(IdempotencyClaim::Perform) => {
                     return Ok(IdempotencyStart::Perform(IdempotencyLease {
                         store: self.store.clone(),
                         tool: tool.into(),
                         request_id: request_id.into(),
                         payload_hash: payload_hash.into(),
+                        scope: scope.into(),
                         settled: false,
                     }));
                 }
@@ -2007,11 +2249,11 @@ impl OrchestrationService {
     /// without exposing runs from another session or workspace.
     pub fn list_runs_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
     ) -> Result<serde_json::Value, OrchError> {
-        let claimed = self.authorize_queue_request(session_id, workspace)?;
+        let (claimed, _) = self.authorize_queue_request(auth, session_id, workspace)?;
         let runs = self
             .store
             .list_runs()
@@ -2127,7 +2369,7 @@ impl OrchestrationService {
         };
         let payload_hash = hash_payload(payload);
         let start = self
-            .begin_idempotency(tool, request_id, &payload_hash, session_id, &claimed)
+            .begin_idempotency(tool, request_id, &payload_hash, session_id, &claimed, "")
             .await?;
         Ok((claimed, start))
     }
@@ -5070,11 +5312,12 @@ impl OrchestrationService {
 
     pub fn get_events(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         run_id: Option<&str>,
         after_seq: u64,
         limit: usize,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_auth(auth)?;
         // run_id is required — never fall back to the global journal.
         let rid = run_id.ok_or_else(|| {
             OrchError::new(
@@ -5083,36 +5326,37 @@ impl OrchestrationService {
             )
         })?;
         let run = self.load_authorized_run(rid)?;
-        self.events_for_run(run, after_seq, limit)
+        let actor = self.queue_actor(auth, run.session_id, Path::new(&run.workspace));
+        self.events_for_run(run, after_seq, limit, Some(&actor))
     }
 
     pub fn get_events_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         run_id: &str,
         after_seq: u64,
         limit: usize,
     ) -> Result<serde_json::Value, OrchError> {
-        self.events_for_run(
-            self.authorize_run_request(session_id, workspace, run_id)?,
-            after_seq,
-            limit,
-        )
+        self.require_current_auth(auth)?;
+        let run = self.authorize_run_request(session_id, workspace, run_id)?;
+        let actor = self.queue_actor(auth, run.session_id, Path::new(&run.workspace));
+        self.events_for_run(run, after_seq, limit, Some(&actor))
     }
 
     /// Authorize a run and return its current journal bounds plus an initial
     /// durable page for the optional Streamable HTTP live channel.
     pub(crate) fn live_run_page(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         run_id: &str,
         after_seq: u64,
         limit: usize,
     ) -> Result<(LiveRunScope, JournalPage), OrchError> {
+        self.require_current_auth(auth)?;
         let run = self.authorize_run_request(session_id, workspace, run_id)?;
         let Some(start_seq) = run.start_seq else {
             return Err(OrchError::new(
@@ -5126,7 +5370,8 @@ impl OrchestrationService {
             start_seq,
             end_seq: run.end_seq,
         };
-        let page = self.events_page_for_run(run, after_seq, limit)?;
+        let actor = self.queue_actor(auth, run.session_id, Path::new(&run.workspace));
+        let page = self.events_page_for_run(run, after_seq, limit, Some(&actor))?;
         Ok((scope, page))
     }
 
@@ -5280,9 +5525,49 @@ impl OrchestrationService {
         run: RunRecord,
         after_seq: u64,
         limit: usize,
+        actor: Option<&QueueActor>,
     ) -> Result<serde_json::Value, OrchError> {
-        serde_json::to_value(self.events_page_for_run(run, after_seq, limit)?)
+        serde_json::to_value(self.events_page_for_run(run, after_seq, limit, actor)?)
             .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))
+    }
+
+    /// Redact queue events in a run projection down to `actor`'s own entries.
+    ///
+    /// A run's event window is a session window, and the session journal
+    /// carries `PromptQueueChanged` with the whole queue attached. Without this
+    /// a principal that owns any run in the session could read every other
+    /// principal's queued prompt text out of the event stream — scoping the
+    /// queue read paths alone would not close it.
+    ///
+    /// `None` means no queue-owning principal is in play (internal service
+    /// reads); those keep the unredacted journal they already had.
+    fn redact_queue_events(entries: &mut [crate::event_bus::JournalEntry], actor: &QueueActor) {
+        use crate::events::SessionUpdate;
+        let key = actor.key();
+        for entry in entries.iter_mut() {
+            if let SessionUpdate::PromptQueueChanged {
+                entries: queue_entries,
+                changed_entry,
+                ..
+            } = &mut entry.update
+            {
+                queue_entries.retain(|queued| queued.owned_by(&key));
+                if changed_entry
+                    .as_ref()
+                    .is_some_and(|queued| !queued.owned_by(&key))
+                {
+                    *changed_entry = None;
+                }
+                for queued in queue_entries.iter_mut() {
+                    queued.owner_key = None;
+                    queued.owner_provenance = None;
+                }
+                if let Some(queued) = changed_entry.as_mut() {
+                    queued.owner_key = None;
+                    queued.owner_provenance = None;
+                }
+            }
+        }
     }
 
     fn events_page_for_run(
@@ -5290,6 +5575,7 @@ impl OrchestrationService {
         run: RunRecord,
         after_seq: u64,
         limit: usize,
+        actor: Option<&QueueActor>,
     ) -> Result<JournalPage, OrchError> {
         // Read the bounded run range before applying the caller's page limit.
         // Applying `limit` to the global journal first can return a page made
@@ -5310,6 +5596,9 @@ impl OrchestrationService {
                 && run.end_seq.map(|s| e.seq <= s).unwrap_or(true)
         });
         entries.truncate(limit.clamp(1, 500));
+        if let Some(actor) = actor {
+            Self::redact_queue_events(&mut entries, actor);
+        }
         let next_cursor = entries.last().map(|e| e.seq);
         Ok(JournalPage {
             entries,
@@ -5613,27 +5902,39 @@ impl OrchestrationService {
         Ok((agent, claimed))
     }
 
+    /// Authorize a queue request and mint the caller's ownership actor.
+    ///
+    /// Authentication currency is rechecked here rather than only at the
+    /// transport edge, so every queue boundary — read and effect alike — is
+    /// covered by the same guard, and a context that was current when the call
+    /// started but not when it reached the queue is refused.
     fn authorize_queue_request(
         &self,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
-    ) -> Result<PathBuf, OrchError> {
+    ) -> Result<(PathBuf, QueueActor), OrchError> {
+        self.require_current_auth(auth)?;
         let session = self.require_build_session(session_id)?;
         let cwd = (!session.cwd.is_empty()).then(|| PathBuf::from(&session.cwd));
         let allowlist = self.config.lock().allowlist.clone();
-        require_workspace_match(&allowlist, cwd.as_deref(), workspace)
+        let claimed = require_workspace_match(&allowlist, cwd.as_deref(), workspace)?;
+        let actor = self.queue_actor(auth, session_id, &claimed);
+        Ok((claimed, actor))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn begin_queue_mutation(
         &self,
         tool: &str,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
         payload: &serde_json::Value,
-    ) -> Result<(PathBuf, IdempotencyStart), OrchError> {
-        let claimed = match self.authorize_queue_request(session_id, workspace) {
-            Ok(path) => path,
+    ) -> Result<(PathBuf, QueueActor, IdempotencyStart), OrchError> {
+        let (claimed, actor) = match self.authorize_queue_request(auth, session_id, workspace) {
+            Ok(scope) => scope,
             Err(error) => {
                 self.audit_err(
                     tool,
@@ -5647,7 +5948,14 @@ impl OrchestrationService {
         };
         let payload_hash = hash_payload(payload);
         let start = match self
-            .begin_idempotency(tool, request_id, &payload_hash, session_id, &claimed)
+            .begin_idempotency(
+                tool,
+                request_id,
+                &payload_hash,
+                session_id,
+                &claimed,
+                &actor.idempotency_scope(),
+            )
             .await
         {
             Ok(start) => start,
@@ -5662,19 +5970,48 @@ impl OrchestrationService {
                 return Err(error);
             }
         };
-        Ok((claimed, start))
+        Ok((claimed, actor, start))
+    }
+
+    /// Strip ownership material from an entry before it goes on the wire.
+    ///
+    /// `owner_key` is an unkeyed digest over low-entropy inputs and
+    /// `owner_provenance` names internal generations; neither is a capability
+    /// and neither should reach a control-plane consumer. Both stay in the
+    /// durable record, which is what ownership is actually enforced against.
+    fn project_entry(mut entry: PromptQueueEntry) -> PromptQueueEntry {
+        entry.owner_key = None;
+        entry.owner_provenance = None;
+        entry
+    }
+
+    fn project_entries(entries: Vec<PromptQueueEntry>) -> Vec<PromptQueueEntry> {
+        entries.into_iter().map(Self::project_entry).collect()
+    }
+
+    /// The single refusal for unknown, malformed, foreign, and quarantined
+    /// queue ids.
+    ///
+    /// Byte-identical in code and message, so a caller cannot tell which of the
+    /// four it hit. The host produces it from one scoped lookup, so this is a
+    /// faithful mapping rather than a second place that has to be kept in sync.
+    fn unknown_queue_entry() -> OrchError {
+        OrchError::new(OrchErrorCode::InvalidRequest, "unknown queued prompt")
     }
 
     fn queue_error(error: anyhow::Error) -> OrchError {
         let message = error.to_string();
+        if message.contains("unknown queued prompt")
+            || message.contains("no prompt queue for session")
+        {
+            // Normalize rather than forward: the host message must not be the
+            // thing that distinguishes these cases downstream.
+            return Self::unknown_queue_entry();
+        }
         let code = if message.contains("stale queued prompt version")
             || message.contains("stale prompt queue revision")
         {
             OrchErrorCode::StaleVersion
-        } else if message.contains("unknown queued prompt")
-            || message.contains("no prompt queue for session")
-        {
-            OrchErrorCode::InvalidRequest
         } else {
             OrchErrorCode::Internal
         };
@@ -5686,6 +6023,7 @@ impl OrchestrationService {
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
+        actor: &QueueActor,
         action: &str,
         entries: Vec<PromptQueueEntry>,
         changed_entry: Option<PromptQueueEntry>,
@@ -5697,7 +6035,7 @@ impl OrchestrationService {
             "actionId": request_id,
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),
-            "origin": "mcp",
+            "origin": actor.origin(),
             "action": action,
             "disposition": disposition,
             "actionVersion": changed_entry.as_ref().map(|entry| entry.version),
@@ -5707,34 +6045,39 @@ impl OrchestrationService {
             // window for someone else to move first. Every receipt now carries
             // the revision its own mutation stamped.
             "revision": revision,
-            "entry": changed_entry,
-            "entries": entries,
+            "entry": changed_entry.map(Self::project_entry),
+            "entries": Self::project_entries(entries),
         })
     }
 
     pub fn get_queue(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
     ) -> Result<serde_json::Value, OrchError> {
-        let claimed = self.authorize_queue_request(session_id, workspace)?;
+        let (claimed, actor) = self.authorize_queue_request(auth, session_id, workspace)?;
         let snapshot = self
             .host
-            .session_queue_snapshot(session_id)
+            .session_queue_snapshot(session_id, &actor)
             .map_err(Self::queue_error)?;
         Ok(json!({
             "sessionId": session_id,
             "workspace": claimed.display().to_string(),
             "revision": snapshot.revision,
-            "entries": snapshot.entries,
+            "owner": actor.origin(),
+            // Legacy entries the ownership migration holds back. Reported so a
+            // fail-closed migration is visible instead of looking like an empty
+            // queue.
+            "quarantined": snapshot.quarantined,
+            "entries": Self::project_entries(snapshot.entries),
         }))
     }
 
     #[allow(clippy::too_many_arguments)]
     pub async fn edit_queue(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -5760,8 +6103,8 @@ impl OrchestrationService {
             "version": version,
             "text": text,
         });
-        let (claimed, start) = self
-            .begin_queue_mutation(tool, request_id, session_id, workspace, &payload)
+        let (claimed, actor, start) = self
+            .begin_queue_mutation(tool, auth, request_id, session_id, workspace, &payload)
             .await?;
         let mut lease = match start {
             IdempotencyStart::Replay(value) => return Ok(value),
@@ -5769,7 +6112,7 @@ impl OrchestrationService {
         };
         let (entries, revision) = match self
             .host
-            .session_queue_edit_with_origin(session_id, entry_id, version, text, "mcp")
+            .session_queue_edit_with_actor(session_id, entry_id, version, text, &actor)
         {
             Ok(entries) => entries,
             Err(error) => {
@@ -5787,6 +6130,7 @@ impl OrchestrationService {
             request_id,
             session_id,
             &claimed,
+            &actor,
             "edited",
             entries,
             changed_entry,
@@ -5810,7 +6154,7 @@ impl OrchestrationService {
 
     pub async fn remove_queue(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -5824,8 +6168,8 @@ impl OrchestrationService {
             "entryId": entry_id,
             "expectedVersion": expected_version,
         });
-        let (claimed, start) = self
-            .begin_queue_mutation(tool, request_id, session_id, workspace, &payload)
+        let (claimed, actor, start) = self
+            .begin_queue_mutation(tool, auth, request_id, session_id, workspace, &payload)
             .await?;
         let mut lease = match start {
             IdempotencyStart::Replay(value) => return Ok(value),
@@ -5833,7 +6177,7 @@ impl OrchestrationService {
         };
         let (entries, changed_entry, revision) = match self
             .host
-            .session_queue_remove_with_origin_receipt(session_id, entry_id, "mcp", expected_version)
+            .session_queue_remove_with_actor_receipt(session_id, entry_id, &actor, expected_version)
         {
             Ok(entries) => entries,
             Err(error) => {
@@ -5850,6 +6194,7 @@ impl OrchestrationService {
             request_id,
             session_id,
             &claimed,
+            &actor,
             "removed",
             entries,
             Some(changed_entry),
@@ -5874,7 +6219,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)]
     pub async fn reorder_queue(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -5884,7 +6229,9 @@ impl OrchestrationService {
         expected_revision: u64,
     ) -> Result<serde_json::Value, OrchError> {
         let tool = "ptah_reorder_queue";
-        self.reject_selecting_control_entry(tool, request_id, session_id, workspace, entry_id)?;
+        self.reject_selecting_control_entry(
+            tool, auth, request_id, session_id, workspace, entry_id,
+        )?;
         let payload = json!({
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),
@@ -5893,18 +6240,18 @@ impl OrchestrationService {
             "expectedVersion": expected_version,
             "expectedRevision": expected_revision,
         });
-        let (claimed, start) = self
-            .begin_queue_mutation(tool, request_id, session_id, workspace, &payload)
+        let (claimed, actor, start) = self
+            .begin_queue_mutation(tool, auth, request_id, session_id, workspace, &payload)
             .await?;
         let mut lease = match start {
             IdempotencyStart::Replay(value) => return Ok(value),
             IdempotencyStart::Perform(lease) => lease,
         };
-        let (entries, revision) = match self.host.session_queue_move_with_origin_and_revision(
+        let (entries, revision) = match self.host.session_queue_move_with_actor_and_revision(
             session_id,
             entry_id,
             to_index,
-            "mcp",
+            &actor,
             expected_version,
             expected_revision,
         ) {
@@ -5924,6 +6271,7 @@ impl OrchestrationService {
             request_id,
             session_id,
             &claimed,
+            &actor,
             "reordered",
             entries,
             changed_entry,
@@ -5948,7 +6296,7 @@ impl OrchestrationService {
 
     pub async fn clear_queue(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -5958,8 +6306,8 @@ impl OrchestrationService {
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),
         });
-        let (claimed, start) = self
-            .begin_queue_mutation(tool, request_id, session_id, workspace, &payload)
+        let (claimed, actor, start) = self
+            .begin_queue_mutation(tool, auth, request_id, session_id, workspace, &payload)
             .await?;
         let mut lease = match start {
             IdempotencyStart::Replay(value) => return Ok(value),
@@ -5967,7 +6315,7 @@ impl OrchestrationService {
         };
         let (entries, outcome, revision) = match self
             .host
-            .session_queue_clear_with_origin_receipt(session_id, "mcp")
+            .session_queue_clear_with_actor_receipt(session_id, &actor)
         {
             Ok(result) => result,
             Err(error) => {
@@ -5981,7 +6329,7 @@ impl OrchestrationService {
             }
         };
         let mut response = Self::queue_response(
-            request_id, session_id, &claimed, "cleared", entries, None, None, revision,
+            request_id, session_id, &claimed, &actor, "cleared", entries, None, None, revision,
         );
         // An empty `entries` list alone would be a fail-open receipt: steering
         // already handed to a model boundary cannot be retracted and will
@@ -6025,9 +6373,11 @@ impl OrchestrationService {
     /// Reading the entry before claiming the mutation is safe against edits in
     /// the gap: changing the text bumps the entry version, so the caller's
     /// `expected_version` fails closed.
+    #[allow(clippy::too_many_arguments)]
     fn reject_selecting_control_entry(
         &self,
         tool: &str,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -6037,13 +6387,20 @@ impl OrchestrationService {
         // which does its own authorization, so without this an unscoped caller
         // could learn something about another workspace's queue from whether
         // the policy rejected it.
-        self.authorize_queue_request(session_id, workspace)?;
-        let entries = self.host.session_queue_list(session_id).map_err(|error| {
-            OrchError::new(
-                OrchErrorCode::Internal,
-                format!("queue unavailable: {error}"),
-            )
-        })?;
+        //
+        // The read is scoped to the caller for the same reason: inspecting a
+        // foreign entry's text to decide whether to refuse would make the
+        // control-prompt policy itself an oracle over other principals' work.
+        let (_, actor) = self.authorize_queue_request(auth, session_id, workspace)?;
+        let entries = self
+            .host
+            .session_queue_list(session_id, &actor)
+            .map_err(|error| {
+                OrchError::new(
+                    OrchErrorCode::Internal,
+                    format!("queue unavailable: {error}"),
+                )
+            })?;
         let Some(entry) = entries.into_iter().find(|entry| entry.id == entry_id) else {
             // Leave "unknown entry" to the mutator, so the not-found contract
             // stays in one place.
@@ -6064,7 +6421,7 @@ impl OrchestrationService {
 
     pub async fn run_next_queue(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -6072,24 +6429,26 @@ impl OrchestrationService {
         expected_version: u64,
     ) -> Result<serde_json::Value, OrchError> {
         let tool = "ptah_run_next";
-        self.reject_selecting_control_entry(tool, request_id, session_id, workspace, entry_id)?;
+        self.reject_selecting_control_entry(
+            tool, auth, request_id, session_id, workspace, entry_id,
+        )?;
         let payload = json!({
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),
             "entryId": entry_id,
             "expectedVersion": expected_version,
         });
-        let (claimed, start) = self
-            .begin_queue_mutation(tool, request_id, session_id, workspace, &payload)
+        let (claimed, actor, start) = self
+            .begin_queue_mutation(tool, auth, request_id, session_id, workspace, &payload)
             .await?;
         let mut lease = match start {
             IdempotencyStart::Replay(value) => return Ok(value),
             IdempotencyStart::Perform(lease) => lease,
         };
-        let (result, revision) = match self.host.session_queue_run_next_with_origin(
+        let (result, revision) = match self.host.session_queue_run_next_with_actor(
             session_id,
             entry_id,
-            "mcp",
+            &actor,
             expected_version,
         ) {
             Ok(result) => result,
@@ -6110,6 +6469,7 @@ impl OrchestrationService {
             request_id,
             session_id,
             &claimed,
+            &actor,
             "run_next",
             result.entries,
             changed_entry,
@@ -6134,7 +6494,7 @@ impl OrchestrationService {
 
     pub async fn steer_queued(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -6142,24 +6502,26 @@ impl OrchestrationService {
         expected_version: u64,
     ) -> Result<serde_json::Value, OrchError> {
         let tool = "ptah_steer_queued";
-        self.reject_selecting_control_entry(tool, request_id, session_id, workspace, entry_id)?;
+        self.reject_selecting_control_entry(
+            tool, auth, request_id, session_id, workspace, entry_id,
+        )?;
         let payload = json!({
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),
             "entryId": entry_id,
             "expectedVersion": expected_version,
         });
-        let (claimed, start) = self
-            .begin_queue_mutation(tool, request_id, session_id, workspace, &payload)
+        let (claimed, actor, start) = self
+            .begin_queue_mutation(tool, auth, request_id, session_id, workspace, &payload)
             .await?;
         let mut lease = match start {
             IdempotencyStart::Replay(value) => return Ok(value),
             IdempotencyStart::Perform(lease) => lease,
         };
-        let (receipt, revision) = match self.host.session_queue_steer_entry_with_origin(
+        let (receipt, revision) = match self.host.session_queue_steer_entry_with_actor(
             session_id,
             entry_id,
-            "mcp",
+            &actor,
             expected_version,
         ) {
             Ok(receipt) => receipt,
@@ -6177,6 +6539,7 @@ impl OrchestrationService {
             request_id,
             session_id,
             &claimed,
+            &actor,
             "steer_now",
             receipt.entries,
             Some(receipt.entry),
@@ -6315,6 +6678,7 @@ impl OrchestrationService {
                 &phash,
                 session_id,
                 Path::new(&run.workspace),
+                "",
             )
             .await
         {
@@ -6444,6 +6808,7 @@ impl OrchestrationService {
                 &phash,
                 session_id,
                 Path::new(&run.workspace),
+                "",
             )
             .await?
         {
@@ -6501,6 +6866,7 @@ impl OrchestrationService {
                 &phash,
                 session_id,
                 Path::new(&run.workspace),
+                "",
             )
             .await?
         {
@@ -6684,7 +7050,7 @@ impl OrchestrationService {
         };
 
         let mut lease = match self
-            .begin_idempotency(tool, request_id, &phash, session_id, &claimed)
+            .begin_idempotency(tool, request_id, &phash, session_id, &claimed, "")
             .await?
         {
             IdempotencyStart::Replay(value) => return Ok(value),
@@ -7333,7 +7699,6 @@ impl OrchestrationService {
         prompt: String,
         priority: bool,
     ) -> Result<serde_json::Value, OrchError> {
-        let _ = auth;
         let tool = "ptah_queue_prompt";
         let payload = json!({
             "sessionId": session_id,
@@ -7355,60 +7720,53 @@ impl OrchestrationService {
         if let Err(e) = reject_control_prompt(&prompt) {
             return Err(fail(self, e));
         }
-        if let Err(e) = self.require_build_session(session_id) {
-            return Err(fail(self, e));
-        }
-        let session = self.host.session_inspect(session_id).unwrap();
-        let cwd = if session.cwd.is_empty() {
-            None
-        } else {
-            Some(PathBuf::from(&session.cwd))
-        };
-        let allowlist = self.config.lock().allowlist.clone();
-        let claimed = match require_workspace_match(&allowlist, cwd.as_deref(), workspace) {
-            Ok(c) => c,
+        let (claimed, actor) = match self.authorize_queue_request(auth, session_id, workspace) {
+            Ok(scope) => scope,
             Err(e) => return Err(fail(self, e)),
         };
 
         let mut lease = match self
-            .begin_idempotency(tool, request_id, &phash, session_id, &claimed)
+            .begin_idempotency(
+                tool,
+                request_id,
+                &phash,
+                session_id,
+                &claimed,
+                &actor.idempotency_scope(),
+            )
             .await?
         {
             IdempotencyStart::Replay(value) => return Ok(value),
             IdempotencyStart::Perform(lease) => lease,
         };
 
-        let (entries, changed_entry, revision) =
-            match self.host.session_queue_add_with_source_receipt(
-                session_id,
-                prompt,
-                priority,
-                "control",
-                Some("mcp".into()),
-            ) {
-                Ok(e) => e,
-                Err(e) => {
-                    return Err(self.fail_claim(
-                        &mut lease,
-                        None,
-                        session_id,
-                        &claimed,
-                        OrchError::new(OrchErrorCode::Internal, e.to_string()),
-                    ));
-                }
-            };
+        let (entries, changed_entry, revision) = match self
+            .host
+            .session_queue_add_with_source_receipt(session_id, prompt, priority, "control", &actor)
+        {
+            Ok(e) => e,
+            Err(e) => {
+                return Err(self.fail_claim(
+                    &mut lease,
+                    None,
+                    session_id,
+                    &claimed,
+                    OrchError::new(OrchErrorCode::Internal, e.to_string()),
+                ));
+            }
+        };
         let response = json!({
             "requestId": request_id,
             "actionId": request_id,
             "sessionId": session_id,
             "workspace": claimed.display().to_string(),
-            "origin": "mcp",
+            "origin": actor.origin(),
             "action": "queued",
             "disposition": "queued",
             "actionVersion": changed_entry.version,
             "revision": revision,
-            "entry": changed_entry,
-            "entries": entries,
+            "entry": Self::project_entry(changed_entry),
+            "entries": Self::project_entries(entries),
         });
         if let Err(e) = lease.complete(None, response.clone()) {
             return Err(self.fail_claim(&mut lease, None, session_id, &claimed, e));
@@ -7433,7 +7791,6 @@ impl OrchestrationService {
         workspace: &Path,
         text: String,
     ) -> Result<serde_json::Value, OrchError> {
-        let _ = auth;
         let tool = "ptah_steer";
         let payload = json!({
             "sessionId": session_id,
@@ -7454,57 +7811,51 @@ impl OrchestrationService {
         if let Err(e) = reject_control_prompt(&text) {
             return Err(fail(self, e));
         }
-        if let Err(e) = self.require_build_session(session_id) {
-            return Err(fail(self, e));
-        }
-        let session = self.host.session_inspect(session_id).unwrap();
-        let cwd = if session.cwd.is_empty() {
-            None
-        } else {
-            Some(PathBuf::from(&session.cwd))
-        };
-        let allowlist = self.config.lock().allowlist.clone();
-        let claimed = match require_workspace_match(&allowlist, cwd.as_deref(), workspace) {
-            Ok(c) => c,
+        let (claimed, actor) = match self.authorize_queue_request(auth, session_id, workspace) {
+            Ok(scope) => scope,
             Err(e) => return Err(fail(self, e)),
         };
 
         let mut lease = match self
-            .begin_idempotency(tool, request_id, &phash, session_id, &claimed)
+            .begin_idempotency(
+                tool,
+                request_id,
+                &phash,
+                session_id,
+                &claimed,
+                &actor.idempotency_scope(),
+            )
             .await?
         {
             IdempotencyStart::Replay(value) => return Ok(value),
             IdempotencyStart::Perform(lease) => lease,
         };
 
-        let (receipt, revision) =
-            match self
-                .host
-                .session_steer_with_owner(session_id, text, Some("mcp".into()))
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    return Err(self.fail_claim(
-                        &mut lease,
-                        None,
-                        session_id,
-                        &claimed,
-                        OrchError::new(OrchErrorCode::Internal, e.to_string()),
-                    ));
-                }
-            };
+        let (receipt, revision) = match self.host.session_steer_with_actor(session_id, text, &actor)
+        {
+            Ok(r) => r,
+            Err(e) => {
+                return Err(self.fail_claim(
+                    &mut lease,
+                    None,
+                    session_id,
+                    &claimed,
+                    OrchError::new(OrchErrorCode::Internal, e.to_string()),
+                ));
+            }
+        };
         let response = json!({
             "requestId": request_id,
             "actionId": request_id,
             "sessionId": session_id,
             "workspace": claimed.display().to_string(),
-            "origin": "mcp",
+            "origin": actor.origin(),
             "action": "steer_now",
             "disposition": receipt.disposition,
-            "entry": receipt.entry,
+            "entry": Self::project_entry(receipt.entry.clone()),
             "actionVersion": receipt.entry.version,
             "revision": revision,
-            "entries": receipt.entries,
+            "entries": Self::project_entries(receipt.entries),
         });
         if let Err(e) = lease.complete(None, response.clone()) {
             return Err(self.fail_claim(&mut lease, None, session_id, &claimed, e));
@@ -7619,7 +7970,7 @@ impl OrchestrationService {
         }
 
         let mut lease = match self
-            .begin_idempotency(tool, request_id, &phash, session_id, &claimed)
+            .begin_idempotency(tool, request_id, &phash, session_id, &claimed, "")
             .await?
         {
             IdempotencyStart::Replay(value) => return Ok(value),
@@ -7906,5 +8257,237 @@ fn session_id_of(u: &crate::events::SessionUpdate) -> Option<Uuid> {
         | SteeringInjected { session_id, .. }
         | PromptQueueChanged { session_id, .. } => Some(*session_id),
         BackgroundTask { session_id, .. } => *session_id,
+    }
+}
+
+#[cfg(test)]
+mod queue_authority_guards {
+    //! Structural guards for #461.
+    //!
+    //! Principal ownership is only worth as much as its weakest entry point, and
+    //! an entry point loses its guard by omission — someone adds a queue verb and
+    //! forgets the check. These tests read the shipped source so that failure mode
+    //! is caught here rather than by an auditor.
+
+    /// The shipped source with this test module cut off.
+    ///
+    /// The module names the very patterns it forbids, so inspecting the whole
+    /// file would make every guard match its own assertion text.
+    fn source() -> &'static str {
+        const MARKER: &str = "#[cfg(test)]\nmod queue_authority_guards";
+        let full = include_str!("service.rs");
+        match full.find(MARKER) {
+            Some(at) => &full[..at],
+            None => full,
+        }
+    }
+
+    /// Body of `fn name(` up to the next top-level `\n    }`.
+    fn body_of(name: &str) -> String {
+        let source = source();
+        let at = source
+            .find(name)
+            .unwrap_or_else(|| panic!("{name} must exist"));
+        let rest = &source[at..];
+        let end = rest.find("\n    }").unwrap_or(rest.len());
+        rest[..end].to_string()
+    }
+
+    /// Every queue read and effect boundary revalidates the caller's
+    /// authentication before it touches the queue.
+    #[test]
+    fn every_queue_entry_point_revalidates_current_auth() {
+        // `authorize_queue_request` calls `require_current_auth` itself, and
+        // `begin_queue_mutation` calls `authorize_queue_request`, so any of the
+        // three satisfies the requirement.
+        for entry in [
+            "pub fn get_queue(",
+            "pub async fn queue_prompt(",
+            "pub async fn edit_queue(",
+            "pub async fn remove_queue(",
+            "pub async fn reorder_queue(",
+            "pub async fn clear_queue(",
+            "pub async fn run_next_queue(",
+            "pub async fn steer_queued(",
+            "pub async fn steer(",
+            "pub fn get_events(",
+            "pub fn get_events_scoped(",
+            "pub(crate) fn live_run_page(",
+        ] {
+            let body = body_of(entry);
+            assert!(
+                body.contains("require_current_auth")
+                    || body.contains("authorize_queue_request")
+                    || body.contains("begin_queue_mutation"),
+                "{entry} must revalidate the caller's authentication"
+            );
+            assert!(
+                !body.contains("_auth: &AuthContext"),
+                "{entry} must not discard its authentication context"
+            );
+        }
+    }
+
+    /// The ownership check must sit inside the primitive every caller goes
+    /// through, not be re-derived per call site.
+    #[test]
+    fn authorization_and_actor_minting_happen_in_one_place() {
+        let body = body_of("fn authorize_queue_request(");
+        assert!(body.contains("self.require_current_auth(auth)?"));
+        assert!(
+            body.contains("require_workspace_match"),
+            "workspace scope must still be enforced alongside principal scope"
+        );
+        assert!(
+            body.contains("self.queue_actor(auth"),
+            "the actor must be minted from the authorized workspace, not a caller-supplied one"
+        );
+        assert_eq!(
+            source().matches("fn queue_actor(").count(),
+            1,
+            "there must be exactly one definition of queue ownership"
+        );
+        assert_eq!(
+            source().matches("fn client_principal(").count(),
+            1,
+            "run and queue ownership must share one principal definition"
+        );
+    }
+
+    /// A rotation must not be able to apply half of itself.
+    #[test]
+    fn every_policy_rotation_advances_authority_before_mutating() {
+        for rotation in [
+            "pub fn set_token(",
+            "pub fn set_auth_credentials(",
+            "pub fn set_agent_owner_id(",
+            "pub fn set_allowlist(",
+        ] {
+            let body = body_of(rotation);
+            let rotation_lock = body
+                .find("let _rotation = self.rotation.lock();")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{rotation} must hold the rotation lock for the whole rotation, or a \
+                         concurrent rotation can publish over its quiesced snapshot"
+                    )
+                });
+            let advance = body.find("self.advance_authority()?;").unwrap_or_else(|| {
+                panic!("{rotation} must advance the authority with checked overflow")
+            });
+            for mutation in [
+                "self.config.lock().bearer_token =",
+                "*self.auth_credentials.lock() =",
+                "*self.agent_owner_id.lock() =",
+                "self.config.lock().allowlist =",
+            ] {
+                if let Some(at) = body.find(mutation) {
+                    assert!(
+                        at > advance,
+                        "{rotation} must not apply `{mutation}` before the authority advance \
+                         succeeds, or an exhausted epoch leaves partial policy behind"
+                    );
+                }
+            }
+            assert!(
+                body.contains("self.publish_queue_authority();"),
+                "{rotation} must republish the queue authority so revocation reaches delivery"
+            );
+            let quiesce = body
+                .find("self.quiesce_queue_authority();")
+                .unwrap_or_else(|| {
+                    panic!(
+                    "{rotation} must quiesce queue delivery before mutating policy, or a drain \
+                     can land between the mutation and the republish"
+                )
+                });
+            assert!(
+                quiesce > advance,
+                "{rotation} must quiesce only after the authority advance succeeds"
+            );
+            assert!(
+                rotation_lock < advance,
+                "{rotation} must take the rotation lock before advancing the authority"
+            );
+            for mutation in [
+                "self.config.lock().bearer_token =",
+                "*self.auth_credentials.lock() =",
+                "*self.agent_owner_id.lock() =",
+                "self.config.lock().allowlist =",
+            ] {
+                if let Some(at) = body.find(mutation) {
+                    assert!(
+                        at > quiesce,
+                        "{rotation} must not apply `{mutation}` before delivery is quiesced"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Foreign, unknown, malformed, and quarantined ids must share one refusal.
+    #[test]
+    fn the_unknown_entry_refusal_has_a_single_definition() {
+        assert_eq!(
+            source().matches("fn unknown_queue_entry(").count(),
+            1,
+            "the non-oracular refusal must have exactly one definition"
+        );
+        let body = body_of("fn queue_error(");
+        assert!(
+            body.contains("return Self::unknown_queue_entry();"),
+            "host not-found messages must be normalized to the single refusal"
+        );
+        // The refusal must not be reachable with an interpolated id.
+        let refusal = body_of("fn unknown_queue_entry(");
+        assert!(
+            !refusal.contains("format!"),
+            "the refusal must be a fixed string, never formatted with caller input"
+        );
+    }
+
+    /// Ownership material must never be projected to a control-plane caller.
+    #[test]
+    fn queue_projections_strip_ownership_material() {
+        let source = source();
+        assert_eq!(
+            source.matches("fn project_entry(").count(),
+            1,
+            "entry projection must have exactly one definition"
+        );
+        for raw in [
+            "\"entries\": snapshot.entries",
+            "\"entries\": entries,",
+            "\"entry\": changed_entry,",
+        ] {
+            assert!(
+                !source.contains(raw),
+                "queue entries must be projected through `project_entries`, found raw `{raw}`"
+            );
+        }
+        assert!(
+            !source.contains("\"ownerKey\""),
+            "the ownership digest must not be projected"
+        );
+        assert!(
+            !source.contains("\"cursor\""),
+            "the withdrawn cursor must not reappear"
+        );
+    }
+
+    /// Control-plane reads must never reach the host's unscoped queue view.
+    #[test]
+    fn the_control_plane_never_reads_the_unscoped_queue() {
+        let source = source();
+        for unscoped in [
+            ".session_queue_list(session_id)",
+            ".session_queue_snapshot(session_id)",
+            "full_queue_list(",
+        ] {
+            assert!(
+                !source.contains(unscoped),
+                "the control plane must not read the queue without a principal scope: {unscoped}"
+            );
+        }
     }
 }

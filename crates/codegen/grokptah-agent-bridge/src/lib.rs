@@ -38,6 +38,7 @@ mod prompt_queue;
 mod provider_discovery;
 pub mod provider_observation;
 mod provider_qualification;
+pub mod queue_authority;
 pub mod reliability_eval;
 mod run_promotion;
 mod search_engine;

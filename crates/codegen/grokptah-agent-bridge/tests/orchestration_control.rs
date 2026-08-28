@@ -71,8 +71,13 @@ fn queue_revision_orders_snapshots_by_commit_not_publish() {
         .map(|i| {
             let host = host.clone();
             std::thread::spawn(move || {
-                host.session_queue_add(session.id, format!("prompt {i}"), false)
-                    .expect("queue add");
+                host.session_queue_add(
+                    session.id,
+                    format!("prompt {i}"),
+                    false,
+                    &desktop_actor(&host, session.id),
+                )
+                .expect("queue add");
             })
         })
         .collect();
@@ -81,8 +86,13 @@ fn queue_revision_orders_snapshots_by_commit_not_publish() {
     }
     // A second session's counter is independent, and its events must not
     // perturb the first session's watermark.
-    host.session_queue_add(other.id, "unrelated".into(), false)
-        .unwrap();
+    host.session_queue_add(
+        other.id,
+        "unrelated".into(),
+        false,
+        &desktop_actor(&host, other.id),
+    )
+    .unwrap();
 
     let mut observed: Vec<(u64, usize)> = Vec::new();
     let mut other_revisions: Vec<u64> = Vec::new();
@@ -120,7 +130,9 @@ fn queue_revision_orders_snapshots_by_commit_not_publish() {
         "each session carries its own revision counter"
     );
     assert_eq!(
-        host.session_queue_list(session.id).unwrap().len(),
+        host.session_queue_list(session.id, &desktop_actor(&host, session.id))
+            .unwrap()
+            .len(),
         WRITERS,
         "every concurrent add must survive"
     );
@@ -139,36 +151,66 @@ fn every_queue_mutation_advances_the_revision() {
     let mut events = host.event_bus().subscribe();
 
     let first = host
-        .session_queue_add(session.id, "one".into(), false)
+        .session_queue_add(
+            session.id,
+            "one".into(),
+            false,
+            &desktop_actor(&host, session.id),
+        )
         .unwrap()[0]
         .clone();
-    host.session_queue_add(session.id, "two".into(), false)
-        .unwrap();
+    host.session_queue_add(
+        session.id,
+        "two".into(),
+        false,
+        &desktop_actor(&host, session.id),
+    )
+    .unwrap();
     // Every mutator is compare-and-set now, and reorder bumps the versions it
     // shifts, so each step has to re-read the version the previous one left.
     let version_of = |entry_id: &str| {
-        host.session_queue_list(session.id)
+        host.session_queue_list(session.id, &desktop_actor(&host, session.id))
             .unwrap()
             .into_iter()
             .find(|entry| entry.id == entry_id)
             .expect("entry present")
             .version
     };
-    host.session_queue_edit(session.id, &first.id, first.version, "one edited".into())
-        .unwrap();
+    host.session_queue_edit(
+        session.id,
+        &first.id,
+        first.version,
+        "one edited".into(),
+        &desktop_actor(&host, session.id),
+    )
+    .unwrap();
     host.session_queue_move(
         session.id,
         &first.id,
         1,
         version_of(&first.id),
-        host.session_queue_snapshot(session.id).unwrap().revision,
+        host.session_queue_snapshot(session.id, &desktop_actor(&host, session.id))
+            .unwrap()
+            .revision,
+        &desktop_actor(&host, session.id),
     )
     .unwrap();
-    host.session_queue_run_next(session.id, &first.id, version_of(&first.id))
+    host.session_queue_run_next(
+        session.id,
+        &first.id,
+        version_of(&first.id),
+        &desktop_actor(&host, session.id),
+    )
+    .unwrap();
+    host.session_queue_remove(
+        session.id,
+        &first.id,
+        version_of(&first.id),
+        &desktop_actor(&host, session.id),
+    )
+    .unwrap();
+    host.session_queue_clear(session.id, &desktop_actor(&host, session.id))
         .unwrap();
-    host.session_queue_remove(session.id, &first.id, version_of(&first.id))
-        .unwrap();
-    host.session_queue_clear(session.id).unwrap();
 
     let mut revisions = Vec::new();
     let mut actions = Vec::new();
@@ -363,7 +405,12 @@ async fn mcp_queue_controls_are_scoped_versioned_and_replay_safe() {
         .await
         .unwrap();
     assert_eq!(replay, edited);
-    assert_eq!(host.session_queue_list(session.id).unwrap().len(), 1);
+    assert_eq!(
+        host.session_queue_list(session.id, &control_actor(&host, session.id))
+            .unwrap()
+            .len(),
+        1
+    );
 
     let stale = orch
         .edit_queue(
@@ -379,7 +426,9 @@ async fn mcp_queue_controls_are_scoped_versioned_and_replay_safe() {
         .unwrap_err();
     assert_eq!(stale.code.as_str(), "stale_version");
     assert_eq!(
-        host.session_queue_list(session.id).unwrap()[0].text,
+        host.session_queue_list(session.id, &control_actor(&host, session.id))
+            .unwrap()[0]
+            .text,
         "edited queued prompt"
     );
 
@@ -407,7 +456,12 @@ async fn mcp_queue_controls_are_scoped_versioned_and_replay_safe() {
     assert_eq!(steered["action"], "steer_now");
     assert_eq!(steered["disposition"], "queued");
     assert_eq!(steered["entry"]["source"], "steering_deferred");
-    assert_eq!(host.session_queue_list(session.id).unwrap().len(), 1);
+    assert_eq!(
+        host.session_queue_list(session.id, &control_actor(&host, session.id))
+            .unwrap()
+            .len(),
+        1
+    );
 
     let outside = tempdir().unwrap();
     let denied = orch
@@ -417,11 +471,17 @@ async fn mcp_queue_controls_are_scoped_versioned_and_replay_safe() {
     set_grokptah_home_override(None);
 }
 
-/// S3: the desktop and an MCP coordinator write the same queue. A coordinator
-/// that read the queue before a desktop mutation is describing a queue that no
-/// longer exists, and every mutator — not just `edit` — has to reject it. The
-/// reorder case is the one that used to be undetectable even with a version
-/// supplied, because reordering did not move any.
+/// S3: two clients write the same queue. A client that read the queue before
+/// another mutation is describing a queue that no longer exists, and every
+/// mutator — not just `edit` — has to reject it. The reorder case is the one
+/// that used to be undetectable even with a version supplied, because
+/// reordering did not move any.
+///
+/// Since #461 the two contending writers are two clients of the *same*
+/// principal, because that is now the only way two writers can reach one
+/// entry: a different principal cannot see it at all. The stale-view contract
+/// under test is unchanged; only the identity of the second writer is. The
+/// cross-principal case is covered in `tests/queue_principal_ownership.rs`.
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn desktop_writes_invalidate_a_coordinators_stale_queue_mutations() {
@@ -435,11 +495,18 @@ async fn desktop_writes_invalidate_a_coordinators_stale_queue_mutations() {
     let auth = orch.auth_header(Some("Bearer t")).unwrap();
 
     for text in ["alpha", "beta", "gamma"] {
-        host.session_queue_add(session.id, text.into(), false)
-            .unwrap();
+        host.session_queue_add(
+            session.id,
+            text.into(),
+            false,
+            &control_actor(&host, session.id),
+        )
+        .unwrap();
     }
     // What the coordinator read before the desktop touched anything.
-    let seen = host.session_queue_list(session.id).unwrap();
+    let seen = host
+        .session_queue_list(session.id, &control_actor(&host, session.id))
+        .unwrap();
     let (alpha, beta, gamma) = (seen[0].clone(), seen[1].clone(), seen[2].clone());
 
     // The desktop reorders underneath it: "gamma" to the head.
@@ -448,11 +515,14 @@ async fn desktop_writes_invalidate_a_coordinators_stale_queue_mutations() {
         &gamma.id,
         0,
         gamma.version,
-        host.session_queue_snapshot(session.id).unwrap().revision,
+        host.session_queue_snapshot(session.id, &control_actor(&host, session.id))
+            .unwrap()
+            .revision,
+        &control_actor(&host, session.id),
     )
     .unwrap();
     assert_eq!(
-        host.session_queue_list(session.id)
+        host.session_queue_list(session.id, &control_actor(&host, session.id))
             .unwrap()
             .iter()
             .map(|entry| entry.text.clone())
@@ -470,7 +540,9 @@ async fn desktop_writes_invalidate_a_coordinators_stale_queue_mutations() {
             &beta.id,
             0,
             beta.version,
-            host.session_queue_snapshot(session.id).unwrap().revision,
+            host.session_queue_snapshot(session.id, &control_actor(&host, session.id))
+                .unwrap()
+                .revision,
         )
         .await
         .unwrap_err();
@@ -518,7 +590,7 @@ async fn desktop_writes_invalidate_a_coordinators_stale_queue_mutations() {
 
     // Nothing the coordinator attempted may have landed.
     assert_eq!(
-        host.session_queue_list(session.id)
+        host.session_queue_list(session.id, &control_actor(&host, session.id))
             .unwrap()
             .iter()
             .map(|entry| entry.text.clone())
@@ -529,7 +601,9 @@ async fn desktop_writes_invalidate_a_coordinators_stale_queue_mutations() {
 
     // Refetching the versions the desktop left behind lets the coordinator
     // proceed, so this is a conflict to retry, not a permanent wedge.
-    let fresh = host.session_queue_list(session.id).unwrap();
+    let fresh = host
+        .session_queue_list(session.id, &control_actor(&host, session.id))
+        .unwrap();
     let beta_now = fresh.iter().find(|entry| entry.id == beta.id).unwrap();
     orch.remove_queue(
         &auth,
@@ -541,7 +615,12 @@ async fn desktop_writes_invalidate_a_coordinators_stale_queue_mutations() {
     )
     .await
     .unwrap();
-    assert_eq!(host.session_queue_list(session.id).unwrap().len(), 2);
+    assert_eq!(
+        host.session_queue_list(session.id, &control_actor(&host, session.id))
+            .unwrap()
+            .len(),
+        2
+    );
     set_grokptah_home_override(None);
 }
 
@@ -549,8 +628,18 @@ async fn desktop_writes_invalidate_a_coordinators_stale_queue_mutations() {
 /// and `/` prompts, but selection verbs took an entry id and never looked at
 /// what they selected. A locally authored admin command could therefore be
 /// promoted to the head of the queue by a correctly authenticated coordinator,
-/// and `run_next` would cancel the active turn to make it run. Selection must
-/// be held to the same policy as authorship.
+/// and `run_next` would cancel the active turn to make it run.
+///
+/// Since #461 that hole is closed twice over. Ownership closes it structurally:
+/// a locally authored entry belongs to the desktop principal, so a coordinator
+/// cannot select it — and cannot even learn it exists, because the refusal is
+/// the same one an unknown id gets. The selection policy is retained as defence
+/// in depth behind that.
+///
+/// This is a deliberate narrowing of what a coordinator may do: it can no
+/// longer manage desktop-authored queue entries at all, not merely forbidden
+/// ones. Restoring cross-principal management requires the explicit delegation
+/// grant #461 calls for, which this change does not add.
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn a_coordinator_cannot_schedule_a_locally_authored_command_entry() {
@@ -564,20 +653,30 @@ async fn a_coordinator_cannot_schedule_a_locally_authored_command_entry() {
     let auth = orch.auth_header(Some("Bearer t")).unwrap();
 
     // The desktop is allowed to author these; the control plane is not.
-    let slash = host
-        .session_queue_add(session.id, "/yolo".into(), false)
-        .unwrap()[0]
-        .clone();
+    let desktop = desktop_actor(&host, session.id);
+    let queued = host
+        .session_queue_add(session.id, "/yolo".into(), false, &desktop)
+        .unwrap();
+    let slash = queued[0].clone();
+    host.session_queue_add(session.id, "!rm -rf /tmp/x".into(), false, &desktop)
+        .unwrap();
     let bang = host
-        .session_queue_add(session.id, "!rm -rf /tmp/x".into(), false)
-        .unwrap()[1]
-        .clone();
-    let ordinary = host
-        .session_queue_add(session.id, "summarise the diff".into(), false)
-        .unwrap()[2]
-        .clone();
+        .session_queue_list(session.id, &desktop)
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.text.starts_with('!'))
+        .expect("bang entry");
+    host.session_queue_add(session.id, "summarise the diff".into(), false, &desktop)
+        .unwrap();
 
+    // Every selection verb refuses, with the one non-oracular refusal. The
+    // coordinator learns nothing about what it tried to select — not that the
+    // entry exists, and not that it holds a forbidden command.
     for (entry, label) in [(&slash, "slash"), (&bang, "bang")] {
+        let revision = host
+            .session_queue_snapshot(session.id, &desktop)
+            .unwrap()
+            .revision;
         let promoted = orch
             .run_next_queue(
                 &auth,
@@ -589,12 +688,6 @@ async fn a_coordinator_cannot_schedule_a_locally_authored_command_entry() {
             )
             .await
             .unwrap_err();
-        assert_eq!(
-            promoted.code.as_str(),
-            "forbidden_scope",
-            "run_next must refuse to schedule a {label} command entry"
-        );
-
         let moved = orch
             .reorder_queue(
                 &auth,
@@ -604,16 +697,10 @@ async fn a_coordinator_cannot_schedule_a_locally_authored_command_entry() {
                 &entry.id,
                 0,
                 entry.version,
-                host.session_queue_snapshot(session.id).unwrap().revision,
+                revision,
             )
             .await
             .unwrap_err();
-        assert_eq!(
-            moved.code.as_str(),
-            "forbidden_scope",
-            "reorder must refuse to promote a {label} command entry"
-        );
-
         let steered = orch
             .steer_queued(
                 &auth,
@@ -625,16 +712,26 @@ async fn a_coordinator_cannot_schedule_a_locally_authored_command_entry() {
             )
             .await
             .unwrap_err();
-        assert_eq!(
-            steered.code.as_str(),
-            "forbidden_scope",
-            "steer_queued must refuse to schedule a {label} command entry"
-        );
+        for (verb, error) in [
+            ("run_next", promoted),
+            ("reorder", moved),
+            ("steer_queued", steered),
+        ] {
+            assert_eq!(
+                error.code.as_str(),
+                "invalid_request",
+                "{verb} must refuse a {label} entry it does not own"
+            );
+            assert_eq!(
+                error.message, "unknown queued prompt",
+                "{verb} must not reveal that a {label} entry exists"
+            );
+        }
     }
 
     // Nothing moved, and nothing was cancelled on the strength of a refusal.
     assert_eq!(
-        host.session_queue_list(session.id)
+        host.session_queue_list(session.id, &desktop)
             .unwrap()
             .iter()
             .map(|entry| entry.text.clone())
@@ -642,22 +739,53 @@ async fn a_coordinator_cannot_schedule_a_locally_authored_command_entry() {
         vec!["/yolo", "!rm -rf /tmp/x", "summarise the diff"],
     );
 
-    // An ordinary entry is still selectable, so this is a policy gate and not
-    // a blanket refusal of the verbs.
+    // The verbs are not blanket-refused: an ordinary entry the coordinator owns
+    // is still selectable. The control plane cannot author a `/` or `!` entry
+    // in the first place, so a coordinator-owned command entry cannot exist —
+    // which is why ownership subsumes the original selection hole.
+    let owned = orch
+        .queue_prompt(
+            &auth,
+            "coordinator-seed",
+            session.id,
+            ws.path(),
+            "coordinator work".into(),
+            false,
+        )
+        .await
+        .unwrap();
+    let owned_id = owned["entry"]["id"].as_str().unwrap().to_string();
+    let owned_version = owned["entry"]["version"].as_u64().unwrap();
     orch.run_next_queue(
         &auth,
-        "run-next-ordinary",
+        "run-next-owned",
         session.id,
         ws.path(),
-        &ordinary.id,
-        ordinary.version,
+        &owned_id,
+        owned_version,
     )
     .await
     .unwrap();
     assert_eq!(
-        host.session_queue_list(session.id).unwrap()[0].text,
-        "summarise the diff",
+        host.session_queue_list(session.id, &control_actor(&host, session.id))
+            .unwrap()[0]
+            .text,
+        "coordinator work",
     );
+
+    // Authoring a command through the control plane is still refused outright.
+    let authored = orch
+        .queue_prompt(
+            &auth,
+            "coordinator-command",
+            session.id,
+            ws.path(),
+            "/yolo".into(),
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(authored.code.as_str(), "forbidden_scope");
     set_grokptah_home_override(None);
 }
 
@@ -675,7 +803,12 @@ async fn selecting_a_command_in_another_workspace_is_not_an_oracle() {
     let session = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(session.id, ws.path()).unwrap();
     let slash = host
-        .session_queue_add(session.id, "/yolo".into(), false)
+        .session_queue_add(
+            session.id,
+            "/yolo".into(),
+            false,
+            &desktop_actor(&host, session.id),
+        )
         .unwrap()[0]
         .clone();
     let orch = OrchestrationService::new(
@@ -743,14 +876,17 @@ async fn selecting_a_command_in_another_workspace_is_not_an_oracle() {
     set_grokptah_home_override(None);
 }
 
-/// The desktop is the other writer on this queue. Fencing only the control
-/// plane leaves the same absolute-reorder hole open from the desktop side: a
-/// coordinator `run_next` displaces entries without changing their versions,
-/// so the per-entry CAS alone cannot tell a desktop reorder that its ordering
-/// is gone.
+/// A second client is the other writer on this queue. Fencing only one caller
+/// leaves the absolute-reorder hole open from the other side: a `run_next`
+/// displaces entries without changing their versions, so the per-entry CAS
+/// alone cannot tell a concurrent reorder that its ordering is gone.
+///
+/// Since #461 both writers are clients of the same principal — a different
+/// principal cannot reach the entry at all — so the second writer is driven
+/// through the host under that principal's own actor.
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
-async fn a_coordinator_run_next_invalidates_a_stale_desktop_reorder() {
+async fn a_coordinator_run_next_invalidates_a_stale_reorder() {
     let (home, _lock) = setup_home();
     let host = started_host();
     let ws = tempdir().unwrap();
@@ -761,11 +897,18 @@ async fn a_coordinator_run_next_invalidates_a_stale_desktop_reorder() {
     let auth = orch.auth_header(Some("Bearer t")).unwrap();
 
     for text in ["alpha", "beta", "gamma"] {
-        host.session_queue_add(session.id, text.into(), false)
-            .unwrap();
+        host.session_queue_add(
+            session.id,
+            text.into(),
+            false,
+            &control_actor(&host, session.id),
+        )
+        .unwrap();
     }
     // What the desktop is rendering, and the revision it goes with.
-    let seen = host.session_queue_snapshot(session.id).unwrap();
+    let seen = host
+        .session_queue_snapshot(session.id, &control_actor(&host, session.id))
+        .unwrap();
     let (alpha, beta, gamma) = (
         seen.entries[0].clone(),
         seen.entries[1].clone(),
@@ -783,7 +926,9 @@ async fn a_coordinator_run_next_invalidates_a_stale_desktop_reorder() {
     )
     .await
     .unwrap();
-    let after = host.session_queue_snapshot(session.id).unwrap();
+    let after = host
+        .session_queue_snapshot(session.id, &control_actor(&host, session.id))
+        .unwrap();
     assert_eq!(
         after.entries[1].version, alpha.version,
         "run_next must not change displaced entry versions"
@@ -792,14 +937,21 @@ async fn a_coordinator_run_next_invalidates_a_stale_desktop_reorder() {
 
     // The desktop drag was computed against the old ordering.
     let stale = host
-        .session_queue_move(session.id, &beta.id, 0, beta.version, seen.revision)
+        .session_queue_move(
+            session.id,
+            &beta.id,
+            0,
+            beta.version,
+            seen.revision,
+            &control_actor(&host, session.id),
+        )
         .expect_err("a desktop reorder against a superseded ordering must fail");
     assert!(
         stale.to_string().contains("stale prompt queue revision"),
         "unexpected error: {stale}"
     );
     assert_eq!(
-        host.session_queue_snapshot(session.id)
+        host.session_queue_snapshot(session.id, &control_actor(&host, session.id))
             .unwrap()
             .entries
             .iter()
@@ -810,7 +962,9 @@ async fn a_coordinator_run_next_invalidates_a_stale_desktop_reorder() {
     );
 
     // Re-reading unblocks it, so this is a conflict to retry, not a wedge.
-    let fresh = host.session_queue_snapshot(session.id).unwrap();
+    let fresh = host
+        .session_queue_snapshot(session.id, &control_actor(&host, session.id))
+        .unwrap();
     let beta_now = fresh
         .entries
         .iter()
@@ -823,6 +977,7 @@ async fn a_coordinator_run_next_invalidates_a_stale_desktop_reorder() {
             0,
             beta_now.version,
             fresh.revision,
+            &control_actor(&host, session.id),
         )
         .unwrap();
     assert_eq!(reordered[0].id, beta.id);
@@ -930,7 +1085,11 @@ async fn every_queue_mutation_receipt_reports_its_revision() {
     );
     assert_eq!(
         revisions.last().copied(),
-        Some(host.session_queue_snapshot(session.id).unwrap().revision),
+        Some(
+            host.session_queue_snapshot(session.id, &desktop_actor(&host, session.id))
+                .unwrap()
+                .revision
+        ),
         "the last receipt must name the queue's current revision"
     );
     set_grokptah_home_override(None);
@@ -995,7 +1154,10 @@ async fn missing_session_workspace_is_not_controllable() {
         .await
         .unwrap_err();
     assert_eq!(err.code.as_str(), "workspace_mismatch");
-    assert!(host.session_queue_list(session.id).unwrap().is_empty());
+    assert!(host
+        .session_queue_list(session.id, &desktop_actor(&host, session.id))
+        .unwrap()
+        .is_empty());
     set_grokptah_home_override(None);
 }
 
@@ -1353,7 +1515,10 @@ async fn e2e_mcp_client_valid_and_invalid_token() {
     );
 
     // workspace mismatch does not mutate
-    let before = host.session_queue_list(session.id).unwrap().len();
+    let before = host
+        .session_queue_list(session.id, &desktop_actor(&host, session.id))
+        .unwrap()
+        .len();
     let bad_ws = client
         .post(&url)
         .header("Authorization", "Bearer secret-196")
@@ -1370,7 +1535,12 @@ async fn e2e_mcp_client_valid_and_invalid_token() {
         .await
         .unwrap();
     assert!(bad_ws.status().is_client_error() || bad_ws.status().is_server_error());
-    assert_eq!(host.session_queue_list(session.id).unwrap().len(), before);
+    assert_eq!(
+        host.session_queue_list(session.id, &desktop_actor(&host, session.id))
+            .unwrap()
+            .len(),
+        before
+    );
 
     srv.stop();
     set_grokptah_home_override(None);
@@ -1758,18 +1928,32 @@ fn queue_survives_host_restart() {
         host.set_project_cwd(ws.path()).unwrap();
         let session = host.session_new_kind(SessionKind::Build).unwrap();
         host.session_set_cwd(session.id, ws.path()).unwrap();
-        host.session_queue_add(session.id, "follow-up after restart".into(), false)
+        host.session_queue_add(
+            session.id,
+            "follow-up after restart".into(),
+            false,
+            &desktop_actor(&host, session.id),
+        )
+        .unwrap();
+        host.session_queue_add(
+            session.id,
+            "second item".into(),
+            true,
+            &desktop_actor(&host, session.id),
+        )
+        .unwrap();
+        let listed = host
+            .session_queue_list(session.id, &desktop_actor(&host, session.id))
             .unwrap();
-        host.session_queue_add(session.id, "second item".into(), true)
-            .unwrap();
-        let listed = host.session_queue_list(session.id).unwrap();
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].text, "second item"); // priority front
         session.id
     };
     // New host process-equivalent: same home, fresh AgentHost.
     let host2 = started_host();
-    let listed = host2.session_queue_list(session_id).unwrap();
+    let listed = host2
+        .session_queue_list(session_id, &desktop_actor(&host2, session_id))
+        .unwrap();
     assert_eq!(listed.len(), 2, "queue must reload from disk");
     assert_eq!(listed[0].text, "second item");
     assert_eq!(listed[1].text, "follow-up after restart");
@@ -2897,16 +3081,30 @@ async fn run_next_invalidates_a_stale_reorder_revision() {
     let auth = orch.auth_header(Some("Bearer t")).unwrap();
 
     for text in ["alpha", "beta", "gamma"] {
-        host.session_queue_add(session.id, text.into(), false)
-            .unwrap();
+        host.session_queue_add(
+            session.id,
+            text.into(),
+            false,
+            &control_actor(&host, session.id),
+        )
+        .unwrap();
     }
-    let seen_snapshot = host.session_queue_snapshot(session.id).unwrap();
+    let seen_snapshot = host
+        .session_queue_snapshot(session.id, &control_actor(&host, session.id))
+        .unwrap();
     let (seen_revision, seen) = (seen_snapshot.revision, seen_snapshot.entries);
     let (alpha, beta, gamma) = (seen[0].clone(), seen[1].clone(), seen[2].clone());
 
-    host.session_queue_run_next(session.id, &gamma.id, gamma.version)
+    host.session_queue_run_next(
+        session.id,
+        &gamma.id,
+        gamma.version,
+        &control_actor(&host, session.id),
+    )
+    .unwrap();
+    let current_snapshot = host
+        .session_queue_snapshot(session.id, &control_actor(&host, session.id))
         .unwrap();
-    let current_snapshot = host.session_queue_snapshot(session.id).unwrap();
     let (current_revision, after_run_next) = (current_snapshot.revision, current_snapshot.entries);
     assert!(current_revision > seen_revision);
     assert_eq!(
@@ -2941,7 +3139,7 @@ async fn run_next_invalidates_a_stale_reorder_revision() {
         .unwrap_err();
     assert_eq!(stale.code.as_str(), "stale_version");
     assert_eq!(
-        host.session_queue_snapshot(session.id)
+        host.session_queue_snapshot(session.id, &control_actor(&host, session.id))
             .unwrap()
             .entries
             .iter()
@@ -2951,7 +3149,9 @@ async fn run_next_invalidates_a_stale_reorder_revision() {
         "a stale absolute reorder must not apply"
     );
 
-    let fresh_snapshot = host.session_queue_snapshot(session.id).unwrap();
+    let fresh_snapshot = host
+        .session_queue_snapshot(session.id, &control_actor(&host, session.id))
+        .unwrap();
     let (fresh_revision, fresh) = (fresh_snapshot.revision, fresh_snapshot.entries);
     let beta_now = fresh.iter().find(|entry| entry.id == beta.id).unwrap();
     let reordered = orch
@@ -2970,4 +3170,39 @@ async fn run_next_invalidates_a_stale_reorder_revision() {
     assert_eq!(reordered["revision"], fresh_revision + 1);
     assert_eq!(reordered["entries"][0]["id"], beta.id);
     set_grokptah_home_override(None);
+}
+
+/// The desktop ownership actor for a session (#461).
+///
+/// Integration tests drive the host directly, which is the local UI's
+/// position, so the desktop principal is the identity they act under.
+fn desktop_actor(
+    host: &grokptah_agent_bridge::AgentHostHandle,
+    session_id: uuid::Uuid,
+) -> grokptah_agent_bridge::queue_authority::QueueActor {
+    host.desktop_actor(session_id).expect("session exists")
+}
+
+/// The control-plane ownership actor for a session (#461).
+///
+/// Mirrors exactly what `OrchestrationService` mints for the compatibility
+/// `primary` credential: tenant `primary`, wire principal `mcp`, bound to the
+/// session and its canonical workspace. Tests that queue through MCP must read
+/// back as that principal — reading as the desktop would (correctly) show an
+/// empty queue.
+fn control_actor(
+    host: &grokptah_agent_bridge::AgentHostHandle,
+    session_id: uuid::Uuid,
+) -> grokptah_agent_bridge::queue_authority::QueueActor {
+    use grokptah_agent_bridge::queue_authority::{QueueActor, QueuePrincipal, QueueProvenance};
+    QueueActor::new(
+        QueuePrincipal::control(
+            "primary",
+            "mcp",
+            session_id,
+            host.session_queue_workspace(session_id)
+                .expect("session exists"),
+        ),
+        QueueProvenance::default(),
+    )
 }

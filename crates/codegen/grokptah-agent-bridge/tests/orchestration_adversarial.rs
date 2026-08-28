@@ -295,7 +295,12 @@ async fn concurrent_idempotent_submit_single_effect() {
         assert_eq!(o, &oks[0]);
     }
     // Exactly one queue entry
-    assert_eq!(host.session_queue_list(s.id).unwrap().len(), 1);
+    assert_eq!(
+        host.session_queue_list(s.id, &control_actor(&host, s.id))
+            .unwrap()
+            .len(),
+        1
+    );
     // Conflict
     let conflict = orch.queue_prompt(
         &auth,
@@ -821,10 +826,13 @@ async fn queue_persistence_failure_does_not_mutate_memory() {
             "must roll back".into(),
             false,
             "control",
-            Some("mcp".into()),
+            &desktop_actor(&host, session.id),
         )
         .is_err());
-    assert!(host.session_queue_list(session.id).unwrap().is_empty());
+    assert!(host
+        .session_queue_list(session.id, &desktop_actor(&host, session.id))
+        .unwrap()
+        .is_empty());
     set_grokptah_home_override(None);
 }
 
@@ -854,4 +862,39 @@ fn journal_concurrent_publish_monotonic() {
         assert!(e.seq > last);
         last = e.seq;
     }
+}
+
+/// The desktop ownership actor for a session (#461).
+///
+/// Integration tests drive the host directly, which is the local UI's
+/// position, so the desktop principal is the identity they act under.
+fn desktop_actor(
+    host: &grokptah_agent_bridge::AgentHostHandle,
+    session_id: uuid::Uuid,
+) -> grokptah_agent_bridge::queue_authority::QueueActor {
+    host.desktop_actor(session_id).expect("session exists")
+}
+
+/// The control-plane ownership actor for a session (#461).
+///
+/// Mirrors exactly what `OrchestrationService` mints for the compatibility
+/// `primary` credential: tenant `primary`, wire principal `mcp`, bound to the
+/// session and its canonical workspace. Tests that queue through MCP must read
+/// back as that principal — reading as the desktop would (correctly) show an
+/// empty queue.
+fn control_actor(
+    host: &grokptah_agent_bridge::AgentHostHandle,
+    session_id: uuid::Uuid,
+) -> grokptah_agent_bridge::queue_authority::QueueActor {
+    use grokptah_agent_bridge::queue_authority::{QueueActor, QueuePrincipal, QueueProvenance};
+    QueueActor::new(
+        QueuePrincipal::control(
+            "primary",
+            "mcp",
+            session_id,
+            host.session_queue_workspace(session_id)
+                .expect("session exists"),
+        ),
+        QueueProvenance::default(),
+    )
 }

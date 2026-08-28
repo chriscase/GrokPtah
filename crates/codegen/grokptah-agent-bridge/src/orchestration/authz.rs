@@ -2,7 +2,62 @@
 
 use std::path::{Path, PathBuf};
 
+use uuid::Uuid;
+
 use super::types::{OrchError, OrchErrorCode};
+
+/// Service-scoped authority stamp carried by every `AuthContext`.
+///
+/// `authority` identifies one live service instance; `counter` is that
+/// instance's monotonic authentication/policy epoch. A context is *current*
+/// only while both halves still match the issuing service, so a context minted
+/// before a credential rotation or a workspace-allowlist change stops being
+/// usable the moment that change lands.
+///
+/// The stamp carries no bearer material: it is an opaque pair of a random
+/// instance id and a counter, and knowing it does not let a caller construct
+/// one (the constructors below are crate-internal).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthEpoch {
+    authority: Uuid,
+    counter: u64,
+}
+
+impl AuthEpoch {
+    /// First epoch of a freshly minted authority. Each call produces an
+    /// authority that no other service instance can match, so a context issued
+    /// by one service is never current at another.
+    pub(super) fn new_authority() -> Self {
+        Self {
+            authority: Uuid::new_v4(),
+            counter: 0,
+        }
+    }
+
+    /// Next epoch of the same authority.
+    ///
+    /// Overflow fails closed with an error instead of saturating or wrapping; a
+    /// wrapped counter would silently make already-issued stale contexts
+    /// current again.
+    pub(super) fn next(self) -> Result<Self, OrchError> {
+        let counter = self.counter.checked_add(1).ok_or_else(|| {
+            OrchError::new(
+                OrchErrorCode::Internal,
+                "authentication epoch exhausted; refusing to rotate credentials or workspace policy",
+            )
+        })?;
+        Ok(Self {
+            authority: self.authority,
+            counter,
+        })
+    }
+
+    /// Monotonic counter, exposed for diagnostics, audit provenance, and health
+    /// payloads. The authority id is deliberately not exposed.
+    pub fn counter(self) -> u64 {
+        self.counter
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthContext {
@@ -13,6 +68,31 @@ pub struct AuthContext {
     /// device credentials. A later multi-tenant service can map credentials to
     /// different owner identities without changing the protocol shape.
     pub owner_id: String,
+    /// Authority + epoch this context was issued under. Private so callers
+    /// outside this module cannot build an `AuthContext` by struct literal:
+    /// contexts must be issued by the service that will honour them.
+    epoch: AuthEpoch,
+}
+
+impl AuthContext {
+    /// Issue a context bound to `epoch`. Crate-internal: the orchestration
+    /// service is the only issuer, and it always stamps its current epoch.
+    pub(super) fn issue(
+        token_id: impl Into<String>,
+        owner_id: impl Into<String>,
+        epoch: AuthEpoch,
+    ) -> Self {
+        Self {
+            token_id: token_id.into(),
+            owner_id: owner_id.into(),
+            epoch,
+        }
+    }
+
+    /// Authority + epoch this context was issued under.
+    pub fn epoch(&self) -> AuthEpoch {
+        self.epoch
+    }
 }
 
 /// One named bearer credential accepted by a service instance.
@@ -121,10 +201,18 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// Authenticate a bearer header against `credentials` and stamp the resulting
+/// context with `epoch`.
+///
+/// The caller supplies the epoch because only the issuing service knows its own
+/// authority; it must pass the epoch it read *before* reading `credentials`, so
+/// a rotation racing this call yields a context that is already stale rather
+/// than one that is current under freshly rotated credentials.
 pub fn authenticate_bearer(
     header: Option<&str>,
     credentials: &[AuthCredential],
     owner_id: &str,
+    epoch: AuthEpoch,
 ) -> Result<AuthContext, OrchError> {
     if credentials.is_empty() || owner_id.trim().is_empty() {
         return Err(OrchError::new(
@@ -159,17 +247,23 @@ pub fn authenticate_bearer(
             "invalid bearer token",
         ));
     };
-    Ok(AuthContext {
-        token_id: credential.id.clone(),
-        owner_id: owner_id.trim().to_string(),
-    })
+    Ok(AuthContext::issue(
+        credential.id.clone(),
+        owner_id.trim(),
+        epoch,
+    ))
 }
 
-/// Backward-compatible single-credential helper used by pure policy tests and
-/// embedders that have not adopted named credentials yet.
+/// Single-credential *policy* helper: checks header shape and token equality
+/// without consulting a service.
+///
+/// The context it returns carries a fresh throwaway authority, so it is not
+/// current at any `OrchestrationService` and every guarded queue entry point
+/// rejects it. Callers that need a usable context must go through
+/// `OrchestrationService::auth_header`.
 pub fn require_bearer(header: Option<&str>, expected: &str) -> Result<AuthContext, OrchError> {
     let credential = AuthCredential::new("primary", expected)?;
-    authenticate_bearer(header, &[credential], "primary")
+    authenticate_bearer(header, &[credential], "primary", AuthEpoch::new_authority())
 }
 
 pub fn require_workspace_match(
@@ -222,11 +316,62 @@ mod tests {
             AuthCredential::new("primary", "tok").unwrap(),
             AuthCredential::new("laptop", "other-tok").unwrap(),
         ];
-        let auth =
-            authenticate_bearer(Some("Bearer other-tok"), &credentials, "account-1").unwrap();
+        let epoch = AuthEpoch::new_authority();
+        let auth = authenticate_bearer(Some("Bearer other-tok"), &credentials, "account-1", epoch)
+            .unwrap();
         assert_eq!(auth.token_id, "laptop");
         assert_eq!(auth.owner_id, "account-1");
-        assert!(authenticate_bearer(Some("Bearer unknown"), &credentials, "account-1").is_err());
+        assert_eq!(auth.epoch(), epoch);
+        assert!(
+            authenticate_bearer(Some("Bearer unknown"), &credentials, "account-1", epoch).is_err()
+        );
+    }
+
+    #[test]
+    fn epoch_is_monotonic_and_fails_closed_on_overflow() {
+        let first = AuthEpoch::new_authority();
+        assert_eq!(first.counter(), 0);
+        let second = first.next().unwrap();
+        assert_eq!(second.counter(), 1);
+        assert_ne!(
+            first, second,
+            "advancing the epoch must invalidate the old one"
+        );
+
+        let exhausted = AuthEpoch {
+            authority: first.authority,
+            counter: u64::MAX,
+        };
+        let err = exhausted.next().unwrap_err();
+        assert_eq!(err.code, OrchErrorCode::Internal);
+        assert!(
+            err.message.contains("epoch exhausted"),
+            "overflow must fail closed rather than wrap: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn distinct_authorities_never_compare_equal() {
+        let a = AuthEpoch::new_authority();
+        let b = AuthEpoch::new_authority();
+        assert_ne!(
+            a, b,
+            "each authority must be unique to its service instance"
+        );
+        assert_eq!(a.counter(), b.counter());
+    }
+
+    #[test]
+    fn require_bearer_context_is_not_bound_to_any_service_authority() {
+        let one = require_bearer(Some("Bearer tok"), "tok").unwrap();
+        let two = require_bearer(Some("Bearer tok"), "tok").unwrap();
+        assert_eq!(one.token_id, "primary");
+        assert_ne!(
+            one.epoch(),
+            two.epoch(),
+            "the policy helper must not mint reusable service authority"
+        );
     }
 
     #[test]

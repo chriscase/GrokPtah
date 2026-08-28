@@ -472,8 +472,13 @@ fn soak_restart_recovery_matrix() {
         host.set_project_cwd(ws.path()).unwrap();
         let session = host.session_new_kind(SessionKind::Build).unwrap();
         host.session_set_cwd(session.id, ws.path()).unwrap();
-        host.session_queue_add(session.id, "queued across restart".into(), false)
-            .unwrap();
+        host.session_queue_add(
+            session.id,
+            "queued across restart".into(),
+            false,
+            &desktop_actor(&host, session.id),
+        )
+        .unwrap();
         session.id
     };
 
@@ -590,7 +595,9 @@ fn soak_restart_recovery_matrix() {
         ..HostConfig::default()
     });
     host2.start().unwrap();
-    let queued = host2.session_queue_list(session_id).unwrap();
+    let queued = host2
+        .session_queue_list(session_id, &desktop_actor(&host2, session_id))
+        .unwrap();
     assert!(!queued.is_empty());
     assert_eq!(queued[0].text, "queued across restart");
 
@@ -681,4 +688,15 @@ fn soak_harness_and_desktop_bootstrap_present() {
     let msrc = std::fs::read_to_string(mcp).unwrap();
     assert!(msrc.contains("GROKPTAH_CONTROL_MAX_CONCURRENT"));
     assert!(msrc.contains("GROKPTAH_CONTROL_REQUEST_TIMEOUT_MS"));
+}
+
+/// The desktop ownership actor for a session (#461).
+///
+/// Integration tests drive the host directly, which is the local UI's
+/// position, so the desktop principal is the identity they act under.
+fn desktop_actor(
+    host: &grokptah_agent_bridge::AgentHostHandle,
+    session_id: uuid::Uuid,
+) -> grokptah_agent_bridge::queue_authority::QueueActor {
+    host.desktop_actor(session_id).expect("session exists")
 }

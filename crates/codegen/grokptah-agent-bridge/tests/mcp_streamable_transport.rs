@@ -395,7 +395,12 @@ async fn concurrent_clients_and_duplicate_mutations() {
             .get("entries")
             .or(b.raw.get("structuredContent"))
     );
-    assert_eq!(host.session_queue_list(session.id).unwrap().len(), 1);
+    assert_eq!(
+        host.session_queue_list(session.id, &control_actor(&host, session.id))
+            .unwrap()
+            .len(),
+        1
+    );
 
     for mut c in clients {
         let _ = c.close_session().await;
@@ -558,7 +563,10 @@ async fn disconnect_mid_request_then_idempotent_retry_no_double_mutation() {
     let session = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(session.id, ws.path()).unwrap();
     let srv = start_control_server(orch.clone(), 0).await.unwrap();
-    let before = host.session_queue_list(session.id).unwrap().len();
+    let before = host
+        .session_queue_list(session.id, &desktop_actor(&host, session.id))
+        .unwrap()
+        .len();
 
     // Mid-request disconnect: open TCP, send a full POST, drop without reading body.
     // Server still processes the mutation; client must be able to retry safely.
@@ -608,7 +616,10 @@ async fn disconnect_mid_request_then_idempotent_retry_no_double_mutation() {
         .await
         .unwrap();
     assert!(!again.is_error);
-    let after = host.session_queue_list(session.id).unwrap().len();
+    let after = host
+        .session_queue_list(session.id, &control_actor(&host, session.id))
+        .unwrap()
+        .len();
     assert_eq!(
         after,
         before + 1,
@@ -628,7 +639,9 @@ async fn disconnect_mid_request_then_idempotent_retry_no_double_mutation() {
         .await;
     assert!(conflict.is_err());
     assert_eq!(
-        host.session_queue_list(session.id).unwrap().len(),
+        host.session_queue_list(session.id, &control_actor(&host, session.id))
+            .unwrap()
+            .len(),
         before + 1
     );
     client.close_session().await.unwrap();
@@ -1754,7 +1767,10 @@ async fn http_steer_idle_queues_without_starting_run() {
     let (_home, _lock, host, ws, orch) = setup();
     let session = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(session.id, ws.path()).unwrap();
-    let before = host.session_queue_list(session.id).unwrap().len();
+    let before = host
+        .session_queue_list(session.id, &desktop_actor(&host, session.id))
+        .unwrap()
+        .len();
     let srv = start_control_server(orch.clone(), 0).await.unwrap();
     let mut client = McpControlClient::new(format!("http://{}", srv.addr), "stream-token-200");
     client.initialize().await.unwrap();
@@ -1783,7 +1799,10 @@ async fn http_steer_idle_queues_without_starting_run() {
         "idle steer must queue, not cancel/start a turn; body={:?}",
         steer.raw
     );
-    let after = host.session_queue_list(session.id).unwrap().len();
+    let after = host
+        .session_queue_list(session.id, &control_actor(&host, session.id))
+        .unwrap()
+        .len();
     assert_eq!(after, before + 1, "steer must enqueue exactly one entry");
     // No active run started by steer alone.
     let cap = client
@@ -2363,4 +2382,39 @@ async fn live_computer_reads_node_smoke() {
     srv.stop_and_wait().await;
     set_grokptah_home_override(None);
     drop(env);
+}
+
+/// The desktop ownership actor for a session (#461).
+///
+/// Integration tests drive the host directly, which is the local UI's
+/// position, so the desktop principal is the identity they act under.
+fn desktop_actor(
+    host: &grokptah_agent_bridge::AgentHostHandle,
+    session_id: uuid::Uuid,
+) -> grokptah_agent_bridge::queue_authority::QueueActor {
+    host.desktop_actor(session_id).expect("session exists")
+}
+
+/// The control-plane ownership actor for a session (#461).
+///
+/// Mirrors exactly what `OrchestrationService` mints for the compatibility
+/// `primary` credential: tenant `primary`, wire principal `mcp`, bound to the
+/// session and its canonical workspace. Tests that queue through MCP must read
+/// back as that principal — reading as the desktop would (correctly) show an
+/// empty queue.
+fn control_actor(
+    host: &grokptah_agent_bridge::AgentHostHandle,
+    session_id: uuid::Uuid,
+) -> grokptah_agent_bridge::queue_authority::QueueActor {
+    use grokptah_agent_bridge::queue_authority::{QueueActor, QueuePrincipal, QueueProvenance};
+    QueueActor::new(
+        QueuePrincipal::control(
+            "primary",
+            "mcp",
+            session_id,
+            host.session_queue_workspace(session_id)
+                .expect("session exists"),
+        ),
+        QueueProvenance::default(),
+    )
 }

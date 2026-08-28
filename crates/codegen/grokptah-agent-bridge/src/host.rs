@@ -61,6 +61,7 @@ use crate::prompt_queue::{
     SteeringReceipt,
 };
 use crate::provider_observation::{ProviderObservationContext, ProviderObservationSession};
+use crate::queue_authority::{workspace_key, DeliveryGate, QueueActor, QueueAuthority};
 use crate::run_promotion::{self, RunReview};
 use crate::search_engine::{self, SearchHit, SearchQuery};
 use crate::session::{
@@ -206,6 +207,13 @@ pub(crate) struct Inner {
     /// Session-local measured authority for built-in/provider routes that do
     /// not have a durable provider-profile capability record. Restart clears it.
     computer_agent_qualifications: HashMap<(Uuid, String), SessionComputerQualification>,
+    /// Live queue authorization published by the orchestration service (#461).
+    ///
+    /// The host owns the queue state machine but not the credential set, so the
+    /// service pushes what is currently authorized rather than the host
+    /// reaching into the service. Defaults to the desktop-only snapshot, which
+    /// is what a host with no control plane should enforce.
+    queue_authority: QueueAuthority,
     /// Short-lived orchestration admission reservations. These close the gap
     /// between accepting a run and polling its async prompt future.
     turn_reservations: HashMap<Uuid, String>,
@@ -907,6 +915,7 @@ impl AgentHost {
             next_turn_generation: 0,
             computer_agent_operations: HashMap::new(),
             computer_agent_qualifications: HashMap::new(),
+            queue_authority: QueueAuthority::default(),
             turn_reservations: HashMap::new(),
             drain_reservations: HashMap::new(),
             orchestration_admissions: HashMap::new(),
@@ -2130,7 +2139,7 @@ impl AgentHostHandle {
             "instructionByteLength": prompt.len(),
             "maxRounds": max_rounds,
         }));
-        match store.claim_idempotency("persistent_agent_resume", &request_id, &payload_hash)? {
+        match store.claim_idempotency("persistent_agent_resume", &request_id, &payload_hash, "")? {
             crate::orchestration::IdempotencyClaim::Replay(Ok(value)) => value
                 .as_str()
                 .map(ToOwned::to_owned)
@@ -2149,6 +2158,7 @@ impl AgentHostHandle {
                             "persistent_agent_resume",
                             &request_id,
                             &payload_hash,
+                            "",
                             None,
                             crate::orchestration::OrchError::new(
                                 crate::orchestration::OrchErrorCode::Conflict,
@@ -2179,6 +2189,7 @@ impl AgentHostHandle {
                             "persistent_agent_resume",
                             &request_id,
                             &payload_hash,
+                            "",
                             durable_run_id,
                             serde_json::Value::String(response.clone()),
                         )?;
@@ -2189,6 +2200,7 @@ impl AgentHostHandle {
                             "persistent_agent_resume",
                             &request_id,
                             &payload_hash,
+                            "",
                             durable_run_id,
                             crate::orchestration::OrchError::new(
                                 crate::orchestration::OrchErrorCode::Internal,
@@ -6024,8 +6036,58 @@ impl AgentHostHandle {
         Ok(())
     }
 
-    pub fn session_queue_list(&self, session_id: Uuid) -> Result<Vec<PromptQueueEntry>> {
-        Ok(self.session_queue_snapshot(session_id)?.entries)
+    /// The full queue, regardless of owner.
+    ///
+    /// Host-internal only: turn delivery, the local UI event stream, and drain
+    /// restoration all act for the host itself rather than for a principal. No
+    /// control-plane path may reach this — those go through the scoped reads.
+    fn full_queue_list(&self, session_id: Uuid) -> Vec<PromptQueueEntry> {
+        self.inner
+            .lock()
+            .prompt_queues
+            .get(&session_id)
+            .map(SessionPromptQueue::list)
+            .unwrap_or_default()
+    }
+
+    /// Publish the live queue authorization snapshot (#461).
+    ///
+    /// Called by the orchestration service on start and on every credential or
+    /// allowlist rotation, so revocation reaches delivery without the host
+    /// needing to know how credentials are configured.
+    pub(crate) fn set_queue_authority(&self, authority: QueueAuthority) {
+        self.inner.lock().queue_authority = authority;
+    }
+
+    /// Canonical workspace string a session's queue ownership is bound to.
+    ///
+    /// Both the host and the control plane derive ownership keys from this one
+    /// function, so a lexically different but equivalent path cannot produce a
+    /// second identity for the same workspace.
+    pub fn session_queue_workspace(&self, session_id: Uuid) -> Result<String> {
+        let g = self.inner.lock();
+        let session = g
+            .sessions
+            .get(&session_id)
+            .ok_or_else(|| anyhow!("unknown session"))?;
+        Ok(workspace_key(&session.cwd))
+    }
+
+    /// The desktop actor for a session: the local UI's own ownership identity.
+    pub fn desktop_actor(&self, session_id: Uuid) -> Result<QueueActor> {
+        Ok(QueueActor::desktop(
+            session_id,
+            self.session_queue_workspace(session_id)?,
+        ))
+    }
+
+    /// Entries owned by `actor`.
+    pub fn session_queue_list(
+        &self,
+        session_id: Uuid,
+        actor: &QueueActor,
+    ) -> Result<Vec<PromptQueueEntry>> {
+        Ok(self.session_queue_snapshot(session_id, actor)?.entries)
     }
 
     /// The queue plus the revision it was read at, taken under one lock.
@@ -6036,16 +6098,21 @@ impl AgentHostHandle {
     /// ordering. Stamping the read with the newest committed revision lets a
     /// consumer put refetches and events through one ordering rule instead of
     /// two that cannot see each other.
-    pub fn session_queue_snapshot(&self, session_id: Uuid) -> Result<PromptQueueSnapshot> {
+    pub fn session_queue_snapshot(
+        &self,
+        session_id: Uuid,
+        actor: &QueueActor,
+    ) -> Result<PromptQueueSnapshot> {
         let g = self.inner.lock();
         if !g.sessions.contains_key(&session_id) {
             bail!("unknown session");
         }
+        let key = actor.key();
+        let queue = g.prompt_queues.get(&session_id);
         Ok(PromptQueueSnapshot {
-            entries: g
-                .prompt_queues
-                .get(&session_id)
-                .map(SessionPromptQueue::list)
+            entries: queue.map(|q| q.list_for(&key)).unwrap_or_default(),
+            quarantined: queue
+                .map(SessionPromptQueue::quarantined)
                 .unwrap_or_default(),
             revision: g.current_queue_revision(session_id),
         })
@@ -6056,26 +6123,21 @@ impl AgentHostHandle {
         session_id: Uuid,
         text: String,
         priority: bool,
+        actor: &QueueActor,
     ) -> Result<Vec<PromptQueueEntry>> {
-        self.session_queue_add_with_source(
-            session_id,
-            text,
-            priority,
-            "composer",
-            Some("desktop".into()),
-        )
+        self.session_queue_add_with_source(session_id, text, priority, "composer", actor)
     }
 
-    /// Queue with explicit source/owner metadata (MCP control uses `control` / `mcp`).
+    /// Queue with explicit source metadata (MCP control uses `control`).
     pub fn session_queue_add_with_source(
         &self,
         session_id: Uuid,
         text: String,
         priority: bool,
         source: &str,
-        owner: Option<String>,
+        actor: &QueueActor,
     ) -> Result<Vec<PromptQueueEntry>> {
-        self.session_queue_add_with_source_receipt(session_id, text, priority, source, owner)
+        self.session_queue_add_with_source_receipt(session_id, text, priority, source, actor)
             .map(|(entries, _, _)| entries)
     }
 
@@ -6088,11 +6150,10 @@ impl AgentHostHandle {
         text: String,
         priority: bool,
         source: &str,
-        owner: Option<String>,
+        actor: &QueueActor,
     ) -> Result<(Vec<PromptQueueEntry>, PromptQueueEntry, u64)> {
         self.ensure_session_accepts_new_work(session_id)?;
-        let origin = owner.clone().unwrap_or_else(|| source.to_string());
-        let (list, changed_entry, revision) = {
+        let (full, scoped, changed_entry, revision) = {
             let mut g = self.inner.lock();
             if !g.sessions.contains_key(&session_id) {
                 bail!("unknown session");
@@ -6102,24 +6163,25 @@ impl AgentHostHandle {
                 .get(&session_id)
                 .cloned()
                 .unwrap_or_default();
-            let changed_entry = next.add_with_owner(text, source, priority, owner)?;
+            let changed_entry = next.add(text, source, priority, actor)?;
             session_store::save_prompt_queue(session_id, &next)
                 .map_err(|e| anyhow!("persist prompt queue: {e}"))?;
-            let list = next.list();
+            let full = next.list();
+            let scoped = next.list_for(&actor.key());
             g.prompt_queues.insert(session_id, next);
             let revision = g.next_queue_revision(session_id);
-            (list, changed_entry, revision)
+            (full, scoped, changed_entry, revision)
         };
         self.emit_prompt_queue_changed(
             session_id,
             revision,
-            list.clone(),
+            full,
             "queued",
-            origin,
+            actor.origin().to_string(),
             Some(changed_entry.clone()),
             None,
         );
-        Ok((list, changed_entry, revision))
+        Ok((scoped, changed_entry, revision))
     }
 
     pub fn session_queue_edit(
@@ -6128,42 +6190,47 @@ impl AgentHostHandle {
         entry_id: &str,
         version: u64,
         text: String,
+        actor: &QueueActor,
     ) -> Result<Vec<PromptQueueEntry>> {
-        self.session_queue_edit_with_origin(session_id, entry_id, version, text, "desktop")
+        self.session_queue_edit_with_actor(session_id, entry_id, version, text, actor)
             .map(|(entries, _)| entries)
     }
 
-    pub fn session_queue_edit_with_origin(
+    pub fn session_queue_edit_with_actor(
         &self,
         session_id: Uuid,
         entry_id: &str,
         version: u64,
         text: String,
-        origin: &str,
+        actor: &QueueActor,
     ) -> Result<(Vec<PromptQueueEntry>, u64)> {
         self.ensure_session_accepts_new_work(session_id)?;
-        let (list, changed_entry, revision) = {
+        let (full, scoped, changed_entry, revision) = {
             let mut g = self.inner.lock();
+            // A session with no queue yet must refuse exactly as a session
+            // whose queue does not hold this id: otherwise "no prompt queue for
+            // session" distinguishes an empty queue from a foreign entry.
             let queue = g
                 .prompt_queues
                 .get_mut(&session_id)
-                .ok_or_else(|| anyhow!("no prompt queue for session {session_id}"))?;
-            let changed_entry = queue.edit(entry_id, version, text)?;
-            let list = queue.list();
+                .ok_or_else(crate::prompt_queue::unknown_queued_prompt)?;
+            let changed_entry = queue.edit(entry_id, version, text, &actor.key())?;
+            let full = queue.list();
+            let scoped = queue.list_for(&actor.key());
             let revision = g.next_queue_revision(session_id);
-            (list, changed_entry, revision)
+            (full, scoped, changed_entry, revision)
         };
         let _ = self.persist_prompt_queue(session_id);
         self.emit_prompt_queue_changed(
             session_id,
             revision,
-            list.clone(),
+            full,
             "edited",
-            origin.to_string(),
+            actor.origin().to_string(),
             Some(changed_entry),
             None,
         );
-        Ok((list, revision))
+        Ok((scoped, revision))
     }
 
     pub fn session_queue_remove(
@@ -6171,69 +6238,71 @@ impl AgentHostHandle {
         session_id: Uuid,
         entry_id: &str,
         expected_version: u64,
+        actor: &QueueActor,
     ) -> Result<Vec<PromptQueueEntry>> {
-        self.session_queue_remove_with_origin(session_id, entry_id, "desktop", expected_version)
+        self.session_queue_remove_with_actor(session_id, entry_id, actor, expected_version)
     }
 
-    pub fn session_queue_remove_with_origin(
+    pub fn session_queue_remove_with_actor(
         &self,
         session_id: Uuid,
         entry_id: &str,
-        origin: &str,
+        actor: &QueueActor,
         expected_version: u64,
     ) -> Result<Vec<PromptQueueEntry>> {
-        self.session_queue_remove_with_origin_receipt(
-            session_id,
-            entry_id,
-            origin,
-            expected_version,
-        )
-        .map(|(entries, _, _)| entries)
+        self.session_queue_remove_with_actor_receipt(session_id, entry_id, actor, expected_version)
+            .map(|(entries, _, _)| entries)
     }
 
-    pub fn session_queue_remove_with_origin_receipt(
+    pub fn session_queue_remove_with_actor_receipt(
         &self,
         session_id: Uuid,
         entry_id: &str,
-        origin: &str,
+        actor: &QueueActor,
         expected_version: u64,
     ) -> Result<(Vec<PromptQueueEntry>, PromptQueueEntry, u64)> {
         self.ensure_session_accepts_new_work(session_id)?;
-        let (list, changed_entry, revision) = {
+        let (full, scoped, changed_entry, revision) = {
             let mut g = self.inner.lock();
             let queue = g
                 .prompt_queues
                 .get_mut(&session_id)
-                .ok_or_else(|| anyhow!("no prompt queue for session {session_id}"))?;
-            queue.check_version(entry_id, expected_version)?;
-            let changed_entry = queue.remove(entry_id)?;
-            let list = queue.list();
+                .ok_or_else(crate::prompt_queue::unknown_queued_prompt)?;
+            let key = actor.key();
+            queue.check_version(entry_id, expected_version, &key)?;
+            let changed_entry = queue.remove(entry_id, &key)?;
+            let full = queue.list();
+            let scoped = queue.list_for(&key);
             let revision = g.next_queue_revision(session_id);
-            (list, changed_entry, revision)
+            (full, scoped, changed_entry, revision)
         };
         let _ = self.persist_prompt_queue(session_id);
         self.emit_prompt_queue_changed(
             session_id,
             revision,
-            list.clone(),
+            full,
             "removed",
-            origin.to_string(),
+            actor.origin().to_string(),
             Some(changed_entry.clone()),
             None,
         );
-        Ok((list, changed_entry, revision))
+        Ok((scoped, changed_entry, revision))
     }
 
-    pub fn session_queue_clear(&self, session_id: Uuid) -> Result<Vec<PromptQueueEntry>> {
-        self.session_queue_clear_with_origin(session_id, "desktop")
-    }
-
-    pub fn session_queue_clear_with_origin(
+    pub fn session_queue_clear(
         &self,
         session_id: Uuid,
-        origin: &str,
+        actor: &QueueActor,
     ) -> Result<Vec<PromptQueueEntry>> {
-        self.session_queue_clear_with_origin_receipt(session_id, origin)
+        self.session_queue_clear_with_actor(session_id, actor)
+    }
+
+    pub fn session_queue_clear_with_actor(
+        &self,
+        session_id: Uuid,
+        actor: &QueueActor,
+    ) -> Result<Vec<PromptQueueEntry>> {
+        self.session_queue_clear_with_actor_receipt(session_id, actor)
             .map(|(entries, _, _)| entries)
     }
 
@@ -6243,28 +6312,33 @@ impl AgentHostHandle {
     /// an empty `entries` list alone does not mean the session is quiet,
     /// because steering already delivered to a model boundary is
     /// unretractable (see [`PromptQueueClearOutcome`]).
-    pub fn session_queue_clear_with_origin_receipt(
+    pub fn session_queue_clear_with_actor_receipt(
         &self,
         session_id: Uuid,
-        origin: &str,
+        actor: &QueueActor,
     ) -> Result<(Vec<PromptQueueEntry>, PromptQueueClearOutcome, u64)> {
         self.ensure_session_accepts_new_work(session_id)?;
-        let (outcome, revision) = {
+        let (full, outcome, revision) = {
             let mut g = self.inner.lock();
             if !g.sessions.contains_key(&session_id) {
                 bail!("unknown session");
             }
-            let outcome = g.prompt_queues.entry(session_id).or_default().clear();
+            let queue = g.prompt_queues.entry(session_id).or_default();
+            let outcome = queue.clear(&actor.key());
+            let full = queue.list();
             let revision = g.next_queue_revision(session_id);
-            (outcome, revision)
+            (full, outcome, revision)
         };
         let _ = self.persist_prompt_queue(session_id);
+        // The event carries the queue that actually remains — other principals'
+        // work survives a scoped clear, and the local UI must not be told the
+        // session is empty when it is not.
         self.emit_prompt_queue_changed(
             session_id,
             revision,
-            Vec::new(),
+            full,
             "cleared",
-            origin.to_string(),
+            actor.origin().to_string(),
             None,
             None,
         );
@@ -6278,12 +6352,13 @@ impl AgentHostHandle {
         to_index: usize,
         expected_version: u64,
         expected_revision: u64,
+        actor: &QueueActor,
     ) -> Result<(Vec<PromptQueueEntry>, u64)> {
-        self.session_queue_move_with_origin(
+        self.session_queue_move_with_actor(
             session_id,
             entry_id,
             to_index,
-            "desktop",
+            actor,
             expected_version,
             expected_revision,
         )
@@ -6296,20 +6371,20 @@ impl AgentHostHandle {
     /// entries without changing their versions. Exempting the desktop would
     /// leave that hole open from the other writer — the same reason S3 made
     /// `expected_version` mandatory here rather than MCP-only.
-    pub fn session_queue_move_with_origin(
+    pub fn session_queue_move_with_actor(
         &self,
         session_id: Uuid,
         entry_id: &str,
         to_index: usize,
-        origin: &str,
+        actor: &QueueActor,
         expected_version: u64,
         expected_revision: u64,
     ) -> Result<(Vec<PromptQueueEntry>, u64)> {
-        self.session_queue_move_with_origin_impl(
+        self.session_queue_move_with_actor_impl(
             session_id,
             entry_id,
             to_index,
-            origin,
+            actor,
             expected_version,
             Some(expected_revision),
         )
@@ -6317,37 +6392,37 @@ impl AgentHostHandle {
 
     /// Reorder an entry with both its per-entry CAS and the queue revision
     /// that gives an absolute `to_index` meaning.
-    pub fn session_queue_move_with_origin_and_revision(
+    pub fn session_queue_move_with_actor_and_revision(
         &self,
         session_id: Uuid,
         entry_id: &str,
         to_index: usize,
-        origin: &str,
+        actor: &QueueActor,
         expected_version: u64,
         expected_revision: u64,
     ) -> Result<(Vec<PromptQueueEntry>, u64)> {
-        self.session_queue_move_with_origin_impl(
+        self.session_queue_move_with_actor_impl(
             session_id,
             entry_id,
             to_index,
-            origin,
+            actor,
             expected_version,
             Some(expected_revision),
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn session_queue_move_with_origin_impl(
+    fn session_queue_move_with_actor_impl(
         &self,
         session_id: Uuid,
         entry_id: &str,
         to_index: usize,
-        origin: &str,
+        actor: &QueueActor,
         expected_version: u64,
         expected_revision: Option<u64>,
     ) -> Result<(Vec<PromptQueueEntry>, u64)> {
         self.ensure_session_accepts_new_work(session_id)?;
-        let (list, changed_entry, revision) = {
+        let (full, scoped, changed_entry, revision) = {
             let mut g = self.inner.lock();
             let current_revision = g
                 .prompt_queue_revisions
@@ -6364,28 +6439,30 @@ impl AgentHostHandle {
             let queue = g
                 .prompt_queues
                 .get_mut(&session_id)
-                .ok_or_else(|| anyhow!("no prompt queue for session {session_id}"))?;
-            queue.check_version(entry_id, expected_version)?;
-            queue.move_to(entry_id, to_index)?;
-            let list = queue.list();
+                .ok_or_else(crate::prompt_queue::unknown_queued_prompt)?;
+            let key = actor.key();
+            queue.check_version(entry_id, expected_version, &key)?;
+            queue.move_to(entry_id, to_index, &key)?;
+            let full = queue.list();
+            let scoped = queue.list_for(&key);
             // Post-move, because reordering now bumps the versions of every
             // entry that shifted: a pre-move copy would hand the caller a
             // version its own next CAS would be rejected for.
-            let changed_entry = list.iter().find(|entry| entry.id == entry_id).cloned();
+            let changed_entry = full.iter().find(|entry| entry.id == entry_id).cloned();
             let revision = g.next_queue_revision(session_id);
-            (list, changed_entry, revision)
+            (full, scoped, changed_entry, revision)
         };
         let _ = self.persist_prompt_queue(session_id);
         self.emit_prompt_queue_changed(
             session_id,
             revision,
-            list.clone(),
+            full,
             "reordered",
-            origin.to_string(),
+            actor.origin().to_string(),
             changed_entry.clone(),
             None,
         );
-        Ok((list, revision))
+        Ok((scoped, revision))
     }
 
     /// Drain the next batch and claim the session's turn slot for it.
@@ -6399,6 +6476,7 @@ impl AgentHostHandle {
     /// [`Self::session_queue_restore_drain`] to give both back.
     pub fn session_queue_take_next(&self, session_id: Uuid) -> Result<PromptQueueTakeResult> {
         self.ensure_session_accepts_new_work(session_id)?;
+        let workspace = self.session_queue_workspace(session_id)?;
         let (result, revision) = {
             let mut g = self.inner.lock();
             if !g.sessions.contains_key(&session_id) {
@@ -6412,6 +6490,12 @@ impl AgentHostHandle {
             g.reclaim_expired_drain_reservation(session_id);
             let busy = g.turn_cancels.contains_key(&session_id)
                 || g.turn_reservations.contains_key(&session_id);
+            // Delivery is revalidated against the *current* authority, not the
+            // one in force when the entry was queued: a credential removed or a
+            // workspace dropped from the allowlist since then must not still be
+            // able to make the agent run its queued work.
+            let authority = g.queue_authority.clone();
+            let gate = DeliveryGate::new(&authority, session_id, workspace.clone());
             let queue = g.prompt_queues.entry(session_id).or_default();
             if busy {
                 let entries = queue.list();
@@ -6424,7 +6508,7 @@ impl AgentHostHandle {
                     None,
                 )
             } else {
-                let mut result = queue.take_next();
+                let mut result = queue.take_next(&gate);
                 // Only a real drain mutates the queue, so only that stamps
                 // a revision and only that claims the turn slot.
                 let revision = if result.batch.is_some() {
@@ -6442,12 +6526,20 @@ impl AgentHostHandle {
         };
         if let (Some(batch), Some(revision)) = (result.batch.as_ref(), revision) {
             let _ = self.persist_prompt_queue(session_id);
+            // The batch carries exactly one owner, so the receipt names that
+            // owner rather than hardcoding the local UI. Attributing another
+            // principal's delivery to `desktop` misreports who is executing.
+            let origin = batch
+                .entries
+                .first()
+                .and_then(|entry| entry.owner.clone())
+                .unwrap_or_else(|| "bridge".into());
             self.emit_prompt_queue_changed(
                 session_id,
                 revision,
                 result.entries.clone(),
                 "delivered",
-                "desktop".into(),
+                origin,
                 batch.entries.first().cloned(),
                 None,
             );
@@ -6473,7 +6565,7 @@ impl AgentHostHandle {
             if let Some(owner) = reservation {
                 self.release_turn_reservation(session_id, owner);
             }
-            return self.session_queue_list(session_id);
+            return Ok(self.full_queue_list(session_id));
         }
         let (list, revision) = {
             let mut g = self.inner.lock();
@@ -6496,7 +6588,11 @@ impl AgentHostHandle {
             revision,
             list.clone(),
             "restored",
-            "desktop".to_string(),
+            // A restore hands back whatever batch was drained, which belonged
+            // to one owner; naming the local UI would misattribute it.
+            list.first()
+                .and_then(|entry| entry.owner.clone())
+                .unwrap_or_else(|| "bridge".into()),
             list.first().cloned(),
             None,
         );
@@ -6508,8 +6604,9 @@ impl AgentHostHandle {
         session_id: Uuid,
         entry_id: &str,
         expected_version: u64,
+        actor: &QueueActor,
     ) -> Result<PromptQueueRunNextResult> {
-        self.session_queue_run_next_with_origin(session_id, entry_id, "desktop", expected_version)
+        self.session_queue_run_next_with_actor(session_id, entry_id, actor, expected_version)
             .map(|(result, _)| result)
     }
 
@@ -6518,11 +6615,11 @@ impl AgentHostHandle {
     /// The cancel happens only after the CAS and the promotion have both
     /// succeeded: a stale `expected_version` returns before the lock is
     /// released, so a losing coordinator never interrupts a running turn.
-    pub fn session_queue_run_next_with_origin(
+    pub fn session_queue_run_next_with_actor(
         &self,
         session_id: Uuid,
         entry_id: &str,
-        origin: &str,
+        actor: &QueueActor,
         expected_version: u64,
     ) -> Result<(PromptQueueRunNextResult, u64)> {
         self.ensure_session_accepts_new_work(session_id)?;
@@ -6531,9 +6628,10 @@ impl AgentHostHandle {
             let queue = g
                 .prompt_queues
                 .get_mut(&session_id)
-                .ok_or_else(|| anyhow!("no prompt queue for session {session_id}"))?;
-            queue.check_version(entry_id, expected_version)?;
-            let changed_entry = queue.run_next(entry_id)?;
+                .ok_or_else(crate::prompt_queue::unknown_queued_prompt)?;
+            let key = actor.key();
+            queue.check_version(entry_id, expected_version, &key)?;
+            let changed_entry = queue.run_next(entry_id, &key)?;
             // Capture *which* turn is active, not merely that one is. The
             // observed turn can finish before the cancel below, and an
             // unconditional cancel would then interrupt whichever turn started
@@ -6547,17 +6645,24 @@ impl AgentHostHandle {
             self.cancel_turn_if_generation(session_id, generation)
                 .is_ok()
         });
+        let full = {
+            let g = self.inner.lock();
+            g.prompt_queues
+                .get(&session_id)
+                .map(SessionPromptQueue::list)
+                .unwrap_or_default()
+        };
         let result = PromptQueueRunNextResult {
-            entries: self.session_queue_list(session_id)?,
+            entries: self.session_queue_list(session_id, actor)?,
             cancelled_active,
             changed_entry: changed_entry.clone(),
         };
         self.emit_prompt_queue_changed(
             session_id,
             revision,
-            result.entries.clone(),
+            full,
             "run_next",
-            origin.to_string(),
+            actor.origin().to_string(),
             Some(changed_entry),
             None,
         );
@@ -6569,25 +6674,21 @@ impl AgentHostHandle {
         session_id: Uuid,
         entry_id: &str,
         expected_version: u64,
+        actor: &QueueActor,
     ) -> Result<SteeringReceipt> {
-        self.session_queue_steer_entry_with_origin(
-            session_id,
-            entry_id,
-            "desktop",
-            expected_version,
-        )
-        .map(|(receipt, _)| receipt)
+        self.session_queue_steer_entry_with_actor(session_id, entry_id, actor, expected_version)
+            .map(|(receipt, _)| receipt)
     }
 
-    pub fn session_queue_steer_entry_with_origin(
+    pub fn session_queue_steer_entry_with_actor(
         &self,
         session_id: Uuid,
         entry_id: &str,
-        origin: &str,
+        actor: &QueueActor,
         expected_version: u64,
     ) -> Result<(SteeringReceipt, u64)> {
         self.ensure_session_accepts_new_work(session_id)?;
-        let (receipt, revision) = {
+        let (receipt, full, revision) = {
             let mut g = self.inner.lock();
             let is_build = g
                 .sessions
@@ -6598,39 +6699,45 @@ impl AgentHostHandle {
             let queue = g
                 .prompt_queues
                 .get_mut(&session_id)
-                .ok_or_else(|| anyhow!("no prompt queue for session {session_id}"))?;
-            queue.check_version(entry_id, expected_version)?;
-            let receipt = queue.steer_queued(entry_id, can_inject)?;
+                .ok_or_else(crate::prompt_queue::unknown_queued_prompt)?;
+            let key = actor.key();
+            queue.check_version(entry_id, expected_version, &key)?;
+            let receipt = queue.steer_queued(entry_id, can_inject, &key)?;
+            let full = queue.list();
             let revision = g.next_queue_revision(session_id);
-            (receipt, revision)
+            (receipt, full, revision)
         };
         let _ = self.persist_prompt_queue(session_id);
         self.emit_prompt_queue_changed(
             session_id,
             revision,
-            receipt.entries.clone(),
+            full,
             "steer_now",
-            origin.to_string(),
+            actor.origin().to_string(),
             Some(receipt.entry.clone()),
             Some(receipt.disposition),
         );
         Ok((receipt, revision))
     }
 
-    pub fn session_steer(&self, session_id: Uuid, text: String) -> Result<SteeringReceipt> {
-        self.session_steer_with_owner(session_id, text, Some("desktop".into()))
-            .map(|(receipt, _)| receipt)
-    }
-
-    pub fn session_steer_with_owner(
+    pub fn session_steer(
         &self,
         session_id: Uuid,
         text: String,
-        owner: Option<String>,
+        actor: &QueueActor,
+    ) -> Result<SteeringReceipt> {
+        self.session_steer_with_actor(session_id, text, actor)
+            .map(|(receipt, _)| receipt)
+    }
+
+    pub fn session_steer_with_actor(
+        &self,
+        session_id: Uuid,
+        text: String,
+        actor: &QueueActor,
     ) -> Result<(SteeringReceipt, u64)> {
         self.ensure_session_accepts_new_work(session_id)?;
-        let origin = owner.clone().unwrap_or_else(|| "desktop".into());
-        let (receipt, revision) = {
+        let (receipt, full, revision) = {
             let mut g = self.inner.lock();
             let is_build = g
                 .sessions
@@ -6643,19 +6750,20 @@ impl AgentHostHandle {
                 .get(&session_id)
                 .cloned()
                 .unwrap_or_default();
-            let receipt = next.steer_text_with_owner(text, can_inject, owner)?;
+            let receipt = next.steer_text(text, can_inject, actor)?;
             session_store::save_prompt_queue(session_id, &next)
                 .map_err(|e| anyhow!("persist prompt queue: {e}"))?;
+            let full = next.list();
             g.prompt_queues.insert(session_id, next);
             let revision = g.next_queue_revision(session_id);
-            (receipt, revision)
+            (receipt, full, revision)
         };
         self.emit_prompt_queue_changed(
             session_id,
             revision,
-            receipt.entries.clone(),
+            full,
             "steer_now",
-            origin,
+            actor.origin().to_string(),
             Some(receipt.entry.clone()),
             Some(receipt.disposition),
         );
@@ -8050,6 +8158,7 @@ impl AgentHostHandle {
         session_id: Uuid,
         event_tx: &crate::event_bus::EventBus,
     ) -> Vec<PromptQueueEntry> {
+        let workspace = self.session_queue_workspace(session_id).unwrap_or_default();
         let (entries, revisions) = match (|| -> Result<(Vec<PromptQueueEntry>, Vec<u64>)> {
             let mut g = self.inner.lock();
             let mut next = g
@@ -8057,7 +8166,12 @@ impl AgentHostHandle {
                 .get(&session_id)
                 .cloned()
                 .unwrap_or_default();
-            let entries = next.drain_steering();
+            // Steering reaches the model here, so it is revalidated here too:
+            // an interjection accepted under a credential that has since been
+            // removed must not be handed to the agent.
+            let authority = g.queue_authority.clone();
+            let gate = DeliveryGate::new(&authority, session_id, workspace.clone());
+            let entries = next.drain_steering(&gate);
             if entries.is_empty() {
                 return Ok((entries, Vec::new()));
             }
@@ -8102,7 +8216,7 @@ impl AgentHostHandle {
             let _ = event_tx.send(SessionUpdate::PromptQueueChanged {
                 session_id,
                 revision,
-                entries: self.session_queue_list(session_id).unwrap_or_default(),
+                entries: self.full_queue_list(session_id),
                 action: "delivered".into(),
                 origin: entry.owner.clone().unwrap_or_else(|| "bridge".into()),
                 changed_entry: Some(entry.clone()),
@@ -11359,6 +11473,28 @@ mod tests {
         )
     }
 
+    /// The desktop actor a test host's session queues under.
+    ///
+    /// Tests exercise the host directly, which is the local UI's position, so
+    /// the desktop principal is the right identity for them.
+    fn test_actor(session_id: Uuid) -> crate::queue_authority::QueueActor {
+        crate::queue_authority::QueueActor::desktop(session_id, "")
+    }
+
+    /// Delivery gate for the default (desktop-only) authority a test host runs
+    /// under, so these tests exercise the same revalidation production does.
+    fn test_authority() -> crate::queue_authority::QueueAuthority {
+        crate::queue_authority::QueueAuthority::default()
+    }
+
+    fn test_gate(session_id: Uuid) -> crate::queue_authority::DeliveryGate<'static> {
+        // Leaked so the gate can borrow for the duration of a test; the
+        // authority is a small immutable snapshot.
+        let authority: &'static crate::queue_authority::QueueAuthority =
+            Box::leak(Box::new(test_authority()));
+        crate::queue_authority::DeliveryGate::new(authority, session_id, "")
+    }
+
     fn usage_test_run(run_id: &str, max_total_tokens: Option<u64>) -> RunRecord {
         let now = Utc::now();
         RunRecord {
@@ -11621,10 +11757,15 @@ mod tests {
             g.turn_cancels.insert(session_id, CancellationToken::new());
             let queue = g.prompt_queues.entry(session_id).or_default();
             let queued = queue
-                .add("durable follow-up", "composer", false)
+                .add(
+                    "durable follow-up",
+                    "composer",
+                    false,
+                    &test_actor(session_id),
+                )
                 .expect("queue follow-up");
             let steering = queue
-                .steer_text_with_owner("recover after abort".into(), true, Some("mcp".into()))
+                .steer_text("recover after abort".into(), true, &test_actor(session_id))
                 .expect("queue steering")
                 .entry;
             (queued, steering)
@@ -11640,7 +11781,7 @@ mod tests {
         assert!(!host.session_busy(session_id));
         assert_recovery_event(&mut events, session_id, &queued, &steering);
         let entries = host
-            .session_queue_list(session_id)
+            .session_queue_list(session_id, &test_actor(session_id))
             .expect("recovered queue");
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].id, steering.id);
@@ -11662,13 +11803,18 @@ mod tests {
         let mut g = host.inner.lock();
         let queue = g.prompt_queues.entry(session_id).or_default();
         let queued = queue
-            .add("durable follow-up", "composer", false)
+            .add(
+                "durable follow-up",
+                "composer",
+                false,
+                &test_actor(session_id),
+            )
             .expect("queue follow-up");
         let steering = queue
-            .steer_text_with_owner("recover me".into(), true, Some("mcp".into()))
+            .steer_text("recover me".into(), true, &test_actor(session_id))
             .expect("queue steering")
             .entry;
-        queue.drain_steering();
+        queue.drain_steering(&test_gate(session_id));
         (queued, steering)
     }
 
@@ -11696,7 +11842,9 @@ mod tests {
 
         // Not lost: the interjection is in the live queue where the session
         // can still act on it.
-        let entries = host.session_queue_list(session_id).expect("queue readable");
+        let entries = host
+            .session_queue_list(session_id, &test_actor(session_id))
+            .expect("queue readable");
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].id, steering.id);
         assert_eq!(entries[0].source, "steering_delivery_recovery");
@@ -11739,7 +11887,9 @@ mod tests {
             "the abort path must report a failed durable write"
         );
 
-        let entries = host.session_queue_list(session_id).expect("queue readable");
+        let entries = host
+            .session_queue_list(session_id, &test_actor(session_id))
+            .expect("queue readable");
         assert_eq!(entries[0].id, steering.id);
     }
 
@@ -11750,13 +11900,22 @@ mod tests {
             let mut g = host.inner.lock();
             let queue = g.prompt_queues.entry(session_id).or_default();
             let queued = queue
-                .add("durable follow-up", "composer", false)
+                .add(
+                    "durable follow-up",
+                    "composer",
+                    false,
+                    &test_actor(session_id),
+                )
                 .expect("queue follow-up");
             let steering = queue
-                .steer_text_with_owner("recover after agent error".into(), true, Some("mcp".into()))
+                .steer_text(
+                    "recover after agent error".into(),
+                    true,
+                    &test_actor(session_id),
+                )
                 .expect("queue steering")
                 .entry;
-            queue.drain_steering();
+            queue.drain_steering(&test_gate(session_id));
             (queued, steering)
         };
         let mut events = host.event_bus().subscribe();
@@ -11767,7 +11926,7 @@ mod tests {
 
         assert_recovery_event(&mut events, session_id, &queued, &steering);
         let entries = host
-            .session_queue_list(session_id)
+            .session_queue_list(session_id, &test_actor(session_id))
             .expect("recovered queue");
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].id, steering.id);
@@ -12114,8 +12273,13 @@ mod tests {
     #[tokio::test]
     async fn archived_lane_inspection_is_read_only_and_new_work_is_rejected() {
         let (_home, host, lane_id) = test_host();
-        host.session_queue_add(lane_id, "preserve this queued prompt".into(), false)
-            .expect("queue before archive");
+        host.session_queue_add(
+            lane_id,
+            "preserve this queued prompt".into(),
+            false,
+            &test_actor(lane_id),
+        )
+        .expect("queue before archive");
         host.session_archive(lane_id, true).expect("archive Lane");
 
         let before = host.workspace_ui_state();
@@ -12130,7 +12294,7 @@ mod tests {
         assert_eq!(before.open_tab_ids, after.open_tab_ids);
         assert_eq!(before.project_cwd, after.project_cwd);
         assert_eq!(
-            host.session_queue_list(lane_id)
+            host.session_queue_list(lane_id, &test_actor(lane_id))
                 .expect("archived queue remains readable")
                 .len(),
             1
@@ -12155,7 +12319,12 @@ mod tests {
         assert!(host.begin_computer_agent_operation(lane_id).is_err());
 
         let queue_error = host
-            .session_queue_add(lane_id, "must not queue".into(), false)
+            .session_queue_add(
+                lane_id,
+                "must not queue".into(),
+                false,
+                &test_actor(lane_id),
+            )
             .unwrap_err()
             .to_string();
         assert!(queue_error.contains("inspection-only"));

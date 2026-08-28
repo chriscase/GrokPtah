@@ -13,7 +13,28 @@ export type PromptQueueEntry = {
   text: string;
   kind: PromptQueueKind;
   source: PromptQueueSource;
+  /**
+   * Opaque wire principal (`desktop`, `mcp`, or a named device credential id).
+   *
+   * A display label, not an authority. Two principals could historically share
+   * `mcp`, which is why `owner_key` exists.
+   */
   owner?: string | null;
+  /**
+   * Opaque ownership handle (`v1-sha256:...`), absent on legacy entries queued
+   * before principal ownership existed (#461).
+   *
+   * Never parse it: it is a digest over the tenant, principal, session, and
+   * workspace, and discloses none of them. Compare it for equality only.
+   */
+  owner_key?: string | null;
+  /**
+   * Authentication epoch and policy revision the entry was stamped under.
+   *
+   * Provenance for display and diagnosis. It never grants anything, so the UI
+   * must not gate any action on it.
+   */
+  owner_provenance?: { epoch: number; policy: number } | null;
   created_at: string;
   priority: boolean;
 };
@@ -111,6 +132,11 @@ export function createPromptQueueEntry(
     kind: overrides.kind ?? queueKind(text),
     source: overrides.source ?? "composer",
     owner: overrides.owner ?? "desktop",
+    // Ownership is carried through rather than defaulted: the bridge is the
+    // only issuer of a handle, so a client-built entry that has not been
+    // through the bridge legitimately has none yet.
+    owner_key: overrides.owner_key ?? null,
+    owner_provenance: overrides.owner_provenance ?? null,
     created_at: overrides.created_at ?? new Date().toISOString(),
     priority: overrides.priority ?? false,
   };
