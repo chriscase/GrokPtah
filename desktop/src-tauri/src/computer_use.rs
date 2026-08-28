@@ -199,7 +199,7 @@ impl DesktopComputerUse {
             .map_err(|error| error.to_string())?;
         let principal = self
             .host
-            .capability_principal(owner_session_id)
+            .capability_principal_for_computer(owner_session_id)
             .map_err(|error| error.to_string())?;
         let service = ComputerUseService::new_with_authority_and_principal(
             backend,
@@ -399,7 +399,7 @@ impl DesktopComputerUse {
             .ok_or_else(|| self.initialization_error())?;
         let principal = self
             .host
-            .capability_principal(owner_session_id)
+            .capability_principal_for_computer(owner_session_id)
             .map_err(|error| error.to_string())?;
         let service = Arc::new(ComputerUseService::new_with_authority_and_principal(
             backend,

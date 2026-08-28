@@ -971,6 +971,17 @@ impl AgentHostHandle {
         CapabilityPrincipal::new(principal, 1)
             .map_err(|error| anyhow!("invalid canonical capability principal: {error}"))
     }
+
+    /// Principal used by an explicitly created Computer Run. Existing local
+    /// sessions use the canonical Agent owner; direct library users without a
+    /// session receive only the host principal, never a session-wide grant.
+    pub fn capability_principal_for_computer(
+        &self,
+        session_id: Uuid,
+    ) -> Result<CapabilityPrincipal> {
+        self.capability_principal(session_id)
+            .or_else(|_| Ok(CapabilityPrincipal::host_default()))
+    }
     /// The validated durable root owned by this host process.
     pub fn runtime_home(&self) -> crate::discover::RuntimeHome {
         self.runtime_home.clone()
