@@ -83,6 +83,7 @@ fallback.
 | C8 | The manifest holds `globalLastSeqFloor` (exact only for sealed generations); the anchor holds the live value. |
 | C9 | A generation id is never reused, and a tombstoned generation's descriptor is never removed. |
 | C10 | A producer intent must carry a keyed identity, and an outcome closes only the same identity; the tracking ceiling refuses before writing. |
+| C11 | Housekeeping and gap records have a separate typed kind, are outcome-only, and cannot mutate producer intent state. |
 
 ## Rotation and the crash-cut contract
 
@@ -193,7 +194,9 @@ approvals, queue/background work, subagents, cancellation, explicit store
 shutdown, and configured Computer Use service mutations. Free-form legacy
 `detail` is deliberately not adapted; the bounded public projection contains no
 prompt, credential, path, locator, clipboard, frame, HMAC key, or private
-provider payload.
+provider payload. Gap, recovery, generation, and shutdown housekeeping uses
+`AuditHousekeepingInput`, a separate outcome-only type that cannot add or close
+a producer intent.
 
 ## Operator recovery
 
@@ -235,8 +238,9 @@ queue, Computer Use, or shutdown outcomes for explicit reconciliation.
   still do so. Only an external append-only sink or a witness makes that
   detectable.
 - **Interrupted intents.** Recovery closes each tracked producer identity with
-  its own uncertain outcome. Inputs without an identity are refused for intent
-  phase; legacy outcome-only records make no causal pairing claim.
+  its own uncertain outcome. Inputs without an identity are refused for either
+  producer phase; housekeeping records are explicitly typed and make no causal
+  pairing claim.
 - **Shutdown ownership.** Explicit `OrchStore::shutdown` journals a paired
   shutdown outcome and releases its store lock; the two-process reuse gate
   proves this store boundary. Full host clone quiescence remains owned by the
