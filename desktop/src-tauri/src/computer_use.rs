@@ -1095,6 +1095,7 @@ mod tests {
                 host,
                 platform: None,
                 store: Some(store),
+                audit_store: None,
                 initialization_error: None,
                 operation: Mutex::new(()),
                 selections: std::sync::Mutex::new(HashMap::new()),
