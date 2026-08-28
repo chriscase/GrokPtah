@@ -1046,10 +1046,10 @@ impl ProviderAttemptStore {
                 });
             }
             if to == SendState::Sending && !record.lease_claimed {
-                if let Some(owner) = self.lease_claim_owner(&record.authority.effect_lease_id)? {
-                    if owner != record.attempt_id {
-                        return Err(AttemptError::EffectLeaseAlreadyUsed);
-                    }
+                if let Some(owner) = self.lease_claim_owner(&record.authority.effect_lease_id)?
+                    && owner != record.attempt_id
+                {
+                    return Err(AttemptError::EffectLeaseAlreadyUsed);
                 }
                 if self.lease_claimed_by_other(
                     &record.attempt_id,
