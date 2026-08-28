@@ -68,6 +68,7 @@ pub struct AuthorityBinding {
 }
 
 impl AuthorityBinding {
+    #[allow(dead_code)]
     pub(crate) fn new(
         principal_incarnation: impl Into<String>,
         auth_generation: u64,
@@ -391,6 +392,7 @@ pub struct AttemptContext {
 }
 
 impl AttemptContext {
+    #[allow(dead_code)]
     pub(crate) fn new(
         store: ProviderAttemptStore,
         operation_id: impl Into<String>,
