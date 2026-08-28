@@ -630,7 +630,11 @@ async function runFullMode() {
     const hasMarker =
       Array.isArray(ch?.changes) &&
       ch.changes.some(
-        (c) => typeof c.path === "string" && c.path.includes("soak_marker")
+        (c) =>
+          typeof c.path === "string" &&
+          c.path.startsWith("path_") &&
+          typeof c.summary === "string" &&
+          c.summary.includes("soak_marker")
       );
     record(
       "durableChanges",

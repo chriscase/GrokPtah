@@ -99,7 +99,6 @@ pub struct RunScope {
 #[serde(rename_all = "camelCase")]
 pub struct PtahEventNotification {
     pub session_id: uuid::Uuid,
-    pub workspace: String,
     pub run_id: String,
     pub seq: u64,
     pub ts: String,
@@ -112,7 +111,6 @@ pub struct PtahEventNotification {
 #[serde(rename_all = "camelCase")]
 pub struct PtahRecoveryNotification {
     pub session_id: uuid::Uuid,
-    pub workspace: String,
     pub run_id: String,
     pub after_seq: u64,
     pub reason: String,
@@ -280,7 +278,7 @@ fn decode_sse_frame(frame: &[u8], scope: &RunScope) -> anyhow::Result<Option<Liv
     let notification = match method {
         "notifications/ptah_event" => {
             let event: PtahEventNotification = serde_json::from_value(params)?;
-            validate_scope(scope, &event.session_id, &event.workspace, &event.run_id)?;
+            validate_scope(scope, &event.session_id, &event.run_id)?;
             if sse_id != Some(event.seq) {
                 anyhow::bail!("SSE id does not match ptah_event seq");
             }
@@ -288,12 +286,7 @@ fn decode_sse_frame(frame: &[u8], scope: &RunScope) -> anyhow::Result<Option<Liv
         }
         "notifications/ptah_recovery" => {
             let recovery: PtahRecoveryNotification = serde_json::from_value(params)?;
-            validate_scope(
-                scope,
-                &recovery.session_id,
-                &recovery.workspace,
-                &recovery.run_id,
-            )?;
+            validate_scope(scope, &recovery.session_id, &recovery.run_id)?;
             LiveNotification::Recovery(recovery)
         }
         _ => LiveNotification::Unknown {
@@ -310,13 +303,9 @@ fn decode_sse_frame(frame: &[u8], scope: &RunScope) -> anyhow::Result<Option<Liv
 fn validate_scope(
     expected: &RunScope,
     session_id: &uuid::Uuid,
-    workspace: &str,
     run_id: &str,
 ) -> anyhow::Result<()> {
-    if expected.session_id != *session_id
-        || expected.workspace != workspace
-        || expected.run_id != run_id
-    {
+    if expected.session_id != *session_id || expected.run_id != run_id {
         anyhow::bail!("live MCP notification scope does not match requested run");
     }
     Ok(())

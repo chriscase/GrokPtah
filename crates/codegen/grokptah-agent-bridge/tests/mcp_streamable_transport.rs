@@ -1056,10 +1056,12 @@ async fn http_submit_durable_run_events_handoff_and_cancel() {
             .await
             .unwrap();
         assert!(!run.is_error);
-        assert_eq!(
-            run.structured.get("clientId").and_then(|v| v.as_str()),
-            Some("mcp"),
-            "MCP-submitted runs must retain their origin for desktop visibility"
+        assert!(
+            run.structured
+                .get("actorHandle")
+                .and_then(|v| v.as_str())
+                .is_some_and(|handle| handle.starts_with("actor_")),
+            "MCP-submitted runs must expose only an opaque actor handle"
         );
         state = run
             .structured
@@ -1389,7 +1391,9 @@ async fn mcp_isolated_run_review_approval_and_restart_promotion() {
             .unwrap();
         state = run.structured["state"].as_str().unwrap_or_default().into();
         if state == "completed" || state == "failed" {
-            assert_eq!(run.structured["clientId"], "mcp");
+            assert!(run.structured["actorHandle"]
+                .as_str()
+                .is_some_and(|handle| handle.starts_with("actor_")));
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1432,7 +1436,7 @@ async fn mcp_isolated_run_review_approval_and_restart_promotion() {
         .as_str()
         .unwrap()
         .to_string();
-    let run_before_tamper = client
+    let _run_before_tamper = client
         .call_tool(
             "ptah_get_run",
             json!({
@@ -1443,9 +1447,14 @@ async fn mcp_isolated_run_review_approval_and_restart_promotion() {
         )
         .await
         .unwrap();
-    let isolated_workspace = run_before_tamper.structured["execution"]["executionWorkspace"]
-        .as_str()
-        .unwrap();
+    let isolated_workspace = orch
+        .store()
+        .load_run(&run_id)
+        .unwrap()
+        .unwrap()
+        .execution
+        .unwrap()
+        .execution_workspace;
     let isolated_file = PathBuf::from(isolated_workspace).join("mcp-approved.txt");
     std::fs::write(&isolated_file, "tampered after approval\n").unwrap();
     let stale = client

@@ -46,6 +46,7 @@ const MAX_CONCURRENT_REQUESTS: usize = 32;
 const MAX_SESSIONS: usize = 256;
 /// Bound long-lived coordinator event streams independently of request floods.
 const MAX_LIVE_STREAMS: usize = 32;
+const LIVE_STREAM_REPLAY_WINDOW: u64 = 256;
 /// Hard wall-clock bound per request.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// Supported MCP protocol versions (initialize + header validation).
@@ -130,6 +131,8 @@ struct LiveStreamState {
     end_seq: Option<u64>,
     receiver: EventReceiver,
     last_seq: u64,
+    observed_global_seq: u64,
+    delivered_since_recovery: u64,
     replay_cursor: Option<u64>,
     pending: VecDeque<Bytes>,
     heartbeat: tokio::time::Interval,
@@ -152,7 +155,21 @@ impl LiveStreamState {
     }
 
     fn queue_entry(&mut self, seq: u64, ts: String, update: SessionUpdate) {
-        if seq <= self.last_seq || seq < self.start_seq {
+        let terminal = matches!(&update, SessionUpdate::TurnComplete { .. });
+        let update = self
+            .orch
+            .public_projection(serde_json::to_value(update).unwrap_or_else(|_| json!({})));
+        self.queue_serialized_entry(seq, ts, update, terminal);
+    }
+
+    fn queue_serialized_entry(&mut self, seq: u64, ts: String, update: Value, terminal: bool) {
+        if self.done || seq <= self.last_seq || seq < self.start_seq {
+            return;
+        }
+        if self.delivered_since_recovery >= LIVE_STREAM_REPLAY_WINDOW {
+            self.queue_recovery(
+                "live event stream reached its bounded delivery window; resynchronize from the durable journal",
+            );
             return;
         }
         if let Some(end_seq) = self.end_seq {
@@ -161,8 +178,8 @@ impl LiveStreamState {
                 return;
             }
         }
-        let terminal = matches!(&update, SessionUpdate::TurnComplete { .. });
         self.last_seq = seq;
+        self.delivered_since_recovery = self.delivered_since_recovery.saturating_add(1);
         self.pending.push_back(sse_message(
             Some(seq),
             json!({
@@ -170,7 +187,6 @@ impl LiveStreamState {
                 "method": "notifications/ptah_event",
                 "params": {
                     "sessionId": self.session_id,
-                    "workspace": self.workspace,
                     "runId": self.run_id,
                     "seq": seq,
                     "ts": ts,
@@ -192,7 +208,6 @@ impl LiveStreamState {
                 "method": "notifications/ptah_recovery",
                 "params": {
                     "sessionId": self.session_id,
-                    "workspace": self.workspace,
                     "runId": self.run_id,
                     "afterSeq": self.last_seq,
                     "reason": reason,
@@ -206,8 +221,22 @@ impl LiveStreamState {
 
     async fn next_frame(&mut self) -> Option<Bytes> {
         loop {
-            if let Some(frame) = self.pending.pop_front() {
-                return Some(frame);
+            if self.pending.front().is_some() {
+                // A frame may have been queued before credential rotation.
+                // Revalidate both after the wakeup and immediately before
+                // returning it; admission-time auth is not a stream lease.
+                if !self.orch.auth_is_current(&self.auth) {
+                    self.pending.clear();
+                    self.done = true;
+                    return None;
+                }
+                let frame = self.pending.pop_front();
+                if !self.orch.auth_is_current(&self.auth) {
+                    self.pending.clear();
+                    self.done = true;
+                    return None;
+                }
+                return frame;
             }
             if self.done {
                 return None;
@@ -236,8 +265,36 @@ impl LiveStreamState {
                 }
             }
 
+            // A fast producer can fill the transport/kernel buffer before
+            // `broadcast::Receiver` observes `Lagged`. Keep the bounded
+            // stream contract deterministic by converting an unread gap into
+            // the same durable-replay recovery signal.
+            if self.orch.bus().current_seq().saturating_sub(self.last_seq)
+                > LIVE_STREAM_REPLAY_WINDOW
+            {
+                self.queue_recovery(
+                    "live event subscriber fell behind the bounded replay window; resynchronize from the durable journal",
+                );
+                continue;
+            }
+
             tokio::select! {
                 event = self.receiver.recv_with_seq() => {
+                    if !self.orch.auth_is_current(&self.auth) {
+                        self.pending.clear();
+                        self.done = true;
+                        continue;
+                    }
+                    let observed_now = self.orch.bus().current_seq();
+                    if observed_now.saturating_sub(self.observed_global_seq)
+                        > LIVE_STREAM_REPLAY_WINDOW
+                    {
+                        self.queue_recovery(
+                            "live event subscriber fell behind the bounded replay window; resynchronize from the durable journal",
+                        );
+                        continue;
+                    }
+                    self.observed_global_seq = observed_now;
                     let Some((seq, update)) = event else {
                         self.done = true;
                         continue;
@@ -249,9 +306,25 @@ impl LiveStreamState {
                     if crate::event_bus::session_id_of(&update) != Some(self.session_id) {
                         continue;
                     }
-                    self.queue_entry(seq, chrono::Utc::now().to_rfc3339(), update);
+                    let update = self.orch.public_projection(
+                        serde_json::to_value(update).unwrap_or_else(|_| json!({})),
+                    );
+                    let terminal = matches!(
+                        update.get("type").and_then(Value::as_str),
+                        Some("turnComplete")
+                    );
+                    self.queue_serialized_entry(
+                        seq,
+                        chrono::Utc::now().to_rfc3339(),
+                        update,
+                        terminal,
+                    );
                 }
                 _ = self.heartbeat.tick() => {
+                    if !self.orch.auth_is_current(&self.auth) {
+                        self.done = true;
+                        continue;
+                    }
                     return Some(Bytes::from_static(b": grokptah-control keep-alive\n\n"));
                 }
             }
@@ -557,10 +630,7 @@ struct ReadinessSnapshot {
 fn readiness_snapshot(state: &AppState) -> ReadinessSnapshot {
     let payload = state
         .orch
-        .get_capacity(&AuthContext {
-            token_id: "health-probe".into(),
-            owner_id: "health-probe".into(),
-        })
+        .capacity_for_health()
         .unwrap_or_else(|error| json!({"health": {"serviceError": error.message}}));
     let health = payload.get("health").cloned().unwrap_or_else(|| json!({}));
     let ready = [
@@ -723,6 +793,8 @@ async fn streamable_get_handler(
         end_seq: scope.end_seq,
         receiver,
         last_seq,
+        observed_global_seq: state.orch.bus().current_seq(),
+        delivered_since_recovery: 0,
         replay_cursor: None,
         pending: VecDeque::new(),
         heartbeat: tokio::time::interval(Duration::from_secs(10)),
@@ -2672,7 +2744,7 @@ async fn tools_call(
     }
     let result = dispatch_tool(orch, auth, name, &call.arguments).await;
     orch.audit_transport_result(name, result.as_ref().err());
-    let body = result?;
+    let body = orch.public_projection(result?);
     Ok(json!({
         "content": [{ "type": "text", "text": serde_json::to_string_pretty(&body).unwrap_or_default() }],
         "structuredContent": body,

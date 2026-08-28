@@ -25,6 +25,8 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
@@ -37,6 +39,56 @@ use crate::session::{Session, TranscriptEntry};
 use crate::types::{EffortLevel, SubagentIsolationPreference};
 
 const STORE_VERSION: u32 = 2;
+const SESSION_CREATION_INTENT_FILE: &str = "session-create-intent.json";
+
+#[cfg(test)]
+static TEST_PERSISTENCE_FAILURE: AtomicU8 = AtomicU8::new(0);
+
+#[cfg(test)]
+pub(crate) fn set_test_persistence_failure(point: Option<&str>) {
+    let value = match point {
+        None => 0,
+        Some("transcript") => 1,
+        Some("meta") => 2,
+        Some("chrome") => 3,
+        Some("write") => 4,
+        Some("file_sync") => 5,
+        Some("rename") => 6,
+        Some("dir_sync") => 7,
+        Some("intent_remove") => 8,
+        Some(other) => panic!("unknown persistence failure point: {other}"),
+    };
+    TEST_PERSISTENCE_FAILURE.store(value, Ordering::Release);
+}
+
+#[cfg(test)]
+fn fail_test_persistence(point: &str) -> Result<()> {
+    let value = match point {
+        "transcript" => 1,
+        "meta" => 2,
+        "chrome" => 3,
+        "write" => 4,
+        "file_sync" => 5,
+        "rename" => 6,
+        "dir_sync" => 7,
+        "intent_remove" => 8,
+        _ => 0,
+    };
+    if value != 0
+        && TEST_PERSISTENCE_FAILURE
+            .compare_exchange(value, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    {
+        bail!("injected persistence failure at boundary {point}");
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionCommitStatus {
+    Committed,
+    RecoveryRequired,
+}
 
 // ── Workspace chrome (always small) ─────────────────────────────────────────
 
@@ -57,6 +109,14 @@ pub struct WorkspaceChrome {
     pub always_approve: bool,
     #[serde(default)]
     pub subagent_isolation: SubagentIsolationPreference,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionCreationIntent {
+    session_id: Uuid,
+    #[serde(default)]
+    prior_chrome: Option<Vec<u8>>,
+    next_chrome: WorkspaceChrome,
 }
 
 impl Default for WorkspaceChrome {
@@ -156,7 +216,7 @@ fn prompt_queue_path(id: Uuid) -> PathBuf {
 /// Persist bridge-owned prompt queue entries so ordering survives restart (#196).
 pub fn save_prompt_queue(id: Uuid, queue: &crate::prompt_queue::SessionPromptQueue) -> Result<()> {
     ensure_home();
-    let _ = fs::create_dir_all(session_dir(id));
+    fs::create_dir_all(session_dir(id))?;
     let path = prompt_queue_path(id);
     let snap = queue.durable_snapshot();
     atomic_write_json(&path, &snap)
@@ -190,7 +250,7 @@ pub fn load_all_prompt_queues(
 /// Persist subagent history for a session (reopen / historical summary) (#152).
 pub fn save_session_subagents(id: Uuid, list: &[crate::types::SubagentInfo]) -> Result<()> {
     ensure_home();
-    let _ = fs::create_dir_all(session_dir(id));
+    fs::create_dir_all(session_dir(id))?;
     // Keep only rows for this session (and rows without session_id for safety).
     let filtered: Vec<_> = list
         .iter()
@@ -203,10 +263,7 @@ pub fn save_session_subagents(id: Uuid, list: &[crate::types::SubagentInfo]) -> 
         .cloned()
         .collect();
     let path = subagents_path(id);
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, serde_json::to_vec_pretty(&filtered)?)?;
-    fs::rename(&tmp, &path)?;
-    Ok(())
+    atomic_write_bytes(&path, &serde_json::to_vec_pretty(&filtered)?)
 }
 
 pub fn load_session_subagents(id: Uuid) -> Vec<crate::types::SubagentInfo> {
@@ -224,6 +281,7 @@ pub fn load_workspace() -> Result<(WorkspaceChrome, HashMap<Uuid, Session>)> {
     ensure_home();
     let _ = fs::create_dir_all(sessions_root());
 
+    recover_session_creation_intent()?;
     // One-shot migration from monolithic v1 file.
     migrate_v1_if_needed()?;
 
@@ -239,11 +297,83 @@ pub fn save_chrome(chrome: &WorkspaceChrome) -> Result<()> {
     atomic_write_json(&chrome_path(), &c)
 }
 
+pub(crate) fn restore_chrome_snapshot(snapshot: Option<&[u8]>) -> Result<()> {
+    match snapshot {
+        Some(bytes) => atomic_write_bytes(&chrome_path(), bytes),
+        None => remove_file_durable(&chrome_path()),
+    }
+}
+
 pub fn save_session_meta(session: &Session) -> Result<()> {
     let dir = session_dir(session.id);
     fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
     let meta = SessionMeta::from_session(session);
+    #[cfg(test)]
+    fail_test_persistence("meta")?;
     atomic_write_json(&meta_path(session.id), &meta)
+}
+
+/// Persist a new session and its chrome publication as one recoverable
+/// transaction. The session is not visible to a restarted host unless both
+/// its durable files and the chrome pointer were committed.
+pub fn create_session_durable(
+    session: &Session,
+    next_chrome: &WorkspaceChrome,
+) -> Result<SessionCommitStatus> {
+    ensure_home();
+    let dir = session_dir(session.id);
+    if dir.exists() {
+        bail!("session id already exists");
+    }
+    let prior_chrome = match fs::read(chrome_path()) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let intent = SessionCreationIntent {
+        session_id: session.id,
+        prior_chrome,
+        next_chrome: next_chrome.clone(),
+    };
+    let intent_path = grokptah_home().join(SESSION_CREATION_INTENT_FILE);
+    atomic_write_json(&intent_path, &intent)?;
+
+    let result = (|| {
+        #[cfg(test)]
+        fail_test_persistence("transcript")?;
+        rewrite_transcript(session)?;
+        #[cfg(test)]
+        fail_test_persistence("chrome")?;
+        save_chrome(next_chrome)?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            #[cfg(test)]
+            if fail_test_persistence("intent_remove").is_err() {
+                return Ok(SessionCommitStatus::RecoveryRequired);
+            }
+            match remove_file_durable(&intent_path) {
+                Ok(()) => Ok(SessionCommitStatus::Committed),
+                Err(error) => {
+                    eprintln!(
+                        "[grokptah] session creation committed; intent cleanup deferred: {error:#}"
+                    );
+                    Ok(SessionCommitStatus::RecoveryRequired)
+                }
+            }
+        }
+        Err(error) => {
+            let rollback = rollback_session_creation(&intent);
+            if let Err(rollback_error) = rollback {
+                return Err(anyhow::anyhow!(
+                    "{error:#}; session creation rollback failed: {rollback_error:#}"
+                ));
+            }
+            remove_file_durable(&intent_path).context("remove failed session creation intent")?;
+            Err(error)
+        }
+    }
 }
 
 /// Append transcript entries that are not yet on disk (`from_index..`).
@@ -275,8 +405,10 @@ pub fn append_transcript(session: &Session, from_index: usize) -> Result<usize> 
     f.write_all(batch.as_bytes())
         .with_context(|| format!("write append {}", path.display()))?;
     f.flush()?;
-    // Durability on turn boundary (best-effort on platforms without full fsync).
-    let _ = f.sync_all();
+    #[cfg(test)]
+    fail_test_persistence("file_sync")?;
+    f.sync_all()
+        .with_context(|| format!("sync append {}", path.display()))?;
     // Keep meta.message_count in sync
     save_session_meta(session)?;
     Ok(n)
@@ -288,31 +420,14 @@ pub fn rewrite_transcript(session: &Session) -> Result<()> {
     let dir = session_dir(session.id);
     fs::create_dir_all(&dir)?;
     let path = transcript_path(session.id);
-    let tmp = path.with_extension("jsonl.tmp");
-    {
-        let mut f = File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
-        let mut batch = String::new();
-        for entry in &session.transcript {
-            let line = serde_json::to_string(entry)?;
-            batch.push_str(&line);
-            batch.push('\n');
-        }
-        f.write_all(batch.as_bytes())?;
-        f.flush()?;
-        let _ = f.sync_all();
+    let mut batch = String::new();
+    for entry in &session.transcript {
+        let line = serde_json::to_string(entry)?;
+        batch.push_str(&line);
+        batch.push('\n');
     }
-    // Sync parent dir so the rename is durable.
-    if let Some(parent) = path.parent() {
-        if let Ok(dirf) = File::open(parent) {
-            let _ = dirf.sync_all();
-        }
-    }
-    fs::rename(&tmp, &path).with_context(|| format!("rename {}", path.display()))?;
-    if let Some(parent) = path.parent() {
-        if let Ok(dirf) = File::open(parent) {
-            let _ = dirf.sync_all();
-        }
-    }
+    atomic_write_bytes(&path, batch.as_bytes())
+        .with_context(|| format!("rewrite transcript {}", path.display()))?;
     save_session_meta(session)?;
     Ok(())
 }
@@ -375,6 +490,9 @@ pub fn delete_session(id: Uuid) -> Result<()> {
     let dir = session_dir(id);
     if dir.is_dir() {
         fs::remove_dir_all(&dir).with_context(|| format!("rm -rf {}", dir.display()))?;
+        if let Some(parent) = dir.parent() {
+            sync_directory(parent)?;
+        }
     }
     Ok(())
 }
@@ -552,30 +670,115 @@ pub fn load_all_metas() -> Result<HashMap<Uuid, Session>> {
 }
 
 fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let raw = serde_json::to_string_pretty(value)?;
+    atomic_write_bytes(path, raw.as_bytes())
+}
+
+fn remove_file_durable(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
+    if let Some(parent) = path.parent() {
+        if let Ok(dirf) = File::open(parent) {
+            dirf.sync_all()?;
+        }
+    }
+    Ok(())
+}
+
+fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let tmp = path.with_extension("json.tmp");
-    let raw = serde_json::to_string_pretty(value)?;
-    {
-        let mut f = File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
-        f.write_all(raw.as_bytes())
-            .with_context(|| format!("write {}", tmp.display()))?;
-        f.flush()?;
-        let _ = f.sync_all();
+    let result = (|| {
+        #[cfg(test)]
+        fail_test_persistence("write")?;
+        {
+            let mut file =
+                File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+            file.write_all(bytes)
+                .with_context(|| format!("write {}", tmp.display()))?;
+            file.flush()?;
+            #[cfg(test)]
+            fail_test_persistence("file_sync")?;
+            file.sync_all()
+                .with_context(|| format!("sync {}", tmp.display()))?;
+        }
+        if let Some(parent) = path.parent() {
+            sync_directory(parent)?;
+        }
+        #[cfg(test)]
+        fail_test_persistence("rename")?;
+        fs::rename(&tmp, path).with_context(|| format!("rename {}", path.display()))?;
+        if let Some(parent) = path.parent() {
+            sync_directory(parent)?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
-    if let Some(parent) = path.parent() {
-        if let Ok(dirf) = File::open(parent) {
-            let _ = dirf.sync_all();
+    result
+}
+
+fn sync_directory(path: &Path) -> Result<()> {
+    let directory =
+        File::open(path).with_context(|| format!("open directory {}", path.display()))?;
+    #[cfg(test)]
+    fail_test_persistence("dir_sync")?;
+    directory
+        .sync_all()
+        .with_context(|| format!("sync directory {}", path.display()))
+}
+
+fn rollback_session_creation(intent: &SessionCreationIntent) -> Result<()> {
+    let mut first_error = None;
+    if let Err(error) = delete_session(intent.session_id) {
+        first_error = Some(error);
+    }
+    let chrome_result = match intent.prior_chrome.as_deref() {
+        Some(bytes) => atomic_write_bytes(&chrome_path(), bytes),
+        None => remove_file_durable(&chrome_path()),
+    };
+    if let Err(error) = chrome_result {
+        if first_error.is_none() {
+            first_error = Some(error);
         }
     }
-    fs::rename(&tmp, path).with_context(|| format!("rename {}", path.display()))?;
-    if let Some(parent) = path.parent() {
-        if let Ok(dirf) = File::open(parent) {
-            let _ = dirf.sync_all();
-        }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
     }
-    Ok(())
+}
+
+fn recover_session_creation_intent() -> Result<()> {
+    let intent_path = grokptah_home().join(SESSION_CREATION_INTENT_FILE);
+    if !intent_path.is_file() {
+        return Ok(());
+    }
+    let intent: SessionCreationIntent = serde_json::from_slice(&fs::read(&intent_path)?)
+        .context("parse session creation intent")?;
+    let session_complete = session_dir(intent.session_id).join("meta.json").is_file()
+        && session_dir(intent.session_id)
+            .join("transcript.jsonl")
+            .is_file();
+    let chrome_complete = fs::read(chrome_path())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<WorkspaceChrome>(&bytes).ok())
+        .is_some_and(|chrome| {
+            serde_json::to_vec(&chrome).ok() == serde_json::to_vec(&intent.next_chrome).ok()
+        });
+    if session_complete && chrome_complete {
+        if let Err(error) = remove_file_durable(&intent_path) {
+            eprintln!("[grokptah] committed session recovery intent cleanup deferred: {error:#}");
+        }
+        return Ok(());
+    }
+    rollback_session_creation(&intent)?;
+    remove_file_durable(&intent_path)
 }
 
 /// Migrate monolithic v1 workspace.json → v2 layout.
@@ -749,6 +952,139 @@ mod tests {
         session.transcript_loaded = false;
         load_transcript(&mut session).unwrap();
         assert_eq!(session.transcript.len(), 2);
+
+        set_grokptah_home_override(None);
+    }
+
+    #[test]
+    fn new_session_rolls_back_at_each_durable_boundary() {
+        for boundary in ["transcript", "meta", "chrome"] {
+            let _g = home_override_serial();
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path().join(".grokptah");
+            std::fs::create_dir_all(home.join("sessions")).unwrap();
+            set_grokptah_home_override(Some(home));
+
+            let prior = WorkspaceChrome::default();
+            save_chrome(&prior).unwrap();
+            let before = std::fs::read(chrome_path()).unwrap();
+            let session = Session::new(tmp.path().to_path_buf(), "m".into(), EffortLevel::Medium);
+            let next = WorkspaceChrome {
+                active_session: Some(session.id),
+                open_tab_ids: vec![session.id],
+                ..prior
+            };
+
+            set_test_persistence_failure(Some(boundary));
+            assert!(create_session_durable(&session, &next).is_err());
+            set_test_persistence_failure(None);
+
+            assert!(
+                !session_dir(session.id).exists(),
+                "{boundary} left a session"
+            );
+            assert_eq!(std::fs::read(chrome_path()).unwrap(), before);
+            assert!(!grokptah_home().join(SESSION_CREATION_INTENT_FILE).exists());
+            set_grokptah_home_override(None);
+        }
+    }
+
+    #[test]
+    fn atomic_session_writes_surface_file_and_directory_faults() {
+        for fault in ["write", "file_sync", "rename", "dir_sync"] {
+            let _g = home_override_serial();
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path().join(".grokptah");
+            std::fs::create_dir_all(home.join("sessions")).unwrap();
+            set_grokptah_home_override(Some(home));
+            set_test_persistence_failure(Some(fault));
+            assert!(save_chrome(&WorkspaceChrome::default()).is_err());
+            set_test_persistence_failure(None);
+            set_grokptah_home_override(None);
+        }
+    }
+
+    #[test]
+    fn intent_cleanup_failure_is_an_explicit_recoverable_commit() {
+        let _g = home_override_serial();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join(".grokptah");
+        std::fs::create_dir_all(home.join("sessions")).unwrap();
+        set_grokptah_home_override(Some(home));
+        let session = Session::new(tmp.path().to_path_buf(), "m".into(), EffortLevel::Medium);
+        let next = WorkspaceChrome {
+            active_session: Some(session.id),
+            open_tab_ids: vec![session.id],
+            ..WorkspaceChrome::default()
+        };
+        set_test_persistence_failure(Some("intent_remove"));
+        assert_eq!(
+            create_session_durable(&session, &next).unwrap(),
+            SessionCommitStatus::RecoveryRequired
+        );
+        set_test_persistence_failure(None);
+        assert!(session_dir(session.id).join("meta.json").is_file());
+        assert!(grokptah_home().join(SESSION_CREATION_INTENT_FILE).is_file());
+        let (_, sessions) = load_workspace().unwrap();
+        assert!(sessions.contains_key(&session.id));
+        assert!(!grokptah_home().join(SESSION_CREATION_INTENT_FILE).exists());
+        set_grokptah_home_override(None);
+    }
+
+    #[test]
+    fn restart_recovery_removes_phantom_session_but_keeps_committed_session() {
+        let _g = home_override_serial();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join(".grokptah");
+        std::fs::create_dir_all(home.join("sessions")).unwrap();
+        set_grokptah_home_override(Some(home));
+        let prior = WorkspaceChrome::default();
+        save_chrome(&prior).unwrap();
+        let prior_bytes = std::fs::read(chrome_path()).unwrap();
+
+        let phantom = Session::new(tmp.path().to_path_buf(), "m".into(), EffortLevel::Medium);
+        let phantom_next = WorkspaceChrome {
+            active_session: Some(phantom.id),
+            open_tab_ids: vec![phantom.id],
+            ..prior.clone()
+        };
+        let phantom_intent = SessionCreationIntent {
+            session_id: phantom.id,
+            prior_chrome: Some(prior_bytes.clone()),
+            next_chrome: phantom_next,
+        };
+        atomic_write_json(
+            &grokptah_home().join(SESSION_CREATION_INTENT_FILE),
+            &phantom_intent,
+        )
+        .unwrap();
+        rewrite_transcript(&phantom).unwrap();
+        let (_, loaded) = load_workspace().unwrap();
+        assert!(!loaded.contains_key(&phantom.id));
+        assert!(!session_dir(phantom.id).exists());
+        assert_eq!(std::fs::read(chrome_path()).unwrap(), prior_bytes);
+
+        let committed = Session::new(tmp.path().to_path_buf(), "m".into(), EffortLevel::Medium);
+        let committed_next = WorkspaceChrome {
+            active_session: Some(committed.id),
+            open_tab_ids: vec![committed.id],
+            ..prior
+        };
+        rewrite_transcript(&committed).unwrap();
+        save_chrome(&committed_next).unwrap();
+        let committed_intent = SessionCreationIntent {
+            session_id: committed.id,
+            prior_chrome: Some(std::fs::read(chrome_path()).unwrap()),
+            next_chrome: committed_next,
+        };
+        atomic_write_json(
+            &grokptah_home().join(SESSION_CREATION_INTENT_FILE),
+            &committed_intent,
+        )
+        .unwrap();
+        let (_, loaded) = load_workspace().unwrap();
+        assert!(loaded.contains_key(&committed.id));
+        assert!(!grokptah_home().join(SESSION_CREATION_INTENT_FILE).exists());
 
         set_grokptah_home_override(None);
     }

@@ -455,11 +455,15 @@ try {
   // Hold the live body unread while the Rust driver floods the bounded
   // subscriber. The server must emit a recovery notification, after which
   // the coordinator reconstructs state with the durable read tool.
+  log("opening gap stream");
   const gapStream = await openLive(gapRunId, null, gapSessionId);
   if (gapStream.status !== 200) throw new Error(`gap stream HTTP ${gapStream.status}`);
+  log("gap stream opened");
   fs.writeFileSync(gapReadyFile, "ready");
   await waitForRelease();
+  log("release observed; waiting for recovery");
   const recovery = await waitForRecovery(gapStream.body.getReader());
+  log("recovery observed");
   const gapRead = await call("ptah_get_events", {
     session_id: gapSessionId,
     workspace,

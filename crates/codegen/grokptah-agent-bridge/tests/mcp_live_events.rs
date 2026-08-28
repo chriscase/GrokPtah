@@ -307,6 +307,60 @@ async fn reusable_client_reconnects_from_last_live_event() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn post_rotation_event_is_not_delivered_to_an_existing_sse_stream() {
+    let guard = home_override_serial();
+    let previous_offline = std::env::var_os("GROKPTAH_AGENT_OFFLINE");
+    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
+    let (_home, _lock, host, workspace, orch) = setup_with_guard(guard);
+    let owner = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(owner.id, workspace.path()).unwrap();
+    let server = start_control_server(orch.clone(), 0).await.unwrap();
+    let mut client = McpControlClient::new(format!("http://{}", server.addr), "live-event-token");
+    client.initialize().await.unwrap();
+    let submitted = client
+        .call_tool(
+            "ptah_submit_task",
+            json!({
+                "request_id": "post-rotation-sse",
+                "session_id": owner.id,
+                "workspace": workspace.path().display().to_string(),
+                "prompt": "bounded offline event"
+            }),
+        )
+        .await
+        .unwrap();
+    let run_id = submitted.structured["runId"].as_str().unwrap().to_string();
+    let scope = RunScope {
+        session_id: owner.id,
+        workspace: workspace.path().display().to_string(),
+        run_id,
+    };
+    let mut stream = client.open_event_stream(scope, None).await.unwrap();
+
+    orch.rotate_authentication_generation("primary").unwrap();
+    host.event_bus().publish(SessionUpdate::AgentMessageChunk {
+        session_id: owner.id,
+        text: "must not cross the rotation fence".into(),
+    });
+    let frame = tokio::time::timeout(Duration::from_secs(3), stream.next_notification())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        frame.is_none(),
+        "stale SSE stream delivered a post-rotation frame"
+    );
+
+    server.stop_and_wait().await;
+    set_grokptah_home_override(None);
+    match previous_offline {
+        Some(value) => std::env::set_var("GROKPTAH_AGENT_OFFLINE", value),
+        None => std::env::remove_var("GROKPTAH_AGENT_OFFLINE"),
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::await_holding_lock)]
