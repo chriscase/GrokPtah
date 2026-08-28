@@ -888,6 +888,18 @@ impl DeterministicFakeTransport {
             }
         }
     }
+
+    pub fn start_stream(&self, permit: &mut PhysicalSendPermit) -> Result<(), AttemptError> {
+        self.requests
+            .lock()
+            .unwrap()
+            .push(permit.provider_request_id().to_owned());
+        permit.mark_response_started()
+    }
+
+    pub fn settle_stream(&self, permit: &mut PhysicalSendPermit) -> Result<(), AttemptError> {
+        permit.settle_http_response(200, b"fake-stream-settlement")
+    }
 }
 
 fn projection(record: &StoredAttempt) -> AttemptProjection {
@@ -1048,6 +1060,23 @@ mod tests {
     }
 
     #[test]
+    fn crash_cut_before_intent_has_no_ledger_record_or_physical_request() {
+        let temp = tempdir().unwrap();
+        let store = ProviderAttemptStore::open(temp.path()).unwrap();
+        let transport = DeterministicFakeTransport::default();
+        assert!(store.projection("never-created").unwrap().is_none());
+        assert!(transport.request_ids().is_empty());
+        assert_eq!(
+            fs::read_dir(temp.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().extension().and_then(|x| x.to_str()) == Some("json"))
+                .count(),
+            0
+        );
+    }
+
+    #[test]
     fn physical_key_is_stable_across_oauth_refresh_and_reopen() {
         let (_temp, store, attempt) = prepared();
         let binding = authority(1);
@@ -1101,10 +1130,24 @@ mod tests {
         attempt.admit(&binding).unwrap();
         let transport = DeterministicFakeTransport::default();
         let mut permit = attempt.begin_send(&binding).unwrap();
-        transport
-            .send(&mut permit, FakeTransportOutcome::StreamAndSettle)
-            .unwrap();
+        transport.start_stream(&mut permit).unwrap();
+        assert_eq!(attempt.state().unwrap(), SendState::Responding);
+        transport.settle_stream(&mut permit).unwrap();
         assert_eq!(attempt.state().unwrap(), SendState::Settled);
+        assert_eq!(transport.request_ids().len(), 1);
+    }
+
+    #[test]
+    fn crash_during_stream_or_before_settlement_becomes_uncertain() {
+        let (_temp, _store, attempt) = prepared();
+        let binding = authority(1);
+        attempt.admit(&binding).unwrap();
+        let transport = DeterministicFakeTransport::default();
+        let mut permit = attempt.begin_send(&binding).unwrap();
+        transport.start_stream(&mut permit).unwrap();
+        assert_eq!(attempt.state().unwrap(), SendState::Responding);
+        drop(permit);
+        assert_eq!(attempt.state().unwrap(), SendState::Uncertain);
         assert_eq!(transport.request_ids().len(), 1);
     }
 
@@ -1163,6 +1206,21 @@ mod tests {
             Ok(())
         );
         assert_eq!(attempt.state().unwrap(), SendState::Admitted);
+    }
+
+    #[test]
+    fn settlement_requires_provider_request_identity_and_effect_proof() {
+        let (_temp, _store, attempt) = prepared();
+        let binding = authority(1);
+        attempt.admit(&binding).unwrap();
+        let mut permit = attempt.begin_send(&binding).unwrap();
+        permit.mark_response_started().unwrap();
+        let wrong = ProviderSettlement::new("opaque-wrong", "provider-effect").unwrap();
+        assert_eq!(
+            permit.settle(wrong).unwrap_err(),
+            AttemptError::SettlementDoesNotMatch
+        );
+        assert_eq!(attempt.state().unwrap(), SendState::Responding);
     }
 
     #[test]
