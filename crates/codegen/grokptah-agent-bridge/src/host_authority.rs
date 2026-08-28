@@ -4,7 +4,7 @@
 //! identity and capability lease into a durable authority snapshot consumed
 //! by `xai-provider-attempt`.
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -277,6 +277,59 @@ fn is_not_found(error: &anyhow::Error) -> bool {
         .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
 }
 
+/// Initialize the host-owned signing key before the common ledger is exposed.
+///
+/// The common attempt crate only verifies this trust anchor; it must never
+/// create a key as a side effect of opening or reading a caller-selected
+/// ledger root.
+pub(crate) fn initialize(root: &Path) -> Result<()> {
+    let directory = root.join("canonical-authorities");
+    fs::create_dir_all(&directory)?;
+    let key_path = directory.join(".authority-signing-key");
+    match fs::symlink_metadata(&key_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(anyhow!("canonical authority signing key is a symlink"));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if directory.join(AUTHORITY_PUBLIC_KEY_FILE).exists() {
+                return Err(anyhow!("canonical authority signing key is unavailable"));
+            }
+            let mut seed = [0u8; 32];
+            seed[..16].copy_from_slice(Uuid::new_v4().as_bytes());
+            seed[16..].copy_from_slice(Uuid::new_v4().as_bytes());
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&key_path)?;
+            file.write_all(&seed)?;
+            set_private_permissions(&file)?;
+            file.sync_all()?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let key = signing_key(root)?;
+    let public_key_path = directory.join(AUTHORITY_PUBLIC_KEY_FILE);
+    match fs::symlink_metadata(&public_key_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(anyhow!("canonical authority public key is a symlink"));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&public_key_path)?;
+            file.write_all(&key.verifying_key().to_bytes())?;
+            set_private_permissions(&file)?;
+            file.sync_all()?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let _ = read_public_key(root)?;
+    Ok(())
+}
+
 fn write_authority(root: &Path, record: &AuthorityRecord, scope: &str) -> Result<()> {
     let directory = root.join("canonical-authorities");
     fs::create_dir_all(&directory)?;
@@ -329,50 +382,24 @@ fn read_authority(root: &Path, scope: &str) -> Result<AuthorityRecord> {
 
 fn signing_key(root: &Path) -> Result<SigningKey> {
     let directory = root.join("canonical-authorities");
-    fs::create_dir_all(&directory)?;
     let key_path = directory.join(".authority-signing-key");
-    let key = match fs::read(&key_path) {
-        Ok(bytes) => {
-            let seed: [u8; 32] = bytes
-                .as_slice()
-                .try_into()
-                .map_err(|_| anyhow!("canonical authority signing key is invalid"))?;
-            SigningKey::from_bytes(&seed)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if key_path.exists() || directory.join(AUTHORITY_PUBLIC_KEY_FILE).exists() {
-                return Err(anyhow!("canonical authority signing key is unavailable"));
-            }
-            let mut seed = [0u8; 32];
-            seed[..16].copy_from_slice(Uuid::new_v4().as_bytes());
-            seed[16..].copy_from_slice(Uuid::new_v4().as_bytes());
-            let mut file = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&key_path)?;
-            file.write_all(&seed)?;
-            set_private_permissions(&file)?;
-            file.sync_all()?;
-            SigningKey::from_bytes(&seed)
-        }
-        Err(error) => return Err(error.into()),
-    };
+    let metadata = fs::symlink_metadata(&key_path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(anyhow!("canonical authority signing key is a symlink"));
+    }
+    let bytes = fs::read(&key_path)?;
+    let seed: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("canonical authority signing key is invalid"))?;
+    let key = SigningKey::from_bytes(&seed);
     let public_key_path = directory.join(AUTHORITY_PUBLIC_KEY_FILE);
     let public_key = key.verifying_key().to_bytes();
     match fs::read(&public_key_path) {
         Ok(existing) if existing == public_key => {}
         Ok(_) => return Err(anyhow!("canonical authority public key mismatch")),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let mut file = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(public_key_path)?;
-            file.write_all(&public_key)?;
-            set_private_permissions(&file)?;
-            file.sync_all()?;
-        }
         Err(error) => return Err(error.into()),
-    }
+    };
     Ok(key)
 }
 
@@ -436,6 +463,7 @@ pub(crate) fn write_test_snapshot(
     capability_generation: u64,
     effect_lease_id: &str,
 ) -> Result<()> {
+    initialize(root)?;
     let mut issued_effect_lease_ids = vec![effect_lease_id.into()];
     issued_effect_lease_ids
         .extend((1..LEASE_BATCH_SIZE).map(|_| format!("test-effect-lease-{}", Uuid::new_v4())));
