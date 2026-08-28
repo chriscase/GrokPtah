@@ -8,11 +8,33 @@
 use std::fs;
 use std::time::Duration;
 
+use grokptah_agent_bridge::orchestration::{
+    OrchestrationConfig, OrchestrationService, RunBounds, WorkspaceAllowlist,
+};
 use grokptah_agent_bridge::{
     home_override_serial, set_grokptah_home_override, AgentHost, HostConfig, SessionUpdate,
     SubagentExecutionMode,
 };
 use tokio::time::timeout;
+
+fn provisioned_host(config: HostConfig) -> grokptah_agent_bridge::AgentHostHandle {
+    let host = AgentHost::create(config);
+    let store = host
+        .ensure_orchestration_store()
+        .expect("open canonical orchestration store");
+    let _authority_service = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        store,
+        OrchestrationConfig {
+            bearer_token: "isolation-authority".into(),
+            allowlist: WorkspaceAllowlist::default(),
+            max_concurrent_runs: 2,
+            bounds: RunBounds::default(),
+        },
+    );
+    host
+}
 
 struct IsolatedHome {
     _tmp: tempfile::TempDir,
@@ -77,7 +99,7 @@ async fn default_isolation_keeps_two_mutating_children_from_colliding() {
     fs::create_dir_all(dir.path().join("src")).unwrap();
     fs::write(dir.path().join("src/lib.rs"), "pub fn x() {}\n").unwrap();
 
-    let host = AgentHost::create(HostConfig {
+    let host = provisioned_host(HostConfig {
         always_approve: true,
         ..HostConfig::default()
     });
@@ -162,7 +184,7 @@ async fn plan_kind_denies_write_offline() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("keep.txt"), "safe").unwrap();
 
-    let host = AgentHost::create(HostConfig {
+    let host = provisioned_host(HostConfig {
         always_approve: true,
         ..HostConfig::default()
     });
@@ -232,7 +254,7 @@ async fn failed_isolation_requires_explicit_shared_cwd_opt_in() {
     fs::write(dir.path().join("README.md"), "root\n").unwrap();
     fs::write(dir.path().join(".grokptah"), "blocks worktree directory").unwrap();
 
-    let host = AgentHost::create(HostConfig {
+    let host = provisioned_host(HostConfig {
         always_approve: true,
         ..HostConfig::default()
     });
