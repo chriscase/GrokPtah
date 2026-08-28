@@ -515,7 +515,7 @@ impl AttemptContext {
             .authority_scope
             .as_deref()
             .ok_or(AttemptError::InvalidAuthority)?;
-        let (record, lease_id) = self.store.select_host_lease(scope, &self.operation_id)?;
+        let (_record, lease_id) = self.store.select_host_lease(scope, &self.operation_id)?;
         let authority = self.authority.with_effect_lease(lease_id)?;
         Self::new(self.store.clone(), self.operation_id.clone(), authority).map(|mut context| {
             context.authority_scope = self.authority_scope.clone();
@@ -1575,6 +1575,20 @@ mod tests {
     }
 
     fn write_host_snapshot(root: &Path, scope: &str, binding: &AuthorityBinding) {
+        write_host_snapshot_with_leases(
+            root,
+            scope,
+            binding,
+            vec![binding.effect_lease_id.clone()],
+        );
+    }
+
+    fn write_host_snapshot_with_leases(
+        root: &Path,
+        scope: &str,
+        binding: &AuthorityBinding,
+        issued_effect_lease_ids: Vec<String>,
+    ) {
         use ed25519_dalek::{Signer, SigningKey};
         fs::create_dir_all(root.join("canonical-authorities")).unwrap();
         let signing_key = SigningKey::from_bytes(&[7; 32]);
@@ -1598,7 +1612,7 @@ mod tests {
             effect_lease_id: binding.effect_lease_id.clone(),
             effect_scope: binding.effect_scope.clone(),
             revoked_effect_lease_ids: Vec::new(),
-            issued_effect_lease_ids: vec![binding.effect_lease_id.clone(), "lease-1".into()],
+            issued_effect_lease_ids,
         };
         let signature = signing_key.sign(&serde_json::to_vec(&payload).unwrap());
         fs::write(
@@ -1753,7 +1767,7 @@ mod tests {
         let context =
             AttemptContext::from_host_ledger(store.clone(), "revoke-operation", scope).unwrap();
         let attempt = context.prepare("xai", b"request", true).unwrap();
-        write_host_snapshot(temp.path(), scope, &authority(2));
+        write_host_snapshot_with_leases(temp.path(), scope, &authority(2), vec!["lease-1".into()]);
         assert_eq!(
             context.begin_send(&attempt).unwrap_err(),
             AttemptError::StaleAuthority
@@ -1764,6 +1778,54 @@ mod tests {
                 .request_ids()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn tampered_host_authority_is_rejected_before_intent_or_provider_bytes() {
+        let temp = tempdir().unwrap();
+        let store = ProviderAttemptStore::open(temp.path()).unwrap();
+        let scope = "tamper-scope";
+        write_host_snapshot(temp.path(), scope, &authority(1));
+        let path = temp
+            .path()
+            .join("canonical-authorities")
+            .join(format!("{scope}.json"));
+        let mut tampered: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        tampered["authGeneration"] = serde_json::json!(2);
+        fs::write(&path, serde_json::to_vec(&tampered).unwrap()).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            AttemptContext::from_host_ledger(store.clone(), "tamper-operation", scope).unwrap_err(),
+            AttemptError::InvalidAuthority
+        );
+        assert!(store.projection("never-created").unwrap().is_none());
+        assert!(
+            DeterministicFakeTransport::default()
+                .request_ids()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn host_issued_lease_is_reserved_once_before_intent() {
+        let temp = tempdir().unwrap();
+        let store = ProviderAttemptStore::open(temp.path()).unwrap();
+        let scope = "single-lease-scope";
+        write_host_snapshot(temp.path(), scope, &authority(1));
+        let context =
+            AttemptContext::from_host_ledger(store.clone(), "single-lease-operation", scope)
+                .unwrap();
+        assert_eq!(
+            AttemptContext::from_host_ledger(store.clone(), "second-operation", scope).unwrap_err(),
+            AttemptError::EffectLeaseAlreadyUsed
+        );
+        let mut permit = context.begin("xai", b"one-use", true).unwrap();
+        DeterministicFakeTransport::default()
+            .send(&mut permit, FakeTransportOutcome::BeforePossibleWrite)
+            .unwrap();
+        assert!(store.projection(permit.attempt_id()).unwrap().is_some());
     }
 
     #[test]
