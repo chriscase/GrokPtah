@@ -200,12 +200,20 @@ pub async fn qualify_provider_model(
     provider_id: &str,
     model_id: &str,
 ) -> Result<ProviderQualificationReport> {
-    qualify_provider_model_with_authority(
-        provider_id,
-        model_id,
-        Arc::new(CapabilityAuthority::new(true)),
-    )
-    .await
+    #[cfg(test)]
+    {
+        qualify_provider_model_with_authority(
+            provider_id,
+            model_id,
+            Arc::new(CapabilityAuthority::new(true)),
+        )
+        .await
+    }
+    #[cfg(not(test))]
+    {
+        let _ = (provider_id, model_id);
+        bail!("host capability authority is required for provider qualification");
+    }
 }
 
 pub(crate) async fn qualify_provider_model_with_authority(

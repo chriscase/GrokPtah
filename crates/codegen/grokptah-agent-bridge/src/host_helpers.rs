@@ -2045,6 +2045,7 @@ fn record_provider_attempt(
 /// Content → `on_delta`; reasoning_content → `on_thought` (#149).
 /// Cancel aborts the HTTP body read within ~one chunk.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) async fn call_xai_agent_step<F, G>(
     creds: &crate::auth_store::WireCredentials,
     model: &str,
@@ -2079,6 +2080,7 @@ where
 /// every physical HTTP attempt. Observation is deliberately orthogonal to
 /// provider execution and failures in the recorder never affect the result.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) async fn call_xai_agent_step_observed<F, G>(
     creds: &crate::auth_store::WireCredentials,
     model: &str,
@@ -2265,16 +2267,31 @@ where
     const MAX_TRANSIENT_RETRIES: u32 = 3;
     let mut transient_retries = 0u32;
     let mut last_err = None::<String>;
+    #[cfg(test)]
     let local_authority;
     let provider_authority = match authority {
         Some(authority) => authority,
         None => {
-            local_authority = CapabilityAuthority::new(true);
-            &local_authority
+            #[cfg(test)]
+            {
+                local_authority = CapabilityAuthority::new(true);
+                &local_authority
+            }
+            #[cfg(not(test))]
+            {
+                bail!("host provider capability authority is unavailable");
+            }
         }
     };
+    #[cfg(test)]
     let principal = principal.unwrap_or("provider-send");
+    #[cfg(not(test))]
+    let principal = principal.ok_or_else(|| anyhow!("host provider principal is unavailable"))?;
+    #[cfg(test)]
     let policy_digest = policy_digest.unwrap_or("provider-send");
+    #[cfg(not(test))]
+    let policy_digest =
+        policy_digest.ok_or_else(|| anyhow!("host provider policy generation is unavailable"))?;
     for _request_attempt in 0..MAX_REQUEST_ATTEMPTS {
         if cancel.is_cancelled() {
             bail!("cancelled");
@@ -3841,6 +3858,7 @@ pub(crate) fn api_context_messages(session: &Session) -> Vec<(String, String)> {
 /// typically the current user prompt. `compacted_summary` is the extractive
 /// stand-in for local-only prefix that left the context window.
 #[allow(dead_code)]
+#[cfg(test)]
 pub(crate) async fn call_xai_chat(
     creds: &crate::auth_store::WireCredentials,
     model: &str,
@@ -3977,16 +3995,31 @@ async fn call_xai_chat_inner(
         "stream": false
     });
     let url = format!("{}/chat/completions", base.trim_end_matches('/'));
+    #[cfg(test)]
     let local_authority;
     let provider_authority = match authority {
         Some(authority) => authority,
         None => {
-            local_authority = CapabilityAuthority::new(true);
-            &local_authority
+            #[cfg(test)]
+            {
+                local_authority = CapabilityAuthority::new(true);
+                &local_authority
+            }
+            #[cfg(not(test))]
+            {
+                bail!("host chat capability authority is unavailable");
+            }
         }
     };
+    #[cfg(test)]
     let principal = principal.unwrap_or("provider-chat");
+    #[cfg(not(test))]
+    let principal = principal.ok_or_else(|| anyhow!("host chat principal is unavailable"))?;
+    #[cfg(test)]
     let policy_digest = policy_digest.unwrap_or("provider-chat");
+    #[cfg(not(test))]
+    let policy_digest =
+        policy_digest.ok_or_else(|| anyhow!("host chat policy generation is unavailable"))?;
 
     let send_once = |c: &crate::auth_store::WireCredentials| {
         let req = client.post(&url).header("Content-Type", "application/json");
