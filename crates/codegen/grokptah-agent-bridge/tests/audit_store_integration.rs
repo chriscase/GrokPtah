@@ -804,3 +804,34 @@ fn a_dropped_producer_entry_survives_restart_as_durable_evidence() {
     assert_eq!(gaps[0].lost_entries, 3);
     assert!(gaps[0].journaled);
 }
+
+#[test]
+fn a_symlinked_or_relative_root_resolves_to_one_key_and_one_ledger() {
+    #[cfg(unix)]
+    {
+        let dir = TempDir::new().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        // Open through the symlink, then through the real path. Both must
+        // resolve to the same key and the same authenticated ledger.
+        let store = OrchStore::open(&link).unwrap();
+        store
+            .append_audit(&entry("through-the-link", "accepted"))
+            .unwrap();
+        let before = store.audit_status().global_last_seq;
+        drop(store);
+
+        let store = OrchStore::open(&real).expect("the real path must find the same key");
+        assert!(store.audit_status().global_last_seq >= before);
+        store.verify_audit().unwrap();
+        assert!(real.join("audit.key").is_file());
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            2,
+            "exactly one store tree plus its symlink"
+        );
+    }
+}

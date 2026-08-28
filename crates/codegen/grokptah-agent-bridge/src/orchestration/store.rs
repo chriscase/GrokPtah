@@ -186,7 +186,15 @@ impl OrchStore {
     ///
     /// Uses the default local-file audit key custody and no rollback witness.
     pub fn open(root: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let custody = AuditKeyCustody::local_file_for(root.as_ref());
+        // Canonicalize before deriving the key location. `open_with_audit`
+        // canonicalizes the root, so deriving custody from the raw path would
+        // put the key somewhere else for a relative or symlinked root — and a
+        // key the next open cannot find is a manifest MAC mismatch, not a
+        // recoverable miss.
+        let root = root.as_ref();
+        fs::create_dir_all(root)?;
+        let root = dunce::canonicalize(root)?;
+        let custody = AuditKeyCustody::local_file_for(&root);
         Self::open_with_audit(root, custody, None)
     }
 
