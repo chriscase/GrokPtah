@@ -715,6 +715,27 @@ impl PhysicalSendPermit {
         Ok(())
     }
 
+    /// Settle from an actual successful provider response without retaining
+    /// its body. The digest is only an audit proof that this adapter consumed
+    /// the response; it is not a fabricated provider result.
+    pub fn settle_http_response(
+        &mut self,
+        status_code: u16,
+        response_bytes: &[u8],
+    ) -> Result<(), AttemptError> {
+        if !(200..=299).contains(&status_code) {
+            return Err(AttemptError::InvalidProviderEffect);
+        }
+        let effect_id = format!(
+            "http-response-{}",
+            hex(&Sha256::digest(response_bytes))
+        );
+        self.settle(ProviderSettlement::new(
+            self.provider_request_id.clone(),
+            effect_id,
+        )?)
+    }
+
     pub fn semantic_rejection(&mut self, status_code: u16) -> Result<(), AttemptError> {
         self.attempt.store.transition(
             self.attempt.attempt_id(),

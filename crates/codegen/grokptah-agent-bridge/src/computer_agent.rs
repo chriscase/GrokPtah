@@ -13,7 +13,9 @@ use crate::computer_use::{
     ComputerAction, ComputerObservation, ComputerUseLimits, SemanticAction, SimulatorBackend,
 };
 use crate::gateway_config::{CapabilitySource, ComputerUseTier};
-use crate::host_helpers::{call_xai_agent_step, resolve_model_target, AgentStep, AgentToolCall};
+use crate::host_helpers::{
+    call_xai_agent_step, resolve_model_target, AgentStep, AgentToolCall, ProviderAttemptContext,
+};
 use crate::types::EffortLevel;
 
 const QUALIFICATION_TOOL: &str = "ptah_computer_qualification_action";
@@ -117,6 +119,7 @@ pub(crate) async fn qualify_semantic_model(
     model: &str,
     effort: EffortLevel,
     cancel: &CancellationToken,
+    provider_attempt: &ProviderAttemptContext,
 ) -> Result<()> {
     let simulator = SimulatorBackend::new();
     let target = SimulatorBackend::demo_target();
@@ -146,6 +149,7 @@ pub(crate) async fn qualify_semantic_model(
             &qualification_tools(),
             true,
             cancel,
+            provider_attempt,
             |_| {},
             |_| {},
         )
@@ -195,6 +199,7 @@ pub(crate) async fn qualify_semantic_model(
             &qualification_tools(),
             true,
             cancel,
+            provider_attempt,
             |_| {},
             |_| {},
         )
@@ -215,6 +220,7 @@ pub(crate) async fn propose_semantic_action(
     objective: &str,
     observation: &ComputerObservation,
     cancel: &CancellationToken,
+    provider_attempt: &ProviderAttemptContext,
 ) -> Result<ComputerAgentProposal> {
     validate_objective(objective)?;
     observation.validate(&ComputerUseLimits::ceiling())?;
@@ -238,6 +244,7 @@ pub(crate) async fn propose_semantic_action(
             &proposal_tools(),
             true,
             cancel,
+            provider_attempt,
             |_| {},
             |_| {},
         )
