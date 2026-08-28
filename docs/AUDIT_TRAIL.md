@@ -2,7 +2,11 @@
 
 `crates/codegen/grokptah-agent-bridge/src/audit/` implements the durable,
 append-only, tamper-evident audit authority used by long-running agents and
-embeddable consumers (#443).
+embeddable consumers (#443), and `OrchStore` writes through it (#462).
+
+**The shipped orchestration store uses v2.** There is no second ledger and no
+dual write: the retired v1 files are read-only inputs that were imported into
+the leading generations and are never opened for writing again.
 
 This document describes the format, the crash-cut contract, and — just as
 importantly — the limits it does **not** close.
@@ -23,6 +27,22 @@ current file onto it. Three consequences follow:
 Entries carry no sequence and no MAC, so truncation, reordering, deletion and
 wholesale substitution are all undetectable. A dropped entry sets an in-memory
 error that dies with the process.
+
+## Where it lives
+
+```
+<orchestration-root>/audit/
+  audit.jsonl            retired v1 bytes, read-only after the cutover
+  audit.jsonl.1          retired v1 bytes, read-only after the cutover
+  audit.key              installation key for the default local-file custody (0600)
+  v2/                    the authority (layout below)
+```
+
+`OrchStore::open` resolves key custody, opens the ledger, imports any v1 bytes
+on first use, and refuses to start if the audit cannot be authenticated. A
+store whose audit is poisoned does not open: that is the fail-closed direction
+and it is deliberate, because an orchestration host that cannot record what it
+did should not do anything.
 
 ## Layout
 
@@ -93,6 +113,52 @@ rename is the only commit point.
 
 Nothing is ranked by mtime, file size, or highest sequence number: the manifest
 is the sole authority for which generation is active.
+
+## Producer wiring
+
+Producers keep their existing call shape. `orchestration/audit_bridge.rs` is the
+one place that translates `AuditEntry` into an authenticated record, and it is
+where the v1 ledger's privacy defects are closed:
+
+| v1 field | v2 record | Why |
+| --- | --- | --- |
+| `tool` | `op` | already a closed set |
+| `outcome` | `outcome` | mapped to `accepted`/`rejected`/`uncertain`; anything unrecognised becomes **uncertain**, never `accepted` |
+| `error_code` | `reason` + `code` | `reason` is the closed vocabulary; `code` keeps the exact string, constrained to `[a-z0-9_]{1,64}` so it cannot carry a path or a secret |
+| `workspace` | `scope` | a real filesystem path becomes an opaque keyed digest |
+| `request_id` | `request` | keyed digest |
+| `session_id` | `actor` | keyed digest |
+| `intent_id` | `producer` | keyed digest of the durable intent identity |
+| `detail` | *(dropped)* | free text; on the rejected path it carried `OrchError::message`, which can contain paths and IO strings. It still reaches the local process log |
+
+### Producer intent identity
+
+`AuditEntry::intent_id` carries the identity of the durable lifecycle an entry
+belongs to; when absent it falls back to the request id and then the session id,
+so sites that already carry a request id need no change. An `Intent`-phase entry
+opens that identity and only an `Outcome` carrying **the same** identity closes
+it. An intent with no identity is tracked under its own sequence and can only be
+closed by recovery, as uncertain — which is the honest outcome for an intent
+nothing ever answered.
+
+The anchor tracks up to `MAX_TRACKED_INTENTS` (256) open identities. Beyond that
+the entries are still recorded and only the correlation set is bounded; the
+anchor says so with `intentTrackingOverflowed`.
+
+## Key custody
+
+`AuditKeyCustody` covers the three deployment modes, and every one of them fails
+closed rather than degrading to an unauthenticated ledger:
+
+| Mode | Custody | Absent or unsafe material |
+| --- | --- | --- |
+| Packaged desktop | `Provided` (keychain bytes passed in by the shell) | store refuses to open |
+| Headless service | `Environment { var }`, 64 hex characters | store refuses to open |
+| External consumer | `Provided` (caller's own bytes) | store refuses to open |
+| Default / tests | `LocalFile`, created on first use at mode `0600` | unsafe owner, mode, or link count refuses to open |
+
+Errors carry only a stable code (`key_unavailable`, `manifest_mac_mismatch`).
+No key path and no key bytes appear in any error, receipt, or health field.
 
 ## Single-writer discipline
 
@@ -188,5 +254,16 @@ are read-only inputs and are never moved or truncated, so nothing can be lost.
 - **Interrupted intents are closed in aggregate.** Recovery states the exact
   number of intents left open and marks the outcome uncertain. Per-intent
   correlation needs producer-supplied intent ids and is not implemented here.
-- **Not yet wired in.** `orchestration/store.rs` still uses the v1 ledger. The
-  integration is a separate, behaviour-changing change.
+- **A poisoned audit blocks startup.** `OrchStore::open` fails when the ledger
+  cannot be authenticated. There is no automatic destructive repair: the
+  operator exports and inspects, and any decision to move past a poisoned
+  ledger is theirs and is itself recorded. This is an availability cost taken
+  deliberately.
+- **Free-text `detail` is no longer durable.** `(op, outcome, code, reason)`
+  identifies every event; the human message stays in the local process log.
+- **Computer Use keeps its own bounded per-run ring** in
+  `computer_use/types.rs`. It does not write to this ledger, and wiring it is
+  out of scope here.
+- **Host lifecycle (#455) is untouched.** The same-home reuse test exercises the
+  `OrchStore` lock through the production lifecycle only; the host `InstanceLock`
+  seam is a separate dependency and nothing here masks it.

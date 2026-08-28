@@ -38,6 +38,10 @@ pub struct AuditEntryInput {
     pub phase: EntryPhase,
     pub outcome: EntryOutcome,
     pub reason: Option<EntryReason>,
+    /// Producer code; sanitized to `[a-z0-9_]{1,64}` on the way in.
+    pub code: Option<String>,
+    /// Stable producer intent identity, hashed into an opaque digest.
+    pub producer: Option<String>,
     pub actor: Option<String>,
     pub request: Option<String>,
     pub scope: Option<String>,
@@ -53,6 +57,8 @@ impl AuditEntryInput {
             phase,
             outcome,
             reason: None,
+            code: None,
+            producer: None,
             actor: None,
             request: None,
             scope: None,
@@ -64,6 +70,18 @@ impl AuditEntryInput {
 
     pub fn with_reason(mut self, reason: EntryReason) -> Self {
         self.reason = Some(reason);
+        self
+    }
+
+    pub fn with_code(mut self, code: impl Into<String>) -> Self {
+        self.code = Some(code.into());
+        self
+    }
+
+    /// Attach the stable identity of the intent this entry belongs to, so an
+    /// intent and its later outcome correlate across restarts.
+    pub fn with_producer(mut self, producer: impl Into<String>) -> Self {
+        self.producer = Some(producer.into());
         self
     }
 
@@ -143,7 +161,8 @@ struct LiveTail {
     last_seq: u64,
     last_tag: String,
     journal_bytes: u64,
-    open_intents: u64,
+    open_intent_ids: Vec<String>,
+    intent_tracking_overflowed: bool,
 }
 
 struct Inner {
@@ -171,7 +190,7 @@ impl std::fmt::Debug for AuditLedger {
             .field("root", &self.root)
             .field("activeGeneration", &guard.manifest.active_generation_id)
             .field("lastSeq", &guard.live.last_seq)
-            .field("openIntents", &guard.live.open_intents)
+            .field("openIntents", &guard.live.open_intent_ids.len())
             .field("poisoned", &guard.poisoned)
             .finish()
     }
@@ -244,7 +263,8 @@ impl AuditLedger {
                     last_seq: 0,
                     last_tag: String::new(),
                     journal_bytes: 0,
-                    open_intents: 0,
+                    open_intent_ids: Vec::new(),
+                    intent_tracking_overflowed: false,
                 },
                 manifest,
                 poisoned: None,
@@ -409,7 +429,8 @@ impl AuditLedger {
             live.last_seq,
             &live.last_tag,
             live.journal_bytes,
-            live.open_intents,
+            live.open_intent_ids.clone(),
+            live.intent_tracking_overflowed,
         )
     }
 
@@ -421,7 +442,8 @@ impl AuditLedger {
         last_seq: u64,
         last_tag: &str,
         journal_bytes: u64,
-        open_intents: u64,
+        open_intent_ids: Vec<String>,
+        intent_tracking_overflowed: bool,
     ) -> AuditResult<()> {
         let mut anchor = Anchor {
             schema: ANCHOR_SCHEMA.to_string(),
@@ -430,7 +452,8 @@ impl AuditLedger {
             last_seq,
             last_tag: last_tag.to_string(),
             journal_bytes,
-            open_intents,
+            open_intent_ids,
+            intent_tracking_overflowed,
             updated_at: Utc::now(),
             mac: String::new(),
         };
@@ -483,7 +506,8 @@ impl AuditLedger {
                 last_seq,
                 &final_tag,
                 legacy.bytes.len() as u64,
-                0,
+                Vec::new(),
+                false,
             )?;
             files::fsync_dir(&dir)?;
             generations.push(GenerationDescriptor {
@@ -526,7 +550,8 @@ impl AuditLedger {
             next_first_seq.saturating_sub(1),
             &chain_base,
             0,
-            0,
+            Vec::new(),
+            false,
         )?;
         files::fsync_dir(&dir)?;
         generations.push(GenerationDescriptor {
@@ -792,7 +817,8 @@ impl AuditLedger {
             last_seq: scan.last_seq,
             last_tag: scan.last_tag,
             journal_bytes: scan.complete_len,
-            open_intents: anchor.open_intents,
+            open_intent_ids: anchor.open_intent_ids.clone(),
+            intent_tracking_overflowed: anchor.intent_tracking_overflowed,
         };
         if adopted > 0 || guard.recovery.torn_tail.is_some() {
             let live = guard.live.clone();
@@ -817,7 +843,7 @@ impl AuditLedger {
     /// Append the honest records recovery owes the journal: torn-tail evidence,
     /// unjournaled dropped entries, and uncertain outcomes for open intents.
     fn close_recovery_evidence(&self) -> AuditResult<()> {
-        let (torn, open_intents, ungapped) = {
+        let (torn, open_intent_ids, ungapped) = {
             let guard = self.inner.lock();
             let ungapped: Vec<GapRecord> = guard
                 .recovery
@@ -828,7 +854,7 @@ impl AuditLedger {
                 .collect();
             (
                 guard.recovery.torn_tail.clone(),
-                guard.live.open_intents,
+                guard.live.open_intent_ids.clone(),
                 ungapped,
             )
         };
@@ -864,10 +890,12 @@ impl AuditLedger {
             self.mark_gaps_journaled()?;
         }
 
-        if open_intents > 0 {
-            // Never fabricate success and never auto-redispatch: the count of
-            // interrupted intents is stated exactly, the outcome is uncertain.
-            self.append_internal(
+        // Close each interrupted intent under its own producer identity, so an
+        // intent recorded before a crash and its uncertain outcome after one
+        // correlate exactly. Never fabricate success, never auto-redispatch.
+        let closed = open_intent_ids.len() as u64;
+        for digest in open_intent_ids {
+            self.append_with_producer_digest(
                 AuditEntryInput::new(
                     "audit.recovery",
                     EntryPhase::Outcome,
@@ -878,12 +906,15 @@ impl AuditLedger {
                     bytes: 0,
                     sha256: String::new(),
                     at_offset: 0,
-                    lost_entries: open_intents,
+                    lost_entries: 1,
                 }),
+                Some(digest),
             )?;
+        }
+        if closed > 0 {
             let mut guard = self.inner.lock();
-            guard.live.open_intents = 0;
-            guard.recovery.closed_intents = open_intents;
+            guard.live.open_intent_ids.clear();
+            guard.recovery.closed_intents = closed;
             let live = guard.live.clone();
             drop(guard);
             self.write_anchor(&live)?;
@@ -1045,6 +1076,20 @@ impl AuditLedger {
         entry: AuditEntryInput,
         recovery: Option<RecoveryEvidence>,
     ) -> AuditResult<u64> {
+        self.append_with_producer_digest(entry, recovery, None)
+    }
+
+    /// Append with an already-hashed producer digest.
+    ///
+    /// Recovery re-emits outcomes for intents whose raw identity it never saw —
+    /// only the digest recorded in the anchor — so it must pass that digest
+    /// straight through instead of hashing it a second time.
+    fn append_with_producer_digest(
+        &self,
+        entry: AuditEntryInput,
+        recovery: Option<RecoveryEvidence>,
+        producer_digest: Option<String>,
+    ) -> AuditResult<u64> {
         let mut guard = self.inner.lock();
         if let Some(reason) = guard.poisoned {
             return Err(AuditError::Poisoned(reason));
@@ -1068,6 +1113,13 @@ impl AuditLedger {
             phase: entry.phase,
             outcome: entry.outcome,
             reason: entry.reason,
+            code: entry.code.as_deref().map(sanitize_code),
+            producer: producer_digest.or_else(|| {
+                entry
+                    .producer
+                    .as_deref()
+                    .map(|v| self.keys.opaque_digest(v))
+            }),
             actor: entry.actor.as_deref().map(|v| self.keys.opaque_digest(v)),
             request: entry.request.as_deref().map(|v| self.keys.opaque_digest(v)),
             scope: entry.scope.as_deref().map(|v| self.keys.opaque_digest(v)),
@@ -1102,10 +1154,39 @@ impl AuditLedger {
         guard.live.last_seq = record.seq;
         guard.live.last_tag = record.tag.clone();
         guard.live.journal_bytes = guard.live.journal_bytes.saturating_add(written);
-        guard.live.open_intents = match record.phase {
-            EntryPhase::Intent => guard.live.open_intents.saturating_add(1),
-            EntryPhase::Outcome => guard.live.open_intents.saturating_sub(1),
-        };
+        // An intent is closed by *its own* outcome. A bare counter let any
+        // later outcome — a shutdown record, say — close an unrelated intent.
+        // An intent with no producer identity can never be paired by a
+        // matching outcome, so it is tracked under its own sequence and stays
+        // open until recovery closes it as uncertain. That is the honest
+        // outcome for an intent nothing ever answered.
+        let tracked = record
+            .producer
+            .clone()
+            .unwrap_or_else(|| format!("seq:{}", record.seq));
+        {
+            let digest = tracked.as_str();
+            match record.phase {
+                EntryPhase::Intent => {
+                    if guard.live.open_intent_ids.iter().all(|id| id != digest) {
+                        if guard.live.open_intent_ids.len() < MAX_TRACKED_INTENTS {
+                            guard.live.open_intent_ids.push(digest.to_string());
+                        } else {
+                            // The entry is still recorded; only correlation is
+                            // bounded, and the bound is stated in the anchor.
+                            guard.live.intent_tracking_overflowed = true;
+                        }
+                    }
+                }
+                EntryPhase::Outcome => {
+                    // Only a producer-identified outcome closes an intent: an
+                    // anonymous outcome must not close somebody else's.
+                    if record.producer.is_some() {
+                        guard.live.open_intent_ids.retain(|id| id != digest);
+                    }
+                }
+            }
+        }
         let live = guard.live.clone();
         if let Err(error) = self.write_anchor(&live) {
             guard.poisoned = Some(PoisonReason::PartialPersistence);
@@ -1164,7 +1245,7 @@ impl AuditLedger {
             if let Some(poison) = guard.poisoned {
                 return Err(AuditError::Poisoned(poison));
             }
-            if guard.live.open_intents != 0 {
+            if !guard.live.open_intent_ids.is_empty() {
                 return Err(AuditError::Refused(RefuseReason::OpenIntentsPresent));
             }
         }
@@ -1217,7 +1298,8 @@ impl AuditLedger {
             last_seq: scan.last_seq,
             last_tag: scan.last_tag.clone(),
             journal_bytes: 0,
-            open_intents: 0,
+            open_intent_ids: Vec::new(),
+            intent_tracking_overflowed: false,
         };
         self.write_anchor(&next_live)?;
         files::fsync_dir(&next_dir)?;
@@ -1356,7 +1438,7 @@ impl AuditLedger {
             global_last_seq: guard.live.last_seq,
             generations: guard.manifest.generations.len(),
             tombstones: guard.manifest.tombstones.len(),
-            open_intents: guard.live.open_intents,
+            open_intents: guard.live.open_intent_ids.len() as u64,
             journal_bytes: guard.live.journal_bytes,
             poisoned: guard.poisoned,
             witness_state: guard.witness_state,
@@ -1375,7 +1457,7 @@ impl AuditLedger {
     }
 
     pub(crate) fn open_intents(&self) -> u64 {
-        self.inner.lock().live.open_intents
+        self.inner.lock().live.open_intent_ids.len() as u64
     }
 
     pub(crate) fn is_poisoned(&self) -> Option<PoisonReason> {

@@ -1249,6 +1249,19 @@ fn default_receipt_status() -> String {
     "complete".into()
 }
 
+/// Whether an entry opens a durable intent or closes one.
+///
+/// Existing producers record outcomes; `Intent` is used where a durable
+/// lifecycle has a real boundary (#462), so a crash between the two recovers as
+/// `uncertain` instead of as silence.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditPhase {
+    Intent,
+    #[default]
+    Outcome,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuditEntry {
@@ -1259,7 +1272,15 @@ pub struct AuditEntry {
     pub workspace: Option<String>,
     pub outcome: String,
     pub error_code: Option<String>,
+    /// Local diagnostic text. Never written to the durable v2 record: on the
+    /// rejected path this carries `OrchError::message`, which can contain
+    /// filesystem paths and IO strings.
     pub detail: String,
+    /// Stable identity of the durable intent this entry belongs to.
+    #[serde(default)]
+    pub intent_id: Option<String>,
+    #[serde(default)]
+    pub phase: AuditPhase,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

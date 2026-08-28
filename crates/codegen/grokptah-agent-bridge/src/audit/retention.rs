@@ -128,6 +128,7 @@ impl AuditLedger {
                 EntryOutcome::Accepted,
             )
             .with_reason(EntryReason::RetentionIntent)
+            .with_producer(&descriptor.generation_id)
             .with_scope(&descriptor.generation_id),
         )?;
 
@@ -192,6 +193,7 @@ impl AuditLedger {
                 EntryOutcome::Accepted,
             )
             .with_reason(EntryReason::RetentionOutcome)
+            .with_producer(&descriptor.generation_id)
             .with_scope(&descriptor.generation_id),
         )?;
 

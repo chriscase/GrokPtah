@@ -5,7 +5,7 @@
 //! `crates/codegen/grokptah-agent-bridge/Cargo.lock` and `--locked` checks stay
 //! reproducible offline.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -230,4 +230,70 @@ fn write_private_key(path: &Path, material: &[u8; 32]) -> AuditResult<()> {
     file.sync_all()
         .map_err(|error| AuditError::Io(format!("audit key sync: {error}")))?;
     Ok(())
+}
+
+/// Where the installation key comes from, per deployment mode (#462).
+///
+/// Every variant fails closed rather than silently degrading to an
+/// unauthenticated ledger: an audit trail nobody can verify is worse than one
+/// that refuses to open, because only the second is honest about it.
+#[derive(Debug, Clone)]
+pub enum AuditKeyCustody {
+    /// Packaged desktop. The OS keychain holds the key; the caller supplies it
+    /// because `keyring` access belongs to the shell, not to this library.
+    /// Absent material fails closed.
+    Provided(Vec<u8>),
+    /// Headless service. 64 hex characters in the named environment variable.
+    /// Absent or malformed fails closed — a service that was configured for a
+    /// managed key must not quietly invent one.
+    Environment { var: String },
+    /// Local file, created on first use with mode `0600`. Used by the packaged
+    /// desktop's fallback and by tests. Unsafe ownership, mode, or link count
+    /// fails closed; it is never repaired.
+    LocalFile { path: PathBuf },
+}
+
+impl AuditKeyCustody {
+    /// Default for a store root: a private key file beside the ledger.
+    pub fn local_file_for(root: &Path) -> Self {
+        Self::LocalFile {
+            path: root.join("audit.key"),
+        }
+    }
+
+    /// Resolve to derived keys.
+    ///
+    /// Errors deliberately carry no path and no key bytes: the caller may
+    /// surface [`AuditError::code`] on a public health projection.
+    pub fn resolve(&self) -> AuditResult<AuditKeys> {
+        match self {
+            Self::Provided(material) => {
+                if material.len() < 16 {
+                    return Err(AuditError::Poisoned(PoisonReason::KeyUnavailable));
+                }
+                Ok(AuditKeys::derive(material))
+            }
+            Self::Environment { var } => {
+                let value = std::env::var(var)
+                    .map_err(|_| AuditError::Poisoned(PoisonReason::KeyUnavailable))?;
+                let trimmed = value.trim();
+                if trimmed.len() != 64 || !trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(AuditError::Poisoned(PoisonReason::KeyUnavailable));
+                }
+                Ok(AuditKeys::derive(&decode_hex(trimmed)))
+            }
+            Self::LocalFile { path } => AuditKeys::load_or_create_file(path),
+        }
+    }
+}
+
+fn decode_hex(text: &str) -> Vec<u8> {
+    text.as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let hi = (pair[0] as char).to_digit(16).unwrap_or(0) as u8;
+            let lo = (pair[1] as char).to_digit(16).unwrap_or(0) as u8;
+            (hi << 4) | lo
+        })
+        .collect()
 }

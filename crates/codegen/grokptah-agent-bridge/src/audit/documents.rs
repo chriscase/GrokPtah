@@ -87,13 +87,42 @@ pub enum EntryReason {
     RetentionIntent,
     RetentionOutcome,
     LegacyImported,
+    /// Legacy v1 bytes changed after the v2 cutover: an older binary wrote to
+    /// the retired ledger. Recorded, never repaired.
+    LegacyWrittenAfterCutover,
+    HostShutdown,
     Unauthenticated,
     ForbiddenScope,
+    WorkspaceMismatch,
+    SessionBusy,
     StaleRevision,
+    CursorExpired,
     CapacityExhausted,
+    Timeout,
     InvalidRequest,
+    Unsupported,
     Conflict,
     Internal,
+}
+
+/// Maximum length of a producer code.
+pub const MAX_CODE_BYTES: usize = 64;
+
+/// Constrain a producer code to `[a-z0-9_]{1,64}`.
+///
+/// Anything else is replaced rather than truncated: a truncated path is still
+/// a path fragment, whereas `invalid_code` carries no caller-controlled bytes.
+pub fn sanitize_code(code: &str) -> String {
+    let acceptable = !code.is_empty()
+        && code.len() <= MAX_CODE_BYTES
+        && code
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+    if acceptable {
+        code.to_string()
+    } else {
+        "invalid_code".to_string()
+    }
 }
 
 /// Byte-exact evidence for a recovery that changed the journal.
@@ -125,6 +154,18 @@ pub struct AuditRecord {
     pub outcome: EntryOutcome,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub reason: Option<EntryReason>,
+    /// Producer error/outcome code, constrained to `[a-z0-9_]{1,64}`.
+    ///
+    /// A closed *shape* rather than a closed vocabulary: it cannot contain a
+    /// path separator, whitespace, a quote, or a dot, so it provably cannot
+    /// carry a filesystem path, a prompt, or a credential. Producers whose
+    /// codes are already an enum (`OrchErrorCode`) round-trip exactly.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub code: Option<String>,
+    /// Keyed digest of the stable producer intent identity, so an intent and
+    /// its outcome can be correlated across restarts without exposing the id.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub producer: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub actor: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -286,10 +327,22 @@ pub struct Anchor {
     pub last_seq: u64,
     pub last_tag: String,
     pub journal_bytes: u64,
-    pub open_intents: u64,
+    /// Producer digests of intents recorded without a matching outcome.
+    ///
+    /// A set rather than a counter: an intent must be closed by *its own*
+    /// outcome. A bare counter let any later outcome — a shutdown record, say —
+    /// silently close an unrelated intent.
+    pub open_intent_ids: Vec<String>,
+    /// `true` once more than [`MAX_TRACKED_INTENTS`] intents were open at once.
+    /// The entries are still recorded; only the correlation set is bounded, and
+    /// the limit is stated rather than hidden.
+    pub intent_tracking_overflowed: bool,
     pub updated_at: DateTime<Utc>,
     pub mac: String,
 }
+
+/// Upper bound on simultaneously tracked open intents.
+pub const MAX_TRACKED_INTENTS: usize = 256;
 
 impl Anchor {
     pub(crate) fn seal(&mut self, keys: &AuditKeys) -> AuditResult<()> {

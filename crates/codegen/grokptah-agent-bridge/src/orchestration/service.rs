@@ -1545,6 +1545,39 @@ impl OrchestrationService {
         error_code: Option<&str>,
         detail: &str,
     ) {
+        self.audit_intent(
+            tool,
+            request_id,
+            session_id,
+            workspace,
+            outcome,
+            error_code,
+            detail,
+            None,
+            AuditPhase::Outcome,
+        );
+    }
+
+    /// Audit with an explicit durable intent identity and phase.
+    ///
+    /// Sites that own a durable lifecycle (run finalization, managed
+    /// execution, cancellation, shutdown) pass the id the lifecycle is keyed
+    /// by, so an intent recorded before a crash and its outcome recorded after
+    /// one correlate (#462). Sites without such an id fall back to the request
+    /// id, which is already the producer's intent identity.
+    #[allow(clippy::too_many_arguments)]
+    fn audit_intent(
+        &self,
+        tool: &str,
+        request_id: Option<&str>,
+        session_id: Option<Uuid>,
+        workspace: Option<&str>,
+        outcome: &str,
+        error_code: Option<&str>,
+        detail: &str,
+        intent_id: Option<&str>,
+        phase: AuditPhase,
+    ) {
         let entry = AuditEntry {
             ts: Utc::now(),
             tool: self.bus.redact_text(tool, 100),
@@ -1554,6 +1587,8 @@ impl OrchestrationService {
             outcome: self.bus.redact_text(outcome, 100),
             error_code: error_code.map(|value| self.bus.redact_text(value, 100)),
             detail: self.bus.redact_text(detail, 500),
+            intent_id: intent_id.map(|value| value.to_string()),
+            phase,
         };
         if let Err(e) = self.store.enqueue_audit(entry) {
             eprintln!("[grokptah] orchestration audit persistence failed: {e}");
@@ -4938,10 +4973,10 @@ impl OrchestrationService {
             .bus
             .last_persistence_error()
             .map(|error| self.bus.redact_text(&error, 500));
-        let audit_error = self
-            .store
-            .last_audit_error()
-            .map(|error| self.bus.redact_text(&error, 500));
+        // Stable code only. `last_audit_error` is deliberately code-shaped so
+        // no path or key material can reach this public projection (#462).
+        let audit_error = self.store.last_audit_error();
+        let audit = self.store.audit_status();
         let run_error = self
             .store
             .last_run_error()
@@ -4983,6 +5018,19 @@ impl OrchestrationService {
                 "laggedLiveEvents": self.bus.lagged_event_count(),
                 "eventJournalPersistenceError": event_error,
                 "auditPersistenceError": audit_error,
+                "audit": {
+                    "generations": audit.generations,
+                    "tombstones": audit.tombstones,
+                    "importedGenerations": audit.imported_generations,
+                    "globalFirstSeq": audit.global_first_seq,
+                    "globalLastSeq": audit.global_last_seq,
+                    "openIntents": audit.open_intents,
+                    "witnessState": audit.witness_state.as_str(),
+                    "poisonReason": audit.poisoned.map(|reason| reason.as_str()),
+                    "recoveredDroppedEntries": audit.recovery.durable_gaps.len(),
+                    "recoveredTornTail": audit.recovery.torn_tail.is_some(),
+                    "closedInterruptedIntents": audit.recovery.closed_intents,
+                },
                 "runPersistenceError": run_error,
                 "workloadSupervisorError": workload_supervisor_error,
                 "workloadSupervisor": workload_supervisor,
@@ -7265,6 +7313,8 @@ impl OrchestrationService {
                                     outcome: "promotion_conflict".into(),
                                     error_code: Some("promotion_conflict".into()),
                                     detail: bus.redact_text(&error.to_string(), 500),
+                                    intent_id: Some(rid.clone()),
+                                    phase: AuditPhase::Outcome,
                                 });
                             }
                         }
@@ -7274,12 +7324,14 @@ impl OrchestrationService {
                 }
             }
             let mut attempt = 0u32;
+            let mut recorded_retry_intent = false;
             loop {
                 let error = match store.persist_finalization(&candidate) {
                     Ok(_) => break,
                     Err(error) => error.to_string(),
                 };
                 if attempt == 0 {
+                    recorded_retry_intent = true;
                     let entry = AuditEntry {
                         ts: Utc::now(),
                         tool: "run_finalization".into(),
@@ -7289,6 +7341,8 @@ impl OrchestrationService {
                         outcome: "retrying".into(),
                         error_code: Some("run_persistence_failed".into()),
                         detail: bus.redact_text(&error, 500),
+                        intent_id: Some(rid.clone()),
+                        phase: AuditPhase::Intent,
                     };
                     let _ = store.enqueue_audit(entry);
                     eprintln!("[grokptah] run {rid} finalization retrying: {error}");
@@ -7297,6 +7351,22 @@ impl OrchestrationService {
                 let shift = attempt.min(6);
                 let backoff_ms = 25u64.saturating_mul(1u64 << shift).min(1_000);
                 tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            }
+            if recorded_retry_intent {
+                // Pair the retry intent so it does not stay open. Without this
+                // the durable record would say the finalization never resolved.
+                let _ = store.enqueue_audit(AuditEntry {
+                    ts: Utc::now(),
+                    tool: "run_finalization".into(),
+                    request_id: None,
+                    session_id: Some(session_id),
+                    workspace: None,
+                    outcome: "accepted".into(),
+                    error_code: None,
+                    detail: String::new(),
+                    intent_id: Some(rid.clone()),
+                    phase: AuditPhase::Outcome,
+                });
             }
 
             // Service-owned Build Runs use the same durable Agent identity as
