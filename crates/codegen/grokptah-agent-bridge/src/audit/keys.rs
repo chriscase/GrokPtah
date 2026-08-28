@@ -360,7 +360,10 @@ fn read_private_key(path: &Path) -> AuditResult<Vec<u8>> {
     Ok(material)
 }
 
-fn write_private_key(path: &Path, material: &[u8; 32]) -> AuditResult<()> {
+fn write_private_key(path: &Path, material: &[u8]) -> AuditResult<()> {
+    if material.len() != 32 {
+        return Err(AuditError::Poisoned(PoisonReason::KeyUnavailable));
+    }
     use std::io::Write;
 
     if let Some(parent) = path.parent() {

@@ -232,10 +232,9 @@ impl AuditLedger {
         keys: Vec<Arc<AuditKeys>>,
         options: AuditLedgerOptions,
     ) -> AuditResult<Self> {
-        let initial_key = keys
-            .first()
-            .cloned()
-            .ok_or(AuditError::Poisoned(PoisonReason::KeyUnavailable))?;
+        if keys.is_empty() {
+            return Err(AuditError::Poisoned(PoisonReason::KeyUnavailable));
+        }
         let witness: Arc<dyn AuditWitness> = options
             .witness
             .unwrap_or_else(|| Arc::new(UnwitnessedBoundary));
@@ -252,11 +251,11 @@ impl AuditLedger {
         let mut recovery = RecoverySummary::default();
         let (selected_key, manifest) = {
             let mut last_error = None;
-            let mut selected = None;
+            let mut selected: Option<(Arc<AuditKeys>, Option<Manifest>)> = None;
             for key in &keys {
                 match Self::load_manifest(&root, key) {
                     Ok(Some(manifest)) => {
-                        selected = Some((Arc::clone(key), manifest));
+                        selected = Some((Arc::clone(key), Some(manifest)));
                         break;
                     }
                     Ok(None) => {
