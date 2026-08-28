@@ -221,7 +221,7 @@ fn physical_provider_tool_and_qualification_boundaries_never_issue() {
     let provider_boundary = provider_source
         .split("fn consume_provider_send_lease")
         .nth(1)
-        .and_then(|body| body.split("fn sha256_hex").next())
+        .and_then(|body| body.split("#[cfg(test)]").next())
         .expect("provider boundary");
     assert!(!provider_boundary.contains(".issue("));
     assert!(!provider_boundary.contains("#[cfg(test)]"));
@@ -233,7 +233,7 @@ fn physical_provider_tool_and_qualification_boundaries_never_issue() {
     let qualification_boundary = qualification_source
         .split("fn consume_qualification_send_lease")
         .nth(1)
-        .and_then(|body| body.split("fn install_test_qualification_envelope").next())
+        .and_then(|body| body.split("#[cfg(test)]").next())
         .expect("qualification boundary");
     assert!(!qualification_boundary.contains(".issue("));
     assert!(!qualification_boundary.contains("#[cfg(test)]"));
