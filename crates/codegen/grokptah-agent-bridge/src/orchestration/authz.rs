@@ -393,6 +393,29 @@ impl AuthRegistry {
         self.persist()
     }
 
+    /// Replace a credential identity rather than rotating its secret. A
+    /// replacement receives a fresh principal and incarnation even when its
+    /// textual credential id is unchanged.
+    pub(crate) fn replace_credential(
+        &mut self,
+        credential_id: &str,
+        owner_id: &str,
+    ) -> Result<(), OrchError> {
+        validate_owner(owner_id)?;
+        let Some(index) = self
+            .state
+            .credentials
+            .iter()
+            .position(|record| record.credential_id == credential_id)
+        else {
+            return Err(stale_authority());
+        };
+        let generation = self.allocate_generation()?;
+        self.state.credentials[index] =
+            new_stored_credential(credential_id, owner_id, generation);
+        self.persist()
+    }
+
     pub(crate) fn change_owner(&mut self, owner_id: &str) -> Result<(), OrchError> {
         validate_owner(owner_id)?;
         if self.state.credentials.is_empty() {
@@ -505,24 +528,6 @@ impl AuthRegistry {
                 self.state.bindings.insert(resource.to_string(), digest);
                 self.persist()
             }
-        }
-    }
-
-    pub(crate) fn require_resource_binding(
-        &self,
-        resource: &str,
-        auth: &AuthContext,
-    ) -> Result<(), OrchError> {
-        self.require_current(auth)?;
-        if self
-            .state
-            .bindings
-            .get(resource)
-            .is_some_and(|binding| binding == &auth.binding_digest())
-        {
-            Ok(())
-        } else {
-            Err(stale_authority())
         }
     }
 
