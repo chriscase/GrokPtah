@@ -44,13 +44,13 @@ use crate::memory::{MemoryAccess, MemoryAddress, MemoryScope};
 use crate::orchestration::{
     apply_run_aggregate, assemble_continuation_context, prompt_preview, AgentAuthorityPolicy,
     AgentContinuationPlan, AgentLaneAssociation, AgentRecord, AgentResumePlan, AgentSpec,
-    AgentState, ContinuationCheckpoint, ContinuationMemoryFact, ContinuationMemoryInput,
-    ContinuationMemoryScope, ContinuationReason, ContinuationReasonCode, ContinuationRunInput,
-    ContinuationTestInput, MissedRunPolicy, OrchStore, PromotionState, RoutineConcurrencyPolicy,
-    RoutineLifecycle, RoutineRecord, RoutineRetryPolicy, RoutineSnapshot, RoutineTrigger,
-    RunAggregates, RunBounds, RunExecution, RunExecutionMode, RunPurpose, RunRecord, RunState,
-    RunStopCause, WorkAttemptView, WorkItem, WorkItemSnapshot, WorkPolicy, WorkTemplate,
-    DEFAULT_AGENT_TOOL_IDS,
+    AgentState, AuthContext, ContinuationCheckpoint, ContinuationMemoryFact,
+    ContinuationMemoryInput, ContinuationMemoryScope, ContinuationReason, ContinuationReasonCode,
+    ContinuationRunInput, ContinuationTestInput, MissedRunPolicy, OrchStore, PromotionState,
+    RoutineConcurrencyPolicy, RoutineLifecycle, RoutineRecord, RoutineRetryPolicy, RoutineSnapshot,
+    RoutineTrigger, RunAggregates, RunBounds, RunExecution, RunExecutionMode, RunPurpose,
+    RunRecord, RunState, RunStopCause, WorkAttemptView, WorkItem, WorkItemSnapshot, WorkPolicy,
+    WorkTemplate, DEFAULT_AGENT_TOOL_IDS,
 };
 use crate::permission::{
     evaluate_tool_gate, PendingPermissionView, PermissionDecision, PermissionRequest, ToolGate,
@@ -90,6 +90,49 @@ pub struct WorkspaceUiState {
     pub sessions: Vec<SessionSummary>,
     #[serde(default)]
     pub lanes: Vec<LaneSummary>,
+}
+
+/// Provider receipt produced by a provider-specific reconciliation adapter.
+/// Its fields are private so callers cannot fabricate provider truth.
+#[derive(Clone)]
+pub struct VerifiedProviderReceipt {
+    provider_request_id: String,
+    provider_effect_id: Option<String>,
+}
+
+impl std::fmt::Debug for VerifiedProviderReceipt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("VerifiedProviderReceipt([redacted])")
+    }
+}
+
+impl VerifiedProviderReceipt {
+    pub(crate) fn from_provider_response(
+        provider_request_id: impl Into<String>,
+        provider_effect_id: Option<impl Into<String>>,
+    ) -> Result<Self> {
+        let provider_request_id = provider_request_id.into();
+        let provider_effect_id = provider_effect_id.map(Into::into);
+        if provider_request_id.trim().is_empty()
+            || provider_effect_id
+                .as_deref()
+                .is_some_and(|effect_id| effect_id.trim().is_empty())
+        {
+            bail!("provider receipt identity is incomplete");
+        }
+        Ok(Self {
+            provider_request_id,
+            provider_effect_id,
+        })
+    }
+
+    pub(crate) fn provider_request_id(&self) -> &str {
+        &self.provider_request_id
+    }
+
+    pub(crate) fn provider_effect_id(&self) -> Option<&str> {
+        self.provider_effect_id.as_deref()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -5905,6 +5948,61 @@ impl AgentHostHandle {
             &provider_attempt,
         )
         .await
+    }
+
+    /// Consume a receipt produced by the provider-specific reconciliation
+    /// adapter. The receipt is opaque outside this crate and its request id
+    /// must match the durable attempt before an operator grant is recorded.
+    pub fn reconcile_provider_attempt(
+        &self,
+        session_id: Uuid,
+        attempt_id: &str,
+        operator: &AuthContext,
+        receipt: VerifiedProviderReceipt,
+    ) -> Result<()> {
+        let provider_attempt = self.provider_attempt_context(session_id)?;
+        let store = self
+            .provider_attempt_store
+            .clone()
+            .ok_or_else(|| anyhow!("provider-attempt ledger is unavailable"))?;
+        let attempt = store
+            .load(attempt_id)
+            .map_err(|error| anyhow!("load provider attempt: {error}"))?
+            .ok_or_else(|| anyhow!("provider attempt does not exist"))?;
+        if attempt
+            .provider_request_id()
+            .map_err(|error| anyhow!("read provider request identity: {error}"))?
+            != receipt.provider_request_id()
+        {
+            bail!("provider reconciliation request identity does not match attempt");
+        }
+        if let Some(agent_id) = self
+            .inner
+            .lock()
+            .sessions
+            .get(&session_id)
+            .and_then(|session| session.agent_id.as_deref())
+        {
+            let agent = self
+                .orchestration_store
+                .lock()
+                .clone()
+                .and_then(|store| store.load_agent(agent_id).ok().flatten())
+                .ok_or_else(|| anyhow!("canonical Agent authority is unavailable"))?;
+            if agent.owner_principal_id.as_deref() != Some(operator.owner_id.as_str()) {
+                bail!("operator is not the Agent owner");
+            }
+        }
+        let root = self
+            .runtime_home
+            .orchestration_root()
+            .join("provider-attempts");
+        crate::host_authority::write_verified_reconciliation(
+            &root, attempt_id, operator, &receipt,
+        )?;
+        provider_attempt
+            .reconcile_from_host_ledger(&attempt)
+            .map_err(|error| anyhow!("reconcile provider attempt: {error}"))
     }
 
     pub fn delete_provider_profile(&self, provider_id: &str) -> Result<()> {

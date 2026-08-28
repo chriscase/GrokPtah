@@ -145,14 +145,9 @@ pub(crate) fn write_verified_reconciliation(
     attempt_root: &Path,
     attempt_id: &str,
     operator: &AuthContext,
-    provider_request_id: &str,
-    provider_effect_id: Option<&str>,
+    receipt: &crate::host::VerifiedProviderReceipt,
 ) -> Result<()> {
-    if operator.token_id.trim().is_empty()
-        || attempt_id.trim().is_empty()
-        || provider_request_id.trim().is_empty()
-        || provider_effect_id.is_some_and(|effect| effect.trim().is_empty())
-    {
+    if operator.token_id.trim().is_empty() || attempt_id.trim().is_empty() {
         return Err(anyhow!("verified reconciliation fields are incomplete"));
     }
     let directory = attempt_root.join("reconciliation");
@@ -164,8 +159,8 @@ pub(crate) fn write_verified_reconciliation(
         .open(&temporary)?;
     let record = VerifiedReconciliation {
         operator_id: operator.token_id.clone(),
-        provider_request_id: provider_request_id.into(),
-        provider_effect_id: provider_effect_id.map(str::to_owned),
+        provider_request_id: receipt.provider_request_id().into(),
+        provider_effect_id: receipt.provider_effect_id().map(str::to_owned),
     };
     file.write_all(&serde_json::to_vec(&record)?)?;
     file.sync_all()?;

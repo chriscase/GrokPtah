@@ -717,6 +717,9 @@ async fn completion(
     let mut transient_retries = 0_u32;
     let request_bytes =
         serde_json::to_vec(&body).context("serialize provider qualification request")?;
+    let provider_attempt = provider_attempt
+        .fork_effect_lease()
+        .map_err(|error| anyhow!("allocate qualification effect lease: {error}"))?;
     let mut permit = Some(
         provider_attempt
             .begin("provider-qualification", &request_bytes, true)
@@ -836,6 +839,9 @@ async fn streaming_probe(
         "stream": true
     });
     let request_bytes = serde_json::to_vec(&body).context("serialize provider stream request")?;
+    let provider_attempt = provider_attempt
+        .fork_effect_lease()
+        .map_err(|error| anyhow!("allocate qualification stream effect lease: {error}"))?;
     let mut permit = Some(
         provider_attempt
             .begin("provider-qualification-stream", &request_bytes, true)
