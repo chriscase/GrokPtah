@@ -1988,7 +1988,6 @@ impl OrchestrationService {
     async fn begin_idempotency(
         &self,
         tool: &str,
-        auth: &AuthContext,
         request_id: &str,
         payload_hash: &str,
         session_id: Uuid,
