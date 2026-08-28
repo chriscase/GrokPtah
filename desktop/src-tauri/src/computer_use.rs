@@ -1,5 +1,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use base64::Engine;
 use chrono::{Duration, Utc};
@@ -18,6 +20,20 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 const MAX_LIVE_NATIVE_SERVICES: usize = 32;
+
+#[cfg(test)]
+static DESKTOP_HOME_LOCK: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+struct DesktopHomeGuard;
+
+#[cfg(test)]
+impl Drop for DesktopHomeGuard {
+    fn drop(&mut self) {
+        grokptah_agent_bridge::set_grokptah_home_override(None);
+        DESKTOP_HOME_LOCK.store(false, Ordering::Release);
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1074,17 +1090,6 @@ mod tests {
     /// Host fixture with its persist directories bound under the disposable
     /// fixture directory. The process-global home override is serialized and
     /// restored so parallel tests never touch the real user home.
-    static DESKTOP_HOME_LOCK: AtomicBool = AtomicBool::new(false);
-
-    struct DesktopHomeGuard;
-
-    impl Drop for DesktopHomeGuard {
-        fn drop(&mut self) {
-            grokptah_agent_bridge::set_grokptah_home_override(None);
-            DESKTOP_HOME_LOCK.store(false, Ordering::Release);
-        }
-    }
-
     fn test_host(dir: &std::path::Path) -> (AgentHostHandle, Uuid, DesktopHomeGuard) {
         while DESKTOP_HOME_LOCK
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
