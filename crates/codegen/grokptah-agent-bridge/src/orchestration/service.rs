@@ -967,6 +967,17 @@ impl OrchestrationService {
         let (Some(attempt_id), Some(run_id)) = (&intent.attempt_id, &intent.run_id) else {
             return;
         };
+        let auth =
+            match self.native_delegation(intent.session_id, &intent.workspace, &intent.agent_id) {
+                Ok(auth) => auth,
+                Err(_) => return,
+            };
+        if self
+            .ensure_resource_binding(&auth, format!("delegation:{}", intent.intent_id))
+            .is_err()
+        {
+            return;
+        }
         let secret = self.config.lock().bearer_token.clone();
         let Ok(Some(attempt)) = self.store.load_work_attempt(attempt_id) else {
             return;
@@ -985,7 +996,7 @@ impl OrchestrationService {
             let _ = self.store.send_message(
                 super::message::WorkMessage::new(
                     MessageKind::Question,
-                    "native-executor",
+                    auth.actor_handle().as_str(),
                     Some(intent.agent_id.clone()),
                     None,
                     intent.session_id,
@@ -1002,7 +1013,7 @@ impl OrchestrationService {
                 .unwrap_or_else(|_| {
                     super::message::WorkMessage::new(
                         MessageKind::Informational,
-                        "native-executor",
+                        auth.actor_handle().as_str(),
                         None,
                         None,
                         intent.session_id,
@@ -1023,6 +1034,28 @@ impl OrchestrationService {
         let intents = self.store.list_managed_intents()?;
         let secret = self.config.lock().bearer_token.clone();
         for intent in intents {
+            let auth = match self.native_delegation(
+                intent.session_id,
+                &intent.workspace,
+                &intent.agent_id,
+            ) {
+                Ok(auth) => auth,
+                Err(_) => {
+                    let _ = self
+                        .store
+                        .abandon_managed_intent(&intent.intent_id, Utc::now());
+                    continue;
+                }
+            };
+            if self
+                .ensure_resource_binding(&auth, format!("delegation:{}", intent.intent_id))
+                .is_err()
+            {
+                let _ = self
+                    .store
+                    .abandon_managed_intent(&intent.intent_id, Utc::now());
+                continue;
+            }
             match intent.state {
                 ManagedIntentState::Resolving => {
                     self.recover_resolving_permission(&intent).await?;
@@ -1294,6 +1327,7 @@ impl OrchestrationService {
             &messages,
             None,
         )?;
+        let auth = self.native_delegation(work.session_id, &work.workspace, &agent.agent_id)?;
         let mut intent = ManagedExecutionIntent {
             schema_version: MANAGED_EXECUTION_SCHEMA_VERSION,
             intent_id: Uuid::new_v4().to_string(),
@@ -1315,6 +1349,7 @@ impl OrchestrationService {
             created_at: now,
             updated_at: now,
         };
+        self.ensure_resource_binding(&auth, format!("delegation:{}", intent.intent_id))?;
         self.store.save_managed_intent(&intent)?;
         let claim = match self.store.claim_work_with_lease_secret(
             &work.work_id,
@@ -1333,20 +1368,8 @@ impl OrchestrationService {
         intent.attempt_id = Some(claim.attempt.attempt_id.clone());
         intent.updated_at = Utc::now();
         self.store.save_managed_intent(&intent)?;
-        // Native execution is not a magic shared credential. It receives a
-        // host-issued capability derived from the current primary authority,
-        // narrowed to this exact Lane/workspace/Agent.
-        let credentials = self.auth_credentials.lock().clone();
-        let auth = {
-            let registry = self.auth_registry.lock();
-            let primary = registry.primary_context(&credentials)?;
-            registry.issue_delegation(
-                &primary,
-                work.session_id,
-                PathBuf::from(&work.workspace),
-                Some(agent.agent_id.clone()),
-            )?
-        };
+        // Native execution is a host-issued capability narrowed to this
+        // exact Lane/workspace/Agent. It is never a shared magic identity.
         let bounds_json = serde_json::to_value(&bounds)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         let submitted = match self
@@ -1543,6 +1566,23 @@ impl OrchestrationService {
         self.agent_owner_id.lock().clone()
     }
 
+    fn native_delegation(
+        &self,
+        session_id: Uuid,
+        workspace: &str,
+        agent_id: &str,
+    ) -> Result<AuthContext, OrchError> {
+        let credentials = self.auth_credentials.lock().clone();
+        let registry = self.auth_registry.lock();
+        let primary = registry.primary_context(&credentials)?;
+        registry.issue_delegation(
+            &primary,
+            session_id,
+            PathBuf::from(workspace),
+            Some(agent_id.to_string()),
+        )
+    }
+
     pub fn set_allowlist(&self, allowlist: WorkspaceAllowlist) {
         self.config.lock().allowlist = allowlist;
     }
@@ -1654,6 +1694,26 @@ impl OrchestrationService {
 
     fn ensure_work_binding(&self, auth: &AuthContext, work_id: &str) -> Result<(), OrchError> {
         self.ensure_resource_binding(auth, format!("work:{work_id}"))
+    }
+
+    fn ensure_routine_binding(
+        &self,
+        auth: &AuthContext,
+        routine_id: &str,
+    ) -> Result<(), OrchError> {
+        self.ensure_resource_binding(auth, format!("routine:{routine_id}"))
+    }
+
+    fn ensure_plan_binding(&self, auth: &AuthContext, plan_id: &str) -> Result<(), OrchError> {
+        self.ensure_resource_binding(auth, format!("manager-plan:{plan_id}"))
+    }
+
+    fn ensure_message_binding(
+        &self,
+        auth: &AuthContext,
+        message_id: &str,
+    ) -> Result<(), OrchError> {
+        self.ensure_resource_binding(auth, format!("message:{message_id}"))
     }
 
     fn ensure_queue_binding(
@@ -2445,6 +2505,7 @@ impl OrchestrationService {
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
         let claimed = self.authorize_work_read_scope(session_id, workspace)?;
+        self.ensure_session_binding(auth, session_id)?;
         let plans = self
             .store
             .list_manager_plans()?
@@ -2453,6 +2514,9 @@ impl OrchestrationService {
                 plan.session_id == session_id && plan.workspace == claimed.display().to_string()
             })
             .collect::<Vec<_>>();
+        for plan in &plans {
+            self.ensure_plan_binding(auth, &plan.plan_id)?;
+        }
         Ok(json!({ "plans": plans }))
     }
 
@@ -2464,6 +2528,8 @@ impl OrchestrationService {
         plan_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
+        self.ensure_session_binding(auth, session_id)?;
+        self.ensure_plan_binding(auth, plan_id)?;
         let (_, plan) = self.load_manager_plan_scoped(session_id, workspace, plan_id)?;
         Ok(json!({ "plan": plan }))
     }
@@ -2525,6 +2591,7 @@ impl OrchestrationService {
         autonomous: bool,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
+        self.ensure_session_binding(auth, session_id)?;
         let payload = json!({
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),
@@ -2643,6 +2710,24 @@ impl OrchestrationService {
                 error,
             ));
         }
+        if let Err(error) = self.ensure_plan_binding(auth, &plan.plan_id) {
+            return Err(self.fail_claim(
+                &mut lease,
+                Some(plan.plan_id.clone()),
+                session_id,
+                &claimed,
+                error,
+            ));
+        }
+        if let Err(error) = self.ensure_work_binding(auth, &root.work_id) {
+            return Err(self.fail_claim(
+                &mut lease,
+                Some(plan.plan_id.clone()),
+                session_id,
+                &claimed,
+                error,
+            ));
+        }
         if let Err(error) = self.store.save_manager_plan_with_root(&plan, &root) {
             return Err(self.fail_claim(
                 &mut lease,
@@ -2679,6 +2764,8 @@ impl OrchestrationService {
         expected_revision: Option<u64>,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
+        self.ensure_session_binding(auth, session_id)?;
+        self.ensure_plan_binding(auth, plan_id)?;
         let payload = json!({
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),
@@ -2748,6 +2835,17 @@ impl OrchestrationService {
                 ));
             }
         };
+        for work in &created {
+            if let Err(error) = self.ensure_work_binding(auth, &work.work_id) {
+                return Err(self.fail_claim(
+                    &mut lease,
+                    Some(plan_id.into()),
+                    session_id,
+                    &claimed,
+                    error,
+                ));
+            }
+        }
         if let Err(error) =
             self.store
                 .save_manager_plan_with_work_cas(&plan, durable_revision, &created)
@@ -2786,6 +2884,8 @@ impl OrchestrationService {
         expected_revision: Option<u64>,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
+        self.ensure_session_binding(auth, session_id)?;
+        self.ensure_plan_binding(auth, plan_id)?;
         let payload = json!({
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),
@@ -2860,6 +2960,17 @@ impl OrchestrationService {
         } else {
             Vec::new()
         };
+        for work in &created {
+            if let Err(error) = self.ensure_work_binding(auth, &work.work_id) {
+                return Err(self.fail_claim(
+                    &mut lease,
+                    Some(plan_id.into()),
+                    session_id,
+                    &claimed,
+                    error,
+                ));
+            }
+        }
         let notifications = plan.pending_notifications(&work_items);
         let mut delivered = Vec::with_capacity(notifications.len());
         let mut message_values = Vec::with_capacity(notifications.len());
@@ -2942,6 +3053,8 @@ impl OrchestrationService {
         expected_revision: Option<u64>,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
+        self.ensure_session_binding(auth, session_id)?;
+        self.ensure_plan_binding(auth, plan_id)?;
         let payload = json!({
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),
@@ -3211,6 +3324,11 @@ impl OrchestrationService {
                 return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
             }
         };
+        if let Err(error) =
+            self.ensure_resource_binding(auth, format!("attempt:{}", claim.attempt.attempt_id))
+        {
+            return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+        }
         let response = json!({
             "work": claim.work,
             "attempt": WorkAttemptView::from(&claim.attempt),
@@ -3253,6 +3371,7 @@ impl OrchestrationService {
             session_id,
             workspace,
             work_id,
+            attempt_id,
             json!({"attemptId": attempt_id, "leaseToken": lease_token, "leaseMs": lease_ms}),
             |store| store.renew_work_lease(work_id, attempt_id, lease_token, lease_ms),
         )
@@ -3268,6 +3387,7 @@ impl OrchestrationService {
         session_id: Uuid,
         workspace: &Path,
         work_id: &str,
+        attempt_id: &str,
         details: serde_json::Value,
         operation: F,
     ) -> Result<serde_json::Value, OrchError>
@@ -3277,6 +3397,9 @@ impl OrchestrationService {
         self.require_current_auth(auth)?;
         self.ensure_session_binding(auth, session_id)?;
         self.ensure_work_binding(auth, work_id)?;
+        if !attempt_id.is_empty() {
+            self.ensure_resource_binding(auth, format!("attempt:{attempt_id}"))?;
+        }
         let payload = json!({
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),
@@ -3345,6 +3468,7 @@ impl OrchestrationService {
                 session_id,
                 workspace,
                 work_id,
+                attempt_id,
                 json!({"attemptId": attempt_id, "leaseToken": lease_token, "runId": run_id}),
                 |store| store.link_work_run(work_id, attempt_id, lease_token, &run.run_id),
             )
@@ -3398,6 +3522,9 @@ impl OrchestrationService {
         if let Err(error) = self.load_work_scoped(session_id, &claimed, work_id, false) {
             return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
         }
+        if let Err(error) = self.ensure_resource_binding(auth, format!("attempt:{attempt_id}")) {
+            return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+        }
         let effect_scope = format!("work:{work_id}:progress-mutation");
         let mut effect_lease = self.mint_effect_lease(auth, effect_scope.clone())?;
         self.consume_effect_lease(auth, &mut effect_lease, &effect_scope)?;
@@ -3447,6 +3574,7 @@ impl OrchestrationService {
             session_id,
             workspace,
             work_id,
+            attempt_id,
             json!({"attemptId": attempt_id, "leaseToken": lease_token, "reason": reason}),
             |store| store.release_work(work_id, attempt_id, lease_token, &reason),
         )
@@ -3473,6 +3601,7 @@ impl OrchestrationService {
             session_id,
             workspace,
             work_id,
+            attempt_id,
             json!({"attemptId": attempt_id, "leaseToken": lease_token, "result": result}),
             |store| store.complete_work(work_id, attempt_id, lease_token, result),
         )
@@ -3499,6 +3628,7 @@ impl OrchestrationService {
             session_id,
             workspace,
             work_id,
+            attempt_id,
             json!({"attemptId": attempt_id, "leaseToken": lease_token, "result": result}),
             |store| store.fail_work(work_id, attempt_id, lease_token, result),
         )
@@ -3514,6 +3644,7 @@ impl OrchestrationService {
         session_id: Uuid,
         workspace: &Path,
         work_id: &str,
+        attempt_id: &str,
         details: serde_json::Value,
         operation: F,
     ) -> Result<serde_json::Value, OrchError>
@@ -3523,6 +3654,9 @@ impl OrchestrationService {
         self.require_current_auth(auth)?;
         self.ensure_session_binding(auth, session_id)?;
         self.ensure_work_binding(auth, work_id)?;
+        if !attempt_id.is_empty() {
+            self.ensure_resource_binding(auth, format!("attempt:{attempt_id}"))?;
+        }
         let payload = json!({
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),
@@ -3548,6 +3682,9 @@ impl OrchestrationService {
                 return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
             }
         };
+        if attempt_id.is_empty() {
+            self.ensure_resource_binding(auth, format!("attempt:{}", attempt.attempt_id))?;
+        }
         let response = json!({"work": item, "attempt": WorkAttemptView::from(&attempt)});
         lease
             .complete(Some(work_id.to_string()), response.clone())
@@ -4210,6 +4347,9 @@ impl OrchestrationService {
                 message.thread_id = parent.thread_id.or(Some(parent.message_id.clone()));
             }
         }
+        if let Err(error) = self.ensure_message_binding(auth, &message.message_id) {
+            return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+        }
         let message = match self.store.send_message(message) {
             Ok(message) => message,
             Err(error) => {
@@ -4241,6 +4381,8 @@ impl OrchestrationService {
         message_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
+        self.ensure_session_binding(auth, session_id)?;
+        self.ensure_message_binding(auth, message_id)?;
         let payload = json!({
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),
@@ -4305,6 +4447,9 @@ impl OrchestrationService {
             None,
             100,
         )?;
+        for message in &page.messages {
+            self.ensure_message_binding(auth, &message.message_id)?;
+        }
         Ok(json!(page))
     }
 
@@ -4326,6 +4471,9 @@ impl OrchestrationService {
             Some(actor_id),
             100,
         )?;
+        for message in &page.messages {
+            self.ensure_message_binding(auth, &message.message_id)?;
+        }
         Ok(json!(page))
     }
 
@@ -4379,6 +4527,7 @@ impl OrchestrationService {
             session_id,
             workspace,
             work_id,
+            "",
             json!({
                 "reviewerId": auth.actor_handle(),
                 "note": note,
@@ -4461,6 +4610,7 @@ impl OrchestrationService {
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
         let claimed = self.authorize_routine_read_scope(session_id, workspace)?;
+        self.ensure_session_binding(auth, session_id)?;
         let routines = self
             .store
             .list_routines()?
@@ -4470,6 +4620,9 @@ impl OrchestrationService {
                     && routine.workspace == claimed.display().to_string()
             })
             .collect::<Vec<_>>();
+        for routine in &routines {
+            self.ensure_routine_binding(auth, &routine.routine_id)?;
+        }
         Ok(json!({ "routines": routines }))
     }
 
@@ -4481,6 +4634,8 @@ impl OrchestrationService {
         routine_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
+        self.ensure_session_binding(auth, session_id)?;
+        self.ensure_routine_binding(auth, routine_id)?;
         let (routine, _) = self.load_routine_scoped(session_id, workspace, routine_id, true)?;
         self.routine_value(routine, true)
     }
@@ -4493,6 +4648,8 @@ impl OrchestrationService {
         routine_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
+        self.ensure_session_binding(auth, session_id)?;
+        self.ensure_routine_binding(auth, routine_id)?;
         let (routine, _) = self.load_routine_scoped(session_id, workspace, routine_id, true)?;
         let activations = self.store.list_activations(&routine.routine_id, 128)?;
         Ok(json!({
@@ -4602,6 +4759,9 @@ impl OrchestrationService {
                 return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
             }
         };
+        if let Err(error) = self.ensure_routine_binding(auth, &routine.routine_id) {
+            return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+        }
         if let Err(error) = self.store.save_routine(&routine) {
             return Err(self.fail_claim(
                 &mut lease,
@@ -4650,6 +4810,8 @@ impl OrchestrationService {
         tool: &str,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
+        self.ensure_session_binding(auth, session_id)?;
+        self.ensure_routine_binding(auth, routine_id)?;
         let payload = json!({
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),
@@ -4713,6 +4875,9 @@ impl OrchestrationService {
         routine_id: &str,
         payload: Option<serde_json::Value>,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_auth(auth)?;
+        self.ensure_session_binding(auth, session_id)?;
+        self.ensure_routine_binding(auth, routine_id)?;
         let tool = "ptah_fire_routine";
         let idempotency_payload = json!({
             "sessionId": session_id,
