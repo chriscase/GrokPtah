@@ -1,0 +1,115 @@
+name: Computer Use Isolated Visual
+
+# `grokptah-isolated-visual` declares its own `[workspace]`, so neither the
+# grokptah-agent-bridge nor the desktop `cargo test` runs its tests: the bridge
+# path-depends on it, which compiles the library but never its 23 unit tests or
+# the 5-case adversarial matrix. This workflow is the only place they execute.
+#
+# It also gates every committed Cargo.lock. Adding this crate to the bridge
+# invalidated the lockfiles of the other workspaces that already depended on the
+# bridge (grokptah-service, evals/certification-lab), and nothing in CI compiled
+# those workspaces, so the stale lockfiles were invisible until someone ran
+# `--locked` themselves.
+#
+# Scope: simulator and source evidence only. Nothing here launches
+# Virtualization.framework, boots a guest, renders a frame, injects input, or
+# qualifies macOS/VM/hardware behavior. The qualification step asserts that CI
+# stays fail-closed and never claims otherwise.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "crates/codegen/grokptah-isolated-visual/**"
+      - "crates/codegen/grokptah-agent-bridge/Cargo.toml"
+      - "evals/computer-use-isolated-visual-demo/**"
+      - "scripts/check-committed-lockfiles.sh"
+      - "scripts/check-adversarial-reachable.sh"
+      - "**/Cargo.lock"
+      - ".github/workflows/computer-use-isolated-visual.yml"
+  pull_request:
+    paths:
+      - "crates/codegen/grokptah-isolated-visual/**"
+      - "crates/codegen/grokptah-agent-bridge/Cargo.toml"
+      - "evals/computer-use-isolated-visual-demo/**"
+      - "scripts/check-committed-lockfiles.sh"
+      - "scripts/check-adversarial-reachable.sh"
+      - "**/Cargo.lock"
+      - ".github/workflows/computer-use-isolated-visual.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cu-isolated-visual-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  isolated-visual:
+    # Portable crate: the host/guest model is simulated and the preflight is
+    # fail-closed off macOS, so ubuntu is sufficient and deterministic. Real VM
+    # qualification is out of scope here and is not implied by a green run.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: never
+    defaults:
+      run:
+        working-directory: crates/codegen/grokptah-isolated-visual
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: "1.92.0"
+          components: rustfmt, clippy
+
+      - name: Format and lint
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Adversarial + lifecycle tests
+        # Serial is required, not stylistic: the store takes advisory file locks
+        # and store_lock_rejects_a_second_open asserts a second open is refused,
+        # which is only meaningful when nothing else holds the lock concurrently.
+        run: cargo test --locked -- --test-threads=1
+
+      - name: Adversarial suites are reachable
+        working-directory: .
+        run: ./scripts/check-adversarial-reachable.sh
+
+      - name: Qualification stays fail-closed on CI
+        # The runner has no Virtualization.framework and no signed helper/image.
+        # A green job must therefore never report a launch or VM-eligible
+        # evidence; this step fails if the honesty markers ever regress.
+        run: |
+          cargo run --locked --bin grokptah-isolated-visual-qualify -- \
+            --out "$RUNNER_TEMP/isolated-visual-evidence.json"
+          python3 - "$RUNNER_TEMP/isolated-visual-evidence.json" <<'PY'
+          import json, sys
+          ev = json.loads(open(sys.argv[1]).read())
+          assert ev["virtualizationFrameworkLaunched"] is False, ev
+          assert ev["simulatorEvidenceIneligibleForVmQualification"] is True, ev
+          assert ev["sourceCompilationIneligibleForVmQualification"] is True, ev
+          assert ev["eligibility"] == "fail_closed", ev
+          assert ev["preflight"]["allowedToLaunch"] is False, ev
+          print("ok: CI evidence is simulator-only and fail-closed")
+          PY
+
+  lockfile-integrity:
+    # Every committed Cargo.lock must resolve from this exact tree. This is the
+    # gate that was missing when the bridge gained a new path dependency.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: "1.92.0"
+      - name: Every committed lockfile resolves under --locked
+        run: ./scripts/check-committed-lockfiles.sh
