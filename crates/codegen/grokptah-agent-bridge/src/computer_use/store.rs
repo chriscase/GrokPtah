@@ -24,7 +24,19 @@ pub struct ComputerStore {
     inner: Arc<ComputerStoreInner>,
 }
 
+impl ComputerStore {
+    pub(crate) fn lease(&self) -> crate::host_runtime::WriteLease {
+        self.inner.write_lease.lock().clone()
+    }
+
+    pub(crate) fn bind_lifecycle(&self, lifecycle: &Arc<crate::host_runtime::HostLifecycle>) {
+        self.inner.write_lease.lock().bind(lifecycle);
+    }
+}
+
 struct ComputerStoreInner {
+    /// Durable-write authority carried by every clone of this handle (#455).
+    write_lease: Mutex<crate::host_runtime::WriteLease>,
     root: PathBuf,
     _store_lock: fs::File,
     lock: Mutex<()>,
@@ -85,6 +97,7 @@ impl ComputerStore {
         })?;
         let store = Self {
             inner: Arc::new(ComputerStoreInner {
+                write_lease: Mutex::new(crate::host_runtime::WriteLease::for_store_root(&root)),
                 root,
                 _store_lock: store_lock,
                 lock: Mutex::new(()),
@@ -104,7 +117,7 @@ impl ComputerStore {
     pub(crate) fn save_run(&self, run: &ComputerRun) -> ComputerResult<()> {
         let _guard = self.inner.lock.lock();
         let path = self.run_path(&run.run_id)?;
-        atomic_write_json(&path, run).map_err(internal_error)
+        atomic_write_json(&self.lease(), &path, run).map_err(internal_error)
     }
 
     pub(crate) fn load_run(&self, run_id: &str) -> ComputerResult<Option<ComputerRun>> {
@@ -125,7 +138,7 @@ impl ComputerStore {
             return Ok(None);
         };
         update(&mut run)?;
-        atomic_write_json(&self.run_path(run_id)?, &run).map_err(internal_error)?;
+        atomic_write_json(&self.lease(), &self.run_path(run_id)?, &run).map_err(internal_error)?;
         Ok(Some(run))
     }
 
@@ -228,7 +241,7 @@ impl ComputerStore {
                 receipt.error = Some(error.clone());
             }
         }
-        atomic_write_json(&path, &receipt).map_err(internal_error)
+        atomic_write_json(&self.lease(), &path, &receipt).map_err(internal_error)
     }
 
     fn run_path(&self, run_id: &str) -> ComputerResult<PathBuf> {
@@ -294,7 +307,7 @@ impl ComputerStore {
                 None,
                 Some(ComputerErrorCode::Interrupted),
             );
-            atomic_write_json(&path, &run).map_err(internal_error)?;
+            atomic_write_json(&self.lease(), &path, &run).map_err(internal_error)?;
         }
         Ok(())
     }
@@ -312,7 +325,7 @@ impl ComputerStore {
                 ComputerErrorCode::UncertainOutcome,
                 "process stopped while the computer-use mutation was in flight; it will not be retried automatically",
             ));
-            atomic_write_json(&path, &receipt).map_err(internal_error)?;
+            atomic_write_json(&self.lease(), &path, &receipt).map_err(internal_error)?;
         }
         Ok(())
     }
@@ -321,6 +334,11 @@ impl ComputerStore {
         let _guard = self.inner.lock.lock();
         let now = Utc::now();
 
+        // Retention deletes durable evidence; hold authority for the pass.
+        let _write = self
+            .lease()
+            .begin("pruning the durable Computer Run ledger")
+            .map_err(internal_error)?;
         let mut runs = Vec::new();
         for path in json_paths(&self.inner.root.join("runs")).map_err(internal_error)? {
             let run = self.read_run_path(&path)?;
@@ -537,7 +555,13 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> anyhow::Result<T> {
     Ok(serde_json::from_slice(&fs::read(path)?)?)
 }
 
-fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
+/// Every durable effect in the Computer Run ledger funnels through here.
+fn atomic_write_json<T: Serialize>(
+    lease: &crate::host_runtime::WriteLease,
+    path: &Path,
+    value: &T,
+) -> anyhow::Result<()> {
+    let _write = lease.begin("writing the durable Computer Run ledger")?;
     let tmp = path.with_extension("json.tmp");
     let mut file = fs::File::create(&tmp)?;
     file.write_all(&serde_json::to_vec_pretty(value)?)?;

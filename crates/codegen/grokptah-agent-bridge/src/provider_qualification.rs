@@ -1441,7 +1441,8 @@ mod tests {
                 let target =
                     crate::host_helpers::resolve_model_target(&credentials, "grok-4.5").unwrap();
                 assert_eq!(target.capabilities.source, CapabilitySource::Measured);
-                let host = crate::host::AgentHost::create(crate::host::HostConfig::default());
+                let host = crate::host::AgentHost::create(crate::host::HostConfig::default())
+                    .expect("acquire the GrokPtah instance lock");
                 let projected = host
                     .models()
                     .into_iter()

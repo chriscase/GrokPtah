@@ -56,7 +56,8 @@ async fn native_executor_runs_assigned_work_without_an_external_worker() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host.start().unwrap();
     let lane = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(lane.id, workspace.path()).unwrap();
@@ -247,7 +248,8 @@ async fn approval_required_work_pauses_before_success() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host.start().unwrap();
     let lane = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(lane.id, workspace.path()).unwrap();
@@ -496,7 +498,8 @@ async fn boot_native(
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host.start().unwrap();
     let lane = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(lane.id, workspace.path()).unwrap();
@@ -854,7 +857,8 @@ async fn resolve_work_input_requires_parked_scope() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host.start().unwrap();
     let lane = host.session_new_kind(SessionKind::Build).unwrap();
     let other_lane = host.session_new_kind(SessionKind::Build).unwrap();
@@ -1110,7 +1114,8 @@ async fn resolve_work_input_uses_real_host_pending() {
     let host = AgentHost::create(HostConfig {
         always_approve: false,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host.start().unwrap();
     let lane = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(lane.id, workspace.path()).unwrap();
@@ -1356,7 +1361,8 @@ async fn native_skips_manual_retry_without_mutating() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host.start().unwrap();
     let lane = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(lane.id, workspace.path()).unwrap();

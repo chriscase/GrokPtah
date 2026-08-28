@@ -785,7 +785,8 @@ mod tests {
         let host = AgentHost::create(HostConfig {
             always_approve: true,
             ..HostConfig::default()
-        });
+        })
+        .expect("acquire the GrokPtah instance lock");
         let orch = OrchestrationService::new(
             host.clone(),
             host.event_bus(),

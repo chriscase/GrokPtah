@@ -1405,6 +1405,13 @@ mod tests {
         .unwrap();
         set_grokptah_home_override(Some(home));
 
+        // The migration is a durable rewrite of the shared gateway config, so
+        // it only persists under the authority of the runtime that owns this
+        // home — which is the production shape: credentials migrate inside a
+        // running desktop or service, never in a process with no owner (#455).
+        let runtime = crate::AgentHost::create(crate::HostConfig::default())
+            .expect("acquire the GrokPtah instance lock");
+
         let mut config = crate::gateway_config::load_for_update().unwrap();
         let profile = config.profile("legacy-corp").unwrap().clone();
         let error = expect_credential_error(migrate_legacy_provider_credential(
@@ -1440,6 +1447,7 @@ mod tests {
             .is_none()
         );
 
+        drop(runtime);
         set_grokptah_home_override(None);
     }
 

@@ -264,7 +264,8 @@ async fn run_one(
         // (CLI --max-turns) instead of the default 24-step ceiling (#187/#188).
         max_agent_rounds: Some(task.max_turns.max(1)),
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     let mut rx = match host.take_event_receiver() {
         Some(r) => r,
         None => {

@@ -16,7 +16,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use grokptah_agent_bridge::orchestration::{
-    AuthContext, OrchStore, OrchestrationConfig, OrchestrationService, RunBounds,
+    AuditEntry, AuthContext, OrchStore, OrchestrationConfig, OrchestrationService, RunBounds,
     WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
@@ -70,7 +70,8 @@ impl Lane {
         let runtime = AgentHost::create(HostConfig {
             always_approve: true,
             ..HostConfig::default()
-        });
+        })
+        .expect("acquire the GrokPtah instance lock");
         runtime.start().expect("start host");
         runtime.set_project_cwd(self.ws()).unwrap();
         let session = runtime.session_new_kind(SessionKind::Build).unwrap();
@@ -145,7 +146,8 @@ fn restart_same_home_now(lane: &Lane) -> HostRuntime {
     let replacement = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     replacement
         .start()
         .unwrap_or_else(|e| panic!("immediate same-home restart must succeed: {e:#}"));
@@ -648,18 +650,21 @@ async fn drop_with_a_running_writer_retains_the_lock_and_refuses_a_replacement()
 
     drop(runtime);
 
-    // Fail closed: the lock was kept because a writer was still live.
+    // Fail closed: the lock was kept because a writer was still live, so a
+    // replacement cannot even be constructed — it is refused before it can
+    // touch the keychain, the workspace, or any durable store.
     assert_eq!(stale.lifecycle_phase(), HostPhase::Closed);
     let refused = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
     });
+    let error = refused
+        .err()
+        .expect("dropping a runtime with a live writer must not hand the home to a replacement");
     assert!(
-        refused.start().is_err(),
-        "dropping a runtime with a live writer must not hand the home to a replacement"
+        format!("{error:#}").contains("single-instance lock"),
+        "unexpected refusal: {error:#}"
     );
-    assert!(!refused.holds_process_lock());
-    drop(refused);
 
     // The stale handle is still closed, so the writer cannot start new work.
     assert_every_durable_mutator_refuses(&stale, session_id, lane.ws());
@@ -726,18 +731,31 @@ async fn shutdown_hook_failures_are_reported_not_swallowed() {
         "{:?}",
         report.flush_errors
     );
-    // The durable-write seal still held, so the lock release itself was safe.
+    // The seal held, but a hook failed — so the durable state this process
+    // leaves behind is not known-good and the lock is deliberately retained.
+    // Refusing a replacement is safer than handing it a home whose teardown
+    // did not complete.
     assert!(report.durable_writes_sealed);
-    assert!(report.process_lock_released);
-    assert!(report.lock_file_present);
+    assert!(!report.process_lock_released);
+    assert!(report.process_lock_retained_for_safety);
+    assert!(report.process_lock_held_after);
+    assert!(report.lock_file_present, "the lock file is never deleted");
 
-    // Registration after shutdown is refused.
+    // Registration after shutdown is refused, so a hook can never be
+    // registered into a drain that has already happened.
     assert!(runtime
         .register_shutdown_hook("late", Box::new(|| Ok(())))
         .is_err());
 
-    let replacement = restart_same_home_now(&lane);
-    drop(replacement);
+    // And the retained lock really does refuse a replacement.
+    let refused = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    assert!(
+        refused.is_err(),
+        "a retained lock must refuse a replacement host"
+    );
 }
 
 /// Immediate same-home restart, repeatedly, each with real supervised work in
@@ -793,5 +811,367 @@ async fn dropped_runtime_closes_before_releasing_the_lock() {
 
     let replacement = restart_same_home_now(&lane);
     assert!(stale.start().is_err());
+    drop(replacement);
+}
+
+// ---------------------------------------------------------------------------
+// Adversarial authority tests required by the independent review packet.
+// ---------------------------------------------------------------------------
+
+/// A second **real process** holding the instance lock, with this process
+/// reaching the same home through a symlinked path.
+///
+/// The child is this same test binary re-executed into a holder test, so the
+/// check is genuinely two processes on every platform rather than depending on
+/// `flock(1)`, which macOS does not ship.
+#[test]
+fn a_second_process_holding_the_lock_refuses_this_one_through_a_path_alias() {
+    if std::env::var_os(LOCK_HOLDER_ENV).is_some() {
+        // We are the child; the holder test below does the work.
+        return;
+    }
+    let lane = Lane::new();
+    let home = lane.grokptah_home();
+    std::fs::create_dir_all(&home).unwrap();
+    let release = home.join("release-the-lock");
+
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "holds_the_instance_lock_until_released",
+            "--nocapture",
+            "--test-threads=1",
+            "--ignored",
+        ])
+        .env(LOCK_HOLDER_ENV, "1")
+        .env("GROKPTAH_HOME", &home)
+        .env("GROKPTAH_LOCK_RELEASE", &release)
+        .spawn()
+        .expect("re-exec this test binary as the lock holder");
+    let mut child = ChildGuard {
+        child,
+        release: release.clone(),
+    };
+
+    // Wait, bounded, for the child to actually own the home.
+    let lock_path = home.join(".instance.lock");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !grokptah_agent_bridge::instance_lock_is_held(&lock_path) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the child process never took the instance lock"
+        );
+        assert!(
+            child.child.try_wait().unwrap().is_none(),
+            "the child exited before taking the lock"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    // The same home through a symlink is the same home.
+    let alias = lane.home.path().join("alias");
+    std::os::unix::fs::symlink(lane.home.path(), &alias).unwrap();
+    set_grokptah_home_override(Some(alias.join(".grokptah")));
+
+    let refused = AgentHost::create(HostConfig::default());
+    assert!(
+        refused.is_err(),
+        "a home another process owns must be refused even through a path alias"
+    );
+
+    // A store on that aliased home is refused outright: opening one runs
+    // recovery and retention, which are durable effects, and registry absence
+    // is not authority when the OS lock says another process owns the home.
+    let store = OrchStore::open(alias.join(".grokptah").join("orchestration"));
+    let error = store
+        .err()
+        .expect("a store on a home another process owns must be refused");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("single-instance lock"),
+        "the refusal must name the lock that another process holds: {message}"
+    );
+
+    child.release();
+    set_grokptah_home_override(Some(home));
+}
+
+const LOCK_HOLDER_ENV: &str = "GROKPTAH_TEST_LOCK_HOLDER";
+
+struct ChildGuard {
+    child: std::process::Child,
+    release: std::path::PathBuf,
+}
+
+impl ChildGuard {
+    fn release(&mut self) {
+        let _ = std::fs::write(&self.release, b"go");
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for ChildGuard {
+    /// A panicking test must not leave a process holding a lock on a temp home
+    /// that is about to be deleted.
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.release, b"go");
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+    }
+}
+
+/// The child half of the two-process check. Ignored so it never runs on its
+/// own; the parent re-executes it with [`LOCK_HOLDER_ENV`] set.
+#[test]
+#[ignore = "child process of a_second_process_holding_the_lock_refuses_this_one_through_a_path_alias"]
+fn holds_the_instance_lock_until_released() {
+    let Some(release) = std::env::var_os("GROKPTAH_LOCK_RELEASE") else {
+        return;
+    };
+    let release = std::path::PathBuf::from(release);
+    let runtime = AgentHost::create(HostConfig::default())
+        .expect("the child must be able to take the lock first");
+    runtime.start().expect("start the holder");
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    while !release.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    drop(runtime);
+}
+
+/// One durable store effect, used to probe whether a handle still has
+/// authority. The audit ledger is the smallest real write the store performs.
+fn probe_store_write(store: &OrchStore, session_id: Uuid) -> anyhow::Result<()> {
+    store.append_audit(&AuditEntry {
+        ts: chrono::Utc::now(),
+        tool: "authority.probe".into(),
+        request_id: None,
+        session_id: Some(session_id),
+        workspace: None,
+        outcome: "accepted".into(),
+        error_code: None,
+        detail: String::new(),
+    })
+}
+
+/// A store handle cloned out of a runtime must fail closed with it, even
+/// though the clone is a perfectly valid `OrchStore` that never learned the
+/// runtime stopped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn a_cloned_store_fails_closed_with_the_runtime_that_opened_it() {
+    let lane = Lane::new();
+    let (runtime, session_id) = lane.boot();
+    let store = runtime
+        .ensure_orchestration_store()
+        .expect("a running host opens its ledger");
+    assert!(
+        probe_store_write(&store, session_id).is_ok(),
+        "a live runtime's store writes"
+    );
+    // The clone a supervisor or service handle would be holding.
+    let stale_clone = store.clone();
+
+    assert_clean_shutdown(&runtime.shutdown().await);
+
+    let refused = probe_store_write(&stale_clone, session_id);
+    let error = refused.expect_err("a cloned store must not outlive its runtime's authority");
+    assert!(
+        format!("{error:#}").contains("authority") || format!("{error:#}").contains("closed"),
+        "unexpected refusal: {error:#}"
+    );
+    drop(store);
+
+    // And it still refuses once a replacement owns the home.
+    let replacement = restart_same_home_now(&lane);
+    assert!(probe_store_write(&stale_clone, session_id).is_err());
+    drop(replacement);
+}
+
+/// A supervisor that was never attached to any runtime — an `OrchStore` opened
+/// directly, the shape a stray background service takes — must not write a home
+/// a runtime owns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn an_unattached_store_cannot_write_a_home_a_runtime_owns() {
+    let lane = Lane::new();
+    let (runtime, session_id) = lane.boot();
+
+    // Opened directly, never handed to the host — the shape a stray background
+    // supervisor takes. It binds to whichever runtime owns the home, so its
+    // writes are serialized against that runtime's seal rather than escaping it.
+    let unattached = OrchStore::open(lane.grokptah_home().join("orchestration-side")).unwrap();
+    assert!(
+        unattached.is_lease_bound(),
+        "a store opened on an owned home must bind to that runtime, not float free"
+    );
+    assert!(
+        probe_store_write(&unattached, session_id).is_ok(),
+        "while the owner is live its authority covers this handle"
+    );
+
+    assert_clean_shutdown(&runtime.shutdown().await);
+    assert!(
+        probe_store_write(&unattached, session_id).is_err(),
+        "an unattached supervisor must fail closed with the runtime that owned the home"
+    );
+
+    let replacement = restart_same_home_now(&lane);
+    assert!(
+        probe_store_write(&unattached, session_id).is_err(),
+        "and it must still refuse once a replacement owns the home"
+    );
+    drop(replacement);
+}
+
+/// A writer that starts *just* as shutdown begins: the seal must either wait
+/// for it or refuse it, never let it land after the lock is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::await_holding_lock)]
+async fn a_delayed_writer_either_completes_before_the_seal_or_is_refused() {
+    let lane = Lane::new();
+    let (runtime, session_id) = lane.boot();
+    let handle = runtime.handle();
+
+    let start = Arc::new(tokio::sync::Barrier::new(2));
+    let outcome = Arc::new(std::sync::Mutex::new(None::<bool>));
+    let writer_start = start.clone();
+    let writer_outcome = outcome.clone();
+    let writer = tokio::spawn(async move {
+        writer_start.wait().await;
+        // Racing the seal deliberately.
+        let wrote = handle
+            .session_rename(session_id, "written by the delayed writer".into())
+            .is_ok();
+        *writer_outcome.lock().unwrap() = Some(wrote);
+    });
+
+    start.wait().await;
+    let report = runtime.shutdown().await;
+    writer.await.unwrap();
+    let wrote = outcome.lock().unwrap().unwrap();
+
+    // Whichever way the race resolved, the invariant is the same: the lock is
+    // only released when nothing can still be writing.
+    if report.process_lock_released {
+        assert!(report.durable_writes_sealed);
+        assert_eq!(report.durable_writes_in_flight, 0);
+    } else {
+        assert!(report.process_lock_retained_for_safety);
+    }
+    assert!(report.lock_file_present);
+    // A write that succeeded must have landed before the seal, so the durable
+    // record is consistent either way.
+    let replacement = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    match replacement {
+        Ok(replacement) => {
+            replacement.start().unwrap();
+            let title = replacement.session_load(session_id).unwrap().title;
+            if wrote {
+                assert_eq!(title, "written by the delayed writer");
+            }
+        }
+        Err(error) => assert!(
+            !report.process_lock_released,
+            "a released lock must admit a replacement: {error:#}"
+        ),
+    }
+}
+
+/// A hook registered concurrently with shutdown is either drained and run, or
+/// refused — never accepted into a drain that already happened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::await_holding_lock)]
+async fn a_hook_registered_during_shutdown_is_never_silently_dropped() {
+    let lane = Lane::new();
+    let (runtime, _session_id) = lane.boot();
+    let runtime = Arc::new(runtime);
+    let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let registrar = runtime.clone();
+    let registrar_ran = ran.clone();
+    let registering = tokio::spawn(async move {
+        let mut accepted = 0usize;
+        for _ in 0..64 {
+            let counter = registrar_ran.clone();
+            if registrar
+                .register_shutdown_hook(
+                    "racing",
+                    Box::new(move || {
+                        counter.fetch_add(1, std::sync::atomic::Ordering::Release);
+                        Ok(())
+                    }),
+                )
+                .is_ok()
+            {
+                accepted += 1;
+            }
+            tokio::task::yield_now().await;
+        }
+        accepted
+    });
+
+    let report = runtime.shutdown().await;
+    let accepted = registering.await.unwrap();
+
+    assert_eq!(
+        report.hooks_run,
+        ran.load(std::sync::atomic::Ordering::Acquire),
+        "every hook the report counts must actually have run"
+    );
+    assert_eq!(
+        report.hooks_run, accepted,
+        "every accepted hook must be drained and run; none may be silently dropped"
+    );
+    assert!(
+        registrar_refuses_after(&runtime),
+        "registration must be refused once shutdown has drained"
+    );
+}
+
+fn registrar_refuses_after(runtime: &HostRuntime) -> bool {
+    runtime
+        .register_shutdown_hook("after", Box::new(|| Ok(())))
+        .is_err()
+}
+
+/// Headless construction on a home another runtime owns must fail before it
+/// reads credentials or touches any durable state.
+///
+/// The keychain read is the one that matters: it used to happen on the way past
+/// a failed lock acquisition.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn headless_construction_fails_before_reading_credentials_or_state() {
+    let lane = Lane::new();
+    let (runtime, _session_id) = lane.boot();
+
+    let home = lane.grokptah_home();
+    let chrome_before = std::fs::read(home.join("workspace.json")).ok();
+
+    let refused = AgentHost::create_with_runtime_home(
+        HostConfig::default(),
+        grokptah_agent_bridge::RuntimeHome::from_path(&home).unwrap(),
+    );
+    let error = refused.err().expect("a second host on one home is refused");
+    assert!(
+        format!("{error:#}").contains("single-instance lock"),
+        "the refusal must name the lock, not a downstream symptom: {error:#}"
+    );
+
+    // Nothing the refused construction would have done touched the home.
+    assert_eq!(
+        std::fs::read(home.join("workspace.json")).ok(),
+        chrome_before,
+        "a refused construction must not have rewritten durable state"
+    );
+
+    assert_clean_shutdown(&runtime.shutdown().await);
+    let replacement = restart_same_home_now(&lane);
     drop(replacement);
 }

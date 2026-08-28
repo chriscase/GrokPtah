@@ -3688,7 +3688,8 @@ mod tests {
         let host = AgentHost::create(HostConfig {
             always_approve: true,
             ..HostConfig::default()
-        });
+        })
+        .expect("acquire the GrokPtah instance lock");
         let bus = host.event_bus();
         let _gui = bus.subscribe();
         let store = OrchStore::open(home.path().join("orch")).unwrap();
@@ -3759,7 +3760,8 @@ mod tests {
         let host = AgentHost::create(HostConfig {
             always_approve: true,
             ..HostConfig::default()
-        });
+        })
+        .expect("acquire the GrokPtah instance lock");
         host.start().unwrap();
         host.set_project_cwd(ws.path()).unwrap();
         let session = host.session_new_kind(crate::SessionKind::Build).unwrap();
@@ -3934,7 +3936,8 @@ mod tests {
         let host = AgentHost::create(HostConfig {
             always_approve: true,
             ..HostConfig::default()
-        });
+        })
+        .expect("acquire the GrokPtah instance lock");
         host.start().unwrap();
         host.set_project_cwd(ws_a.path()).unwrap();
         let session_a = host.session_new_kind(crate::SessionKind::Build).unwrap();
@@ -4286,7 +4289,8 @@ mod tests {
         let host = AgentHost::create(HostConfig {
             always_approve: true,
             ..HostConfig::default()
-        });
+        })
+        .expect("acquire the GrokPtah instance lock");
         host.start().unwrap();
         host.set_project_cwd(ws.path()).unwrap();
         let session = host.session_new_kind(crate::SessionKind::Build).unwrap();
@@ -4386,7 +4390,8 @@ mod tests {
         let host = AgentHost::create(HostConfig {
             always_approve: true,
             ..HostConfig::default()
-        });
+        })
+        .expect("acquire the GrokPtah instance lock");
         host.start().unwrap();
         host.set_project_cwd(ws.path()).unwrap();
         let session = host.session_new_kind(crate::SessionKind::Build).unwrap();
@@ -4502,7 +4507,8 @@ mod tests {
         let host = AgentHost::create(HostConfig {
             always_approve: true,
             ..HostConfig::default()
-        });
+        })
+        .expect("acquire the GrokPtah instance lock");
         host.start().unwrap();
         host.set_project_cwd(ws.path()).unwrap();
         let session = host.session_new_kind(crate::SessionKind::Build).unwrap();
@@ -4612,7 +4618,8 @@ mod tests {
         let host = AgentHost::create(HostConfig {
             always_approve: true,
             ..HostConfig::default()
-        });
+        })
+        .expect("acquire the GrokPtah instance lock");
         host.start().unwrap();
         let session = host.session_new_kind(crate::SessionKind::Build).unwrap();
         host.session_set_cwd(session.id, workspace.path()).unwrap();

@@ -344,17 +344,23 @@ impl EventBus {
                 let writer_path = path.clone();
                 let writer_gap_path = gap_path.clone();
                 let capacity = g.capacity;
+                // The journal directory lives under the runtime home, so the
+                // writer binds to whichever runtime owns that home (#455).
+                let writer_lease = crate::host_runtime::WriteLease::for_store_root(dir.as_ref());
                 let join = std::thread::Builder::new()
                     .name("grokptah-event-journal".into())
                     .spawn(move || {
                         run_journal_writer(
-                            &writer_path,
-                            capacity,
+                            &JournalWriterContext {
+                                lease: writer_lease,
+                                path: writer_path,
+                                gap_path: writer_gap_path,
+                                capacity,
+                                persistence_error,
+                                journal_gap,
+                            },
                             durable_tail,
                             rx,
-                            &persistence_error,
-                            &writer_gap_path,
-                            &journal_gap,
                         );
                     });
                 match join {
@@ -642,16 +648,35 @@ pub(crate) fn session_id_of(u: &SessionUpdate) -> Option<uuid::Uuid> {
     }
 }
 
-fn run_journal_writer(
-    path: &Path,
+/// Everything the journal writer thread owns for the life of one bus.
+struct JournalWriterContext {
+    /// Durable-write authority for the home this journal lives under (#455).
+    lease: crate::host_runtime::WriteLease,
+    path: PathBuf,
+    gap_path: PathBuf,
     capacity: usize,
+    persistence_error: Arc<Mutex<Option<String>>>,
+    journal_gap: Arc<Mutex<Option<(u64, u64)>>>,
+}
+
+fn run_journal_writer(
+    context: &JournalWriterContext,
     mut tail: VecDeque<JournalEntry>,
     rx: std::sync::mpsc::Receiver<JournalEntry>,
-    persistence_error: &Mutex<Option<String>>,
-    gap_path: &Path,
-    journal_gap: &Mutex<Option<(u64, u64)>>,
 ) {
     use std::sync::mpsc::RecvTimeoutError;
+
+    let JournalWriterContext {
+        lease,
+        path,
+        gap_path,
+        capacity,
+        persistence_error,
+        journal_gap,
+    } = context;
+    let (path, gap_path, capacity) = (path.as_path(), gap_path.as_path(), *capacity);
+    let persistence_error = persistence_error.as_ref();
+    let journal_gap = journal_gap.as_ref();
 
     let mut tail_bytes: usize = tail.iter().map(journal_entry_size).sum();
     let mut file_bytes = std::fs::metadata(path)
@@ -684,7 +709,7 @@ fn run_journal_writer(
                 file_bytes = tail_bytes;
             })
         } else {
-            append_journal_line(path, &entry).map(|_| {
+            append_journal_line(lease, path, &entry).map(|_| {
                 file_bytes = file_bytes.saturating_add(entry_bytes);
             })
         };
@@ -749,8 +774,18 @@ fn persist_current_gap(
     atomic_write_bytes(path, &bytes)
 }
 
-fn append_journal_line(path: &Path, entry: &JournalEntry) -> std::io::Result<()> {
+fn append_journal_line(
+    lease: &crate::host_runtime::WriteLease,
+    path: &Path,
+    entry: &JournalEntry,
+) -> std::io::Result<()> {
     use std::io::Write;
+
+    // The journal is durable state on the runtime home, so the writer thread
+    // carries the same authority every other durable effect does (#455).
+    lease
+        .begin("appending to the durable event journal")
+        .map_err(std::io::Error::other)?;
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)

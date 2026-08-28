@@ -21,6 +21,7 @@ mod host;
 mod host_helpers;
 mod host_runtime;
 mod instance_lock;
+pub use instance_lock::instance_lock_is_held;
 mod isolation;
 mod lane;
 pub mod live_attestation;

@@ -26,7 +26,8 @@ pub struct AppState {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let runtime = AgentHost::create(HostConfig::default());
+    let runtime = AgentHost::create(HostConfig::default())
+            .expect("acquire the GrokPtah instance lock");
     // Prefer fan-out subscribe so MCP can also attach; fall back to take for compat.
     let event_rx = runtime.subscribe_events();
     let _primary = runtime.take_event_receiver();

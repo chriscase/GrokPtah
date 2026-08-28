@@ -794,7 +794,7 @@ impl AgentHost {
     /// of the process instance lock and of the task supervisor (#455). It
     /// derefs to [`AgentHostHandle`], and `runtime.clone()` yields a cloneable
     /// *request handle* that carries no process authority of its own.
-    pub fn create(config: HostConfig) -> HostRuntime {
+    pub fn create(config: HostConfig) -> Result<HostRuntime> {
         Self::create_with_runtime_home(config, crate::discover::RuntimeHome::discover())
     }
 
@@ -804,19 +804,24 @@ impl AgentHost {
     pub fn create_with_runtime_home(
         config: HostConfig,
         runtime_home: crate::discover::RuntimeHome,
-    ) -> HostRuntime {
+    ) -> Result<HostRuntime> {
         let runtime_home_context = Arc::new(runtime_home.install());
-        // Single-instance guard before any GC or writes that could race another process.
-        let instance_lock = match crate::instance_lock::InstanceLock::try_acquire_at(&runtime_home)
-        {
-            Ok(l) => Some(l),
-            Err(e) => {
-                eprintln!("[grokptah] {e:#}");
-                None
-            }
-        };
+        // Exclusive ownership is the *precondition* for construction, not a
+        // warning on the way past it (#455). Nothing writable is initialized
+        // before this: no keychain read, no workspace load or migration, no
+        // session GC, no event journal, no durable store. A host that could not
+        // take the lock must not exist at all — a half-constructed one used to
+        // go on to touch every one of those surfaces on a home another process
+        // owns.
+        let instance_lock = crate::instance_lock::InstanceLock::try_acquire_at(&runtime_home)
+            .with_context(|| {
+                format!(
+                    "acquire the GrokPtah single-instance lock for {}",
+                    runtime_home.path().display()
+                )
+            })?;
         let lifecycle = crate::host_runtime::HostLifecycle::new(
-            instance_lock,
+            Some(instance_lock),
             runtime_home.instance_lock_path(),
         );
         let mut event_tx = crate::event_bus::EventBus::new(
@@ -830,9 +835,12 @@ impl AgentHost {
         // Keep a dedicated channel for take_event_receiver / first GUI subscriber.
         let event_rx = event_tx.subscribe();
         let auth = crate::auth_store::load_auth_state();
-        // Construction is the one point that always holds authority: the
-        // lifecycle was just created in `Running` with the lock in hand.
-        let startup_write = crate::host_runtime::DurableWriteGuard::owner_uncounted(&lifecycle);
+        // Construction takes ordinary counted authority: the lifecycle was
+        // just created `Running` with the lock in hand, so this cannot fail,
+        // and being counted means it is not a special case the seal ignores.
+        let startup_write = lifecycle
+            .begin_durable_write("initializing the host from its durable home")
+            .context("durable-write authority for host construction")?;
         let (chrome, mut sessions) =
             session_store::load_workspace(&startup_write).unwrap_or_else(|e| {
                 eprintln!("[grokptah] workspace load failed: {e:#}");
@@ -878,15 +886,13 @@ impl AgentHost {
         let mut open_tab_ids = chrome.open_tab_ids.clone();
         // Drop tab ids that no longer exist.
         open_tab_ids.retain(|id| sessions.contains_key(id));
-        // Soft GC only when we own the instance lock (never GC another process's sessions).
-        if lifecycle.acquired_process_lock() {
-            if let Ok(n) = session_store::garbage_collect(&startup_write, &open_tab_ids, 80, 24 * 7)
-            {
-                if n > 0 {
-                    if let Ok(reloaded) = session_store::load_all_metas() {
-                        sessions = reloaded;
-                        open_tab_ids.retain(|id| sessions.contains_key(id));
-                    }
+        // Construction holds the instance lock, so GC can never touch another
+        // process's sessions.
+        if let Ok(n) = session_store::garbage_collect(&startup_write, &open_tab_ids, 80, 24 * 7) {
+            if n > 0 {
+                if let Ok(reloaded) = session_store::load_all_metas() {
+                    sessions = reloaded;
+                    open_tab_ids.retain(|id| sessions.contains_key(id));
                 }
             }
         }
@@ -974,7 +980,7 @@ impl AgentHost {
             runtime_home,
             _runtime_home_context: runtime_home_context,
         };
-        HostRuntime::new(handle, lifecycle)
+        Ok(HostRuntime::new(handle, lifecycle))
     }
 }
 
@@ -993,6 +999,14 @@ impl AgentHostHandle {
     /// that outlived its runtime reports false and refuses new work.
     pub fn is_accepting_work(&self) -> bool {
         self.lifecycle.is_open()
+    }
+
+    /// Whether this handle can still perform durable writes at all. False once
+    /// the owning runtime has sealed or closed, which is the signal a bounded
+    /// retry uses to stop rather than spin (#455).
+    pub fn can_write_durably(&self) -> bool {
+        !self.lifecycle.durable_writes_sealed()
+            && self.lifecycle.phase() != crate::host_runtime::HostPhase::Closed
     }
 
     /// Fail-closed guard for authority-bearing operations.
@@ -1447,6 +1461,9 @@ impl AgentHostHandle {
             return Ok(existing.clone());
         }
         let opened = OrchStore::open(self.runtime_home.orchestration_root())?;
+        // Bind explicitly rather than relying on open-time registry lookup, so
+        // every clone of this ledger fails closed with this runtime.
+        opened.bind_lifecycle(&self.lifecycle);
         *store = Some(opened.clone());
         Ok(opened)
     }
@@ -1462,6 +1479,7 @@ impl AgentHostHandle {
             return Ok(existing.clone());
         }
         let opened = crate::computer_use::ComputerStore::open(self.runtime_home.computer_root())?;
+        opened.bind_lifecycle(&self.lifecycle);
         *store = Some(opened.clone());
         Ok(opened)
     }
@@ -1478,6 +1496,9 @@ impl AgentHostHandle {
     pub(crate) fn install_orchestration_store(&self, store: OrchStore) {
         let mut current = self.orchestration_store.lock();
         if current.is_none() {
+            // A store handed in from outside becomes this runtime's, and its
+            // clones fail closed with it (#455).
+            store.bind_lifecycle(&self.lifecycle);
             *current = Some(store);
         }
     }
@@ -3228,14 +3249,8 @@ impl AgentHostHandle {
     }
 
     pub fn start(&self) -> Result<()> {
-        if !self.lifecycle.acquired_process_lock() {
-            bail!(
-                "another GrokPtah instance is already using {}. \
-                 Quit the other window before starting a second one.",
-                crate::discover::grokptah_home().display()
-            );
-        }
-        // A handle that outlived its runtime must not restart the host (#455).
+        // Construction cannot succeed without the instance lock, so the only
+        // way to fail here is a handle that outlived its runtime (#455).
         self.lifecycle.ensure_open("starting the agent host")?;
         self.inner.lock().running = true;
         Ok(())
@@ -11557,7 +11572,8 @@ mod computer_agent_host_tests {
         let home = tempfile::tempdir().unwrap();
         crate::set_grokptah_home_override(Some(home.path().to_path_buf()));
 
-        let host = AgentHost::create(HostConfig::default());
+        let host =
+            AgentHost::create(HostConfig::default()).expect("acquire the GrokPtah instance lock");
         host.start().unwrap();
         let first = host.session_new().unwrap();
         let second = host.session_new().unwrap();
@@ -11661,7 +11677,8 @@ mod computer_agent_host_tests {
         )
         .unwrap();
 
-        let host = AgentHost::create(HostConfig::default());
+        let host =
+            AgentHost::create(HostConfig::default()).expect("acquire the GrokPtah instance lock");
         host.inner.lock().auth = AuthState {
             signed_in: true,
             display_name: Some("stale Grok Build session".into()),
@@ -11751,7 +11768,8 @@ mod tests {
         let host = AgentHost::create(HostConfig {
             always_approve: true,
             ..HostConfig::default()
-        });
+        })
+        .expect("acquire the GrokPtah instance lock");
         host.start().expect("start host");
         let session = host
             .session_new_kind(SessionKind::Build)
