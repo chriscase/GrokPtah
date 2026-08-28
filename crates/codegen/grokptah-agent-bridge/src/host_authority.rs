@@ -104,7 +104,6 @@ pub(crate) fn scope(session_id: Uuid) -> String {
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn refresh(
-    session_id: Uuid,
     agent_id: Option<&str>,
     model: &str,
     turn_generation: u64,

@@ -1084,7 +1084,6 @@ impl AgentHostHandle {
         for (session_id, agent_id, model, turn_generation) in sessions {
             let scope = crate::host_authority::scope(session_id);
             let _ = crate::host_authority::refresh(
-                session_id,
                 agent_id.as_deref(),
                 &model,
                 turn_generation,
