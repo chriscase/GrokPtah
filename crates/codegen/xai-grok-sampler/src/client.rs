@@ -118,10 +118,12 @@ impl GrokRequestHeaders<'_> {
     fn apply(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         let mut b = builder
             .header("x-grok-conv-id", self.conv_id)
-            .header("x-grok-req-id", self.req_id)
             .header("x-grok-model-override", self.model_id)
             .header("x-grok-session-id", self.session_id)
             .header("x-grok-agent-id", self.agent_id);
+        if !self.req_id.is_empty() {
+            b = b.header("x-grok-req-id", self.req_id);
+        }
         if let Some(idx) = self.turn_idx {
             b = b.header("x-grok-turn-idx", idx);
         }
