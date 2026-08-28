@@ -1510,7 +1510,7 @@ impl AgentHostHandle {
     /// List the product-facing Lane projection, including archived Lanes when
     /// requested. The backing session records remain the source of truth.
     pub fn list_lanes(&self, include_archived: bool) -> Vec<LaneSummary> {
-        let g = self.inner.lock();
+        let mut g = self.inner.lock();
         let mut lanes: Vec<_> = g
             .sessions
             .values()
@@ -2885,7 +2885,7 @@ impl AgentHostHandle {
             eprintln!("[grokptah] transcript rewrite failed: {e:#}");
             return;
         }
-        let g = self.inner.lock();
+        let mut g = self.inner.lock();
         if let Some(s) = g.sessions.get_mut(&id) {
             s.persisted_len = s.transcript.len();
             s.transcript_loaded = true;
