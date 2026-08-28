@@ -863,6 +863,29 @@ mod tests {
     }
 
     #[test]
+    fn foreign_principal_cannot_install_an_envelope() {
+        let authority = CapabilityAuthority::new(true);
+        let now = Utc::now();
+        let foreign = snapshot("foreign-principal");
+        let capability = authority
+            .issue(&foreign, now, DEFAULT_CAPABILITY_TTL)
+            .unwrap();
+        assert!(authority
+            .install_envelope(
+                "foreign-envelope",
+                capability,
+                foreign,
+                "different-principal",
+                INITIAL_AUTH_GENERATION,
+                "policy-v1",
+                ["act"],
+                "resource-1",
+                now,
+            )
+            .is_err());
+    }
+
+    #[test]
     fn capability_downgrade_replaces_generation_and_stales_old_envelope() {
         let authority = CapabilityAuthority::new(true);
         let now = Utc::now();

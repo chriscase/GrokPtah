@@ -1676,6 +1676,25 @@ mod tests {
             .unwrap();
     }
 
+    #[test]
+    fn service_construction_without_host_policy_denies_local_user() {
+        let dir = tempdir().unwrap();
+        let service = ComputerUseService::new(
+            Arc::new(SimulatorBackend::new()),
+            ComputerStore::open(dir.path().join("computer-use")).unwrap(),
+        );
+        let error = service
+            .create_run(
+                "create-without-policy",
+                Uuid::new_v4(),
+                None,
+                SimulatorBackend::demo_target(),
+                Default::default(),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ComputerErrorCode::Unauthorized);
+    }
+
     fn grant(run: &ComputerRun) -> ActionGrant {
         let now = Utc::now();
         ActionGrant {

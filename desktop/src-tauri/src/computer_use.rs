@@ -1285,6 +1285,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_session_authority_denies_without_installing_policy() {
+        let (_dir, desktop) = test_desktop();
+        let error = desktop
+            .start_simulator(Uuid::new_v4(), &SimulatorBackend::demo_target().app_id)
+            .await
+            .unwrap_err();
+        assert!(error.contains("unknown session"));
+    }
+
+    #[tokio::test]
     async fn approval_cannot_cross_sessions_or_survive_takeover() {
         let (_dir, desktop) = test_desktop();
         let owner = test_owner(&desktop);
