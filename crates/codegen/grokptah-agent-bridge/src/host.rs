@@ -8727,13 +8727,7 @@ impl AgentHostHandle {
                 }
             };
             let provider_observation = self.provider_observation_context(session_id);
-            let provider_attempt = match self.provider_attempt_context(session_id) {
-                Ok(context) => context,
-                Err(error) => {
-                    last = format!("GP subagent provider admission failed: {error:#}");
-                    break;
-                }
-            };
+            let provider_attempt = self.provider_attempt_context(session_id)?;
             let step = match call_xai_agent_step_observed(
                 creds,
                 model,
@@ -10261,7 +10255,13 @@ impl AgentHostHandle {
                     }
                 };
             let provider_observation = self.provider_observation_context(session_id);
-            let provider_attempt = self.provider_attempt_context(session_id)?;
+            let provider_attempt = match self.provider_attempt_context(session_id) {
+                Ok(context) => context,
+                Err(error) => {
+                    last = format!("GP subagent provider admission failed: {error:#}");
+                    break;
+                }
+            };
             let step = call_xai_agent_step_observed(
                 &creds,
                 &model,
