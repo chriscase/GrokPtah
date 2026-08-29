@@ -42,6 +42,7 @@ pub enum AuditEvent {
     CapabilitySealed {
         capability: String,
         principal: String,
+        actor: String,
         effect: String,
     },
     /// A one-use effect lease was minted against an action digest.
@@ -69,6 +70,7 @@ pub enum AuditEvent {
         session: String,
         workspace: String,
         resource: String,
+        actor: String,
         request_digest: String,
         body_digest: String,
     },

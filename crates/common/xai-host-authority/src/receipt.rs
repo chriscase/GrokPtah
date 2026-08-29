@@ -116,6 +116,7 @@ impl std::fmt::Debug for AuthContext {
 pub struct SealedCapability {
     pub(crate) id: CapabilityId,
     pub(crate) binding: AuthorityBinding,
+    pub(crate) actor: ActorClass,
     pub(crate) effect: EffectClass,
     pub(crate) expires_at_ms: u64,
 }
@@ -130,8 +131,50 @@ impl SealedCapability {
     pub fn effect(&self) -> EffectClass {
         self.effect
     }
+    /// Who stands behind this grant. Read-only: there is no setter, so a
+    /// model-sealed capability can never be re-presented as operator-sealed.
+    pub fn actor(&self) -> ActorClass {
+        self.actor
+    }
     pub fn expires_at_ms(&self) -> u64 {
         self.expires_at_ms
+    }
+}
+
+/// Who stands behind a capability.
+///
+/// Required when the capability is sealed, so there is no absent-actor case
+/// that could be read as operator authority by default. A model-originated
+/// proposal cannot present itself as operator-approved: the host fixes the
+/// actor at seal time and nothing widens it afterwards.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, PartialOrd, Ord)]
+pub enum ActorClass {
+    /// A human operator the host verified.
+    VerifiedOperator,
+    /// A model proposal the host admitted. Never equivalent to operator
+    /// authority, however the proposal was phrased.
+    VerifiedModel,
+}
+
+impl ActorClass {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::VerifiedOperator => "verified_operator",
+            Self::VerifiedModel => "verified_model",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "verified_operator" => Some(Self::VerifiedOperator),
+            "verified_model" => Some(Self::VerifiedModel),
+            _ => None,
+        }
+    }
+
+    /// Whether this actor carries operator authority.
+    pub const fn is_operator(self) -> bool {
+        matches!(self, Self::VerifiedOperator)
     }
 }
 
@@ -179,6 +222,7 @@ pub struct EffectLease {
     pub(crate) observation_revision: ObservationRevision,
     pub(crate) observation_digest: ContentDigest,
     pub(crate) action_digest: ContentDigest,
+    pub(crate) actor: ActorClass,
     pub(crate) effect: EffectClass,
     pub(crate) expires_at_ms: u64,
 }
@@ -198,6 +242,10 @@ impl EffectLease {
     }
     pub fn effect(&self) -> EffectClass {
         self.effect
+    }
+    /// Who stands behind the capability this lease came from.
+    pub fn actor(&self) -> ActorClass {
+        self.actor
     }
 }
 

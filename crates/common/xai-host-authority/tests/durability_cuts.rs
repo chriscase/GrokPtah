@@ -69,7 +69,13 @@ fn ready() -> Ready {
         )
         .unwrap();
     let capability = authority
-        .seal_capability(&auth, resource, EffectClass::ProviderSend, 60_000)
+        .seal_capability(
+            &auth,
+            resource,
+            ActorClass::VerifiedOperator,
+            EffectClass::ProviderSend,
+            60_000,
+        )
         .unwrap();
     let lease = authority
         .mint_lease(&auth, &capability, request(b"body").digest(), 60_000)
