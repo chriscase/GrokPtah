@@ -313,6 +313,13 @@ async fn service_mcp_contract_covers_scoped_live_reconnect_controls_and_restart(
     );
     let submit_session_id =
         Uuid::parse_str(created.structured["sessionId"].as_str().unwrap()).unwrap();
+    // Hold this session's turn slot while admitting the submission so the
+    // cancellation assertion is deterministic. Without the reservation a
+    // provider-less hosted runner can finish the synthetic turn between the
+    // submit response and the cancel request, turning an intended live-control
+    // check into a timing-dependent "already terminal" error.
+    host.reserve_orchestration_turn("service-e2e-submit-hold", submit_session_id)
+        .unwrap();
     let submitted = client
         .call_tool(
             "ptah_submit_task",
@@ -328,6 +335,7 @@ async fn service_mcp_contract_covers_scoped_live_reconnect_controls_and_restart(
         .await
         .unwrap();
     assert!(!submitted.is_error, "submit task: {:?}", submitted.raw);
+    assert_eq!(submitted.structured["state"], "queued");
     let submitted_run_id = submitted.structured["runId"].as_str().unwrap();
     assert_eq!(
         submitted.structured["sessionId"],
@@ -350,6 +358,7 @@ async fn service_mcp_contract_covers_scoped_live_reconnect_controls_and_restart(
         "cancel submitted task: {:?}",
         submitted_cancel.raw
     );
+    host.release_orchestration_turn("service-e2e-submit-hold");
 
     let mut stream = client
         .open_event_stream(scope.clone(), Some(first_seq.saturating_sub(1)))
