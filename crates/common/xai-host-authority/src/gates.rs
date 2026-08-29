@@ -638,7 +638,7 @@ impl HostAuthority {
         let epoch = self.read(|state| Ok(state.control_epoch))?;
         let mut ids = Vec::with_capacity(recovered.len());
         for key in &recovered {
-            let id: AttemptId = decode_id(&key, "attempt")?;
+            let id: AttemptId = decode_id(key, "attempt")?;
             self.append_audit(
                 epoch,
                 AuditEvent::SendOutcome {
