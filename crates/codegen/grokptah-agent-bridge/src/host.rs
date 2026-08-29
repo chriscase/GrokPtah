@@ -1197,13 +1197,6 @@ impl AgentHostHandle {
                 errors.push(format!("persist subagents for {session_id}: {error:#}"));
             }
         }
-        // Close and join the durable event-journal writer. Its thread is
-        // otherwise joined only when the last handle to the bus is dropped,
-        // which is after this report is produced — so a queued-but-unwritten
-        // entry, or a writer that died, would never reach the report.
-        if let Some(error) = self.event_bus().close_journal_writer() {
-            errors.push(format!("close the durable event journal: {error}"));
-        }
         // Record the shutdown in the durable audit ledger while this process
         // still owns it, and surface a ledger failure instead of reporting a
         // clean stop over a lost record. The v2 ledger (#462 / #469) replaces
