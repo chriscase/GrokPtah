@@ -204,12 +204,29 @@ struct AuditWriter {
     join: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
+impl AuditWriter {
+    /// Stop accepting audit entries and join the writer while its durable
+    /// authority is still live. Shutdown owns the final synchronous audit
+    /// append, so draining here prevents a queued entry from racing the
+    /// lifecycle seal and leaving a stale authority error behind.
+    fn close(&self) -> Result<(), String> {
+        self.tx.lock().take();
+        let Some(join) = self.join.lock().take() else {
+            return Ok(());
+        };
+        join.join().map_err(|payload| {
+            payload
+                .downcast_ref::<&str>()
+                .map(|message| (*message).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic payload".to_string())
+        })
+    }
+}
+
 impl Drop for AuditWriter {
     fn drop(&mut self) {
-        self.tx.lock().take();
-        if let Some(join) = self.join.lock().take() {
-            let _ = join.join();
-        }
+        let _ = self.close();
     }
 }
 
@@ -5068,6 +5085,17 @@ impl OrchStore {
             *self.inner.last_audit_error.lock() = Some(detail.into());
             anyhow::anyhow!(detail)
         })
+    }
+
+    /// Drain and stop the asynchronous audit writer. This is a shutdown-only
+    /// seam: callers must invoke it before sealing the owning runtime's
+    /// durable-write authority. The synchronous `append_audit` path remains
+    /// available for the final host-shutdown record after the drain.
+    pub(crate) fn close_audit_writer(&self) -> anyhow::Result<()> {
+        self.inner
+            .audit_writer
+            .close()
+            .map_err(|error| anyhow::anyhow!("audit writer join failed: {error}"))
     }
 
     pub fn last_audit_error(&self) -> Option<String> {

@@ -1332,6 +1332,18 @@ impl HostRuntime {
             .map(|error| format!("close the durable event journal: {error}"))
             .collect::<Vec<_>>();
 
+        // The orchestration audit has its own bounded writer thread. Drain it
+        // while the runtime still owns durable-write authority, just as we do
+        // for the event journal above. If it were left alive until the final
+        // flush, a queued entry would be refused after the seal and make a
+        // successful shutdown look unclean (and retain the process lock).
+        let mut audit_writer_errors = Vec::new();
+        if let Some(store) = self.handle().orchestration_store() {
+            if let Err(error) = store.close_audit_writer() {
+                audit_writer_errors.push(format!("close the durable orchestration audit: {error:#}"));
+            }
+        }
+
         // 5. Seal durable-write authority. After this no handle — stale or
         //    not — can mutate this home again.
         //
@@ -1354,6 +1366,7 @@ impl HostRuntime {
         let durable_writes_in_flight = self.lifecycle.in_flight_durable_writes();
 
         let mut flush_errors = writer_drain_errors;
+        flush_errors.extend(audit_writer_errors);
         if let Some(error) = self.handle().event_bus().last_persistence_error() {
             let error =
                 format!("durable event journal degraded after sealing publication: {error}");

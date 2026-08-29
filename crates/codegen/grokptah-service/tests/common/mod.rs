@@ -326,5 +326,13 @@ pub fn flood_journal(host: &AgentHostHandle, count: usize) {
             session_id: flood_sid,
             text: format!("journal-flood-{i}"),
         });
+        // Keep this cursor-retention fixture below the asynchronous journal
+        // writer's bounded queue. The scenario is exercising in-memory
+        // retention/expiry, not intentionally injecting a persistence gap;
+        // an induced gap correctly makes HostRuntime retain its lock and
+        // would preclude the restart half of this test.
+        if i % 32 == 31 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 }

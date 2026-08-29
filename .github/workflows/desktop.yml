@@ -7,9 +7,12 @@ on:
     paths:
       - "desktop/**"
       - "crates/codegen/grokptah-agent-bridge/**"
+      - "crates/codegen/grokptah-service/**"
+      - "crates/codegen/xai-grok-pager/**"
       - "crates/common/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "docs/**"
       - "crates/common/grokptah-help-*/**"
       - "README.md"
       - "docs/COMPUTER_USE.md"
@@ -28,9 +31,12 @@ on:
     paths:
       - "desktop/**"
       - "crates/codegen/grokptah-agent-bridge/**"
+      - "crates/codegen/grokptah-service/**"
+      - "crates/codegen/xai-grok-pager/**"
       - "crates/common/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "docs/**"
       - "crates/common/grokptah-help-*/**"
       - "README.md"
       - "docs/COMPUTER_USE.md"
@@ -136,6 +142,12 @@ jobs:
           cargo fmt --manifest-path test-support/grokptah-test-gateway/Cargo.toml --all -- --check
           cargo clippy --manifest-path test-support/grokptah-test-gateway/Cargo.toml --locked --all-targets -- -D warnings
           cargo test --manifest-path test-support/grokptah-test-gateway/Cargo.toml --locked
+      - name: Headless service fmt + clippy + tests
+        working-directory: crates/codegen/grokptah-service
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked -- --test-threads=1
       - name: Host authority spine (fmt + clippy + tests)
         working-directory: .
         run: |
