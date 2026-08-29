@@ -1066,9 +1066,10 @@ impl HostRuntime {
     /// 1. Refuse new admissions (`Running` → `Quiescing`).
     /// 2. Stop HTTP/SSE acceptance and join every attached control server.
     /// 3. Cancel in-flight work, then **join** every supervised task, bounded.
-    /// 4. Seal durable-write authority and wait for in-flight writes, bounded.
-    /// 5. Flush durable state and run shutdown hooks; record every failure.
-    /// 6. Mark closed, then release the advisory OS lock exactly once —
+    /// 4. Drain the durable writer threads while authority still exists.
+    /// 5. Seal durable-write authority and wait for in-flight writes, bounded.
+    /// 6. Flush durable state and run shutdown hooks; record every failure.
+    /// 7. Mark closed, then release the advisory OS lock exactly once —
     ///    **only** if durable writes are sealed. Keeps the lock file.
     ///
     /// If the seal fails the lock is deliberately retained: refusing a
@@ -1108,7 +1109,23 @@ impl HostRuntime {
             .is_err();
         let supervised_tasks_remaining = self.lifecycle.tasks().len();
 
-        // 4. Seal durable-write authority. After this no handle — stale or
+        // 4. Drain the durable writer threads, *before* the seal.
+        //
+        //    The event-journal writer runs on its own thread, so it is not the
+        //    owner-flush thread and gets no post-seal exemption. Closing it
+        //    after the seal therefore refuses its own final metadata write and
+        //    reports an unclean shutdown for a journal that was in fact fine —
+        //    which is exactly what hosted macOS caught, and what Linux hid by
+        //    happening to have drained the queue already. Draining here, while
+        //    authority still exists, lets the writer finish its work; a real
+        //    failure still lands in `flush_errors` below and still makes the
+        //    shutdown unclean.
+        let mut writer_drain_errors = Vec::new();
+        if let Some(error) = self.handle().event_bus().close_journal_writer() {
+            writer_drain_errors.push(format!("close the durable event journal: {error}"));
+        }
+
+        // 5. Seal durable-write authority. After this no handle — stale or
         //    not — can mutate this home again.
         //
         //    The seal can block for up to its timeout, so it runs on the
@@ -1129,7 +1146,7 @@ impl HostRuntime {
         };
         let durable_writes_in_flight = self.lifecycle.in_flight_durable_writes();
 
-        let mut flush_errors = Vec::new();
+        let mut flush_errors = writer_drain_errors;
         if join_timed_out {
             flush_errors.push(format!(
                 "{supervised_tasks_remaining} supervised task(s) did not finish within {:?}",
@@ -1143,7 +1160,7 @@ impl HostRuntime {
             ));
         }
 
-        // 5. Flush durable state and run teardown hooks — but only under a
+        // 6. Flush durable state and run teardown hooks — but only under a
         //    seal that actually holds. Writing while another writer is still
         //    live is exactly the corruption this seam exists to prevent, so a
         //    failed seal skips the flush rather than racing it.
@@ -1174,7 +1191,7 @@ impl HostRuntime {
             ));
         }
 
-        // 6. Stale handles must fail closed before the lock can be re-acquired.
+        // 7. Stale handles must fail closed before the lock can be re-acquired.
         self.lifecycle.mark_closed();
 
         // The lock is released only when every guarantee held. Anything
