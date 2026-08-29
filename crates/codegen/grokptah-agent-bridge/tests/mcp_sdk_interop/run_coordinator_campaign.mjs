@@ -448,7 +448,17 @@ try {
   record(
     "isolatedRun",
     isolatedSubmit.status === 200 && isolatedTerminal?.state === "completed" && isolated.executionMode === "isolated_worktree",
-    { runId: isolatedRunId, state: isolatedTerminal?.state }
+    // Report the status and the host's own error, not just the absent runId.
+    // A `runId: undefined` says the submit produced nothing and nothing about
+    // why, which makes a hosted failure unactionable — and this check feeds
+    // `durableReadAfterReconnect`, so one silent failure reads as two.
+    {
+      runId: isolatedRunId,
+      state: isolatedTerminal?.state,
+      submitStatus: isolatedSubmit.status,
+      executionMode: isolated?.executionMode,
+      error: isolatedSubmit.status === 200 ? null : isolatedSubmit.json?.error ?? isolatedSubmit.json,
+    }
   );
   if (isolatedRunId) {
     const reviewResponse = await call("ptah_review_run", { run_id: isolatedRunId });
@@ -616,6 +626,8 @@ try {
     clientInfo: { name: "grokptah-reference-coordinator-reconnect", version: "1.0.0" },
   });
   mcpSession = reconnect.sessionId;
+  // Cascades from `isolatedRun`: with no run id there is nothing to read, so a
+  // failure here may simply be that one reported twice. `dependsOn` says which.
   const reconnectRead = isolatedRunId
     ? await call("ptah_get_run", { run_id: isolatedRunId })
     : { status: 0, json: null };
@@ -623,7 +635,14 @@ try {
     "durableReadAfterReconnect",
     reconnect.status === 200 && !!mcpSession && reconnectRead.status === 200 &&
       structured(reconnectRead.json)?.runId === isolatedRunId,
-    { sessionId: mcpSession, runId: isolatedRunId }
+    {
+      sessionId: mcpSession,
+      runId: isolatedRunId,
+      readStatus: reconnectRead.status,
+      // `0` means this never ran: `isolatedRun` produced no run id, so this
+      // failure is that one restated rather than an independent defect.
+      dependsOn: isolatedRunId ? null : "isolatedRun",
+    }
   );
 
   clearTimeout(watchdog);
