@@ -1097,6 +1097,35 @@ export interface ComputerRunProjection {
   } | null;
   lastError?: { code: string } | null;
   eventRange?: { startSeq: number; endSeq: number } | null;
+  /**
+   * Adaptive profile, budget, and honest spend. Absent when the run carries no
+   * adaptive authority — which is "no authority", not "no constraints".
+   *
+   * `profile` is always the canonical vocabulary (`economy` / `balanced` /
+   * `high_assurance`); the ingest-only aliases `efficient` and `frontier` are
+   * never serialized. `ingestedAlias` is true when this run was opened under
+   * one of them. No challenge, digest, label, value, geometry, evidence token,
+   * or path appears here.
+   */
+  adaptive?: {
+    profile: "economy" | "balanced" | "high_assurance";
+    ingestedAlias: boolean;
+    budget: {
+      maxModelTurns: number;
+      maxImageBytes: number;
+      maxRepairs: number;
+      maxTurnMillis: number;
+    };
+    spend: {
+      attempts: number;
+      accepted: number;
+      rejected: number;
+      imageBytes: number;
+      reportedTokens?: number | null;
+    };
+    stationaryStrikes: number;
+    budgetExhausted: boolean;
+  } | null;
 }
 
 export interface ComputerCockpitSnapshot {

@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use super::adaptive::AdaptiveProfileProjection;
 use super::types::{
     ActionClass, ComputerControlDisposition, ComputerError, ComputerErrorCode, ComputerRun,
     ComputerRunState, ComputerUseLimits, GrantIssuer, Sensitivity,
@@ -153,6 +154,10 @@ pub struct ComputerRunProjection {
     pub last_outcome: Option<ActionOutcomeSummary>,
     pub last_error: Option<ComputerErrorSummary>,
     pub event_range: Option<ComputerRunEventRange>,
+    /// Adaptive profile, budget, and honest spend. Absent when the run has no
+    /// adaptive authority. Carries no challenge, digest, label, value,
+    /// geometry, evidence token, or path.
+    pub adaptive: Option<AdaptiveProfileProjection>,
 }
 
 /// One bounded, cursor-addressed page of a run's durable event journal.
@@ -276,6 +281,7 @@ pub fn project_run_at(run: &ComputerRun, now: DateTime<Utc>) -> ComputerRunProje
             .as_ref()
             .map(|error| ComputerErrorSummary { code: error.code }),
         event_range: event_range(run),
+        adaptive: run.adaptive.as_ref().map(AdaptiveProfileProjection::of),
     }
 }
 
