@@ -234,50 +234,94 @@ fn retry_budgets_are_bounded_by_construction() {
     assert!(policy.validate().is_ok(), "the bound itself is allowed");
 }
 
-/// **Characterization — uncertain and not-sent are not distinguished.**
+/// Both attempt vocabularies now answer the delivery question, and they agree.
 ///
-/// `AttemptDisposition` classifies *what went wrong* and carries no
-/// delivery-knowledge dimension. A connection refused before any byte moved is
-/// `TransportError`; a timeout that may have been fully delivered is `Timeout`;
-/// neither says whether the provider saw the request. Two attempts with very
-/// different safe answers — one provably retryable, one that must never
-/// auto-retry — are therefore indistinguishable from the disposition alone.
-///
-/// This is the gap #478 names and #497's G3 lattice closes with an explicit
-/// `NotSent` / `Uncertain` / `Settled` split. It is recorded here rather than
-/// papered over with a second lattice, which is what the audit of this branch
-/// rejected.
+/// `main` carries two disposition enums — the live observation path's and the
+/// durable capture's — with different variants and no way to ask either the
+/// only question a reader needs: *did the request reach the provider?* Both now
+/// derive the same three-valued answer, so a record from either side means the
+/// same thing.
 #[test]
-fn attempt_dispositions_do_not_yet_separate_not_sent_from_uncertain() {
-    // Every failure disposition today is just a failure kind.
-    let failures = [
+fn both_attempt_vocabularies_answer_the_delivery_question_the_same_way() {
+    use grokptah_agent_bridge::certification::AttemptDisposition as Captured;
+    use grokptah_agent_bridge::durable::DeliveryKnowledge;
+
+    // A provider that answered settles the exchange, however the answer looked.
+    for disposition in [
+        AttemptDisposition::Completed,
         AttemptDisposition::HttpError,
+        AttemptDisposition::ProtocolError,
+    ] {
+        assert_eq!(
+            disposition.delivery_knowledge(),
+            DeliveryKnowledge::KnownDelivered,
+            "{disposition:?} means the provider answered"
+        );
+        assert!(!disposition.delivery_knowledge().may_auto_retry());
+        assert!(disposition.delivery_knowledge().is_settled());
+    }
+    for disposition in [
+        Captured::Success,
+        Captured::RateLimited,
+        Captured::ProviderRejected,
+    ] {
+        assert_eq!(
+            disposition.clone().delivery_knowledge(),
+            DeliveryKnowledge::KnownDelivered,
+            "{disposition:?} means the provider answered"
+        );
+    }
+
+    // Everything else is uncertain on both sides, and never auto-retried.
+    for disposition in [
         AttemptDisposition::TransportError,
         AttemptDisposition::Timeout,
         AttemptDisposition::Cancelled,
-        AttemptDisposition::ProtocolError,
-    ];
-    for disposition in failures {
-        assert_ne!(disposition, AttemptDisposition::Completed);
+    ] {
+        assert_eq!(disposition.delivery_knowledge(), DeliveryKnowledge::Unknown);
+        assert!(!disposition.delivery_knowledge().may_auto_retry());
     }
-
-    // The two that need opposite retry answers are the same shape of value:
-    // nothing on the type tells them apart by delivery.
-    assert_ne!(
-        AttemptDisposition::TransportError,
-        AttemptDisposition::Timeout,
-        "they are distinct variants"
-    );
-    let refused_connection = AttemptDisposition::TransportError;
-    let may_have_landed = AttemptDisposition::Timeout;
-    for disposition in [refused_connection, may_have_landed] {
-        // Neither carries, nor can be asked for, a delivery answer. The
-        // assertion that matters is what is *absent*: no `delivery_knowledge`,
-        // no `may_auto_retry`, no `NotSent` variant.
-        let rendered = format!("{disposition:?}").to_ascii_lowercase();
-        assert!(
-            !rendered.contains("sent") && !rendered.contains("uncertain"),
-            "delivery knowledge is not represented today: {rendered}"
+    for disposition in [
+        Captured::TimedOut,
+        Captured::TransportFailed,
+        Captured::Cancelled,
+        // These two describe what the *host* did next, not what the provider
+        // did, so neither can settle the exchange.
+        Captured::Retried,
+        Captured::Downgraded,
+    ] {
+        assert_eq!(
+            disposition.clone().delivery_knowledge(),
+            DeliveryKnowledge::Unknown,
+            "{disposition:?} cannot settle the exchange"
         );
     }
+}
+
+/// **Characterization — `KnownNotDelivered` is not derivable from a record.**
+///
+/// `TransportError` covers both a refused connection (provably nothing moved)
+/// and a reset after the write (provably nothing known), so a recorded
+/// disposition must answer `Unknown` for both rather than claim the stronger
+/// one. Only the send site can tell them apart, because only it holds the
+/// connect and timeout facts — and `main` records no durable attempt state from
+/// the live send path at all, so that finer answer drives the retry decision
+/// and is then discarded.
+///
+/// Closing this means a durable attempt record on the live path, which is
+/// #497's G3. This pins the boundary rather than approximating it.
+#[test]
+fn not_sent_is_only_knowable_at_the_send_site_not_from_the_record() {
+    use grokptah_agent_bridge::durable::{classify_transport_failure, DeliveryKnowledge};
+
+    assert_eq!(
+        classify_transport_failure(true, false),
+        DeliveryKnowledge::KnownNotDelivered,
+        "the send site can prove non-delivery"
+    );
+    assert_eq!(
+        AttemptDisposition::TransportError.delivery_knowledge(),
+        DeliveryKnowledge::Unknown,
+        "a recorded transport failure must not claim non-delivery it cannot prove"
+    );
 }

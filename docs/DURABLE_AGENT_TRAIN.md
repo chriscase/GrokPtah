@@ -243,8 +243,33 @@ reviewed reason for every HTTP client in the crate, so a fifth path cannot
 appear silently. **Verified to fire:** adding one smuggled send site to an
 unrelated file fails two of its tests by name.
 
-The durable half — recording which attempt reached which state, and the
-`Settled` distinction — is #497's G3 and is deliberately not built. Binding the
+### Uncertain / not-sent / settled on the records that exist
+
+`main` carries **two** attempt-disposition vocabularies that do not agree with
+each other, and neither could answer the only question a reader needs:
+
+| Vocabulary | Variants |
+| --- | --- |
+| `provider_observation::AttemptDisposition` (live path) | `Completed, HttpError, TransportError, Timeout, Cancelled, ProtocolError` |
+| `certification::AttemptDisposition` (durable capture) | `Success, Retried, Downgraded, RateLimited, TimedOut, TransportFailed, ProviderRejected, Cancelled` |
+
+Both now derive the same three-valued `DeliveryKnowledge`, so a record from
+either side means the same thing. A provider that produced *any* response —
+a completion, an HTTP status, or bytes that could not be parsed — settled the
+exchange; `Retried` and `Downgraded` describe what the *host* did next and so
+settle nothing.
+
+**`KnownNotDelivered` is deliberately not derivable from a record.**
+`TransportError` covers both a refused connection and a reset after the write,
+so the recorded disposition must answer `Unknown` for both rather than claim
+the stronger one. Only the send site holds the connect and timeout facts, and
+`main` keeps no durable attempt state from the live send path, so that finer
+answer drives the retry decision and is then discarded.
+
+That last sentence is the honest shape of what remains: the live path has no
+durable attempt record at all. `ProviderAttemptEvidence` is a certification-lab
+artifact, not something the send path writes. Adding one is #497's G3, and a
+second attempt ledger beside it is what the audit of this branch rejected. Binding the
 qualification probes needs the attempt identity G3 provides, so it is named as
 the remaining work rather than approximated.
 

@@ -74,6 +74,32 @@ pub enum AttemptDisposition {
     ProtocolError,
 }
 
+impl AttemptDisposition {
+    /// What this disposition proves about whether the request reached the
+    /// provider.
+    ///
+    /// The mapping is deliberately conservative. A provider that produced *any*
+    /// response — a completion, an HTTP status, or bytes this host could not
+    /// parse — settled the exchange, so a fresh request is a new request rather
+    /// than a retry. Everything else is honestly uncertain: `TransportError`
+    /// covers both a refused connection and a reset after the write, and this
+    /// vocabulary cannot tell them apart, so it must not claim to.
+    ///
+    /// A caller that *can* tell them apart — the send site, which has the
+    /// connect and timeout facts — should use
+    /// [`crate::durable::classify_transport_failure`] instead of inferring
+    /// from the disposition alone.
+    pub fn delivery_knowledge(self) -> crate::durable::DeliveryKnowledge {
+        use crate::durable::DeliveryKnowledge;
+        match self {
+            Self::Completed | Self::HttpError | Self::ProtocolError => {
+                DeliveryKnowledge::KnownDelivered
+            }
+            Self::TransportError | Self::Timeout | Self::Cancelled => DeliveryKnowledge::Unknown,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResponseContentClass {

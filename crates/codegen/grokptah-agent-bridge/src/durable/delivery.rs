@@ -16,10 +16,20 @@
 //! happened.*
 
 /// What the host honestly knows about whether a request reached the provider.
+///
+/// Three answers, because two is not enough: a request that provably never
+/// left, one that provably arrived, and — the common case after a write begins
+/// — one the host cannot decide. Collapsing the third into either of the others
+/// is how a retry loop duplicates work or a projection claims certainty it does
+/// not have.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeliveryKnowledge {
     /// The connection was never established, so no request byte can have moved.
     KnownNotDelivered,
+    /// The provider answered — with a completion, a rejection, or bytes that
+    /// could not be parsed. The exchange is settled: whatever happened, it
+    /// happened, and a fresh request is a *new* request rather than a retry.
+    KnownDelivered,
     /// The request may or may not have been delivered. Not an error state, and
     /// not a licence to retry — it is the honest answer when the host cannot
     /// tell, which is most transport failures after a write begins.
@@ -36,6 +46,20 @@ impl DeliveryKnowledge {
     /// its own.
     pub fn may_auto_retry(self) -> bool {
         matches!(self, Self::KnownNotDelivered)
+    }
+
+    /// Whether the exchange is settled: the provider answered, so this attempt
+    /// has an outcome even if the host could not read it.
+    pub fn is_settled(self) -> bool {
+        matches!(self, Self::KnownDelivered)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::KnownNotDelivered => "not_sent",
+            Self::KnownDelivered => "settled",
+            Self::Unknown => "uncertain",
+        }
     }
 }
 
@@ -83,5 +107,19 @@ mod tests {
     fn only_known_not_delivered_may_auto_retry() {
         assert!(DeliveryKnowledge::KnownNotDelivered.may_auto_retry());
         assert!(!DeliveryKnowledge::Unknown.may_auto_retry());
+        assert!(
+            !DeliveryKnowledge::KnownDelivered.may_auto_retry(),
+            "a settled exchange is not re-sent; a fresh request is a new request"
+        );
+    }
+
+    #[test]
+    fn the_three_answers_stay_distinct() {
+        assert!(DeliveryKnowledge::KnownDelivered.is_settled());
+        assert!(!DeliveryKnowledge::Unknown.is_settled());
+        assert!(!DeliveryKnowledge::KnownNotDelivered.is_settled());
+        assert_eq!(DeliveryKnowledge::KnownNotDelivered.as_str(), "not_sent");
+        assert_eq!(DeliveryKnowledge::Unknown.as_str(), "uncertain");
+        assert_eq!(DeliveryKnowledge::KnownDelivered.as_str(), "settled");
     }
 }
