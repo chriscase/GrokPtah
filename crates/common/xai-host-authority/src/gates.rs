@@ -31,6 +31,12 @@ impl HostAuthority {
     /// applies on the next open. This makes either cut replay-safe without
     /// pretending two filesystem files can be atomically renamed together.
     pub(crate) fn replay_attempt_settlements(&self) -> Result<(), AuthorityError> {
+        let _lifecycle = self.lock_attempt_lifecycle()?;
+        self.replay_attempt_settlements_locked()
+    }
+
+    /// Replay while the caller holds `attempt_lifecycle`.
+    fn replay_attempt_settlements_locked(&self) -> Result<(), AuthorityError> {
         let records = {
             let log = self
                 .audit
@@ -372,6 +378,7 @@ impl HostAuthority {
         lease: EffectLease,
         request: &RequestIdentity,
     ) -> Result<PhysicalSendPermit, AuthorityError> {
+        let _lifecycle = self.lock_attempt_lifecycle()?;
         if lease.effect != EffectClass::ProviderSend {
             return Err(AuthorityError::NotPermitted);
         }
@@ -598,6 +605,15 @@ impl HostAuthority {
         detail: Option<Result<UncertainReason, FailedReason>>,
     ) -> SendOutcome {
         let attempt = permit.attempt;
+        let _lifecycle = match self.lock_attempt_lifecycle() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return SendOutcome::Uncertain {
+                    attempt,
+                    reason: UncertainReason::LifecycleUnavailableAfterDispatch,
+                };
+            }
+        };
         let epoch = permit.binding.control_epoch.raw();
         let detail_text = match detail {
             None => "response observed".to_string(),
@@ -663,11 +679,12 @@ impl HostAuthority {
         admin: &HostAdminAuthority,
     ) -> Result<Vec<AttemptId>, AuthorityError> {
         self.require_admin(admin)?;
+        let _lifecycle = self.lock_attempt_lifecycle()?;
         // A prior terminal audit append may already describe a snapshot that
         // failed to persist. Converge that WAL evidence before treating any
         // remaining Sending record as a crash cut; otherwise a same-host retry
         // could duplicate uncertainty or overwrite recorded settled truth.
-        self.replay_attempt_settlements()?;
+        self.replay_attempt_settlements_locked()?;
         // Write the recovery evidence before changing the snapshot. A crash
         // after the snapshot rename but before the audit append would leave an
         // ambiguous attempt with no durable explanation and nothing for the
@@ -752,6 +769,7 @@ impl HostAuthority {
         took_effect: bool,
     ) -> Result<(), AuthorityError> {
         self.require_admin(admin)?;
+        let _lifecycle = self.lock_attempt_lifecycle()?;
         let epoch = self.read(|state| {
             let record = state
                 .attempts
@@ -843,6 +861,12 @@ impl HostAuthority {
         Ok(())
     }
 
+    fn lock_attempt_lifecycle(&self) -> Result<std::sync::MutexGuard<'_, ()>, AuthorityError> {
+        self.attempt_lifecycle
+            .lock()
+            .map_err(|_| AuthorityError::Durability("attempt lifecycle lock poisoned".into()))
+    }
+
     /// Every audit record, oldest first.
     ///
     /// Exporting the whole log is an operator action, not something a served
@@ -885,4 +909,145 @@ pub struct AttemptProjection {
 /// one deduplicates a repeat of the *same* attempt rather than acting twice.
 fn idempotency_key_for(attempt: AttemptId) -> String {
     format!("grokptah-{}", attempt.public_handle())
+}
+
+#[cfg(test)]
+mod concurrency_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    const ADMIN_SECRET: &str = "host-admin-custody-secret-32-bytes-minimum-v1";
+    const BEARER: &str = "provider-bearer-for-lifecycle-lock-test";
+
+    fn permit_for(
+        authority: &HostAuthority,
+        auth: &AuthContext,
+        resource: ResourceIncarnation,
+        body: &[u8],
+    ) -> PhysicalSendPermit {
+        let request = RequestIdentity::new(
+            "https://api.example.invalid/v1/chat",
+            "POST",
+            "openai-chat",
+            b"provider-key",
+            "grok-4",
+            body,
+        );
+        let capability = authority
+            .seal_capability(
+                auth,
+                resource,
+                ActorClass::VerifiedOperator,
+                EffectClass::ProviderSend,
+                60_000,
+            )
+            .unwrap();
+        let lease = authority
+            .mint_lease(auth, &capability, request.digest(), 60_000)
+            .unwrap();
+        authority.begin_send(auth, lease, &request).unwrap()
+    }
+
+    #[test]
+    fn attempt_lifecycle_transactions_share_one_in_process_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let admin_credential = HostAdminCredential::new(ADMIN_SECRET).unwrap();
+        let (authority, admin) = HostAuthority::open(dir.path(), &admin_credential).unwrap();
+        authority
+            .set_credentials(&admin, &[HostCredential::new("primary", BEARER).unwrap()])
+            .unwrap();
+        let auth = authority.authenticate(BEARER).unwrap();
+        let session = authority.issue_session(&auth).unwrap();
+        let workspace = authority
+            .issue_workspace(&auth, &dir.path().join("workspace"))
+            .unwrap();
+        let resource = authority
+            .issue_resource(&auth, session, workspace, ContentDigest::of_bytes(b"frame"))
+            .unwrap();
+
+        // Settlement cannot interleave its WAL append and snapshot update with
+        // replay or recovery on another thread.
+        let permit = permit_for(&authority, &auth, resource, b"settle");
+        let lifecycle = authority.attempt_lifecycle.lock().unwrap();
+        std::thread::scope(|scope| {
+            let (started_tx, started_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let authority = &authority;
+            scope.spawn(move || {
+                started_tx.send(()).unwrap();
+                done_tx.send(authority.settle_settled(permit)).unwrap();
+            });
+            started_rx.recv().unwrap();
+            assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+            drop(lifecycle);
+            assert!(matches!(
+                done_rx.recv().unwrap(),
+                SendOutcome::Settled { .. }
+            ));
+        });
+
+        // Recovery uses the same lock, including its replay, scan, WAL, and
+        // snapshot phases.
+        let permit = permit_for(&authority, &auth, resource, b"recover");
+        let recovering = permit.attempt();
+        std::mem::forget(permit);
+        let lifecycle = authority.attempt_lifecycle.lock().unwrap();
+        std::thread::scope(|scope| {
+            let (started_tx, started_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let authority = &authority;
+            let admin = &admin;
+            scope.spawn(move || {
+                started_tx.send(()).unwrap();
+                done_tx.send(authority.recover_incomplete(admin)).unwrap();
+            });
+            started_rx.recv().unwrap();
+            assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+            drop(lifecycle);
+            assert_eq!(done_rx.recv().unwrap().unwrap(), vec![recovering]);
+        });
+
+        // Reconciliation is serialized with the same transaction boundary.
+        let lifecycle = authority.attempt_lifecycle.lock().unwrap();
+        std::thread::scope(|scope| {
+            let (started_tx, started_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let authority = &authority;
+            let admin = &admin;
+            scope.spawn(move || {
+                started_tx.send(()).unwrap();
+                done_tx
+                    .send(authority.reconcile_attempt(admin, recovering, true))
+                    .unwrap();
+            });
+            started_rx.recv().unwrap();
+            assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+            drop(lifecycle);
+            done_rx.recv().unwrap().unwrap();
+        });
+
+        let projection = authority
+            .attempt_projection(&auth, recovering)
+            .unwrap()
+            .unwrap();
+        assert_eq!(projection.state, STATE_SETTLED);
+        assert!(!projection.ambiguous);
+
+        // Poisoning the lifecycle boundary after a permit exists is reported
+        // honestly as local lifecycle unavailability, not as an audit write
+        // that was never attempted and never as a safe-to-retry failure.
+        let permit = permit_for(&authority, &auth, resource, b"poison");
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _lifecycle = authority.attempt_lifecycle.lock().unwrap();
+            panic!("poison attempt lifecycle for test");
+        }));
+        assert!(matches!(
+            authority.settle_settled(permit),
+            SendOutcome::Uncertain {
+                reason: UncertainReason::LifecycleUnavailableAfterDispatch,
+                ..
+            }
+        ));
+    }
 }

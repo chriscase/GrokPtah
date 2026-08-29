@@ -150,6 +150,15 @@ pub struct HostAuthority {
     root_binding: ContentDigest,
     /// Held for this object's lifetime. Dropping it releases the root.
     _admin_lock: File,
+    /// Serializes the multi-file attempt transaction within this host.
+    ///
+    /// The filesystem lock protects each individual snapshot operation and
+    /// the audit mutex protects each WAL operation, but settlement, recovery,
+    /// reconciliation, and replay intentionally span both files.  Without an
+    /// outer in-process lock, two threads sharing one `HostAuthority` could
+    /// interleave those individually-safe operations and append a stale later
+    /// outcome over newer provider truth.
+    pub(crate) attempt_lifecycle: std::sync::Mutex<()>,
     pub(crate) audit: std::sync::Mutex<AuditLog>,
 }
 
@@ -213,6 +222,7 @@ impl HostAuthority {
             root,
             root_binding,
             _admin_lock: admin_lock,
+            attempt_lifecycle: std::sync::Mutex::new(()),
             audit: std::sync::Mutex::new(audit),
         };
         // Establish the root if absent, and advance the control epoch for this

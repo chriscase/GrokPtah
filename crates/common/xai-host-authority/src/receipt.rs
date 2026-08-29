@@ -367,6 +367,12 @@ pub enum UncertainReason {
     /// ordinary failure: the effect may have happened, so the outcome stays
     /// ambiguous even though the local error was "just" a write error.
     AuditNotDurableAfterDispatch,
+    /// The in-process lifecycle transaction could not be entered after a
+    /// physical effect was already possible. This normally means another
+    /// thread panicked while holding the lifecycle lock. No audit append was
+    /// attempted, so this stays distinct from audit-media failure while still
+    /// requiring operator/provider reconciliation.
+    LifecycleUnavailableAfterDispatch,
     /// The outcome audit record is durable, but the derived state snapshot
     /// could not be updated. Open-time WAL replay will converge the snapshot;
     /// until then the caller must treat the local view as ambiguous.
