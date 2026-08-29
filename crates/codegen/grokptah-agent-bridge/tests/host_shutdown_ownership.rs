@@ -1287,6 +1287,140 @@ fn a_refused_store_open_creates_nothing() {
     child.release();
 }
 
+/// P1 — a nested store owner and a parent runtime must not both hold "their"
+/// lock over the same state.
+///
+/// A durable root inside a home is governed by the home's lock. A root opened
+/// before any runtime could be identified governs itself, taking
+/// `<root>/.instance.lock`. Without this check a runtime could then acquire the
+/// home lock and both would be correct about their own lock while writing the
+/// same ledger.
+#[test]
+fn a_home_is_refused_while_one_of_its_stores_is_separately_owned() {
+    let lane = Lane::new();
+    let home = lane.grokptah_home();
+    let orch_root = home.join("orchestration");
+    std::fs::create_dir_all(&orch_root).unwrap();
+
+    // Take the nested root's own lock, the shape an offline handle leaves when
+    // it resolved its home before any runtime existed.
+    let nested = orch_root.join(".instance.lock");
+    let nested_owner =
+        grokptah_agent_bridge::InstanceLock::try_acquire_path_for_test(&nested, &orch_root)
+            .expect("nobody owns this root yet");
+
+    let refused = AgentHost::create(HostConfig::default());
+    let error = refused
+        .err()
+        .expect("a home with a separately owned store must be refused");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("separately owned"),
+        "the refusal must name the overlapping owner: {message}"
+    );
+
+    // Released, the home is takeable again — the refusal tracks live ownership,
+    // not the mere presence of a lock file.
+    drop(nested_owner);
+    assert!(nested.is_file(), "the nested lock file stays on disk");
+    let runtime = AgentHost::create(HostConfig::default())
+        .expect("the home is free once the nested owner releases");
+    runtime.start().unwrap();
+    drop(runtime);
+}
+
+/// P0 — a refused contender must not mutate the home it does not own.
+///
+/// Two ordering defects made this false. `InstanceLock::try_acquire_at` ran the
+/// full `RuntimeHome::prepare()` layout *before* acquiring, and the lock file
+/// itself was opened with `truncate(true)` *before* `flock` — so a process that
+/// was about to be refused had already laid down the home tree and erased the
+/// live owner's pid stamp, the one piece of evidence an operator uses to find
+/// the process actually holding the home.
+///
+/// The contender here is this process; the owner is a real second process.
+#[test]
+fn a_refused_host_creates_nothing_and_preserves_the_owner_stamp() {
+    if std::env::var_os(LOCK_HOLDER_ENV).is_some() {
+        return;
+    }
+    let lane = Lane::new();
+    let home = lane.grokptah_home();
+    std::fs::create_dir_all(&home).unwrap();
+    let release = home.join("release-the-lock");
+
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "holds_the_instance_lock_until_released",
+            "--nocapture",
+            "--test-threads=1",
+            "--ignored",
+        ])
+        .env(LOCK_HOLDER_ENV, "1")
+        .env("GROKPTAH_HOME", &home)
+        .env("GROKPTAH_LOCK_RELEASE", &release)
+        .spawn()
+        .expect("re-exec as the lock holder");
+    let mut child = ChildGuard {
+        child,
+        release: release.clone(),
+    };
+    let lock_path = lane.instance_lock();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !grokptah_agent_bridge::instance_lock_is_held(&lock_path) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "child never took the lock"
+        );
+        assert!(
+            child.child.try_wait().unwrap().is_none(),
+            "child exited early"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    // The owner's stamp, and the exact set of entries the owner's home has.
+    let owner_stamp = std::fs::read(&lock_path).expect("the owner stamped its lock");
+    assert!(
+        !owner_stamp.is_empty(),
+        "the owning process must have written a pid stamp"
+    );
+    let entries_before = home_entries(&home);
+
+    let refused = AgentHost::create(HostConfig::default());
+    assert!(
+        refused.is_err(),
+        "a home another live process owns must be refused"
+    );
+
+    assert_eq!(
+        std::fs::read(&lock_path).unwrap(),
+        owner_stamp,
+        "a refused contender must not truncate or rewrite the live owner's lock stamp"
+    );
+    assert_eq!(
+        home_entries(&home),
+        entries_before,
+        "a refused contender must not create any of the home layout"
+    );
+
+    child.release();
+}
+
+/// Sorted file names directly under a home, for before/after comparison.
+fn home_entries(home: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(home)
+        .map(|dir| {
+            dir.filter_map(|entry| entry.ok())
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
 /// P0 — bypass inventory. Each of these public entry points reaches a durable
 /// primitive that was **not** the audit append: exclusive create, durable
 /// remove, and the Computer Run mutation claim. A stale clone must be refused
@@ -1494,6 +1628,117 @@ async fn an_effectful_task_cannot_act_after_a_replacement_acquires() {
     );
 
     assert_clean_shutdown(&replacement.shutdown().await);
+}
+
+/// P0 — "retained on uncertainty" must survive the destruction of every object.
+///
+/// The previous shape retained the lock by *leaving it inside the lifecycle*.
+/// That is only a decision not to release, and it lasts exactly as long as the
+/// last `Arc<HostLifecycle>` does — which, for a consuming `shutdown()`, is
+/// until this function returns. `InstanceLock::drop` would then release the OS
+/// lock and admit the replacement the unclean report was refusing.
+///
+/// The tests that previously covered this all kept a runtime or a stale handle
+/// alive, so none of them could have caught it. This one deliberately keeps
+/// nothing: the shutdown consumes the runtime, no handle is retained, and the
+/// replacement attempt happens with every object gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn an_unclean_shutdown_retains_the_home_with_no_surviving_handle() {
+    let lane = Lane::new();
+    let quarantined_before = grokptah_agent_bridge::quarantined_process_lock_count();
+
+    // Scoped so nothing outlives it: the runtime is consumed by `shutdown()`
+    // and no handle escapes.
+    let report = {
+        let (runtime, _session_id) = lane.boot();
+        runtime
+            .register_shutdown_hook(
+                "audit-ledger-seal",
+                Box::new(|| anyhow::bail!("ledger seal could not be committed")),
+            )
+            .unwrap();
+        runtime.shutdown().await
+    };
+    assert!(
+        !report.is_clean(),
+        "a failed shutdown hook must produce an unclean report: {}",
+        report.operator_summary()
+    );
+    assert!(
+        !report.process_lock_released,
+        "an unclean shutdown must not release the process lock"
+    );
+    assert!(
+        report.process_lock_retained_for_safety,
+        "the report must say the lock was retained: {}",
+        report.operator_summary()
+    );
+
+    // The decisive assertion: every object from that runtime is gone, and the
+    // home is still refused.
+    assert_eq!(
+        grokptah_agent_bridge::quarantined_process_lock_count(),
+        quarantined_before + 1,
+        "the lock must be held by the process, not by an object someone can drop"
+    );
+    let refused = AgentHost::create(HostConfig::default());
+    assert!(
+        refused.is_err(),
+        "a home whose owner could not prove a safe stop must stay refused once \
+         every handle to that owner is gone"
+    );
+    assert!(
+        lane.instance_lock().is_file(),
+        "quarantine holds the advisory lock; it never deletes the lock file"
+    );
+}
+
+/// P0 — the same property on the `Drop` path, with a task that captures no
+/// lifecycle so nothing but the runtime itself could have kept the lock alive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn a_dropped_runtime_retains_the_home_with_no_surviving_handle() {
+    let lane = Lane::new();
+    let quarantined_before = grokptah_agent_bridge::quarantined_process_lock_count();
+    let released = Arc::new(tokio::sync::Notify::new());
+    let entered = Arc::new(tokio::sync::Notify::new());
+
+    {
+        let (mut runtime, _session_id) = lane.boot();
+        runtime.set_durable_write_seal_timeout(Duration::from_millis(100));
+        let entered_tx = entered.clone();
+        let release_rx = released.clone();
+        // Captures only two Notify handles — no host handle, no lifecycle. When
+        // the runtime is dropped below, nothing in this task keeps it alive.
+        runtime
+            .spawn_supervised("an effectful task holding no host reference", async move {
+                entered_tx.notify_one();
+                release_rx.notified().await;
+            })
+            .expect("a running host supervises work");
+        entered.notified().await;
+        assert!(runtime.supervised_task_count() > 0);
+        drop(runtime);
+    }
+
+    assert_eq!(
+        grokptah_agent_bridge::quarantined_process_lock_count(),
+        quarantined_before + 1,
+        "a drop with outstanding work must quarantine the lock in the process"
+    );
+    assert!(
+        AgentHost::create(HostConfig::default()).is_err(),
+        "no replacement may start while work this process cannot account for is outstanding"
+    );
+
+    // Even after the task finishes, the quarantine stands: `Drop` had no later
+    // point to re-check, so the honest contract is "until this process exits".
+    released.notify_one();
+    assert!(
+        AgentHost::create(HostConfig::default()).is_err(),
+        "a quarantined home stays quarantined for the life of the process"
+    );
 }
 
 /// P1 — a lease may only be bound to a runtime that owns its home.

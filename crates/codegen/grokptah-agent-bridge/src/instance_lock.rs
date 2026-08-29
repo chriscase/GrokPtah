@@ -27,9 +27,17 @@ impl InstanceLock {
     }
 
     /// Acquire the lock for an explicitly selected runtime home.
+    ///
+    /// Authority comes **before** layout. Only the one directory the lock file
+    /// itself lives in may be created before ownership is proven; the rest of
+    /// the home tree is prepared afterwards, under the lock. A contender that
+    /// is going to be refused must not be able to lay down a home tree on a
+    /// home it does not own (#455).
     pub fn try_acquire_at(home: &RuntimeHome) -> Result<Self> {
+        let lock = Self::try_acquire_path(&home.instance_lock_path(), home.path())?;
+        refuse_if_a_nested_store_is_owned(home)?;
         home.prepare()?;
-        Self::try_acquire_path(&home.instance_lock_path(), home.path())
+        Ok(lock)
     }
 
     /// Acquire the lock directly at its path, creating only the directory the
@@ -50,10 +58,25 @@ impl InstanceLock {
         Self::open_and_lock(path, home_label)
     }
 
+    /// Test seam: take a lock directly at a path, modelling an offline handle
+    /// that resolved its own home.
+    pub fn try_acquire_path_for_test(
+        path: &std::path::Path,
+        home_label: &std::path::Path,
+    ) -> Result<Self> {
+        Self::try_acquire_path(path, home_label)
+    }
+
     fn open_and_lock(path: &std::path::Path, home_label: &std::path::Path) -> Result<Self> {
+        // Deliberately **not** truncating. Truncation is a mutation of the live
+        // owner's lock file, and doing it before `flock` means a contender that
+        // is about to be refused has already erased the owner's pid stamp — the
+        // one piece of evidence an operator uses to find the process holding
+        // the home. The file is truncated below, after ownership is proven
+        // (#455).
         let mut file = OpenOptions::new()
             .create(true)
-            .truncate(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(path)
@@ -67,8 +90,10 @@ impl InstanceLock {
             )
         })?;
 
-        // Best-effort pid stamp for operators debugging locks.
+        // Owned now, so rewriting the stamp is this process's to do.
         let _ = file.set_len(0);
+        use std::io::Seek;
+        let _ = file.seek(std::io::SeekFrom::Start(0));
         let _ = writeln!(
             file,
             "pid={} home={}",
@@ -79,6 +104,35 @@ impl InstanceLock {
 
         Ok(Self { _file: file })
     }
+}
+
+/// Refuse a home whose durable roots are already owned by an offline handle.
+///
+/// A durable root inside a home is normally governed by the home's own lock. A
+/// root opened *before* any runtime could be identified governs itself instead,
+/// taking `<root>/.instance.lock`. If a runtime then acquired the home lock, the
+/// two would be different locks over overlapping state — two writers, each
+/// correctly holding "its" lock.
+///
+/// Holding the home lock is therefore not sufficient: the home is only ours if
+/// no nested root is separately owned. Probing is sound here because we already
+/// hold the home lock, so no *new* nested owner can appear — a nested root can
+/// only be taken by a handle that resolved its home before we did, and this runs
+/// after our acquisition (#455).
+fn refuse_if_a_nested_store_is_owned(home: &RuntimeHome) -> Result<()> {
+    for root in [home.orchestration_root(), home.computer_root()] {
+        let nested = root.join(".instance.lock");
+        if instance_lock_is_held(&nested) {
+            anyhow::bail!(
+                "a durable store under {} is separately owned ({} is held), so this home \
+                 cannot be taken without creating two writers over the same state. Stop the \
+                 process or offline maintenance handle holding it first.",
+                home.path().display(),
+                nested.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Whether **any** process — including this one, through another file

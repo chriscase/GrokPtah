@@ -26,8 +26,8 @@ pub struct AppState {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let runtime = AgentHost::create(HostConfig::default())
-            .expect("acquire the GrokPtah instance lock");
+    let runtime =
+        AgentHost::create(HostConfig::default()).expect("acquire the GrokPtah instance lock");
     // Prefer fan-out subscribe so MCP can also attach; fall back to take for compat.
     let event_rx = runtime.subscribe_events();
     let _primary = runtime.take_event_receiver();
@@ -293,10 +293,7 @@ pub fn run() {
                 // (including a bootstrap still in flight), flushes durable
                 // state and releases the instance lock exactly once.
                 let report = tauri::async_runtime::block_on(state.runtime.shutdown());
-                eprintln!(
-                    "[grokptah] host shutdown: {}",
-                    report.operator_summary()
-                );
+                eprintln!("[grokptah] host shutdown: {}", report.operator_summary());
             }
         });
 }
