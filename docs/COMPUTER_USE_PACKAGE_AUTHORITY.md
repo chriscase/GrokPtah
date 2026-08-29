@@ -144,6 +144,50 @@ SHA-256 over file bytes, and the same sorted `path\0digest\0` bundle manifest.
 `crypto.createHash("sha256")` and additionally asserts the Rust digest is a
 single SHA-256, not a double hash.
 
+## Ancestry is three-valued
+
+The inspector reports whether the tree descends from the reviewed base. That
+question has three answers, not two.
+
+`git merge-base --is-ancestor` exits non-zero both when a commit genuinely is
+not an ancestor and when it is simply missing from a truncated history. CI
+checks out a shallow merge ref, so the second case is the normal one there.
+Collapsing them into a boolean turns "we could not look" into "it does not
+descend" — a definite negative the tool has not earned, and the same
+Unknown-as-negative confusion the cleanup receipts avoid.
+
+So `baseAncestry.result` is `proven`, `refuted`, or `indeterminate`, each with
+a reason. A non-zero exit is read as `refuted` only when the history was
+complete enough to have answered: the clone is not shallow *and* the base
+commit is present locally. Otherwise it is `indeterminate`.
+
+Consumers do not treat `indeterminate` as proven. `refuted` is `fail_closed`
+— this is not the reviewed base. `indeterminate` is `unavailable`, alongside
+the other cases where the inputs to decide were absent. Neither can reach
+`partial`.
+
+`scripts/qualify-ancestry.test.mjs` covers the decision table through an
+injected runner and then builds a real shallow clone of a real merge commit and
+drives it through real git, so the CI shape is exercised rather than described.
+
+## The projection carries no filesystem paths
+
+Evidence records get shared. A path in one discloses the layout of the machine
+that produced it and nothing a reader can verify, so the operator projection
+identifies things by digest and by fact:
+
+- the trust root appears as `trustRoot.sha256` and its issuer, never its path;
+- inspected bundles appear as digests; the `commands` list records *what* was
+  run with `<packaged-app>` placeholders rather than the supplied paths;
+- the Rust record reports `artifactRootConfigured` as a boolean, not a location;
+- `IsolatedPreflight` carries no path-typed field at all. `bundle_path` and
+  `image_path` live on the observation types that feed admission, which are
+  inputs and are never projected.
+
+`declaredBaseSha` in the Rust record is named for what it is: the base this work
+targets, declared by the binary. That binary does not read git history, so it
+makes no ancestry claim of its own.
+
 ## What would move the verdict
 
 To reach `partial`, a machine needs all of:

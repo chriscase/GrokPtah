@@ -58,12 +58,16 @@ fn main() {
     let evidence = serde_json::json!({
         "schemaVersion": 1,
         "kind": "isolatedVisualQualification",
-        "baseSha": "67e29bd34dc64049432c715c93c2cef2185c63ea",
+        // Declared, not verified. This binary does not inspect git history, so
+        // it must not read as a proven statement about the current tree.
+        "declaredBaseSha": "67e29bd34dc64049432c715c93c2cef2185c63ea",
         "verdict": verdict,
         "trustRootPresent": preflight.trust_root_present,
         "trustRootIssuer": trust_root.as_ref().ok().map(|root| root.issuer.clone()),
         "trustRootError": trust_root.as_ref().err().map(|error| error.message.clone()),
-        "artifactRoot": artifact_root.as_ref().map(|path| path.display().to_string()),
+        // Whether one was configured, not where it is. The path would put the
+        // operator's filesystem layout into a shareable record.
+        "artifactRootConfigured": artifact_root.is_some(),
         "codeIdentityProbeAvailable": preflight.code_identity_probe_available,
         "evidenceClass": preflight.evidence_class,
         "virtualizationFrameworkLaunched": preflight.virtualization_framework_launched_claim(),

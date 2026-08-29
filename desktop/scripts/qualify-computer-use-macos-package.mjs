@@ -34,7 +34,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const DESKTOP_DIR = resolve(SCRIPT_DIR, "..");
@@ -78,6 +78,15 @@ function sha256File(path) {
   if (stat.isSymbolicLink()) throw new Error(`refusing to hash symlink: ${path}`);
   if (!stat.isFile()) throw new Error(`refusing to hash non-file path: ${path}`);
   return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
+
+/** Digest a file, reporting null rather than throwing if it cannot be read. */
+function safeSha256File(path) {
+  try {
+    return sha256File(path);
+  } catch {
+    return null;
+  }
 }
 
 function hashBundleManifest(root) {
@@ -314,6 +323,90 @@ function git(args) {
   return run("git", ["-C", REPO, ...args]);
 }
 
+/**
+ * Run a git command and report its exit status separately from its output.
+ * `run` above folds failures into the returned string, which is fine for
+ * display but useless for a decision that turns on the exit code.
+ */
+function gitStatus(repo, args) {
+  const result = spawnSync("git", ["-C", repo, ...args], { encoding: "utf8" });
+  return {
+    code: result.status === null ? -1 : result.status,
+    stdout: (result.stdout || "").trim(),
+  };
+}
+
+/**
+ * Ancestry of HEAD relative to the required base, as a three-valued result.
+ *
+ * `git merge-base --is-ancestor` exits non-zero for two very different
+ * reasons: the commit genuinely is not an ancestor, and the commit is simply
+ * absent from a truncated history. CI checks out a shallow merge ref, so the
+ * second case is the common one — and reporting it as "does not descend" is a
+ * definite negative the tool has not earned.
+ *
+ * So a non-zero exit is only read as `refuted` when the history is complete
+ * enough to have answered: the clone is not shallow and the base commit is
+ * present locally. Otherwise the answer is `indeterminate`, which every
+ * consumer must treat as "not proven" rather than as either verdict.
+ *
+ * `runner` is injectable so the shallow case can be exercised deterministically.
+ */
+export function decideAncestry(repo, requiredBase, head, runner = gitStatus) {
+  // Probes actually executed, so the evidence record cannot claim a command
+  // that a short-circuit skipped.
+  const probes = [];
+  const probe = (args, label) => {
+    probes.push(label);
+    return runner(repo, args);
+  };
+  const done = (result, reason) => ({ result, reason, probes });
+
+  if (head && head === requiredBase) {
+    return done("proven", "HEAD is the required base commit");
+  }
+
+  const ancestor = probe(
+    ["merge-base", "--is-ancestor", requiredBase, "HEAD"],
+    "git merge-base --is-ancestor <required-base> HEAD",
+  );
+  if (ancestor.code === 0) {
+    return done("proven", "HEAD descends from the required base");
+  }
+
+  const shallow = probe(
+    ["rev-parse", "--is-shallow-repository"],
+    "git rev-parse --is-shallow-repository",
+  );
+  if (shallow.code !== 0) {
+    return done(
+      "indeterminate",
+      "cannot determine whether the checkout is shallow",
+    );
+  }
+  if (shallow.stdout === "true") {
+    return done(
+      "indeterminate",
+      "shallow checkout: the required base is outside the fetched history, " +
+        "so ancestry cannot be proven or refuted here",
+    );
+  }
+
+  const present = probe(
+    ["cat-file", "-e", `${requiredBase}^{commit}`],
+    "git cat-file -e <required-base>^{commit}",
+  );
+  if (present.code !== 0) {
+    return done(
+      "indeterminate",
+      "the required base commit is not present locally, so ancestry cannot " +
+        "be proven or refuted here",
+    );
+  }
+
+  return done("refuted", "HEAD does not descend from the required base");
+}
+
 function diskFreeGiB() {
   const parts = (run("df", ["-k", "/"]).split("\n")[1] || "").split(/\s+/);
   const availableKb = Number(parts[3]);
@@ -329,15 +422,7 @@ function main() {
   const head = git(["rev-parse", "HEAD"]);
   const branch = git(["branch", "--show-current"]);
 
-  let descendsFromRequiredBase = head === REQUIRED_BASE;
-  try {
-    execFileSync("git", ["-C", REPO, "merge-base", "--is-ancestor", REQUIRED_BASE, "HEAD"], {
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    descendsFromRequiredBase = true;
-  } catch {
-    /* keep the exact-head answer */
-  }
+  const ancestry = decideAncestry(REPO, REQUIRED_BASE, head);
 
   // --- source topology --------------------------------------------------
   const failures = [];
@@ -384,6 +469,12 @@ function main() {
   if (!osProbeAvailable()) denials.push("no OS code-signing probe on this host");
   if (!trust.present) denials.push(trust.error);
   if (!packageApp) denials.push("no packaged .app was supplied for inspection");
+  // Unproven ancestry is never treated as proven. Refuted is an active
+  // failure; indeterminate merely cannot decide, and both stop short of
+  // `partial` rather than being waved through.
+  if (ancestry.result !== "proven") {
+    denials.push(`base ancestry ${ancestry.result}: ${ancestry.reason}`);
+  }
   if (trust.present && packageApp) {
     denials.push(...admitAgainstTrustRoot(appObserved, trust.root.app).map((d) => `app: ${d}`));
     denials.push(
@@ -394,9 +485,18 @@ function main() {
   // Verdict vocabulary, deliberately capped. `pass` is unreachable from this
   // script: it inspects, and never observes TCC grants or a hardware action.
   let verdict;
-  if (failures.length > 0) {
+  if (failures.length > 0 || ancestry.result === "refuted") {
+    // Refuted ancestry is a definite negative: this tree is not the reviewed
+    // base, and that is a failure rather than a gap in what we could observe.
     verdict = "fail_closed";
-  } else if (!osProbeAvailable() || !trust.present || !packageApp) {
+  } else if (
+    !osProbeAvailable() ||
+    !trust.present ||
+    !packageApp ||
+    ancestry.result === "indeterminate"
+  ) {
+    // Indeterminate ancestry sits with the other "could not establish it"
+    // cases. It can never reach `partial`.
     verdict = "unavailable";
   } else if (denials.length > 0) {
     verdict = "fail_closed";
@@ -410,7 +510,9 @@ function main() {
     sourceHead: head,
     branch,
     requiredBase: REQUIRED_BASE,
-    descendsFromRequiredBase,
+    // Three-valued on purpose. There is deliberately no boolean here: a
+    // shallow checkout that cannot answer must not read as "does not descend".
+    baseAncestry: { result: ancestry.result, reason: ancestry.reason },
     verdict,
     appBundleId: identity.app.bundleId,
     helperBundleId: identity.helper.bundleId,
@@ -418,7 +520,10 @@ function main() {
     helperVersion: identity.helper.version,
     trustRoot: {
       present: trust.present,
-      path: trust.path || null,
+      // Identified by digest, not by location. An operator can confirm which
+      // trust root was used by hashing their own copy; the path would only
+      // disclose their machine layout.
+      sha256: trust.present ? safeSha256File(trust.path) : null,
       issuer: trust.present ? trust.root.issuer ?? null : null,
       error: trust.error || null,
     },
@@ -464,11 +569,18 @@ function main() {
       helperEntitlements: sha256File(HELPER_ENTITLEMENTS),
       helperInfoPlist: sha256File(HELPER_INFO),
     },
+    // What was run, not where. Interpolating the supplied paths here would
+    // put the operator's filesystem layout into a shareable record.
     commands: [
       "git rev-parse HEAD",
+      ...ancestry.probes,
       "df -k /",
-      packageApp ? `codesign -d --verbose=2 ${packageApp}` : "(no package app inspected)",
-      packageApp ? `spctl --assess --type execute -vv ${packageApp}` : "(no package app inspected)",
+      packageApp
+        ? "codesign -d --verbose=2 <packaged-app>"
+        : "(no package app inspected)",
+      packageApp
+        ? "spctl --assess --type execute -vv <packaged-app>"
+        : "(no package app inspected)",
     ],
     topologyFailures: failures,
     admissionDenials: denials,
@@ -492,4 +604,8 @@ function main() {
   );
 }
 
-main();
+// Importable for the focused ancestry regression; only runs when invoked
+// directly, so importing this module has no side effects.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main();
+}

@@ -13,7 +13,8 @@
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
-    "qualify:computer-use-package": "node scripts/qualify-computer-use-macos-package.mjs"
+    "qualify:computer-use-package": "node scripts/qualify-computer-use-macos-package.mjs",
+    "qualify:ancestry-regression": "node scripts/qualify-ancestry.test.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.2.0",

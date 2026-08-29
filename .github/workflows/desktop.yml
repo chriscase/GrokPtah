@@ -105,7 +105,13 @@ jobs:
         # Inspects source topology only. It never signs, never opens the
         # Keychain, never prompts TCC, and treats a missing .app as
         # unavailable rather than as a pass.
-        run: npm run qualify:computer-use-package
+        #
+        # The ancestry regression runs first: CI checks out a shallow merge
+        # ref, which is exactly the case where an unprovable ancestry must
+        # report indeterminate rather than a definite "does not descend".
+        run: |
+          npm run qualify:ancestry-regression
+          npm run qualify:computer-use-package
       - name: Offline parity oracles (no network)
         # Structured oracle unit tests + fixture selftests; live suite is on-demand.
         working-directory: crates/codegen/grokptah-agent-bridge
