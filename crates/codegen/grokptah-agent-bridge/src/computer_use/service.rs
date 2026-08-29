@@ -811,15 +811,22 @@ fn classify_act_failure(error: ComputerError) -> ComputerError {
         | ComputerErrorCode::ForbiddenAction
         | ComputerErrorCode::SensitiveSurface
         | ComputerErrorCode::StaleObservation
-        | ComputerErrorCode::TargetChanged
-        | ComputerErrorCode::TargetClosed
         | ComputerErrorCode::LimitReached
         | ComputerErrorCode::Conflict
         | ComputerErrorCode::BackendUnavailable
         // Already ambiguous; keep the caller's own classification.
         | ComputerErrorCode::UncertainOutcome => error,
         // May have taken physical effect.
-        ComputerErrorCode::Pending
+        //
+        // `TargetChanged` and `TargetClosed` belong here, not above: on macOS
+        // the accessibility API can report either *after* the input event was
+        // dispatched — indeed a window closing is a plausible consequence of
+        // the very click that was sent. Without a dispatch-phase marker from
+        // the backend we cannot tell that from a pre-dispatch check, so the
+        // safe reading is that the action may have landed.
+        ComputerErrorCode::TargetChanged
+        | ComputerErrorCode::TargetClosed
+        | ComputerErrorCode::Pending
         | ComputerErrorCode::Interrupted
         | ComputerErrorCode::BackendFailure
         | ComputerErrorCode::Internal => ComputerError::new(
@@ -1168,8 +1175,6 @@ mod tests {
             ForbiddenAction,
             SensitiveSurface,
             StaleObservation,
-            TargetChanged,
-            TargetClosed,
             LimitReached,
             Conflict,
             BackendUnavailable,
@@ -1182,7 +1187,14 @@ mod tests {
         }
 
         // May have taken physical effect before the error surfaced.
-        for code in [Pending, Interrupted, BackendFailure, Internal] {
+        for code in [
+            TargetChanged,
+            TargetClosed,
+            Pending,
+            Interrupted,
+            BackendFailure,
+            Internal,
+        ] {
             let classified = classify_act_failure(ComputerError::new(code, "boom"));
             assert_eq!(
                 classified.code, UncertainOutcome,

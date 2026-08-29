@@ -118,6 +118,10 @@ pub(crate) struct AuditLog {
     previous_digest: String,
     /// Length of the log when the cached head was derived.
     observed_len: u64,
+    /// Set when replay found content it could not parse. The log is then
+    /// unappendable: continuing would reuse the sequence number of whatever
+    /// was damaged and quietly reseal a chain over dropped evidence.
+    damaged: Option<String>,
 }
 
 const GENESIS_DIGEST: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -132,6 +136,7 @@ impl AuditLog {
             sequence: 0,
             previous_digest: GENESIS_DIGEST.to_string(),
             observed_len: 0,
+            damaged: None,
         };
         let _guard = log.lock()?;
         log.replay()?;
@@ -168,6 +173,7 @@ impl AuditLog {
         if self.current_len()? != self.observed_len {
             self.sequence = 0;
             self.previous_digest = GENESIS_DIGEST.to_string();
+            self.damaged = None;
             self.replay()?;
         }
         Ok(())
@@ -190,10 +196,31 @@ impl AuditLog {
                 continue;
             }
             let Ok(record) = serde_json::from_str::<AuditRecord>(line) else {
-                // Torn or unparsable trailing record: stop replaying here and
-                // keep the chain head from the last good record.
+                // A torn trailing record is a normal crash artifact, but it is
+                // still evidence. The chain head stays at the last good record
+                // and the log is marked unappendable, so nothing reuses the
+                // damaged record's sequence number.
+                self.damaged = Some(format!(
+                    "audit log has unparsable content after sequence {}",
+                    self.sequence
+                ));
                 break;
             };
+            // Sequence numbers are dense: a gap means a record was dropped.
+            if record.sequence != self.sequence + 1 {
+                self.damaged = Some(format!(
+                    "audit log jumps from sequence {} to {}",
+                    self.sequence, record.sequence
+                ));
+                break;
+            }
+            if record.previous_digest != self.previous_digest {
+                self.damaged = Some(format!(
+                    "audit log breaks its chain at sequence {}",
+                    record.sequence
+                ));
+                break;
+            }
             self.sequence = record.sequence;
             self.previous_digest = record_digest(line);
         }
@@ -212,6 +239,9 @@ impl AuditLog {
     ) -> Result<AuditRecord, AuthorityError> {
         let _guard = self.lock()?;
         self.refresh_if_stale()?;
+        if let Some(damage) = &self.damaged {
+            return Err(AuthorityError::CorruptState(damage.clone()));
+        }
         let sequence = self
             .sequence
             .checked_add(1)
@@ -244,6 +274,18 @@ impl AuditLog {
         Ok(record)
     }
 
+    /// Whether the log holds any bytes at all.
+    ///
+    /// Deliberately does not parse: this answers "did this root serve before?"
+    /// even when the log is damaged.
+    pub(crate) fn has_content(&self) -> Result<bool, AuthorityError> {
+        match std::fs::metadata(&self.path) {
+            Ok(meta) => Ok(meta.len() > 0),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(AuthorityError::Durability(e.to_string())),
+        }
+    }
+
     /// Read every well-formed record, oldest first.
     pub(crate) fn records(&self) -> Result<Vec<AuditRecord>, AuthorityError> {
         let _guard = self.lock()?;
@@ -260,7 +302,14 @@ impl AuditLog {
             }
             match serde_json::from_str::<AuditRecord>(line) {
                 Ok(record) => out.push(record),
-                Err(_) => break,
+                // Returning the readable prefix would present a truncated log
+                // as the whole log.
+                Err(error) => {
+                    return Err(AuthorityError::CorruptState(format!(
+                        "audit log is unreadable after sequence {}: {error}",
+                        out.last().map(|r| r.sequence).unwrap_or(0)
+                    )));
+                }
             }
         }
         Ok(out)
@@ -282,7 +331,8 @@ impl AuditLog {
                 continue;
             }
             let Ok(record) = serde_json::from_str::<AuditRecord>(line) else {
-                break;
+                // Unparsable content is damage, not an end-of-log marker.
+                return Ok(false);
             };
             if record.previous_digest != expected_prev || record.sequence != expected_seq {
                 return Ok(false);

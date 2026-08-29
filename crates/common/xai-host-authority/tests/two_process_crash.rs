@@ -152,8 +152,18 @@ const RACING_CHILDREN: usize = 4;
 /// One racing child: hammer the shared root with audit appends from its own
 /// process, then exit 21.
 fn child_race(root: &Path) -> ! {
-    let Ok((authority, _admin)) = HostAuthority::open(root, OWNER) else {
-        std::process::exit(30);
+    // Admin authority is exclusive, so the children take the root in turn
+    // rather than concurrently. The appends still come from separate
+    // processes, which is what the chain has to survive.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let authority = loop {
+        match HostAuthority::open(root, OWNER) {
+            Ok((authority, _admin)) => break authority,
+            Err(_) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(_) => std::process::exit(30),
+        }
     };
     for _ in 0..APPENDS_PER_CHILD {
         if authority.authenticate(SECRET).is_err() {
@@ -180,6 +190,8 @@ fn concurrent_processes_cannot_fork_the_audit_chain() {
         )
         .unwrap();
     let before = authority.audit_records(&admin).unwrap().len();
+    // Release the root so the children can take it; exclusivity is proven by
+    // the fact that they must.
     drop(authority);
 
     // Separate processes, so this is genuine cross-process exclusion rather

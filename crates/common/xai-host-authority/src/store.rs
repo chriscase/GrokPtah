@@ -99,6 +99,11 @@ pub struct HostAdminAuthority {
     _seal: (),
 }
 
+/// A root already has a live holder. Admin authority is scarce: exactly one
+/// `HostAuthority` may hold a root at a time, process-wide and machine-wide,
+/// so a second caller cannot open the same root to mint itself an admin.
+const ADMIN_LOCK_FILE: &str = "admin.lock";
+
 impl std::fmt::Debug for HostAdminAuthority {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("HostAdminAuthority")
@@ -109,6 +114,8 @@ impl std::fmt::Debug for HostAdminAuthority {
 #[derive(Debug)]
 pub struct HostAuthority {
     pub(crate) root: PathBuf,
+    /// Held for this object's lifetime. Dropping it releases the root.
+    _admin_lock: File,
     pub(crate) audit: std::sync::Mutex<AuditLog>,
 }
 
@@ -127,18 +134,37 @@ impl HostAuthority {
             return Err(AuthorityError::Invalid("owner id"));
         }
         std::fs::create_dir_all(&root).map_err(|e| AuthorityError::Durability(e.to_string()))?;
+        // Take the root exclusively before reading anything. Admin authority is
+        // handed out by this call, so a second holder would be a second admin.
+        let admin_lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(root.join(ADMIN_LOCK_FILE))
+            .map_err(|e| AuthorityError::Durability(e.to_string()))?;
+        admin_lock.try_lock_exclusive().map_err(|_| {
+            AuthorityError::Durability(
+                "authority root is already held by another host; admin authority is exclusive"
+                    .into(),
+            )
+        })?;
         let audit = AuditLog::open(&root)?;
         // Evidence of prior service with no authority root means the root was
         // removed under us. Minting a fresh lineage here would silently orphan
         // every record the old lineage produced and let removed credentials
         // come back as new ones, so refuse instead of quietly re-establishing.
-        if !root.join("authority.json").exists() && !audit.records()?.is_empty() {
+        // Cheap presence check rather than a full parse: a damaged log must
+        // still open far enough for an operator to inspect it, while appends
+        // stay refused and the chain reports itself broken.
+        if !root.join("authority.json").exists() && audit.has_content()? {
             return Err(AuthorityError::CorruptState(
                 "authority root is missing but prior audit evidence exists".into(),
             ));
         }
         let this = Self {
             root,
+            _admin_lock: admin_lock,
             audit: std::sync::Mutex::new(audit),
         };
         // Establish the root if absent, and advance the control epoch for this
@@ -219,7 +245,17 @@ impl HostAuthority {
     ) -> Result<T, AuthorityError> {
         let _guard = self.lock()?;
         let mut state = match self.read_state()? {
-            Some(state) => state,
+            Some(state) => {
+                // The stored owner is the root's identity. Opening it under a
+                // different one would let a caller name itself the owner and
+                // administer someone else's root.
+                if state.owner_id != owner_id {
+                    return Err(AuthorityError::CorruptState(
+                        "authority root belongs to a different owner".into(),
+                    ));
+                }
+                state
+            }
             None => StoredAuthority::new(owner_id),
         };
         let out = f(&mut state)?;
