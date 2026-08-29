@@ -1187,8 +1187,15 @@ impl OrchestrationService {
             if let Some(latest) = attempts.last() {
                 value["sendState"] = serde_json::json!(latest.send_state.as_str());
                 value["attemptId"] = serde_json::json!(latest.attempt_id.as_str());
-                value["providerRequestId"] =
+                // The host's idempotency key is not a provider receipt. Naming
+                // it `providerRequestId` claimed the provider had identified a
+                // request it may never have seen — this projection reported one
+                // even while the send state was `known_not_sent`.
+                value["providerIdempotencyKey"] =
                     serde_json::json!(latest.intent.provider_idempotency_key.as_str());
+                if let Some(receipt) = latest.receipts.request.as_ref() {
+                    value["providerRequestId"] = serde_json::json!(receipt.as_str());
+                }
                 if latest.send_state.requires_reconciliation() {
                     value["requiredOperatorAction"] =
                         serde_json::json!("reconcile_uncertain_dispatch");
@@ -3457,7 +3464,6 @@ impl OrchestrationService {
             attempt_binding::settle_run(
                 &store,
                 &rid,
-                durable_result.is_ok(),
                 attempt_binding::usage_receipt(
                     candidate.aggregates.usage.prompt_tokens,
                     candidate.aggregates.usage.completion_tokens,

@@ -152,11 +152,11 @@ Do not commit, push, open a PR, promote, or access paths outside this disposable
         );
     }
     eprintln!(
-        "LIVE_SELF_HOST_TERMINAL state={} send={} attempt={} providerRequest={} authorityGrant={}",
+        "LIVE_SELF_HOST_TERMINAL state={} send={} attempt={} idempotencyKey={} authorityGrant={}",
         last["state"],
         last["sendState"],
         last["attemptId"],
-        last["providerRequestId"],
+        last["providerIdempotencyKey"],
         last["authority"]["grantClass"]
     );
 

@@ -5751,7 +5751,6 @@ impl AgentHostHandle {
             crate::attempt_binding::settle_run(
                 store,
                 run_id,
-                result.is_ok() && !cancelled,
                 crate::attempt_binding::usage_receipt(usage.prompt_tokens, usage.completion_tokens),
             );
         }

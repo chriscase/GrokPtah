@@ -258,7 +258,7 @@ async fn a_settled_send_is_terminal_and_releases_the_run() {
     send_under_binding(&store, run, Cut::Settled, Some("req-provider-88")).await;
     assert_eq!(state(&store, run), SendState::Responding);
 
-    binding::settle_run(&store, run, true, None);
+    binding::settle_run(&store, run, None);
     let store = restart(&home, Some(store));
 
     assert_eq!(state(&store, run), SendState::Settled);
@@ -422,7 +422,7 @@ async fn a_turn_that_never_dispatches_is_not_recorded_as_sent() {
 
     // The turn ran to a successful local answer without touching a provider.
     send_under_binding(&store, run, Cut::BeforeSend, None).await;
-    binding::settle_run(&store, run, true, None);
+    binding::settle_run(&store, run, None);
 
     let recorded = only(&store, run);
     assert_eq!(
@@ -464,11 +464,19 @@ async fn a_successful_turn_does_not_acknowledge_an_unreported_request() {
     let store = restart(&home, Some(store));
     assert_eq!(state(&store, run), SendState::Uncertain);
 
-    binding::settle_run(&store, run, true, None);
+    binding::settle_run(&store, run, None);
     let recorded = only(&store, run);
     assert!(
         !matches!(recorded.send_state, SendState::Sent),
         "a request nobody reported on was not acknowledged"
     );
-    assert_eq!(recorded.send_state, SendState::Settled);
+    // And it does not settle either. A later round of the same turn succeeding
+    // says nothing about this request's fate, so the ambiguity survives until
+    // an operator reconciles it.
+    assert_eq!(recorded.send_state, SendState::Uncertain);
+    assert!(
+        !recorded.receipts.provider_replied,
+        "turn success must not fabricate a provider acknowledgement"
+    );
+    assert!(!store.run_permits_new_attempt(run).expect("read the ledger"));
 }

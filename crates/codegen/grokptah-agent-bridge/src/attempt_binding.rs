@@ -323,19 +323,20 @@ pub(crate) fn reconcile_run(store: &OrchStore, run_id: &str) {
 
 /// Settle this run's attempts once the turn is over.
 ///
-/// `succeeded` is the *turn's* outcome, which is deliberately not treated as
-/// evidence about the *request*. A turn can succeed without its provider call
-/// succeeding — a Chat turn renders a failed model call as its reply, and a
-/// tool loop can finish on a local answer — so reading turn success as a
-/// provider acknowledgement would manufacture a receipt for a request that
-/// may never have arrived.
+/// Deliberately takes no turn outcome. A turn's verdict is not evidence about
+/// any individual physical request: a Chat turn renders a failed model call as
+/// its reply and returns success, and a tool loop can succeed on a later round
+/// while an earlier request remains one nobody ever reported on. Every
+/// transition here is therefore a function of what the transport actually
+/// recorded, plus the fact that the turn is over.
 ///
-/// So `sent` is never reached from here. Only the transport can observe an
-/// acknowledgement, and it records one through
-/// [`crate::physical_send::mark_sent`]. What is left in `sending` at turn end
-/// is a request that crossed the boundary and was never reported on again:
-/// that is exactly `uncertain`, whatever the turn went on to return.
-pub fn settle_run(store: &OrchStore, run_id: &str, succeeded: bool, usage: Option<UsageReceipt>) {
+/// So `sent` is never reached from here — only
+/// [`crate::physical_send::mark_sent`] can record an acknowledgement — and
+/// `uncertain` is absorbing, clearable only by an explicit operator
+/// reconciliation. What is left in `sending` at turn end is a request that
+/// crossed the boundary and was never reported on, which is exactly
+/// `uncertain`.
+pub fn settle_run(store: &OrchStore, run_id: &str, usage: Option<UsageReceipt>) {
     let Ok(attempts) = store.list_attempts_for_run(run_id) else {
         return;
     };
@@ -346,10 +347,14 @@ pub fn settle_run(store: &OrchStore, run_id: &str, succeeded: bool, usage: Optio
             SendState::Sent | SendState::Responding => SendState::Settled,
             // Crossed the boundary, never reported on again.
             SendState::Sending => SendState::Uncertain,
-            // Already ambiguous; a turn that went on to succeed did get its
-            // reply, so the identity can be released.
-            SendState::Uncertain if succeeded => SendState::Settled,
-            // Provably unsent, still ambiguous, or already terminal.
+            // Provably unsent, already ambiguous, or already terminal.
+            //
+            // `uncertain` is deliberately absorbing here. A turn can succeed on
+            // a later round while an earlier physical request remains one
+            // nobody ever reported on, so turn success is not evidence about
+            // *that* request; settling on it would fabricate the very
+            // acknowledgement this module exists to avoid. Only an explicit
+            // operator reconciliation may move it.
             SendState::KnownNotSent | SendState::Uncertain | SendState::Settled => continue,
         };
         let _ = store.update_attempt(&id, |attempt| {
