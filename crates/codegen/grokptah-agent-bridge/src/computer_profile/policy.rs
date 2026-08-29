@@ -86,10 +86,12 @@ pub enum ProfileReason {
     HigherRiskObjective,
     /// Stopped: the profile's wall-clock budget for one turn was exceeded.
     TurnBudgetExceeded,
-    /// Stopped: the profile's repair budget for one turn was exhausted.
-    RepairBudgetExceeded,
     /// Terminal: a process restart cut the run. Nothing is replayed.
     RunInterrupted,
+    /// Terminal: the durable record failed its own invariants, so it is not
+    /// trusted as authority. A record that cannot be shown to be internally
+    /// consistent is treated as tampered or corrupt, never as permissive.
+    RecordInvalid,
 }
 
 impl ProfileReason {
@@ -114,8 +116,8 @@ impl ProfileReason {
             Self::CapabilityGenerationChanged => "capability_generation_changed",
             Self::HigherRiskObjective => "higher_risk_objective",
             Self::TurnBudgetExceeded => "turn_budget_exceeded",
-            Self::RepairBudgetExceeded => "repair_budget_exceeded",
             Self::RunInterrupted => "run_interrupted",
+            Self::RecordInvalid => "record_invalid",
         }
     }
 
@@ -177,11 +179,11 @@ impl ProfileReason {
             Self::TurnBudgetExceeded => {
                 "The model did not answer within this profile's time budget for one step."
             }
-            Self::RepairBudgetExceeded => {
-                "The model used every repair this profile allows without returning a usable proposal."
-            }
             Self::RunInterrupted => {
                 "A restart interrupted this run. Nothing was replayed; a new authorization is required."
+            }
+            Self::RecordInvalid => {
+                "This run's adaptive record is inconsistent, so it is no longer trusted. Start a new run."
             }
         }
     }
@@ -222,8 +224,6 @@ pub enum RuntimeSignal {
     HigherRiskObjective,
     /// One turn exceeded the profile's wall-clock budget.
     TurnBudgetExceeded,
-    /// One turn exhausted the profile's repair budget.
-    RepairBudgetExceeded,
 }
 
 impl RuntimeSignal {
@@ -241,7 +241,6 @@ impl RuntimeSignal {
             Self::CapabilityGenerationChanged => ProfileReason::CapabilityGenerationChanged,
             Self::HigherRiskObjective => ProfileReason::HigherRiskObjective,
             Self::TurnBudgetExceeded => ProfileReason::TurnBudgetExceeded,
-            Self::RepairBudgetExceeded => ProfileReason::RepairBudgetExceeded,
         }
     }
 
@@ -258,7 +257,6 @@ impl RuntimeSignal {
                 | Self::BudgetExhausted
                 | Self::VerificationExhausted
                 | Self::TurnBudgetExceeded
-                | Self::RepairBudgetExceeded
                 | Self::HigherRiskObjective
         )
     }
@@ -605,7 +603,6 @@ mod tests {
             RuntimeSignal::CapabilityGenerationChanged,
             RuntimeSignal::HigherRiskObjective,
             RuntimeSignal::TurnBudgetExceeded,
-            RuntimeSignal::RepairBudgetExceeded,
         ];
         for signal in signals {
             for profile in AdaptiveProfile::ALL {
@@ -660,8 +657,8 @@ mod tests {
             ProfileReason::CapabilityGenerationChanged,
             ProfileReason::HigherRiskObjective,
             ProfileReason::TurnBudgetExceeded,
-            ProfileReason::RepairBudgetExceeded,
             ProfileReason::RunInterrupted,
+            ProfileReason::RecordInvalid,
         ];
         let codes: std::collections::BTreeSet<_> =
             reasons.iter().map(|reason| reason.as_str()).collect();

@@ -30,10 +30,10 @@ use grokptah_agent_bridge::computer_use::{
     SemanticElement, Sensitivity,
 };
 use grokptah_agent_bridge::{
-    AdaptiveAttemptOutcome, AdaptiveLifecycle, AdaptiveProfile, CapabilityEvidence,
-    CapabilityGeneration, CapabilitySource, ComputerUseService, ComputerUseTier,
-    HostCapabilityEvidence, ModelCapabilities, ModelCapabilityEvidence, ObservationFingerprint,
-    OperatorCapabilityPolicy, ProfileReason, RuntimeSignal, TaskRisk,
+    AdaptiveAttemptOutcome, AdaptiveLifecycle, AdaptiveProfile, AdaptiveRecord,
+    AdaptiveTurnRequest, CapabilityGeneration, CapabilitySource, ComputerUseService,
+    ComputerUseTier, ModelCapabilities, ModelCapabilityEvidence, ObservationFingerprint,
+    OperatorCapabilityPolicy, ProfileReason, RuntimeSignal, TaskRisk, TerminalOutcome,
 };
 
 /// Env var that turns this test binary into the "first process" of the
@@ -151,26 +151,37 @@ fn generation(route: &str, credential: &str, image: bool) -> CapabilityGeneratio
     )
 }
 
-fn evidence(route: &str, credential: &str, image: bool, verifier: bool) -> CapabilityEvidence {
-    CapabilityEvidence::new(
-        ModelCapabilityEvidence::from_model_capabilities(
-            &capabilities(image),
-            true,
-            false,
-            route,
-            credential,
-            &OperatorCapabilityPolicy::default(),
-        ),
-        HostCapabilityEvidence {
-            semantic_observation: true,
-            screenshot_capture: image,
-            independent_verifier: verifier,
-        },
+/// The model half of the evidence — the only half a caller still supplies,
+/// because it is the only half the service cannot read off the live run.
+///
+/// The host half is now derived inside `begin_adaptive_turn` from the run's own
+/// observation and a build constant, so these gates can no longer assert an
+/// independent verifier the build does not have. That is the point: High
+/// Assurance is unreachable here, and saying so is the honest thing.
+fn model_evidence(route: &str, credential: &str, image: bool) -> ModelCapabilityEvidence {
+    ModelCapabilityEvidence::from_model_capabilities(
+        &capabilities(image),
+        true,
+        false,
+        route,
+        credential,
+        &OperatorCapabilityPolicy::default(),
     )
+}
+
+/// A routine objective. Risk is classified from this and the live frame inside
+/// the service; no caller asserts a risk class any more.
+const ROUTINE: &str = "save the open document";
+/// A destructive objective, in the operator's own words.
+const DESTRUCTIVE: &str = "delete the saved document permanently";
+
+fn request<'a>(model: &'a ModelCapabilityEvidence, objective: &'a str) -> AdaptiveTurnRequest<'a> {
+    AdaptiveTurnRequest { model, objective }
 }
 
 struct Harness {
     _dir: TempDir,
+    root: std::path::PathBuf,
     service: Arc<ComputerUseService>,
     owner: Uuid,
 }
@@ -179,11 +190,28 @@ impl Harness {
     fn new() -> Self {
         let dir = TempDir::new().expect("temp dir");
         let store = ComputerStore::open(dir.path()).expect("store");
+        let root = dir.path().to_path_buf();
         Self {
             _dir: dir,
+            root,
             service: Arc::new(ComputerUseService::new(Arc::new(FixtureBackend), store)),
             owner: Uuid::new_v4(),
         }
+    }
+
+    /// The durable file behind one run, so a gate can tamper with it the way
+    /// anything outside this process would have to. The store sanitizes run ids
+    /// into file names, so find the file rather than guessing its name.
+    fn run_file(&self, run_id: &str) -> std::path::PathBuf {
+        let dir = self.root.join("runs");
+        for entry in std::fs::read_dir(&dir).expect("runs directory") {
+            let path = entry.expect("entry").path();
+            let text = std::fs::read_to_string(&path).expect("read run");
+            if text.contains(run_id) {
+                return path;
+            }
+        }
+        panic!("no durable file for run {run_id} under {}", dir.display());
     }
 
     async fn ready_run(&self) -> ReadyRun {
@@ -326,10 +354,10 @@ async fn crash_child_writes_an_in_flight_record() {
     let service = ComputerUseService::new(Arc::new(FixtureBackend), store);
     let owner = Uuid::new_v4();
     let run = ready_run_on(&service, owner).await;
-    let evidence = evidence("route-1", "cred-1", true, true);
+    let evidence = model_evidence("route-1", "cred-1", true);
 
     service
-        .begin_adaptive_turn(&run.run_id, owner, &evidence, TaskRisk::Routine)
+        .begin_adaptive_turn(&run.run_id, owner, request(&evidence, ROUTINE))
         .expect("admit a turn");
     service
         .record_adaptive_attempt(&run.run_id)
@@ -345,11 +373,15 @@ async fn crash_child_writes_an_in_flight_record() {
 async fn a_same_route_downgrade_stops_the_run() {
     let harness = Harness::new();
     let run = harness.ready_run().await;
-    let evidence = evidence("route-1", "cred-1", true, true);
+    let evidence = model_evidence("route-1", "cred-1", true);
     harness
         .service
-        .begin_adaptive_turn(&run.run_id, harness.owner, &evidence, TaskRisk::Routine)
+        .begin_adaptive_turn(&run.run_id, harness.owner, request(&evidence, ROUTINE))
         .expect("first turn admitted");
+    harness
+        .service
+        .record_adaptive_attempt(&run.run_id)
+        .expect("count the attempt");
     harness
         .service
         .finish_adaptive_turn(
@@ -363,27 +395,20 @@ async fn a_same_route_downgrade_stops_the_run() {
         .expect("close the turn");
 
     // Same endpoint, model, and dialect; smaller tier.
-    let downgraded = CapabilityEvidence::new(
-        ModelCapabilityEvidence::from_model_capabilities(
-            &ModelCapabilities {
-                computer_use_tier: ComputerUseTier::Observe,
-                ..capabilities(true)
-            },
-            true,
-            false,
-            "route-1",
-            "cred-1",
-            &OperatorCapabilityPolicy::default(),
-        ),
-        HostCapabilityEvidence {
-            semantic_observation: true,
-            screenshot_capture: true,
-            independent_verifier: true,
+    let downgraded = ModelCapabilityEvidence::from_model_capabilities(
+        &ModelCapabilities {
+            computer_use_tier: ComputerUseTier::Observe,
+            ..capabilities(true)
         },
+        true,
+        false,
+        "route-1",
+        "cred-1",
+        &OperatorCapabilityPolicy::default(),
     );
     let error = harness
         .service
-        .begin_adaptive_turn(&run.run_id, harness.owner, &downgraded, TaskRisk::Routine)
+        .begin_adaptive_turn(&run.run_id, harness.owner, request(&downgraded, ROUTINE))
         .expect_err("a downgrade must not be admitted");
     assert!(
         error.to_string().contains("capability"),
@@ -433,11 +458,15 @@ fn rotation_and_policy_edits_change_the_generation() {
 async fn a_later_higher_risk_objective_stops_the_run() {
     let harness = Harness::new();
     let run = harness.ready_run().await;
-    let evidence = evidence("route-1", "cred-1", true, true);
+    let evidence = model_evidence("route-1", "cred-1", true);
     harness
         .service
-        .begin_adaptive_turn(&run.run_id, harness.owner, &evidence, TaskRisk::Routine)
+        .begin_adaptive_turn(&run.run_id, harness.owner, request(&evidence, ROUTINE))
         .expect("routine turn admitted");
+    harness
+        .service
+        .record_adaptive_attempt(&run.run_id)
+        .expect("count the attempt");
     harness
         .service
         .finish_adaptive_turn(
@@ -452,7 +481,7 @@ async fn a_later_higher_risk_objective_stops_the_run() {
 
     let error = harness
         .service
-        .begin_adaptive_turn(&run.run_id, harness.owner, &evidence, TaskRisk::Destructive)
+        .begin_adaptive_turn(&run.run_id, harness.owner, request(&evidence, DESTRUCTIVE))
         .expect_err("a higher-risk objective must not ride the old authorization");
     assert!(!error.to_string().is_empty());
     let projection = harness
@@ -472,11 +501,11 @@ async fn a_later_higher_risk_objective_stops_the_run() {
 async fn failed_attempts_consume_the_budget_and_keep_their_usage() {
     let harness = Harness::new();
     let run = harness.ready_run().await;
-    let evidence = evidence("route-1", "cred-1", false, false);
+    let evidence = model_evidence("route-1", "cred-1", false);
 
     harness
         .service
-        .begin_adaptive_turn(&run.run_id, harness.owner, &evidence, TaskRisk::Routine)
+        .begin_adaptive_turn(&run.run_id, harness.owner, request(&evidence, ROUTINE))
         .expect("turn admitted");
     harness
         .service
@@ -517,12 +546,12 @@ async fn failed_attempts_consume_the_budget_and_keep_their_usage() {
 #[tokio::test]
 async fn a_second_run_does_not_inherit_the_first_runs_state() {
     let harness = Harness::new();
-    let evidence = evidence("route-1", "cred-1", true, true);
+    let evidence = model_evidence("route-1", "cred-1", true);
 
     let first = harness.ready_run().await;
     harness
         .service
-        .begin_adaptive_turn(&first.run_id, harness.owner, &evidence, TaskRisk::Routine)
+        .begin_adaptive_turn(&first.run_id, harness.owner, request(&evidence, ROUTINE))
         .expect("first run turn");
     harness
         .service
@@ -548,7 +577,7 @@ async fn a_second_run_does_not_inherit_the_first_runs_state() {
     let second = harness.ready_run().await;
     harness
         .service
-        .begin_adaptive_turn(&second.run_id, harness.owner, &evidence, TaskRisk::Routine)
+        .begin_adaptive_turn(&second.run_id, harness.owner, request(&evidence, ROUTINE))
         .expect("second run turn");
     let projection = harness
         .service
@@ -573,10 +602,10 @@ async fn a_second_run_does_not_inherit_the_first_runs_state() {
 async fn stationarity_is_tracked_on_the_durable_record() {
     let harness = Harness::new();
     let run = harness.ready_run().await;
-    let evidence = evidence("route-1", "cred-1", true, true);
+    let evidence = model_evidence("route-1", "cred-1", true);
     harness
         .service
-        .begin_adaptive_turn(&run.run_id, harness.owner, &evidence, TaskRisk::Routine)
+        .begin_adaptive_turn(&run.run_id, harness.owner, request(&evidence, ROUTINE))
         .expect("turn");
 
     let fingerprint = ObservationFingerprint::of(&run.observation);
@@ -652,10 +681,10 @@ async fn a_run_without_a_record_cannot_spend_a_turn() {
 async fn the_shared_run_projection_carries_the_durable_adaptive_record() {
     let harness = Harness::new();
     let run = harness.ready_run().await;
-    let evidence = evidence("route-1", "cred-1", true, true);
+    let evidence = model_evidence("route-1", "cred-1", true);
     harness
         .service
-        .begin_adaptive_turn(&run.run_id, harness.owner, &evidence, TaskRisk::Routine)
+        .begin_adaptive_turn(&run.run_id, harness.owner, request(&evidence, ROUTINE))
         .expect("turn");
     harness
         .service
@@ -759,6 +788,43 @@ async fn the_projection_wire_shape_is_pinned() {
         "terminal",
     ];
 
+    /// Mirrors `ADAPTIVE_BUDGET_KEYS` in `run_computer_reads_smoke.mjs`.
+    const BUDGET_KEYS: &[&str] = &[
+        "keyChordAllowed",
+        "maxModelCalls",
+        "maxObservationBytes",
+        "maxObservationElements",
+        "maxTurnMillis",
+        "observationDetail",
+        "pointerFallbackAllowed",
+    ];
+    /// Mirrors `ADAPTIVE_CAPABILITY_KEYS` in `run_computer_reads_smoke.mjs`.
+    const CAPABILITY_KEYS: &[&str] = &[
+        "attribution",
+        "ceiling",
+        "declaredCapabilityTrusted",
+        "durableAuthority",
+        "generation",
+        "hostIndependentVerifier",
+        "hostScreenshotCapture",
+        "imageInput",
+        "qualifiedVisualPath",
+        "sessionMeasured",
+        "structuredTools",
+        "syntheticOnly",
+        "tier",
+    ];
+    /// Mirrors `ADAPTIVE_COST_KEYS` in `run_computer_reads_smoke.mjs`.
+    const COST_KEYS: &[&str] = &[
+        "acceptedAttempts",
+        "completionTokens",
+        "failedAttempts",
+        "observationBytes",
+        "promptTokens",
+        "providerAttempts",
+        "screenshotBytes",
+    ];
+
     fn keys(value: &serde_json::Value) -> Vec<String> {
         let mut keys: Vec<String> = value
             .as_object()
@@ -772,10 +838,10 @@ async fn the_projection_wire_shape_is_pinned() {
 
     let harness = Harness::new();
     let run = harness.ready_run().await;
-    let evidence = evidence("route-1", "cred-1", true, true);
+    let evidence = model_evidence("route-1", "cred-1", true);
     harness
         .service
-        .begin_adaptive_turn(&run.run_id, harness.owner, &evidence, TaskRisk::Routine)
+        .begin_adaptive_turn(&run.run_id, harness.owner, request(&evidence, ROUTINE))
         .expect("turn");
 
     let projection = harness
@@ -794,4 +860,154 @@ async fn the_projection_wire_shape_is_pinned() {
         ADAPTIVE_KEYS,
         "the adaptive projection's wire keys changed"
     );
+    assert_eq!(
+        keys(&wire["adaptive"]["budget"]),
+        BUDGET_KEYS,
+        "the adaptive budget's wire keys changed"
+    );
+    assert_eq!(
+        keys(&wire["adaptive"]["capability"]),
+        CAPABILITY_KEYS,
+        "the adaptive capability evidence's wire keys changed"
+    );
+    assert_eq!(
+        keys(&wire["adaptive"]["cost"]),
+        COST_KEYS,
+        "the adaptive cost ledger's wire keys changed"
+    );
+}
+
+/// **A record that fails its own invariants is not authority.**
+///
+/// The durable record is a file. It can be truncated by a full disk, restored
+/// from a backup taken mid-write, or edited on purpose — and every field in it
+/// is an input to an authority decision. Each case below tampers with exactly
+/// one field, in the direction that would *help* an attacker, and asserts the
+/// record comes back terminal rather than permissive.
+#[tokio::test]
+async fn a_tampered_record_is_refused_rather_than_trusted() {
+    /// One tamper case: a label, and the single edit it makes.
+    type TamperCase = (&'static str, fn(&mut AdaptiveRecord));
+
+    // Each case names what it edits and why that edit is worth making.
+    let cases: Vec<TamperCase> = vec![
+        ("claim a profile the evidence cannot support", |record| {
+            record.profile = AdaptiveProfile::HighAssurance;
+        }),
+        ("inflate accepted attempts to hide spend", |record| {
+            record.cost.accepted_attempts = record.cost.accepted_attempts.saturating_add(40);
+        }),
+        ("claim screenshot bytes were sent to a model", |record| {
+            record.cost.screenshot_bytes = 1;
+        }),
+        ("lower the risk high-water mark", |record| {
+            record.risk_high_water = TaskRisk::Routine;
+            record.decision.risk = TaskRisk::Destructive;
+        }),
+        (
+            "resurrect a terminal record by clearing its outcome",
+            |record| {
+                record.lifecycle = AdaptiveLifecycle::Stopped;
+                record.terminal = None;
+            },
+        ),
+        ("forge an admitted turn on a terminal record", |record| {
+            record.lifecycle = AdaptiveLifecycle::Stopped;
+            record.terminal = Some(TerminalOutcome {
+                lifecycle: AdaptiveLifecycle::Stopped,
+                reason: ProfileReason::BudgetExhausted,
+                profile: record.profile,
+                required_profile: None,
+            });
+            record.active_permit = Some("permit-forged".into());
+        }),
+    ];
+
+    for (label, tamper) in cases {
+        let harness = Harness::new();
+        let run = harness.ready_run().await;
+        let evidence = model_evidence("route-1", "cred-1", true);
+        harness
+            .service
+            .begin_adaptive_turn(&run.run_id, harness.owner, request(&evidence, ROUTINE))
+            .expect("turn admitted");
+        harness
+            .service
+            .record_adaptive_attempt(&run.run_id)
+            .expect("count the attempt");
+        harness
+            .service
+            .finish_adaptive_turn(
+                &run.run_id,
+                (None, None),
+                AdaptiveAttemptOutcome::Succeeded {
+                    observation_bytes: 128,
+                    truncated: false,
+                },
+            )
+            .expect("close the turn");
+
+        // Edit the file behind the store's back, exactly as anything outside
+        // this process would have to.
+        let path = harness.run_file(&run.run_id);
+        let mut raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("parse");
+        let mut record: grokptah_agent_bridge::AdaptiveRecord =
+            serde_json::from_value(raw["adaptive"].clone()).expect("record");
+        assert!(
+            record.check_invariants().is_ok(),
+            "{label}: the untampered record must be valid to start with"
+        );
+        tamper(&mut record);
+        raw["adaptive"] = serde_json::to_value(&record).expect("serialize");
+        std::fs::write(&path, serde_json::to_string(&raw).expect("encode")).expect("write");
+
+        // Reading it is enough: the record comes back terminal, not permissive.
+        let loaded = harness
+            .service
+            .get_run(&run.run_id)
+            .expect("load")
+            .expect("run")
+            .adaptive
+            .expect("record survives so the operator can see what happened");
+        assert_eq!(
+            loaded.lifecycle,
+            AdaptiveLifecycle::Stopped,
+            "{label}: a record that fails its invariants must not stay live"
+        );
+        assert_eq!(
+            loaded.terminal.as_ref().map(|terminal| terminal.reason),
+            Some(ProfileReason::RecordInvalid),
+            "{label}: the stop must name why"
+        );
+        assert_eq!(
+            loaded.active_permit, None,
+            "{label}: an invalid record holds no admitted turn"
+        );
+
+        // And nothing can be admitted against it afterwards.
+        let refused = harness
+            .service
+            .begin_adaptive_turn(&run.run_id, harness.owner, request(&evidence, ROUTINE))
+            .expect_err(&format!("{label}: an invalid record must admit nothing"));
+        assert_eq!(refused.code, ComputerErrorCode::Unauthorized, "{label}");
+
+        // The operator can read what happened, in words.
+        let projection = harness
+            .service
+            .adaptive_projection(&run.run_id)
+            .expect("projection")
+            .expect("record");
+        assert_eq!(
+            projection.terminal.as_ref().map(|t| t.reason),
+            Some(ProfileReason::RecordInvalid),
+            "{label}"
+        );
+        assert!(!projection
+            .terminal
+            .as_ref()
+            .expect("terminal")
+            .message
+            .is_empty());
+    }
 }

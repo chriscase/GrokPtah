@@ -383,8 +383,16 @@ impl ComputerStore {
     }
 
     fn read_run_path(&self, path: &Path) -> ComputerResult<ComputerRun> {
-        let run: ComputerRun = read_json(path).map_err(internal_error)?;
+        let mut run: ComputerRun = read_json(path).map_err(internal_error)?;
         validate_run_record(&run)?;
+        // Every load, not only restart recovery: a record edited or corrupted
+        // at any point stops being authority the next time anything reads it.
+        // The record is kept so the operator can see that this happened, but it
+        // is converted to a terminal `record_invalid` stop, which every
+        // admission path already refuses (#435).
+        if let Some(adaptive) = run.adaptive.as_mut() {
+            adaptive.enforce_invariants();
+        }
         if self.run_path(&run.run_id)? != path {
             return Err(ComputerError::new(
                 ComputerErrorCode::Internal,

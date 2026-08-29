@@ -12,8 +12,8 @@ use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 pub use seal::{
-    accept_model_proposal, AcceptedIntent, AcceptedModelProposal, ModelProposalContext,
-    RawModelProposal, PROPOSAL_SEAL_VERSION,
+    accept_model_proposal, AcceptedIntent, AcceptedModelProposal, AdaptiveSealBinding,
+    ModelProposalContext, RawModelProposal, PROPOSAL_SEAL_VERSION,
 };
 
 use crate::computer_profile::{AdaptiveProfile, ProfileBudget, TurnPermit};
@@ -246,6 +246,13 @@ pub struct ProposalAttempt {
     pub prompt_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
     pub outcome: Result<RawModelProposal>,
+    /// The turn outlived the profile's `maxTurnMillis`.
+    ///
+    /// Reported separately from the error so the caller can raise
+    /// [`RuntimeSignal::TurnBudgetExceeded`] for it. Without this the timeout
+    /// was enforced but indistinguishable from any other failure, and the
+    /// signal the projection advertises had no producer.
+    pub timed_out: bool,
 }
 
 /// Asks the selected, qualified model for exactly one bounded proposal.
@@ -282,6 +289,7 @@ pub(crate) async fn propose_semantic_action(
         prompt_tokens,
         completion_tokens,
         outcome,
+        timed_out: false,
     };
     let _ = rendered_bytes;
 
@@ -329,14 +337,17 @@ pub(crate) async fn propose_semantic_action(
         Ok(Ok(step)) => step,
         Ok(Err(error)) => return Ok(attempt(Err(error), None, None)),
         Err(_elapsed) => {
-            return Ok(attempt(
-                Err(anyhow!(
-                    "the model did not answer within the {} profile turn budget",
-                    permit.profile
-                )),
-                None,
-                None,
-            ))
+            return Ok(ProposalAttempt {
+                timed_out: true,
+                ..attempt(
+                    Err(anyhow!(
+                        "the model did not answer within the {} profile turn budget",
+                        permit.profile
+                    )),
+                    None,
+                    None,
+                )
+            })
         }
     };
 

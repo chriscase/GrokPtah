@@ -125,6 +125,16 @@ impl CapabilityGeneration {
     /// Computes the generation. Deterministic, and a pure function of its
     /// inputs, so two callers reading the same route agree without
     /// coordinating.
+    /// A generation that can never equal a computed one.
+    ///
+    /// `compute` always yields lowercase hex, so this sentinel is
+    /// unrepresentable there. It exists for the opt-in live provider proof,
+    /// which reaches no durable Computer Run at all: a permit carrying it can
+    /// bound what is *sent*, and can never match a record's authority.
+    pub fn unbound() -> Self {
+        Self("unbound".to_string())
+    }
+
     pub fn compute(
         route_fingerprint: &str,
         capabilities: &ModelCapabilities,
@@ -322,6 +332,15 @@ pub struct HostCapabilityEvidence {
     pub independent_verifier: bool,
 }
 
+/// Whether this build has a postcondition verifier independent of the model
+/// that proposed the action.
+///
+/// A build fact, not a caller claim, and deliberately const: High Assurance is
+/// unreachable while it is `false`, and flipping it is the whole change once a
+/// real verifier exists. It lives here rather than in the host so the service
+/// can derive host evidence itself instead of being handed a conclusion.
+pub const HOST_INDEPENDENT_VERIFIER_AVAILABLE: bool = false;
+
 impl HostCapabilityEvidence {
     /// The conservative default: semantics only, nothing else established.
     pub const SEMANTIC_ONLY: Self = Self {
@@ -329,6 +348,22 @@ impl HostCapabilityEvidence {
         screenshot_capture: false,
         independent_verifier: false,
     };
+
+    /// Read what the host can actually offer off the frame the operator already
+    /// approved, rather than accepting a caller's account of it.
+    ///
+    /// This is the only construction any admission path uses. A caller that
+    /// wants High Assurance cannot get it by asserting a verifier it does not
+    /// have: the verifier bit comes from
+    /// [`HOST_INDEPENDENT_VERIFIER_AVAILABLE`], and the other two are read off
+    /// the observation.
+    pub fn observe(observation: &crate::computer_use::ComputerObservation) -> Self {
+        Self {
+            semantic_observation: !observation.elements.is_empty(),
+            screenshot_capture: observation.screenshot.is_some(),
+            independent_verifier: HOST_INDEPENDENT_VERIFIER_AVAILABLE,
+        }
+    }
 }
 
 /// The complete evidence set a profile decision is derived from.

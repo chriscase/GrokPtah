@@ -52,7 +52,7 @@ pub fn canonical_workspace_string(path: &std::path::Path) -> Option<String> {
 
 #[cfg(target_os = "macos")]
 mod macos_native;
-pub use service::{AdaptiveAttemptOutcome, ComputerUseService};
+pub use service::{AdaptiveAttemptOutcome, AdaptiveTurnRequest, ComputerUseService};
 pub use simulator::SimulatorBackend;
 pub use store::ComputerStore;
 pub use types::{

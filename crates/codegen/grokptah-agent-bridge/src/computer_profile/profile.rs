@@ -227,8 +227,6 @@ pub struct ProfileBudget {
     pub max_element_text_bytes: u32,
     /// Model calls this run may spend in total, across proposals and repairs.
     pub max_model_calls: u32,
-    /// Re-asks allowed after a rejected response within one turn.
-    pub max_repairs: u32,
     /// Raw model response bytes. Always checkable, unlike token counts.
     pub max_response_bytes: u64,
     /// Wall-clock budget for one proposal turn including its repairs.
@@ -239,10 +237,6 @@ pub struct ProfileBudget {
     pub max_scroll_delta: i32,
     /// Bytes of operator-facing proposal summary.
     pub max_summary_bytes: u32,
-    /// Whether the host may spend a screenshot capture at all. Economy is
-    /// semantic-first precisely because a small text-oriented model gains
-    /// nothing from pixels it cannot read.
-    pub allows_screenshot_capture: bool,
     /// Whether the model may reach for pointer-fallback actions. Still subject
     /// to the grant's own action classes, which the kernel checks separately.
     pub allows_pointer_fallback: bool,
@@ -257,13 +251,11 @@ pub const ECONOMY_BUDGET: ProfileBudget = ProfileBudget {
     max_observation_bytes: 24 * 1024,
     max_element_text_bytes: 256,
     max_model_calls: 16,
-    max_repairs: 1,
     max_response_bytes: 8 * 1024,
     max_turn_millis: 20_000,
     max_text_entry_bytes: 1_024,
     max_scroll_delta: 2_000,
     max_summary_bytes: 256,
-    allows_screenshot_capture: false,
     allows_pointer_fallback: false,
     allows_key_chord: false,
 };
@@ -275,13 +267,11 @@ pub const BALANCED_BUDGET: ProfileBudget = ProfileBudget {
     max_observation_bytes: 128 * 1024,
     max_element_text_bytes: 512,
     max_model_calls: 48,
-    max_repairs: 2,
     max_response_bytes: 32 * 1024,
     max_turn_millis: 60_000,
     max_text_entry_bytes: 4 * 1024,
     max_scroll_delta: 10_000,
     max_summary_bytes: 512,
-    allows_screenshot_capture: true,
     allows_pointer_fallback: true,
     allows_key_chord: false,
 };
@@ -295,13 +285,11 @@ pub const HIGH_ASSURANCE_BUDGET: ProfileBudget = ProfileBudget {
     max_observation_bytes: 512 * 1024,
     max_element_text_bytes: 512,
     max_model_calls: 96,
-    max_repairs: 3,
     max_response_bytes: 128 * 1024,
     max_turn_millis: 120_000,
     max_text_entry_bytes: KERNEL_TEXT_ENTRY_BYTES,
     max_scroll_delta: KERNEL_SCROLL_DELTA,
     max_summary_bytes: 512,
-    allows_screenshot_capture: true,
     allows_pointer_fallback: true,
     allows_key_chord: true,
 };
@@ -398,7 +386,6 @@ mod assertions {
             && budget.max_text_entry_bytes <= KERNEL_TEXT_ENTRY_BYTES
             && budget.max_scroll_delta > 0
             && budget.max_scroll_delta <= KERNEL_SCROLL_DELTA
-            && budget.max_repairs <= KERNEL_RETRIES_PER_ACTION
             && budget.max_observation_elements > 0
             && budget.max_observation_elements <= KERNEL_SEMANTIC_ELEMENTS
             && budget.max_observation_bytes > 0
@@ -420,16 +407,11 @@ mod assertions {
             && lower.max_observation_bytes <= higher.max_observation_bytes
             && lower.max_element_text_bytes <= higher.max_element_text_bytes
             && lower.max_model_calls <= higher.max_model_calls
-            && lower.max_repairs <= higher.max_repairs
             && lower.max_response_bytes <= higher.max_response_bytes
             && lower.max_turn_millis <= higher.max_turn_millis
             && lower.max_text_entry_bytes <= higher.max_text_entry_bytes
             && lower.max_scroll_delta <= higher.max_scroll_delta
             && lower.max_summary_bytes <= higher.max_summary_bytes
-            && implies(
-                lower.allows_screenshot_capture,
-                higher.allows_screenshot_capture,
-            )
             && implies(
                 lower.allows_pointer_fallback,
                 higher.allows_pointer_fallback,
@@ -478,8 +460,7 @@ mod assertions {
     /// ever buy more observation and more attempts.
     const _: () = assert!(
         ECONOMY_BUDGET.observation_detail as u8 == ObservationDetail::SemanticOnly as u8
-            && !ECONOMY_BUDGET.allows_screenshot_capture
-            && ECONOMY_BUDGET.max_repairs == 1,
+            && !ECONOMY_BUDGET.observation_detail.allows_screenshot_bytes(),
         "Economy is no longer the semantic-first, screenshot-free profile"
     );
 }

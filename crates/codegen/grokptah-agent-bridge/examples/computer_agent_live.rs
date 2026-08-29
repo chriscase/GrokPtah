@@ -80,11 +80,7 @@ async fn main() -> Result<()> {
     // the permit directly here keeps that boundary visible — it grants no
     // authority, because the bytes it produces have none either.
     let objective = "Enter Ada Lovelace in the visible Name field. Do not submit yet.";
-    let permit = TurnPermit {
-        profile: AdaptiveProfile::Economy,
-        budget: AdaptiveProfile::Economy.budget(),
-        revision: 0,
-    };
+    let permit = TurnPermit::unbound(AdaptiveProfile::Economy);
     let proposal_started = Instant::now();
     let attempt = host
         .propose_computer_action(session.id, objective, &observation, &permit)

@@ -44,10 +44,10 @@ use grokptah_agent_bridge::computer_use::{
 };
 use grokptah_agent_bridge::{
     accept_model_proposal, enforce_profile_budget, render_computer_observation, AcceptedIntent,
-    AdaptiveAttemptOutcome, AdaptiveLifecycle, AdaptiveProfile, CapabilityEvidence,
-    CapabilitySource, ComputerUseService, ComputerUseTier, HostCapabilityEvidence,
-    ModelCapabilities, ModelCapabilityEvidence, ModelProposalContext, OperatorCapabilityPolicy,
-    ProfileReason, RawModelProposal, TaskRisk,
+    AdaptiveAttemptOutcome, AdaptiveLifecycle, AdaptiveProfile, AdaptiveTurnRequest,
+    CapabilitySource, ComputerUseService, ComputerUseTier, ModelCapabilities,
+    ModelCapabilityEvidence, ModelProposalContext, OperatorCapabilityPolicy, ProfileReason,
+    RawModelProposal, RuntimeSignal, TurnPermit,
 };
 
 const NAME_ELEMENT: &str = "name-field";
@@ -163,22 +163,48 @@ fn capabilities() -> ModelCapabilities {
     }
 }
 
-fn evidence(route: &str, credential: &str) -> CapabilityEvidence {
-    CapabilityEvidence::new(
-        ModelCapabilityEvidence::from_model_capabilities(
-            &capabilities(),
-            true,
-            false,
-            route,
-            credential,
-            &OperatorCapabilityPolicy::default(),
-        ),
-        HostCapabilityEvidence {
-            semantic_observation: true,
-            screenshot_capture: false,
-            // This build has no verifier independent of the proposing model.
-            independent_verifier: false,
-        },
+/// The model half of the evidence — the one half a caller still supplies,
+/// because it is the one half the service cannot read off the live run. The
+/// host half (semantics, capture, independent verifier) is derived inside
+/// `begin_adaptive_turn` from the run's own frame and a build constant.
+fn model_evidence(route: &str, credential: &str) -> ModelCapabilityEvidence {
+    ModelCapabilityEvidence::from_model_capabilities(
+        &capabilities(),
+        true,
+        false,
+        route,
+        credential,
+        &OperatorCapabilityPolicy::default(),
+    )
+}
+
+/// A routine objective, in the operator's own words. Risk is classified from
+/// this and the live frame inside the service; no caller asserts a class.
+const ROUTINE: &str = "type the visible name into the form";
+/// A destructive objective.
+const DESTRUCTIVE: &str = "delete the saved record permanently";
+
+/// A route with a real image path, so its ceiling is Balanced rather than
+/// Economy and the run has somewhere to escalate *to*. Escalation and stopping
+/// both invalidate an in-flight turn, but only escalation proves the profile
+/// itself is bound into the seal.
+fn visual_capabilities() -> ModelCapabilities {
+    ModelCapabilities {
+        image_input: true,
+        max_image_bytes: Some(4 * 1024 * 1024),
+        computer_use_tier: ComputerUseTier::VisualFallbackAct,
+        ..capabilities()
+    }
+}
+
+fn visual_model_evidence() -> ModelCapabilityEvidence {
+    ModelCapabilityEvidence::from_model_capabilities(
+        &visual_capabilities(),
+        true,
+        false,
+        "route/end-to-end",
+        "credential-1",
+        &OperatorCapabilityPolicy::default(),
     )
 }
 
@@ -292,7 +318,7 @@ enum Approval {
 async fn turn(
     harness: &Harness,
     run_id: &str,
-    risk: TaskRisk,
+    objective: &str,
     approval: Approval,
     provider_reply: impl FnOnce(&ComputerObservation) -> Result<RawModelProposal, ComputerErrorCode>,
 ) -> Result<Stage, Refused> {
@@ -305,8 +331,10 @@ async fn turn(
         .begin_adaptive_turn(
             run_id,
             harness.owner,
-            &evidence("route/end-to-end", "credential-1"),
-            risk,
+            AdaptiveTurnRequest {
+                model: &model_evidence("route/end-to-end", "credential-1"),
+                objective,
+            },
         )
         .map_err(|error| Refused {
             stage: Stage::Admission,
@@ -359,9 +387,13 @@ async fn turn(
     // --- seal ------------------------------------------------------------
     // The single universal validator, run against the live record. Raw provider
     // bytes carry no authority until this returns.
-    let context =
-        ModelProposalContext::from_run(&run, harness.owner, harness.service.capabilities())
-            .map_err(|error| fail(Stage::Seal, error.code, REPORTED_USAGE))?;
+    let context = ModelProposalContext::from_run_with_permit(
+        &run,
+        harness.owner,
+        harness.service.capabilities(),
+        &permit,
+    )
+    .map_err(|error| fail(Stage::Seal, error.code, REPORTED_USAGE))?;
     let accepted = accept_model_proposal(&context, &raw)
         .map_err(|error| fail(Stage::Seal, error.code, REPORTED_USAGE))?;
 
@@ -490,7 +522,7 @@ async fn the_full_path_runs_end_to_end_and_dispatches_exactly_once() {
     let reached = turn(
         &harness,
         &run.run_id,
-        TaskRisk::Routine,
+        ROUTINE,
         Approval::Approve,
         |observation| Ok(set_value(observation, "Ada Lovelace")),
     )
@@ -515,7 +547,7 @@ async fn the_full_path_runs_end_to_end_and_dispatches_exactly_once() {
     let reached = turn(
         &harness,
         &run.run_id,
-        TaskRisk::Routine,
+        ROUTINE,
         Approval::Approve,
         |observation| Ok(complete(observation)),
     )
@@ -572,7 +604,7 @@ async fn a_forged_completion_is_refused_at_the_seal_with_zero_dispatches() {
     let refused = turn(
         &harness,
         &run.run_id,
-        TaskRisk::Routine,
+        ROUTINE,
         Approval::Approve,
         |observation| Ok(complete(observation)),
     )
@@ -611,7 +643,7 @@ async fn a_profile_budget_refusal_lands_after_the_seal_and_before_dispatch() {
     let refused = turn(
         &harness,
         &run.run_id,
-        TaskRisk::Routine,
+        ROUTINE,
         Approval::Approve,
         |observation| Ok(set_value(observation, &oversized)),
     )
@@ -646,7 +678,7 @@ async fn a_declined_approval_never_dispatches() {
     let refused = turn(
         &harness,
         &run.run_id,
-        TaskRisk::Routine,
+        ROUTINE,
         Approval::Decline,
         |observation| Ok(set_value(observation, "Ada Lovelace")),
     )
@@ -668,7 +700,7 @@ async fn a_higher_risk_objective_stops_at_admission_before_any_spend() {
     turn(
         &harness,
         &run.run_id,
-        TaskRisk::Routine,
+        ROUTINE,
         Approval::Approve,
         |observation| Ok(set_value(observation, "Ada Lovelace")),
     )
@@ -685,7 +717,7 @@ async fn a_higher_risk_objective_stops_at_admission_before_any_spend() {
     let refused = turn(
         &harness,
         &run.run_id,
-        TaskRisk::Destructive,
+        DESTRUCTIVE,
         Approval::Approve,
         |observation| Ok(set_value(observation, "anything")),
     )
@@ -722,7 +754,7 @@ async fn a_stopped_run_admits_nothing_afterwards() {
     turn(
         &harness,
         &run.run_id,
-        TaskRisk::Destructive,
+        DESTRUCTIVE,
         Approval::Approve,
         |observation| Ok(set_value(observation, "anything")),
     )
@@ -755,11 +787,25 @@ async fn a_stopped_run_admits_nothing_afterwards() {
         "a run refused at selection never called a provider"
     );
 
+    // This record is built on a construction path of its own, and it carries
+    // the capability evidence that justified the refusal. That is exactly where
+    // credential material could leak into an operator-visible surface, so the
+    // redaction pin applies here too.
+    let wire = serde_json::to_string(&projection).expect("serialize");
+    assert!(!wire.contains("credential-1"), "{wire}");
+    assert!(!wire.contains("route/end-to-end"), "{wire}");
+    assert!(
+        !wire
+            .split(|c: char| !c.is_ascii_hexdigit())
+            .any(|token| token.len() >= 64),
+        "no full digest may appear in an operator projection: {wire}"
+    );
+
     for _ in 0..3 {
         let refused = turn(
             &harness,
             &run.run_id,
-            TaskRisk::Routine,
+            ROUTINE,
             Approval::Approve,
             |observation| Ok(set_value(observation, "Ada Lovelace")),
         )
@@ -782,7 +828,7 @@ async fn a_provider_transport_failure_is_still_a_paid_attempt() {
     let refused = turn(
         &harness,
         &run.run_id,
-        TaskRisk::Routine,
+        ROUTINE,
         Approval::Approve,
         |_observation| Err(ComputerErrorCode::Interrupted),
     )
@@ -808,7 +854,7 @@ async fn a_provider_transport_failure_is_still_a_paid_attempt() {
     let reached = turn(
         &harness,
         &run.run_id,
-        TaskRisk::Routine,
+        ROUTINE,
         Approval::Approve,
         |observation| Ok(set_value(observation, "Ada Lovelace")),
     )
@@ -827,4 +873,302 @@ async fn a_provider_transport_failure_is_still_a_paid_attempt() {
         record.cost.accepted_attempts + record.cost.failed_attempts,
         "attempts always reconcile"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Drift during inference
+// ---------------------------------------------------------------------------
+//
+// Everything below attacks the same window: the provider has been asked, and
+// the answer has not come back yet. The turn was admitted under one set of
+// facts; by the time the answer arrives those facts have changed. Before the
+// permit was bound into the seal, the answer applied anyway — the kernel seal
+// proved only that the *run* had not moved, and the adaptive profile was
+// re-read at application time rather than carried from admission.
+//
+// Each gate admits a turn, moves exactly one thing, and then tries to seal the
+// answer. The seal must refuse, and nothing may dispatch.
+
+/// Seal an answer against a permit, the way the production path does.
+fn seal_under(
+    harness: &Harness,
+    run: &ComputerRun,
+    permit: &TurnPermit,
+    raw: &RawModelProposal,
+) -> Result<(), ComputerErrorCode> {
+    let context = ModelProposalContext::from_run_with_permit(
+        run,
+        harness.owner,
+        harness.service.capabilities(),
+        permit,
+    )
+    .map_err(|error| error.code)?;
+    accept_model_proposal(&context, raw)
+        .map(|_| ())
+        .map_err(|error| error.code)
+}
+
+/// Admit a turn, count its attempt, and hand back the permit plus the frame
+/// the provider would have been shown.
+async fn admitted_turn(harness: &Harness, run_id: &str) -> (TurnPermit, ComputerObservation) {
+    admitted_turn_with(
+        harness,
+        run_id,
+        &model_evidence("route/end-to-end", "credential-1"),
+    )
+    .await
+}
+
+async fn admitted_turn_with(
+    harness: &Harness,
+    run_id: &str,
+    model: &ModelCapabilityEvidence,
+) -> (TurnPermit, ComputerObservation) {
+    let permit = harness
+        .service
+        .begin_adaptive_turn(
+            run_id,
+            harness.owner,
+            AdaptiveTurnRequest {
+                model,
+                objective: ROUTINE,
+            },
+        )
+        .expect("turn admitted");
+    harness
+        .service
+        .record_adaptive_attempt(run_id)
+        .expect("count the attempt");
+    let observation = harness
+        .run(run_id)
+        .current_observation
+        .expect("a ready run has a frame");
+    (permit, observation)
+}
+
+/// **The capability generation moved while the model was thinking.**
+///
+/// Covers the whole #458 family at once, because all of them are inputs to the
+/// same digest: a same-route tier downgrade, a credential rotation, an operator
+/// policy edit, and a capability-schema drift each change the generation, and
+/// the seal is bound to the generation the turn was admitted under.
+#[tokio::test]
+async fn a_generation_move_during_inference_refuses_the_answer() {
+    let cases: Vec<(&str, ModelCapabilityEvidence)> = vec![
+        (
+            "same-route tier downgrade",
+            ModelCapabilityEvidence::from_model_capabilities(
+                &ModelCapabilities {
+                    computer_use_tier: ComputerUseTier::Observe,
+                    ..capabilities()
+                },
+                true,
+                false,
+                "route/end-to-end",
+                "credential-1",
+                &OperatorCapabilityPolicy::default(),
+            ),
+        ),
+        (
+            "credential rotation",
+            ModelCapabilityEvidence::from_model_capabilities(
+                &capabilities(),
+                true,
+                false,
+                "route/end-to-end",
+                "credential-2",
+                &OperatorCapabilityPolicy::default(),
+            ),
+        ),
+        (
+            "operator policy edit",
+            ModelCapabilityEvidence::from_model_capabilities(
+                &capabilities(),
+                true,
+                false,
+                "route/end-to-end",
+                "credential-1",
+                &OperatorCapabilityPolicy {
+                    trust_declared_capability: true,
+                    policy_generation: "operator/v2".into(),
+                },
+            ),
+        ),
+        (
+            "capability schema drift",
+            ModelCapabilityEvidence::from_model_capabilities(
+                &ModelCapabilities {
+                    computer_qualification_schema: Some("computer.v2".into()),
+                    ..capabilities()
+                },
+                true,
+                false,
+                "route/end-to-end",
+                "credential-1",
+                &OperatorCapabilityPolicy::default(),
+            ),
+        ),
+        (
+            "route change",
+            ModelCapabilityEvidence::from_model_capabilities(
+                &capabilities(),
+                true,
+                false,
+                "route/somewhere-else",
+                "credential-1",
+                &OperatorCapabilityPolicy::default(),
+            ),
+        ),
+    ];
+
+    for (label, moved) in cases {
+        let harness = Harness::new();
+        let run = harness.ready_run().await;
+        let (permit, observation) = admitted_turn(&harness, &run.run_id).await;
+
+        // The turn closes normally — the provider answered, and nothing about
+        // *this* turn failed. What changed is the world it was admitted into.
+        harness
+            .service
+            .finish_adaptive_turn(
+                &run.run_id,
+                REPORTED_USAGE,
+                AdaptiveAttemptOutcome::Succeeded {
+                    observation_bytes: 256,
+                    truncated: false,
+                },
+            )
+            .expect("close the turn");
+
+        // The next admission sees the moved generation and stops the run.
+        let refused = harness
+            .service
+            .begin_adaptive_turn(
+                &run.run_id,
+                harness.owner,
+                AdaptiveTurnRequest {
+                    model: &moved,
+                    objective: ROUTINE,
+                },
+            )
+            .expect_err(&format!("{label} must not be admitted"));
+        assert_eq!(refused.code, ComputerErrorCode::Unauthorized, "{label}");
+
+        // And the answer from the turn admitted under the *old* generation is
+        // refused too, rather than applying under authority that is gone.
+        let live = harness.run(&run.run_id);
+        let error = seal_under(
+            &harness,
+            &live,
+            &permit,
+            &set_value(&observation, "Ada Lovelace"),
+        )
+        .expect_err(&format!("{label}: the in-flight answer must not seal"));
+        assert!(
+            matches!(
+                error,
+                ComputerErrorCode::Unauthorized | ComputerErrorCode::Conflict
+            ),
+            "{label}: unexpected code {error:?}"
+        );
+        assert_eq!(harness.dispatches(), 0, "{label}: nothing reached the OS");
+    }
+}
+
+/// **The run escalated to a different profile while the model was thinking.**
+///
+/// The answer was admitted under Economy. If it applied under the escalated
+/// profile it would be held to a budget it was never asked to satisfy — and,
+/// worse, the escalation exists precisely because the host stopped trusting the
+/// cheap view the answer was formed from.
+#[tokio::test]
+async fn a_profile_escalation_during_inference_refuses_the_answer() {
+    let harness = Harness::new();
+    let run = harness.ready_run().await;
+    let (permit, observation) =
+        admitted_turn_with(&harness, &run.run_id, &visual_model_evidence()).await;
+    assert_eq!(permit.profile, AdaptiveProfile::Economy);
+    harness
+        .service
+        .finish_adaptive_turn(
+            &run.run_id,
+            REPORTED_USAGE,
+            AdaptiveAttemptOutcome::Succeeded {
+                observation_bytes: 256,
+                truncated: false,
+            },
+        )
+        .expect("close the turn");
+
+    // The surface turned out to be ambiguous, so the run escalates.
+    harness
+        .service
+        .apply_adaptive_signal(&run.run_id, RuntimeSignal::AmbiguousObservation)
+        .expect("escalate");
+    let escalated = harness.run(&run.run_id);
+    assert_ne!(
+        escalated.adaptive.as_ref().expect("record").profile,
+        permit.profile,
+        "the run moved to a different profile"
+    );
+
+    let error = seal_under(
+        &harness,
+        &escalated,
+        &permit,
+        &set_value(&observation, "Ada Lovelace"),
+    )
+    .expect_err("an answer admitted under the old profile must not seal");
+    assert_eq!(error, ComputerErrorCode::Conflict);
+    assert_eq!(harness.dispatches(), 0);
+}
+
+/// **A permit that no record ever admitted is not an authority.**
+///
+/// `TurnPermit::unbound` exists for the opt-in live provider proof, which
+/// reaches no durable run. It must not be usable to seal anything.
+#[tokio::test]
+async fn an_unbound_permit_cannot_seal_against_a_real_run() {
+    let harness = Harness::new();
+    let run = harness.ready_run().await;
+    let (_permit, observation) = admitted_turn(&harness, &run.run_id).await;
+    let live = harness.run(&run.run_id);
+
+    let error = seal_under(
+        &harness,
+        &live,
+        &TurnPermit::unbound(AdaptiveProfile::HighAssurance),
+        &set_value(&observation, "Ada Lovelace"),
+    )
+    .expect_err("a permit no record admitted grants nothing");
+    assert!(
+        matches!(
+            error,
+            ComputerErrorCode::Unauthorized | ComputerErrorCode::Conflict
+        ),
+        "unexpected code {error:?}"
+    );
+    assert_eq!(harness.dispatches(), 0);
+}
+
+/// **A run under adaptive authority has no permit-free path to a seal.**
+///
+/// This is the SDK bypass in its simplest form: skip the permit, mint a seal
+/// straight off the run, and the profile has nothing to hold the answer to.
+#[tokio::test]
+async fn an_adaptive_run_refuses_a_permit_free_seal() {
+    let harness = Harness::new();
+    let run = harness.ready_run().await;
+    let (_permit, _observation) = admitted_turn(&harness, &run.run_id).await;
+    let live = harness.run(&run.run_id);
+
+    let error =
+        ModelProposalContext::from_run(&live, harness.owner, harness.service.capabilities())
+            .expect_err("an adaptive run must not mint a permit-free context");
+    assert_eq!(error.code, ComputerErrorCode::Unauthorized);
+    assert!(
+        error.to_string().contains("adaptive"),
+        "the refusal should say why: {error}"
+    );
+    assert_eq!(harness.dispatches(), 0);
 }

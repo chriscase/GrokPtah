@@ -104,8 +104,10 @@ pub struct CostLedger {
     pub provider_attempts: u32,
     /// Attempts that produced a usable proposal.
     pub accepted_attempts: u32,
-    /// Attempts that failed for any reason. `provider_attempts` is always the
-    /// sum of this and `accepted_attempts`.
+    /// Attempts that failed for any reason. At rest, `provider_attempts` is the
+    /// sum of this and `accepted_attempts`; while a turn is in flight — or
+    /// after a restart cut one — exactly one attempt is counted and not yet
+    /// resolved, because the attempt is counted before the request leaves.
     pub failed_attempts: u32,
     /// Serialized observation bytes actually rendered for the model.
     pub observation_bytes: u64,
@@ -178,8 +180,6 @@ pub struct AdaptiveRecord {
     pub uncertain_streak: u32,
     /// Postcondition failures. The second one halts rather than escalating.
     pub verification_failures: u32,
-    /// Repairs spent inside the turn currently in flight.
-    pub turn_repairs: u32,
     /// Whether the profile's element ceiling bounded the last rendered view.
     pub observation_truncated: bool,
     /// Structural digest of the most recent frame, hex. Opaque: it is derived
@@ -187,6 +187,18 @@ pub struct AdaptiveRecord {
     /// never sent to a model.
     pub last_frame_digest: Option<String>,
     pub terminal: Option<TerminalOutcome>,
+    /// Opaque identity of the turn currently admitted, if any.
+    ///
+    /// Written only by [`AdaptiveController::begin_turn`], and cleared by every
+    /// path that ends the run, escalates it, or recovers it after a restart. A
+    /// sealed proposal binds this value, so authority admitted for one turn
+    /// cannot be spent after the run has moved on — including a move that
+    /// happened *while the provider was still thinking*.
+    ///
+    /// `#[serde(default)]` so a record written before this field existed loads
+    /// as `None`, which is "no turn is admitted" — the fail-closed reading.
+    #[serde(default)]
+    pub active_permit: Option<String>,
 }
 
 impl AdaptiveRecord {
@@ -204,10 +216,10 @@ impl AdaptiveRecord {
             stationary_repeats: 0,
             uncertain_streak: 0,
             verification_failures: 0,
-            turn_repairs: 0,
             observation_truncated: false,
             last_frame_digest: None,
             terminal: None,
+            active_permit: None,
         }
     }
 
@@ -250,6 +262,108 @@ impl AdaptiveRecord {
         record
     }
 
+    /// Check the record against its own invariants.
+    ///
+    /// A durable record is a file on disk. It can be truncated by a full
+    /// filesystem, rewritten by a careless operator, restored from a backup
+    /// taken mid-write, or edited on purpose. Every field here is an input to
+    /// an authority decision, so a record that cannot be shown to be internally
+    /// consistent must not be treated as a permissive one.
+    ///
+    /// Returns the first violated invariant, named, so a refusal says which.
+    pub fn check_invariants(&self) -> Result<(), &'static str> {
+        // Attempts reconcile, with one exception that is not tampering: the
+        // attempt is counted *before* the request leaves, so a turn that is
+        // still in flight — or one a restart cut before it could be closed —
+        // is legitimately counted and not yet resolved. At most one turn can be
+        // in flight at a time, so at most one attempt may be outstanding.
+        let resolved = self
+            .cost
+            .accepted_attempts
+            .saturating_add(self.cost.failed_attempts);
+        if resolved > self.cost.provider_attempts {
+            return Err("more provider attempts were resolved than were made");
+        }
+        if self.cost.provider_attempts - resolved > 1 {
+            return Err("more than one provider attempt is unaccounted for");
+        }
+        if self.cost.screenshot_bytes != 0 {
+            return Err("a record reports screenshot bytes sent to a model");
+        }
+        // The profile may never exceed what the evidence can support. This is
+        // the invariant an edited record would most want to break: it is the
+        // one standing between a text-only route and High Assurance.
+        if self.profile > self.decision.evidence.ceiling() {
+            return Err("the recorded profile exceeds what its evidence can support");
+        }
+        if self.profile > self.decision.ceiling {
+            return Err("the recorded profile exceeds the ceiling it was decided under");
+        }
+        if self.profile < self.decision.profile {
+            return Err("the recorded profile is below the profile it was selected at");
+        }
+        if self.risk_high_water < self.decision.risk {
+            return Err("the risk high-water mark is below the risk it was decided at");
+        }
+        if self.escalations.len() > MAX_ESCALATION_HISTORY {
+            return Err("the escalation history exceeds its bound");
+        }
+        // The ladder is climbed one rung at a time, in order, ending where the
+        // record says it is.
+        let mut rung = self.decision.profile;
+        for entry in &self.escalations {
+            if entry.from != rung || entry.to <= entry.from {
+                return Err("the escalation history is not a contiguous climb");
+            }
+            rung = entry.to;
+        }
+        if rung != self.profile {
+            return Err("the escalation history does not end at the recorded profile");
+        }
+        if self.terminal.is_some() != self.lifecycle.is_terminal() {
+            return Err("the terminal outcome and the lifecycle disagree");
+        }
+        if let Some(terminal) = &self.terminal {
+            if terminal.lifecycle != self.lifecycle {
+                return Err("the terminal outcome names a different lifecycle");
+            }
+            if self.active_permit.is_some() {
+                return Err("a terminal record still holds an admitted turn");
+            }
+        }
+        if self.lifecycle != AdaptiveLifecycle::InFlight && self.active_permit.is_some() {
+            // A permit outlives the in-flight window on purpose — the answer it
+            // admitted may still be applied once the turn is accounted for —
+            // but only while the run is idle and able to accept it.
+            if self.lifecycle != AdaptiveLifecycle::Idle {
+                return Err("a record holds an admitted turn in a state that cannot spend one");
+            }
+        }
+        Ok(())
+    }
+
+    /// Fail closed on a record that violates its own invariants.
+    ///
+    /// Called on every load, not only at restart, so a record corrupted or
+    /// edited at any point stops being authority the next time it is read. The
+    /// record is kept — the operator should be able to see that this happened
+    /// and why — but it is converted to a terminal `record_invalid` stop, which
+    /// every admission path already refuses.
+    ///
+    /// Returns the violated invariant when one was found.
+    pub fn enforce_invariants(&mut self) -> Option<&'static str> {
+        let violation = self.check_invariants().err()?;
+        self.active_permit = None;
+        self.lifecycle = AdaptiveLifecycle::Stopped;
+        self.terminal = Some(TerminalOutcome {
+            lifecycle: AdaptiveLifecycle::Stopped,
+            reason: ProfileReason::RecordInvalid,
+            profile: self.profile,
+            required_profile: None,
+        });
+        Some(violation)
+    }
+
     pub fn bump(&mut self) {
         self.revision = self.revision.saturating_add(1);
     }
@@ -268,7 +382,6 @@ impl AdaptiveRecord {
     pub fn reset_for_new_profile(&mut self) {
         self.stationary_repeats = 0;
         self.uncertain_streak = 0;
-        self.turn_repairs = 0;
         self.observation_truncated = false;
         self.last_frame_digest = None;
     }
@@ -280,7 +393,8 @@ impl AdaptiveRecord {
         self.bump();
         self.last_frame_digest = None;
         self.stationary_repeats = 0;
-        self.turn_repairs = 0;
+        // Whatever turn was admitted before the restart is not admitted now.
+        self.active_permit = None;
         if self.lifecycle.is_terminal() {
             return;
         }
@@ -374,12 +488,15 @@ mod tests {
     fn recovery_interrupts_an_in_flight_turn_without_replaying() {
         let mut record = AdaptiveRecord::new(decision(), generation());
         record.lifecycle = AdaptiveLifecycle::InFlight;
-        record.turn_repairs = 2;
+        record.active_permit = Some("permit-before-the-crash".into());
         let before = record.revision;
         record.recover_interrupted();
         assert_eq!(record.lifecycle, AdaptiveLifecycle::Interrupted);
         assert!(record.revision > before, "revision must advance");
-        assert_eq!(record.turn_repairs, 0);
+        assert_eq!(
+            record.active_permit, None,
+            "a turn admitted before the restart is not admitted after it"
+        );
         assert_eq!(record.cost.provider_attempts, 0, "nothing was replayed");
         assert_eq!(
             record.terminal.as_ref().map(|terminal| terminal.reason),

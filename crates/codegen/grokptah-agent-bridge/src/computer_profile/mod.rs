@@ -56,7 +56,7 @@ pub mod risk;
 
 pub use capability::{
     CapabilityAttribution, CapabilityEvidence, CapabilityGeneration, HostCapabilityEvidence,
-    ModelCapabilityEvidence, OperatorCapabilityPolicy,
+    ModelCapabilityEvidence, OperatorCapabilityPolicy, HOST_INDEPENDENT_VERIFIER_AVAILABLE,
 };
 pub use controller::{AdaptiveController, ControllerError, ObservationFingerprint, TurnPermit};
 pub use policy::{

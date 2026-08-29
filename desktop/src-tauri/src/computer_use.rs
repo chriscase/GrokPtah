@@ -6,8 +6,8 @@ use chrono::{Duration, Utc};
 use grokptah_agent_bridge::{
     accept_model_proposal, canonical_workspace_string, classify_task, enforce_profile_budget,
     project_adaptive, render_computer_observation, AcceptedIntent, AcceptedModelProposal,
-    AdaptiveAttemptOutcome, AdaptiveProfileProjection, ObservationFingerprint, ProfileTransition,
-    RuntimeSignal,
+    AdaptiveAttemptOutcome, AdaptiveLifecycle, AdaptiveProfileProjection, AdaptiveTurnRequest, ObservationFingerprint, ProfileTransition,
+    ReceiptVerification, RuntimeSignal, TurnPermit,
     ActionClass, ActionGrant, AgentHostHandle, ComputerAction, ComputerCapabilities, ComputerError,
     ComputerObservation, ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
     ComputerPlatformStatus, ComputerRun, ComputerRunProjection, ComputerRunState,
@@ -587,13 +587,25 @@ impl DesktopComputerUse {
             self.model_proposal_context(owner_session_id, run_id, expected_version, observation_id)?;
         let (service, _run) = self.owned_service(owner_session_id, run_id)?;
 
+        // The host resolves what the configured route actually is, from
+        // credentials and gateway config. It is the one input the service
+        // cannot derive for itself; the host half of the evidence and the task
+        // risk are both derived inside `begin_adaptive_turn`, from this run's
+        // own live frame, so nothing here asserts a capability tier or a risk
+        // class on the adaptive layer's behalf.
         let evidence = self
             .host
             .computer_capability_evidence(owner_session_id, &observation)
             .map_err(|error| error.to_string())?;
-        let risk = classify_task(objective, &observation);
         let permit = service
-            .begin_adaptive_turn(run_id, owner_session_id, &evidence, risk)
+            .begin_adaptive_turn(
+                run_id,
+                owner_session_id,
+                AdaptiveTurnRequest {
+                    model: &evidence.model,
+                    objective,
+                },
+            )
             .map_err(|error| error.to_string())?;
 
         // The frame has not moved: escalate or stop rather than re-reading it.
@@ -647,40 +659,90 @@ impl DesktopComputerUse {
             }
         };
 
-        let outcome = if attempt.outcome.is_ok() {
-            AdaptiveAttemptOutcome::Succeeded {
-                observation_bytes: attempt.rendered.bytes,
-                truncated: attempt.rendered.truncated,
-            }
-        } else {
-            AdaptiveAttemptOutcome::Failed {
-                observation_bytes: attempt.rendered.bytes,
+        let usage = (attempt.prompt_tokens, attempt.completion_tokens);
+        let bytes = attempt.rendered.bytes;
+        let truncated = attempt.rendered.truncated;
+
+        // Closes the turn as failed and renders the operator's sentence. Usage
+        // is passed through even here: a body that arrived and then failed was
+        // still billed.
+        let fail = |detail: String| {
+            let signal = service
+                .finish_adaptive_turn(
+                    run_id,
+                    usage,
+                    AdaptiveAttemptOutcome::Failed {
+                        observation_bytes: bytes,
+                    },
+                )
+                .ok()
+                .flatten();
+            match signal {
+                Some(signal) => format!(
+                    "{detail} {}",
+                    self.resolve_adaptive_signal(&service, run_id, signal)
+                ),
+                None => detail,
             }
         };
-        let signal = service
-            .finish_adaptive_turn(
+
+        // A turn that outlived `maxTurnMillis` is not merely a failed call: it
+        // is the signal the profile advertises, so raise it rather than letting
+        // the enforced timeout look like any other error.
+        if attempt.timed_out {
+            let detail = attempt
+                .outcome
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "the model did not answer within the turn budget".to_string());
+            let _ = service.finish_adaptive_turn(
                 run_id,
-                (attempt.prompt_tokens, attempt.completion_tokens),
-                outcome,
-            )
-            .map_err(|error| error.to_string())?;
+                usage,
+                AdaptiveAttemptOutcome::Failed {
+                    observation_bytes: bytes,
+                },
+            );
+            return Err(format!(
+                "{detail} {}",
+                self.resolve_adaptive_signal(&service, run_id, RuntimeSignal::TurnBudgetExceeded)
+            ));
+        }
 
         let raw = match attempt.outcome {
             Ok(raw) => raw,
-            Err(error) => {
-                let detail = error.to_string();
-                return Err(match signal {
-                    Some(signal) => {
-                        format!("{detail} {}", self.resolve_adaptive_signal(&service, run_id, signal))
-                    }
-                    None => detail,
-                });
-            }
+            Err(error) => return Err(fail(error.to_string())),
         };
 
-        let result = self
-            .apply_model_proposal(owner_session_id, run_id, expected_version, observation_id, raw)
-            .await?;
+        // The turn is accounted for only once the seal and the profile budget
+        // have both had their say. A body that parsed and was then refused by
+        // the seal or the budget is a *failed* attempt: charging it as accepted
+        // would let a model that reliably proposes forbidden actions look as
+        // productive as one that proposes valid ones, and would reset the
+        // consecutive-unusable-answer streak that stops exactly that loop.
+        let result = match self
+            .apply_model_proposal(
+                owner_session_id,
+                run_id,
+                expected_version,
+                observation_id,
+                raw,
+                Some(&permit),
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(detail) => return Err(fail(detail)),
+        };
+        service
+            .finish_adaptive_turn(
+                run_id,
+                usage,
+                AdaptiveAttemptOutcome::Succeeded {
+                    observation_bytes: bytes,
+                    truncated,
+                },
+            )
+            .map_err(|error| error.to_string())?;
         if result.completed {
             service.record_adaptive_completed(run_id);
         }
@@ -726,6 +788,7 @@ impl DesktopComputerUse {
         expected_version: u64,
         observation_id: &str,
         raw: RawModelProposal,
+        permit: Option<&TurnPermit>,
     ) -> Result<ComputerAgentProposalResult, String> {
         let _guard = self.simulator_operation.lock().await;
         let (service, run) = self.owned_service(owner_session_id, run_id)?;
@@ -740,18 +803,22 @@ impl DesktopComputerUse {
         {
             return Err("The model proposal does not match the current observation".into());
         }
-        let context =
-            ModelProposalContext::from_run(&run, owner_session_id, service.capabilities())
-                .map_err(|error| self.refuse(&service, run_id, error))?;
+        // The first of the two adaptive revalidations: the provider's answer is
+        // sealed against the *live* record, not the snapshot the turn started
+        // from, so drift during inference is refused here. A run under adaptive
+        // authority has no permit-free path to a seal at all.
+        let context = match permit {
+            Some(permit) => ModelProposalContext::from_run_with_permit(
+                &run,
+                owner_session_id,
+                service.capabilities(),
+                permit,
+            ),
+            None => ModelProposalContext::from_run(&run, owner_session_id, service.capabilities()),
+        }
+        .map_err(|error| self.refuse(&service, run_id, error))?;
         let accepted = accept_model_proposal(&context, &raw)
             .map_err(|error| self.refuse(&service, run_id, error))?;
-        // Profile narrowing runs *after* the universal seal and can only
-        // reject more. A run with no adaptive record has no profile to narrow
-        // by, which is the operator-driven path.
-        if let Some(profile) = run.adaptive.as_ref().map(|record| record.profile) {
-            enforce_profile_budget(&accepted, profile)
-                .map_err(|error| self.refuse(&service, run_id, error))?;
-        }
         self.apply_accepted_locked(owner_session_id, &service, accepted)
     }
 
@@ -796,6 +863,20 @@ impl DesktopComputerUse {
         accepted
             .authorize_against(&run, owner_session_id)
             .map_err(|error| self.refuse(service, &run.run_id, error))?;
+        // Profile narrowing runs *strictly after* the universal seal and can
+        // only reject more. It lives here, in the one function every spend goes
+        // through, rather than in the model-bytes entry point: the SDK seam
+        // takes an already-sealed capability, and putting the budget check
+        // upstream of only one of the two callers left that seam able to apply
+        // a proposal its profile forbids.
+        //
+        // The profile comes from the seal, and `authorize_against` above has
+        // already proven the live record still agrees with it, so a run that
+        // has since escalated cannot be spent at the cheaper ceiling.
+        if let Some(profile) = accepted.adaptive_profile() {
+            enforce_profile_budget(&accepted, profile)
+                .map_err(|error| self.refuse(service, &run.run_id, error))?;
+        }
         self.claim_proposal(accepted.proposal_fingerprint())?;
 
         let summary = accepted.summary().to_string();
@@ -903,6 +984,27 @@ impl DesktopComputerUse {
             let _ = service
                 .observe_postcondition(&Uuid::new_v4().to_string(), &pending.run_id, acted.version)
                 .await;
+        }
+
+        // A dispatch whose postcondition the verifying frame did not confirm is
+        // the adaptive layer's `VerificationFailed` signal. Without this the
+        // counter existed, the floor's tolerance existed, and nothing in
+        // production ever raised it — so a model could keep proposing moves
+        // that demonstrably did not do what it said, and the run would never
+        // escalate or stop for it.
+        //
+        // Only a run actually under adaptive authority is charged: an operator
+        // driving the simulator by hand has no profile to escalate.
+        let verified = owned_run(&service, owner_session_id, &pending.run_id)?;
+        if verified.adaptive.is_some() {
+            let confirmed = verified.last_receipt.as_ref().is_some_and(|receipt| {
+                matches!(receipt.verification, ReceiptVerification::Verified { .. })
+            });
+            if !confirmed {
+                if let Ok(signal) = service.record_adaptive_verification_failure(&pending.run_id) {
+                    let _ = self.resolve_adaptive_signal(&service, &pending.run_id, signal);
+                }
+            }
         }
         self.cockpit_snapshot(owner_session_id)
     }
@@ -1193,6 +1295,11 @@ mod tests {
     struct NativeTestBackend {
         target: ComputerTarget,
         actions: Arc<AtomicUsize>,
+        /// Whether a dispatch reports a positive outcome. `false` models the
+        /// case the adaptive layer exists to notice: the action ran, and the
+        /// host could not confirm on the verifying frame that it did what the
+        /// model said it would.
+        positive: bool,
     }
 
     #[async_trait]
@@ -1270,7 +1377,10 @@ mod tests {
                 ));
             }
             self.actions.fetch_add(1, Ordering::SeqCst);
-            Ok(ActionOutcome::bounded("native test action", Some(true)))
+            Ok(ActionOutcome::bounded(
+                "native test action",
+                self.positive.then_some(true),
+            ))
         }
 
         async fn cancel(&self, _run_id: &str) -> Result<(), ComputerError> {
@@ -1283,6 +1393,7 @@ mod tests {
         candidate: ComputerTargetCandidate,
         actions: Arc<AtomicUsize>,
         available: std::sync::Mutex<bool>,
+        positive: bool,
     }
 
     #[async_trait]
@@ -1325,6 +1436,7 @@ mod tests {
             Ok(Arc::new(NativeTestBackend {
                 target: self.candidate.target.clone(),
                 actions: self.actions.clone(),
+                positive: self.positive,
             }))
         }
     }
@@ -1370,6 +1482,12 @@ mod tests {
     }
 
     fn native_test_desktop() -> (tempfile::TempDir, DesktopComputerUse, Arc<AtomicUsize>) {
+        native_test_desktop_with(true)
+    }
+
+    fn native_test_desktop_with(
+        positive: bool,
+    ) -> (tempfile::TempDir, DesktopComputerUse, Arc<AtomicUsize>) {
         let (dir, mut desktop) = test_desktop();
         let actions = Arc::new(AtomicUsize::new(0));
         let target = ComputerTarget {
@@ -1396,6 +1514,7 @@ mod tests {
             },
             actions: actions.clone(),
             available: std::sync::Mutex::new(true),
+            positive,
         }));
         (dir, desktop, actions)
     }
@@ -1482,6 +1601,7 @@ mod tests {
                     "text": "Ada Lovelace",
                     "summary": "Enter the visible name"
                 })),
+                None,
             )
             .await
             .unwrap();
@@ -1500,6 +1620,7 @@ mod tests {
                     "action_type": "activate_target",
                     "summary": "stale"
                 })),
+                None,
             )
             .await;
         assert!(stale.is_err());
@@ -1530,6 +1651,7 @@ mod tests {
                     "action_type": "complete",
                     "summary": "The visible objective is complete"
                 })),
+                None,
             )
             .await
             .expect_err("a fresh run has no completion evidence");
@@ -1581,6 +1703,7 @@ mod tests {
                 run.version,
                 &observation.observation_id,
                 raw(proposal.clone()),
+                None,
             )
             .await
             .unwrap();
@@ -1592,6 +1715,7 @@ mod tests {
                 run.version,
                 &observation.observation_id,
                 raw(proposal),
+                None,
             )
             .await;
         assert!(repeated.is_err(), "a duplicate proposal must be refused");
@@ -1745,6 +1869,109 @@ mod tests {
             .await
             .is_err());
         assert_eq!(actions.load(Ordering::SeqCst), 1);
+    }
+
+    /// **A dispatch the verifying frame did not confirm escalates or stops the
+    /// run** — through the production approval path, not through a direct call
+    /// to the controller.
+    ///
+    /// The counter and the floor's tolerance for it both existed before this,
+    /// and nothing in production ever raised the signal. A model could keep
+    /// proposing moves that demonstrably did not do what it said, and the run
+    /// would never react.
+    #[tokio::test]
+    async fn an_unverified_postcondition_moves_the_adaptive_record() {
+        let (_dir, desktop, actions) = native_test_desktop_with(false);
+        let owner = Uuid::new_v4();
+        let candidate = desktop.list_targets().await.unwrap().remove(0);
+        let started = desktop
+            .start_native(owner, &candidate.selection_token, NATIVE_TEST_APP_ID)
+            .await
+            .unwrap();
+        let run = started.run.unwrap();
+        let observation = run.current_observation.as_ref().unwrap();
+
+        // Put the run under adaptive authority, exactly as a model turn does.
+        let service = desktop
+            .native_services
+            .lock()
+            .unwrap()
+            .get(&run.run_id)
+            .cloned()
+            .expect("native run has a service");
+        let model = grokptah_agent_bridge::ModelCapabilityEvidence::from_model_capabilities(
+            &grokptah_agent_bridge::ModelCapabilities {
+                tools: true,
+                computer_use_tier: grokptah_agent_bridge::ComputerUseTier::SemanticAct,
+                computer_capability_source: grokptah_agent_bridge::CapabilitySource::Measured,
+                ..Default::default()
+            },
+            true,
+            false,
+            "native-route",
+            "native-credential",
+            &grokptah_agent_bridge::OperatorCapabilityPolicy::default(),
+        );
+        service
+            .begin_adaptive_turn(
+                &run.run_id,
+                owner,
+                AdaptiveTurnRequest {
+                    model: &model,
+                    objective: "set the visible project label",
+                },
+            )
+            .expect("turn admitted");
+        service
+            .record_adaptive_attempt(&run.run_id)
+            .expect("count the attempt");
+        service
+            .finish_adaptive_turn(
+                &run.run_id,
+                (None, None),
+                AdaptiveAttemptOutcome::Succeeded {
+                    observation_bytes: 128,
+                    truncated: false,
+                },
+            )
+            .expect("close the turn");
+        let before = service
+            .adaptive_projection(&run.run_id)
+            .expect("projection")
+            .expect("record");
+        assert_eq!(before.lifecycle, AdaptiveLifecycle::Idle);
+
+        let staged = desktop
+            .stage_simulator_action(
+                owner,
+                &run.run_id,
+                run.version,
+                &observation.observation_id,
+                ComputerAction::SetValue {
+                    element_id: "native-name".into(),
+                    text: "after".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let approval = staged.pending_approval.unwrap();
+        desktop
+            .approve_simulator_action(owner, &approval.approval_id, "native-approve-unverified")
+            .await
+            .unwrap();
+        assert_eq!(actions.load(Ordering::SeqCst), 1, "the action did dispatch");
+
+        // The backend reported no positive outcome, so nothing turned the
+        // receipt into completion evidence — and the adaptive layer noticed.
+        let after = service
+            .adaptive_projection(&run.run_id)
+            .expect("projection")
+            .expect("record");
+        assert!(
+            after.escalations.len() > before.escalations.len()
+                || after.terminal.is_some(),
+            "an unverified postcondition must escalate or stop the run: {after:?}"
+        );
     }
 
     #[tokio::test]

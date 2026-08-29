@@ -87,6 +87,78 @@ a declared-only route may observe but never act until a local operator
 explicitly opts in. The policy participates in the generation digest, so
 changing it invalidates every authority decided under the old policy.
 
+## The admitted turn is bound into the seal
+
+Re-deriving authority at admission is not enough on its own. A turn is admitted,
+the provider is asked, and the answer arrives some seconds later — and in that
+window the facts can move. Before the binding existed, the kernel seal proved
+only that the *run* had not moved (version, control epoch, observation), and the
+profile was re-read at application time rather than carried from admission. So a
+tier downgrade, a credential rotation, a policy edit, a schema drift, or an
+escalation to a different profile could all happen mid-inference and the answer
+would still apply.
+
+`begin_turn` now mints an opaque `permit_id` and writes it to the record as
+`active_permit`. `ModelProposalContext::from_run_with_permit` binds that permit,
+the canonical profile, and the full capability generation into the sealed
+proposal, and the binding is re-checked **twice**: once when the provider's
+answer is sealed, and again inside `authorize_against` under the lock that
+guards the mutation.
+
+- `begin_turn` is the only thing that writes `active_permit`. Every stop,
+  escalation, completion, restart recovery, and subsequent admission clears or
+  replaces it, so a seal from an invalidated turn has nothing to match.
+- The record's `revision` is deliberately **not** bound: revision is the
+  compare-and-swap witness for admission, and ordinary accounting advances it.
+  Binding it would conflate "this run spent money" with "this run's authority
+  changed".
+- `ModelProposalContext::from_run` — the permit-free path — **refuses** a run
+  that has an adaptive record. A run under adaptive authority has no way to
+  obtain an unbound seal.
+
+## One spend path, so the SDK cannot skip the budget
+
+`enforce_profile_budget` lives in `apply_accepted_locked`, the one function every
+spend goes through, and takes its profile from the seal rather than from a fresh
+read. It used to sit in the model-bytes entry point instead — which left the
+SDK seam, `apply_accepted_proposal`, taking an already-sealed capability and
+applying it with no profile ceiling at all.
+
+Taking the profile from the seal also closes the cheaper-ceiling read: a run that
+has escalated since the turn was admitted cannot be spent at the profile it
+started under, because `authorize_against` has already proven the live record
+still agrees with the bound one.
+
+## The host mints the evidence and the risk
+
+`begin_adaptive_turn` takes an `AdaptiveTurnRequest`: *inputs*, not conclusions.
+
+- **Host capability evidence** is derived inside the service by
+  `HostCapabilityEvidence::observe` on the run's own current observation, plus
+  the build constant `HOST_INDEPENDENT_VERIFIER_AVAILABLE`. A caller cannot
+  unlock High Assurance by asserting a verifier this build does not have.
+- **Task risk** is classified inside the service from the operator's objective
+  and that same frame. A caller cannot label a destructive objective `Routine`
+  to slip it past the run's risk high-water mark.
+
+What remains an input is the *model* half of the evidence, which is a fact about
+the configured route that only the host can resolve — credentials, gateway
+config, measured qualifications. Its declared claims are observation-only unless
+local operator policy says otherwise, and that policy is part of the generation.
+
+## A record that fails its own invariants is not authority
+
+The durable record is a file. `AdaptiveRecord::check_invariants` verifies that
+attempts reconcile, that no screenshot bytes were ever accounted to a model, that
+the profile is within both the evidence ceiling and the ceiling it was decided
+under, that the escalation history is a contiguous climb ending where the record
+says it is, and that the terminal outcome and lifecycle agree.
+
+`enforce_invariants` runs on **every load**, not only at restart, and converts a
+violating record into a terminal `record_invalid` stop. The record is kept, so
+the operator can see that this happened and why, but every admission path already
+refuses a terminal record.
+
 ## The record is durable, per-run, and recovered
 
 `AdaptiveRecord` is a field on `ComputerRun`, written through the same
@@ -115,12 +187,17 @@ high-water, revision, lifecycle, spend, escalation history, stationarity state.
   selection on the same authorized run. That is the probe-then-proceed shape
   this layer exists to refuse, so a stopped run now stays stopped.
 
-## Every provider attempt is counted
+## Every provider attempt is counted, and refusals count as failures
 
 `provider_attempts` is incremented **before** the request leaves. A timeout, a
 transport failure, prose instead of a tool call, an unknown field, a stale
 frame — all of them cost money and all of them consumed the run's allowance, so
-all of them count exactly as much as a success. `provider_attempts` is always
+all of them count exactly as much as a success. A turn is accounted for only
+once the seal and the profile budget have both had their say: a body that parsed
+and was then refused is a **failed** attempt, because charging it as accepted
+would let a model that reliably proposes forbidden actions look as productive as
+one that proposes valid ones — and would reset the consecutive-unusable-answer
+streak that exists to stop that loop. `provider_attempts` is always
 `accepted_attempts + failed_attempts`.
 
 Provider-reported usage is recorded even when the body that carried it then

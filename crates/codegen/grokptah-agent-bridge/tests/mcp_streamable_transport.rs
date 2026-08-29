@@ -2261,6 +2261,34 @@ async fn live_computer_reads_node_smoke() {
         .observe("smoke-observe-a", &run_a.run_id, run_a.version)
         .await
         .unwrap();
+    // Admit one adaptive turn on run A so its projection carries a *populated*
+    // adaptive record on the wire. Without this the Node client only ever saw
+    // `adaptive: null`, so the nested redaction pin never executed and a new
+    // key inside the adaptive projection could ship unnoticed. Run C keeps no
+    // adaptive record, which pins the legacy shape in the same pass.
+    computer
+        .begin_adaptive_turn(
+            &run_a.run_id,
+            session.id,
+            grokptah_agent_bridge::AdaptiveTurnRequest {
+                model: &grokptah_agent_bridge::ModelCapabilityEvidence::from_model_capabilities(
+                    &grokptah_agent_bridge::ModelCapabilities {
+                        tools: true,
+                        computer_use_tier: grokptah_agent_bridge::ComputerUseTier::SemanticAct,
+                        computer_capability_source:
+                            grokptah_agent_bridge::CapabilitySource::Measured,
+                        ..Default::default()
+                    },
+                    true,
+                    false,
+                    "smoke-route",
+                    "smoke-credential-generation",
+                    &grokptah_agent_bridge::OperatorCapabilityPolicy::default(),
+                ),
+                objective: "read the visible list",
+            },
+        )
+        .unwrap();
 
     // Run B: another session's run in another workspace — the rejection target.
     let run_b = computer

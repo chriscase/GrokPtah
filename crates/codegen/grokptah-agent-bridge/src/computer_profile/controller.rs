@@ -123,14 +123,56 @@ impl ObservationFingerprint {
 /// observation against a budget the run has since escalated past, and the
 /// revision that admitted it so the outcome can be applied under
 /// compare-and-swap.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnPermit {
     pub profile: AdaptiveProfile,
     pub budget: ProfileBudget,
     pub revision: u64,
+    /// Opaque identity of the admitted turn, minted by [`AdaptiveController::begin_turn`]
+    /// and written to the durable record as `active_permit`.
+    ///
+    /// A sealed proposal binds this, so authority granted for one turn cannot
+    /// be spent on another. Holding the value is not itself an authority: it
+    /// means something only while it still equals the live record's
+    /// `active_permit`, which nothing outside `begin_turn` can write.
+    permit_id: String,
+    /// The capability generation in force when the turn was admitted. Bound
+    /// into the seal so a same-route tier downgrade, credential rotation,
+    /// schema drift, or operator policy edit *during inference* is refused
+    /// when the answer comes back (#458).
+    generation: CapabilityGeneration,
 }
 
 impl TurnPermit {
+    /// A permit bound to no durable run.
+    ///
+    /// The opt-in live provider proof exercises the provider round-trip against
+    /// the deterministic simulator and reaches no Computer Run, so there is no
+    /// record to admit a turn against. This carries a profile and a budget,
+    /// which is all that is needed to *bound what is sent*, and it grants no
+    /// authority whatsoever: its `permit_id` matches no record's
+    /// `active_permit` and its generation is
+    /// [`CapabilityGeneration::unbound`], which no computed generation can
+    /// equal. `ModelProposalContext::from_run_with_permit` therefore refuses
+    /// it, so nothing produced under it can be applied to a run.
+    pub fn unbound(profile: AdaptiveProfile) -> Self {
+        Self {
+            profile,
+            budget: profile.budget(),
+            revision: 0,
+            permit_id: "unbound".to_string(),
+            generation: CapabilityGeneration::unbound(),
+        }
+    }
+
+    pub fn permit_id(&self) -> &str {
+        &self.permit_id
+    }
+
+    pub fn generation(&self) -> &CapabilityGeneration {
+        &self.generation
+    }
+
     /// The wall-clock budget for this turn, as a duration the caller can hand
     /// straight to a timeout. Advertising `maxTurnMillis` and not enforcing it
     /// would be a claim rather than a control, so this is the only way the
@@ -216,12 +258,19 @@ impl<'a> AdaptiveController<'a> {
                 reason: stop.reason,
             });
         }
+        // Mint the turn's opaque identity and write it to the durable record.
+        // Everything that ends or moves the run clears or replaces it, so a
+        // proposal sealed against this permit stops being applicable the
+        // moment the run is no longer in the state that admitted it.
+        let permit_id = format!("permit-{}", uuid::Uuid::new_v4());
+        self.record.active_permit = Some(permit_id.clone());
         self.record.lifecycle = AdaptiveLifecycle::InFlight;
-        self.record.turn_repairs = 0;
         Ok(TurnPermit {
             profile: self.record.profile,
             budget: self.budget(),
             revision: self.record.revision,
+            permit_id,
+            generation: self.record.generation.clone(),
         })
     }
 
@@ -277,15 +326,6 @@ impl<'a> AdaptiveController<'a> {
         self.record.bump();
         (self.record.uncertain_streak >= self.safety_floor().max_consecutive_uncertain_answers)
             .then_some(RuntimeSignal::RepeatedUncertainty)
-    }
-
-    /// Spends one repair inside the turn in flight. Returns the signal once
-    /// the profile's repair budget is exhausted, so `maxRepairs` is a control
-    /// rather than a published number nothing reads.
-    pub fn record_repair(&mut self) -> Option<RuntimeSignal> {
-        self.record.turn_repairs = self.record.turn_repairs.saturating_add(1);
-        (self.record.turn_repairs > self.budget().max_repairs)
-            .then_some(RuntimeSignal::RepairBudgetExceeded)
     }
 
     /// Feeds one frame into the stationarity window.
@@ -346,6 +386,9 @@ impl<'a> AdaptiveController<'a> {
                 self.record.profile = *to;
                 self.record.reset_for_new_profile();
                 self.record.lifecycle = AdaptiveLifecycle::Idle;
+                // The turn in flight was admitted under the old profile, so
+                // its answer may not be applied under the new one.
+                self.record.active_permit = None;
                 let revision = self.record.revision;
                 self.record.push_escalation(EscalationRecord {
                     from: *from,
@@ -356,6 +399,7 @@ impl<'a> AdaptiveController<'a> {
             }
             ProfileTransition::Stop(stop) => {
                 self.record.lifecycle = AdaptiveLifecycle::Stopped;
+                self.record.active_permit = None;
                 self.record.terminal = Some(TerminalOutcome {
                     lifecycle: AdaptiveLifecycle::Stopped,
                     reason: stop.reason,
@@ -381,6 +425,7 @@ impl<'a> AdaptiveController<'a> {
                     ceiling: self.record.decision.ceiling,
                 };
                 self.record.lifecycle = AdaptiveLifecycle::Stopped;
+                self.record.active_permit = None;
                 self.record.terminal = Some(TerminalOutcome {
                     lifecycle: AdaptiveLifecycle::Stopped,
                     reason: stop.reason,
@@ -400,6 +445,7 @@ impl<'a> AdaptiveController<'a> {
             return;
         }
         self.record.lifecycle = AdaptiveLifecycle::Completed;
+        self.record.active_permit = None;
         self.record.bump();
         self.record.terminal = Some(TerminalOutcome {
             lifecycle: AdaptiveLifecycle::Completed,
@@ -672,21 +718,58 @@ mod tests {
         assert_eq!(record.cost.failed_attempts, budget);
     }
 
+    /// The permit is opaque and unique per admitted turn, and the durable
+    /// record agrees with it. That pairing is what makes a seal bound to one
+    /// turn unusable on another.
     #[test]
-    fn the_repair_budget_is_enforced_not_merely_advertised() {
+    fn each_admitted_turn_mints_a_distinct_permit_the_record_agrees_with() {
+        let mut record = record(true, true, TaskRisk::Routine);
+        let generation = generation(true);
+        let first = {
+            let mut controller = AdaptiveController::new(&mut record);
+            let permit = controller
+                .begin_turn(0, &generation, TaskRisk::Routine)
+                .unwrap();
+            assert_eq!(
+                controller.record().active_permit.as_deref(),
+                Some(permit.permit_id())
+            );
+            assert_eq!(permit.generation(), &generation);
+            permit.permit_id().to_string()
+        };
+        let mut controller = AdaptiveController::new(&mut record);
+        controller.record_success(128, false);
+        let revision = controller.record().revision;
+        let second = controller
+            .begin_turn(revision, &generation, TaskRisk::Routine)
+            .unwrap();
+        assert_ne!(
+            second.permit_id(),
+            first,
+            "a second turn must not reuse the first turn's authority"
+        );
+        assert_eq!(
+            controller.record().active_permit.as_deref(),
+            Some(second.permit_id())
+        );
+    }
+
+    /// Anything that ends or moves the run withdraws the admitted turn, so an
+    /// answer that arrives afterwards has nothing left to apply against.
+    #[test]
+    fn a_stop_withdraws_the_admitted_turn() {
         let mut record = record(true, true, TaskRisk::Routine);
         let generation = generation(true);
         let mut controller = AdaptiveController::new(&mut record);
-        let permit = controller
+        controller
             .begin_turn(0, &generation, TaskRisk::Routine)
             .unwrap();
-        let allowed = permit.budget.max_repairs;
-        for _ in 0..allowed {
-            assert_eq!(controller.record_repair(), None);
-        }
+        assert!(controller.record().active_permit.is_some());
+        controller.stop(RuntimeSignal::CapabilityRevoked);
         assert_eq!(
-            controller.record_repair(),
-            Some(RuntimeSignal::RepairBudgetExceeded)
+            controller.record().active_permit,
+            None,
+            "a stopped run holds no admitted turn"
         );
     }
 

@@ -30,6 +30,7 @@ export type AdaptiveCaution = {
     | "independent_verifier_missing"
     | "declared_only"
     | "interrupted"
+    | "record_invalid"
     | "stationary";
   message: string;
 };
@@ -165,6 +166,13 @@ export function describeAdaptiveProfile(
       code: "interrupted",
       message:
         "A restart cut this run mid-turn. Nothing was replayed; a fresh authorization is required.",
+    });
+  }
+  if (projection.terminal?.reason === "record_invalid") {
+    cautions.push({
+      code: "record_invalid",
+      message:
+        "This run's adaptive record failed its own consistency checks, so it is no longer trusted as authority. Nothing further can be approved on it; start a new run.",
     });
   }
   if (projection.stationaryRepeats > 0) {

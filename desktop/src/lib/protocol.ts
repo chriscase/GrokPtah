@@ -1182,8 +1182,8 @@ export type AdaptiveProfileReason =
   | "capability_generation_changed"
   | "higher_risk_objective"
   | "turn_budget_exceeded"
-  | "repair_budget_exceeded"
-  | "run_interrupted";
+  | "run_interrupted"
+  | "record_invalid";
 
 export interface AdaptiveEscalation {
   from: AdaptiveProfile;
@@ -1259,9 +1259,7 @@ export interface AdaptiveProfileProjection {
     maxObservationElements: number;
     maxObservationBytes: number;
     maxModelCalls: number;
-    maxRepairs: number;
     maxTurnMillis: number;
-    screenshotCaptureAllowed: boolean;
     pointerFallbackAllowed: boolean;
     keyChordAllowed: boolean;
   };

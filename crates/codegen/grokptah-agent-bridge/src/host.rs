@@ -685,32 +685,6 @@ async fn kill_shells(live_shells: local_tools::LiveShellMap, kill_ids: Vec<Uuid>
     }
 }
 
-/// Whether this build has a postcondition verifier independent of the model
-/// that proposed the action.
-///
-/// It does not. #473 gives the host a real `ActionReceipt` and a single
-/// verifying frame, which is what makes *completion* honest — but that frame is
-/// captured by the same host loop that dispatched the action, not by an
-/// independent checker, and there are no pixels to cross-check it against.
-/// Declaring this `false` is deliberate: it is what keeps High Assurance
-/// unreachable and makes destructive objectives stop with
-/// `independent_verifier_unavailable` rather than run under a label this build
-/// cannot back. Flipping the constant is the whole change once real pixels and
-/// an independent verifier both exist.
-const HOST_INDEPENDENT_VERIFIER_AVAILABLE: bool = false;
-
-/// What the host can actually offer this run, read off the observation the
-/// operator already approved rather than asserted by a caller.
-fn host_capability_evidence(
-    observation: &crate::computer_use::ComputerObservation,
-) -> HostCapabilityEvidence {
-    HostCapabilityEvidence {
-        semantic_observation: !observation.elements.is_empty(),
-        screenshot_capture: observation.screenshot.is_some(),
-        independent_verifier: HOST_INDEPENDENT_VERIFIER_AVAILABLE,
-    }
-}
-
 fn canonical_session_workspace(
     host: &AgentHostHandle,
     session_id: Uuid,
@@ -1123,7 +1097,7 @@ impl AgentHostHandle {
                 &credential_generation,
                 &policy,
             ),
-            host_capability_evidence(observation),
+            HostCapabilityEvidence::observe(observation),
         ))
     }
 

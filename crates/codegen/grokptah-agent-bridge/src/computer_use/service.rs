@@ -7,6 +7,21 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+/// The inputs one adaptive turn is admitted from.
+///
+/// Deliberately inputs rather than conclusions: the service derives the host
+/// capability evidence and the task risk itself, from the run's live
+/// observation. See [`ComputerUseService::begin_adaptive_turn`].
+#[derive(Debug, Clone, Copy)]
+pub struct AdaptiveTurnRequest<'a> {
+    /// What the configured route actually is, resolved by the host from
+    /// credentials and gateway config. The one thing the service cannot know.
+    pub model: &'a crate::computer_profile::ModelCapabilityEvidence,
+    /// The local operator's objective, in their own words. Risk is classified
+    /// from this and the live frame; it is never taken from model output.
+    pub objective: &'a str,
+}
+
 /// How one admitted adaptive turn ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdaptiveAttemptOutcome {
@@ -900,15 +915,34 @@ impl ComputerUseService {
     /// Resuming revalidates the capability generation and the task risk
     /// against the record, so a same-route downgrade or a later higher-risk
     /// objective stops the run instead of riding the earlier authorization.
+    /// Admit one model turn on a run, or refuse.
+    ///
+    /// The caller supplies *inputs*, never conclusions. Two things it used to
+    /// assert are now derived here, from the live run:
+    ///
+    /// - **Host capability evidence** comes from
+    ///   [`HostCapabilityEvidence::observe`] on the run's own current
+    ///   observation plus a build constant. A caller cannot unlock High
+    ///   Assurance by claiming an independent verifier this build does not
+    ///   have, or claim a semantic surface on a frame that has no elements.
+    /// - **Task risk** is classified here from the operator's objective and
+    ///   that same frame. A caller cannot label a destructive objective
+    ///   `Routine` to slip it past the run's risk high-water mark.
+    ///
+    /// What remains an input is the *model* half of the evidence, which is a
+    /// fact about the configured route that only the host can resolve
+    /// (credentials, gateway config, measured qualifications). Its declared
+    /// claims are observation-only unless local operator policy says otherwise,
+    /// and that policy is itself part of the capability generation.
     pub fn begin_adaptive_turn(
         &self,
         run_id: &str,
         owner_session_id: uuid::Uuid,
-        evidence: &crate::computer_profile::CapabilityEvidence,
-        risk: crate::computer_profile::TaskRisk,
+        request: AdaptiveTurnRequest<'_>,
     ) -> ComputerResult<crate::computer_profile::TurnPermit> {
         use crate::computer_profile::{
-            AdaptiveController, AdaptivePolicyEngine, AdaptiveRecord, PolicyOutcome,
+            AdaptiveController, AdaptivePolicyEngine, AdaptiveRecord, CapabilityEvidence,
+            HostCapabilityEvidence, PolicyOutcome,
         };
         // A refusal that *stops the run* is a durable state change, so it must
         // be written, not thrown away. `update_run` skips its write when the
@@ -931,6 +965,19 @@ impl ComputerUseService {
                     "computer run is not ready for a model proposal",
                 ));
             }
+            // Derived from the live frame, inside the lock, so the evidence and
+            // the risk describe the run as it actually is at admission time.
+            let observation = run.current_observation.as_ref().ok_or_else(|| {
+                ComputerError::new(
+                    ComputerErrorCode::StaleObservation,
+                    "computer run has no current observation to admit a turn against",
+                )
+            })?;
+            let evidence = &CapabilityEvidence::new(
+                request.model.clone(),
+                HostCapabilityEvidence::observe(observation),
+            );
+            let risk = crate::computer_profile::classify_task(request.objective, observation);
             run.updated_at = Utc::now();
             if run.adaptive.is_none() {
                 match AdaptivePolicyEngine.select(evidence, risk) {

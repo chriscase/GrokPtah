@@ -97,6 +97,19 @@ const CAPACITY_KEYS = ["boundActiveRuns", "boundRuns", "maxRunRecords"];
 // operator-readable account of what a run cost and why it stopped must never
 // start carrying element labels, values, geometry, frame digests, or evidence
 // tokens. A new key here has to be added deliberately, and reviewed.
+const ADAPTIVE_BUDGET_KEYS = [
+  "keyChordAllowed", "maxModelCalls", "maxObservationBytes", "maxObservationElements",
+  "maxTurnMillis", "observationDetail", "pointerFallbackAllowed",
+];
+const ADAPTIVE_CAPABILITY_KEYS = [
+  "attribution", "ceiling", "declaredCapabilityTrusted", "durableAuthority", "generation",
+  "hostIndependentVerifier", "hostScreenshotCapture", "imageInput", "qualifiedVisualPath",
+  "sessionMeasured", "structuredTools", "syntheticOnly", "tier",
+];
+const ADAPTIVE_COST_KEYS = [
+  "acceptedAttempts", "completionTokens", "failedAttempts", "observationBytes", "promptTokens",
+  "providerAttempts", "screenshotBytes",
+];
 const ADAPTIVE_KEYS = [
   "budget", "capability", "cost", "escalations", "lifecycle", "message",
   "observationTruncated", "profile", "profileDisplayName", "reason",
@@ -135,12 +148,48 @@ function pinProjection(name, projection) {
     );
   }
   if (projection.adaptive) {
+    seenPopulatedAdaptive = true;
     check(
       `${name}: adaptive keys are pinned`,
       JSON.stringify(Object.keys(projection.adaptive).sort()) ===
         JSON.stringify(ADAPTIVE_KEYS),
       Object.keys(projection.adaptive).sort().join(","),
     );
+    check(
+      `${name}: adaptive budget keys are pinned`,
+      JSON.stringify(Object.keys(projection.adaptive.budget).sort()) ===
+        JSON.stringify(ADAPTIVE_BUDGET_KEYS),
+      Object.keys(projection.adaptive.budget).sort().join(","),
+    );
+    check(
+      `${name}: adaptive capability keys are pinned`,
+      JSON.stringify(Object.keys(projection.adaptive.capability).sort()) ===
+        JSON.stringify(ADAPTIVE_CAPABILITY_KEYS),
+      Object.keys(projection.adaptive.capability).sort().join(","),
+    );
+    check(
+      `${name}: adaptive cost keys are pinned`,
+      JSON.stringify(Object.keys(projection.adaptive.cost).sort()) ===
+        JSON.stringify(ADAPTIVE_COST_KEYS),
+      Object.keys(projection.adaptive.cost).sort().join(","),
+    );
+    // The capability generation reaches the wire as a short prefix, never the
+    // whole digest, and never any credential material it was derived from.
+    check(
+      `${name}: only a generation prefix reaches the wire`,
+      typeof projection.adaptive.capability.generation === "string" &&
+        projection.adaptive.capability.generation.length <= 16,
+      String(projection.adaptive.capability.generation),
+    );
+    // Structural: no profile may send pixels across the model boundary, so
+    // this is zero on the wire and not merely zero in the Rust type.
+    check(
+      `${name}: no screenshot bytes are ever accounted to a model`,
+      projection.adaptive.cost.screenshotBytes === 0,
+      String(projection.adaptive.cost.screenshotBytes),
+    );
+  } else {
+    seenLegacyAdaptive = true;
   }
   // A run with no adaptive decision must read `null`, not `{}`. "No adaptive
   // authority has been established" and "established, with nothing in it" are
@@ -151,6 +200,11 @@ function pinProjection(name, projection) {
     JSON.stringify(projection.adaptive),
   );
 }
+
+// Both shapes must actually be exercised. A pin that never runs proves nothing,
+// and before this the seeded runs all had `adaptive: null`.
+let seenPopulatedAdaptive = false;
+let seenLegacyAdaptive = false;
 
 async function main() {
   // Lifecycle: initialize + initialized.
@@ -344,6 +398,19 @@ async function main() {
   check(
     "durable events replay identically across reconnect",
     JSON.stringify(afterReconnect.result) === JSON.stringify(firstPage.result),
+  );
+
+  // A pin that never executes proves nothing. Both projection shapes must have
+  // been seen for this smoke to be evidence about either of them.
+  check(
+    "a populated adaptive projection was actually pinned",
+    seenPopulatedAdaptive,
+    "no run on the wire carried an adaptive record",
+  );
+  check(
+    "a legacy null adaptive projection was actually pinned",
+    seenLegacyAdaptive,
+    "no run on the wire lacked an adaptive record",
   );
 
   const report = {

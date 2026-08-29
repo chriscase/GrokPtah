@@ -127,9 +127,7 @@ pub struct BudgetProjection {
     pub max_observation_elements: u32,
     pub max_observation_bytes: u64,
     pub max_model_calls: u32,
-    pub max_repairs: u32,
     pub max_turn_millis: u64,
-    pub screenshot_capture_allowed: bool,
     pub pointer_fallback_allowed: bool,
     pub key_chord_allowed: bool,
 }
@@ -141,9 +139,7 @@ impl BudgetProjection {
             max_observation_elements: budget.max_observation_elements,
             max_observation_bytes: budget.max_observation_bytes,
             max_model_calls: budget.max_model_calls,
-            max_repairs: budget.max_repairs,
             max_turn_millis: budget.max_turn_millis,
-            screenshot_capture_allowed: budget.allows_screenshot_capture,
             pointer_fallback_allowed: budget.allows_pointer_fallback,
             key_chord_allowed: budget.allows_key_chord,
         }
