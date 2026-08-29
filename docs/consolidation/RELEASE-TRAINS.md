@@ -169,7 +169,7 @@ Each row: the older PR's head **is a git ancestor of** the newer PR's head, so t
 
 Seven trains, each rooted at `67e29bd`. Order **within** a train is load-bearing: it is the sequence that was simulated clean. Trains T1–T4 are blocked; T5–T7 are ready.
 
-### T7 — Manager certification *(READY — simulated clean, builds clean)*
+### T7 — Manager certification *(READY — simulated clean; 722 passed / 1 pre-existing failure locally)*
 
 `#344 → #345 → #346 → #347 → #348`
 
@@ -307,12 +307,12 @@ These five are the recommended next promotion, **in this order**. They were simu
 base        67e29bd34dc64049432c715c93c2cef2185c63ea   (clean main)
 simulated   #344 -> #345 -> #346 -> #347 -> #348            all CLEAN
 
-Local gate, run in an isolated worktree with tests unmodified, on the
-14-PR superset that contains all five (see below):
+Local gate, run in isolated worktrees with tests unmodified:
 
                               suites   passed   failed
   clean 67e29bd (baseline)      29       713       1
-  67e29bd + 14 PRs              34      1000       1
+  67e29bd + these 5 PRs         29       722       1     <- this recommendation
+  67e29bd + 14-PR superset      34      1000       1
 
   cargo check --all-targets   ->  0 errors, 2 pre-existing warnings
   cargo test --no-fail-fast -- --test-threads=1
@@ -322,7 +322,8 @@ The single failure is identical on both sides:
 It fails on clean main in this container because it spawns a Node harness
 that cannot complete without network. It is pre-existing, not introduced.
 
-Net: +287 passing tests, +5 suites, zero new failures.
+Net for the five: +9 passing tests, zero new failures.
+Net for the 14-PR superset: +287 passing tests, +5 suites, zero new failures.
 ```
 
 **Two caveats that must travel with this recommendation.**
