@@ -22,6 +22,7 @@ use grokptah_agent_bridge::computer_use::{
     PointerButton, SemanticAction, SemanticElement, Sensitivity,
 };
 use grokptah_agent_bridge::ComputerUseService;
+use grokptah_agent_bridge::OrchStore;
 
 #[derive(Debug, Clone, Copy)]
 enum BackendMode {
@@ -169,7 +170,8 @@ fn fixture(
     let directory = tempfile::tempdir().expect("fixture directory");
     let backend = Arc::new(ReleaseGateBackend::new(mode));
     let store = ComputerStore::open(directory.path().join("computer-use")).expect("store");
-    let service = ComputerUseService::new(backend.clone(), store);
+    let audit = OrchStore::open(directory.path().join("orchestration")).expect("audit store");
+    let service = ComputerUseService::new_with_audit_store(backend.clone(), store, audit);
     let run = service
         .create_run(
             "release-gate-create",

@@ -3,7 +3,6 @@
 use std::fs;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -11,6 +10,11 @@ use chrono::{Duration, Utc};
 use fs2::FileExt;
 use parking_lot::Mutex;
 use uuid::Uuid;
+
+use crate::audit::{
+    AuditEntryInput, AuditKeyCustody, AuditLedger, AuditLedgerOptions, AuditStatus, EntryOutcome,
+    EntryPhase, EntryReason, ExportFormat, ExportReceipt, RetentionReceipt, RetentionRequest,
+};
 
 use super::managed::{
     ManagedExecutionIntent, ManagedExecutionPolicy, ManagedFinalizationOutcome,
@@ -50,8 +54,7 @@ struct OrchStoreInner {
     lock: Mutex<()>,
     last_run_error: Mutex<Option<String>>,
     last_audit_error: Arc<Mutex<Option<String>>>,
-    audit_file_lock: Arc<Mutex<()>>,
-    audit_writer: AuditWriter,
+    audit: AuditLedger,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -92,8 +95,6 @@ struct ManagerCreationIntent {
     plan: ManagerPlan,
     root_work: WorkItem,
 }
-
-const MAX_AUDIT_BYTES: u64 = 4 * 1024 * 1024;
 
 struct AssignmentMutation<'a> {
     work_id: &'a str,
@@ -143,24 +144,26 @@ pub struct RetentionReport {
     pub skipped_files: usize,
 }
 
-struct AuditWriter {
-    tx: Mutex<Option<SyncSender<AuditEntry>>>,
-    join: Mutex<Option<std::thread::JoinHandle<()>>>,
-}
-
-impl Drop for AuditWriter {
-    fn drop(&mut self) {
-        self.tx.lock().take();
-        if let Some(join) = self.join.lock().take() {
-            let _ = join.join();
-        }
-    }
-}
-
 impl OrchStore {
     /// Open store and convert unfinished runs to `interrupted` (crash recovery).
     pub fn open(root: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let custody = AuditKeyCustody::headless_service(root.as_ref())
+            .map_err(|error| anyhow::anyhow!("audit key custody: {error}"))?;
+        Self::open_with_custody(root, custody)
+    }
+
+    /// Open the store with an explicit custody boundary. Packaged desktop and
+    /// headless service callers use private file custody; external consumers
+    /// must inject a held key and never receive a path or key byte from this
+    /// store.
+    pub fn open_with_custody(
+        root: impl AsRef<Path>,
+        custody: AuditKeyCustody,
+    ) -> anyhow::Result<Self> {
         let root = root.as_ref().to_path_buf();
+        if root.exists() && fs::symlink_metadata(&root)?.file_type().is_symlink() {
+            anyhow::bail!("orchestration store root is a symlink");
+        }
         fs::create_dir_all(root.join("runs"))?;
         fs::create_dir_all(root.join("agents"))?;
         fs::create_dir_all(root.join("agent-specs"))?;
@@ -199,23 +202,18 @@ impl OrchStore {
                 root.display()
             )
         })?;
+        let audit_root = root.join("audit");
+        let audit = AuditLedger::open_with_keyring(
+            &audit_root,
+            custody.all_keys(),
+            AuditLedgerOptions {
+                legacy_v1_dir: Some(audit_root.clone()),
+                key_provider: Some(custody.provider()),
+                ..AuditLedgerOptions::default()
+            },
+        )
+        .map_err(|error| anyhow::anyhow!("open canonical audit ledger: {error}"))?;
         let last_audit_error = Arc::new(Mutex::new(None));
-        let audit_file_lock = Arc::new(Mutex::new(()));
-        let (audit_tx, audit_rx) = sync_channel::<AuditEntry>(256);
-        let audit_root = root.clone();
-        let writer_error = last_audit_error.clone();
-        let writer_lock = audit_file_lock.clone();
-        let audit_join = std::thread::Builder::new()
-            .name("grokptah-orchestration-audit".into())
-            .spawn(move || {
-                while let Ok(entry) = audit_rx.recv() {
-                    let _guard = writer_lock.lock();
-                    let result = append_audit_entry(&audit_root, &entry);
-                    if let Err(error) = result {
-                        *writer_error.lock() = Some(error.to_string());
-                    }
-                }
-            })?;
         let store = Self {
             inner: Arc::new(OrchStoreInner {
                 root,
@@ -223,11 +221,7 @@ impl OrchStore {
                 lock: Mutex::new(()),
                 last_run_error: Mutex::new(None),
                 last_audit_error,
-                audit_file_lock,
-                audit_writer: AuditWriter {
-                    tx: Mutex::new(Some(audit_tx)),
-                    join: Mutex::new(Some(audit_join)),
-                },
+                audit,
             }),
         };
         store.recover_agent_activation_intents()?;
@@ -246,6 +240,42 @@ impl OrchStore {
 
     pub fn root(&self) -> &Path {
         &self.inner.root
+    }
+
+    /// Explicitly close the shared store. Refuse while another handle still
+    /// owns the lock so callers cannot mistake a dropped local reference for
+    /// host-wide shutdown.
+    pub fn shutdown(self) -> anyhow::Result<()> {
+        if Arc::strong_count(&self.inner) != 1 {
+            return Err(anyhow::anyhow!("orchestration store still has live owners"));
+        }
+        let inner = self.inner;
+        let intent_id = format!("store-shutdown-{}", Uuid::new_v4());
+        let result = inner
+            .audit
+            .append(
+                AuditEntryInput::new(
+                    "orchestration.shutdown",
+                    EntryPhase::Intent,
+                    EntryOutcome::Accepted,
+                )
+                .with_intent_id(&intent_id),
+            )
+            .and_then(|_| {
+                inner.audit.append(
+                    AuditEntryInput::new(
+                        "orchestration.shutdown",
+                        EntryPhase::Outcome,
+                        EntryOutcome::Accepted,
+                    )
+                    .with_reason(EntryReason::HostShutdown)
+                    .with_intent_id(intent_id),
+                )
+            })
+            .map(|_| ())
+            .map_err(|error| anyhow::anyhow!("audit shutdown failed: {}", error.code()));
+        drop(inner);
+        result
     }
 
     fn run_path(&self, run_id: &str) -> Result<PathBuf, OrchError> {
@@ -4953,34 +4983,92 @@ impl OrchStore {
             .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))
     }
 
-    pub fn append_audit(&self, entry: &AuditEntry) -> anyhow::Result<()> {
-        let _guard = self.inner.audit_file_lock.lock();
-        let result = append_audit_entry(&self.inner.root, entry);
-        if let Err(error) = &result {
-            *self.inner.last_audit_error.lock() = Some(error.to_string());
+    pub(crate) fn append_audit(&self, entry: &AuditEntry) -> anyhow::Result<()> {
+        let outcome = adapt_audit_entry(entry);
+        if outcome.intent_id.is_some() {
+            let mut intent = outcome.clone();
+            intent.phase = EntryPhase::Intent;
+            intent.outcome = EntryOutcome::Accepted;
+            self.append_audit_input(intent)?;
         }
-        result
+        self.append_audit_input(outcome)
     }
 
-    pub fn enqueue_audit(&self, entry: AuditEntry) -> anyhow::Result<()> {
-        let sender = self.inner.audit_writer.tx.lock();
-        let Some(sender) = sender.as_ref() else {
-            let error = "audit writer is stopped".to_string();
-            *self.inner.last_audit_error.lock() = Some(error.clone());
-            return Err(anyhow::anyhow!(error));
-        };
-        sender.try_send(entry).map_err(|error| {
-            let detail = match error {
-                TrySendError::Full(_) => "audit writer queue is full",
-                TrySendError::Disconnected(_) => "audit writer stopped",
-            };
-            *self.inner.last_audit_error.lock() = Some(detail.into());
-            anyhow::anyhow!(detail)
-        })
+    pub(crate) fn append_audit_input(&self, input: AuditEntryInput) -> anyhow::Result<()> {
+        let result = self.inner.audit.append(input);
+        if let Err(error) = &result {
+            *self.inner.last_audit_error.lock() =
+                Some(format!("audit persistence failed: {}", error.code()));
+        }
+        result
+            .map(|_| ())
+            .map_err(|error| anyhow::anyhow!("audit persistence failed: {}", error.code()))
+    }
+
+    pub(crate) fn audit_intent_state(
+        &self,
+        intent_id: &str,
+    ) -> anyhow::Result<crate::audit::AuditIntentState> {
+        self.inner
+            .audit
+            .producer_intent_state(intent_id)
+            .map_err(|error| anyhow::anyhow!("audit reconciliation failed: {}", error.code()))
+    }
+
+    pub(crate) fn enqueue_audit(&self, entry: AuditEntry) -> anyhow::Result<()> {
+        // v2 is the sole authority and appends synchronously. There is no
+        // second in-memory queue whose overflow could disappear at shutdown.
+        self.append_audit(&entry)
     }
 
     pub fn last_audit_error(&self) -> Option<String> {
         self.inner.last_audit_error.lock().clone()
+    }
+
+    /// Authenticated audit health. A missing in-memory error is not a clean
+    /// ledger claim; callers must inspect `poisoned` and `recovery`.
+    pub fn audit_status(&self) -> AuditStatus {
+        self.inner.audit.status()
+    }
+
+    pub fn export_audit(
+        &self,
+        destination: &Path,
+        format: ExportFormat,
+    ) -> anyhow::Result<ExportReceipt> {
+        self.inner
+            .audit
+            .export(destination, format)
+            .map_err(|error| anyhow::anyhow!("audit export failed: {}", error.code()))
+    }
+
+    pub fn retain_audit(&self, request: RetentionRequest) -> anyhow::Result<RetentionReceipt> {
+        self.inner
+            .audit
+            .retain(request)
+            .map_err(|error| anyhow::anyhow!("audit retention failed: {}", error.code()))
+    }
+
+    pub fn rotate_audit_key(&self) -> anyhow::Result<String> {
+        self.inner
+            .audit
+            .rotate_key()
+            .map_err(|error| anyhow::anyhow!("audit key rotation failed: {}", error.code()))
+    }
+
+    pub fn rotate_audit(&self) -> anyhow::Result<String> {
+        self.inner
+            .audit
+            .rotate(crate::audit::RotationReason::Operator)
+            .map_err(|error| anyhow::anyhow!("audit rotation failed: {}", error.code()))
+    }
+
+    pub fn verify_audit(&self) -> anyhow::Result<usize> {
+        self.inner
+            .audit
+            .verify_all()
+            .map(|generations| generations.len())
+            .map_err(|error| anyhow::anyhow!("audit verification failed: {}", error.code()))
     }
 
     pub fn last_run_error(&self) -> Option<String> {
@@ -5233,33 +5321,61 @@ fn merge_run_observations(target: &mut RunRecord, current: &RunRecord) {
     }
 }
 
-fn append_audit_entry(root: &Path, entry: &AuditEntry) -> anyhow::Result<()> {
-    use std::io::Write;
-
-    let path = root.join("audit").join("audit.jsonl");
-    if fs::metadata(&path)
-        .map(|metadata| metadata.len() >= MAX_AUDIT_BYTES)
-        .unwrap_or(false)
-    {
-        let rotated = path.with_extension("jsonl.1");
-        if rotated.exists() {
-            fs::remove_file(&rotated)?;
-        }
-        fs::rename(&path, rotated)?;
-    }
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    writeln!(file, "{}", serde_json::to_string(entry)?)?;
-    file.sync_data()?;
-    Ok(())
-}
-
 pub enum IdempotencyClaim {
     Perform,
     Pending,
     Replay(Result<serde_json::Value, OrchError>),
+}
+
+fn adapt_audit_entry(entry: &AuditEntry) -> AuditEntryInput {
+    let normalized = entry.outcome.to_ascii_lowercase();
+    let outcome = match normalized.as_str() {
+        "accepted" | "complete" | "completed" | "success" | "succeeded" => EntryOutcome::Accepted,
+        "rejected" | "denied" | "failed" | "error" => EntryOutcome::Rejected,
+        _ => EntryOutcome::Uncertain,
+    };
+    let reason = entry.error_code.as_deref().map(|code| match code {
+        "unauthenticated" => EntryReason::Unauthenticated,
+        "forbidden_scope" | "workspace_mismatch" => EntryReason::ForbiddenScope,
+        "stale_version" | "cursor_expired" => EntryReason::StaleRevision,
+        "capacity_exhausted" => EntryReason::CapacityExhausted,
+        "invalid_request" => EntryReason::InvalidRequest,
+        "conflict" => EntryReason::Conflict,
+        _ => EntryReason::Internal,
+    });
+    let mut input = AuditEntryInput::new(entry.tool.clone(), EntryPhase::Outcome, outcome);
+    if let Some(reason) = reason {
+        input = input.with_reason(reason);
+    }
+    if let Some(code) = entry.error_code.as_deref() {
+        input = input.with_code(code);
+    }
+    if let Some(actor) = entry.session_id {
+        input = input.with_actor(actor.to_string());
+    }
+    if let Some(request_id) = entry.request_id.as_deref() {
+        input = input.with_request(request_id).with_intent_id(request_id);
+    } else if let Some(session_id) = entry.session_id {
+        // Older producers did not supply an intent id. This stable fallback
+        // preserves correlation without claiming that separate operations in
+        // one session are the same producer intent.
+        input = input.with_intent_id(format!("legacy-session:{session_id}:{}", entry.tool));
+    } else {
+        // Transport/authentication producers predate request ids. Allocate a
+        // host-owned identity rather than allowing an unkeyed effect record.
+        input = input.with_intent_id(format!(
+            "legacy-event:{}:{}",
+            entry.tool,
+            entry.ts.timestamp_micros()
+        ));
+    }
+    if let Some(workspace) = entry.workspace.as_deref() {
+        input = input.with_scope(workspace);
+    }
+    // `detail` is intentionally not adapted: it may contain prompts,
+    // credentials, paths, locators, clipboard data, frames, or provider
+    // payloads, none of which are audit facts.
+    input
 }
 
 fn remove_file_durable(path: &Path) -> anyhow::Result<()> {
@@ -6055,15 +6171,13 @@ mod tests {
     }
 
     #[test]
-    fn audit_rotates_at_bound_and_reports_success() {
+    fn canonical_audit_is_authenticated_and_never_uses_v1_rotation() {
         let d = tempdir().unwrap();
         let store = OrchStore::open(d.path()).unwrap();
-        let path = d.path().join("audit").join("audit.jsonl");
-        fs::write(&path, vec![b'x'; MAX_AUDIT_BYTES as usize]).unwrap();
         let entry = AuditEntry {
             ts: Utc::now(),
             tool: "ptah_get_capacity".into(),
-            request_id: None,
+            request_id: Some("capacity-audit".into()),
             session_id: None,
             workspace: None,
             outcome: "accepted".into(),
@@ -6071,21 +6185,28 @@ mod tests {
             detail: "test".into(),
         };
         store.append_audit(&entry).unwrap();
-        assert!(path.with_extension("jsonl.1").is_file());
-        assert!(path.is_file());
+        let status = store.audit_status();
+        let path = d
+            .path()
+            .join("audit")
+            .join("generations")
+            .join(status.active_generation_id)
+            .join("journal.jsonl");
+        let body = fs::read_to_string(path).unwrap();
+        assert!(body.contains("\"op\":\"ptah_get_capacity\""));
+        assert!(!d.path().join("audit").join("audit.jsonl.1").exists());
         assert!(store.last_audit_error().is_none());
     }
 
     #[test]
-    fn queued_audit_flushes_before_store_shutdown() {
+    fn audit_append_is_durable_before_store_shutdown() {
         let d = tempdir().unwrap();
         let store = OrchStore::open(d.path()).unwrap();
-        let path = d.path().join("audit").join("audit.jsonl");
         store
             .enqueue_audit(AuditEntry {
                 ts: Utc::now(),
                 tool: "auth".into(),
-                request_id: None,
+                request_id: Some("auth-audit".into()),
                 session_id: None,
                 workspace: None,
                 outcome: "rejected".into(),
@@ -6093,9 +6214,100 @@ mod tests {
                 detail: "test".into(),
             })
             .unwrap();
+        let status = store.audit_status();
+        let path = d
+            .path()
+            .join("audit")
+            .join("generations")
+            .join(status.active_generation_id)
+            .join("journal.jsonl");
+        let before_drop = fs::read_to_string(&path).unwrap();
+        assert!(before_drop.contains("\"op\":\"auth\""));
         drop(store);
         let body = fs::read_to_string(path).unwrap();
-        assert!(body.contains("\"tool\":\"auth\""));
+        assert!(body.contains("\"op\":\"auth\""));
+    }
+
+    #[test]
+    fn store_key_rotation_keeps_old_generation_verifiable_after_restart() {
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+        let old_key_id = store.audit_status().key_id;
+        let next_generation = store.rotate_audit_key().unwrap();
+        assert_eq!(next_generation, "g-000002");
+        assert_ne!(store.audit_status().key_id, old_key_id);
+        let custody = crate::audit::AuditKeyCustody::headless_service(d.path()).unwrap();
+        assert_eq!(custody.all_keys().len(), 2);
+        store
+            .append_audit(&AuditEntry {
+                ts: Utc::now(),
+                tool: "provider_attempt".into(),
+                request_id: Some("request-rotation".into()),
+                session_id: None,
+                workspace: None,
+                outcome: "accepted".into(),
+                error_code: None,
+                detail: "must not be retained".into(),
+            })
+            .unwrap();
+        assert_eq!(store.verify_audit().unwrap(), 2);
+        drop(store);
+
+        let reopened = OrchStore::open(d.path()).unwrap();
+        assert_eq!(reopened.verify_audit().unwrap(), 2);
+        assert_eq!(reopened.audit_status().global_last_seq, 4);
+    }
+
+    #[test]
+    fn real_store_rotation_crash_cuts_converge_without_sequence_loss() {
+        for point in [
+            crate::audit::CrashPoint::R1Frozen,
+            crate::audit::CrashPoint::R2Prepared,
+            crate::audit::CrashPoint::R3Committed,
+        ] {
+            let d = tempdir().unwrap();
+            let store = OrchStore::open(d.path()).unwrap();
+            store
+                .append_audit(&AuditEntry {
+                    ts: Utc::now(),
+                    tool: "crash-cut".into(),
+                    request_id: Some(format!("rotation-{point:?}")),
+                    session_id: None,
+                    workspace: None,
+                    outcome: "accepted".into(),
+                    error_code: None,
+                    detail: "private".into(),
+                })
+                .unwrap();
+            store.inner.audit.set_crash_at(point);
+            assert!(store.rotate_audit().is_err());
+            drop(store);
+            let reopened = OrchStore::open(d.path()).unwrap();
+            assert!(reopened.verify_audit().is_ok());
+            assert!(reopened.audit_status().global_last_seq >= 1);
+        }
+    }
+
+    #[test]
+    fn real_store_retention_crash_cuts_resume_only_authenticated_tombstones() {
+        for point in [
+            crate::audit::CrashPoint::T3Committed,
+            crate::audit::CrashPoint::T4Removed,
+        ] {
+            let d = tempdir().unwrap();
+            let store = OrchStore::open(d.path()).unwrap();
+            store.rotate_audit().unwrap();
+            let export = d.path().join("export");
+            let seal = store.export_audit(&export, ExportFormat::V2).unwrap();
+            store.inner.audit.set_crash_at(point);
+            assert!(store
+                .retain_audit(RetentionRequest::new("g-000001").with_export_seal(seal.seal_id))
+                .is_err());
+            drop(store);
+            let reopened = OrchStore::open(d.path()).unwrap();
+            assert_eq!(reopened.audit_status().tombstones, 1);
+            assert!(reopened.verify_audit().is_ok());
+        }
     }
 
     #[test]

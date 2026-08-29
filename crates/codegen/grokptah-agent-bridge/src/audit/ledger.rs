@@ -1,0 +1,2026 @@
+//! The audit generation ledger: open, recover, append, rotate (#443).
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use chrono::Utc;
+use parking_lot::{Mutex, RwLock};
+
+use super::documents::*;
+use super::files;
+use super::import::{
+    bootstrap_path, plan_legacy_import, write_imported_journal, BootstrapMarker, LegacyImportPlan,
+};
+use super::keys::{sha256_hex, AuditKeyProvider, AuditKeys, StaticAuditKeyProvider};
+use super::witness::{
+    AuditWitness, UnwitnessedBoundary, WitnessBeacon, WitnessState, WitnessVerdict,
+};
+use super::{AuditError, AuditResult, PoisonReason, RefuseReason};
+
+pub const MAX_GENERATION_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Deterministic crash-injection points. In non-test builds [`AuditLedger::cut`]
+/// is a no-op, so no injection state exists in a shipped binary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrashPoint {
+    JournalAppendedBeforeAnchor,
+    R1Frozen,
+    R2Prepared,
+    R3Committed,
+    T3Committed,
+    T4Removed,
+}
+
+/// The caller-facing shape of one audit entry. Raw identifiers are converted to
+/// keyed digests on the way in, so a path, prompt or native id cannot reach the
+/// journal even if a producer passes one.
+#[derive(Debug, Clone)]
+pub(crate) struct AuditEntryInput {
+    pub(crate) op: String,
+    pub(crate) phase: EntryPhase,
+    pub(crate) outcome: EntryOutcome,
+    pub(crate) reason: Option<EntryReason>,
+    pub(crate) code: Option<String>,
+    pub(crate) actor: Option<String>,
+    pub(crate) request: Option<String>,
+    pub(crate) scope: Option<String>,
+    pub(crate) authz_rev: Option<u64>,
+    pub(crate) cap_rev: Option<u64>,
+    pub(crate) policy_rev: Option<u64>,
+    pub(crate) intent_id: Option<String>,
+    intent_digest: Option<String>,
+}
+
+impl AuditEntryInput {
+    pub(crate) fn new(op: impl Into<String>, phase: EntryPhase, outcome: EntryOutcome) -> Self {
+        Self {
+            op: op.into(),
+            phase,
+            outcome,
+            reason: None,
+            code: None,
+            actor: None,
+            request: None,
+            scope: None,
+            authz_rev: None,
+            cap_rev: None,
+            policy_rev: None,
+            intent_id: None,
+            intent_digest: None,
+        }
+    }
+
+    pub(crate) fn with_reason(mut self, reason: EntryReason) -> Self {
+        self.reason = Some(reason);
+        self
+    }
+
+    pub(crate) fn with_code(mut self, code: impl Into<String>) -> Self {
+        self.code = Some(code.into());
+        self
+    }
+
+    pub(crate) fn with_actor(mut self, actor: impl Into<String>) -> Self {
+        self.actor = Some(actor.into());
+        self
+    }
+
+    pub(crate) fn with_request(mut self, request: impl Into<String>) -> Self {
+        self.request = Some(request.into());
+        self
+    }
+
+    pub(crate) fn with_scope(mut self, scope: impl Into<String>) -> Self {
+        self.scope = Some(scope.into());
+        self
+    }
+
+    pub(crate) fn with_intent_id(mut self, intent_id: impl Into<String>) -> Self {
+        self.intent_id = Some(intent_id.into());
+        self
+    }
+
+    pub(crate) fn with_intent_digest(mut self, digest: impl Into<String>) -> Self {
+        self.intent_digest = Some(digest.into());
+        self
+    }
+}
+
+/// A typed non-producer record. Housekeeping, gap, and recovery evidence is
+/// always an outcome with no producer identity and therefore can never add,
+/// remove, or otherwise alter the set of open producer intents.
+#[derive(Debug, Clone)]
+pub(crate) struct AuditHousekeepingInput {
+    pub(crate) op: String,
+    pub(crate) outcome: EntryOutcome,
+    pub(crate) reason: Option<EntryReason>,
+    pub(crate) code: Option<String>,
+}
+
+impl AuditHousekeepingInput {
+    pub(crate) fn new(op: impl Into<String>, outcome: EntryOutcome) -> Self {
+        Self {
+            op: op.into(),
+            outcome,
+            reason: None,
+            code: None,
+        }
+    }
+
+    pub(crate) fn with_reason(mut self, reason: EntryReason) -> Self {
+        self.reason = Some(reason);
+        self
+    }
+}
+
+/// Open-time configuration.
+#[derive(Default)]
+pub struct AuditLedgerOptions {
+    /// Rollback witness boundary. Defaults to [`UnwitnessedBoundary`].
+    pub witness: Option<Arc<dyn AuditWitness>>,
+    /// Directory holding legacy v1 `audit.jsonl` / `audit.jsonl.1`. Imported
+    /// only when this root has never committed a manifest.
+    pub legacy_v1_dir: Option<PathBuf>,
+    /// Custody-owned key retrieval/rotation. A static key ring refuses key
+    /// rotation instead of deriving or persisting material inside the ledger.
+    pub key_provider: Option<Arc<dyn AuditKeyProvider>>,
+}
+
+/// What recovery actually did, so an operator never has to infer it.
+#[derive(Debug, Clone, Default)]
+pub struct RecoverySummary {
+    pub adopted_tail_entries: u64,
+    pub torn_tail: Option<RecoveryEvidence>,
+    pub orphan_generation: Option<String>,
+    pub resumed_removals: Vec<String>,
+    pub closed_intents: u64,
+    pub durable_gaps: Vec<GapRecord>,
+    pub legacy_divergences: Vec<String>,
+    pub initialized: bool,
+    pub imported_generations: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct AuditStatus {
+    pub installation_id: String,
+    pub key_id: String,
+    pub key_epoch: u32,
+    pub manifest_epoch: u64,
+    pub retention_epoch: u64,
+    pub active_generation_id: String,
+    pub global_first_seq: u64,
+    pub global_last_seq: u64,
+    pub generations: usize,
+    pub tombstones: usize,
+    pub open_intents: u64,
+    pub journal_bytes: u64,
+    pub poisoned: Option<PoisonReason>,
+    pub witness_state: WitnessState,
+    pub imported_generations: usize,
+    pub recovery: RecoverySummary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuditIntentState {
+    Missing,
+    Open,
+    Settled(EntryOutcome),
+}
+
+#[derive(Debug, Clone)]
+pub struct GenerationVerification {
+    pub generation_id: String,
+    pub first_seq: u64,
+    pub last_seq: u64,
+    pub entry_count: u64,
+    pub journal_bytes: u64,
+    pub journal_sha256: String,
+    pub final_tag: String,
+    pub origin_authenticated: bool,
+}
+
+#[derive(Debug, Clone)]
+struct LiveTail {
+    generation_id: String,
+    last_seq: u64,
+    last_tag: String,
+    journal_bytes: u64,
+    open_intent_ids: Vec<String>,
+}
+
+struct Inner {
+    manifest: Manifest,
+    live: LiveTail,
+    poisoned: Option<PoisonReason>,
+    recovery: RecoverySummary,
+    witness_state: WitnessState,
+}
+
+pub struct AuditLedger {
+    root: PathBuf,
+    legacy_v1_dir: Option<PathBuf>,
+    key_provider: Arc<dyn AuditKeyProvider>,
+    keys: RwLock<Arc<AuditKeys>>,
+    keyring: RwLock<Vec<Arc<AuditKeys>>>,
+    witness: Arc<dyn AuditWitness>,
+    inner: Mutex<Inner>,
+    /// Serializes transactions that span more than one durable document.  The
+    /// in-memory mutex alone is insufficient because rotation and retention
+    /// intentionally have multiple commit phases.
+    pub(crate) operation_lock: Mutex<()>,
+    #[cfg(test)]
+    crash_at: Mutex<Option<CrashPoint>>,
+}
+
+impl std::fmt::Debug for AuditLedger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never renders key material, journal contents, or scope.
+        let guard = self.inner.lock();
+        f.debug_struct("AuditLedger")
+            .field("root", &self.root)
+            .field("activeGeneration", &guard.manifest.active_generation_id)
+            .field("lastSeq", &guard.live.last_seq)
+            .field("openIntents", &guard.live.open_intent_ids.len())
+            .field("poisoned", &guard.poisoned)
+            .finish()
+    }
+}
+
+pub(crate) struct JournalScan {
+    pub(crate) last_seq: u64,
+    pub(crate) last_tag: String,
+    pub(crate) bytes: u64,
+    pub(crate) complete_len: u64,
+    pub(crate) torn: Option<RecoveryEvidence>,
+    pub(crate) entry_count: u64,
+    pub(crate) open_intent_ids: Vec<String>,
+}
+
+impl AuditLedger {
+    pub fn open(root: impl AsRef<Path>, keys: Arc<AuditKeys>) -> AuditResult<Self> {
+        Self::open_with_options(root, keys, AuditLedgerOptions::default())
+    }
+
+    pub fn open_with_witness(
+        root: impl AsRef<Path>,
+        keys: Arc<AuditKeys>,
+        witness: Arc<dyn AuditWitness>,
+    ) -> AuditResult<Self> {
+        Self::open_with_options(
+            root,
+            keys,
+            AuditLedgerOptions {
+                witness: Some(witness),
+                ..AuditLedgerOptions::default()
+            },
+        )
+    }
+
+    pub fn open_with_options(
+        root: impl AsRef<Path>,
+        keys: Arc<AuditKeys>,
+        options: AuditLedgerOptions,
+    ) -> AuditResult<Self> {
+        Self::open_with_keyring(root, vec![keys], options)
+    }
+
+    pub fn open_with_keyring(
+        root: impl AsRef<Path>,
+        keys: Vec<Arc<AuditKeys>>,
+        options: AuditLedgerOptions,
+    ) -> AuditResult<Self> {
+        if keys.is_empty() {
+            return Err(AuditError::Poisoned(PoisonReason::KeyUnavailable));
+        }
+        let key_provider: Arc<dyn AuditKeyProvider> = options
+            .key_provider
+            .clone()
+            .unwrap_or_else(|| Arc::new(StaticAuditKeyProvider::new(keys.clone())));
+        let witness: Arc<dyn AuditWitness> = options
+            .witness
+            .unwrap_or_else(|| Arc::new(UnwitnessedBoundary));
+        let root = root.as_ref().to_path_buf();
+        if root.exists() {
+            files::reject_symlink_components(&root)?;
+            files::reject_symlink(&root)?;
+        }
+        files::create_private_dir_all(&root)?;
+        files::reject_symlink_components(&root)?;
+        files::reject_symlink(&root)?;
+        files::create_private_dir_all(&root.join("generations"))?;
+
+        let mut recovery = RecoverySummary::default();
+        let (selected_key, manifest) = {
+            let mut last_error = None;
+            let mut selected: Option<(Arc<AuditKeys>, Option<Manifest>)> = None;
+            for key in &keys {
+                match Self::load_manifest(&root, key) {
+                    Ok(Some(manifest)) => {
+                        selected = Some((Arc::clone(key), Some(manifest)));
+                        break;
+                    }
+                    Ok(None) => {
+                        selected = Some((Arc::clone(key), None));
+                        break;
+                    }
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            match selected {
+                Some((key, Some(manifest))) => (key, manifest),
+                Some((key, None)) => {
+                    recovery.initialized = true;
+                    let plan = match options.legacy_v1_dir.as_deref() {
+                        Some(dir) if dir.exists() => plan_legacy_import(dir)?,
+                        _ => LegacyImportPlan::default(),
+                    };
+                    recovery.imported_generations = plan.generations.len();
+                    let manifest = Self::initialize(&root, &key, &plan)?;
+                    (key, manifest)
+                }
+                None => {
+                    return Err(last_error
+                        .unwrap_or(AuditError::Poisoned(PoisonReason::ManifestMacMismatch)))
+                }
+            }
+        };
+        Self::check_structure(&manifest, &selected_key, &keys)?;
+
+        let ledger = Self {
+            root,
+            legacy_v1_dir: options.legacy_v1_dir,
+            key_provider,
+            keys: RwLock::new(selected_key),
+            keyring: RwLock::new(keys),
+            witness,
+            inner: Mutex::new(Inner {
+                live: LiveTail {
+                    generation_id: manifest.active_generation_id.clone(),
+                    last_seq: 0,
+                    last_tag: String::new(),
+                    journal_bytes: 0,
+                    open_intent_ids: Vec::new(),
+                },
+                manifest,
+                poisoned: None,
+                recovery,
+                witness_state: WitnessState::Unwitnessed,
+            }),
+            operation_lock: Mutex::new(()),
+            #[cfg(test)]
+            crash_at: Mutex::new(None),
+        };
+        ledger.recover()?;
+        Ok(ledger)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_crash_at(self, point: CrashPoint) -> Self {
+        *self.crash_at.lock() = Some(point);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cut(&self, point: CrashPoint) -> AuditResult<()> {
+        if *self.crash_at.lock() == Some(point) {
+            return Err(AuditError::CrashCut);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_crash_at(&self, point: CrashPoint) {
+        *self.crash_at.lock() = Some(point);
+    }
+
+    #[cfg(not(test))]
+    #[inline]
+    pub(crate) fn cut(&self, _point: CrashPoint) -> AuditResult<()> {
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------- paths
+
+    pub(crate) fn manifest_path(root: &Path) -> PathBuf {
+        root.join("manifest.json")
+    }
+
+    pub(crate) fn generation_dir(root: &Path, generation_id: &str) -> PathBuf {
+        root.join("generations").join(generation_id)
+    }
+
+    pub(crate) fn journal_path(root: &Path, generation_id: &str) -> PathBuf {
+        Self::generation_dir(root, generation_id).join("journal.jsonl")
+    }
+
+    pub(crate) fn anchor_path(root: &Path, generation_id: &str) -> PathBuf {
+        Self::generation_dir(root, generation_id).join("anchor.json")
+    }
+
+    fn gap_path(&self) -> PathBuf {
+        self.root.join("gap.json")
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub(crate) fn keys(&self) -> Arc<AuditKeys> {
+        self.keys.read().clone()
+    }
+
+    pub(crate) fn keyring(&self) -> Vec<Arc<AuditKeys>> {
+        self.keyring.read().clone()
+    }
+
+    // ------------------------------------------------------------ documents
+
+    fn load_manifest(root: &Path, keys: &AuditKeys) -> AuditResult<Option<Manifest>> {
+        let path = Self::manifest_path(root);
+        if !path.exists() {
+            // A temporary is never promoted: it may be a partial write.
+            if files::tmp_path(&path)?.exists() {
+                return Err(AuditError::Poisoned(PoisonReason::ManifestTmpPresent));
+            }
+            let generations = root.join("generations");
+            let present: Vec<String> = std::fs::read_dir(&generations)
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .map(|entry| entry.file_name().to_string_lossy().to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            if present.is_empty() {
+                let _ = std::fs::remove_file(bootstrap_path(root));
+                return Ok(None);
+            }
+            // A first-open legacy import that never reached its manifest commit.
+            // Only directories the authenticated marker declared may be cleared,
+            // and the v1 source files it copied from are never touched, so this
+            // removes a staging copy rather than any evidence.
+            let marker_path = bootstrap_path(root);
+            if marker_path.exists() {
+                let bytes = files::read_bytes(&marker_path)?;
+                let marker: BootstrapMarker = serde_json::from_slice(&bytes)
+                    .map_err(|_| AuditError::Poisoned(PoisonReason::ManifestUnknownSchema))?;
+                marker.verify(keys)?;
+                if present
+                    .iter()
+                    .all(|name| marker.generation_ids.iter().any(|id| id == name))
+                {
+                    for name in &present {
+                        std::fs::remove_dir_all(generations.join(name)).map_err(|error| {
+                            AuditError::Io(format!("clear uncommitted bootstrap: {error}"))
+                        })?;
+                    }
+                    files::fsync_dir(&generations)?;
+                    std::fs::remove_file(&marker_path).map_err(|error| {
+                        AuditError::Io(format!("clear bootstrap marker: {error}"))
+                    })?;
+                    files::fsync_dir(root)?;
+                    return Ok(None);
+                }
+            }
+            return Err(AuditError::Poisoned(
+                PoisonReason::ManifestAbsentWithGenerations,
+            ));
+        }
+        files::reject_symlink(&path)?;
+        let bytes = files::read_bytes(&path)?;
+        let manifest: Manifest = serde_json::from_slice(&bytes)
+            .map_err(|_| AuditError::Poisoned(PoisonReason::ManifestUnknownSchema))?;
+        manifest.verify(keys)?;
+        Ok(Some(manifest))
+    }
+
+    fn write_manifest(&self, manifest: &mut Manifest) -> AuditResult<()> {
+        let keys = self.keys();
+        self.write_manifest_with_key(manifest, &keys)
+    }
+
+    fn write_manifest_with_key(
+        &self,
+        manifest: &mut Manifest,
+        keys: &AuditKeys,
+    ) -> AuditResult<()> {
+        manifest.manifest_epoch = manifest
+            .manifest_epoch
+            .checked_add(1)
+            .ok_or(AuditError::Poisoned(PoisonReason::SequenceExhausted))?;
+        manifest.updated_at = Utc::now();
+        manifest.seal(keys)?;
+        let bytes = serde_json::to_vec(manifest)
+            .map_err(|error| AuditError::Io(format!("serialize manifest: {error}")))?;
+        files::atomic_write(&Self::manifest_path(&self.root), &bytes)?;
+        self.witness.record(&Self::beacon(manifest));
+        Ok(())
+    }
+
+    fn beacon(manifest: &Manifest) -> WitnessBeacon {
+        WitnessBeacon {
+            installation_id: manifest.installation_id.clone(),
+            manifest_epoch: manifest.manifest_epoch,
+            retention_epoch: manifest.retention_epoch,
+            global_last_seq_floor: manifest.global_last_seq_floor,
+            active_generation_id: manifest.active_generation_id.clone(),
+            manifest_mac: manifest.mac.clone(),
+        }
+    }
+
+    fn load_anchor(&self, generation_id: &str) -> AuditResult<Anchor> {
+        let path = Self::anchor_path(&self.root, generation_id);
+        files::reject_symlink(&path)?;
+        let bytes = files::read_bytes(&path)?;
+        let anchor: Anchor = serde_json::from_slice(&bytes)
+            .map_err(|_| AuditError::Poisoned(PoisonReason::AnchorMacMismatch))?;
+        let keys = self.keys();
+        anchor.verify(&keys, generation_id)?;
+        Ok(anchor)
+    }
+
+    fn write_anchor(&self, live: &LiveTail) -> AuditResult<()> {
+        let keys = self.keys();
+        Self::write_anchor_at(
+            &self.root,
+            &keys,
+            &live.generation_id,
+            keys.key_epoch(),
+            live.last_seq,
+            &live.last_tag,
+            live.journal_bytes,
+            &live.open_intent_ids,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_anchor_at(
+        root: &Path,
+        keys: &AuditKeys,
+        generation_id: &str,
+        key_epoch: u32,
+        last_seq: u64,
+        last_tag: &str,
+        journal_bytes: u64,
+        open_intent_ids: &[String],
+    ) -> AuditResult<()> {
+        let mut anchor = Anchor {
+            schema: ANCHOR_SCHEMA.to_string(),
+            generation_id: generation_id.to_string(),
+            key_id: keys.key_id().to_string(),
+            key_epoch,
+            last_seq,
+            last_tag: last_tag.to_string(),
+            journal_bytes,
+            open_intent_ids: open_intent_ids.to_vec(),
+            updated_at: Utc::now(),
+            mac: String::new(),
+        };
+        anchor.seal(keys)?;
+        let bytes = serde_json::to_vec(&anchor)
+            .map_err(|error| AuditError::Io(format!("serialize anchor: {error}")))?;
+        files::atomic_write(&Self::anchor_path(root, generation_id), &bytes)
+    }
+
+    // --------------------------------------------------------------- init
+
+    /// Build the first committed manifest, optionally importing legacy v1
+    /// bytes as sealed, explicitly unauthenticated leading generations.
+    ///
+    /// Every generation directory is prepared before the manifest is written,
+    /// so the manifest rename is the single commit point here exactly as it is
+    /// for rotation. An import declares its directories in an authenticated
+    /// bootstrap marker first, so a crash before that commit is recoverable
+    /// without guessing (see `load_manifest`).
+    fn initialize(root: &Path, keys: &AuditKeys, plan: &LegacyImportPlan) -> AuditResult<Manifest> {
+        let now = Utc::now();
+        let genesis = keys.genesis_tag();
+        let total = plan.generations.len() as u32 + 1;
+        let ids: Vec<String> = (1..=total).map(generation_id).collect();
+
+        if !plan.generations.is_empty() {
+            let marker = BootstrapMarker::new(ids.clone(), keys)?;
+            let bytes = serde_json::to_vec(&marker)
+                .map_err(|error| AuditError::Io(format!("serialize bootstrap: {error}")))?;
+            files::atomic_write(&bootstrap_path(root), &bytes)?;
+        }
+
+        let mut generations: Vec<GenerationDescriptor> = Vec::with_capacity(total as usize);
+        let mut chain_base = genesis;
+        let mut predecessor: Option<String> = None;
+        let mut next_first_seq: u64 = 1;
+
+        for (offset, legacy) in plan.generations.iter().enumerate() {
+            let id = ids[offset].clone();
+            let dir = Self::generation_dir(root, &id);
+            files::create_private_dir_all(&dir)?;
+            write_imported_journal(&Self::journal_path(root, &id), &legacy.bytes)?;
+            let final_tag = keys.import_seal_tag(&id, &legacy.sha256);
+            let first_seq = next_first_seq;
+            let last_seq = first_seq
+                .checked_add(legacy.lines)
+                .and_then(|value| value.checked_sub(1))
+                .ok_or(AuditError::Poisoned(PoisonReason::SequenceExhausted))?;
+            Self::write_anchor_at(
+                root,
+                keys,
+                &id,
+                keys.key_epoch(),
+                last_seq,
+                &final_tag,
+                legacy.bytes.len() as u64,
+                &[],
+            )?;
+            files::fsync_dir(&dir)?;
+            generations.push(GenerationDescriptor {
+                generation_id: id.clone(),
+                index: offset as u32 + 1,
+                state: GenerationState::Sealed,
+                key_id: keys.key_id().to_string(),
+                key_epoch: keys.key_epoch(),
+                predecessor_id: predecessor.clone(),
+                chain_base: chain_base.clone(),
+                first_seq,
+                last_seq,
+                entry_count: legacy.lines,
+                journal_bytes: legacy.bytes.len() as u64,
+                journal_sha256: Some(legacy.sha256.clone()),
+                final_tag: Some(final_tag.clone()),
+                rotation_reason: RotationReason::LegacyImport,
+                sequence_origin: SequenceOrigin::ImportAssigned,
+                origin_authenticated: false,
+                preceding_loss_unknown: legacy.preceding_loss_unknown,
+                legacy_source: Some(legacy.source_name.clone()),
+                opened_at: now,
+                sealed_at: Some(now),
+                tombstoned_at: None,
+            });
+            chain_base = final_tag;
+            predecessor = Some(id);
+            next_first_seq = last_seq
+                .checked_add(1)
+                .ok_or(AuditError::Poisoned(PoisonReason::SequenceExhausted))?;
+        }
+
+        let active_id = ids[total as usize - 1].clone();
+        let dir = Self::generation_dir(root, &active_id);
+        files::create_private_dir_all(&dir)?;
+        let journal = Self::journal_path(root, &active_id);
+        if !journal.exists() {
+            drop(files::create_private_file_new(&journal)?);
+        }
+        Self::write_anchor_at(
+            root,
+            keys,
+            &active_id,
+            keys.key_epoch(),
+            next_first_seq
+                .checked_sub(1)
+                .ok_or(AuditError::Poisoned(PoisonReason::SequenceExhausted))?,
+            &chain_base,
+            0,
+            &[],
+        )?;
+        files::fsync_dir(&dir)?;
+        generations.push(GenerationDescriptor {
+            generation_id: active_id.clone(),
+            index: total,
+            state: GenerationState::Active,
+            key_id: keys.key_id().to_string(),
+            key_epoch: keys.key_epoch(),
+            predecessor_id: predecessor,
+            chain_base,
+            first_seq: next_first_seq,
+            last_seq: next_first_seq
+                .checked_sub(1)
+                .ok_or(AuditError::Poisoned(PoisonReason::SequenceExhausted))?,
+            entry_count: 0,
+            journal_bytes: 0,
+            journal_sha256: None,
+            final_tag: None,
+            rotation_reason: if plan.generations.is_empty() {
+                RotationReason::Genesis
+            } else {
+                RotationReason::LegacyImport
+            },
+            sequence_origin: SequenceOrigin::Issued,
+            origin_authenticated: true,
+            preceding_loss_unknown: false,
+            legacy_source: None,
+            opened_at: now,
+            sealed_at: None,
+            tombstoned_at: None,
+        });
+
+        let mut manifest = Manifest {
+            schema: MANIFEST_SCHEMA.to_string(),
+            manifest_version: MANIFEST_VERSION,
+            installation_id: keys.installation_id().to_string(),
+            key_id: keys.key_id().to_string(),
+            key_epoch: 1,
+            manifest_epoch: 1,
+            retention_epoch: 0,
+            active_generation_id: active_id,
+            global_first_seq: 1,
+            global_last_seq_floor: next_first_seq
+                .checked_sub(1)
+                .ok_or(AuditError::Poisoned(PoisonReason::SequenceExhausted))?,
+            generations,
+            tombstones: Vec::new(),
+            legacy_divergence_digests: Vec::new(),
+            created_at: now,
+            updated_at: now,
+            mac: String::new(),
+        };
+        manifest.seal(keys)?;
+        let bytes = serde_json::to_vec(&manifest)
+            .map_err(|error| AuditError::Io(format!("serialize manifest: {error}")))?;
+        files::atomic_write(&Self::manifest_path(root), &bytes)?;
+
+        if !plan.generations.is_empty() {
+            std::fs::remove_file(bootstrap_path(root))
+                .map_err(|error| AuditError::Io(format!("clear bootstrap marker: {error}")))?;
+            files::fsync_dir(root)?;
+        }
+        Ok(manifest)
+    }
+
+    // --------------------------------------------------------- invariants
+
+    fn check_structure(
+        manifest: &Manifest,
+        keys: &AuditKeys,
+        keyring: &[Arc<AuditKeys>],
+    ) -> AuditResult<()> {
+        if manifest.generations.is_empty() {
+            return Err(AuditError::Poisoned(PoisonReason::ActiveGenerationInvalid));
+        }
+        if manifest.installation_id != keys.installation_id() {
+            return Err(AuditError::Poisoned(PoisonReason::ManifestMacMismatch));
+        }
+        if manifest.key_id != keys.key_id() || manifest.key_epoch != keys.key_epoch() {
+            return Err(AuditError::Poisoned(PoisonReason::KeyUnavailable));
+        }
+        let active_count = manifest
+            .generations
+            .iter()
+            .filter(|g| g.state == GenerationState::Active)
+            .count();
+        if active_count != 1 {
+            return Err(AuditError::Poisoned(PoisonReason::ActiveGenerationInvalid));
+        }
+        let last = manifest
+            .generations
+            .last()
+            .ok_or(AuditError::Poisoned(PoisonReason::ActiveGenerationInvalid))?;
+        if last.state != GenerationState::Active
+            || last.generation_id != manifest.active_generation_id
+            || last.key_id != manifest.key_id
+            || last.key_epoch != manifest.key_epoch
+        {
+            return Err(AuditError::Poisoned(PoisonReason::ActiveGenerationInvalid));
+        }
+        let first_key = keyring
+            .iter()
+            .find(|key| key.key_id() == manifest.generations[0].key_id)
+            .ok_or(AuditError::Poisoned(PoisonReason::KeyUnavailable))?;
+        let genesis = first_key.genesis_tag();
+        for (position, generation) in manifest.generations.iter().enumerate() {
+            if !valid_generation_id(&generation.generation_id) {
+                return Err(AuditError::Poisoned(PoisonReason::ActiveGenerationInvalid));
+            }
+            if !keyring.iter().any(|key| key.key_id() == generation.key_id) {
+                return Err(AuditError::Poisoned(PoisonReason::KeyUnavailable));
+            }
+            if generation.index as usize != position + 1 {
+                return Err(AuditError::Poisoned(
+                    PoisonReason::GenerationIndexDiscontinuity,
+                ));
+            }
+            match generation.state {
+                GenerationState::Active => {
+                    if generation.final_tag.is_some() || generation.journal_sha256.is_some() {
+                        return Err(AuditError::Poisoned(PoisonReason::ActiveGenerationInvalid));
+                    }
+                }
+                GenerationState::Sealed | GenerationState::Tombstoned => {
+                    if generation.final_tag.is_none() || generation.journal_sha256.is_none() {
+                        return Err(AuditError::Poisoned(PoisonReason::SealedGenerationChanged));
+                    }
+                }
+            }
+            if position == 0 {
+                if generation.chain_base != genesis || generation.predecessor_id.is_some() {
+                    return Err(AuditError::Poisoned(PoisonReason::ChainDiscontinuity));
+                }
+                if generation.first_seq != manifest.global_first_seq {
+                    return Err(AuditError::Poisoned(PoisonReason::SequenceDiscontinuity));
+                }
+            } else {
+                let previous = &manifest.generations[position - 1];
+                let expected_first = previous
+                    .last_seq
+                    .checked_add(1)
+                    .ok_or(AuditError::Poisoned(PoisonReason::SequenceExhausted))?;
+                if generation.first_seq != expected_first {
+                    return Err(AuditError::Poisoned(PoisonReason::SequenceDiscontinuity));
+                }
+                let expected_base = previous
+                    .final_tag
+                    .as_deref()
+                    .ok_or(AuditError::Poisoned(PoisonReason::ChainDiscontinuity))?;
+                if generation.chain_base != expected_base
+                    || generation.predecessor_id.as_deref() != Some(previous.generation_id.as_str())
+                {
+                    return Err(AuditError::Poisoned(PoisonReason::ChainDiscontinuity));
+                }
+            }
+            let tombstoned = manifest
+                .tombstones
+                .iter()
+                .any(|t| t.generation_id == generation.generation_id);
+            if tombstoned != (generation.state == GenerationState::Tombstoned) {
+                return Err(AuditError::Poisoned(PoisonReason::TombstoneInconsistent));
+            }
+        }
+        let mut tombstone_ids = Vec::with_capacity(manifest.tombstones.len());
+        for tombstone in &manifest.tombstones {
+            if !tombstone_ids
+                .iter()
+                .all(|generation_id| generation_id != &tombstone.generation_id)
+            {
+                return Err(AuditError::Poisoned(PoisonReason::TombstoneInconsistent));
+            }
+            tombstone_ids.push(tombstone.generation_id.clone());
+            let descriptor = manifest
+                .generation(&tombstone.generation_id)
+                .ok_or(AuditError::Poisoned(PoisonReason::TombstoneInconsistent))?;
+            if descriptor.state != GenerationState::Tombstoned
+                || descriptor.index != tombstone.index
+                || descriptor.first_seq != tombstone.first_seq
+                || descriptor.last_seq != tombstone.last_seq
+                || descriptor.entry_count != tombstone.entry_count
+                || descriptor.journal_bytes != tombstone.journal_bytes
+                || descriptor.journal_sha256.as_deref() != Some(tombstone.journal_sha256.as_str())
+                || descriptor.chain_base != tombstone.chain_base
+                || descriptor.final_tag.as_deref() != Some(tombstone.final_tag.as_str())
+                || descriptor.key_id != tombstone.key_id
+            {
+                return Err(AuditError::Poisoned(PoisonReason::TombstoneInconsistent));
+            }
+        }
+        let active = manifest.active()?;
+        if manifest.global_last_seq_floor != active.last_seq {
+            return Err(AuditError::Poisoned(PoisonReason::SequenceDiscontinuity));
+        }
+        Ok(())
+    }
+
+    // ----------------------------------------------------------- recovery
+
+    fn recover(&self) -> AuditResult<()> {
+        let mut guard = self.inner.lock();
+
+        // If the manifest commit completed but cleanup did not, the committed
+        // manifest is authoritative. Verify the marker names only, then clear
+        // the staging marker; never infer a manifest from a marker.
+        let bootstrap = bootstrap_path(&self.root);
+        if bootstrap.exists() {
+            files::reject_symlink(&bootstrap)?;
+            let bytes = files::read_bytes(&bootstrap)?;
+            let marker: BootstrapMarker = serde_json::from_slice(&bytes)
+                .map_err(|_| AuditError::Poisoned(PoisonReason::ManifestUnknownSchema))?;
+            marker.verify(&self.keys())?;
+            if !marker.generation_ids.iter().all(|id| {
+                guard
+                    .manifest
+                    .generations
+                    .iter()
+                    .any(|generation| generation.generation_id == *id)
+            }) {
+                return Err(AuditError::Poisoned(
+                    PoisonReason::ManifestAbsentWithGenerations,
+                ));
+            }
+            std::fs::remove_file(&bootstrap)
+                .map_err(|error| AuditError::Io(format!("clear committed bootstrap: {error}")))?;
+            files::fsync_dir(&self.root)?;
+        }
+
+        // Interrupted retention removal (crash cut T3): the committed manifest
+        // is the authorization, so resuming is the only legal deletion path.
+        loop {
+            let pending = guard
+                .manifest
+                .tombstones
+                .iter()
+                .find(|t| {
+                    t.removed_at.is_none()
+                        && Self::generation_dir(&self.root, &t.generation_id).exists()
+                })
+                .map(|t| t.generation_id.clone());
+            let Some(generation_id) = pending else { break };
+            let generation_dir = Self::generation_dir(&self.root, &generation_id);
+            if generation_dir.exists() {
+                files::reject_symlink(&generation_dir)?;
+            }
+            std::fs::remove_dir_all(generation_dir)
+                .map_err(|error| AuditError::Io(format!("resume removal: {error}")))?;
+            files::fsync_dir(&self.root.join("generations"))?;
+            if let Some(tombstone) = guard
+                .manifest
+                .tombstones
+                .iter_mut()
+                .find(|t| t.generation_id == generation_id)
+            {
+                tombstone.removed_at = Some(Utc::now());
+            }
+            let mut manifest = guard.manifest.clone();
+            self.write_manifest(&mut manifest)?;
+            guard.manifest = manifest;
+            guard.recovery.resumed_removals.push(generation_id);
+        }
+        // Crash cut T4: bytes already gone, only the marker is missing.
+        let mut needs_commit = false;
+        for tombstone in guard.manifest.tombstones.iter_mut() {
+            if tombstone.removed_at.is_none() {
+                tombstone.removed_at = Some(Utc::now());
+                needs_commit = true;
+            }
+        }
+        if needs_commit {
+            let mut manifest = guard.manifest.clone();
+            self.write_manifest(&mut manifest)?;
+            guard.manifest = manifest;
+        }
+
+        // Orphan generation directories (crash cut R2). The manifest is the
+        // authority; an orphan is kept for an idempotent retry, never deleted.
+        let known: Vec<String> = guard
+            .manifest
+            .generations
+            .iter()
+            .map(|g| g.generation_id.clone())
+            .collect();
+        let next_id = generation_id(guard.manifest.generations.len() as u32 + 1);
+        let entries = std::fs::read_dir(self.root.join("generations"))
+            .map_err(|error| AuditError::Io(format!("read generations: {error}")))?;
+        let mut orphans: Vec<String> = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if known.iter().any(|k| k == &name) {
+                continue;
+            }
+            orphans.push(name);
+        }
+        orphans.sort();
+        for name in orphans {
+            if name != next_id {
+                return Err(AuditError::Poisoned(PoisonReason::OrphanGenerationNotEmpty));
+            }
+            let journal = Self::journal_path(&self.root, &name);
+            let size = std::fs::metadata(&journal).map(|m| m.len()).unwrap_or(0);
+            if size != 0 {
+                return Err(AuditError::Poisoned(PoisonReason::OrphanGenerationNotEmpty));
+            }
+            guard.recovery.orphan_generation = Some(name);
+        }
+
+        // Durable dropped-entry evidence survives restart.
+        if self.gap_path().exists() {
+            let bytes = files::read_bytes(&self.gap_path())?;
+            let mut gap: GapFile = serde_json::from_slice(&bytes)
+                .map_err(|_| AuditError::Poisoned(PoisonReason::GapMacMismatch))?;
+            if !self.keyring().iter().any(|key| gap.verify(key).is_ok()) {
+                return Err(AuditError::Poisoned(PoisonReason::GapMacMismatch));
+            }
+            let current_key = self.keys();
+            if gap.verify(&current_key).is_err() {
+                gap.seal(&current_key)?;
+                let bytes = serde_json::to_vec(&gap)
+                    .map_err(|error| AuditError::Io(format!("serialize gap file: {error}")))?;
+                files::atomic_write(&self.gap_path(), &bytes)?;
+            }
+            guard.recovery.durable_gaps = gap.gaps;
+        }
+
+        // Active generation: verify from the chain base and adopt any
+        // authenticated tail the anchor does not yet cover.
+        let active = guard.manifest.active()?.clone();
+        let anchor = self.load_anchor(&active.generation_id)?;
+        let active_key = self.key_for_generation(&active)?;
+        let active_journal = Self::journal_path(&self.root, &active.generation_id);
+        if !active_journal.is_file() {
+            return Err(AuditError::Poisoned(PoisonReason::ActiveGenerationInvalid));
+        }
+        let scan = self.scan_journal(
+            &active_key,
+            &active_journal,
+            &active.generation_id,
+            &active.chain_base,
+            active.first_seq,
+            active.origin_authenticated,
+        )?;
+        if scan.last_seq < anchor.last_seq || scan.complete_len < anchor.journal_bytes {
+            return Err(AuditError::Poisoned(PoisonReason::ActiveJournalTruncated));
+        }
+        if scan.last_seq == anchor.last_seq
+            && (scan.last_tag != anchor.last_tag
+                || scan.complete_len != anchor.journal_bytes
+                || scan.open_intent_ids != anchor.open_intent_ids)
+        {
+            return Err(AuditError::Poisoned(PoisonReason::AnchorStateMismatch));
+        }
+        if let Some(evidence) = scan.torn.clone() {
+            // The one legal truncate: a byte-exact unterminated trailing run.
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(Self::journal_path(&self.root, &active.generation_id))
+                .map_err(|error| AuditError::Io(format!("open for torn-tail trim: {error}")))?;
+            file.set_len(scan.complete_len)
+                .map_err(|error| AuditError::Io(format!("trim torn tail: {error}")))?;
+            file.sync_all()
+                .map_err(|error| AuditError::Io(format!("sync torn-tail trim: {error}")))?;
+            guard.recovery.torn_tail = Some(evidence);
+        }
+        let adopted = scan.last_seq.saturating_sub(anchor.last_seq);
+        guard.recovery.adopted_tail_entries = adopted;
+        guard.live = LiveTail {
+            generation_id: active.generation_id.clone(),
+            last_seq: scan.last_seq,
+            last_tag: scan.last_tag,
+            journal_bytes: scan.complete_len,
+            open_intent_ids: scan.open_intent_ids,
+        };
+        if adopted > 0 || guard.recovery.torn_tail.is_some() {
+            let live = guard.live.clone();
+            self.write_anchor(&live)?;
+        }
+
+        // Rollback witness: fail closed on contradiction, fail soft on outage.
+        let verdict = self.witness.check(&Self::beacon(&guard.manifest));
+        guard.witness_state = match verdict {
+            WitnessVerdict::Rollback { .. } => {
+                return Err(AuditError::Poisoned(PoisonReason::RollbackDetected))
+            }
+            WitnessVerdict::Verified => WitnessState::Verified,
+            WitnessVerdict::Unverified(_) => self.witness.state(),
+        };
+
+        drop(guard);
+        self.detect_legacy_v1_divergence()?;
+        self.verify_sealed_generations()?;
+        self.close_recovery_evidence()?;
+        Ok(())
+    }
+
+    fn detect_legacy_v1_divergence(&self) -> AuditResult<()> {
+        let Some(legacy_dir) = self.legacy_v1_dir.as_deref() else {
+            return Ok(());
+        };
+        let manifest = self.manifest_snapshot();
+        let imported = manifest
+            .generations
+            .iter()
+            .filter(|generation| !generation.origin_authenticated)
+            .cloned()
+            .collect::<Vec<_>>();
+        for (index, generation) in imported.iter().enumerate() {
+            let name = generation.legacy_source.as_deref().unwrap_or({
+                if imported.len() == 1 || index > 0 {
+                    "audit.jsonl"
+                } else {
+                    "audit.jsonl.1"
+                }
+            });
+            let path = legacy_dir.join(name);
+            let (digest, bytes) = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => {
+                    files::reject_symlink(&path)?;
+                    if !metadata.is_file() {
+                        return Err(AuditError::Poisoned(PoisonReason::SymlinkedPath));
+                    }
+                    let bytes = files::read_bytes(&path)?;
+                    (sha256_hex(&bytes), bytes)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    ("missing".to_string(), Vec::new())
+                }
+                Err(error) => {
+                    return Err(AuditError::Io(format!("legacy audit metadata: {error}")))
+                }
+            };
+            let expected = generation.journal_sha256.as_deref().unwrap_or_default();
+            if digest == expected {
+                continue;
+            }
+            let marker = format!("{name}:{digest}");
+            if manifest
+                .legacy_divergence_digests
+                .iter()
+                .any(|known| known == &marker)
+            {
+                continue;
+            }
+            self.append_housekeeping_internal(
+                AuditHousekeepingInput::new("audit.legacy_divergence", EntryOutcome::Uncertain)
+                    .with_reason(EntryReason::LegacyWrittenAfterCutover),
+                Some(RecoveryEvidence {
+                    bytes: bytes.len() as u64,
+                    sha256: if bytes.is_empty() {
+                        String::new()
+                    } else {
+                        digest.clone()
+                    },
+                    at_offset: 0,
+                    lost_entries: 0,
+                }),
+            )?;
+            let mut updated = self.manifest_snapshot();
+            if !updated
+                .legacy_divergence_digests
+                .iter()
+                .any(|known| known == &marker)
+            {
+                updated.legacy_divergence_digests.push(marker.clone());
+                self.commit_manifest(updated)?;
+            }
+            self.inner.lock().recovery.legacy_divergences.push(marker);
+        }
+        Ok(())
+    }
+
+    fn verify_sealed_generations(&self) -> AuditResult<()> {
+        let generations = self.inner.lock().manifest.generations.clone();
+        for generation in generations {
+            if generation.state == GenerationState::Sealed {
+                self.verify_generation(&generation.generation_id)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Append the honest records recovery owes the journal: torn-tail evidence,
+    /// unjournaled dropped entries, and uncertain outcomes for open intents.
+    fn close_recovery_evidence(&self) -> AuditResult<()> {
+        let (torn, open_intents, ungapped) = {
+            let guard = self.inner.lock();
+            let ungapped: Vec<GapRecord> = guard
+                .recovery
+                .durable_gaps
+                .iter()
+                .filter(|gap| !gap.journaled)
+                .cloned()
+                .collect();
+            (
+                guard.recovery.torn_tail.clone(),
+                guard.live.open_intent_ids.clone(),
+                ungapped,
+            )
+        };
+
+        if let Some(evidence) = torn {
+            self.append_housekeeping_internal(
+                AuditHousekeepingInput::new("audit.recovery", EntryOutcome::Uncertain)
+                    .with_reason(EntryReason::RecoveryTornTail),
+                Some(evidence),
+            )?;
+        }
+        for gap in ungapped {
+            self.append_housekeeping_internal(
+                AuditHousekeepingInput::new("audit.recovery", EntryOutcome::Uncertain)
+                    .with_reason(EntryReason::RecoveryDroppedEntries),
+                Some(RecoveryEvidence {
+                    bytes: 0,
+                    sha256: String::new(),
+                    at_offset: gap.after_seq,
+                    lost_entries: gap.lost_entries,
+                }),
+            )?;
+        }
+        if !self.inner.lock().recovery.durable_gaps.is_empty() {
+            self.mark_gaps_journaled()?;
+        }
+
+        if !open_intents.is_empty() {
+            // Never fabricate success and never auto-redispatch: close each
+            // interrupted producer intent by its own keyed identity.
+            for intent_id in &open_intents {
+                self.append_internal(
+                    AuditEntryInput::new(
+                        "audit.recovery",
+                        EntryPhase::Outcome,
+                        EntryOutcome::Uncertain,
+                    )
+                    .with_reason(EntryReason::HostRestartInterrupted)
+                    .with_intent_digest(intent_id),
+                    Some(RecoveryEvidence {
+                        bytes: 0,
+                        sha256: String::new(),
+                        at_offset: 0,
+                        lost_entries: 1,
+                    }),
+                    false,
+                )?;
+            }
+            let mut guard = self.inner.lock();
+            guard.recovery.closed_intents = open_intents.len() as u64;
+            let live = guard.live.clone();
+            drop(guard);
+            self.write_anchor(&live)?;
+        }
+        Ok(())
+    }
+
+    fn mark_gaps_journaled(&self) -> AuditResult<()> {
+        let mut guard = self.inner.lock();
+        for gap in guard.recovery.durable_gaps.iter_mut() {
+            gap.journaled = true;
+        }
+        let mut file = GapFile::new();
+        file.gaps = guard.recovery.durable_gaps.clone();
+        drop(guard);
+        let keys = self.keys();
+        file.seal(&keys)?;
+        let bytes = serde_json::to_vec(&file)
+            .map_err(|error| AuditError::Io(format!("serialize gap file: {error}")))?;
+        files::atomic_write(&self.gap_path(), &bytes)
+    }
+
+    // ------------------------------------------------------- journal scan
+
+    fn scan_journal(
+        &self,
+        keys: &AuditKeys,
+        path: &Path,
+        generation_id: &str,
+        chain_base: &str,
+        first_seq: u64,
+        origin_authenticated: bool,
+    ) -> AuditResult<JournalScan> {
+        scan_journal_at(
+            keys,
+            path,
+            generation_id,
+            chain_base,
+            first_seq,
+            origin_authenticated,
+        )
+    }
+
+    fn key_for_generation(&self, generation: &GenerationDescriptor) -> AuditResult<Arc<AuditKeys>> {
+        self.keyring
+            .read()
+            .iter()
+            .find(|key| key.key_id() == generation.key_id)
+            .cloned()
+            .ok_or(AuditError::Poisoned(PoisonReason::KeyUnavailable))
+    }
+
+    pub(crate) fn producer_intent_state(&self, intent_id: &str) -> AuditResult<AuditIntentState> {
+        let digest = self.keys().opaque_digest(intent_id);
+        let manifest = self.manifest_snapshot();
+        let mut state = AuditIntentState::Missing;
+        for generation in manifest.generations {
+            if generation.state == GenerationState::Tombstoned {
+                continue;
+            }
+            let path = Self::journal_path(&self.root, &generation.generation_id);
+            if !path.is_file() {
+                return Err(AuditError::Poisoned(match generation.state {
+                    GenerationState::Active => PoisonReason::ActiveGenerationInvalid,
+                    GenerationState::Sealed => PoisonReason::SealedGenerationChanged,
+                    GenerationState::Tombstoned => PoisonReason::TombstoneInconsistent,
+                }));
+            }
+            for line in files::read_bytes(&path)?.split(|byte| *byte == b'\n') {
+                if line.is_empty() {
+                    continue;
+                }
+                let record: AuditRecord = serde_json::from_slice(line)
+                    .map_err(|_| AuditError::Poisoned(PoisonReason::EntryMalformed))?;
+                if record.kind != AuditRecordKind::Producer
+                    || record.intent.as_deref() != Some(digest.as_str())
+                {
+                    continue;
+                }
+                state = match record.phase {
+                    EntryPhase::Intent => AuditIntentState::Open,
+                    EntryPhase::Outcome => AuditIntentState::Settled(record.outcome),
+                };
+            }
+        }
+        Ok(state)
+    }
+}
+
+/// Replay and authenticate one journal file. Free-standing on purpose: export
+/// re-verification must be able to check a copied tree with a fresh reader that
+/// shares no in-memory state with the live ledger.
+pub(crate) fn scan_journal_at(
+    keys: &AuditKeys,
+    path: &Path,
+    generation_id: &str,
+    chain_base: &str,
+    first_seq: u64,
+    origin_authenticated: bool,
+) -> AuditResult<JournalScan> {
+    {
+        let bytes = if path.exists() {
+            files::reject_symlink(path)?;
+            files::read_bytes(path)?
+        } else {
+            Vec::new()
+        };
+
+        if !origin_authenticated {
+            // Imported legacy bytes carry no chain. Their *boundary* is
+            // authenticated by the import seal; their contents are not, and
+            // this code never pretends otherwise.
+            let lines = super::import::count_legacy_lines(&bytes);
+            return Ok(JournalScan {
+                last_seq: first_seq
+                    .checked_add(lines)
+                    .and_then(|value| value.checked_sub(1))
+                    .ok_or(AuditError::Poisoned(PoisonReason::SequenceExhausted))?,
+                last_tag: keys.import_seal_tag(generation_id, &sha256_hex(&bytes)),
+                bytes: bytes.len() as u64,
+                complete_len: bytes.len() as u64,
+                torn: None,
+                entry_count: lines,
+                open_intent_ids: Vec::new(),
+            });
+        }
+
+        let mut previous = chain_base.to_string();
+        let mut expected_seq = first_seq;
+        let mut last_seq = first_seq.saturating_sub(1);
+        let mut offset: u64 = 0;
+        let mut complete_len: u64 = 0;
+        let mut entry_count: u64 = 0;
+        let mut open_intent_ids: Vec<String> = Vec::new();
+
+        let mut cursor = 0usize;
+        while cursor < bytes.len() {
+            let Some(newline) = bytes[cursor..].iter().position(|b| *b == b'\n') else {
+                break;
+            };
+            let line = &bytes[cursor..cursor + newline];
+            if newline + 1 > MAX_LINE_BYTES {
+                return Err(AuditError::Poisoned(PoisonReason::OversizedLine));
+            }
+            let record: AuditRecord = serde_json::from_slice(line)
+                .map_err(|_| AuditError::Poisoned(PoisonReason::EntryMalformed))?;
+            if record.v != RECORD_VERSION {
+                return Err(AuditError::Poisoned(PoisonReason::EntryMalformed));
+            }
+            if record.generation != generation_id {
+                return Err(AuditError::Poisoned(PoisonReason::EntryForeignGeneration));
+            }
+            if record.seq != expected_seq {
+                return Err(AuditError::Poisoned(PoisonReason::EntrySequenceBreak));
+            }
+            if record.prev != previous {
+                return Err(AuditError::Poisoned(PoisonReason::ChainDiscontinuity));
+            }
+            let expected_tag = record.compute_tag(keys)?;
+            if !crate::orchestration::constant_time_eq(
+                expected_tag.as_bytes(),
+                record.tag.as_bytes(),
+            ) {
+                return Err(AuditError::Poisoned(PoisonReason::EntryMacMismatch));
+            }
+            previous = record.tag;
+            last_seq = record.seq;
+            expected_seq = expected_seq
+                .checked_add(1)
+                .ok_or(AuditError::Poisoned(PoisonReason::SequenceExhausted))?;
+            entry_count = entry_count
+                .checked_add(1)
+                .ok_or(AuditError::Poisoned(PoisonReason::SequenceExhausted))?;
+            match record.kind {
+                AuditRecordKind::Producer if record.intent.is_none() => {
+                    return Err(AuditError::Poisoned(PoisonReason::EntryMalformed));
+                }
+                AuditRecordKind::Housekeeping
+                    if record.phase != EntryPhase::Outcome || record.intent.is_some() =>
+                {
+                    return Err(AuditError::Poisoned(PoisonReason::EntryMalformed));
+                }
+                _ => {}
+            }
+            match record.phase {
+                EntryPhase::Intent => {
+                    if let Some(intent) = record.intent {
+                        if open_intent_ids.iter().any(|open| open == &intent) {
+                            return Err(AuditError::Poisoned(PoisonReason::EntrySequenceBreak));
+                        }
+                        if open_intent_ids.len() >= MAX_TRACKED_INTENTS {
+                            return Err(AuditError::Poisoned(PoisonReason::PartialPersistence));
+                        }
+                        open_intent_ids.push(intent);
+                    }
+                }
+                EntryPhase::Outcome => {
+                    if let Some(intent) = record.intent {
+                        let Some(position) =
+                            open_intent_ids.iter().position(|open| open == &intent)
+                        else {
+                            return Err(AuditError::Poisoned(PoisonReason::EntrySequenceBreak));
+                        };
+                        open_intent_ids.remove(position);
+                    }
+                }
+            }
+            cursor += newline + 1;
+            offset = cursor as u64;
+            complete_len = offset;
+        }
+
+        let torn = if cursor < bytes.len() {
+            let trailing = &bytes[cursor..];
+            if trailing.len() > MAX_LINE_BYTES {
+                return Err(AuditError::Poisoned(PoisonReason::OversizedLine));
+            }
+            Some(RecoveryEvidence {
+                bytes: trailing.len() as u64,
+                sha256: sha256_hex(trailing),
+                at_offset: offset,
+                lost_entries: 1,
+            })
+        } else {
+            None
+        };
+
+        Ok(JournalScan {
+            last_seq,
+            last_tag: previous,
+            bytes: bytes.len() as u64,
+            complete_len,
+            torn,
+            entry_count,
+            open_intent_ids,
+        })
+    }
+}
+
+impl AuditLedger {
+    // --------------------------------------------------------------- append
+
+    pub(crate) fn append(&self, entry: AuditEntryInput) -> AuditResult<u64> {
+        let _transaction = self.operation_lock.lock();
+        let seq = self.append_internal(entry, None, false)?;
+        let should_rotate = {
+            let guard = self.inner.lock();
+            guard.live.journal_bytes >= MAX_GENERATION_BYTES
+                && guard.live.open_intent_ids.is_empty()
+        };
+        if should_rotate {
+            if let Err(error) = self.rotate_locked(RotationReason::Bytes) {
+                self.inner.lock().poisoned = Some(PoisonReason::PartialPersistence);
+                return Err(error);
+            }
+        }
+        Ok(seq)
+    }
+
+    pub(crate) fn append_transaction_record(
+        &self,
+        entry: AuditEntryInput,
+        recovery: Option<RecoveryEvidence>,
+    ) -> AuditResult<u64> {
+        self.append_internal(entry, recovery, false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn append_housekeeping(
+        &self,
+        input: AuditHousekeepingInput,
+        recovery: Option<RecoveryEvidence>,
+    ) -> AuditResult<u64> {
+        let _transaction = self.operation_lock.lock();
+        self.append_housekeeping_internal(input, recovery)
+    }
+
+    fn append_housekeeping_internal(
+        &self,
+        input: AuditHousekeepingInput,
+        recovery: Option<RecoveryEvidence>,
+    ) -> AuditResult<u64> {
+        let mut entry = AuditEntryInput::new(input.op, EntryPhase::Outcome, input.outcome);
+        entry.reason = input.reason;
+        entry.code = input.code;
+        self.append_internal(entry, recovery, true)
+    }
+
+    fn append_internal(
+        &self,
+        entry: AuditEntryInput,
+        recovery: Option<RecoveryEvidence>,
+        housekeeping: bool,
+    ) -> AuditResult<u64> {
+        let mut guard = self.inner.lock();
+        if let Some(reason) = guard.poisoned {
+            return Err(AuditError::Poisoned(reason));
+        }
+        // Single-writer discipline comes from the process-wide `InstanceLock`,
+        // which this ledger relies on rather than adding a second lock. Detect a
+        // violation instead of interleaving two chains into one journal: in the
+        // healthy case the durable anchor always equals the in-memory tail.
+        let on_disk = self.load_anchor(&guard.live.generation_id)?;
+        if on_disk.generation_id != guard.live.generation_id
+            || on_disk.last_seq != guard.live.last_seq
+            || on_disk.last_tag != guard.live.last_tag
+            || on_disk.journal_bytes != guard.live.journal_bytes
+            || on_disk.open_intent_ids != guard.live.open_intent_ids
+        {
+            guard.poisoned = Some(PoisonReason::ConcurrentWriter);
+            return Err(AuditError::Poisoned(PoisonReason::ConcurrentWriter));
+        }
+        let live = guard.live.clone();
+        let keys = self.keys();
+        let mut record = AuditRecord {
+            v: RECORD_VERSION,
+            kind: if housekeeping {
+                AuditRecordKind::Housekeeping
+            } else {
+                AuditRecordKind::Producer
+            },
+            generation: live.generation_id.clone(),
+            seq: live
+                .last_seq
+                .checked_add(1)
+                .ok_or(AuditError::Poisoned(PoisonReason::SequenceExhausted))?,
+            ts: Utc::now(),
+            op: bounded(&entry.op, 64),
+            phase: entry.phase,
+            outcome: entry.outcome,
+            reason: entry.reason,
+            code: entry.code.as_deref().and_then(safe_code),
+            actor: entry.actor.as_deref().map(|v| keys.opaque_digest(v)),
+            request: entry.request.as_deref().map(|v| keys.opaque_digest(v)),
+            scope: entry.scope.as_deref().map(|v| keys.opaque_digest(v)),
+            intent: entry.intent_digest.as_deref().map_or_else(
+                || entry.intent_id.as_deref().map(|v| keys.opaque_digest(v)),
+                |digest| {
+                    Some(if is_opaque_digest(digest) {
+                        digest.to_string()
+                    } else {
+                        keys.opaque_digest(digest)
+                    })
+                },
+            ),
+            authz_rev: entry.authz_rev,
+            cap_rev: entry.cap_rev,
+            policy_rev: entry.policy_rev,
+            recovery,
+            prev: live.last_tag.clone(),
+            tag: String::new(),
+        };
+        record.tag = record.compute_tag(&keys)?;
+        let mut line = serde_json::to_string(&record)
+            .map_err(|error| AuditError::Io(format!("serialize record: {error}")))?;
+        line.push('\n');
+        if line.len() > MAX_LINE_BYTES {
+            return Err(AuditError::Refused(RefuseReason::EntryTooLarge));
+        }
+        if !housekeeping && record.intent.is_none() {
+            return Err(AuditError::Refused(RefuseReason::IntentIdentityRequired));
+        }
+        if let Some(intent) = record.intent.as_ref() {
+            match record.phase {
+                EntryPhase::Intent => {
+                    if live.open_intent_ids.len() >= MAX_TRACKED_INTENTS
+                        || live.open_intent_ids.iter().any(|open| open == intent)
+                    {
+                        return Err(AuditError::Refused(RefuseReason::IntentTrackingFull));
+                    }
+                }
+                EntryPhase::Outcome => {
+                    if !live.open_intent_ids.iter().any(|open| open == intent) {
+                        return Err(AuditError::Refused(RefuseReason::IntentNotOpen));
+                    }
+                }
+            }
+        }
+
+        // The lock is held across the whole append. Releasing it between the
+        // journal write and the anchor update would let a second in-process
+        // appender read a stale tail and issue the same sequence twice.
+        let path = Self::journal_path(&self.root, &live.generation_id);
+        let new_journal_bytes = live
+            .journal_bytes
+            .checked_add(line.len() as u64)
+            .ok_or(AuditError::Poisoned(PoisonReason::SequenceExhausted))?;
+        let written = match files::append_line(&path, &line) {
+            Ok(written) => written,
+            Err(error) => {
+                guard.poisoned = Some(PoisonReason::PartialPersistence);
+                return Err(error);
+            }
+        };
+        self.cut(CrashPoint::JournalAppendedBeforeAnchor)?;
+
+        guard.live.last_seq = record.seq;
+        guard.live.last_tag = record.tag.clone();
+        debug_assert_eq!(written, new_journal_bytes - live.journal_bytes);
+        guard.live.journal_bytes = new_journal_bytes;
+        if let Some(intent) = record.intent.clone() {
+            match record.phase {
+                EntryPhase::Intent => {
+                    guard.live.open_intent_ids.push(intent);
+                }
+                EntryPhase::Outcome => {
+                    let position = guard
+                        .live
+                        .open_intent_ids
+                        .iter()
+                        .position(|open| open == &intent)
+                        .expect("intent validated before durable append");
+                    guard.live.open_intent_ids.remove(position);
+                }
+            }
+        }
+        let live = guard.live.clone();
+        if let Err(error) = self.write_anchor(&live) {
+            guard.poisoned = Some(PoisonReason::PartialPersistence);
+            return Err(error);
+        }
+        Ok(record.seq)
+    }
+
+    /// Record that producer-side entries were dropped before they reached the
+    /// journal. Written to the authenticated gap file first, so the evidence
+    /// survives even when the journal itself is unwritable.
+    pub fn record_dropped(&self, lost_entries: u64) -> AuditResult<()> {
+        let _transaction = self.operation_lock.lock();
+        if lost_entries == 0 {
+            return Ok(());
+        }
+        let (generation_id, after_seq) = {
+            let guard = self.inner.lock();
+            (guard.live.generation_id.clone(), guard.live.last_seq)
+        };
+        let mut file = GapFile::new();
+        {
+            let mut guard = self.inner.lock();
+            guard.recovery.durable_gaps.push(GapRecord {
+                generation_id,
+                after_seq,
+                lost_entries,
+                reason: EntryReason::RecoveryDroppedEntries,
+                recorded_at: Utc::now(),
+                journaled: false,
+            });
+            file.gaps = guard.recovery.durable_gaps.clone();
+        }
+        let keys = self.keys();
+        file.seal(&keys)?;
+        let bytes = serde_json::to_vec(&file)
+            .map_err(|error| AuditError::Io(format!("serialize gap file: {error}")))?;
+        files::atomic_write(&self.gap_path(), &bytes)?;
+
+        self.append_housekeeping_internal(
+            AuditHousekeepingInput::new("audit.gap", EntryOutcome::Uncertain)
+                .with_reason(EntryReason::RecoveryDroppedEntries),
+            Some(RecoveryEvidence {
+                bytes: 0,
+                sha256: String::new(),
+                at_offset: after_seq,
+                lost_entries,
+            }),
+        )?;
+        self.mark_gaps_journaled()
+    }
+
+    // --------------------------------------------------------------- rotate
+
+    pub fn rotate(&self, reason: RotationReason) -> AuditResult<String> {
+        let _transaction = self.operation_lock.lock();
+        self.rotate_locked(reason)
+    }
+
+    fn rotate_locked(&self, reason: RotationReason) -> AuditResult<String> {
+        {
+            let guard = self.inner.lock();
+            if let Some(poison) = guard.poisoned {
+                return Err(AuditError::Poisoned(poison));
+            }
+            if !guard.live.open_intent_ids.is_empty() {
+                return Err(AuditError::Refused(RefuseReason::OpenIntentsPresent));
+            }
+        }
+
+        // R0.5: the sealing record is the last entry of the outgoing generation.
+        self.append_housekeeping_internal(
+            AuditHousekeepingInput::new("audit.generation.sealing", EntryOutcome::Accepted)
+                .with_reason(EntryReason::GenerationSealing),
+            None,
+        )?;
+
+        // R1: freeze and verify the outgoing generation end to end.
+        let (manifest, live) = {
+            let guard = self.inner.lock();
+            (guard.manifest.clone(), guard.live.clone())
+        };
+        let outgoing = manifest.active()?.clone();
+        let outgoing_key = self.key_for_generation(&outgoing)?;
+        let journal = Self::journal_path(&self.root, &outgoing.generation_id);
+        let scan = self.scan_journal(
+            &outgoing_key,
+            &journal,
+            &outgoing.generation_id,
+            &outgoing.chain_base,
+            outgoing.first_seq,
+            outgoing.origin_authenticated,
+        )?;
+        if scan.torn.is_some() || scan.last_seq != live.last_seq {
+            return Err(AuditError::Poisoned(PoisonReason::SealedGenerationChanged));
+        }
+        let journal_bytes = files::read_bytes(&journal).unwrap_or_default();
+        let journal_sha256 = sha256_hex(&journal_bytes);
+        self.cut(CrashPoint::R1Frozen)?;
+
+        // R2: prepare the next generation on disk. No manifest change yet.
+        let next_index = outgoing
+            .index
+            .checked_add(1)
+            .ok_or(AuditError::Poisoned(PoisonReason::SequenceExhausted))?;
+        let next_id = generation_id(next_index);
+        let next_keys = if reason == RotationReason::KeyRotation {
+            self.key_provider.rotate(&outgoing_key)?
+        } else {
+            Arc::clone(&outgoing_key)
+        };
+        let next_dir = Self::generation_dir(&self.root, &next_id);
+        if !next_dir.exists() {
+            files::create_private_dir_new(&next_dir)?;
+        }
+        let next_journal = Self::journal_path(&self.root, &next_id);
+        if !next_journal.exists() {
+            drop(files::create_private_file_new(&next_journal)?);
+        }
+        let next_live = LiveTail {
+            generation_id: next_id.clone(),
+            last_seq: scan.last_seq,
+            last_tag: scan.last_tag.clone(),
+            journal_bytes: 0,
+            open_intent_ids: Vec::new(),
+        };
+        Self::write_anchor_at(
+            &self.root,
+            &next_keys,
+            &next_id,
+            next_keys.key_epoch(),
+            next_live.last_seq,
+            &next_live.last_tag,
+            next_live.journal_bytes,
+            &next_live.open_intent_ids,
+        )?;
+        files::fsync_dir(&next_dir)?;
+        files::fsync_dir(&self.root.join("generations"))?;
+        self.cut(CrashPoint::R2Prepared)?;
+
+        // R3: the single commit point.
+        let now = Utc::now();
+        let mut manifest = manifest;
+        {
+            let descriptor = manifest
+                .generation_mut(&outgoing.generation_id)
+                .ok_or(AuditError::Poisoned(PoisonReason::ActiveGenerationInvalid))?;
+            descriptor.state = GenerationState::Sealed;
+            descriptor.last_seq = scan.last_seq;
+            descriptor.entry_count = scan.entry_count;
+            descriptor.journal_bytes = scan.bytes;
+            descriptor.journal_sha256 = Some(journal_sha256);
+            descriptor.final_tag = Some(scan.last_tag.clone());
+            descriptor.sealed_at = Some(now);
+        }
+        manifest.generations.push(GenerationDescriptor {
+            generation_id: next_id.clone(),
+            index: next_index,
+            state: GenerationState::Active,
+            key_id: next_keys.key_id().to_string(),
+            key_epoch: next_keys.key_epoch(),
+            predecessor_id: Some(outgoing.generation_id.clone()),
+            chain_base: scan.last_tag.clone(),
+            first_seq: scan
+                .last_seq
+                .checked_add(1)
+                .ok_or(AuditError::Poisoned(PoisonReason::SequenceExhausted))?,
+            last_seq: scan.last_seq,
+            entry_count: 0,
+            journal_bytes: 0,
+            journal_sha256: None,
+            final_tag: None,
+            rotation_reason: reason,
+            sequence_origin: SequenceOrigin::Issued,
+            origin_authenticated: true,
+            preceding_loss_unknown: false,
+            legacy_source: None,
+            opened_at: now,
+            sealed_at: None,
+            tombstoned_at: None,
+        });
+        manifest.active_generation_id = next_id.clone();
+        manifest.global_last_seq_floor = scan.last_seq;
+        manifest.key_id = next_keys.key_id().to_string();
+        manifest.key_epoch = next_keys.key_epoch();
+        if reason == RotationReason::KeyRotation {
+            self.commit_manifest_with_key(manifest, next_keys.clone())?;
+        } else {
+            self.commit_manifest(manifest)?;
+        }
+        {
+            let mut guard = self.inner.lock();
+            guard.live = next_live;
+        }
+        self.cut(CrashPoint::R3Committed)?;
+
+        // R4: publish.
+        self.append_housekeeping_internal(
+            AuditHousekeepingInput::new("audit.generation.opened", EntryOutcome::Accepted)
+                .with_reason(EntryReason::GenerationOpened),
+            None,
+        )?;
+        Ok(next_id)
+    }
+
+    /// Rotate to the next authenticated custody epoch. The old epoch remains
+    /// in the private key ring so sealed generations stay verifiable after a
+    /// restart; the manifest switch is still the single commit boundary.
+    pub fn rotate_key(&self) -> AuditResult<String> {
+        self.rotate(RotationReason::KeyRotation)
+    }
+
+    // -------------------------------------------------------------- verify
+
+    pub fn verify_generation(&self, generation_id: &str) -> AuditResult<GenerationVerification> {
+        let manifest = self.inner.lock().manifest.clone();
+        let descriptor = manifest
+            .generation(generation_id)
+            .ok_or(AuditError::Refused(RefuseReason::GenerationUnknown))?
+            .clone();
+        if descriptor.state == GenerationState::Tombstoned {
+            return Err(AuditError::Refused(RefuseReason::GenerationTombstoned));
+        }
+        let path = Self::journal_path(&self.root, generation_id);
+        if !path.is_file() {
+            return Err(AuditError::Poisoned(match descriptor.state {
+                GenerationState::Active => PoisonReason::ActiveGenerationInvalid,
+                GenerationState::Sealed => PoisonReason::SealedGenerationChanged,
+                GenerationState::Tombstoned => PoisonReason::TombstoneInconsistent,
+            }));
+        }
+        let generation_key = self.key_for_generation(&descriptor)?;
+        let scan = self.scan_journal(
+            &generation_key,
+            &path,
+            generation_id,
+            &descriptor.chain_base,
+            descriptor.first_seq,
+            descriptor.origin_authenticated,
+        )?;
+        if scan.torn.is_some() && descriptor.state != GenerationState::Active {
+            return Err(AuditError::Poisoned(PoisonReason::SealedGenerationChanged));
+        }
+        let bytes = files::read_bytes(&path).unwrap_or_default();
+        let journal_sha256 = sha256_hex(&bytes);
+        if descriptor.state == GenerationState::Sealed {
+            if scan.last_seq != descriptor.last_seq {
+                return Err(AuditError::Poisoned(PoisonReason::SealedGenerationChanged));
+            }
+            if descriptor.journal_sha256.as_deref() != Some(journal_sha256.as_str()) {
+                return Err(AuditError::Poisoned(PoisonReason::SealedGenerationChanged));
+            }
+            if descriptor.final_tag.as_deref() != Some(scan.last_tag.as_str()) {
+                return Err(AuditError::Poisoned(PoisonReason::SealedGenerationChanged));
+            }
+        }
+        Ok(GenerationVerification {
+            generation_id: generation_id.to_string(),
+            first_seq: descriptor.first_seq,
+            last_seq: scan.last_seq,
+            entry_count: scan.entry_count,
+            journal_bytes: scan.bytes,
+            journal_sha256,
+            final_tag: scan.last_tag,
+            origin_authenticated: descriptor.origin_authenticated,
+        })
+    }
+
+    pub fn verify_all(&self) -> AuditResult<Vec<GenerationVerification>> {
+        let manifest = self.inner.lock().manifest.clone();
+        let mut out = Vec::new();
+        for descriptor in &manifest.generations {
+            if descriptor.state == GenerationState::Tombstoned {
+                continue;
+            }
+            out.push(self.verify_generation(&descriptor.generation_id)?);
+        }
+        Ok(out)
+    }
+
+    // -------------------------------------------------------------- status
+
+    pub fn status(&self) -> AuditStatus {
+        let guard = self.inner.lock();
+        AuditStatus {
+            installation_id: guard.manifest.installation_id.clone(),
+            key_id: guard.manifest.key_id.clone(),
+            key_epoch: guard.manifest.key_epoch,
+            manifest_epoch: guard.manifest.manifest_epoch,
+            retention_epoch: guard.manifest.retention_epoch,
+            active_generation_id: guard.manifest.active_generation_id.clone(),
+            global_first_seq: guard.manifest.global_first_seq,
+            global_last_seq: guard.live.last_seq,
+            generations: guard.manifest.generations.len(),
+            tombstones: guard.manifest.tombstones.len(),
+            open_intents: guard.live.open_intent_ids.len() as u64,
+            journal_bytes: guard.live.journal_bytes,
+            poisoned: guard.poisoned,
+            witness_state: guard.witness_state,
+            imported_generations: guard
+                .manifest
+                .generations
+                .iter()
+                .filter(|g| !g.origin_authenticated)
+                .count(),
+            recovery: guard.recovery.clone(),
+        }
+    }
+
+    pub(crate) fn manifest_snapshot(&self) -> Manifest {
+        self.inner.lock().manifest.clone()
+    }
+
+    pub(crate) fn open_intents(&self) -> u64 {
+        self.inner.lock().live.open_intent_ids.len() as u64
+    }
+
+    pub(crate) fn is_poisoned(&self) -> Option<PoisonReason> {
+        self.inner.lock().poisoned
+    }
+
+    pub(crate) fn witness_state(&self) -> WitnessState {
+        self.inner.lock().witness_state
+    }
+
+    pub(crate) fn commit_manifest(&self, manifest: Manifest) -> AuditResult<()> {
+        let keys = self.keys();
+        self.commit_manifest_with_key(manifest, keys)
+    }
+
+    fn commit_manifest_with_key(
+        &self,
+        manifest: Manifest,
+        commit_key: Arc<AuditKeys>,
+    ) -> AuditResult<()> {
+        let expected_epoch = self.inner.lock().manifest.manifest_epoch;
+        if manifest.manifest_epoch != expected_epoch {
+            return Err(AuditError::Poisoned(PoisonReason::ConcurrentWriter));
+        }
+        let current_key = self.keys();
+        if let Some(on_disk) = Self::load_manifest(&self.root, &current_key)? {
+            if on_disk.manifest_epoch != expected_epoch
+                || on_disk.active_generation_id != self.inner.lock().manifest.active_generation_id
+            {
+                self.inner.lock().poisoned = Some(PoisonReason::ConcurrentWriter);
+                return Err(AuditError::Poisoned(PoisonReason::ConcurrentWriter));
+            }
+        }
+        let mut manifest = manifest;
+        self.write_manifest_with_key(&mut manifest, &commit_key)?;
+        if !self
+            .keyring
+            .read()
+            .iter()
+            .any(|key| key.key_id() == commit_key.key_id())
+        {
+            self.keyring.write().push(Arc::clone(&commit_key));
+        }
+        *self.keys.write() = commit_key;
+        self.inner.lock().manifest = manifest;
+        Ok(())
+    }
+}
+
+fn bounded(value: &str, max: usize) -> String {
+    crate::textutil::truncate_at_char_boundary(value, max).to_string()
+}
+
+fn is_opaque_digest(value: &str) -> bool {
+    value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn safe_code(value: &str) -> Option<String> {
+    if value.is_empty()
+        || value.len() > 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        return None;
+    }
+    Some(value.to_string())
+}

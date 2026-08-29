@@ -39,6 +39,19 @@ enum ReceiptState {
     Uncertain,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MutationStage {
+    Claimed,
+    IntentRecorded,
+    EffectCommitted,
+    OutcomeRecorded,
+}
+
+fn default_mutation_stage() -> MutationStage {
+    MutationStage::Claimed
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct MutationReceipt {
@@ -46,10 +59,21 @@ struct MutationReceipt {
     operation: String,
     payload_hash: String,
     state: ReceiptState,
+    #[serde(default = "default_mutation_stage")]
+    stage: MutationStage,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     result: Option<serde_json::Value>,
     error: Option<ComputerError>,
+    #[serde(default)]
+    effect_run_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct MutationRecovery {
+    pub request_id: String,
+    pub operation: String,
+    pub effect_run_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -150,6 +174,7 @@ impl ComputerStore {
         request_id: &str,
         operation: &str,
         payload_hash: &str,
+        effect_run_id: Option<&str>,
     ) -> ComputerResult<MutationClaim> {
         let _guard = self.inner.lock.lock();
         let path = self.receipt_path(request_id)?;
@@ -194,13 +219,81 @@ impl ComputerStore {
             operation: operation.into(),
             payload_hash: payload_hash.into(),
             state: ReceiptState::Claimed,
+            stage: MutationStage::Claimed,
             created_at: now,
             updated_at: now,
             result: None,
             error: None,
+            effect_run_id: effect_run_id.map(str::to_string),
         };
         write_json_exclusive(&path, &receipt).map_err(internal_error)?;
         Ok(MutationClaim::Perform)
+    }
+
+    pub(crate) fn mark_intent_recorded(&self, request_id: &str) -> ComputerResult<()> {
+        let _guard = self.inner.lock.lock();
+        let path = self.receipt_path(request_id)?;
+        let mut receipt = self.read_receipt_path(&path)?;
+        if receipt.state != ReceiptState::Claimed || receipt.stage != MutationStage::Claimed {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Conflict,
+                "computer-use mutation is not awaiting its audit intent",
+            ));
+        }
+        receipt.stage = MutationStage::IntentRecorded;
+        receipt.updated_at = Utc::now();
+        atomic_write_json(&path, &receipt).map_err(internal_error)
+    }
+
+    pub(crate) fn commit_mutation_effect(
+        &self,
+        request_id: &str,
+        result: &ComputerResult<serde_json::Value>,
+    ) -> ComputerResult<()> {
+        let _guard = self.inner.lock.lock();
+        let path = self.receipt_path(request_id)?;
+        let mut receipt = self.read_receipt_path(&path)?;
+        if receipt.state != ReceiptState::Claimed || receipt.stage != MutationStage::IntentRecorded
+        {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Conflict,
+                "computer-use mutation is not awaiting its durable effect",
+            ));
+        }
+        match result {
+            Ok(value) => {
+                receipt.result = Some(value.clone());
+                receipt.error = None;
+                receipt.effect_run_id = value
+                    .get("runId")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+            }
+            Err(error) => {
+                receipt.result = None;
+                receipt.error = Some(error.clone());
+                receipt.effect_run_id = None;
+            }
+        }
+        receipt.stage = MutationStage::EffectCommitted;
+        receipt.updated_at = Utc::now();
+        atomic_write_json(&path, &receipt).map_err(internal_error)
+    }
+
+    pub(crate) fn record_mutation_outcome(&self, request_id: &str) -> ComputerResult<()> {
+        let _guard = self.inner.lock.lock();
+        let path = self.receipt_path(request_id)?;
+        let mut receipt = self.read_receipt_path(&path)?;
+        if receipt.state != ReceiptState::Claimed || receipt.stage != MutationStage::EffectCommitted
+        {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Conflict,
+                "computer-use mutation is not awaiting its audit outcome",
+            ));
+        }
+        receipt.stage = MutationStage::OutcomeRecorded;
+        receipt.updated_at = Utc::now();
+        atomic_write_json(&path, &receipt).map_err(internal_error)
     }
 
     pub(crate) fn complete_mutation(
@@ -211,23 +304,88 @@ impl ComputerStore {
         let _guard = self.inner.lock.lock();
         let path = self.receipt_path(request_id)?;
         let mut receipt = self.read_receipt_path(&path)?;
-        if receipt.state != ReceiptState::Claimed {
+        if receipt.state != ReceiptState::Claimed || receipt.stage != MutationStage::OutcomeRecorded
+        {
             return Err(ComputerError::new(
                 ComputerErrorCode::Conflict,
-                "computer-use mutation receipt is already terminal",
+                "computer-use mutation receipt is not ready to complete",
             ));
         }
         receipt.updated_at = Utc::now();
         match result {
             Ok(value) => {
+                if receipt.result.as_ref() != Some(value) {
+                    return Err(ComputerError::new(
+                        ComputerErrorCode::Conflict,
+                        "computer-use effect changed before receipt completion",
+                    ));
+                }
                 receipt.state = ReceiptState::Succeeded;
-                receipt.result = Some(value.clone());
             }
             Err(error) => {
-                receipt.state = ReceiptState::Failed;
-                receipt.error = Some(error.clone());
+                if receipt.error.as_ref() != Some(error) {
+                    return Err(ComputerError::new(
+                        ComputerErrorCode::Conflict,
+                        "computer-use effect error changed before receipt completion",
+                    ));
+                }
+                receipt.state = if error.code == ComputerErrorCode::UncertainOutcome {
+                    ReceiptState::Uncertain
+                } else {
+                    ReceiptState::Failed
+                };
             }
         }
+        atomic_write_json(&path, &receipt).map_err(internal_error)
+    }
+
+    pub(crate) fn incomplete_mutations(&self) -> ComputerResult<Vec<MutationRecovery>> {
+        let _guard = self.inner.lock.lock();
+        let mut recoveries = Vec::new();
+        for path in json_paths(&self.inner.root.join("receipts")).map_err(internal_error)? {
+            let receipt = self.read_receipt_path(&path)?;
+            if receipt.stage != MutationStage::OutcomeRecorded
+                && matches!(
+                    receipt.state,
+                    ReceiptState::Claimed | ReceiptState::Uncertain
+                )
+            {
+                recoveries.push(MutationRecovery {
+                    request_id: receipt.request_id,
+                    operation: receipt.operation,
+                    effect_run_id: receipt.effect_run_id,
+                });
+            }
+        }
+        Ok(recoveries)
+    }
+
+    pub(crate) fn reconcile_uncertain(
+        &self,
+        request_id: &str,
+        outcome: crate::audit::EntryOutcome,
+    ) -> ComputerResult<()> {
+        let _guard = self.inner.lock.lock();
+        let path = self.receipt_path(request_id)?;
+        let mut receipt = self.read_receipt_path(&path)?;
+        if receipt.state == ReceiptState::Succeeded || receipt.state == ReceiptState::Failed {
+            return Ok(());
+        }
+        receipt.stage = MutationStage::OutcomeRecorded;
+        receipt.state = match outcome {
+            crate::audit::EntryOutcome::Accepted if receipt.result.is_some() => {
+                ReceiptState::Succeeded
+            }
+            crate::audit::EntryOutcome::Rejected if receipt.error.is_some() => ReceiptState::Failed,
+            _ => {
+                receipt.error = Some(ComputerError::new(
+                    ComputerErrorCode::UncertainOutcome,
+                    "mutation outcome reconciled as uncertain after interruption",
+                ));
+                ReceiptState::Uncertain
+            }
+        };
+        receipt.updated_at = Utc::now();
         atomic_write_json(&path, &receipt).map_err(internal_error)
     }
 
@@ -306,12 +464,26 @@ impl ComputerStore {
             if receipt.state != ReceiptState::Claimed {
                 continue;
             }
-            receipt.state = ReceiptState::Uncertain;
+            if receipt.stage == MutationStage::OutcomeRecorded {
+                receipt.state = match (&receipt.result, &receipt.error) {
+                    (Some(_), None) => ReceiptState::Succeeded,
+                    (None, Some(error)) if error.code == ComputerErrorCode::UncertainOutcome => {
+                        ReceiptState::Uncertain
+                    }
+                    (None, Some(_)) => ReceiptState::Failed,
+                    _ => ReceiptState::Uncertain,
+                };
+            } else {
+                receipt.state = ReceiptState::Uncertain;
+            }
             receipt.updated_at = Utc::now();
-            receipt.error = Some(ComputerError::new(
-                ComputerErrorCode::UncertainOutcome,
-                "process stopped while the computer-use mutation was in flight; it will not be retried automatically",
-            ));
+            if receipt.state == ReceiptState::Uncertain {
+                receipt.result = None;
+                receipt.error = Some(ComputerError::new(
+                    ComputerErrorCode::UncertainOutcome,
+                    "process stopped while the computer-use mutation was in flight; it will not be retried automatically",
+                ));
+            }
             atomic_write_json(&path, &receipt).map_err(internal_error)?;
         }
         Ok(())
@@ -481,12 +653,19 @@ fn validate_receipt(receipt: &MutationReceipt) -> ComputerResult<()> {
     {
         return Err(invalid_record());
     }
-    let payload_shape_is_valid = match receipt.state {
-        ReceiptState::Claimed => receipt.result.is_none() && receipt.error.is_none(),
-        ReceiptState::Succeeded => receipt.result.is_some() && receipt.error.is_none(),
-        ReceiptState::Failed | ReceiptState::Uncertain => {
-            receipt.result.is_none() && receipt.error.is_some()
-        }
+    let payload_shape_is_valid = match receipt.stage {
+        MutationStage::Claimed | MutationStage::IntentRecorded => match receipt.state {
+            ReceiptState::Claimed => receipt.result.is_none() && receipt.error.is_none(),
+            ReceiptState::Uncertain => receipt.result.is_none() && receipt.error.is_some(),
+            ReceiptState::Succeeded | ReceiptState::Failed => false,
+        },
+        MutationStage::EffectCommitted | MutationStage::OutcomeRecorded => match receipt.state {
+            ReceiptState::Claimed => receipt.result.is_some() ^ receipt.error.is_some(),
+            ReceiptState::Succeeded => receipt.result.is_some() && receipt.error.is_none(),
+            ReceiptState::Failed | ReceiptState::Uncertain => {
+                receipt.result.is_none() && receipt.error.is_some()
+            }
+        },
     };
     if !payload_shape_is_valid
         || receipt
@@ -645,7 +824,7 @@ mod tests {
             let store = ComputerStore::open(dir.path()).unwrap();
             assert!(matches!(
                 store
-                    .claim_mutation("request-1", "act", &payload_hash)
+                    .claim_mutation("request-1", "act", &payload_hash, None)
                     .unwrap(),
                 MutationClaim::Perform
             ));
@@ -653,13 +832,13 @@ mod tests {
         let store = ComputerStore::open(dir.path()).unwrap();
         assert!(matches!(
             store
-                .claim_mutation("request-1", "act", &payload_hash)
+                .claim_mutation("request-1", "act", &payload_hash, None)
                 .unwrap(),
             MutationClaim::Uncertain
         ));
         assert_eq!(
             store
-                .claim_mutation("request-1", "act", "other")
+                .claim_mutation("request-1", "act", "other", None)
                 .unwrap_err()
                 .code,
             ComputerErrorCode::Conflict

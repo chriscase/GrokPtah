@@ -7,7 +7,7 @@ use chrono::{Duration, Utc};
 use grokptah_agent_bridge::{
     ActionClass, ActionGrant, ComputerAction, ComputerObservation, ComputerObservationPlatform,
     ComputerRun, ComputerStore, ComputerUseLimits, ComputerUseService, GrantIssuer,
-    MacOsObservationPlatform, SemanticAction,
+    MacOsObservationPlatform, OrchStore, SemanticAction,
 };
 #[cfg(target_os = "macos")]
 use uuid::Uuid;
@@ -40,9 +40,10 @@ async fn main() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("repository Computer Use demo window is not running"))?;
     let backend = platform.bind_target(&candidate.selection_token).await?;
     let temp = tempfile::tempdir()?;
-    let service = ComputerUseService::new(
+    let service = ComputerUseService::new_with_audit_store(
         backend,
         ComputerStore::open(temp.path().join("computer-use"))?,
+        OrchStore::open(temp.path().join("orchestration"))?,
     );
     // Live smoke has no AgentHost session cwd. Fail closed with None rather
     // than inventing a workspace from process cwd or the demo bundle path.
