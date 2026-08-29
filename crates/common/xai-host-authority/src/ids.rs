@@ -10,16 +10,18 @@
 //! short, stable, non-reversible handle instead of the underlying bytes so that
 //! logs, telemetry, and MCP projections never carry authority material.
 
-use serde::{Deserialize, Serialize};
-
 use crate::digest::{hex, short_handle};
 
 /// Declare an opaque 16-byte host-issued identifier.
 macro_rules! opaque_id {
     ($(#[$meta:meta])* $name:ident, $label:literal) => {
         $(#[$meta])*
-        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-        #[serde(transparent)]
+        // Deliberately not `Serialize`/`Deserialize`. A derived `Deserialize`
+        // is a public constructor in disguise: downstream code could mint an
+        // identity straight from JSON and walk past the private constructor
+        // these types rely on. Durable records carry hex strings instead, and
+        // only this crate turns one back into an identifier.
+        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub struct $name([u8; 16]);
 
         impl $name {
@@ -127,8 +129,9 @@ opaque_id!(
 macro_rules! generation {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
-        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-        #[serde(transparent)]
+        // Not `Deserialize`, for the same reason: a caller could otherwise
+        // claim any generation it liked by parsing a number.
+        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub struct $name(u64);
 
         impl $name {

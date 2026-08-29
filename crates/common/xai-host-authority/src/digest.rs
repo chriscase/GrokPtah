@@ -4,7 +4,6 @@
 //! themselves are never stored, so a durable authority record — and every
 //! projection derived from it — is content-free by construction.
 
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub(crate) fn hex(bytes: &[u8]) -> String {
@@ -28,8 +27,10 @@ pub(crate) fn short_handle(label: &str, bytes: &[u8]) -> String {
 }
 
 /// A SHA-256 digest of some action or body, bound into an authority record.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
+// Not `Serialize`/`Deserialize`: durable records carry hex strings, and
+// keeping the derives off means there is exactly one way a digest enters this
+// crate - by being computed over real bytes.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ContentDigest([u8; 32]);
 
 impl ContentDigest {
