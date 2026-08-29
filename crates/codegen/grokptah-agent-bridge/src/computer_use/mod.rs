@@ -12,6 +12,7 @@
 //! Which runs each surface may list is a separate gate: the cockpit is
 //! session-scoped; coordinator reads take [`ComputerReadBinding`].
 
+#[allow(dead_code)]
 mod macos_observation;
 mod platform;
 mod policy;
@@ -53,7 +54,7 @@ pub use store::ComputerStore;
 pub use types::{
     ActionClass, ActionGrant, ActionOutcome, ComputerAction, ComputerAuditEntry, ComputerBackend,
     ComputerCapabilities, ComputerControlDisposition, ComputerError, ComputerErrorCode,
-    ComputerObservation, ComputerRun, ComputerRunState, ComputerTarget, ComputerUseLimits,
-    EvidenceRef, GrantIssuer, ObservationGeometry, PointerButton, SemanticAction, SemanticElement,
-    Sensitivity,
+    ComputerExecutionEnvelope, ComputerObservation, ComputerRun, ComputerRunState, ComputerTarget,
+    ComputerUseLimits, EvidenceRef, GrantIssuer, ObservationGeometry, PointerButton,
+    SemanticAction, SemanticElement, Sensitivity,
 };

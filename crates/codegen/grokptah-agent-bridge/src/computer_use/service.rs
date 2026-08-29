@@ -15,8 +15,9 @@ use super::projection::{
 use super::store::{ComputerStore, MutationClaim};
 use super::types::{
     validate_id, ActionGrant, ActionOutcome, ComputerAction, ComputerBackend,
-    ComputerControlDisposition, ComputerError, ComputerErrorCode, ComputerObservation,
-    ComputerResult, ComputerRun, ComputerRunState, ComputerTarget, ComputerUseLimits,
+    ComputerControlDisposition, ComputerError, ComputerErrorCode, ComputerExecutionEnvelope,
+    ComputerObservation, ComputerResult, ComputerRun, ComputerRunState, ComputerTarget,
+    ComputerUseLimits,
 };
 
 pub struct ComputerUseService {
@@ -190,6 +191,104 @@ impl ComputerUseService {
         })();
         self.finish_mutation(request_id, &result)?;
         result
+    }
+
+    pub fn issue_execution_envelope(
+        &self,
+        run_id: &str,
+        expected_version: u64,
+        observation_id: &str,
+        action: &ComputerAction,
+    ) -> ComputerResult<ComputerExecutionEnvelope> {
+        let run = self.store.load_run(run_id)?.ok_or_else(unknown_run)?;
+        if run.version != expected_version {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Conflict,
+                "computer approval is based on a stale run version",
+            ));
+        }
+        let observation = run
+            .current_observation
+            .as_ref()
+            .filter(|observation| observation.observation_id == observation_id)
+            .ok_or_else(|| {
+                ComputerError::new(
+                    ComputerErrorCode::StaleObservation,
+                    "computer approval is based on a stale observation",
+                )
+            })?;
+        self.policy
+            .authorize_action(&run, observation, action, Utc::now())?;
+        if run.adaptive.as_ref().is_some_and(|adaptive| {
+            !adaptive.effect_authority_bound
+                || adaptive.objective_digest.is_none()
+                || adaptive.principal_generation_reference.is_none()
+                || adaptive.capability_snapshot_reference.is_none()
+                || adaptive.effect_lease_reference.is_none()
+                || adaptive.provider_attempt_reference.is_none()
+        }) {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "adaptive approval lacks canonical effect-time authority",
+            ));
+        }
+        ComputerExecutionEnvelope::issue(&run, observation_id, action)
+    }
+
+    /// Approval dispatch path. The opaque envelope is checked against the
+    /// current durable run and adaptive state before entering the existing
+    /// action method. Adaptive envelopes require effect-time authority proof;
+    /// this exact base has none and therefore never dispatches them.
+    pub async fn act_with_envelope(
+        &self,
+        request_id: &str,
+        run_id: &str,
+        expected_version: u64,
+        observation_id: &str,
+        action: ComputerAction,
+        envelope: ComputerExecutionEnvelope,
+    ) -> ComputerResult<ActionOutcome> {
+        let run = self.store.load_run(run_id)?.ok_or_else(unknown_run)?;
+        if !envelope.matches(&run, observation_id, &action) {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Conflict,
+                "computer approval envelope does not match the current action",
+            ));
+        }
+        if envelope.requires_effect_authority() {
+            let Some(adaptive) = run.adaptive.as_ref() else {
+                return Err(ComputerError::new(
+                    ComputerErrorCode::Unauthorized,
+                    "adaptive approval has no durable authority binding",
+                ));
+            };
+            if !envelope.effect_authority_bound()
+                || adaptive.revision != envelope.adaptive_revision().unwrap_or_default()
+                || adaptive.profile != envelope.profile().unwrap_or_default()
+                || adaptive.risk != envelope.risk().unwrap_or_default()
+                || adaptive.objective_digest.as_deref() != envelope.objective_digest()
+                || adaptive.principal_generation_reference.as_deref()
+                    != envelope.principal_generation_reference()
+                || adaptive.capability_snapshot_reference.as_deref()
+                    != envelope.capability_snapshot_reference()
+                || adaptive.provider_attempt_reference.as_deref()
+                    != envelope.provider_attempt_reference()
+                || adaptive.effect_authority_bound != envelope.effect_authority_bound()
+            {
+                return Err(ComputerError::new(
+                    ComputerErrorCode::Unauthorized,
+                    "adaptive approval authority or policy generation changed",
+                ));
+            }
+            return Err(ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "canonical effect-time authority is unavailable",
+            ));
+        }
+        // `act` repeats run, grant, observation, capability, lease, and
+        // version checks immediately before the backend call.
+        self.act(request_id, run_id, expected_version, observation_id, action)
+            .await
     }
 
     pub fn authorize(
@@ -829,7 +928,13 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::*;
+    use crate::computer_profile::capability::{
+        CapabilityAttribution, HostCapabilityEvidence, ModelCapabilityEvidence,
+    };
+    use crate::computer_profile::policy::{PolicyOutcome, TaskPolicy};
+    use crate::computer_profile::{AdaptiveController, AdaptiveProfile, TaskRisk};
     use crate::computer_use::{ActionClass, ComputerCapabilities, EvidenceRef, SimulatorBackend};
+    use crate::gateway_config::ComputerUseTier;
 
     #[derive(Debug, Default)]
     struct BlockingBackend {
@@ -1007,6 +1112,133 @@ mod tests {
             uses_remaining: Some(8),
             revoked_at: None,
         }
+    }
+
+    fn adaptive_state_for_envelope() -> crate::computer_profile::AdaptiveRunState {
+        let evidence = crate::computer_profile::CapabilityEvidence::with_authority(
+            ModelCapabilityEvidence {
+                tools: true,
+                image_input: true,
+                max_image_bytes: Some(4 * 1024 * 1024),
+                tier: ComputerUseTier::VisualFallbackAct,
+                attribution: CapabilityAttribution::Measured,
+                durable_authority: true,
+                session_measured: false,
+                synthetic_only: false,
+            },
+            HostCapabilityEvidence {
+                semantic_observation: true,
+                screenshot_capture: true,
+                independent_verifier: true,
+                isolated_guest: true,
+            },
+            crate::computer_profile::test_binding(),
+        );
+        let PolicyOutcome::Proceed(decision) = crate::computer_profile::AdaptivePolicyEngine
+            .select(
+                &evidence,
+                TaskPolicy {
+                    risk: TaskRisk::Routine,
+                    minimum_profile: Some(AdaptiveProfile::Economy),
+                },
+            )
+        else {
+            panic!("envelope fixture should proceed");
+        };
+        let mut controller = AdaptiveController::new("run", decision);
+        controller.bind_objective_digest("a".repeat(64));
+        controller.bind_effect_authority();
+        let mut state = controller.into_state();
+        // Model the receipt already settled by the canonical transport. The
+        // test only exercises the service's effect-time CAS, not receipt
+        // authoring.
+        state.provider_attempt_reference = Some("attempt-1".into());
+        state.spend.model_calls = 1;
+        state.spend.provider_attempts = 1;
+        assert!(state.validate());
+        state
+    }
+
+    #[tokio::test]
+    async fn adaptive_envelope_rejects_a_risk_change_at_effect_time() {
+        let (_backend, service) = service();
+        let owner = Uuid::new_v4();
+        let run = service
+            .create_run(
+                "create-envelope-risk-cas",
+                owner,
+                None,
+                SimulatorBackend::demo_target(),
+                Default::default(),
+            )
+            .unwrap();
+        let run = service
+            .authorize(
+                "grant-envelope-risk-cas",
+                &run.run_id,
+                run.version,
+                grant(&run),
+            )
+            .unwrap();
+        let observation = service
+            .observe("observe-envelope-risk-cas", &run.run_id, run.version)
+            .await
+            .unwrap();
+        let state = adaptive_state_for_envelope();
+        let current = service
+            .store
+            .update_run(&run.run_id, |stored| {
+                stored.adaptive = Some(state.clone());
+                Ok(())
+            })
+            .unwrap()
+            .unwrap();
+        let action = ComputerAction::SetValue {
+            element_id: format!("{}-name", observation.observation_id),
+            text: "Ada".into(),
+        };
+        let envelope = service
+            .issue_execution_envelope(
+                &run.run_id,
+                current.version,
+                &observation.observation_id,
+                &action,
+            )
+            .unwrap();
+
+        let mut elevated = AdaptiveController::from_state(state).unwrap();
+        assert_eq!(
+            elevated.enforce_risk_floor(TaskRisk::Consequential),
+            Some(crate::computer_profile::ProfileTransition::Escalate {
+                from: AdaptiveProfile::Economy,
+                to: AdaptiveProfile::Balanced,
+                reason: crate::computer_profile::ProfileReason::ConsequentialIntent,
+            })
+        );
+        let mut tampered = current.clone();
+        tampered.adaptive = Some(elevated.into_state());
+        let path = service.store.root().join("runs").join(format!(
+            "{}.json",
+            crate::orchestration::safe_id_filename(&run.run_id).unwrap()
+        ));
+        std::fs::write(path, serde_json::to_string(&tampered).unwrap()).unwrap();
+
+        let error = service
+            .act_with_envelope(
+                "act-envelope-risk-cas",
+                &run.run_id,
+                current.version,
+                &observation.observation_id,
+                action,
+                envelope,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ComputerErrorCode::Unauthorized);
+        assert_eq!(
+            service.get_run(&run.run_id).unwrap().unwrap().action_count,
+            0
+        );
     }
 
     #[tokio::test]

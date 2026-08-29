@@ -4,12 +4,13 @@ use std::sync::Arc;
 use base64::Engine;
 use chrono::{Duration, Utc};
 use grokptah_agent_bridge::{
-    canonical_workspace_string, ActionClass, ActionGrant, AgentHostHandle, ComputerAction,
-    ComputerAgentProposal, ComputerCapabilities, ComputerError, ComputerObservation,
-    ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
+    canonical_workspace_string, ActionClass, ActionGrant, AdaptiveProfileProjection,
+    AgentHostHandle, ComputerAction, ComputerAgentProposal, ComputerCapabilities, ComputerError,
+    ComputerExecutionEnvelope, ComputerObservation, ComputerObservationPlatform, ComputerPermission,
+    ComputerPermissionStatus,
     ComputerPlatformStatus, ComputerRun, ComputerRunProjection, ComputerRunState,
-    ComputerTargetCandidate, ComputerUseLimits, ComputerUseService, GrantIssuer,
-    MacOsObservationPlatform, SemanticAction, SimulatorBackend,
+    ComputerTargetCandidate, ComputerUseLimits, ComputerUseService, GrantIssuer, SemanticAction,
+    SimulatorBackend,
 };
 use serde::Serialize;
 use tokio::sync::Mutex;
@@ -36,6 +37,9 @@ pub struct PendingComputerApproval {
     pub action: ComputerAction,
     pub action_summary: String,
     pub risk: String,
+    /// Opaque host-issued envelope revalidated by ComputerUseService at
+    /// approval time. It serializes only as a capability token.
+    pub execution_envelope: ComputerExecutionEnvelope,
     pub created_at: chrono::DateTime<Utc>,
 }
 
@@ -53,6 +57,9 @@ pub struct ComputerCockpitSnapshot {
     /// projection above is what does.
     pub run: Option<ComputerRun>,
     pub pending_approval: Option<PendingComputerApproval>,
+    /// Redacted adaptive state projected from the same durable Computer Run
+    /// record; coordinator and cockpit consumers share this exact shape.
+    pub adaptive: Option<AdaptiveProfileProjection>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -303,14 +310,19 @@ impl DesktopComputerUse {
                 .unwrap_or_else(unavailable_native_capabilities),
             None => index.capabilities(),
         };
+        let projection = run
+            .as_ref()
+            .map(|run| grokptah_agent_bridge::project_run_at(run, Utc::now()));
+        let adaptive = projection
+            .as_ref()
+            .and_then(|projection| projection.adaptive.clone());
         Ok(ComputerCockpitSnapshot {
             backend,
             origin: "desktop".into(),
-            projection: run
-                .as_ref()
-                .map(|run| grokptah_agent_bridge::project_run_at(run, Utc::now())),
+            projection,
             run,
             pending_approval,
+            adaptive,
         })
     }
 
@@ -472,7 +484,7 @@ impl DesktopComputerUse {
         observation_id: &str,
         action: ComputerAction,
     ) -> Result<ComputerCockpitSnapshot, String> {
-        let (_service, run) = self.owned_service(owner_session_id, run_id)?;
+        let (service, run) = self.owned_service(owner_session_id, run_id)?;
         if run.version != expected_version {
             return Err("The proposed action is based on a stale Computer Run".into());
         }
@@ -489,6 +501,9 @@ impl DesktopComputerUse {
             .map_err(|error| error.to_string())?;
 
         let (action_summary, risk) = approval_copy(observation, &action)?;
+        let execution_envelope = service
+            .issue_execution_envelope(run_id, expected_version, observation_id, &action)
+            .map_err(|error| error.to_string())?;
 
         let mut pending = self
             .pending_approval
@@ -507,6 +522,7 @@ impl DesktopComputerUse {
             action,
             action_summary,
             risk,
+            execution_envelope,
             created_at: Utc::now(),
         });
         drop(pending);
@@ -537,6 +553,41 @@ impl DesktopComputerUse {
             .ok_or_else(|| {
                 "The Computer observation changed before the model request started".into()
             })
+    }
+
+    /// Read the current redacted evidence only for the private visual adapter.
+    /// The bytes never enter a Tauri response, durable projection, or replay
+    /// record; they are consumed by the host's authenticated provider route.
+    pub async fn model_proposal_evidence(
+        &self,
+        owner_session_id: Uuid,
+        run_id: &str,
+        expected_version: u64,
+        observation_id: &str,
+    ) -> Result<Option<Vec<u8>>, String> {
+        let (service, run) = self.owned_service(owner_session_id, run_id)?;
+        if run.version != expected_version
+            || run.state != ComputerRunState::Ready
+            || run
+                .current_observation
+                .as_ref()
+                .map(|observation| observation.observation_id.as_str())
+                != Some(observation_id)
+        {
+            return Err("The Computer Run changed before visual evidence was read".into());
+        }
+        let Some(evidence) = run
+            .current_observation
+            .as_ref()
+            .and_then(|observation| observation.screenshot.as_ref())
+        else {
+            return Ok(None);
+        };
+        service
+            .read_current_evidence(run_id, &evidence.asset_id)
+            .await
+            .map(Some)
+            .map_err(|error| error.to_string())
     }
 
     pub async fn apply_model_proposal(
@@ -580,6 +631,18 @@ impl DesktopComputerUse {
                 {
                     return Err("The Computer Run changed while the model was responding".into());
                 }
+                let store = self
+                    .store
+                    .as_ref()
+                    .ok_or_else(|| self.initialization_error())?;
+                self.host
+                    .complete_computer_adaptive_run_using_store(
+                        store,
+                        owner_session_id,
+                        run_id,
+                        expected_version,
+                    )
+                    .map_err(|error| error.to_string())?;
                 service
                     .complete(&Uuid::new_v4().to_string(), run_id, expected_version)
                     .map_err(|error| error.to_string())?;
@@ -619,16 +682,44 @@ impl DesktopComputerUse {
             self.clear_pending_for_owner(owner_session_id)?;
             return Err("This Computer Use approval no longer matches the live run".into());
         }
+        let action = pending.action.clone();
+        let observation_id = pending.observation_id.clone();
         let result = service
-            .act(
+            .act_with_envelope(
                 request_id,
                 &pending.run_id,
                 pending.run_version,
-                &pending.observation_id,
-                pending.action,
+                &observation_id,
+                action.clone(),
+                pending.execution_envelope.clone(),
             )
             .await;
         self.clear_pending_for_owner(owner_session_id)?;
+        let current_version = service
+            .get_run(&pending.run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "Computer Run disappeared after action".to_string())?
+            .version;
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| self.initialization_error())?;
+        let (result_code, postcondition) = match &result {
+            Ok(outcome) => ("completed".to_string(), outcome.expected_postcondition_met),
+            Err(error) => (format!("{:?}", error.code), None),
+        };
+        self.host
+            .record_computer_adaptive_action_result_using_store(
+                store,
+                owner_session_id,
+                &pending.run_id,
+                current_version,
+                &observation_id,
+                &action,
+                &result_code,
+                postcondition,
+            )
+            .map_err(|error| error.to_string())?;
         result.map_err(|error| error.to_string())?;
         self.cockpit_snapshot(owner_session_id)
     }
@@ -664,6 +755,19 @@ impl DesktopComputerUse {
     ) -> Result<ComputerCockpitSnapshot, String> {
         self.clear_pending_for_owner(owner_session_id)?;
         let (service, _) = self.owned_service(owner_session_id, run_id)?;
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| self.initialization_error())?;
+        self.host
+            .stop_computer_adaptive_run_using_store(
+                store,
+                owner_session_id,
+                run_id,
+                expected_version,
+                grokptah_agent_bridge::RuntimeSignal::CapabilityRevoked,
+            )
+            .map_err(|error| error.to_string())?;
         service
             .take_over(&Uuid::new_v4().to_string(), run_id, expected_version)
             .await
@@ -678,6 +782,24 @@ impl DesktopComputerUse {
     ) -> Result<ComputerCockpitSnapshot, String> {
         self.clear_pending_for_owner(owner_session_id)?;
         let (service, _) = self.owned_service(owner_session_id, run_id)?;
+        let expected_version = service
+            .get_run(run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "Computer Run is not available".to_string())?
+            .version;
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| self.initialization_error())?;
+        self.host
+            .stop_computer_adaptive_run_using_store(
+                store,
+                owner_session_id,
+                run_id,
+                expected_version,
+                grokptah_agent_bridge::RuntimeSignal::CapabilityRevoked,
+            )
+            .map_err(|error| error.to_string())?;
         service
             .cancel(&Uuid::new_v4().to_string(), run_id)
             .await
@@ -822,6 +944,18 @@ fn approval_copy(
             "Application focus".into(),
         ));
     }
+    if matches!(action, ComputerAction::PointerClick { .. }) {
+        return Ok((
+            "Click a target-relative point grounded in the current redacted frame".into(),
+            "Visual grounded action".into(),
+        ));
+    }
+    if matches!(action, ComputerAction::KeyChord { .. }) {
+        return Ok((
+            "Apply the bounded key chord".into(),
+            "Keyboard action".into(),
+        ));
+    }
     let element_id = action
         .referenced_element()
         .ok_or_else(|| "The proposed action does not identify an element".to_string())?;
@@ -856,7 +990,12 @@ async fn authorize_and_observe_once(
         grant_id: Uuid::new_v4().to_string(),
         run_id: run.run_id.clone(),
         target: run.target.clone(),
-        action_classes: BTreeSet::from([ActionClass::Semantic, ActionClass::TextEntry]),
+        action_classes: BTreeSet::from([
+            ActionClass::Semantic,
+            ActionClass::TextEntry,
+            ActionClass::KeyChord,
+            ActionClass::PointerFallback,
+        ]),
         issued_by: GrantIssuer::LocalUser,
         issued_at: now,
         expires_at: now + Duration::minutes(2),
@@ -871,7 +1010,7 @@ async fn authorize_and_observe_once(
 
 #[cfg(target_os = "macos")]
 fn native_platform() -> (Option<Arc<dyn ComputerObservationPlatform>>, Option<String>) {
-    match MacOsObservationPlatform::new_native() {
+    match grokptah_agent_bridge::MacOsObservationPlatform::new_native() {
         Ok(platform) => (Some(Arc::new(platform)), None),
         Err(error) => (None, Some(error.to_string())),
     }

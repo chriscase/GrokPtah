@@ -120,6 +120,18 @@ impl Drop for OrchestrationService {
         if let Some(watcher) = self.scheduler_watcher.get_mut().take() {
             watcher.abort();
         }
+        if let Some(watcher) = self.manager_supervisor_watcher.get_mut().take() {
+            watcher.abort();
+        }
+        if let Some(watcher) = self.native_executor_watcher.get_mut().take() {
+            watcher.abort();
+        }
+        // A finished JoinHandle still owns the captured AgentHostHandle until
+        // it is dropped. Abort and drain every run handle so dropping a
+        // control service cannot retain the process-wide instance lock.
+        for join in self.join_handles.get_mut().drain(..) {
+            join.abort();
+        }
         let pending = self
             .pending_admissions
             .get_mut()
@@ -1410,6 +1422,21 @@ impl OrchestrationService {
     /// This is separate from `Drop` because an async service shutdown must
     /// wait for the supervisor task to release its store handle.
     pub async fn stop_background_tasks(&self) {
+        let scheduler_watcher = { self.scheduler_watcher.lock().take() };
+        if let Some(watcher) = scheduler_watcher {
+            watcher.abort();
+            let _ = watcher.await;
+        }
+        let manager_supervisor_watcher = { self.manager_supervisor_watcher.lock().take() };
+        if let Some(watcher) = manager_supervisor_watcher {
+            watcher.abort();
+            let _ = watcher.await;
+        }
+        let native_executor_watcher = { self.native_executor_watcher.lock().take() };
+        if let Some(watcher) = native_executor_watcher {
+            watcher.abort();
+            let _ = watcher.await;
+        }
         let supervisor = self.workload_supervisor.lock().take();
         if let Some(mut supervisor) = supervisor {
             supervisor.stop_and_wait();
@@ -1418,11 +1445,13 @@ impl OrchestrationService {
         if let Some(mut supervisor) = supervisor {
             supervisor.stop_and_wait();
         }
-        if let Some(watcher) = self.native_executor_watcher.lock().take() {
-            watcher.abort();
-        }
-        if let Some(watcher) = self.manager_supervisor_watcher.lock().take() {
-            watcher.abort();
+        // A JoinHandle retains all values captured by its task even after the
+        // task has completed. Drain finished and in-flight runs explicitly so
+        // the host lock is released before a caller reopens the same home.
+        let joins = std::mem::take(&mut *self.join_handles.lock());
+        for join in joins {
+            join.abort();
+            let _ = join.await;
         }
         self.native_executor.lock().enabled = false;
         self.manager_supervisor.lock().enabled = false;

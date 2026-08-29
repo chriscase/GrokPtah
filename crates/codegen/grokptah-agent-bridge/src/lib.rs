@@ -8,6 +8,7 @@ mod auth_store;
 pub mod certification;
 mod completion;
 mod computer_agent;
+pub mod computer_profile;
 pub mod computer_use;
 mod discover;
 pub mod eval_oracle;
@@ -106,19 +107,32 @@ pub use completion::{
     enrich_terminal_handoff, CompletionClaims, CompletionEvidence, CompletionObservations,
     CompletionUsage,
 };
-pub use computer_agent::{ComputerAgentEligibility, ComputerAgentProposal};
+pub use computer_agent::{
+    render_computer_observation, validate_computer_proposal,
+    validate_computer_proposal_safety_only, ComputerAgentEligibility, ComputerAgentProposal,
+    RenderedObservation,
+};
+pub use computer_profile::{
+    classify_objective, classify_task, project_adaptive, AdaptiveController, AdaptiveEvidenceEvent,
+    AdaptiveEvidenceKind, AdaptivePolicyEngine, AdaptiveProfile, AdaptiveProfileProjection,
+    AdaptiveRunState, CapabilityAttribution, CapabilityEvidence, HostCapabilityEvidence,
+    ModelCapabilityEvidence, ObservationFingerprint, PolicyOutcome, ProfileReason,
+    ProfileTransition, ReplayError, ReplayEvent, ReplayEventKind, ReplaySummary, ReplayVerifier,
+    RuntimeSignal, SafetyFloor, TaskPolicy, TaskRisk, TerminalKind,
+};
 pub use computer_use::{
     canonical_workspace_string, project_run_at, ActionClass, ActionGrant, ActionGrantSummary,
     ActionOutcome, ActionOutcomeSummary, ComputerAction, ComputerAuditEntry, ComputerBackend,
     ComputerCapabilities, ComputerControlDisposition, ComputerError, ComputerErrorCode,
-    ComputerErrorSummary, ComputerObservation, ComputerObservationPlatform, ComputerPermission,
-    ComputerPermissionStatus, ComputerPlatformStatus, ComputerPolicy, ComputerReadBinding,
-    ComputerRun, ComputerRunCapacity, ComputerRunEventPage, ComputerRunEventRange,
-    ComputerRunProgress, ComputerRunProjection, ComputerRunReads, ComputerRunState,
-    ComputerScopeCapacity, ComputerStore, ComputerTarget, ComputerTargetCandidate,
-    ComputerTargetSummary, ComputerUseLimits, ComputerUseService, GrantIssuer,
-    MacOsObservationPlatform, ObservationSummary, SemanticAction, SimulatorBackend,
-    DEFAULT_EVENT_PAGE, MAX_EVENT_PAGE,
+    ComputerErrorSummary, ComputerExecutionEnvelope, ComputerObservation,
+    ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
+    ComputerPlatformStatus, ComputerPolicy, ComputerReadBinding, ComputerRun, ComputerRunCapacity,
+    ComputerRunEventPage, ComputerRunEventRange, ComputerRunProgress, ComputerRunProjection,
+    ComputerRunReads, ComputerRunState, ComputerScopeCapacity, ComputerStore, ComputerTarget,
+    ComputerTargetCandidate, ComputerTargetSummary, ComputerUseLimits, ComputerUseService,
+    EvidenceRef, GrantIssuer, MacOsObservationPlatform, ObservationGeometry, ObservationSummary,
+    SemanticAction, SemanticElement, Sensitivity, SimulatorBackend, DEFAULT_EVENT_PAGE,
+    MAX_EVENT_PAGE,
 };
 pub use discover::{
     grokptah_home, home_override_serial, is_project_mcp_trusted, project_has_local_mcp_servers,

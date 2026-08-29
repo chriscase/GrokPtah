@@ -132,6 +132,11 @@ See [Computer Use Threat Model and Release Gate](COMPUTER_USE_THREAT_MODEL.md) f
 threat-to-evidence matrix, trust boundaries, explicit unsupported dispositions, and remaining
 packaged/hardware release blockers.
 
+Adaptive Economy/Balanced/High Assurance execution is documented in
+[ADAPTIVE_COMPUTER_USE.md](ADAPTIVE_COMPUTER_USE.md). It is an efficiency layer
+over this same control plane; it does not create another action runtime or
+authority.
+
 The design assumes model output, application content, screenshots, accessibility trees, MCP
 clients, and persisted cache contents may be hostile. Important threats include prompt injection
 from observed content, stale-observation clicks, target substitution, duplicate action delivery,
