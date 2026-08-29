@@ -47,7 +47,8 @@ for one endpoint or one credential cannot be replayed against another.
 | --- | --- |
 | No caller-forgeable approvals | Every receipt has private fields and `pub(crate)` construction. Compile-fail doctests pin it. |
 | No ordinary send bypass | A send needs a permit; `begin_send` is its only producer. There is no raw store accessor of any kind. |
-| Administration is not ambient | Replacing credentials, rotating epochs or generations, and exporting the log need a `HostAdminAuthority`, returned only by `open` and not `Clone`. |
+| Administration is not ambient | Replacing credentials, rotating epochs or generations, exporting the log, crash recovery, and resolving an ambiguous effect all need a `HostAdminAuthority`, returned only by `open` and not `Clone`. |
+| Authority identity is not deserializable | No identifier or generation derives `Deserialize`; a derived one would be a public constructor in disguise. Durable records carry hex strings that only this crate decodes. |
 | Pre-effect persistence failure prevents dispatch | The attempt record and the intent audit record must both be durable *before* the permit is constructed. No permit, no dispatch. |
 | A possible effect never reports ordinary failure | Any settlement whose persistence fails returns `Uncertain`, because the durable record still reads `sending` and recovery will conclude the same. |
 | Ambiguity never auto-retries | There is no retry API. `reconcile_attempt` is the only exit, and it takes provider truth the host established. |
