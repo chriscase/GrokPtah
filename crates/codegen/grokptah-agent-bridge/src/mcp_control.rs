@@ -299,7 +299,29 @@ pub struct ControlServerHandle {
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
+/// Evidence from stopping one control server. A timeout is not completion:
+/// callers must retain/quarantine process authority when `fully_stopped` is
+/// false.
+#[derive(Debug, Default)]
+pub struct ControlServerStopReport {
+    pub fully_stopped: bool,
+    pub errors: Vec<String>,
+}
+
 impl ControlServerHandle {
+    #[cfg(test)]
+    pub(crate) fn uncooperative_for_test(orch: Arc<OrchestrationService>) -> Self {
+        let (shutdown, _shutdown_rx) = tokio::sync::oneshot::channel();
+        Self {
+            addr: "127.0.0.1:1".parse().expect("test socket address"),
+            token: "test-token".into(),
+            orch,
+            shutdown: Some(shutdown),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            task: Some(tokio::spawn(std::future::pending())),
+        }
+    }
+
     /// Shared policy service for trusted desktop commands that surface the
     /// same MCP-owned runs. The transport remains the only network boundary.
     pub fn orchestration_service(&self) -> Arc<OrchestrationService> {
@@ -315,15 +337,43 @@ impl ControlServerHandle {
 
     /// Stop the server and wait until its serving task has released the
     /// orchestration store and other owned resources.
-    pub async fn stop_and_wait(mut self) {
+    pub async fn stop_and_wait(mut self) -> ControlServerStopReport {
+        self.stop_and_wait_bounded(Duration::from_secs(30)).await
+    }
+
+    /// Stop and join every server-owned execution surface under one deadline.
+    pub async fn stop_and_wait_bounded(&mut self, timeout: Duration) -> ControlServerStopReport {
         self.cancel.cancel();
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.send(());
         }
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut errors = Vec::new();
+        let mut fully_stopped = true;
         if let Some(task) = self.task.take() {
-            let _ = task.await;
+            match tokio::time::timeout_at(deadline, task).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    errors.push(format!("control server task failed to join: {error}"));
+                }
+                Err(_) => {
+                    fully_stopped = false;
+                    errors.push(format!(
+                        "control server task did not stop within {timeout:?}"
+                    ));
+                }
+            }
         }
-        self.orch.stop_background_tasks().await;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let background = self.orch.stop_background_tasks_bounded(remaining).await;
+        if !background.fully_stopped {
+            fully_stopped = false;
+        }
+        errors.extend(background.errors);
+        ControlServerStopReport {
+            fully_stopped,
+            errors,
+        }
     }
 
     /// Actionable transport health snapshot for coordinators.
@@ -334,6 +384,18 @@ impl ControlServerHandle {
             "activeRequests": state_active,
             "totalRequests": state_total,
         })
+    }
+}
+
+impl Drop for ControlServerHandle {
+    fn drop(&mut self) {
+        // Dropping a handle can never be permission to leave its listener
+        // accepting work. Joining is async and belongs to the ordered path,
+        // but cancellation itself is unconditional.
+        self.cancel.cancel();
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
     }
 }
 

@@ -159,6 +159,20 @@ impl EventBus {
         }
         self.persistence_error.lock().clone()
     }
+
+    /// Hold the same publication lock used by [`Self::publish`] across the
+    /// caller's final durable-health decision. Ordered shutdown uses this to
+    /// make "last error check + process-lock release" one atomic boundary with
+    /// every stale publisher: a publish is either observed before handoff or
+    /// refused only after the old owner has released all authority.
+    pub(crate) fn with_final_publication_barrier<R>(
+        &self,
+        decide: impl FnOnce(Option<String>) -> R,
+    ) -> R {
+        let _publication = self.inner.lock();
+        let error = self.persistence_error.lock().clone();
+        decide(error)
+    }
 }
 
 impl Drop for PersistenceHandle {
@@ -2037,5 +2051,47 @@ mod tests {
         let page = bus.read_after(0, 8);
         assert_eq!(page.entries.len(), 1);
         assert_eq!(page.entries[0].seq, 42);
+    }
+
+    #[test]
+    fn final_publication_barrier_excludes_the_last_stale_publisher() {
+        let bus = Arc::new(EventBus::new(8));
+        assert!(bus.close_journal_writer().is_none());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        let barrier_bus = bus.clone();
+        let barrier = std::thread::spawn(move || {
+            barrier_bus.with_final_publication_barrier(|error| {
+                assert!(error.is_none());
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+        });
+        entered_rx.recv().unwrap();
+
+        let published = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let publisher_bus = bus.clone();
+        let publisher_done = published.clone();
+        let publisher = std::thread::spawn(move || {
+            publisher_bus.publish(SessionUpdate::AgentMessageChunk {
+                session_id: Uuid::new_v4(),
+                text: "must wait for final handoff".into(),
+            });
+            publisher_done.store(true, std::sync::atomic::Ordering::Release);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(
+            !published.load(std::sync::atomic::Ordering::Acquire),
+            "a stale publisher must not fit between the final check and handoff"
+        );
+
+        release_tx.send(()).unwrap();
+        barrier.join().unwrap();
+        publisher.join().unwrap();
+        assert!(published.load(std::sync::atomic::Ordering::Acquire));
+        assert!(bus
+            .last_persistence_error()
+            .is_some_and(|error| error.contains("publication refused")));
     }
 }

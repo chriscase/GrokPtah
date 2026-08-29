@@ -740,17 +740,47 @@ async fn drop_with_a_running_writer_retains_the_lock_and_refuses_a_replacement()
     assert!(lane.instance_lock().is_file());
 }
 
-/// The same `Drop`, with no writer in flight: the seal succeeds immediately and
-/// the lock is released, so an immediate replacement works.
+/// Even with no writer in flight, implicit `Drop` has not proved journal drain,
+/// hook execution, or task outcomes. It must retain the home; only ordered
+/// shutdown may release it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::await_holding_lock)]
-async fn drop_without_a_running_writer_releases_the_lock() {
+async fn drop_without_ordered_teardown_retains_the_lock() {
     let lane = Lane::new();
-    let (runtime, _session_id) = lane.boot();
+    let (runtime, session_id) = lane.boot();
+    let hook_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hook_observer = hook_ran.clone();
+    runtime
+        .register_shutdown_hook(
+            "pending-drop-hook",
+            Box::new(move || {
+                hook_observer.store(true, std::sync::atomic::Ordering::Release);
+                Ok(())
+            }),
+        )
+        .unwrap();
+    runtime
+        .event_bus()
+        .publish(SessionUpdate::AgentMessageChunk {
+            session_id,
+            text: "pending journal entry before implicit drop".into(),
+        });
     assert_eq!(runtime.in_flight_durable_writes(), 0);
+    let quarantined_before = grokptah_agent_bridge::quarantined_process_lock_count();
     drop(runtime);
-    let replacement = restart_same_home_now(&lane);
-    drop(replacement);
+    assert!(
+        !hook_ran.load(std::sync::atomic::Ordering::Acquire),
+        "Drop cannot pretend an ordered hook drain occurred"
+    );
+    assert_eq!(
+        grokptah_agent_bridge::quarantined_process_lock_count(),
+        quarantined_before + 1
+    );
+    assert!(AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    })
+    .is_err());
 }
 
 /// P1 from independent review: a failing shutdown hook must be reported, and
@@ -826,6 +856,53 @@ async fn shutdown_hook_failures_are_reported_not_swallowed() {
     );
 }
 
+/// A hook panic is a teardown failure, not permission to unwind past the lock
+/// decision. Ordered shutdown catches it, reports it, and quarantines.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn shutdown_hook_panics_are_reported_and_quarantine() {
+    let lane = Lane::new();
+    let (runtime, _session_id) = lane.boot();
+    runtime
+        .register_shutdown_hook(
+            "panicking-audit-close",
+            Box::new(|| panic!("synthetic hook panic")),
+        )
+        .unwrap();
+
+    let report = runtime.shutdown().await;
+    assert!(!report.is_clean());
+    assert!(report.flush_errors.iter().any(|error| {
+        error.contains("panicking-audit-close") && error.contains("synthetic hook panic")
+    }));
+    assert!(report.process_lock_retained_for_safety);
+    assert!(!report.process_lock_released);
+}
+
+/// Caller-owned JoinHandles may be dropped or consumed before shutdown. The
+/// lifecycle must independently retain a supervised panic and prevent a clean
+/// handoff after TaskTracker reaches zero.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn supervised_task_panics_survive_the_caller_join_handle() {
+    let lane = Lane::new();
+    let (runtime, _session_id) = lane.boot();
+    let task = runtime
+        .spawn_supervised("synthetic panicking task", async {
+            panic!("synthetic supervised panic")
+        })
+        .unwrap();
+    assert!(task.await.is_err());
+
+    let report = runtime.shutdown().await;
+    assert!(!report.is_clean());
+    assert_eq!(report.supervised_tasks_remaining, 0);
+    assert!(report.join_errors.iter().any(|error| {
+        error.contains("synthetic panicking task") && error.contains("synthetic supervised panic")
+    }));
+    assert!(report.process_lock_retained_for_safety);
+}
+
 /// Immediate same-home restart, repeatedly, each with real supervised work in
 /// flight. This is the loop the desktop soak performs once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -862,12 +939,11 @@ async fn immediate_same_home_restart_loop() {
     drop(final_runtime);
 }
 
-/// A runtime dropped without an ordered shutdown still closes the lifecycle
-/// before releasing the lock, so no surviving handle can mutate a home that a
-/// replacement process now owns.
+/// A runtime dropped without ordered shutdown closes stale handles and
+/// quarantines the home. A replacement remains refused for this process.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::await_holding_lock)]
-async fn dropped_runtime_closes_before_releasing_the_lock() {
+async fn dropped_runtime_closes_and_quarantines_before_replacement() {
     let lane = Lane::new();
     let (runtime, session_id) = lane.boot();
     let stale = runtime.handle();
@@ -877,9 +953,12 @@ async fn dropped_runtime_closes_before_releasing_the_lock() {
     assert!(stale.ensure_session_accepts_new_work(session_id).is_err());
     assert!(stale.ensure_orchestration_store().is_err());
 
-    let replacement = restart_same_home_now(&lane);
+    let replacement = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    assert!(replacement.is_err());
     assert!(stale.start().is_err());
-    drop(replacement);
 }
 
 // ---------------------------------------------------------------------------

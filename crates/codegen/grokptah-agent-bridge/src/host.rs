@@ -1078,7 +1078,9 @@ impl AgentHostHandle {
         &self,
         operation: &str,
         future: F,
-    ) -> Result<tokio_util::task::task_tracker::TrackedFuture<F>>
+    ) -> Result<
+        tokio_util::task::task_tracker::TrackedFuture<impl std::future::Future<Output = F::Output>>,
+    >
     where
         F: std::future::Future,
     {

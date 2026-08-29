@@ -1992,8 +1992,11 @@ async fn mcp_isolated_run_review_approval_and_restart_promotion() {
         })
         .unwrap();
     client.close_session().await.unwrap();
-    srv.stop_and_wait().await;
+    let server_stop = srv.stop_and_wait().await;
+    assert!(server_stop.fully_stopped, "{:?}", server_stop.errors);
     drop(orch);
+    let shutdown = host.shutdown().await;
+    assert!(shutdown.is_clean(), "{}", shutdown.operator_summary());
     drop(host);
 
     // Reopen the same durable home. The approval must remain usable without

@@ -31,10 +31,11 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
+use futures::FutureExt;
 use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -42,6 +43,14 @@ use tokio_util::task::TaskTracker;
 use crate::host::AgentHostHandle;
 use crate::instance_lock::InstanceLock;
 use crate::mcp_control::ControlServerHandle;
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_string())
+}
 
 /// The runtime that currently owns durable writes for each home, keyed by the
 /// home's instance-lock path.
@@ -250,6 +259,15 @@ pub(crate) struct HostLifecycle {
     /// lock is gone from `instance_lock`, but the home is *more* firmly held,
     /// not less — so ownership queries must still answer "held".
     lock_quarantined: AtomicBool,
+    /// Control servers removed from the attachment list for ordered shutdown
+    /// but not yet proven stopped. This count deliberately survives
+    /// cancellation of the shutdown future, so `Drop` cannot mistake a
+    /// detached join for a completed one and release the home.
+    control_servers_stopping: AtomicUsize,
+    /// Panics/cancellations observed inside supervised work. `TaskTracker`
+    /// proves completion, not success, so the lifecycle retains the failure
+    /// independently of caller-owned `JoinHandle`s.
+    supervised_failures: Arc<Mutex<Vec<String>>>,
 }
 
 /// Proof that the runtime holding it still owns durable-write authority for its
@@ -354,6 +372,8 @@ impl HostLifecycle {
             writes_sealed: std::sync::atomic::AtomicBool::new(false),
             owner_flush_thread: parking_lot::Mutex::new(None),
             lock_quarantined: AtomicBool::new(false),
+            control_servers_stopping: AtomicUsize::new(0),
+            supervised_failures: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -438,7 +458,20 @@ impl HostLifecycle {
     {
         let _admission = self.spawn_gate.read();
         self.ensure_open(operation)?;
-        Ok(self.tasks.spawn(future))
+        let operation = operation.to_string();
+        let failures = self.supervised_failures.clone();
+        Ok(self.tasks.spawn(async move {
+            match std::panic::AssertUnwindSafe(future).catch_unwind().await {
+                Ok(output) => output,
+                Err(payload) => {
+                    failures.lock().push(format!(
+                        "supervised task {operation} panicked: {}",
+                        panic_message(payload.as_ref())
+                    ));
+                    std::panic::resume_unwind(payload)
+                }
+            }
+        }))
     }
 
     /// Register a future with the shutdown join barrier without spawning it.
@@ -451,13 +484,32 @@ impl HostLifecycle {
         &self,
         operation: &str,
         future: F,
-    ) -> Result<tokio_util::task::task_tracker::TrackedFuture<F>>
+    ) -> Result<
+        tokio_util::task::task_tracker::TrackedFuture<impl std::future::Future<Output = F::Output>>,
+    >
     where
         F: std::future::Future,
     {
         let _admission = self.spawn_gate.read();
         self.ensure_open(operation)?;
-        Ok(self.tasks.track_future(future))
+        let operation = operation.to_string();
+        let failures = self.supervised_failures.clone();
+        Ok(self.tasks.track_future(async move {
+            match std::panic::AssertUnwindSafe(future).catch_unwind().await {
+                Ok(output) => output,
+                Err(payload) => {
+                    failures.lock().push(format!(
+                        "supervised future {operation} panicked: {}",
+                        panic_message(payload.as_ref())
+                    ));
+                    std::panic::resume_unwind(payload)
+                }
+            }
+        }))
+    }
+
+    fn supervised_failures(&self) -> Vec<String> {
+        self.supervised_failures.lock().clone()
     }
 
     /// Arm the join barrier. After this returns no further supervised task can
@@ -628,6 +680,8 @@ pub struct HostShutdownReport {
     pub already_complete: bool,
     /// Control servers whose accept loop was cancelled and joined.
     pub control_servers_stopped: usize,
+    /// Control servers/background workers that could not be proven joined.
+    pub control_servers_unjoined: usize,
     /// Supervised tasks still tracked at the moment admissions closed.
     pub supervised_tasks_at_quiesce: usize,
     /// Supervised tasks still tracked after the join barrier. Non-zero only
@@ -636,6 +690,9 @@ pub struct HostShutdownReport {
     /// True when supervised work did not finish inside the join timeout. The
     /// process lock is then released only if durable writes still sealed.
     pub join_timed_out: bool,
+    /// Panics, cancellations, and join failures retained independently of
+    /// caller-owned task handles.
+    pub join_errors: Vec<String>,
     /// True when no durable write can still be in progress. The process lock is
     /// never released without this.
     pub durable_writes_sealed: bool,
@@ -665,6 +722,8 @@ impl HostShutdownReport {
     /// durable writes sealed, nothing failed to flush, lock released, file kept.
     pub fn is_clean(&self) -> bool {
         !self.join_timed_out
+            && self.control_servers_unjoined == 0
+            && self.join_errors.is_empty()
             && self.supervised_tasks_remaining == 0
             && self.durable_writes_sealed
             && self.flush_errors.is_empty()
@@ -684,13 +743,15 @@ impl HostShutdownReport {
             );
         }
         format!(
-            "UNCLEAN: joinTimedOut={} tasksRemaining={} writesSealed={} writesInFlight={} \
-             lockRetainedForSafety={} errors={:?}",
+            "UNCLEAN: joinTimedOut={} serversUnjoined={} tasksRemaining={} writesSealed={} \
+             writesInFlight={} lockRetainedForSafety={} joinErrors={:?} errors={:?}",
             self.join_timed_out,
+            self.control_servers_unjoined,
             self.supervised_tasks_remaining,
             self.durable_writes_sealed,
             self.durable_writes_in_flight,
             self.process_lock_retained_for_safety,
+            self.join_errors,
             self.flush_errors,
         )
     }
@@ -1054,7 +1115,9 @@ impl HostRuntime {
         &self,
         operation: &str,
         future: F,
-    ) -> anyhow::Result<tokio_util::task::task_tracker::TrackedFuture<F>>
+    ) -> anyhow::Result<
+        tokio_util::task::task_tracker::TrackedFuture<impl std::future::Future<Output = F::Output>>,
+    >
     where
         F: std::future::Future,
     {
@@ -1094,20 +1157,54 @@ impl HostRuntime {
         //    still in flight is inside the join barrier below, and its attach
         //    will be refused.
         self.lifecycle.seal_task_admission();
+        let shutdown_deadline = tokio::time::Instant::now() + self.join_timeout;
         let servers: Vec<ControlServerHandle> = self.control_servers.lock().drain(..).collect();
-        let control_servers_stopped = servers.len();
-        for server in servers {
-            server.stop_and_wait().await;
+        self.lifecycle
+            .control_servers_stopping
+            .fetch_add(servers.len(), Ordering::AcqRel);
+        let control_servers_seen = servers.len();
+        let mut join_errors = Vec::new();
+        let mut control_servers_stopped = 0;
+        for mut server in servers {
+            let remaining =
+                shutdown_deadline.saturating_duration_since(tokio::time::Instant::now());
+            let result = server.stop_and_wait_bounded(remaining).await;
+            join_errors.extend(result.errors);
+            if result.fully_stopped {
+                control_servers_stopped += 1;
+                self.lifecycle
+                    .control_servers_stopping
+                    .fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        let control_servers_unjoined = self
+            .lifecycle
+            .control_servers_stopping
+            .load(Ordering::Acquire);
+        if control_servers_unjoined > 0
+            && !join_errors
+                .iter()
+                .any(|error| error.contains("control server"))
+        {
+            join_errors.push(format!(
+                "{control_servers_unjoined} control server(s) remain unjoined after an interrupted shutdown"
+            ));
+        }
+        if control_servers_stopped + control_servers_unjoined < control_servers_seen {
+            join_errors.push("control server stop accounting became inconsistent".to_string());
         }
 
         // 3. Cancel every in-flight unit of work, then join the supervised set.
         self.handle.cancel_all_activity().await;
         self.lifecycle.cancel_token().cancel();
         let supervised_tasks_at_quiesce = self.lifecycle.tasks().len();
-        let join_timed_out = tokio::time::timeout(self.join_timeout, self.lifecycle.tasks().wait())
-            .await
-            .is_err();
+        let supervised_join_timed_out =
+            tokio::time::timeout_at(shutdown_deadline, self.lifecycle.tasks().wait())
+                .await
+                .is_err();
         let supervised_tasks_remaining = self.lifecycle.tasks().len();
+        join_errors.extend(self.lifecycle.supervised_failures());
+        let join_timed_out = supervised_join_timed_out || control_servers_unjoined > 0;
 
         // 4. Drain the durable writer threads, *before* the seal.
         //
@@ -1154,7 +1251,7 @@ impl HostRuntime {
                 flush_errors.push(error);
             }
         }
-        if join_timed_out {
+        if supervised_join_timed_out {
             flush_errors.push(format!(
                 "{supervised_tasks_remaining} supervised task(s) did not finish within {:?}",
                 self.join_timeout
@@ -1182,11 +1279,20 @@ impl HostRuntime {
         };
         if durable_writes_sealed {
             self.lifecycle.open_owner_flush();
-            let _ = self.handle.stop();
+            if let Err(error) = self.handle.stop() {
+                flush_errors.push(format!("stopping the agent host failed: {error:#}"));
+            }
             flush_errors.extend(self.handle.flush_durable_state());
             for (name, hook) in hooks {
-                if let Err(error) = hook() {
-                    flush_errors.push(format!("shutdown hook {name} failed: {error:#}"));
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook)) {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        flush_errors.push(format!("shutdown hook {name} failed: {error:#}"));
+                    }
+                    Err(payload) => flush_errors.push(format!(
+                        "shutdown hook {name} panicked: {}",
+                        panic_message(payload.as_ref())
+                    )),
                 }
             }
             self.lifecycle.close_owner_flush();
@@ -1198,47 +1304,49 @@ impl HostRuntime {
             ));
         }
 
-        // A stale, unsupervised publisher racing the close is refused by the
-        // bus's publication seal and records a persistence error. Re-check at
-        // the final release boundary so even a race that lands after the first
-        // check prevents a falsely clean lock handoff.
-        if let Some(error) = self.handle().event_bus().last_persistence_error() {
-            let error =
-                format!("durable event journal degraded after sealing publication: {error}");
-            if !flush_errors.contains(&error) {
-                flush_errors.push(error);
-            }
-        }
+        // A stale publisher and the release decision share one lock. It is
+        // therefore impossible for a refused publication to land between the
+        // final health read and the process-lock handoff.
+        let (release_is_safe, process_lock_released) = self
+            .handle()
+            .event_bus()
+            .with_final_publication_barrier(|persistence_error| {
+                if let Some(error) = persistence_error {
+                    let error = format!(
+                        "durable event journal degraded after sealing publication: {error}"
+                    );
+                    if !flush_errors.contains(&error) {
+                        flush_errors.push(error);
+                    }
+                }
 
-        // 7. Stale handles must fail closed before the lock can be re-acquired.
-        self.lifecycle.mark_closed();
+                // 7. Stale handles must fail closed before the lock can be
+                // re-acquired.
+                self.lifecycle.mark_closed();
 
-        // The lock is released only when every guarantee held. Anything
-        // uncertain — an unjoined task that could still act, an unsealed
-        // writer, a failed flush or a lost audit record — retains it: refusing
-        // a replacement is always safer than handing it a home this process
-        // may still be writing.
-        let release_is_safe = durable_writes_sealed && !join_timed_out && flush_errors.is_empty();
-        let process_lock_released = if release_is_safe {
-            self.lifecycle.release_process_lock()
-        } else {
-            // Not "decline to release" — *quarantine*. Leaving the lock inside
-            // this runtime would hand the home on the moment the last handle
-            // to it was destroyed, which for a consuming `stop_and_wait` is
-            // immediately after this function returns. Moving it into process
-            // ownership is what makes the retention outlive every object
-            // (#455).
-            self.lifecycle.quarantine_process_lock();
-            false
-        };
+                let release_is_safe = durable_writes_sealed
+                    && !join_timed_out
+                    && control_servers_unjoined == 0
+                    && join_errors.is_empty()
+                    && flush_errors.is_empty();
+                let released = if release_is_safe {
+                    self.lifecycle.release_process_lock()
+                } else {
+                    self.lifecycle.quarantine_process_lock();
+                    false
+                };
+                (release_is_safe, released)
+            });
         let process_lock_held_after = self.lifecycle.process_lock_held();
 
         let report = HostShutdownReport {
             already_complete: false,
             control_servers_stopped,
+            control_servers_unjoined,
             supervised_tasks_at_quiesce,
             supervised_tasks_remaining,
             join_timed_out,
+            join_errors,
             durable_writes_sealed,
             durable_writes_in_flight,
             flush_errors,
@@ -1276,10 +1384,10 @@ impl Drop for HostRuntime {
     /// `Drop` cannot await, so it cannot join tasks. What it *can* do — and
     /// must — is make concurrent durable writers impossible before the lock
     /// becomes available: it closes the lifecycle, then seals durable-write
-    /// authority and waits, bounded, for the writes already running. The lock
-    /// is released only if that seal holds. If it does not, the lock is moved
-    /// into **process-owned quarantine** and a replacement process is refused
-    /// until this process exits.
+    /// authority and waits, bounded, for the writes already running. Because it
+    /// cannot prove journal drain, hooks, task outcomes, or server joins, it
+    /// always moves the lock into **process-owned quarantine**. Only the
+    /// ordered async shutdown path may release it.
     ///
     /// Quarantine, not mere retention, is what makes that promise true: the
     /// lock no longer lives in any object a caller can destroy, so dropping
@@ -1298,59 +1406,42 @@ impl Drop for HostRuntime {
             return;
         }
         self.lifecycle.begin_quiesce();
-        let attached_control_servers = self.control_servers.get_mut().len();
+        let attached_control_servers = self.control_servers.get_mut().len()
+            + self
+                .lifecycle
+                .control_servers_stopping
+                .load(Ordering::Acquire);
         for server in self.control_servers.get_mut().drain(..) {
             server.stop();
         }
         self.lifecycle.cancel_token().cancel();
-        let outstanding = self.lifecycle.tasks().len();
         self.lifecycle.seal_task_admission();
         self.lifecycle.mark_closed();
 
-        let sealed = self.lifecycle.seal_durable_writes(self.write_seal_timeout);
-
-        // Sealing durable writes is not enough to make a release safe. A
-        // supervised task that is still running can act *outside* the durable
-        // home — edit the user's workspace, send a physical provider request,
-        // drive Computer Use input, hold a shell — and none of that is bounded
-        // by the durable-write seal. Handing the lock to a replacement host
-        // while any such task is outstanding is exactly the split brain this
-        // seam exists to prevent, so `Drop` releases only when nothing is
-        // outstanding at all (#455). Until every effect is bound to this
-        // lifecycle (#454 / #463), "no supervised task" is the honest proxy
-        // for "no effect can still happen".
-        //
-        // Retaining is permanent for this process: `Drop` cannot await, so
-        // there is no later point at which it could re-check. The OS reclaims
-        // the lock when the process exits, and until then a replacement is
-        // refused. `shutdown().await` is the path that joins and releases.
+        let _sealed = self.lifecycle.seal_durable_writes(self.write_seal_timeout);
         let outstanding_after = self.lifecycle.tasks().len();
-        if !sealed || outstanding_after > 0 || attached_control_servers > 0 {
-            // Move the lock into process ownership before returning. `self` and
-            // every handle sharing this lifecycle may be destroyed moments from
-            // now; if the lock were still inside the lifecycle, that destruction
-            // would release it and admit exactly the replacement this branch
-            // exists to refuse.
-            self.lifecycle.quarantine_process_lock();
-            eprintln!(
-                "[grokptah] host runtime for {} dropped without an ordered shutdown: \
-                 {} durable write(s) in flight, {outstanding_after} supervised task(s), and \
-                 {attached_control_servers} unjoined control server(s) \
-                 outstanding. The instance lock is RETAINED for the life of this process so \
-                 no replacement can start beside work that may still act. Await \
-                 HostRuntime::shutdown() for an ordered stop.",
-                self.lifecycle.lock_path().display(),
-                self.lifecycle.in_flight_durable_writes(),
-            );
-            let _ = outstanding;
-            return;
-        }
-        self.lifecycle.release_process_lock();
+        // Even a zero-count snapshot cannot prove the ordered teardown duties
+        // (journal close, flush, hooks, join outcomes) ran. Implicit Drop is
+        // therefore always fail-closed.
+        self.lifecycle.quarantine_process_lock();
+        eprintln!(
+            "[grokptah] host runtime for {} dropped without an ordered shutdown: \
+             {} durable write(s) in flight, {outstanding_after} supervised task(s), and \
+             {attached_control_servers} unjoined control server(s). Ordered durable teardown \
+             was not proven, so the instance lock is RETAINED for the life of this process. \
+             Await HostRuntime::shutdown() for a releasable stop.",
+            self.lifecycle.lock_path().display(),
+            self.lifecycle.in_flight_durable_writes(),
+        );
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host::{AgentHost, HostConfig};
+    use crate::orchestration::{
+        OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, WorkspaceAllowlist,
+    };
     use std::sync::atomic::AtomicBool;
 
     fn lifecycle(dir: &std::path::Path) -> Arc<HostLifecycle> {
@@ -1358,6 +1449,86 @@ mod tests {
         let path = home.instance_lock_path();
         let lock = InstanceLock::try_acquire_at(&home).expect("acquire instance lock");
         HostLifecycle::new(Some(lock), path)
+    }
+
+    fn runtime_with_orchestration() -> (tempfile::TempDir, HostRuntime, Arc<OrchestrationService>) {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_home = crate::discover::RuntimeHome::from_path(dir.path().join(".grokptah"))
+            .expect("runtime home");
+        let runtime =
+            AgentHost::create_with_runtime_home(HostConfig::default(), runtime_home.clone())
+                .expect("host runtime");
+        runtime.start().expect("start host");
+        let orch = OrchestrationService::new(
+            runtime.handle(),
+            runtime.event_bus(),
+            OrchStore::open(runtime_home.orchestration_root()).expect("orchestration store"),
+            OrchestrationConfig {
+                bearer_token: "test-token".into(),
+                allowlist: WorkspaceAllowlist::new([dir.path().to_path_buf()]),
+                max_concurrent_runs: 1,
+                bounds: RunBounds::default(),
+            },
+        );
+        (dir, runtime, orch)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_uncooperative_control_tail_is_bounded_and_quarantined() {
+        let (_dir, mut runtime, orch) = runtime_with_orchestration();
+        runtime.set_join_timeout(std::time::Duration::from_millis(30));
+        assert!(runtime
+            .attach_control_server(ControlServerHandle::uncooperative_for_test(orch))
+            .is_ok());
+
+        let started = tokio::time::Instant::now();
+        let report = runtime.shutdown().await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(report.control_servers_unjoined, 1);
+        assert!(report.join_timed_out);
+        assert!(report
+            .join_errors
+            .iter()
+            .any(|error| error.contains("control server task did not stop")));
+        assert!(report.process_lock_retained_for_safety);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_shutdown_after_server_drain_cannot_evade_quarantine() {
+        let (dir, mut runtime, orch) = runtime_with_orchestration();
+        runtime.set_join_timeout(std::time::Duration::from_secs(30));
+        assert!(runtime
+            .attach_control_server(ControlServerHandle::uncooperative_for_test(orch))
+            .is_ok());
+        let quarantined_before = quarantined_process_lock_count();
+
+        let mut shutdown = Box::pin(runtime.shutdown());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(40), &mut shutdown)
+                .await
+                .is_err()
+        );
+        drop(shutdown);
+        assert_eq!(
+            runtime
+                .lifecycle
+                .control_servers_stopping
+                .load(Ordering::Acquire),
+            1
+        );
+        let resumed = runtime.shutdown().await;
+        assert_eq!(resumed.control_servers_unjoined, 1);
+        assert!(resumed.join_timed_out);
+        assert!(resumed.process_lock_retained_for_safety);
+        drop(runtime);
+        assert_eq!(quarantined_process_lock_count(), quarantined_before + 1);
+
+        let replacement_home =
+            crate::discover::RuntimeHome::from_path(dir.path().join(".grokptah"))
+                .expect("replacement home");
+        assert!(
+            AgentHost::create_with_runtime_home(HostConfig::default(), replacement_home).is_err()
+        );
     }
 
     /// The join barrier, isolated from any agent work: a task that has already

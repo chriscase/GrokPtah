@@ -272,6 +272,8 @@ async fn session_lifecycle_prompt_streams_message() {
         runs[0].aggregates.verification,
         Some(history[0].evidence.clone())
     );
+    let shutdown = host.shutdown().await;
+    assert!(shutdown.is_clean(), "{}", shutdown.operator_summary());
     drop(host);
 
     let restored_host =
@@ -286,6 +288,12 @@ async fn session_lifecycle_prompt_streams_message() {
     let restored_runs = restored_host.list_session_runs(session.id).unwrap();
     assert_eq!(restored_runs.len(), 1);
     assert_eq!(restored_runs[0].state, RunState::Completed);
+    let restored_shutdown = restored_host.shutdown().await;
+    assert!(
+        restored_shutdown.is_clean(),
+        "{}",
+        restored_shutdown.operator_summary()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

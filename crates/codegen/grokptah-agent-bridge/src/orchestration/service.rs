@@ -123,6 +123,14 @@ pub(crate) struct LiveRunScope {
     pub end_seq: Option<u64>,
 }
 
+/// Bounded stop evidence for the threads and tasks owned by one orchestration
+/// service. Errors prove the stop was not clean; `fully_stopped=false` proves
+/// authority must remain quarantined because work may still be live.
+pub struct BackgroundStopReport {
+    pub fully_stopped: bool,
+    pub errors: Vec<String>,
+}
+
 impl Drop for OrchestrationService {
     fn drop(&mut self) {
         if let Some(watcher) = self.scheduler_watcher.get_mut().take() {
@@ -1439,14 +1447,59 @@ impl OrchestrationService {
     /// Stop background recovery before a caller reopens the shared ledger.
     /// This is separate from `Drop` because an async service shutdown must
     /// wait for the supervisor task to release its store handle.
-    pub async fn stop_background_tasks(&self) {
+    pub async fn stop_background_tasks(&self) -> BackgroundStopReport {
+        self.stop_background_tasks_bounded(std::time::Duration::from_secs(30))
+            .await
+    }
+
+    pub(crate) async fn stop_background_tasks_bounded(
+        &self,
+        timeout: std::time::Duration,
+    ) -> BackgroundStopReport {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut report = BackgroundStopReport {
+            fully_stopped: true,
+            errors: Vec::new(),
+        };
         let supervisor = self.workload_supervisor.lock().take();
-        if let Some(mut supervisor) = supervisor {
-            supervisor.stop_and_wait();
+        if let Some(supervisor) = supervisor {
+            let join = tokio::task::spawn_blocking(move || {
+                let mut supervisor = supervisor;
+                supervisor.stop_and_wait()
+            });
+            match tokio::time::timeout_at(deadline, join).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(error))) => report.errors.push(error),
+                Ok(Err(error)) => report
+                    .errors
+                    .push(format!("workload supervisor join task failed: {error}")),
+                Err(_) => {
+                    report.fully_stopped = false;
+                    report.errors.push(format!(
+                        "workload supervisor did not stop within {timeout:?}"
+                    ));
+                }
+            }
         }
         let supervisor = self.routine_supervisor.lock().take();
-        if let Some(mut supervisor) = supervisor {
-            supervisor.stop_and_wait();
+        if let Some(supervisor) = supervisor {
+            let join = tokio::task::spawn_blocking(move || {
+                let mut supervisor = supervisor;
+                supervisor.stop_and_wait()
+            });
+            match tokio::time::timeout_at(deadline, join).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(error))) => report.errors.push(error),
+                Ok(Err(error)) => report
+                    .errors
+                    .push(format!("routine supervisor join task failed: {error}")),
+                Err(_) => {
+                    report.fully_stopped = false;
+                    report.errors.push(format!(
+                        "routine supervisor did not stop within {timeout:?}"
+                    ));
+                }
+            }
         }
         // Abort *and join*: an aborted watcher has not released its store
         // handle or its event subscription until its task has actually
@@ -1458,10 +1511,23 @@ impl OrchestrationService {
         ];
         for watcher in watchers.into_iter().flatten() {
             watcher.abort();
-            let _ = watcher.await;
+            match tokio::time::timeout_at(deadline, watcher).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) if error.is_cancelled() => {}
+                Ok(Err(error)) => report
+                    .errors
+                    .push(format!("background watcher failed to join: {error}")),
+                Err(_) => {
+                    report.fully_stopped = false;
+                    report.errors.push(format!(
+                        "background watcher did not stop within {timeout:?}"
+                    ));
+                }
+            }
         }
         self.native_executor.lock().enabled = false;
         self.manager_supervisor.lock().enabled = false;
+        report
     }
 
     pub fn store(&self) -> &OrchStore {
