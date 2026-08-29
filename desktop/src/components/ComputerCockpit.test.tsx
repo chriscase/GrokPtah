@@ -245,6 +245,15 @@ beforeEach(() => {
     screenRecording: "granted",
     accessibility: "granted",
     detail: null,
+    executor: {
+      kind: "in_process_host",
+      bundleId: "com.chriscase.grokptah",
+      helperBundleId: "com.chriscase.grokptah.computer-use-helper",
+      version: "0.1.0",
+      helperVersion: "0.1.0",
+      signingClass: "uninspected",
+      tccPrincipal: "com.chriscase.grokptah",
+    },
   });
   mocks.requestPermission.mockResolvedValue("granted");
   mocks.targets.mockResolvedValue([]);
@@ -342,6 +351,15 @@ describe("ComputerCockpit", () => {
   });
 
   it("blocks native discovery until required permissions are granted", async () => {
+    const executor = {
+      kind: "in_process_host" as const,
+      bundleId: "com.chriscase.grokptah",
+      helperBundleId: "com.chriscase.grokptah.computer-use-helper",
+      version: "0.1.0",
+      helperVersion: "0.1.0",
+      signingClass: "uninspected" as const,
+      tccPrincipal: "com.chriscase.grokptah",
+    };
     mocks.status
       .mockResolvedValueOnce({
         platformId: "macos",
@@ -350,6 +368,7 @@ describe("ComputerCockpit", () => {
         screenRecording: "missing",
         accessibility: "granted",
         detail: "Screen Recording is required before window discovery.",
+        executor,
       })
       .mockResolvedValueOnce({
         platformId: "macos",
@@ -358,6 +377,7 @@ describe("ComputerCockpit", () => {
         screenRecording: "granted",
         accessibility: "granted",
         detail: null,
+        executor,
       });
     render(<ComputerCockpit {...props} />);
 
@@ -369,6 +389,12 @@ describe("ComputerCockpit", () => {
         /Codex Computer Use and Terminal grants do not grant GrokPtah access/,
       ),
     ).toBeTruthy();
+    expect(
+      await screen.findByTestId("computer-executor-identity"),
+    ).toHaveTextContent("com.chriscase.grokptah");
+    expect(screen.getByTestId("computer-executor-identity")).toHaveTextContent(
+      "not packaged helper qualification",
+    );
     fireEvent.click(
       await screen.findByRole("button", {
         name: "Request Screen Recording permission",

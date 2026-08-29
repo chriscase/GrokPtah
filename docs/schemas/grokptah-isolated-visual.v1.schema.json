@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://grokptah.dev/schemas/grokptah-isolated-visual.v1.schema.json",
+  "title": "GrokPtah isolated visual qualification evidence v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "kind",
+    "eligibility",
+    "virtualizationFrameworkLaunched",
+    "simulatorEvidenceIneligibleForVmQualification",
+    "sourceCompilationIneligibleForVmQualification"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "kind": { "const": "isolatedVisualQualification" },
+    "baseSha": { "type": "string", "minLength": 40, "maxLength": 40 },
+    "issue": { "const": 288 },
+    "eligibility": {
+      "type": "string",
+      "enum": ["pass", "partial", "fail_closed"]
+    },
+    "virtualizationFrameworkLaunched": { "type": "boolean" },
+    "simulatorEvidenceIneligibleForVmQualification": { "const": true },
+    "sourceCompilationIneligibleForVmQualification": { "const": true },
+    "evidenceClass": {
+      "type": "string",
+      "enum": ["simulator_ineligible", "source_compilation_ineligible", "virtualization_framework"]
+    },
+    "preflight": { "type": "object" },
+    "launchError": { "type": "string" },
+    "note": { "type": "string" },
+    "continuation": { "type": "object" }
+  }
+}
