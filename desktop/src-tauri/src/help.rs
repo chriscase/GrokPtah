@@ -165,13 +165,11 @@ impl HelpState {
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HelpInner> {
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, HelpInner>, HelpError> {
         // A poisoned lock means a previous command panicked mid-mutation. The
         // state is then of unknown validity, so Help refuses rather than
         // serving from it.
-        self.inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.inner.lock().map_err(|_| UNAVAILABLE)
     }
 }
 
@@ -251,7 +249,7 @@ pub fn help_ask(
     state: tauri::State<'_, HelpState>,
     ask: HelpAskInput,
 ) -> Result<HelpProjection, HelpError> {
-    let mut inner = state.lock();
+    let mut inner = state.lock()?;
     let now = now_ms();
     let Some(principal) = inner.authority.principal_for(&ask.session) else {
         return Err(UNAVAILABLE);
@@ -307,7 +305,7 @@ pub fn help_follow(
     state: tauri::State<'_, HelpState>,
     follow: HelpHandleInput,
 ) -> Result<HelpProjection, HelpError> {
-    let mut inner = state.lock();
+    let mut inner = state.lock()?;
     let now = now_ms();
     let HelpInner {
         authority,
@@ -330,7 +328,7 @@ pub fn help_cancel(
     state: tauri::State<'_, HelpState>,
     cancel: HelpHandleInput,
 ) -> Result<HelpProjection, HelpError> {
-    let mut inner = state.lock();
+    let mut inner = state.lock()?;
     let now = now_ms();
     // Check ownership before acting: cancelling by a handle alone would let a
     // leaked handle stop another session's run.
@@ -350,9 +348,9 @@ pub fn help_cancel(
 
 /// The executor's fixed bounds, so a surface renders honest limits.
 #[tauri::command]
-pub fn help_bounds(state: tauri::State<'_, HelpState>) -> BoundsProjection {
-    let inner = state.lock();
-    inner.executor.bounds().projection()
+pub fn help_bounds(state: tauri::State<'_, HelpState>) -> Result<BoundsProjection, HelpError> {
+    let inner = state.lock()?;
+    Ok(inner.executor.bounds().projection())
 }
 
 /// The corpus this session may see, filtered by the host.
@@ -367,7 +365,7 @@ pub fn help_visible_corpus(
     state: tauri::State<'_, HelpState>,
     session: String,
 ) -> Result<Corpus, HelpError> {
-    let inner = state.lock();
+    let inner = state.lock()?;
     let Some(principal) = inner.authority.principal_for(&session) else {
         return Err(UNAVAILABLE);
     };
@@ -380,8 +378,8 @@ pub fn help_visible_corpus(
 /// table, and a token the host does not recognise resolves to nothing — a
 /// denial, never a promotion.
 #[tauri::command]
-pub fn help_session(state: tauri::State<'_, HelpState>) -> String {
-    state.lock().session_token.clone()
+pub fn help_session(state: tauri::State<'_, HelpState>) -> Result<String, HelpError> {
+    Ok(state.lock()?.session_token.clone())
 }
 
 #[cfg(test)]
@@ -395,7 +393,7 @@ mod tests {
     /// Build a request the way the host actually builds one, so the test
     /// cannot pass against a shape the contract no longer has.
     fn real_request(state: &HelpState) -> HelpRequest {
-        let mut inner = state.lock();
+        let mut inner = state.lock().expect("healthy Help state");
         let token = inner.session_token.clone();
         let principal = inner
             .authority
@@ -426,9 +424,13 @@ mod tests {
     #[test]
     fn an_ask_resolves_to_unavailable_rather_than_a_fabricated_answer() {
         let state = state();
-        let session = state.lock().session_token.clone();
+        let session = state
+            .lock()
+            .expect("healthy Help state")
+            .session_token
+            .clone();
         let chunk_ids: Vec<String> = {
-            let inner = state.lock();
+            let inner = state.lock().expect("healthy Help state");
             let principal = inner
                 .authority
                 .principal_for(&session)
@@ -444,7 +446,7 @@ mod tests {
         };
         // Drive the same path the command drives, without Tauri's state
         // wrapper, so the assertion is about Help and not about the framework.
-        let mut inner = state.lock();
+        let mut inner = state.lock().expect("healthy Help state");
         let now = now_ms();
         let principal = inner
             .authority
@@ -501,7 +503,12 @@ mod tests {
     #[test]
     fn bounds_report_no_tools_history_workspace_or_fallback() {
         let state = state();
-        let bounds = state.lock().executor.bounds().projection();
+        let bounds = state
+            .lock()
+            .expect("healthy Help state")
+            .executor
+            .bounds()
+            .projection();
         assert!(!bounds.tools_enabled);
         assert!(!bounds.history_enabled);
         assert!(!bounds.workspace_enabled);
@@ -512,14 +519,14 @@ mod tests {
     #[test]
     fn an_unknown_session_is_refused_the_corpus() {
         let state = state();
-        let inner = state.lock();
+        let inner = state.lock().expect("healthy Help state");
         assert!(inner.authority.principal_for("not-a-session").is_none());
     }
 
     #[test]
     fn the_visible_corpus_carries_nothing_above_the_ceiling() {
         let state = state();
-        let inner = state.lock();
+        let inner = state.lock().expect("healthy Help state");
         let token = inner.session_token.clone();
         let principal = inner
             .authority
@@ -541,9 +548,48 @@ mod tests {
     #[test]
     fn a_handle_from_one_session_is_not_readable_by_another() {
         let state = state();
-        let inner = state.lock();
+        let inner = state.lock().expect("healthy Help state");
         // No run exists, so any handle is unknown; the point is that the
         // lookup is by (session, handle) and not by handle alone.
         assert!(projection_for(&inner, "session-a", "help-1").is_err());
+    }
+
+    #[test]
+    fn a_poisoned_state_is_never_resumed() {
+        let state = state();
+        let original_session = state
+            .lock()
+            .expect("healthy Help state")
+            .session_token
+            .clone();
+
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut inner = state.inner.lock().expect("healthy Help mutex");
+            // Model a command that changed authority-adjacent state and then
+            // panicked before it could restore its invariants.
+            inner.session_token = "partially-mutated-session".to_string();
+            panic!("hostile command panic while holding Help state");
+        }));
+        assert!(poisoned.is_err(), "the hostile panic was not observed");
+        assert!(state.inner.is_poisoned(), "the mutex was not poisoned");
+
+        let error = match state.lock() {
+            Err(error) => error,
+            Ok(_) => panic!("poisoned Help state was resumed"),
+        };
+        assert_eq!(error.to_string(), UNAVAILABLE.to_string());
+
+        // Inspecting through PoisonError is test-only proof that the poisoned
+        // value really differs from the last known-good value. Production
+        // code must never call into_inner/get_ref and resume this state.
+        let poisoned_guard = match state.inner.lock() {
+            Err(error) => error,
+            Ok(_) => panic!("mutex unexpectedly recovered from poison"),
+        };
+        assert_ne!(poisoned_guard.get_ref().session_token, original_session);
+        assert_eq!(
+            poisoned_guard.get_ref().session_token,
+            "partially-mutated-session"
+        );
     }
 }
