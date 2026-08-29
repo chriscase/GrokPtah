@@ -172,10 +172,97 @@ deterministic simulator. Its report is redacted and explicitly records that no a
 | Stale frame or invented element/action | Exact observation ID, enabled element, sensitivity, and advertised action are rechecked |
 | Cross-session qualification reuse | Ephemeral authority is keyed to the exact session and model |
 | Model or provider-route change | In-flight inference is cancelled and ephemeral authority is cleared |
+| Same-route capability change (tier, provenance, schema, credential, policy) | The capability generation moves and the binding stops validating — see [Provider capability generation](#provider-capability-generation-458) |
 | Duplicate/concurrent model requests | One Computer model operation may run per session |
 | Stop, Take over, or run change during inference | The request is cancelled; any late proposal fails run/version/observation revalidation |
 | Completion with hidden action arguments | Unknown or action-bearing completion fields are rejected |
 | Valid action proposal | It is staged visibly and still requires the same local one-use approval as a manual action |
+
+### Provider capability generation (#458)
+
+A route fingerprint — base URL, wire model, dialect — is stable across exactly the changes that
+matter. A provider can keep serving the same endpoint and the same wire model while the capability
+record behind it is rewritten: a measured tier replaced by a declared one, a schema bumped, a
+credential rotated to a different principal, an operator policy narrowed, a requalification failing
+outright. None of that moves the fingerprint, so a session qualified once used to keep
+model-action authority it no longer had.
+
+Session qualification is now bound to a **capability generation**: a secret-free binding of
+everything that must still be true for a qualification to still mean what it meant when it was
+taken. Two halves are checked, and they guard different failures. The generation stamp — an
+authority id drawn at process start plus a monotonic counter — catches events that revoke
+authority without changing any observable fact (explicit revocation, failed requalification,
+process restart). The capability digest catches drift in the facts themselves.
+
+The digest binds:
+
+| Bound input | Why |
+|---|---|
+| Normalized route identity (provider, base URL, wire model, dialect) | The original binding, preserved |
+| Effective tier *after* operator policy | A downgrade must not be inheritable |
+| Provenance, including which declared trust was honoured | Declared and measured are not interchangeable |
+| Qualification schema id and version | A change to what qualification proves retires old proofs |
+| Credential incarnation (secret-free principal fingerprint + monotonic incarnation) | Rotation, and deletion followed by re-adding identical material |
+| Policy/allowlist revision | An operator narrowing takes effect immediately |
+| Assurance profile | A qualification is valid only at the profile it was taken under |
+| Measured or signed qualification evidence digest | The proof itself, without the transcript |
+
+The binding is re-validated at every boundary: qualification, observation, model proposal,
+staging, approval, lease acquisition, live-frame delivery, and dispatch. Dispatch and live-frame
+delivery re-derive the capability facts from live state **at the instant of the call**, so a
+downgrade that lands mid-operation is refused before the action becomes physical and before the
+next frame of screen content leaves the host, rather than at the next operation.
+
+A binding reference is secret-free and confers nothing on its own: the authority half lives only
+in memory. A reference persisted in a run record and restored after a restart therefore names
+nothing, is refused, and is quarantined as needing explicit re-establishment. Nothing promotes a
+quarantined qualification in place.
+
+Every refusal is one value with one message. A foreign binding, an unknown binding, a revoked
+binding and a stale binding are indistinguishable, so a denial cannot be used to probe which
+qualifications exist on the host.
+
+Generation advance is checked before any mutation. On exhaustion nothing is mutated, the counter
+neither saturates nor wraps, and the authority refuses every boundary from then on — a host that
+cannot prove a revocation does not grant.
+
+#### Declared capability is not evidence
+
+A `Measured` capability statement is the record of a probe that actually ran. A `Declared` one is a
+statement someone wrote down. The deployment must say which it means:
+
+| `GROKPTAH_COMPUTER_DECLARED_TRUST_PROVENANCE` | Behaviour |
+|---|---|
+| unset (default) | Declared capability qualifies **observation only**. Whatever tier the record claims, it can never become durable action authority. |
+| set to a provenance name | Declared capability may carry action authority. The name is published in the binding and bound into the digest, so withdrawing or changing the trust invalidates every binding taken under it. |
+
+The `high_assurance` profile does not honour declared trust at all, even when configured.
+
+`GROKPTAH_COMPUTER_ASSURANCE_PROFILE` selects `economy`, `balanced` (default), or
+`high_assurance`. The three profiles check the **same** boundaries, produce the same
+indistinguishable refusal, and bind the same digest; they differ only in how long a qualification
+may stand, how many dispatches it may authorize, and what evidence class the deployment insists on:
+
+| Profile | Qualification lifetime | Dispatches per qualification | Minimum action evidence | Honours declared trust |
+|---|---|---|---|---|
+| `economy` | 5 min | 8 | measured | yes |
+| `balanced` | 15 min | 32 | measured | yes |
+| `high_assurance` | 2 min | 1 | signed | no |
+
+An unrecognised profile name narrows to `high_assurance` rather than leaving the deployment on
+something broader than the operator meant. Changing the profile or the trust policy advances the
+generation, so bindings taken under the old setting stop validating immediately.
+
+| Adversarial condition | Fail-closed behavior |
+|---|---|
+| Same-route tier downgrade between observation and dispatch | Refused at dispatch; the backend is never called |
+| Measured capability rewritten to declared | Tier resolves to observation; action boundaries refuse |
+| Credential rotated to a different principal mid-run | Every standing binding is retired at the rotation |
+| Credential deleted and re-added with identical material | The incarnation advances; the old authority is not restored |
+| Requalification failure | The standing binding is retired before the next boundary |
+| Schema bump or operator policy change | Digest and generation both move; bindings refuse |
+| Restart with a persisted binding reference | Names nothing; quarantined for explicit re-establishment |
+| Generation exhaustion | Nothing mutates, nothing wraps, every boundary refuses |
 
 ## macOS observation and semantic action slices (#269, #270)
 

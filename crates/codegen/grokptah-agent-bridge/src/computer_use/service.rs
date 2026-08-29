@@ -7,6 +7,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use super::capability_gate::{ComputerCapabilityGate, OperatorOnlyCapabilityGate};
 use super::policy::ComputerPolicy;
 use super::projection::{
     not_available, project_events, project_run_at, ComputerRunCapacity, ComputerRunEventPage,
@@ -18,20 +19,121 @@ use super::types::{
     ComputerControlDisposition, ComputerError, ComputerErrorCode, ComputerObservation,
     ComputerResult, ComputerRun, ComputerRunState, ComputerTarget, ComputerUseLimits,
 };
+use crate::capability_authority::{CapabilityBindingRef, CapabilityBoundary};
 
 pub struct ComputerUseService {
     backend: Arc<dyn ComputerBackend>,
     store: ComputerStore,
     policy: ComputerPolicy,
+    capability_gate: Arc<dyn ComputerCapabilityGate>,
 }
 
 impl ComputerUseService {
+    /// A kernel with no provider capability authority wired to it.
+    ///
+    /// It drives operator-authorized runs exactly as before. A run that
+    /// carries model authority cannot lease, deliver a frame, or dispatch
+    /// through it — see [`OperatorOnlyCapabilityGate`].
     pub fn new(backend: Arc<dyn ComputerBackend>, store: ComputerStore) -> Self {
         Self {
             backend,
             store,
             policy: ComputerPolicy,
+            capability_gate: Arc::new(OperatorOnlyCapabilityGate),
         }
+    }
+
+    /// Wires a live provider capability authority to this kernel (#458).
+    pub fn with_capability_gate(mut self, gate: Arc<dyn ComputerCapabilityGate>) -> Self {
+        self.capability_gate = gate;
+        self
+    }
+
+    /// Attaches model authority to a run, or replaces the authority it holds.
+    ///
+    /// This is the staging boundary: the point where a model's proposal stops
+    /// being a suggestion and becomes something this kernel will lease and
+    /// dispatch on. The binding is validated before it is written, so a
+    /// binding that is already stale never lands on a run in the first place.
+    pub fn bind_model_authority(
+        &self,
+        request_id: &str,
+        run_id: &str,
+        expected_version: u64,
+        binding: CapabilityBindingRef,
+    ) -> ComputerResult<ComputerRun> {
+        validate_id("run_id", run_id)?;
+        let payload = json!({
+            "runId": run_id,
+            "expectedVersion": expected_version,
+            "bindingId": binding.binding_id,
+            "digest": binding.digest,
+        });
+        if let Some(replayed) = self.begin_mutation(request_id, "bind_model_authority", &payload)? {
+            return replayed;
+        }
+        let result = self
+            .store
+            .update_run(run_id, |run| {
+                ensure_version(run, expected_version)?;
+                if run.state.is_terminal() {
+                    return Err(ComputerError::new(
+                        ComputerErrorCode::InvalidState,
+                        "computer run is not accepting model authority",
+                    ));
+                }
+                if run.control_disposition == ComputerControlDisposition::OperatorTakeover {
+                    return Err(ComputerError::new(
+                        ComputerErrorCode::InvalidState,
+                        "operator takeover is absorbing; create a new computer run",
+                    ));
+                }
+                self.capability_gate.authorize(
+                    CapabilityBoundary::Staging,
+                    run.owner_session_id,
+                    Some(&binding),
+                )?;
+                run.capability_binding = Some(binding.clone());
+                run.record_audit("bind_model_authority", "bound", None, None, None);
+                Ok(())
+            })
+            .and_then(|run| run.ok_or_else(unknown_run));
+        if let Err(error) = &result {
+            self.record_denial(run_id, "bind_model_authority", None, error);
+        }
+        self.finish_mutation(request_id, &result)?;
+        result
+    }
+
+    /// Drops any model authority attached to a run, leaving it operator-driven.
+    pub fn clear_model_authority(
+        &self,
+        request_id: &str,
+        run_id: &str,
+        expected_version: u64,
+    ) -> ComputerResult<ComputerRun> {
+        validate_id("run_id", run_id)?;
+        let payload = json!({ "runId": run_id, "expectedVersion": expected_version });
+        if let Some(replayed) =
+            self.begin_mutation(request_id, "clear_model_authority", &payload)?
+        {
+            return replayed;
+        }
+        let result = self
+            .store
+            .update_run(run_id, |run| {
+                ensure_version(run, expected_version)?;
+                if run.capability_binding.take().is_some() {
+                    run.record_audit("clear_model_authority", "cleared", None, None, None);
+                }
+                Ok(())
+            })
+            .and_then(|run| run.ok_or_else(unknown_run));
+        if let Err(error) = &result {
+            self.record_denial(run_id, "clear_model_authority", None, error);
+        }
+        self.finish_mutation(request_id, &result)?;
+        result
     }
 
     pub fn capabilities(&self) -> super::types::ComputerCapabilities {
@@ -219,6 +321,14 @@ impl ComputerUseService {
                         "operator takeover is absorbing; create a new computer run",
                     ));
                 }
+                // The action grant *is* the lease: bounded, expiring, and
+                // use-counted. A model-driven run may not take one out on a
+                // capability that is no longer current.
+                self.capability_gate.authorize(
+                    CapabilityBoundary::Lease,
+                    run.owner_session_id,
+                    run.capability_binding.as_ref(),
+                )?;
                 self.policy.authorize_grant(run, &grant, Utc::now())?;
                 run.grant = Some(grant.clone());
                 run.last_error = None;
@@ -262,6 +372,11 @@ impl ComputerUseService {
                     budget_error = Some(error);
                     return Ok(());
                 }
+                self.capability_gate.authorize(
+                    CapabilityBoundary::Observation,
+                    run.owner_session_id,
+                    run.capability_binding.as_ref(),
+                )?;
                 self.policy.authorize_observation(run, now)?;
                 run.transition(ComputerRunState::Observing)?;
                 run.record_audit("observe", "started", None, None, None);
@@ -292,6 +407,16 @@ impl ComputerUseService {
                             observation.validate(&prepared.limits)
                         }
                         .and_then(|()| self.policy.authorize_observation_exposure(&observation))
+                        // Every frame, not just the first. Screen content is
+                        // leaving the host under model authority, so the
+                        // capability is re-derived at this exact delivery.
+                        .and_then(|()| {
+                            self.capability_gate.authorize(
+                                CapabilityBoundary::LiveFrame,
+                                prepared.owner_session_id,
+                                prepared.capability_binding.as_ref(),
+                            )
+                        })
                         .map(|()| observation);
                         match validated {
                             Ok(observation) => match self.commit_observation(run_id, observation) {
@@ -404,14 +529,32 @@ impl ComputerUseService {
                     .clone()
                     .expect("prepared action has an observation");
                 let control_epoch = prepared.control_epoch;
-                let outcome = self.backend.act(run_id, &observation, &action).await;
-                match outcome {
-                    Ok(outcome) => {
-                        self.commit_action(run_id, &action, &observation, control_epoch, outcome)
-                    }
-                    Err(error) => {
-                        self.fail_inflight(run_id, "act", &error)?;
-                        Err(error)
+                // The last instant before the action becomes physical. A
+                // downgrade, revocation, or credential rotation that landed
+                // while this run was being prepared is refused here rather
+                // than after the screen has already changed.
+                let dispatch = self.capability_gate.authorize(
+                    CapabilityBoundary::Dispatch,
+                    prepared.owner_session_id,
+                    prepared.capability_binding.as_ref(),
+                );
+                if let Err(error) = dispatch {
+                    self.fail_inflight(run_id, "act", &error)?;
+                    Err(error)
+                } else {
+                    let outcome = self.backend.act(run_id, &observation, &action).await;
+                    match outcome {
+                        Ok(outcome) => self.commit_action(
+                            run_id,
+                            &action,
+                            &observation,
+                            control_epoch,
+                            outcome,
+                        ),
+                        Err(error) => {
+                            self.fail_inflight(run_id, "act", &error)?;
+                            Err(error)
+                        }
                     }
                 }
             }
@@ -806,6 +949,10 @@ fn revoke_authority(run: &mut ComputerRun) {
         grant.revoked_at.get_or_insert_with(Utc::now);
     }
     run.current_observation = None;
+    // Model authority is revoked with everything else. A paused, taken-over,
+    // limit-reached or terminal run does not keep a standing claim that a
+    // provider capability authorized it; resuming requires staging it again.
+    run.capability_binding = None;
 }
 
 fn unknown_run() -> ComputerError {

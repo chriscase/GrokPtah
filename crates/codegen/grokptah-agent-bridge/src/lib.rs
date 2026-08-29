@@ -5,6 +5,7 @@
 
 mod agents_personas;
 mod auth_store;
+pub mod capability_authority;
 pub mod certification;
 mod completion;
 mod computer_agent;
@@ -102,6 +103,11 @@ pub use host_helpers::{replay_xai_provider_contract_on_loopback, ProviderContrac
 
 pub use memory::{MemoryFact, MemoryScope};
 
+pub use capability_authority::{
+    AssuranceCeilings, AssuranceProfile, BoundarySet, CapabilityBoundary, CapabilityDenied,
+    CapabilityDigest, CapabilityProvenance, DeclaredCapabilityPolicy, QualificationEvidence,
+    QualificationEvidenceKind, QualificationSchema,
+};
 pub use completion::{
     enrich_terminal_handoff, CompletionClaims, CompletionEvidence, CompletionObservations,
     CompletionUsage,

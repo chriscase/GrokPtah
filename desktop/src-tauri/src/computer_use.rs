@@ -89,11 +89,16 @@ impl DesktopComputerUse {
                 Some(format!("Computer Use storage is unavailable: {error}")),
             ),
         };
+        // Every kernel this cockpit drives is wired to the host's live
+        // provider capability authority (#458), so a model-attributed lease,
+        // frame, or dispatch is refused the moment the capability behind it
+        // stops being the one that was qualified.
+        let capability_gate = host.computer_capability_gate();
         let simulator = store.clone().map(|store| {
-            Arc::new(ComputerUseService::new(
-                Arc::new(SimulatorBackend::new()),
-                store,
-            ))
+            Arc::new(
+                ComputerUseService::new(Arc::new(SimulatorBackend::new()), store)
+                    .with_capability_gate(capability_gate.clone()),
+            )
         });
         Self {
             host: host.clone(),
@@ -387,7 +392,10 @@ impl DesktopComputerUse {
             .store
             .clone()
             .ok_or_else(|| self.initialization_error())?;
-        let service = Arc::new(ComputerUseService::new(backend, store));
+        let service = Arc::new(
+            ComputerUseService::new(backend, store)
+                .with_capability_gate(self.host.computer_capability_gate()),
+        );
         let limits = ComputerUseLimits {
             max_actions: 8,
             max_duration_secs: 10 * 60,
@@ -555,6 +563,23 @@ impl DesktopComputerUse {
             ComputerAgentProposal::Action {
                 action, summary, ..
             } => {
+                // Staging is where a suggestion becomes something the kernel
+                // will lease and dispatch on, so the capability behind it is
+                // revalidated and attached to the run before anything is
+                // shown for approval.
+                let binding = self
+                    .host
+                    .computer_staging_binding(owner_session_id)
+                    .map_err(|error| error.to_string())?;
+                let (service, _) = self.owned_service(owner_session_id, run_id)?;
+                service
+                    .bind_model_authority(
+                        &Uuid::new_v4().to_string(),
+                        run_id,
+                        expected_version,
+                        binding,
+                    )
+                    .map_err(|error| error.to_string())?;
                 let snapshot = self.stage_action_locked(
                     owner_session_id,
                     run_id,
@@ -619,6 +644,18 @@ impl DesktopComputerUse {
             self.clear_pending_for_owner(owner_session_id)?;
             return Err("This Computer Use approval no longer matches the live run".into());
         }
+        // The operator approved one exact action against one exact capability.
+        // If that capability moved between the approval being shown and this
+        // click, it is not the approval they gave.
+        if let Some(binding) = run.capability_binding.as_ref() {
+            if let Err(error) = self
+                .host
+                .authorize_computer_approval(owner_session_id, binding)
+            {
+                self.clear_pending_for_owner(owner_session_id)?;
+                return Err(error.to_string());
+            }
+        }
         let result = service
             .act(
                 request_id,
@@ -638,6 +675,21 @@ impl DesktopComputerUse {
         owner_session_id: Uuid,
     ) -> Result<ComputerCockpitSnapshot, String> {
         self.clear_pending_for_owner(owner_session_id)?;
+        // Discarding a model proposal returns the run to operator control, so
+        // it stops carrying a standing claim that a provider capability
+        // authorized it. A later model proposal has to stage its own.
+        let index = self.simulator()?;
+        if let Some(run) = latest_desktop_run(&index, owner_session_id)? {
+            if run.capability_binding.is_some() {
+                if let Ok((service, _)) = self.owned_service(owner_session_id, &run.run_id) {
+                    let _ = service.clear_model_authority(
+                        &Uuid::new_v4().to_string(),
+                        &run.run_id,
+                        run.version,
+                    );
+                }
+            }
+        }
         self.cockpit_snapshot(owner_session_id)
     }
 
@@ -1172,8 +1224,16 @@ mod tests {
         assert!(refreshed.run.unwrap().current_observation.is_some());
     }
 
+    /// A model proposal cannot be staged without live model authority (#458).
+    ///
+    /// Staging is the step where a suggestion becomes something the kernel
+    /// will lease and dispatch on, so it now requires a capability binding the
+    /// host's authority still honours. This session has none, so nothing is
+    /// staged, nothing is attached to the run, and nothing dispatches. The
+    /// staged-under-a-current-capability path is exercised against a live
+    /// authority in the bridge's `computer_capability_generation` suite.
     #[tokio::test]
-    async fn model_proposal_is_revalidated_and_staged_without_dispatch() {
+    async fn model_proposal_without_capability_authority_stages_nothing() {
         let (_dir, desktop) = test_desktop();
         let owner = Uuid::new_v4();
         let target = SimulatorBackend::demo_target();
@@ -1183,7 +1243,7 @@ mod tests {
             .unwrap();
         let run = started.run.unwrap();
         let observation = run.current_observation.as_ref().unwrap();
-        let result = desktop
+        let refused = desktop
             .apply_model_proposal(
                 owner,
                 &run.run_id,
@@ -1198,11 +1258,23 @@ mod tests {
                     summary: "Enter the visible name".into(),
                 },
             )
-            .await
-            .unwrap();
-        assert!(!result.completed);
-        assert!(result.snapshot.pending_approval.is_some());
-        assert_eq!(result.snapshot.run.unwrap().action_count, 0);
+            .await;
+        assert!(
+            refused.is_err(),
+            "a model proposal must not stage without a current capability"
+        );
+
+        let snapshot = desktop.cockpit_snapshot(owner).unwrap();
+        assert!(
+            snapshot.pending_approval.is_none(),
+            "a refused proposal must not leave an approval in front of the operator"
+        );
+        let current = snapshot.run.unwrap();
+        assert_eq!(current.action_count, 0);
+        assert!(
+            current.capability_binding.is_none(),
+            "no model authority may be attached to the run"
+        );
 
         let stale = desktop
             .apply_model_proposal(

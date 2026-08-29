@@ -645,6 +645,18 @@ pub struct ComputerRun {
     pub last_outcome: Option<ActionOutcome>,
     pub audit: Vec<ComputerAuditEntry>,
     pub last_error: Option<ComputerError>,
+    /// Model authority this run is being driven under, when it is being driven
+    /// by a model at all (#458).
+    ///
+    /// `None` is an operator-driven run and needs no provider capability.
+    /// `Some` is a claim that a provider capability generation authorized this
+    /// run, and the kernel refuses to lease, deliver a frame, or dispatch on it
+    /// unless a live capability authority still agrees. The reference is
+    /// secret-free and confers nothing on its own: after a restart it names a
+    /// binding no live authority holds, so a restored record cannot resume
+    /// model authority.
+    #[serde(default)]
+    pub capability_binding: Option<crate::capability_authority::CapabilityBindingRef>,
 }
 
 impl ComputerRun {
@@ -681,6 +693,7 @@ impl ComputerRun {
             last_outcome: None,
             audit: Vec::new(),
             last_error: None,
+            capability_binding: None,
         })
     }
 

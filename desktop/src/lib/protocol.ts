@@ -996,6 +996,17 @@ export interface ComputerRun {
     expectedPostconditionMet?: boolean | null;
   } | null;
   lastError?: { code: string; message: string } | null;
+  /**
+   * Model authority this run is being driven under (#458). Absent on an
+   * operator-driven run. Secret-free and non-transferable: it names a binding
+   * the host holds in memory, so it confers nothing on its own and is refused
+   * after a restart.
+   */
+  capabilityBinding?: {
+    bindingId: string;
+    digest: string;
+    generation: number;
+  } | null;
   audit: Array<{
     sequence: number;
     at: string;
