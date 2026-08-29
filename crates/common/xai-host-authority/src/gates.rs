@@ -81,6 +81,47 @@ impl HostAuthority {
             }
         }
 
+        if outcomes.is_empty() {
+            return Ok(());
+        }
+
+        // Avoid rewriting an already-converged snapshot. Besides reducing
+        // churn, this lets crash recovery use replay as its first step: a
+        // genuine crash with no audited outcome must still be able to append
+        // its uncertainty even when the later snapshot write is the failing
+        // cut under test.
+        let needs_replay = self.read(|state| {
+            let mut by_handle = std::collections::BTreeMap::<String, String>::new();
+            for key in state.attempts.keys() {
+                let attempt: AttemptId = decode_id(key, "attempt")?;
+                if by_handle
+                    .insert(attempt.public_handle(), key.clone())
+                    .is_some()
+                {
+                    return Err(AuthorityError::CorruptState(
+                        "attempt public-handle collision".into(),
+                    ));
+                }
+            }
+            for (handle, (outcome, detail)) in &outcomes {
+                let key = by_handle.get(handle).ok_or_else(|| {
+                    AuthorityError::CorruptState(format!(
+                        "audit outcome references unknown attempt {handle}"
+                    ))
+                })?;
+                let attempt = state.attempts.get(key).ok_or_else(|| {
+                    AuthorityError::CorruptState("attempt index changed during replay".into())
+                })?;
+                if attempt.state != *outcome || attempt.settlement.as_deref() != Some(detail) {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })?;
+        if !needs_replay {
+            return Ok(());
+        }
+
         self.with_state(|state| {
             let mut by_handle = std::collections::BTreeMap::<String, String>::new();
             for key in state.attempts.keys() {
@@ -622,6 +663,11 @@ impl HostAuthority {
         admin: &HostAdminAuthority,
     ) -> Result<Vec<AttemptId>, AuthorityError> {
         self.require_admin(admin)?;
+        // A prior terminal audit append may already describe a snapshot that
+        // failed to persist. Converge that WAL evidence before treating any
+        // remaining Sending record as a crash cut; otherwise a same-host retry
+        // could duplicate uncertainty or overwrite recorded settled truth.
+        self.replay_attempt_settlements()?;
         // Write the recovery evidence before changing the snapshot. A crash
         // after the snapshot rename but before the audit append would leave an
         // ambiguous attempt with no durable explanation and nothing for the

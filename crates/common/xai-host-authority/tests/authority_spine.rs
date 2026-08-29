@@ -1397,6 +1397,159 @@ fn settlement_audit_replays_when_the_state_snapshot_write_fails() {
 }
 
 #[test]
+fn same_host_recovery_does_not_downgrade_an_audited_settlement() {
+    let f = fixture();
+    let req = request(b"body");
+    let lease = lease_for(&f, &req);
+    let permit = f.authority.begin_send(&f.auth, lease, &req).unwrap();
+    let attempt = permit.attempt();
+
+    let state_tmp = f.root.join("authority.json.tmp");
+    std::fs::create_dir(&state_tmp).unwrap();
+    assert!(matches!(
+        f.authority.settle_settled(permit),
+        SendOutcome::Uncertain {
+            reason: UncertainReason::StateNotDurableAfterDispatch,
+            ..
+        }
+    ));
+    std::fs::remove_dir(&state_tmp).unwrap();
+
+    assert!(f.authority.recover_incomplete(&f.admin).unwrap().is_empty());
+    let projection = f
+        .authority
+        .attempt_projection(&f.auth, attempt)
+        .unwrap()
+        .unwrap();
+    assert_eq!(projection.state, "settled");
+    assert!(projection.settled);
+    assert!(!projection.ambiguous);
+
+    let handle = attempt.public_handle();
+    assert!(
+        !f.authority
+            .audit_records(&f.admin)
+            .unwrap()
+            .into_iter()
+            .any(|record| {
+                matches!(
+                    record.event,
+                    AuditEvent::SendOutcome {
+                        attempt,
+                        outcome,
+                        ..
+                    } if attempt == handle && outcome == "uncertain"
+                )
+            })
+    );
+}
+
+#[test]
+fn crash_recovery_audit_replays_when_the_state_snapshot_write_fails() {
+    let f = fixture();
+    let req = request(b"body");
+    let lease = lease_for(&f, &req);
+    let permit = f.authority.begin_send(&f.auth, lease, &req).unwrap();
+    let attempt = permit.attempt();
+    // Model the prior host dying after dispatch but before settlement.
+    std::mem::forget(permit);
+
+    // Recovery can append its uncertain outcome, but cannot replace the state
+    // snapshot. The next open must replay the WAL rather than requiring a
+    // second recovery pass or losing the explanation for the ambiguity.
+    let state_tmp = f.root.join("authority.json.tmp");
+    std::fs::create_dir(&state_tmp).unwrap();
+    assert!(matches!(
+        f.authority.recover_incomplete(&f.admin),
+        Err(AuthorityError::Durability(_))
+    ));
+    std::fs::remove_dir(&state_tmp).unwrap();
+
+    let root = f.root.clone();
+    drop(f.authority);
+    let (reopened, admin) = HostAuthority::open(&root, &admin_credential()).unwrap();
+    let auth = reopened.authenticate(SECRET).unwrap();
+    let projection = reopened
+        .attempt_projection(&auth, attempt)
+        .unwrap()
+        .unwrap();
+    assert_eq!(projection.state, "uncertain");
+    assert!(projection.ambiguous);
+    assert!(reopened.recover_incomplete(&admin).unwrap().is_empty());
+
+    let handle = attempt.public_handle();
+    let recovery_records = reopened
+        .audit_records(&admin)
+        .unwrap()
+        .into_iter()
+        .filter(|record| {
+            matches!(
+                &record.event,
+                AuditEvent::SendOutcome {
+                    attempt,
+                    outcome,
+                    detail,
+                } if attempt == &handle
+                    && outcome == "uncertain"
+                    && detail == "CrashBetweenDispatchAndSettlement"
+            )
+        })
+        .count();
+    assert_eq!(recovery_records, 1, "recovery evidence must not duplicate");
+}
+
+#[test]
+fn crash_recovery_retry_on_the_same_authority_reuses_the_audited_outcome() {
+    let f = fixture();
+    let req = request(b"body");
+    let lease = lease_for(&f, &req);
+    let permit = f.authority.begin_send(&f.auth, lease, &req).unwrap();
+    let attempt = permit.attempt();
+    std::mem::forget(permit);
+
+    let state_tmp = f.root.join("authority.json.tmp");
+    std::fs::create_dir(&state_tmp).unwrap();
+    assert!(matches!(
+        f.authority.recover_incomplete(&f.admin),
+        Err(AuthorityError::Durability(_))
+    ));
+    std::fs::remove_dir(&state_tmp).unwrap();
+
+    // The live authority must replay the already-durable outcome before it
+    // scans Sending attempts. Retrying is therefore empty and does not append
+    // a second recovery record.
+    assert!(f.authority.recover_incomplete(&f.admin).unwrap().is_empty());
+    let projection = f
+        .authority
+        .attempt_projection(&f.auth, attempt)
+        .unwrap()
+        .unwrap();
+    assert_eq!(projection.state, "uncertain");
+    assert!(projection.ambiguous);
+
+    let handle = attempt.public_handle();
+    let recovery_records = f
+        .authority
+        .audit_records(&f.admin)
+        .unwrap()
+        .into_iter()
+        .filter(|record| {
+            matches!(
+                &record.event,
+                AuditEvent::SendOutcome {
+                    attempt,
+                    outcome,
+                    detail,
+                } if attempt == &handle
+                    && outcome == "uncertain"
+                    && detail == "CrashBetweenDispatchAndSettlement"
+            )
+        })
+        .count();
+    assert_eq!(recovery_records, 1, "same-host retry must reuse the WAL");
+}
+
+#[test]
 fn reconciliation_audit_replays_when_the_state_snapshot_write_fails() {
     let f = fixture();
     let req = request(b"body");
