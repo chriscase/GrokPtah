@@ -718,14 +718,17 @@ async fn control_secret_redacted_on_shared_host_bus() {
         .queue_prompt(&auth, token, session.id, ws.path(), "/yolo".into(), false,)
         .await
         .is_err());
-    let audit_path = home.path().join("orch/audit/audit.jsonl");
+    // The audit ledger is the v2 authority (#462). Scan the whole tree rather
+    // than one file, so manifest, anchors and every generation are covered.
+    let audit_dir = home.path().join("orch/audit");
     for _ in 0..100 {
-        if audit_path.is_file() {
+        if !read_audit_tree(&audit_dir).is_empty() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    let audit = std::fs::read_to_string(audit_path).unwrap();
+    let audit = read_audit_tree(&audit_dir);
+    assert!(!audit.is_empty(), "audit ledger produced no bytes");
     assert!(!audit.contains(token), "control token leaked into audit");
     let accepted = orch
         .submit_task(
@@ -854,4 +857,24 @@ fn journal_concurrent_publish_monotonic() {
         assert!(e.seq > last);
         last = e.seq;
     }
+}
+
+/// Concatenate every byte under the audit root, so a leak anywhere in the
+/// authenticated tree is caught rather than only in one journal file.
+fn read_audit_tree(dir: &std::path::Path) -> String {
+    let mut out = String::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                stack.push(entry.path());
+            } else if let Ok(body) = std::fs::read(entry.path()) {
+                out.push_str(&String::from_utf8_lossy(&body));
+            }
+        }
+    }
+    out
 }

@@ -12,6 +12,15 @@ use fs2::FileExt;
 use parking_lot::Mutex;
 use uuid::Uuid;
 
+use crate::audit::{
+    AuditAuthorityProvider, AuditCapability, AuditEntryInput, AuditKeyCustody, AuditLedger,
+    AuditLedgerOptions, AuditStatus, AuditWitness, AuthorityGrant, EntryOutcome, EntryPhase,
+    EntryReason, ExportFormat, ExportReceipt, GenerationVerification, RetentionFailure,
+    RetentionReceipt, RetentionRequest, RotationReason,
+};
+
+use super::audit_bridge;
+
 use super::managed::{
     ManagedExecutionIntent, ManagedExecutionPolicy, ManagedFinalizationOutcome,
     ManagedFinalizationRecord, ManagedFinalizationStage, ManagedIntentState, ManagedRetryCause,
@@ -44,14 +53,53 @@ pub struct OrchStore {
     inner: Arc<OrchStoreInner>,
 }
 
+/// Capacity of the channel between `enqueue_audit` and the writer thread.
+const AUDIT_QUEUE_CAPACITY: usize = 256;
+
+/// Upper bound on entries accepted but not yet journaled.
+///
+/// One more than the channel holds: the writer `recv`s an entry — freeing its
+/// slot — before the append that makes it durable, so a crash at that instant
+/// leaves a full channel *plus* the entry in the writer's hand. Reporting the
+/// channel capacity alone under-counted the loss by exactly one, and an
+/// under-count of a loss bound is the direction that hides evidence.
+const AUDIT_IN_FLIGHT_BOUND: u64 = AUDIT_QUEUE_CAPACITY as u64 + 1;
+
 struct OrchStoreInner {
     root: PathBuf,
     _store_lock: fs::File,
     lock: Mutex<()>,
     last_run_error: Mutex<Option<String>>,
     last_audit_error: Arc<Mutex<Option<String>>>,
-    audit_file_lock: Arc<Mutex<()>>,
+    /// The single audit authority for this store. There is no second ledger
+    /// and no dual write: the retired v1 files are read-only inputs that were
+    /// imported into generation 1 and are never opened for writing again.
+    audit: Arc<AuditLedger>,
     audit_writer: AuditWriter,
+}
+
+impl Drop for OrchStoreInner {
+    fn drop(&mut self) {
+        // Shutdown is part of the durable record (#462): close the writer so
+        // queued entries land, then note the shutdown itself.
+        self.audit_writer.tx.lock().take();
+        if let Some(join) = self.audit_writer.join.lock().take() {
+            let _ = join.join();
+        }
+        // A failed shutdown record is never swallowed. Reporting a clean
+        // ledger while the last thing we tried to write was lost would make
+        // the shutdown itself unaccounted for.
+        if let Err(error) = self.audit.append(
+            AuditEntryInput::new("host.shutdown", EntryPhase::Outcome, EntryOutcome::Accepted)
+                .with_reason(EntryReason::HostShutdown),
+        ) {
+            let code = error.code();
+            *self.last_audit_error.lock() = Some(code.to_string());
+            // Best effort durable evidence that the shutdown went unrecorded.
+            let _ = self.audit.record_dropped(1);
+            eprintln!("[grokptah] audit shutdown record failed: {code}");
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -92,8 +140,6 @@ struct ManagerCreationIntent {
     plan: ManagerPlan,
     root_work: WorkItem,
 }
-
-const MAX_AUDIT_BYTES: u64 = 4 * 1024 * 1024;
 
 struct AssignmentMutation<'a> {
     work_id: &'a str,
@@ -159,7 +205,60 @@ impl Drop for AuditWriter {
 
 impl OrchStore {
     /// Open store and convert unfinished runs to `interrupted` (crash recovery).
+    ///
+    /// Uses the default local-file audit key custody and no rollback witness.
     pub fn open(root: impl AsRef<Path>) -> anyhow::Result<Self> {
+        Self::open_with_authority(root, None)
+    }
+
+    /// Open with the default local-file audit key custody and an explicit
+    /// capability authority.
+    ///
+    /// Custody is derived exactly as [`Self::open`] derives it, which is the
+    /// point of having one function: the root is canonicalized *before* the
+    /// key location is computed. Deriving custody from the raw path would put
+    /// the key somewhere else for a relative or symlinked root, and a key the
+    /// next open cannot find is a manifest MAC mismatch, not a recoverable
+    /// miss.
+    pub fn open_with_authority(
+        root: impl AsRef<Path>,
+        authority: Option<Arc<dyn AuditAuthorityProvider>>,
+    ) -> anyhow::Result<Self> {
+        let root = root.as_ref();
+        fs::create_dir_all(root)?;
+        let root = dunce::canonicalize(root)?;
+        let custody = AuditKeyCustody::local_file_for(&root);
+        Self::open_with_audit_authority(root, custody, None, authority)
+    }
+
+    /// Open with explicit audit key custody and an optional rollback witness.
+    ///
+    /// Packaged desktop passes keychain material as [`AuditKeyCustody::Provided`],
+    /// the headless service passes [`AuditKeyCustody::Environment`], and an
+    /// external consumer supplies its own bytes. Every one of them fails closed
+    /// when the required material is missing or unsafe.
+    ///
+    /// No capability authority is installed, so this store can neither take a
+    /// privileged raw export nor delete an unexported generation.
+    pub fn open_with_audit(
+        root: impl AsRef<Path>,
+        custody: AuditKeyCustody,
+        witness: Option<Arc<dyn AuditWitness>>,
+    ) -> anyhow::Result<Self> {
+        Self::open_with_audit_authority(root, custody, witness, None)
+    }
+
+    /// Open with an explicit capability authority provider.
+    ///
+    /// The provider decides whether the two operations that can destroy or
+    /// expose history are available on this host. Passing `None` keeps the
+    /// fail-closed default: neither is.
+    pub fn open_with_audit_authority(
+        root: impl AsRef<Path>,
+        custody: AuditKeyCustody,
+        witness: Option<Arc<dyn AuditWitness>>,
+        authority: Option<Arc<dyn AuditAuthorityProvider>>,
+    ) -> anyhow::Result<Self> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(root.join("runs"))?;
         fs::create_dir_all(root.join("agents"))?;
@@ -200,19 +299,47 @@ impl OrchStore {
             )
         })?;
         let last_audit_error = Arc::new(Mutex::new(None));
-        let audit_file_lock = Arc::new(Mutex::new(()));
-        let (audit_tx, audit_rx) = sync_channel::<AuditEntry>(256);
-        let audit_root = root.clone();
+
+        // One-way v1 -> v2 cutover. The legacy files stay where they are as
+        // read-only evidence; the v2 root is a sibling, so the committed v2
+        // manifest is the single durable boundary between the two.
+        let legacy_v1 = root.join("audit");
+        let audit_root = legacy_v1.join("v2");
+        let keys = custody
+            .resolve()
+            .map_err(|error| anyhow::anyhow!("audit key custody: {}", error.code()))?;
+        let audit = AuditLedger::open_with_options(
+            &audit_root,
+            Arc::new(keys),
+            AuditLedgerOptions {
+                witness,
+                legacy_v1_dir: Some(legacy_v1.clone()),
+                authority,
+            },
+        )
+        .map_err(|error| anyhow::anyhow!("audit ledger: {}", error.code()))?;
+        let audit = Arc::new(audit);
+        note_legacy_v1_state(&audit, &legacy_v1)?;
+
+        let (audit_tx, audit_rx) = sync_channel::<AuditEntry>(AUDIT_QUEUE_CAPACITY);
         let writer_error = last_audit_error.clone();
-        let writer_lock = audit_file_lock.clone();
+        let writer_audit = audit.clone();
         let audit_join = std::thread::Builder::new()
             .name("grokptah-orchestration-audit".into())
             .spawn(move || {
                 while let Ok(entry) = audit_rx.recv() {
-                    let _guard = writer_lock.lock();
-                    let result = append_audit_entry(&audit_root, &entry);
-                    if let Err(error) = result {
-                        *writer_error.lock() = Some(error.to_string());
+                    if let Err(error) = writer_audit.append(audit_bridge::to_input(&entry)) {
+                        // Public projections get the stable code only: an
+                        // `Io` message can name a path.
+                        *writer_error.lock() = Some(error.code().to_string());
+                        let _ = writer_audit.record_dropped(1);
+                    }
+                    // Settle after the append is durable (or after the loss is
+                    // durably recorded as a gap), never before: the pending
+                    // marker is what turns a crash mid-queue into recorded
+                    // uncertainty instead of a silently vanished entry.
+                    if let Err(error) = writer_audit.note_settled() {
+                        *writer_error.lock() = Some(error.code().to_string());
                     }
                 }
             })?;
@@ -223,7 +350,7 @@ impl OrchStore {
                 lock: Mutex::new(()),
                 last_run_error: Mutex::new(None),
                 last_audit_error,
-                audit_file_lock,
+                audit,
                 audit_writer: AuditWriter {
                     tx: Mutex::new(Some(audit_tx)),
                     join: Mutex::new(Some(audit_join)),
@@ -4953,34 +5080,161 @@ impl OrchStore {
             .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))
     }
 
+    /// Append synchronously through the v2 authority.
     pub fn append_audit(&self, entry: &AuditEntry) -> anyhow::Result<()> {
-        let _guard = self.inner.audit_file_lock.lock();
-        let result = append_audit_entry(&self.inner.root, entry);
-        if let Err(error) = &result {
-            *self.inner.last_audit_error.lock() = Some(error.to_string());
+        match self.inner.audit.append(audit_bridge::to_input(entry)) {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                let code = error.code();
+                *self.inner.last_audit_error.lock() = Some(code.to_string());
+                let _ = self.inner.audit.record_dropped(1);
+                Err(anyhow::anyhow!("audit append failed: {code}"))
+            }
         }
-        result
     }
 
+    /// Queue an entry for the audit writer thread.
+    ///
+    /// A refused enqueue is durable evidence, not a lost line: the drop is
+    /// recorded in the authenticated gap file so it survives restart, which the
+    /// v1 ledger's in-memory `last_audit_error` did not.
+    ///
+    /// An *accepted* enqueue is not a promise that the entry is journaled --
+    /// the whole point of the queue is that it is not yet. It is a promise
+    /// that its loss would be visible: the durable pending marker is written
+    /// before this returns, so a crash while entries are in flight is reported
+    /// at the next open as bounded uncertainty rather than leaving no trace at
+    /// all. Call sites that need the stronger guarantee use
+    /// [`Self::append_audit`], which returns only after a durable append.
     pub fn enqueue_audit(&self, entry: AuditEntry) -> anyhow::Result<()> {
         let sender = self.inner.audit_writer.tx.lock();
         let Some(sender) = sender.as_ref() else {
-            let error = "audit writer is stopped".to_string();
-            *self.inner.last_audit_error.lock() = Some(error.clone());
-            return Err(anyhow::anyhow!(error));
+            *self.inner.last_audit_error.lock() = Some("audit_writer_stopped".into());
+            let _ = self.inner.audit.record_dropped(1);
+            return Err(anyhow::anyhow!("audit writer is stopped"));
         };
+        // Durable *before* the entry can be taken by the writer, so the marker
+        // can never trail the work it accounts for.
+        if let Err(error) = self.inner.audit.note_accepted(AUDIT_IN_FLIGHT_BOUND) {
+            let code = error.code();
+            *self.inner.last_audit_error.lock() = Some(code.to_string());
+            let _ = self.inner.audit.record_dropped(1);
+            return Err(anyhow::anyhow!("audit pending marker: {code}"));
+        }
         sender.try_send(entry).map_err(|error| {
-            let detail = match error {
-                TrySendError::Full(_) => "audit writer queue is full",
-                TrySendError::Disconnected(_) => "audit writer stopped",
+            let code = match error {
+                TrySendError::Full(_) => "audit_writer_queue_full",
+                TrySendError::Disconnected(_) => "audit_writer_stopped",
             };
-            *self.inner.last_audit_error.lock() = Some(detail.into());
-            anyhow::anyhow!(detail)
+            *self.inner.last_audit_error.lock() = Some(code.into());
+            let _ = self.inner.audit.record_dropped(1);
+            // The entry never entered the queue, so it is not in flight.
+            let _ = self.inner.audit.note_settled();
+            anyhow::anyhow!(code)
         })
     }
 
+    /// Stable, secret-free audit health code.
+    ///
+    /// Only a code is ever returned. The underlying `AuditError::Io` message
+    /// can name a file, and this value reaches a public health projection.
     pub fn last_audit_error(&self) -> Option<String> {
+        if let Some(poison) = self.inner.audit.status().poisoned {
+            return Some(poison.as_str().to_string());
+        }
         self.inner.last_audit_error.lock().clone()
+    }
+
+    /// Record that producer entries were dropped before reaching the ledger.
+    ///
+    /// Written to the authenticated gap file first, so the evidence survives a
+    /// restart even when the journal itself is unwritable.
+    pub fn record_dropped_audit(&self, lost_entries: u64) -> anyhow::Result<()> {
+        self.inner
+            .audit
+            .record_dropped(lost_entries)
+            .map_err(|error| anyhow::anyhow!("audit gap: {}", error.code()))
+    }
+
+    /// Operator projection of the audit authority. Carries no path, no key,
+    /// and no journal content.
+    pub fn audit_status(&self) -> AuditStatus {
+        self.inner.audit.status()
+    }
+
+    /// Verify every non-tombstoned generation.
+    pub fn verify_audit(&self) -> anyhow::Result<Vec<GenerationVerification>> {
+        self.inner
+            .audit
+            .verify_all()
+            .map_err(|error| anyhow::anyhow!("audit verify: {}", error.code()))
+    }
+
+    /// Sealed **public** operator export. Never rotates, truncates, or deletes.
+    ///
+    /// Imported v1 bytes are withheld: they were preserved verbatim and were
+    /// never redacted to the v2 rules, so they can still contain workspace
+    /// paths, free-text detail, IO strings and provider material.
+    pub fn export_audit(&self, dest: &Path, format: ExportFormat) -> anyhow::Result<ExportReceipt> {
+        self.inner
+            .audit
+            .export(dest, format)
+            .map_err(|error| anyhow::anyhow!("audit export: {}", error.code()))
+    }
+
+    /// Ask this host's authority provider for a capability grant.
+    ///
+    /// Fails closed when no provider is installed. The request and its outcome
+    /// are journaled either way.
+    pub fn request_audit_authority(
+        &self,
+        capability: AuditCapability,
+        subject: &str,
+    ) -> anyhow::Result<AuthorityGrant> {
+        self.inner
+            .audit
+            .issue_authority(capability, subject)
+            .map_err(|error| anyhow::anyhow!("audit authority: {}", error.code()))
+    }
+
+    /// Sealed **privileged raw preservation** export.
+    ///
+    /// Carries imported v1 bytes verbatim. For operator custody only; the
+    /// receipt and the sealed manifest both declare that it is not redacted.
+    pub fn export_audit_privileged_raw(
+        &self,
+        dest: &Path,
+        format: ExportFormat,
+        grant: &AuthorityGrant,
+    ) -> anyhow::Result<ExportReceipt> {
+        self.inner
+            .audit
+            .export_privileged_raw(dest, format, grant)
+            .map_err(|error| anyhow::anyhow!("audit export: {}", error.code()))
+    }
+
+    /// Seal the active audit generation and open the next one.
+    ///
+    /// Forward-only: nothing is renamed or truncated, and the manifest commit
+    /// is the single boundary.
+    pub fn rotate_audit(&self, reason: RotationReason) -> anyhow::Result<String> {
+        self.inner
+            .audit
+            .rotate(reason)
+            .map_err(|error| anyhow::anyhow!("audit rotation: {}", error.code()))
+    }
+
+    /// Tombstone-first retention. The only path that removes audit bytes, and
+    /// it refuses the active generation and any generation it cannot verify.
+    pub fn retain_audit_generation(
+        &self,
+        request: RetentionRequest,
+    ) -> Result<RetentionReceipt, RetentionFailure> {
+        // The failure is returned whole rather than flattened into an
+        // `anyhow` string: a caller must be able to tell "nothing was
+        // deleted" from "the deletion is committed and may be half applied",
+        // and a message cannot be branched on.
+        self.inner.audit.retain(request)
     }
 
     pub fn last_run_error(&self) -> Option<String> {
@@ -5233,26 +5487,51 @@ fn merge_run_observations(target: &mut RunRecord, current: &RunRecord) {
     }
 }
 
-fn append_audit_entry(root: &Path, entry: &AuditEntry) -> anyhow::Result<()> {
-    use std::io::Write;
+/// Record, once per open, whether the retired v1 files still match what was
+/// imported.
+///
+/// The v1 ledger is never written again by this build, but an older binary
+/// rolled onto the same home would still append to it and those entries would
+/// never reach v2. That is recorded as durable uncertainty rather than
+/// repaired, and never silently ignored.
+fn note_legacy_v1_state(audit: &AuditLedger, legacy_dir: &Path) -> anyhow::Result<()> {
+    use sha2::{Digest, Sha256};
 
-    let path = root.join("audit").join("audit.jsonl");
-    if fs::metadata(&path)
-        .map(|metadata| metadata.len() >= MAX_AUDIT_BYTES)
-        .unwrap_or(false)
-    {
-        let rotated = path.with_extension("jsonl.1");
-        if rotated.exists() {
-            fs::remove_file(&rotated)?;
+    let imported: Vec<String> = audit
+        .manifest_snapshot()
+        .generations
+        .iter()
+        .filter(|generation| !generation.origin_authenticated)
+        .filter_map(|generation| generation.journal_sha256.clone())
+        .collect();
+    // No early return on an empty import set. A cutover that found no v1
+    // ledger imported nothing, and skipping the scan in that case meant a v1
+    // file created *afterwards* -- an older binary writing to the retired
+    // ledger -- was never noticed at all. With no imports, every nonempty v1
+    // file is divergent, which is exactly the right answer.
+    for name in ["audit.jsonl", "audit.jsonl.1"] {
+        let path = legacy_dir.join(name);
+        let Ok(bytes) = fs::read(&path) else { continue };
+        if bytes.is_empty() {
+            continue;
         }
-        fs::rename(&path, rotated)?;
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        if imported.iter().any(|known| known == &digest) {
+            continue;
+        }
+        // Report a given divergence once, not on every open forever.
+        if audit.record_legacy_divergence_once(&digest).unwrap_or(true) {
+            let _ = audit.append(
+                AuditEntryInput::new(
+                    "audit.legacy_v1",
+                    EntryPhase::Outcome,
+                    EntryOutcome::Uncertain,
+                )
+                .with_reason(EntryReason::LegacyWrittenAfterCutover)
+                .with_code(&digest),
+            );
+        }
     }
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    writeln!(file, "{}", serde_json::to_string(entry)?)?;
-    file.sync_data()?;
     Ok(())
 }
 
@@ -5333,6 +5612,7 @@ fn write_json_exclusive<T: serde::Serialize>(path: &Path, value: &T) -> std::io:
 
 #[cfg(test)]
 mod tests {
+    use super::super::types::AuditPhase;
     use super::*;
     use crate::orchestration::types::RunPurpose;
     use crate::orchestration::types::{
@@ -6055,32 +6335,44 @@ mod tests {
     }
 
     #[test]
-    fn audit_rotates_at_bound_and_reports_success() {
+    fn audit_appends_through_the_v2_authority_and_never_writes_v1() {
         let d = tempdir().unwrap();
         let store = OrchStore::open(d.path()).unwrap();
-        let path = d.path().join("audit").join("audit.jsonl");
-        fs::write(&path, vec![b'x'; MAX_AUDIT_BYTES as usize]).unwrap();
-        let entry = AuditEntry {
-            ts: Utc::now(),
-            tool: "ptah_get_capacity".into(),
-            request_id: None,
-            session_id: None,
-            workspace: None,
-            outcome: "accepted".into(),
-            error_code: None,
-            detail: "test".into(),
-        };
-        store.append_audit(&entry).unwrap();
-        assert!(path.with_extension("jsonl.1").is_file());
-        assert!(path.is_file());
+        let before = store.audit_status().global_last_seq;
+        store
+            .append_audit(&AuditEntry {
+                ts: Utc::now(),
+                tool: "ptah_get_capacity".into(),
+                request_id: None,
+                session_id: None,
+                workspace: None,
+                outcome: "accepted".into(),
+                error_code: None,
+                detail: "test".into(),
+                intent_id: None,
+                phase: AuditPhase::Outcome,
+            })
+            .unwrap();
+        let status = store.audit_status();
+        assert_eq!(status.global_last_seq, before + 1);
+        assert!(status.poisoned.is_none());
         assert!(store.last_audit_error().is_none());
+        // The retired v1 ledger is never created or appended to.
+        assert!(!d.path().join("audit").join("audit.jsonl").exists());
+        assert!(!d.path().join("audit").join("audit.jsonl.1").exists());
+        // Exactly one authority exists.
+        assert!(d
+            .path()
+            .join("audit")
+            .join("v2")
+            .join("manifest.json")
+            .is_file());
     }
 
     #[test]
-    fn queued_audit_flushes_before_store_shutdown() {
+    fn queued_audit_flushes_and_shutdown_is_recorded_before_store_drop() {
         let d = tempdir().unwrap();
         let store = OrchStore::open(d.path()).unwrap();
-        let path = d.path().join("audit").join("audit.jsonl");
         store
             .enqueue_audit(AuditEntry {
                 ts: Utc::now(),
@@ -6091,11 +6383,30 @@ mod tests {
                 outcome: "rejected".into(),
                 error_code: Some("unauthenticated".into()),
                 detail: "test".into(),
+                intent_id: None,
+                phase: AuditPhase::Outcome,
             })
             .unwrap();
         drop(store);
-        let body = fs::read_to_string(path).unwrap();
-        assert!(body.contains("\"tool\":\"auth\""));
+
+        // Reopening replays the authenticated chain, so the queued entry and
+        // the shutdown record are both durable and both in order.
+        let reopened = OrchStore::open(d.path()).unwrap();
+        let generation = reopened.audit_status().active_generation_id;
+        let journal = d
+            .path()
+            .join("audit")
+            .join("v2")
+            .join("generations")
+            .join(&generation)
+            .join("journal.jsonl");
+        let body = fs::read_to_string(journal).unwrap();
+        assert!(body.contains("\"op\":\"auth\""));
+        assert!(body.contains("\"code\":\"unauthenticated\""));
+        assert!(body.contains("\"op\":\"host.shutdown\""));
+        // Free-text detail never reaches the durable record.
+        assert!(!body.contains("test"));
+        assert!(reopened.audit_status().poisoned.is_none());
     }
 
     #[test]

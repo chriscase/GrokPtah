@@ -4,6 +4,7 @@
 //! sessions, streams typed updates, and completes permission futures from the UI.
 
 mod agents_personas;
+pub mod audit;
 mod auth_store;
 pub mod certification;
 mod completion;

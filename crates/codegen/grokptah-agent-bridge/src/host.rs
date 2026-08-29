@@ -1,5 +1,8 @@
 //! In-process agent host — the shipped runtime desktop uses.
 
+use crate::audit::{
+    AuditAuthorityProvider, AuditCapability, AuditKeyCustody, LocalOperatorAuthority,
+};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1200,7 +1203,13 @@ impl AgentHostHandle {
         if let Some(existing) = store.as_ref() {
             return Ok(existing.clone());
         }
-        let opened = OrchStore::open(self.runtime_home.orchestration_root())?;
+        let root = self.runtime_home.orchestration_root();
+        let opened = OrchStore::open_with_audit_authority(
+            &root,
+            audit_key_custody(&root),
+            None,
+            audit_authority(),
+        )?;
         *store = Some(opened.clone());
         Ok(opened)
     }
@@ -12521,4 +12530,85 @@ mod tests {
         assert_eq!(runs[0].stop_cause, Some(RunStopCause::DurationLimit));
         assert_eq!(runs[0].bounds.max_duration_ms, 50);
     }
+}
+
+/// Select the audit capability authority for this deployment (#462).
+///
+/// Two audit operations are not ordinary ledger use: a privileged raw export,
+/// which carries unredacted legacy bytes, and retention of a generation no
+/// verified export ever carried, which destroys the last copy of a range.
+/// Neither is reachable unless this returns a provider.
+///
+/// The default is `None`, so a host that was never told an operator is present
+/// can do neither. `GROKPTAH_AUDIT_OPERATOR` names which capabilities the
+/// operator is asserting, so a host that needs raw preservation exports does
+/// not thereby gain the ability to delete unexported history.
+///
+/// This is a **structural and evidentiary** boundary: the process asserts an
+/// operator act, and every grant is single-use, expiring, subject-bound and
+/// journaled. It is not an authenticated principal boundary -- there is no
+/// principal authority in the codebase yet (#460/#461) -- and every grant it
+/// produces records `AuthoritySource::LocalOperator` permanently so that it
+/// is never mistaken for one.
+fn audit_authority() -> Option<std::sync::Arc<dyn AuditAuthorityProvider>> {
+    const OPERATOR_ENV: &str = "GROKPTAH_AUDIT_OPERATOR";
+
+    let requested = std::env::var(OPERATOR_ENV).ok()?;
+    let capabilities: Vec<AuditCapability> = requested
+        .split(',')
+        .filter_map(|name| match name.trim() {
+            "privileged_raw_export" => Some(AuditCapability::PrivilegedRawExport),
+            "retain_unexported" => Some(AuditCapability::RetainUnexported),
+            _ => None,
+        })
+        .collect();
+    if capabilities.is_empty() {
+        // An unrecognised value grants nothing rather than everything.
+        eprintln!(
+            "[grokptah] {OPERATOR_ENV} named no known audit capability; \
+             privileged export and unexported retention stay unavailable"
+        );
+        return None;
+    }
+    Some(std::sync::Arc::new(LocalOperatorAuthority::new(
+        capabilities,
+    )))
+}
+
+/// Select audit key custody for this deployment (#462).
+///
+/// Every mode fails closed inside the ledger when its material is missing or
+/// unsafe; this only chooses which one applies.
+///
+/// The OS keychain is opt-in rather than the default because writing a new
+/// keychain item can block on an interactive prompt, which would hang a
+/// headless or packaged-build environment. Until that is validated on a real
+/// packaged host, the default stays the private key file beside the ledger.
+fn audit_key_custody(orchestration_root: &std::path::Path) -> AuditKeyCustody {
+    const KEY_ENV: &str = "GROKPTAH_AUDIT_KEY";
+    const KEYCHAIN_ENV: &str = "GROKPTAH_AUDIT_KEYCHAIN";
+
+    // Headless service: an operator-managed key in the environment.
+    if std::env::var_os(KEY_ENV).is_some() {
+        return AuditKeyCustody::Environment {
+            var: KEY_ENV.to_string(),
+        };
+    }
+    // Packaged desktop, opt-in: the OS keychain.
+    //
+    // Explicit means explicit. This used to warn and fall back to the private
+    // key file, which is the wrong shape for a custody choice: an operator who
+    // asked for keychain custody would silently get file custody instead, and
+    // the fallback *creates* a local key — so the very outcome the choice was
+    // meant to avoid happens quietly on first run. Every other custody mode
+    // here fails closed on missing material; this one now does too.
+    if std::env::var(KEYCHAIN_ENV).is_ok_and(|value| value == "1") {
+        return match crate::auth_store::audit_chain_key() {
+            Some(material) => AuditKeyCustody::Provided(material),
+            // An empty `Provided` fails closed inside the ledger with
+            // `key_unavailable`, and creates nothing on disk.
+            None => AuditKeyCustody::Provided(Vec::new()),
+        };
+    }
+    AuditKeyCustody::local_file_for(orchestration_root)
 }
