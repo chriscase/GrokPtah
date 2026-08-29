@@ -326,19 +326,32 @@ impl AttemptLedger {
         fs::create_dir_all(&dir)?;
 
         for _ in 0..MAX_ORDINAL_CONTENTION_RETRIES {
-            // Re-read on every attempt: a competing process may have both
-            // settled an attempt and allocated the next ordinal since last look.
-            let existing = self.list_scope(&scope)?;
-            if let Some(blocking) = existing.iter().find(|record| record.blocks_new_ordinal()) {
-                return Err(LedgerError::ScopeNotSettled {
-                    ordinal: blocking.ordinal(),
-                    state: blocking.state,
-                });
-            }
-            let next = existing
-                .last()
-                .map(|record| record.ordinal() + 1)
-                .unwrap_or(1);
+            // Re-read on every pass: a competing process may have both settled
+            // an attempt and allocated the next ordinal since the last look.
+            //
+            // Only the highest ordinal needs reading. Admission itself
+            // guarantees it: ordinal N+1 is only ever created once N is
+            // terminal, so if any attempt in the scope is unresolved it is the
+            // highest one. Scanning the whole scope instead would make a long
+            // session quadratic in its own round count.
+            let next = match self.max_ordinal(&scope)? {
+                None => 1,
+                Some(highest) => {
+                    let record = self.load(&scope, highest)?.ok_or_else(|| {
+                        LedgerError::Io(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            "highest attempt vanished between listing and read",
+                        ))
+                    })?;
+                    if record.blocks_new_ordinal() {
+                        return Err(LedgerError::ScopeNotSettled {
+                            ordinal: record.ordinal(),
+                            state: record.state,
+                        });
+                    }
+                    highest + 1
+                }
+            };
             if next > MAX_ORDINAL {
                 return Err(LedgerError::OrdinalExhausted);
             }

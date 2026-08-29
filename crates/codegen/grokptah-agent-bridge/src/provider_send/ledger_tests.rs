@@ -463,3 +463,75 @@ fn a_tampered_record_is_refused_rather_than_trusted() {
         Err(LedgerError::BindingNotRederivable { .. })
     ));
 }
+
+#[test]
+fn only_the_highest_ordinal_can_ever_be_unresolved() {
+    // The admission rule's own invariant, and what lets `begin_attempt` read
+    // exactly one record instead of the whole scope: ordinal N+1 is only ever
+    // created once N is terminal, so an unresolved attempt is always the
+    // highest one. Build a realistic scope and check it holds throughout.
+    let dir = tempfile::tempdir().expect("tmp");
+    let store = ledger(&dir, "host-1");
+
+    for round in 1..=5u64 {
+        let mut handle = store.begin_attempt(spec_for("s", "b")).expect("begin");
+        assert_eq!(handle.ordinal(), round);
+        store.mark_sending(&mut handle).expect("sending");
+        // Alternate the terminal shape so the scope is not uniform.
+        if round % 2 == 0 {
+            store
+                .apply_transport(&mut handle, TransportEvidence::ConnectionNeverEstablished)
+                .expect("not sent");
+        } else {
+            store
+                .apply_transport(
+                    &mut handle,
+                    TransportEvidence::ResponseComplete {
+                        status: 200,
+                        bytes: 1,
+                    },
+                )
+                .expect("settled");
+            store.settle(&mut handle, completed()).expect("settle");
+        }
+
+        let all = store.list_scope(&scope("s")).expect("list");
+        let unresolved: Vec<u64> = all
+            .iter()
+            .filter(|record| record.blocks_new_ordinal())
+            .map(ProviderAttempt::ordinal)
+            .collect();
+        assert!(
+            unresolved.is_empty(),
+            "settled rounds leave nothing unresolved: {unresolved:?}"
+        );
+    }
+
+    // Now leave the highest unresolved and confirm it is the only blocker.
+    let mut handle = store.begin_attempt(spec_for("s", "b")).expect("begin");
+    store.mark_sending(&mut handle).expect("sending");
+    store
+        .apply_transport(
+            &mut handle,
+            TransportEvidence::PossibleWriteUnresolved {
+                class: UncertaintyClass::Timeout,
+            },
+        )
+        .expect("uncertain");
+
+    let all = store.list_scope(&scope("s")).expect("list");
+    let unresolved: Vec<u64> = all
+        .iter()
+        .filter(|record| record.blocks_new_ordinal())
+        .map(ProviderAttempt::ordinal)
+        .collect();
+    assert_eq!(
+        unresolved,
+        vec![store.max_ordinal(&scope("s")).expect("max").expect("some")],
+        "only the highest ordinal may be unresolved"
+    );
+    assert!(matches!(
+        store.begin_attempt(spec_for("s", "b")),
+        Err(LedgerError::ScopeNotSettled { ordinal: 6, .. })
+    ));
+}
