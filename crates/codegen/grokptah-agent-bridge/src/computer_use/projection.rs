@@ -153,6 +153,13 @@ pub struct ComputerRunProjection {
     pub last_outcome: Option<ActionOutcomeSummary>,
     pub last_error: Option<ComputerErrorSummary>,
     pub event_range: Option<ComputerRunEventRange>,
+    /// Adaptive execution profile state (#435), from the run's own durable
+    /// record. Carried on the *shared* projection deliberately: the cockpit,
+    /// the MCP read surface, and any SDK consumer then read one truth rather
+    /// than each deriving its own. It is redaction-safe by construction — no
+    /// field for an element label, value, geometry, evidence token, or frame
+    /// digest — so it is safe on the coordinator side of the boundary too.
+    pub adaptive: Option<crate::computer_profile::AdaptiveProfileProjection>,
 }
 
 /// One bounded, cursor-addressed page of a run's durable event journal.
@@ -276,6 +283,10 @@ pub fn project_run_at(run: &ComputerRun, now: DateTime<Utc>) -> ComputerRunProje
             .as_ref()
             .map(|error| ComputerErrorSummary { code: error.code }),
         event_range: event_range(run),
+        adaptive: run
+            .adaptive
+            .as_ref()
+            .map(crate::computer_profile::project_adaptive),
     }
 }
 

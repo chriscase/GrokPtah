@@ -7,6 +7,19 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+/// How one admitted adaptive turn ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdaptiveAttemptOutcome {
+    /// The provider returned bytes the sealed boundary accepted.
+    Succeeded {
+        observation_bytes: u64,
+        truncated: bool,
+    },
+    /// The attempt failed for any reason at all — timeout, transport, prose,
+    /// unknown field, stale frame, refused action. All of them cost the same.
+    Failed { observation_bytes: u64 },
+}
+
 use super::policy::ComputerPolicy;
 use super::projection::{
     not_available, project_events, project_run_at, ComputerRunCapacity, ComputerRunEventPage,
@@ -870,6 +883,257 @@ impl ComputerUseService {
             run.record_audit(operation, "refused", None, None, Some(error.code));
             Ok(())
         });
+    }
+
+    // ---------------------------------------------------------------
+    // Adaptive execution profiles (#435)
+    //
+    // Every method here reads, mutates, and writes the run under the store's
+    // own lock, so adaptive truth is durable, crash-atomic, and keyed by run
+    // rather than by session. There is no second ledger and no in-memory
+    // cache to go stale.
+    // ---------------------------------------------------------------
+
+    /// Opens or resumes the run's adaptive record and admits exactly one turn.
+    ///
+    /// Opening runs the policy engine against the evidence supplied *now*.
+    /// Resuming revalidates the capability generation and the task risk
+    /// against the record, so a same-route downgrade or a later higher-risk
+    /// objective stops the run instead of riding the earlier authorization.
+    pub fn begin_adaptive_turn(
+        &self,
+        run_id: &str,
+        owner_session_id: uuid::Uuid,
+        evidence: &crate::computer_profile::CapabilityEvidence,
+        risk: crate::computer_profile::TaskRisk,
+    ) -> ComputerResult<crate::computer_profile::TurnPermit> {
+        use crate::computer_profile::{
+            AdaptiveController, AdaptivePolicyEngine, AdaptiveRecord, PolicyOutcome,
+        };
+        // A refusal that *stops the run* is a durable state change, so it must
+        // be written, not thrown away. `update_run` skips its write when the
+        // closure returns `Err`, so this closure returns `Ok` for both outcomes
+        // and the refusal is turned back into an error afterwards. Getting this
+        // wrong would leave a run reading `idle` after the policy had already
+        // stopped it — and a later turn would then be admitted.
+        let mut admitted = None;
+        let mut refused = None;
+        let updated = self.store.update_run(run_id, |run| {
+            if run.owner_session_id != owner_session_id {
+                return Err(ComputerError::new(
+                    ComputerErrorCode::Unauthorized,
+                    "computer run is not available to this session",
+                ));
+            }
+            if run.state != ComputerRunState::Ready {
+                return Err(ComputerError::new(
+                    ComputerErrorCode::InvalidState,
+                    "computer run is not ready for a model proposal",
+                ));
+            }
+            run.updated_at = Utc::now();
+            if run.adaptive.is_none() {
+                match AdaptivePolicyEngine.select(evidence, risk) {
+                    PolicyOutcome::Proceed(decision) => {
+                        run.adaptive = Some(AdaptiveRecord::new(
+                            decision,
+                            evidence.model.generation.clone(),
+                        ));
+                    }
+                    PolicyOutcome::Stop(stop) => {
+                        run.record_audit(
+                            "adaptive_select",
+                            "refused",
+                            None,
+                            None,
+                            Some(ComputerErrorCode::Unauthorized),
+                        );
+                        refused = Some(stop.operator_message().to_string());
+                        return Ok(());
+                    }
+                }
+            }
+            let record = run.adaptive.as_mut().expect("opened above");
+            let revision = record.revision;
+            match AdaptiveController::new(record).begin_turn(
+                revision,
+                &evidence.model.generation,
+                risk,
+            ) {
+                Ok(permit) => admitted = Some(permit),
+                Err(error) => {
+                    run.record_audit(
+                        "adaptive_turn",
+                        "refused",
+                        None,
+                        None,
+                        Some(ComputerErrorCode::Unauthorized),
+                    );
+                    refused = Some(error.to_string());
+                }
+            }
+            Ok(())
+        })?;
+        if updated.is_none() {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "unknown computer run",
+            ));
+        }
+        if let Some(message) = refused {
+            return Err(ComputerError::new(ComputerErrorCode::Unauthorized, message));
+        }
+        admitted.ok_or_else(|| {
+            ComputerError::new(
+                ComputerErrorCode::InvalidState,
+                "adaptive turn was not admitted",
+            )
+        })
+    }
+
+    /// Counts one provider attempt before the request leaves the host, so a
+    /// timeout, transport failure, malformed body, or schema refusal costs the
+    /// run exactly what a success costs it.
+    pub fn record_adaptive_attempt(&self, run_id: &str) -> ComputerResult<()> {
+        self.with_adaptive(run_id, |controller| {
+            controller.record_attempt();
+            Ok(())
+        })
+    }
+
+    /// Closes an admitted turn. `usage` is recorded whether or not the body
+    /// was usable, because a response that arrived and then failed to parse was
+    /// still billed.
+    pub fn finish_adaptive_turn(
+        &self,
+        run_id: &str,
+        usage: (Option<u64>, Option<u64>),
+        outcome: AdaptiveAttemptOutcome,
+    ) -> ComputerResult<Option<crate::computer_profile::RuntimeSignal>> {
+        self.with_adaptive(run_id, |controller| {
+            controller.record_usage(usage.0, usage.1);
+            Ok(match outcome {
+                AdaptiveAttemptOutcome::Succeeded {
+                    observation_bytes,
+                    truncated,
+                } => {
+                    controller.record_success(observation_bytes, truncated);
+                    None
+                }
+                AdaptiveAttemptOutcome::Failed { observation_bytes } => {
+                    controller.record_failure(observation_bytes)
+                }
+            })
+        })
+    }
+
+    /// Releases an admitted turn without advancing the run.
+    pub fn abort_adaptive_turn(&self, run_id: &str) {
+        let _ = self.with_adaptive(run_id, |controller| {
+            controller.abort_turn();
+            Ok(())
+        });
+    }
+
+    /// Feeds one frame into the run's stationarity window.
+    pub fn observe_adaptive_frame(
+        &self,
+        run_id: &str,
+        fingerprint: &crate::computer_profile::ObservationFingerprint,
+    ) -> ComputerResult<Option<crate::computer_profile::RuntimeSignal>> {
+        self.with_adaptive(run_id, |controller| {
+            Ok(controller.observe_frame(fingerprint))
+        })
+    }
+
+    /// Records a dispatch whose postcondition the verifying frame did not
+    /// confirm. Returns the signal the caller must then apply.
+    pub fn record_adaptive_verification_failure(
+        &self,
+        run_id: &str,
+    ) -> ComputerResult<crate::computer_profile::RuntimeSignal> {
+        self.with_adaptive(run_id, |controller| {
+            Ok(controller.record_verification_failure())
+        })
+    }
+
+    /// Applies a runtime signal, escalating or stopping the run durably.
+    pub fn apply_adaptive_signal(
+        &self,
+        run_id: &str,
+        signal: crate::computer_profile::RuntimeSignal,
+    ) -> ComputerResult<crate::computer_profile::ProfileTransition> {
+        let transition =
+            self.with_adaptive(run_id, |controller| Ok(controller.apply_signal(signal)))?;
+        // The escalation or stop belongs in the run's own durable journal, so a
+        // coordinator replaying events sees why the profile moved without
+        // needing a second stream. Typed code only: no model text, no observed
+        // content (#271, #462).
+        let disposition = match &transition {
+            crate::computer_profile::ProfileTransition::Escalate { .. } => "escalated",
+            crate::computer_profile::ProfileTransition::Stop(_) => "stopped",
+        };
+        let _ = self.store.update_run(run_id, |run| {
+            run.updated_at = Utc::now();
+            run.record_audit("adaptive_signal", disposition, None, None, None);
+            Ok(())
+        });
+        Ok(transition)
+    }
+
+    /// Marks the run's adaptive record completed. The caller must already hold
+    /// the host-issued completion proof; this records the outcome, it does not
+    /// decide it.
+    pub fn record_adaptive_completed(&self, run_id: &str) {
+        let _ = self.with_adaptive(run_id, |controller| {
+            controller.record_completed();
+            Ok(())
+        });
+    }
+
+    /// The durable operator-readable adaptive projection for one run.
+    pub fn adaptive_projection(
+        &self,
+        run_id: &str,
+    ) -> ComputerResult<Option<crate::computer_profile::AdaptiveProfileProjection>> {
+        Ok(self
+            .store
+            .load_run(run_id)?
+            .and_then(|run| run.adaptive)
+            .as_ref()
+            .map(crate::computer_profile::project_adaptive))
+    }
+
+    fn with_adaptive<T>(
+        &self,
+        run_id: &str,
+        apply: impl FnOnce(&mut crate::computer_profile::AdaptiveController<'_>) -> ComputerResult<T>,
+    ) -> ComputerResult<T> {
+        let mut captured = None;
+        let updated = self.store.update_run(run_id, |run| {
+            let record = run.adaptive.as_mut().ok_or_else(|| {
+                ComputerError::new(
+                    ComputerErrorCode::InvalidState,
+                    "computer run has no adaptive record",
+                )
+            })?;
+            let mut controller = crate::computer_profile::AdaptiveController::new(record);
+            captured = Some(apply(&mut controller)?);
+            run.updated_at = Utc::now();
+            Ok(())
+        })?;
+        if updated.is_none() {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "unknown computer run",
+            ));
+        }
+        captured.ok_or_else(|| {
+            ComputerError::new(
+                ComputerErrorCode::InvalidState,
+                "adaptive transition did not run",
+            )
+        })
     }
 
     fn record_denial(

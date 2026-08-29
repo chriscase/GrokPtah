@@ -657,6 +657,14 @@ pub struct ComputerRun {
     /// a legacy record can never authorize a completion.
     #[serde(default)]
     pub last_receipt: Option<super::receipt::ActionReceipt>,
+    /// Durable adaptive execution state (#435): the profile in force, the
+    /// capability generation it was decided under, risk high-water mark,
+    /// spend, escalation history, and lifecycle. `None` on records written
+    /// before adaptive profiles existed, which fails closed: a legacy record
+    /// carries no adaptive authority and the host must open one before it can
+    /// spend a model call.
+    #[serde(default)]
+    pub adaptive: Option<crate::computer_profile::AdaptiveRecord>,
     pub audit: Vec<ComputerAuditEntry>,
     pub last_error: Option<ComputerError>,
 }
@@ -694,6 +702,7 @@ impl ComputerRun {
             grant: None,
             last_outcome: None,
             last_receipt: None,
+            adaptive: None,
             audit: Vec::new(),
             last_error: None,
         })

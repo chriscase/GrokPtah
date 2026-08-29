@@ -4,7 +4,10 @@ use std::sync::Arc;
 use base64::Engine;
 use chrono::{Duration, Utc};
 use grokptah_agent_bridge::{
-    accept_model_proposal, canonical_workspace_string, AcceptedIntent, AcceptedModelProposal,
+    accept_model_proposal, canonical_workspace_string, classify_task, enforce_profile_budget,
+    project_adaptive, render_computer_observation, AcceptedIntent, AcceptedModelProposal,
+    AdaptiveAttemptOutcome, AdaptiveProfileProjection, ObservationFingerprint, ProfileTransition,
+    RuntimeSignal,
     ActionClass, ActionGrant, AgentHostHandle, ComputerAction, ComputerCapabilities, ComputerError,
     ComputerObservation, ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
     ComputerPlatformStatus, ComputerRun, ComputerRunProjection, ComputerRunState,
@@ -54,6 +57,11 @@ pub struct ComputerCockpitSnapshot {
     /// projection above is what does.
     pub run: Option<ComputerRun>,
     pub pending_approval: Option<PendingComputerApproval>,
+    /// Durable adaptive execution state (#435), read from the run record
+    /// itself rather than from a process-local cache, so the cockpit, MCP, and
+    /// any SDK consumer see one truth that survives a restart. `None` until a
+    /// profile has actually been selected for this run.
+    pub adaptive: Option<AdaptiveProfileProjection>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -321,6 +329,9 @@ impl DesktopComputerUse {
             projection: run
                 .as_ref()
                 .map(|run| grokptah_agent_bridge::project_run_at(run, Utc::now())),
+            adaptive: run.as_ref().and_then(|run| {
+                run.adaptive.as_ref().map(project_adaptive)
+            }),
             run,
             pending_approval,
         })
@@ -551,6 +562,154 @@ impl DesktopComputerUse {
             })
     }
 
+    /// Run exactly one adaptive model turn end to end: admit it, spend it,
+    /// account for it, and apply the result through the sealed boundary.
+    ///
+    /// Admission is durable and per-run. It re-derives the capability
+    /// generation and the task risk from live state every single time and
+    /// hands them to `begin_adaptive_turn`, which refuses when either has moved
+    /// (#458). Nothing here caches a decision across turns.
+    ///
+    /// The order is deliberate. Stationarity and an unusable bounded view are
+    /// both established *before* a provider attempt is counted, because paying
+    /// a model to re-read a frame that has not moved is exactly the waste the
+    /// adaptive layer exists to avoid. Everything after the attempt is charged
+    /// to the run whether or not it worked.
+    pub async fn run_model_turn(
+        &self,
+        owner_session_id: Uuid,
+        run_id: &str,
+        expected_version: u64,
+        observation_id: &str,
+        objective: &str,
+    ) -> Result<ComputerAgentProposalResult, String> {
+        let observation =
+            self.model_proposal_context(owner_session_id, run_id, expected_version, observation_id)?;
+        let (service, _run) = self.owned_service(owner_session_id, run_id)?;
+
+        let evidence = self
+            .host
+            .computer_capability_evidence(owner_session_id, &observation)
+            .map_err(|error| error.to_string())?;
+        let risk = classify_task(objective, &observation);
+        let permit = service
+            .begin_adaptive_turn(run_id, owner_session_id, &evidence, risk)
+            .map_err(|error| error.to_string())?;
+
+        // The frame has not moved: escalate or stop rather than re-reading it.
+        let fingerprint = ObservationFingerprint::of(&observation);
+        if let Some(signal) = service
+            .observe_adaptive_frame(run_id, &fingerprint)
+            .map_err(|error| error.to_string())?
+        {
+            return Err(self.resolve_adaptive_signal(&service, run_id, signal));
+        }
+
+        // Rendering is deterministic, so the view examined here is byte-for-byte
+        // the view the provider will receive.
+        let (_payload, rendered) = render_computer_observation(&observation, permit.profile);
+        if rendered.actionable_elements == 0 {
+            return Err(self.resolve_adaptive_signal(
+                &service,
+                run_id,
+                RuntimeSignal::MissingSemantics,
+            ));
+        }
+        if rendered.ambiguous_candidates > 0 {
+            return Err(self.resolve_adaptive_signal(
+                &service,
+                run_id,
+                RuntimeSignal::AmbiguousObservation,
+            ));
+        }
+
+        // From here the run is charged for the attempt no matter how it ends.
+        service
+            .record_adaptive_attempt(run_id)
+            .map_err(|error| error.to_string())?;
+        let attempt = match self
+            .host
+            .propose_computer_action(owner_session_id, objective, &observation, &permit)
+            .await
+        {
+            Ok(attempt) => attempt,
+            Err(error) => {
+                // The provider was never reached, or the operator cancelled.
+                // The attempt still counted; close the turn honestly.
+                let _ = service.finish_adaptive_turn(
+                    run_id,
+                    (None, None),
+                    AdaptiveAttemptOutcome::Failed {
+                        observation_bytes: 0,
+                    },
+                );
+                return Err(error.to_string());
+            }
+        };
+
+        let outcome = if attempt.outcome.is_ok() {
+            AdaptiveAttemptOutcome::Succeeded {
+                observation_bytes: attempt.rendered.bytes,
+                truncated: attempt.rendered.truncated,
+            }
+        } else {
+            AdaptiveAttemptOutcome::Failed {
+                observation_bytes: attempt.rendered.bytes,
+            }
+        };
+        let signal = service
+            .finish_adaptive_turn(
+                run_id,
+                (attempt.prompt_tokens, attempt.completion_tokens),
+                outcome,
+            )
+            .map_err(|error| error.to_string())?;
+
+        let raw = match attempt.outcome {
+            Ok(raw) => raw,
+            Err(error) => {
+                let detail = error.to_string();
+                return Err(match signal {
+                    Some(signal) => {
+                        format!("{detail} {}", self.resolve_adaptive_signal(&service, run_id, signal))
+                    }
+                    None => detail,
+                });
+            }
+        };
+
+        let result = self
+            .apply_model_proposal(owner_session_id, run_id, expected_version, observation_id, raw)
+            .await?;
+        if result.completed {
+            service.record_adaptive_completed(run_id);
+        }
+        // The snapshot was taken before the completion was recorded, so refresh
+        // it rather than showing the operator a stale profile panel.
+        Ok(ComputerAgentProposalResult {
+            snapshot: self.cockpit_snapshot(owner_session_id)?,
+            ..result
+        })
+    }
+
+    /// Apply a runtime signal durably and render the operator sentence for it.
+    fn resolve_adaptive_signal(
+        &self,
+        service: &Arc<ComputerUseService>,
+        run_id: &str,
+        signal: RuntimeSignal,
+    ) -> String {
+        match service.apply_adaptive_signal(run_id, signal) {
+            Ok(ProfileTransition::Escalate { to, reason, .. }) => format!(
+                "{} The run escalated to {}; observe again to continue.",
+                reason.operator_message(),
+                to
+            ),
+            Ok(ProfileTransition::Stop(stop)) => stop.operator_message().to_string(),
+            Err(error) => error.to_string(),
+        }
+    }
+
     /// Normalize untrusted model output against the live run and apply the
     /// sealed result. This is the only entry point that takes model bytes.
     ///
@@ -586,6 +745,13 @@ impl DesktopComputerUse {
                 .map_err(|error| self.refuse(&service, run_id, error))?;
         let accepted = accept_model_proposal(&context, &raw)
             .map_err(|error| self.refuse(&service, run_id, error))?;
+        // Profile narrowing runs *after* the universal seal and can only
+        // reject more. A run with no adaptive record has no profile to narrow
+        // by, which is the operator-driven path.
+        if let Some(profile) = run.adaptive.as_ref().map(|record| record.profile) {
+            enforce_profile_budget(&accepted, profile)
+                .map_err(|error| self.refuse(&service, run_id, error))?;
+        }
         self.apply_accepted_locked(owner_session_id, &service, accepted)
     }
 
@@ -776,6 +942,10 @@ impl DesktopComputerUse {
             .take_over(&Uuid::new_v4().to_string(), run_id, expected_version)
             .await
             .map_err(|error| error.to_string())?;
+        // Operator takeover is an absorbing fence for agent authority, so the
+        // adaptive decision made under that authority ends with it. The record
+        // stays on the run as the operator's account of what happened.
+        let _ = service.apply_adaptive_signal(run_id, RuntimeSignal::CapabilityRevoked);
         self.cockpit_snapshot(owner_session_id)
     }
 
@@ -790,6 +960,7 @@ impl DesktopComputerUse {
             .cancel(&Uuid::new_v4().to_string(), run_id)
             .await
             .map_err(|error| error.to_string())?;
+        let _ = service.apply_adaptive_signal(run_id, RuntimeSignal::CapabilityRevoked);
         self.cockpit_snapshot(owner_session_id)
     }
 

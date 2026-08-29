@@ -66,6 +66,21 @@ impl ComputerStore {
     pub const MAX_RUN_RECORDS: usize = 256;
 
     pub fn open(root: impl AsRef<Path>) -> anyhow::Result<Self> {
+        Self::open_inner(root, true)
+    }
+
+    /// Open the ledger **without** running startup recovery.
+    ///
+    /// Ordinary startup must always recover, which is why [`Self::open`] is the
+    /// only constructor callers reach for. This variant exists so a test can
+    /// inspect exactly what a crashed process left on disk *before* recovery
+    /// rewrites it — the difference between the two is the whole evidence of
+    /// what recovery does.
+    pub fn open_without_recovery(root: impl AsRef<Path>) -> anyhow::Result<Self> {
+        Self::open_inner(root, false)
+    }
+
+    fn open_inner(root: impl AsRef<Path>, recover: bool) -> anyhow::Result<Self> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(root.join("runs"))?;
         fs::create_dir_all(root.join("receipts"))?;
@@ -90,9 +105,11 @@ impl ComputerStore {
                 lock: Mutex::new(()),
             }),
         };
-        store.recover_interrupted()?;
-        store.recover_receipts()?;
-        store.prune_retention()?;
+        if recover {
+            store.recover_interrupted()?;
+            store.recover_receipts()?;
+            store.prune_retention()?;
+        }
         Ok(store)
     }
 
@@ -129,7 +146,7 @@ impl ComputerStore {
         Ok(Some(run))
     }
 
-    pub(crate) fn list_runs(&self) -> ComputerResult<Vec<ComputerRun>> {
+    pub fn list_runs(&self) -> ComputerResult<Vec<ComputerRun>> {
         let _guard = self.inner.lock.lock();
         self.list_runs_unlocked()
     }
@@ -284,6 +301,15 @@ impl ComputerStore {
             // authority epoch. A restart has neither, so recovery must strand
             // it rather than let a pre-restart receipt complete a run (#456).
             run.last_receipt = None;
+            // Adaptive state is the operator's account of *why* the run was
+            // doing what it was doing, so unlike the observation and the
+            // receipt it is preserved rather than dropped. Recovery marks it
+            // interrupted and advances its revision, which strands any turn
+            // that was in flight: a response from before the restart can never
+            // be applied, and nothing is replayed (#435).
+            if let Some(adaptive) = run.adaptive.as_mut() {
+                crate::computer_profile::AdaptiveRecord::recover_interrupted(adaptive);
+            }
             run.last_error = Some(ComputerError::new(
                 ComputerErrorCode::Interrupted,
                 "computer run interrupted by process restart; explicit reauthorization required",

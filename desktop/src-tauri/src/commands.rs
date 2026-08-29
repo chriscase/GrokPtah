@@ -900,22 +900,18 @@ pub async fn computer_use_cockpit_propose_agent_action(
     objective: String,
 ) -> Result<crate::computer_use::ComputerAgentProposalResult, String> {
     let owner = computer_owner(&state, &session_id)?;
-    let observation = state.computer_use.model_proposal_context(
-        owner,
-        &run_id,
-        expected_version,
-        &observation_id,
-    )?;
-    // `raw` is untrusted provider output. It gains authority only inside
-    // `apply_model_proposal`, which seals it against the live run (#457).
-    let raw = state
-        .host
-        .propose_computer_action(owner, &objective, &observation)
-        .await
-        .map_err(map_err)?;
+    // One durable adaptive turn: admit, spend, account, apply. Orchestrated in
+    // `DesktopComputerUse` because that is the one place that holds both the
+    // host (credentials, model, provider) and the service that owns the run.
     state
         .computer_use
-        .apply_model_proposal(owner, &run_id, expected_version, &observation_id, raw)
+        .run_model_turn(
+            owner,
+            &run_id,
+            expected_version,
+            &observation_id,
+            &objective,
+        )
         .await
 }
 
