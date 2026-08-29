@@ -303,9 +303,16 @@ pub struct ControlServerHandle {
 /// callers must retain/quarantine process authority when `fully_stopped` is
 /// false.
 #[derive(Debug, Default)]
+#[must_use = "control-server stop evidence must be checked before restart or qualification"]
 pub struct ControlServerStopReport {
     pub fully_stopped: bool,
     pub errors: Vec<String>,
+}
+
+impl ControlServerStopReport {
+    pub fn is_clean(&self) -> bool {
+        self.fully_stopped && self.errors.is_empty()
+    }
 }
 
 impl ControlServerHandle {

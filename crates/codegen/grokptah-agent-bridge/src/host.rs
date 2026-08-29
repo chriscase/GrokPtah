@@ -1121,6 +1121,21 @@ impl AgentHostHandle {
         self.lifecycle.spawn_supervised(operation, future)
     }
 
+    /// Supervise an auxiliary task whose owner intentionally aborts its
+    /// read-only loop after reconciling durable state.
+    pub(crate) fn spawn_supervised_expected_abort<F>(
+        &self,
+        operation: &str,
+        future: F,
+    ) -> Result<tokio::task::JoinHandle<F::Output>>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.lifecycle
+            .spawn_supervised_expected_abort(operation, future)
+    }
+
     /// Cancel every unit of in-flight work this host owns, so the shutdown
     /// join barrier is bounded: turns (which also cascade to their subagents
     /// and tool shells), standalone subagents, background scans and shell
@@ -2874,7 +2889,7 @@ impl AgentHostHandle {
         let run_id = run_id.to_string();
         let mut receiver = self.subscribe_events();
         let shutdown = self.shutdown_token();
-        self.spawn_supervised("starting a desktop run aggregator", async move {
+        self.spawn_supervised_expected_abort("starting a desktop run aggregator", async move {
             loop {
                 tokio::select! {
                     update = receiver.recv() => {

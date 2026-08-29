@@ -452,6 +452,10 @@ async fn restart_durability() -> Result<ScenarioResult> {
     let before_history = host.session_completion_history(session.id)?;
     let before_transcript = host.session_transcript(session.id)?;
     drop(rx);
+    let shutdown = host.shutdown().await;
+    if !shutdown.is_clean() {
+        anyhow::bail!("restart fixture shutdown: {}", shutdown.operator_summary());
+    }
     drop(host);
 
     let restored_host =

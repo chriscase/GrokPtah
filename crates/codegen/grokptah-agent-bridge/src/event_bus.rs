@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::{Arc, OnceLock};
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
@@ -111,7 +111,111 @@ impl EventBus {
 struct PersistenceHandle {
     tx: Mutex<Option<SyncSender<JournalEntry>>>,
     join: Mutex<Option<std::thread::JoinHandle<()>>>,
+    join_state: Arc<(Mutex<PersistenceJoinState>, Condvar)>,
+    persistence_error: Arc<Mutex<Option<String>>>,
     gap_path: PathBuf,
+}
+
+#[derive(Debug, Default)]
+struct PersistenceJoinState {
+    started: bool,
+    outcome: Option<JournalWriterStopReport>,
+}
+
+/// Bounded evidence from stopping the durable journal writer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[must_use = "journal-writer stop evidence must be checked before releasing host authority"]
+pub(crate) struct JournalWriterStopReport {
+    pub fully_stopped: bool,
+    pub errors: Vec<String>,
+}
+
+impl PersistenceHandle {
+    /// Start joining the writer on a dedicated monitor thread. The monitor and
+    /// its outcome live independently of a cancellable shutdown future, so a
+    /// second shutdown can observe completion rather than losing the writer's
+    /// JoinHandle when the first waiter is dropped.
+    fn begin_join(&self) {
+        self.tx.lock().take();
+        let (state_lock, state_ready) = &*self.join_state;
+        let mut state = state_lock.lock();
+        if state.started {
+            return;
+        }
+        state.started = true;
+        let Some(join) = self.join.lock().take() else {
+            state.outcome = Some(JournalWriterStopReport {
+                fully_stopped: true,
+                errors: Vec::new(),
+            });
+            state_ready.notify_all();
+            return;
+        };
+        drop(state);
+
+        let join_state = self.join_state.clone();
+        let persistence_error = self.persistence_error.clone();
+        let monitor = std::thread::Builder::new()
+            .name("grokptah-event-journal-join".into())
+            .spawn(move || {
+                let report = match join.join() {
+                    Ok(()) => JournalWriterStopReport {
+                        fully_stopped: true,
+                        errors: Vec::new(),
+                    },
+                    Err(_) => {
+                        let error = "the durable event-journal writer panicked".to_string();
+                        *persistence_error.lock() = Some(error.clone());
+                        eprintln!("[grokptah] {error}");
+                        JournalWriterStopReport {
+                            fully_stopped: true,
+                            errors: vec![error],
+                        }
+                    }
+                };
+                let (state_lock, state_ready) = &*join_state;
+                state_lock.lock().outcome = Some(report);
+                state_ready.notify_all();
+            });
+        if let Err(error) = monitor {
+            let error = format!("failed to start the durable event-journal join monitor: {error}");
+            *self.persistence_error.lock() = Some(error.clone());
+            let mut state = state_lock.lock();
+            state.outcome = Some(JournalWriterStopReport {
+                fully_stopped: false,
+                errors: vec![error],
+            });
+            state_ready.notify_all();
+        }
+    }
+
+    fn wait_bounded(&self, timeout: std::time::Duration) -> JournalWriterStopReport {
+        self.begin_join();
+        let (state_lock, state_ready) = &*self.join_state;
+        let mut state = state_lock.lock();
+        if state.outcome.is_none() {
+            let deadline = std::time::Instant::now() + timeout;
+            while state.outcome.is_none() {
+                if state_ready.wait_until(&mut state, deadline).timed_out()
+                    && state.outcome.is_none()
+                {
+                    return JournalWriterStopReport {
+                        fully_stopped: false,
+                        errors: vec![format!(
+                            "durable event-journal writer did not stop within {timeout:?}"
+                        )],
+                    };
+                }
+            }
+        }
+        state
+            .outcome
+            .clone()
+            .unwrap_or_else(|| JournalWriterStopReport {
+                fully_stopped: false,
+                errors: vec!["durable event-journal join outcome was unavailable".to_string()],
+            })
+    }
 }
 
 impl EventBus {
@@ -138,26 +242,55 @@ impl EventBus {
             .is_some_and(|handle| handle.tx.lock().is_some())
     }
 
-    pub fn close_journal_writer(&self) -> Option<String> {
+    fn seal_journal_writer(&self) -> Option<Arc<PersistenceHandle>> {
         // Seal publication and detach the sender under the same BusInner lock
         // used by `publish`. A publisher is therefore wholly before the close
         // (and its entry is drained by the writer), or wholly after it (and is
         // denied below); there is no writer-close/publication gap.
-        let join = {
+        let handle = {
             let mut inner = self.inner.lock();
             inner.publications_sealed = true;
-            let handle = inner.persistence.clone();
-            handle.as_ref().and_then(|handle| {
-                handle.tx.lock().take();
-                handle.join.lock().take()
-            })
+            inner.persistence.clone()
         };
-        if let Some(join) = join {
-            if join.join().is_err() {
-                return Some("the durable event-journal writer panicked".to_string());
+        if let Some(handle) = &handle {
+            handle.begin_join();
+        }
+        handle
+    }
+
+    /// Seal publication and start the process-visible writer join without
+    /// waiting. Ordered shutdown calls this before entering a cancellable
+    /// blocking wait so cancellation cannot leave publication open.
+    pub(crate) fn begin_close_journal_writer(&self) {
+        let _ = self.seal_journal_writer();
+    }
+
+    pub(crate) fn close_journal_writer_bounded(
+        &self,
+        timeout: std::time::Duration,
+    ) -> JournalWriterStopReport {
+        let mut report = match self.seal_journal_writer() {
+            Some(handle) => handle.wait_bounded(timeout),
+            None => JournalWriterStopReport {
+                fully_stopped: true,
+                errors: Vec::new(),
+            },
+        };
+        if let Some(error) = self.persistence_error.lock().clone() {
+            if !report.errors.contains(&error) {
+                report.errors.push(error);
             }
         }
-        self.persistence_error.lock().clone()
+        report
+    }
+
+    pub fn close_journal_writer(&self) -> Option<String> {
+        let report = self.close_journal_writer_bounded(std::time::Duration::from_secs(30));
+        if report.errors.is_empty() && report.fully_stopped {
+            None
+        } else {
+            Some(report.errors.join("; "))
+        }
     }
 
     /// Hold the same publication lock used by [`Self::publish`] across the
@@ -177,10 +310,11 @@ impl EventBus {
 
 impl Drop for PersistenceHandle {
     fn drop(&mut self) {
-        self.tx.lock().take();
-        if let Some(join) = self.join.lock().take() {
-            let _ = join.join();
-        }
+        // Drop may run on an async executor worker and may not block. Start the
+        // same monitored join used by ordered shutdown, but leave waiting and
+        // authority disposition to HostRuntime. A writer panic remains in the
+        // shared outcome instead of being silently discarded.
+        self.begin_join();
     }
 }
 
@@ -494,6 +628,11 @@ impl EventBus {
                         g.persistence = Some(Arc::new(PersistenceHandle {
                             tx: Mutex::new(Some(tx)),
                             join: Mutex::new(Some(join)),
+                            join_state: Arc::new((
+                                Mutex::new(PersistenceJoinState::default()),
+                                Condvar::new(),
+                            )),
+                            persistence_error: self.persistence_error.clone(),
                             gap_path: gap_path.clone(),
                         }));
                     }
@@ -1859,6 +1998,7 @@ mod tests {
             });
         }
         let seq_before = bus1.current_seq();
+        assert!(bus1.close_journal_writer().is_none());
         drop(bus1);
 
         let bus2 = EventBus::new(64).with_persist_dir(dir.path());
@@ -1887,6 +2027,7 @@ mod tests {
             .trim()
             .parse::<u64>()
             .unwrap();
+        assert!(bus1.close_journal_writer().is_none());
         drop(bus1);
 
         let bus2 = EventBus::new(8).with_persist_dir(dir.path());
@@ -1952,6 +2093,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bus = EventBus::new(8).with_persist_dir(dir.path());
         record_journal_gap(&bus.journal_gap, 7);
+        assert!(bus.close_journal_writer().is_none());
         drop(bus);
 
         let reopened = EventBus::new(8).with_persist_dir(dir.path());
@@ -2005,6 +2147,7 @@ mod tests {
             session_id: sid,
             message: format!("failed with {secret}"),
         });
+        assert!(bus1.close_journal_writer().is_none());
         drop(bus1);
         let disk = std::fs::read_to_string(dir.path().join("event_journal.jsonl")).unwrap();
         assert!(!disk.contains(&secret), "secret leaked to disk: {disk}");
@@ -2093,5 +2236,67 @@ mod tests {
         assert!(bus
             .last_persistence_error()
             .is_some_and(|error| error.contains("publication refused")));
+    }
+
+    #[test]
+    fn stuck_journal_join_is_bounded_and_a_second_wait_observes_completion() {
+        let bus = EventBus::new(8);
+        let (tx, rx) = sync_channel::<JournalEntry>(1);
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_release = release.clone();
+        let join = std::thread::spawn(move || {
+            let _rx = rx;
+            while !thread_release.load(std::sync::atomic::Ordering::Acquire) {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        });
+        bus.inner.lock().persistence = Some(Arc::new(PersistenceHandle {
+            tx: Mutex::new(Some(tx)),
+            join: Mutex::new(Some(join)),
+            join_state: Arc::new((Mutex::new(PersistenceJoinState::default()), Condvar::new())),
+            persistence_error: bus.persistence_error.clone(),
+            gap_path: PathBuf::from("unused-test-gap"),
+        }));
+
+        let started = std::time::Instant::now();
+        let first = bus.close_journal_writer_bounded(std::time::Duration::from_millis(20));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(!first.fully_stopped);
+        assert!(first
+            .errors
+            .iter()
+            .any(|error| error.contains("did not stop")));
+
+        release.store(true, std::sync::atomic::Ordering::Release);
+        let second = bus.close_journal_writer_bounded(std::time::Duration::from_secs(1));
+        assert!(second.fully_stopped, "{:?}", second.errors);
+        assert!(second.errors.is_empty(), "{:?}", second.errors);
+    }
+
+    #[test]
+    fn journal_writer_panic_is_retained_in_stop_evidence() {
+        let bus = EventBus::new(8);
+        let (tx, rx) = sync_channel::<JournalEntry>(1);
+        let join = std::thread::spawn(move || {
+            let _rx = rx;
+            panic!("synthetic journal writer panic");
+        });
+        bus.inner.lock().persistence = Some(Arc::new(PersistenceHandle {
+            tx: Mutex::new(Some(tx)),
+            join: Mutex::new(Some(join)),
+            join_state: Arc::new((Mutex::new(PersistenceJoinState::default()), Condvar::new())),
+            persistence_error: bus.persistence_error.clone(),
+            gap_path: PathBuf::from("unused-panic-gap"),
+        }));
+
+        let report = bus.close_journal_writer_bounded(std::time::Duration::from_secs(1));
+        assert!(report.fully_stopped);
+        assert!(report
+            .errors
+            .iter()
+            .any(|error| error.contains("writer panicked")));
+        assert!(bus
+            .last_persistence_error()
+            .is_some_and(|error| error.contains("writer panicked")));
     }
 }

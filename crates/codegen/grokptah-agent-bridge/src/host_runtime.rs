@@ -52,6 +52,39 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
         .unwrap_or_else(|| "non-string panic payload".to_string())
 }
 
+struct SupervisedOutcomeGuard {
+    operation: String,
+    kind: &'static str,
+    failures: Arc<Mutex<Vec<String>>>,
+    lifecycle_cancel: CancellationToken,
+    abort_is_failure: bool,
+    completed: bool,
+}
+
+impl SupervisedOutcomeGuard {
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for SupervisedOutcomeGuard {
+    fn drop(&mut self) {
+        // Panic is recorded by the surrounding catch_unwind with its payload.
+        // A non-panicking drop before completion means the future was aborted
+        // or discarded, and must independently survive caller-owned handles.
+        if !self.completed
+            && !std::thread::panicking()
+            && !self.lifecycle_cancel.is_cancelled()
+            && self.abort_is_failure
+        {
+            self.failures.lock().push(format!(
+                "supervised {} {} was cancelled before completion",
+                self.kind, self.operation
+            ));
+        }
+    }
+}
+
 /// The runtime that currently owns durable writes for each home, keyed by the
 /// home's instance-lock path.
 ///
@@ -456,13 +489,52 @@ impl HostLifecycle {
         F: std::future::Future + Send + 'static,
         F::Output: Send + 'static,
     {
+        self.spawn_supervised_with_abort_policy(operation, future, true)
+    }
+
+    /// Register a task whose owner deliberately uses `JoinHandle::abort` as
+    /// its normal stop protocol, such as a read-only event aggregator.
+    pub(crate) fn spawn_supervised_expected_abort<F>(
+        &self,
+        operation: &str,
+        future: F,
+    ) -> Result<tokio::task::JoinHandle<F::Output>>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.spawn_supervised_with_abort_policy(operation, future, false)
+    }
+
+    fn spawn_supervised_with_abort_policy<F>(
+        &self,
+        operation: &str,
+        future: F,
+        abort_is_failure: bool,
+    ) -> Result<tokio::task::JoinHandle<F::Output>>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
         let _admission = self.spawn_gate.read();
         self.ensure_open(operation)?;
         let operation = operation.to_string();
         let failures = self.supervised_failures.clone();
+        let lifecycle_cancel = self.cancel.clone();
+        let mut outcome = SupervisedOutcomeGuard {
+            operation: operation.clone(),
+            kind: "task",
+            failures: failures.clone(),
+            lifecycle_cancel,
+            abort_is_failure,
+            completed: false,
+        };
         Ok(self.tasks.spawn(async move {
             match std::panic::AssertUnwindSafe(future).catch_unwind().await {
-                Ok(output) => output,
+                Ok(output) => {
+                    outcome.complete();
+                    output
+                }
                 Err(payload) => {
                     failures.lock().push(format!(
                         "supervised task {operation} panicked: {}",
@@ -494,9 +566,21 @@ impl HostLifecycle {
         self.ensure_open(operation)?;
         let operation = operation.to_string();
         let failures = self.supervised_failures.clone();
+        let lifecycle_cancel = self.cancel.clone();
+        let mut outcome = SupervisedOutcomeGuard {
+            operation: operation.clone(),
+            kind: "future",
+            failures: failures.clone(),
+            lifecycle_cancel,
+            abort_is_failure: true,
+            completed: false,
+        };
         Ok(self.tasks.track_future(async move {
             match std::panic::AssertUnwindSafe(future).catch_unwind().await {
-                Ok(output) => output,
+                Ok(output) => {
+                    outcome.complete();
+                    output
+                }
                 Err(payload) => {
                     failures.lock().push(format!(
                         "supervised future {operation} panicked: {}",
@@ -1195,8 +1279,8 @@ impl HostRuntime {
         }
 
         // 3. Cancel every in-flight unit of work, then join the supervised set.
-        self.handle.cancel_all_activity().await;
         self.lifecycle.cancel_token().cancel();
+        self.handle.cancel_all_activity().await;
         let supervised_tasks_at_quiesce = self.lifecycle.tasks().len();
         let supervised_join_timed_out =
             tokio::time::timeout_at(shutdown_deadline, self.lifecycle.tasks().wait())
@@ -1204,7 +1288,7 @@ impl HostRuntime {
                 .is_err();
         let supervised_tasks_remaining = self.lifecycle.tasks().len();
         join_errors.extend(self.lifecycle.supervised_failures());
-        let join_timed_out = supervised_join_timed_out || control_servers_unjoined > 0;
+        let mut join_timed_out = supervised_join_timed_out || control_servers_unjoined > 0;
 
         // 4. Drain the durable writer threads, *before* the seal.
         //
@@ -1217,10 +1301,36 @@ impl HostRuntime {
         //    authority still exists, lets the writer finish its work; a real
         //    failure still lands in `flush_errors` below and still makes the
         //    shutdown unclean.
-        let mut writer_drain_errors = Vec::new();
-        if let Some(error) = self.handle().event_bus().close_journal_writer() {
-            writer_drain_errors.push(format!("close the durable event journal: {error}"));
+        let event_bus = self.handle().event_bus();
+        event_bus.begin_close_journal_writer();
+        let writer_wait = event_bus.clone();
+        let writer_remaining =
+            shutdown_deadline.saturating_duration_since(tokio::time::Instant::now());
+        let writer_join = tokio::task::spawn_blocking(move || {
+            writer_wait.close_journal_writer_bounded(writer_remaining)
+        });
+        let writer_report = match tokio::time::timeout_at(shutdown_deadline, writer_join).await {
+            Ok(Ok(report)) => report,
+            Ok(Err(error)) => crate::event_bus::JournalWriterStopReport {
+                fully_stopped: false,
+                errors: vec![format!("durable event-journal join task failed: {error}")],
+            },
+            Err(_) => crate::event_bus::JournalWriterStopReport {
+                fully_stopped: false,
+                errors: vec![format!(
+                    "durable event-journal writer did not stop within the shared {:?} shutdown deadline",
+                    self.join_timeout
+                )],
+            },
+        };
+        if !writer_report.fully_stopped {
+            join_timed_out = true;
         }
+        let writer_drain_errors = writer_report
+            .errors
+            .into_iter()
+            .map(|error| format!("close the durable event journal: {error}"))
+            .collect::<Vec<_>>();
 
         // 5. Seal durable-write authority. After this no handle — stale or
         //    not — can mutate this home again.
@@ -1648,11 +1758,14 @@ mod tests {
         assert!(joined.is_err(), "the join must time out, bounded");
         assert_eq!(lifecycle.tasks().len(), 1);
 
-        // No durable write is in flight, so the seal still holds and releasing
-        // the lock is safe even though a task is stuck.
+        // A durable seal does not prove an external effect ended. The task is
+        // still live, so authority must be quarantined even though no home
+        // write is currently in flight.
         assert!(lifecycle.seal_durable_writes(std::time::Duration::from_millis(50)));
         lifecycle.mark_closed();
-        assert!(lifecycle.release_process_lock());
+        assert!(lifecycle.quarantine_process_lock());
+        assert!(lifecycle.process_lock_held());
+        assert!(lifecycle.lock_is_quarantined());
     }
 
     /// A durable write in flight is what actually blocks the release: the seal

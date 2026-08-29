@@ -298,14 +298,15 @@ async fn failed_isolation_requires_explicit_shared_cwd_opt_in() {
     );
 }
 
-#[test]
-fn shared_cwd_preference_is_explicit_and_persistent() {
+#[tokio::test]
+async fn shared_cwd_preference_is_explicit_and_persistent() {
     let _iso = IsolatedHome::install();
     let host =
         AgentHost::create(HostConfig::default()).expect("acquire the GrokPtah instance lock");
     assert!(host.set_subagent_isolation("off".into()).is_err());
     host.set_subagent_isolation("shared".into()).unwrap();
-    drop(host);
+    let report = host.shutdown().await;
+    assert!(report.is_clean(), "{}", report.operator_summary());
 
     let restored =
         AgentHost::create(HostConfig::default()).expect("acquire the GrokPtah instance lock");

@@ -156,10 +156,11 @@ impl ActiveTransport {
         }
     }
 
-    async fn stop(self) {
+    async fn stop(self) -> Result<()> {
         if let Self::Local { service, .. } = self {
-            service.stop().await;
+            service.stop().await?;
         }
+        Ok(())
     }
 }
 
@@ -250,7 +251,10 @@ pub async fn preflight(options: &CampaignOptions) -> Result<PreflightSummary> {
         },
     };
     drop(recorder);
-    transport.stop().await;
+    transport
+        .stop()
+        .await
+        .context("stop certification preflight transport cleanly")?;
     Ok(summary)
 }
 
@@ -594,6 +598,10 @@ pub async fn run_campaign(options: &CampaignOptions) -> Result<CampaignCompletio
     // alone. A future enabled live path must first produce an attested,
     // complete PersistentAgentCapture and bind it to this report.
     drop(recorder);
+    transport
+        .stop()
+        .await
+        .context("stop certification campaign transport cleanly")?;
     report.finished_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
     report.recompute_summary()?;
     report.certified = report.summary.probes > 0
@@ -612,7 +620,6 @@ pub async fn run_campaign(options: &CampaignOptions) -> Result<CampaignCompletio
         .map_err(|_| anyhow::anyhow!("installed_report_invalid"))?;
     installed_report.validate_at(artifacts.path())?;
     artifacts.mark_complete(&final_digest)?;
-    transport.stop().await;
     let mut failure_classes = Vec::new();
     for probe in &report.probes {
         if probe.failure_class != FailureClass::None
@@ -1374,7 +1381,7 @@ mod tests {
         }
         client.close_session().await.unwrap();
         drop(recorder);
-        transport.stop().await;
+        transport.stop().await.unwrap();
 
         let completion = run_campaign(&options).await.unwrap();
         assert_eq!(completion.summary.probes, 1);
@@ -1435,7 +1442,7 @@ mod tests {
         assert!(execution.provider_run.is_some());
         client.close_session().await.unwrap();
         drop(recorder);
-        transport.stop().await;
+        transport.stop().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1464,7 +1471,7 @@ mod tests {
         assert!(execution.provider_run.is_some());
         client.close_session().await.unwrap();
         drop(recorder);
-        transport.stop().await;
+        transport.stop().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

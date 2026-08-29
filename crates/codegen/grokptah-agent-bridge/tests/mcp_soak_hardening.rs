@@ -133,7 +133,7 @@ async fn soak_bootstrap_capacity_429_and_timeout_504() {
     let r429: serde_json::Value = serde_json::from_str(s429.trim()).unwrap();
     assert_eq!(r429["checks"]["capacity429"], true);
     assert!(r429["metrics"]["capacity429"].as_u64().unwrap_or(0) >= 1);
-    srv.stop_and_wait().await;
+    assert!(srv.stop_and_wait().await.is_clean());
 
     // --- 504: inject > request timeout ---
     env.set("GROKPTAH_CONTROL_MAX_CONCURRENT", "4");
@@ -159,7 +159,12 @@ async fn soak_bootstrap_capacity_429_and_timeout_504() {
     assert!(out504.status.success(), "504 soak failed: {s504}");
     let r504: serde_json::Value = serde_json::from_str(s504.trim()).unwrap();
     assert_eq!(r504["checks"]["requestTimeout504"], true);
-    srv2.stop_and_wait().await;
+    assert!(srv2.stop_and_wait().await.is_clean());
+    let shutdown = host.shutdown().await;
+    assert!(
+        shutdown.is_clean(),
+        "the capacity/timeout campaign must release its host through ordered shutdown: {shutdown:?}"
+    );
 
     set_grokptah_home_override(None);
 }
@@ -379,7 +384,7 @@ async fn soak_desktop_bootstrap_node_campaign() {
     // cancels and joins every supervised task, flushes durable state, and
     // releases the single-instance lock exactly once — so the next host can
     // reopen the same durable home immediately, with no retry and no delay.
-    srv.stop_and_wait().await;
+    assert!(srv.stop_and_wait().await.is_clean());
     let shutdown = host.shutdown().await;
     assert_eq!(
         shutdown.supervised_tasks_remaining, 0,
@@ -462,7 +467,7 @@ async fn soak_desktop_bootstrap_node_campaign() {
         ws.path().join("soak_marker.txt").is_file(),
         "offline write must leave soak_marker.txt"
     );
-    srv2.stop_and_wait().await;
+    assert!(srv2.stop_and_wait().await.is_clean());
     let shutdown2 = host2.shutdown().await;
     assert!(shutdown2.process_lock_released);
     assert!(!shutdown2.process_lock_held_after);
@@ -495,6 +500,15 @@ fn soak_restart_recovery_matrix() {
         host.session_set_cwd(session.id, ws.path()).unwrap();
         host.session_queue_add(session.id, "queued across restart".into(), false)
             .unwrap();
+        let shutdown = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(host.shutdown());
+        assert!(
+            shutdown.is_clean(),
+            "the restart fixture must release its authority through ordered shutdown: {shutdown:?}"
+        );
         session.id
     };
 
@@ -615,6 +629,16 @@ fn soak_restart_recovery_matrix() {
     let queued = host2.session_queue_list(session_id).unwrap();
     assert!(!queued.is_empty());
     assert_eq!(queued[0].text, "queued across restart");
+
+    let shutdown2 = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(host2.shutdown());
+    assert!(
+        shutdown2.is_clean(),
+        "the replacement fixture must also close through ordered shutdown: {shutdown2:?}"
+    );
 
     set_grokptah_home_override(None);
 }

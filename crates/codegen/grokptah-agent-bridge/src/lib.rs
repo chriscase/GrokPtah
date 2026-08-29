@@ -141,6 +141,7 @@ pub use lane::{LaneSummary, RuntimeConnectionState, RuntimeTarget};
 pub use mcp_control::{
     discovered_tool_names, start_control_from_env, start_control_server, start_control_server_with,
     start_control_server_with_bind, ControlServerHandle, ControlServerLimits,
+    ControlServerStopReport,
 };
 pub use mcp_control_client::{
     ListedTool, LiveEventFrame, LiveNotification, McpControlClient, McpEventStream, McpRemoteError,

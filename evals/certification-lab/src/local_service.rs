@@ -13,8 +13,8 @@ use anyhow::{bail, Context, Result};
 use grokptah_agent_bridge::provider_observation::ProviderObservationSession;
 use grokptah_agent_bridge::{
     home_override_serial, start_control_server_with, AgentHost, ControlServerHandle,
-    ControlServerLimits, HostConfig, HostRuntime, McpControlClient, OrchestrationConfig,
-    OrchestrationService, RunBounds, RuntimeHome, WorkspaceAllowlist,
+    ControlServerLimits, ControlServerStopReport, HostConfig, HostRuntime, McpControlClient,
+    OrchestrationConfig, OrchestrationService, RunBounds, RuntimeHome, WorkspaceAllowlist,
 };
 use uuid::Uuid;
 
@@ -188,7 +188,7 @@ impl LocalService {
     /// bearer and disposable workspace allowlist remain unchanged.
     #[allow(clippy::await_holding_lock)]
     pub async fn restart(&mut self) -> Result<()> {
-        self.shutdown_parts().await;
+        self.shutdown_parts().await?;
         let (host, server, base_url) = bootstrap(&self.config, &self.token)
             .await
             .context("restart isolated GrokPtah control plane")?;
@@ -200,13 +200,17 @@ impl LocalService {
 
     /// Gracefully release the control server, background supervisors, and host.
     #[allow(clippy::await_holding_lock)]
-    pub async fn stop(mut self) {
-        self.shutdown_parts().await;
+    pub async fn stop(mut self) -> Result<()> {
+        self.shutdown_parts().await
     }
 
-    async fn shutdown_parts(&mut self) {
+    async fn shutdown_parts(&mut self) -> Result<()> {
+        let mut failures = Vec::new();
         if let Some(server) = self.server.take() {
-            server.stop_and_wait().await;
+            let report = server.stop_and_wait().await;
+            if let Some(failure) = control_server_stop_failure(&report) {
+                failures.push(failure);
+            }
         }
         if let Some(host) = self.host.take() {
             // Ordered shutdown: join every supervised task, flush durable
@@ -214,13 +218,27 @@ impl LocalService {
             // lab run can reopen the same disposable home immediately (#455).
             let report = host.shutdown().await;
             if !report.is_clean() {
-                eprintln!(
-                    "[certification-lab] host shutdown: {}",
-                    report.operator_summary()
-                );
+                failures.push(format!("host shutdown: {}", report.operator_summary()));
             }
         }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "certification-lab teardown was not clean; restart/qualification refused: {}",
+                failures.join("; ")
+            )
+        }
     }
+}
+
+fn control_server_stop_failure(report: &ControlServerStopReport) -> Option<String> {
+    (!report.is_clean()).then(|| {
+        format!(
+            "control server did not stop cleanly: fullyStopped={} errors={:?}",
+            report.fully_stopped, report.errors
+        )
+    })
 }
 
 impl Drop for LocalService {
@@ -383,6 +401,20 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn incomplete_control_stop_refuses_qualification_restart() {
+        let report = ControlServerStopReport {
+            fully_stopped: false,
+            errors: vec!["synthetic stuck control tail".into()],
+        };
+        let failure = control_server_stop_failure(&report).expect("must fail closed");
+        assert!(failure.contains("fullyStopped=false"), "{failure}");
+        assert!(
+            failure.contains("synthetic stuck control tail"),
+            "{failure}"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn offline_control_plane_is_black_box_and_restart_durable() {
         if !loopback_test_available() {
@@ -444,7 +476,7 @@ mod tests {
             .any(|session| session["sessionId"] == session_id));
         reconnected.close_session().await.expect("close client");
 
-        service.stop().await;
+        service.stop().await.unwrap();
         assert_eq!(std::env::var_os(OFFLINE_ENV), previous_offline);
     }
 

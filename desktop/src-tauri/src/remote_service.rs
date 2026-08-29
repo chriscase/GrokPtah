@@ -1763,7 +1763,7 @@ mod tests {
             .is_err());
 
         let address = first_server.addr;
-        first_server.stop_and_wait().await;
+        assert!(first_server.stop_and_wait().await.is_clean());
         let restarted_server = start_control_server_with_bind(
             orch,
             address,
@@ -1785,7 +1785,7 @@ mod tests {
             .unwrap()
             .iter()
             .any(|run| run.run_id == submission.run_id));
-        restarted_server.stop_and_wait().await;
+        assert!(restarted_server.stop_and_wait().await.is_clean());
         set_grokptah_home_override(None);
     }
 }

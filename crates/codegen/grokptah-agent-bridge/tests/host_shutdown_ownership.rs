@@ -648,7 +648,7 @@ async fn late_control_server_attach_is_refused_and_handed_back() {
         .expect_err("a closed runtime must refuse a late control server");
     assert_eq!(rejected.phase, HostPhase::Closed);
     // The caller still owns the listener and must stop it.
-    rejected.server.stop_and_wait().await;
+    assert!(rejected.server.stop_and_wait().await.is_clean());
 
     // Nothing is serving that address any more, and the home is free.
     let probe = reqwest::Client::new()
@@ -901,6 +901,31 @@ async fn supervised_task_panics_survive_the_caller_join_handle() {
         error.contains("synthetic panicking task") && error.contains("synthetic supervised panic")
     }));
     assert!(report.process_lock_retained_for_safety);
+}
+
+/// Aborting the caller-owned JoinHandle drops the tracked future without an
+/// unwind. That abrupt cancellation is still an uncertain supervised outcome
+/// and must survive until shutdown rather than turning into a false clean
+/// release when TaskTracker reaches zero.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn supervised_task_abort_survives_the_caller_join_handle() {
+    let lane = Lane::new();
+    let (runtime, _session_id) = lane.boot();
+    let task = runtime
+        .spawn_supervised("synthetic aborted task", std::future::pending::<()>())
+        .unwrap();
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+
+    let report = runtime.shutdown().await;
+    assert!(!report.is_clean());
+    assert_eq!(report.supervised_tasks_remaining, 0);
+    assert!(report.join_errors.iter().any(|error| {
+        error.contains("synthetic aborted task") && error.contains("cancelled before completion")
+    }));
+    assert!(report.process_lock_retained_for_safety);
+    assert!(!report.process_lock_released);
 }
 
 /// Immediate same-home restart, repeatedly, each with real supervised work in

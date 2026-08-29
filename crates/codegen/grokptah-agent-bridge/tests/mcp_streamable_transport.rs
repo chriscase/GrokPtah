@@ -215,7 +215,7 @@ async fn run_reads_require_exact_session_and_workspace_scope() {
         );
     }
 
-    srv.stop_and_wait().await;
+    assert!(srv.stop_and_wait().await.is_clean());
     set_grokptah_home_override(None);
     std::env::remove_var("GROKPTAH_AGENT_OFFLINE");
 }
@@ -1510,7 +1510,7 @@ async fn http_submit_allow_queue_and_cancel_queued_run() {
     assert_eq!(visible_cancelled.structured["state"], "cancelled");
     assert!(visible_cancelled.structured["queuePosition"].is_null());
 
-    srv.stop_and_wait().await;
+    assert!(srv.stop_and_wait().await.is_clean());
     set_grokptah_home_override(None);
 }
 
@@ -1824,7 +1824,7 @@ async fn http_retry_interrupted_run_is_explicit_and_idempotent() {
         .await
         .is_err());
 
-    srv.stop_and_wait().await;
+    assert!(srv.stop_and_wait().await.is_clean());
     set_grokptah_home_override(None);
     std::env::remove_var("GROKPTAH_AGENT_OFFLINE");
 }
@@ -2085,7 +2085,7 @@ async fn mcp_isolated_run_review_approval_and_restart_promotion() {
         .unwrap();
     assert_eq!(replay.structured["runId"], promoted.structured["runId"]);
     client2.close_session().await.unwrap();
-    srv2.stop_and_wait().await;
+    assert!(srv2.stop_and_wait().await.is_clean());
     set_grokptah_home_override(None);
     std::env::remove_var("GROKPTAH_AGENT_OFFLINE");
 }
@@ -2870,7 +2870,7 @@ async fn live_computer_reads_node_smoke() {
     // Durable transcript for verifiers (`--nocapture`).
     eprintln!("LIVE_COMPUTER_READS_SMOKE_REPORT {report}");
 
-    srv.stop_and_wait().await;
+    assert!(srv.stop_and_wait().await.is_clean());
     set_grokptah_home_override(None);
     drop(env);
 }
