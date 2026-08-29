@@ -17,6 +17,7 @@ All are runnable from a clean clone with caches disabled
 | Desktop shell | `cargo test --locked` | `desktop/src-tauri` |
 | Agent bridge | `cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked -- --test-threads=1` | `crates/codegen/grokptah-agent-bridge` |
 | Offline oracles | `cargo test --locked eval_oracle -- --nocapture` | `crates/codegen/grokptah-agent-bridge` |
+| Host authority spine | `cargo fmt -p xai-host-authority -- --check && cargo clippy -p xai-host-authority --all-targets --locked -- -D warnings && cargo test -p xai-host-authority --locked -- --test-threads=1` | repository root |
 | Focused upstream support | `cargo fmt -p xai-grok-env -p xai-grok-shell-base -- --check && cargo clippy -p xai-grok-env -p xai-grok-shell-base --all-targets --all-features --locked -- -D warnings && cargo test -p xai-grok-shell-base --all-features --locked` | repository root |
 
 The deterministic reliability campaign is also a supported focused check:
