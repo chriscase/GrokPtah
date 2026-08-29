@@ -726,3 +726,88 @@ fn a_corrupt_authority_root_refuses_service_rather_than_inventing_authority() {
         }
     }
 }
+
+#[test]
+fn a_send_intent_always_names_its_producing_principal_and_generations() {
+    // An audit entry whose producer could be absent would let an unattributed
+    // intent sit beside attributed ones and read as equivalent. Every field is
+    // required, so that state is unrepresentable.
+    let f = fixture();
+    let req = request(b"body");
+    let lease = lease_for(&f, &req);
+    let permit = f.authority.begin_send(&f.auth, lease, &req).unwrap();
+    let _ = f.authority.settle_settled(permit);
+
+    let records = f.authority.audit_records().unwrap();
+    let intent = records
+        .iter()
+        .find_map(|r| match &r.event {
+            AuditEvent::SendIntent {
+                principal,
+                auth_generation,
+                capability_generation,
+                session,
+                workspace,
+                resource,
+                ..
+            } => Some((
+                principal.clone(),
+                *auth_generation,
+                *capability_generation,
+                session.clone(),
+                workspace.clone(),
+                resource.clone(),
+            )),
+            _ => None,
+        })
+        .expect("a send intent must be recorded");
+
+    assert_eq!(intent.0, f.auth.principal().public_handle());
+    assert_eq!(intent.1, 1, "the producing authentication generation");
+    assert_eq!(intent.2, 1, "the producing capability generation");
+    assert_eq!(intent.3, f.session.public_handle());
+    assert_eq!(intent.4, f.workspace.public_handle());
+    assert_eq!(intent.5, f.resource.public_handle());
+}
+
+#[test]
+fn there_is_no_unauthenticated_path_that_mutates_or_prunes_the_log() {
+    // The audit surface is append-plus-read only: there is no retention,
+    // deletion, or compaction entry point at all, authenticated or otherwise,
+    // so no operator act can drop evidence without leaving the chain broken.
+    let f = fixture();
+    let before = f.authority.audit_records().unwrap().len();
+    assert!(before > 0);
+    // Reading never mutates.
+    let _ = f.authority.audit_records().unwrap();
+    assert!(f.authority.audit_chain_intact().unwrap());
+    assert_eq!(f.authority.audit_records().unwrap().len(), before);
+}
+
+#[test]
+fn a_refused_send_is_recorded_against_the_principal_that_asked() {
+    let f = fixture();
+    let req = request(b"body");
+    let lease = lease_for(&f, &req);
+    // Spend the lease, then replay it.
+    let permit = f
+        .authority
+        .begin_send(&f.auth, lease.clone(), &req)
+        .unwrap();
+    let _ = f.authority.settle_settled(permit);
+    assert!(f.authority.begin_send(&f.auth, lease, &req).is_err());
+
+    let denied = f
+        .authority
+        .audit_records()
+        .unwrap()
+        .into_iter()
+        .filter_map(|r| match r.event {
+            AuditEvent::Denied { principal, reason } => Some((principal, reason)),
+            _ => None,
+        })
+        .next()
+        .expect("a refusal must be attributable");
+    assert_eq!(denied.0, f.auth.principal().public_handle());
+    assert!(denied.1.contains("AlreadyConsumed"), "got {}", denied.1);
+}

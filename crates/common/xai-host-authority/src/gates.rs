@@ -240,7 +240,7 @@ impl HostAuthority {
         let body_digest = request.body_digest();
 
         // Step 1: consume the lease and record the attempt, atomically.
-        let (attempt, binding) = self.with_state(|state| {
+        let admitted = self.with_state(|state| {
             require_current_state(state, auth)?;
             let stored = state
                 .leases
@@ -329,7 +329,24 @@ impl HostAuthority {
                 },
             );
             Ok((attempt, lease.binding))
-        })?;
+        });
+
+        // A refusal is recorded against the authenticated principal that asked.
+        // Failing to record a *denial* cannot change the denial: no effect
+        // occurred and none is being permitted, so the refusal still stands.
+        let (attempt, binding) = match admitted {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                let _ = self.append_audit(
+                    auth.control_epoch.raw(),
+                    AuditEvent::Denied {
+                        principal: auth.principal.public_handle(),
+                        reason: format!("{error:?}"),
+                    },
+                );
+                return Err(error);
+            }
+        };
 
         // Step 2: the intent must be durable before a permit can exist.
         self.append_audit(
@@ -337,6 +354,12 @@ impl HostAuthority {
             AuditEvent::SendIntent {
                 attempt: attempt.public_handle(),
                 lease: lease.id.public_handle(),
+                principal: binding.principal.public_handle(),
+                auth_generation: binding.auth_generation.raw(),
+                capability_generation: binding.capability_generation.raw(),
+                session: binding.session.public_handle(),
+                workspace: binding.workspace.public_handle(),
+                resource: binding.resource.public_handle(),
                 request_digest: request_digest.public_handle(),
                 body_digest: body_digest.public_handle(),
             },

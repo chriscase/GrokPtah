@@ -50,9 +50,23 @@ pub enum AuditEvent {
         observation_revision: u64,
     },
     /// Intent to perform a physical send. Written *before* the permit exists.
+    ///
+    /// Every field is required. The producing principal and its generations
+    /// are part of the record rather than an optional annotation, so an
+    /// auditor reading the log alone can always say which principal, under
+    /// which authentication and capability generation, and against which
+    /// session, workspace and resource, asked for the effect. An intent whose
+    /// producer could be absent would let an unattributed entry sit beside
+    /// attributed ones and read as equivalent.
     SendIntent {
         attempt: String,
         lease: String,
+        principal: String,
+        auth_generation: u64,
+        capability_generation: u64,
+        session: String,
+        workspace: String,
+        resource: String,
         request_digest: String,
         body_digest: String,
     },
