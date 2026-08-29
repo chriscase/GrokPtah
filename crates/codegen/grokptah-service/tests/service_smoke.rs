@@ -49,21 +49,52 @@ async fn standalone_service_exposes_authenticated_mcp_and_readiness() {
         .unwrap();
     assert_eq!(unauthenticated.status(), reqwest::StatusCode::UNAUTHORIZED);
 
+    // The unauthenticated loopback projection carries no diagnostics, but it
+    // reports the real verdict: a healthy service answers 200 and an unhealthy
+    // one would answer 503, so this can never be a fabricated liveness 200.
     let readiness = reqwest::get(format!("{base}/ready")).await.unwrap();
     assert_eq!(readiness.status(), reqwest::StatusCode::OK);
     let readiness_json: serde_json::Value = readiness.json().await.unwrap();
+    assert_eq!(readiness_json["ok"], true);
     assert_eq!(readiness_json["ready"], true);
+    assert_eq!(readiness_json["status"], "ready");
+    assert_eq!(readiness_json["authoritative"], true);
+    assert!(readiness_json.get("capacity").is_none());
+
+    // A valid bearer reaches the authoritative readiness result, diagnostics
+    // included.
+    let authenticated = reqwest::Client::new()
+        .get(format!("{base}/ready"))
+        .bearer_auth("standalone-service-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(authenticated.status(), reqwest::StatusCode::OK);
+    let authenticated_json: serde_json::Value = authenticated.json().await.unwrap();
+    assert_eq!(authenticated_json["ready"], true);
+    assert_eq!(authenticated_json["authoritative"], true);
     assert_eq!(
-        readiness_json["capacity"]["health"]["workloadSupervisor"]["enabled"],
+        authenticated_json["capacity"]["health"]["workloadSupervisor"]["enabled"],
         true
     );
     assert!(
-        readiness_json["capacity"]["health"]["workloadSupervisor"]["lastSuccessAt"].is_string()
+        authenticated_json["capacity"]["health"]["workloadSupervisor"]["lastSuccessAt"].is_string()
     );
     assert_eq!(
-        readiness_json["capacity"]["health"]["routineSupervisor"]["enabled"],
+        authenticated_json["capacity"]["health"]["routineSupervisor"]["enabled"],
         true
     );
+    // Both projections must agree on the verdict.
+    assert_eq!(authenticated_json["ready"], readiness_json["ready"]);
+
+    // An invalid bearer is refused rather than downgraded to the open probe.
+    let bad_credential = reqwest::Client::new()
+        .get(format!("{base}/ready"))
+        .bearer_auth("not-the-service-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_credential.status(), reqwest::StatusCode::UNAUTHORIZED);
 
     let mut client = McpControlClient::new(base, "standalone-service-token");
     client.initialize().await.unwrap();
@@ -159,7 +190,26 @@ async fn service_mcp_contract_covers_scoped_live_reconnect_controls_and_restart(
     .unwrap();
     let handle = start_service(config).await.unwrap();
     let host = handle.host();
-    let (session_id, run_id, agent_id, first_seq) = seed_active_run(&host, &workspace_path);
+    // A durable record is bound to the credential incarnation that wrote it
+    // (#477), so the fixture stamps the lineage this service authenticates as.
+    // Seeded without it the record is quarantined — correctly — and the reads
+    // below would refuse it.
+    let orch = handle.orchestration();
+    let seed_session = host.session_new().unwrap();
+    host.session_set_cwd(seed_session.id, &workspace_path).unwrap();
+    let lineage = {
+        let auth = orch
+            .auth_header(Some(&format!("Bearer {token}")))
+            .expect("the configured service token authenticates");
+        orch.scoped_reads(&auth, seed_session.id, &workspace_path)
+            .expect("the service workspace is in the allowlist")
+            .identity()["lineage"]
+            .as_str()
+            .expect("the scoped identity projects its credential lineage")
+            .to_string()
+    };
+    let (session_id, run_id, agent_id, first_seq) =
+        seed_active_run(&host, &workspace_path, &lineage);
     let scope = RunScope {
         session_id,
         workspace: workspace_path.display().to_string(),
@@ -596,6 +646,7 @@ async fn service_capacity_and_scope_matrix_is_fail_closed() {
 fn seed_active_run(
     host: &AgentHostHandle,
     workspace: &std::path::Path,
+    client_lineage: &str,
 ) -> (Uuid, String, String, u64) {
     let session = host.session_new().unwrap();
     host.session_set_cwd(session.id, workspace).unwrap();
@@ -635,6 +686,7 @@ fn seed_active_run(
             workspace: workspace.display().to_string(),
             request_id: "service-e2e-request".into(),
             client_id: Some("mcp".into()),
+            client_lineage: Some(client_lineage.to_string()),
             state: RunState::Running,
             purpose: Default::default(),
             agent_id: Some(agent_id.clone()),

@@ -443,6 +443,97 @@ fn credential_re_add_with_a_new_secret_cannot_reach_old_work() {
     teardown();
 }
 
+/// Re-declaring an unchanged credential keeps its incarnation, so the records
+/// that registration already wrote stay reachable.
+///
+/// A host that installs its credentials after construction — which is what
+/// `grokptah-service` does on every boot — re-declares them from configuration,
+/// and `AuthCredential::declare` mints a fresh incarnation each time. Without
+/// reconciliation the host would orphan its own durable records on every
+/// restart while reporting a clean resume. The alias *and* the secret digest
+/// must both match to carry an incarnation forward, so this must not weaken
+/// `credential_re_add_with_a_new_secret_cannot_reach_old_work`, which is
+/// asserted here too.
+#[test]
+fn re_declaring_unchanged_credentials_keeps_their_incarnation() {
+    let fx = fixture();
+    let session = fx.session();
+    let canonical = fx.canonical_workspace();
+
+    let auth = fx.auth();
+    let lineage = fx
+        .orch
+        .scoped_reads(&auth, session, &fx.claimed_workspace)
+        .unwrap()
+        .identity()["lineage"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    fx.store()
+        .save_run(&planted_run(
+            "run-owned",
+            session,
+            &canonical,
+            Some(COMPAT_PRIMARY_PRINCIPAL),
+            Some(&lineage),
+        ))
+        .unwrap();
+
+    // Re-declare the identical secret, as a restarting host does.
+    fx.orch
+        .set_auth_credentials(
+            &fx.admin,
+            vec![AuthCredential::declare(&fx.admin, "primary", TOKEN).unwrap()],
+        )
+        .unwrap();
+    let after = fx
+        .orch
+        .auth_header(Some(&format!("Bearer {TOKEN}")))
+        .expect("the unchanged secret still authenticates");
+    let after_lineage = fx
+        .orch
+        .scoped_reads(&after, session, &fx.claimed_workspace)
+        .unwrap()
+        .identity()["lineage"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        after_lineage, lineage,
+        "an unchanged secret keeps the incarnation its records are bound to"
+    );
+    assert!(
+        fx.orch.get_run(&after, "run-owned").is_ok(),
+        "re-declaring the same credential must not orphan its own durable work"
+    );
+
+    // The generation still advanced, so identities issued before it are dead.
+    assert!(
+        fx.orch.get_run(&auth, "run-owned").is_err(),
+        "re-registration is still a generation advance for issued identities"
+    );
+
+    // A changed secret is still a different principal.
+    fx.orch
+        .set_auth_credentials(
+            &fx.admin,
+            vec![AuthCredential::declare(&fx.admin, "primary", "a-different-secret").unwrap()],
+        )
+        .unwrap();
+    let rotated = fx
+        .orch
+        .auth_header(Some("Bearer a-different-secret"))
+        .unwrap();
+    let absent = fx.orch.get_run(&rotated, "run-absent").unwrap_err();
+    let refused = fx.orch.get_run(&rotated, "run-owned").unwrap_err();
+    assert_eq!(
+        (refused.code.as_str(), refused.message.as_str()),
+        (absent.code.as_str(), absent.message.as_str()),
+        "a changed secret must not inherit the previous incarnation's work"
+    );
+    teardown();
+}
+
 /// A restart with unchanged credentials keeps each registration's incarnation,
 /// so a caller's own durable work stays reachable across a restart while
 /// pre-restart *identities* still die.

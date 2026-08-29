@@ -2180,6 +2180,33 @@ impl OrchestrationService {
     /// The generation lock is held throughout, and every authentication takes
     /// it too, so a rotation cannot interleave with an authentication and stamp
     /// a revoked credential with the new generation.
+    /// Carry a live incarnation forward onto a replacement registration when
+    /// the alias *and* the secret digest both match.
+    ///
+    /// [`Self::establish_authority`] applies this rule at construction, against
+    /// what the store persisted. Re-registration needs it too: a host that
+    /// re-declares its unchanged credentials — which is what a service restart
+    /// does on every boot — must not orphan the durable records that same
+    /// credential already wrote. A changed secret still yields a fresh
+    /// incarnation, because the digest is half the key, so removal and re-add
+    /// under a new secret stays a different principal.
+    ///
+    /// Takes the credential lock and releases it before any caller advances the
+    /// generation, preserving the documented order (generation, then
+    /// credentials).
+    fn adopt_live_incarnations(&self, credentials: &mut [AuthCredential]) {
+        let live = self.auth_credentials.lock();
+        for credential in credentials.iter_mut() {
+            let digest = credential.token_digest();
+            if let Some(existing) = live
+                .iter()
+                .find(|c| c.id() == credential.id() && c.token_digest() == digest)
+            {
+                credential.adopt_incarnation(existing.incarnation());
+            }
+        }
+    }
+
     fn advance_authority(
         &self,
         policy_change: bool,
@@ -2221,11 +2248,14 @@ impl OrchestrationService {
         let token = token.trim().to_string();
         // Build and validate before advancing so a rejected token changes
         // nothing, not even the generation.
-        let credentials = if token.is_empty() {
+        let mut credentials = if token.is_empty() {
             Vec::new()
         } else {
             vec![AuthCredential::mint("primary", token.clone())?]
         };
+        // Re-setting the identical token is not a rotation: it keeps the
+        // incarnation. A different token changes the digest, so it does not.
+        self.adopt_live_incarnations(&mut credentials);
         let bindings = credentials.clone();
         self.advance_authority(false, Some(&bindings), || {
             if !token.is_empty() {
@@ -2266,6 +2296,10 @@ impl OrchestrationService {
             .expect("primary credential was checked above")
             .token()
             .to_string();
+        // An unchanged registration keeps the incarnation its records are bound
+        // to; only a changed secret gets a new one.
+        let mut credentials = credentials;
+        self.adopt_live_incarnations(&mut credentials);
         let bindings = credentials.clone();
         self.advance_authority(false, Some(&bindings), || {
             for credential in &credentials {

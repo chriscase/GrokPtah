@@ -14,9 +14,9 @@ use grokptah_agent_bridge::orchestration::{
 };
 use grokptah_agent_bridge::{
     canonical_workspace_string, set_grokptah_home_override, start_control_from_env,
-    start_control_server, start_control_server_with, ActionClass, ActionGrant, AgentHost,
-    ComputerRun, ComputerUseService, ControlServerLimits, GrantIssuer, HostConfig,
-    McpControlClient, SessionKind, SimulatorBackend, CONTROL_TOOLS,
+    start_control_server, start_control_server_with, start_control_server_with_bind, ActionClass,
+    ActionGrant, AgentHost, ComputerRun, ComputerUseService, ControlServerLimits, GrantIssuer,
+    HostConfig, McpControlClient, SessionKind, SimulatorBackend, CONTROL_TOOLS,
 };
 use serde_json::json;
 use tempfile::tempdir;
@@ -311,6 +311,485 @@ async fn unauthenticated_and_oversized_fail_closed() {
 
     srv.stop();
     set_grokptah_home_override(None);
+}
+
+/// Send a raw HTTP/1.1 request so a test can shape the request line and header
+/// block in ways a well-behaved client library will not — absolute-form
+/// targets, duplicate `Host`, a missing `Host` — and return the status code.
+///
+/// `Connection: close` makes the server hang up after the response so the read
+/// terminates. A protocol-level rejection from hyper is reported the same way,
+/// which is what the caller asserts on.
+async fn raw_http_status(addr: std::net::SocketAddr, request: &str) -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream.write_all(request.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+    let mut raw = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut raw))
+        .await
+        .expect("raw response timed out")
+        .expect("raw response read failed");
+    let text = String::from_utf8_lossy(&raw);
+    let status_line = text.lines().next().unwrap_or_default();
+    status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or_else(|| panic!("no HTTP status line in raw response: {text:?}"))
+}
+
+/// A loopback listener is reachable from browser code, so every authority a
+/// request carries must name this host. `Host` alone is not enough: an
+/// absolute-form request target carries its own authority (the same `Uri` slot
+/// hyper fills from an HTTP/2 `:authority`; this build enables only `http1`, so
+/// absolute-form is how the stack exposes that slot), and duplicate or absent
+/// authority inputs are ambiguous rather than benign.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn loopback_request_authority_policy_fails_closed_on_hostile_and_ambiguous_input() {
+    let (_home, _lock, _host, _ws, orch) = setup();
+    let srv = start_control_server(orch.clone(), 0).await.unwrap();
+    let addr = srv.addr;
+    let port = addr.port();
+    // A second loopback port that is not this listener's.
+    let other_port = port.checked_add(1).unwrap_or(port - 1);
+
+    let rejected: Vec<(&str, String)> = vec![
+        // Absolute-form request target naming a hostile authority, no `Host`.
+        // This is the bypass that a `Host`-only check misses entirely.
+        (
+            "absolute-form hostile authority",
+            "GET http://attacker.example/health HTTP/1.1\r\nConnection: close\r\n\r\n"
+                .to_string(),
+        ),
+        // Target authority and `Host` disagree: hostile target, loopback Host.
+        (
+            "target/Host disagreement, hostile target",
+            format!(
+                "GET http://attacker.example/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+            ),
+        ),
+        // ...and the reverse: loopback target, hostile Host.
+        (
+            "target/Host disagreement, hostile host",
+            format!(
+                "GET http://127.0.0.1:{port}/health HTTP/1.1\r\nHost: attacker.example\r\nConnection: close\r\n\r\n"
+            ),
+        ),
+        // Both loopback, but naming different authorities.
+        (
+            "target/Host port disagreement",
+            format!(
+                "GET http://127.0.0.1:{other_port}/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+            ),
+        ),
+        // Duplicate authority inputs: two intermediaries may read different
+        // values from the same request.
+        (
+            "duplicate Host",
+            format!(
+                "GET /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nHost: attacker.example\r\nConnection: close\r\n\r\n"
+            ),
+        ),
+        (
+            "duplicate Host, hostile first",
+            format!(
+                "GET /health HTTP/1.1\r\nHost: attacker.example\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+            ),
+        ),
+        (
+            "duplicate Origin",
+            format!(
+                "GET /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://127.0.0.1:{port}\r\nOrigin: http://attacker.example\r\nConnection: close\r\n\r\n"
+            ),
+        ),
+        // No authority at all: the request cannot be attributed to this
+        // listener, so it is refused rather than assumed local.
+        (
+            "absent Host",
+            "GET /health HTTP/1.1\r\nConnection: close\r\n\r\n".to_string(),
+        ),
+        // Userinfo must never make an authority look like loopback.
+        (
+            "userinfo in Host",
+            format!(
+                "GET /health HTTP/1.1\r\nHost: attacker.example@127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+            ),
+        ),
+        (
+            "userinfo in Origin",
+            format!(
+                "GET /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://attacker.example@127.0.0.1\r\nConnection: close\r\n\r\n"
+            ),
+        ),
+        // `Authority::host` stops at the first `]`, so trailing junk after an
+        // IPv6 literal must not be silently discarded.
+        (
+            "IPv6 literal with trailing junk",
+            "GET /health HTTP/1.1\r\nHost: [::1]attacker.example\r\nConnection: close\r\n\r\n"
+                .to_string(),
+        ),
+        (
+            "unbracketed IPv6 literal",
+            "GET /health HTTP/1.1\r\nHost: ::1\r\nConnection: close\r\n\r\n".to_string(),
+        ),
+        (
+            "unterminated IPv6 literal",
+            "GET /health HTTP/1.1\r\nHost: [::1\r\nConnection: close\r\n\r\n".to_string(),
+        ),
+        (
+            "malformed authority",
+            format!("GET /health HTTP/1.1\r\nHost: :{port}\r\nConnection: close\r\n\r\n"),
+        ),
+        // DNS rebinding shapes: resolution is attacker-controlled.
+        (
+            "rebinding host suffix",
+            format!(
+                "GET /health HTTP/1.1\r\nHost: localhost.attacker.example:{port}\r\nConnection: close\r\n\r\n"
+            ),
+        ),
+        (
+            "rebinding host subdomain",
+            format!(
+                "GET /health HTTP/1.1\r\nHost: attacker.localhost:{port}\r\nConnection: close\r\n\r\n"
+            ),
+        ),
+        (
+            "rebinding address suffix",
+            format!(
+                "GET /health HTTP/1.1\r\nHost: 127.0.0.1.attacker.example:{port}\r\nConnection: close\r\n\r\n"
+            ),
+        ),
+        // Routable and unspecified addresses are not this host.
+        (
+            "unspecified address",
+            format!("GET /health HTTP/1.1\r\nHost: 0.0.0.0:{port}\r\nConnection: close\r\n\r\n"),
+        ),
+        (
+            "IPv4-mapped IPv6 address",
+            format!(
+                "GET /health HTTP/1.1\r\nHost: [::ffff:127.0.0.1]:{port}\r\nConnection: close\r\n\r\n"
+            ),
+        ),
+        // The policy also guards the MCP endpoint, ahead of authentication.
+        (
+            "hostile Host on the MCP endpoint",
+            "POST /mcp HTTP/1.1\r\nHost: attacker.example\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_string(),
+        ),
+    ];
+
+    for (label, request) in rejected {
+        let status = raw_http_status(addr, &request).await;
+        assert_ne!(status, 200, "{label} must not be served");
+        assert_eq!(status, 400, "{label} must be refused as a bad request");
+    }
+
+    // Well-formed loopback requests still work, including an absolute-form
+    // target that agrees with `Host`.
+    let accepted: Vec<(&str, String)> = vec![
+        (
+            "loopback address",
+            format!("GET /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+        ),
+        (
+            "reserved loopback name",
+            format!("GET /health HTTP/1.1\r\nHost: localhost:{port}\r\nConnection: close\r\n\r\n"),
+        ),
+        (
+            "mixed-case loopback name",
+            format!("GET /health HTTP/1.1\r\nHost: LocalHost:{port}\r\nConnection: close\r\n\r\n"),
+        ),
+        (
+            "agreeing absolute-form target",
+            format!(
+                "GET http://127.0.0.1:{port}/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+            ),
+        ),
+        (
+            "loopback Origin on a different loopback port",
+            format!(
+                "GET /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://localhost:{other_port}\r\nConnection: close\r\n\r\n"
+            ),
+        ),
+    ];
+    for (label, request) in accepted {
+        assert_eq!(
+            raw_http_status(addr, &request).await,
+            200,
+            "{label} must be served"
+        );
+    }
+
+    // The reqwest-shaped cases the original policy already covered.
+    let client = reqwest::Client::new();
+    let health_url = format!("http://{addr}/health");
+    for (label, header, value) in [
+        ("hostile host", "Host", "attacker.example".to_string()),
+        (
+            "hostile origin",
+            "Origin",
+            "https://attacker.example".to_string(),
+        ),
+        ("opaque origin", "Origin", "null".to_string()),
+        (
+            "non-http origin scheme",
+            "Origin",
+            "file://localhost".to_string(),
+        ),
+        (
+            "origin carrying a path",
+            "Origin",
+            format!("http://127.0.0.1:{port}/evil"),
+        ),
+    ] {
+        let response = client
+            .get(&health_url)
+            .header(header, value)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "{label} must be refused"
+        );
+    }
+
+    srv.stop();
+    set_grokptah_home_override(None);
+}
+
+/// An IPv6 loopback listener must accept `[::1]`, which the previous
+/// `IpAddr`-only parse rejected because `Authority::host` keeps the brackets.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn ipv6_loopback_authority_is_accepted_and_spoofs_are_not() {
+    let (_home, _lock, _host, _ws, orch) = setup();
+    let bind = std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 0));
+    let Ok(srv) =
+        start_control_server_with_bind(orch.clone(), bind, ControlServerLimits::default(), false)
+            .await
+    else {
+        // No IPv6 loopback on this machine; the IPv4 suite still covers policy.
+        set_grokptah_home_override(None);
+        return;
+    };
+    let addr = srv.addr;
+    let port = addr.port();
+
+    for (label, host) in [
+        ("compressed IPv6 loopback", format!("[::1]:{port}")),
+        (
+            "expanded IPv6 loopback",
+            format!("[0:0:0:0:0:0:0:1]:{port}"),
+        ),
+    ] {
+        let request = format!("GET /health HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+        assert_eq!(
+            raw_http_status(addr, &request).await,
+            200,
+            "{label} must be served"
+        );
+    }
+
+    for (label, host) in [
+        ("routable IPv6", format!("[2001:db8::1]:{port}")),
+        ("unspecified IPv6", format!("[::]:{port}")),
+        (
+            "IPv6 literal with trailing junk",
+            "[::1]attacker.example".to_string(),
+        ),
+    ] {
+        let request = format!("GET /health HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+        assert_eq!(
+            raw_http_status(addr, &request).await,
+            400,
+            "{label} must be refused"
+        );
+    }
+
+    srv.stop();
+    set_grokptah_home_override(None);
+}
+
+/// Readiness must be truthful for every caller, and a bearer must be able to
+/// reach the authoritative result even though loopback probes are open.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn readiness_is_truthful_and_reachable_with_a_bearer() {
+    let (_home, _lock, _host, _ws, orch) = setup();
+    let srv = start_control_server(orch.clone(), 0).await.unwrap();
+    let client = reqwest::Client::new();
+    let health_url = format!("http://{}/health", srv.addr);
+    let ready_url = format!("http://{}/ready", srv.addr);
+
+    // Unauthenticated `/health` stays a closed, non-authoritative liveness
+    // envelope that asserts nothing about readiness.
+    let health = client.get(&health_url).send().await.unwrap();
+    assert_eq!(health.status(), reqwest::StatusCode::OK);
+    let health_body: serde_json::Value = health.json().await.unwrap();
+    assert_eq!(health_body["ok"], true);
+    assert_eq!(health_body["status"], "alive");
+    assert_eq!(health_body["authoritative"], false);
+    assert!(health_body.get("ready").is_none());
+    assert!(health_body.get("capacity").is_none());
+    assert!(health_body.get("sessions").is_none());
+    assert!(health_body.get("maxConcurrent").is_none());
+    assert_probe_body_is_secret_free(&health_body);
+
+    // Unauthenticated `/ready` carries no diagnostics but does report the real
+    // verdict, so it can never answer 200 while the service is unready.
+    let ready = client.get(&ready_url).send().await.unwrap();
+    assert_eq!(ready.status(), reqwest::StatusCode::OK);
+    let ready_body: serde_json::Value = ready.json().await.unwrap();
+    assert_eq!(ready_body["ok"], true);
+    assert_eq!(ready_body["ready"], true);
+    assert_eq!(ready_body["status"], "ready");
+    assert_eq!(ready_body["authoritative"], true);
+    assert!(ready_body.get("capacity").is_none());
+    assert_probe_body_is_secret_free(&ready_body);
+
+    // A valid bearer reaches the authoritative result with its diagnostics.
+    let authed_ready = client
+        .get(&ready_url)
+        .bearer_auth("stream-token-200")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(authed_ready.status(), reqwest::StatusCode::OK);
+    let authed_ready_body: serde_json::Value = authed_ready.json().await.unwrap();
+    assert_eq!(authed_ready_body["ready"], true);
+    assert_eq!(authed_ready_body["authoritative"], true);
+    // Diagnostics the unauthenticated projection deliberately withholds.
+    assert!(authed_ready_body["capacity"]["health"].is_object());
+    assert!(authed_ready_body["capacity"]["health"]["workloadSupervisor"]["enabled"].is_boolean());
+    assert!(authed_ready_body["capacity"]["health"]["routineSupervisor"]["enabled"].is_boolean());
+    assert!(authed_ready_body["capacity"]["maxConcurrentRuns"].is_number());
+    // The two projections must agree on the verdict they report.
+    assert_eq!(authed_ready_body["ready"], ready_body["ready"]);
+
+    // ...and the same for `/health`, which becomes the detailed envelope.
+    let authed_health = client
+        .get(&health_url)
+        .bearer_auth("stream-token-200")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(authed_health.status(), reqwest::StatusCode::OK);
+    let authed_health_body: serde_json::Value = authed_health.json().await.unwrap();
+    assert_eq!(authed_health_body["ok"], true);
+    assert_eq!(authed_health_body["ready"], true);
+    assert!(authed_health_body["maxConcurrent"].as_u64().unwrap() >= 1);
+    assert!(authed_health_body["protocolVersions"].is_array());
+
+    // A bad credential on an open probe route is rejected, not downgraded to
+    // the unauthenticated projection.
+    for url in [&health_url, &ready_url] {
+        let response = client
+            .get(url)
+            .bearer_auth("not-the-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "{url} must reject a bad bearer"
+        );
+    }
+
+    srv.stop();
+    set_grokptah_home_override(None);
+}
+
+/// A listener started with authenticated health probes — the mode a
+/// non-loopback deployment is required to use — must authenticate `/health` and
+/// `/ready` for every caller, and answer authoritatively once it has.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn authenticated_health_probe_deployments_keep_requiring_credentials() {
+    let (_home, _lock, _host, _ws, orch) = setup();
+    let srv = start_control_server_with_bind(
+        orch.clone(),
+        std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
+        ControlServerLimits::default(),
+        true,
+    )
+    .await
+    .unwrap();
+    let client = reqwest::Client::new();
+    let health_url = format!("http://{}/health", srv.addr);
+    let ready_url = format!("http://{}/ready", srv.addr);
+
+    // No open projection exists in this mode: probes are credentials-only.
+    for url in [&health_url, &ready_url] {
+        assert_eq!(
+            client.get(url).send().await.unwrap().status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "{url} must require credentials when health probes are authenticated"
+        );
+        assert_eq!(
+            client
+                .get(url)
+                .bearer_auth("not-the-token")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "{url} must reject a bad bearer"
+        );
+    }
+
+    let health: serde_json::Value = client
+        .get(&health_url)
+        .bearer_auth("stream-token-200")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(health["ok"], true);
+    assert_eq!(health["ready"], true);
+    assert!(health["maxConcurrent"].as_u64().unwrap() >= 1);
+
+    let ready = client
+        .get(&ready_url)
+        .bearer_auth("stream-token-200")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ready.status(), reqwest::StatusCode::OK);
+    let ready_body: serde_json::Value = ready.json().await.unwrap();
+    assert_eq!(ready_body["ready"], true);
+    assert_eq!(ready_body["authoritative"], true);
+    assert!(ready_body["capacity"]["health"].is_object());
+
+    srv.stop();
+    set_grokptah_home_override(None);
+}
+
+/// An unauthenticated probe body must never carry host telemetry or secrets.
+fn assert_probe_body_is_secret_free(body: &serde_json::Value) {
+    let rendered = body.to_string().to_ascii_lowercase();
+    for needle in [
+        "capacity",
+        "credential",
+        "error",
+        "path",
+        "persistence",
+        "secret",
+        "session",
+        "supervisor",
+        "token",
+        "workspace",
+    ] {
+        assert!(!rendered.contains(needle), "probe leaked {needle}: {body}");
+    }
 }
 
 #[tokio::test]
@@ -705,8 +1184,20 @@ async fn session_map_hard_capped_under_initialize_spam() {
             oldest = Some(sid);
         }
     }
+    // The unauthenticated probe stays a closed liveness envelope...
+    let public_health = http
+        .get(format!("http://{}/health", srv.addr))
+        .send()
+        .await
+        .unwrap();
+    let public: serde_json::Value = public_health.json().await.unwrap();
+    assert_eq!(public["status"], "alive");
+    assert_eq!(public["authoritative"], false);
+    assert!(public.get("sessions").is_none());
+    // ...while an authenticated probe still proves the map is bounded.
     let health = http
         .get(format!("http://{}/health", srv.addr))
+        .header("Authorization", "Bearer stream-token-200")
         .send()
         .await
         .unwrap();
@@ -759,9 +1250,21 @@ async fn binds_loopback_only() {
     assert_eq!(health.status(), 200);
     let h: serde_json::Value = health.json().await.unwrap();
     assert_eq!(h["ok"], true);
+    assert_eq!(h["status"], "alive");
+    assert_eq!(h["authoritative"], false);
+    assert!(h.get("maxConcurrent").is_none());
+    // The concurrency bound is still advertised, to authenticated probes.
+    let authed = reqwest::Client::new()
+        .get(format!("http://{}/health", srv.addr))
+        .bearer_auth("stream-token-200")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(authed.status(), 200);
+    let a: serde_json::Value = authed.json().await.unwrap();
     assert!(
-        h["maxConcurrent"].as_u64().unwrap() >= 1,
-        "health must advertise concurrency bound"
+        a["maxConcurrent"].as_u64().unwrap() >= 1,
+        "authenticated health must advertise concurrency bound"
     );
     srv.stop();
     set_grokptah_home_override(None);

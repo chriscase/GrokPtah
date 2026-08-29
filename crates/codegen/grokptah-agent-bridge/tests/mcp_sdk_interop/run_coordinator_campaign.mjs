@@ -159,8 +159,41 @@ try {
   const healthJson = await health.json();
   record(
     "healthAndCapacity",
-    health.status === 200 && healthJson.ok === true && typeof healthJson.maxConcurrent === "number",
+    health.status === 200 &&
+      healthJson.ok === true &&
+      healthJson.status === "alive" &&
+      healthJson.authoritative === false &&
+      healthJson.capacity === undefined,
     healthJson
+  );
+
+  // Readiness reports the real verdict to every caller; a bearer additionally
+  // reaches the authoritative diagnostics.
+  const ready = await fetch(`${base}/ready`);
+  const readyJson = await ready.json();
+  record(
+    "readinessTruthful",
+    ready.status === 200 &&
+      readyJson.ok === true &&
+      readyJson.ready === true &&
+      readyJson.status === "ready" &&
+      readyJson.authoritative === true &&
+      readyJson.capacity === undefined,
+    readyJson
+  );
+  const authedReady = await fetch(`${base}/ready`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const authedReadyJson = await authedReady.json();
+  record(
+    "authenticatedReadinessIsAuthoritative",
+    authedReady.status === 200 &&
+      authedReadyJson.ready === true &&
+      authedReadyJson.authoritative === true &&
+      !!authedReadyJson.capacity &&
+      typeof authedReadyJson.capacity.health === "object" &&
+      authedReadyJson.ready === readyJson.ready,
+    { ready: authedReadyJson.ready, authoritative: authedReadyJson.authoritative }
   );
 
   const init = await mcpFetch("initialize", {

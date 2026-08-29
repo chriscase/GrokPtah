@@ -9,9 +9,9 @@ mod common;
 use std::time::Duration;
 
 use grokptah_agent_bridge::{
-    AuthCredential, LiveNotification, McpControlClient, McpRemoteError, RunScope,
+    LiveNotification, McpControlClient, McpRemoteError, RunScope,
 };
-use grokptah_service::{start_service, ServiceConfig};
+use grokptah_service::{start_service, ClientCredentialSpec, ServiceConfig};
 use serde_json::json;
 use tokio::time::timeout;
 use uuid::Uuid;
@@ -81,7 +81,7 @@ async fn named_device_credentials_share_agent_owner_and_attribute_runs() {
     .unwrap();
     config
         .client_credentials
-        .push(AuthCredential::new("laptop", secondary_token).unwrap());
+        .push(ClientCredentialSpec::new("laptop", secondary_token));
     let handle = start_service(config).await.unwrap();
     let host = handle.host();
     let mut primary = mcp_client(handle.addr).await;
@@ -442,8 +442,7 @@ async fn authorization_is_fail_closed_across_token_session_and_workspace() {
     let workspace = env.workspace_path();
     let other = env.other_workspace_path();
     let handle = start_isolated(&env, vec![workspace.clone(), other.clone()], 2).await;
-    let host = handle.host();
-    let (victim_session, victim_run, _, _) = seed_active_run(&host, &workspace, "authz-victim");
+    let (victim_session, victim_run, _, _) = seed_active_run(&handle, &workspace, "authz-victim");
     let mut client = mcp_client(handle.addr).await;
     let peer = create_build_session(&mut client, &other, "Peer session").await;
 
@@ -579,7 +578,7 @@ async fn disconnect_reconnect_restart_and_cursor_expiry_are_durable() {
     let workspace = env.workspace_path();
     let handle = start_isolated(&env, vec![workspace.clone()], 1).await;
     let host = handle.host();
-    let (session_id, run_id, _, first_seq) = seed_active_run(&host, &workspace, "resilience-run");
+    let (session_id, run_id, _, first_seq) = seed_active_run(&handle, &workspace, "resilience-run");
     let mut client = mcp_client(handle.addr).await;
     let holder = create_build_session(&mut client, &workspace, "Disconnect holder").await;
     let submit_session = create_build_session(&mut client, &workspace, "Disconnect session").await;
@@ -757,9 +756,9 @@ async fn desktop_contract_lists_history_after_active_pointer_changes() {
     let workspace = env.workspace_path();
     let handle = start_isolated(&env, vec![workspace.clone()], 2).await;
     let host = handle.host();
-    let (session_id, first_run, _, _) = seed_active_run(&host, &workspace, "desktop-history-1");
+    let (session_id, first_run, _, _) = seed_active_run(&handle, &workspace, "desktop-history-1");
     point_agent_at_new_run(
-        &host,
+        &handle,
         session_id,
         &workspace,
         &first_run,
