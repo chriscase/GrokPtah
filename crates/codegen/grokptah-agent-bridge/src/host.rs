@@ -23,8 +23,7 @@ use crate::computer_agent::{
 use crate::event_bus::{session_id_of, JournalPage};
 use crate::events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 use crate::host_helpers::{
-    action_stationarity_nudge, action_stationarity_stop_message, api_context_messages,
-    auto_cargo_reverify_command, build_agent_messages, build_compact_summary,
+    api_context_messages, auto_cargo_reverify_command, build_agent_messages, build_compact_summary,
     call_xai_agent_step_observed, call_xai_chat, cargo_test_failure_coaching,
     cargo_test_output_failed, cargo_test_output_passed, cargo_test_reverify_coaching,
     coding_agent_tools, count_cargo_test_failures, emit_message, emit_thought,
@@ -36,7 +35,7 @@ use crate::host_helpers::{
     round_limit_stop_message, sandbox_blocks_shell, sandbox_is_readonly,
     should_auto_cargo_reverify_after_edit, should_skip_tool_after_cargo_failure,
     surface_rate_limit_or_error, tool_kind, tool_step_signature, tool_web_fetch, AgentStep,
-    IdenticalToolCallRun, McpToolIndex,
+    McpToolIndex,
 };
 use crate::lane::LaneSummary;
 use crate::local_tools;
@@ -605,6 +604,12 @@ impl RunUsageTracker {
         Ok(stop.map(RunTokenStop::message))
     }
 }
+
+/// Byte cap applied to one tool result before it reaches the model wire.
+///
+/// The raw output is digested before this bound is applied; see
+/// [`crate::durable::observation`] for why the order matters.
+const TOOL_OUTPUT_WIRE_BYTES: usize = 24_000;
 
 const MAX_SESSION_COMPLETION_HISTORY: usize = 64;
 
@@ -8463,7 +8468,7 @@ impl AgentHostHandle {
         let (tools, mcp_index) = coding_agent_tools(&mcp_specs);
         // #168: at most one Stop-hook continue per user turn
         let mut stop_continued = false;
-        let mut identical_tool_calls = IdenticalToolCallRun::default();
+        let mut identical_tool_calls = crate::durable::ProgressLedger::new();
         let mut test_failure_needs_edit = false;
         // Cargo failures since last successful edit while armed.
         let mut cargo_fails_since_edit: u32 = 0;
@@ -8501,14 +8506,14 @@ impl AgentHostHandle {
             // Give an explicit steering prompt one model boundary to break a
             // stationary run before applying the automatic stop.
             if steering_count == 0 {
-                if let Some((run_len, tool_name, true_noop)) = identical_tool_calls.stop_info() {
-                    let msg = action_stationarity_stop_message(run_len, &tool_name, true_noop);
+                if let crate::durable::StopDecision::Stop(detail) = identical_tool_calls.decide() {
+                    let msg = crate::durable::progress::stop_message(&detail);
                     self.mark_run_stop(session_id, RunStopCause::Stationarity, "stationarity")?;
                     let _ = event_tx.send(SessionUpdate::AgentProgress {
                         session_id,
                         round: round as u32,
                         max_rounds: visible_max_rounds as u32,
-                        last_tool: Some(tool_name),
+                        last_tool: Some(detail.tool_name.clone()),
                         detail: msg.clone(),
                     });
                     emit_message(event_tx, session_id, &msg);
@@ -8518,9 +8523,9 @@ impl AgentHostHandle {
             }
 
             if identical_tool_calls.take_nudge() {
-                let run_len = identical_tool_calls.run_len();
-                let tool_name = identical_tool_calls.tool_name();
-                let nudge = action_stationarity_nudge(&tool_name, run_len);
+                let run_len = identical_tool_calls.repeats();
+                let tool_name = identical_tool_calls.tool_name().to_string();
+                let nudge = crate::durable::progress::nudge_message(&tool_name, run_len);
                 let _ = event_tx.send(SessionUpdate::AgentProgress {
                     session_id,
                     round: round as u32,
@@ -8814,6 +8819,10 @@ impl AgentHostHandle {
                     }));
 
                     let mut edited_while_needs_reverify = false;
+                    // Raw observation digests for this round, taken before any
+                    // bounded projection of the tool output.
+                    let mut round_raw_outputs: Vec<crate::durable::RawObservationDigest> =
+                        Vec::new();
                     for tc in &tool_calls {
                         if cancel.is_cancelled() {
                             break;
@@ -8857,17 +8866,13 @@ impl AgentHostHandle {
                             Ok(s) => s.clone(),
                             Err(e) => format!("ERROR: {e}"),
                         };
-                        // Cap tool output size for the wire
-                        let content = if content.len() > 24_000 {
-                            let orig_len = content.len();
-                            format!(
-                                "{}…\n(truncated {} bytes)",
-                                crate::textutil::truncate_at_char_boundary(&content, 24_000),
-                                orig_len
-                            )
-                        } else {
-                            content
-                        };
+                        // Digest the raw output *before* bounding it for the wire.
+                        // A digest taken from the bounded projection cannot see a
+                        // change past the cap, so a long, advancing output would
+                        // read as inert and cut a productive turn short (#209).
+                        let observation = crate::durable::RawObservation::capture(content);
+                        round_raw_outputs.push(observation.digest());
+                        let content = observation.project(TOOL_OUTPUT_WIRE_BYTES).into_text();
                         // Under tight budgets, only clear the post-failure gate when cargo is
                         // green again. Clearing on edit alone allowed final answers without a
                         // re-run (#187 verified=false despite oracle pass via external check).
@@ -8971,16 +8976,13 @@ impl AgentHostHandle {
                             Ok(s) => s.clone(),
                             Err(e) => format!("ERROR: {e}"),
                         };
-                        let content = if content.len() > 24_000 {
-                            let orig_len = content.len();
-                            format!(
-                                "{}…\n(truncated {} bytes)",
-                                crate::textutil::truncate_at_char_boundary(&content, 24_000),
-                                orig_len
-                            )
-                        } else {
-                            content
-                        };
+                        // Digest the raw output *before* bounding it for the wire.
+                        // A digest taken from the bounded projection cannot see a
+                        // change past the cap, so a long, advancing output would
+                        // read as inert and cut a productive turn short (#209).
+                        let observation = crate::durable::RawObservation::capture(content);
+                        round_raw_outputs.push(observation.digest());
+                        let content = observation.project(TOOL_OUTPUT_WIRE_BYTES).into_text();
                         if cargo_test_output_failed(&content) {
                             test_failure_needs_edit = true;
                             cargo_fails_since_edit = cargo_fails_since_edit.saturating_add(1);
@@ -9023,11 +9025,19 @@ impl AgentHostHandle {
                         .first()
                         .map(|tool_call| tool_call.name.as_str())
                         .unwrap_or("");
-                    identical_tool_calls.observe(
+                    identical_tool_calls.observe_call(
                         &signature,
                         tool_name,
                         is_true_noop_tool_step(&tool_calls),
                     );
+                    // Judge the repeat by what it produced, not only by what it
+                    // asked for: a poll whose output keeps advancing is not
+                    // stationary and must not be stopped as a no-op.
+                    if let Some(digest) =
+                        crate::durable::RawObservationDigest::of_digests(&round_raw_outputs)
+                    {
+                        identical_tool_calls.observe_outcome(digest);
+                    }
                     // Usage belongs to the model boundary that produced these
                     // calls. Let every tool in that accepted response settle,
                     // then stop here so the final loop exit cannot overwrite a

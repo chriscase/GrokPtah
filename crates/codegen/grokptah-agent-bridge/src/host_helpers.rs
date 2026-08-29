@@ -423,76 +423,10 @@ pub(crate) struct AgentToolCall {
     pub(crate) arguments: String,
 }
 
-const MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS: u32 = 16;
-const NUDGE_AFTER_IDENTICAL_TOOL_CALLS: u32 = 8;
-const MAX_CONSECUTIVE_TRUE_NOOPS: u32 = 4;
-
-const _: () = assert!(NUDGE_AFTER_IDENTICAL_TOOL_CALLS < MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS);
-const _: () = assert!(MAX_CONSECUTIVE_TRUE_NOOPS < NUDGE_AFTER_IDENTICAL_TOOL_CALLS);
-
-/// Tracks action stationarity within one model turn (#209).
-///
-/// A true no-op is deliberately broader than an identical call: `true` with
-/// different JSON arguments is still no progress, while non-noop calls must
-/// retain their exact tool-and-arguments signature.
-#[derive(Default)]
-pub(crate) struct IdenticalToolCallRun {
-    last_signature_hash: Option<u64>,
-    tool_name: String,
-    run_len: u32,
-    is_true_noop_run: bool,
-    nudged: bool,
-}
-
-impl IdenticalToolCallRun {
-    pub(crate) fn observe(&mut self, signature: &str, tool_name: &str, is_true_noop: bool) -> u32 {
-        use std::hash::{Hash, Hasher};
-
-        let signature = if is_true_noop {
-            "\0true_noop"
-        } else {
-            signature
-        };
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        signature.hash(&mut hasher);
-        let hash = hasher.finish();
-        if self.last_signature_hash == Some(hash) {
-            self.run_len += 1;
-        } else {
-            self.run_len = 1;
-            self.last_signature_hash = Some(hash);
-            self.is_true_noop_run = is_true_noop;
-            self.nudged = false;
-        }
-        self.tool_name = tool_name.to_string();
-        self.run_len
-    }
-
-    /// Call at the next safe model boundary, after the tool result is in the wire context.
-    pub(crate) fn take_nudge(&mut self) -> bool {
-        let fire = self.run_len >= NUDGE_AFTER_IDENTICAL_TOOL_CALLS && !self.nudged;
-        self.nudged |= fire;
-        fire
-    }
-
-    pub(crate) fn run_len(&self) -> u32 {
-        self.run_len
-    }
-
-    pub(crate) fn tool_name(&self) -> String {
-        self.tool_name.clone()
-    }
-
-    pub(crate) fn stop_info(&self) -> Option<(u32, String, bool)> {
-        let threshold = if self.is_true_noop_run {
-            MAX_CONSECUTIVE_TRUE_NOOPS
-        } else {
-            MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS
-        };
-        (self.run_len >= threshold)
-            .then(|| (self.run_len, self.tool_name.clone(), self.is_true_noop_run))
-    }
-}
+// Action stationarity now lives in `crate::durable::progress`, which judges a
+// repeat by the raw observation it produced as well as by the call signature.
+// The call-shape helpers below stay here because they are about tool calls,
+// not about progress.
 
 fn command_is_true(command: &str) -> bool {
     command.trim().eq_ignore_ascii_case("true")
@@ -521,30 +455,6 @@ pub(crate) fn tool_step_signature(tool_calls: &[AgentToolCall]) -> String {
         .map(|tool_call| format!("{}\u{1f}{}", tool_call.name, tool_call.arguments))
         .collect::<Vec<_>>()
         .join("\u{1e}")
-}
-
-pub(crate) fn action_stationarity_nudge(tool_name: &str, run_len: u32) -> String {
-    format!(
-        "You have called `{tool_name}` with the same action signature {run_len} times in a row. \
-         You appear to be stuck. Stop repeating it; use a different approach, wait once for \
-         a long-running operation, or tell the user what is blocking progress."
-    )
-}
-
-pub(crate) fn action_stationarity_stop_message(
-    run_len: u32,
-    tool_name: &str,
-    true_noop: bool,
-) -> String {
-    let reason = if true_noop {
-        "true no-op tool calls"
-    } else {
-        "identical tool calls"
-    };
-    format!(
-        "Stopped after {run_len} consecutive {reason} (`{tool_name}`) without making progress. \
-         Ask me to continue with a different approach."
-    )
 }
 
 pub(crate) enum AgentStep {
@@ -3858,9 +3768,18 @@ mod efficiency_tests {
         assert!(recovery.contains("bounded test-recovery step"));
     }
 
+    fn stationarity_message() -> String {
+        crate::durable::progress::stop_message(&crate::durable::progress::StopDetail {
+            class: crate::durable::progress::RepeatClass::TrueNoop,
+            repeats: 4,
+            tool_name: "run_terminal_cmd".into(),
+            observation_fingerprint: None,
+        })
+    }
+
     #[test]
     fn every_guardrail_stop_is_incomplete() {
-        let stationarity = action_stationarity_stop_message(4, "run_terminal_cmd", true);
+        let stationarity = stationarity_message();
         assert!(is_incomplete_stop_message(&stationarity));
         assert!(is_incomplete_stop_message(&round_limit_stop_message(4)));
         assert!(!is_incomplete_stop_message(
@@ -4212,26 +4131,6 @@ test result: FAILED. 0 passed; 3 failed; 0 ignored
     }
 
     #[test]
-    fn action_stationarity_resets_on_a_different_signature() {
-        let mut run = IdenticalToolCallRun::default();
-        assert_eq!(run.observe("a", "read_file", false), 1);
-        assert_eq!(run.observe("a", "read_file", false), 2);
-        assert_eq!(run.observe("b", "read_file", false), 1);
-        assert!(run.stop_info().is_none());
-    }
-
-    #[test]
-    fn true_noops_chain_across_arguments_and_stop_at_four() {
-        let mut run = IdenticalToolCallRun::default();
-        for i in 1..=4 {
-            assert_eq!(run.observe(&format!("sig{i}"), "run_terminal_cmd", true), i);
-        }
-        assert_eq!(run.stop_info(), Some((4, "run_terminal_cmd".into(), true)));
-        assert_eq!(run.observe("different", "run_terminal_cmd", false), 1);
-        assert!(run.stop_info().is_none());
-    }
-
-    #[test]
     fn true_noop_detection_normalizes_command_and_requires_one_shell_call() {
         assert!(is_true_noop_tool_step(&[tool_call(
             "run_terminal_cmd",
@@ -4248,23 +4147,9 @@ test result: FAILED. 0 passed; 3 failed; 0 ignored
     }
 
     #[test]
-    fn identical_non_noop_run_nudges_once_at_eight() {
-        let mut run = IdenticalToolCallRun::default();
-        for i in 1..8 {
-            assert_eq!(run.observe("poll", "get_task_output", false), i);
-            assert!(!run.take_nudge());
-        }
-        assert_eq!(run.observe("poll", "get_task_output", false), 8);
-        assert!(run.take_nudge());
-        assert!(!run.take_nudge());
-        assert_eq!(run.observe("poll", "get_task_output", false), 9);
-        assert!(!run.take_nudge());
-    }
-
-    #[test]
     fn stationarity_stop_is_distinct_from_round_limit_stop() {
-        let stationarity = action_stationarity_stop_message(4, "run_terminal_cmd", true);
-        assert!(stationarity.contains("true no-op tool calls"));
+        let stationarity = stationarity_message();
+        assert!(stationarity.contains("no-op tool calls"));
         assert!(!is_round_limit_stop_message(&stationarity));
         assert!(round_limit_stop_message(4).contains("tool rounds without a final answer"));
     }

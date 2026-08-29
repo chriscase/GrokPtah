@@ -10,6 +10,7 @@ mod completion;
 mod computer_agent;
 pub mod computer_use;
 mod discover;
+pub mod durable;
 pub mod eval_oracle;
 pub mod eval_report;
 pub mod event_bus;
