@@ -15,13 +15,26 @@ release (#435 packaged Economy + isolated-visual High Assurance remain open;
 ## Commands
 
 ```sh
-cd evals/computer-use-adaptive
+REPO="$(git rev-parse --show-toplevel)"
+EXPECTED_HEAD="$(git -C "$REPO" rev-parse HEAD)"
+EXPECTED_BASE=c6f1cb23e9d6217005599850d9e0d6f7df64d5a1
+cd "$REPO/evals/computer-use-adaptive"
 cargo test --locked -- --test-threads=1
-cargo run --locked --bin grokptah-cu-adaptive-eval -- --out campaign-out --repeats 5 --seed 435272 --source-gate c6f1cb23e9d6217005599850d9e0d6f7df64d5a1
+cargo run --locked --bin grokptah-cu-adaptive-eval -- \
+  --out campaign-out --repeats 5 --seed 435272 \
+  --repository "$REPO" --expected-head "$EXPECTED_HEAD" \
+  --source-gate "$EXPECTED_BASE"
 cargo run --locked --bin grokptah-cu-adaptive-eval -- \
   --verify-report campaign-out/campaign-report.json \
-  --verify-evidence campaign-out/campaign-evidence.json
+  --verify-evidence campaign-out/campaign-evidence.json \
+  --repository "$REPO" --expected-head "$EXPECTED_HEAD" \
+  --source-gate "$EXPECTED_BASE"
 ```
+
+Generation and verification both require the explicit repository, candidate
+head, and base. They fail closed when the worktree is dirty, the head differs,
+or the base is not an ancestor. Report-only verification is diagnostic and
+cannot return an authoritative PASS without the matching evidence set.
 
 Do not run `cargo test --workspace`. Do not `cargo clean`. Do not overlap a
 protected target directory.

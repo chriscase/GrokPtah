@@ -5,8 +5,8 @@
 | Field | Value |
 | --- | --- |
 | Exact base | `origin/main` `c6f1cb23e9d6217005599850d9e0d6f7df64d5a1` |
-| Exact evaluated code head | `270102554529e1995ec79e095aaa807250be26fb` (docs-only child may follow) |
-| Exact evaluated tree | `9ca2e6b1dd1c60b1b8a9f39fe4a1e39653442f5d` |
+| Exact evaluated code head | `be38197ba05bd5b572d7cf5cbd94e51955d70e86` (this record's docs-only child may follow) |
+| Exact evaluated tree | `f1ca0c62004c92c926c357ef7b43f8b5bc7eb75e` |
 | Branch | `codex/reconstruct-adaptive-eval-newmain-v1` (current-main consolidation of drafts #446 and #448) |
 | Allowlist | `evals/computer-use-adaptive/**`, `docs/COMPUTER_USE_ADAPTIVE_EVAL.md`, `.github/workflows/desktop.yml` |
 | Production runtime edited | **none** |
@@ -16,17 +16,20 @@
 | Task success | **425 / 425** (repeats=5, seed=435272) |
 | Provider calls | **0** |
 | Cost USD | **null** (fake adapters; not fabricated) |
-| Campaign digest (repeats=5, seed=435272) | `71c09944d0e9da769563063f71ff4e48a1217ecae68f77ea5bf0b88c792a4415` |
+| Campaign digest (repeats=5, seed=435272) | `a6b24cd62d30f1ba21393667faf4020133d1e08e77c05bcea61ad16591390d1e` |
 | Campaign digest (repeats=5, seed=435273) | Regenerate with the same mandatory source-binding flags |
 | Fixture hash | `614a8b4b0bf5d5f559764f894661475a11e75e1e40279bdbe5e48cf5387cc20a` |
 | Verifier | **ok**, independent matrix reconstruction; 0 errors |
 | Live / packaged macOS | **not claimed** |
 
 Evaluator residuals closed on this head: `release_failing` is independently
-recomputed and a disagreeing claim is `VERIFIER_ERROR`; evidence digesting and
-unknown-surface observe return `Result` (no run-path `expect`/`panic`);
-deny-unknown-fields and nullable `costUsd` remain required. Synthetic PASS is
-still not live, VM, or production-runtime qualification.
+recomputed and a disagreeing claim is `VERIFIER_ERROR`; deterministic typed
+replay rejects fully rebound invented dispatches; unscheduled authority traces
+are rejected without mutating reconstructed authority; public generation binds
+an exact clean source; and report-only verification cannot return PASS. Evidence
+digesting and unknown-surface observe return `Result` (no run-path
+`expect`/`panic`); deny-unknown-fields and nullable `costUsd` remain required.
+Synthetic PASS is still not live, VM, or production-runtime qualification.
 
 ### Schema compatibility / migration
 
