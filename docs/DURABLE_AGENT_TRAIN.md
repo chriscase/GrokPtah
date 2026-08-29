@@ -215,6 +215,39 @@ The second retry site (`:2228`) is deliberately unchanged: it fires after the
 provider *answered* with an HTTP status, so the request demonstrably arrived and
 was refused rather than processed.
 
+### One provider-send lattice — the structural half
+
+#478's first acceptance criterion is structural, not durable: *every provider
+call site uses the same transport boundary, and a gate rejects unbound call
+sites*. That half needs no ledger, permit or authority, so it is enforced here.
+
+`main` does not have one send path. It has **four**, and three are unrecorded:
+
+| Site | Instrumented | Retry |
+| --- | --- | --- |
+| `host_helpers.rs` `call_provider_agent_step` | yes | transient, gated on proven non-delivery |
+| `host_helpers.rs` `call_xai_chat` | no observation context | 401-after-refresh only (provider answered) |
+| `provider_qualification.rs` `completion` | **no** | — |
+| `provider_qualification.rs` `streaming_probe` | **no** | — |
+
+`provider_qualification.rs` builds its own client and POSTs to
+`/chat/completions` with **zero** observation references in the whole file, so
+those sends spend the operator's credential without producing a record. #494
+found exactly this; it is still true on `main`.
+
+`tests/provider_send_gate.rs` keys on *constructing a provider request* — the
+completions URL and the HTTP client — rather than on the two known helpers,
+because a gate that inspected only the helpers would report full coverage while
+those probes went unrecorded. It holds an exact inventory of send sites and a
+reviewed reason for every HTTP client in the crate, so a fifth path cannot
+appear silently. **Verified to fire:** adding one smuggled send site to an
+unrelated file fails two of its tests by name.
+
+The durable half — recording which attempt reached which state, and the
+`Settled` distinction — is #497's G3 and is deliberately not built. Binding the
+qualification probes needs the attempt identity G3 provides, so it is named as
+the remaining work rather than approximated.
+
 ### Not here, and why
 
 | Goal item | Where it belongs |
