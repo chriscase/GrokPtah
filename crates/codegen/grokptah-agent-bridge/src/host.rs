@@ -482,7 +482,11 @@ impl RunUsageTracker {
         self.max_total_tokens.is_some()
     }
 
-    async fn begin_attempt(self: &Arc<Self>) -> Result<RunUsageAttempt> {
+    /// Reserve run/token accounting for one upcoming provider round.
+    ///
+    /// Distinct from a provider-send attempt (#478): this bounds spend, it does
+    /// not record whether bytes reached a provider.
+    async fn begin_usage_reservation(self: &Arc<Self>) -> Result<RunUsageAttempt> {
         let bounded_admission = if self.is_bounded() {
             Some(self.bounded_admission.clone().lock_owned().await)
         } else {
@@ -748,6 +752,11 @@ pub struct AgentHostHandle {
     /// children it spawns. A session counter is not a safe run identity.
     run_usage_trackers: Arc<Mutex<HashMap<Uuid, Arc<RunUsageTracker>>>>,
     provider_observation: Option<ProviderObservationSession>,
+    /// The one durable provider-send attempt ledger (#478). Every physical
+    /// provider request in this process is admitted and recorded here; there is
+    /// no second send ledger and no ambient binding. `None` means the ledger
+    /// could not be opened, and every provider send then fails closed.
+    provider_ledger: Option<Arc<crate::provider_send::AttemptLedger>>,
     /// Exclusive lock on `~/.grokptah` — kept alive for the process (#119).
     _instance_lock: Option<Arc<crate::instance_lock::InstanceLock>>,
     /// Selects the durable root for legacy modules that still resolve paths
@@ -933,6 +942,15 @@ impl AgentHost {
             orchestration_wakeup: Arc::new(Notify::new()),
             run_usage_trackers: Arc::new(Mutex::new(HashMap::new())),
             provider_observation: config.provider_observation,
+            provider_ledger: match crate::provider_send::AttemptLedger::open(
+                runtime_home.provider_attempts_root(),
+            ) {
+                Ok(ledger) => Some(Arc::new(ledger)),
+                Err(error) => {
+                    eprintln!("[grokptah] provider send ledger unavailable: {error}");
+                    None
+                }
+            },
             _instance_lock: instance_lock,
             runtime_home,
             _runtime_home_context: runtime_home_context,
@@ -944,6 +962,74 @@ impl AgentHostHandle {
     /// The validated durable root owned by this host process.
     pub fn runtime_home(&self) -> crate::discover::RuntimeHome {
         self.runtime_home.clone()
+    }
+
+    /// Open a bound provider-send context for one physical call-site family.
+    ///
+    /// This is the only way a host path obtains the right to send to a
+    /// provider. The context is an ordinary value, so it survives
+    /// `tokio::spawn` — which is exactly why subagent and Computer Use rounds
+    /// cannot silently run unbound the way an ambient task-local allowed.
+    pub(crate) fn provider_send_context(
+        &self,
+        session_id: Uuid,
+        family: crate::provider_send::CallSiteFamily,
+        origin: crate::provider_send::SendOrigin,
+    ) -> Result<crate::provider_send::ProviderSendContext> {
+        let ledger = self
+            .provider_ledger
+            .clone()
+            .ok_or_else(|| anyhow!("provider send ledger unavailable; refusing to send"))?;
+        let workspace = {
+            let guard = self.inner.lock();
+            guard
+                .sessions
+                .get(&session_id)
+                .map(|session| session.cwd.display().to_string())
+                .ok_or_else(|| anyhow!("unknown session"))?
+        };
+        let run = self
+            .run_usage_trackers
+            .lock()
+            .get(&session_id)
+            .map(|tracker| tracker.run_id().to_string());
+        let authorities = self.send_authorities();
+        crate::provider_send::ProviderSendContext::new(
+            ledger,
+            &workspace,
+            &session_id.to_string(),
+            run.as_deref(),
+            origin,
+            family,
+            authorities,
+        )
+        .map_err(|error| anyhow!("provider send scope: {error}"))
+    }
+
+    /// Bind the authority generations an attempt is attributed to.
+    ///
+    /// Each is a typed seam (#477 principal, #458 capability, #455/#468
+    /// lifecycle, #461 queue ownership, #462 audit). None of those authorities
+    /// is on the mainline yet, so the generations are derived provisionally
+    /// from non-secret credential identity and recorded as provisional. When an
+    /// authority lands, only this function changes.
+    pub(crate) fn send_authorities(&self) -> crate::provider_send::SendAuthorities {
+        // Non-secret account identity markers. They are hashed by the seam, so
+        // even a mistake here cannot put credential material in a record.
+        let (provider_id, account) = {
+            let guard = self.inner.lock();
+            (
+                guard.auth.method.clone().unwrap_or_else(|| "none".into()),
+                guard.auth.display_name.clone().unwrap_or_default(),
+            )
+        };
+        crate::provider_send::SendAuthorities::provisional(
+            &provider_id,
+            &account,
+            crate::provider_send::PROVIDER_ATTEMPT_SCHEMA_VERSION
+                .to_string()
+                .as_str(),
+        )
     }
 
     fn provider_observation_context(&self, session_id: Uuid) -> Option<ProviderObservationContext> {
@@ -1017,7 +1103,12 @@ impl AgentHostHandle {
         if resolved.eligibility.tier >= crate::gateway_config::ComputerUseTier::SemanticAct {
             return Ok(resolved.eligibility);
         }
-        qualify_semantic_model(&credentials, &model, effort, &cancel)
+        let send = self.provider_send_context(
+            session_id,
+            crate::provider_send::CallSiteFamily::ComputerUseQualification,
+            crate::provider_send::SendOrigin::Desktop,
+        )?;
+        qualify_semantic_model(&send, &credentials, &model, effort, &cancel)
             .await
             .context("selected model did not pass bounded Computer qualification")?;
         if cancel.is_cancelled() {
@@ -1072,7 +1163,13 @@ impl AgentHostHandle {
         if !durable_authority && !session_authority {
             bail!("selected model is not qualified for semantic Computer actions");
         }
+        let send = self.provider_send_context(
+            session_id,
+            crate::provider_send::CallSiteFamily::ComputerUseRound,
+            crate::provider_send::SendOrigin::Desktop,
+        )?;
         let proposal = propose_semantic_action(
+            &send,
             &credentials,
             &model,
             effort,
@@ -3870,7 +3967,25 @@ impl AgentHostHandle {
     }
 
     /// Async compact: model-backed summary when online, extractive offline.
+    ///
+    /// The public entry opens its own desktop-origin send context. Callers
+    /// already inside a turn use [`Self::compact_session_with_send`] so the
+    /// compaction round is bound to that turn's principal and run rather than
+    /// opening a second, unrelated scope.
     pub async fn compact_session_async(&self, id: Uuid) -> Result<SessionSummary> {
+        let send = self.provider_send_context(
+            id,
+            crate::provider_send::CallSiteFamily::SessionCompaction,
+            crate::provider_send::SendOrigin::Desktop,
+        )?;
+        self.compact_session_with_send(id, &send).await
+    }
+
+    pub(crate) async fn compact_session_with_send(
+        &self,
+        id: Uuid,
+        send: &crate::provider_send::ProviderSendContext,
+    ) -> Result<SessionSummary> {
         self.ensure_session_accepts_new_work(id)?;
         self.ensure_transcript_loaded(id)?;
         const KEEP_RECENT: usize = 6;
@@ -3915,6 +4030,7 @@ impl AgentHostHandle {
                 None
             } else {
                 match call_xai_chat(
+                    send,
                     &creds,
                     &model,
                     &[("user".into(), prompt)],
@@ -4156,7 +4272,7 @@ impl AgentHostHandle {
         tracker: Option<Arc<RunUsageTracker>>,
     ) -> Result<Option<RunUsageAttempt>> {
         match tracker {
-            Some(tracker) => Ok(Some(tracker.begin_attempt().await?)),
+            Some(tracker) => Ok(Some(tracker.begin_usage_reservation().await?)),
             None => Ok(None),
         }
     }
@@ -4946,7 +5062,20 @@ impl AgentHostHandle {
                 .unwrap_or_else(CancellationToken::new)
         };
         let event_tx = self.inner.lock().event_tx.clone();
-        self.spawn_gp_subagent_parallel(session_id, &cwd, prompt, kind, &parent_cancel, &event_tx)
+        let send = self.provider_send_context(
+            session_id,
+            crate::provider_send::CallSiteFamily::GeneralPurposeSubagent,
+            crate::provider_send::SendOrigin::Desktop,
+        )?;
+        self.spawn_gp_subagent_parallel(
+            send,
+            session_id,
+            &cwd,
+            prompt,
+            kind,
+            &parent_cancel,
+            &event_tx,
+        )
     }
 
     /// Test helper: register a parent turn cancel token for `session_id`.
@@ -5758,7 +5887,36 @@ impl AgentHostHandle {
         provider_id: &str,
         model_id: &str,
     ) -> Result<crate::provider_qualification::ProviderQualificationReport> {
-        crate::provider_qualification::qualify_provider_model(provider_id, model_id).await
+        let send = self.provider_qualification_send_context(provider_id, model_id)?;
+        crate::provider_qualification::qualify_provider_model(&send, provider_id, model_id).await
+    }
+
+    /// A bound send context for provider/model qualification.
+    ///
+    /// Qualification runs outside any session, so its scope is the
+    /// provider/model pair rather than a session id — but it is a scope like
+    /// any other: ordinals are monotonic within it, an unresolved probe blocks
+    /// the next one, and the probes appear in the same durable ledger as a
+    /// chat turn.
+    pub(crate) fn provider_qualification_send_context(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+    ) -> Result<crate::provider_send::ProviderSendContext> {
+        let ledger = self
+            .provider_ledger
+            .clone()
+            .ok_or_else(|| anyhow!("provider send ledger unavailable; refusing to send"))?;
+        crate::provider_send::ProviderSendContext::new(
+            ledger,
+            "provider-qualification",
+            &format!("{provider_id}/{model_id}"),
+            None,
+            crate::provider_send::SendOrigin::Qualification,
+            crate::provider_send::CallSiteFamily::ProviderQualificationProbe,
+            self.send_authorities(),
+        )
+        .map_err(|error| anyhow!("provider send scope: {error}"))
     }
 
     pub fn delete_provider_profile(&self, provider_id: &str) -> Result<()> {
@@ -7218,7 +7376,23 @@ impl AgentHostHandle {
             turn_id,
         });
 
+        // One bound send context for this turn. Everything the turn reaches —
+        // the chat call, the build rounds, plan, compaction, and every subagent
+        // — re-scopes from this value rather than inheriting an ambient one.
+        let send = self.provider_send_context(
+            session_id,
+            match kind {
+                SessionKind::Chat => crate::provider_send::CallSiteFamily::DesktopChatTurn,
+                SessionKind::Build => crate::provider_send::CallSiteFamily::DesktopBuildRound,
+            },
+            if external_run.is_some() {
+                crate::provider_send::SendOrigin::Orchestration
+            } else {
+                crate::provider_send::SendOrigin::Desktop
+            },
+        )?;
         let run_turn = self.run_turn(
+            &send,
             session_id,
             &execution_cwd,
             &model,
@@ -7526,8 +7700,10 @@ impl AgentHostHandle {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     async fn run_turn(
         &self,
+        send: &crate::provider_send::ProviderSendContext,
         session_id: Uuid,
         cwd: &Path,
         model: &str,
@@ -7568,6 +7744,7 @@ impl AgentHostHandle {
                     .map_err(anyhow::Error::msg)?
             {
                 match call_xai_chat(
+                    send,
                     &creds,
                     model,
                     &wire_messages,
@@ -7625,7 +7802,16 @@ impl AgentHostHandle {
                 if plan_token_stop.is_some() {
                     offline_plan_steps(&goal)
                 } else {
-                    match propose_plan_with_model(&creds, model, cwd, &goal, &cancel).await {
+                    match propose_plan_with_model(
+                        &send.for_family(crate::provider_send::CallSiteFamily::PlanProposal),
+                        &creds,
+                        model,
+                        cwd,
+                        &goal,
+                        &cancel,
+                    )
+                    .await
+                    {
                         Ok((steps, usage)) if !steps.is_empty() => {
                             plan_token_stop = self.finish_provider_attempt(
                                 session_id,
@@ -7734,7 +7920,14 @@ impl AgentHostHandle {
                             .map(|s| s.transcript.len())
                             .unwrap_or(0)
                     };
-                    let _ = self.compact_session_async(session_id).await?;
+                    let _ = self
+                        .compact_session_with_send(
+                            session_id,
+                            &send.for_family(
+                                crate::provider_send::CallSiteFamily::SessionCompaction,
+                            ),
+                        )
+                        .await?;
                     let after = {
                         let g = self.inner.lock();
                         g.sessions
@@ -7932,7 +8125,14 @@ impl AgentHostHandle {
                         args.join(" ")
                     };
                     let summary = self
-                        .run_explore_subagent(session_id, cwd, &query, &cancel, &event_tx)
+                        .run_explore_subagent(
+                            &send.for_family(crate::provider_send::CallSiteFamily::ExploreSubagent),
+                            session_id,
+                            cwd,
+                            &query,
+                            &cancel,
+                            &event_tx,
+                        )
                         .await?;
                     emit_message(&event_tx, session_id, &summary);
                     push_assistant(self, session_id, &summary);
@@ -7945,7 +8145,7 @@ impl AgentHostHandle {
         // Offline / CI: no live model (tests set GROKPTAH_AGENT_OFFLINE=1).
         if std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_some() {
             return self
-                .run_offline_build_turn(session_id, cwd, prompt, &cancel, &event_tx)
+                .run_offline_build_turn(send, session_id, cwd, prompt, &cancel, &event_tx)
                 .await;
         }
 
@@ -7977,6 +8177,7 @@ impl AgentHostHandle {
 
         match self
             .run_coding_agent_loop(
+                send,
                 session_id,
                 cwd,
                 model,
@@ -8130,8 +8331,10 @@ impl AgentHostHandle {
 
     /// Deterministic Build turn for offline tests (no network).
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     async fn run_offline_build_turn(
         &self,
+        send: &crate::provider_send::ProviderSendContext,
         session_id: Uuid,
         cwd: &Path,
         prompt: &str,
@@ -8267,6 +8470,7 @@ impl AgentHostHandle {
             };
             let _ = self
                 .dispatch_agent_tool(
+                    send,
                     session_id,
                     cwd,
                     "todo_write",
@@ -8280,6 +8484,7 @@ impl AgentHostHandle {
         if let Some(rest) = prompt.strip_prefix("remember ") {
             let _ = self
                 .dispatch_agent_tool(
+                    send,
                     session_id,
                     cwd,
                     "memory_write",
@@ -8297,6 +8502,7 @@ impl AgentHostHandle {
         if let Some(rest) = prompt.strip_prefix("recall ") {
             let _ = self
                 .dispatch_agent_tool(
+                    send,
                     session_id,
                     cwd,
                     "memory_read",
@@ -8314,6 +8520,7 @@ impl AgentHostHandle {
         if let Some(rest) = prompt.strip_prefix("patch ") {
             let _ = self
                 .dispatch_agent_tool(
+                    send,
                     session_id,
                     cwd,
                     "apply_patch",
@@ -8328,6 +8535,7 @@ impl AgentHostHandle {
             if let Some(url) = prompt.split_whitespace().nth(1) {
                 let _ = self
                     .dispatch_agent_tool(
+                        send,
                         session_id,
                         cwd,
                         "web_fetch",
@@ -8380,6 +8588,7 @@ impl AgentHostHandle {
     #[allow(clippy::too_many_arguments)]
     async fn run_coding_agent_loop(
         &self,
+        send: &crate::provider_send::ProviderSendContext,
         session_id: Uuid,
         cwd: &Path,
         model: &str,
@@ -8410,7 +8619,12 @@ impl AgentHostHandle {
                     .unwrap_or(false)
             };
             if need {
-                let _ = self.compact_session_async(session_id).await;
+                let _ = self
+                    .compact_session_with_send(
+                        session_id,
+                        &send.for_family(crate::provider_send::CallSiteFamily::SessionCompaction),
+                    )
+                    .await;
             }
         }
 
@@ -8626,6 +8840,7 @@ impl AgentHostHandle {
             };
             let provider_observation = self.provider_observation_context(session_id);
             let step = match call_xai_agent_step_observed(
+                send,
                 creds,
                 model,
                 effort,
@@ -8844,6 +9059,7 @@ impl AgentHostHandle {
                         });
                         let output = self
                             .dispatch_agent_tool(
+                                send,
                                 session_id,
                                 cwd,
                                 &tc.name,
@@ -8958,6 +9174,7 @@ impl AgentHostHandle {
                         }));
                         let output = self
                             .dispatch_agent_tool(
+                                send,
                                 session_id,
                                 cwd,
                                 "run_terminal_cmd",
@@ -9096,8 +9313,10 @@ impl AgentHostHandle {
 
     /// Run one model-requested tool with permissions + UI events.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     async fn dispatch_agent_tool(
         &self,
+        send: &crate::provider_send::ProviderSendContext,
         session_id: Uuid,
         cwd: &Path,
         name: &str,
@@ -9444,7 +9663,14 @@ impl AgentHostHandle {
                     .and_then(|v| v.as_str())
                     .unwrap_or("explore the codebase")
                     .to_string();
-                self.run_explore_subagent(session_id, cwd, &query, cancel, event_tx)
+                self.run_explore_subagent(
+                    &send.for_family(crate::provider_send::CallSiteFamily::ExploreSubagent),
+                    session_id,
+                    cwd,
+                    &query,
+                    cancel,
+                    event_tx,
+                )
                     .await
             }
             "spawn_general_purpose" | "spawn_subagent" => {
@@ -9461,7 +9687,17 @@ impl AgentHostHandle {
                     .unwrap_or("general-purpose")
                     .to_string();
                 // Fire-and-forget: returns immediately so multiple children run in parallel (#151).
-                self.spawn_gp_subagent_parallel(session_id, cwd, &prompt, &kind, cancel, event_tx)
+                self.spawn_gp_subagent_parallel(
+                    send.for_family(
+                        crate::provider_send::CallSiteFamily::GeneralPurposeSubagent,
+                    ),
+                    session_id,
+                    cwd,
+                    &prompt,
+                    &kind,
+                    cancel,
+                    event_tx,
+                )
             }
             "todo_write" => {
                 let (items, merge) =
@@ -9683,8 +9919,10 @@ impl AgentHostHandle {
     }
 
     /// Read-only explore subagent: gather layout/search hits and return a summary.
+    #[allow(clippy::too_many_arguments)]
     async fn run_explore_subagent(
         &self,
+        send: &crate::provider_send::ProviderSendContext,
         session_id: Uuid,
         cwd: &Path,
         query: &str,
@@ -9787,6 +10025,7 @@ impl AgentHostHandle {
                     || self.run_token_stop_before_request(session_id).is_none()
                 {
                     match call_xai_chat(
+                        send,
                         &creds,
                         &model,
                         &[("user".into(), ask)],
@@ -9837,8 +10076,10 @@ impl AgentHostHandle {
 
     /// Spawn a GP/plan child on a background task and return immediately (#151).
     /// Multiple spawns therefore overlap (true parallelism via JoinHandle tasks).
+    #[allow(clippy::too_many_arguments)]
     fn spawn_gp_subagent_parallel(
         &self,
+        send: crate::provider_send::ProviderSendContext,
         session_id: Uuid,
         cwd: &Path,
         prompt: &str,
@@ -9969,6 +10210,7 @@ impl AgentHostHandle {
         let sub_id_task = sub_id.clone();
         tokio::spawn(async move {
             host.run_gp_subagent_body(
+                send,
                 session_id,
                 &child_cwd,
                 &prompt,
@@ -9999,8 +10241,10 @@ impl AgentHostHandle {
 
     /// Body of a GP child (runs on a JoinHandle task).
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     async fn run_gp_subagent_body(
         &self,
+        send: crate::provider_send::ProviderSendContext,
         session_id: Uuid,
         cwd: &Path,
         prompt: &str,
@@ -10150,6 +10394,7 @@ impl AgentHostHandle {
                 };
             let provider_observation = self.provider_observation_context(session_id);
             let step = call_xai_agent_step_observed(
+                &send,
                 &creds,
                 &model,
                 effort,
@@ -10246,6 +10491,7 @@ impl AgentHostHandle {
                             )
                         } else {
                             Box::pin(self.dispatch_agent_tool(
+                                &send,
                                 session_id,
                                 cwd,
                                 &tc.name,
@@ -11501,7 +11747,7 @@ mod tests {
         store.save_run(&run).unwrap();
         let tracker = RunUsageTracker::from_run(store.clone(), &run);
 
-        let first = tracker.begin_attempt().await.unwrap();
+        let first = tracker.begin_usage_reservation().await.unwrap();
         assert_eq!(
             store
                 .load_run("bounded-admission")
@@ -11513,7 +11759,7 @@ mod tests {
         );
         assert!(tokio::time::timeout(
             std::time::Duration::from_millis(25),
-            tracker.begin_attempt()
+            tracker.begin_usage_reservation()
         )
         .await
         .is_err());
@@ -11528,7 +11774,7 @@ mod tests {
             .unwrap();
         let second = tokio::time::timeout(
             std::time::Duration::from_millis(250),
-            tracker.begin_attempt(),
+            tracker.begin_usage_reservation(),
         )
         .await
         .unwrap()

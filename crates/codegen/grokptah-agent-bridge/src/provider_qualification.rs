@@ -3,8 +3,8 @@
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 
 use crate::computer_use::{ComputerBackend, ComputerUseLimits, SemanticAction, SimulatorBackend};
 use crate::gateway_config::{CapabilitySource, ComputerUseTier};
@@ -183,7 +183,12 @@ struct ComputerProbeArguments {
     text: String,
 }
 
+/// Qualification probes are real model invocations that spend the operator's
+/// credential, so they are bound exactly like a chat turn. They used to build
+/// their own `reqwest` client and never reach the instrumented transport at
+/// all — the precise hole the #478 structural gate closes.
 pub async fn qualify_provider_model(
+    send: &crate::provider_send::ProviderSendContext,
     provider_id: &str,
     model_id: &str,
 ) -> Result<ProviderQualificationReport> {
@@ -239,15 +244,14 @@ pub async fn qualify_provider_model(
             anyhow!("model `{model_id}` is not registered on provider `{provider_id}`")
         })?;
     let wire_model_id = provider_model.wire_model_id().to_string();
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(45))
-        .connect_timeout(Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .context("build qualification client")?;
+    let probe = QualificationSend {
+        context: send,
+        dialect: crate::provider_send::WireDialect::from(profile.dialect),
+        request_timeout: Duration::from_secs(45),
+    };
 
     let basic_value = completion(
-        &client,
+        &probe,
         &profile.base_url,
         &mut credentials,
         serde_json::json!({
@@ -276,7 +280,7 @@ pub async fn qualify_provider_model(
 
     let tool_schema = qualification_tool_schema();
     let tool_value = completion(
-        &client,
+        &probe,
         &profile.base_url,
         &mut credentials,
         serde_json::json!({
@@ -310,7 +314,7 @@ pub async fn qualify_provider_model(
 
     let continuation_value = if let Some(call) = native_call.as_ref() {
         completion(
-            &client,
+            &probe,
             &profile.base_url,
             &mut credentials,
             serde_json::json!({
@@ -342,7 +346,7 @@ pub async fn qualify_provider_model(
     };
 
     let streaming =
-        match streaming_probe(&client, &profile.base_url, &mut credentials, &wire_model_id).await {
+        match streaming_probe(&probe, &profile.base_url, &mut credentials, &wire_model_id).await {
             Ok(true) => QualificationCheck::pass("SSE deltas preserved the synthetic marker"),
             Ok(false) => QualificationCheck::fail("Stream completed without the marker"),
             Err(error) => QualificationCheck::fail(safe_probe_error(&error)),
@@ -350,7 +354,7 @@ pub async fn qualify_provider_model(
     let coding_ready =
         basic_generation.passed() && native_tool_call.passed() && tool_result_continuation.passed();
     let (semantic_observation, stale_observation_recovery, computer_use_tier) = if coding_ready {
-        match computer_semantic_probe(&client, &profile.base_url, &mut credentials, &wire_model_id)
+        match computer_semantic_probe(&probe, &profile.base_url, &mut credentials, &wire_model_id)
             .await
         {
             Ok(result) => result,
@@ -418,7 +422,7 @@ pub async fn qualify_provider_model(
 }
 
 async fn computer_semantic_probe(
-    client: &reqwest::Client,
+    probe: &QualificationSend<'_>,
     base_url: &str,
     credentials: &mut QualificationCredentials,
     model_id: &str,
@@ -441,7 +445,7 @@ async fn computer_semantic_probe(
         .ok_or_else(|| anyhow!("deterministic simulator has no visible text element"))?;
     let first_prompt = computer_probe_prompt(&first, first_element.element_id.as_str())?;
     let first_value = completion(
-        client,
+        probe,
         base_url,
         credentials,
         serde_json::json!({
@@ -498,7 +502,7 @@ async fn computer_semantic_probe(
         .find(|element| element.actions.contains(&SemanticAction::SetValue))
         .ok_or_else(|| anyhow!("deterministic simulator lost its visible text element"))?;
     let recovery_value = completion(
-        client,
+        probe,
         base_url,
         credentials,
         serde_json::json!({
@@ -677,39 +681,112 @@ fn safe_probe_error(error: &anyhow::Error) -> String {
     }
 }
 
+/// Everything a qualification probe needs to reach the one send chokepoint.
+///
+/// It carries a binding rather than a client: the probe describes a request and
+/// `provider_send::transport` constructs it, which is why the probe can no
+/// longer reach a model on a path production code could not.
+struct QualificationSend<'a> {
+    context: &'a crate::provider_send::ProviderSendContext,
+    dialect: crate::provider_send::WireDialect,
+    request_timeout: Duration,
+}
+
+impl QualificationSend<'_> {
+    fn spec<'a>(
+        &self,
+        base_url: &'a str,
+        wire_model: &'a str,
+        credentials: Option<&'a crate::auth_store::WireCredentials>,
+        credential_binding: Option<&'a str>,
+        body: &'a serde_json::Value,
+        accept: crate::provider_send::ResponseAccept,
+    ) -> crate::provider_send::ProviderRequestSpec<'a> {
+        crate::provider_send::ProviderRequestSpec {
+            credentials,
+            base_url,
+            wire_model,
+            dialect: self.dialect,
+            credential_binding,
+            body,
+            accept,
+            effort_header: None,
+            request_timeout: self.request_timeout,
+            observation: None,
+        }
+    }
+}
+
+/// Report a send failure without leaking the operator's endpoint or transport
+/// diagnostics, and without flattening "may have been written" into "failed".
+fn probe_send_error(error: &crate::provider_send::ProviderSendError) -> anyhow::Error {
+    match error.delivery() {
+        crate::provider_send::DeliveryKnowledge::Unknown => anyhow!(
+            "provider request may have been sent; its outcome is unknown and it was not retried"
+        ),
+        _ => anyhow!("provider transport failed"),
+    }
+}
+
+fn wire_model_of(body: &serde_json::Value) -> String {
+    body.get("model")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn credential_binding_of(credentials: &QualificationCredentials) -> Option<String> {
+    credentials
+        .current()
+        .map(crate::auth_store::WireCredentials::qualification_identity_fingerprint)
+}
+
 async fn completion(
-    client: &reqwest::Client,
+    probe: &QualificationSend<'_>,
     base_url: &str,
     credentials: &mut QualificationCredentials,
     mut body: serde_json::Value,
     allow_tool_choice_fallback: bool,
 ) -> Result<serde_json::Value> {
-    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+    let cancel = CancellationToken::new();
     let mut removed_tool_choice = false;
     let mut transient_retries = 0_u32;
     for _attempt in 0..5 {
-        let mut request = client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json");
-        if let Some(credentials) = credentials.current() {
-            request = crate::auth_store::apply_auth_headers(request, credentials, base_url);
-        }
-        let response = request
-            .json(&body)
-            .send()
-            .await
-            .map_err(classify_transport)?;
-        let status = response.status();
+        let wire_model = wire_model_of(&body);
+        let binding = credential_binding_of(credentials);
+        let sent = {
+            let spec = probe.spec(
+                base_url,
+                &wire_model,
+                credentials.current(),
+                binding.as_deref(),
+                &body,
+                crate::provider_send::ResponseAccept::Json,
+            );
+            crate::provider_send::dispatch(probe.context, spec, &cancel)
+                .await
+                .map_err(|error| probe_send_error(&error))?
+        };
+        let status = sent.status();
+        let mut reader = sent.into_reader();
         if status.is_redirection() {
+            // Redirects are disabled on the client, so a 3xx is the provider
+            // answering; the attempt settles as a rejection rather than being
+            // followed to an unbound second endpoint.
+            let _ = reader.settle_rejected();
             bail!("provider redirect refused");
         }
-        if status == reqwest::StatusCode::UNAUTHORIZED
-            && credentials.refresh_after_unauthorized().await?
-        {
-            continue;
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            let _ = reader.settle_rejected();
+            drop(reader);
+            if credentials.refresh_after_unauthorized().await? {
+                continue;
+            }
+            bail!("provider request failed (HTTP {})", status.as_u16());
         }
         if status.as_u16() == 400 && allow_tool_choice_fallback && !removed_tool_choice {
+            let _ = reader.settle_rejected();
+            drop(reader);
             if let Some(object) = body.as_object_mut() {
                 object.remove("tool_choice");
             }
@@ -717,26 +794,55 @@ async fn completion(
             continue;
         }
         if (status.as_u16() == 429 || status.is_server_error()) && transient_retries < 3 {
+            let _ = reader.settle_rejected();
+            drop(reader);
             tokio::time::sleep(Duration::from_millis(100 * (1 << transient_retries))).await;
             transient_retries += 1;
             continue;
         }
         if !status.is_success() {
+            let _ = reader.settle_rejected();
             bail!("provider request failed (HTTP {})", status.as_u16());
         }
-        let raw = read_body(response).await?;
-        return serde_json::from_str(&raw).context("provider returned malformed JSON");
+        let raw = reader
+            .read_to_string(&cancel)
+            .await
+            .map_err(|error| probe_send_error(&error))?;
+        let value: serde_json::Value = match serde_json::from_str(&raw) {
+            Ok(value) => value,
+            Err(error) => {
+                let _ =
+                    reader.settle_uncertain(crate::provider_send::UncertaintyClass::ResponseParse);
+                return Err(anyhow!(error)).context("provider returned malformed JSON");
+            }
+        };
+        let usage = value.get("usage");
+        reader
+            .settle_completed(
+                value.get("id").and_then(serde_json::Value::as_str),
+                usage
+                    .and_then(|usage| usage.get("prompt_tokens"))
+                    .and_then(serde_json::Value::as_u64),
+                usage
+                    .and_then(|usage| usage.get("completion_tokens"))
+                    .and_then(serde_json::Value::as_u64),
+                usage
+                    .and_then(|usage| usage.get("total_tokens"))
+                    .and_then(serde_json::Value::as_u64),
+            )
+            .map_err(|error| anyhow!("{error}"))?;
+        return Ok(value);
     }
     bail!("provider request failed after bounded fallback")
 }
 
 async fn streaming_probe(
-    client: &reqwest::Client,
+    probe: &QualificationSend<'_>,
     base_url: &str,
     credentials: &mut QualificationCredentials,
     model_id: &str,
 ) -> Result<bool> {
-    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+    let cancel = CancellationToken::new();
     let body = serde_json::json!({
         "model": model_id,
         "messages": [{
@@ -745,48 +851,68 @@ async fn streaming_probe(
         }],
         "stream": true
     });
-    let response = loop {
-        let mut request = client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .header("Accept", "text/event-stream");
-        if let Some(current) = credentials.current() {
-            request = crate::auth_store::apply_auth_headers(request, current, base_url);
+    let mut reader = loop {
+        let binding = credential_binding_of(credentials);
+        let sent = {
+            let spec = probe.spec(
+                base_url,
+                model_id,
+                credentials.current(),
+                binding.as_deref(),
+                &body,
+                crate::provider_send::ResponseAccept::EventStream,
+            );
+            crate::provider_send::dispatch(probe.context, spec, &cancel)
+                .await
+                .map_err(|error| probe_send_error(&error))?
+        };
+        let status = sent.status();
+        let mut reader = sent.into_reader();
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            let _ = reader.settle_rejected();
+            drop(reader);
+            if credentials.refresh_after_unauthorized().await? {
+                continue;
+            }
+            bail!("provider stream failed (HTTP {})", status.as_u16());
         }
-        let response = request
-            .json(&body)
-            .send()
-            .await
-            .map_err(classify_transport)?;
-        if response.status() == reqwest::StatusCode::UNAUTHORIZED
-            && credentials.refresh_after_unauthorized().await?
-        {
-            continue;
+        if !status.is_success() {
+            let _ = reader.settle_rejected();
+            bail!("provider stream failed (HTTP {})", status.as_u16());
         }
-        break response;
+        break reader;
     };
-    if !response.status().is_success() {
-        bail!(
-            "provider stream failed (HTTP {})",
-            response.status().as_u16()
-        );
-    }
-    let content_type = response
+
+    let content_type = reader
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .to_ascii_lowercase();
     if content_type.contains("application/json") {
+        // The provider answered but declined to stream. Drain so the attempt
+        // settles on a complete response rather than being abandoned mid-body.
+        let _ = reader.read_to_string(&cancel).await;
+        let _ = reader.settle_completed(None, None, None, None);
         return Ok(false);
     }
+
     let mut decoder = crate::sse::SseLineDecoder::new();
     let mut full_body = crate::sse::BoundedBodyAccumulator::new();
     let mut content = String::new();
     let mut done = false;
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let bytes = chunk.map_err(classify_transport)?;
+    while let Some(chunk) = reader.next_chunk(&cancel).await {
+        let bytes = match chunk {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let _ = reader.settle_uncertain(
+                    error
+                        .uncertainty()
+                        .unwrap_or(crate::provider_send::UncertaintyClass::TransportError),
+                );
+                return Err(probe_send_error(&error));
+            }
+        };
         full_body.push(&bytes)?;
         for line in decoder.push(&bytes)? {
             done |= apply_stream_probe_line(&line, &mut content)?;
@@ -796,6 +922,9 @@ async fn streaming_probe(
         done |= apply_stream_probe_line(&line, &mut content)?;
     }
     full_body.finish()?;
+    reader
+        .settle_completed(None, None, None, None)
+        .map_err(|error| anyhow!("{error}"))?;
     Ok(done && content.contains(GENERATION_MARKER))
 }
 
@@ -817,27 +946,25 @@ fn apply_stream_probe_line(line: &str, content: &mut String) -> Result<bool> {
     Ok(false)
 }
 
-async fn read_body(response: reqwest::Response) -> Result<String> {
-    let mut body = crate::sse::BoundedBodyAccumulator::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        body.push(&chunk.map_err(classify_transport)?)?;
-    }
-    body.finish()
-}
-
-fn classify_transport(error: reqwest::Error) -> anyhow::Error {
-    if error.is_timeout() {
-        anyhow!("provider transport timed out")
-    } else if error.is_connect() {
-        anyhow!("provider transport could not connect")
-    } else {
-        anyhow!("provider transport failed")
-    }
-}
-
 #[cfg(test)]
 mod tests {
+
+    /// A real bound probe for the in-crate qualification tests. It uses the
+    /// same chokepoint as production, so a test cannot exercise the old
+    /// unbound path by accident.
+    fn test_probe(
+        root: &std::path::Path,
+        session: &str,
+    ) -> crate::provider_send::ProviderSendContext {
+        crate::provider_send::ProviderSendContext::for_root(
+            root.join("provider-attempts"),
+            "in-crate-qualification-test",
+            session,
+            crate::provider_send::SendOrigin::Qualification,
+            crate::provider_send::CallSiteFamily::ProviderQualificationProbe,
+        )
+        .expect("ledger")
+    }
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -1200,7 +1327,9 @@ mod tests {
                 let previous_key = std::env::var_os("XAI_API_KEY");
                 unsafe { std::env::set_var("XAI_API_KEY", "must-not-leak") };
 
-                let error = qualify_provider_model("attacker", "grok-4.5")
+                let ledger_root = tempfile::tempdir().unwrap();
+                let send = test_probe(ledger_root.path(), "unknown-profile");
+                let error = qualify_provider_model(&send, "attacker", "grok-4.5")
                     .await
                     .unwrap_err();
                 assert!(error.to_string().contains("unknown provider profile"));
@@ -1229,10 +1358,15 @@ mod tests {
         )
         .unwrap();
         credentials.forced_refresh_override = Some(wire_credentials("xai", "fresh-token", true));
-        let client = reqwest::Client::new();
+        let ledger_root = tempfile::tempdir().unwrap();
+        let probe = QualificationSend {
+            context: &test_probe(ledger_root.path(), "oidc-refresh"),
+            dialect: crate::provider_send::WireDialect::XaiChatCompletions,
+            request_timeout: Duration::from_secs(45),
+        };
 
         let value = completion(
-            &client,
+            &probe,
             &base_url,
             &mut credentials,
             serde_json::json!({
@@ -1265,9 +1399,15 @@ mod tests {
         refreshed.principal_id = Some("user-b".into());
         let mut credentials = QualificationCredentials::new(Some(initial), &profile).unwrap();
         credentials.forced_refresh_override = Some(refreshed);
+        let ledger_root = tempfile::tempdir().unwrap();
+        let probe = QualificationSend {
+            context: &test_probe(ledger_root.path(), "principal-change"),
+            dialect: crate::provider_send::WireDialect::XaiChatCompletions,
+            request_timeout: Duration::from_secs(45),
+        };
 
         let error = completion(
-            &reqwest::Client::new(),
+            &probe,
             &base_url,
             &mut credentials,
             serde_json::json!({
@@ -1305,7 +1445,9 @@ mod tests {
                 let temp = tempfile::tempdir().unwrap();
                 install_profile(temp.path(), &base_url, "qualified");
 
-                let report = qualify_provider_model("qualified", "cheap-code-model")
+                let ledger_root = tempfile::tempdir().unwrap();
+                let send = test_probe(ledger_root.path(), "qualified");
+                let report = qualify_provider_model(&send, "qualified", "cheap-code-model")
                     .await
                     .unwrap();
                 assert!(report.coding_ready);
@@ -1376,7 +1518,11 @@ mod tests {
                 );
                 assert!(unqualified.models[0].capabilities.tools);
 
-                let report = qualify_provider_model("xai", "grok-4.5").await.unwrap();
+                let ledger_root = tempfile::tempdir().unwrap();
+                let send = test_probe(ledger_root.path(), "xai-grok");
+                let report = qualify_provider_model(&send, "xai", "grok-4.5")
+                    .await
+                    .unwrap();
                 assert!(report.coding_ready);
                 assert_eq!(report.provider_id, "xai");
                 assert_eq!(report.computer_use_tier, ComputerUseTier::SemanticAct);
@@ -1476,7 +1622,9 @@ mod tests {
                 let temp = tempfile::tempdir().unwrap();
                 install_profile(temp.path(), &base_url, "discussion-only");
 
-                let report = qualify_provider_model("discussion-only", "cheap-code-model")
+                let ledger_root = tempfile::tempdir().unwrap();
+                let send = test_probe(ledger_root.path(), "discussion-only");
+                let report = qualify_provider_model(&send, "discussion-only", "cheap-code-model")
                     .await
                     .unwrap();
                 assert!(!report.coding_ready);
@@ -1510,12 +1658,18 @@ mod tests {
             request_count: request_count.clone(),
         })
         .await;
-        let client = reqwest::Client::new();
+        let ledger_root = tempfile::tempdir().unwrap();
+        let context = test_probe(ledger_root.path(), "bounded-retry");
+        let probe = QualificationSend {
+            context: &context,
+            dialect: crate::provider_send::WireDialect::OpenAiChatCompletions,
+            request_timeout: Duration::from_secs(45),
+        };
         let profile =
             crate::gateway_config::ProviderProfile::openai_compatible("test", "Test", &base_url);
         let mut credentials = QualificationCredentials::new(None, &profile).unwrap();
         let value = completion(
-            &client,
+            &probe,
             &base_url,
             &mut credentials,
             serde_json::json!({
@@ -1542,7 +1696,7 @@ mod tests {
         })
         .await;
         let error = completion(
-            &client,
+            &probe,
             &base_url,
             &mut credentials,
             serde_json::json!({

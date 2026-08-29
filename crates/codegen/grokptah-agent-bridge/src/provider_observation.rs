@@ -805,7 +805,12 @@ impl fmt::Debug for ProviderObservationContext {
 }
 
 impl ProviderObservationContext {
-    pub fn begin_attempt(&self) -> Result<ProviderObservationAttempt, ObservationError> {
+    /// Open one *observation* of a physical attempt.
+    ///
+    /// Not a send ledger: the number it allocates orders diagnostics within a
+    /// campaign, and every observation it produces is filled in from the one
+    /// durable send lattice (#478) rather than from anything tracked here.
+    pub fn begin_observation(&self) -> Result<ProviderObservationAttempt, ObservationError> {
         let attempt_number = loop {
             let current = self.next_attempt.load(Ordering::Relaxed);
             if current >= MAX_ATTEMPT_NUMBER as u64 {
@@ -1053,7 +1058,7 @@ mod tests {
         let context = session
             .context("desktop-018f1234-5678-7abc-8def-0123456789ac", Uuid::nil())
             .unwrap();
-        let attempt = context.begin_attempt().unwrap();
+        let attempt = context.begin_observation().unwrap();
         let encoded = serde_json::to_string(attempt.scope().run_id()).unwrap();
         assert!(!encoded.contains("desktop-"));
         assert_eq!(encoded.len(), 66); // quoted 64-character SHA-256 digest
@@ -1233,7 +1238,7 @@ mod tests {
             recorder.observer(),
         );
         let context = session.context("run-mode-check", Uuid::nil()).unwrap();
-        let attempt = context.begin_attempt().unwrap();
+        let attempt = context.begin_observation().unwrap();
 
         let mut mismatched = observation(attempt.attempt_number(), EvidenceMode::Disabled);
         mismatched.scope = attempt.scope().clone();
@@ -1260,7 +1265,7 @@ mod tests {
             recorder.observer(),
         );
         let context = session.context("run-disabled-mode", Uuid::nil()).unwrap();
-        let attempt = context.begin_attempt().unwrap();
+        let attempt = context.begin_observation().unwrap();
         let mut enabled = observation(attempt.attempt_number(), EvidenceMode::MetadataOnly);
         enabled.scope = attempt.scope().clone();
 
