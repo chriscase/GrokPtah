@@ -15,6 +15,7 @@
     "tauri:build": "tauri build",
     "verify:help-public": "npm run build && node scripts/verify-help-public.mjs",
     "build:help-evidence": "vite build --config evidence/vite.config.ts",
+    "test:help-evidence-contract": "node --test scripts/help-evidence-contract.test.mjs",
     "verify:help-evidence-manifest": "node scripts/help-evidence-manifest.mjs"
   },
   "dependencies": {

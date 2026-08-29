@@ -609,6 +609,7 @@
     }
   },
   "$id": "https://grokptah.dev/schemas/grokptah-help.v1.schema.json",
+  "$ref": "#/$defs/HelpCorpus",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "Generated from the Rust model in grokptah-help-contract. The host owns every type here; a renderer may send only HelpAsk, HelpFollow, and HelpCancelRequest.",
   "title": "GrokPtah Semantic Help contract"

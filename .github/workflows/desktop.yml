@@ -102,6 +102,9 @@ jobs:
         run: |
           npm run verify:help-public
           npm run build:help-evidence
+          npm run test:help-evidence-contract
+          npx playwright install chromium
+          node scripts/help-evidence.mjs
           npm run verify:help-evidence-manifest -- --out "$RUNNER_TEMP/help-evidence-manifest.json"
       - name: Upload Semantic Help provenance manifest
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

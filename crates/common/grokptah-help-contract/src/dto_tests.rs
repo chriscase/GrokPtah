@@ -414,6 +414,30 @@ fn generated_artifacts_are_deterministic() {
 }
 
 #[test]
+fn published_schema_validates_a_help_corpus_at_its_root() {
+    let schema = crate::codegen::emit_json_schema(&crate::codegen::model());
+    assert_eq!(
+        schema.get("$ref").and_then(serde_json::Value::as_str),
+        Some("#/$defs/HelpCorpus"),
+        "using the published schema directly must validate a HelpCorpus rather than accept any JSON"
+    );
+    assert_eq!(
+        schema
+            .pointer("/$defs/HelpCorpus/properties/schema_version/const")
+            .and_then(serde_json::Value::as_str),
+        Some(crate::corpus::SCHEMA_VERSION),
+        "the root corpus schema must reject unknown versions"
+    );
+    assert_eq!(
+        schema
+            .pointer("/$defs/HelpCorpus/additionalProperties")
+            .and_then(serde_json::Value::as_bool),
+        Some(false),
+        "the root corpus schema must reject unknown fields"
+    );
+}
+
+#[test]
 fn public_error_codes_carry_no_authorization_detail() {
     // Every authorization outcome must be indistinguishable from outside.
     let authorization = [

@@ -556,6 +556,7 @@ pub fn emit_json_schema(decls: &[Decl]) -> serde_json::Value {
         "description":
             "Generated from the Rust model in grokptah-help-contract. The host owns every \
              type here; a renderer may send only HelpAsk, HelpFollow, and HelpCancelRequest.",
+        "$ref": "#/$defs/HelpCorpus",
         "$defs": defs,
     })
 }

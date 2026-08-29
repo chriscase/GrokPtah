@@ -12,6 +12,8 @@ import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { validateHelpEvidenceReport } from "./help-evidence-contract.mjs";
+
 const here = dirname(fileURLToPath(import.meta.url));
 const desktop = resolve(here, "..");
 const repository = resolve(desktop, "..");
@@ -71,35 +73,16 @@ const evidenceBundleDigest = `sha256:${sha256(Buffer.from(JSON.stringify(evidenc
 
 const reportFile = join(evidence, "accessibility-report.json");
 const report = JSON.parse(readFileSync(reportFile, "utf8"));
-if (report.generatedFrom !== "synthetic fixture corpus") {
-  throw new Error("accessibility evidence is not labelled synthetic");
-}
-if (report.publicCorpusDigest !== publicCorpus.digest) {
-  throw new Error("accessibility evidence is stale for the public corpus");
-}
-if (report.evidenceBundleDigest !== evidenceBundleDigest) {
-  throw new Error("accessibility evidence is stale for the built evidence harness");
-}
-if (JSON.stringify(report.evidenceAssets) !== JSON.stringify(evidenceAssets)) {
-  throw new Error("accessibility evidence asset set is stale or reordered");
-}
-const states = ["browse", "answer", "ambiguous", "low-confidence", "no-match", "rejected"];
-const viewports = ["desktop", "narrow"];
-const expected = new Set(states.flatMap((state) => viewports.map((viewport) => `${state}:${viewport}`)));
-const screenshots = {};
-for (const entry of report.report) {
-  const key = `${entry.state}:${entry.viewport}`;
-  if (!expected.delete(key)) throw new Error(`unexpected or duplicate evidence row ${key}`);
-  if (entry.violations.length !== 0) throw new Error(`accessibility violations remain for ${key}`);
-  const screenshot = join(desktop, entry.screenshot);
-  if (!existsSync(screenshot)) throw new Error(`missing evidence screenshot ${entry.screenshot}`);
-  const screenshotDigest = digestFile(screenshot);
-  if (entry.screenshotDigest !== screenshotDigest) {
-    throw new Error(`screenshot digest mismatch for ${entry.screenshot}`);
-  }
-  screenshots[entry.screenshot] = screenshotDigest;
-}
-if (expected.size > 0) throw new Error(`missing evidence rows: ${[...expected].sort().join(", ")}`);
+const screenshots = validateHelpEvidenceReport(report, {
+  publicCorpusDigest: publicCorpus.digest,
+  evidenceBundleDigest,
+  evidenceAssets,
+  screenshotDigest: (relative) => {
+    const screenshot = join(desktop, relative);
+    if (!existsSync(screenshot)) throw new Error(`missing evidence screenshot ${relative}`);
+    return digestFile(screenshot);
+  },
+});
 
 const manifest = {
   schemaVersion: "grokptah.help-evidence.v1",
