@@ -138,6 +138,20 @@ pub use mcp_control_client::{
 };
 /// List MCP tools for the project (spawns stdio servers when allowed).
 pub use mcp_runtime::list_mcp_tools;
+pub use orchestration::provider_authority::{
+    authority_policy_digest, confirmation_nonce_digest, installation_identity,
+    new_confirmation_nonce, provider_payload_digest, provider_request_fingerprint,
+    resolve_authority_scope, single_tenant_identity, AuthorityBindingSummary, CancelDisposition,
+    ConfirmationGrant, FollowUpDisposition, ProviderAttemptReceipt, ProviderAttemptRecord,
+    ProviderAttemptRequest, ProviderAuthorityBinding, ProviderAuthorityDenial,
+    ProviderAuthorityInputs, ProviderAuthorityLedger, ProviderAuthorityScope,
+    ProviderContinuationIntent, ProviderRepositoryBinding, ProviderRequestIdentity,
+    ProviderRouteAuthority, ProviderSendState, ProviderSendTransition, ProviderSettledOutcome,
+    ProviderUncertaintyReason, ProviderUncertaintyResolution, ProviderUnknown,
+    DEFAULT_BINDING_TTL_MS, DEFAULT_GRANT_TTL_MS, MAX_PROVIDER_ATTEMPT_TRANSITIONS,
+    MAX_PROVIDER_BINDING_FIELD_BYTES, MAX_PROVIDER_RECEIPTS_PER_RUN, MIN_CONFIRMATION_NONCE_BYTES,
+    PROVIDER_ATTEMPT_RECEIPT_SCHEMA, PROVIDER_AUTHORITY_SCHEMA_VERSION,
+};
 pub use orchestration::{
     is_recognized_test_command, merge_bounds, prompt_preview, safe_id_filename,
     ActivationDisposition, ActivationRecord, AgentAuthorityPolicy, AgentContinuationPlan,

@@ -5283,7 +5283,7 @@ pub(crate) fn workspaces_match(left: &str, right: &str) -> bool {
     }
 }
 
-fn atomic_write_json<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
+pub(crate) fn atomic_write_json<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -5300,7 +5300,10 @@ fn atomic_write_json<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Res
     Ok(())
 }
 
-fn write_json_exclusive<T: serde::Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
+pub(crate) fn write_json_exclusive<T: serde::Serialize>(
+    path: &Path,
+    value: &T,
+) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }

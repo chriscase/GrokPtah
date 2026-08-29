@@ -35,6 +35,9 @@ rules and the explicit-operator-resume boundary.
   and `model` remain compatibility projections during migration.
 - `AgentLaneAssociation` is independent of Lane archival. Archiving a Lane
   never retires its Agent or deletes identity, memory, Runs, or checkpoints.
+- Provider execution authority, the send-state lattice, confirmation
+  grants, and the attempt receipt projection are defined in
+  [`PROVIDER_EXECUTION_AUTHORITY.md`](PROVIDER_EXECUTION_AUTHORITY.md).
 - `RunRecord.agent_id` links a run to its agent.
 - `RunRecord.parent_run_id` links a continuation to the run that produced its
   verified checkpoint. It is separate from `retry_of`, which means an explicit
