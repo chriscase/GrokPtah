@@ -695,6 +695,49 @@ though the SDK projects them away client-side. Cross-principal disclosure is
 closed (F-12); this is the defence-in-depth half. Narrowing it is a contract
 change the Desktop `RunInspector` consumes directly, so it belongs to that lane.
 
+**R14 — `ptah_cancel` reports `teardownComplete: true` while the session is
+still busy.** *Not this branch's defect, and deliberately not fixed here.
+Owner: the host runtime / shutdown authority lane (#455).*
+
+`cancel_run` computes:
+
+```rust
+let was_pending = self.remove_pending(rid);
+let reservation_released = self.host.release_turn_reservation(session_id, rid);
+let teardown_complete = if was_pending || reservation_released {
+    true                       // ← claims completion having only dropped a reservation
+} else {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let _ = self.host.cancel_turn_and_await(Some(session_id)).await;
+        self.host.wait_turn_idle(session_id).await;
+    }).await.is_ok()
+};
+```
+
+`release_turn_reservation` removes an entry from `turn_reservations` and
+returns whether it was there. It says **nothing** about a turn that has already
+started. So a run reported `state: running` can be cancelled, answer
+`teardownComplete: true` on the strength of dropping its reservation, and leave
+the session's turn winding down. `try_reserve_capacity` maps anything that is
+not "max concurrent" to `session_busy`, so the next submit to that session is
+refused — and a JSON-RPC error carries no `result`, so a client reading
+`structuredContent` sees an absent run id rather than a stated reason.
+
+**What completion has to mean:** the session can accept new work. Releasing a
+reservation is not that.
+
+**The patch**, for whoever owns this: stop short-circuiting on
+`reservation_released` and confirm the turn is idle before claiming completion.
+`wait_turn_idle` polls `session_busy` and returns immediately when the session
+is already idle, so it is safe to call unconditionally — the fast path costs one
+check rather than a claim that is sometimes false.
+
+Reproduced on the hosted macOS runner, where the campaign submitted immediately
+after a cancel and was refused; it does not reproduce on this Linux container,
+where the turn finishes before the next submit lands. The campaign now waits for
+the host to report the session not busy rather than trusting the cancel
+response, so CI is deterministic while the defect stands.
+
 **R11 — `AuthContext` is publicly constructible.** Sealing the receipt store
 does not by itself create a verified principal boundary: `AuthContext` is a
 public struct with public fields, so an in-process or downstream caller can
