@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Computer Use uses TCC Screen Recording and Accessibility bound to the
+       packaged code identity. This file is intentionally empty: no App Sandbox,
+       no Apple Events, no Keychain access groups, and no private entitlements. -->
+</dict>
+</plist>

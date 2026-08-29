@@ -187,7 +187,9 @@ non-cancelling steering. Native actions are limited to activation, Accessibility
 value entry, selection, and semantic scrolling. Every mutation requires a fresh observation and
 local one-use grant. It does not register a model action or MCP tool. See
 [Computer Use on macOS](COMPUTER_USE_MACOS.md) for the privacy boundary, dispatch attestation,
-packaging requirements, and disposable smoke fixture.
+packaging requirements, and disposable smoke fixture. Packaged app/helper identity, signing-class
+eligibility, and the synthetic helper-authority oracle live in
+[Computer Use packaged macOS authority](COMPUTER_USE_PACKAGE_AUTHORITY.md) (#444).
 
 ## Deliberate non-goals of the current desktop slice
 

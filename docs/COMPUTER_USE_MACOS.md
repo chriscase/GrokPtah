@@ -77,15 +77,24 @@ and Foundation. ScreenCaptureKit is runtime-loaded from `/System/Library/Framewo
 below macOS 14 can still launch GrokPtah with Computer Use reported as unavailable. The adapter
 does not search user-writable framework locations.
 
+Declared packaged identities (#444) are `com.chriscase.grokptah` for the app and
+`com.chriscase.grokptah.computer-use-helper` for the Computer Use helper. The current native
+adapter still executes **in-process** in `grokptah-desktop`; platform status reports that
+in-process host as the TCC principal. A nested helper at
+`Contents/Helpers/GrokPtah Computer Use Helper.app` is the declared packaged executor, not an
+assembled notarized binary on this branch. In-process, cargo-run, and ad-hoc identities cannot
+count as packaged qualification. See [Computer Use packaged macOS authority](COMPUTER_USE_PACKAGE_AUTHORITY.md).
+
 Apple's Screen Recording and Accessibility consent APIs used here do not define camera-style
 `Info.plist` usage-description keys, so GrokPtah does not invent unsupported keys. The app is not
-sandboxed and this slice adds no private entitlement. If App Sandbox is introduced later, native
-computer control must be re-reviewed before release.
+sandboxed and this slice adds no private entitlement. The checked-in entitlements files are empty
+on purpose: no Apple Events, Keychain access groups, or private entitlements. If App Sandbox is
+introduced later, native computer control must be re-reviewed before release.
 
-TCC grants are associated with the application identity. Development binaries that move or change
-ad-hoc signatures may need consent again. Release testing should use the same stable Developer ID
-signature and bundle identifier as the shipped app, then verify the notarized artifact rather than
-assuming a development grant transfers.
+TCC grants are associated with the application or helper code identity. Development binaries that
+move or change ad-hoc signatures may need consent again. Release testing should use the same
+stable Developer ID signature and bundle identifier as the shipped app **and helper**, then verify
+the notarized artifact rather than assuming a development or Terminal grant transfers.
 
 References:
 
