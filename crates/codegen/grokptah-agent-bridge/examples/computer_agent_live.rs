@@ -8,8 +8,8 @@ use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use grokptah_agent_bridge::{
-    set_grokptah_home_override, AgentHost, ComputerBackend, ComputerUseLimits, EffortLevel,
-    HostConfig, SimulatorBackend,
+    set_grokptah_home_override, AdaptiveProfile, AgentHost, ComputerBackend, ComputerUseLimits,
+    EffortLevel, HostConfig, SimulatorBackend, TurnPermit,
 };
 use serde::Serialize;
 
@@ -25,6 +25,13 @@ struct LiveProof {
     /// only. The bytes carry no authority and were never sealed against a live
     /// run, so nothing here could stage or complete anything (#457).
     raw_proposal: grokptah_agent_bridge::RawModelProposal,
+    /// The adaptive profile the turn ran under, and what its bounded view
+    /// actually cost. Provider token figures stay `null` unless the provider
+    /// reported them.
+    profile: AdaptiveProfile,
+    observation_bytes: u64,
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
     proposal_sealed: bool,
     action_executed: bool,
 }
@@ -67,15 +74,26 @@ async fn main() -> Result<()> {
         )
         .await
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    // The adaptive layer admits turns against a *durable* Computer Run record,
+    // and this proof deliberately has no such run: it exercises the provider
+    // round-trip against the deterministic simulator and nothing else. Building
+    // the permit directly here keeps that boundary visible — it grants no
+    // authority, because the bytes it produces have none either.
+    let objective = "Enter Ada Lovelace in the visible Name field. Do not submit yet.";
+    let permit = TurnPermit {
+        profile: AdaptiveProfile::Economy,
+        budget: AdaptiveProfile::Economy.budget(),
+        revision: 0,
+    };
     let proposal_started = Instant::now();
-    let raw_proposal = host
-        .propose_computer_action(
-            session.id,
-            "Enter Ada Lovelace in the visible Name field. Do not submit yet.",
-            &observation,
-        )
+    let attempt = host
+        .propose_computer_action(session.id, objective, &observation, &permit)
         .await?;
     let proposal_ms = proposal_started.elapsed().as_millis();
+    let raw_proposal = attempt.outcome?;
+    let observation_bytes = attempt.rendered.bytes;
+    let prompt_tokens = attempt.prompt_tokens;
+    let completion_tokens = attempt.completion_tokens;
 
     println!(
         "{}",
@@ -86,6 +104,10 @@ async fn main() -> Result<()> {
             qualification_ms,
             proposal_ms,
             raw_proposal,
+            observation_bytes,
+            prompt_tokens,
+            completion_tokens,
+            profile: AdaptiveProfile::Economy,
             proposal_sealed: false,
             action_executed: false,
         })?

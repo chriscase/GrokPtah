@@ -613,7 +613,16 @@ async fn stationarity_is_tracked_on_the_durable_record() {
     assert_eq!(projection.stationary_repeats, 2);
     let wire = serde_json::to_string(&projection).expect("serialize");
     assert!(!wire.contains("lastFrameDigest"), "{wire}");
-    assert!(!wire.contains(&format!("{fingerprint:?}")[..16.min(wire.len())]) || true);
+    // Stronger than a field-name check: no 64-character hex run appears
+    // anywhere in the payload, so the digest cannot have leaked under some
+    // other key either.
+    assert!(
+        !wire
+            .as_bytes()
+            .windows(64)
+            .any(|window| window.iter().all(u8::is_ascii_hexdigit)),
+        "projection contains a digest-shaped value: {wire}"
+    );
 }
 
 /// **A legacy run carries no adaptive authority.** A record written before this

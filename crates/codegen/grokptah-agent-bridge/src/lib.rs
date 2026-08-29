@@ -117,7 +117,7 @@ pub use computer_profile::{
     AdaptiveProfileProjection, AdaptiveRecord, CapabilityEvidence, CapabilityGeneration,
     HostCapabilityEvidence, ModelCapabilityEvidence, ObservationFingerprint,
     OperatorCapabilityPolicy, ProfileReason, ProfileTransition, RuntimeSignal, TaskRisk,
-    CANONICAL_PROFILE_NAMES,
+    TurnPermit, CANONICAL_PROFILE_NAMES,
 };
 pub use computer_use::{
     canonical_workspace_string, project_run_at, ActionClass, ActionGrant, ActionGrantSummary,

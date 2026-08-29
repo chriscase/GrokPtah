@@ -316,7 +316,7 @@ mod tests {
                     ComputerUseTier::SemanticAct
                 },
                 attribution: CapabilityAttribution::Measured,
-                durable_authority: !image || true,
+                durable_authority: true,
                 session_measured: false,
                 synthetic_only: false,
                 generation: generation(),

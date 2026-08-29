@@ -619,11 +619,7 @@ fn observation_for_model(
             ))
             .or_default() += 1;
     }
-    let ambiguous = names
-        .values()
-        .filter(|count| **count > 1)
-        .map(|count| *count)
-        .sum();
+    let ambiguous = names.values().copied().filter(|count| *count > 1).sum();
     (
         payload,
         RenderedObservation {
