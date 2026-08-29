@@ -4276,6 +4276,11 @@ mod tests {
         assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
 
         fixture.srv.stop();
+        // Ordered shutdown, not a bare drop. A dropped `HostRuntime` with work
+        // outstanding quarantines its home's lock for the life of this test
+        // binary (#455), which leaks across tests in the same process. Stopping
+        // properly is also what the production contract asks of every embedder.
+        assert!(host.shutdown().await.is_clean());
         set_grokptah_home_override(None);
     }
 
@@ -4377,6 +4382,11 @@ mod tests {
         assert_eq!(body["result"]["structuredContent"]["cursorExpired"], false);
 
         fixture.srv.stop();
+        // Ordered shutdown, not a bare drop. A dropped `HostRuntime` with work
+        // outstanding quarantines its home's lock for the life of this test
+        // binary (#455), which leaks across tests in the same process. Stopping
+        // properly is also what the production contract asks of every embedder.
+        assert!(host.shutdown().await.is_clean());
         set_grokptah_home_override(None);
     }
 
@@ -4494,6 +4504,11 @@ mod tests {
         assert!(operations.contains(&"recover"));
 
         fixture.srv.stop();
+        // Ordered shutdown, not a bare drop. A dropped `HostRuntime` with work
+        // outstanding quarantines its home's lock for the life of this test
+        // binary (#455), which leaks across tests in the same process. Stopping
+        // properly is also what the production contract asks of every embedder.
+        assert!(host.shutdown().await.is_clean());
         set_grokptah_home_override(None);
     }
 
@@ -4536,6 +4551,11 @@ mod tests {
         assert_eq!(body["error"]["data"]["code"], "unsupported");
 
         fixture.srv.stop();
+        // Ordered shutdown, not a bare drop. A dropped `HostRuntime` with work
+        // outstanding quarantines its home's lock for the life of this test
+        // binary (#455), which leaks across tests in the same process. Stopping
+        // properly is also what the production contract asks of every embedder.
+        assert!(host.shutdown().await.is_clean());
         set_grokptah_home_override(None);
     }
 
@@ -4615,10 +4635,18 @@ mod tests {
         let home = tempdir().unwrap();
         set_grokptah_home_override(Some(home.path().join(".grokptah")));
         let workspace = tempdir().unwrap();
-        let host = AgentHost::create(HostConfig {
-            always_approve: true,
-            ..HostConfig::default()
-        })
+        // Constructed against an *explicit* home rather than the ambient
+        // override. The override is still set for the legacy path-resolving
+        // helpers this test exercises, but the host's own ownership no longer
+        // depends on a mutable process-global that a concurrently running test
+        // can change between this line and the acquisition (#455).
+        let host = AgentHost::create_with_runtime_home(
+            HostConfig {
+                always_approve: true,
+                ..HostConfig::default()
+            },
+            crate::discover::RuntimeHome::from_path(home.path().join(".grokptah")).unwrap(),
+        )
         .expect("acquire the GrokPtah instance lock");
         host.start().unwrap();
         let session = host.session_new_kind(crate::SessionKind::Build).unwrap();
@@ -4701,6 +4729,16 @@ mod tests {
             .get_persistent_agent_scoped(&auth, session.id, &workspace_path, "agent-not-visible")
             .unwrap_err();
         assert_eq!(error.code, OrchErrorCode::ForbiddenScope);
+        // Ordered shutdown before releasing the home, for the same reason as the
+        // fixture-based tests above: a bare drop with work outstanding
+        // quarantines this home's lock for the life of the test binary.
+        drop(orch);
+        let report = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(host.shutdown());
+        assert!(report.is_clean(), "{}", report.operator_summary());
         set_grokptah_home_override(None);
     }
 }

@@ -26,8 +26,16 @@ pub struct AppState {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let runtime =
-        AgentHost::create(HostConfig::default()).expect("acquire the GrokPtah instance lock");
+    // A second instance on the same home is refused by design. That refusal is
+    // the guard working, so it exits with a message an operator can act on and
+    // a non-zero status — not a panic and a backtrace (#119, #455).
+    let runtime = match AgentHost::create(HostConfig::default()) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("[grokptah] cannot start: {error:#}");
+            std::process::exit(1);
+        }
+    };
     // Prefer fan-out subscribe so MCP can also attach; fall back to take for compat.
     let event_rx = runtime.subscribe_events();
     let _primary = runtime.take_event_receiver();

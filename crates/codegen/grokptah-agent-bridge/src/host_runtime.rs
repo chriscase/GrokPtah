@@ -116,15 +116,34 @@ fn owner_key(lock_path: &std::path::Path) -> PathBuf {
 /// believe an unrelated lock protects it. Two writers on the same root are still
 /// excluded, which is the property the lease actually needs (#455).
 ///
-/// "Inside a home" is decided by evidence, never by shape: either a live runtime
-/// is registered for the parent, or the parent *is* the home this process is
-/// configured to use.
+/// "Inside a home" is decided by **per-path evidence**, never by ambient state
+/// and never by shape: a live runtime in this process is registered as the
+/// parent's owner, or the parent's lock is currently *held* — by any process.
+///
+/// It deliberately does not consult `grokptah_home()`. That is a mutable
+/// process-global, and reading it here made an authority decision depend on
+/// whatever the last caller happened to set: a store opened during one caller's
+/// teardown could resolve to a *different* caller's home and take a retained
+/// lock on it. In this crate's test binary that showed up as default-thread
+/// flakiness the base does not have; in production it is a lock taken on the
+/// wrong home. An authority decision must not depend on a mutable global.
+///
+/// The held-lock check is **identification, not authorization**. It decides
+/// *which* lock governs this root; it never grants a write. Whichever branch is
+/// taken, the caller must then actually hold that lock — via the registered
+/// runtime's lifecycle, or by acquiring it as an offline authority — and is
+/// refused if it cannot. A stale lock file nobody holds is not a home, so an
+/// unrelated root under it governs itself rather than contending on it.
+///
+/// The converse direction is closed by `refuse_if_a_nested_store_is_owned`: a
+/// runtime taking a home whose store is separately held is refused, so a root
+/// that self-governed cannot later be written beside a parent owner (#455).
 fn governing_home_lock(root: &std::path::Path) -> PathBuf {
     if let Some(parent) = root.parent() {
         let parent_lock = owner_key(&parent.join(".instance.lock"));
-        let parent_is_a_home = registered_owner(&parent_lock).is_some()
-            || owner_key(&crate::discover::grokptah_home().join(".instance.lock")) == parent_lock;
-        if parent_is_a_home {
+        if registered_owner(&parent_lock).is_some()
+            || crate::instance_lock::instance_lock_is_held(&parent_lock)
+        {
             return parent_lock;
         }
     }
@@ -1120,9 +1139,37 @@ impl HostRuntime {
         //    authority still exists, lets the writer finish its work; a real
         //    failure still lands in `flush_errors` below and still makes the
         //    shutdown unclean.
+        //    The join is a blocking `std::thread` join, so it runs on the
+        //    blocking pool with its own bound rather than stalling the async
+        //    shutdown. An unbounded blocking join here would let one wedged
+        //    writer hang the whole stop with no timeout and no report; a
+        //    timeout instead becomes a flush error, which makes the shutdown
+        //    unclean and quarantines the home — the same fail-closed answer
+        //    every other uncertainty gets.
         let mut writer_drain_errors = Vec::new();
-        if let Some(error) = self.handle().event_bus().close_journal_writer() {
-            writer_drain_errors.push(format!("close the durable event journal: {error}"));
+        let drain_bus = self.handle().event_bus();
+        match tokio::time::timeout(
+            self.write_seal_timeout,
+            tokio::task::spawn_blocking(move || drain_bus.close_journal_writer()),
+        )
+        .await
+        {
+            Ok(Ok(Some(error))) => {
+                writer_drain_errors.push(format!("close the durable event journal: {error}"));
+            }
+            Ok(Ok(None)) => {}
+            // The blocking pool is gone — the runtime is being torn down around
+            // us. Fall back to closing inline; it is idempotent.
+            Ok(Err(_)) => {
+                if let Some(error) = self.handle().event_bus().close_journal_writer() {
+                    writer_drain_errors.push(format!("close the durable event journal: {error}"));
+                }
+            }
+            Err(_) => writer_drain_errors.push(format!(
+                "the durable event-journal writer did not finish within {:?}; its queued entries \
+                 are unaccounted for",
+                self.write_seal_timeout
+            )),
         }
 
         // 5. Seal durable-write authority. After this no handle — stale or

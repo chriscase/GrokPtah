@@ -342,12 +342,16 @@ pub async fn start_service(config: ServiceConfig) -> Result<ServiceHandle> {
         bail!("every configured workspace must exist and resolve to a directory");
     }
 
+    // Refusing a second instance on one home is an intended, documented outcome
+    // (#119, #455) — it must reach the caller as an error, not abort the
+    // process. `.expect` here turned the single-instance guard doing its job
+    // into a panic, which is both a worse operator experience and impossible
+    // for an embedder to handle.
     let runtime = match config.runtime_home.clone() {
-        Some(home) => AgentHost::create_with_runtime_home(HostConfig::default(), home)
-            .expect("acquire the GrokPtah instance lock"),
-        None => AgentHost::create(HostConfig::default())
-            .expect("acquire the GrokPtah instance lock"),
-    };
+        Some(home) => AgentHost::create_with_runtime_home(HostConfig::default(), home),
+        None => AgentHost::create(HostConfig::default()),
+    }
+    .context("acquire the GrokPtah single-instance lock for this home")?;
     runtime.start().context("start GrokPtah agent host")?;
     let store: OrchStore = runtime
         .ensure_orchestration_store()

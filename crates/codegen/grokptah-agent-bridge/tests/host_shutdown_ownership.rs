@@ -1196,9 +1196,17 @@ fn an_offline_handle_holds_the_home_lock_for_its_whole_lifetime() {
         .expect("no runtime owns this home, so offline maintenance may take it");
 
     // A momentary probe would have said "free" here. The retained lock does not.
+    // The lock it retains is its own root's: authority is resolved from per-path
+    // evidence, never from the ambient `grokptah_home()`, so an unowned root
+    // governs itself rather than claiming a whole home nobody owns.
     assert!(
-        grokptah_agent_bridge::instance_lock_is_held(&lane.instance_lock()),
-        "an offline handle must hold the home's lock, not merely have probed it"
+        grokptah_agent_bridge::instance_lock_is_held(
+            &lane
+                .grokptah_home()
+                .join("orchestration")
+                .join(".instance.lock")
+        ),
+        "an offline handle must hold its root's lock, not merely have probed it"
     );
     // The decisive form of that claim: the handle can say it *is* the owner.
     // A reintroduced check-only probe would leave this false while writes kept
@@ -1211,10 +1219,16 @@ fn an_offline_handle_holds_the_home_lock_for_its_whole_lifetime() {
         !store.is_lease_bound(),
         "there is no runtime to be bound to; the authority must be the retained lock"
     );
+    // Home-level exclusion is enforced where it belongs — at acquisition. A host
+    // takes the home lock and is then refused because one of its stores is
+    // separately owned, which is the property that actually matters.
     let refused = AgentHost::create(HostConfig::default());
+    let error = refused
+        .err()
+        .expect("a host must not start beside a live offline maintenance handle");
     assert!(
-        refused.is_err(),
-        "a host must not start beside a live offline maintenance handle"
+        format!("{error:#}").contains("separately owned"),
+        "the refusal must name the overlapping owner: {error:#}"
     );
     // And the handle can still write, because it is the owner.
     assert!(probe_store_write(&store, Uuid::nil()).is_ok());
