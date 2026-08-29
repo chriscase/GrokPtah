@@ -271,6 +271,32 @@ durable attempt record at all. `ProviderAttemptEvidence` is a certification-lab
 artifact, not something the send path writes — it is constructed in exactly one
 place in this repository, a test.
 
+### The durable half, as a recorder
+
+The live send path now writes durable breadcrumbs: `Preparing` fsynced before
+dispatch, `Sending` fsynced before the send future exists, then the outcome.
+After a crash the host can say which provider attempts **provably never left**
+and which **may already have been delivered** — a distinction `main` loses
+entirely, because its observation sink is in memory. `AgentHost::start` reports
+the summary; nothing is auto-retried on the strength of it.
+
+**It records; it never authorizes.** There is no permit, nothing admits or
+refuses a send, and no call path is conditioned on it. That is what separates it
+from the `SendLedger` the audit rejected: that one *gated* dispatch, minted a
+permit, and settled attempts from caller-supplied state, which is what made it
+an authority and what made its five forgeability defects reachable. None of them
+can exist in a write-only record.
+
+It carries no session, principal, capability or audit binding, and does not
+pretend to — only the public model, a short non-invertible endpoint handle, and
+the state. Growth is bounded by rotation; malformed lines are counted; a
+crash-cut tail is distinguished from corruption.
+
+**When #497's G3 reaches the live send path this file should be deleted, not
+reconciled.** Its records are operational breadcrumbs, not evidence.
+
+### What the authoritative record still needs
+
 ### Exactly what blocks the durable half
 
 Not "it belongs to #497" in the abstract. The blocker is checkable at #497's

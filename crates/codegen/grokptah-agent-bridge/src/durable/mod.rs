@@ -35,6 +35,7 @@
 //! canonical G1-G4 host authority spine (#497), and a second public copy of any
 //! of them is precisely what #478 and #492 exist to prevent.
 
+pub(crate) mod attempt;
 pub(crate) mod cancel;
 pub mod delivery;
 pub(crate) mod effects;

@@ -3023,7 +3023,33 @@ impl AgentHostHandle {
             );
         }
         self.inner.lock().running = true;
+        self.report_interrupted_provider_attempts();
         Ok(())
+    }
+
+    /// Report provider attempts that were in flight when this home last stopped.
+    ///
+    /// `main` cannot make this distinction after a restart: its observation sink
+    /// is in memory, so every interrupted attempt looks alike. The durable
+    /// breadcrumbs separate one that provably never left from one that may
+    /// already have been delivered — and the latter is never auto-retried, it is
+    /// surfaced for a person to decide.
+    ///
+    /// Advisory only. A missing or damaged log never blocks startup.
+    pub fn interrupted_provider_attempts(&self) -> Option<String> {
+        let report = crate::durable::attempt::AttemptRecorder::recover(
+            &crate::discover::grokptah_home().join("provider"),
+        );
+        if !report.has_indeterminate() && report.provably_not_sent.is_empty() {
+            return None;
+        }
+        Some(report.operator_summary())
+    }
+
+    fn report_interrupted_provider_attempts(&self) {
+        if let Some(summary) = self.interrupted_provider_attempts() {
+            eprintln!("[grokptah] provider attempts from the previous run: {summary}");
+        }
     }
 
     pub fn stop(&self) -> Result<()> {

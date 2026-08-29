@@ -2008,10 +2008,39 @@ where
     const MAX_TRANSIENT_RETRIES: u32 = 3;
     let mut transient_retries = 0u32;
     let mut last_err = None::<String>;
+    // Durable breadcrumbs for crash recovery. This records; it never
+    // authorizes, and nothing below is conditioned on it — a recorder that
+    // could refuse a send would be a second authority, which is #497's G3.
+    // Best-effort by design: losing the log must never fail a turn.
+    let mut attempts = crate::durable::attempt::AttemptRecorder::open(
+        &crate::discover::grokptah_home().join("provider"),
+    )
+    .ok();
     for _request_attempt in 0..MAX_REQUEST_ATTEMPTS {
         if cancel.is_cancelled() {
             bail!("cancelled");
         }
+        // `Preparing` is durable before dispatch and `Sending` before the send
+        // future exists, so a record still at `Preparing` proves no request
+        // byte moved and one at `Sending` proves nothing either way.
+        let attempt_record = attempts.as_mut().and_then(|recorder| {
+            let handle = crate::durable::attempt::request_handle(&url, &target.wire_model);
+            let at_ms = crate::durable::attempt::now_ms();
+            let ordinal = recorder
+                .record_preparing(&target.wire_model, &handle, at_ms)
+                .ok()?;
+            Some(crate::durable::attempt::AttemptRecord {
+                ordinal,
+                state: crate::durable::attempt::AttemptState::Preparing,
+                model: target.wire_model.clone(),
+                request_digest: handle,
+                at_ms,
+            })
+        });
+        if let (Some(recorder), Some(record)) = (attempts.as_mut(), attempt_record.as_ref()) {
+            let _ = recorder.record_sending(record);
+        }
+
         let send_once = |c: &crate::auth_store::WireCredentials| {
             let mut req = client
                 .post(&url)
@@ -2096,6 +2125,21 @@ where
                 // by standing down, not by trying again.
                 let delivery =
                     crate::durable::classify_transport_failure(e.is_connect(), e.is_timeout());
+                if let (Some(recorder), Some(record)) = (attempts.as_mut(), attempt_record.as_ref())
+                {
+                    // Uncertainty is recorded as uncertainty. Only a proven
+                    // non-delivery may be written as `NotSent`.
+                    // Named, so the retry gate below stays the single
+                    // `if delivery.may_auto_retry()` in this crate — which is
+                    // what the source guard pins.
+                    let proven_not_sent = delivery.may_auto_retry();
+                    let outcome = if proven_not_sent {
+                        crate::durable::attempt::AttemptState::NotSent
+                    } else {
+                        crate::durable::attempt::AttemptState::Uncertain
+                    };
+                    let _ = recorder.record_outcome(record, outcome);
+                }
                 if delivery.may_auto_retry()
                     && allow_transient_retries
                     && transient_retries < MAX_TRANSIENT_RETRIES
@@ -2118,6 +2162,12 @@ where
                 bail!("{}", last_err.unwrap());
             }
         };
+
+        // The provider answered, so this exchange is settled whatever the
+        // status says. A fresh request after this is a new request.
+        if let (Some(recorder), Some(record)) = (attempts.as_mut(), attempt_record.as_ref()) {
+            let _ = recorder.record_outcome(record, crate::durable::attempt::AttemptState::Settled);
+        }
 
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED && creds.oidc_token_auth {
             if let Some((route, attempt)) = observation_attempt.take() {
