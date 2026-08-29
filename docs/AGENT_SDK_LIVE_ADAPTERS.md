@@ -333,6 +333,23 @@ though it had never run — the one inference a receipt log must never invite.
 An unreadable receipt now fails the listing and says which file, because a
 partial listing presented as a complete one is worse than an error.
 
+**Which crash cut is actually covered.** Worth being exact, because the two
+tests here cover different windows and only one of them covers the decisive
+one. `restart_settles_an_orphaned_claim_as_uncertain` reaches the cut this
+repair is about: a claim is written, nothing settles it, the store is dropped
+and reopened, and the reopened store must answer `uncertain_outcome` rather
+than `Perform`. That is effect-committed/receipt-pending, deterministically,
+because a claim is written *before* its mutation runs.
+
+`a_killed_service_process_replays_its_receipt_to_a_second_process` does **not**
+reach it: the child is SIGKILLed after the underlying tool response, so the
+receipt is already settled by then. It proves a real process boundary and
+durable replay, which is what it was added for, and it is not evidence about
+the pending window. Closing that at process level would mean a fault-injection
+point inside the service binary — a crash path shipped for a test — which is
+not obviously worth it when the store-level test covers the same state. Stated
+here rather than left for a reader to assume the SIGKILL test covers both.
+
 ### F-11 — Five holes behind the seal, and one claim that was not true (fixed)
 
 An exact-delta review of the sealing commit found that sealing the *type* had
