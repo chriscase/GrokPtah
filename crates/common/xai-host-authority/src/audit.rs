@@ -19,6 +19,8 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use fs2::FileExt;
+
 use serde::{Deserialize, Serialize};
 
 use crate::error::AuthorityError;
@@ -99,11 +101,21 @@ pub struct AuditRecord {
 }
 
 /// Append-only audit log over a single file.
+///
+/// The chain head is cached, but the cache is only trusted while the file is
+/// exactly as long as it was when the cache was taken. Another process
+/// appending makes the file longer, which invalidates the cache and forces a
+/// replay under the lock. Without that check two processes would each compute
+/// the head at open time and then write the same sequence number and the same
+/// `previous_digest`, silently forking the chain.
 #[derive(Debug)]
 pub(crate) struct AuditLog {
     path: PathBuf,
+    lock_path: PathBuf,
     sequence: u64,
     previous_digest: String,
+    /// Length of the log when the cached head was derived.
+    observed_len: u64,
 }
 
 const GENESIS_DIGEST: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -111,13 +123,52 @@ const GENESIS_DIGEST: &str = "00000000000000000000000000000000000000000000000000
 impl AuditLog {
     pub(crate) fn open(root: &Path) -> Result<Self, AuthorityError> {
         let path = root.join("audit.log");
+        let lock_path = root.join("audit.lock");
         let mut log = Self {
             path,
+            lock_path,
             sequence: 0,
             previous_digest: GENESIS_DIGEST.to_string(),
+            observed_len: 0,
         };
+        let _guard = log.lock()?;
         log.replay()?;
         Ok(log)
+    }
+
+    /// Exclusive, cross-process lock over the log.
+    ///
+    /// `flock` is held per open file description, so two opens in the same
+    /// process contend exactly as two processes do.
+    fn lock(&self) -> Result<File, AuthorityError> {
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&self.lock_path)
+            .map_err(|e| AuthorityError::Durability(e.to_string()))?;
+        file.lock_exclusive()
+            .map_err(|e| AuthorityError::Durability(e.to_string()))?;
+        Ok(file)
+    }
+
+    fn current_len(&self) -> Result<u64, AuthorityError> {
+        match std::fs::metadata(&self.path) {
+            Ok(meta) => Ok(meta.len()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(e) => Err(AuthorityError::Durability(e.to_string())),
+        }
+    }
+
+    /// Refresh the cached head if anyone else has appended.
+    fn refresh_if_stale(&mut self) -> Result<(), AuthorityError> {
+        if self.current_len()? != self.observed_len {
+            self.sequence = 0;
+            self.previous_digest = GENESIS_DIGEST.to_string();
+            self.replay()?;
+        }
+        Ok(())
     }
 
     /// Rebuild the chain head from what is on disk.
@@ -144,6 +195,7 @@ impl AuditLog {
             self.sequence = record.sequence;
             self.previous_digest = record_digest(line);
         }
+        self.observed_len = self.current_len()?;
         Ok(())
     }
 
@@ -156,6 +208,8 @@ impl AuditLog {
         control_epoch: u64,
         event: AuditEvent,
     ) -> Result<AuditRecord, AuthorityError> {
+        let _guard = self.lock()?;
+        self.refresh_if_stale()?;
         let sequence = self
             .sequence
             .checked_add(1)
@@ -184,11 +238,13 @@ impl AuditLog {
 
         self.sequence = sequence;
         self.previous_digest = record_digest(&line);
+        self.observed_len = self.current_len()?;
         Ok(record)
     }
 
     /// Read every well-formed record, oldest first.
     pub(crate) fn records(&self) -> Result<Vec<AuditRecord>, AuthorityError> {
+        let _guard = self.lock()?;
         let text = match std::fs::read_to_string(&self.path) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -210,6 +266,7 @@ impl AuditLog {
 
     /// Verify the hash chain over the persisted records.
     pub(crate) fn verify_chain(&self) -> Result<bool, AuthorityError> {
+        let _guard = self.lock()?;
         let text = match std::fs::read_to_string(&self.path) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
