@@ -7,12 +7,18 @@ on:
     paths:
       - "desktop/**"
       - "crates/codegen/grokptah-agent-bridge/**"
+      - "crates/common/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
       - "evals/**"
       - ".github/workflows/desktop.yml"
   pull_request:
     paths:
       - "desktop/**"
       - "crates/codegen/grokptah-agent-bridge/**"
+      - "crates/common/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
       - "evals/**"
       - ".github/workflows/desktop.yml"
 
@@ -75,6 +81,12 @@ jobs:
           cargo fmt --manifest-path test-support/grokptah-test-gateway/Cargo.toml --all -- --check
           cargo clippy --manifest-path test-support/grokptah-test-gateway/Cargo.toml --locked --all-targets -- -D warnings
           cargo test --manifest-path test-support/grokptah-test-gateway/Cargo.toml --locked
+      - name: Host authority spine (fmt + clippy + tests)
+        working-directory: .
+        run: |
+          cargo fmt -p xai-host-authority -- --check
+          cargo clippy -p xai-host-authority --all-targets --locked -- -D warnings
+          cargo test -p xai-host-authority --locked -- --test-threads=1
       - name: Offline parity oracles (no network)
         # Structured oracle unit tests + fixture selftests; live suite is on-demand.
         working-directory: crates/codegen/grokptah-agent-bridge
