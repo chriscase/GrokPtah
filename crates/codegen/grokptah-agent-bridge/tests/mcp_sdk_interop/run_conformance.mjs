@@ -11,6 +11,8 @@
  *   GROKPTAH_MCP_SESSION_ID   — optional Build session UUID for mutation checks
  *   GROKPTAH_MCP_WORKSPACE    — optional allowlisted workspace path for mutations
  */
+import http from "node:http";
+
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
@@ -96,12 +98,87 @@ async function mcpFetch(
   };
 }
 
+/// Probe with headers `fetch` refuses to set — `Host` and `Origin` are
+/// forbidden header names there, and a request target is never absolute — so
+/// the loopback request-authority policy can be exercised from an independent
+/// client stack. Resolves to the HTTP status code.
+function authorityProbeStatus({ path: requestPath = "/health", headers = {} } = {}) {
+  const target = new URL(base);
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      {
+        host: target.hostname,
+        port: target.port,
+        method: "GET",
+        path: requestPath,
+        headers,
+      },
+      (res) => {
+        res.resume();
+        res.on("end", () => resolve(res.statusCode));
+      }
+    );
+    req.on("error", reject);
+    req.end();
+  });
+}
+
 try {
   // Health / loopback probe (unauthenticated)
   const health = await fetch(`${base}/health`);
   const hj = await health.json();
   checks.loopbackHealth =
-    health.status === 200 && hj.ok === true && typeof hj.maxConcurrent === "number";
+    health.status === 200 &&
+    hj.ok === true &&
+    hj.status === "alive" &&
+    hj.authoritative === false &&
+    hj.capacity === undefined;
+
+  // Readiness must be truthful: the unauthenticated projection withholds the
+  // diagnostics but still reports the real verdict (200 ready / 503 not ready).
+  const ready = await fetch(`${base}/ready`);
+  const rj = await ready.json();
+  checks.loopbackReadinessTruthful =
+    ready.status === 200 &&
+    rj.ok === true &&
+    rj.ready === true &&
+    rj.status === "ready" &&
+    rj.authoritative === true &&
+    rj.capacity === undefined;
+
+  // ...and a valid bearer reaches the authoritative result with diagnostics.
+  const authedReady = await fetch(`${base}/ready`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const arj = await authedReady.json();
+  checks.authenticatedReadinessIsAuthoritative =
+    authedReady.status === 200 &&
+    arj.ready === true &&
+    arj.authoritative === true &&
+    !!arj.capacity &&
+    typeof arj.capacity.health === "object" &&
+    arj.ready === rj.ready;
+
+  // A bad credential on an open probe route is refused, not downgraded.
+  const badReady = await fetch(`${base}/ready`, {
+    headers: { Authorization: "Bearer wrong-token-not-real" },
+  });
+  checks.readinessRejectsBadBearer = badReady.status === 401;
+
+  // Loopback request-authority policy: a hostile authority is refused before
+  // authentication, whether it arrives in `Host`, in `Origin`, or as an
+  // absolute-form request target that carries its own authority.
+  const hostileHost = await authorityProbeStatus({
+    headers: { Host: "attacker.example" },
+  });
+  const hostileOrigin = await authorityProbeStatus({
+    headers: { Origin: "https://attacker.example" },
+  });
+  const hostileAbsoluteForm = await authorityProbeStatus({
+    path: "http://attacker.example/health",
+  });
+  checks.loopbackAuthorityPolicy =
+    hostileHost === 400 && hostileOrigin === 400 && hostileAbsoluteForm === 400;
 
   // Auth-before-body: malformed body without token → 401
   const unauthMal = await fetch(endpoint, {

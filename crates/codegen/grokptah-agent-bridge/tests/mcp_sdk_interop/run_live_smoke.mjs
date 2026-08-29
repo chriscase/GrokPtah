@@ -13,6 +13,7 @@
  * Independent of McpControlClient. Protocol-level fetch is the hard gate.
  */
 import fs from "node:fs";
+import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -137,15 +138,95 @@ async function pollRun(mcpSession, runId, wantTerminal = true, ms = 15000) {
   return last;
 }
 
+/// Probe with headers `fetch` refuses to set — `Host` and `Origin` are
+/// forbidden header names there, and a request target is never absolute — so
+/// the loopback request-authority policy can be exercised from an independent
+/// client stack. Resolves to the HTTP status code.
+function authorityProbeStatus({ path: requestPath = "/health", headers = {} } = {}) {
+  const target = new URL(base);
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      {
+        host: target.hostname,
+        port: target.port,
+        method: "GET",
+        path: requestPath,
+        headers,
+      },
+      (res) => {
+        res.resume();
+        res.on("end", () => resolve(res.statusCode));
+      }
+    );
+    req.on("error", reject);
+    req.end();
+  });
+}
+
 try {
   // --- Health / loopback ---
   const health = await fetch(`${base}/health`);
   const hj = await health.json();
   record(
     "loopbackHealth",
-    health.status === 200 && hj.ok === true && typeof hj.maxConcurrent === "number",
-    { maxConcurrent: hj.maxConcurrent, sessions: hj.sessions }
+    health.status === 200 &&
+      hj.ok === true &&
+      hj.status === "alive" &&
+      hj.authoritative === false &&
+      hj.capacity === undefined &&
+      hj.sessions === undefined,
+    hj
   );
+  // Readiness must be truthful for both projections, and a bearer must reach
+  // the authoritative result even though loopback probes are open.
+  const ready = await fetch(`${base}/ready`);
+  const rj = await ready.json();
+  record(
+    "loopbackReadinessTruthful",
+    ready.status === 200 &&
+      rj.ok === true &&
+      rj.ready === true &&
+      rj.status === "ready" &&
+      rj.authoritative === true &&
+      rj.capacity === undefined,
+    rj
+  );
+  const authedReady = await fetch(`${base}/ready`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const arj = await authedReady.json();
+  record(
+    "authenticatedReadinessIsAuthoritative",
+    authedReady.status === 200 &&
+      arj.ready === true &&
+      arj.authoritative === true &&
+      !!arj.capacity &&
+      typeof arj.capacity.health === "object" &&
+      arj.ready === rj.ready,
+    { ready: arj.ready, authoritative: arj.authoritative }
+  );
+  const badReady = await fetch(`${base}/ready`, {
+    headers: { Authorization: "Bearer wrong-token-not-real" },
+  });
+  record("readinessRejectsBadBearer", badReady.status === 401, badReady.status);
+
+  // Loopback request-authority policy is enforced ahead of authentication,
+  // for `Host`, for `Origin`, and for an absolute-form request target.
+  const hostileHost = await authorityProbeStatus({
+    headers: { Host: "attacker.example" },
+  });
+  const hostileOrigin = await authorityProbeStatus({
+    headers: { Origin: "https://attacker.example" },
+  });
+  const hostileAbsoluteForm = await authorityProbeStatus({
+    path: "http://attacker.example/health",
+  });
+  record(
+    "loopbackAuthorityPolicy",
+    hostileHost === 400 && hostileOrigin === 400 && hostileAbsoluteForm === 400,
+    { host: hostileHost, origin: hostileOrigin, absoluteForm: hostileAbsoluteForm }
+  );
+
   // Addr must be loopback (client connected to 127.0.0.1).
   const hostPart = new URL(base).hostname;
   record(
