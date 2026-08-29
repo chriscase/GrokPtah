@@ -17,6 +17,38 @@ use uuid::Uuid;
 
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
+async fn a_second_service_on_the_same_home_returns_a_startup_error() {
+    let _serial = home_override_serial();
+    let home = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    set_grokptah_home_override(Some(home.path().to_path_buf()));
+    let config = ServiceConfig::new(
+        "127.0.0.1:0".parse().unwrap(),
+        "fallible-startup-token",
+        vec![workspace.path().to_path_buf()],
+        false,
+        1,
+        Duration::from_secs(5),
+    )
+    .unwrap()
+    .with_runtime_home(home.path())
+    .unwrap();
+
+    let owner = start_service(config.clone()).await.unwrap();
+    let error = match start_service(config).await {
+        Ok(_) => panic!("a second owner must be refused without panicking"),
+        Err(error) => error,
+    };
+    assert!(
+        format!("{error:#}").contains("acquire the GrokPtah instance lock"),
+        "startup refusal must retain useful context: {error:#}"
+    );
+    assert!(owner.stop_and_wait().await.is_clean());
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn standalone_service_exposes_authenticated_mcp_and_readiness() {
     let _serial = home_override_serial();
     let home = tempdir().unwrap();
@@ -281,6 +313,13 @@ async fn service_mcp_contract_covers_scoped_live_reconnect_controls_and_restart(
     );
     let submit_session_id =
         Uuid::parse_str(created.structured["sessionId"].as_str().unwrap()).unwrap();
+    // Hold this session's turn slot while admitting the submission so the
+    // cancellation assertion is deterministic. Without the reservation a
+    // provider-less hosted runner can finish the synthetic turn between the
+    // submit response and the cancel request, turning an intended live-control
+    // check into a timing-dependent "already terminal" error.
+    host.reserve_orchestration_turn("service-e2e-submit-hold", submit_session_id)
+        .unwrap();
     let submitted = client
         .call_tool(
             "ptah_submit_task",
@@ -296,6 +335,7 @@ async fn service_mcp_contract_covers_scoped_live_reconnect_controls_and_restart(
         .await
         .unwrap();
     assert!(!submitted.is_error, "submit task: {:?}", submitted.raw);
+    assert_eq!(submitted.structured["state"], "queued");
     let submitted_run_id = submitted.structured["runId"].as_str().unwrap();
     assert_eq!(
         submitted.structured["sessionId"],
@@ -318,6 +358,27 @@ async fn service_mcp_contract_covers_scoped_live_reconnect_controls_and_restart(
         "cancel submitted task: {:?}",
         submitted_cancel.raw
     );
+    assert_eq!(submitted_cancel.structured["cancelled"], true);
+    assert_eq!(submitted_cancel.structured["wasQueued"], true);
+    assert_eq!(submitted_cancel.structured["teardownComplete"], true);
+    let submitted_after_cancel = client
+        .call_tool(
+            "ptah_get_run",
+            json!({
+                "session_id": submit_session_id,
+                "workspace": workspace_path,
+                "run_id": submitted_run_id,
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !submitted_after_cancel.is_error,
+        "cancelled queued run was not readable: {:?}",
+        submitted_after_cancel.raw
+    );
+    assert_eq!(submitted_after_cancel.structured["state"], "cancelled");
+    host.release_orchestration_turn("service-e2e-submit-hold");
 
     let mut stream = client
         .open_event_stream(scope.clone(), Some(first_seq.saturating_sub(1)))

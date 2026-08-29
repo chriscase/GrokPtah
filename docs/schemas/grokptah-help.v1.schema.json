@@ -1,0 +1,616 @@
+{
+  "$defs": {
+    "HelpArticle": {
+      "additionalProperties": false,
+      "description": "One Help article in the single canonical corpus.",
+      "properties": {
+        "aliases": {
+          "description": "Natural-language phrasings a user might type.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "body": {
+          "description": "Full prose body.",
+          "type": "string"
+        },
+        "capability_ids": {
+          "description": "Capabilities a principal must hold.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "digest": {
+          "description": "Digest over the article's fields and its sources' digests.",
+          "type": "string"
+        },
+        "id": {
+          "description": "Stable article id.",
+          "type": "string"
+        },
+        "keywords": {
+          "description": "Expert / identifier terminology.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "source_ids": {
+          "description": "Sources this article cites.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "summary": {
+          "description": "One-sentence summary.",
+          "type": "string"
+        },
+        "title": {
+          "description": "Display title.",
+          "type": "string"
+        },
+        "topic": {
+          "$ref": "#/$defs/HelpTopic",
+          "description": "Navigation grouping."
+        },
+        "visibility": {
+          "$ref": "#/$defs/HelpVisibility",
+          "description": "Who may be shown this article."
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "topic",
+        "summary",
+        "body",
+        "aliases",
+        "keywords",
+        "source_ids",
+        "visibility",
+        "capability_ids",
+        "digest"
+      ],
+      "type": "object"
+    },
+    "HelpAsk": {
+      "additionalProperties": false,
+      "description": "Ask Help a question. The complete set of content a renderer supplies: an opaque session handle, a question, and a locale. No route, principal, capability, chunk, or source may be named here.",
+      "properties": {
+        "locale": {
+          "description": "Preferred locale, if any.",
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "question": {
+          "description": "The user's question.",
+          "type": "string"
+        },
+        "session": {
+          "description": "Opaque handle the host issued.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session",
+        "question",
+        "locale"
+      ],
+      "type": "object"
+    },
+    "HelpBoundsProjection": {
+      "additionalProperties": false,
+      "description": "The executor's fixed bounds, exposed so a surface can render honest limits instead of guessing them.",
+      "properties": {
+        "deadline_ms": {
+          "description": "Wall-clock budget for one ask.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "fallback_enabled": {
+          "description": "Always false.",
+          "type": "boolean"
+        },
+        "history_enabled": {
+          "description": "Always false.",
+          "type": "boolean"
+        },
+        "max_concurrency": {
+          "description": "Simultaneous provider attempts.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_queued": {
+          "description": "Waiting asks before new ones are refused.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "single_request": {
+          "description": "Always true: exactly one provider request per ask.",
+          "type": "boolean"
+        },
+        "tools_enabled": {
+          "description": "Always false.",
+          "type": "boolean"
+        },
+        "workspace_enabled": {
+          "description": "Always false.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "max_concurrency",
+        "max_queued",
+        "deadline_ms",
+        "single_request",
+        "tools_enabled",
+        "history_enabled",
+        "workspace_enabled",
+        "fallback_enabled"
+      ],
+      "type": "object"
+    },
+    "HelpCancelRequest": {
+      "additionalProperties": false,
+      "description": "Cancel an in-flight ask by its opaque handle.",
+      "properties": {
+        "handle": {
+          "description": "Opaque ask handle the host issued.",
+          "type": "string"
+        },
+        "session": {
+          "description": "Opaque handle the host issued.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session",
+        "handle"
+      ],
+      "type": "object"
+    },
+    "HelpChunk": {
+      "additionalProperties": false,
+      "description": "A retrievable unit, digest-bound to the exact bytes a span indexes.",
+      "properties": {
+        "article_id": {
+          "description": "Article this chunk was cut from.",
+          "type": "string"
+        },
+        "digest": {
+          "description": "Digest over the chunk's identity and its exact text.",
+          "type": "string"
+        },
+        "id": {
+          "description": "`${article_id}#${kind}.${ordinal}` — stable and citable.",
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/HelpChunkKind",
+          "description": "Which part of the article."
+        },
+        "locale": {
+          "description": "Locale of `text`.",
+          "type": "string"
+        },
+        "ordinal": {
+          "description": "Stable position within that part.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "source_ids": {
+          "description": "Sources backing this chunk. Never empty.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "text": {
+          "description": "The exact bytes a citation span indexes into.",
+          "type": "string"
+        },
+        "visibility": {
+          "$ref": "#/$defs/HelpVisibility",
+          "description": "Who may be shown this chunk."
+        }
+      },
+      "required": [
+        "id",
+        "article_id",
+        "kind",
+        "ordinal",
+        "text",
+        "locale",
+        "source_ids",
+        "visibility",
+        "digest"
+      ],
+      "type": "object"
+    },
+    "HelpChunkKind": {
+      "description": "The part of an article a chunk was cut from.",
+      "enum": [
+        "title",
+        "summary",
+        "body"
+      ],
+      "type": "string"
+    },
+    "HelpCitationProjection": {
+      "additionalProperties": false,
+      "description": "A citation as a renderer sees it: where to look and the exact redacted quote.",
+      "properties": {
+        "heading": {
+          "description": "Heading within that path.",
+          "type": "string"
+        },
+        "path": {
+          "description": "Repository-relative path.",
+          "type": "string"
+        },
+        "quote": {
+          "description": "The exact quoted bytes, already redacted.",
+          "type": "string"
+        },
+        "source_id": {
+          "description": "Stable citation id.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source_id",
+        "path",
+        "heading",
+        "quote"
+      ],
+      "type": "object"
+    },
+    "HelpClaimProjection": {
+      "additionalProperties": false,
+      "description": "One validator-derived claim and the citations supporting it.",
+      "properties": {
+        "citations": {
+          "description": "Supporting citations.",
+          "items": {
+            "$ref": "#/$defs/HelpCitationProjection"
+          },
+          "type": "array"
+        },
+        "ordinal": {
+          "description": "Position in the answer.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "text": {
+          "description": "Plain text. Never markup.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "ordinal",
+        "text",
+        "citations"
+      ],
+      "type": "object"
+    },
+    "HelpCorpus": {
+      "additionalProperties": false,
+      "description": "The frozen, digest-bound corpus. Exactly one exists in the tree, and Rust and TypeScript read the same bytes of it.",
+      "properties": {
+        "articles": {
+          "description": "Every article, sorted by id.",
+          "items": {
+            "$ref": "#/$defs/HelpArticle"
+          },
+          "type": "array"
+        },
+        "chunks": {
+          "description": "Every chunk, sorted by id.",
+          "items": {
+            "$ref": "#/$defs/HelpChunk"
+          },
+          "type": "array"
+        },
+        "content_version": {
+          "description": "Bumped when the content changes.",
+          "type": "string"
+        },
+        "digest": {
+          "description": "Digest over the article and chunk digests, in order.",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": "grokptah.help-canonical.v1",
+          "description": "Bumped when a record's shape changes.",
+          "type": "string"
+        },
+        "source_digest": {
+          "description": "Digest over the ordered source-record digests.",
+          "type": "string"
+        },
+        "sources": {
+          "description": "Every distinct source, sorted by id.",
+          "items": {
+            "$ref": "#/$defs/HelpSourceAnchor"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "schema_version",
+        "content_version",
+        "sources",
+        "articles",
+        "chunks",
+        "digest",
+        "source_digest"
+      ],
+      "type": "object"
+    },
+    "HelpFollow": {
+      "additionalProperties": false,
+      "description": "Poll an in-flight ask by its opaque handle.",
+      "properties": {
+        "handle": {
+          "description": "Opaque ask handle the host issued.",
+          "type": "string"
+        },
+        "session": {
+          "description": "Opaque handle the host issued.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session",
+        "handle"
+      ],
+      "type": "object"
+    },
+    "HelpProjection": {
+      "additionalProperties": false,
+      "description": "The renderer-facing result. An opaque handle, plain text, and no authority: there is no grant, admission, route, principal, capability, or transport in this type, and none can be constructed from it.",
+      "properties": {
+        "claims": {
+          "description": "Validated claims.",
+          "items": {
+            "$ref": "#/$defs/HelpClaimProjection"
+          },
+          "type": "array"
+        },
+        "error": {
+          "description": "Coarse code, when there are no claims.",
+          "oneOf": [
+            {
+              "$ref": "#/$defs/HelpPublicErrorCode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "handle": {
+          "description": "Opaque; meaningful only to the host that issued it.",
+          "type": "string"
+        },
+        "message": {
+          "description": "Fixed message for `error`.",
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/HelpProjectionStatus",
+          "description": "Lifecycle state."
+        }
+      },
+      "required": [
+        "handle",
+        "status",
+        "claims",
+        "error",
+        "message"
+      ],
+      "type": "object"
+    },
+    "HelpProjectionStatus": {
+      "description": "Lifecycle of one ask, as a renderer sees it.",
+      "enum": [
+        "queued",
+        "running",
+        "answered",
+        "abstained",
+        "unavailable"
+      ],
+      "type": "string"
+    },
+    "HelpPublicErrorCode": {
+      "description": "The complete public error vocabulary. Three codes, no detail: every authorization outcome collapses to `not_available` so a refusal cannot be read as a statement about what exists.",
+      "enum": [
+        "not_available",
+        "busy",
+        "timeout"
+      ],
+      "type": "string"
+    },
+    "HelpReceiptProjection": {
+      "additionalProperties": false,
+      "description": "The zero-content receipt view. Counts, digests, and timings — never the question, the answer, a chunk, or a provider reply.",
+      "properties": {
+        "claim_count": {
+          "description": "Number of validated claims.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "corpus_digest": {
+          "description": "Corpus the attempt ran against.",
+          "type": "string"
+        },
+        "digest": {
+          "description": "Digest binding this receipt to its request.",
+          "type": "string"
+        },
+        "finished_at_ms": {
+          "description": "Finish time.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "manifest_revision": {
+          "description": "Manifest revision the attempt ran against.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "outcome": {
+          "description": "How the attempt ended.",
+          "type": "string"
+        },
+        "receipt_id": {
+          "description": "Stable receipt id.",
+          "type": "string"
+        },
+        "redactions": {
+          "description": "Redaction counts by kind.",
+          "items": {
+            "$ref": "#/$defs/HelpRedactionCount"
+          },
+          "type": "array"
+        },
+        "run_id": {
+          "description": "The durable Run this attempt belongs to.",
+          "type": "string"
+        },
+        "send_certainty": {
+          "description": "Whether a provider request is known to have been sent.",
+          "type": "string"
+        },
+        "span_count": {
+          "description": "Number of citation spans.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "started_at_ms": {
+          "description": "Start time.",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "receipt_id",
+        "run_id",
+        "outcome",
+        "send_certainty",
+        "claim_count",
+        "span_count",
+        "redactions",
+        "corpus_digest",
+        "manifest_revision",
+        "started_at_ms",
+        "finished_at_ms",
+        "digest"
+      ],
+      "type": "object"
+    },
+    "HelpRedactionCount": {
+      "additionalProperties": false,
+      "description": "How many of one redaction kind fired, without saying what was redacted.",
+      "properties": {
+        "count": {
+          "description": "How many.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "kind": {
+          "$ref": "#/$defs/HelpRedactionKind",
+          "description": "Which kind."
+        }
+      },
+      "required": [
+        "kind",
+        "count"
+      ],
+      "type": "object"
+    },
+    "HelpRedactionKind": {
+      "description": "What the validator removed before anything reached a renderer.",
+      "enum": [
+        "secret",
+        "path",
+        "control",
+        "bidi",
+        "markup"
+      ],
+      "type": "string"
+    },
+    "HelpSourceAnchor": {
+      "additionalProperties": false,
+      "description": "A citation target: an exact repository path plus an exact heading.",
+      "properties": {
+        "digest": {
+          "description": "`domain_digest(source, [id, path, heading, visibility])`.",
+          "type": "string"
+        },
+        "heading": {
+          "description": "Exact Markdown heading text within `path`.",
+          "type": "string"
+        },
+        "id": {
+          "description": "Stable citation id used in answers.",
+          "type": "string"
+        },
+        "path": {
+          "description": "Repository-relative path. Must exist in the tree.",
+          "type": "string"
+        },
+        "visibility": {
+          "$ref": "#/$defs/HelpVisibility",
+          "description": "Who may be shown this source."
+        }
+      },
+      "required": [
+        "id",
+        "path",
+        "heading",
+        "visibility",
+        "digest"
+      ],
+      "type": "object"
+    },
+    "HelpTopic": {
+      "description": "Top-level grouping used by the Help Center navigation.",
+      "enum": [
+        "getting-started",
+        "providers",
+        "computer-use",
+        "operations"
+      ],
+      "type": "string"
+    },
+    "HelpVisibility": {
+      "description": "Who a source may be shown to. Only `public` may enter a published bundle.",
+      "enum": [
+        "public",
+        "gated",
+        "operator"
+      ],
+      "type": "string"
+    }
+  },
+  "$id": "https://grokptah.dev/schemas/grokptah-help.v1.schema.json",
+  "$ref": "#/$defs/HelpCorpus",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Generated from the Rust model in grokptah-help-contract. The host owns every type here; a renderer may send only HelpAsk, HelpFollow, and HelpCancelRequest.",
+  "title": "GrokPtah Semantic Help contract"
+}

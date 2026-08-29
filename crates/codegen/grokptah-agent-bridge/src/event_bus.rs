@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::{Arc, OnceLock};
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
@@ -53,6 +53,10 @@ struct BusInner {
     persistence: Option<Arc<PersistenceHandle>>,
     /// Optional configured control secrets to scrub from durable text.
     control_secrets: Vec<String>,
+    /// Set atomically with taking the durable writer sender during ordered
+    /// shutdown. Once sealed, stale bus clones cannot accept an event that can
+    /// no longer reach the durable journal.
+    publications_sealed: bool,
 }
 
 /// Multi-subscriber event bus with monotonic sequence numbers.
@@ -62,20 +66,255 @@ pub struct EventBus {
     lagged_events: Arc<AtomicU64>,
     persistence_error: Arc<Mutex<Option<String>>>,
     journal_gap: Arc<Mutex<Option<(u64, u64)>>>,
+    /// Durable-write authority for the journal, shared by every clone of this
+    /// bus (#455). A bus with no persist directory has no home and authorizes
+    /// nothing; `with_persist_dir` resolves the real one.
+    write_lease: Arc<Mutex<crate::host_runtime::WriteLease>>,
+    /// The directory the journal persists into, kept so the authority above can
+    /// be re-checked against the home a runtime actually owns.
+    persist_root: Arc<Mutex<Option<PathBuf>>>,
+}
+
+impl EventBus {
+    fn journal_lease(&self) -> crate::host_runtime::WriteLease {
+        self.write_lease.lock().clone()
+    }
+
+    /// Bind the journal's durable-write authority to the runtime that owns the
+    /// home it persists into.
+    ///
+    /// `with_persist_dir` resolves authority by looking the home up, which is
+    /// correct but implicit. This makes it explicit and *checked*: the bind
+    /// succeeds only when the canonical home of the journal directory is the
+    /// canonical home this runtime holds the lock for, so a journal can never
+    /// borrow a runtime's authority for a different home (#455, P1).
+    ///
+    /// Returns whether it bound. A journal outside this runtime's home keeps
+    /// the authority it established at `with_persist_dir` time.
+    pub(crate) fn bind_journal_lifecycle(
+        &self,
+        lifecycle: &Arc<crate::host_runtime::HostLifecycle>,
+    ) -> bool {
+        let mut current = self.write_lease.lock();
+        let root = self.persist_root.lock().clone();
+        let Some(root) = root else {
+            return false;
+        };
+        let Some(rebound) = crate::host_runtime::WriteLease::bound_to(&root, lifecycle) else {
+            return false;
+        };
+        *current = rebound;
+        true
+    }
 }
 
 struct PersistenceHandle {
     tx: Mutex<Option<SyncSender<JournalEntry>>>,
     join: Mutex<Option<std::thread::JoinHandle<()>>>,
+    join_state: Arc<(Mutex<PersistenceJoinState>, Condvar)>,
+    persistence_error: Arc<Mutex<Option<String>>>,
     gap_path: PathBuf,
+}
+
+#[derive(Debug, Default)]
+struct PersistenceJoinState {
+    started: bool,
+    outcome: Option<JournalWriterStopReport>,
+}
+
+/// Bounded evidence from stopping the durable journal writer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[must_use = "journal-writer stop evidence must be checked before releasing host authority"]
+pub(crate) struct JournalWriterStopReport {
+    pub fully_stopped: bool,
+    pub errors: Vec<String>,
+}
+
+impl PersistenceHandle {
+    /// Start joining the writer on a dedicated monitor thread. The monitor and
+    /// its outcome live independently of a cancellable shutdown future, so a
+    /// second shutdown can observe completion rather than losing the writer's
+    /// JoinHandle when the first waiter is dropped.
+    fn begin_join(&self) {
+        self.tx.lock().take();
+        let (state_lock, state_ready) = &*self.join_state;
+        let mut state = state_lock.lock();
+        if state.started {
+            return;
+        }
+        state.started = true;
+        let Some(join) = self.join.lock().take() else {
+            state.outcome = Some(JournalWriterStopReport {
+                fully_stopped: true,
+                errors: Vec::new(),
+            });
+            state_ready.notify_all();
+            return;
+        };
+        drop(state);
+
+        let join_state = self.join_state.clone();
+        let persistence_error = self.persistence_error.clone();
+        let monitor = std::thread::Builder::new()
+            .name("grokptah-event-journal-join".into())
+            .spawn(move || {
+                let report = match join.join() {
+                    Ok(()) => JournalWriterStopReport {
+                        fully_stopped: true,
+                        errors: Vec::new(),
+                    },
+                    Err(_) => {
+                        let error = "the durable event-journal writer panicked".to_string();
+                        *persistence_error.lock() = Some(error.clone());
+                        eprintln!("[grokptah] {error}");
+                        JournalWriterStopReport {
+                            fully_stopped: true,
+                            errors: vec![error],
+                        }
+                    }
+                };
+                let (state_lock, state_ready) = &*join_state;
+                state_lock.lock().outcome = Some(report);
+                state_ready.notify_all();
+            });
+        if let Err(error) = monitor {
+            let error = format!("failed to start the durable event-journal join monitor: {error}");
+            *self.persistence_error.lock() = Some(error.clone());
+            let mut state = state_lock.lock();
+            state.outcome = Some(JournalWriterStopReport {
+                fully_stopped: false,
+                errors: vec![error],
+            });
+            state_ready.notify_all();
+        }
+    }
+
+    fn wait_bounded(&self, timeout: std::time::Duration) -> JournalWriterStopReport {
+        self.begin_join();
+        let (state_lock, state_ready) = &*self.join_state;
+        let mut state = state_lock.lock();
+        if state.outcome.is_none() {
+            let deadline = std::time::Instant::now() + timeout;
+            while state.outcome.is_none() {
+                if state_ready.wait_until(&mut state, deadline).timed_out()
+                    && state.outcome.is_none()
+                {
+                    return JournalWriterStopReport {
+                        fully_stopped: false,
+                        errors: vec![format!(
+                            "durable event-journal writer did not stop within {timeout:?}"
+                        )],
+                    };
+                }
+            }
+        }
+        state
+            .outcome
+            .clone()
+            .unwrap_or_else(|| JournalWriterStopReport {
+                fully_stopped: false,
+                errors: vec!["durable event-journal join outcome was unavailable".to_string()],
+            })
+    }
+}
+
+impl EventBus {
+    /// Close the journal writer and join it, returning any persistence failure.
+    ///
+    /// Without this, a "clean" shutdown could be reported while journal entries
+    /// were still queued in the writer channel: the thread is joined only when
+    /// the last `PersistenceHandle` is dropped, which happens after the report
+    /// is produced — or not at all, if any clone of the bus outlives shutdown.
+    /// Entries lost that way would never appear in the report (#455).
+    ///
+    /// Idempotent: a second call finds the sender already taken and returns the
+    /// persistence error slot as it stands.
+    /// Whether the journal writer thread is still alive and accepting entries.
+    ///
+    /// After a clean shutdown this must be false even while clones of the bus
+    /// survive — that is the difference between "the writer happened to keep
+    /// up" and "shutdown closed and joined it".
+    pub fn journal_writer_is_live(&self) -> bool {
+        self.inner
+            .lock()
+            .persistence
+            .as_ref()
+            .is_some_and(|handle| handle.tx.lock().is_some())
+    }
+
+    fn seal_journal_writer(&self) -> Option<Arc<PersistenceHandle>> {
+        // Seal publication and detach the sender under the same BusInner lock
+        // used by `publish`. A publisher is therefore wholly before the close
+        // (and its entry is drained by the writer), or wholly after it (and is
+        // denied below); there is no writer-close/publication gap.
+        let handle = {
+            let mut inner = self.inner.lock();
+            inner.publications_sealed = true;
+            inner.persistence.clone()
+        };
+        if let Some(handle) = &handle {
+            handle.begin_join();
+        }
+        handle
+    }
+
+    /// Seal publication and start the process-visible writer join without
+    /// waiting. Ordered shutdown calls this before entering a cancellable
+    /// blocking wait so cancellation cannot leave publication open.
+    pub(crate) fn begin_close_journal_writer(&self) {
+        let _ = self.seal_journal_writer();
+    }
+
+    pub(crate) fn close_journal_writer_bounded(
+        &self,
+        timeout: std::time::Duration,
+    ) -> JournalWriterStopReport {
+        let mut report = match self.seal_journal_writer() {
+            Some(handle) => handle.wait_bounded(timeout),
+            None => JournalWriterStopReport {
+                fully_stopped: true,
+                errors: Vec::new(),
+            },
+        };
+        if let Some(error) = self.persistence_error.lock().clone() {
+            if !report.errors.contains(&error) {
+                report.errors.push(error);
+            }
+        }
+        report
+    }
+
+    pub fn close_journal_writer(&self) -> Option<String> {
+        let report = self.close_journal_writer_bounded(std::time::Duration::from_secs(30));
+        if report.errors.is_empty() && report.fully_stopped {
+            None
+        } else {
+            Some(report.errors.join("; "))
+        }
+    }
+
+    /// Hold the same publication lock used by [`Self::publish`] across the
+    /// caller's final durable-health decision. Ordered shutdown uses this to
+    /// make "last error check + process-lock release" one atomic boundary with
+    /// every stale publisher: a publish is either observed before handoff or
+    /// refused only after the old owner has released all authority.
+    pub(crate) fn with_final_publication_barrier<R>(
+        &self,
+        decide: impl FnOnce(Option<String>) -> R,
+    ) -> R {
+        let _publication = self.inner.lock();
+        let error = self.persistence_error.lock().clone();
+        decide(error)
+    }
 }
 
 impl Drop for PersistenceHandle {
     fn drop(&mut self) {
-        self.tx.lock().take();
-        if let Some(join) = self.join.lock().take() {
-            let _ = join.join();
-        }
+        // Drop may run on an async executor worker and may not block. Start the
+        // same monitored join used by ordered shutdown, but leave waiting and
+        // authority disposition to HostRuntime. A writer panic remains in the
+        // shared outcome instead of being silently discarded.
+        self.begin_join();
     }
 }
 
@@ -241,10 +480,17 @@ impl EventBus {
                 oldest_seq: 1,
                 persistence: None,
                 control_secrets: Vec::new(),
+                publications_sealed: false,
             })),
             lagged_events: Arc::new(AtomicU64::new(0)),
             persistence_error: Arc::new(Mutex::new(None)),
             journal_gap: Arc::new(Mutex::new(None)),
+            // No persist directory yet, so no home and no authority. Every
+            // durable path is refused until `with_persist_dir` resolves one.
+            write_lease: Arc::new(Mutex::new(crate::host_runtime::WriteLease::denied(
+                "this event bus has no durable home",
+            ))),
+            persist_root: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -279,9 +525,23 @@ impl EventBus {
         let path = dir.as_ref().join("event_journal.jsonl");
         let sequence_path = dir.as_ref().join("event_journal.seq");
         let gap_path = dir.as_ref().join("event_journal.gap.json");
-        if let Some(parent) = path.parent() {
-            if let Err(error) = std::fs::create_dir_all(parent) {
-                *self.persistence_error.lock() = Some(error.to_string());
+        // Authority *before* mutation (#455): the journal directory is itself a
+        // durable effect on the home, so it is created under a held guard —
+        // never on a home this process may not write, and never before the
+        // authority to write it has been established.
+        let writer_lease = crate::host_runtime::WriteLease::for_store_root(dir.as_ref());
+        *self.write_lease.lock() = writer_lease.clone();
+        *self.persist_root.lock() = Some(dir.as_ref().to_path_buf());
+        match writer_lease.begin("creating the durable event-journal directory") {
+            Ok(_write) => {
+                if let Some(parent) = path.parent() {
+                    if let Err(error) = std::fs::create_dir_all(parent) {
+                        *self.persistence_error.lock() = Some(error.to_string());
+                    }
+                }
+            }
+            Err(error) => {
+                *self.persistence_error.lock() = Some(format!("{error:#}"));
             }
         }
         {
@@ -314,7 +574,7 @@ impl EventBus {
                         g.journal = loaded.clone();
                         durable_tail = loaded;
                         // Compact durable file to current in-memory tail.
-                        if let Err(e) = rewrite_journal_file(&path, &g.journal) {
+                        if let Err(e) = rewrite_journal_file(&writer_lease, &path, &g.journal) {
                             *self.persistence_error.lock() = Some(e.to_string());
                         }
                     }
@@ -323,20 +583,21 @@ impl EventBus {
                     }
                 }
             }
-            let sequence_ready = match reserve_sequence_range(&sequence_path, g.next_seq) {
-                Ok((start, reserved_through)) => {
-                    g.next_seq = start;
-                    g.reserved_through = reserved_through;
-                    g.sequence_path = Some(sequence_path);
-                    true
-                }
-                Err(error) => {
-                    *self.persistence_error.lock() = Some(error.to_string());
-                    g.reserved_through = u64::MAX;
-                    g.sequence_path = None;
-                    false
-                }
-            };
+            let sequence_ready =
+                match reserve_sequence_range(&writer_lease, &sequence_path, g.next_seq) {
+                    Ok((start, reserved_through)) => {
+                        g.next_seq = start;
+                        g.reserved_through = reserved_through;
+                        g.sequence_path = Some(sequence_path);
+                        true
+                    }
+                    Err(error) => {
+                        *self.persistence_error.lock() = Some(error.to_string());
+                        g.reserved_through = u64::MAX;
+                        g.sequence_path = None;
+                        false
+                    }
+                };
             if sequence_ready && gap_ready {
                 let (tx, rx) = sync_channel::<JournalEntry>(256);
                 let persistence_error = self.persistence_error.clone();
@@ -344,17 +605,22 @@ impl EventBus {
                 let writer_path = path.clone();
                 let writer_gap_path = gap_path.clone();
                 let capacity = g.capacity;
+                // The journal directory lives under the runtime home, so the
+                // writer binds to whichever runtime owns that home (#455).
                 let join = std::thread::Builder::new()
                     .name("grokptah-event-journal".into())
                     .spawn(move || {
                         run_journal_writer(
-                            &writer_path,
-                            capacity,
+                            &JournalWriterContext {
+                                lease: writer_lease.clone(),
+                                path: writer_path,
+                                gap_path: writer_gap_path,
+                                capacity,
+                                persistence_error,
+                                journal_gap,
+                            },
                             durable_tail,
                             rx,
-                            &persistence_error,
-                            &writer_gap_path,
-                            &journal_gap,
                         );
                     });
                 match join {
@@ -362,6 +628,11 @@ impl EventBus {
                         g.persistence = Some(Arc::new(PersistenceHandle {
                             tx: Mutex::new(Some(tx)),
                             join: Mutex::new(Some(join)),
+                            join_state: Arc::new((
+                                Mutex::new(PersistenceJoinState::default()),
+                                Condvar::new(),
+                            )),
+                            persistence_error: self.persistence_error.clone(),
                             gap_path: gap_path.clone(),
                         }));
                     }
@@ -394,9 +665,14 @@ impl EventBus {
     /// Publish: allocate seq + journal insert + fan-out under one lock (monotonic).
     pub fn publish(&self, update: SessionUpdate) {
         let mut g = self.inner.lock();
+        if g.publications_sealed {
+            *self.persistence_error.lock() =
+                Some("event publication refused after the durable journal was sealed".to_string());
+            return;
+        }
         if g.next_seq > g.reserved_through {
             if let Some(path) = g.sequence_path.clone() {
-                match reserve_sequence_range(&path, g.next_seq) {
+                match reserve_sequence_range(&self.journal_lease(), &path, g.next_seq) {
                     Ok((start, reserved_through)) => {
                         g.next_seq = start;
                         g.reserved_through = reserved_through;
@@ -442,9 +718,11 @@ impl EventBus {
                 *self.persistence_error.lock() = Some(detail.into());
                 record_journal_gap(&self.journal_gap, seq);
                 if disconnected {
-                    if let Err(error) =
-                        persist_current_gap(&persistence.gap_path, &self.journal_gap)
-                    {
+                    if let Err(error) = persist_current_gap(
+                        &self.journal_lease(),
+                        &persistence.gap_path,
+                        &self.journal_gap,
+                    ) {
                         *self.persistence_error.lock() = Some(error.to_string());
                     }
                 }
@@ -642,16 +920,35 @@ pub(crate) fn session_id_of(u: &SessionUpdate) -> Option<uuid::Uuid> {
     }
 }
 
-fn run_journal_writer(
-    path: &Path,
+/// Everything the journal writer thread owns for the life of one bus.
+struct JournalWriterContext {
+    /// Durable-write authority for the home this journal lives under (#455).
+    lease: crate::host_runtime::WriteLease,
+    path: PathBuf,
+    gap_path: PathBuf,
     capacity: usize,
+    persistence_error: Arc<Mutex<Option<String>>>,
+    journal_gap: Arc<Mutex<Option<(u64, u64)>>>,
+}
+
+fn run_journal_writer(
+    context: &JournalWriterContext,
     mut tail: VecDeque<JournalEntry>,
     rx: std::sync::mpsc::Receiver<JournalEntry>,
-    persistence_error: &Mutex<Option<String>>,
-    gap_path: &Path,
-    journal_gap: &Mutex<Option<(u64, u64)>>,
 ) {
     use std::sync::mpsc::RecvTimeoutError;
+
+    let JournalWriterContext {
+        lease,
+        path,
+        gap_path,
+        capacity,
+        persistence_error,
+        journal_gap,
+    } = context;
+    let (path, gap_path, capacity) = (path.as_path(), gap_path.as_path(), *capacity);
+    let persistence_error = persistence_error.as_ref();
+    let journal_gap = journal_gap.as_ref();
 
     let mut tail_bytes: usize = tail.iter().map(journal_entry_size).sum();
     let mut file_bytes = std::fs::metadata(path)
@@ -663,12 +960,24 @@ fn run_journal_writer(
             Ok(entry) => Some(entry),
             Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => {
-                flush_journal_gap(gap_path, journal_gap, &mut persisted_gap, persistence_error);
+                flush_journal_gap(
+                    lease,
+                    gap_path,
+                    journal_gap,
+                    &mut persisted_gap,
+                    persistence_error,
+                );
                 break;
             }
         };
         let Some(entry) = entry else {
-            flush_journal_gap(gap_path, journal_gap, &mut persisted_gap, persistence_error);
+            flush_journal_gap(
+                lease,
+                gap_path,
+                journal_gap,
+                &mut persisted_gap,
+                persistence_error,
+            );
             continue;
         };
         let entry_bytes = journal_entry_size(&entry);
@@ -680,11 +989,11 @@ fn run_journal_writer(
             }
         }
         let result = if file_bytes.saturating_add(entry_bytes) > MAX_JOURNAL_BYTES {
-            rewrite_journal_file(path, &tail).map(|_| {
+            rewrite_journal_file(lease, path, &tail).map(|_| {
                 file_bytes = tail_bytes;
             })
         } else {
-            append_journal_line(path, &entry).map(|_| {
+            append_journal_line(lease, path, &entry).map(|_| {
                 file_bytes = file_bytes.saturating_add(entry_bytes);
             })
         };
@@ -692,7 +1001,13 @@ fn run_journal_writer(
             *persistence_error.lock() = Some(error.to_string());
             record_journal_gap(journal_gap, entry.seq);
         }
-        flush_journal_gap(gap_path, journal_gap, &mut persisted_gap, persistence_error);
+        flush_journal_gap(
+            lease,
+            gap_path,
+            journal_gap,
+            &mut persisted_gap,
+            persistence_error,
+        );
     }
 }
 
@@ -717,6 +1032,7 @@ fn load_journal_gap(path: &Path) -> std::io::Result<(u64, u64)> {
 }
 
 fn flush_journal_gap(
+    lease: &crate::host_runtime::WriteLease,
     path: &Path,
     journal_gap: &Mutex<Option<(u64, u64)>>,
     persisted_gap: &mut Option<(u64, u64)>,
@@ -731,7 +1047,7 @@ fn flush_journal_gap(
     };
     let result = serde_json::to_vec(&gap)
         .map_err(std::io::Error::other)
-        .and_then(|bytes| atomic_write_bytes(path, &bytes));
+        .and_then(|bytes| atomic_write_bytes(lease, path, &bytes));
     match result {
         Ok(()) => *persisted_gap = Some(gap),
         Err(error) => *persistence_error.lock() = Some(error.to_string()),
@@ -739,6 +1055,7 @@ fn flush_journal_gap(
 }
 
 fn persist_current_gap(
+    lease: &crate::host_runtime::WriteLease,
     path: &Path,
     journal_gap: &Mutex<Option<(u64, u64)>>,
 ) -> std::io::Result<()> {
@@ -746,11 +1063,21 @@ fn persist_current_gap(
         return Ok(());
     };
     let bytes = serde_json::to_vec(&gap).map_err(std::io::Error::other)?;
-    atomic_write_bytes(path, &bytes)
+    atomic_write_bytes(lease, path, &bytes)
 }
 
-fn append_journal_line(path: &Path, entry: &JournalEntry) -> std::io::Result<()> {
+fn append_journal_line(
+    lease: &crate::host_runtime::WriteLease,
+    path: &Path,
+    entry: &JournalEntry,
+) -> std::io::Result<()> {
     use std::io::Write;
+
+    // The journal is durable state on the runtime home, so the writer thread
+    // carries the same authority every other durable effect does (#455).
+    let _write = lease
+        .begin("appending to the durable event journal")
+        .map_err(std::io::Error::other)?;
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -759,7 +1086,14 @@ fn append_journal_line(path: &Path, entry: &JournalEntry) -> std::io::Result<()>
     writeln!(f, "{line}")
 }
 
-fn rewrite_journal_file(path: &Path, journal: &VecDeque<JournalEntry>) -> std::io::Result<()> {
+fn rewrite_journal_file(
+    lease: &crate::host_runtime::WriteLease,
+    path: &Path,
+    journal: &VecDeque<JournalEntry>,
+) -> std::io::Result<()> {
+    let _write = lease
+        .begin("compacting the durable event journal")
+        .map_err(std::io::Error::other)?;
     let tmp = path.with_extension("jsonl.tmp");
     {
         use std::io::Write;
@@ -773,7 +1107,14 @@ fn rewrite_journal_file(path: &Path, journal: &VecDeque<JournalEntry>) -> std::i
     Ok(())
 }
 
-fn reserve_sequence_range(path: &Path, requested_start: u64) -> std::io::Result<(u64, u64)> {
+fn reserve_sequence_range(
+    lease: &crate::host_runtime::WriteLease,
+    path: &Path,
+    requested_start: u64,
+) -> std::io::Result<(u64, u64)> {
+    let _write = lease
+        .begin("reserving a durable event sequence range")
+        .map_err(std::io::Error::other)?;
     let previous = match std::fs::read_to_string(path) {
         Ok(text) => text.trim().parse::<u64>().map_err(|error| {
             std::io::Error::new(
@@ -786,11 +1127,18 @@ fn reserve_sequence_range(path: &Path, requested_start: u64) -> std::io::Result<
     };
     let start = requested_start.max(previous.saturating_add(1));
     let reserved_through = start.saturating_add(SEQUENCE_RESERVATION_SIZE - 1);
-    atomic_write_bytes(path, format!("{reserved_through}\n").as_bytes())?;
+    atomic_write_bytes(lease, path, format!("{reserved_through}\n").as_bytes())?;
     Ok((start, reserved_through))
 }
 
-fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+fn atomic_write_bytes(
+    lease: &crate::host_runtime::WriteLease,
+    path: &Path,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    let _write = lease
+        .begin("writing durable event-journal metadata")
+        .map_err(std::io::Error::other)?;
     use std::io::Write;
 
     let tmp = path.with_extension("tmp");
@@ -1108,6 +1456,156 @@ fn scrub_registered_secret(text: &str, secret: &str) -> String {
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    /// P1 — a journal may only be bound to a runtime that owns its home.
+    ///
+    /// `with_persist_dir` resolves authority by looking up the journal's home.
+    /// Binding must *verify* that home rather than trust the caller, or a
+    /// runtime could hand a journal outside its home its own authority — the
+    /// case where a stale journal keeps writing after a replacement acquires.
+    #[test]
+    fn a_journal_cannot_be_bound_to_a_runtime_that_owns_another_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join(".grokptah");
+        std::fs::create_dir_all(&home).unwrap();
+
+        // A real acquired lock: only a runtime that actually holds one is an
+        // owner, which is the rule production runs under.
+        let lock_path = home.join(".instance.lock");
+        let lock = crate::instance_lock::InstanceLock::try_acquire_path(&lock_path, &home).unwrap();
+        let owner = crate::host_runtime::HostLifecycle::new(Some(lock), lock_path);
+
+        // A journal inside the home this lifecycle owns binds.
+        let inside = EventBus::new(8).with_persist_dir(home.join("orchestration"));
+        assert!(
+            inside.bind_journal_lifecycle(&owner),
+            "a journal in this runtime's home must bind to it"
+        );
+
+        // A journal in a different home does not, and keeps its own authority.
+        let elsewhere = tempfile::tempdir().unwrap();
+        let outside_root = elsewhere.path().join(".grokptah").join("orchestration");
+        let outside = EventBus::new(8).with_persist_dir(&outside_root);
+        assert!(
+            !outside.bind_journal_lifecycle(&owner),
+            "a journal outside this runtime's home must not borrow its authority"
+        );
+
+        // A bus with no durable home has nothing to bind and authorizes nothing.
+        let homeless = EventBus::new(8);
+        assert!(!homeless.bind_journal_lifecycle(&owner));
+        assert!(append_journal_line(
+            &homeless.journal_lease(),
+            &dir.path().join("nope.jsonl"),
+            &JournalEntry {
+                seq: 1,
+                ts: "1970-01-01T00:00:00Z".into(),
+                update: SessionUpdate::AgentMessageChunk {
+                    session_id: Uuid::nil(),
+                    text: "probe".into(),
+                },
+            },
+        )
+        .is_err());
+    }
+
+    /// P0 — bypass inventory, journal half.
+    ///
+    /// Every durable journal primitive must refuse a lease that carries no
+    /// authority, not merely the append that was guarded first. Each of these
+    /// is a *separate* filesystem mutation reachable without going through
+    /// `append_journal_line`, so each needs its own refusal.
+    ///
+    /// The negative control is the second half: the identical calls succeed
+    /// through a lease that does hold authority, so a refusal here is the lease
+    /// deciding rather than the path or the payload being unusable.
+    #[test]
+    fn every_journal_primitive_refuses_a_lease_without_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("journal.jsonl");
+        let seq_path = dir.path().join("seq");
+        let gap_path = dir.path().join("gap");
+        let entry = JournalEntry {
+            seq: 1,
+            ts: "1970-01-01T00:00:00Z".into(),
+            update: SessionUpdate::AgentMessageChunk {
+                session_id: Uuid::nil(),
+                text: "probe".into(),
+            },
+        };
+        let mut ring = VecDeque::new();
+        ring.push_back(entry.clone());
+
+        let denied = crate::host_runtime::WriteLease::denied("no authority in this test");
+        let mut refused: Vec<&str> = Vec::new();
+        let mut accepted: Vec<&str> = Vec::new();
+        macro_rules! check {
+            ($name:literal, $call:expr) => {
+                if $call.is_err() {
+                    refused.push($name);
+                } else {
+                    accepted.push($name);
+                }
+            };
+        }
+        check!(
+            "append_journal_line",
+            append_journal_line(&denied, &journal, &entry)
+        );
+        check!(
+            "rewrite_journal_file",
+            rewrite_journal_file(&denied, &journal, &ring)
+        );
+        check!(
+            "reserve_sequence_range",
+            reserve_sequence_range(&denied, &seq_path, 1)
+        );
+        check!(
+            "atomic_write_bytes",
+            atomic_write_bytes(&denied, &gap_path, b"probe")
+        );
+        let gap = Mutex::new(Some((1u64, 2u64)));
+        check!(
+            "persist_current_gap",
+            persist_current_gap(&denied, &gap_path, &gap)
+        );
+        assert!(
+            accepted.is_empty(),
+            "these journal primitives wrote without authority: {accepted:?}"
+        );
+        assert_eq!(refused.len(), 5, "expected the whole journal write surface");
+
+        // Nothing may have been created on the way to those refusals.
+        assert!(!journal.exists(), "a refused append must leave no journal");
+        assert!(
+            !seq_path.exists(),
+            "a refused reservation must leave no file"
+        );
+        assert!(!gap_path.exists(), "a refused gap write must leave no file");
+
+        // `flush_journal_gap` swallows its error into the persistence-error
+        // slot rather than returning it, so it is checked through that slot.
+        let persistence_error = Mutex::new(None);
+        let mut persisted = None;
+        flush_journal_gap(&denied, &gap_path, &gap, &mut persisted, &persistence_error);
+        assert!(
+            persistence_error.lock().is_some(),
+            "a refused gap flush must be reported, not silently dropped"
+        );
+        assert!(
+            persisted.is_none(),
+            "a refused flush must not record progress"
+        );
+
+        // Negative control: with real authority the same calls all succeed, so
+        // the refusals above are the lease's doing.
+        let owner = crate::host_runtime::WriteLease::for_store_root(&dir.path().join("store"));
+        assert!(append_journal_line(&owner, &journal, &entry).is_ok());
+        assert!(rewrite_journal_file(&owner, &journal, &ring).is_ok());
+        assert!(reserve_sequence_range(&owner, &seq_path, 1).is_ok());
+        assert!(atomic_write_bytes(&owner, &gap_path, b"probe").is_ok());
+        assert!(persist_current_gap(&owner, &gap_path, &gap).is_ok());
+    }
 
     #[test]
     fn fan_out_preserves_order_for_two_subscribers() {
@@ -1500,6 +1998,7 @@ mod tests {
             });
         }
         let seq_before = bus1.current_seq();
+        assert!(bus1.close_journal_writer().is_none());
         drop(bus1);
 
         let bus2 = EventBus::new(64).with_persist_dir(dir.path());
@@ -1528,6 +2027,7 @@ mod tests {
             .trim()
             .parse::<u64>()
             .unwrap();
+        assert!(bus1.close_journal_writer().is_none());
         drop(bus1);
 
         let bus2 = EventBus::new(8).with_persist_dir(dir.path());
@@ -1593,6 +2093,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bus = EventBus::new(8).with_persist_dir(dir.path());
         record_journal_gap(&bus.journal_gap, 7);
+        assert!(bus.close_journal_writer().is_none());
         drop(bus);
 
         let reopened = EventBus::new(8).with_persist_dir(dir.path());
@@ -1646,6 +2147,7 @@ mod tests {
             session_id: sid,
             message: format!("failed with {secret}"),
         });
+        assert!(bus1.close_journal_writer().is_none());
         drop(bus1);
         let disk = std::fs::read_to_string(dir.path().join("event_journal.jsonl")).unwrap();
         assert!(!disk.contains(&secret), "secret leaked to disk: {disk}");
@@ -1692,5 +2194,109 @@ mod tests {
         let page = bus.read_after(0, 8);
         assert_eq!(page.entries.len(), 1);
         assert_eq!(page.entries[0].seq, 42);
+    }
+
+    #[test]
+    fn final_publication_barrier_excludes_the_last_stale_publisher() {
+        let bus = Arc::new(EventBus::new(8));
+        assert!(bus.close_journal_writer().is_none());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        let barrier_bus = bus.clone();
+        let barrier = std::thread::spawn(move || {
+            barrier_bus.with_final_publication_barrier(|error| {
+                assert!(error.is_none());
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+        });
+        entered_rx.recv().unwrap();
+
+        let published = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let publisher_bus = bus.clone();
+        let publisher_done = published.clone();
+        let publisher = std::thread::spawn(move || {
+            publisher_bus.publish(SessionUpdate::AgentMessageChunk {
+                session_id: Uuid::new_v4(),
+                text: "must wait for final handoff".into(),
+            });
+            publisher_done.store(true, std::sync::atomic::Ordering::Release);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(
+            !published.load(std::sync::atomic::Ordering::Acquire),
+            "a stale publisher must not fit between the final check and handoff"
+        );
+
+        release_tx.send(()).unwrap();
+        barrier.join().unwrap();
+        publisher.join().unwrap();
+        assert!(published.load(std::sync::atomic::Ordering::Acquire));
+        assert!(bus
+            .last_persistence_error()
+            .is_some_and(|error| error.contains("publication refused")));
+    }
+
+    #[test]
+    fn stuck_journal_join_is_bounded_and_a_second_wait_observes_completion() {
+        let bus = EventBus::new(8);
+        let (tx, rx) = sync_channel::<JournalEntry>(1);
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_release = release.clone();
+        let join = std::thread::spawn(move || {
+            let _rx = rx;
+            while !thread_release.load(std::sync::atomic::Ordering::Acquire) {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        });
+        bus.inner.lock().persistence = Some(Arc::new(PersistenceHandle {
+            tx: Mutex::new(Some(tx)),
+            join: Mutex::new(Some(join)),
+            join_state: Arc::new((Mutex::new(PersistenceJoinState::default()), Condvar::new())),
+            persistence_error: bus.persistence_error.clone(),
+            gap_path: PathBuf::from("unused-test-gap"),
+        }));
+
+        let started = std::time::Instant::now();
+        let first = bus.close_journal_writer_bounded(std::time::Duration::from_millis(20));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(!first.fully_stopped);
+        assert!(first
+            .errors
+            .iter()
+            .any(|error| error.contains("did not stop")));
+
+        release.store(true, std::sync::atomic::Ordering::Release);
+        let second = bus.close_journal_writer_bounded(std::time::Duration::from_secs(1));
+        assert!(second.fully_stopped, "{:?}", second.errors);
+        assert!(second.errors.is_empty(), "{:?}", second.errors);
+    }
+
+    #[test]
+    fn journal_writer_panic_is_retained_in_stop_evidence() {
+        let bus = EventBus::new(8);
+        let (tx, rx) = sync_channel::<JournalEntry>(1);
+        let join = std::thread::spawn(move || {
+            let _rx = rx;
+            panic!("synthetic journal writer panic");
+        });
+        bus.inner.lock().persistence = Some(Arc::new(PersistenceHandle {
+            tx: Mutex::new(Some(tx)),
+            join: Mutex::new(Some(join)),
+            join_state: Arc::new((Mutex::new(PersistenceJoinState::default()), Condvar::new())),
+            persistence_error: bus.persistence_error.clone(),
+            gap_path: PathBuf::from("unused-panic-gap"),
+        }));
+
+        let report = bus.close_journal_writer_bounded(std::time::Duration::from_secs(1));
+        assert!(report.fully_stopped);
+        assert!(report
+            .errors
+            .iter()
+            .any(|error| error.contains("writer panicked")));
+        assert!(bus
+            .last_persistence_error()
+            .is_some_and(|error| error.contains("writer panicked")));
     }
 }

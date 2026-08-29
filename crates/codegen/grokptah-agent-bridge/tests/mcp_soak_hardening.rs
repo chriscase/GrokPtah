@@ -94,7 +94,8 @@ async fn soak_bootstrap_capacity_429_and_timeout_504() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host.start().unwrap();
     host.set_project_cwd(ws.path()).unwrap();
 
@@ -132,7 +133,7 @@ async fn soak_bootstrap_capacity_429_and_timeout_504() {
     let r429: serde_json::Value = serde_json::from_str(s429.trim()).unwrap();
     assert_eq!(r429["checks"]["capacity429"], true);
     assert!(r429["metrics"]["capacity429"].as_u64().unwrap_or(0) >= 1);
-    srv.stop_and_wait().await;
+    assert!(srv.stop_and_wait().await.is_clean());
 
     // --- 504: inject > request timeout ---
     env.set("GROKPTAH_CONTROL_MAX_CONCURRENT", "4");
@@ -158,7 +159,12 @@ async fn soak_bootstrap_capacity_429_and_timeout_504() {
     assert!(out504.status.success(), "504 soak failed: {s504}");
     let r504: serde_json::Value = serde_json::from_str(s504.trim()).unwrap();
     assert_eq!(r504["checks"]["requestTimeout504"], true);
-    srv2.stop_and_wait().await;
+    assert!(srv2.stop_and_wait().await.is_clean());
+    let shutdown = host.shutdown().await;
+    assert!(
+        shutdown.is_clean(),
+        "the capacity/timeout campaign must release its host through ordered shutdown: {shutdown:?}"
+    );
 
     set_grokptah_home_override(None);
 }
@@ -187,7 +193,8 @@ async fn soak_desktop_bootstrap_node_campaign() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host.start().unwrap();
     host.set_project_cwd(ws.path()).unwrap();
 
@@ -372,14 +379,29 @@ async fn soak_desktop_bootstrap_node_campaign() {
     }
     assert!(replay_terminal, "restart idempotency fixture must finish");
 
-    // Simulate a real desktop process restart: stop the first server and drop
-    // its host so the next host must reopen the same durable home and ledger.
-    srv.stop_and_wait().await;
+    // Simulate a real desktop process restart. The ordered host shutdown is
+    // the production primitive (#455): it stops and joins the control plane,
+    // cancels and joins every supervised task, flushes durable state, and
+    // releases the single-instance lock exactly once — so the next host can
+    // reopen the same durable home immediately, with no retry and no delay.
+    assert!(srv.stop_and_wait().await.is_clean());
+    let shutdown = host.shutdown().await;
+    assert_eq!(
+        shutdown.supervised_tasks_remaining, 0,
+        "shutdown must join every supervised task before releasing the lock"
+    );
+    assert!(shutdown.process_lock_released);
+    assert!(!shutdown.process_lock_held_after);
+    assert!(
+        shutdown.lock_file_present,
+        "the instance lock file must remain on disk"
+    );
     drop(host);
     let host2 = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host2.start().unwrap();
     host2.set_project_cwd(ws.path()).unwrap();
     let recovered_session = Uuid::parse_str(&session_ids[0]).unwrap();
@@ -445,7 +467,10 @@ async fn soak_desktop_bootstrap_node_campaign() {
         ws.path().join("soak_marker.txt").is_file(),
         "offline write must leave soak_marker.txt"
     );
-    srv2.stop_and_wait().await;
+    assert!(srv2.stop_and_wait().await.is_clean());
+    let shutdown2 = host2.shutdown().await;
+    assert!(shutdown2.process_lock_released);
+    assert!(!shutdown2.process_lock_held_after);
     drop(host2);
 
     set_grokptah_home_override(None);
@@ -467,13 +492,23 @@ fn soak_restart_recovery_matrix() {
         let host = AgentHost::create(HostConfig {
             always_approve: true,
             ..HostConfig::default()
-        });
+        })
+        .expect("acquire the GrokPtah instance lock");
         host.start().unwrap();
         host.set_project_cwd(ws.path()).unwrap();
         let session = host.session_new_kind(SessionKind::Build).unwrap();
         host.session_set_cwd(session.id, ws.path()).unwrap();
         host.session_queue_add(session.id, "queued across restart".into(), false)
             .unwrap();
+        let shutdown = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(host.shutdown());
+        assert!(
+            shutdown.is_clean(),
+            "the restart fixture must release its authority through ordered shutdown: {shutdown:?}"
+        );
         session.id
     };
 
@@ -588,11 +623,22 @@ fn soak_restart_recovery_matrix() {
     let host2 = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host2.start().unwrap();
     let queued = host2.session_queue_list(session_id).unwrap();
     assert!(!queued.is_empty());
     assert_eq!(queued[0].text, "queued across restart");
+
+    let shutdown2 = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(host2.shutdown());
+    assert!(
+        shutdown2.is_clean(),
+        "the replacement fixture must also close through ordered shutdown: {shutdown2:?}"
+    );
 
     set_grokptah_home_override(None);
 }

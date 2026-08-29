@@ -375,6 +375,7 @@ fn save_to_path(
 /// serialized for this address, so concurrent Lanes cannot overwrite one
 /// another's updates.
 pub(crate) fn remember(
+    _write: &crate::host_runtime::DurableWriteGuard,
     address: &MemoryAddress,
     text: &str,
     tags: &[String],
@@ -489,7 +490,13 @@ mod tests {
         let source = tempfile::tempdir().unwrap();
         let access = MemoryAccess::new(source.path(), None);
         let address = access.resolve(MemoryScope::Project).unwrap();
-        let id = remember(&address, "Always use tabs in this repo", &[]).unwrap();
+        let id = remember(
+            &crate::host_runtime::DurableWriteGuard::unowned_for_test(),
+            &address,
+            "Always use tabs in this repo",
+            &[],
+        )
+        .unwrap();
         assert!(!id.is_empty());
 
         let legacy_path = memory_dir().join(format!("{}.json", legacy_project_key(source.path())));
@@ -513,7 +520,13 @@ mod tests {
         let isolated_execution = tempfile::tempdir().unwrap();
         let address = MemoryAccess::new(source.path(), None).project();
 
-        remember(&address, "shared from an isolated run", &[]).unwrap();
+        remember(
+            &crate::host_runtime::DurableWriteGuard::unowned_for_test(),
+            &address,
+            "shared from an isolated run",
+            &[],
+        )
+        .unwrap();
         assert_ne!(
             legacy_project_key(source.path()),
             legacy_project_key(isolated_execution.path())
@@ -549,7 +562,13 @@ mod tests {
         assert!(!first_path
             .to_string_lossy()
             .contains(&legacy_project_key(source.path())));
-        remember(&first_address, "first agent only", &[]).unwrap();
+        remember(
+            &crate::host_runtime::DurableWriteGuard::unowned_for_test(),
+            &first_address,
+            "first agent only",
+            &[],
+        )
+        .unwrap();
 
         assert!(second
             .resolve(MemoryScope::AgentPrivate {
@@ -578,7 +597,13 @@ mod tests {
             .allow_team("release-team")
             .unwrap();
         let address = approved.resolve(scope).unwrap();
-        remember(&address, "approved shared ritual", &[]).unwrap();
+        remember(
+            &crate::host_runtime::DurableWriteGuard::unowned_for_test(),
+            &address,
+            "approved shared ritual",
+            &[],
+        )
+        .unwrap();
         assert_eq!(list_facts(&address).unwrap().len(), 1);
     }
 
@@ -594,7 +619,13 @@ mod tests {
             let start = start.clone();
             writers.push(std::thread::spawn(move || {
                 start.wait();
-                remember(&address, lane, &[]).unwrap();
+                remember(
+                    &crate::host_runtime::DurableWriteGuard::unowned_for_test(),
+                    &address,
+                    lane,
+                    &[],
+                )
+                .unwrap();
             }));
         }
         start.wait();
@@ -615,12 +646,24 @@ mod tests {
         let _home = IsolatedHome::install();
         let source = tempfile::tempdir().unwrap();
         let address = MemoryAccess::new(source.path(), None).project();
-        remember(&address, "valid fact", &[]).unwrap();
+        remember(
+            &crate::host_runtime::DurableWriteGuard::unowned_for_test(),
+            &address,
+            "valid fact",
+            &[],
+        )
+        .unwrap();
         let path = path_for(&address).unwrap();
         fs::write(&path, b"{ truncated").unwrap();
 
         assert!(list_facts(&address).is_err());
-        assert!(remember(&address, "must not erase history", &[]).is_err());
+        assert!(remember(
+            &crate::host_runtime::DurableWriteGuard::unowned_for_test(),
+            &address,
+            "must not erase history",
+            &[]
+        )
+        .is_err());
         assert_eq!(fs::read(&path).unwrap(), b"{ truncated");
     }
 
@@ -636,7 +679,13 @@ mod tests {
                 agent_id: "private-agent".into(),
             })
             .unwrap();
-        remember(&address, "private fact", &[]).unwrap();
+        remember(
+            &crate::host_runtime::DurableWriteGuard::unowned_for_test(),
+            &address,
+            "private fact",
+            &[],
+        )
+        .unwrap();
 
         let mode = fs::metadata(path_for(&address).unwrap())
             .unwrap()
@@ -651,14 +700,26 @@ mod tests {
         let _home = IsolatedHome::install();
         let source = tempfile::tempdir().unwrap();
         let address = MemoryAccess::new(source.path(), None).project();
-        remember(&address, "canonical fact", &[]).unwrap();
+        remember(
+            &crate::host_runtime::DurableWriteGuard::unowned_for_test(),
+            &address,
+            "canonical fact",
+            &[],
+        )
+        .unwrap();
         let path = path_for(&address).unwrap();
         let sibling = path.with_extension("json.interrupted.tmp");
         fs::write(&sibling, b"partial").unwrap();
 
         let facts = list_facts(&address).unwrap();
         assert_eq!(facts[0].text, "canonical fact");
-        remember(&address, "later fact", &[]).unwrap();
+        remember(
+            &crate::host_runtime::DurableWriteGuard::unowned_for_test(),
+            &address,
+            "later fact",
+            &[],
+        )
+        .unwrap();
         assert_eq!(list_facts(&address).unwrap().len(), 2);
         assert_eq!(fs::read(&sibling).unwrap(), b"partial");
     }
@@ -685,7 +746,13 @@ mod tests {
         fs::write(&path, &original).unwrap();
 
         assert!(list_facts(&address).is_err());
-        assert!(remember(&address, "must not overwrite", &[]).is_err());
+        assert!(remember(
+            &crate::host_runtime::DurableWriteGuard::unowned_for_test(),
+            &address,
+            "must not overwrite",
+            &[]
+        )
+        .is_err());
         assert_eq!(fs::read(path).unwrap(), original);
     }
 
@@ -697,12 +764,24 @@ mod tests {
         let discarded_execution = tempfile::tempdir().unwrap();
         let address = MemoryAccess::new(source.path(), None).project();
 
-        remember(&address, "written before promotion", &[]).unwrap();
+        remember(
+            &crate::host_runtime::DurableWriteGuard::unowned_for_test(),
+            &address,
+            "written before promotion",
+            &[],
+        )
+        .unwrap();
         fs::write(promoted_execution.path().join("change.txt"), "promoted").unwrap();
         fs::write(source.path().join("change.txt"), "promoted").unwrap();
         drop(promoted_execution);
 
-        remember(&address, "written before discard", &[]).unwrap();
+        remember(
+            &crate::host_runtime::DurableWriteGuard::unowned_for_test(),
+            &address,
+            "written before discard",
+            &[],
+        )
+        .unwrap();
         drop(discarded_execution);
 
         let texts: Vec<_> = list_facts(&address)

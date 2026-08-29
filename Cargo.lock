@@ -4681,6 +4681,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b40ca9252762c466af32d0b1002e91e4e1bc5398f77455e55474deb466355ff5"
 
 [[package]]
+name = "grokptah-help-authority"
+version = "0.1.0"
+dependencies = [
+ "grokptah-help-contract",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "grokptah-help-contract"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
+name = "grokptah-help-runtime"
+version = "0.1.0"
+dependencies = [
+ "grokptah-help-authority",
+ "grokptah-help-contract",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "group"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -14160,6 +14188,19 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "xai-host-authority"
+version = "0.1.0"
+dependencies = [
+ "dunce",
+ "fs2",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "uuid",
 ]
 
 [[package]]

@@ -4,13 +4,15 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use futures::StreamExt;
 
 use crate::gateway_config::{ProviderKind, ProviderModel};
 
 const MAX_CATALOG_BYTES: usize = 1024 * 1024;
 
-pub async fn discover_profile_models(profile_id: &str) -> Result<Vec<ProviderModel>> {
+pub(crate) async fn discover_profile_models(
+    authority: &crate::host_runtime::WriteAuthority,
+    profile_id: &str,
+) -> Result<Vec<ProviderModel>> {
     let config = crate::gateway_config::load();
     let profile = config
         .profile(profile_id)
@@ -41,45 +43,78 @@ pub async fn discover_profile_models(profile_id: &str) -> Result<Vec<ProviderMod
             request =
                 crate::auth_store::apply_auth_headers(request, credentials, &profile.base_url);
         }
-        let response = match request.send().await {
+        let credential_secret = credentials
+            .as_ref()
+            .map(|credentials| credentials.bearer.as_bytes())
+            .unwrap_or_default();
+        let mut response = match crate::provider_transport::send_provider_request(
+            &client,
+            request,
+            crate::provider_transport::ProviderRequestScope {
+                credential_secret,
+                dialect: "openai_model_catalog",
+                model: "model-catalog",
+                target_scope: "provider-model-discovery",
+            },
+            None,
+        )
+        .await
+        {
             Ok(response) => response,
-            Err(error) => {
+            Err(error) if error.is_safe_to_resend() => {
                 failures.push(format!(
                     "{}: {}",
                     redacted_path(&url),
-                    transport_error_class(&error)
+                    "provider catalog could not connect"
                 ));
                 continue;
             }
+            Err(error) => return Err(anyhow!(error.to_string())),
         };
         let status = response.status();
         if status.is_redirection() {
+            let _ = read_catalog_body(&mut response).await?;
+            response.settle_success().map_err(anyhow::Error::new)?;
             failures.push(format!(
                 "{}: redirect refused ({status})",
                 redacted_path(&url)
             ));
             continue;
         }
-        let body = match read_catalog_body(response).await {
+        let body = match read_catalog_body(&mut response).await {
             Ok(body) => body,
             Err(error) => {
-                failures.push(format!("{}: {error}", redacted_path(&url)));
-                continue;
+                return Err(anyhow!(
+                    "{}: provider catalog response is uncertain: {error}",
+                    redacted_path(&url)
+                ));
             }
         };
         if !status.is_success() {
+            if crate::provider_transport::is_retry_oriented_http_status(status) {
+                return Err(anyhow!(response.settle_http_failure(format!(
+                    "provider catalog returned retry-oriented HTTP {status}; explicit reconciliation required"
+                ))));
+            }
             let class = match status.as_u16() {
                 401 | 403 => "credential rejected",
-                429 => "rate limited",
                 _ => "request failed",
             };
+            response.settle_success().map_err(anyhow::Error::new)?;
             failures.push(format!("{}: {class} ({status})", redacted_path(&url)));
             continue;
         }
         match parse_compatible_model_catalog(body.as_bytes()) {
-            Ok(models) if models.len() > best.len() => best = models,
-            Ok(_) => {}
-            Err(error) => failures.push(format!("{}: {error}", redacted_path(&url))),
+            Ok(models) => {
+                response.settle_success().map_err(anyhow::Error::new)?;
+                if models.len() > best.len() {
+                    best = models;
+                }
+            }
+            Err(error) => {
+                let error = response.settle_protocol_error(error.to_string());
+                return Err(anyhow!(error));
+            }
         }
     }
 
@@ -109,27 +144,21 @@ pub async fn discover_profile_models(profile_id: &str) -> Result<Vec<ProviderMod
             }
             target.upsert_model(discovered.clone());
         }
-        crate::gateway_config::save(&updated).context("save discovered provider models")?;
+        let write = authority
+            .begin("saving discovered provider models")
+            .context("durable-write authority for discovered provider models")?;
+        crate::gateway_config::save(&write, &updated).context("save discovered provider models")?;
     }
 
     Ok(best)
 }
 
-fn transport_error_class(error: &reqwest::Error) -> &'static str {
-    if error.is_timeout() {
-        "transport timed out"
-    } else if error.is_connect() {
-        "transport could not connect"
-    } else {
-        "transport failed"
-    }
-}
-
-async fn read_catalog_body(response: reqwest::Response) -> Result<String> {
+async fn read_catalog_body(
+    response: &mut crate::provider_transport::ProviderResponse,
+) -> Result<String> {
     let mut body = crate::sse::BoundedBodyAccumulator::with_max_bytes(MAX_CATALOG_BYTES);
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        body.push(&chunk.context("catalog transport failed")?)
+    while let Some(chunk) = response.next_chunk(None).await? {
+        body.push(&chunk)
             .context("catalog exceeds bounded response size")?;
     }
     body.finish().context("catalog is not valid UTF-8")

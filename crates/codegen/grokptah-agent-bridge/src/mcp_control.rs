@@ -101,6 +101,9 @@ struct AppState {
     /// requests before authentication or handler dispatch. Remote listeners
     /// have an explicit deployment policy and retain their existing behavior.
     enforce_loopback_origin_policy: bool,
+    /// Fired when the server stops accepting. Long-lived SSE bodies select on
+    /// it so graceful shutdown cannot hang on an open live stream (#455).
+    shutdown: tokio_util::sync::CancellationToken,
 }
 
 #[derive(Debug, Clone)]
@@ -138,6 +141,7 @@ struct LiveStreamState {
     pending: VecDeque<Bytes>,
     heartbeat: tokio::time::Interval,
     done: bool,
+    shutdown: tokio_util::sync::CancellationToken,
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
@@ -258,6 +262,17 @@ impl LiveStreamState {
                 _ = self.heartbeat.tick() => {
                     return Some(Bytes::from_static(b": grokptah-control keep-alive\n\n"));
                 }
+                // Without this arm an idle live stream keeps the graceful
+                // shutdown of the serving task open forever, so the host could
+                // never reach its join barrier (#455). The client is told to
+                // resynchronize from the durable journal, which is the same
+                // contract every other recovery path uses.
+                _ = self.shutdown.cancelled() => {
+                    self.queue_recovery(
+                        "control plane is shutting down; resynchronize from the durable journal",
+                    );
+                    continue;
+                }
             }
         }
     }
@@ -284,7 +299,36 @@ pub struct ControlServerHandle {
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
+/// Evidence from stopping one control server. A timeout is not completion:
+/// callers must retain/quarantine process authority when `fully_stopped` is
+/// false.
+#[derive(Debug, Default)]
+#[must_use = "control-server stop evidence must be checked before restart or qualification"]
+pub struct ControlServerStopReport {
+    pub fully_stopped: bool,
+    pub errors: Vec<String>,
+}
+
+impl ControlServerStopReport {
+    pub fn is_clean(&self) -> bool {
+        self.fully_stopped && self.errors.is_empty()
+    }
+}
+
 impl ControlServerHandle {
+    #[cfg(test)]
+    pub(crate) fn uncooperative_for_test(orch: Arc<OrchestrationService>) -> Self {
+        let (shutdown, _shutdown_rx) = tokio::sync::oneshot::channel();
+        Self {
+            addr: "127.0.0.1:1".parse().expect("test socket address"),
+            token: "test-token".into(),
+            orch,
+            shutdown: Some(shutdown),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            task: Some(tokio::spawn(std::future::pending())),
+        }
+    }
+
     /// Shared policy service for trusted desktop commands that surface the
     /// same MCP-owned runs. The transport remains the only network boundary.
     pub fn orchestration_service(&self) -> Arc<OrchestrationService> {
@@ -300,15 +344,43 @@ impl ControlServerHandle {
 
     /// Stop the server and wait until its serving task has released the
     /// orchestration store and other owned resources.
-    pub async fn stop_and_wait(mut self) {
+    pub async fn stop_and_wait(mut self) -> ControlServerStopReport {
+        self.stop_and_wait_bounded(Duration::from_secs(30)).await
+    }
+
+    /// Stop and join every server-owned execution surface under one deadline.
+    pub async fn stop_and_wait_bounded(&mut self, timeout: Duration) -> ControlServerStopReport {
         self.cancel.cancel();
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.send(());
         }
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut errors = Vec::new();
+        let mut fully_stopped = true;
         if let Some(task) = self.task.take() {
-            let _ = task.await;
+            match tokio::time::timeout_at(deadline, task).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    errors.push(format!("control server task failed to join: {error}"));
+                }
+                Err(_) => {
+                    fully_stopped = false;
+                    errors.push(format!(
+                        "control server task did not stop within {timeout:?}"
+                    ));
+                }
+            }
         }
-        self.orch.stop_background_tasks().await;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let background = self.orch.stop_background_tasks_bounded(remaining).await;
+        if !background.fully_stopped {
+            fully_stopped = false;
+        }
+        errors.extend(background.errors);
+        ControlServerStopReport {
+            fully_stopped,
+            errors,
+        }
     }
 
     /// Actionable transport health snapshot for coordinators.
@@ -319,6 +391,18 @@ impl ControlServerHandle {
             "activeRequests": state_active,
             "totalRequests": state_total,
         })
+    }
+}
+
+impl Drop for ControlServerHandle {
+    fn drop(&mut self) {
+        // Dropping a handle can never be permission to leave its listener
+        // accepting work. Joining is async and belongs to the ordered path,
+        // but cancellation itself is unconditional.
+        self.cancel.cancel();
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
     }
 }
 
@@ -466,6 +550,7 @@ pub async fn start_control_server_with_bind(
         live_streams: Arc::new(Semaphore::new(MAX_LIVE_STREAMS)),
         health_requires_auth,
         enforce_loopback_origin_policy: bound_addr.ip().is_loopback(),
+        shutdown: cancel.clone(),
     };
     let app = Router::new()
         .route("/health", get(health_handler))
@@ -995,6 +1080,7 @@ async fn streamable_get_handler(
         pending: VecDeque::new(),
         heartbeat: tokio::time::interval(Duration::from_secs(10)),
         done: false,
+        shutdown: state.shutdown.clone(),
         _permit: permit,
     };
     live.queue_page(page);
@@ -4116,7 +4202,8 @@ mod tests {
         let host = AgentHost::create(HostConfig {
             always_approve: true,
             ..HostConfig::default()
-        });
+        })
+        .expect("acquire the GrokPtah instance lock");
         let bus = host.event_bus();
         let _gui = bus.subscribe();
         let store = OrchStore::open(home.path().join("orch")).unwrap();
@@ -4187,7 +4274,8 @@ mod tests {
         let host = AgentHost::create(HostConfig {
             always_approve: true,
             ..HostConfig::default()
-        });
+        })
+        .expect("acquire the GrokPtah instance lock");
         host.start().unwrap();
         host.set_project_cwd(ws.path()).unwrap();
         let session = host.session_new_kind(crate::SessionKind::Build).unwrap();
@@ -4362,7 +4450,8 @@ mod tests {
         let host = AgentHost::create(HostConfig {
             always_approve: true,
             ..HostConfig::default()
-        });
+        })
+        .expect("acquire the GrokPtah instance lock");
         host.start().unwrap();
         host.set_project_cwd(ws_a.path()).unwrap();
         let session_a = host.session_new_kind(crate::SessionKind::Build).unwrap();
@@ -4714,7 +4803,8 @@ mod tests {
         let host = AgentHost::create(HostConfig {
             always_approve: true,
             ..HostConfig::default()
-        });
+        })
+        .expect("acquire the GrokPtah instance lock");
         host.start().unwrap();
         host.set_project_cwd(ws.path()).unwrap();
         let session = host.session_new_kind(crate::SessionKind::Build).unwrap();
@@ -4814,7 +4904,8 @@ mod tests {
         let host = AgentHost::create(HostConfig {
             always_approve: true,
             ..HostConfig::default()
-        });
+        })
+        .expect("acquire the GrokPtah instance lock");
         host.start().unwrap();
         host.set_project_cwd(ws.path()).unwrap();
         let session = host.session_new_kind(crate::SessionKind::Build).unwrap();
@@ -4930,7 +5021,8 @@ mod tests {
         let host = AgentHost::create(HostConfig {
             always_approve: true,
             ..HostConfig::default()
-        });
+        })
+        .expect("acquire the GrokPtah instance lock");
         host.start().unwrap();
         host.set_project_cwd(ws.path()).unwrap();
         let session = host.session_new_kind(crate::SessionKind::Build).unwrap();
@@ -5040,7 +5132,8 @@ mod tests {
         let host = AgentHost::create(HostConfig {
             always_approve: true,
             ..HostConfig::default()
-        });
+        })
+        .expect("acquire the GrokPtah instance lock");
         host.start().unwrap();
         let session = host.session_new_kind(crate::SessionKind::Build).unwrap();
         host.session_set_cwd(session.id, workspace.path()).unwrap();

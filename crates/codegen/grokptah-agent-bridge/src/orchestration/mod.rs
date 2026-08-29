@@ -55,6 +55,7 @@ pub use routine::{
 pub(crate) use service::apply_run_aggregate;
 pub use service::{OrchestrationConfig, OrchestrationService};
 pub(crate) use store::workspaces_match;
+pub(crate) use store::AuditWriterStopReport;
 pub use store::{IdempotencyClaim, OrchStore, RetentionPolicy, RetentionReport};
 pub use supervisor::{
     ManagerSupervisorReport, ManagerSupervisorStatus, RoutineSupervisor, RoutineSupervisorStatus,

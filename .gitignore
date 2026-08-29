@@ -6,6 +6,7 @@
 # GrokPtah desktop
 desktop/node_modules/
 desktop/dist/
+desktop/tsconfig.tsbuildinfo
 desktop/src-tauri/target/
 crates/codegen/grokptah-agent-bridge/target/
 evals/certification-lab/target/
@@ -15,3 +16,11 @@ evals/fixtures/**/target/
 evals/fixtures/**/Cargo.lock
 evals/runs/
 node_modules/
+
+# Tauri build artifacts produced by a local verification run
+desktop/src-tauri/gen/schemas/
+
+# Help evidence harness build output. The captures in desktop/evidence-out/
+# are the reviewable deliverable and are committed; this is just the bundle
+# they were taken from.
+desktop/evidence-dist/

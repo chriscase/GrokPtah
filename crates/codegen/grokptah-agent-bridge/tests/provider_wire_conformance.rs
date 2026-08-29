@@ -148,6 +148,7 @@ async fn synthetic_xai_fixture_replays_through_the_production_provider_path() {
     assert_eq!(request.header("accept"), Some("text/event-stream"));
     assert!(request.header("content-type").is_some());
     assert!(request.header("authorization").is_some());
+    assert!(request.header("idempotency-key").is_some());
     assert!(request.header("x-xai-token-auth").is_some());
     assert!(request.header("x-grok-client-version").is_some());
     assert_eq!(request.header("x-grok-client-mode"), Some("interactive"));

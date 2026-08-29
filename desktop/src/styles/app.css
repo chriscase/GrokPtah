@@ -6977,3 +6977,496 @@ html[data-accent="violet"] {
   margin-top: 0.35rem;
   font-size: 11px;
 }
+
+/* ------------------------------------------------------------------ *
+ * Help
+ *
+ * Every colour is a token already defined for this theme, checked against
+ * --bg-panel at AA for body text. Meaning is never carried by colour alone:
+ * each state and badge also says what it is in words, which is what a reader
+ * in forced-colors mode is left with.
+ * ------------------------------------------------------------------ */
+
+.help-center {
+  position: fixed;
+  inset: 0;
+  z-index: 86;
+  display: grid;
+  grid-template-rows: 1fr;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.help-surface {
+  display: grid;
+  grid-template-rows: auto 1fr;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+}
+
+.help-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1rem 1.25rem;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.help-header h2 {
+  margin: 0.15rem 0;
+  font-size: 18px;
+}
+
+.help-eyebrow {
+  margin: 0;
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.help-subtitle {
+  margin: 0;
+  max-width: 60ch;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.help-header > button {
+  flex: none;
+  min-height: 32px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius, 6px);
+  padding: 0 0.7rem;
+  background: var(--bg-panel);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.help-layout {
+  display: grid;
+  grid-template-columns: minmax(260px, 34%) 1fr;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.help-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  min-height: 0;
+  padding: 1rem;
+  border-right: 1px solid var(--border-soft);
+  overflow-y: auto;
+}
+
+.help-search {
+  display: grid;
+  gap: 0.3rem;
+}
+
+.help-search label,
+.help-topic-label {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.help-search input,
+.help-topic {
+  min-height: 34px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius, 6px);
+  padding: 0 0.6rem;
+  background: var(--bg-input);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+}
+
+.help-result-count,
+.help-retrieval-mode {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.help-digest {
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+
+.help-list {
+  display: grid;
+  gap: 0.4rem;
+  margin: 0.2rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.help-list-item {
+  display: grid;
+  gap: 0.22rem;
+  min-height: 44px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 0.65rem;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.help-list-item:hover,
+.help-list-item.is-selected {
+  border-color: var(--border);
+  background: var(--accent-bg);
+}
+
+/* The active option is named through aria-activedescendant rather than
+   focused, so :focus-visible never fires on it and it needs its own marker. */
+.help-list-item.is-active {
+  border-color: var(--accent);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.help-list-item strong {
+  font-size: 12px;
+}
+
+.help-list-item > span:not(.help-list-topic):not(.help-list-labels),
+.help-list-item small {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.help-list-topic,
+.help-article-topic {
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.help-list-labels {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  align-items: center;
+}
+
+.help-badge-answer,
+.help-badge-suggestion {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0.05rem 0.45rem;
+  font-size: 10px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.help-badge-answer {
+  color: var(--ok);
+  border-color: var(--ok);
+}
+
+.help-badge-suggestion {
+  color: var(--muted);
+}
+
+.help-article {
+  min-height: 0;
+  padding: 1.25rem 1.5rem;
+  overflow-y: auto;
+}
+
+.help-article h3 {
+  margin: 0.2rem 0 0.35rem;
+  font-size: 17px;
+}
+
+.help-article-summary {
+  margin: 0 0 0.6rem;
+  max-width: 70ch;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+/* Retrieval outcome banner. Exactly one state renders at a time. */
+.help-state {
+  display: grid;
+  gap: 0.3rem;
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+  border-radius: var(--radius, 6px);
+  padding: 0.7rem 0.85rem;
+  margin-bottom: 0.9rem;
+  background: var(--bg-elevated);
+}
+
+.help-state-answer { border-left-color: var(--ok); }
+.help-state-ambiguous,
+.help-state-low-confidence { border-left-color: var(--accent); }
+.help-state-no-match { border-left-color: var(--muted); }
+.help-state-rejected { border-left-color: var(--danger); }
+.help-state-browse { border-left-color: var(--border); }
+
+.help-state-headline {
+  font-size: 13px;
+  color: var(--text);
+}
+
+.help-state-detail {
+  margin: 0;
+  max-width: 72ch;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.help-state-verdict,
+.help-suggestion-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.help-state-verdict code {
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+
+.help-suggestion-note {
+  border-left: 2px solid var(--accent);
+  padding-left: 0.55rem;
+  margin-bottom: 0.6rem;
+}
+
+.help-citations {
+  display: grid;
+  gap: 0.4rem;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius, 6px);
+  padding: 0.7rem 0.8rem;
+  margin: 0.8rem 0;
+  background: var(--surface-chip);
+}
+
+.help-citation-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.help-citation-quote {
+  margin: 0;
+  border-left: 2px solid var(--accent);
+  padding-left: 0.55rem;
+  max-width: 74ch;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.help-citations ul {
+  display: grid;
+  gap: 0.2rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.help-citation {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.help-citation code {
+  font-family: var(--font-mono);
+  color: var(--tool);
+}
+
+.help-citation-meta {
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+
+.help-citation-dropped {
+  margin: 0;
+  color: var(--danger);
+  font-size: 11px;
+}
+
+.help-source-card,
+.help-answer-card {
+  display: grid;
+  gap: 0.3rem;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius, 6px);
+  padding: 0.7rem 0.8rem;
+  margin: 0.8rem 0;
+  background: var(--bg-panel);
+}
+
+.help-source-card span,
+.help-answer-card p {
+  margin: 0;
+  max-width: 72ch;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.help-source-card code {
+  font-family: var(--font-mono);
+  color: var(--tool);
+}
+
+.help-answers-disabled {
+  border-left: 2px solid var(--accent);
+  padding-left: 0.55rem;
+  color: var(--text) !important;
+}
+
+/* The unknowns are the point, not fine print: they are shown at reading size
+   and in full-strength text. */
+.help-unknowns {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text) !important;
+}
+
+.help-unknowns-note {
+  margin: 0;
+  max-width: 72ch;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.help-empty {
+  border: 1px dashed var(--border);
+  border-radius: var(--radius, 6px);
+  padding: 1.2rem;
+  text-align: center;
+}
+
+.help-empty h3 {
+  margin: 0 0 0.3rem;
+}
+
+.help-empty p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+@media (max-width: 720px) {
+  .help-layout {
+    grid-template-columns: 1fr;
+    grid-template-rows: minmax(220px, 44%) 1fr;
+  }
+
+  .help-nav {
+    border-right: none;
+    border-bottom: 1px solid var(--border-soft);
+  }
+
+  .help-article {
+    padding: 1.1rem;
+  }
+
+  .help-header {
+    padding: 0.85rem 1rem;
+  }
+}
+
+/* A reader who asks the platform for more contrast gets it: secondary text is
+   promoted to full strength and every boundary becomes visible. */
+@media (prefers-contrast: more) {
+  .help-center .help-subtitle,
+  .help-center .help-result-count,
+  .help-center .help-retrieval-mode,
+  .help-center .help-state-verdict,
+  .help-center .help-suggestion-note,
+  .help-center .help-citation-note,
+  .help-center .help-citation,
+  .help-center .help-article-summary,
+  .help-center .help-badge-suggestion,
+  .help-center .help-source-card span,
+  .help-center .help-answer-card p,
+  .help-center .help-empty p,
+  .help-center .help-list-item > span:not(.help-list-topic):not(.help-list-labels),
+  .help-center .help-list-item small {
+    color: var(--text);
+  }
+
+  .help-center .help-state,
+  .help-center .help-citations,
+  .help-center .help-source-card,
+  .help-center .help-answer-card,
+  .help-center .help-list-item {
+    border-color: var(--text);
+  }
+
+  .help-center .help-list-item.is-active,
+  .help-center .help-list-item.is-selected {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .help-center,
+  .help-center * {
+    animation: none !important;
+    transition: none;
+  }
+}
+
+@media (forced-colors: active) {
+  .help-center,
+  .help-header,
+  .help-nav,
+  .help-surface,
+  .help-state,
+  .help-citations,
+  .help-source-card,
+  .help-answer-card,
+  .help-badge-answer,
+  .help-badge-suggestion,
+  .help-list-item {
+    border-color: CanvasText;
+  }
+
+  /* State is carried by the left rule in colour themes; forced colours drop
+     that hue, so the words in each banner are all a reader has left. They
+     always say the state in full. */
+  .help-state {
+    border-left-color: CanvasText;
+  }
+
+  .help-list-item.is-selected,
+  .help-list-item.is-active,
+  .help-list-item:hover {
+    border-color: Highlight;
+    background: Canvas;
+    color: CanvasText;
+  }
+
+  .help-search input:focus-visible,
+  .help-topic:focus-visible,
+  .help-header > button:focus-visible {
+    outline-color: Highlight;
+  }
+}

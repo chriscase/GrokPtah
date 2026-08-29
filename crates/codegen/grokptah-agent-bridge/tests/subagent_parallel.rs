@@ -61,7 +61,8 @@ async fn parallel_gp_children_overlap_in_time() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..Default::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     let mut rx = host.take_event_receiver().expect("rx");
     host.start().unwrap();
     host.set_project_cwd(fix.path()).unwrap();
@@ -123,7 +124,8 @@ async fn cancel_one_child_leaves_sibling_running() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..Default::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     let _rx = host.take_event_receiver();
     host.start().unwrap();
     host.set_project_cwd(fix.path()).unwrap();
@@ -159,7 +161,8 @@ async fn parent_cancel_cancels_running_children() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..Default::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     let _rx = host.take_event_receiver();
     host.start().unwrap();
     host.set_project_cwd(fix.path()).unwrap();
@@ -195,7 +198,8 @@ async fn subagent_history_survives_session_reload() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..Default::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     let mut rx = host.take_event_receiver().expect("rx");
     host.start().unwrap();
     host.set_project_cwd(fix.path()).unwrap();
@@ -244,7 +248,8 @@ async fn explore_still_available() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..Default::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     let mut rx = host.take_event_receiver().expect("rx");
     host.start().unwrap();
     host.set_project_cwd(fix.path()).unwrap();

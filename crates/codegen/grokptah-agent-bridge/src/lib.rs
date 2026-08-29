@@ -19,7 +19,9 @@ mod gateway_config;
 mod hooks;
 mod host;
 mod host_helpers;
+mod host_runtime;
 mod instance_lock;
+pub use instance_lock::{instance_lock_is_held, InstanceLock};
 mod isolation;
 mod lane;
 pub mod live_attestation;
@@ -38,6 +40,43 @@ mod prompt_queue;
 mod provider_discovery;
 pub mod provider_observation;
 mod provider_qualification;
+mod provider_transport;
+
+/// Scarce proof required to inspect or resolve provider-send ambiguity. The
+/// bridge never substitutes its cached authority for this caller-supplied
+/// proof, and downstream code cannot construct or clone one.
+pub use provider_transport::ProviderReconciliationAuthority;
+/// Opaque identity of a provider send requiring reconciliation. It contains no
+/// provider request, credential, model, URL, content, or path material.
+pub use xai_host_authority::AttemptId as ProviderAttemptId;
+
+/// Authenticate an operator against the provider-send custody secret and mint
+/// a process-local, non-cloneable reconciliation capability. The secret is
+/// checked in constant time and is not retained by the capability.
+pub fn authenticate_provider_reconciliation(
+    custody_secret: &str,
+) -> anyhow::Result<ProviderReconciliationAuthority> {
+    provider_transport::authenticate_provider_reconciliation(custody_secret)
+}
+
+/// List provider sends whose outcome requires independently established
+/// operator/provider truth. Listing never retries a request.
+pub fn provider_attempts_requiring_reconciliation(
+    authority: &ProviderReconciliationAuthority,
+) -> anyhow::Result<Vec<ProviderAttemptId>> {
+    provider_transport::provider_attempts_requiring_reconciliation(authority)
+}
+
+/// Resolve one ambiguous provider send from independently established truth.
+/// This never performs or retries a physical provider request.
+pub fn reconcile_provider_attempt(
+    authority: &ProviderReconciliationAuthority,
+    attempt: ProviderAttemptId,
+    took_effect: bool,
+) -> anyhow::Result<()> {
+    provider_transport::reconcile_provider_attempt(authority, attempt, took_effect)
+}
+
 pub mod reliability_eval;
 mod run_promotion;
 mod search_engine;
@@ -64,11 +103,14 @@ pub use certification::{
     MAX_RAW_ARTIFACT_BYTES, PERSISTENT_AGENT_CAPTURE_SCHEMA,
 };
 pub use exec_risk::{assess_shell_risk, peel_transparent_prefixes, RiskReport, RiskTier};
+// `gateway_config::save`, `discover_profile_models` and `qualify_provider_model`
+// are deliberately no longer re-exported: they take durable-write authority,
+// which only a live host runtime can mint, so external callers must go through
+// the equivalent `AgentHostHandle` methods (#455).
 pub use gateway_config::{
-    load as load_gateway_config, model_selection_key, parse_model_selection,
-    save as save_gateway_config, CapabilitySource, ComputerUseTier, GatewayConfig,
-    ModelCapabilities, ModelSelection, ProviderDeadlineClass, ProviderDialect, ProviderKind,
-    ProviderModel, ProviderProfile, ProviderProfileUpdate,
+    load as load_gateway_config, model_selection_key, parse_model_selection, CapabilitySource,
+    ComputerUseTier, GatewayConfig, ModelCapabilities, ModelSelection, ProviderDeadlineClass,
+    ProviderDialect, ProviderKind, ProviderModel, ProviderProfile, ProviderProfileUpdate,
 };
 pub use isolation::prepare_isolation_cwd;
 pub use live_attestation::{
@@ -83,9 +125,9 @@ pub use prompt_queue::{
     PromptQueueBatch, PromptQueueEntry, PromptQueueRunNextResult, PromptQueueSnapshot,
     PromptQueueTakeResult, SteeringDisposition, SteeringReceipt,
 };
-pub use provider_discovery::{discover_profile_models, parse_compatible_model_catalog};
+pub use provider_discovery::parse_compatible_model_catalog;
 pub use provider_qualification::{
-    qualify_provider_model, ProviderQualificationReport, QualificationCheck, QualificationStatus,
+    ProviderQualificationReport, QualificationCheck, QualificationStatus,
 };
 pub use ssrf::{check_url as ssrf_check_url, SsrfDecision};
 
@@ -127,10 +169,16 @@ pub use discover::{
 pub use event_bus::{EventBus, EventReceiver, JournalEntry, JournalPage};
 pub use events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 pub use host::{AgentHost, AgentHostHandle, AgentStatus, HostConfig, WorkspaceUiState};
+pub use host_runtime::{
+    quarantined_process_lock_count, ControlServerRejected, DurableWriteLease, HostPhase,
+    HostRuntime, HostShutdownReport, ShutdownHook, DEFAULT_DURABLE_WRITE_SEAL_TIMEOUT,
+    DEFAULT_SHUTDOWN_JOIN_TIMEOUT,
+};
 pub use lane::{LaneSummary, RuntimeConnectionState, RuntimeTarget};
 pub use mcp_control::{
     discovered_tool_names, start_control_from_env, start_control_server, start_control_server_with,
     start_control_server_with_bind, ControlServerHandle, ControlServerLimits,
+    ControlServerStopReport,
 };
 pub use mcp_control_client::{
     ListedTool, LiveEventFrame, LiveNotification, McpControlClient, McpEventStream, McpRemoteError,

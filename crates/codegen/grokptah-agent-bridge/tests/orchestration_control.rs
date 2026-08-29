@@ -17,7 +17,8 @@ use grokptah_agent_bridge::orchestration::{
 };
 use grokptah_agent_bridge::{
     discovered_tool_names, model_selection_key, set_grokptah_home_override, start_control_server,
-    AgentHost, EventBus, HostConfig, SessionKind, SessionUpdate, CONTROL_TOOLS, FORBIDDEN_TOOLS,
+    AgentHost, EventBus, HostConfig, RuntimeHome, SessionKind, SessionUpdate, CONTROL_TOOLS,
+    FORBIDDEN_TOOLS,
 };
 use serde_json::json;
 use tempfile::tempdir;
@@ -36,11 +37,12 @@ fn setup_home() -> (tempfile::TempDir, ProcessEnvGuard) {
     (d, guard)
 }
 
-fn started_host() -> grokptah_agent_bridge::AgentHostHandle {
+fn started_host() -> grokptah_agent_bridge::HostRuntime {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host.start().expect("start host");
     host
 }
@@ -679,7 +681,7 @@ async fn selecting_a_command_in_another_workspace_is_not_an_oracle() {
         .unwrap()[0]
         .clone();
     let orch = OrchestrationService::new(
-        host,
+        host.clone(),
         EventBus::new(64),
         OrchStore::open(home.path().join("orch")).unwrap(),
         OrchestrationConfig {
@@ -946,7 +948,7 @@ async fn workspace_mismatch_fail_closed() {
     let session = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(session.id, ws.path()).unwrap();
     let orch = OrchestrationService::new(
-        host,
+        host.clone(),
         EventBus::new(64),
         OrchStore::open(home.path().join("orch")).unwrap(),
         OrchestrationConfig {
@@ -1008,7 +1010,7 @@ async fn reject_shell_and_admin_prompts() {
     let session = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(session.id, ws.path()).unwrap();
     let orch = OrchestrationService::new(
-        host,
+        host.clone(),
         EventBus::new(64),
         OrchStore::open(home.path().join("orch")).unwrap(),
         OrchestrationConfig {
@@ -1749,12 +1751,26 @@ async fn steer_via_orchestration_service() {
     set_grokptah_home_override(None);
 }
 
-#[test]
-fn queue_survives_host_restart() {
-    let (_home, _lock) = setup_home();
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn queue_survives_host_restart() {
+    let (home, _lock) = setup_home();
+    let runtime_home = RuntimeHome::from_path(home.path().join(".grokptah")).unwrap();
+    let start_host = || {
+        let host = AgentHost::create_with_runtime_home(
+            HostConfig {
+                always_approve: true,
+                ..HostConfig::default()
+            },
+            runtime_home.clone(),
+        )
+        .expect("acquire the GrokPtah instance lock");
+        host.start().expect("start host");
+        host
+    };
     let ws = tempdir().unwrap();
     let session_id = {
-        let host = started_host();
+        let host = start_host();
         host.set_project_cwd(ws.path()).unwrap();
         let session = host.session_new_kind(SessionKind::Build).unwrap();
         host.session_set_cwd(session.id, ws.path()).unwrap();
@@ -1765,10 +1781,17 @@ fn queue_survives_host_restart() {
         let listed = host.session_queue_list(session.id).unwrap();
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].text, "second item"); // priority front
+        let report = host.shutdown().await;
+        assert!(
+            report.is_clean(),
+            "queue persistence restart requires an ordered clean shutdown: {}",
+            report.operator_summary()
+        );
+        assert!(report.process_lock_released);
         session.id
     };
     // New host process-equivalent: same home, fresh AgentHost.
-    let host2 = started_host();
+    let host2 = start_host();
     let listed = host2.session_queue_list(session_id).unwrap();
     assert_eq!(listed.len(), 2, "queue must reload from disk");
     assert_eq!(listed[0].text, "second item");
@@ -1788,6 +1811,10 @@ fn journal_reload_supports_run_scoped_reads() {
         unified_diff: "diff".into(),
     });
     let start = bus1.current_seq();
+    assert!(
+        bus1.close_journal_writer().is_none(),
+        "the durable journal must drain cleanly before restart"
+    );
     drop(bus1);
     let bus2 = EventBus::new(64).with_persist_dir(dir.path());
     let page = bus2.read_after(0, 50);

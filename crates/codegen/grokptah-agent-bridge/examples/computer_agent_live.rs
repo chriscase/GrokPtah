@@ -43,7 +43,8 @@ async fn main() -> Result<()> {
         default_model: model.clone(),
         default_effort: effort,
         ..HostConfig::default()
-    });
+    })
+    .context("acquire the GrokPtah instance lock")?;
     host.start()?;
     host.set_model(model.clone());
     host.set_effort(effort);

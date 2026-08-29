@@ -17,8 +17,8 @@ use grokptah_agent_bridge::reliability_eval::{
     write_report, EventLedger, ReliabilityReport, ScenarioCheck, ScenarioResult,
 };
 use grokptah_agent_bridge::{
-    home_override_serial, set_grokptah_home_override, AgentHost, AgentHostHandle, EventReceiver,
-    HostConfig, PermissionDecision, SessionUpdate, SteeringDisposition, ToolCallStatus,
+    home_override_serial, set_grokptah_home_override, AgentHost, EventReceiver, HostConfig,
+    HostRuntime, PermissionDecision, SessionUpdate, SteeringDisposition, ToolCallStatus,
 };
 use tokio::time::timeout;
 
@@ -64,15 +64,31 @@ fn fixture_repo() -> Result<tempfile::TempDir> {
     Ok(dir)
 }
 
-fn started_host(always_approve: bool) -> Result<AgentHostHandle> {
+fn started_host(always_approve: bool) -> Result<HostRuntime> {
     let host = AgentHost::create(HostConfig {
         always_approve,
         ..HostConfig::default()
-    });
+    })
+    .context("acquire the GrokPtah instance lock")?;
     host.start()?;
     // Persisted chrome can outlive a scenario, so make policy explicit.
     host.set_always_approve(always_approve);
     Ok(host)
+}
+
+async fn shutdown_host(host: HostRuntime, context: &str) -> Result<()> {
+    let report = host.shutdown().await;
+    anyhow::ensure!(
+        report.is_clean(),
+        "{context} ordered shutdown was unclean: {}",
+        report.operator_summary()
+    );
+    anyhow::ensure!(
+        report.process_lock_released,
+        "{context} ordered shutdown retained the process lock"
+    );
+    drop(host);
+    Ok(())
 }
 
 async fn drain_until_complete(rx: &mut EventReceiver) -> Result<Vec<SessionUpdate>> {
@@ -157,7 +173,7 @@ async fn coding_flow() -> Result<ScenarioResult> {
             ScenarioCheck::fail("evidence_before_complete", "terminal ordering was invalid")
         },
     ];
-    Ok(finish(
+    let result = finish(
         "coding_flow",
         started,
         &ledger,
@@ -167,7 +183,9 @@ async fn coding_flow() -> Result<ScenarioResult> {
             .into_iter()
             .map(|file| file.path)
             .collect(),
-    ))
+    );
+    shutdown_host(host, "coding_flow").await?;
+    Ok(result)
 }
 
 async fn queue_and_steering() -> Result<ScenarioResult> {
@@ -293,13 +311,9 @@ async fn queue_and_steering() -> Result<ScenarioResult> {
             ScenarioCheck::fail("turn_completed", "active turn returned an empty response")
         },
     ];
-    Ok(finish(
-        "queue_and_steering",
-        started,
-        &ledger,
-        checks,
-        Vec::new(),
-    ))
+    let result = finish("queue_and_steering", started, &ledger, checks, Vec::new());
+    shutdown_host(host, "queue_and_steering").await?;
+    Ok(result)
 }
 
 async fn permission_deny() -> Result<ScenarioResult> {
@@ -360,13 +374,9 @@ async fn permission_deny() -> Result<ScenarioResult> {
         },
         ScenarioCheck::pass("turn_recovered", "denied tool returned control to the turn"),
     ];
-    Ok(finish(
-        "permission_deny",
-        started,
-        &ledger,
-        checks,
-        Vec::new(),
-    ))
+    let result = finish("permission_deny", started, &ledger, checks, Vec::new());
+    shutdown_host(host, "permission_deny").await?;
+    Ok(result)
 }
 
 async fn cancellation() -> Result<ScenarioResult> {
@@ -433,7 +443,9 @@ async fn cancellation() -> Result<ScenarioResult> {
             ScenarioCheck::fail("turn_cancelled", "turn completion lost cancellation state")
         },
     ];
-    Ok(finish("cancellation", started, &ledger, checks, Vec::new()))
+    let result = finish("cancellation", started, &ledger, checks, Vec::new());
+    shutdown_host(host, "cancellation").await?;
+    Ok(result)
 }
 
 async fn restart_durability() -> Result<ScenarioResult> {
@@ -451,9 +463,11 @@ async fn restart_durability() -> Result<ScenarioResult> {
     let before_history = host.session_completion_history(session.id)?;
     let before_transcript = host.session_transcript(session.id)?;
     drop(rx);
-    drop(host);
+    shutdown_host(host, "restart_durability first host").await?;
 
-    let restored_host = AgentHost::create(HostConfig::default());
+    let restored_host =
+        AgentHost::create(HostConfig::default()).expect("acquire the GrokPtah instance lock");
+    restored_host.start()?;
     let after_history = restored_host.session_completion_history(session.id)?;
     let after_transcript = restored_host.session_transcript(session.id)?;
     let mut ledger = EventLedger::default();
@@ -476,16 +490,18 @@ async fn restart_durability() -> Result<ScenarioResult> {
             ScenarioCheck::fail("transcript_reloaded", "transcript was not restored")
         },
     ];
-    Ok(finish(
+    let result = finish(
         "restart_durability",
         started,
         &ledger,
         checks,
         vec!["durable.txt".into()],
-    ))
+    );
+    shutdown_host(restored_host, "restart_durability replacement host").await?;
+    Ok(result)
 }
 
-fn event_fanout_and_journal() -> Result<ScenarioResult> {
+async fn event_fanout_and_journal() -> Result<ScenarioResult> {
     let started = Instant::now();
     let host = started_host(true)?;
     let bus = host.event_bus();
@@ -531,13 +547,18 @@ fn event_fanout_and_journal() -> Result<ScenarioResult> {
             )
         },
     ];
-    Ok(finish(
+    let result = finish(
         "event_fanout_and_journal",
         started,
         &ledger,
         checks,
         Vec::new(),
-    ))
+    );
+    drop(gui);
+    drop(coordinator);
+    drop(bus);
+    shutdown_host(host, "event_fanout_and_journal").await?;
+    Ok(result)
 }
 
 fn stale_evidence_detection() -> Result<ScenarioResult> {
@@ -598,7 +619,7 @@ pub async fn run_campaign() -> Result<ReliabilityReport> {
         permission_deny().await?,
         cancellation().await?,
         restart_durability().await?,
-        event_fanout_and_journal()?,
+        event_fanout_and_journal().await?,
         stale_evidence_detection()?,
     ];
     Ok(report_start.finish(scenarios))

@@ -535,6 +535,8 @@ pub struct ProviderObservation {
     evidence_mode: EvidenceMode,
     scope: ObservationScope,
     attempt_number: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authority_attempt: Option<String>,
     route_class: ProviderRouteClass,
     dialect: ProviderDialect,
     credential_method: CredentialMethod,
@@ -609,6 +611,7 @@ impl ProviderObservation {
             evidence_mode,
             scope,
             attempt_number,
+            authority_attempt: None,
             route_class,
             dialect,
             credential_method,
@@ -632,6 +635,11 @@ impl ProviderObservation {
 
     pub const fn attempt_number(&self) -> u32 {
         self.attempt_number
+    }
+
+    pub(crate) fn with_authority_attempt(mut self, handle: Option<String>) -> Self {
+        self.authority_attempt = handle;
+        self
     }
 
     pub fn credential_binding(&self) -> Option<&OpaqueIdentity> {
@@ -824,25 +832,35 @@ impl ProviderObservationContext {
             observer: self.observer.clone(),
             scope: self.scope.clone(),
             attempt_number,
+            authority_attempt: None,
             started_at: Instant::now(),
         })
     }
 }
 
-/// One physical HTTP attempt. The caller supplies validated structural
-/// metadata; this type supplies the shared scope, attempt number, and bounded
-/// elapsed time.
+/// Diagnostic evidence for one canonical physical-send attempt. This type
+/// never authorizes or settles a send; it carries the host-authority attempt
+/// handle so evidence and authority cannot describe different effects.
 pub struct ProviderObservationAttempt {
     mode: EvidenceMode,
     observer: ProviderObserver,
     scope: ObservationScope,
     attempt_number: u32,
+    authority_attempt: Option<String>,
     started_at: Instant,
 }
 
 impl ProviderObservationAttempt {
     pub const fn attempt_number(&self) -> u32 {
         self.attempt_number
+    }
+
+    pub(crate) fn bind_authority_attempt(&mut self, handle: Option<String>) {
+        self.authority_attempt = handle;
+    }
+
+    pub(crate) fn authority_attempt(&self) -> Option<String> {
+        self.authority_attempt.clone()
     }
 
     pub fn scope(&self) -> &ObservationScope {

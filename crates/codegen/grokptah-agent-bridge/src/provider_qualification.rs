@@ -3,7 +3,6 @@
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
 use crate::computer_use::{ComputerBackend, ComputerUseLimits, SemanticAction, SimulatorBackend};
@@ -183,7 +182,8 @@ struct ComputerProbeArguments {
     text: String,
 }
 
-pub async fn qualify_provider_model(
+pub(crate) async fn qualify_provider_model(
+    authority: &crate::host_runtime::WriteAuthority,
     provider_id: &str,
     model_id: &str,
 ) -> Result<ProviderQualificationReport> {
@@ -386,7 +386,11 @@ pub async fn qualify_provider_model(
             .current()
             .map(crate::auth_store::WireCredentials::qualification_identity_fingerprint)
             .unwrap_or_else(|| "anonymous".into());
+        let write = authority
+            .begin("saving managed measured model capabilities")
+            .context("durable-write authority for measured capabilities")?;
         crate::gateway_config::save_managed_profile_capabilities(
+            &write,
             &profile,
             &measured_model,
             &credential_fingerprint,
@@ -400,7 +404,11 @@ pub async fn qualify_provider_model(
             .and_then(|item| item.models.iter_mut().find(|model| model.id == model_id))
             .ok_or_else(|| anyhow!("provider/model disappeared during qualification"))?;
         *stored_model = measured_model;
-        crate::gateway_config::save(&updated).context("save measured model capabilities")?;
+        let write = authority
+            .begin("saving measured model capabilities")
+            .context("durable-write authority for measured capabilities")?;
+        crate::gateway_config::save(&write, &updated)
+            .context("save measured model capabilities")?;
     }
 
     Ok(ProviderQualificationReport {
@@ -686,7 +694,6 @@ async fn completion(
 ) -> Result<serde_json::Value> {
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let mut removed_tool_choice = false;
-    let mut transient_retries = 0_u32;
     for _attempt in 0..5 {
         let mut request = client
             .post(&url)
@@ -695,37 +702,66 @@ async fn completion(
         if let Some(credentials) = credentials.current() {
             request = crate::auth_store::apply_auth_headers(request, credentials, base_url);
         }
-        let response = request
-            .json(&body)
-            .send()
-            .await
-            .map_err(classify_transport)?;
+        let credential_secret = credentials
+            .current()
+            .map(|current| current.bearer.as_bytes())
+            .unwrap_or_default();
+        let model = body
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("qualification-probe");
+        let mut response = crate::provider_transport::send_provider_request(
+            client,
+            request.json(&body),
+            crate::provider_transport::ProviderRequestScope {
+                credential_secret,
+                dialect: "provider_qualification",
+                model,
+                target_scope: "provider-qualification-completion",
+            },
+            None,
+        )
+        .await
+        .map_err(|error| anyhow!(error.to_string()))?;
         let status = response.status();
+        let raw = read_body(&mut response).await?;
         if status.is_redirection() {
+            response.settle_success().map_err(anyhow::Error::new)?;
             bail!("provider redirect refused");
         }
         if status == reqwest::StatusCode::UNAUTHORIZED
             && credentials.refresh_after_unauthorized().await?
         {
+            response.settle_success().map_err(anyhow::Error::new)?;
             continue;
         }
         if status.as_u16() == 400 && allow_tool_choice_fallback && !removed_tool_choice {
+            response.settle_success().map_err(anyhow::Error::new)?;
             if let Some(object) = body.as_object_mut() {
                 object.remove("tool_choice");
             }
             removed_tool_choice = true;
             continue;
         }
-        if (status.as_u16() == 429 || status.is_server_error()) && transient_retries < 3 {
-            tokio::time::sleep(Duration::from_millis(100 * (1 << transient_retries))).await;
-            transient_retries += 1;
-            continue;
+        if crate::provider_transport::is_retry_oriented_http_status(status) {
+            return Err(anyhow!(response.settle_http_failure(format!(
+                "provider returned retry-oriented HTTP {status}; explicit reconciliation required"
+            ))));
         }
         if !status.is_success() {
+            response.settle_success().map_err(anyhow::Error::new)?;
             bail!("provider request failed (HTTP {})", status.as_u16());
         }
-        let raw = read_body(response).await?;
-        return serde_json::from_str(&raw).context("provider returned malformed JSON");
+        let value = match serde_json::from_str(&raw) {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(anyhow!(response.settle_protocol_error(format!(
+                    "provider returned malformed JSON: {error}"
+                ))));
+            }
+        };
+        response.settle_success().map_err(anyhow::Error::new)?;
+        return Ok(value);
     }
     bail!("provider request failed after bounded fallback")
 }
@@ -745,7 +781,7 @@ async fn streaming_probe(
         }],
         "stream": true
     });
-    let response = loop {
+    let mut response = loop {
         let mut request = client
             .post(&url)
             .header("Content-Type", "application/json")
@@ -753,23 +789,42 @@ async fn streaming_probe(
         if let Some(current) = credentials.current() {
             request = crate::auth_store::apply_auth_headers(request, current, base_url);
         }
-        let response = request
-            .json(&body)
-            .send()
-            .await
-            .map_err(classify_transport)?;
+        let credential_secret = credentials
+            .current()
+            .map(|current| current.bearer.as_bytes())
+            .unwrap_or_default();
+        let mut response = crate::provider_transport::send_provider_request(
+            client,
+            request.json(&body),
+            crate::provider_transport::ProviderRequestScope {
+                credential_secret,
+                dialect: "provider_qualification",
+                model: model_id,
+                target_scope: "provider-qualification-stream",
+            },
+            None,
+        )
+        .await
+        .map_err(|error| anyhow!(error.to_string()))?;
         if response.status() == reqwest::StatusCode::UNAUTHORIZED
             && credentials.refresh_after_unauthorized().await?
         {
+            let _ = read_body(&mut response).await?;
+            response.settle_success().map_err(anyhow::Error::new)?;
             continue;
         }
         break response;
     };
     if !response.status().is_success() {
-        bail!(
-            "provider stream failed (HTTP {})",
-            response.status().as_u16()
-        );
+        let status = response.status();
+        let _ = read_body(&mut response).await?;
+        if crate::provider_transport::is_retry_oriented_http_status(status) {
+            return Err(anyhow!(response.settle_http_failure(format!(
+                "provider stream returned retry-oriented HTTP {status}; explicit reconciliation required"
+            ))));
+        }
+        response.settle_success().map_err(anyhow::Error::new)?;
+        bail!("provider stream failed (HTTP {})", status.as_u16());
     }
     let content_type = response
         .headers()
@@ -778,15 +833,15 @@ async fn streaming_probe(
         .unwrap_or_default()
         .to_ascii_lowercase();
     if content_type.contains("application/json") {
+        let _ = read_body(&mut response).await?;
+        response.settle_success().map_err(anyhow::Error::new)?;
         return Ok(false);
     }
     let mut decoder = crate::sse::SseLineDecoder::new();
     let mut full_body = crate::sse::BoundedBodyAccumulator::new();
     let mut content = String::new();
     let mut done = false;
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let bytes = chunk.map_err(classify_transport)?;
+    while let Some(bytes) = response.next_chunk(None).await? {
         full_body.push(&bytes)?;
         for line in decoder.push(&bytes)? {
             done |= apply_stream_probe_line(&line, &mut content)?;
@@ -796,7 +851,13 @@ async fn streaming_probe(
         done |= apply_stream_probe_line(&line, &mut content)?;
     }
     full_body.finish()?;
-    Ok(done && content.contains(GENERATION_MARKER))
+    if !done {
+        return Err(anyhow!(response.settle_protocol_error(
+            "provider stream ended without a terminal marker"
+        )));
+    }
+    response.settle_success().map_err(anyhow::Error::new)?;
+    Ok(content.contains(GENERATION_MARKER))
 }
 
 fn apply_stream_probe_line(line: &str, content: &mut String) -> Result<bool> {
@@ -817,23 +878,12 @@ fn apply_stream_probe_line(line: &str, content: &mut String) -> Result<bool> {
     Ok(false)
 }
 
-async fn read_body(response: reqwest::Response) -> Result<String> {
+async fn read_body(response: &mut crate::provider_transport::ProviderResponse) -> Result<String> {
     let mut body = crate::sse::BoundedBodyAccumulator::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        body.push(&chunk.map_err(classify_transport)?)?;
+    while let Some(chunk) = response.next_chunk(None).await? {
+        body.push(&chunk)?;
     }
     body.finish()
-}
-
-fn classify_transport(error: reqwest::Error) -> anyhow::Error {
-    if error.is_timeout() {
-        anyhow!("provider transport timed out")
-    } else if error.is_connect() {
-        anyhow!("provider transport could not connect")
-    } else {
-        anyhow!("provider transport failed")
-    }
 }
 
 #[cfg(test)]
@@ -1076,7 +1126,11 @@ mod tests {
             "cheap-code-model",
         ));
         config.upsert_profile(profile).unwrap();
-        crate::gateway_config::save(&config).unwrap();
+        crate::gateway_config::save(
+            &crate::host_runtime::DurableWriteGuard::unowned_for_test(),
+            &config,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1200,9 +1254,13 @@ mod tests {
                 let previous_key = std::env::var_os("XAI_API_KEY");
                 unsafe { std::env::set_var("XAI_API_KEY", "must-not-leak") };
 
-                let error = qualify_provider_model("attacker", "grok-4.5")
-                    .await
-                    .unwrap_err();
+                let error = qualify_provider_model(
+                    &crate::host_runtime::WriteAuthority::unowned_for_test(),
+                    "attacker",
+                    "grok-4.5",
+                )
+                .await
+                .unwrap_err();
                 assert!(error.to_string().contains("unknown provider profile"));
                 assert_eq!(request_count.load(Ordering::SeqCst), 0);
 
@@ -1305,9 +1363,13 @@ mod tests {
                 let temp = tempfile::tempdir().unwrap();
                 install_profile(temp.path(), &base_url, "qualified");
 
-                let report = qualify_provider_model("qualified", "cheap-code-model")
-                    .await
-                    .unwrap();
+                let report = qualify_provider_model(
+                    &crate::host_runtime::WriteAuthority::unowned_for_test(),
+                    "qualified",
+                    "cheap-code-model",
+                )
+                .await
+                .unwrap();
                 assert!(report.coding_ready);
                 assert_eq!(report.computer_use_tier, ComputerUseTier::SemanticAct);
                 assert_eq!(
@@ -1376,7 +1438,13 @@ mod tests {
                 );
                 assert!(unqualified.models[0].capabilities.tools);
 
-                let report = qualify_provider_model("xai", "grok-4.5").await.unwrap();
+                let report = qualify_provider_model(
+                    &crate::host_runtime::WriteAuthority::unowned_for_test(),
+                    "xai",
+                    "grok-4.5",
+                )
+                .await
+                .unwrap();
                 assert!(report.coding_ready);
                 assert_eq!(report.provider_id, "xai");
                 assert_eq!(report.computer_use_tier, ComputerUseTier::SemanticAct);
@@ -1414,7 +1482,8 @@ mod tests {
                 let target =
                     crate::host_helpers::resolve_model_target(&credentials, "grok-4.5").unwrap();
                 assert_eq!(target.capabilities.source, CapabilitySource::Measured);
-                let host = crate::host::AgentHost::create(crate::host::HostConfig::default());
+                let host = crate::host::AgentHost::create(crate::host::HostConfig::default())
+                    .expect("acquire the GrokPtah instance lock");
                 let projected = host
                     .models()
                     .into_iter()
@@ -1476,9 +1545,13 @@ mod tests {
                 let temp = tempfile::tempdir().unwrap();
                 install_profile(temp.path(), &base_url, "discussion-only");
 
-                let report = qualify_provider_model("discussion-only", "cheap-code-model")
-                    .await
-                    .unwrap();
+                let report = qualify_provider_model(
+                    &crate::host_runtime::WriteAuthority::unowned_for_test(),
+                    "discussion-only",
+                    "cheap-code-model",
+                )
+                .await
+                .unwrap();
                 assert!(!report.coding_ready);
                 assert_eq!(report.computer_use_tier, ComputerUseTier::None);
                 assert_eq!(report.basic_generation.status, QualificationStatus::Pass);
@@ -1498,7 +1571,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn transient_rate_limits_retry_but_remain_bounded() {
+    async fn transient_rate_limit_is_uncertain_and_is_not_retried() {
         let rejections = Arc::new(AtomicUsize::new(2));
         let request_count = Arc::new(AtomicUsize::new(0));
         let (base_url, server) = start_gateway(GatewayState {
@@ -1514,33 +1587,6 @@ mod tests {
         let profile =
             crate::gateway_config::ProviderProfile::openai_compatible("test", "Test", &base_url);
         let mut credentials = QualificationCredentials::new(None, &profile).unwrap();
-        let value = completion(
-            &client,
-            &base_url,
-            &mut credentials,
-            serde_json::json!({
-                "model": "cheap-code-model",
-                "messages": [{"role": "user", "content": "synthetic"}],
-                "stream": false
-            }),
-            false,
-        )
-        .await
-        .unwrap();
-        assert_eq!(message_content(&value), Some(GENERATION_MARKER));
-        assert_eq!(request_count.load(Ordering::SeqCst), 3);
-        server.abort();
-
-        let request_count = Arc::new(AtomicUsize::new(0));
-        let (base_url, server) = start_gateway(GatewayState {
-            prose_tools: false,
-            json_for_stream: false,
-            reject_first_tool_choice: false,
-            tool_choice_rejections: Arc::new(AtomicUsize::new(0)),
-            rate_limits_remaining: Arc::new(AtomicUsize::new(20)),
-            request_count: request_count.clone(),
-        })
-        .await;
         let error = completion(
             &client,
             &base_url,
@@ -1555,7 +1601,10 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.to_string().contains("HTTP 429"));
-        assert_eq!(request_count.load(Ordering::SeqCst), 4);
+        assert!(error
+            .to_string()
+            .contains("explicit reconciliation required"));
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
         server.abort();
     }
 }

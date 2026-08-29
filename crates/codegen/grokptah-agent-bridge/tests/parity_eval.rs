@@ -85,7 +85,8 @@ async fn smoke_search_lists_and_reads() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     let mut rx = host.take_event_receiver().unwrap();
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
@@ -114,7 +115,8 @@ async fn smoke_edit_apply_patch_region() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     let mut rx = host.take_event_receiver().unwrap();
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
@@ -143,7 +145,8 @@ async fn smoke_refuse_unsafe_write_in_readonly() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     let mut rx = host.take_event_receiver().unwrap();
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
@@ -166,7 +169,8 @@ async fn smoke_todo_and_memory_tools() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     let mut rx = host.take_event_receiver().unwrap();
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
@@ -200,7 +204,8 @@ async fn compact_never_shrinks_local_transcript() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     let mut rx = host.take_event_receiver().unwrap();
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
@@ -271,7 +276,8 @@ async fn tools_persist_on_transcript_after_offline_write() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     let mut rx = host.take_event_receiver().unwrap();
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
@@ -304,7 +310,8 @@ async fn terminal_handoff_enrichment_reports_changed_files() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     let mut rx = host.take_event_receiver().unwrap();
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
@@ -347,7 +354,8 @@ async fn smoke_web_fetch_offline() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     let mut rx = host.take_event_receiver().unwrap();
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
@@ -390,7 +398,8 @@ async fn smoke_web_fetch_offline() {
 async fn rate_limited_surfaces_user_visible_event() {
     let _iso = IsolatedHome::install();
     let dir = fixture_repo();
-    let host = AgentHost::create(HostConfig::default());
+    let host =
+        AgentHost::create(HostConfig::default()).expect("acquire the GrokPtah instance lock");
     let mut rx = host.take_event_receiver().unwrap();
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();

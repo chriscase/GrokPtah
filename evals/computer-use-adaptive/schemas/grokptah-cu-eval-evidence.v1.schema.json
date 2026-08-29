@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:grokptah:schema:cu-eval-evidence:v1",
+  "title": "GrokPtah Computer Use adaptive evaluation evidence v1",
+  "description": "Redacted reproducible evidence. No credentials, raw screenshots of real displays, host paths, grant secrets, or provider tokens.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "evidenceId",
+    "scenarioId",
+    "profile",
+    "adapter",
+    "repetition",
+    "observationIds",
+    "dispatchIds",
+    "observations",
+    "physicalDispatches",
+    "authority",
+    "trace",
+    "redacted",
+    "contentSha256"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "grokptah.cu_eval_evidence.v1" },
+    "evidenceId": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "scenarioId": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "profile": { "type": "string", "enum": ["economy", "balanced", "high_assurance"] },
+    "adapter": { "type": "string", "enum": ["text_only_tools", "weak_multimodal", "malformed_overconfident", "stationarity_loop", "frontier_multimodal"] },
+    "repetition": { "type": "integer", "minimum": 0 },
+    "observationIds": { "type": "array", "items": { "type": "string" } },
+    "dispatchIds": { "type": "array", "items": { "type": "string" } },
+    "observations": {
+      "type": "array",
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["observationId", "sequence", "surfaceId", "generation", "incarnation", "capturedAtMs", "encodedBytes", "imageBytes"],
+        "properties": {
+          "observationId": { "type": "string", "minLength": 1 },
+          "sequence": { "type": "integer", "minimum": 1 },
+          "surfaceId": { "type": "string", "minLength": 1 },
+          "generation": { "type": "integer", "minimum": 1 },
+          "incarnation": { "type": "integer", "minimum": 1 },
+          "capturedAtMs": { "type": "integer", "minimum": 0 },
+          "encodedBytes": { "type": "integer", "minimum": 0 },
+          "imageBytes": { "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    "physicalDispatches": {
+      "type": "array",
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["dispatchId", "leaseId", "grantId", "visualGrantId", "permitted", "agentId", "surfaceId", "conflictDomain", "observationId", "observationSequence", "surfaceGeneration", "surfaceIncarnation", "leaseIncarnation", "actionClass", "grantRemainingUsesBefore", "grantExpiresAtMs", "clockMs"],
+        "properties": {
+          "dispatchId": { "type": "string", "minLength": 1 },
+          "leaseId": { "type": "string", "minLength": 1 },
+          "grantId": { "type": ["string", "null"] },
+          "visualGrantId": { "type": ["string", "null"] },
+          "permitted": { "type": "boolean" },
+          "agentId": { "type": "string" },
+          "surfaceId": { "type": "string" },
+          "conflictDomain": { "type": "string" },
+          "observationId": { "type": "string", "minLength": 1 },
+          "observationSequence": { "type": "integer", "minimum": 0 },
+          "surfaceGeneration": { "type": "integer", "minimum": 0 },
+          "surfaceIncarnation": { "type": "integer", "minimum": 0 },
+          "leaseIncarnation": { "type": "integer", "minimum": 0 },
+          "actionClass": { "type": "string", "enum": ["semantic", "text_entry", "key_chord", "pointer_fallback"] },
+          "grantRemainingUsesBefore": { "type": ["integer", "null"], "minimum": 0 },
+          "grantExpiresAtMs": { "type": ["integer", "null"], "minimum": 0 },
+          "clockMs": { "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runId", "grantId", "leaseIds", "visualGrantId"],
+      "properties": {
+        "runId": { "type": "string" },
+        "grantId": { "type": ["string", "null"] },
+        "leaseIds": { "type": "array", "items": { "type": "string" } },
+        "visualGrantId": { "type": ["string", "null"] }
+      }
+    },
+    "trace": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["step", "clockMs", "kind", "detail"],
+        "properties": {
+          "step": { "type": "integer", "minimum": 0 },
+          "clockMs": { "type": "integer", "minimum": 0 },
+          "kind": { "type": "string", "enum": ["agent", "cancel", "contention", "crash", "deny", "dispatch", "downgrade", "grant", "observe", "overlap", "restart", "takeover", "target", "timeout", "uncertain"] },
+          "detail": { "type": "string", "maxLength": 256 }
+        }
+      }
+    },
+    "redacted": { "const": true },
+    "contentSha256": { "type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[a-f0-9]{64}$" }
+  }
+}

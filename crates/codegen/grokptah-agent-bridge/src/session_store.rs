@@ -21,6 +21,7 @@
 //!
 //! Migrates legacy v1 `workspace.json` that embedded full sessions (one-shot).
 
+use crate::host_runtime::DurableWriteGuard;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -154,7 +155,11 @@ fn prompt_queue_path(id: Uuid) -> PathBuf {
 }
 
 /// Persist bridge-owned prompt queue entries so ordering survives restart (#196).
-pub fn save_prompt_queue(id: Uuid, queue: &crate::prompt_queue::SessionPromptQueue) -> Result<()> {
+pub fn save_prompt_queue(
+    _write: &DurableWriteGuard,
+    id: Uuid,
+    queue: &crate::prompt_queue::SessionPromptQueue,
+) -> Result<()> {
     ensure_home();
     let _ = fs::create_dir_all(session_dir(id));
     let path = prompt_queue_path(id);
@@ -188,7 +193,11 @@ pub fn load_all_prompt_queues(
 }
 
 /// Persist subagent history for a session (reopen / historical summary) (#152).
-pub fn save_session_subagents(id: Uuid, list: &[crate::types::SubagentInfo]) -> Result<()> {
+pub fn save_session_subagents(
+    _write: &DurableWriteGuard,
+    id: Uuid,
+    list: &[crate::types::SubagentInfo],
+) -> Result<()> {
     ensure_home();
     let _ = fs::create_dir_all(session_dir(id));
     // Keep only rows for this session (and rows without session_id for safety).
@@ -220,26 +229,30 @@ pub fn load_session_subagents(id: Uuid) -> Vec<crate::types::SubagentInfo> {
 // ── Public API ──────────────────────────────────────────────────────────────
 
 /// Load chrome + session shells (transcripts empty until [`load_transcript`]).
-pub fn load_workspace() -> Result<(WorkspaceChrome, HashMap<Uuid, Session>)> {
+/// Loading can migrate a v1 workspace in place, which is a durable write —
+/// so it demands write authority even though the common path only reads.
+pub fn load_workspace(
+    write: &DurableWriteGuard,
+) -> Result<(WorkspaceChrome, HashMap<Uuid, Session>)> {
     ensure_home();
     let _ = fs::create_dir_all(sessions_root());
 
     // One-shot migration from monolithic v1 file.
-    migrate_v1_if_needed()?;
+    migrate_v1_if_needed(write)?;
 
     let chrome = load_chrome().unwrap_or_default();
     let sessions = load_all_metas()?;
     Ok((chrome, sessions))
 }
 
-pub fn save_chrome(chrome: &WorkspaceChrome) -> Result<()> {
+pub fn save_chrome(_write: &DurableWriteGuard, chrome: &WorkspaceChrome) -> Result<()> {
     ensure_home();
     let mut c = chrome.clone();
     c.version = STORE_VERSION;
     atomic_write_json(&chrome_path(), &c)
 }
 
-pub fn save_session_meta(session: &Session) -> Result<()> {
+pub fn save_session_meta(_write: &DurableWriteGuard, session: &Session) -> Result<()> {
     let dir = session_dir(session.id);
     fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
     let meta = SessionMeta::from_session(session);
@@ -252,7 +265,11 @@ pub fn save_session_meta(session: &Session) -> Result<()> {
 /// Each entry is serialized to a complete line string first, then written as a
 /// single `write_all` so a crash cannot leave a half-encoded JSON object
 /// mid-line (#118).
-pub fn append_transcript(session: &Session, from_index: usize) -> Result<usize> {
+pub fn append_transcript(
+    write: &DurableWriteGuard,
+    session: &Session,
+    from_index: usize,
+) -> Result<usize> {
     if from_index >= session.transcript.len() {
         return Ok(0);
     }
@@ -278,13 +295,13 @@ pub fn append_transcript(session: &Session, from_index: usize) -> Result<usize> 
     // Durability on turn boundary (best-effort on platforms without full fsync).
     let _ = f.sync_all();
     // Keep meta.message_count in sync
-    save_session_meta(session)?;
+    save_session_meta(write, session)?;
     Ok(n)
 }
 
 /// Full rewrite of transcript.jsonl (rewind / fork only — never compact).
 /// Compact must not call this: local history is append-only forever.
-pub fn rewrite_transcript(session: &Session) -> Result<()> {
+pub fn rewrite_transcript(write: &DurableWriteGuard, session: &Session) -> Result<()> {
     let dir = session_dir(session.id);
     fs::create_dir_all(&dir)?;
     let path = transcript_path(session.id);
@@ -313,7 +330,7 @@ pub fn rewrite_transcript(session: &Session) -> Result<()> {
             let _ = dirf.sync_all();
         }
     }
-    save_session_meta(session)?;
+    save_session_meta(write, session)?;
     Ok(())
 }
 
@@ -371,7 +388,7 @@ pub fn load_transcript(session: &mut Session) -> Result<()> {
 }
 
 /// Delete a session directory (optional GC / close-and-forget).
-pub fn delete_session(id: Uuid) -> Result<()> {
+pub fn delete_session(_write: &DurableWriteGuard, id: Uuid) -> Result<()> {
     let dir = session_dir(id);
     if dir.is_dir() {
         fs::remove_dir_all(&dir).with_context(|| format!("rm -rf {}", dir.display()))?;
@@ -382,6 +399,7 @@ pub fn delete_session(id: Uuid) -> Result<()> {
 /// Soft GC: drop empty "New session" shells older than `max_age` and cap
 /// **active** (non-archived) session dirs. Never deletes open tabs or archived.
 pub fn garbage_collect(
+    write: &DurableWriteGuard,
     open_ids: &[Uuid],
     max_sessions: usize,
     max_empty_age_hours: i64,
@@ -403,7 +421,7 @@ pub fn garbage_collect(
             && m.title == "New session"
             && (now - m.updated_at).num_hours() >= max_empty_age_hours
         {
-            delete_session(m.id)?;
+            delete_session(write, m.id)?;
             removed += 1;
         }
     }
@@ -418,7 +436,7 @@ pub fn garbage_collect(
             if open.contains(&m.id) {
                 continue;
             }
-            delete_session(m.id)?;
+            delete_session(write, m.id)?;
             removed += 1;
         }
     }
@@ -579,7 +597,7 @@ fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 }
 
 /// Migrate monolithic v1 workspace.json → v2 layout.
-fn migrate_v1_if_needed() -> Result<()> {
+fn migrate_v1_if_needed(write: &DurableWriteGuard) -> Result<()> {
     let path = chrome_path();
     if !path.is_file() {
         return Ok(());
@@ -646,7 +664,7 @@ fn migrate_v1_if_needed() -> Result<()> {
             always_approve: v1.always_approve,
             subagent_isolation: SubagentIsolationPreference::Worktree,
         };
-        save_chrome(&chrome)?;
+        save_chrome(write, &chrome)?;
         return Ok(());
     }
 
@@ -657,7 +675,7 @@ fn migrate_v1_if_needed() -> Result<()> {
     for mut s in v1.sessions {
         s.transcript_loaded = true;
         s.persisted_len = 0;
-        rewrite_transcript(&s)?;
+        rewrite_transcript(write, &s)?;
     }
     let chrome = WorkspaceChrome {
         version: STORE_VERSION,
@@ -686,7 +704,7 @@ fn migrate_v1_if_needed() -> Result<()> {
     // Backup then replace
     let bak = path.with_extension("json.v1.bak");
     let _ = fs::copy(&path, &bak);
-    save_chrome(&chrome)?;
+    save_chrome(write, &chrome)?;
     eprintln!(
         "[grokptah] migration complete (backup at {})",
         bak.display()
@@ -744,7 +762,12 @@ mod tests {
         session.transcript.push(TranscriptEntry::user("a"));
         session.transcript.push(TranscriptEntry::assistant("b"));
         session.persisted_len = 0;
-        append_transcript(&session, 0).unwrap();
+        append_transcript(
+            &crate::host_runtime::DurableWriteGuard::unowned_for_test(),
+            &session,
+            0,
+        )
+        .unwrap();
         session.transcript.clear();
         session.transcript_loaded = false;
         load_transcript(&mut session).unwrap();

@@ -80,7 +80,8 @@ async fn default_isolation_keeps_two_mutating_children_from_colliding() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     let mut rx = host.take_event_receiver().unwrap();
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
@@ -165,7 +166,8 @@ async fn plan_kind_denies_write_offline() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     let mut rx = host.take_event_receiver().unwrap();
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
@@ -235,7 +237,8 @@ async fn failed_isolation_requires_explicit_shared_cwd_opt_in() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     let mut rx = host.take_event_receiver().unwrap();
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
@@ -295,15 +298,18 @@ async fn failed_isolation_requires_explicit_shared_cwd_opt_in() {
     );
 }
 
-#[test]
-fn shared_cwd_preference_is_explicit_and_persistent() {
+#[tokio::test]
+async fn shared_cwd_preference_is_explicit_and_persistent() {
     let _iso = IsolatedHome::install();
-    let host = AgentHost::create(HostConfig::default());
+    let host =
+        AgentHost::create(HostConfig::default()).expect("acquire the GrokPtah instance lock");
     assert!(host.set_subagent_isolation("off".into()).is_err());
     host.set_subagent_isolation("shared".into()).unwrap();
-    drop(host);
+    let report = host.shutdown().await;
+    assert!(report.is_clean(), "{}", report.operator_summary());
 
-    let restored = AgentHost::create(HostConfig::default());
+    let restored =
+        AgentHost::create(HostConfig::default()).expect("acquire the GrokPtah instance lock");
     assert_eq!(
         restored.settings_snapshot()["subagentIsolation"],
         serde_json::json!("shared")
