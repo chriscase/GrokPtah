@@ -27,6 +27,10 @@ on:
       - "docs/VERIFICATION.md"
       - "docs/schemas/grokptah-help.v1.schema.json"
       - "evals/**"
+      - "bin/**"
+      - "rust-toolchain.toml"
+      - "clippy.toml"
+      - "rustfmt.toml"
       - ".github/workflows/desktop.yml"
   pull_request:
     paths:
@@ -52,6 +56,10 @@ on:
       - "docs/VERIFICATION.md"
       - "docs/schemas/grokptah-help.v1.schema.json"
       - "evals/**"
+      - "bin/**"
+      - "rust-toolchain.toml"
+      - "clippy.toml"
+      - "rustfmt.toml"
       - ".github/workflows/desktop.yml"
 
 permissions:
@@ -158,11 +166,11 @@ jobs:
           cargo clippy --locked --all-targets -- -D warnings
           cargo test --locked -- --test-threads=1
       - name: Pager fmt + clippy + tests
-        working-directory: crates/codegen/xai-grok-pager
+        working-directory: .
         run: |
-          cargo fmt --check
-          cargo clippy --locked --all-targets -- -D warnings
-          cargo test --locked --lib --tests -- --test-threads=1
+          cargo fmt -p xai-grok-pager -p xai-grok-pager-bin -p xai-grok-pager-minimal -p xai-grok-pager-pty-harness -p xai-grok-pager-render -- --check
+          cargo clippy --locked -p xai-grok-pager -p xai-grok-pager-bin -p xai-grok-pager-minimal -p xai-grok-pager-pty-harness -p xai-grok-pager-render --all-targets -- -D warnings
+          cargo test --locked -p xai-grok-pager -p xai-grok-pager-bin -p xai-grok-pager-minimal -p xai-grok-pager-pty-harness -p xai-grok-pager-render --lib --tests -- --test-threads=1
       - name: Host authority spine (fmt + clippy + tests)
         working-directory: .
         run: |

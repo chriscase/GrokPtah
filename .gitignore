@@ -6,6 +6,7 @@
 # GrokPtah desktop
 desktop/node_modules/
 desktop/dist/
+desktop/tsconfig.tsbuildinfo
 desktop/src-tauri/target/
 crates/codegen/grokptah-agent-bridge/target/
 evals/certification-lab/target/
