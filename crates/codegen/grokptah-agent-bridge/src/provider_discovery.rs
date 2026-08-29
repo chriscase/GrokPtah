@@ -10,7 +10,10 @@ use crate::gateway_config::{ProviderKind, ProviderModel};
 
 const MAX_CATALOG_BYTES: usize = 1024 * 1024;
 
-pub async fn discover_profile_models(profile_id: &str) -> Result<Vec<ProviderModel>> {
+pub(crate) async fn discover_profile_models(
+    authority: &crate::host_runtime::WriteAuthority,
+    profile_id: &str,
+) -> Result<Vec<ProviderModel>> {
     let config = crate::gateway_config::load();
     let profile = config
         .profile(profile_id)
@@ -109,7 +112,10 @@ pub async fn discover_profile_models(profile_id: &str) -> Result<Vec<ProviderMod
             }
             target.upsert_model(discovered.clone());
         }
-        crate::gateway_config::save(&updated).context("save discovered provider models")?;
+        let write = authority
+            .begin("saving discovered provider models")
+            .context("durable-write authority for discovered provider models")?;
+        crate::gateway_config::save(&write, &updated).context("save discovered provider models")?;
     }
 
     Ok(best)

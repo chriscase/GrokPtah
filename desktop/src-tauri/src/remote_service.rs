@@ -4,9 +4,9 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use grokptah_agent_bridge::orchestration::WorkPolicy;
 use grokptah_agent_bridge::{
-    ActivationRecord, AgentRecord, AgentResumePlan, JournalPage, McpControlClient,
-    RoutineRecord, RoutineSnapshot, RunExecutionMode, RunRecord, RunScope, RunState,
-    RuntimeConnectionState, RuntimeTarget, SessionUpdate, WorkAttemptView, WorkItem,
+    ActivationRecord, AgentRecord, AgentResumePlan, JournalPage, McpControlClient, RoutineRecord,
+    RoutineSnapshot, RunExecutionMode, RunRecord, RunScope, RunState, RuntimeConnectionState,
+    RuntimeTarget, SessionUpdate, WorkAttemptView, WorkItem,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -528,7 +528,12 @@ impl RemoteServiceState {
         };
         Ok(Some(
             client
-                .fire_routine(session_id, workspace, routine_id, Uuid::new_v4().to_string())
+                .fire_routine(
+                    session_id,
+                    workspace,
+                    routine_id,
+                    Uuid::new_v4().to_string(),
+                )
                 .await?,
         ))
     }
@@ -1705,7 +1710,8 @@ mod tests {
         let host = AgentHost::create(HostConfig {
             always_approve: true,
             ..HostConfig::default()
-        });
+        })
+        .expect("acquire the GrokPtah instance lock");
         let orch = OrchestrationService::new(
             host.clone(),
             host.event_bus(),

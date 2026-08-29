@@ -183,7 +183,8 @@ struct ComputerProbeArguments {
     text: String,
 }
 
-pub async fn qualify_provider_model(
+pub(crate) async fn qualify_provider_model(
+    authority: &crate::host_runtime::WriteAuthority,
     provider_id: &str,
     model_id: &str,
 ) -> Result<ProviderQualificationReport> {
@@ -386,7 +387,11 @@ pub async fn qualify_provider_model(
             .current()
             .map(crate::auth_store::WireCredentials::qualification_identity_fingerprint)
             .unwrap_or_else(|| "anonymous".into());
+        let write = authority
+            .begin("saving managed measured model capabilities")
+            .context("durable-write authority for measured capabilities")?;
         crate::gateway_config::save_managed_profile_capabilities(
+            &write,
             &profile,
             &measured_model,
             &credential_fingerprint,
@@ -400,7 +405,11 @@ pub async fn qualify_provider_model(
             .and_then(|item| item.models.iter_mut().find(|model| model.id == model_id))
             .ok_or_else(|| anyhow!("provider/model disappeared during qualification"))?;
         *stored_model = measured_model;
-        crate::gateway_config::save(&updated).context("save measured model capabilities")?;
+        let write = authority
+            .begin("saving measured model capabilities")
+            .context("durable-write authority for measured capabilities")?;
+        crate::gateway_config::save(&write, &updated)
+            .context("save measured model capabilities")?;
     }
 
     Ok(ProviderQualificationReport {
@@ -1076,7 +1085,11 @@ mod tests {
             "cheap-code-model",
         ));
         config.upsert_profile(profile).unwrap();
-        crate::gateway_config::save(&config).unwrap();
+        crate::gateway_config::save(
+            &crate::host_runtime::DurableWriteGuard::unowned_for_test(),
+            &config,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1200,9 +1213,13 @@ mod tests {
                 let previous_key = std::env::var_os("XAI_API_KEY");
                 unsafe { std::env::set_var("XAI_API_KEY", "must-not-leak") };
 
-                let error = qualify_provider_model("attacker", "grok-4.5")
-                    .await
-                    .unwrap_err();
+                let error = qualify_provider_model(
+                    &crate::host_runtime::WriteAuthority::unowned_for_test(),
+                    "attacker",
+                    "grok-4.5",
+                )
+                .await
+                .unwrap_err();
                 assert!(error.to_string().contains("unknown provider profile"));
                 assert_eq!(request_count.load(Ordering::SeqCst), 0);
 
@@ -1305,9 +1322,13 @@ mod tests {
                 let temp = tempfile::tempdir().unwrap();
                 install_profile(temp.path(), &base_url, "qualified");
 
-                let report = qualify_provider_model("qualified", "cheap-code-model")
-                    .await
-                    .unwrap();
+                let report = qualify_provider_model(
+                    &crate::host_runtime::WriteAuthority::unowned_for_test(),
+                    "qualified",
+                    "cheap-code-model",
+                )
+                .await
+                .unwrap();
                 assert!(report.coding_ready);
                 assert_eq!(report.computer_use_tier, ComputerUseTier::SemanticAct);
                 assert_eq!(
@@ -1376,7 +1397,13 @@ mod tests {
                 );
                 assert!(unqualified.models[0].capabilities.tools);
 
-                let report = qualify_provider_model("xai", "grok-4.5").await.unwrap();
+                let report = qualify_provider_model(
+                    &crate::host_runtime::WriteAuthority::unowned_for_test(),
+                    "xai",
+                    "grok-4.5",
+                )
+                .await
+                .unwrap();
                 assert!(report.coding_ready);
                 assert_eq!(report.provider_id, "xai");
                 assert_eq!(report.computer_use_tier, ComputerUseTier::SemanticAct);
@@ -1414,7 +1441,8 @@ mod tests {
                 let target =
                     crate::host_helpers::resolve_model_target(&credentials, "grok-4.5").unwrap();
                 assert_eq!(target.capabilities.source, CapabilitySource::Measured);
-                let host = crate::host::AgentHost::create(crate::host::HostConfig::default());
+                let host = crate::host::AgentHost::create(crate::host::HostConfig::default())
+                    .expect("acquire the GrokPtah instance lock");
                 let projected = host
                     .models()
                     .into_iter()
@@ -1476,9 +1504,13 @@ mod tests {
                 let temp = tempfile::tempdir().unwrap();
                 install_profile(temp.path(), &base_url, "discussion-only");
 
-                let report = qualify_provider_model("discussion-only", "cheap-code-model")
-                    .await
-                    .unwrap();
+                let report = qualify_provider_model(
+                    &crate::host_runtime::WriteAuthority::unowned_for_test(),
+                    "discussion-only",
+                    "cheap-code-model",
+                )
+                .await
+                .unwrap();
                 assert!(!report.coding_ready);
                 assert_eq!(report.computer_use_tier, ComputerUseTier::None);
                 assert_eq!(report.basic_generation.status, QualificationStatus::Pass);

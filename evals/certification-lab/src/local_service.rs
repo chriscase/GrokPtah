@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use grokptah_agent_bridge::provider_observation::ProviderObservationSession;
 use grokptah_agent_bridge::{
-    home_override_serial, start_control_server_with, AgentHost, AgentHostHandle,
-    ControlServerHandle, ControlServerLimits, HostConfig, McpControlClient, OrchestrationConfig,
+    home_override_serial, start_control_server_with, AgentHost, ControlServerHandle,
+    ControlServerLimits, HostConfig, HostRuntime, McpControlClient, OrchestrationConfig,
     OrchestrationService, RunBounds, RuntimeHome, WorkspaceAllowlist,
 };
 use uuid::Uuid;
@@ -139,7 +139,10 @@ pub struct LocalService {
     token: String,
     base_url: String,
     server: Option<ControlServerHandle>,
-    host: Option<AgentHostHandle>,
+    /// The single non-cloneable owner of the lab's disposable home: it owns the
+    /// instance lock and the task supervisor, and its ordered shutdown is what
+    /// releases them (#455).
+    host: Option<HostRuntime>,
     _process_environment: ProcessEnvironment,
 }
 
@@ -206,8 +209,16 @@ impl LocalService {
             server.stop_and_wait().await;
         }
         if let Some(host) = self.host.take() {
-            let _ = host.stop();
-            drop(host);
+            // Ordered shutdown: join every supervised task, flush durable
+            // state, then release the instance lock exactly once, so the next
+            // lab run can reopen the same disposable home immediately (#455).
+            let report = host.shutdown().await;
+            if !report.is_clean() {
+                eprintln!(
+                    "[certification-lab] host shutdown: {}",
+                    report.operator_summary()
+                );
+            }
         }
     }
 }
@@ -228,7 +239,7 @@ impl Drop for LocalService {
 async fn bootstrap(
     config: &LocalServiceConfig,
     token: &str,
-) -> Result<(AgentHostHandle, ControlServerHandle, String)> {
+) -> Result<(HostRuntime, ControlServerHandle, String)> {
     let runtime_home = RuntimeHome::from_path(&config.runtime_home)
         .context("reopen disposable GrokPtah runtime home")?;
     let host = AgentHost::create_with_runtime_home(
@@ -240,7 +251,8 @@ async fn bootstrap(
             ..HostConfig::default()
         },
         runtime_home,
-    );
+    )
+    .context("acquire the GrokPtah single-instance lock for the disposable lab home")?;
     host.start().context("start isolated GrokPtah host")?;
 
     let store = match host.ensure_orchestration_store() {

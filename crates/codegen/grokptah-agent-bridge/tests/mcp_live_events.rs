@@ -21,7 +21,7 @@ fn setup_with_guard(
 ) -> (
     tempfile::TempDir,
     HomeGuard,
-    grokptah_agent_bridge::AgentHostHandle,
+    grokptah_agent_bridge::HostRuntime,
     tempfile::TempDir,
     Arc<OrchestrationService>,
 ) {
@@ -31,7 +31,8 @@ fn setup_with_guard(
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host.start().unwrap();
     host.set_project_cwd(workspace.path()).unwrap();
     let orch = OrchestrationService::new(

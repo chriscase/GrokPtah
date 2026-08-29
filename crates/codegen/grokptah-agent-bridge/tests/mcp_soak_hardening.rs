@@ -94,7 +94,8 @@ async fn soak_bootstrap_capacity_429_and_timeout_504() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host.start().unwrap();
     host.set_project_cwd(ws.path()).unwrap();
 
@@ -187,7 +188,8 @@ async fn soak_desktop_bootstrap_node_campaign() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host.start().unwrap();
     host.set_project_cwd(ws.path()).unwrap();
 
@@ -372,14 +374,29 @@ async fn soak_desktop_bootstrap_node_campaign() {
     }
     assert!(replay_terminal, "restart idempotency fixture must finish");
 
-    // Simulate a real desktop process restart: stop the first server and drop
-    // its host so the next host must reopen the same durable home and ledger.
+    // Simulate a real desktop process restart. The ordered host shutdown is
+    // the production primitive (#455): it stops and joins the control plane,
+    // cancels and joins every supervised task, flushes durable state, and
+    // releases the single-instance lock exactly once — so the next host can
+    // reopen the same durable home immediately, with no retry and no delay.
     srv.stop_and_wait().await;
+    let shutdown = host.shutdown().await;
+    assert_eq!(
+        shutdown.supervised_tasks_remaining, 0,
+        "shutdown must join every supervised task before releasing the lock"
+    );
+    assert!(shutdown.process_lock_released);
+    assert!(!shutdown.process_lock_held_after);
+    assert!(
+        shutdown.lock_file_present,
+        "the instance lock file must remain on disk"
+    );
     drop(host);
     let host2 = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host2.start().unwrap();
     host2.set_project_cwd(ws.path()).unwrap();
     let recovered_session = Uuid::parse_str(&session_ids[0]).unwrap();
@@ -446,6 +463,9 @@ async fn soak_desktop_bootstrap_node_campaign() {
         "offline write must leave soak_marker.txt"
     );
     srv2.stop_and_wait().await;
+    let shutdown2 = host2.shutdown().await;
+    assert!(shutdown2.process_lock_released);
+    assert!(!shutdown2.process_lock_held_after);
     drop(host2);
 
     set_grokptah_home_override(None);
@@ -467,7 +487,8 @@ fn soak_restart_recovery_matrix() {
         let host = AgentHost::create(HostConfig {
             always_approve: true,
             ..HostConfig::default()
-        });
+        })
+        .expect("acquire the GrokPtah instance lock");
         host.start().unwrap();
         host.set_project_cwd(ws.path()).unwrap();
         let session = host.session_new_kind(SessionKind::Build).unwrap();
@@ -588,7 +609,8 @@ fn soak_restart_recovery_matrix() {
     let host2 = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host2.start().unwrap();
     let queued = host2.session_queue_list(session_id).unwrap();
     assert!(!queued.is_empty());

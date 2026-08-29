@@ -53,6 +53,14 @@ use super::workload::{
 /// queued submissions into an unbounded in-memory prompt store.
 const MAX_PENDING_ADMISSIONS: usize = 32;
 
+/// How long `ptah_cancel` waits to *prove* a cancelled run's session went idle
+/// before reporting `teardownComplete: false`.
+///
+/// Bounded on purpose: an uncooperative turn must produce one honest "could not
+/// prove it" rather than block the caller, and `false` is the fail-closed answer
+/// the receipt is designed around (#455).
+const TEARDOWN_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[derive(Default)]
 struct AdmissionQueueState {
     pending: VecDeque<PendingRun>,
@@ -288,9 +296,9 @@ impl OrchestrationService {
     }
 
     fn start_manager_supervisor(&self) {
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        if tokio::runtime::Handle::try_current().is_err() {
             return;
-        };
+        }
         {
             let mut status = self.manager_supervisor.lock();
             status.enabled = true;
@@ -299,32 +307,39 @@ impl OrchestrationService {
         let service_ref = self.self_ref.clone();
         let mut events = self.host.subscribe_events();
         let wakeup = self.manager_wakeup.clone();
-        let watcher = runtime.spawn(async move {
-            let mut ticker = tokio::time::interval(DEFAULT_MANAGER_TICK_INTERVAL);
-            loop {
-                tokio::select! {
-                    _ = ticker.tick() => {
-                        let Some(service) = service_ref.upgrade() else { break; };
-                        service.drive_manager_supervisor_once().await;
-                    }
-                    update = events.recv() => {
-                        let Some(update) = update else { break; };
-                        if matches!(update,
-                            crate::events::SessionUpdate::TurnComplete { .. }
-                            | crate::events::SessionUpdate::Error { .. }
-                            | crate::events::SessionUpdate::PermissionRequired { .. }
-                        ) {
-                            let Some(service) = service_ref.upgrade() else { break; };
-                            service.drive_manager_supervisor_once().await;
+        let shutdown = self.host.shutdown_token();
+        let Ok(watcher) =
+            self.host
+                .spawn_supervised("starting the manager supervisor watcher", async move {
+                    let mut ticker = tokio::time::interval(DEFAULT_MANAGER_TICK_INTERVAL);
+                    loop {
+                        tokio::select! {
+                            _ = shutdown.cancelled() => break,
+                            _ = ticker.tick() => {
+                                let Some(service) = service_ref.upgrade() else { break; };
+                                service.drive_manager_supervisor_once().await;
+                            }
+                            update = events.recv() => {
+                                let Some(update) = update else { break; };
+                                if matches!(update,
+                                    crate::events::SessionUpdate::TurnComplete { .. }
+                                    | crate::events::SessionUpdate::Error { .. }
+                                    | crate::events::SessionUpdate::PermissionRequired { .. }
+                                ) {
+                                    let Some(service) = service_ref.upgrade() else { break; };
+                                    service.drive_manager_supervisor_once().await;
+                                }
+                            }
+                            _ = wakeup.notified() => {
+                                let Some(service) = service_ref.upgrade() else { break; };
+                                service.drive_manager_supervisor_once().await;
+                            }
                         }
                     }
-                    _ = wakeup.notified() => {
-                        let Some(service) = service_ref.upgrade() else { break; };
-                        service.drive_manager_supervisor_once().await;
-                    }
-                }
-            }
-        });
+                })
+        else {
+            return;
+        };
         *self.manager_supervisor_watcher.lock() = Some(watcher);
     }
 
@@ -835,46 +850,53 @@ impl OrchestrationService {
     }
 
     fn start_scheduler_watcher(&self) {
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        if tokio::runtime::Handle::try_current().is_err() {
             return;
-        };
+        }
         let mut events = self.host.subscribe_events();
         let wakeup = self.host.orchestration_wakeup();
         let service_ref = self.self_ref.clone();
-        let watcher = runtime.spawn(async move {
-            loop {
-                tokio::select! {
-                    update = events.recv() => {
-                        let Some(update) = update else {
-                            break;
-                        };
-                        if matches!(
-                            update,
-                            crate::events::SessionUpdate::TurnComplete { .. }
-                                | crate::events::SessionUpdate::Error { .. }
-                        ) {
+        let shutdown = self.host.shutdown_token();
+        let Ok(watcher) = self.host.spawn_supervised(
+            "starting the orchestration scheduler watcher",
+            async move {
+                loop {
+                    tokio::select! {
+                        _ = shutdown.cancelled() => break,
+                        update = events.recv() => {
+                            let Some(update) = update else {
+                                break;
+                            };
+                            if matches!(
+                                update,
+                                crate::events::SessionUpdate::TurnComplete { .. }
+                                    | crate::events::SessionUpdate::Error { .. }
+                            ) {
+                                let Some(service) = service_ref.upgrade() else {
+                                    break;
+                                };
+                                service.pump_pending();
+                            }
+                        }
+                        _ = wakeup.notified() => {
                             let Some(service) = service_ref.upgrade() else {
                                 break;
                             };
                             service.pump_pending();
                         }
                     }
-                    _ = wakeup.notified() => {
-                        let Some(service) = service_ref.upgrade() else {
-                            break;
-                        };
-                        service.pump_pending();
-                    }
                 }
-            }
-        });
+            },
+        ) else {
+            return;
+        };
         *self.scheduler_watcher.lock() = Some(watcher);
     }
 
     fn start_native_executor(&self) {
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        if tokio::runtime::Handle::try_current().is_err() {
             return;
-        };
+        }
         {
             let mut status = self.native_executor.lock();
             status.enabled = true;
@@ -883,23 +905,31 @@ impl OrchestrationService {
         }
         let service_ref = self.self_ref.clone();
         let mut events = self.host.subscribe_events();
-        let watcher = runtime.spawn(async move {
-            let mut ticker =
-                tokio::time::interval(Duration::from_millis(DEFAULT_NATIVE_EXECUTOR_INTERVAL_MS));
-            loop {
-                tokio::select! {
-                    _ = ticker.tick() => {
-                        let Some(service) = service_ref.upgrade() else { break; };
-                        service.drive_native_executor_once().await;
+        let shutdown = self.host.shutdown_token();
+        let Ok(watcher) =
+            self.host
+                .spawn_supervised("starting the native executor watcher", async move {
+                    let mut ticker = tokio::time::interval(Duration::from_millis(
+                        DEFAULT_NATIVE_EXECUTOR_INTERVAL_MS,
+                    ));
+                    loop {
+                        tokio::select! {
+                            _ = shutdown.cancelled() => break,
+                            _ = ticker.tick() => {
+                                let Some(service) = service_ref.upgrade() else { break; };
+                                service.drive_native_executor_once().await;
+                            }
+                            update = events.recv() => {
+                                let Some(update) = update else { break; };
+                                let Some(service) = service_ref.upgrade() else { break; };
+                                service.handle_native_executor_event(&update).await;
+                            }
+                        }
                     }
-                    update = events.recv() => {
-                        let Some(update) = update else { break; };
-                        let Some(service) = service_ref.upgrade() else { break; };
-                        service.handle_native_executor_event(&update).await;
-                    }
-                }
-            }
-        });
+                })
+        else {
+            return;
+        };
         *self.native_executor_watcher.lock() = Some(watcher);
     }
 
@@ -1418,11 +1448,17 @@ impl OrchestrationService {
         if let Some(mut supervisor) = supervisor {
             supervisor.stop_and_wait();
         }
-        if let Some(watcher) = self.native_executor_watcher.lock().take() {
+        // Abort *and join*: an aborted watcher has not released its store
+        // handle or its event subscription until its task has actually
+        // finished, so only the join is a barrier (#455).
+        let watchers = [
+            self.native_executor_watcher.lock().take(),
+            self.manager_supervisor_watcher.lock().take(),
+            self.scheduler_watcher.lock().take(),
+        ];
+        for watcher in watchers.into_iter().flatten() {
             watcher.abort();
-        }
-        if let Some(watcher) = self.manager_supervisor_watcher.lock().take() {
-            watcher.abort();
+            let _ = watcher.await;
         }
         self.native_executor.lock().enabled = false;
         self.manager_supervisor.lock().enabled = false;
@@ -7108,13 +7144,30 @@ impl OrchestrationService {
         let mut agg_rx = bus.subscribe();
         let store_agg = store.clone();
         let rid_agg = rid.clone();
-        let agg_task = tokio::spawn(async move {
-            while let Some(update) = agg_rx.recv().await {
-                apply_run_aggregate(&store_agg, &rid_agg, session_id, &update);
-            }
-        });
+        let agg_shutdown = self.host.shutdown_token();
+        let Ok(agg_task) = self
+            .host
+            .spawn_supervised("starting a run aggregator", async move {
+                loop {
+                    tokio::select! {
+                        update = agg_rx.recv() => {
+                            let Some(update) = update else { break };
+                            apply_run_aggregate(&store_agg, &rid_agg, session_id, &update);
+                        }
+                        _ = agg_shutdown.cancelled() => break,
+                    }
+                }
+            })
+        else {
+            // Shutting down: the admission slot must not be stranded.
+            self.host.release_orchestration_turn(&rid);
+            return;
+        };
 
-        let join = tokio::spawn(async move {
+        let run_shutdown = self.host.shutdown_token();
+        let run_id_for_release = rid.clone();
+        let agg_abort = agg_task.abort_handle();
+        let spawned = self.host.spawn_supervised("starting a run", async move {
             let admission_guard = AdmissionGuard {
                 host: host.clone(),
                 run_id: rid.clone(),
@@ -7133,8 +7186,30 @@ impl OrchestrationService {
 
             // Cancellation and teardown are bounded. A backend that ignores its
             // token cannot hold admission capacity forever.
+            let mut host_stopped = false;
             let (timed_out, result): (bool, Result<String, anyhow::Error>) = tokio::select! {
                 biased;
+                _ = run_shutdown.cancelled() => {
+                    // Ordered host shutdown: stop the turn through the same
+                    // bounded teardown the duration limit uses, so the run
+                    // still finalizes durably before the task is joined.
+                    host_stopped = true;
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        host.cancel_turn_and_await(Some(session_id)),
+                    ).await;
+                    let settled = tokio::time::timeout(
+                        Duration::from_secs(1),
+                        &mut prompt_fut,
+                    ).await;
+                    let result = match settled {
+                        Ok(result) => result,
+                        Err(_) => Err(anyhow::anyhow!(
+                            "host shutdown stopped this run before it completed"
+                        )),
+                    };
+                    (false, result)
+                }
                 _ = &mut deadline => {
                     let _ = tokio::time::timeout(
                         Duration::from_secs(5),
@@ -7173,7 +7248,19 @@ impl OrchestrationService {
             candidate.end_seq = candidate.end_seq.or(Some(end_seq));
             candidate.updated_at = Utc::now();
             if !candidate.state.is_terminal() {
-                if timed_out {
+                if host_stopped {
+                    // A run stopped by host shutdown is interrupted, not
+                    // failed or limit-reached: it records the same durable
+                    // state that crash recovery produces, so the replacement
+                    // process sees one consistent story.
+                    candidate.state = RunState::Interrupted;
+                    candidate.terminal_result = Some("interrupted".into());
+                    candidate.error_code = Some("interrupted".into());
+                    candidate.stop_cause = Some(RunStopCause::Interrupted);
+                    if let Ok(text) = &durable_result {
+                        candidate.final_response = Some(text.clone());
+                    }
+                } else if timed_out {
                     candidate.state = RunState::LimitReached;
                     candidate.terminal_result = Some("limit_reached".into());
                     candidate.error_code = Some("limit_reached".into());
@@ -7273,12 +7360,32 @@ impl OrchestrationService {
                     }
                 }
             }
+            // Bounded: a finalization that cannot be persisted must not spin
+            // forever. Once the host has sealed durable writes, retrying can
+            // never succeed — the run stays non-terminal and the replacement
+            // process recovers it as interrupted, which is the documented
+            // durable-recovery path (#455).
+            const MAX_FINALIZATION_ATTEMPTS: u32 = 8;
             let mut attempt = 0u32;
             loop {
                 let error = match store.persist_finalization(&candidate) {
                     Ok(_) => break,
                     Err(error) => error.to_string(),
                 };
+                if !host.can_write_durably() {
+                    eprintln!(
+                        "[grokptah] run {rid} finalization abandoned: the host released \
+                         durable-write authority ({error}); recovery will mark it interrupted"
+                    );
+                    break;
+                }
+                if attempt >= MAX_FINALIZATION_ATTEMPTS {
+                    eprintln!(
+                        "[grokptah] run {rid} finalization gave up after \
+                         {MAX_FINALIZATION_ATTEMPTS} attempts: {error}"
+                    );
+                    break;
+                }
                 if attempt == 0 {
                     let entry = AuditEntry {
                         ts: Utc::now(),
@@ -7321,7 +7428,16 @@ impl OrchestrationService {
             }
         });
         self.reaping_handles();
-        self.join_handles.lock().push(join);
+        match spawned {
+            Ok(join) => self.join_handles.lock().push(join),
+            Err(_) => {
+                // Shutting down between the aggregator and the run task: leave
+                // nothing stranded. The durable record stays non-terminal and
+                // is recovered as interrupted by the replacement process.
+                agg_abort.abort();
+                self.host.release_orchestration_turn(&run_id_for_release);
+            }
+        }
     }
 
     pub async fn queue_prompt(
@@ -7671,11 +7787,38 @@ impl OrchestrationService {
 
         let was_pending = self.remove_pending(rid);
         let reservation_released = self.host.release_turn_reservation(session_id, rid);
-        let teardown_complete = if was_pending || reservation_released {
+        // `teardownComplete` claims this run's execution is finished. Neither a
+        // de-queued pending run nor a released reservation proves that. Both are
+        // reasons to *expect* the session to be idle, and that expectation rests
+        // on an invariant kept in a different module — a reservation is consumed
+        // under the same lock that registers the turn, so a released reservation
+        // implies the turn never started. That invariant holds today, but it is
+        // not local to this decision and nothing enforces it, so a change to the
+        // reservation lifecycle would silently turn this claim into a lie: the
+        // caller would be told teardown was complete while a provider request or
+        // a tool editing the workspace was still running.
+        //
+        // Proof is cheap, so the claim is proven rather than inferred:
+        // `wait_turn_idle` returns immediately when the session is already idle,
+        // which is exactly the case a released reservation is asserting, so the
+        // fast path stays fast while no longer being taken on trust. A run that
+        // had actually started is still cancelled first, the bounded timeout is
+        // unchanged, and `false` remains the fail-closed answer — "could not
+        // prove teardown finished" is honest where "teardown finished" is not.
+        //
+        // `was_pending` is deliberately *not* folded into that wait. It is
+        // run-scoped proof rather than a proxy: the run was still in the pending
+        // queue, so it was never admitted to a turn and has nothing to wait for.
+        // Session idleness is the wrong question for it — a queued run sits
+        // behind a *different* run's turn, so waiting would report `false` for a
+        // run that is provably torn down, purely because someone else is busy.
+        let teardown_complete = if was_pending {
             true
         } else {
-            tokio::time::timeout(Duration::from_secs(5), async {
-                let _ = self.host.cancel_turn_and_await(Some(session_id)).await;
+            tokio::time::timeout(TEARDOWN_IDLE_TIMEOUT, async {
+                if !reservation_released {
+                    let _ = self.host.cancel_turn_and_await(Some(session_id)).await;
+                }
                 self.host.wait_turn_idle(session_id).await;
             })
             .await

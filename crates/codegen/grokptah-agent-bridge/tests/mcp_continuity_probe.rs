@@ -136,7 +136,8 @@ async fn continuity_probe_is_evidence_first_and_recoverable() {
         always_approve: true,
         event_bus_capacity: Some(256),
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host.start().unwrap();
     let session = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(session.id, workspace.path()).unwrap();

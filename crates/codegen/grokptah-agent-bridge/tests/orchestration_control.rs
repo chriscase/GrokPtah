@@ -36,11 +36,12 @@ fn setup_home() -> (tempfile::TempDir, ProcessEnvGuard) {
     (d, guard)
 }
 
-fn started_host() -> grokptah_agent_bridge::AgentHostHandle {
+fn started_host() -> grokptah_agent_bridge::HostRuntime {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host.start().expect("start host");
     host
 }
@@ -679,7 +680,7 @@ async fn selecting_a_command_in_another_workspace_is_not_an_oracle() {
         .unwrap()[0]
         .clone();
     let orch = OrchestrationService::new(
-        host,
+        host.clone(),
         EventBus::new(64),
         OrchStore::open(home.path().join("orch")).unwrap(),
         OrchestrationConfig {
@@ -946,7 +947,7 @@ async fn workspace_mismatch_fail_closed() {
     let session = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(session.id, ws.path()).unwrap();
     let orch = OrchestrationService::new(
-        host,
+        host.clone(),
         EventBus::new(64),
         OrchStore::open(home.path().join("orch")).unwrap(),
         OrchestrationConfig {
@@ -1008,7 +1009,7 @@ async fn reject_shell_and_admin_prompts() {
     let session = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(session.id, ws.path()).unwrap();
     let orch = OrchestrationService::new(
-        host,
+        host.clone(),
         EventBus::new(64),
         OrchStore::open(home.path().join("orch")).unwrap(),
         OrchestrationConfig {

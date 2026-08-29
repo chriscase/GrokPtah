@@ -97,6 +97,9 @@ struct AppState {
     max_concurrent: usize,
     live_streams: Arc<Semaphore>,
     health_requires_auth: bool,
+    /// Fired when the server stops accepting. Long-lived SSE bodies select on
+    /// it so graceful shutdown cannot hang on an open live stream (#455).
+    shutdown: tokio_util::sync::CancellationToken,
 }
 
 #[derive(Debug, Clone)]
@@ -134,6 +137,7 @@ struct LiveStreamState {
     pending: VecDeque<Bytes>,
     heartbeat: tokio::time::Interval,
     done: bool,
+    shutdown: tokio_util::sync::CancellationToken,
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
@@ -253,6 +257,17 @@ impl LiveStreamState {
                 }
                 _ = self.heartbeat.tick() => {
                     return Some(Bytes::from_static(b": grokptah-control keep-alive\n\n"));
+                }
+                // Without this arm an idle live stream keeps the graceful
+                // shutdown of the serving task open forever, so the host could
+                // never reach its join barrier (#455). The client is told to
+                // resynchronize from the durable journal, which is the same
+                // contract every other recovery path uses.
+                _ = self.shutdown.cancelled() => {
+                    self.queue_recovery(
+                        "control plane is shutting down; resynchronize from the durable journal",
+                    );
+                    continue;
                 }
             }
         }
@@ -459,6 +474,7 @@ pub async fn start_control_server_with_bind(
         max_concurrent,
         live_streams: Arc::new(Semaphore::new(MAX_LIVE_STREAMS)),
         health_requires_auth,
+        shutdown: cancel.clone(),
     };
     let app = Router::new()
         .route("/health", get(health_handler))
@@ -727,6 +743,7 @@ async fn streamable_get_handler(
         pending: VecDeque::new(),
         heartbeat: tokio::time::interval(Duration::from_secs(10)),
         done: false,
+        shutdown: state.shutdown.clone(),
         _permit: permit,
     };
     live.queue_page(page);
@@ -3671,7 +3688,8 @@ mod tests {
         let host = AgentHost::create(HostConfig {
             always_approve: true,
             ..HostConfig::default()
-        });
+        })
+        .expect("acquire the GrokPtah instance lock");
         let bus = host.event_bus();
         let _gui = bus.subscribe();
         let store = OrchStore::open(home.path().join("orch")).unwrap();
@@ -3742,7 +3760,8 @@ mod tests {
         let host = AgentHost::create(HostConfig {
             always_approve: true,
             ..HostConfig::default()
-        });
+        })
+        .expect("acquire the GrokPtah instance lock");
         host.start().unwrap();
         host.set_project_cwd(ws.path()).unwrap();
         let session = host.session_new_kind(crate::SessionKind::Build).unwrap();
@@ -3917,7 +3936,8 @@ mod tests {
         let host = AgentHost::create(HostConfig {
             always_approve: true,
             ..HostConfig::default()
-        });
+        })
+        .expect("acquire the GrokPtah instance lock");
         host.start().unwrap();
         host.set_project_cwd(ws_a.path()).unwrap();
         let session_a = host.session_new_kind(crate::SessionKind::Build).unwrap();
@@ -4269,7 +4289,8 @@ mod tests {
         let host = AgentHost::create(HostConfig {
             always_approve: true,
             ..HostConfig::default()
-        });
+        })
+        .expect("acquire the GrokPtah instance lock");
         host.start().unwrap();
         host.set_project_cwd(ws.path()).unwrap();
         let session = host.session_new_kind(crate::SessionKind::Build).unwrap();
@@ -4369,7 +4390,8 @@ mod tests {
         let host = AgentHost::create(HostConfig {
             always_approve: true,
             ..HostConfig::default()
-        });
+        })
+        .expect("acquire the GrokPtah instance lock");
         host.start().unwrap();
         host.set_project_cwd(ws.path()).unwrap();
         let session = host.session_new_kind(crate::SessionKind::Build).unwrap();
@@ -4485,7 +4507,8 @@ mod tests {
         let host = AgentHost::create(HostConfig {
             always_approve: true,
             ..HostConfig::default()
-        });
+        })
+        .expect("acquire the GrokPtah instance lock");
         host.start().unwrap();
         host.set_project_cwd(ws.path()).unwrap();
         let session = host.session_new_kind(crate::SessionKind::Build).unwrap();
@@ -4595,7 +4618,8 @@ mod tests {
         let host = AgentHost::create(HostConfig {
             always_approve: true,
             ..HostConfig::default()
-        });
+        })
+        .expect("acquire the GrokPtah instance lock");
         host.start().unwrap();
         let session = host.session_new_kind(crate::SessionKind::Build).unwrap();
         host.session_set_cwd(session.id, workspace.path()).unwrap();

@@ -17,8 +17,8 @@ use grokptah_agent_bridge::reliability_eval::{
     write_report, EventLedger, ReliabilityReport, ScenarioCheck, ScenarioResult,
 };
 use grokptah_agent_bridge::{
-    home_override_serial, set_grokptah_home_override, AgentHost, AgentHostHandle, EventReceiver,
-    HostConfig, PermissionDecision, SessionUpdate, SteeringDisposition, ToolCallStatus,
+    home_override_serial, set_grokptah_home_override, AgentHost, EventReceiver, HostConfig,
+    HostRuntime, PermissionDecision, SessionUpdate, SteeringDisposition, ToolCallStatus,
 };
 use tokio::time::timeout;
 
@@ -64,11 +64,12 @@ fn fixture_repo() -> Result<tempfile::TempDir> {
     Ok(dir)
 }
 
-fn started_host(always_approve: bool) -> Result<AgentHostHandle> {
+fn started_host(always_approve: bool) -> Result<HostRuntime> {
     let host = AgentHost::create(HostConfig {
         always_approve,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host.start()?;
     // Persisted chrome can outlive a scenario, so make policy explicit.
     host.set_always_approve(always_approve);
@@ -453,7 +454,8 @@ async fn restart_durability() -> Result<ScenarioResult> {
     drop(rx);
     drop(host);
 
-    let restored_host = AgentHost::create(HostConfig::default());
+    let restored_host =
+        AgentHost::create(HostConfig::default()).expect("acquire the GrokPtah instance lock");
     let after_history = restored_host.session_completion_history(session.id)?;
     let after_transcript = restored_host.session_transcript(session.id)?;
     let mut ledger = EventLedger::default();

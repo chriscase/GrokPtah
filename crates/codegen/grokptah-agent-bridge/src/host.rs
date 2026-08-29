@@ -38,6 +38,7 @@ use crate::host_helpers::{
     surface_rate_limit_or_error, tool_kind, tool_step_signature, tool_web_fetch, AgentStep,
     IdenticalToolCallRun, McpToolIndex,
 };
+use crate::host_runtime::HostRuntime;
 use crate::lane::LaneSummary;
 use crate::local_tools;
 use crate::memory::{MemoryAccess, MemoryAddress, MemoryScope};
@@ -326,7 +327,17 @@ enum PromptQueueRecoveryOutcome {
 /// return `Err` before touching the queue — left accepted steering stranded in
 /// `steering`/`delivering`, where no later boundary would deliver it and
 /// neither the GUI nor `ptah_get_queue` could see it.
-fn recover_pending_steering_locked(g: &mut Inner, session_id: Uuid) -> PromptQueueRecoveryOutcome {
+/// `write` is `None` when this runtime no longer owns durable writes for its
+/// home — a turn tearing down during shutdown, or a stale handle. The recovery
+/// is still applied in memory (dropping it would lose the interjection
+/// outright), but nothing is persisted and the caller is handed the same
+/// `NotPersisted` outcome an IO failure produces, so no revision is claimed for
+/// a mutation that will not survive a restart (#455).
+fn recover_pending_steering_locked(
+    write: Option<&crate::host_runtime::DurableWriteGuard>,
+    g: &mut Inner,
+    session_id: Uuid,
+) -> PromptQueueRecoveryOutcome {
     let mut next = g
         .prompt_queues
         .get(&session_id)
@@ -337,8 +348,14 @@ fn recover_pending_steering_locked(g: &mut Inner, session_id: Uuid) -> PromptQue
     }
 
     let entries = next.list();
-    let persisted = session_store::save_prompt_queue(session_id, &next)
-        .map_err(|error| anyhow!("persist steering recovery: {error}"));
+    let persisted = match write {
+        Some(write) => session_store::save_prompt_queue(write, session_id, &next)
+            .map_err(|error| anyhow!("persist steering recovery: {error}")),
+        None => Err(anyhow!(
+            "persist steering recovery: this process no longer holds durable-write \
+             authority for its GrokPtah home"
+        )),
+    };
     // Applied regardless: the in-memory queue is what the session actually
     // runs from, and leaving it un-recovered loses the interjection outright.
     g.prompt_queues.insert(session_id, next);
@@ -631,12 +648,13 @@ impl Drop for TurnBusyGuard {
         if !self.armed {
             return;
         }
+        let write = self.host.durable_write("recovering pending steering").ok();
         let outcome = {
             let mut g = self.host.inner.lock();
             g.turn_cancels.remove(&self.session_id);
             g.turn_generations.remove(&self.session_id);
             g.turn_max_rounds.remove(&self.session_id);
-            recover_pending_steering_locked(&mut g, self.session_id)
+            recover_pending_steering_locked(write.as_ref(), &mut g, self.session_id)
         };
         match outcome {
             PromptQueueRecoveryOutcome::Nothing => {}
@@ -748,8 +766,12 @@ pub struct AgentHostHandle {
     /// children it spawns. A session counter is not a safe run identity.
     run_usage_trackers: Arc<Mutex<HashMap<Uuid, Arc<RunUsageTracker>>>>,
     provider_observation: Option<ProviderObservationSession>,
-    /// Exclusive lock on `~/.grokptah` — kept alive for the process (#119).
-    _instance_lock: Option<Arc<crate::instance_lock::InstanceLock>>,
+    /// Shared process lifecycle (#455). The handle observes the phase and
+    /// registers supervised tasks; it deliberately does **not** own the
+    /// single-instance lock, which lives in the non-cloneable
+    /// [`crate::HostRuntime`] so release is an explicit ordered action rather
+    /// than a clone-refcount side effect.
+    pub(crate) lifecycle: Arc<crate::host_runtime::HostLifecycle>,
     /// Selects the durable root for legacy modules that still resolve paths
     /// through `grokptah_home()`. Shared by all host clones.
     runtime_home: crate::discover::RuntimeHome,
@@ -765,8 +787,14 @@ pub(crate) struct ExternalRunContext {
 pub struct AgentHost;
 
 impl AgentHost {
-    /// Create a new host. Events are pulled via [`AgentHostHandle::take_event_receiver`] once.
-    pub fn create(config: HostConfig) -> AgentHostHandle {
+    /// Create a new host runtime. Events are pulled via
+    /// [`AgentHostHandle::take_event_receiver`] once.
+    ///
+    /// The returned [`HostRuntime`] is **not** `Clone`: it is the single owner
+    /// of the process instance lock and of the task supervisor (#455). It
+    /// derefs to [`AgentHostHandle`], and `runtime.clone()` yields a cloneable
+    /// *request handle* that carries no process authority of its own.
+    pub fn create(config: HostConfig) -> Result<HostRuntime> {
         Self::create_with_runtime_home(config, crate::discover::RuntimeHome::discover())
     }
 
@@ -776,17 +804,26 @@ impl AgentHost {
     pub fn create_with_runtime_home(
         config: HostConfig,
         runtime_home: crate::discover::RuntimeHome,
-    ) -> AgentHostHandle {
+    ) -> Result<HostRuntime> {
         let runtime_home_context = Arc::new(runtime_home.install());
-        // Single-instance guard before any GC or writes that could race another process.
-        let instance_lock = match crate::instance_lock::InstanceLock::try_acquire_at(&runtime_home)
-        {
-            Ok(l) => Some(Arc::new(l)),
-            Err(e) => {
-                eprintln!("[grokptah] {e:#}");
-                None
-            }
-        };
+        // Exclusive ownership is the *precondition* for construction, not a
+        // warning on the way past it (#455). Nothing writable is initialized
+        // before this: no keychain read, no workspace load or migration, no
+        // session GC, no event journal, no durable store. A host that could not
+        // take the lock must not exist at all — a half-constructed one used to
+        // go on to touch every one of those surfaces on a home another process
+        // owns.
+        let instance_lock = crate::instance_lock::InstanceLock::try_acquire_at(&runtime_home)
+            .with_context(|| {
+                format!(
+                    "acquire the GrokPtah single-instance lock for {}",
+                    runtime_home.path().display()
+                )
+            })?;
+        let lifecycle = crate::host_runtime::HostLifecycle::new(
+            Some(instance_lock),
+            runtime_home.instance_lock_path(),
+        );
         let mut event_tx = crate::event_bus::EventBus::new(
             config
                 .event_bus_capacity
@@ -794,14 +831,33 @@ impl AgentHost {
         );
         {
             event_tx = event_tx.with_persist_dir(runtime_home.orchestration_root());
+            // Bind the journal's authority explicitly to *this* lifecycle rather
+            // than leaving it resolved by home lookup. The bind verifies the
+            // journal's canonical home is the one this runtime holds the lock
+            // for, so the journal fails closed with this runtime and can never
+            // borrow its authority for a different home (#455).
+            //
+            // The journal is under this runtime's home by construction, so this
+            // always binds; a false here would mean the home moved underneath us.
+            debug_assert!(
+                event_tx.bind_journal_lifecycle(&lifecycle),
+                "the event journal must live in the home this runtime owns"
+            );
         }
         // Keep a dedicated channel for take_event_receiver / first GUI subscriber.
         let event_rx = event_tx.subscribe();
         let auth = crate::auth_store::load_auth_state();
-        let (chrome, mut sessions) = session_store::load_workspace().unwrap_or_else(|e| {
-            eprintln!("[grokptah] workspace load failed: {e:#}");
-            (WorkspaceChrome::default(), HashMap::new())
-        });
+        // Construction takes ordinary counted authority: the lifecycle was
+        // just created `Running` with the lock in hand, so this cannot fail,
+        // and being counted means it is not a special case the seal ignores.
+        let startup_write = lifecycle
+            .begin_durable_write("initializing the host from its durable home")
+            .context("durable-write authority for host construction")?;
+        let (chrome, mut sessions) =
+            session_store::load_workspace(&startup_write).unwrap_or_else(|e| {
+                eprintln!("[grokptah] workspace load failed: {e:#}");
+                (WorkspaceChrome::default(), HashMap::new())
+            });
         let project_cwd = session_store::cwd_still_valid(chrome.project_cwd.as_deref());
         let mcp_servers = crate::discover::load_mcp_servers(project_cwd.as_deref());
         let plugins = crate::discover::discover_plugins();
@@ -842,14 +898,13 @@ impl AgentHost {
         let mut open_tab_ids = chrome.open_tab_ids.clone();
         // Drop tab ids that no longer exist.
         open_tab_ids.retain(|id| sessions.contains_key(id));
-        // Soft GC only when we own the instance lock (never GC another process's sessions).
-        if instance_lock.is_some() {
-            if let Ok(n) = session_store::garbage_collect(&open_tab_ids, 80, 24 * 7) {
-                if n > 0 {
-                    if let Ok(reloaded) = session_store::load_all_metas() {
-                        sessions = reloaded;
-                        open_tab_ids.retain(|id| sessions.contains_key(id));
-                    }
+        // Construction holds the instance lock, so GC can never touch another
+        // process's sessions.
+        if let Ok(n) = session_store::garbage_collect(&startup_write, &open_tab_ids, 80, 24 * 7) {
+            if n > 0 {
+                if let Ok(reloaded) = session_store::load_all_metas() {
+                    sessions = reloaded;
+                    open_tab_ids.retain(|id| sessions.contains_key(id));
                 }
             }
         }
@@ -923,7 +978,7 @@ impl AgentHost {
             live_shells: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             session_usage: HashMap::new(),
         };
-        AgentHostHandle {
+        let handle = AgentHostHandle {
             inner: Arc::new(Mutex::new(inner)),
             event_rx_factory: Arc::new(Mutex::new(Some(event_rx))),
             orchestration_store: Arc::new(Mutex::new(None)),
@@ -933,10 +988,11 @@ impl AgentHost {
             orchestration_wakeup: Arc::new(Notify::new()),
             run_usage_trackers: Arc::new(Mutex::new(HashMap::new())),
             provider_observation: config.provider_observation,
-            _instance_lock: instance_lock,
+            lifecycle: lifecycle.clone(),
             runtime_home,
             _runtime_home_context: runtime_home_context,
-        }
+        };
+        Ok(HostRuntime::new(handle, lifecycle))
     }
 }
 
@@ -944,6 +1000,232 @@ impl AgentHostHandle {
     /// The validated durable root owned by this host process.
     pub fn runtime_home(&self) -> crate::discover::RuntimeHome {
         self.runtime_home.clone()
+    }
+
+    /// Current lifecycle phase of the owning [`crate::HostRuntime`] (#455).
+    pub fn lifecycle_phase(&self) -> crate::host_runtime::HostPhase {
+        self.lifecycle.phase()
+    }
+
+    /// True while this handle may still take new process authority. A handle
+    /// that outlived its runtime reports false and refuses new work.
+    pub fn is_accepting_work(&self) -> bool {
+        self.lifecycle.is_open()
+    }
+
+    /// Whether this handle can still perform durable writes at all. False once
+    /// the owning runtime has sealed or closed, which is the signal a bounded
+    /// retry uses to stop rather than spin (#455).
+    pub fn can_write_durably(&self) -> bool {
+        !self.lifecycle.durable_writes_sealed()
+            && self.lifecycle.phase() != crate::host_runtime::HostPhase::Closed
+    }
+
+    /// Fail-closed guard for authority-bearing operations.
+    pub(crate) fn ensure_accepting(&self, operation: &str) -> Result<()> {
+        self.lifecycle.ensure_open(operation)
+    }
+
+    /// A token that can mint durable-write authority later, for operations
+    /// that do slow work before their write (#455). Holding a guard across
+    /// network I/O would let an ordinary slow request block the shutdown seal.
+    pub(crate) fn write_authority(&self) -> crate::host_runtime::WriteAuthority {
+        crate::host_runtime::WriteAuthority::new(self.lifecycle.clone())
+    }
+
+    /// Mint durable-write authority for this home, or fail closed (#455).
+    ///
+    /// Every durable mutator in this crate takes the returned guard by
+    /// reference, so a stale handle cannot reach one: the compiler, not a
+    /// reviewer, is what keeps the write behind the lifecycle check. Ordered
+    /// shutdown seals this authority *before* releasing the process lock, so a
+    /// replacement process can never write the same home concurrently.
+    pub(crate) fn durable_write(
+        &self,
+        operation: &str,
+    ) -> Result<crate::host_runtime::DurableWriteGuard> {
+        self.lifecycle.begin_durable_write(operation)
+    }
+
+    /// Test seam: hold durable-write authority open, so a test can observe what
+    /// shutdown and `Drop` do while a writer is genuinely in flight (#455).
+    ///
+    /// This is the *same* authority every production durable write takes; it is
+    /// exposed so tests can reproduce a concurrent writer rather than simulate
+    /// one.
+    pub fn hold_durable_write_for_test(
+        &self,
+        operation: &str,
+    ) -> Result<crate::host_runtime::DurableWriteLease> {
+        self.durable_write(operation)
+            .map(crate::host_runtime::DurableWriteLease::new)
+    }
+
+    /// Track a future on the shutdown join barrier without spawning it, for
+    /// embedders that own their executor (see [`crate::HostRuntime::track`]).
+    pub fn track_supervised<F>(
+        &self,
+        operation: &str,
+        future: F,
+    ) -> Result<tokio_util::task::task_tracker::TrackedFuture<F>>
+    where
+        F: std::future::Future,
+    {
+        self.lifecycle.track_future(operation, future)
+    }
+
+    /// Cancellation token fired when the owning runtime begins shutdown.
+    /// Public so embedders and lifecycle tests can observe the same signal
+    /// supervised tasks select on.
+    pub fn shutdown_signal(&self) -> CancellationToken {
+        self.lifecycle.cancel_token()
+    }
+
+    /// Test seam: bind a store to this runtime, so a test can prove a ledger
+    /// for another home is refused (#455).
+    pub fn bind_store_for_test(&self, store: &OrchStore) -> bool {
+        store.bind_lifecycle(&self.lifecycle)
+    }
+
+    /// Cancellation token fired when the owning runtime begins shutdown.
+    /// Long-lived supervised tasks select on this so the join barrier is
+    /// bounded without polling or sleeping.
+    pub(crate) fn shutdown_token(&self) -> CancellationToken {
+        self.lifecycle.cancel_token()
+    }
+
+    /// Spawn a task the owning runtime must join before releasing the process
+    /// lock. Refused once shutdown has begun (#455).
+    pub fn spawn_supervised<F>(
+        &self,
+        operation: &str,
+        future: F,
+    ) -> Result<tokio::task::JoinHandle<F::Output>>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.lifecycle.spawn_supervised(operation, future)
+    }
+
+    /// Cancel every unit of in-flight work this host owns, so the shutdown
+    /// join barrier is bounded: turns (which also cascade to their subagents
+    /// and tool shells), standalone subagents, background scans and shell
+    /// tasks, Computer Use operations, and any live child processes.
+    ///
+    /// Cancellation is cooperative — durable finalization still runs — and the
+    /// caller joins the supervised tasks afterwards.
+    pub async fn cancel_all_activity(&self) {
+        let (live_shells, shell_ids) = {
+            let mut g = self.inner.lock();
+            for token in g.turn_cancels.values() {
+                token.cancel();
+            }
+            for (_, token) in g.subagent_cancels.drain() {
+                token.cancel();
+            }
+            for subagent in g.subagents.iter_mut() {
+                if subagent.status == "running" {
+                    subagent.status = "cancelled".into();
+                    subagent.summary = Some("host shutdown".into());
+                }
+            }
+            for (_, token) in g.background_cancels.drain() {
+                token.cancel();
+            }
+            for task in g.background_tasks.iter_mut() {
+                if task.status == "running" {
+                    task.status = "cancelled".into();
+                    task.detail = Some("host shutdown".into());
+                }
+            }
+            for (_, (_, token)) in g.computer_agent_operations.drain() {
+                token.cancel();
+            }
+            let shell_ids: Vec<Uuid> = g.turn_cancels.keys().copied().collect();
+            (g.live_shells.clone(), shell_ids)
+        };
+        kill_shells(live_shells, shell_ids).await;
+        // Any surviving child process for a session with no live turn.
+        let orphans: Vec<Uuid> = {
+            let map = self.inner.lock().live_shells.clone();
+            let guard = map.lock().await;
+            guard.keys().copied().collect()
+        };
+        if !orphans.is_empty() {
+            let map = self.inner.lock().live_shells.clone();
+            kill_shells(map, orphans).await;
+        }
+        self.invalidate_computer_agent_authority();
+    }
+
+    /// Persist the durable state this process owns and release the shared
+    /// ledgers, so a replacement host on the same home reopens a consistent
+    /// world. Called by ordered shutdown after every supervised task joined.
+    ///
+    /// Returns one stable description per failure. A caller that reports a
+    /// clean lock release while this returned errors would be lying about the
+    /// durable state it left behind, so the report carries them (#455).
+    pub fn flush_durable_state(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        // The flush is this runtime's own last write, and it runs after the
+        // durable-write seal. `flush_write` is the one authority that outlives
+        // the seal, and it never leaves the runtime.
+        let write = crate::host_runtime::DurableWriteGuard::owner_uncounted(&self.lifecycle);
+        let chrome = self.workspace_chrome_snapshot();
+        if let Err(error) = session_store::save_chrome(&write, &chrome) {
+            errors.push(format!("persist workspace chrome: {error:#}"));
+        }
+        let sessions: Vec<Uuid> = self.inner.lock().prompt_queues.keys().copied().collect();
+        for session_id in sessions {
+            if let Some(queue) = self.inner.lock().prompt_queues.get(&session_id).cloned() {
+                if let Err(error) = session_store::save_prompt_queue(&write, session_id, &queue) {
+                    errors.push(format!("persist prompt queue {session_id}: {error:#}"));
+                }
+            }
+        }
+        let subagents = self.inner.lock().subagents.clone();
+        let subagent_sessions: HashSet<Uuid> = subagents
+            .iter()
+            .filter_map(|s| s.session_id.as_deref())
+            .filter_map(|s| Uuid::parse_str(s).ok())
+            .collect();
+        for session_id in subagent_sessions {
+            if let Err(error) =
+                session_store::save_session_subagents(&write, session_id, &subagents)
+            {
+                errors.push(format!("persist subagents for {session_id}: {error:#}"));
+            }
+        }
+        // Record the shutdown in the durable audit ledger while this process
+        // still owns it, and surface a ledger failure instead of reporting a
+        // clean stop over a lost record. The v2 ledger (#462 / #469) replaces
+        // the sink behind these same calls without changing this seam.
+        if let Some(store) = self.orchestration_store.lock().clone() {
+            let entry = crate::orchestration::AuditEntry {
+                ts: Utc::now(),
+                tool: "host.shutdown".into(),
+                request_id: None,
+                session_id: None,
+                workspace: None,
+                outcome: "accepted".into(),
+                error_code: None,
+                detail: String::new(),
+            };
+            if let Err(error) = store.append_audit(&entry) {
+                errors.push(format!("record host.shutdown audit entry: {error:#}"));
+            }
+            if let Some(audit_error) = store.last_audit_error() {
+                errors.push(format!("durable audit ledger degraded: {audit_error}"));
+            }
+        }
+        // Drop this process's ledger handles last: they must outlive every
+        // supervised task that could still be writing.
+        let orchestration = self.orchestration_store.lock().take();
+        drop(orchestration);
+        let computer = self.computer_store.lock().take();
+        drop(computer);
+        errors
     }
 
     fn provider_observation_context(&self, session_id: Uuid) -> Option<ProviderObservationContext> {
@@ -1196,11 +1478,20 @@ impl AgentHostHandle {
 
     /// Open the single process-owned durable run ledger on first use.
     pub fn ensure_orchestration_store(&self) -> Result<OrchStore> {
+        // A stale handle must not reopen the durable ledger for a home this
+        // process no longer owns (#455).
+        self.ensure_accepting("opening the durable orchestration ledger")?;
         let mut store = self.orchestration_store.lock();
         if let Some(existing) = store.as_ref() {
             return Ok(existing.clone());
         }
         let opened = OrchStore::open(self.runtime_home.orchestration_root())?;
+        // Bind explicitly rather than relying on open-time registry lookup, so
+        // every clone of this ledger fails closed with this runtime. The bind
+        // verifies the ledger's home is the one this runtime owns.
+        // The ledger is under this runtime's home by construction, so this
+        // always binds; a false here would mean the home moved underneath us.
+        debug_assert!(opened.bind_lifecycle(&self.lifecycle));
         *store = Some(opened.clone());
         Ok(opened)
     }
@@ -1210,11 +1501,13 @@ impl AgentHostHandle {
     /// and embedded MCP control plane alike — must share this handle; a
     /// second open in the same process would fail on the lock.
     pub fn ensure_computer_store(&self) -> Result<crate::computer_use::ComputerStore> {
+        self.ensure_accepting("opening the durable Computer Run ledger")?;
         let mut store = self.computer_store.lock();
         if let Some(existing) = store.as_ref() {
             return Ok(existing.clone());
         }
         let opened = crate::computer_use::ComputerStore::open(self.runtime_home.computer_root())?;
+        debug_assert!(opened.bind_lifecycle(&self.lifecycle));
         *store = Some(opened.clone());
         Ok(opened)
     }
@@ -1224,15 +1517,32 @@ impl AgentHostHandle {
         self.computer_store.lock().clone()
     }
 
-    /// Install a store supplied by the orchestration service when the host has
-    /// not opened one yet. This keeps library/test construction and the
-    /// desktop bootstrap on one durable ledger rather than silently splitting
-    /// external and desktop run records.
-    pub(crate) fn install_orchestration_store(&self, store: OrchStore) {
+    /// Adopt a store the caller opened, if this runtime has none yet. This
+    /// keeps library/test construction and the desktop bootstrap on one
+    /// durable ledger rather than silently splitting external and desktop run
+    /// records.
+    ///
+    /// A ledger under this runtime's home is bound to its lifecycle, so every
+    /// clone of it fails closed with this runtime. A ledger rooted elsewhere
+    /// is still adopted as the process ledger but keeps the authority it
+    /// established at open, because this runtime's instance lock does not
+    /// protect that root — authority is never borrowed across homes (#455).
+    pub(crate) fn install_orchestration_store(&self, store: OrchStore) -> bool {
         let mut current = self.orchestration_store.lock();
-        if current.is_none() {
-            *current = Some(store);
+        if current.is_some() {
+            return false;
         }
+        if !store.bind_lifecycle(&self.lifecycle) {
+            eprintln!(
+                "[grokptah] adopting an orchestration ledger governed by {}, outside the home \
+                 this runtime owns ({}); it keeps the durable-write authority it established at \
+                 open rather than borrowing this runtime's",
+                store.authority_home_lock().display(),
+                self.lifecycle.lock_path().display()
+            );
+        }
+        *current = Some(store);
+        true
     }
 
     /// Return the already-open ledger without causing filesystem work.
@@ -1244,6 +1554,7 @@ impl AgentHostHandle {
     /// session owns the binding, while the orchestration store owns lifecycle
     /// state; this keeps transport adapters from inventing identity.
     pub fn ensure_session_agent(&self, session_id: Uuid) -> Result<AgentRecord> {
+        let write = self.durable_write("ensuring a session agent")?;
         let (cwd, model, kind, existing_id, authority, default_bounds) = {
             let g = self.inner.lock();
             let selected_model = g.model.clone();
@@ -1376,7 +1687,7 @@ impl AgentHostHandle {
                 session.agent_id = Some(agent_id.clone());
                 session.clone()
             };
-            if let Err(error) = session_store::save_session_meta(&session) {
+            if let Err(error) = session_store::save_session_meta(&write, &session) {
                 bail!("failed to persist session agent binding: {error:#}");
             }
         }
@@ -1391,6 +1702,7 @@ impl AgentHostHandle {
     /// and transcript; attaching it never rewrites the Agent's legacy primary
     /// workspace or silently resumes a Run.
     pub fn attach_session_to_agent(&self, session_id: Uuid, agent_id: &str) -> Result<AgentRecord> {
+        let write = self.durable_write("attaching a session to an agent")?;
         let (kind, session) = {
             let g = self.inner.lock();
             let session = g
@@ -1447,7 +1759,7 @@ impl AgentHostHandle {
                     .ok_or_else(|| anyhow!("unknown session"))?;
                 current.agent_id = Some(agent_id.to_string());
                 let updated = current.clone();
-                let persist_result = session_store::save_session_meta(&updated);
+                let persist_result = session_store::save_session_meta(&write, &updated);
                 let rollback_result = if persist_result.is_err() {
                     current.agent_id = session.agent_id.clone();
                     if association_changed {
@@ -2545,14 +2857,24 @@ impl AgentHostHandle {
         run_id: &str,
         session_id: Uuid,
         store: OrchStore,
-    ) -> tokio::task::JoinHandle<()> {
+    ) -> Option<tokio::task::JoinHandle<()>> {
         let run_id = run_id.to_string();
         let mut receiver = self.subscribe_events();
-        tokio::spawn(async move {
-            while let Some(update) = receiver.recv().await {
-                apply_run_aggregate(&store, &run_id, session_id, &update);
+        let shutdown = self.shutdown_token();
+        self.spawn_supervised("starting a desktop run aggregator", async move {
+            loop {
+                tokio::select! {
+                    update = receiver.recv() => {
+                        let Some(update) = update else { break };
+                        apply_run_aggregate(&store, &run_id, session_id, &update);
+                    }
+                    // Without this arm the aggregator would outlive shutdown
+                    // and stall the join barrier forever.
+                    _ = shutdown.cancelled() => break,
+                }
             }
         })
+        .ok()
     }
 
     fn checkpoint_context(
@@ -2796,29 +3118,45 @@ impl AgentHostHandle {
     }
 
     /// Persist tiny workspace chrome (tabs / project / model) only.
+    fn workspace_chrome_snapshot(&self) -> WorkspaceChrome {
+        let g = self.inner.lock();
+        WorkspaceChrome {
+            version: 2,
+            project_cwd: g.project_cwd.as_ref().map(|p| p.display().to_string()),
+            active_session: g.active_session,
+            open_tab_ids: g.open_tab_ids.clone(),
+            model: g.model.clone(),
+            effort: g.effort,
+            sandbox_profile: g.sandbox_profile.clone(),
+            appearance: g.appearance.clone(),
+            always_approve: g.always_approve,
+            subagent_isolation: g.subagent_isolation,
+        }
+    }
+
     pub fn persist_chrome(&self) {
-        let chrome = {
-            let g = self.inner.lock();
-            WorkspaceChrome {
-                version: 2,
-                project_cwd: g.project_cwd.as_ref().map(|p| p.display().to_string()),
-                active_session: g.active_session,
-                open_tab_ids: g.open_tab_ids.clone(),
-                model: g.model.clone(),
-                effort: g.effort,
-                sandbox_profile: g.sandbox_profile.clone(),
-                appearance: g.appearance.clone(),
-                always_approve: g.always_approve,
-                subagent_isolation: g.subagent_isolation,
+        let write = match self.durable_write("persisting workspace chrome") {
+            Ok(write) => write,
+            Err(error) => {
+                eprintln!("[grokptah] chrome persist refused: {error:#}");
+                return;
             }
         };
-        if let Err(e) = session_store::save_chrome(&chrome) {
+        let chrome = self.workspace_chrome_snapshot();
+        if let Err(e) = session_store::save_chrome(&write, &chrome) {
             eprintln!("[grokptah] chrome persist failed: {e:#}");
         }
     }
 
     /// Append new transcript lines + refresh meta for one session.
     pub fn persist_session(&self, id: Uuid) {
+        let write = match self.durable_write("persisting a session") {
+            Ok(write) => write,
+            Err(error) => {
+                eprintln!("[grokptah] persisting a session refused: {error:#}");
+                return;
+            }
+        };
         let mut session = {
             let g = self.inner.lock();
             match g.sessions.get(&id) {
@@ -2829,13 +3167,13 @@ impl AgentHostHandle {
         // Ensure we only append what isn't on disk yet.
         if !session.transcript_loaded {
             // Still push meta (title/count) without loading body.
-            if let Err(e) = session_store::save_session_meta(&session) {
+            if let Err(e) = session_store::save_session_meta(&write, &session) {
                 eprintln!("[grokptah] meta persist failed: {e:#}");
             }
             return;
         }
         let from = session.persisted_len;
-        match session_store::append_transcript(&session, from) {
+        match session_store::append_transcript(&write, &session, from) {
             Ok(n) => {
                 session.persisted_len += n;
                 let mut g = self.inner.lock();
@@ -2846,13 +3184,20 @@ impl AgentHostHandle {
             Err(e) => eprintln!("[grokptah] transcript append failed: {e:#}"),
         }
         // Always refresh meta (compact cursor, title, counts) even when no new lines.
-        if let Err(e) = session_store::save_session_meta(&session) {
+        if let Err(e) = session_store::save_session_meta(&write, &session) {
             eprintln!("[grokptah] meta persist failed: {e:#}");
         }
     }
 
     /// Full transcript rewrite (rewind / fork only — never used by compact).
     pub fn persist_session_rewrite(&self, id: Uuid) {
+        let write = match self.durable_write("rewriting a session transcript") {
+            Ok(write) => write,
+            Err(error) => {
+                eprintln!("[grokptah] rewriting a session transcript refused: {error:#}");
+                return;
+            }
+        };
         let session = {
             let g = self.inner.lock();
             match g.sessions.get(&id) {
@@ -2860,7 +3205,7 @@ impl AgentHostHandle {
                 None => return,
             }
         };
-        if let Err(e) = session_store::rewrite_transcript(&session) {
+        if let Err(e) = session_store::rewrite_transcript(&write, &session) {
             eprintln!("[grokptah] transcript rewrite failed: {e:#}");
             return;
         }
@@ -2946,13 +3291,9 @@ impl AgentHostHandle {
     }
 
     pub fn start(&self) -> Result<()> {
-        if self._instance_lock.is_none() {
-            bail!(
-                "another GrokPtah instance is already using {}. \
-                 Quit the other window before starting a second one.",
-                crate::discover::grokptah_home().display()
-            );
-        }
+        // Construction cannot succeed without the instance lock, so the only
+        // way to fail here is a handle that outlived its runtime (#455).
+        self.lifecycle.ensure_open("starting the agent host")?;
         self.inner.lock().running = true;
         Ok(())
     }
@@ -2969,6 +3310,7 @@ impl AgentHostHandle {
     }
 
     pub fn set_project_cwd(&self, path: impl AsRef<Path>) -> Result<String> {
+        let _write = self.durable_write("selecting the project directory")?;
         let p = path.as_ref().to_path_buf();
         if !p.is_dir() {
             bail!("not a directory: {}", p.display());
@@ -2990,6 +3332,7 @@ impl AgentHostHandle {
     }
 
     pub fn session_new_kind(&self, kind: SessionKind) -> Result<SessionSummary> {
+        let _write = self.durable_write("creating a session")?;
         let summary = {
             let mut g = self.inner.lock();
             if !g.running {
@@ -3090,6 +3433,11 @@ impl AgentHostHandle {
     /// Reject work/state mutations for an archived Lane while leaving read and
     /// explicit recovery operations available.
     pub fn ensure_session_accepts_new_work(&self, id: Uuid) -> Result<()> {
+        // Ordered shutdown rejects new admissions before anything is torn
+        // down, and stale handles stay rejected forever (#455). This is the
+        // single seam shared by desktop turns, orchestration reservations,
+        // queued admissions and Computer Use, so one check closes them all.
+        self.ensure_accepting("admitting new work")?;
         let g = self.inner.lock();
         let session = g
             .sessions
@@ -3130,6 +3478,7 @@ impl AgentHostHandle {
         turn_id: Uuid,
         evidence: crate::completion::CompletionEvidence,
     ) -> Result<()> {
+        let write = self.durable_write("recording completion evidence")?;
         let snapshot = {
             let mut g = self.inner.lock();
             let session = g
@@ -3154,7 +3503,7 @@ impl AgentHostHandle {
             session.updated_at = Utc::now();
             session.clone()
         };
-        session_store::save_session_meta(&snapshot)
+        session_store::save_session_meta(&write, &snapshot)
     }
 
     /// Whether a session currently has an in-flight turn.
@@ -3419,6 +3768,7 @@ impl AgentHostHandle {
     }
 
     pub fn session_rename(&self, id: Uuid, title: String) -> Result<SessionSummary> {
+        let _write = self.durable_write("renaming a session")?;
         let title = title.trim().to_string();
         if title.is_empty() {
             bail!("title must not be empty");
@@ -3433,11 +3783,12 @@ impl AgentHostHandle {
             s.updated_at = Utc::now();
             s.summary()
         };
-        self.persist_session_meta_only(id);
+        self.persist_session_meta_only(id)?;
         Ok(summary)
     }
 
     pub fn session_delete(&self, id: Uuid) -> Result<()> {
+        let write = self.durable_write("deleting a session")?;
         self.cancel_computer_agent(id);
         {
             let mut g = self.inner.lock();
@@ -3458,12 +3809,13 @@ impl AgentHostHandle {
                 g.active_session = None;
             }
         }
-        session_store::delete_session(id)?;
+        session_store::delete_session(&write, id)?;
         self.persist_chrome();
         Ok(())
     }
 
     pub fn session_archive(&self, id: Uuid, archived: bool) -> Result<SessionSummary> {
+        let _write = self.durable_write("archiving a session")?;
         let summary = {
             let mut g = self.inner.lock();
             if archived && g.turn_cancels.contains_key(&id) {
@@ -3488,7 +3840,7 @@ impl AgentHostHandle {
                 .ok_or_else(|| anyhow!("unknown session"))?
                 .summary()
         };
-        self.persist_session_meta_only(id);
+        self.persist_session_meta_only(id)?;
         self.persist_chrome();
         Ok(summary)
     }
@@ -3512,7 +3864,7 @@ impl AgentHostHandle {
             s.updated_at = Utc::now();
             s.summary()
         };
-        self.persist_session_meta_only(id);
+        self.persist_session_meta_only(id)?;
         Ok(summary)
     }
 
@@ -3521,6 +3873,7 @@ impl AgentHostHandle {
     /// For build sessions this is the project root. When the session is active,
     /// also updates the host project cwd so the files/git panels match.
     pub fn session_set_cwd(&self, id: Uuid, path: impl AsRef<Path>) -> Result<SessionSummary> {
+        let _write = self.durable_write("selecting a session directory")?;
         self.ensure_session_accepts_new_work(id)?;
         let p = path.as_ref().to_path_buf();
         if !p.is_dir() {
@@ -3536,7 +3889,7 @@ impl AgentHostHandle {
             s.updated_at = Utc::now();
             s.summary()
         };
-        self.persist_session_meta_only(id);
+        self.persist_session_meta_only(id)?;
 
         // Keep host workspace + discovery in sync when this is the focused session
         // or when no project is open yet.
@@ -3575,7 +3928,7 @@ impl AgentHostHandle {
             s.updated_at = Utc::now();
             s.summary()
         };
-        self.persist_session_meta_only(id);
+        self.persist_session_meta_only(id)?;
         Ok(summary)
     }
 
@@ -3597,7 +3950,7 @@ impl AgentHostHandle {
             s.updated_at = Utc::now();
             s.summary()
         };
-        self.persist_session_meta_only(id);
+        self.persist_session_meta_only(id)?;
         Ok(summary)
     }
 
@@ -3634,17 +3987,19 @@ impl AgentHostHandle {
         set.into_iter().collect()
     }
 
-    fn persist_session_meta_only(&self, id: Uuid) {
+    /// Returns the durable outcome rather than swallowing it: a caller that
+    /// mutated a session must not report success when the process no longer
+    /// holds durable-write authority for its home (#455).
+    fn persist_session_meta_only(&self, id: Uuid) -> Result<()> {
+        let write = self.durable_write("persisting session metadata")?;
         let session = {
             let g = self.inner.lock();
             match g.sessions.get(&id) {
                 Some(s) => s.clone(),
-                None => return,
+                None => return Ok(()),
             }
         };
-        if let Err(e) = session_store::save_session_meta(&session) {
-            eprintln!("[grokptah] meta persist failed: {e:#}");
-        }
+        session_store::save_session_meta(&write, &session)
     }
 
     pub fn fork_session(&self, source: Uuid) -> Result<SessionSummary> {
@@ -3807,6 +4162,7 @@ impl AgentHostHandle {
         id: Uuid,
         quality_summary: Option<String>,
     ) -> Result<SessionSummary> {
+        let write = self.durable_write("compacting a session")?;
         self.ensure_session_accepts_new_work(id)?;
         self.ensure_transcript_loaded(id)?;
         const KEEP_RECENT: usize = 6;
@@ -3861,7 +4217,8 @@ impl AgentHostHandle {
             {
                 let clip: String = t.chars().take(400).collect();
                 if let Ok(Some(address)) = &project_memory {
-                    let _ = crate::memory::remember(address, &clip, &["compact-flush".into()]);
+                    let _ =
+                        crate::memory::remember(&write, address, &clip, &["compact-flush".into()]);
                 }
             }
         }
@@ -4133,8 +4490,9 @@ impl AgentHostHandle {
         scope: MemoryScope,
         text: &str,
     ) -> Result<String> {
+        let write = self.durable_write("writing a memory fact")?;
         let address = self.memory_address_for_session(session_id, scope)?;
-        crate::memory::remember(&address, text, &[]).map_err(|error| anyhow!(error))
+        crate::memory::remember(&write, &address, text, &[]).map_err(|error| anyhow!(error))
     }
 
     pub fn set_model(&self, model: String) {
@@ -4644,8 +5002,9 @@ impl AgentHostHandle {
     }
 
     pub fn set_api_key(&self, api_key: String, display_name: String) -> Result<AuthState> {
-        let state =
-            crate::auth_store::store_api_key(&api_key, &display_name).map_err(|e| anyhow!(e))?;
+        let write = self.durable_write("storing the API key")?;
+        let state = crate::auth_store::store_api_key(&write, &api_key, &display_name)
+            .map_err(|e| anyhow!(e))?;
         self.inner.lock().auth = state.clone();
         Ok(state)
     }
@@ -4949,6 +5308,27 @@ impl AgentHostHandle {
         self.spawn_gp_subagent_parallel(session_id, &cwd, prompt, kind, &parent_cancel, &event_tx)
     }
 
+    /// Test helper: register a Computer Use operation the same way the
+    /// production qualify/propose paths do, so lifecycle tests can assert that
+    /// ordered shutdown cancels Computer authority without a live provider.
+    pub fn begin_computer_agent_operation_for_test(
+        &self,
+        session_id: Uuid,
+    ) -> Result<(String, CancellationToken)> {
+        let (operation_id, cancel, guard) = self.begin_computer_agent_operation(session_id)?;
+        // Deliberately leak the busy guard: this models the exact hazard #455
+        // is about — a guard that still holds session authority when shutdown
+        // starts. Ordered shutdown, not the guard's `Drop`, must be what
+        // clears the registration and cancels the operation.
+        std::mem::forget(guard);
+        Ok((operation_id, cancel))
+    }
+
+    /// Number of Computer Use operations currently holding session authority.
+    pub fn computer_agent_operation_count(&self) -> usize {
+        self.inner.lock().computer_agent_operations.len()
+    }
+
     /// Test helper: register a parent turn cancel token for `session_id`.
     pub fn begin_turn_for_test(&self, session_id: Uuid) {
         let mut g = self.inner.lock();
@@ -4958,6 +5338,7 @@ impl AgentHostHandle {
 
     /// Cancel a single subagent without cancelling the parent turn or siblings (#152).
     pub fn cancel_subagent(&self, id: &str) -> Result<()> {
+        let write = self.durable_write("cancelling a subagent")?;
         let mut g = self.inner.lock();
         if let Some(token) = g.subagent_cancels.remove(id) {
             token.cancel();
@@ -4977,7 +5358,7 @@ impl AgentHostHandle {
         let snap = g.subagents.clone();
         drop(g);
         if let Some(sid) = session_id {
-            let _ = session_store::save_session_subagents(sid, &snap);
+            let _ = session_store::save_session_subagents(&write, sid, &snap);
             let tx = self.inner.lock().event_tx.clone();
             let _ = tx.send(SessionUpdate::SubagentUpdate {
                 session_id: sid,
@@ -5066,7 +5447,17 @@ impl AgentHostHandle {
         let task_id = id.clone();
         let event_tx = self.inner.lock().event_tx.clone();
         let title_for_task = title.clone();
-        tokio::spawn(async move {
+        // Background scans and shells hold host authority, so shutdown must be
+        // able to cancel and join them (#455).
+        let shutdown_cancel = cancel.clone();
+        let shutdown = self.shutdown_token();
+        let cascade =
+            self.spawn_supervised("cascading shutdown to a background task", async move {
+                shutdown.cancelled().await;
+                shutdown_cancel.cancel();
+            });
+        drop(cascade);
+        let spawned = self.spawn_supervised("scheduling a background task", async move {
             let final_status = if is_shell {
                 let cmd = title_for_task.trim_start().trim_start_matches('!').trim();
                 let cwd = host.inner.lock().project_cwd.clone();
@@ -5189,6 +5580,19 @@ impl AgentHostHandle {
                 status: final_status,
             });
         });
+        if spawned.is_err() {
+            // Shutting down: never leave a phantom "running" row behind.
+            let mut g = self.inner.lock();
+            g.background_cancels.remove(&id);
+            if let Some(task) = g.background_tasks.iter_mut().find(|task| task.id == id) {
+                task.status = "cancelled".into();
+                task.detail = Some("host shutdown".into());
+            }
+            let mut refused = t.clone();
+            refused.status = "cancelled".into();
+            refused.detail = Some("host shutdown".into());
+            return refused;
+        }
         t
     }
 
@@ -5594,6 +5998,7 @@ impl AgentHostHandle {
         base_url: String,
         api_key: Option<String>,
     ) -> Result<()> {
+        let write = self.durable_write("setting the gateway config")?;
         let provider_id = if provider_id.trim().is_empty() {
             "corporate".to_string()
         } else {
@@ -5637,7 +6042,7 @@ impl AgentHostHandle {
             .filter(|key| !key.is_empty())
         {
             profile.credential_ref = Some(
-                crate::auth_store::store_provider_api_key(&provider_id, key)
+                crate::auth_store::store_provider_api_key(&write, &provider_id, key)
                     .map_err(anyhow::Error::msg)?,
             );
             cfg.clear_legacy_fields();
@@ -5646,7 +6051,7 @@ impl AgentHostHandle {
         }
         cfg.upsert_profile(profile).map_err(anyhow::Error::msg)?;
         cfg.active_profile_id = Some(provider_id.clone());
-        crate::gateway_config::save(&cfg).map_err(|e| anyhow!("save gateway.json: {e}"))?;
+        crate::gateway_config::save(&write, &cfg).map_err(|e| anyhow!("save gateway.json: {e}"))?;
         self.invalidate_computer_agent_authority();
         self.set_model(crate::gateway_config::model_selection_key(
             &provider_id,
@@ -5660,6 +6065,7 @@ impl AgentHostHandle {
         &self,
         update: crate::gateway_config::ProviderProfileUpdate,
     ) -> Result<()> {
+        let write = self.durable_write("upserting a provider profile")?;
         let crate::gateway_config::ProviderProfileUpdate {
             provider_id,
             label,
@@ -5716,7 +6122,7 @@ impl AgentHostHandle {
             .filter(|key| !key.is_empty())
         {
             profile.credential_ref = Some(
-                crate::auth_store::store_provider_api_key(&provider_id, key)
+                crate::auth_store::store_provider_api_key(&write, &provider_id, key)
                     .map_err(anyhow::Error::msg)?,
             );
             config.clear_legacy_fields();
@@ -5727,7 +6133,7 @@ impl AgentHostHandle {
         }
         config.upsert_profile(profile).map_err(anyhow::Error::msg)?;
         config.active_profile_id = Some(provider_id.clone());
-        crate::gateway_config::save(&config).context("save provider profile")?;
+        crate::gateway_config::save(&write, &config).context("save provider profile")?;
         self.invalidate_computer_agent_authority();
         self.set_model(crate::gateway_config::model_selection_key(
             &provider_id,
@@ -5745,7 +6151,11 @@ impl AgentHostHandle {
     }
 
     pub async fn discover_provider_models(&self, provider_id: &str) -> Result<Vec<ModelInfo>> {
-        crate::provider_discovery::discover_profile_models(provider_id).await?;
+        // Authority is minted around the save inside, not held across the
+        // network round-trip: a slow provider must not block the shutdown seal.
+        self.ensure_accepting("discovering provider models")?;
+        crate::provider_discovery::discover_profile_models(&self.write_authority(), provider_id)
+            .await?;
         Ok(self
             .models()
             .into_iter()
@@ -5758,10 +6168,18 @@ impl AgentHostHandle {
         provider_id: &str,
         model_id: &str,
     ) -> Result<crate::provider_qualification::ProviderQualificationReport> {
-        crate::provider_qualification::qualify_provider_model(provider_id, model_id).await
+        // As above: mint at the write, not across the qualification probes.
+        self.ensure_accepting("qualifying a provider model")?;
+        crate::provider_qualification::qualify_provider_model(
+            &self.write_authority(),
+            provider_id,
+            model_id,
+        )
+        .await
     }
 
     pub fn delete_provider_profile(&self, provider_id: &str) -> Result<()> {
+        let write = self.durable_write("deleting a provider profile")?;
         let provider_id = crate::gateway_config::normalized_profile_id(provider_id)
             .map_err(anyhow::Error::msg)?;
         let mut config =
@@ -5778,7 +6196,7 @@ impl AgentHostHandle {
         if config.has_pending_legacy_secret() {
             config.clear_legacy_fields();
         }
-        crate::gateway_config::save(&config).context("remove provider profile")?;
+        crate::gateway_config::save(&write, &config).context("remove provider profile")?;
         self.invalidate_computer_agent_authority();
 
         if let Some(reference) = profile.credential_ref.as_deref() {
@@ -6090,6 +6508,7 @@ impl AgentHostHandle {
         source: &str,
         owner: Option<String>,
     ) -> Result<(Vec<PromptQueueEntry>, PromptQueueEntry, u64)> {
+        let write = self.durable_write("queueing a prompt")?;
         self.ensure_session_accepts_new_work(session_id)?;
         let origin = owner.clone().unwrap_or_else(|| source.to_string());
         let (list, changed_entry, revision) = {
@@ -6103,7 +6522,7 @@ impl AgentHostHandle {
                 .cloned()
                 .unwrap_or_default();
             let changed_entry = next.add_with_owner(text, source, priority, owner)?;
-            session_store::save_prompt_queue(session_id, &next)
+            session_store::save_prompt_queue(&write, session_id, &next)
                 .map_err(|e| anyhow!("persist prompt queue: {e}"))?;
             let list = next.list();
             g.prompt_queues.insert(session_id, next);
@@ -6628,6 +7047,7 @@ impl AgentHostHandle {
         text: String,
         owner: Option<String>,
     ) -> Result<(SteeringReceipt, u64)> {
+        let write = self.durable_write("steering a session")?;
         self.ensure_session_accepts_new_work(session_id)?;
         let origin = owner.clone().unwrap_or_else(|| "desktop".into());
         let (receipt, revision) = {
@@ -6644,7 +7064,7 @@ impl AgentHostHandle {
                 .cloned()
                 .unwrap_or_default();
             let receipt = next.steer_text_with_owner(text, can_inject, owner)?;
-            session_store::save_prompt_queue(session_id, &next)
+            session_store::save_prompt_queue(&write, session_id, &next)
                 .map_err(|e| anyhow!("persist prompt queue: {e}"))?;
             g.prompt_queues.insert(session_id, next);
             let revision = g.next_queue_revision(session_id);
@@ -6855,7 +7275,41 @@ impl AgentHostHandle {
         .await
     }
 
+    /// One prompt turn, registered on the shutdown join barrier **before** any
+    /// of it starts.
+    ///
+    /// A turn is the crate's largest external effect: it sends to the provider
+    /// over the network and runs tools that edit the user's workspace and spawn
+    /// child processes. It was supervised only when a caller happened to spawn
+    /// it inside a supervised task — the orchestration service does, but a
+    /// desktop Tauri command and a direct embedder call do not. Registration
+    /// therefore belongs at the effect, not at each call site: put here, the
+    /// turn is on the barrier before its first poll, so there is no window in
+    /// which it has started but shutdown cannot see it (#455).
     async fn session_prompt_inner(
+        &self,
+        session_id: Uuid,
+        prompt: String,
+        max_rounds: Option<u32>,
+        reservation_owner: Option<&str>,
+        external_run: Option<ExternalRunContext>,
+        resume: Option<AgentContinuationPlan>,
+    ) -> Result<String> {
+        let effect = self.session_prompt_effect(
+            session_id,
+            prompt,
+            max_rounds,
+            reservation_owner,
+            external_run,
+            resume,
+        );
+        // `track_supervised` registers before returning, so the count rises
+        // here rather than when the future is first polled.
+        self.track_supervised("running a prompt turn", effect)?
+            .await
+    }
+
+    async fn session_prompt_effect(
         &self,
         session_id: Uuid,
         prompt: String,
@@ -7210,7 +7664,7 @@ impl AgentHostHandle {
                 .lock()
                 .insert(session_id, tracker.clone());
         }
-        let mut desktop_aggregator = desktop_run.as_ref().map(|(run_id, store)| {
+        let mut desktop_aggregator = desktop_run.as_ref().and_then(|(run_id, store)| {
             self.start_desktop_run_aggregator(run_id, session_id, store.clone())
         });
         let _ = event_tx.send(SessionUpdate::TurnStarted {
@@ -7472,15 +7926,16 @@ impl AgentHostHandle {
     }
 
     fn persist_prompt_queue(&self, session_id: Uuid) -> Result<()> {
+        let write = self.durable_write("persisting a prompt queue")?;
         let queue = {
             let g = self.inner.lock();
             g.prompt_queues.get(&session_id).cloned()
         };
         if let Some(q) = queue {
-            session_store::save_prompt_queue(session_id, &q)
+            session_store::save_prompt_queue(&write, session_id, &q)
                 .map_err(|e| anyhow!("persist prompt queue: {e}"))?;
         } else {
-            session_store::save_prompt_queue(session_id, &SessionPromptQueue::default())
+            session_store::save_prompt_queue(&write, session_id, &SessionPromptQueue::default())
                 .map_err(|e| anyhow!("persist prompt queue: {e}"))?;
         }
         Ok(())
@@ -8014,9 +8469,12 @@ impl AgentHostHandle {
     }
 
     fn recover_pending_steering_delivery(&self, session_id: Uuid) -> Result<()> {
+        let write = self
+            .durable_write("recovering pending steering delivery")
+            .ok();
         let outcome = {
             let mut g = self.inner.lock();
-            recover_pending_steering_locked(&mut g, session_id)
+            recover_pending_steering_locked(write.as_ref(), &mut g, session_id)
         };
         match outcome {
             PromptQueueRecoveryOutcome::Nothing => Ok(()),
@@ -8050,6 +8508,16 @@ impl AgentHostHandle {
         session_id: Uuid,
         event_tx: &crate::event_bus::EventBus,
     ) -> Vec<PromptQueueEntry> {
+        // Steering is only consumed once its in-flight state is durable. With
+        // no write authority the note stays queued rather than being delivered
+        // and lost (#455).
+        let write = match self.durable_write("delivering queued steering") {
+            Ok(write) => write,
+            Err(error) => {
+                eprintln!("[grokptah] steering delivery refused: {error:#}");
+                return Vec::new();
+            }
+        };
         let (entries, revisions) = match (|| -> Result<(Vec<PromptQueueEntry>, Vec<u64>)> {
             let mut g = self.inner.lock();
             let mut next = g
@@ -8063,7 +8531,7 @@ impl AgentHostHandle {
             }
             // Persist the in-flight delivery state before exposing the note to
             // the model. The next completed boundary acknowledges it.
-            session_store::save_prompt_queue(session_id, &next)
+            session_store::save_prompt_queue(&write, session_id, &next)
                 .map_err(|e| anyhow!("persist consumed steering: {e}"))?;
             g.prompt_queues.insert(session_id, next);
             if let Some(session) = g.sessions.get_mut(&session_id) {
@@ -9517,12 +9985,14 @@ impl AgentHostHandle {
                     })
                     .unwrap_or_default();
                 let address = self.memory_address_from_args(session_id, &args)?;
+                let self_for_memory = self.clone();
                 self.run_tool_for_output(
                     session_id,
                     "memory_write",
                     &args,
                     || async move {
-                        let id = crate::memory::remember(&address, &text, &tags)?;
+                        let write = self_for_memory.durable_write("writing a memory fact")?;
+                        let id = crate::memory::remember(&write, &address, &text, &tags)?;
                         let out = format!("Remembered fact {id}: {text}");
                         Ok(local_tools::ToolResult::basic(
                             "memory_write".into(),
@@ -9846,6 +10316,7 @@ impl AgentHostHandle {
         parent_cancel: &CancellationToken,
         event_tx: &crate::event_bus::EventBus,
     ) -> Result<String> {
+        let write = self.durable_write("spawning a subagent")?;
         // kind may be `general-purpose`, `plan`, or `kind@persona` (#164).
         let (kind, persona_name) = if let Some((k, p)) = kind.split_once('@') {
             (k.trim(), Some(p.trim()))
@@ -9915,7 +10386,8 @@ impl AgentHostHandle {
                                 detail: Some(detail),
                             });
                             let snap = self.inner.lock().subagents.clone();
-                            let _ = session_store::save_session_subagents(session_id, &snap);
+                            let _ =
+                                session_store::save_session_subagents(&write, session_id, &snap);
                             return Ok(format!(
                                 "ERROR: subagent isolation failed (not starting child): {error}. \
                                  Choose shared cwd explicitly to permit mutating the parent workspace."
@@ -9953,7 +10425,7 @@ impl AgentHostHandle {
         // Persist "running" row so reopen can show in-flight / history (#152).
         {
             let snap = self.inner.lock().subagents.clone();
-            let _ = session_store::save_session_subagents(session_id, &snap);
+            let _ = session_store::save_session_subagents(&write, session_id, &snap);
         }
 
         let host = self.clone();
@@ -9967,7 +10439,15 @@ impl AgentHostHandle {
         // the session after the parent finishes could charge a later Run.
         let run_usage_tracker = self.run_usage_trackers.lock().get(&session_id).cloned();
         let sub_id_task = sub_id.clone();
-        tokio::spawn(async move {
+        // Subagents capture a host clone, so ordered shutdown must cancel and
+        // join them before the process lock is released (#455).
+        let subagent_cancel = child_cancel.clone();
+        let shutdown = self.shutdown_token();
+        let _ = self.spawn_supervised("cascading shutdown to a subagent", async move {
+            shutdown.cancelled().await;
+            subagent_cancel.cancel();
+        });
+        let spawned = self.spawn_supervised("spawning a subagent", async move {
             host.run_gp_subagent_body(
                 session_id,
                 &child_cwd,
@@ -9981,6 +10461,14 @@ impl AgentHostHandle {
             )
             .await;
         });
+        if spawned.is_err() {
+            let mut g = self.inner.lock();
+            g.subagent_cancels.remove(&sub_id);
+            if let Some(entry) = g.subagents.iter_mut().find(|entry| entry.id == sub_id) {
+                entry.status = "cancelled".into();
+                entry.summary = Some("host shutdown".into());
+            }
+        }
 
         let isolation_note = match execution_mode {
             SubagentExecutionMode::Worktree => "isolated worktree",
@@ -10293,6 +10781,7 @@ impl AgentHostHandle {
         session_id: Uuid,
         detail: Option<String>,
     ) {
+        let write = self.durable_write("recording a subagent outcome");
         let snap = {
             let mut g = self.inner.lock();
             g.subagent_cancels.remove(sub_id);
@@ -10304,7 +10793,14 @@ impl AgentHostHandle {
             }
             g.subagents.clone()
         };
-        let _ = session_store::save_session_subagents(session_id, &snap);
+        match &write {
+            Ok(write) => {
+                let _ = session_store::save_session_subagents(write, session_id, &snap);
+            }
+            Err(error) => {
+                eprintln!("[grokptah] subagent outcome not persisted: {error:#}");
+            }
+        }
         let _ = event_tx.send(SessionUpdate::SubagentUpdate {
             session_id,
             subagent_id: sub_id.to_string(),
@@ -11152,7 +11648,8 @@ mod computer_agent_host_tests {
         let home = tempfile::tempdir().unwrap();
         crate::set_grokptah_home_override(Some(home.path().to_path_buf()));
 
-        let host = AgentHost::create(HostConfig::default());
+        let host =
+            AgentHost::create(HostConfig::default()).expect("acquire the GrokPtah instance lock");
         host.start().unwrap();
         let first = host.session_new().unwrap();
         let second = host.session_new().unwrap();
@@ -11240,6 +11737,7 @@ mod computer_agent_host_tests {
             .unwrap();
         let live_fingerprint = live_credentials.qualification_identity_fingerprint();
         crate::gateway_config::save_managed_profile_capabilities(
+            &crate::host_runtime::DurableWriteGuard::unowned_for_test(),
             &api_profile,
             &api_model,
             &live_fingerprint,
@@ -11248,13 +11746,15 @@ mod computer_agent_host_tests {
         let oidc_model = measured_model(true);
         let oidc_profile = managed_profile("managed:xai:oidc", oidc_model.clone());
         crate::gateway_config::save_managed_profile_capabilities(
+            &crate::host_runtime::DurableWriteGuard::unowned_for_test(),
             &oidc_profile,
             &oidc_model,
             "v1-sha256:other-oidc-principal",
         )
         .unwrap();
 
-        let host = AgentHost::create(HostConfig::default());
+        let host =
+            AgentHost::create(HostConfig::default()).expect("acquire the GrokPtah instance lock");
         host.inner.lock().auth = AuthState {
             signed_in: true,
             display_name: Some("stale Grok Build session".into()),
@@ -11334,7 +11834,7 @@ mod tests {
         }
     }
 
-    fn test_host() -> (TestHome, AgentHostHandle, Uuid) {
+    fn test_host() -> (TestHome, HostRuntime, Uuid) {
         let lock = home_override_serial();
         let tmp = tempfile::tempdir().expect("test home");
         let home = tmp.path().join(".grokptah");
@@ -11344,7 +11844,8 @@ mod tests {
         let host = AgentHost::create(HostConfig {
             always_approve: true,
             ..HostConfig::default()
-        });
+        })
+        .expect("acquire the GrokPtah instance lock");
         host.start().expect("start host");
         let session = host
             .session_new_kind(SessionKind::Build)
