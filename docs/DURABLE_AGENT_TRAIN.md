@@ -165,14 +165,47 @@ a model of it, because a second claim ledger would be a second authority:
 Ceilings, ordered by strength of evidence: true no-op 4 · nudge 8 · inert 10 ·
 identical-call 16 · advancing has no stationarity ceiling.
 
+### Already on `main` — tested, not reimplemented
+
+Two goal items turned out to be satisfied by code that already exists. Building
+a second copy of either would have been the same duplication mistake in a new
+place, so this train tests them instead:
+
+- **Bounded event/audit growth.** `event_bus.rs` already enforces
+  `MAX_JOURNAL_BYTES` (16 MiB), a per-line cap, capacity-based trimming, and
+  `OrchStore::prune_retention`. An earlier revision of this branch shipped its
+  own bounded journal; it was withdrawn as redundant.
+- **Durable work claims and revisions.** `OrchStore::claim_work` is already
+  durable, lease-scoped and revision-bearing. The evidence above is what this
+  train adds.
+
+### Strict old/new protocol negotiation
+
+`tests/mcp_streamable_transport.rs` exercises the **real** MCP negotiation:
+
+- an old but supported version (`2024-10-07` … `2025-06-18`) is honoured
+  exactly, not quietly upgraded;
+- a header that disagrees with the body is refused, and an agreeing pair is
+  accepted;
+- **characterization:** the two negotiation paths disagree. The
+  `MCP-Protocol-Version` header check (`mcp_control.rs:1522`) *refuses* an
+  unsupported version with 400, while `handle_initialize` (`:1716`) *accepts*
+  the same string and silently substitutes the newest supported version.
+  Answering with a supported version is what the MCP spec calls for, so the
+  downgrade is defensible alone; the disagreement is not, and the
+  header-match check compares against the *requested* version rather than the
+  negotiated one, which traps an old client on its next request. Changing this
+  is wire-visible, so the test pins today's answer rather than asserting a
+  preferred one.
+
 ### Not here, and why
 
 | Goal item | Where it belongs |
 | --- | --- |
 | One provider-send lattice; uncertain/not-sent/settled | #497 **G3**. A second lattice is what #478 forbids, and the first attempt here was forgeable. |
-| Provider-neutral manager/SDK boundary, no operator escape | #497 **G1/G2**. Operator authority cannot be minted outside the authority root. |
-| Durable effect crash/restart recovery | Needs durable effect records, i.e. #497 **G4** audit. The registry is per-turn and in-memory, so there is nothing to recover *from* yet; recovery of durable **work** is covered above against the real store. |
-| Bounded event/audit growth; uniform malformed-record accounting | `store.rs` run and idempotency read paths, which are the four-donor collision surface and #470's seam. |
+| Minting operator authority for an embedder | #497 **G1/G2**. What *is* asserted here is the property against the real surface: `CONTROL_TOOLS` exposes no transport, provider, credential or self-elevation tool, and stays disjoint from `FORBIDDEN_TOOLS`. |
+| Durable effect crash/restart recovery | Needs durable effect records — #497 **G4**. The registry is per-turn and in-memory, so there is nothing to recover *from*; durable **work** restart recovery is covered above against the real store. |
+| Uniform malformed-record accounting on the run and idempotency read paths | `store.rs`, the four-donor collision surface and #470's seam. Work records already fail closed; those two paths still skip in silence. |
 
 ## 5a. Exact-head audit, and what it changed
 

@@ -3,6 +3,8 @@
 //! Every test here is deterministic and offline. Nothing contacts a provider,
 //! reads a credential, opens a socket, or sleeps.
 
+use grokptah_agent_bridge::orchestration::{CONTROL_TOOLS, FORBIDDEN_TOOLS};
+
 use grokptah_agent_bridge::durable::{
     self, progress::RepeatClass, progress::StopDecision, ActiveTaskWaitWitness, ActiveWaitState,
     ProgressLedger, RawObservation, RawObservationDigest,
@@ -506,4 +508,86 @@ fn the_durable_core_contacts_nothing_and_declares_no_authority() {
         checked, 5,
         "expected exactly mod, observation, progress, effects and cancel"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The embeddable manager surface
+// ---------------------------------------------------------------------------
+
+/// The control surface an embedder actually gets is `CONTROL_TOOLS`. Whatever
+/// else it grows, it must stay provider-neutral: no tool may hand a caller a
+/// raw transport, a credential, or a way to assert operator authority for
+/// itself.
+///
+/// This asserts the property against the **real** surface. A parallel SDK type
+/// asserting it about itself would prove nothing about what is exposed, and a
+/// second operator-grant path is what #497's G1/G2 exist to prevent.
+#[test]
+fn the_embeddable_control_surface_exposes_no_raw_transport_or_operator_escape() {
+    // Provider-neutral: nothing names a provider, a dialect, or a wire detail.
+    for forbidden in [
+        "http",
+        "url",
+        "endpoint",
+        "header",
+        "socket",
+        "stream_raw",
+        "transport",
+        "xai",
+        "openai",
+        "anthropic",
+        "dialect",
+        "credential",
+        "token",
+        "secret",
+        "api_key",
+        "bearer",
+    ] {
+        let offenders: Vec<&str> = CONTROL_TOOLS
+            .iter()
+            .copied()
+            .filter(|tool| tool.to_ascii_lowercase().contains(forbidden))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "control tool(s) {offenders:?} expose `{forbidden}` to an embedder"
+        );
+    }
+
+    // No self-granted authority: an embedder must not be able to elevate
+    // *itself* through a tool call. Note what is deliberately absent from this
+    // list: `authorize`. `ptah_authorize_work_execution` authorizes a unit of
+    // work under the caller's existing scope, which is a domain action, not a
+    // caller minting authority for itself. Banning the word would have flagged
+    // a legitimate tool and taught the next reader the wrong rule.
+    for forbidden in ["grant", "elevate", "impersonate", "sudo", "escalate"] {
+        let offenders: Vec<&str> = CONTROL_TOOLS
+            .iter()
+            .copied()
+            .filter(|tool| tool.to_ascii_lowercase().contains(forbidden))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "control tool(s) {offenders:?} look like a `{forbidden}` escape"
+        );
+    }
+
+    // The escape-hatch tools and the embeddable surface must stay disjoint.
+    // `FORBIDDEN_TOOLS` names shells, config, plugin and MCP management — the
+    // things that would turn a scoped embedder into an unscoped one.
+    for tool in FORBIDDEN_TOOLS {
+        assert!(
+            !CONTROL_TOOLS.contains(tool),
+            "`{tool}` is forbidden yet reachable on the embeddable surface"
+        );
+    }
+
+    // Every tool is namespaced, so the surface cannot be widened by accident.
+    for tool in CONTROL_TOOLS {
+        assert!(
+            tool.starts_with("ptah_"),
+            "`{tool}` is outside the ptah_ control namespace"
+        );
+    }
+    assert!(!CONTROL_TOOLS.is_empty());
 }

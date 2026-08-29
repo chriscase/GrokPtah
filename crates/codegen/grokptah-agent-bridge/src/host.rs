@@ -636,6 +636,46 @@ const MAX_SESSION_COMPLETION_HISTORY: usize = 64;
 /// is not coming back, and the session must not stay busy on its behalf.
 const DRAIN_RESERVATION_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Finishes a supervised effect on every exit path.
+///
+/// The provider round returns early on several error branches, so pairing
+/// register/start with an explicit finish would leave an effect marked running
+/// on exactly the paths where knowing it stopped matters most.
+struct TurnEffectGuard {
+    host: AgentHostHandle,
+    session_id: Uuid,
+    ticket: Option<crate::durable::effects::EffectTicket>,
+}
+
+impl TurnEffectGuard {
+    fn start(
+        host: &AgentHostHandle,
+        session_id: Uuid,
+        kind: crate::durable::effects::EffectKind,
+        label: &str,
+    ) -> Self {
+        let ticket = host.register_turn_effect(session_id, kind, label);
+        if let Some(ticket) = ticket.as_ref() {
+            host.start_turn_effect(session_id, ticket);
+        }
+        Self {
+            host: host.clone(),
+            session_id,
+            ticket,
+        }
+    }
+}
+
+impl Drop for TurnEffectGuard {
+    fn drop(&mut self) {
+        if let Some(ticket) = self.ticket.as_ref() {
+            // Whether the effect completed or was cut short, it is no longer in
+            // flight; the registry records that it ended, never that it worked.
+            self.host.finish_turn_effect(self.session_id, ticket, false);
+        }
+    }
+}
+
 /// Clears `turn_cancels` for a session when dropped — keeps panics from wedging busy.
 struct TurnBusyGuard {
     host: AgentHostHandle,
@@ -8834,6 +8874,16 @@ impl AgentHostHandle {
                 }
             };
             let provider_observation = self.provider_observation_context(session_id);
+            // Registered before the round starts, so a cancel arriving mid-round
+            // can tell "the provider call is still open" from "the turn is
+            // actually idle". Dropped on every exit path, including the early
+            // returns below.
+            let provider_effect = TurnEffectGuard::start(
+                self,
+                session_id,
+                crate::durable::effects::EffectKind::ProviderSend,
+                "provider_round",
+            );
             let step = match call_xai_agent_step_observed(
                 creds,
                 model,
@@ -8865,6 +8915,8 @@ impl AgentHostHandle {
                     return Err(e);
                 }
             };
+            // The provider round is over; anything after this is host work.
+            drop(provider_effect);
             let token_stop = self.finish_provider_attempt(
                 session_id,
                 usage_attempt,
@@ -11670,6 +11722,71 @@ mod tests {
             "with nothing in flight the turn is provably idle"
         );
         assert!(host.turn_active_effects(session).is_empty());
+    }
+
+    /// The provider round is the other thing that keeps running behind a
+    /// "cancelled" turn, and it is the one a caller cannot see at all.
+    #[test]
+    fn a_cancel_during_an_active_provider_round_is_not_reported_as_stopped() {
+        let (_home, host, session) = test_host();
+        host.begin_turn_for_test(session);
+        let round = host
+            .register_turn_effect(
+                session,
+                crate::durable::effects::EffectKind::ProviderSend,
+                "provider_round",
+            )
+            .expect("registered");
+        host.start_turn_effect(session, &round);
+
+        host.cancel_turn(Some(session)).expect("cancel accepted");
+        assert_eq!(host.turn_cancellation_settled(session), Some(false));
+        assert_eq!(host.turn_active_effects(session), vec!["provider_send"]);
+
+        host.finish_turn_effect(session, &round, true);
+        assert_eq!(host.turn_cancellation_settled(session), Some(true));
+    }
+
+    /// A round holding both a provider call and a tool call is idle only when
+    /// both have stopped — settling on the first one to finish is the bug.
+    #[test]
+    fn a_cancel_waits_for_every_active_effect_not_just_the_first() {
+        let (_home, host, session) = test_host();
+        host.begin_turn_for_test(session);
+        let round = host
+            .register_turn_effect(
+                session,
+                crate::durable::effects::EffectKind::ProviderSend,
+                "provider_round",
+            )
+            .expect("registered");
+        host.start_turn_effect(session, &round);
+        let tool = host
+            .register_turn_effect(
+                session,
+                crate::durable::effects::EffectKind::ToolCall,
+                "run_terminal_cmd",
+            )
+            .expect("registered");
+        host.start_turn_effect(session, &tool);
+
+        host.cancel_turn(Some(session)).expect("cancel accepted");
+        assert_eq!(host.turn_cancellation_settled(session), Some(false));
+        assert_eq!(
+            host.turn_active_effects(session),
+            vec!["tool_call", "provider_send"]
+        );
+
+        host.finish_turn_effect(session, &round, true);
+        assert_eq!(
+            host.turn_cancellation_settled(session),
+            Some(false),
+            "the tool call is still running"
+        );
+        assert_eq!(host.turn_active_effects(session), vec!["tool_call"]);
+
+        host.finish_turn_effect(session, &tool, true);
+        assert_eq!(host.turn_cancellation_settled(session), Some(true));
     }
 
     /// An effect registered but never started still holds the turn open: the

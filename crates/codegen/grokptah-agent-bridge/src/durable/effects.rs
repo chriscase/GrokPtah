@@ -26,18 +26,20 @@ pub(crate) const MAX_SUPERVISED_EFFECTS: usize = 256;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum EffectKind {
     ToolCall,
+    ProviderSend,
 }
 
 impl EffectKind {
     /// Whether an interrupted effect of this kind may have changed something
     /// outside the host.
     pub(crate) fn externally_visible(self) -> bool {
-        matches!(self, Self::ToolCall)
+        matches!(self, Self::ToolCall | Self::ProviderSend)
     }
 
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::ToolCall => "tool_call",
+            Self::ProviderSend => "provider_send",
         }
     }
 }
@@ -272,8 +274,14 @@ mod tests {
     }
 
     #[test]
-    fn a_tool_call_is_externally_visible() {
-        assert!(EffectKind::ToolCall.externally_visible());
+    fn every_supervised_kind_is_externally_visible_and_named() {
+        // Both kinds can change something outside the host, so an interrupted
+        // one is never assumed harmless.
+        for kind in [EffectKind::ToolCall, EffectKind::ProviderSend] {
+            assert!(kind.externally_visible());
+            assert!(!kind.as_str().is_empty());
+        }
         assert_eq!(EffectKind::ToolCall.as_str(), "tool_call");
+        assert_eq!(EffectKind::ProviderSend.as_str(), "provider_send");
     }
 }
