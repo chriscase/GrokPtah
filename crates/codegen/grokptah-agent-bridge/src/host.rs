@@ -23,8 +23,7 @@ use crate::computer_agent::{
 use crate::event_bus::{session_id_of, JournalPage};
 use crate::events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 use crate::host_helpers::{
-    action_stationarity_nudge, action_stationarity_stop_message, api_context_messages,
-    auto_cargo_reverify_command, build_agent_messages, build_compact_summary,
+    api_context_messages, auto_cargo_reverify_command, build_agent_messages, build_compact_summary,
     call_xai_agent_step_observed, call_xai_chat, cargo_test_failure_coaching,
     cargo_test_output_failed, cargo_test_output_passed, cargo_test_reverify_coaching,
     coding_agent_tools, count_cargo_test_failures, emit_message, emit_thought,
@@ -36,7 +35,7 @@ use crate::host_helpers::{
     round_limit_stop_message, sandbox_blocks_shell, sandbox_is_readonly,
     should_auto_cargo_reverify_after_edit, should_skip_tool_after_cargo_failure,
     surface_rate_limit_or_error, tool_kind, tool_step_signature, tool_web_fetch, AgentStep,
-    IdenticalToolCallRun, McpToolIndex,
+    McpToolIndex,
 };
 use crate::lane::LaneSummary;
 use crate::local_tools;
@@ -186,12 +185,30 @@ pub(crate) struct Inner {
     /// Per-subagent cancel tokens (#151/#152) — cancel one child without killing siblings.
     subagent_cancels: HashMap<String, CancellationToken>,
     background_tasks: Vec<BackgroundTask>,
+    /// Host-assigned generation per task/subagent id, with the identity
+    /// fingerprint the generation was issued for.
+    ///
+    /// One registry for background tasks and subagents alike. It is consulted
+    /// lazily at witness time rather than written at each creation site, so a
+    /// creation path that does not know about it — including one added later —
+    /// cannot bypass it. Re-registering an id whose fingerprint changed means
+    /// the id was recycled onto different work and gets a new generation, so a
+    /// wait witness can never be carried across identities.
+    wait_generations: HashMap<String, (u64, String)>,
+    next_wait_generation: u64,
     /// Cancel tokens for in-flight background tasks (#52).
     background_cancels: HashMap<String, CancellationToken>,
     pending_permissions: HashMap<Uuid, PendingPermission>,
     /// Per-session turn cancellation so multiple sessions can run concurrently
     /// (Claude Code–style parallel build sessions).
     turn_cancels: HashMap<Uuid, CancellationToken>,
+    /// Per-turn effect supervision, created lazily on first registration and
+    /// cleared with the turn. Bookkeeping over this host's own work: it grants
+    /// nothing and is unreachable outside this crate.
+    turn_effects: HashMap<Uuid, crate::durable::effects::EffectRegistry>,
+    /// Per-turn cancellation, so a cancel can report the turn stopped only once
+    /// its effects are proven idle rather than when the token was flipped.
+    turn_cancel_ledgers: HashMap<Uuid, crate::durable::cancel::CancellationLedger>,
     /// Identity of the turn currently installed in `turn_cancels`, so a caller
     /// that observed a turn under the lock can prove the turn it is about to
     /// cancel is still that same turn. Without it, a turn that finishes while
@@ -606,12 +623,58 @@ impl RunUsageTracker {
     }
 }
 
+/// Byte cap applied to one tool result before it reaches the model wire.
+///
+/// The raw output is digested before this bound is applied; see
+/// [`crate::durable::observation`] for why the order matters.
+const TOOL_OUTPUT_WIRE_BYTES: usize = 24_000;
+
 const MAX_SESSION_COMPLETION_HISTORY: usize = 64;
 
 /// How long a queue-drain reservation may go unclaimed before another drain
 /// may take the slot. A drain that has not started its turn within this window
 /// is not coming back, and the session must not stay busy on its behalf.
 const DRAIN_RESERVATION_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Finishes a supervised effect on every exit path.
+///
+/// The provider round returns early on several error branches, so pairing
+/// register/start with an explicit finish would leave an effect marked running
+/// on exactly the paths where knowing it stopped matters most.
+struct TurnEffectGuard {
+    host: AgentHostHandle,
+    session_id: Uuid,
+    ticket: Option<crate::durable::effects::EffectTicket>,
+}
+
+impl TurnEffectGuard {
+    fn start(
+        host: &AgentHostHandle,
+        session_id: Uuid,
+        kind: crate::durable::effects::EffectKind,
+        label: &str,
+    ) -> Self {
+        let ticket = host.register_turn_effect(session_id, kind, label);
+        if let Some(ticket) = ticket.as_ref() {
+            host.start_turn_effect(session_id, ticket);
+        }
+        Self {
+            host: host.clone(),
+            session_id,
+            ticket,
+        }
+    }
+}
+
+impl Drop for TurnEffectGuard {
+    fn drop(&mut self) {
+        if let Some(ticket) = self.ticket.as_ref() {
+            // Whether the effect completed or was cut short, it is no longer in
+            // flight; the registry records that it ended, never that it worked.
+            self.host.finish_turn_effect(self.session_id, ticket, false);
+        }
+    }
+}
 
 /// Clears `turn_cancels` for a session when dropped — keeps panics from wedging busy.
 struct TurnBusyGuard {
@@ -634,6 +697,8 @@ impl Drop for TurnBusyGuard {
         let outcome = {
             let mut g = self.host.inner.lock();
             g.turn_cancels.remove(&self.session_id);
+            g.turn_effects.remove(&self.session_id);
+            g.turn_cancel_ledgers.remove(&self.session_id);
             g.turn_generations.remove(&self.session_id);
             g.turn_max_rounds.remove(&self.session_id);
             recover_pending_steering_locked(&mut g, self.session_id)
@@ -900,9 +965,13 @@ impl AgentHost {
             subagents: Vec::new(),
             subagent_cancels: HashMap::new(),
             background_tasks: Vec::new(),
+            wait_generations: HashMap::new(),
+            next_wait_generation: 1,
             background_cancels: HashMap::new(),
             pending_permissions: HashMap::new(),
             turn_cancels: HashMap::new(),
+            turn_effects: HashMap::new(),
+            turn_cancel_ledgers: HashMap::new(),
             turn_generations: HashMap::new(),
             next_turn_generation: 0,
             computer_agent_operations: HashMap::new(),
@@ -2954,7 +3023,33 @@ impl AgentHostHandle {
             );
         }
         self.inner.lock().running = true;
+        self.report_interrupted_provider_attempts();
         Ok(())
+    }
+
+    /// Report provider attempts that were in flight when this home last stopped.
+    ///
+    /// `main` cannot make this distinction after a restart: its observation sink
+    /// is in memory, so every interrupted attempt looks alike. The durable
+    /// breadcrumbs separate one that provably never left from one that may
+    /// already have been delivered — and the latter is never auto-retried, it is
+    /// surfaced for a person to decide.
+    ///
+    /// Advisory only. A missing or damaged log never blocks startup.
+    pub fn interrupted_provider_attempts(&self) -> Option<String> {
+        let report = crate::durable::attempt::AttemptRecorder::recover(
+            &crate::discover::grokptah_home().join("provider"),
+        );
+        if !report.has_indeterminate() && report.provably_not_sent.is_empty() {
+            return None;
+        }
+        Some(report.operator_summary())
+    }
+
+    fn report_interrupted_provider_attempts(&self) {
+        if let Some(summary) = self.interrupted_provider_attempts() {
+            eprintln!("[grokptah] provider attempts from the previous run: {summary}");
+        }
     }
 
     pub fn stop(&self) -> Result<()> {
@@ -4949,6 +5044,80 @@ impl AgentHostHandle {
         self.spawn_gp_subagent_parallel(session_id, &cwd, prompt, kind, &parent_cancel, &event_tx)
     }
 
+    /// Register an effect for this turn *before* it starts.
+    ///
+    /// Returns `None` when the turn is stopping, which is the caller's signal
+    /// not to start the effect at all.
+    fn register_turn_effect(
+        &self,
+        session_id: Uuid,
+        kind: crate::durable::effects::EffectKind,
+        label: &str,
+    ) -> Option<crate::durable::effects::EffectTicket> {
+        let mut g = self.inner.lock();
+        g.turn_effects
+            .entry(session_id)
+            .or_default()
+            .register(kind, label)
+            .ok()
+    }
+
+    fn start_turn_effect(&self, session_id: Uuid, ticket: &crate::durable::effects::EffectTicket) {
+        let mut g = self.inner.lock();
+        if let Some(registry) = g.turn_effects.get_mut(&session_id) {
+            let _ = registry.start(ticket);
+        }
+    }
+
+    fn finish_turn_effect(
+        &self,
+        session_id: Uuid,
+        ticket: &crate::durable::effects::EffectTicket,
+        cancelled: bool,
+    ) {
+        let mut g = self.inner.lock();
+        if let Some(registry) = g.turn_effects.get_mut(&session_id) {
+            let _ = if cancelled {
+                registry.cancel(ticket)
+            } else {
+                registry.finish(ticket)
+            };
+        }
+    }
+
+    /// Whether a cancelled turn is *provably* idle.
+    ///
+    /// `None` when no cancellation was requested for this session. `Some(false)`
+    /// means the token was flipped but effects from the turn are still active,
+    /// which is precisely the state `main` reports as "cancelled" today.
+    pub fn turn_cancellation_settled(&self, session_id: Uuid) -> Option<bool> {
+        let g = self.inner.lock();
+        let ledger = g.turn_cancel_ledgers.get(&session_id)?;
+        let empty = crate::durable::effects::EffectRegistry::default();
+        let registry = g.turn_effects.get(&session_id).unwrap_or(&empty);
+        if !ledger.requested() {
+            return None;
+        }
+        Some(ledger.status(registry).is_settled())
+    }
+
+    /// Effects still holding a turn open, for an operator projection.
+    ///
+    /// Names kinds only — never a path, prompt, argument or credential.
+    pub fn turn_active_effects(&self, session_id: Uuid) -> Vec<&'static str> {
+        let g = self.inner.lock();
+        let Some(registry) = g.turn_effects.get(&session_id) else {
+            return Vec::new();
+        };
+        let empty = crate::durable::cancel::CancellationLedger::default();
+        let ledger = g.turn_cancel_ledgers.get(&session_id).unwrap_or(&empty);
+        ledger
+            .blocking_kinds(registry)
+            .into_iter()
+            .map(|kind| kind.as_str())
+            .collect()
+    }
+
     /// Test helper: register a parent turn cancel token for `session_id`.
     pub fn begin_turn_for_test(&self, session_id: Uuid) {
         let mut g = self.inner.lock();
@@ -5000,6 +5169,97 @@ impl AgentHostHandle {
         g.subagents
             .retain(|s| s.session_id.as_deref() != Some(&session_id.to_string()));
         g.subagents.extend(hist);
+    }
+
+    /// Assign, or reuse, the host generation for a wait identity.
+    ///
+    /// A fingerprint change means the id was recycled onto different work, so
+    /// it earns a fresh generation and any witness held against the old one is
+    /// no longer the same identity.
+    fn wait_generation_for(&self, id: &str, fingerprint: &str) -> u64 {
+        let mut guard = self.inner.lock();
+        if let Some((generation, seen)) = guard.wait_generations.get(id) {
+            if seen == fingerprint {
+                return *generation;
+            }
+        }
+        let generation = guard.next_wait_generation;
+        guard.next_wait_generation = generation.saturating_add(1);
+        guard
+            .wait_generations
+            .insert(id.to_string(), (generation, fingerprint.to_string()));
+        generation
+    }
+
+    /// Issue a wait witness for an id, or refuse.
+    ///
+    /// This is the whole of the exemption's authority. It answers only for ids
+    /// the host has registered, whose status is still outstanding, and whose
+    /// owning session is the one asking. An unknown id, a finished or failed
+    /// task, another session's task, or an id the host never registered all
+    /// return `None`, and the round is then ordinary work.
+    fn issue_wait_witness(
+        &self,
+        session_id: Uuid,
+        id: &str,
+        elapsed_ms: u64,
+    ) -> Option<crate::durable::ActiveTaskWaitWitness> {
+        let owns = |owner: &Option<String>| {
+            owner
+                .as_deref()
+                .and_then(|value| Uuid::parse_str(value).ok())
+                .is_some_and(|owner| owner == session_id)
+        };
+        // Identity fingerprint from stable fields only. Status is deliberately
+        // excluded: a task moving from queued to running is the same work and
+        // must not look like a recycled id.
+        let (state, fingerprint) =
+            if let Some(task) = self.background_tasks().into_iter().find(|t| t.id == id) {
+                if !owns(&task.session_id) {
+                    return None;
+                }
+                (
+                    crate::durable::ActiveWaitState::from_status(&task.status)?,
+                    format!("task\u{1f}{}\u{1f}{}", task.kind, task.title),
+                )
+            } else if let Some(sub) = self.subagents().into_iter().find(|s| s.id == id) {
+                if !owns(&sub.session_id) {
+                    return None;
+                }
+                (
+                    crate::durable::ActiveWaitState::from_status(&sub.status)?,
+                    format!("subagent\u{1f}{}\u{1f}{}", sub.kind, sub.title),
+                )
+            } else {
+                return None;
+            };
+        Some(crate::durable::ActiveTaskWaitWitness {
+            task_id: id.to_string(),
+            state,
+            owner_session: session_id,
+            generation: self.wait_generation_for(id, &fingerprint),
+            deadline_ms: elapsed_ms
+                .saturating_add(crate::durable::progress::WITNESSED_WAIT_DEADLINE_MS),
+        })
+    }
+
+    /// Issue a witness for a dispatched wait call.
+    ///
+    /// Parses the id exactly as the dispatcher does, so the witness describes
+    /// the call the host actually served. A wait with no id is a *listing*, not
+    /// a wait on anything, and gets no witness.
+    fn witness_dispatched_wait(
+        &self,
+        session_id: Uuid,
+        arguments_json: &str,
+        elapsed_ms: u64,
+    ) -> Option<crate::durable::ActiveTaskWaitWitness> {
+        let args: serde_json::Value = serde_json::from_str(arguments_json).ok()?;
+        let id = args
+            .get("id")
+            .or_else(|| args.get("task_id"))
+            .and_then(|value| value.as_str())?;
+        self.issue_wait_witness(session_id, id, elapsed_ms)
     }
 
     pub fn background_tasks(&self) -> Vec<BackgroundTask> {
@@ -6752,6 +7012,18 @@ impl AgentHostHandle {
                     bail!("no active turn for session {id}");
                 };
                 c.cancel();
+                // Flipping the token is the request, not the outcome. Record it
+                // and seal admission so the turn can be reported stopped only
+                // once its registered effects are proven idle.
+                {
+                    let inner = &mut *g;
+                    let registry = inner.turn_effects.entry(id).or_default();
+                    inner
+                        .turn_cancel_ledgers
+                        .entry(id)
+                        .or_default()
+                        .request(registry);
+                }
                 let sid = id.to_string();
                 let child_ids: Vec<String> = g
                     .subagents
@@ -8463,7 +8735,10 @@ impl AgentHostHandle {
         let (tools, mcp_index) = coding_agent_tools(&mcp_specs);
         // #168: at most one Stop-hook continue per user turn
         let mut stop_continued = false;
-        let mut identical_tool_calls = IdenticalToolCallRun::default();
+        let mut identical_tool_calls = crate::durable::ProgressLedger::new();
+        // Turn clock, so a witnessed wait has a bounded deadline rather
+        // than an open-ended exemption.
+        let turn_started_at = std::time::Instant::now();
         let mut test_failure_needs_edit = false;
         // Cargo failures since last successful edit while armed.
         let mut cargo_fails_since_edit: u32 = 0;
@@ -8501,14 +8776,14 @@ impl AgentHostHandle {
             // Give an explicit steering prompt one model boundary to break a
             // stationary run before applying the automatic stop.
             if steering_count == 0 {
-                if let Some((run_len, tool_name, true_noop)) = identical_tool_calls.stop_info() {
-                    let msg = action_stationarity_stop_message(run_len, &tool_name, true_noop);
+                if let crate::durable::StopDecision::Stop(detail) = identical_tool_calls.decide() {
+                    let msg = crate::durable::progress::stop_message(&detail);
                     self.mark_run_stop(session_id, RunStopCause::Stationarity, "stationarity")?;
                     let _ = event_tx.send(SessionUpdate::AgentProgress {
                         session_id,
                         round: round as u32,
                         max_rounds: visible_max_rounds as u32,
-                        last_tool: Some(tool_name),
+                        last_tool: Some(detail.tool_name.clone()),
                         detail: msg.clone(),
                     });
                     emit_message(event_tx, session_id, &msg);
@@ -8518,9 +8793,9 @@ impl AgentHostHandle {
             }
 
             if identical_tool_calls.take_nudge() {
-                let run_len = identical_tool_calls.run_len();
-                let tool_name = identical_tool_calls.tool_name();
-                let nudge = action_stationarity_nudge(&tool_name, run_len);
+                let run_len = identical_tool_calls.repeats();
+                let tool_name = identical_tool_calls.tool_name().to_string();
+                let nudge = crate::durable::progress::nudge_message(&tool_name, run_len);
                 let _ = event_tx.send(SessionUpdate::AgentProgress {
                     session_id,
                     round: round as u32,
@@ -8625,6 +8900,16 @@ impl AgentHostHandle {
                 }
             };
             let provider_observation = self.provider_observation_context(session_id);
+            // Registered before the round starts, so a cancel arriving mid-round
+            // can tell "the provider call is still open" from "the turn is
+            // actually idle". Dropped on every exit path, including the early
+            // returns below.
+            let provider_effect = TurnEffectGuard::start(
+                self,
+                session_id,
+                crate::durable::effects::EffectKind::ProviderSend,
+                "provider_round",
+            );
             let step = match call_xai_agent_step_observed(
                 creds,
                 model,
@@ -8656,6 +8941,8 @@ impl AgentHostHandle {
                     return Err(e);
                 }
             };
+            // The provider round is over; anything after this is host work.
+            drop(provider_effect);
             let token_stop = self.finish_provider_attempt(
                 session_id,
                 usage_attempt,
@@ -8814,6 +9101,16 @@ impl AgentHostHandle {
                     }));
 
                     let mut edited_while_needs_reverify = false;
+                    // Raw observation digests for this round, taken before any
+                    // bounded projection of the tool output.
+                    let mut round_raw_outputs: Vec<crate::durable::RawObservationDigest> =
+                        Vec::new();
+                    // Host-issued witnesses for this round's wait calls. Empty
+                    // unless the host can see real, authorized, outstanding work
+                    // behind every call, so a wait cannot be asserted into
+                    // existence by naming a task id.
+                    let mut round_witnesses: Vec<crate::durable::ActiveTaskWaitWitness> =
+                        Vec::new();
                     for tc in &tool_calls {
                         if cancel.is_cancelled() {
                             break;
@@ -8842,6 +9139,18 @@ impl AgentHostHandle {
                             last_tool: Some(tc.name.clone()),
                             detail: format!("Tool `{}` (round {round})", tc.name),
                         });
+                        // Registered before the effect starts, so an
+                        // interrupted turn always leaves a record to recover
+                        // from, and a cancel can tell "still running" from
+                        // "actually idle".
+                        let effect = self.register_turn_effect(
+                            session_id,
+                            crate::durable::effects::EffectKind::ToolCall,
+                            &tc.name,
+                        );
+                        if let Some(ticket) = effect.as_ref() {
+                            self.start_turn_effect(session_id, ticket);
+                        }
                         let output = self
                             .dispatch_agent_tool(
                                 session_id,
@@ -8853,21 +9162,32 @@ impl AgentHostHandle {
                                 &mcp_index,
                             )
                             .await;
+                        if let Some(ticket) = effect.as_ref() {
+                            self.finish_turn_effect(session_id, ticket, cancel.is_cancelled());
+                        }
                         let content = match &output {
                             Ok(s) => s.clone(),
                             Err(e) => format!("ERROR: {e}"),
                         };
-                        // Cap tool output size for the wire
-                        let content = if content.len() > 24_000 {
-                            let orig_len = content.len();
-                            format!(
-                                "{}…\n(truncated {} bytes)",
-                                crate::textutil::truncate_at_char_boundary(&content, 24_000),
-                                orig_len
-                            )
-                        } else {
-                            content
-                        };
+                        // Digest the raw output *before* bounding it for the wire.
+                        // A digest taken from the bounded projection cannot see a
+                        // change past the cap, so a long, advancing output would
+                        // read as inert and cut a productive turn short (#209).
+                        let observation = crate::durable::RawObservation::capture(content);
+                        round_raw_outputs.push(observation.digest());
+                        let content = observation.project(TOOL_OUTPUT_WIRE_BYTES).into_text();
+                        // The witness is the host's answer about the call it just
+                        // served. A wait naming an unknown, finished or foreign
+                        // task yields no witness and earns no exemption.
+                        if crate::durable::is_wait_shaped_tool(&tc.name) && output.is_ok() {
+                            if let Some(witness) = self.witness_dispatched_wait(
+                                session_id,
+                                &tc.arguments,
+                                turn_started_at.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                            ) {
+                                round_witnesses.push(witness);
+                            }
+                        }
                         // Under tight budgets, only clear the post-failure gate when cargo is
                         // green again. Clearing on edit alone allowed final answers without a
                         // re-run (#187 verified=false despite oracle pass via external check).
@@ -8956,6 +9276,14 @@ impl AgentHostHandle {
                                 }
                             }],
                         }));
+                        let effect = self.register_turn_effect(
+                            session_id,
+                            crate::durable::effects::EffectKind::ToolCall,
+                            "run_terminal_cmd",
+                        );
+                        if let Some(ticket) = effect.as_ref() {
+                            self.start_turn_effect(session_id, ticket);
+                        }
                         let output = self
                             .dispatch_agent_tool(
                                 session_id,
@@ -8967,20 +9295,20 @@ impl AgentHostHandle {
                                 &mcp_index,
                             )
                             .await;
+                        if let Some(ticket) = effect.as_ref() {
+                            self.finish_turn_effect(session_id, ticket, cancel.is_cancelled());
+                        }
                         let content = match &output {
                             Ok(s) => s.clone(),
                             Err(e) => format!("ERROR: {e}"),
                         };
-                        let content = if content.len() > 24_000 {
-                            let orig_len = content.len();
-                            format!(
-                                "{}…\n(truncated {} bytes)",
-                                crate::textutil::truncate_at_char_boundary(&content, 24_000),
-                                orig_len
-                            )
-                        } else {
-                            content
-                        };
+                        // Digest the raw output *before* bounding it for the wire.
+                        // A digest taken from the bounded projection cannot see a
+                        // change past the cap, so a long, advancing output would
+                        // read as inert and cut a productive turn short (#209).
+                        let observation = crate::durable::RawObservation::capture(content);
+                        round_raw_outputs.push(observation.digest());
+                        let content = observation.project(TOOL_OUTPUT_WIRE_BYTES).into_text();
                         if cargo_test_output_failed(&content) {
                             test_failure_needs_edit = true;
                             cargo_fails_since_edit = cargo_fails_since_edit.saturating_add(1);
@@ -9023,11 +9351,35 @@ impl AgentHostHandle {
                         .first()
                         .map(|tool_call| tool_call.name.as_str())
                         .unwrap_or("");
-                    identical_tool_calls.observe(
+                    identical_tool_calls.observe_call(
                         &signature,
                         tool_name,
                         is_true_noop_tool_step(&tool_calls),
                     );
+                    // A witnessed wait is exempt: a poll against work the host
+                    // can see is still outstanding is not stuck, and when it
+                    // should end is for its own deadline to decide. The
+                    // identical-call ceiling, the nudge and the round and
+                    // duration budgets all still apply.
+                    let tool_names: Vec<&str> =
+                        tool_calls.iter().map(|call| call.name.as_str()).collect();
+                    if crate::durable::round_is_witnessed_wait(
+                        &tool_names,
+                        &round_witnesses,
+                        session_id,
+                        turn_started_at.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                    ) {
+                        identical_tool_calls.observe_witnessed_wait();
+                    } else if let Some(digest) =
+                        // Judge the repeat by what it produced, not only by what
+                        // it asked for: a poll whose output keeps advancing is
+                        // not stationary and must not be stopped as a no-op.
+                        crate::durable::RawObservationDigest::of_digests(
+                                &round_raw_outputs,
+                            )
+                    {
+                        identical_tool_calls.observe_outcome(digest);
+                    }
                     // Usage belongs to the model boundary that produced these
                     // calls. Let every tool in that accepted response settle,
                     // then stop here so the final loop exit cannot overwrite a
@@ -11357,6 +11709,167 @@ mod tests {
             host,
             session.id,
         )
+    }
+
+    /// Flipping the cancellation token is a *request*. `main` reports the turn
+    /// stopped at that moment, while the tool subprocess it started is still
+    /// running. The turn is stopped only once its registered effects are idle.
+    #[test]
+    fn a_cancel_during_active_tool_work_is_not_reported_as_stopped() {
+        let (_home, host, session) = test_host();
+        host.begin_turn_for_test(session);
+
+        // Nobody has asked, so there is nothing to report.
+        assert_eq!(host.turn_cancellation_settled(session), None);
+
+        let ticket = host
+            .register_turn_effect(
+                session,
+                crate::durable::effects::EffectKind::ToolCall,
+                "run_terminal_cmd",
+            )
+            .expect("effect registered before it starts");
+        host.start_turn_effect(session, &ticket);
+
+        host.cancel_turn(Some(session)).expect("cancel accepted");
+
+        assert_eq!(
+            host.turn_cancellation_settled(session),
+            Some(false),
+            "a live tool call means the turn has not actually stopped"
+        );
+        assert_eq!(host.turn_active_effects(session), vec!["tool_call"]);
+
+        host.finish_turn_effect(session, &ticket, true);
+
+        assert_eq!(
+            host.turn_cancellation_settled(session),
+            Some(true),
+            "with nothing in flight the turn is provably idle"
+        );
+        assert!(host.turn_active_effects(session).is_empty());
+    }
+
+    /// The provider round is the other thing that keeps running behind a
+    /// "cancelled" turn, and it is the one a caller cannot see at all.
+    #[test]
+    fn a_cancel_during_an_active_provider_round_is_not_reported_as_stopped() {
+        let (_home, host, session) = test_host();
+        host.begin_turn_for_test(session);
+        let round = host
+            .register_turn_effect(
+                session,
+                crate::durable::effects::EffectKind::ProviderSend,
+                "provider_round",
+            )
+            .expect("registered");
+        host.start_turn_effect(session, &round);
+
+        host.cancel_turn(Some(session)).expect("cancel accepted");
+        assert_eq!(host.turn_cancellation_settled(session), Some(false));
+        assert_eq!(host.turn_active_effects(session), vec!["provider_send"]);
+
+        host.finish_turn_effect(session, &round, true);
+        assert_eq!(host.turn_cancellation_settled(session), Some(true));
+    }
+
+    /// A round holding both a provider call and a tool call is idle only when
+    /// both have stopped — settling on the first one to finish is the bug.
+    #[test]
+    fn a_cancel_waits_for_every_active_effect_not_just_the_first() {
+        let (_home, host, session) = test_host();
+        host.begin_turn_for_test(session);
+        let round = host
+            .register_turn_effect(
+                session,
+                crate::durable::effects::EffectKind::ProviderSend,
+                "provider_round",
+            )
+            .expect("registered");
+        host.start_turn_effect(session, &round);
+        let tool = host
+            .register_turn_effect(
+                session,
+                crate::durable::effects::EffectKind::ToolCall,
+                "run_terminal_cmd",
+            )
+            .expect("registered");
+        host.start_turn_effect(session, &tool);
+
+        host.cancel_turn(Some(session)).expect("cancel accepted");
+        assert_eq!(host.turn_cancellation_settled(session), Some(false));
+        assert_eq!(
+            host.turn_active_effects(session),
+            vec!["tool_call", "provider_send"]
+        );
+
+        host.finish_turn_effect(session, &round, true);
+        assert_eq!(
+            host.turn_cancellation_settled(session),
+            Some(false),
+            "the tool call is still running"
+        );
+        assert_eq!(host.turn_active_effects(session), vec!["tool_call"]);
+
+        host.finish_turn_effect(session, &tool, true);
+        assert_eq!(host.turn_cancellation_settled(session), Some(true));
+    }
+
+    /// An effect registered but never started still holds the turn open: the
+    /// host cannot yet say it will not run.
+    #[test]
+    fn a_registered_effect_that_never_started_still_holds_the_turn_open() {
+        let (_home, host, session) = test_host();
+        host.begin_turn_for_test(session);
+        let ticket = host
+            .register_turn_effect(
+                session,
+                crate::durable::effects::EffectKind::ToolCall,
+                "apply_patch",
+            )
+            .expect("registered");
+        host.cancel_turn(Some(session)).expect("cancel accepted");
+        assert_eq!(host.turn_cancellation_settled(session), Some(false));
+        host.finish_turn_effect(session, &ticket, true);
+        assert_eq!(host.turn_cancellation_settled(session), Some(true));
+    }
+
+    /// A cancel seals admission, so a racing round cannot start new work behind
+    /// a turn that is already stopping.
+    #[test]
+    fn a_cancelled_turn_refuses_to_register_new_effects() {
+        let (_home, host, session) = test_host();
+        host.begin_turn_for_test(session);
+        host.cancel_turn(Some(session)).expect("cancel accepted");
+        assert!(
+            host.register_turn_effect(
+                session,
+                crate::durable::effects::EffectKind::ToolCall,
+                "late",
+            )
+            .is_none(),
+            "admission is sealed once cancellation is requested"
+        );
+        assert_eq!(host.turn_cancellation_settled(session), Some(true));
+    }
+
+    #[test]
+    fn cancelling_an_unrelated_session_leaves_this_turn_alone() {
+        let (_home, host, session) = test_host();
+        host.begin_turn_for_test(session);
+        let ticket = host
+            .register_turn_effect(
+                session,
+                crate::durable::effects::EffectKind::ToolCall,
+                "read_file",
+            )
+            .expect("registered");
+        host.start_turn_effect(session, &ticket);
+        let other = Uuid::new_v4();
+        assert!(host.cancel_turn(Some(other)).is_err());
+        assert_eq!(host.turn_cancellation_settled(session), None);
+        assert_eq!(host.turn_cancellation_settled(other), None);
+        host.finish_turn_effect(session, &ticket, false);
     }
 
     fn usage_test_run(run_id: &str, max_total_tokens: Option<u64>) -> RunRecord {

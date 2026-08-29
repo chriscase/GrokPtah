@@ -2867,3 +2867,134 @@ async fn live_computer_reads_node_smoke() {
     set_grokptah_home_override(None);
     drop(env);
 }
+
+// ---------------------------------------------------------------------------
+// Strict old/new protocol negotiation
+// ---------------------------------------------------------------------------
+
+/// Post one `initialize` with an explicit protocol version and return the
+/// HTTP status together with the parsed body.
+async fn initialize_with_version(
+    addr: &std::net::SocketAddr,
+    body_version: &str,
+    header_version: Option<&str>,
+) -> (reqwest::StatusCode, serde_json::Value) {
+    let client = reqwest::Client::new();
+    let mut request = client
+        .post(format!("http://{addr}/mcp"))
+        .header("Authorization", "Bearer stream-token-200")
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream");
+    if let Some(header_version) = header_version {
+        request = request.header("mcp-protocol-version", header_version);
+    }
+    let response = request
+        .json(&json!({
+            "jsonrpc":"2.0","id":1,"method":"initialize",
+            "params":{
+                "protocolVersion": body_version,
+                "capabilities":{},
+                "clientInfo":{"name":"negotiation","version":"0"}
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap();
+    (status, body)
+}
+
+/// An older version the host still implements must be honoured exactly, not
+/// quietly upgraded to the newest one.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn an_old_but_supported_protocol_version_is_honoured_exactly() {
+    let (_home, _lock, _host, _ws, orch) = setup();
+    let srv = start_control_server(orch.clone(), 0).await.unwrap();
+
+    for version in ["2024-10-07", "2024-11-05", "2025-03-26", "2025-06-18"] {
+        let (status, body) = initialize_with_version(&srv.addr, version, None).await;
+        assert_eq!(status, 200, "{version} is supported");
+        assert_eq!(
+            body["result"]["protocolVersion"], version,
+            "an old client must keep the version it asked for"
+        );
+    }
+
+    srv.stop();
+    set_grokptah_home_override(None);
+}
+
+/// **Characterization — the two negotiation paths disagree.**
+///
+/// The same unsupported version string is *refused* when it arrives in the
+/// `MCP-Protocol-Version` header and *accepted* when it arrives in the
+/// `initialize` body, where it is silently replaced by the newest supported
+/// version. A client that asked for something this host does not implement is
+/// told `2025-11-25`, which it may not implement either, and nothing in the
+/// exchange says a substitution happened.
+///
+/// Responding with a supported version is what the MCP spec calls for, so the
+/// downgrade is defensible on its own; the disagreement between the two paths
+/// is not. Changing it is wire-visible behaviour and a product decision, so
+/// this test pins today's answer rather than asserting a preferred one.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn the_two_protocol_negotiation_paths_disagree_on_one_unsupported_version() {
+    let (_home, _lock, _host, _ws, orch) = setup();
+    let srv = start_control_server(orch.clone(), 0).await.unwrap();
+    let unsupported = "2099-01-01";
+
+    // Body path: accepted, and silently downgraded.
+    let (status, body) = initialize_with_version(&srv.addr, unsupported, None).await;
+    assert_eq!(status, 200, "the body path accepts an unsupported version");
+    assert_eq!(
+        body["result"]["protocolVersion"], "2025-11-25",
+        "and substitutes the newest supported version without saying so"
+    );
+
+    // Header path: refused outright, for the very same string.
+    let (status, body) = initialize_with_version(&srv.addr, unsupported, Some(unsupported)).await;
+    assert!(
+        status.is_client_error(),
+        "the header path refuses the same version the body path accepted"
+    );
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("unsupported MCP-Protocol-Version"),
+        "and says why: {body}"
+    );
+
+    srv.stop();
+    set_grokptah_home_override(None);
+}
+
+/// A header that disagrees with the body is refused rather than one silently
+/// winning over the other.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn a_protocol_header_that_disagrees_with_the_body_is_refused() {
+    let (_home, _lock, _host, _ws, orch) = setup();
+    let srv = start_control_server(orch.clone(), 0).await.unwrap();
+
+    let (status, body) = initialize_with_version(&srv.addr, "2024-11-05", Some("2025-11-25")).await;
+    assert!(status.is_client_error() || body.get("error").is_some());
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("does not match"),
+        "the mismatch is named: {body}"
+    );
+
+    // Agreeing header and body are accepted.
+    let (status, body) = initialize_with_version(&srv.addr, "2024-11-05", Some("2024-11-05")).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["result"]["protocolVersion"], "2024-11-05");
+
+    srv.stop();
+    set_grokptah_home_override(None);
+}

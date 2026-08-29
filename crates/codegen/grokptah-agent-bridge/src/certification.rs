@@ -161,6 +161,33 @@ pub enum AttemptDisposition {
     Cancelled,
 }
 
+impl AttemptDisposition {
+    /// What this recorded disposition proves about whether the request reached
+    /// the provider.
+    ///
+    /// The durable capture and the live observation path
+    /// ([`crate::provider_observation::AttemptDisposition`]) use different
+    /// vocabularies, which is a wart on `main`. Giving both the *same* question
+    /// one answer keeps them from drifting into disagreement about the only
+    /// property a reader of either record actually needs.
+    ///
+    /// `Retried` and `Downgraded` describe what the host did next, not what the
+    /// provider did, so neither can settle the exchange.
+    pub fn delivery_knowledge(self) -> crate::durable::DeliveryKnowledge {
+        use crate::durable::DeliveryKnowledge;
+        match self {
+            Self::Success | Self::RateLimited | Self::ProviderRejected => {
+                DeliveryKnowledge::KnownDelivered
+            }
+            Self::TimedOut
+            | Self::TransportFailed
+            | Self::Cancelled
+            | Self::Retried
+            | Self::Downgraded => DeliveryKnowledge::Unknown,
+        }
+    }
+}
+
 /// Identifies why a durable state is present in a provider capture.
 ///
 /// `Primary` is the backwards-compatible default for the original single-Run
