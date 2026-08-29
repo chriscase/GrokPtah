@@ -1148,7 +1148,7 @@ async fn interrupted_run_retry_is_explicit_linked_and_idempotent() {
     let orch = orch_for(&host, &home, &ws, 2);
     let auth = orch.auth_header(Some("Bearer t")).unwrap();
     let source_id = "interrupted-source";
-    orch.store()
+    orch.store_unscoped()
         .save_run(&RunRecord {
             run_id: source_id.into(),
             session_id: session.id,
@@ -1840,7 +1840,7 @@ fn run_event_pages_filter_before_limit_across_sessions() {
     let end_seq = bus.current_seq();
 
     let run_id = Uuid::new_v4().to_string();
-    orch.store()
+    orch.store_unscoped()
         .save_run(&RunRecord {
             run_id: run_id.clone(),
             session_id: session.id,
@@ -1849,7 +1849,13 @@ fn run_event_pages_filter_before_limit_across_sessions() {
                 .display()
                 .to_string(),
             request_id: "event-page-test".into(),
-            client_id: None,
+            // The caller reading these pages authenticates with the primary
+            // credential, so the fixture stamps the run the way the service
+            // stamps a run that principal submitted. A record with no stamped
+            // principal is owned by nobody and is quarantined (#477); that is
+            // covered deliberately in tests/principal_authority.rs, and this
+            // test is about event-page filtering, not attribution.
+            client_id: Some("mcp".into()),
             state: RunState::Completed,
             purpose: Default::default(),
             agent_id: None,
@@ -2224,7 +2230,7 @@ async fn capacity_is_shared_across_control_service_instances() {
     let two = OrchestrationService::new(
         host.clone(),
         host.event_bus(),
-        one.store().clone(),
+        one.store_unscoped().clone(),
         OrchestrationConfig {
             bearer_token: "t".into(),
             allowlist: WorkspaceAllowlist::new([ws.path().to_path_buf()]),
@@ -2284,7 +2290,7 @@ async fn pending_admission_bound_is_shared_across_control_services() {
     let two = OrchestrationService::new(
         host.clone(),
         host.event_bus(),
-        one.store().clone(),
+        one.store_unscoped().clone(),
         OrchestrationConfig {
             bearer_token: "t".into(),
             allowlist: WorkspaceAllowlist::new([ws.path().to_path_buf()]),
@@ -2398,7 +2404,7 @@ async fn global_scheduler_fairness_spans_control_services() {
     let two = OrchestrationService::new(
         host.clone(),
         host.event_bus(),
-        one.store().clone(),
+        one.store_unscoped().clone(),
         OrchestrationConfig {
             bearer_token: "t".into(),
             allowlist: WorkspaceAllowlist::new([ws.path().to_path_buf()]),
@@ -2561,7 +2567,7 @@ async fn dropping_control_service_releases_pending_admission_slot() {
     let queued_service = OrchestrationService::new(
         host.clone(),
         host.event_bus(),
-        primary.store().clone(),
+        primary.store_unscoped().clone(),
         OrchestrationConfig {
             bearer_token: "t".into(),
             allowlist: WorkspaceAllowlist::new([ws.path().to_path_buf()]),

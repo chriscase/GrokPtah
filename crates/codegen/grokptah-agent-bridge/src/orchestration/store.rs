@@ -12,6 +12,7 @@ use fs2::FileExt;
 use parking_lot::Mutex;
 use uuid::Uuid;
 
+use super::authz::DurableAuthority;
 use super::managed::{
     ManagedExecutionIntent, ManagedExecutionPolicy, ManagedFinalizationOutcome,
     ManagedFinalizationRecord, ManagedFinalizationStage, ManagedIntentState, ManagedRetryCause,
@@ -246,6 +247,53 @@ impl OrchStore {
 
     pub fn root(&self) -> &Path {
         &self.inner.root
+    }
+
+    // ── durable authority lineage (#477) ───────────────────────────────
+    //
+    // The host's authority lineage lives beside the records it stamps so a
+    // restart resumes the same lineage instead of silently becoming a new
+    // authority that the previous host's records would then be re-attributed
+    // to. It is host-private state, not a record: no read path projects it.
+
+    fn authority_path(&self) -> PathBuf {
+        self.inner.root.join("authority.json")
+    }
+
+    /// Read the persisted authority lineage.
+    ///
+    /// `Ok(None)` means "no lineage has ever been written here" — a first run.
+    /// `Err` means one was written but cannot be trusted, which is a very
+    /// different thing: the caller must re-establish fail-closed rather than
+    /// treat it as a first run, or a corrupted file would silently hand every
+    /// record from the old lineage to a brand-new one.
+    pub(super) fn load_authority(&self) -> anyhow::Result<Option<DurableAuthority>> {
+        let path = self.authority_path();
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(anyhow::Error::new(error)
+                    .context(format!("reading authority record {}", path.display())))
+            }
+        };
+        let record: DurableAuthority = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing authority record {}", path.display()))?;
+        Ok(Some(record))
+    }
+
+    /// Persist the authority lineage, durably, before it is relied on.
+    ///
+    /// Every advance writes through here first: an advance that cannot be
+    /// persisted must not take effect in memory either, or a later restart
+    /// would re-adopt an epoch that identities have already been issued under.
+    pub(super) fn save_authority(&self, record: DurableAuthority) -> Result<(), OrchError> {
+        atomic_write_json(&self.authority_path(), &record).map_err(|error| {
+            OrchError::new(
+                OrchErrorCode::Internal,
+                format!("authority lineage could not be persisted: {error}"),
+            )
+        })
     }
 
     fn run_path(&self, run_id: &str) -> Result<PathBuf, OrchError> {

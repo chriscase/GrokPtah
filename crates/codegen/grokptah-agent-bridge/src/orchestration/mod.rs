@@ -16,8 +16,10 @@ mod worker;
 mod workload;
 
 pub use authz::{
-    authenticate_bearer, canonical_workspace, constant_time_eq, require_bearer, AuthContext,
-    AuthCredential, WorkspaceAllowlist,
+    canonical_workspace, constant_time_eq, AuthContext, AuthCredential, AuthGeneration,
+    AuthorityOrigin, Delegation, DelegationLimit, DurableAuthority, PrincipalKind,
+    PrincipalProvenance, PrincipalScope, ReadinessAuthority, VerifiedPrincipal, WorkspaceAllowlist,
+    COMPAT_PRIMARY_PRINCIPAL, MAX_DELEGATION_TTL_SECONDS, NATIVE_EXECUTOR_PRINCIPAL,
 };
 pub use continuation::{
     assemble_continuation_context, AgentContinuationPlan, ContinuationAssemblyFailure,

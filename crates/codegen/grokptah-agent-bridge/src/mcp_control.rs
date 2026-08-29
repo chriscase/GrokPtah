@@ -33,10 +33,10 @@ use uuid::Uuid;
 use crate::host::AgentHostHandle;
 use crate::orchestration::{
     AuthContext, ChangeRecord, ManagerStepSpec, MessageKind, MissedRunPolicy, OrchError,
-    OrchErrorCode, OrchestrationConfig, OrchestrationService, RoutineConcurrencyPolicy,
-    RoutineLifecycle, RoutineRetryPolicy, RoutineTrigger, RunExecutionMode, WorkArtifactRef,
-    WorkDependency, WorkPolicy, WorkResult, WorkTemplate, WorkerHostKind, WorkspaceAllowlist,
-    CONTROL_TOOLS, FORBIDDEN_TOOLS,
+    OrchErrorCode, OrchestrationConfig, OrchestrationService, ReadinessAuthority,
+    RoutineConcurrencyPolicy, RoutineLifecycle, RoutineRetryPolicy, RoutineTrigger,
+    RunExecutionMode, WorkArtifactRef, WorkDependency, WorkPolicy, WorkResult, WorkTemplate,
+    WorkerHostKind, WorkspaceAllowlist, CONTROL_TOOLS, FORBIDDEN_TOOLS,
 };
 use crate::{EventReceiver, JournalPage, SessionUpdate};
 
@@ -206,6 +206,32 @@ impl LiveStreamState {
 
     async fn next_frame(&mut self) -> Option<Bytes> {
         loop {
+            // A live stream is a read that outlives the call that authorized
+            // it. Revalidate the identity before *every* delivery so a
+            // credential, owner or workspace-policy rotation ends the stream
+            // instead of quietly continuing to deliver another generation's
+            // events.
+            //
+            // The check has to come before the `pending` drain, not after it:
+            // frames are produced into `pending` in batches, so checking only
+            // when the buffer runs dry would hand out events that were already
+            // queued under the previous generation. Anything still buffered is
+            // discarded for the same reason.
+            //
+            // This is a frame-boundary check, not a preemption: a stream parked
+            // in the select below notices the rotation on its next event or
+            // keep-alive tick, so closure is bounded by the keep-alive interval
+            // rather than immediate. No event is delivered after the rotation,
+            // because every delivery passes through here first.
+            if !self.done {
+                if let Err(error) = self.orch.require_current_auth(&self.auth) {
+                    self.pending.clear();
+                    self.queue_recovery(&format!(
+                        "authentication is no longer current: {}; re-authenticate and reopen",
+                        error.message
+                    ));
+                }
+            }
             if let Some(frame) = self.pending.pop_front() {
                 return Some(frame);
             }
@@ -555,13 +581,14 @@ struct ReadinessSnapshot {
 }
 
 fn readiness_snapshot(state: &AppState) -> ReadinessSnapshot {
+    // The probe reads capacity without a bearer credential, exactly as before.
+    // It now does so through a narrowly typed internal authority (#477) rather
+    // than fabricating a public `AuthContext` with invented principal and owner
+    // values: an unauthenticated local probe must not hold a value that is
+    // indistinguishable from a real caller's identity.
     let payload = state
         .orch
-        .get_capacity(&AuthContext {
-            token_id: "health-probe".into(),
-            owner_id: "health-probe".into(),
-        })
-        .unwrap_or_else(|error| json!({"health": {"serviceError": error.message}}));
+        .capacity_for_readiness(&ReadinessAuthority::internal());
     let health = payload.get("health").cloned().unwrap_or_else(|| json!({}));
     let ready = [
         "eventJournalPersistenceError",
@@ -3647,6 +3674,132 @@ fn default_manager_replans() -> u32 {
 /// Discoverable tool names for schema snapshot tests.
 pub fn discovered_tool_names() -> Vec<&'static str> {
     CONTROL_TOOLS.to_vec()
+}
+
+#[cfg(test)]
+mod live_frame_authority {
+    //! The frame-boundary check on live delivery (#477).
+    //!
+    //! Exercised here rather than over HTTP because the invariant is about
+    //! *already-buffered* frames: a terminal run's durable page is queued in
+    //! one batch and the transport can flush it before a test's rotation lands,
+    //! so an end-to-end test cannot distinguish "the fence released it" from
+    //! "the socket already had it". Driving `next_frame` directly can.
+
+    use std::collections::VecDeque;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tempfile::tempdir;
+
+    use super::LiveStreamState;
+    use crate::orchestration::{
+        OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, WorkspaceAllowlist,
+    };
+    use crate::{set_grokptah_home_override, AgentHost, HostConfig};
+
+    #[tokio::test]
+    // The home-override guard is the crate's own test serialization; holding it
+    // across awaits is exactly its job, as in every other async test here.
+    #[allow(clippy::await_holding_lock)]
+    async fn a_rotation_drops_buffered_frames_and_closes_the_stream() {
+        let _serial = crate::home_override_serial();
+        let home = tempdir().unwrap();
+        set_grokptah_home_override(Some(home.path().join(".grokptah")));
+        let workspace = tempdir().unwrap();
+        let host = AgentHost::create(HostConfig {
+            always_approve: true,
+            ..HostConfig::default()
+        });
+        host.start().unwrap();
+        let session = host.session_new_kind(crate::SessionKind::Build).unwrap();
+        host.session_set_cwd(session.id, workspace.path()).unwrap();
+        let orch = OrchestrationService::new(
+            host.clone(),
+            host.event_bus(),
+            OrchStore::open(home.path().join("orch")).unwrap(),
+            OrchestrationConfig {
+                bearer_token: "live-frame-token".into(),
+                allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
+                max_concurrent_runs: 2,
+                bounds: RunBounds::default(),
+            },
+        );
+        let auth = orch.auth_header(Some("Bearer live-frame-token")).unwrap();
+
+        let permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .try_acquire_owned()
+            .unwrap();
+        let mut live = LiveStreamState {
+            orch: orch.clone(),
+            auth,
+            session_id: session.id,
+            workspace: workspace.path().to_path_buf(),
+            run_id: "run-live-frame".into(),
+            start_seq: 1,
+            end_seq: None,
+            receiver: orch.subscribe_events(),
+            last_seq: 0,
+            replay_cursor: None,
+            pending: VecDeque::new(),
+            heartbeat: tokio::time::interval(Duration::from_secs(10)),
+            done: false,
+            _permit: permit,
+        };
+
+        // Two events are produced and buffered under the current generation.
+        live.queue_entry(
+            1,
+            chrono::Utc::now().to_rfc3339(),
+            crate::SessionUpdate::AgentMessageChunk {
+                session_id: session.id,
+                text: "before".into(),
+            },
+        );
+        live.queue_entry(
+            2,
+            chrono::Utc::now().to_rfc3339(),
+            crate::SessionUpdate::AgentMessageChunk {
+                session_id: session.id,
+                text: "also before".into(),
+            },
+        );
+        assert_eq!(live.pending.len(), 2);
+
+        // The first is delivered normally.
+        let first = live
+            .next_frame()
+            .await
+            .expect("a frame under the live generation");
+        let first = String::from_utf8_lossy(&first).to_string();
+        assert!(first.contains("notifications/ptah_event") && first.contains("\"seq\":1"));
+
+        // Rotate. The second frame is still buffered — and must not be handed
+        // out, because it was released under a generation that is now stale.
+        orch.set_token("live-frame-token".into()).unwrap();
+
+        let next = live
+            .next_frame()
+            .await
+            .expect("a rotation must produce a recovery frame, not silence");
+        let next = String::from_utf8_lossy(&next).to_string();
+        assert!(
+            !next.contains("notifications/ptah_event"),
+            "a buffered event was delivered after the rotation: {next}"
+        );
+        assert!(
+            next.contains("ptah_recovery")
+                && next.contains("no longer current")
+                && next.contains("re-authenticate"),
+            "expected the stale-identity recovery frame: {next}"
+        );
+
+        assert!(
+            live.next_frame().await.is_none(),
+            "the stream must be finished after the recovery frame"
+        );
+        set_grokptah_home_override(None);
+    }
 }
 
 #[cfg(test)]

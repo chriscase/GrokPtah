@@ -239,7 +239,7 @@ async fn reads_require_run_ownership_no_global_events() {
     let foreign = OrchestrationService::new(
         host.clone(),
         host.event_bus(),
-        orch.store().clone(),
+        orch.store_unscoped().clone(),
         OrchestrationConfig {
             bearer_token: "secret-token-adversarial-196".into(),
             allowlist: WorkspaceAllowlist::new([other.path().to_path_buf()]),
@@ -590,7 +590,7 @@ async fn journal_rollover_preserves_durable_aggregates() {
     // Poll briefly for the production aggregator task to flush.
     let mut aggs_ok = false;
     for _ in 0..40 {
-        let run = orch.store().load_run(&run_id).unwrap().unwrap();
+        let run = orch.store_unscoped().load_run(&run_id).unwrap().unwrap();
         if !run.aggregates.changes.is_empty() {
             aggs_ok = true;
             break;
@@ -759,7 +759,7 @@ async fn control_secret_redacted_on_shared_host_bus() {
         });
     tokio::time::sleep(Duration::from_millis(100)).await;
     let run_id = accepted["runId"].as_str().unwrap();
-    let durable = serde_json::to_string(&orch.store().load_run(run_id).unwrap()).unwrap();
+    let durable = serde_json::to_string(&orch.store_unscoped().load_run(run_id).unwrap()).unwrap();
     assert!(
         !durable.contains(token),
         "control token leaked into run data"

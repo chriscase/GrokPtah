@@ -368,11 +368,12 @@ fn retry_policy(retry_eligible: bool) -> ManagedExecutionPolicy {
     }
 }
 
-fn auth() -> AuthContext {
-    AuthContext {
-        token_id: "native-token-308".into(),
-        owner_id: "primary".into(),
-    }
+/// Identities must be issued by the service that will honour them: a struct
+/// literal here would be a fabricated identity, which the fence no longer
+/// permits to be written at all and which every guarded entry point rejects.
+fn auth(orch: &OrchestrationService) -> AuthContext {
+    orch.auth_header(Some("Bearer native-token-308"))
+        .expect("test service is configured with the native-token-308 bearer")
 }
 
 fn run_record(
@@ -514,7 +515,7 @@ async fn boot_native(
     );
     let workspace_text = workspace.path().display().to_string();
     orch.set_managed_execution(
-        &auth(),
+        &auth(&orch),
         lane.id,
         workspace.path(),
         &agent.agent_id,
@@ -553,13 +554,13 @@ async fn manager_decision_native_admission_has_durable_proposal_purpose() {
     work.source_manager_plan_id = Some("manager-plan-test".into());
     work.source_manager_step_id = Some("__manager_decision__".into());
     work.validate().unwrap();
-    orch.store().save_work_item(&work).unwrap();
+    orch.store_unscoped().save_work_item(&work).unwrap();
 
     orch.drive_native_executor_once().await;
     let admission_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(3);
     let (intent, mut run) = loop {
         let intents = orch
-            .store()
+            .store_unscoped()
             .list_managed_intents()
             .unwrap()
             .into_iter()
@@ -569,9 +570,9 @@ async fn manager_decision_native_admission_has_durable_proposal_purpose() {
             intent
                 .run_id
                 .as_deref()
-                .and_then(|run_id| orch.store().load_run(run_id).ok().flatten())
+                .and_then(|run_id| orch.store_unscoped().load_run(run_id).ok().flatten())
                 .or_else(|| {
-                    orch.store()
+                    orch.store_unscoped()
                         .find_run_by_request_id(&intent.intent_id)
                         .ok()
                         .flatten()
@@ -595,18 +596,26 @@ async fn manager_decision_native_admission_has_durable_proposal_purpose() {
 
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
     while tokio::time::Instant::now() < deadline {
-        let agent = orch.store().load_agent(&agent_id).unwrap().unwrap();
+        let agent = orch
+            .store_unscoped()
+            .load_agent(&agent_id)
+            .unwrap()
+            .unwrap();
         if run.state.is_terminal() && agent.current_run_id.as_deref() != Some(run_id.as_str()) {
             break;
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
-        run = orch.store().load_run(&run_id).unwrap().unwrap();
+        run = orch.store_unscoped().load_run(&run_id).unwrap().unwrap();
     }
     assert!(run.state.is_terminal(), "proposal Run did not settle");
-    let agent = orch.store().load_agent(&agent_id).unwrap().unwrap();
+    let agent = orch
+        .store_unscoped()
+        .load_agent(&agent_id)
+        .unwrap()
+        .unwrap();
     assert_ne!(agent.current_run_id.as_deref(), Some(run_id.as_str()));
 
-    orch.store()
+    orch.store_unscoped()
         .update_run(&run_id, |run| {
             run.state = RunState::Interrupted;
             run.terminal_result = Some("interrupted".into());
@@ -615,7 +624,7 @@ async fn manager_decision_native_admission_has_durable_proposal_purpose() {
         .unwrap();
     let retry = orch
         .retry_run(
-            &auth(),
+            &auth(&orch),
             "manager-proposal-retry",
             session,
             Path::new(&workspace_text),
@@ -642,7 +651,7 @@ async fn live_interrupted_run_retry_forbidden_is_terminal() {
     let (_env, _home, _workspace, _host, orch, session, agent_id, workspace_text) =
         boot_native(false).await;
     let (item, intent, run) = seed_admitted_work(
-        orch.store(),
+        orch.store_unscoped(),
         session,
         &workspace_text,
         &agent_id,
@@ -650,27 +659,35 @@ async fn live_interrupted_run_retry_forbidden_is_terminal() {
         "native-token-308",
     );
     orch.drive_native_executor_once().await;
-    let work = orch.store().load_work_item(&item.work_id).unwrap().unwrap();
+    let work = orch
+        .store_unscoped()
+        .load_work_item(&item.work_id)
+        .unwrap()
+        .unwrap();
     assert_eq!(work.state, WorkState::Failed);
     let closed = orch
-        .store()
+        .store_unscoped()
         .load_managed_intent(&intent.intent_id)
         .unwrap()
         .unwrap();
     assert_eq!(closed.state, ManagedIntentState::Finalized);
     assert_eq!(
-        orch.store().load_run(&run.run_id).unwrap().unwrap().state,
+        orch.store_unscoped()
+            .load_run(&run.run_id)
+            .unwrap()
+            .unwrap()
+            .state,
         RunState::Interrupted
     );
     assert_eq!(
-        orch.store()
+        orch.store_unscoped()
             .live_managed_intents_for_agent(&agent_id)
             .unwrap(),
         0
     );
     orch.drive_native_executor_once().await;
     assert_eq!(
-        orch.store()
+        orch.store_unscoped()
             .load_work_item(&item.work_id)
             .unwrap()
             .unwrap()
@@ -686,7 +703,7 @@ async fn live_interrupted_run_retry_allowed_requeues_new_attempt() {
     let (_env, _home, _workspace, _host, orch, session, agent_id, workspace_text) =
         boot_native(true).await;
     let (item, intent, run) = seed_admitted_work(
-        orch.store(),
+        orch.store_unscoped(),
         session,
         &workspace_text,
         &agent_id,
@@ -694,10 +711,14 @@ async fn live_interrupted_run_retry_allowed_requeues_new_attempt() {
         "native-token-308",
     );
     orch.drive_native_executor_once().await;
-    let work = orch.store().load_work_item(&item.work_id).unwrap().unwrap();
+    let work = orch
+        .store_unscoped()
+        .load_work_item(&item.work_id)
+        .unwrap()
+        .unwrap();
     assert_ne!(work.state, WorkState::Failed);
     assert_eq!(
-        orch.store()
+        orch.store_unscoped()
             .load_managed_intent(&intent.intent_id)
             .unwrap()
             .unwrap()
@@ -705,10 +726,14 @@ async fn live_interrupted_run_retry_allowed_requeues_new_attempt() {
         ManagedIntentState::Finalized
     );
     assert_eq!(
-        orch.store().load_run(&run.run_id).unwrap().unwrap().state,
+        orch.store_unscoped()
+            .load_run(&run.run_id)
+            .unwrap()
+            .unwrap()
+            .state,
         RunState::Interrupted
     );
-    let intents = orch.store().list_managed_intents().unwrap();
+    let intents = orch.store_unscoped().list_managed_intents().unwrap();
     let live: Vec<_> = intents
         .iter()
         .filter(|candidate| {
@@ -727,7 +752,7 @@ async fn live_interrupted_run_retry_allowed_requeues_new_attempt() {
         assert_ne!(next.run_id.as_deref(), Some(run.run_id.as_str()));
     }
     assert_eq!(
-        orch.store()
+        orch.store_unscoped()
             .list_work_attempts(Some(&item.work_id))
             .unwrap()
             .iter()
@@ -744,7 +769,7 @@ async fn restart_interrupted_run_retry_forbidden_is_terminal() {
     let (_env, _home, workspace, host, orch, session, agent_id, workspace_text) =
         boot_native(false).await;
     let (item, intent, run) = seed_admitted_work(
-        orch.store(),
+        orch.store_unscoped(),
         session,
         &workspace_text,
         &agent_id,
@@ -772,7 +797,7 @@ async fn restart_interrupted_run_retry_forbidden_is_terminal() {
     );
     orch.drive_native_executor_once().await;
     assert_eq!(
-        orch.store()
+        orch.store_unscoped()
             .load_work_item(&item.work_id)
             .unwrap()
             .unwrap()
@@ -780,7 +805,7 @@ async fn restart_interrupted_run_retry_forbidden_is_terminal() {
         WorkState::Failed
     );
     assert_eq!(
-        orch.store()
+        orch.store_unscoped()
             .load_managed_intent(&intent.intent_id)
             .unwrap()
             .unwrap()
@@ -789,7 +814,7 @@ async fn restart_interrupted_run_retry_forbidden_is_terminal() {
     );
     orch.drive_native_executor_once().await;
     assert_eq!(
-        orch.store()
+        orch.store_unscoped()
             .live_managed_intents_for_agent(&agent_id)
             .unwrap(),
         0
@@ -803,7 +828,7 @@ async fn restart_interrupted_run_retry_allowed_does_not_resume() {
     let (_env, _home, workspace, host, orch, session, agent_id, workspace_text) =
         boot_native(true).await;
     let (item, intent, run) = seed_admitted_work(
-        orch.store(),
+        orch.store_unscoped(),
         session,
         &workspace_text,
         &agent_id,
@@ -826,14 +851,22 @@ async fn restart_interrupted_run_retry_allowed_does_not_resume() {
         },
     );
     orch.drive_native_executor_once().await;
-    let restarted = orch.store().load_work_item(&item.work_id).unwrap().unwrap();
+    let restarted = orch
+        .store_unscoped()
+        .load_work_item(&item.work_id)
+        .unwrap()
+        .unwrap();
     assert_ne!(restarted.state, WorkState::Failed);
     assert_eq!(
-        orch.store().load_run(&run.run_id).unwrap().unwrap().state,
+        orch.store_unscoped()
+            .load_run(&run.run_id)
+            .unwrap()
+            .unwrap()
+            .state,
         RunState::Interrupted
     );
     assert_eq!(
-        orch.store()
+        orch.store_unscoped()
             .load_managed_intent(&intent.intent_id)
             .unwrap()
             .unwrap()
@@ -878,7 +911,7 @@ async fn resolve_work_input_requires_parked_scope() {
     client.initialize().await.unwrap();
     let workspace_text = workspace.path().display().to_string();
     orch.set_managed_execution(
-        &auth(),
+        &auth(&orch),
         lane.id,
         workspace.path(),
         &agent.agent_id,
@@ -896,12 +929,12 @@ async fn resolve_work_input_requires_parked_scope() {
     .unwrap();
     item.assigned_agent_id = Some(agent.agent_id.clone());
     item.assignment_status = AssignmentStatus::Accepted;
-    orch.store().save_work_item(&item).unwrap();
+    orch.store_unscoped().save_work_item(&item).unwrap();
     let claim = orch
-        .store()
+        .store_unscoped()
         .claim_work_with_lease_secret(&item.work_id, &agent.agent_id, None, "native-token-308")
         .unwrap();
-    orch.store()
+    orch.store_unscoped()
         .park_work_input(
             &item.work_id,
             &claim.attempt.attempt_id,
@@ -932,7 +965,7 @@ async fn resolve_work_input_requires_parked_scope() {
         created_at: now,
         updated_at: now,
     };
-    orch.store().save_managed_intent(&intent).unwrap();
+    orch.store_unscoped().save_managed_intent(&intent).unwrap();
 
     let unknown = client
         .call_tool(
@@ -974,7 +1007,11 @@ async fn resolve_work_input_requires_parked_scope() {
         .await
         .unwrap_err();
     assert_remote_error(cross_workspace, "workspace_mismatch");
-    let parked = orch.store().load_work_item(&item.work_id).unwrap().unwrap();
+    let parked = orch
+        .store_unscoped()
+        .load_work_item(&item.work_id)
+        .unwrap()
+        .unwrap();
     assert_eq!(parked.state, WorkState::AwaitingInput);
 
     let missing_host = client
@@ -991,7 +1028,7 @@ async fn resolve_work_input_requires_parked_scope() {
         .unwrap_err();
     assert_remote_error(missing_host, "conflict");
     assert_eq!(
-        orch.store()
+        orch.store_unscoped()
             .load_work_item(&item.work_id)
             .unwrap()
             .unwrap()
@@ -999,14 +1036,14 @@ async fn resolve_work_input_requires_parked_scope() {
         WorkState::AwaitingInput
     );
 
-    orch.store()
+    orch.store_unscoped()
         .cancel_work(&item.work_id, "cancelled while parked")
         .unwrap();
     let mut race = intent.clone();
     race.intent_id = Uuid::new_v4().to_string();
     race.state = ManagedIntentState::Parked;
     race.permission_request_id = Some(Uuid::new_v4().to_string());
-    orch.store().save_managed_intent(&race).unwrap();
+    orch.store_unscoped().save_managed_intent(&race).unwrap();
     let cancelled = client
         .call_tool(
             "ptah_resolve_work_input",
@@ -1021,7 +1058,7 @@ async fn resolve_work_input_requires_parked_scope() {
         .unwrap_err();
     assert_remote_error(cancelled, "conflict");
     assert_eq!(
-        orch.store()
+        orch.store_unscoped()
             .load_work_item(&item.work_id)
             .unwrap()
             .unwrap()
@@ -1039,7 +1076,7 @@ async fn permission_from_run_b_does_not_park_work_a() {
     let (_env, _home, _workspace, host, orch, session, agent_id, workspace_text) =
         boot_native(false).await;
     let (work_a, intent_a, run_a) = seed_admitted_work(
-        orch.store(),
+        orch.store_unscoped(),
         session,
         &workspace_text,
         &agent_id,
@@ -1047,7 +1084,7 @@ async fn permission_from_run_b_does_not_park_work_a() {
         "native-token-308",
     );
     let (work_b, intent_b, run_b) = seed_admitted_work(
-        orch.store(),
+        orch.store_unscoped(),
         session,
         &workspace_text,
         &agent_id,
@@ -1068,19 +1105,19 @@ async fn permission_from_run_b_does_not_park_work_a() {
     })
     .await;
     let loaded_a = orch
-        .store()
+        .store_unscoped()
         .load_work_item(&work_a.work_id)
         .unwrap()
         .unwrap();
     assert_ne!(loaded_a.state, WorkState::AwaitingInput);
     let loaded_b = orch
-        .store()
+        .store_unscoped()
         .load_work_item(&work_b.work_id)
         .unwrap()
         .unwrap();
     assert_eq!(loaded_b.state, WorkState::AwaitingInput);
     assert_eq!(
-        orch.store()
+        orch.store_unscoped()
             .load_managed_intent(&intent_a.intent_id)
             .unwrap()
             .unwrap()
@@ -1088,7 +1125,7 @@ async fn permission_from_run_b_does_not_park_work_a() {
         ManagedIntentState::Admitted
     );
     assert_eq!(
-        orch.store()
+        orch.store_unscoped()
             .load_managed_intent(&intent_b.intent_id)
             .unwrap()
             .unwrap()
@@ -1131,7 +1168,7 @@ async fn resolve_work_input_uses_real_host_pending() {
     client.initialize().await.unwrap();
     let workspace_text = workspace.path().display().to_string();
     orch.set_managed_execution(
-        &auth(),
+        &auth(&orch),
         lane.id,
         workspace.path(),
         &agent.agent_id,
@@ -1139,7 +1176,7 @@ async fn resolve_work_input_uses_real_host_pending() {
     )
     .unwrap();
     let (item, intent, run) = seed_admitted_work(
-        orch.store(),
+        orch.store_unscoped(),
         lane.id,
         &workspace_text,
         &agent.agent_id,
@@ -1178,7 +1215,7 @@ async fn resolve_work_input_uses_real_host_pending() {
         grokptah_agent_bridge::PermissionDecision::Allow
     );
     assert_eq!(
-        orch.store()
+        orch.store_unscoped()
             .load_work_item(&item.work_id)
             .unwrap()
             .unwrap()
@@ -1200,7 +1237,7 @@ async fn resolve_work_input_uses_real_host_pending() {
     assert_remote_error(replay, "conflict");
 
     let (deny_item, _, deny_run) = seed_admitted_work(
-        orch.store(),
+        orch.store_unscoped(),
         lane.id,
         &workspace_text,
         &agent.agent_id,
@@ -1238,7 +1275,7 @@ async fn resolve_work_input_uses_real_host_pending() {
         grokptah_agent_bridge::PermissionDecision::Deny
     );
     assert_eq!(
-        orch.store()
+        orch.store_unscoped()
             .load_work_item(&deny_item.work_id)
             .unwrap()
             .unwrap()
@@ -1247,7 +1284,7 @@ async fn resolve_work_input_uses_real_host_pending() {
     );
 
     let (drop_item, _, drop_run) = seed_admitted_work(
-        orch.store(),
+        orch.store_unscoped(),
         lane.id,
         &workspace_text,
         &agent.agent_id,
@@ -1282,7 +1319,7 @@ async fn resolve_work_input_uses_real_host_pending() {
         .unwrap_err();
     assert_remote_error(dropped, "conflict");
     assert_eq!(
-        orch.store()
+        orch.store_unscoped()
             .load_work_item(&drop_item.work_id)
             .unwrap()
             .unwrap()
@@ -1291,7 +1328,7 @@ async fn resolve_work_input_uses_real_host_pending() {
     );
 
     let (wrong_item, mut wrong_intent, _) = seed_admitted_work(
-        orch.store(),
+        orch.store_unscoped(),
         lane.id,
         &workspace_text,
         &agent.agent_id,
@@ -1300,12 +1337,12 @@ async fn resolve_work_input_uses_real_host_pending() {
     );
     let attempt_id = wrong_intent.attempt_id.clone().unwrap();
     let token = orch
-        .store()
+        .store_unscoped()
         .load_work_attempt(&attempt_id)
         .unwrap()
         .unwrap()
         .lease_token_for_secret("native-token-308");
-    orch.store()
+    orch.store_unscoped()
         .park_work_input(
             &wrong_item.work_id,
             &attempt_id,
@@ -1318,7 +1355,9 @@ async fn resolve_work_input_uses_real_host_pending() {
         .unwrap();
     wrong_intent.state = ManagedIntentState::Parked;
     wrong_intent.permission_request_id = Some(wrong_req.id.to_string());
-    orch.store().save_managed_intent(&wrong_intent).unwrap();
+    orch.store_unscoped()
+        .save_managed_intent(&wrong_intent)
+        .unwrap();
     let wrong = client
         .call_tool(
             "ptah_resolve_work_input",
@@ -1333,7 +1372,7 @@ async fn resolve_work_input_uses_real_host_pending() {
         .unwrap_err();
     assert_remote_error(wrong, "forbidden_scope");
     assert_eq!(
-        orch.store()
+        orch.store_unscoped()
             .load_work_item(&wrong_item.work_id)
             .unwrap()
             .unwrap()
@@ -1388,7 +1427,7 @@ async fn native_skips_manual_retry_without_mutating() {
     client.initialize().await.unwrap();
     let workspace_text = workspace.path().display().to_string();
     orch.set_managed_execution(
-        &auth(),
+        &auth(&orch),
         lane.id,
         workspace.path(),
         &agent.agent_id,
@@ -1430,7 +1469,7 @@ async fn native_skips_manual_retry_without_mutating() {
     for _ in 0..10 {
         orch.drive_native_executor_once().await;
         intent = orch
-            .store()
+            .store_unscoped()
             .list_managed_intents()
             .unwrap()
             .into_iter()
@@ -1441,15 +1480,15 @@ async fn native_skips_manual_retry_without_mutating() {
     }
     let intent = intent.expect("native admission");
     if let Some(run_id) = intent.run_id.as_deref() {
-        if let Ok(Some(mut run)) = orch.store().load_run(run_id) {
+        if let Ok(Some(mut run)) = orch.store_unscoped().load_run(run_id) {
             run.state = RunState::Failed;
             run.error_code = Some("failed".into());
-            orch.store().save_run(&run).unwrap();
+            orch.store_unscoped().save_run(&run).unwrap();
         }
     }
     orch.drive_native_executor_once().await;
     assert_eq!(
-        orch.store()
+        orch.store_unscoped()
             .load_work_item(&work_id)
             .unwrap()
             .unwrap()
@@ -1457,7 +1496,7 @@ async fn native_skips_manual_retry_without_mutating() {
         WorkState::Failed
     );
     assert_eq!(
-        orch.store()
+        orch.store_unscoped()
             .load_managed_intent(&intent.intent_id)
             .unwrap()
             .unwrap()
@@ -1466,7 +1505,10 @@ async fn native_skips_manual_retry_without_mutating() {
     );
     let settle_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
     loop {
-        let attempts = orch.store().list_work_attempts(Some(&work_id)).unwrap();
+        let attempts = orch
+            .store_unscoped()
+            .list_work_attempts(Some(&work_id))
+            .unwrap();
         if attempts.iter().all(|attempt| !attempt.state.is_active()) {
             break;
         }
@@ -1478,7 +1520,7 @@ async fn native_skips_manual_retry_without_mutating() {
         orch.drive_native_executor_once().await;
     }
     let original_attempts = orch
-        .store()
+        .store_unscoped()
         .list_work_attempts(Some(&work_id))
         .unwrap()
         .len();
@@ -1499,15 +1541,19 @@ async fn native_skips_manual_retry_without_mutating() {
     for _ in 0..3 {
         orch.drive_native_executor_once().await;
     }
-    let still = orch.store().load_work_item(&work_id).unwrap().unwrap();
+    let still = orch
+        .store_unscoped()
+        .load_work_item(&work_id)
+        .unwrap()
+        .unwrap();
     assert_eq!(still.state, WorkState::Queued);
     assert!(orch
-        .store()
+        .store_unscoped()
         .live_managed_intent_for_work(&work_id)
         .unwrap()
         .is_none());
     assert_eq!(
-        orch.store()
+        orch.store_unscoped()
             .list_work_attempts(Some(&work_id))
             .unwrap()
             .len(),
@@ -1553,7 +1599,7 @@ async fn resolve_work_input_fails_after_restart_without_host_pending() {
     let mut client = McpControlClient::new(format!("http://{}", server.addr), "native-token-308");
     client.initialize().await.unwrap();
     let (item, _, run) = seed_admitted_work(
-        orch.store(),
+        orch.store_unscoped(),
         session,
         &workspace_text,
         &agent_id,
@@ -1589,13 +1635,17 @@ async fn resolve_work_input_fails_after_restart_without_host_pending() {
         },
     );
     let missing = orch
-        .resolve_work_input(&auth(), session, workspace.path(), req.id, true)
+        .resolve_work_input(&auth(&orch), session, workspace.path(), req.id, true)
         .unwrap_err();
     assert_eq!(
         missing.code,
         grokptah_agent_bridge::orchestration::OrchErrorCode::Conflict
     );
-    let work = orch.store().load_work_item(&item.work_id).unwrap().unwrap();
+    let work = orch
+        .store_unscoped()
+        .load_work_item(&item.work_id)
+        .unwrap()
+        .unwrap();
     assert_ne!(work.state, WorkState::Running);
     orch.stop_background_tasks().await;
     client.close_session().await.unwrap();
@@ -1607,7 +1657,7 @@ async fn resolving_dead_oneshot_does_not_unpark_on_recovery() {
     let (_env, _home, workspace, host, orch, session, agent_id, workspace_text) =
         boot_native(false).await;
     let (item, _, run) = seed_admitted_work(
-        orch.store(),
+        orch.store_unscoped(),
         session,
         &workspace_text,
         &agent_id,
@@ -1628,7 +1678,7 @@ async fn resolving_dead_oneshot_does_not_unpark_on_recovery() {
     })
     .await;
     orch.stop_background_tasks().await;
-    orch.store()
+    orch.store_unscoped()
         .begin_managed_permission_resolve(
             &req.id.to_string(),
             session,
@@ -1639,7 +1689,7 @@ async fn resolving_dead_oneshot_does_not_unpark_on_recovery() {
     drop(rx);
     orch.drive_native_executor_once().await;
     assert_eq!(
-        orch.store()
+        orch.store_unscoped()
             .load_work_item(&item.work_id)
             .unwrap()
             .unwrap()
@@ -1647,7 +1697,7 @@ async fn resolving_dead_oneshot_does_not_unpark_on_recovery() {
         WorkState::AwaitingInput
     );
     assert_eq!(
-        orch.store()
+        orch.store_unscoped()
             .live_managed_intent_for_work(&item.work_id)
             .unwrap()
             .unwrap()
@@ -1663,7 +1713,7 @@ async fn failed_permission_respond_then_recovery_does_not_unpark() {
     let (_env, _home, workspace, host, orch, session, agent_id, workspace_text) =
         boot_native(false).await;
     let (item, _, run) = seed_admitted_work(
-        orch.store(),
+        orch.store_unscoped(),
         session,
         &workspace_text,
         &agent_id,
@@ -1684,7 +1734,7 @@ async fn failed_permission_respond_then_recovery_does_not_unpark() {
     })
     .await;
     orch.stop_background_tasks().await;
-    orch.store()
+    orch.store_unscoped()
         .begin_managed_permission_resolve(
             &req.id.to_string(),
             session,
@@ -1699,7 +1749,7 @@ async fn failed_permission_respond_then_recovery_does_not_unpark() {
     assert!(host.inspect_pending_permission(req.id).is_none());
     orch.drive_native_executor_once().await;
     assert_eq!(
-        orch.store()
+        orch.store_unscoped()
             .load_work_item(&item.work_id)
             .unwrap()
             .unwrap()
@@ -1707,7 +1757,7 @@ async fn failed_permission_respond_then_recovery_does_not_unpark() {
         WorkState::AwaitingInput
     );
     assert_eq!(
-        orch.store()
+        orch.store_unscoped()
             .live_managed_intent_for_work(&item.work_id)
             .unwrap()
             .unwrap()

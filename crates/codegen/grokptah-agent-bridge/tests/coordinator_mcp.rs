@@ -591,7 +591,11 @@ async fn coordinator_identity_and_scope_are_enforced() {
         ack_err.contains("forbidden_scope") || ack_err.contains("403"),
         "cross-workspace ack must fail: {ack_err}"
     );
-    let stored = orch.store().load_message(&message_id).unwrap().unwrap();
+    let stored = orch
+        .store_unscoped()
+        .load_message(&message_id)
+        .unwrap()
+        .unwrap();
     assert!(stored.acked_at.is_none());
     assert!(stored.acked_by.is_none());
 

@@ -2115,6 +2115,27 @@ impl AgentHostHandle {
         max_rounds: Option<u32>,
         request_id: Option<String>,
     ) -> Result<String> {
+        self.resume_agent_with_request_id_for_principal(
+            session_id, prompt, max_rounds, request_id, None,
+        )
+        .await
+    }
+
+    /// Resume on behalf of an authenticated control-plane principal (#477).
+    ///
+    /// The durable continuation Run the host creates for this turn is the
+    /// caller's own work rather than a desktop turn, so it is stamped with
+    /// `run_principal` — the same public principal alias run ownership is
+    /// checked against. Passing `None` keeps the desktop default and is what
+    /// the desktop's own resume path does.
+    pub async fn resume_agent_with_request_id_for_principal(
+        &self,
+        session_id: Uuid,
+        prompt: String,
+        max_rounds: Option<u32>,
+        request_id: Option<String>,
+        run_principal: Option<String>,
+    ) -> Result<String> {
         let store = self.ensure_orchestration_store()?;
         let request_id = request_id.unwrap_or_else(|| format!("resume-{}", Uuid::new_v4()));
         let bound_agent_id = self
@@ -2165,7 +2186,15 @@ impl AgentHostHandle {
                     .map(|run| run.run_id)
                     .collect();
                 let result = self
-                    .session_prompt_inner(session_id, prompt, max_rounds, None, None, Some(plan))
+                    .session_prompt_inner(
+                        session_id,
+                        prompt,
+                        max_rounds,
+                        None,
+                        None,
+                        Some(plan),
+                        run_principal,
+                    )
                     .await;
                 let durable_run_id = store.list_runs()?.into_iter().find_map(|run| {
                     (!prior_run_ids.contains(&run.run_id)
@@ -2478,6 +2507,7 @@ impl AgentHostHandle {
         agent_spec_revision: Option<u64>,
         parent_run_id: Option<String>,
         continuation: Option<&AgentContinuationPlan>,
+        run_principal: Option<String>,
     ) -> Option<(String, OrchStore)> {
         let store = match self.ensure_orchestration_store() {
             Ok(store) => store,
@@ -2497,7 +2527,11 @@ impl AgentHostHandle {
             session_id,
             workspace: durable_workspace,
             request_id: format!("desktop-turn-{turn_id}"),
-            client_id: Some("desktop".into()),
+            // A turn the desktop started is the desktop's own. A continuation
+            // started through the authenticated control plane is coordinator
+            // work, so it is stamped with the principal that asked for it and
+            // that caller owns the Run it just created.
+            client_id: Some(run_principal.unwrap_or_else(|| "desktop".into())),
             state: RunState::Running,
             purpose: RunPurpose::Execution,
             agent_id: agent_id.clone(),
@@ -6813,7 +6847,7 @@ impl AgentHostHandle {
         prompt: String,
         max_rounds: Option<u32>,
     ) -> Result<String> {
-        self.session_prompt_inner(session_id, prompt, max_rounds, None, None, None)
+        self.session_prompt_inner(session_id, prompt, max_rounds, None, None, None, None)
             .await
     }
 
@@ -6825,8 +6859,16 @@ impl AgentHostHandle {
         max_rounds: Option<u32>,
         owner: &str,
     ) -> Result<String> {
-        self.session_prompt_inner(session_id, prompt, max_rounds, Some(owner), None, None)
-            .await
+        self.session_prompt_inner(
+            session_id,
+            prompt,
+            max_rounds,
+            Some(owner),
+            None,
+            None,
+            None,
+        )
+        .await
     }
 
     /// Start a reserved turn under a durable run identity owned by an
@@ -6851,10 +6893,12 @@ impl AgentHostHandle {
                 execution_mode,
             }),
             None,
+            None,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)] // Keeps durable run identity inputs explicit.
     async fn session_prompt_inner(
         &self,
         session_id: Uuid,
@@ -6863,6 +6907,7 @@ impl AgentHostHandle {
         reservation_owner: Option<&str>,
         external_run: Option<ExternalRunContext>,
         resume: Option<AgentContinuationPlan>,
+        run_principal: Option<String>,
     ) -> Result<String> {
         self.ensure_session_accepts_new_work(session_id)?;
         self.ensure_transcript_loaded(session_id)?;
@@ -7168,6 +7213,7 @@ impl AgentHostHandle {
                     .and_then(|agent| agent.current_spec().ok().map(|spec| spec.revision)),
                 resume.as_ref().map(|plan| plan.parent_run_id.clone()),
                 resume.as_ref(),
+                run_principal,
             )
         } else {
             None
@@ -12015,6 +12061,7 @@ mod tests {
                 None,
                 None,
                 Some(losing_plan),
+                None,
             )
             .await
             .unwrap_err()

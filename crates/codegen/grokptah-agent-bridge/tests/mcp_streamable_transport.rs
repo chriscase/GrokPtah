@@ -1214,7 +1214,7 @@ async fn http_retry_interrupted_run_is_explicit_and_idempotent() {
     let session = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(session.id, ws.path()).unwrap();
     let source_id = "http-interrupted-source";
-    orch.store()
+    orch.store_unscoped()
         .save_run(&RunRecord {
             run_id: source_id.into(),
             session_id: session.id,
@@ -1462,7 +1462,7 @@ async fn mcp_isolated_run_review_approval_and_restart_promotion() {
         .await;
     assert!(stale.is_err(), "tampered worktree must fail closed");
     std::fs::write(&isolated_file, "hello from isolated run").unwrap();
-    orch.store()
+    orch.store_unscoped()
         .update_run(&run_id, |run| {
             run.approval.as_mut().unwrap().expires_at = Utc::now() - ChronoDuration::seconds(1);
             Ok(())
@@ -1481,7 +1481,7 @@ async fn mcp_isolated_run_review_approval_and_restart_promotion() {
         )
         .await;
     assert!(expired.is_err(), "expired approval must fail closed");
-    orch.store()
+    orch.store_unscoped()
         .update_run(&run_id, |run| {
             run.approval.as_mut().unwrap().expires_at = Utc::now() + ChronoDuration::minutes(5);
             Ok(())
@@ -1558,7 +1558,7 @@ async fn mcp_isolated_run_review_approval_and_restart_promotion() {
         "hello from isolated run"
     );
     assert_eq!(
-        orch2.store().list_runs().unwrap().len(),
+        orch2.store_unscoped().list_runs().unwrap().len(),
         1,
         "one durable MCP run, no desktop duplicate"
     );
