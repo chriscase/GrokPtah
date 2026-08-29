@@ -5,8 +5,8 @@
 | Field | Value |
 | --- | --- |
 | Exact base | `origin/main` `c6f1cb23e9d6217005599850d9e0d6f7df64d5a1` |
-| Branch | `grok/cu-adaptive-evaluator-authority-v2` (correction of #446; does not modify `grok/cu-adaptive-eval-harness-v1`) |
-| Allowlist | `evals/computer-use-adaptive/**`, `docs/COMPUTER_USE_ADAPTIVE_EVAL.md` |
+| Branch | `codex/reconstruct-adaptive-eval-newmain-v1` (current-main consolidation of drafts #446 and #448) |
+| Allowlist | `evals/computer-use-adaptive/**`, `docs/COMPUTER_USE_ADAPTIVE_EVAL.md`, `.github/workflows/desktop.yml` |
 | Production runtime edited | **none** |
 | Synthetic campaign | **PASS** |
 | Unauthorized dispatches | **0** |
@@ -62,7 +62,8 @@ Recorded in `src/naming.rs` and every campaign report `naming` object.
 cd evals/computer-use-adaptive
 cargo test --locked -- --test-threads=1
 cargo clippy --locked --all-targets -- -D warnings
-cargo run --locked --bin grokptah-cu-adaptive-eval -- --out campaign-out --repeats 5 --seed 435272
+cargo run --locked --bin grokptah-cu-adaptive-eval -- --out campaign-out --repeats 5 --seed 435272 --source-gate c6f1cb23e9d6217005599850d9e0d6f7df64d5a1
+cargo run --locked --bin grokptah-cu-adaptive-eval -- --verify-report campaign-out/campaign-report.json --verify-evidence campaign-out/campaign-evidence.json
 ```
 
 Focused crate only. Do not `cargo test --workspace`, `cargo clean`, or overlap a

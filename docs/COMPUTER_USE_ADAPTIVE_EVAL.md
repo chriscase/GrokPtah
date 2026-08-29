@@ -17,7 +17,7 @@ release (#435 packaged Economy + isolated-visual High Assurance remain open;
 ```sh
 cd evals/computer-use-adaptive
 cargo test --locked -- --test-threads=1
-cargo run --locked --bin grokptah-cu-adaptive-eval -- --out campaign-out --repeats 5 --seed 435272
+cargo run --locked --bin grokptah-cu-adaptive-eval -- --out campaign-out --repeats 5 --seed 435272 --source-gate c6f1cb23e9d6217005599850d9e0d6f7df64d5a1
 cargo run --locked --bin grokptah-cu-adaptive-eval -- \
   --verify-report campaign-out/campaign-report.json \
   --verify-evidence campaign-out/campaign-evidence.json
