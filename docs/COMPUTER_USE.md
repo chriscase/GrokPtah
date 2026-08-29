@@ -198,6 +198,7 @@ The digest binds:
 
 | Bound input | Why |
 |---|---|
+| Upstream authority lineage | An upstream rotation retires every capability beneath it |
 | Normalized route identity (provider, base URL, wire model, dialect) | The original binding, preserved |
 | Effective tier *after* operator policy | A downgrade must not be inheritable |
 | Provenance, including which declared trust was honoured | Declared and measured are not interchangeable |
@@ -217,6 +218,51 @@ A binding reference is secret-free and confers nothing on its own: the authority
 in memory. A reference persisted in a run record and restored after a restart therefore names
 nothing, is refused, and is quarantined as needing explicit re-establishment. Nothing promotes a
 quarantined qualification in place.
+
+#### The authority is not reachable from outside
+
+Everything that mints or moves authority is crate-internal. There is no way for a caller of the
+library to construct a registry, reach the host's, mint a binding, manufacture evidence, change
+the policy, or install its own boundary — a public gate trait, in particular, would let a caller
+install an allow-all boundary in production. `AgentHostHandle::computer_use_service` is the single
+seam: it is the only way to obtain a kernel wired to the authority, and the authority itself is
+never handed out. A kernel built any other way admits operator-driven runs and refuses every
+model-attributed one.
+
+#### Who is driving is named, not inferred
+
+The kernel does not read "no binding, therefore the operator". Inferring an actor from an absence
+means any path that drops a binding silently widens the run into the operator's authority. The
+actor is explicit, and there are three:
+
+| Actor | Proof | Effect |
+|---|---|---|
+| Operator | The run's live one-use `ActionGrant` | Needs no provider capability |
+| Model | A capability binding the live authority still honours | Re-validated at every boundary |
+| Stripped | None — the binding is gone while the grant it was driving under is still live | Dispatches nothing |
+
+Clearing model authority always revokes the grant underneath it, so handing control back (Pause,
+Take over) issues a *fresh* grant and the run is honestly operator-driven again. There is no
+method that clears a binding on its own: that would be a way to walk a model-driven run back into
+the operator's authority.
+
+#### A dispatch authorization names its effect
+
+Dispatch authorization is not "this model may act" — it is "this model may perform *this*". The
+authorization is issued against the exact run, observation, and action class, and is redeemed once,
+by value, immediately before the backend call. It cannot cover a second dispatch and cannot be
+paired with a different action than the one it was taken for. Redemption re-derives the capability,
+so an authorization is good only while the capability it was issued against is still exactly the
+same one.
+
+#### A stored capability record is not evidence
+
+A record in `gateway.json` asserting `measured` is a file the configuration can rewrite. It no
+longer short-circuits into durable action authority: this authority calls something measured only
+when it measured it. An unqualified model reports observation authority whatever the stored record
+claims, and action authority requires the bounded local qualification to run in this session (or
+signed evidence). What durable capability still does is decide whether the model is *eligible* to
+be qualified at all.
 
 Every refusal is one value with one message. A foreign binding, an unknown binding, a revoked
 binding and a stale binding are indistinguishable, so a denial cannot be used to probe which
@@ -253,6 +299,16 @@ An unrecognised profile name narrows to `high_assurance` rather than leaving the
 something broader than the operator meant. Changing the profile or the trust policy advances the
 generation, so bindings taken under the old setting stop validating immediately.
 
+#### What this does not claim
+
+The lineage field binds the *upstream authority a capability descends from*, and today the host
+populates it with its own process auth lineage: an id drawn at startup and a counter that advances
+on every credential or policy invalidation. That is a real upstream — a restart or an invalidation
+does retire every binding — but it is deliberately not a claim of verified principal, tenant,
+scope, or operator identity. None of those exist to bind yet; minting them is separate work
+(#477), as is the service-scoped auth epoch (#460). The field is the seam they plug into, and
+their rotation will retire capability generations without further design.
+
 | Adversarial condition | Fail-closed behavior |
 |---|---|
 | Same-route tier downgrade between observation and dispatch | Refused at dispatch; the backend is never called |
@@ -263,6 +319,10 @@ generation, so bindings taken under the old setting stop validating immediately.
 | Schema bump or operator policy change | Digest and generation both move; bindings refuse |
 | Restart with a persisted binding reference | Names nothing; quarantined for explicit re-establishment |
 | Generation exhaustion | Nothing mutates, nothing wraps, every boundary refuses |
+| Model authority stripped while its grant is still live | The run is nobody, not the operator; it dispatches nothing |
+| A dispatch authorization reused, or paired with another action | The lease redeems once, and only against the effect it names |
+| Upstream authority rotation | Lineage moves; every capability beneath it is retired |
+| Caller-supplied gate or caller-minted binding | Not expressible: the authority, its gate, and its evidence are crate-internal |
 
 ## macOS observation and semantic action slices (#269, #270)
 

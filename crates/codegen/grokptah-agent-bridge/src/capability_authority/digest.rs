@@ -109,6 +109,37 @@ pub fn normalize_base_url(value: &str) -> String {
     format!("{scheme}://{authority}{tail}")
 }
 
+/// The upstream authority a capability descends from.
+///
+/// # What this is, and what it is not
+///
+/// A capability generation answers "is this still the capability that was
+/// qualified?". It does not, on its own, answer "and is the authority that
+/// qualified it still the one in force?" — that is an *upstream* question,
+/// and without an answer to it an upstream rotation cannot retire anything
+/// downstream.
+///
+/// This field is where that answer binds. It is folded into the digest, so
+/// when the upstream lineage moves, every capability binding taken under the
+/// old one stops matching and is refused at its next boundary.
+///
+/// Today the host populates it with its own process auth lineage: an id drawn
+/// at startup and a counter that advances on every credential or policy
+/// invalidation. That is a real upstream — a host restart or an auth
+/// invalidation does retire every binding — but it is deliberately **not** a
+/// claim of verified principal, tenant, scope, or operator identity. None of
+/// those exist to bind yet; minting them is separate work (#477), as is the
+/// service-scoped auth epoch (#460). When a canonical one lands, it populates
+/// this field and its rotation retires capability generations for free.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthorityLineage {
+    /// Names the upstream authority. Opaque and secret-free.
+    pub authority: String,
+    /// That authority's own monotonic generation.
+    pub generation: u64,
+}
+
 /// The qualification contract a binding was taken under.
 ///
 /// A code change that alters what qualification proves must bump `version`;
@@ -192,7 +223,11 @@ pub struct QualificationEvidence {
 
 impl QualificationEvidence {
     /// Evidence for a qualification that never ran.
-    pub fn absent() -> Self {
+    ///
+    /// Test-only: no production path mints a binding on no evidence, and one
+    /// that could would be a way to buy authority with nothing.
+    #[cfg(test)]
+    pub(crate) fn absent() -> Self {
         Self {
             kind: QualificationEvidenceKind::Absent,
             digest: hex_digest(&[(b"evidence".as_slice(), b"absent".as_slice())]),
@@ -201,7 +236,11 @@ impl QualificationEvidence {
 
     /// Reduces a transcript to a one-way digest. The transcript is consumed
     /// here and never stored.
-    pub fn of(kind: QualificationEvidenceKind, transcript: &[u8]) -> Self {
+    ///
+    /// Crate-internal: evidence is the authority's own record of what it
+    /// proved. A caller that could construct `Signed` evidence could
+    /// manufacture the authority that evidence buys.
+    pub(crate) fn of(kind: QualificationEvidenceKind, transcript: &[u8]) -> Self {
         Self {
             kind,
             digest: hex_digest(&[
@@ -216,6 +255,8 @@ impl QualificationEvidence {
 /// meant when it was taken.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapabilityFacts {
+    /// The upstream authority this capability descends from.
+    pub lineage: AuthorityLineage,
     pub route: NormalizedRoute,
     /// The operator-visible `provider/model` selection key. Bound separately
     /// from the wire model so an aliased selection cannot silently retarget.
@@ -233,6 +274,12 @@ impl CapabilityFacts {
     pub fn digest(&self) -> CapabilityDigest {
         let mut digest = Sha256::new();
         digest.update(DOMAIN);
+        field(&mut digest, "lineage", self.lineage.authority.as_bytes());
+        field(
+            &mut digest,
+            "lineage_generation",
+            &self.lineage.generation.to_be_bytes(),
+        );
         field(&mut digest, "provider", self.route.provider_id.as_bytes());
         field(&mut digest, "base_url", self.route.base_url.as_bytes());
         field(&mut digest, "wire_model", self.route.wire_model.as_bytes());
@@ -292,6 +339,7 @@ impl CapabilityDigest {
     }
 
     /// The digest carried by a reference that names no binding.
+    #[cfg(test)]
     pub(super) fn unbound() -> Self {
         Self(hex_digest(&[(
             b"binding".as_slice(),
@@ -327,6 +375,75 @@ impl fmt::Display for CapabilityDigest {
     }
 }
 
+/// The exact effect one dispatch authorization covers.
+///
+/// A dispatch authorization that named only the binding could be paired with
+/// any action: it would say "this model may act", not "this model may perform
+/// *this*". Binding the effect closes that, and makes the authorization
+/// meaningless anywhere but at the action it was taken for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DispatchEffect {
+    run_id: String,
+    observation_id: String,
+    action_class: String,
+}
+
+impl DispatchEffect {
+    pub(crate) fn new(
+        run_id: impl Into<String>,
+        observation_id: impl Into<String>,
+        action_class: impl Into<String>,
+    ) -> Self {
+        Self {
+            run_id: run_id.into(),
+            observation_id: observation_id.into(),
+            action_class: action_class.into(),
+        }
+    }
+
+    fn digest(&self, binding: &CapabilityDigest) -> CapabilityDigest {
+        CapabilityDigest(hex_digest(&[
+            (b"binding".as_slice(), binding.0.as_bytes()),
+            (b"run".as_slice(), self.run_id.as_bytes()),
+            (b"observation".as_slice(), self.observation_id.as_bytes()),
+            (b"action_class".as_slice(), self.action_class.as_bytes()),
+        ]))
+    }
+}
+
+/// A single-use authorization for one exact effect.
+///
+/// [`Self::redeem`] takes `self`, so the type system enforces the one-shot
+/// property: an authorization cannot cover a second dispatch, and it cannot be
+/// transplanted onto a different action, observation, or run. `must_use`
+/// because dropping one silently would mean dispatching without redeeming.
+#[derive(Debug)]
+#[must_use = "a dispatch lease authorizes nothing until it is redeemed"]
+pub(crate) struct DispatchLease {
+    effect_digest: CapabilityDigest,
+}
+
+impl DispatchLease {
+    pub(crate) fn issue(binding: &CapabilityDigest, effect: &DispatchEffect) -> Self {
+        Self {
+            effect_digest: effect.digest(binding),
+        }
+    }
+
+    /// Consumes the lease against the effect about to happen.
+    pub(crate) fn redeem(
+        self,
+        binding: &CapabilityDigest,
+        effect: &DispatchEffect,
+    ) -> Result<(), super::generation::CapabilityDenied> {
+        if self.effect_digest == effect.digest(binding) {
+            Ok(())
+        } else {
+            Err(super::generation::CapabilityDenied)
+        }
+    }
+}
+
 /// Length-prefixed, labelled field update.
 ///
 /// Without the length prefixes, `("ab", "c")` and `("a", "bc")` would digest
@@ -357,6 +474,10 @@ mod tests {
 
     fn facts() -> CapabilityFacts {
         CapabilityFacts {
+            lineage: AuthorityLineage {
+                authority: "test-authority".into(),
+                generation: 1,
+            },
             route: NormalizedRoute::new(
                 "xai",
                 "https://api.x.ai/v1",
@@ -395,6 +516,10 @@ mod tests {
         policy.policy.revision = 8;
         let mut selection = facts();
         selection.selection_key = "xai/grok-4-alias".into();
+        let mut lineage = facts();
+        lineage.lineage.generation = 2;
+        let mut authority = facts();
+        authority.lineage.authority = "other-authority".into();
         for (label, drifted) in [
             ("route", route),
             ("tier", tier),
@@ -404,6 +529,8 @@ mod tests {
             ("credential", credential),
             ("policy", policy),
             ("selection", selection),
+            ("lineage_generation", lineage),
+            ("lineage_authority", authority),
         ] {
             assert_ne!(
                 base,
@@ -455,6 +582,37 @@ mod tests {
         right.route.provider_id = "a".into();
         right.route.base_url = "bc".into();
         assert_ne!(left.digest(), right.digest());
+    }
+
+    #[test]
+    fn a_dispatch_lease_is_one_shot_and_bound_to_its_exact_effect() {
+        let binding = facts().digest();
+        let effect = DispatchEffect::new("run-1", "observation-1", "semantic");
+        DispatchLease::issue(&binding, &effect)
+            .redeem(&binding, &effect)
+            .expect("the effect it was issued for");
+
+        for other in [
+            DispatchEffect::new("run-2", "observation-1", "semantic"),
+            DispatchEffect::new("run-1", "observation-2", "semantic"),
+            DispatchEffect::new("run-1", "observation-1", "text_entry"),
+        ] {
+            assert!(
+                DispatchLease::issue(&binding, &effect)
+                    .redeem(&binding, &other)
+                    .is_err(),
+                "a lease must not transplant onto {other:?}"
+            );
+        }
+
+        let mut drifted = facts();
+        drifted.tier = ComputerUseTier::Observe;
+        assert!(
+            DispatchLease::issue(&binding, &effect)
+                .redeem(&drifted.digest(), &effect)
+                .is_err(),
+            "a lease must not survive the capability it was issued against"
+        );
     }
 
     #[test]

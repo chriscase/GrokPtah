@@ -23,7 +23,7 @@ mod simulator;
 mod store;
 mod types;
 
-pub use capability_gate::{capability_denied, ComputerCapabilityGate, OperatorOnlyCapabilityGate};
+pub(crate) use capability_gate::{capability_denied, ComputerActor, ComputerCapabilityGate};
 pub use macos_observation::MacOsObservationPlatform;
 pub use platform::{
     ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,

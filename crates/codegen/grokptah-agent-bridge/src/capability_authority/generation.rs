@@ -103,6 +103,7 @@ impl CapabilityGeneration {
     /// terminal transition and the refusal after it can be exercised without
     /// 2^64 rotations. Crate-internal; reached only through
     /// [`super::CapabilityRegistry::pin_near_exhaustion_for_test`].
+    #[cfg(test)]
     pub(super) fn pinned_near_exhaustion(self) -> Self {
         Self {
             authority: self.authority,

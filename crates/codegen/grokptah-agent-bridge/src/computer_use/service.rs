@@ -7,7 +7,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use super::capability_gate::{ComputerCapabilityGate, OperatorOnlyCapabilityGate};
+use super::capability_gate::{ComputerActor, ComputerCapabilityGate, OperatorOnlyCapabilityGate};
 use super::policy::ComputerPolicy;
 use super::projection::{
     not_available, project_events, project_run_at, ComputerRunCapacity, ComputerRunEventPage,
@@ -19,7 +19,7 @@ use super::types::{
     ComputerControlDisposition, ComputerError, ComputerErrorCode, ComputerObservation,
     ComputerResult, ComputerRun, ComputerRunState, ComputerTarget, ComputerUseLimits,
 };
-use crate::capability_authority::{CapabilityBindingRef, CapabilityBoundary};
+use crate::capability_authority::{CapabilityBindingRef, CapabilityBoundary, DispatchEffect};
 
 pub struct ComputerUseService {
     backend: Arc<dyn ComputerBackend>,
@@ -44,7 +44,11 @@ impl ComputerUseService {
     }
 
     /// Wires a live provider capability authority to this kernel (#458).
-    pub fn with_capability_gate(mut self, gate: Arc<dyn ComputerCapabilityGate>) -> Self {
+    ///
+    /// Crate-internal, and reachable only through
+    /// [`crate::AgentHostHandle::computer_use_service`]: a public injection
+    /// point would let a caller install an allow-all boundary in production.
+    pub(crate) fn with_capability_gate(mut self, gate: Arc<dyn ComputerCapabilityGate>) -> Self {
         self.capability_gate = gate;
         self
     }
@@ -66,8 +70,8 @@ impl ComputerUseService {
         let payload = json!({
             "runId": run_id,
             "expectedVersion": expected_version,
-            "bindingId": binding.binding_id,
-            "digest": binding.digest,
+            "digest": binding.digest(),
+            "generation": binding.generation(),
         });
         if let Some(replayed) = self.begin_mutation(request_id, "bind_model_authority", &payload)? {
             return replayed;
@@ -91,8 +95,13 @@ impl ComputerUseService {
                 self.capability_gate.authorize(
                     CapabilityBoundary::Staging,
                     run.owner_session_id,
-                    Some(&binding),
+                    ComputerActor::Model(&binding),
                 )?;
+                // Remember the grant the model is driving under, so a binding
+                // that later disappears cannot leave the run dispatching on
+                // that same grant as though the operator had asked for it.
+                run.model_authority_grant_id =
+                    run.grant.as_ref().map(|grant| grant.grant_id.clone());
                 run.capability_binding = Some(binding.clone());
                 run.record_audit("bind_model_authority", "bound", None, None, None);
                 Ok(())
@@ -100,37 +109,6 @@ impl ComputerUseService {
             .and_then(|run| run.ok_or_else(unknown_run));
         if let Err(error) = &result {
             self.record_denial(run_id, "bind_model_authority", None, error);
-        }
-        self.finish_mutation(request_id, &result)?;
-        result
-    }
-
-    /// Drops any model authority attached to a run, leaving it operator-driven.
-    pub fn clear_model_authority(
-        &self,
-        request_id: &str,
-        run_id: &str,
-        expected_version: u64,
-    ) -> ComputerResult<ComputerRun> {
-        validate_id("run_id", run_id)?;
-        let payload = json!({ "runId": run_id, "expectedVersion": expected_version });
-        if let Some(replayed) =
-            self.begin_mutation(request_id, "clear_model_authority", &payload)?
-        {
-            return replayed;
-        }
-        let result = self
-            .store
-            .update_run(run_id, |run| {
-                ensure_version(run, expected_version)?;
-                if run.capability_binding.take().is_some() {
-                    run.record_audit("clear_model_authority", "cleared", None, None, None);
-                }
-                Ok(())
-            })
-            .and_then(|run| run.ok_or_else(unknown_run));
-        if let Err(error) = &result {
-            self.record_denial(run_id, "clear_model_authority", None, error);
         }
         self.finish_mutation(request_id, &result)?;
         result
@@ -327,7 +305,7 @@ impl ComputerUseService {
                 self.capability_gate.authorize(
                     CapabilityBoundary::Lease,
                     run.owner_session_id,
-                    run.capability_binding.as_ref(),
+                    ComputerActor::of(run),
                 )?;
                 self.policy.authorize_grant(run, &grant, Utc::now())?;
                 run.grant = Some(grant.clone());
@@ -375,7 +353,7 @@ impl ComputerUseService {
                 self.capability_gate.authorize(
                     CapabilityBoundary::Observation,
                     run.owner_session_id,
-                    run.capability_binding.as_ref(),
+                    ComputerActor::of(run),
                 )?;
                 self.policy.authorize_observation(run, now)?;
                 run.transition(ComputerRunState::Observing)?;
@@ -414,7 +392,7 @@ impl ComputerUseService {
                             self.capability_gate.authorize(
                                 CapabilityBoundary::LiveFrame,
                                 prepared.owner_session_id,
-                                prepared.capability_binding.as_ref(),
+                                ComputerActor::of(&prepared),
                             )
                         })
                         .map(|()| observation);
@@ -533,11 +511,28 @@ impl ComputerUseService {
                 // downgrade, revocation, or credential rotation that landed
                 // while this run was being prepared is refused here rather
                 // than after the screen has already changed.
-                let dispatch = self.capability_gate.authorize(
-                    CapabilityBoundary::Dispatch,
-                    prepared.owner_session_id,
-                    prepared.capability_binding.as_ref(),
+                //
+                // The authorization names this exact effect and is redeemed
+                // once, immediately before the backend call, so it cannot
+                // cover a second dispatch and cannot be paired with a
+                // different action than the one it was taken for.
+                let effect = DispatchEffect::new(
+                    run_id,
+                    &observation.observation_id,
+                    action.class().as_str(),
                 );
+                let actor = ComputerActor::of(&prepared);
+                let dispatch = self
+                    .capability_gate
+                    .authorize_dispatch(prepared.owner_session_id, actor, &effect)
+                    .and_then(|lease| {
+                        self.capability_gate.redeem_dispatch(
+                            prepared.owner_session_id,
+                            actor,
+                            lease,
+                            &effect,
+                        )
+                    });
                 if let Err(error) = dispatch {
                     self.fail_inflight(run_id, "act", &error)?;
                     Err(error)

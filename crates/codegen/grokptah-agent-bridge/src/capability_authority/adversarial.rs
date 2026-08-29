@@ -1,5 +1,12 @@
 //! Adversarial coverage for the provider capability generation (#458).
 //!
+//! These live inside the crate rather than in `tests/` on purpose. The
+//! authority's minting and mutating surface is crate-internal — a caller of
+//! this library must not be able to build a registry, mint a binding, or
+//! manufacture evidence — so an external integration test could not reach the
+//! seams these tests need without reopening exactly the hole they exist to
+//! prove is closed.
+//!
 //! Every test here uses a synthetic provider: a plain struct holding the
 //! capability facts a real provider route would produce. Nothing in this file
 //! resolves a credential, opens a socket, or reaches a provider. The point is
@@ -22,19 +29,20 @@ use parking_lot::Mutex;
 use tempfile::TempDir;
 use uuid::Uuid;
 
-use grokptah_agent_bridge::capability_authority::{
-    AssuranceProfile, CapabilityAssessment, CapabilityBindingRef, CapabilityBoundary,
-    CapabilityDenied, CapabilityRegistry, CapabilityRequest, DeclaredCapabilityPolicy,
-    NormalizedRoute, QualificationEvidence, QualificationEvidenceKind, QualificationKey,
-    QualificationSchema,
+use super::{
+    AssuranceProfile, AuthorityLineage, CapabilityAssessment, CapabilityBindingRef,
+    CapabilityBoundary, CapabilityDenied, CapabilityRegistry, CapabilityRequest,
+    DeclaredCapabilityPolicy, DispatchEffect, DispatchLease, NormalizedRoute,
+    QualificationEvidence, QualificationEvidenceKind, QualificationKey, QualificationSchema,
 };
-use grokptah_agent_bridge::computer_use::{
-    ActionClass, ActionGrant, ActionOutcome, ComputerAction, ComputerBackend, ComputerCapabilities,
-    ComputerCapabilityGate, ComputerError, ComputerErrorCode, ComputerObservation, ComputerRun,
-    ComputerStore, ComputerTarget, ComputerUseLimits, GrantIssuer, ObservationGeometry,
-    SemanticAction, SemanticElement, Sensitivity,
+use crate::computer_use::{
+    ActionClass, ActionGrant, ActionOutcome, ComputerAction, ComputerActor, ComputerBackend,
+    ComputerCapabilities, ComputerCapabilityGate, ComputerError, ComputerErrorCode,
+    ComputerObservation, ComputerRun, ComputerStore, ComputerTarget, ComputerUseLimits,
+    ComputerUseService, GrantIssuer, ObservationGeometry, SemanticAction, SemanticElement,
+    Sensitivity,
 };
-use grokptah_agent_bridge::{CapabilitySource, ComputerUseService, ComputerUseTier};
+use crate::gateway_config::{CapabilitySource, ComputerUseTier};
 
 const SCHEMA_ID: &str = "grokptah.computer-use.session-qualification";
 const PROVIDER: &str = "synthetic";
@@ -80,6 +88,10 @@ impl SyntheticProvider {
     fn request(&self) -> CapabilityRequest {
         let facts = self.facts.lock().clone();
         CapabilityRequest {
+            lineage: AuthorityLineage {
+                authority: "synthetic-host".into(),
+                generation: 0,
+            },
             route: NormalizedRoute::new(PROVIDER, &facts.base_url, facts.wire_model, facts.dialect),
             selection_key: facts.selection_key,
             source: facts.source,
@@ -142,22 +154,69 @@ impl ComputerCapabilityGate for SyntheticGate {
         &self,
         boundary: CapabilityBoundary,
         owner_session_id: Uuid,
-        binding: Option<&CapabilityBindingRef>,
+        actor: ComputerActor<'_>,
     ) -> Result<(), ComputerError> {
-        let Some(binding) = binding else {
-            return Ok(());
+        let binding = match actor {
+            ComputerActor::Operator => return Ok(()),
+            ComputerActor::Stripped => {
+                self.checks.lock().push(boundary);
+                return Err(capability_error());
+            }
+            ComputerActor::Model(binding) => binding,
         };
         self.checks.lock().push(boundary);
-        let live =
-            live_assessment(&self.registry, &self.provider).map_err(|_| capability_error())?;
-        self.registry
-            .validate(owner_session_id, binding, boundary, &live)
-            .map_err(|_| capability_error())?;
         assert_eq!(
             owner_session_id, self.session_id,
             "the kernel must present the owning session"
         );
-        Ok(())
+        let live =
+            live_assessment(&self.registry, &self.provider).map_err(|_| capability_error())?;
+        self.registry
+            .validate(owner_session_id, binding, boundary, &live)
+            .map_err(|_| capability_error())
+    }
+
+    fn authorize_dispatch(
+        &self,
+        owner_session_id: Uuid,
+        actor: ComputerActor<'_>,
+        effect: &DispatchEffect,
+    ) -> Result<Option<DispatchLease>, ComputerError> {
+        let binding = match actor {
+            ComputerActor::Operator => return Ok(None),
+            ComputerActor::Stripped => {
+                self.checks.lock().push(CapabilityBoundary::Dispatch);
+                return Err(capability_error());
+            }
+            ComputerActor::Model(binding) => binding,
+        };
+        self.checks.lock().push(CapabilityBoundary::Dispatch);
+        let live =
+            live_assessment(&self.registry, &self.provider).map_err(|_| capability_error())?;
+        self.registry
+            .authorize_dispatch(owner_session_id, binding, &live, effect)
+            .map(Some)
+            .map_err(|_| capability_error())
+    }
+
+    fn redeem_dispatch(
+        &self,
+        _owner_session_id: Uuid,
+        actor: ComputerActor<'_>,
+        lease: Option<DispatchLease>,
+        effect: &DispatchEffect,
+    ) -> Result<(), ComputerError> {
+        match (actor, lease) {
+            (ComputerActor::Operator, None) => Ok(()),
+            (ComputerActor::Model(_), Some(lease)) => {
+                let live = live_assessment(&self.registry, &self.provider)
+                    .map_err(|_| capability_error())?;
+                lease
+                    .redeem(live.digest(), effect)
+                    .map_err(|_| capability_error())
+            }
+            _ => Err(capability_error()),
+        }
     }
 }
 

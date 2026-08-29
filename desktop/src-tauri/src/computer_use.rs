@@ -89,16 +89,12 @@ impl DesktopComputerUse {
                 Some(format!("Computer Use storage is unavailable: {error}")),
             ),
         };
-        // Every kernel this cockpit drives is wired to the host's live
-        // provider capability authority (#458), so a model-attributed lease,
-        // frame, or dispatch is refused the moment the capability behind it
-        // stops being the one that was qualified.
-        let capability_gate = host.computer_capability_gate();
+        // Every kernel this cockpit drives is built by the host, so it is
+        // wired to the host's live provider capability authority (#458) and a
+        // model-attributed lease, frame, or dispatch is refused the moment the
+        // capability behind it stops being the one that was qualified.
         let simulator = store.clone().map(|store| {
-            Arc::new(
-                ComputerUseService::new(Arc::new(SimulatorBackend::new()), store)
-                    .with_capability_gate(capability_gate.clone()),
-            )
+            Arc::new(host.computer_use_service(Arc::new(SimulatorBackend::new()), store))
         });
         Self {
             host: host.clone(),
@@ -392,10 +388,7 @@ impl DesktopComputerUse {
             .store
             .clone()
             .ok_or_else(|| self.initialization_error())?;
-        let service = Arc::new(
-            ComputerUseService::new(backend, store)
-                .with_capability_gate(self.host.computer_capability_gate()),
-        );
+        let service = Arc::new(self.host.computer_use_service(backend, store));
         let limits = ComputerUseLimits {
             max_actions: 8,
             max_duration_secs: 10 * 60,
@@ -674,22 +667,13 @@ impl DesktopComputerUse {
         &self,
         owner_session_id: Uuid,
     ) -> Result<ComputerCockpitSnapshot, String> {
+        // Discarding only withdraws the approval in front of the operator. It
+        // deliberately does not strip the run's model authority: clearing a
+        // binding without revoking the grant underneath it would be a way to
+        // walk a model-driven run back into the operator's authority, which is
+        // exactly the widening #458 closes. Pause and Take over remain the
+        // ways to hand control back, and both revoke the grant with it.
         self.clear_pending_for_owner(owner_session_id)?;
-        // Discarding a model proposal returns the run to operator control, so
-        // it stops carrying a standing claim that a provider capability
-        // authorized it. A later model proposal has to stage its own.
-        let index = self.simulator()?;
-        if let Some(run) = latest_desktop_run(&index, owner_session_id)? {
-            if run.capability_binding.is_some() {
-                if let Ok((service, _)) = self.owned_service(owner_session_id, &run.run_id) {
-                    let _ = service.clear_model_authority(
-                        &Uuid::new_v4().to_string(),
-                        &run.run_id,
-                        run.version,
-                    );
-                }
-            }
-        }
         self.cockpit_snapshot(owner_session_id)
     }
 

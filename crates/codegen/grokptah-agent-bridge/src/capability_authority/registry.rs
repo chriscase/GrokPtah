@@ -10,8 +10,9 @@ use uuid::Uuid;
 
 use super::boundary::{BoundarySet, CapabilityBoundary};
 use super::digest::{
-    CapabilityDigest, CapabilityFacts, CredentialIncarnation, NormalizedRoute, PolicyRevision,
-    QualificationEvidence, QualificationEvidenceKind, QualificationSchema,
+    AuthorityLineage, CapabilityDigest, CapabilityFacts, CredentialIncarnation, DispatchEffect,
+    DispatchLease, NormalizedRoute, PolicyRevision, QualificationEvidence,
+    QualificationEvidenceKind, QualificationSchema,
 };
 use super::generation::{CapabilityDenied, CapabilityGeneration};
 use super::policy::{resolve_provenance, CapabilityProvenance, DeclaredCapabilityPolicy};
@@ -48,23 +49,35 @@ impl QualificationKey {
 #[serde(rename_all = "camelCase")]
 pub struct CapabilityBindingRef {
     /// Opaque handle into the live authority's binding table.
-    pub binding_id: String,
+    binding_id: String,
     /// Sealed capability + evidence digest, for operator display and for
     /// detecting an edited reference.
-    pub digest: CapabilityDigest,
+    digest: CapabilityDigest,
     /// Generation counter the binding was minted at, for diagnostics.
-    pub generation: u64,
+    generation: u64,
 }
 
 impl CapabilityBindingRef {
+    /// Operator-facing digest of the capability this reference names. Safe to
+    /// display and to persist; it confers nothing.
+    pub fn digest(&self) -> &CapabilityDigest {
+        &self.digest
+    }
+
+    /// Generation counter the binding was minted at, for diagnostics.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// A reference that names no binding any authority holds.
     ///
     /// This is the shape a legacy or restored qualification has: a record that
-    /// exists but was never issued by the live authority. It is refused at
-    /// every boundary, and it is constructible so that a migration finding an
-    /// old record can say "this is unbound" explicitly instead of leaving a
-    /// half-filled record that might read as authority.
-    pub fn unbound() -> Self {
+    /// exists but was never issued by the live authority, refused at every
+    /// boundary. Test-only — there is deliberately no production constructor
+    /// for a binding reference at all, so nothing outside this authority can
+    /// produce one.
+    #[cfg(test)]
+    pub(crate) fn unbound() -> Self {
         Self {
             binding_id: Uuid::new_v4().to_string(),
             digest: CapabilityDigest::unbound(),
@@ -119,15 +132,17 @@ impl CapabilityAssessment {
 /// Inputs for one assessment. Everything here is public identity material;
 /// no credential secret enters this module.
 #[derive(Debug, Clone)]
-pub struct CapabilityRequest {
-    pub route: NormalizedRoute,
-    pub selection_key: String,
+pub(crate) struct CapabilityRequest {
+    /// Upstream authority this capability descends from.
+    pub(crate) lineage: AuthorityLineage,
+    pub(crate) route: NormalizedRoute,
+    pub(crate) selection_key: String,
     /// Provenance of the capability record as stored, before policy.
-    pub source: CapabilitySource,
+    pub(crate) source: CapabilitySource,
     /// Tier the capability record claims, before policy.
-    pub claimed_tier: ComputerUseTier,
+    pub(crate) claimed_tier: ComputerUseTier,
     /// Secret-free credential principal fingerprint.
-    pub credential_fingerprint: String,
+    pub(crate) credential_fingerprint: String,
 }
 
 #[derive(Debug, Clone)]
@@ -198,10 +213,14 @@ impl std::fmt::Debug for CapabilityRegistry {
 impl CapabilityRegistry {
     /// Builds a registry for one process.
     ///
+    /// Crate-internal: the host is the only thing that may own a capability
+    /// authority. A caller that could build its own — or reach the host's —
+    /// could mint the authority this type exists to withhold.
+    ///
     /// The assurance profile and the declared-capability policy are taken
     /// explicitly: neither has a silent default that a deployment could
     /// inherit without deciding it.
-    pub fn new(
+    pub(crate) fn new(
         profile: AssuranceProfile,
         declared_policy: DeclaredCapabilityPolicy,
         schema: QualificationSchema,
@@ -221,30 +240,28 @@ impl CapabilityRegistry {
         }
     }
 
-    pub fn generation_counter(&self) -> u64 {
+    /// State observers. They exist so a test can assert that a *refused*
+    /// mutation changed nothing, which is the property that makes exhaustion
+    /// safe; nothing in production reads them.
+    #[cfg(test)]
+    pub(crate) fn generation_counter(&self) -> u64 {
         self.state.lock().generation.counter()
     }
 
-    pub fn profile(&self) -> AssuranceProfile {
+    #[cfg(test)]
+    pub(crate) fn profile(&self) -> AssuranceProfile {
         self.state.lock().profile
     }
 
-    pub fn declared_policy(&self) -> DeclaredCapabilityPolicy {
-        self.state.lock().declared_policy.clone()
-    }
-
-    pub fn policy_revision(&self) -> PolicyRevision {
+    #[cfg(test)]
+    pub(crate) fn policy_revision(&self) -> PolicyRevision {
         PolicyRevision {
             revision: self.state.lock().policy_revision,
         }
     }
 
-    pub fn qualification_schema(&self) -> QualificationSchema {
-        self.state.lock().schema.clone()
-    }
-
     /// Explicit revocation of every standing qualification.
-    pub fn revoke_all(&self) -> Result<(), CapabilityDenied> {
+    pub(crate) fn revoke_all(&self) -> Result<(), CapabilityDenied> {
         let mut state = self.state.lock();
         state.advance()?;
         state.bindings.clear();
@@ -259,7 +276,7 @@ impl CapabilityRegistry {
     /// stamp, which is fine, but it would also let a caller distinguish "this
     /// one was revoked" from "everything moved on" by timing. One advance for
     /// every revocation keeps that uniform.
-    pub fn revoke_session(&self, session_id: Uuid) -> Result<(), CapabilityDenied> {
+    pub(crate) fn revoke_session(&self, session_id: Uuid) -> Result<(), CapabilityDenied> {
         let mut state = self.state.lock();
         state.advance()?;
         let doomed: Vec<QualificationKey> = state
@@ -280,7 +297,7 @@ impl CapabilityRegistry {
     ///
     /// The previous binding does not survive a failed re-proof: whatever it
     /// once demonstrated, the model has just failed to demonstrate now.
-    pub fn record_requalification_failure(
+    pub(crate) fn record_requalification_failure(
         &self,
         key: &QualificationKey,
     ) -> Result<(), CapabilityDenied> {
@@ -294,7 +311,14 @@ impl CapabilityRegistry {
 
     /// Changes the assurance profile. Every binding taken under the old
     /// profile stops being current.
-    pub fn set_profile(&self, profile: AssuranceProfile) -> Result<(), CapabilityDenied> {
+    ///
+    /// Operator capability policy is read once at startup, so there is no
+    /// production caller yet: changing it today means restarting, which draws
+    /// a fresh authority and retires everything anyway. These setters exist so
+    /// the invalidation contract is proven now and holds unchanged when a
+    /// runtime settings surface lands.
+    #[cfg(test)]
+    pub(crate) fn set_profile(&self, profile: AssuranceProfile) -> Result<(), CapabilityDenied> {
         let mut state = self.state.lock();
         if state.profile == profile {
             return Ok(());
@@ -304,8 +328,10 @@ impl CapabilityRegistry {
         Ok(())
     }
 
-    /// Changes operator policy for declared capability.
-    pub fn set_declared_policy(
+    /// Changes operator policy for declared capability. See
+    /// [`Self::set_profile`] on why this has no production caller yet.
+    #[cfg(test)]
+    pub(crate) fn set_declared_policy(
         &self,
         declared_policy: DeclaredCapabilityPolicy,
     ) -> Result<(), CapabilityDenied> {
@@ -319,7 +345,9 @@ impl CapabilityRegistry {
     }
 
     /// Records a change to the qualification schema this host proves against.
-    pub fn set_qualification_schema(
+    /// See [`Self::set_profile`] on why this has no production caller yet.
+    #[cfg(test)]
+    pub(crate) fn set_qualification_schema(
         &self,
         schema: QualificationSchema,
     ) -> Result<(), CapabilityDenied> {
@@ -334,7 +362,7 @@ impl CapabilityRegistry {
 
     /// Records any other operator policy or allowlist change that a capability
     /// depends on.
-    pub fn bump_policy_revision(&self) -> Result<(), CapabilityDenied> {
+    pub(crate) fn bump_policy_revision(&self) -> Result<(), CapabilityDenied> {
         let mut state = self.state.lock();
         let next_revision = state
             .policy_revision
@@ -351,7 +379,7 @@ impl CapabilityRegistry {
     /// incarnation advances and every binding is retired. An unchanged
     /// fingerprint is a no-op, so ordinary token refresh on a stable principal
     /// does not churn authority.
-    pub fn observe_credential(
+    pub(crate) fn observe_credential(
         &self,
         provider_id: &str,
         fingerprint: &str,
@@ -391,7 +419,7 @@ impl CapabilityRegistry {
     /// The slot is kept with its incarnation advanced rather than deleted, so
     /// re-adding byte-identical credential material lands on a *new*
     /// incarnation and cannot inherit the deleted credential's authority.
-    pub fn forget_credential(&self, provider_id: &str) -> Result<(), CapabilityDenied> {
+    pub(crate) fn forget_credential(&self, provider_id: &str) -> Result<(), CapabilityDenied> {
         let mut state = self.state.lock();
         let Some(slot) = state.credentials.get(provider_id).cloned() else {
             return Ok(());
@@ -415,7 +443,7 @@ impl CapabilityRegistry {
     /// The credential must already have been observed: an unobserved provider
     /// has no incarnation, and inventing one would let a rotation that this
     /// authority never saw pass unnoticed.
-    pub fn assess(
+    pub(crate) fn assess(
         &self,
         request: &CapabilityRequest,
     ) -> Result<CapabilityAssessment, CapabilityDenied> {
@@ -435,6 +463,7 @@ impl CapabilityRegistry {
             &state.declared_policy,
         );
         let facts = CapabilityFacts {
+            lineage: request.lineage.clone(),
             route: request.route.clone(),
             selection_key: request.selection_key.clone(),
             tier,
@@ -462,7 +491,7 @@ impl CapabilityRegistry {
     ///
     /// Minting does not advance the generation: qualifying one session must
     /// not retire another session's standing authority.
-    pub fn qualify(
+    pub(crate) fn qualify(
         &self,
         key: &QualificationKey,
         assessment: &CapabilityAssessment,
@@ -519,7 +548,7 @@ impl CapabilityRegistry {
     /// wrong session, one past its profile's lifetime or dispatch budget, and
     /// one presented at a boundary its tier does not reach are all the same
     /// answer.
-    pub fn validate(
+    pub(crate) fn validate(
         &self,
         session_id: Uuid,
         reference: &CapabilityBindingRef,
@@ -563,6 +592,24 @@ impl CapabilityRegistry {
         Ok(())
     }
 
+    /// Authorizes one exact dispatch and issues its single-use lease.
+    ///
+    /// This is [`Self::validate`] at the dispatch boundary plus the effect the
+    /// authorization covers. A caller cannot hold a general "this model may
+    /// act" result and pair it with whatever action it likes: the lease
+    /// redeems only against the run, observation, and action class it was
+    /// taken for, and only once.
+    pub(crate) fn authorize_dispatch(
+        &self,
+        session_id: Uuid,
+        reference: &CapabilityBindingRef,
+        live: &CapabilityAssessment,
+        effect: &DispatchEffect,
+    ) -> Result<DispatchLease, CapabilityDenied> {
+        self.validate(session_id, reference, CapabilityBoundary::Dispatch, live)?;
+        Ok(DispatchLease::issue(&live.digest, effect))
+    }
+
     /// Records a qualification that exists but is not bound to any capability
     /// generation this authority issued — a legacy in-memory record, a
     /// restored snapshot, or a reference whose binding could not be found.
@@ -570,7 +617,13 @@ impl CapabilityRegistry {
     /// A quarantined qualification is never attributed to current authority.
     /// It has to be re-established by a fresh qualification; nothing promotes
     /// it in place.
-    pub fn quarantine_legacy(&self, key: &QualificationKey) {
+    ///
+    /// The production path is [`Self::quarantine_if_unbound`], which only
+    /// quarantines a reference this authority does not hold. This unconditional
+    /// form exists so the "never promoted in place" contract can be exercised
+    /// directly.
+    #[cfg(test)]
+    pub(crate) fn quarantine_legacy(&self, key: &QualificationKey) {
         let mut state = self.state.lock();
         if let Some(id) = state.index.remove(key) {
             state.bindings.remove(&id);
@@ -588,7 +641,11 @@ impl CapabilityRegistry {
     /// this authority *does* hold is left alone, so an ordinary refusal (a
     /// downgrade, a spent budget) does not tear down a binding a
     /// requalification would otherwise refresh in place.
-    pub fn quarantine_if_unbound(&self, key: &QualificationKey, reference: &CapabilityBindingRef) {
+    pub(crate) fn quarantine_if_unbound(
+        &self,
+        key: &QualificationKey,
+        reference: &CapabilityBindingRef,
+    ) {
         let mut state = self.state.lock();
         if state.bindings.contains_key(&reference.binding_id) {
             return;
@@ -599,24 +656,22 @@ impl CapabilityRegistry {
         state.quarantined.insert(key.clone());
     }
 
-    pub fn is_quarantined(&self, key: &QualificationKey) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_quarantined(&self, key: &QualificationKey) -> bool {
         self.state.lock().quarantined.contains(key)
     }
 
     /// Whether this authority currently holds a binding for `key`. It says
     /// nothing about whether that binding would pass a boundary.
-    pub fn has_binding(&self, key: &QualificationKey) -> bool {
+    #[cfg(test)]
+    pub(crate) fn has_binding(&self, key: &QualificationKey) -> bool {
         self.state.lock().index.contains_key(key)
     }
 
-    /// Pins the authority one advance short of exhaustion.
-    ///
-    /// Exists so exhaustion can be exercised without 2^64 rotations. It only
-    /// ever moves the authority *towards* its terminal state, so calling it
-    /// cannot widen anything — the worst it can do is retire this process's
-    /// capability authority early.
-    #[doc(hidden)]
-    pub fn pin_near_exhaustion_for_test(&self) {
+    /// Pins the authority one advance short of exhaustion, so exhaustion can
+    /// be exercised without 2^64 rotations.
+    #[cfg(test)]
+    pub(crate) fn pin_near_exhaustion_for_test(&self) {
         let mut state = self.state.lock();
         state.generation = state.generation.pinned_near_exhaustion();
     }
@@ -669,6 +724,10 @@ mod tests {
 
     fn request(source: CapabilitySource, tier: ComputerUseTier) -> CapabilityRequest {
         CapabilityRequest {
+            lineage: AuthorityLineage {
+                authority: "test-host".into(),
+                generation: 1,
+            },
             route: NormalizedRoute::new(
                 "xai",
                 "https://api.x.ai/v1",
@@ -972,6 +1031,38 @@ mod tests {
         );
     }
 
+    /// A stored capability record is a file, not a proof.
+    ///
+    /// The host now presents a stored record as declared-class evidence, so a
+    /// record asserting `measured` cannot buy action authority: measured means
+    /// this authority measured it.
+    #[test]
+    fn a_measured_claim_cannot_be_bought_with_declared_class_evidence() {
+        let registry = registry(AssuranceProfile::Balanced);
+        let session = Uuid::new_v4();
+        let key = QualificationKey::new(session, "xai/grok-4");
+        let assessment = registry
+            .assess(&request(
+                CapabilitySource::Measured,
+                ComputerUseTier::SemanticAct,
+            ))
+            .expect("assess");
+        assert_eq!(assessment.provenance(), &CapabilityProvenance::Measured);
+        for asserted in [
+            QualificationEvidence::absent(),
+            QualificationEvidence::of(QualificationEvidenceKind::Declared, b"stored-record"),
+        ] {
+            assert_eq!(
+                registry.qualify(&key, &assessment, &asserted),
+                Err(CapabilityDenied),
+                "a stored assertion must not stand in for a measurement"
+            );
+        }
+        registry
+            .qualify(&key, &assessment, &evidence())
+            .expect("a measurement this authority took does qualify");
+    }
+
     #[test]
     fn a_dispatch_budget_is_per_qualification_and_never_refills_itself() {
         let registry = registry(AssuranceProfile::HighAssurance);
@@ -1178,6 +1269,51 @@ mod tests {
         registry
             .validate(session, &second, CapabilityBoundary::Dispatch, &live)
             .expect("the current binding still works");
+    }
+
+    #[test]
+    fn an_upstream_lineage_rotation_retires_every_capability_binding() {
+        let registry = registry(AssuranceProfile::Balanced);
+        let session = Uuid::new_v4();
+        let (_, reference) = qualified(&registry, session);
+        let mut rotated = request(CapabilitySource::Measured, ComputerUseTier::SemanticAct);
+        rotated.lineage.generation = 2;
+        let live = registry.assess(&rotated).expect("assess");
+        assert_eq!(
+            registry.validate(session, &reference, CapabilityBoundary::Dispatch, &live),
+            Err(CapabilityDenied),
+            "a capability must not outlive the authority it descends from"
+        );
+    }
+
+    #[test]
+    fn a_dispatch_lease_covers_one_effect_and_no_other() {
+        let registry = registry(AssuranceProfile::Balanced);
+        let session = Uuid::new_v4();
+        let (_, reference) = qualified(&registry, session);
+        let live = registry
+            .assess(&request(
+                CapabilitySource::Measured,
+                ComputerUseTier::SemanticAct,
+            ))
+            .expect("assess");
+        let effect = DispatchEffect::new("run-1", "observation-1", "semantic");
+        let lease = registry
+            .authorize_dispatch(session, &reference, &live, &effect)
+            .expect("authorize dispatch");
+        assert!(
+            lease
+                .redeem(
+                    live.digest(),
+                    &DispatchEffect::new("run-1", "observation-1", "text_entry")
+                )
+                .is_err(),
+            "a lease must not authorize a different action class"
+        );
+        let lease = registry
+            .authorize_dispatch(session, &reference, &live, &effect)
+            .expect("authorize dispatch");
+        lease.redeem(live.digest(), &effect).expect("redeem once");
     }
 
     #[test]

@@ -13,9 +13,10 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::capability_authority::{
-    CapabilityAssessment, CapabilityBindingRef, CapabilityBoundary, CapabilityDenied,
-    CapabilityRegistry, CapabilityRequest, NormalizedRoute, QualificationEvidence,
-    QualificationEvidenceKind, QualificationKey, QualificationSchema,
+    AuthorityLineage, CapabilityAssessment, CapabilityBindingRef, CapabilityBoundary,
+    CapabilityDenied, CapabilityRegistry, CapabilityRequest, DispatchEffect, DispatchLease,
+    NormalizedRoute, QualificationEvidence, QualificationEvidenceKind, QualificationKey,
+    QualificationSchema,
 };
 use crate::completion::{
     build_evidence, enrich_terminal_handoff, observe_updates, CompletionObservations,
@@ -766,6 +767,14 @@ pub struct AgentHostHandle {
     /// (#458). It is per-process by construction: its authority id is drawn at
     /// startup, so nothing qualified by an earlier process is current here.
     capability_registry: Arc<CapabilityRegistry>,
+    /// The upstream authority every capability generation descends from.
+    ///
+    /// The id is drawn at startup and the counter advances on every credential
+    /// or policy invalidation, so an upstream rotation retires capability
+    /// bindings rather than leaving them to be noticed later. This is the seam
+    /// a canonical principal/auth-epoch authority (#477/#460) plugs into; it
+    /// claims no verified principal, tenant, or scope today.
+    auth_lineage: Arc<(Uuid, std::sync::atomic::AtomicU64)>,
     /// Selects the durable root for legacy modules that still resolve paths
     /// through `grokptah_home()`. Shared by all host clones.
     runtime_home: crate::discover::RuntimeHome,
@@ -778,31 +787,6 @@ pub struct AgentHostHandle {
 /// to invalidate every binding taken under the old meaning.
 pub(crate) fn computer_qualification_schema() -> QualificationSchema {
     QualificationSchema::new("grokptah.computer-use.session-qualification", 1)
-}
-
-/// Evidence for capability that was already durable before this session.
-///
-/// The proof is the stored capability record itself — its route, tier,
-/// provenance, schema, credential incarnation and policy revision, exactly as
-/// the authority resolved them. A record that is later rewritten therefore
-/// digests differently and cannot be inherited.
-fn durable_capability_evidence(assessment: &CapabilityAssessment) -> QualificationEvidence {
-    let kind = match assessment.provenance() {
-        crate::capability_authority::CapabilityProvenance::Signed => {
-            QualificationEvidenceKind::Signed
-        }
-        crate::capability_authority::CapabilityProvenance::Measured => {
-            QualificationEvidenceKind::Measured
-        }
-        crate::capability_authority::CapabilityProvenance::DeclaredTrusted { .. } => {
-            QualificationEvidenceKind::Declared
-        }
-        crate::capability_authority::CapabilityProvenance::Unknown
-        | crate::capability_authority::CapabilityProvenance::DeclaredObservationOnly => {
-            QualificationEvidenceKind::Absent
-        }
-    };
-    QualificationEvidence::of(kind, assessment.digest().as_str().as_bytes())
 }
 
 /// Connects the provider-neutral Computer Use kernel to this host's live
@@ -827,14 +811,59 @@ impl crate::computer_use::ComputerCapabilityGate for HostComputerCapabilityGate 
         &self,
         boundary: CapabilityBoundary,
         owner_session_id: Uuid,
-        binding: Option<&CapabilityBindingRef>,
+        actor: crate::computer_use::ComputerActor<'_>,
     ) -> Result<(), crate::computer_use::ComputerError> {
-        let Some(binding) = binding else {
-            return Ok(());
-        };
-        self.host
-            .validate_capability_boundary(owner_session_id, binding, boundary)
-            .map_err(|_| crate::computer_use::capability_denied())
+        match actor {
+            // An operator-driven run is proven by its own live one-use grant
+            // and needs no provider capability at all.
+            crate::computer_use::ComputerActor::Operator => Ok(()),
+            crate::computer_use::ComputerActor::Model(binding) => self
+                .host
+                .validate_capability_boundary(owner_session_id, binding, boundary)
+                .map_err(|_| crate::computer_use::capability_denied()),
+            // Model authority was stripped rather than handed back. Regaining
+            // manual control takes a fresh operator grant, not the one the
+            // model was driving under.
+            crate::computer_use::ComputerActor::Stripped => {
+                Err(crate::computer_use::capability_denied())
+            }
+        }
+    }
+
+    fn authorize_dispatch(
+        &self,
+        owner_session_id: Uuid,
+        actor: crate::computer_use::ComputerActor<'_>,
+        effect: &DispatchEffect,
+    ) -> Result<Option<DispatchLease>, crate::computer_use::ComputerError> {
+        match actor {
+            crate::computer_use::ComputerActor::Operator => Ok(None),
+            crate::computer_use::ComputerActor::Model(binding) => self
+                .host
+                .authorize_capability_dispatch(owner_session_id, binding, effect)
+                .map(Some)
+                .map_err(|_| crate::computer_use::capability_denied()),
+            crate::computer_use::ComputerActor::Stripped => {
+                Err(crate::computer_use::capability_denied())
+            }
+        }
+    }
+
+    fn redeem_dispatch(
+        &self,
+        owner_session_id: Uuid,
+        actor: crate::computer_use::ComputerActor<'_>,
+        lease: Option<DispatchLease>,
+        effect: &DispatchEffect,
+    ) -> Result<(), crate::computer_use::ComputerError> {
+        match (actor, lease) {
+            (crate::computer_use::ComputerActor::Operator, None) => Ok(()),
+            (crate::computer_use::ComputerActor::Model(_), Some(lease)) => self
+                .host
+                .redeem_capability_dispatch(owner_session_id, lease, effect)
+                .map_err(|_| crate::computer_use::capability_denied()),
+            _ => Err(crate::computer_use::capability_denied()),
+        }
     }
 }
 
@@ -1032,6 +1061,7 @@ impl AgentHost {
                 declared_policy,
                 computer_qualification_schema(),
             )),
+            auth_lineage: Arc::new((Uuid::new_v4(), std::sync::atomic::AtomicU64::new(0))),
             runtime_home,
             _runtime_home_context: runtime_home_context,
         }
@@ -1064,15 +1094,21 @@ impl AgentHostHandle {
         self.inner.lock().event_tx.subscribe()
     }
 
-    /// The live capability authority for this process (#458).
-    pub fn capability_registry(&self) -> Arc<CapabilityRegistry> {
-        self.capability_registry.clone()
-    }
-
-    /// The gate a Computer Use kernel must be built with so its lease,
-    /// live-frame and dispatch boundaries consult this host's authority.
-    pub fn computer_capability_gate(&self) -> Arc<dyn crate::computer_use::ComputerCapabilityGate> {
-        Arc::new(HostComputerCapabilityGate { host: self.clone() })
+    /// Builds a Computer Use kernel wired to this host's capability authority
+    /// (#458).
+    ///
+    /// This is the only way to obtain a gated kernel. The authority itself is
+    /// never handed out: a caller that could reach it could mint the bindings
+    /// it exists to withhold, and a caller that could supply its own gate
+    /// could install an allow-all boundary. Both are crate-internal, and this
+    /// constructor is the seam between them.
+    pub fn computer_use_service(
+        &self,
+        backend: Arc<dyn crate::computer_use::ComputerBackend>,
+        store: crate::computer_use::ComputerStore,
+    ) -> crate::computer_use::ComputerUseService {
+        crate::computer_use::ComputerUseService::new(backend, store)
+            .with_capability_gate(Arc::new(HostComputerCapabilityGate { host: self.clone() }))
     }
 
     /// Derives the live capability facts for one model selection, right now.
@@ -1101,6 +1137,7 @@ impl AgentHostHandle {
             .observe_credential(&selection.provider_id, &fingerprint)
             .map_err(anyhow::Error::new)?;
         let request = CapabilityRequest {
+            lineage: self.auth_lineage(),
             route: NormalizedRoute::new(
                 selection.provider_id.clone(),
                 &target.base_url,
@@ -1115,6 +1152,62 @@ impl AgentHostHandle {
         self.capability_registry
             .assess(&request)
             .map_err(anyhow::Error::new)
+    }
+
+    /// The upstream authority lineage every capability descends from.
+    fn auth_lineage(&self) -> AuthorityLineage {
+        AuthorityLineage {
+            authority: self.auth_lineage.0.to_string(),
+            generation: self
+                .auth_lineage
+                .1
+                .load(std::sync::atomic::Ordering::SeqCst),
+        }
+    }
+
+    /// Authorizes one exact physical effect and issues its single-use lease.
+    pub(crate) fn authorize_capability_dispatch(
+        &self,
+        session_id: Uuid,
+        binding: &CapabilityBindingRef,
+        effect: &DispatchEffect,
+    ) -> Result<DispatchLease, CapabilityDenied> {
+        let (model, _) = self
+            .selected_computer_model(session_id)
+            .map_err(|_| CapabilityDenied)?;
+        let key = QualificationKey::new(session_id, model.clone());
+        let live = self
+            .assess_model_capability(&model)
+            .map_err(|_| CapabilityDenied)?;
+        let outcome = self
+            .capability_registry
+            .authorize_dispatch(session_id, binding, &live, effect);
+        if outcome.is_err() {
+            self.capability_registry
+                .quarantine_if_unbound(&key, binding);
+        }
+        outcome
+    }
+
+    /// Consumes a dispatch lease immediately before the effect happens.
+    ///
+    /// The capability is re-derived here rather than reused, so the lease is
+    /// good only while the capability it was issued against is still exactly
+    /// the same one. A downgrade landing between issue and redemption changes
+    /// the digest and the lease stops redeeming.
+    pub(crate) fn redeem_capability_dispatch(
+        &self,
+        session_id: Uuid,
+        lease: DispatchLease,
+        effect: &DispatchEffect,
+    ) -> Result<(), CapabilityDenied> {
+        let (model, _) = self
+            .selected_computer_model(session_id)
+            .map_err(|_| CapabilityDenied)?;
+        let live = self
+            .assess_model_capability(&model)
+            .map_err(|_| CapabilityDenied)?;
+        lease.redeem(live.digest(), effect)
     }
 
     /// Validates a binding at one boundary against freshly derived facts.
@@ -1164,14 +1257,6 @@ impl AgentHostHandle {
             .ok_or_else(|| anyhow!(crate::auth_store::auth_help_message()))?;
         let route_fingerprint = resolve_computer_route_fingerprint(&credentials, &model)?;
         let assessment = self.assess_model_capability_with(&credentials, &model)?;
-        let provenance = assessment.provenance().label().to_string();
-        if assessment.tier() >= crate::gateway_config::ComputerUseTier::SemanticAct {
-            return Ok(ComputerAgentEligibility {
-                model,
-                tier: assessment.tier(),
-                source: provenance,
-            });
-        }
         // A session qualification only counts while its binding is still the
         // current capability. A route fingerprint that still matches is not
         // enough, and never was.
@@ -1190,14 +1275,19 @@ impl AgentHostHandle {
         if qualified {
             return Ok(ComputerAgentEligibility {
                 model,
-                tier: crate::gateway_config::ComputerUseTier::SemanticAct,
-                source: "session_measured".into(),
+                tier: assessment.tier(),
+                source: assessment.provenance().label().to_string(),
             });
         }
+        // Unqualified, the model may be observed but may not act — whatever
+        // the stored capability record claims. Action authority is something
+        // this authority grants, not something a configuration file asserts.
         Ok(ComputerAgentEligibility {
             model,
-            tier: assessment.tier(),
-            source: provenance,
+            tier: assessment
+                .tier()
+                .min(crate::gateway_config::ComputerUseTier::Observe),
+            source: "unqualified".into(),
         })
     }
 
@@ -1235,31 +1325,13 @@ impl AgentHostHandle {
             .ok_or_else(|| anyhow!(crate::auth_store::auth_help_message()))?;
         let route_fingerprint = resolve_computer_route_fingerprint(&credentials, &model)?;
         let key = QualificationKey::new(session_id, model.clone());
-        let assessment = self.assess_model_capability_with(&credentials, &model)?;
 
-        // Durable capability still has to be bound before it authorizes
-        // anything. The evidence is the stored capability record itself, so a
-        // record that is later rewritten produces a different binding.
-        if assessment.tier() >= crate::gateway_config::ComputerUseTier::SemanticAct {
-            let evidence = durable_capability_evidence(&assessment);
-            let binding = self
-                .capability_registry
-                .qualify(&key, &assessment, &evidence)
-                .map_err(anyhow::Error::new)?;
-            self.record_session_qualification(
-                session_id,
-                &model,
-                &operation_id,
-                route_fingerprint,
-                binding,
-            )?;
-            return Ok(ComputerAgentEligibility {
-                model,
-                tier: assessment.tier(),
-                source: assessment.provenance().label().to_string(),
-            });
-        }
-
+        // A stored capability record is not evidence. It is a file the
+        // operator's configuration can rewrite, so a record asserting
+        // `measured` cannot short-circuit into durable action authority: this
+        // authority only calls something measured when it measured it. The
+        // bounded probe below is that measurement, and its transcript is the
+        // evidence.
         let transcript = match qualify_semantic_model(&credentials, &model, effort, &cancel).await {
             Ok(transcript) => transcript,
             Err(error) => {
@@ -1454,6 +1526,11 @@ impl AgentHostHandle {
     /// mutated in the authority, and every subsequent boundary refuses, which
     /// is the same outcome a successful revocation would have produced.
     fn invalidate_computer_agent_authority(&self) {
+        // The upstream lineage moves first, so a binding is retired by the
+        // authority it descends from as well as by the capability generation.
+        self.auth_lineage
+            .1
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let _ = self.capability_registry.revoke_all();
         let tokens = {
             let mut inner = self.inner.lock();
@@ -3794,6 +3871,11 @@ impl AgentHostHandle {
 
     pub fn session_delete(&self, id: Uuid) -> Result<()> {
         self.cancel_computer_agent(id);
+        // Forgetting the host-side qualification map is not enough: a run
+        // record can still carry a binding reference. Retire the session's
+        // capability bindings in the authority so nothing left behind can
+        // validate against a session that no longer exists.
+        let _ = self.capability_registry.revoke_session(id);
         {
             let mut g = self.inner.lock();
             if !g.sessions.contains_key(&id) {

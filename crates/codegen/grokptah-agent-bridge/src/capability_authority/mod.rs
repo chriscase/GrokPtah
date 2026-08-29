@@ -65,6 +65,8 @@
 //! writes no audit journal (#462). It answers exactly one question: is this
 //! capability still the capability that was qualified?
 
+#[cfg(test)]
+mod adversarial;
 mod boundary;
 mod digest;
 mod generation;
@@ -74,16 +76,16 @@ mod registry;
 
 pub use boundary::{BoundarySet, CapabilityBoundary};
 pub use digest::{
-    normalize_base_url, CapabilityDigest, CapabilityFacts, CredentialIncarnation, NormalizedRoute,
-    PolicyRevision, QualificationEvidence, QualificationEvidenceKind, QualificationSchema,
+    normalize_base_url, AuthorityLineage, CapabilityDigest, CapabilityFacts, CredentialIncarnation,
+    NormalizedRoute, PolicyRevision, QualificationEvidence, QualificationEvidenceKind,
+    QualificationSchema,
 };
+pub(crate) use digest::{DispatchEffect, DispatchLease};
 pub use generation::{CapabilityDenied, CapabilityGeneration};
 pub use policy::{CapabilityProvenance, DeclaredCapabilityPolicy};
 pub use profile::{AssuranceCeilings, AssuranceProfile};
-pub use registry::{
-    CapabilityAssessment, CapabilityBindingRef, CapabilityRegistry, CapabilityRequest,
-    QualificationKey,
-};
+pub use registry::{CapabilityAssessment, CapabilityBindingRef, QualificationKey};
+pub(crate) use registry::{CapabilityRegistry, CapabilityRequest};
 
 /// Operator setting naming the assurance profile Computer Use runs under.
 pub const ASSURANCE_PROFILE_ENV: &str = "GROKPTAH_COMPUTER_ASSURANCE_PROFILE";
