@@ -16,7 +16,9 @@ on:
       - "docs/MCP_CONTROL_COORDINATOR.md"
       - "docs/PROVIDER_PRODUCT_BOUNDARIES.md"
       - "docs/PROVIDER_PROFILES.md"
+      - "docs/SEMANTIC_HELP.md"
       - "docs/VERIFICATION.md"
+      - "docs/schemas/grokptah-help.v1.schema.json"
       - "evals/**"
       - ".github/workflows/desktop.yml"
   pull_request:
@@ -32,7 +34,9 @@ on:
       - "docs/MCP_CONTROL_COORDINATOR.md"
       - "docs/PROVIDER_PRODUCT_BOUNDARIES.md"
       - "docs/PROVIDER_PROFILES.md"
+      - "docs/SEMANTIC_HELP.md"
       - "docs/VERIFICATION.md"
+      - "docs/schemas/grokptah-help.v1.schema.json"
       - "evals/**"
       - ".github/workflows/desktop.yml"
 
@@ -97,7 +101,15 @@ jobs:
           HELP_EVIDENCE_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
           npm run verify:help-public
+          npm run build:help-evidence
           npm run verify:help-evidence-manifest -- --out "$RUNNER_TEMP/help-evidence-manifest.json"
+      - name: Upload Semantic Help provenance manifest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: semantic-help-provenance-${{ github.event.pull_request.head.sha || github.sha }}
+          path: ${{ runner.temp }}/help-evidence-manifest.json
+          if-no-files-found: error
+          retention-days: 14
       - name: Cargo tests (desktop)
         working-directory: desktop/src-tauri
         # cargo test compiles the library, binary, and test targets.

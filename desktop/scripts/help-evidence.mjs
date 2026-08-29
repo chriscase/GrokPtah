@@ -12,7 +12,8 @@
  */
 
 import { createServer } from "node:http";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
@@ -24,6 +25,17 @@ const here = dirname(fileURLToPath(import.meta.url));
 const desktop = resolve(here, "..");
 const distDir = join(desktop, "evidence-dist");
 const outDir = join(desktop, "evidence-out");
+const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
+const digestFile = (file) => `sha256:${sha256(readFileSync(file))}`;
+const evidenceAssets = readdirSync(join(distDir, "assets"))
+  .filter((name) => name.endsWith(".js") || name.endsWith(".css"))
+  .sort()
+  .map((name) => ({ name, digest: digestFile(join(distDir, "assets", name)) }));
+if (evidenceAssets.length === 0) throw new Error("built evidence harness has no JS/CSS assets");
+const evidenceBundleDigest = `sha256:${sha256(Buffer.from(JSON.stringify(evidenceAssets)))}`;
+const publicCorpus = JSON.parse(
+  readFileSync(join(desktop, "src/lib/help/canonical/help-corpus-public.v1.json"), "utf8"),
+);
 
 /**
  * Serve the built harness over loopback HTTP.
@@ -121,6 +133,7 @@ for (const viewport of VIEWPORTS) {
       state,
       viewport: viewport.name,
       screenshot: `evidence-out/help-${state}-${viewport.name}.png`,
+      screenshotDigest: digestFile(shot),
       violations: applicable.map((entry) => ({
         id: entry.id,
         impact: entry.impact,
@@ -138,7 +151,17 @@ await new Promise((closed) => server.close(closed));
 
 writeFileSync(
   join(outDir, "accessibility-report.json"),
-  `${JSON.stringify({ generatedFrom: "synthetic fixture corpus", report }, null, 2)}\n`,
+  `${JSON.stringify(
+    {
+      generatedFrom: "synthetic fixture corpus",
+      publicCorpusDigest: publicCorpus.digest,
+      evidenceBundleDigest,
+      evidenceAssets,
+      report,
+    },
+    null,
+    2,
+  )}\n`,
 );
 
 for (const entry of report) {

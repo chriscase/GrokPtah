@@ -61,10 +61,27 @@ const assets = readdirSync(assetDir)
 if (assets.length === 0) throw new Error("built renderer has no JS/CSS assets");
 const bundleDigest = `sha256:${sha256(Buffer.from(JSON.stringify(assets)))}`;
 
+const evidenceAssetDir = join(desktop, "evidence-dist", "assets");
+const evidenceAssets = readdirSync(evidenceAssetDir)
+  .filter((name) => name.endsWith(".js") || name.endsWith(".css"))
+  .sort()
+  .map((name) => ({ name, digest: digestFile(join(evidenceAssetDir, name)) }));
+if (evidenceAssets.length === 0) throw new Error("built evidence harness has no JS/CSS assets");
+const evidenceBundleDigest = `sha256:${sha256(Buffer.from(JSON.stringify(evidenceAssets)))}`;
+
 const reportFile = join(evidence, "accessibility-report.json");
 const report = JSON.parse(readFileSync(reportFile, "utf8"));
 if (report.generatedFrom !== "synthetic fixture corpus") {
   throw new Error("accessibility evidence is not labelled synthetic");
+}
+if (report.publicCorpusDigest !== publicCorpus.digest) {
+  throw new Error("accessibility evidence is stale for the public corpus");
+}
+if (report.evidenceBundleDigest !== evidenceBundleDigest) {
+  throw new Error("accessibility evidence is stale for the built evidence harness");
+}
+if (JSON.stringify(report.evidenceAssets) !== JSON.stringify(evidenceAssets)) {
+  throw new Error("accessibility evidence asset set is stale or reordered");
 }
 const states = ["browse", "answer", "ambiguous", "low-confidence", "no-match", "rejected"];
 const viewports = ["desktop", "narrow"];
@@ -76,7 +93,11 @@ for (const entry of report.report) {
   if (entry.violations.length !== 0) throw new Error(`accessibility violations remain for ${key}`);
   const screenshot = join(desktop, entry.screenshot);
   if (!existsSync(screenshot)) throw new Error(`missing evidence screenshot ${entry.screenshot}`);
-  screenshots[entry.screenshot] = digestFile(screenshot);
+  const screenshotDigest = digestFile(screenshot);
+  if (entry.screenshotDigest !== screenshotDigest) {
+    throw new Error(`screenshot digest mismatch for ${entry.screenshot}`);
+  }
+  screenshots[entry.screenshot] = screenshotDigest;
 }
 if (expected.size > 0) throw new Error(`missing evidence rows: ${[...expected].sort().join(", ")}`);
 
@@ -94,6 +115,7 @@ const manifest = {
     publicArtifactDigest: digestFile(publicCorpusFile),
   },
   renderer: { bundleDigest, assets },
+  evidenceHarness: { bundleDigest: evidenceBundleDigest, assets: evidenceAssets },
   evidence: {
     generatedFrom: report.generatedFrom,
     accessibilityReportDigest: digestFile(reportFile),

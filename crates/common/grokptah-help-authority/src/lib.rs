@@ -602,7 +602,10 @@ impl Authority {
                 let Some(known) = self.corpus.chunk(&chunk.chunk_id) else {
                     return Err(DenyReason::SourceDrift);
                 };
-                if known.digest != chunk.chunk_digest || known.text != chunk.text {
+                if known.digest != chunk.chunk_digest
+                    || known.text != chunk.text
+                    || known.source_ids != chunk.source_ids
+                {
                     return Err(DenyReason::SourceDrift);
                 }
                 for source_id in &chunk.source_ids {

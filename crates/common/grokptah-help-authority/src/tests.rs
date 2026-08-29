@@ -323,6 +323,43 @@ fn source_drift_denies() {
 }
 
 #[test]
+fn request_context_cannot_substitute_another_authorized_source_set() {
+    let mut authority = fixture();
+    let principal = authority.principal_for("tok-public").unwrap();
+    let chunk_ids = public_chunk_ids(&authority);
+    let grant = authority.issue_grant(&principal, NOW, TTL);
+    let mut request = authority
+        .build_request(&principal, "how do i recover a run", "en", &chunk_ids)
+        .expect("request builds");
+
+    let canonical_sources = request.context[0].source_ids.clone();
+    let manifest = authority.manifest_for(&principal);
+    let substitute = manifest
+        .entries
+        .iter()
+        .flat_map(|entry| entry.source_ids.iter())
+        .find(|source_id| !canonical_sources.contains(source_id))
+        .expect("fixture contains another authorized public source")
+        .clone();
+    request.context[0].source_ids = vec![substitute];
+    request.digest = HelpRequest::compute_digest(
+        &request.request_id,
+        &request.corpus_digest,
+        request.manifest_revision,
+        &request.question,
+        &request.locale,
+        &request.context,
+        &request.instruction,
+    );
+
+    assert_eq!(
+        authority.admit("tok-public", &grant, &request, NOW, NOW + TTL),
+        Err(DenyReason::SourceDrift),
+        "a context chunk cited a different generally-authorized source set"
+    );
+}
+
+#[test]
 fn a_substituted_request_denies() {
     // A request whose digest no longer matches the admission it travels under.
     for checkpoint in Checkpoint::all() {
