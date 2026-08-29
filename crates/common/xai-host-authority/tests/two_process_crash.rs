@@ -108,7 +108,7 @@ fn an_attempt_in_flight_when_the_process_dies_recovers_as_uncertain() {
     // A fresh host incarnation takes over.
     let (authority, admin) = HostAuthority::open(&root, OWNER).unwrap();
     let auth = authority.authenticate(SECRET).unwrap();
-    let recovered = authority.recover_incomplete().unwrap();
+    let recovered = authority.recover_incomplete(&admin).unwrap();
     assert_eq!(
         recovered.len(),
         1,
@@ -130,7 +130,7 @@ fn an_attempt_in_flight_when_the_process_dies_recovers_as_uncertain() {
     );
 
     // Recovery never re-sends and is idempotent.
-    assert!(authority.recover_incomplete().unwrap().is_empty());
+    assert!(authority.recover_incomplete(&admin).unwrap().is_empty());
 
     // The audit log survived the crash and still chains.
     assert!(authority.audit_chain_intact(&admin).unwrap());

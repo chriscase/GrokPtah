@@ -548,7 +548,9 @@ fn ambiguity_after_dispatch_is_uncertain_and_offers_no_retry() {
     assert!(projection.ambiguous);
 
     // The only exit is an explicit reconciliation against provider truth.
-    f.authority.reconcile_attempt(attempt, true).unwrap();
+    f.authority
+        .reconcile_attempt(&f.admin, attempt, true)
+        .unwrap();
     let projection = f
         .authority
         .attempt_projection(&f.auth, attempt)
@@ -556,7 +558,11 @@ fn ambiguity_after_dispatch_is_uncertain_and_offers_no_retry() {
         .unwrap();
     assert!(!projection.ambiguous);
     // Reconciling twice is refused: the attempt is no longer uncertain.
-    assert!(f.authority.reconcile_attempt(attempt, true).is_err());
+    assert!(
+        f.authority
+            .reconcile_attempt(&f.admin, attempt, true)
+            .is_err()
+    );
 }
 
 #[test]
@@ -617,7 +623,7 @@ fn a_crash_between_dispatch_and_settlement_settles_uncertain() {
     // A new host incarnation recovers.
     let (authority, admin) = HostAuthority::open(&root, OWNER).unwrap();
     let _ = &admin;
-    let recovered = authority.recover_incomplete().unwrap();
+    let recovered = authority.recover_incomplete(&admin).unwrap();
     assert_eq!(recovered, vec![attempt]);
     let auth = authority.authenticate(SECRET).unwrap();
 
@@ -631,7 +637,7 @@ fn a_crash_between_dispatch_and_settlement_settles_uncertain() {
     );
 
     // Recovery is idempotent and still never retries.
-    assert!(authority.recover_incomplete().unwrap().is_empty());
+    assert!(authority.recover_incomplete(&admin).unwrap().is_empty());
 }
 
 #[test]

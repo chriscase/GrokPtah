@@ -121,6 +121,17 @@
 //! let _ = ControlEpoch(9_999);
 //! ```
 //!
+//! Resolving an ambiguous effect is an operator assertion about the outside
+//! world, so it needs the admin authority too - a component that merely serves
+//! requests cannot declare that an uncertain send did or did not happen:
+//!
+//! ```compile_fail
+//! # use xai_host_authority::*;
+//! fn decide(authority: &HostAuthority, attempt: AttemptId) {
+//!     let _ = authority.reconcile_attempt(attempt, true);
+//! }
+//! ```
+//!
 //! Authority identity is not deserializable. A derived `Deserialize` would be
 //! a public constructor in disguise, letting downstream code mint an identity
 //! or claim a generation straight from JSON:

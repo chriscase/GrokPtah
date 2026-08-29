@@ -495,7 +495,14 @@ impl HostAuthority {
     /// Called at open time after a crash. It never re-sends: an attempt that
     /// was `sending` when the process stopped may have reached the provider,
     /// so it becomes ambiguous and waits for reconciliation.
-    pub fn recover_incomplete(&self) -> Result<Vec<AttemptId>, AuthorityError> {
+    ///
+    /// Requires admin authority. Forcing every in-flight attempt into the
+    /// ambiguous state is a host decision, not something a component serving
+    /// a request may do to work already in flight.
+    pub fn recover_incomplete(
+        &self,
+        _admin: &HostAdminAuthority,
+    ) -> Result<Vec<AttemptId>, AuthorityError> {
         let recovered = self.with_state(|state| {
             let mut out = Vec::new();
             for (key, record) in state.attempts.iter_mut() {
@@ -531,8 +538,14 @@ impl HostAuthority {
     ///
     /// This is the only exit from [`SendOutcome::Uncertain`], and it takes a
     /// decision the host made by observing the provider, not a retry.
+    ///
+    /// Requires admin authority precisely because it is that decision:
+    /// declaring that an ambiguous effect did or did not happen is an operator
+    /// assertion about the outside world, and nothing that merely holds a
+    /// `&HostAuthority` is entitled to make it.
     pub fn reconcile_attempt(
         &self,
+        _admin: &HostAdminAuthority,
         attempt: AttemptId,
         took_effect: bool,
     ) -> Result<(), AuthorityError> {
