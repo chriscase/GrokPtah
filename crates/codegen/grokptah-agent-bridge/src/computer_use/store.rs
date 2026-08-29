@@ -280,6 +280,10 @@ impl ComputerStore {
             // is the same fail-closed move as dropping the observation: restart
             // must not keep a leaky last_outcome on the durable record.
             run.last_outcome = None;
+            // Completion evidence is bound to a live frame and a live
+            // authority epoch. A restart has neither, so recovery must strand
+            // it rather than let a pre-restart receipt complete a run (#456).
+            run.last_receipt = None;
             run.last_error = Some(ComputerError::new(
                 ComputerErrorCode::Interrupted,
                 "computer run interrupted by process restart; explicit reauthorization required",

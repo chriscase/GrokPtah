@@ -18,7 +18,7 @@ use crate::completion::{
 };
 use crate::computer_agent::{
     propose_semantic_action, qualify_semantic_model, resolve_computer_eligibility,
-    ComputerAgentEligibility, ComputerAgentProposal,
+    ComputerAgentEligibility,
 };
 use crate::event_bus::{session_id_of, JournalPage};
 use crate::events::{SessionUpdate, ToolCallKind, ToolCallStatus};
@@ -1048,13 +1048,20 @@ impl AgentHostHandle {
     }
 
     /// Ask the selected, qualified model for one bounded semantic proposal.
-    /// This method cannot dispatch an OS action.
+    ///
+    /// Returns the provider's **raw, untrusted** tool arguments. It cannot
+    /// dispatch an OS action and it cannot stage one: the bytes carry no
+    /// authority until [`crate::computer_agent::accept_model_proposal`] seals
+    /// them against a live run (#457).
     pub async fn propose_computer_action(
         &self,
         session_id: Uuid,
         objective: &str,
         observation: &crate::computer_use::ComputerObservation,
-    ) -> Result<ComputerAgentProposal> {
+    ) -> Result<(
+        crate::computer_agent::RawModelProposal,
+        crate::computer_agent::RouteBinding,
+    )> {
         let (_operation_id, cancel, _guard) = self.begin_computer_agent_operation(session_id)?;
         let (model, effort) = self.selected_computer_model(session_id)?;
         let credentials = crate::auth_store::resolve_wire_credentials_for_model(&model)
@@ -1086,7 +1093,13 @@ impl AgentHostHandle {
             bail!("Computer model proposal was cancelled");
         }
         self.ensure_computer_route_unchanged(session_id, &model, &resolved.route_fingerprint)?;
-        Ok(proposal)
+        // The route the proposal was actually requested over travels with the
+        // bytes, so the seal can bind it and refuse to apply under a different
+        // one. Capability generation (#458), adaptive profile (#435),
+        // principal generation (#477), and lease binding stay unbound until
+        // those authorities exist.
+        let route = crate::computer_agent::RouteBinding::new(resolved.route_fingerprint, model);
+        Ok((proposal, route))
     }
 
     /// Local Stop/Take over cancellation. It does not share the Build-turn

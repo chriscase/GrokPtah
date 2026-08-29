@@ -1070,6 +1070,17 @@ fn scrub_secrets(s: &str, secrets: &[String]) -> String {
     out
 }
 
+/// Scrub model- or tool-authored display text with the same public privacy
+/// needles the durable journal uses, then cap it.
+///
+/// Exposed so surfaces that show untrusted text to an operator — Computer Use
+/// proposal summaries among them — cannot quietly grow a second, weaker needle
+/// set. No registered per-process secrets are applied here: this is the public
+/// pattern set only.
+pub(crate) fn redact_display_text(text: &str, max: usize) -> String {
+    scrub_text(text, &[], max)
+}
+
 /// Scrub secrets, then cap length for display-only fields.
 fn scrub_text(s: &str, secrets: &[String], max: usize) -> String {
     let out = scrub_secrets(s, secrets);

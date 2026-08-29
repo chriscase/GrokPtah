@@ -906,14 +906,26 @@ pub async fn computer_use_cockpit_propose_agent_action(
         expected_version,
         &observation_id,
     )?;
-    let proposal = state
+    // `raw` is untrusted provider output. It gains authority only inside
+    // `apply_model_proposal`, which seals it against host-owned state (#457).
+    // `route` records the exact provider route it was requested over, so the
+    // seal cannot be applied under a different one.
+    let (raw, route) = state
         .host
         .propose_computer_action(owner, &objective, &observation)
         .await
         .map_err(map_err)?;
     state
         .computer_use
-        .apply_model_proposal(owner, &run_id, expected_version, &observation_id, proposal)
+        .apply_model_proposal(
+            owner,
+            &run_id,
+            expected_version,
+            &observation_id,
+            &objective,
+            route,
+            raw,
+        )
         .await
 }
 
@@ -927,17 +939,43 @@ pub fn computer_use_cockpit_cancel_agent(
         .cancel_computer_agent(computer_owner(&state, &session_id)?))
 }
 
+/// Operator-authored objective for a Computer Run, as the local UI sends it.
+///
+/// This arrives from the operator's own cockpit, never from a model: the
+/// predicate is what decides whether the model's work is done, so a
+/// model-authored one would be circular.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComputerObjectiveRequest {
+    pub objective: String,
+    pub predicate: grokptah_agent_bridge::TaskPredicate,
+    pub max_actions: u32,
+}
+
 #[tauri::command]
 pub async fn computer_use_cockpit_start_simulator(
     state: State<'_, AppState>,
     session_id: String,
     reviewed_target_app_id: String,
+    objective: Option<ComputerObjectiveRequest>,
 ) -> Result<crate::computer_use::ComputerCockpitSnapshot, String> {
+    let task_spec = match objective {
+        Some(request) => Some(
+            grokptah_agent_bridge::ComputerTaskSpec::new(
+                &request.objective,
+                request.predicate,
+                request.max_actions,
+            )
+            .map_err(|error| error.to_string())?,
+        ),
+        None => None,
+    };
     state
         .computer_use
         .start_simulator(
             computer_work_owner(&state, &session_id)?,
             &reviewed_target_app_id,
+            task_spec,
         )
         .await
 }

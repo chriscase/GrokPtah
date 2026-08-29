@@ -23,6 +23,117 @@ failure, target changes, or exhausted limits. Secure and system-restricted surfa
 even when a grant exists. Pointer fallback and key chords require separate action classes; a
 semantic-action grant cannot silently expand into raw input control.
 
+## Model-output boundary and completion proof (#456, #457)
+
+Untrusted model output has exactly one way into a run, and success has exactly one way out.
+
+### Host-owned sealing
+
+`propose_computer_action` returns `RawModelProposal`: the provider's bytes, carrying no authority,
+plus the `RouteBinding` describing the route they were requested over. `accept_model_output` is the
+only public entry to the boundary. It takes **identifiers only** and looks every authority-relevant
+value up itself — the run from the durable ledger, the capabilities from the backend. There is no
+seam anywhere that accepts a caller-supplied `ComputerRun`, capability set, or pre-minted
+capability, because a caller that could hand in a fabricated context could mint a seal that says
+whatever it likes. The strict normalizer behind it is private, and `ModelProposalContext` has no
+public constructor; a `compile_fail` doctest on `accept_model_output` holds that shut.
+
+The resulting `AcceptedModelProposal` has private fields, no `Deserialize`, no public constructor,
+and is not `Clone`. The authority-free `ComputerAgentProposal` is `Serialize`-only and reaches no
+application seam, so a deserialized value cannot stage or complete.
+
+### What the seal binds
+
+One digest covers everything, recomputed from the live run when the capability is spent: run ID,
+owner session, run version, control epoch, run state and disposition, exact grant ID and generation
+(issue time, expiry, remaining uses, revocation, action classes), target identity and generation,
+exact frame ID, sequence and capture time, effective policy limits, the operator objective and its
+predicate digest, the backend capability surface, and the provider route. One digest rather than a
+list of comparisons is deliberate: adding an authority means adding it there, and every existing
+seal is invalidated by construction — there is no way to add a binding and forget to check it.
+
+Four `RouteBinding` slots are typed and digested but unbound on this branch, because the
+authorities that fill them do not exist yet: provider capability generation
+([#458](https://github.com/chriscase/GrokPtah/issues/458)), adaptive profile
+([#435](https://github.com/chriscase/GrokPtah/issues/435)), host-issued principal/auth generation
+([#477](https://github.com/chriscase/GrokPtah/issues/477)), and lease/agent binding. An unbound
+slot digests as a distinct marker, never as an empty string, so it cannot collide with a real
+value. Until #458 lands, `route_fingerprint` and `model` are caller-attested and the seal proves
+only that they did not change between minting and application.
+
+The seal is not a secret: no key, no MAC. Unforgeability is Rust module privacy; freshness is the
+re-check. Seals are versioned and time-bounded, and minting plus application both run under one
+operation lock.
+
+The normalizer parses model arguments under a reader that rejects duplicate JSON keys (which
+`serde_json` would otherwise resolve last-key-wins, letting one payload mean two things), unknown
+keys, trailing content, prose, and oversized payloads. Pointer, key-chord, and wait actions stay
+operator-only regardless of grant or backend capability. Summaries are capped, refused if they
+carry control characters, and scrubbed with the same public privacy needles the durable journal
+uses.
+
+### Completion proves the operator's objective
+
+A verified receipt proves that *one approved action ran and the host captured the next frame*. That
+is not the same claim as "the thing the operator asked for is done", so it is not enough to
+terminate a run.
+
+A `ComputerTaskSpec` closes the gap. The operator authors the objective and, with it, a **closed**
+predicate over observable frame state — a fixed enum, no expression language, nothing a model can
+contribute to. The objective text is bound by digest so a spec cannot be paired with a different
+ask than the model was given, and it is settable only before authorization, so "done" is fixed
+before any authority exists. A run with no authored objective can never be completed on a model's
+say-so, because nothing defines success for it.
+
+Predicate locators address elements by **role and label**, never by element ID. Semantic element
+IDs are ephemeral per observation, so an ID-addressed predicate would silently stop matching after
+any re-observation. A locator that resolves to nothing — or ambiguously, to more than one element —
+is an explicit failure. Missing evidence is never success.
+
+Completion therefore requires both, in order:
+
+1. **A credible claim.** A host-issued receipt, positive, verifying the exact current frame. Without
+   one the claim is refused outright and nothing changes — a model cannot halt a run by asserting
+   success repeatedly.
+2. **A satisfied objective.** The operator's predicate must hold on that same frame. A credible
+   claim with an unmet objective stops the run for review (`Paused` with an `awaiting_review`
+   disposition) rather than completing. That is explicitly not a success.
+
+`complete_verified` is the only route to `Completed`; there is no unguarded completion entry point,
+and operators end runs through cancellation, which claims nothing about success.
+
+### Receipt lifecycle
+
+A dispatch mints an `ActionReceipt` bound to the frame it was authorized against, the accepted
+action's fingerprint, a host-minted receipt identity, the authority epoch, and the backend outcome.
+It starts unverified and acquires evidence only through `observe_postcondition` — the single frame
+the host captures immediately after a dispatch, in the same epoch — and only when the outcome was
+positive and the action's expectation holds on that frame. An expectation whose effect a semantic
+frame cannot show is `Opaque` and can never be met: "we could not check" must not stand in for "it
+worked".
+
+Any ordinary observation, pause, takeover, cancellation, limit, in-flight failure, new grant, or
+restart recovery clears the receipt. So the #456 dispatch → re-observe → complete sequence returns a
+typed `UnverifiedCompletion` and mutates nothing.
+
+### Failure classification and durability
+
+Once `ComputerBackend::act` has been entered, the host cannot know whether the machine was touched,
+so **every** failure from that point is reclassified `UncertainOutcome` and needs operator
+reconciliation. An in-flight failure also clears `last_outcome`: a positive outcome on a failed run
+is a statement about the machine that nothing currently backs.
+
+Duplicate-proposal admission is durable on the run record and consumed **only after** a proposal
+actually stages, so a refused or failed application never burns a fingerprint and blocks a
+legitimate retry.
+
+Refusals are journaled onto the run's existing durable event stream via `record_proposal_refusal`,
+carrying the typed `ComputerErrorCode` and the operation only — no model text, no observed content.
+Each refusal advances the run revision, so the refused capability and any sibling minted from the
+same snapshot die immediately rather than being retryable against an unchanged record. That reuses
+the existing projection seam rather than adding a second ledger; richer audit integration is
+[#462](https://github.com/chriscase/GrokPtah/issues/462).
+
 ## Foundation (#268)
 
 `grokptah-agent-bridge::computer_use` provides:
@@ -196,7 +307,14 @@ packaging requirements, and disposable smoke fixture.
 - no MCP Computer Run surface;
 - no raw arbitrary keyboard, pointer, coordinate fallback, clipboard, AppleScript, or shell endpoint;
 - no background or unattended grant;
-- no cross-application target switching inside a run.
+- no cross-application target switching inside a run;
+- no semantic re-verification of a postcondition beyond the single host-issued verifying frame;
+- no model-driven completion of a run whose final action is not frame-checkable: an `Opaque`
+  expectation carries no receipt, so such a run must be ended by operator review. This is
+  fail-closed and deliberate;
+- no binding to provider capability generation (#458), adaptive profile (#435), host principal/auth
+  generation (#477), or lease/agent identity — those slots are typed and digested but unbound until
+  those authorities exist.
 
 ## Delivery sequence
 

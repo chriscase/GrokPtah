@@ -4,10 +4,17 @@
 //! dispatches the proposal: the desktop cockpit revalidates and stages it for
 //! an exact, one-use local approval.
 
+pub mod seal;
+
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
+
+pub use seal::{
+    accept_model_output, AcceptedIntent, AcceptedModelProposal, ModelProposalContext, ModelTurn,
+    RawModelProposal, RouteBinding, PROPOSAL_SEAL_VERSION,
+};
 
 use crate::computer_use::{
     ComputerAction, ComputerObservation, ComputerUseLimits, SemanticAction, SimulatorBackend,
@@ -20,7 +27,6 @@ const QUALIFICATION_TOOL: &str = "ptah_computer_qualification_action";
 const PROPOSAL_TOOL: &str = "ptah_computer_proposal";
 const QUALIFICATION_TEXT: &str = "PTAH_VISIBLE_DEMO_VALUE_V1";
 const MAX_OBJECTIVE_BYTES: usize = 4 * 1024;
-const MAX_SUMMARY_BYTES: usize = 512;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -30,7 +36,15 @@ pub struct ComputerAgentEligibility {
     pub source: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Authority-free projection of an accepted proposal, for the cockpit and
+/// telemetry.
+///
+/// Deliberately `Serialize` but **not** `Deserialize`: no application seam
+/// accepts this type, and it cannot be reconstructed from wire bytes at all, so
+/// it cannot be smuggled back in as authority (#457). The only value that can
+/// stage or complete is [`AcceptedModelProposal`], which the strict normalizer
+/// alone can mint.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "decision", rename_all = "snake_case")]
 pub enum ComputerAgentProposal {
     Action {
@@ -67,22 +81,6 @@ struct QualificationArguments {
     action: String,
     element_id: String,
     text: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProposalArguments {
-    observation_id: String,
-    action_type: String,
-    #[serde(default)]
-    element_id: Option<String>,
-    #[serde(default)]
-    text: Option<String>,
-    #[serde(default)]
-    delta_x: Option<i32>,
-    #[serde(default)]
-    delta_y: Option<i32>,
-    summary: String,
 }
 
 pub(crate) fn resolve_computer_eligibility(
@@ -215,7 +213,7 @@ pub(crate) async fn propose_semantic_action(
     objective: &str,
     observation: &ComputerObservation,
     cancel: &CancellationToken,
-) -> Result<ComputerAgentProposal> {
+) -> Result<RawModelProposal> {
     validate_objective(objective)?;
     observation.validate(&ComputerUseLimits::ceiling())?;
     let messages = vec![
@@ -244,7 +242,11 @@ pub(crate) async fn propose_semantic_action(
         .await?,
         PROPOSAL_TOOL,
     )?;
-    proposal_from_arguments(&call.arguments, observation)
+    // The raw arguments are returned untouched. Normalization is not this
+    // layer's job: it belongs to [`seal::accept_model_proposal`], run against
+    // the live run at application time, so there is exactly one validation
+    // path and no window in which a "validated" value can go stale (#457).
+    Ok(RawModelProposal::new(call.arguments))
 }
 
 fn computer_system_message() -> serde_json::Value {
@@ -332,121 +334,10 @@ fn validate_qualification_call(
     Ok(())
 }
 
-fn proposal_from_arguments(
-    raw: &str,
-    observation: &ComputerObservation,
-) -> Result<ComputerAgentProposal> {
-    let arguments: ProposalArguments = serde_json::from_str(raw)
-        .map_err(|_| anyhow!("model returned malformed Computer proposal arguments"))?;
-    if arguments.observation_id != observation.observation_id {
-        bail!("model proposal is bound to a stale observation");
-    }
-    validate_summary(&arguments.summary)?;
-    if arguments.action_type == "complete" {
-        if arguments.element_id.is_some()
-            || arguments.text.is_some()
-            || arguments.delta_x.is_some()
-            || arguments.delta_y.is_some()
-        {
-            bail!("completion proposal contains action arguments");
-        }
-        return Ok(ComputerAgentProposal::Complete {
-            observation_id: arguments.observation_id,
-            summary: arguments.summary,
-        });
-    }
-
-    let action = match arguments.action_type.as_str() {
-        "activate_target"
-            if arguments.element_id.is_none()
-                && arguments.text.is_none()
-                && arguments.delta_x.is_none()
-                && arguments.delta_y.is_none() =>
-        {
-            ComputerAction::ActivateTarget
-        }
-        "invoke" if only_element(&arguments) => ComputerAction::Invoke {
-            element_id: arguments.element_id.clone().expect("checked element"),
-        },
-        "select" if only_element(&arguments) => ComputerAction::Select {
-            element_id: arguments.element_id.clone().expect("checked element"),
-        },
-        "set_value"
-            if arguments.element_id.is_some()
-                && arguments.text.is_some()
-                && arguments.delta_x.is_none()
-                && arguments.delta_y.is_none() =>
-        {
-            ComputerAction::SetValue {
-                element_id: arguments.element_id.clone().expect("checked element"),
-                text: arguments.text.clone().expect("checked text"),
-            }
-        }
-        "scroll"
-            if arguments.element_id.is_some()
-                && arguments.text.is_none()
-                && arguments.delta_x.is_some()
-                && arguments.delta_y.is_some() =>
-        {
-            ComputerAction::Scroll {
-                element_id: arguments.element_id.clone(),
-                delta_x: arguments.delta_x.expect("checked delta"),
-                delta_y: arguments.delta_y.expect("checked delta"),
-            }
-        }
-        _ => bail!("model proposed an unsupported or incoherent Computer action"),
-    };
-    action.validate(&ComputerUseLimits::ceiling())?;
-    validate_action_against_observation(&action, observation)?;
-    Ok(ComputerAgentProposal::Action {
-        observation_id: arguments.observation_id,
-        action,
-        summary: arguments.summary,
-    })
-}
-
-fn only_element(arguments: &ProposalArguments) -> bool {
-    arguments.element_id.is_some()
-        && arguments.text.is_none()
-        && arguments.delta_x.is_none()
-        && arguments.delta_y.is_none()
-}
-
-fn validate_action_against_observation(
-    action: &ComputerAction,
-    observation: &ComputerObservation,
-) -> Result<()> {
-    let Some(element_id) = action.referenced_element() else {
-        return Ok(());
-    };
-    let element = observation
-        .element(element_id)
-        .filter(|element| element.enabled && !element.sensitivity.is_hard_denied())
-        .ok_or_else(|| anyhow!("model selected a missing, disabled, or sensitive element"))?;
-    let required = match action {
-        ComputerAction::Invoke { .. } => SemanticAction::Invoke,
-        ComputerAction::SetValue { .. } => SemanticAction::SetValue,
-        ComputerAction::Select { .. } => SemanticAction::Select,
-        ComputerAction::Scroll { .. } => SemanticAction::Scroll,
-        _ => return Ok(()),
-    };
-    if !element.actions.contains(&required) {
-        bail!("model selected an action not advertised by the observation");
-    }
-    Ok(())
-}
-
 fn validate_objective(objective: &str) -> Result<()> {
     let objective = objective.trim();
     if objective.is_empty() || objective.len() > MAX_OBJECTIVE_BYTES || objective.contains('\0') {
         bail!("Computer objective must be non-empty and at most {MAX_OBJECTIVE_BYTES} bytes");
-    }
-    Ok(())
-}
-
-fn validate_summary(summary: &str) -> Result<()> {
-    if summary.trim().is_empty() || summary.len() > MAX_SUMMARY_BYTES || summary.contains('\0') {
-        bail!("Computer proposal summary is empty or oversized");
     }
     Ok(())
 }
@@ -542,62 +433,6 @@ mod tests {
     }
 
     #[test]
-    fn proposal_requires_exact_observation_and_advertised_action() {
-        let current = observation();
-        let proposal = proposal_from_arguments(
-            &serde_json::json!({
-                "observation_id": current.observation_id,
-                "action_type": "set_value",
-                "element_id": "name",
-                "text": "Ada Lovelace",
-                "summary": "Enter the requested visible name"
-            })
-            .to_string(),
-            &current,
-        )
-        .unwrap();
-        assert!(matches!(proposal, ComputerAgentProposal::Action { .. }));
-
-        let stale = serde_json::json!({
-            "observation_id": "old",
-            "action_type": "set_value",
-            "element_id": "name",
-            "text": "Ada",
-            "summary": "stale"
-        });
-        assert!(proposal_from_arguments(&stale.to_string(), &current).is_err());
-
-        let invented = serde_json::json!({
-            "observation_id": current.observation_id,
-            "action_type": "invoke",
-            "element_id": "name",
-            "summary": "invented action"
-        });
-        assert!(proposal_from_arguments(&invented.to_string(), &current).is_err());
-    }
-
-    #[test]
-    fn completion_cannot_smuggle_action_arguments() {
-        let current = observation();
-        let clean = serde_json::json!({
-            "observation_id": current.observation_id,
-            "action_type": "complete",
-            "summary": "The visible objective is satisfied"
-        });
-        assert!(matches!(
-            proposal_from_arguments(&clean.to_string(), &current).unwrap(),
-            ComputerAgentProposal::Complete { .. }
-        ));
-        let smuggled = serde_json::json!({
-            "observation_id": current.observation_id,
-            "action_type": "complete",
-            "element_id": "name",
-            "summary": "complete and click"
-        });
-        assert!(proposal_from_arguments(&smuggled.to_string(), &current).is_err());
-    }
-
-    #[test]
     fn model_observation_has_no_evidence_locator_or_host_path() {
         let value = observation_for_model(&observation());
         let text = value.to_string();
@@ -608,21 +443,6 @@ mod tests {
     }
 
     #[test]
-    fn malformed_and_extra_arguments_fail_closed() {
-        let current = observation();
-        let extra = serde_json::json!({
-            "observation_id": current.observation_id,
-            "action_type": "set_value",
-            "element_id": "name",
-            "text": "Ada",
-            "summary": "set name",
-            "shell": "whoami"
-        });
-        assert!(proposal_from_arguments(&extra.to_string(), &current).is_err());
-        assert!(proposal_from_arguments("{", &current).is_err());
-    }
-
-    #[test]
     fn computer_proposal_tools_never_enter_general_agent_or_mcp_surfaces() {
         let (coding_tools, _) = crate::host_helpers::coding_agent_tools(&[]);
         let coding_tools = coding_tools.to_string();
@@ -630,5 +450,24 @@ mod tests {
         assert!(!coding_tools.contains(QUALIFICATION_TOOL));
         assert!(!crate::orchestration::CONTROL_TOOLS.contains(&PROPOSAL_TOOL));
         assert!(!crate::orchestration::CONTROL_TOOLS.contains(&QUALIFICATION_TOOL));
+    }
+
+    /// The proposal view is a projection, not an authority. If it ever regains
+    /// a `Deserialize` impl, a caller could rebuild one from wire bytes and the
+    /// #457 boundary would be back to where it started, so the absence is
+    /// asserted rather than assumed.
+    #[test]
+    fn proposal_view_is_serialize_only() {
+        fn assert_serialize<T: serde::Serialize>() {}
+        assert_serialize::<ComputerAgentProposal>();
+        let json = serde_json::to_string(&ComputerAgentProposal::Complete {
+            observation_id: "observation-current".into(),
+            summary: "done".into(),
+        })
+        .unwrap();
+        assert!(serde_json::from_str::<serde_json::Value>(&json).is_ok());
+        // Compile-time proof lives in the type itself: `ComputerAgentProposal`
+        // derives only `Serialize`, so `serde_json::from_str::<ComputerAgentProposal>`
+        // does not compile and no application seam accepts the type.
     }
 }

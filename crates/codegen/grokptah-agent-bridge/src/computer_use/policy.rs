@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 
+use super::receipt::CompletionProof;
 use super::types::{
     ActionGrant, ComputerAction, ComputerError, ComputerErrorCode, ComputerObservation,
     ComputerResult, ComputerRun, ComputerRunState, SemanticAction,
@@ -221,6 +222,54 @@ impl ComputerPolicy {
         Ok(())
     }
 
+    /// The single authority for terminating a run on model-proposed evidence
+    /// (#456). Every clause is required and all of them are re-read from the
+    /// live run, so evidence that was valid when the model answered cannot
+    /// apply after re-observation, steering, takeover, cancellation, a grant
+    /// change, or restart recovery.
+    pub fn authorize_completion(
+        &self,
+        run: &ComputerRun,
+        evidence: &CompletionProof,
+        now: DateTime<Utc>,
+    ) -> ComputerResult<()> {
+        self.authorize_active_run(run, now)?;
+        let Some(observation) = run.current_observation.as_ref() else {
+            return Err(unverified_completion(
+                "computer run has no current observation",
+            ));
+        };
+        if !evidence.frame.matches(observation) {
+            return Err(unverified_completion(
+                "completion evidence is not bound to the current observation",
+            ));
+        }
+        if run.control_epoch != evidence.control_epoch {
+            return Err(unverified_completion(
+                "authority revision changed after the completion evidence was captured",
+            ));
+        }
+        let Some(receipt) = run.last_receipt.as_ref() else {
+            return Err(unverified_completion(
+                "computer run has no action receipt for this frame",
+            ));
+        };
+        if receipt.receipt_id != evidence.receipt_id
+            || receipt.action_fingerprint != evidence.action_fingerprint
+            || receipt.control_epoch != evidence.control_epoch
+        {
+            return Err(unverified_completion(
+                "completion evidence does not match the run's live action receipt",
+            ));
+        }
+        if !receipt.authorizes_completion(&run.run_id, observation, run.control_epoch) {
+            return Err(unverified_completion(
+                "no positive postcondition receipt verifies the current observation",
+            ));
+        }
+        Ok(())
+    }
+
     fn authorize_active_run(&self, run: &ComputerRun, now: DateTime<Utc>) -> ComputerResult<()> {
         if run.state != ComputerRunState::Ready {
             return Err(ComputerError::new(
@@ -245,6 +294,10 @@ impl ComputerPolicy {
         }
         Ok(())
     }
+}
+
+fn unverified_completion(message: &str) -> ComputerError {
+    ComputerError::new(ComputerErrorCode::UnverifiedCompletion, message)
 }
 
 fn required_semantic_action(action: &ComputerAction) -> Option<SemanticAction> {

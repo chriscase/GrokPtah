@@ -29,6 +29,14 @@ pub enum ComputerErrorCode {
     Conflict,
     Pending,
     UncertainOutcome,
+    /// A completion was proposed without a host-issued action receipt that
+    /// verifies the exact current frame (#456).
+    UnverifiedCompletion,
+    /// Model output tried to reach an application seam without a sealed
+    /// capability minted by the strict normalizer (#457).
+    UnsealedProposal,
+    /// The same normalized proposal was presented twice for one run.
+    DuplicateProposal,
     Interrupted,
     BackendUnavailable,
     BackendFailure,
@@ -477,6 +485,10 @@ pub enum ComputerControlDisposition {
     Stopped,
     Interrupted,
     UncertainOutcome,
+    /// A model proposed completion but the operator's objective predicate did
+    /// not hold. The run stops here for a person to look at; it is explicitly
+    /// not a success (#456).
+    AwaitingReview,
 }
 
 impl ComputerRunState {
@@ -643,6 +655,23 @@ pub struct ComputerRun {
     pub current_observation: Option<ComputerObservation>,
     pub grant: Option<ActionGrant>,
     pub last_outcome: Option<ActionOutcome>,
+    /// Host-issued evidence for the most recent dispatch, bound to the frame
+    /// it was authorized against and to at most one verifying frame (#456).
+    /// `None` on records written before receipts existed, which fails closed:
+    /// a legacy record can never authorize a completion.
+    #[serde(default)]
+    pub last_receipt: Option<super::receipt::ActionReceipt>,
+    /// Operator-authored objective and the closed predicate that decides
+    /// whether it is done (#456). `None` means no objective was authored, and
+    /// a run without one can never be completed on a model's say-so: a
+    /// receipt proves an action happened, not that the ask was satisfied.
+    #[serde(default)]
+    pub task_spec: Option<super::objective::ComputerTaskSpec>,
+    /// Fingerprints of proposals that actually staged, oldest first. Durable
+    /// so a duplicate cannot be replayed across a process boundary, and
+    /// bounded so it cannot grow without limit (#457).
+    #[serde(default)]
+    pub applied_proposals: Vec<String>,
     pub audit: Vec<ComputerAuditEntry>,
     pub last_error: Option<ComputerError>,
 }
@@ -679,6 +708,9 @@ impl ComputerRun {
             current_observation: None,
             grant: None,
             last_outcome: None,
+            last_receipt: None,
+            task_spec: None,
+            applied_proposals: Vec::new(),
             audit: Vec::new(),
             last_error: None,
         })
@@ -841,7 +873,7 @@ pub(super) fn validate_workspace(workspace: Option<&str>) -> ComputerResult<()> 
     Ok(())
 }
 
-fn validate_text(name: &str, value: &str, max: usize) -> ComputerResult<()> {
+pub(super) fn validate_text(name: &str, value: &str, max: usize) -> ComputerResult<()> {
     if value.trim().is_empty() || value.len() > max || value.contains('\0') {
         return Err(ComputerError::new(
             ComputerErrorCode::InvalidRequest,

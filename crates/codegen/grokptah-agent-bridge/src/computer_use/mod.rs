@@ -13,16 +13,21 @@
 //! session-scoped; coordinator reads take [`ComputerReadBinding`].
 
 mod macos_observation;
+mod objective;
 mod platform;
 mod policy;
 mod projection;
 mod reads;
+mod receipt;
 mod service;
 mod simulator;
 mod store;
 mod types;
 
 pub use macos_observation::MacOsObservationPlatform;
+pub use objective::{
+    objective_digest, ComputerTaskSpec, ElementLocator, TaskPredicate, TASK_SPEC_VERSION,
+};
 pub use platform::{
     ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
     ComputerPlatformStatus, ComputerTargetCandidate,
@@ -35,6 +40,10 @@ pub use projection::{
     DEFAULT_EVENT_PAGE, MAX_EVENT_PAGE,
 };
 pub use reads::{ComputerReadBinding, ComputerRunReads};
+pub use receipt::{
+    action_fingerprint, ActionReceipt, CompletionProof, FrameIdentity, PostconditionExpectation,
+    ReceiptVerification, ACTION_RECEIPT_VERSION,
+};
 
 /// Canonical string form of a workspace path for the durable Computer Run
 /// binding. This is the same canonicalization the control plane applies to a
@@ -53,7 +62,7 @@ pub use store::ComputerStore;
 pub use types::{
     ActionClass, ActionGrant, ActionOutcome, ComputerAction, ComputerAuditEntry, ComputerBackend,
     ComputerCapabilities, ComputerControlDisposition, ComputerError, ComputerErrorCode,
-    ComputerObservation, ComputerRun, ComputerRunState, ComputerTarget, ComputerUseLimits,
-    EvidenceRef, GrantIssuer, ObservationGeometry, PointerButton, SemanticAction, SemanticElement,
-    Sensitivity,
+    ComputerObservation, ComputerResult, ComputerRun, ComputerRunState, ComputerTarget,
+    ComputerUseLimits, EvidenceRef, GrantIssuer, ObservationGeometry, PointerButton,
+    SemanticAction, SemanticElement, Sensitivity,
 };
