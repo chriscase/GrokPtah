@@ -34,6 +34,22 @@ type ParityFile = {
     sourceDigests: string[];
     digest: string;
   }>;
+  requestDigests: Array<{
+    name: string;
+    requestId: string;
+    corpusDigest: string;
+    manifestRevision: number;
+    question: string;
+    locale: string;
+    context: Array<{
+      chunk_id: string;
+      chunk_digest: string;
+      source_ids: string[];
+      text: string;
+    }>;
+    instruction: string;
+    digest: string;
+  }>;
 };
 
 const vectors = parity as unknown as ParityFile;
@@ -135,5 +151,33 @@ describe("digest parity with the Rust implementation", () => {
     // And no two vectors collide with each other.
     const digests = vectors.articleDigests.map((v) => v.digest);
     expect(new Set(digests).size).toBe(digests.length);
+  });
+
+  const requestDigest = (vector: ParityFile["requestDigests"][number]): string =>
+    domainDigest("grokptah.help.request.v1", [
+      vector.requestId,
+      vector.corpusDigest,
+      String(vector.manifestRevision),
+      vector.question,
+      vector.locale,
+      vector.instruction,
+      "context",
+      String(vector.context.length),
+      ...vector.context.flatMap((chunk) => [
+        chunk.chunk_id,
+        chunk.chunk_digest,
+        chunk.text,
+        "sources",
+        String(chunk.source_ids.length),
+        ...chunk.source_ids,
+      ]),
+    ]);
+
+  it("binds every request context source id exactly as Rust does", () => {
+    expect(vectors.requestDigests.length).toBeGreaterThan(1);
+    for (const vector of vectors.requestDigests) {
+      expect(requestDigest(vector), vector.name).toBe(vector.digest);
+    }
+    expect(vectors.requestDigests[0].digest).not.toBe(vectors.requestDigests[1].digest);
   });
 });

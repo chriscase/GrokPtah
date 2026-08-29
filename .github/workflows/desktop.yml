@@ -7,12 +7,32 @@ on:
     paths:
       - "desktop/**"
       - "crates/codegen/grokptah-agent-bridge/**"
+      - "crates/common/grokptah-help-*/**"
+      - "README.md"
+      - "docs/COMPUTER_USE.md"
+      - "docs/COMPUTER_USE_THREAT_MODEL.md"
+      - "docs/DURABLE_RUNS.md"
+      - "docs/EMBEDDING.md"
+      - "docs/MCP_CONTROL_COORDINATOR.md"
+      - "docs/PROVIDER_PRODUCT_BOUNDARIES.md"
+      - "docs/PROVIDER_PROFILES.md"
+      - "docs/VERIFICATION.md"
       - "evals/**"
       - ".github/workflows/desktop.yml"
   pull_request:
     paths:
       - "desktop/**"
       - "crates/codegen/grokptah-agent-bridge/**"
+      - "crates/common/grokptah-help-*/**"
+      - "README.md"
+      - "docs/COMPUTER_USE.md"
+      - "docs/COMPUTER_USE_THREAT_MODEL.md"
+      - "docs/DURABLE_RUNS.md"
+      - "docs/EMBEDDING.md"
+      - "docs/MCP_CONTROL_COORDINATOR.md"
+      - "docs/PROVIDER_PRODUCT_BOUNDARIES.md"
+      - "docs/PROVIDER_PROFILES.md"
+      - "docs/VERIFICATION.md"
       - "evals/**"
       - ".github/workflows/desktop.yml"
 
@@ -37,6 +57,11 @@ jobs:
         working-directory: desktop
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # PR checks must bind evidence to the exact candidate, not GitHub's synthetic merge ref.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          # The evidence verifier proves the declared base is an ancestor of the candidate.
+          fetch-depth: 0
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "20"
@@ -56,10 +81,23 @@ jobs:
           version: "v0.16.0"
       - name: Install frontend deps
         run: npm ci
+      - name: Semantic Help contract and generated-artifact gates
+        working-directory: .
+        run: |
+          cargo fmt -p grokptah-help-contract -p grokptah-help-authority -p grokptah-help-runtime -- --check
+          cargo clippy --locked -p grokptah-help-contract -p grokptah-help-authority -p grokptah-help-runtime --all-targets -- -D warnings
+          cargo test --locked -p grokptah-help-contract -p grokptah-help-authority -p grokptah-help-runtime -- --test-threads=1
+          cargo run --locked -p grokptah-help-contract --bin help-codegen -- --verify
       - name: Typecheck + unit tests
         run: |
           npm run typecheck
           npm test
+      - name: Semantic Help public bundle and provenance gates
+        env:
+          HELP_EVIDENCE_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          npm run verify:help-public
+          npm run verify:help-evidence-manifest -- --out "$RUNNER_TEMP/help-evidence-manifest.json"
       - name: Cargo tests (desktop)
         working-directory: desktop/src-tauri
         # cargo test compiles the library, binary, and test targets.

@@ -165,6 +165,12 @@ describe("the bundled JSON runtime boundary", () => {
     enumeration.articles[0].visibility = "everyone";
     expect(() => parseHelpCorpus(enumeration)).toThrow(HelpCorpusSchemaError);
   });
+
+  it("rejects an unknown schema version instead of interpreting it as v1", () => {
+    const unknown = JSON.parse(JSON.stringify(publicCorpusJson)) as Record<string, unknown>;
+    unknown.schema_version = "grokptah.help-canonical.v2";
+    expect(() => parseHelpCorpus(unknown)).toThrow(HelpCorpusSchemaError);
+  });
 });
 
 describe("what this bundle ships", () => {
@@ -383,6 +389,48 @@ describe("a tampered corpus is refused", () => {
     const error = rejection(() => verifyHelpCorpus(tampered));
     expect(error.record).toBe(`chunk:${orphan.id}`);
     expect(error.actual).toBe("unknown article");
+  });
+
+  it("rejects a chunk with no sources after every digest is re-minted", () => {
+    const tampered = clone(FULL);
+    const chunk = tampered.chunks[0];
+    (chunk as unknown as { source_ids: string[] }).source_ids = [];
+    remintChunk(chunk);
+    rebindSetDigests(tampered);
+    expect(rejection(() => verifyHelpCorpus(tampered)).record).toBe(`chunk:${chunk.id}`);
+  });
+
+  it("rejects an unknown or substituted chunk source", () => {
+    for (const replacement of ["unknown.source", FULL.sources.find((source) => source.visibility === "public")!.id]) {
+      const tampered = clone(FULL);
+      const chunk = tampered.chunks.find(
+        (entry) => entry.visibility === "public" && !entry.source_ids.includes(replacement),
+      );
+      expect(chunk).toBeDefined();
+      if (!chunk) continue;
+      (chunk as unknown as { source_ids: string[] }).source_ids = [replacement];
+      remintChunk(chunk);
+      rebindSetDigests(tampered);
+      expect(rejection(() => verifyHelpCorpus(tampered)).record).toBe(`chunk:${chunk.id}`);
+    }
+  });
+
+  it("rejects a public chunk citing a restricted source", () => {
+    const tampered = clone(FULL);
+    const restricted = tampered.sources.find((source) => source.visibility === "operator")!;
+    const chunk = tampered.chunks.find((entry) => entry.visibility === "public")!;
+    (chunk as unknown as { source_ids: string[] }).source_ids = [restricted.id];
+    remintChunk(chunk);
+    rebindSetDigests(tampered);
+    expect(rejection(() => verifyHelpCorpus(tampered)).record).toBe(`chunk:${chunk.id}`);
+  });
+
+  it("rejects a self-consistent unknown schema version", () => {
+    const tampered = clone(FULL);
+    (tampered as unknown as { schema_version: string }).schema_version =
+      "grokptah.help-canonical.v2";
+    rebindSetDigests(tampered);
+    expect(rejection(() => verifyHelpCorpus(tampered)).record).toBe("schema-version");
   });
 
   it("rejects a dropped record even though every surviving digest is intact", () => {

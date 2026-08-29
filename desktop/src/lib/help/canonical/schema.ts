@@ -21,6 +21,9 @@ import type {
 
 type JsonObject = Record<string, unknown>;
 
+/** The only corpus schema this parser understands. Unknown versions fail closed. */
+export const HELP_CORPUS_SCHEMA_VERSION = "grokptah.help-canonical.v1" as const;
+
 export class HelpCorpusSchemaError extends Error {
   constructor(readonly path: string, readonly problem: string) {
     super(`Invalid Help corpus at ${path}: ${problem}`);
@@ -155,7 +158,13 @@ export function parseHelpCorpus(value: unknown): HelpCorpus {
     "digest",
     "source_digest",
   ]);
-  stringValue(corpus.schema_version, "$.schema_version");
+  const schemaVersion = stringValue(corpus.schema_version, "$.schema_version");
+  if (schemaVersion !== HELP_CORPUS_SCHEMA_VERSION) {
+    throw new HelpCorpusSchemaError(
+      "$.schema_version",
+      `unsupported schema version ${schemaVersion}`,
+    );
+  }
   stringValue(corpus.content_version, "$.content_version");
   arrayValue(corpus.sources, "$.sources").forEach((item, index) =>
     sourceValue(item, `$.sources[${index}]`),

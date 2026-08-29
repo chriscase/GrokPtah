@@ -312,6 +312,11 @@ impl HelpRequest {
         instruction: &str,
     ) -> String {
         let revision = manifest_revision.to_string();
+        let context_count = context.len().to_string();
+        let source_counts: Vec<String> = context
+            .iter()
+            .map(|chunk| chunk.source_ids.len().to_string())
+            .collect();
         let mut fields: Vec<&str> = vec![
             request_id,
             corpus_digest,
@@ -319,11 +324,16 @@ impl HelpRequest {
             question,
             locale,
             instruction,
+            "context",
+            &context_count,
         ];
-        for chunk in context {
+        for (chunk, source_count) in context.iter().zip(&source_counts) {
             fields.push(&chunk.chunk_id);
             fields.push(&chunk.chunk_digest);
             fields.push(&chunk.text);
+            fields.push("sources");
+            fields.push(source_count);
+            fields.extend(chunk.source_ids.iter().map(String::as_str));
         }
         domain_digest(domain::REQUEST, &fields)
     }

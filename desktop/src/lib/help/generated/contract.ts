@@ -165,7 +165,7 @@ export type HelpCorpus = {
   /**
    * Bumped when a record's shape changes.
    */
-  readonly schema_version: string;
+  readonly schema_version: "grokptah.help-canonical.v1";
   /**
    * Bumped when the content changes.
    */

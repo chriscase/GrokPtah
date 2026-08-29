@@ -329,6 +329,7 @@
           "type": "string"
         },
         "schema_version": {
+          "const": "grokptah.help-canonical.v1",
           "description": "Bumped when a record's shape changes.",
           "type": "string"
         },

@@ -24,6 +24,8 @@ use std::fmt::Write as _;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeRef {
     Str,
+    /// One exact string value. Used for versioned runtime boundaries.
+    Literal(&'static str),
     U64,
     Usize,
     Bool,
@@ -45,6 +47,7 @@ impl TypeRef {
     fn typescript(&self) -> String {
         match self {
             Self::Str => "string".to_string(),
+            Self::Literal(value) => quote(value),
             Self::U64 | Self::Usize => "number".to_string(),
             Self::Bool => "boolean".to_string(),
             Self::Named(name) => (*name).to_string(),
@@ -56,6 +59,7 @@ impl TypeRef {
     fn json_schema(&self) -> serde_json::Value {
         match self {
             Self::Str => serde_json::json!({ "type": "string" }),
+            Self::Literal(value) => serde_json::json!({ "type": "string", "const": value }),
             Self::U64 => serde_json::json!({ "type": "integer", "minimum": 0 }),
             Self::Usize => serde_json::json!({ "type": "integer", "minimum": 0 }),
             Self::Bool => serde_json::json!({ "type": "boolean" }),
@@ -108,7 +112,7 @@ fn field(name: &'static str, ty: TypeRef, doc: &'static str) -> Field {
 /// The complete generated contract.
 #[must_use]
 pub fn model() -> Vec<Decl> {
-    use TypeRef::{Bool, Named, Str, U64, Usize};
+    use TypeRef::{Bool, Literal, Named, Str, U64, Usize};
     vec![
         Decl::StringEnum {
             name: "HelpVisibility",
@@ -244,7 +248,7 @@ pub fn model() -> Vec<Decl> {
             fields: vec![
                 field(
                     "schema_version",
-                    Str,
+                    Literal(crate::corpus::SCHEMA_VERSION),
                     "Bumped when a record's shape changes.",
                 ),
                 field("content_version", Str, "Bumped when the content changes."),
@@ -631,7 +635,63 @@ pub fn digest_parity_cases() -> serde_json::Value {
         "sha256": hashes,
         "domainDigests": emitted,
         "articleDigests": article_digest_parity_cases(),
+        "requestDigests": request_digest_parity_cases(),
     })
+}
+
+/// Cross-language vectors for the request digest's context and source regions.
+#[must_use]
+fn request_digest_parity_cases() -> serde_json::Value {
+    use crate::dto::{ContextChunk, HelpRequest};
+
+    let contexts = vec![
+        (
+            "two-sources",
+            vec![ContextChunk {
+                chunk_id: "article#body.0".to_string(),
+                chunk_digest: "sha256:chunk".to_string(),
+                source_ids: vec!["source.a".to_string(), "source.b".to_string()],
+                text: "Exact context bytes.".to_string(),
+            }],
+        ),
+        (
+            "source-substitution",
+            vec![ContextChunk {
+                chunk_id: "article#body.0".to_string(),
+                chunk_digest: "sha256:chunk".to_string(),
+                source_ids: vec!["source.a".to_string(), "source.c".to_string()],
+                text: "Exact context bytes.".to_string(),
+            }],
+        ),
+    ];
+
+    serde_json::Value::Array(
+        contexts
+            .into_iter()
+            .map(|(name, context)| {
+                let digest = HelpRequest::compute_digest(
+                    "request-parity",
+                    "sha256:corpus",
+                    7,
+                    "What happened?",
+                    "en",
+                    &context,
+                    "Use only the supplied context.",
+                );
+                serde_json::json!({
+                    "name": name,
+                    "requestId": "request-parity",
+                    "corpusDigest": "sha256:corpus",
+                    "manifestRevision": 7,
+                    "question": "What happened?",
+                    "locale": "en",
+                    "context": context,
+                    "instruction": "Use only the supplied context.",
+                    "digest": digest,
+                })
+            })
+            .collect(),
+    )
 }
 
 /// Cross-language vectors for the article digest's labelled, counted regions.

@@ -813,6 +813,66 @@ fn the_projection_drops_a_gated_chunk_even_if_verification_were_bypassed() {
 }
 
 #[test]
+fn the_projection_drops_a_chunk_that_smuggles_a_restricted_source_id() {
+    let mut crafted = build_corpus();
+    let restricted = crafted
+        .sources
+        .iter()
+        .find(|source| source.visibility == Visibility::Operator)
+        .expect("operator source")
+        .id
+        .clone();
+    let chunk = crafted
+        .chunks
+        .iter_mut()
+        .find(|chunk| chunk.visibility == Visibility::Public)
+        .expect("public chunk");
+    let smuggled_chunk = chunk.id.clone();
+    chunk.source_ids = vec![restricted.clone()];
+    let ordinal = chunk.ordinal.to_string();
+    let mut fields: Vec<&str> = vec![
+        &chunk.id,
+        &chunk.article_id,
+        chunk.kind.as_str(),
+        &ordinal,
+        &chunk.locale,
+        &chunk.text,
+        chunk.visibility.as_str(),
+    ];
+    fields.extend(chunk.source_ids.iter().map(String::as_str));
+    chunk.digest = grokptah_help_contract::digest::domain_digest(
+        grokptah_help_contract::digest::domain::CHUNK,
+        &fields,
+    );
+    crafted.rebind_set_digests();
+
+    let mut authority = Authority::adopt_unverified(crafted);
+    authority.register_session(session(
+        "tok-public",
+        "p-public",
+        "tenant-a",
+        PrincipalKind::Anonymous,
+        Visibility::Public,
+        &[],
+    ));
+    let principal = authority.principal_for("tok-public").unwrap();
+    let visible = authority.visible_corpus(&principal);
+    assert!(
+        !visible
+            .chunks
+            .iter()
+            .any(|chunk| chunk.id == smuggled_chunk)
+    );
+    assert!(
+        !visible
+            .chunks
+            .iter()
+            .flat_map(|chunk| &chunk.source_ids)
+            .any(|source_id| source_id == &restricted)
+    );
+}
+
+#[test]
 fn an_operator_still_receives_a_chunk_a_public_reader_does_not() {
     // The filter narrows by ceiling rather than dropping restricted chunks
     // outright, so the entitled principal keeps what it is entitled to.

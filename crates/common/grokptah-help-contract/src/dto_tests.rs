@@ -545,6 +545,25 @@ fn digests_bind_a_request_to_its_exact_context_bytes() {
 }
 
 #[test]
+fn request_digests_bind_context_source_ids() {
+    let chunk = ContextChunk {
+        chunk_id: "a#body.0".into(),
+        chunk_digest: "sha256:c".into(),
+        source_ids: vec!["source.a".into(), "source.b".into()],
+        text: "the exact bytes".into(),
+    };
+    let mut substituted = chunk.clone();
+    substituted.source_ids[1] = "source.c".into();
+    let left = HelpRequest::compute_digest("r", "sha256:c", 1, "q", "en", &[chunk], "instruction");
+    let right =
+        HelpRequest::compute_digest("r", "sha256:c", 1, "q", "en", &[substituted], "instruction");
+    assert_ne!(
+        left, right,
+        "changing provenance must invalidate the request and its admission"
+    );
+}
+
+#[test]
 fn digest_labels_match_serde_labels() {
     // `as_str` feeds digests; serde feeds the JSON both languages read. If the
     // two disagree, Rust and TypeScript digest different strings for the same

@@ -196,6 +196,41 @@ fn the_authored_corpus_verifies() {
 }
 
 #[test]
+fn every_authored_source_resolves_in_the_exact_repository_tree() {
+    let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = crate_dir
+        .ancestors()
+        .nth(3)
+        .expect("Help contract crate is three levels below the repository root");
+    corpus()
+        .verify_source_anchors(root)
+        .expect("every canonical path and Markdown heading resolves");
+}
+
+#[test]
+fn source_anchor_verification_rejects_missing_headings_and_path_escape() {
+    let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = crate_dir
+        .ancestors()
+        .nth(3)
+        .expect("Help contract crate is three levels below the repository root");
+
+    let mut missing = corpus();
+    missing.sources[0].heading = "This heading does not exist".to_string();
+    assert!(matches!(
+        missing.verify_source_anchors(root),
+        Err(super::corpus::SourceAnchorError::MissingHeading { .. })
+    ));
+
+    let mut escaping = corpus();
+    escaping.sources[0].path = "../README.md".to_string();
+    assert!(matches!(
+        escaping.verify_source_anchors(root),
+        Err(super::corpus::SourceAnchorError::UnsafePath { .. })
+    ));
+}
+
+#[test]
 fn verify_rejects_a_stale_source_set_digest() {
     let mut tampered = corpus();
     tampered.source_digest = "sha256:stale".to_string();
@@ -409,6 +444,84 @@ fn a_chunk_naming_an_unknown_article_is_rejected() {
         matches!(error, CorpusError::UnknownArticle { ref chunk, .. } if chunk == &orphan.id),
         "expected an unknown-article error, got {error:?}"
     );
+}
+
+#[test]
+fn a_chunk_without_sources_is_rejected_even_after_redigesting() {
+    let mut tampered = corpus();
+    let chunk = &mut tampered.chunks[0];
+    chunk.source_ids.clear();
+    chunk.digest = chunk_digest_of(chunk);
+    tampered.rebind_set_digests();
+    assert!(matches!(
+        tampered.verify(),
+        Err(CorpusError::EmptyChunkSources { .. })
+    ));
+}
+
+#[test]
+fn a_chunk_citing_an_unknown_source_is_rejected_even_after_redigesting() {
+    let mut tampered = corpus();
+    let chunk = &mut tampered.chunks[0];
+    chunk.source_ids = vec!["unknown.source".to_string()];
+    chunk.digest = chunk_digest_of(chunk);
+    tampered.rebind_set_digests();
+    assert!(matches!(
+        tampered.verify(),
+        Err(CorpusError::UnknownChunkSource { .. })
+    ));
+}
+
+#[test]
+fn a_public_chunk_citing_a_restricted_source_is_rejected() {
+    let mut tampered = corpus();
+    let restricted = tampered
+        .sources
+        .iter()
+        .find(|source| source.visibility == Visibility::Operator)
+        .expect("operator source")
+        .id
+        .clone();
+    let chunk = tampered
+        .chunks
+        .iter_mut()
+        .find(|chunk| chunk.visibility == Visibility::Public)
+        .expect("public chunk");
+    chunk.source_ids = vec![restricted];
+    chunk.digest = chunk_digest_of(chunk);
+    tampered.rebind_set_digests();
+    assert!(matches!(
+        tampered.verify(),
+        Err(CorpusError::ChunkSourceVisibilityMismatch { .. })
+    ));
+}
+
+#[test]
+fn a_chunk_cannot_substitute_a_different_public_source() {
+    let mut tampered = corpus();
+    let index = tampered
+        .chunks
+        .iter()
+        .position(|chunk| chunk.visibility == Visibility::Public)
+        .expect("public chunk");
+    let original_sources = tampered.chunks[index].source_ids.clone();
+    let replacement = tampered
+        .sources
+        .iter()
+        .find(|source| {
+            source.visibility == Visibility::Public && !original_sources.contains(&source.id)
+        })
+        .expect("another public source")
+        .id
+        .clone();
+    let chunk = &mut tampered.chunks[index];
+    chunk.source_ids = vec![replacement];
+    chunk.digest = chunk_digest_of(chunk);
+    tampered.rebind_set_digests();
+    assert!(matches!(
+        tampered.verify(),
+        Err(CorpusError::ChunkSourcesMismatch { .. })
+    ));
 }
 
 #[test]

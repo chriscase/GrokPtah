@@ -13,7 +13,8 @@
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
-    "verify:help-public": "npm run build && node scripts/verify-help-public.mjs"
+    "verify:help-public": "npm run build && node scripts/verify-help-public.mjs",
+    "verify:help-evidence-manifest": "node scripts/help-evidence-manifest.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.2.0",

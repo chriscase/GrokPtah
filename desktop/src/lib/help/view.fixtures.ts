@@ -89,7 +89,7 @@ const RUNBOOK = SOURCE("fixture.lantern-runbook", "docs/synthetic/lantern-runboo
  * of these words and the fixture stops testing what it claims to.
  */
 export const HELP_VIEW_FIXTURE_CORPUS: HelpCorpus = {
-  schema_version: "grokptah-help.v1",
+  schema_version: "grokptah.help-canonical.v1",
   content_version: "fixture-v1",
   sources: [GUIDE, RUNBOOK],
   articles: [

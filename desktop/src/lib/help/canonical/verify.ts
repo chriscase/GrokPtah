@@ -15,6 +15,7 @@
 
 import type { HelpArticle, HelpChunk, HelpCorpus, HelpSourceAnchor } from "../generated/contract";
 import { HELP_DIGEST_DOMAINS, domainDigest } from "./digest";
+import { HELP_CORPUS_SCHEMA_VERSION } from "./schema";
 
 /** Raised when a corpus does not match its own digests. */
 export class HelpCorpusDigestMismatchError extends Error {
@@ -135,6 +136,13 @@ function verifyArticle(
  * published, or that the corpus a server sent is the one that server claims.
  */
 export function verifyHelpCorpus(corpus: HelpCorpus): void {
+  if (corpus.schema_version !== HELP_CORPUS_SCHEMA_VERSION) {
+    throw new HelpCorpusDigestMismatchError(
+      "schema-version",
+      HELP_CORPUS_SCHEMA_VERSION,
+      corpus.schema_version,
+    );
+  }
   // Refuse ambiguity before Map construction or first-match lookup. A Map
   // keeps the last duplicate while Rust's iterator lookup keeps the first;
   // accepting duplicates therefore made visibility depend on the reader.
@@ -178,6 +186,37 @@ export function verifyHelpCorpus(corpus: HelpCorpus): void {
         `chunk:${chunk.id}`,
         `article ${article.id} is ${article.visibility}`,
         `chunk is ${chunk.visibility}`,
+      );
+    }
+    if (chunk.source_ids.length === 0) {
+      throw new HelpCorpusDigestMismatchError(
+        `chunk:${chunk.id}`,
+        "at least one source",
+        "empty",
+      );
+    }
+    for (const sourceId of chunk.source_ids) {
+      const source = sources.get(sourceId);
+      if (!source) {
+        throw new HelpCorpusDigestMismatchError(`chunk:${chunk.id}`, sourceId, "unknown source");
+      }
+      const rank = { public: 0, gated: 1, operator: 2 } as const;
+      if (rank[source.visibility] > rank[chunk.visibility]) {
+        throw new HelpCorpusDigestMismatchError(
+          `chunk:${chunk.id}`,
+          `visibility at least ${source.visibility}`,
+          chunk.visibility,
+        );
+      }
+    }
+    if (
+      chunk.source_ids.length !== article.source_ids.length ||
+      chunk.source_ids.some((sourceId, index) => sourceId !== article.source_ids[index])
+    ) {
+      throw new HelpCorpusDigestMismatchError(
+        `chunk:${chunk.id}`,
+        `sources ${article.source_ids.join(",")}`,
+        chunk.source_ids.join(","),
       );
     }
     verifyChunk(chunk);

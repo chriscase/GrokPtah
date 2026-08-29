@@ -303,6 +303,16 @@ impl Authority {
             .iter()
             .map(|entry| entry.article_id.as_str())
             .collect();
+        let allowed_sources: std::collections::BTreeSet<&str> = manifest
+            .entries
+            .iter()
+            .flat_map(|entry| entry.source_ids.iter().map(String::as_str))
+            .collect();
+        let article_sources: std::collections::BTreeMap<&str, &[String]> = manifest
+            .entries
+            .iter()
+            .map(|entry| (entry.article_id.as_str(), entry.source_ids.as_slice()))
+            .collect();
         let ceiling = principal.visibility_ceiling;
         let mut filtered = self.corpus.clone();
         filtered
@@ -315,16 +325,21 @@ impl Authority {
         // wrong. A chunk above this principal's ceiling is dropped here on its
         // own label, whatever its article says.
         filtered.chunks.retain(|chunk| {
-            allowed.contains(chunk.article_id.as_str()) && chunk.visibility.rank() <= ceiling.rank()
+            allowed.contains(chunk.article_id.as_str())
+                && chunk.visibility.rank() <= ceiling.rank()
+                && !chunk.source_ids.is_empty()
+                && article_sources
+                    .get(chunk.article_id.as_str())
+                    .is_some_and(|sources| *sources == chunk.source_ids.as_slice())
+                && chunk
+                    .source_ids
+                    .iter()
+                    .all(|source_id| allowed_sources.contains(source_id.as_str()))
         });
-        let cited: std::collections::BTreeSet<&str> = filtered
-            .articles
-            .iter()
-            .flat_map(|article| article.source_ids.iter().map(String::as_str))
-            .collect();
-        filtered
-            .sources
-            .retain(|source| cited.contains(source.id.as_str()));
+        filtered.sources.retain(|source| {
+            allowed_sources.contains(source.id.as_str())
+                && source.visibility.rank() <= ceiling.rank()
+        });
 
         // The contract owns what a filtered document's digest is, so the host
         // asks it rather than re-deriving the rule alongside it.

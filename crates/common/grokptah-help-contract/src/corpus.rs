@@ -31,6 +31,8 @@
 //! document where the two disagree is served differently by each; [`Corpus::verify`]
 //! refuses it rather than letting the two resolve it differently.
 
+use std::path::{Component, Path};
+
 use serde::{Deserialize, Serialize};
 
 use crate::digest::{canonical_digest, domain, domain_digest};
@@ -224,6 +226,25 @@ pub enum CorpusError {
     EmptySources {
         article: String,
     },
+    /// A chunk without a source cannot support a citation.
+    EmptyChunkSources {
+        chunk: String,
+    },
+    /// A chunk cites a source the corpus does not carry.
+    UnknownChunkSource {
+        chunk: String,
+        source: String,
+    },
+    /// A chunk cites a source above its own visibility.
+    ChunkSourceVisibilityMismatch {
+        chunk: String,
+        source: String,
+    },
+    /// Chunks are projections of an article and must preserve its exact source set.
+    ChunkSourcesMismatch {
+        chunk: String,
+        article: String,
+    },
     DuplicateId {
         id: String,
     },
@@ -265,6 +286,18 @@ impl std::fmt::Display for CorpusError {
                 write!(f, "article `{article}` cites unknown source `{source}`")
             }
             Self::EmptySources { article } => write!(f, "article `{article}` cites no source"),
+            Self::EmptyChunkSources { chunk } => write!(f, "chunk `{chunk}` cites no source"),
+            Self::UnknownChunkSource { chunk, source } => {
+                write!(f, "chunk `{chunk}` cites unknown source `{source}`")
+            }
+            Self::ChunkSourceVisibilityMismatch { chunk, source } => write!(
+                f,
+                "chunk `{chunk}` is less restricted than source `{source}`"
+            ),
+            Self::ChunkSourcesMismatch { chunk, article } => write!(
+                f,
+                "chunk `{chunk}` does not preserve article `{article}`'s source set"
+            ),
             Self::DuplicateId { id } => write!(f, "duplicate id `{id}`"),
             Self::DigestMismatch {
                 record,
@@ -302,6 +335,67 @@ impl std::fmt::Display for CorpusError {
 }
 
 impl std::error::Error for CorpusError {}
+
+/// A canonical source anchor does not resolve inside the repository tree.
+#[derive(Debug)]
+pub enum SourceAnchorError {
+    UnsafePath {
+        source: String,
+        path: String,
+    },
+    Unreadable {
+        source: String,
+        path: String,
+        error: std::io::Error,
+    },
+    MissingHeading {
+        source: String,
+        path: String,
+        heading: String,
+    },
+}
+
+impl std::fmt::Display for SourceAnchorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsafePath { source, path } => {
+                write!(f, "source `{source}` has unsafe repository path `{path}`")
+            }
+            Self::Unreadable {
+                source,
+                path,
+                error,
+            } => write!(f, "source `{source}` cannot read `{path}`: {error}"),
+            Self::MissingHeading {
+                source,
+                path,
+                heading,
+            } => write!(
+                f,
+                "source `{source}` cannot find heading `{heading}` in `{path}`"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SourceAnchorError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Unreadable { error, .. } => Some(error),
+            _ => None,
+        }
+    }
+}
+
+fn markdown_heading(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    let hashes = trimmed.bytes().take_while(|byte| *byte == b'#').count();
+    if !(1..=6).contains(&hashes) || trimmed.as_bytes().get(hashes) != Some(&b' ') {
+        return None;
+    }
+    let heading = trimmed[hashes + 1..].trim();
+    Some(heading.trim_end_matches('#').trim_end())
+}
 
 /// Labels that open each variable-length region of a digest.
 ///
@@ -657,6 +751,45 @@ pub fn build(
 }
 
 impl Corpus {
+    /// Prove every canonical source names a real repository-relative Markdown heading.
+    ///
+    /// Runtime verification is intentionally repository-independent, but code generation and CI
+    /// run this check against the exact tree whose Help artifacts they publish.
+    pub fn verify_source_anchors(&self, repo_root: &Path) -> Result<(), SourceAnchorError> {
+        for source in &self.sources {
+            let relative = Path::new(&source.path);
+            if relative.is_absolute()
+                || relative
+                    .components()
+                    .any(|component| !matches!(component, Component::Normal(_)))
+            {
+                return Err(SourceAnchorError::UnsafePath {
+                    source: source.id.clone(),
+                    path: source.path.clone(),
+                });
+            }
+            let text = std::fs::read_to_string(repo_root.join(relative)).map_err(|error| {
+                SourceAnchorError::Unreadable {
+                    source: source.id.clone(),
+                    path: source.path.clone(),
+                    error,
+                }
+            })?;
+            if !text
+                .lines()
+                .filter_map(markdown_heading)
+                .any(|heading| heading == source.heading)
+            {
+                return Err(SourceAnchorError::MissingHeading {
+                    source: source.id.clone(),
+                    path: source.path.clone(),
+                    heading: source.heading.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Recompute every digest from the stored bytes and reject any drift.
     ///
     /// This is the check a host runs before serving anything: it proves the
@@ -793,6 +926,31 @@ impl Corpus {
                     article_visibility: article.visibility,
                 });
             }
+            if chunk.source_ids.is_empty() {
+                return Err(CorpusError::EmptyChunkSources {
+                    chunk: chunk.id.clone(),
+                });
+            }
+            for source_id in &chunk.source_ids {
+                let Some(source) = self.source(source_id) else {
+                    return Err(CorpusError::UnknownChunkSource {
+                        chunk: chunk.id.clone(),
+                        source: source_id.clone(),
+                    });
+                };
+                if source.visibility.rank() > chunk.visibility.rank() {
+                    return Err(CorpusError::ChunkSourceVisibilityMismatch {
+                        chunk: chunk.id.clone(),
+                        source: source_id.clone(),
+                    });
+                }
+            }
+            if chunk.source_ids != article.source_ids {
+                return Err(CorpusError::ChunkSourcesMismatch {
+                    chunk: chunk.id.clone(),
+                    article: article.id.clone(),
+                });
+            }
             let ordinal = chunk.ordinal.to_string();
             let mut fields: Vec<&str> = vec![
                 &chunk.id,
@@ -873,21 +1031,42 @@ impl Corpus {
             .filter(|s| keep(s.visibility))
             .cloned()
             .collect();
+        let retained_sources: std::collections::BTreeSet<&str> =
+            sources.iter().map(|source| source.id.as_str()).collect();
         let articles: Vec<Article> = self
             .articles
             .iter()
-            .filter(|a| keep(a.visibility))
+            .filter(|article| {
+                keep(article.visibility)
+                    && !article.source_ids.is_empty()
+                    && article
+                        .source_ids
+                        .iter()
+                        .all(|source_id| retained_sources.contains(source_id.as_str()))
+            })
             .cloned()
             .collect();
         // Both conditions, not either: a chunk labelled `public` under an
         // article that did not survive would otherwise ship the text of a
         // restricted article as a free-standing public chunk.
-        let retained: std::collections::BTreeSet<&str> =
-            articles.iter().map(|a| a.id.as_str()).collect();
+        let retained: std::collections::BTreeMap<&str, &[String]> = articles
+            .iter()
+            .map(|article| (article.id.as_str(), article.source_ids.as_slice()))
+            .collect();
         let chunks: Vec<Chunk> = self
             .chunks
             .iter()
-            .filter(|c| keep(c.visibility) && retained.contains(c.article_id.as_str()))
+            .filter(|chunk| {
+                keep(chunk.visibility)
+                    && !chunk.source_ids.is_empty()
+                    && retained
+                        .get(chunk.article_id.as_str())
+                        .is_some_and(|sources| *sources == chunk.source_ids.as_slice())
+                    && chunk
+                        .source_ids
+                        .iter()
+                        .all(|source_id| retained_sources.contains(source_id.as_str()))
+            })
             .cloned()
             .collect();
         let mut bundle = Corpus {

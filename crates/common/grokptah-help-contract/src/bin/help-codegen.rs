@@ -71,6 +71,10 @@ fn main() -> ExitCode {
         .unwrap_or_else(|| "--verify".to_string());
     let root = repo_root();
     let artifacts = artifacts();
+    if let Err(error) = build_corpus().verify_source_anchors(&root) {
+        eprintln!("canonical Help source anchor failed: {error}");
+        return ExitCode::FAILURE;
+    }
 
     match mode.as_str() {
         "--write" => {
