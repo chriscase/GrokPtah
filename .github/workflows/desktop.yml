@@ -95,6 +95,13 @@ jobs:
         uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
         with:
           version: "v0.16.0"
+      - name: Install hermetic protobuf compiler
+        # bin/protoc is a dotslash launcher; install dotslash before any
+        # workspace that generates protobuf bindings is compiled.
+        working-directory: .
+        run: |
+          cargo install dotslash --version 0.5.7 --locked
+          bin/protoc --version
       - name: Install frontend deps
         run: npm ci
       - name: Semantic Help contract and generated-artifact gates
