@@ -72,6 +72,7 @@ members = [
     "crates/codegen/xai-token-estimation",
     "crates/codegen/xai-tracing-macros",
     "crates/codegen/xai-tty-utils",
+    "crates/common/grokptah-swarm-control-plane",
     "crates/common/xai-circuit-breaker",
     "crates/common/xai-computer-hub-core",
     "crates/common/xai-computer-hub-mcp-adapter",
@@ -155,6 +156,7 @@ gethostname = "1"
 gix = { version = "0.83", default-features = false, features = ["sha1"] }
 glob = "0.3"
 globset = "0.4"
+grokptah-swarm-control-plane = { path = "crates/common/grokptah-swarm-control-plane" }
 htmd = "0.5.4"
 html-escape = "0.2"
 http = "1"

@@ -1,0 +1,78 @@
+name: Swarm Control Plane
+
+on:
+  push:
+    paths:
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/common/grokptah-swarm-control-plane/**"
+      - "crates/codegen/xai-grok-secrets/**"
+      - "crates/common/xai-tool-types/**"
+      - ".github/workflows/swarm-control-plane.yml"
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/common/grokptah-swarm-control-plane/**"
+      - "crates/codegen/xai-grok-secrets/**"
+      - "crates/common/xai-tool-types/**"
+      - ".github/workflows/swarm-control-plane.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: swarm-control-plane-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  crate:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUSTC_WRAPPER: sccache
+      SCCACHE_CACHE_SIZE: 2G
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_GHA_RW_MODE: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'READ_ONLY' || 'READ_WRITE' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: "1.92.0"
+          components: rustfmt, clippy
+      - name: Install compiler cache
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        env:
+          SCCACHE_DIR: ${{ runner.temp }}/grokptah-swarm-control-plane-sccache
+        with:
+          version: "v0.16.0"
+      - name: Format and verify locked metadata
+        env:
+          CARGO_HOME: ${{ runner.temp }}/grokptah-swarm-control-plane-cargo
+          CARGO_TARGET_DIR: ${{ runner.temp }}/grokptah-swarm-control-plane-target
+          SCCACHE_DIR: ${{ runner.temp }}/grokptah-swarm-control-plane-sccache
+        run: |
+          cargo fmt -p grokptah-swarm-control-plane -- --check
+          cargo metadata --locked --no-deps --format-version 1
+      - name: Focused graph and projection tests
+        env:
+          CARGO_HOME: ${{ runner.temp }}/grokptah-swarm-control-plane-cargo
+          CARGO_TARGET_DIR: ${{ runner.temp }}/grokptah-swarm-control-plane-target
+          SCCACHE_DIR: ${{ runner.temp }}/grokptah-swarm-control-plane-sccache
+        run: |
+          cargo test -p grokptah-swarm-control-plane --locked --test graph_validation
+          cargo test -p grokptah-swarm-control-plane --locked --test projection
+      - name: Full crate tests
+        env:
+          CARGO_HOME: ${{ runner.temp }}/grokptah-swarm-control-plane-cargo
+          CARGO_TARGET_DIR: ${{ runner.temp }}/grokptah-swarm-control-plane-target
+          SCCACHE_DIR: ${{ runner.temp }}/grokptah-swarm-control-plane-sccache
+        run: cargo test -p grokptah-swarm-control-plane --locked --all-targets -- --test-threads=1
+      - name: Clippy
+        env:
+          CARGO_HOME: ${{ runner.temp }}/grokptah-swarm-control-plane-cargo
+          CARGO_TARGET_DIR: ${{ runner.temp }}/grokptah-swarm-control-plane-target
+          SCCACHE_DIR: ${{ runner.temp }}/grokptah-swarm-control-plane-sccache
+        run: cargo clippy -p grokptah-swarm-control-plane --locked --all-targets -- -D warnings
