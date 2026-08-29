@@ -17,7 +17,9 @@ import { validateHelpEvidenceReport } from "./help-evidence-contract.mjs";
 const here = dirname(fileURLToPath(import.meta.url));
 const desktop = resolve(here, "..");
 const repository = resolve(desktop, "..");
-const evidence = join(desktop, "evidence-out");
+const evidence = process.env.HELP_EVIDENCE_OUT_DIR
+  ? resolve(process.env.HELP_EVIDENCE_OUT_DIR)
+  : join(desktop, "evidence-out");
 const outputIndex = process.argv.indexOf("--out");
 const output =
   outputIndex >= 0
@@ -30,7 +32,10 @@ const git = (...args) =>
   execFileSync("git", args, { cwd: repository, encoding: "utf8" }).trim();
 
 let event = {};
-if (process.env.GITHUB_EVENT_PATH && existsSync(process.env.GITHUB_EVENT_PATH)) {
+if (
+  process.env.GITHUB_EVENT_PATH &&
+  existsSync(process.env.GITHUB_EVENT_PATH)
+) {
   event = JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, "utf8"));
 }
 const checkedOutCommit = git("rev-parse", "HEAD");
@@ -44,14 +49,27 @@ if (candidateCommit !== checkedOutCommit) {
     `candidate/checkout mismatch: candidate=${candidateCommit} checkout=${checkedOutCommit}`,
   );
 }
-if (!/^[0-9a-f]{40}$/.test(baseCommit)) throw new Error(`invalid base commit ${baseCommit}`);
-execFileSync("git", ["cat-file", "-e", `${baseCommit}^{commit}`], { cwd: repository });
-execFileSync("git", ["merge-base", "--is-ancestor", baseCommit, candidateCommit], {
+if (!/^[0-9a-f]{40}$/.test(baseCommit))
+  throw new Error(`invalid base commit ${baseCommit}`);
+execFileSync("git", ["cat-file", "-e", `${baseCommit}^{commit}`], {
   cwd: repository,
 });
+execFileSync(
+  "git",
+  ["merge-base", "--is-ancestor", baseCommit, candidateCommit],
+  {
+    cwd: repository,
+  },
+);
 
-const publicCorpusFile = join(desktop, "src/lib/help/canonical/help-corpus-public.v1.json");
-const fullCorpusFile = join(desktop, "src/lib/help/canonical/help-corpus.v1.json");
+const publicCorpusFile = join(
+  desktop,
+  "src/lib/help/canonical/help-corpus-public.v1.json",
+);
+const fullCorpusFile = join(
+  desktop,
+  "src/lib/help/canonical/help-corpus.v1.json",
+);
 const publicCorpus = JSON.parse(readFileSync(publicCorpusFile, "utf8"));
 const fullCorpus = JSON.parse(readFileSync(fullCorpusFile, "utf8"));
 
@@ -68,7 +86,8 @@ const evidenceAssets = readdirSync(evidenceAssetDir)
   .filter((name) => name.endsWith(".js") || name.endsWith(".css"))
   .sort()
   .map((name) => ({ name, digest: digestFile(join(evidenceAssetDir, name)) }));
-if (evidenceAssets.length === 0) throw new Error("built evidence harness has no JS/CSS assets");
+if (evidenceAssets.length === 0)
+  throw new Error("built evidence harness has no JS/CSS assets");
 const evidenceBundleDigest = `sha256:${sha256(Buffer.from(JSON.stringify(evidenceAssets)))}`;
 
 const reportFile = join(evidence, "accessibility-report.json");
@@ -78,8 +97,13 @@ const screenshots = validateHelpEvidenceReport(report, {
   evidenceBundleDigest,
   evidenceAssets,
   screenshotDigest: (relative) => {
-    const screenshot = join(desktop, relative);
-    if (!existsSync(screenshot)) throw new Error(`missing evidence screenshot ${relative}`);
+    const prefix = "evidence-out/";
+    if (!relative.startsWith(prefix)) {
+      throw new Error(`non-canonical evidence screenshot ${relative}`);
+    }
+    const screenshot = join(evidence, relative.slice(prefix.length));
+    if (!existsSync(screenshot))
+      throw new Error(`missing evidence screenshot ${relative}`);
     return digestFile(screenshot);
   },
 });
@@ -98,7 +122,10 @@ const manifest = {
     publicArtifactDigest: digestFile(publicCorpusFile),
   },
   renderer: { bundleDigest, assets },
-  evidenceHarness: { bundleDigest: evidenceBundleDigest, assets: evidenceAssets },
+  evidenceHarness: {
+    bundleDigest: evidenceBundleDigest,
+    assets: evidenceAssets,
+  },
   evidence: {
     generatedFrom: report.generatedFrom,
     accessibilityReportDigest: digestFile(reportFile),

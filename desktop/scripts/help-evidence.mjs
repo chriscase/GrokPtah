@@ -24,17 +24,27 @@ const axeSource = axe.source;
 const here = dirname(fileURLToPath(import.meta.url));
 const desktop = resolve(here, "..");
 const distDir = join(desktop, "evidence-dist");
-const outDir = join(desktop, "evidence-out");
+// Hosted qualification replays capture into an ephemeral runner directory so
+// fresh PNG encoder bytes cannot dirty the checked-out source tree before
+// later repository-integrity gates. Local evidence maintenance keeps the
+// historical in-tree default.
+const outDir = process.env.HELP_EVIDENCE_OUT_DIR
+  ? resolve(process.env.HELP_EVIDENCE_OUT_DIR)
+  : join(desktop, "evidence-out");
 const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const digestFile = (file) => `sha256:${sha256(readFileSync(file))}`;
 const evidenceAssets = readdirSync(join(distDir, "assets"))
   .filter((name) => name.endsWith(".js") || name.endsWith(".css"))
   .sort()
   .map((name) => ({ name, digest: digestFile(join(distDir, "assets", name)) }));
-if (evidenceAssets.length === 0) throw new Error("built evidence harness has no JS/CSS assets");
+if (evidenceAssets.length === 0)
+  throw new Error("built evidence harness has no JS/CSS assets");
 const evidenceBundleDigest = `sha256:${sha256(Buffer.from(JSON.stringify(evidenceAssets)))}`;
 const publicCorpus = JSON.parse(
-  readFileSync(join(desktop, "src/lib/help/canonical/help-corpus-public.v1.json"), "utf8"),
+  readFileSync(
+    join(desktop, "src/lib/help/canonical/help-corpus-public.v1.json"),
+    "utf8",
+  ),
 );
 
 /**
@@ -62,7 +72,9 @@ const server = createServer((request, response) => {
   try {
     const body = readFileSync(file);
     const extension = file.slice(file.lastIndexOf("."));
-    response.writeHead(200, { "content-type": MIME[extension] ?? "application/octet-stream" });
+    response.writeHead(200, {
+      "content-type": MIME[extension] ?? "application/octet-stream",
+    });
     response.end(body);
   } catch {
     response.writeHead(404).end();
@@ -71,7 +83,14 @@ const server = createServer((request, response) => {
 await new Promise((ready) => server.listen(0, "127.0.0.1", ready));
 const pageUrl = `http://127.0.0.1:${server.address().port}/index.html`;
 
-const STATES = ["browse", "answer", "ambiguous", "low-confidence", "no-match", "rejected"];
+const STATES = [
+  "browse",
+  "answer",
+  "ambiguous",
+  "low-confidence",
+  "no-match",
+  "rejected",
+];
 const VIEWPORTS = [
   { name: "desktop", width: 1440, height: 900 },
   { name: "narrow", width: 390, height: 844 },
@@ -120,14 +139,20 @@ for (const viewport of VIEWPORTS) {
     await page.screenshot({ path: shot, fullPage: false });
 
     await page.addScriptTag({ content: axeSource });
-    const result = await page.evaluate(async () =>
-      // eslint-disable-next-line no-undef
-      await window.axe.run(document, {
-        resultTypes: ["violations"],
-        runOnly: { type: "tag", values: ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"] },
-      }),
+    const result = await page.evaluate(
+      async () =>
+        // eslint-disable-next-line no-undef
+        await window.axe.run(document, {
+          resultTypes: ["violations"],
+          runOnly: {
+            type: "tag",
+            values: ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"],
+          },
+        }),
     );
-    const applicable = result.violations.filter((entry) => !HARNESS_EXEMPT.has(entry.id));
+    const applicable = result.violations.filter(
+      (entry) => !HARNESS_EXEMPT.has(entry.id),
+    );
     violations += applicable.length;
     report.push({
       state,
@@ -171,7 +196,9 @@ for (const entry of report) {
   } else {
     console.error(`FAIL  ${label}`);
     for (const violation of entry.violations) {
-      console.error(`        ${violation.id} (${violation.impact}) x${violation.nodes}`);
+      console.error(
+        `        ${violation.id} (${violation.impact}) x${violation.nodes}`,
+      );
     }
   }
 }

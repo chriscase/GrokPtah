@@ -99,6 +99,7 @@ jobs:
       - name: Semantic Help public bundle and provenance gates
         env:
           HELP_EVIDENCE_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HELP_EVIDENCE_OUT_DIR: ${{ runner.temp }}/help-evidence-out
         run: |
           npm run verify:help-public
           npm run build:help-evidence
@@ -106,6 +107,7 @@ jobs:
           npx playwright install chromium
           node scripts/help-evidence.mjs
           npm run verify:help-evidence-manifest -- --out "$RUNNER_TEMP/help-evidence-manifest.json"
+          test -z "$(git status --porcelain)"
       - name: Upload Semantic Help provenance manifest
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
