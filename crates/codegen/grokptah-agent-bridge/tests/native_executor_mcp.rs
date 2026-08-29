@@ -72,9 +72,6 @@ async fn native_executor_runs_assigned_work_without_an_external_worker() {
             bounds: RunBounds::default(),
         },
     );
-    let _admin = orch
-        .take_host_admin()
-        .expect("the constructing host holds the one-shot admin capability");
     let server = start_control_server(orch.clone(), 0).await.unwrap();
     let mut client = McpControlClient::new(format!("http://{}", server.addr), "native-token-308");
     client.initialize().await.unwrap();
@@ -266,9 +263,6 @@ async fn approval_required_work_pauses_before_success() {
             bounds: RunBounds::default(),
         },
     );
-    let _admin = orch
-        .take_host_admin()
-        .expect("the constructing host holds the one-shot admin capability");
     let server = start_control_server(orch.clone(), 0).await.unwrap();
     let mut client = McpControlClient::new(format!("http://{}", server.addr), "native-token-308");
     client.initialize().await.unwrap();

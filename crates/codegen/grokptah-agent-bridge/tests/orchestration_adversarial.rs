@@ -23,16 +23,33 @@ use common::ProcessEnvGuard;
 
 /// Take this host's one-shot admin capability and hand back its raw store.
 ///
-/// Raw store access is admin-gated (#477 P0-4): the capability is issued once,
-/// to whoever constructed the host, so a test that reaches behind the principal
-/// fence has to say so explicitly here.
+/// Raw store access is admin-gated (#477): the capability is issued once, to
+/// whoever constructed the host. The harness caches the capability so repeated
+/// use inside one test does not re-take a one-shot, and re-takes it whenever
+/// the cached one is not this host's — several hosts are built per test binary.
 fn admin_store(orch: &OrchestrationService) -> grokptah_agent_bridge::orchestration::OrchStore {
-    let admin = orch
-        .take_host_admin()
-        .expect("the constructing host holds the one-shot admin capability");
-    orch.store_for_admin(&admin)
-        .expect("admin capability authorizes this host")
-        .clone()
+    thread_local! {
+        static ADMIN: std::cell::RefCell<
+            Option<grokptah_agent_bridge::orchestration::HostAdmin>,
+        > = const { std::cell::RefCell::new(None) };
+    }
+    ADMIN.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if let Some(admin) = slot.as_ref() {
+            if let Ok(store) = orch.store_for_admin(admin) {
+                return store.clone();
+            }
+        }
+        let admin = orch
+            .take_host_admin()
+            .expect("the constructing host holds the one-shot admin capability");
+        let store = orch
+            .store_for_admin(&admin)
+            .expect("a freshly taken capability authorizes its own host")
+            .clone();
+        *slot = Some(admin);
+        store
+    })
 }
 
 fn setup_home() -> (tempfile::TempDir, ProcessEnvGuard) {
