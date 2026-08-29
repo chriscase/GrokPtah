@@ -293,10 +293,14 @@ fn assignment_and_manual_retry_use_revision_fences_and_preserve_history() {
 fn dependency_blocks_then_unblocks_work() {
     let home = tempdir().unwrap();
     let store = OrchStore::open(home.path()).unwrap();
+    // Dependencies resolve within one session and workspace. These two items
+    // previously used unrelated session ids, which only worked because
+    // dependency resolution was installation-wide.
+    let session = Uuid::new_v4();
     let dependency = WorkItem::new(
         "test",
         "dependency",
-        Uuid::new_v4(),
+        session,
         "/tmp/project",
         "operator",
         WorkPolicy::default(),
@@ -306,7 +310,7 @@ fn dependency_blocks_then_unblocks_work() {
     let mut dependent = WorkItem::new(
         "test",
         "dependent",
-        Uuid::new_v4(),
+        session,
         "/tmp/project",
         "operator",
         WorkPolicy::default(),
@@ -383,10 +387,12 @@ fn reconciliation_expires_leases_and_requeues_with_deterministic_time() {
 fn reconciliation_fails_deadlines_and_reports_dependency_transitions() {
     let home = tempdir().unwrap();
     let store = OrchStore::open(home.path()).unwrap();
+    // Same session and workspace: dependency resolution is scope-relative.
+    let session = Uuid::new_v4();
     let dependency = WorkItem::new(
         "test",
         "dependency",
-        Uuid::new_v4(),
+        session,
         "/tmp/project",
         "operator",
         WorkPolicy::default(),
@@ -397,7 +403,7 @@ fn reconciliation_fails_deadlines_and_reports_dependency_transitions() {
     let mut dependent = WorkItem::new(
         "test",
         "dependent",
-        Uuid::new_v4(),
+        session,
         "/tmp/project",
         "operator",
         WorkPolicy::default(),

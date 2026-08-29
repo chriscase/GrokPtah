@@ -10,6 +10,7 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::graph::{BlockProvenance, ReviewReceipt, WorkReviewPolicy, MAX_QUORUM_REVIEWERS};
 use super::types::{hash_payload, OrchError, OrchErrorCode, RunBounds};
 
 pub const WORKLOAD_SCHEMA_VERSION: u32 = 1;
@@ -400,6 +401,20 @@ pub struct WorkItem {
     pub blocked_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_decision_id: Option<String>,
+    /// Durable review gate. The reviewer set is fixed when the item is
+    /// created: a gate whose membership can be edited afterwards approves
+    /// nothing. Absent on items that need no review, and on every record
+    /// written before the gate existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<WorkReviewPolicy>,
+    /// Durable, attributable verdicts cast against `review`. Revoked receipts
+    /// are retained rather than deleted so the trail stays complete.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub review_receipts: Vec<ReviewReceipt>,
+    /// Why this item is blocked, when it is. Typed and durable, so
+    /// reconciliation never infers provenance from a free-form reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_provenance: Option<BlockProvenance>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -461,6 +476,9 @@ impl WorkItem {
             assignment_status: AssignmentStatus::Unassigned,
             blocked_reason: None,
             last_decision_id: None,
+            review: None,
+            review_receipts: Vec::new(),
+            block_provenance: None,
             created_at: now,
             updated_at: now,
         };
@@ -541,6 +559,20 @@ impl WorkItem {
         }
         if let Some(decision_id) = &self.last_decision_id {
             validate_id(decision_id, "last_decision_id")?;
+        }
+        if let Some(review) = &self.review {
+            review.validate()?;
+        }
+        if self.review_receipts.len() > MAX_QUORUM_REVIEWERS * 4 {
+            return Err(invalid("work item retains too many review receipts"));
+        }
+        for receipt in &self.review_receipts {
+            receipt.validate()?;
+            if self.review.is_none() {
+                return Err(invalid(
+                    "work item carries review receipts without a review policy",
+                ));
+            }
         }
         Ok(())
     }

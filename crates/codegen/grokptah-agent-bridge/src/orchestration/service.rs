@@ -1309,6 +1309,28 @@ impl OrchestrationService {
             created_at: now,
             updated_at: now,
         };
+        // Prove admission before anything durable exists. A review-gated or
+        // dependency-blocked item must leave *no* trace of an execution
+        // attempt: no managed intent, no lease, no attempt, no run. Checking
+        // after persisting the intent would mean a denied item still wrote a
+        // `Claiming` record that then had to be abandoned.
+        //
+        // This precheck and the claim below are not one atomic step, and
+        // deliberately so: the intent has to be durable before the claim, or a
+        // crash between them would leave a lease no recovery pass could
+        // attribute. The authority is therefore the claim, which re-evaluates
+        // admission under the store lock (see `claim_work_inner`). A verdict
+        // revoked in the window between the two makes the claim fail, and the
+        // intent is abandoned here — or, if that abandon is itself
+        // interrupted, swept on the next open. The residual is one abandoned
+        // `Claiming` record: no lease, no attempt, no run, and no execution.
+        let block = self.store.admission_block_at(&work.work_id, Utc::now())?;
+        if !block.is_admissible() {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                format!("work item is not admissible: {}", block.as_str()),
+            ));
+        }
         self.store.save_managed_intent(&intent)?;
         let claim = match self.store.claim_work_with_lease_secret(
             &work.work_id,
@@ -2098,9 +2120,19 @@ impl OrchestrationService {
         } else {
             Vec::new()
         };
+        // The public projection reports the same admission decision the claim
+        // path enforces, so a client is never shown a queued item it would in
+        // fact be refused. Resolved through the store so there is exactly one
+        // answer.
+        let admission = self
+            .store
+            .admission_block_at(&item.work_id, Utc::now())
+            .ok()
+            .map(|block| block.as_str());
         Ok(json!({
             "work": item,
             "attempts": attempts,
+            "admission": admission,
         }))
     }
 
@@ -2804,6 +2836,113 @@ impl OrchestrationService {
         Ok(response)
     }
 
+    /// Record a review verdict as the authenticated principal.
+    ///
+    /// The reviewer identity is derived from the authenticated context, never
+    /// from a caller-supplied string: `VerifiedPrincipal` cannot be built
+    /// outside this crate. Scope authorization is the same session/workspace
+    /// check every other work mutation passes.
+    #[allow(clippy::too_many_arguments)]
+    /// Record the authenticated principal's own review verdict.
+    ///
+    /// Deliberately crate-internal and deliberately absent from
+    /// [`CONTROL_TOOLS`](super::types::CONTROL_TOOLS). Quorum is the one place
+    /// in this control plane where an identity is treated as a *grant from a
+    /// third party* rather than as attribution of the caller's own action, and
+    /// [`AuthContext`] is today an assertion the embedder constructs. Exposing
+    /// this on any transport before canonical principal generation, delegation
+    /// and auth-epoch authority (#460) would let a caller that can mint an
+    /// `AuthContext` satisfy a quorum in another principal's name. The seam is
+    /// compiled and tested so #460 has something exact to bind to; it is not
+    /// reachable from outside the crate, and the tests below assert that.
+    #[allow(dead_code)]
+    pub(crate) fn record_work_review_verdict_scoped(
+        &self,
+        auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        work_id: &str,
+        reviewer_id: &str,
+        verdict: super::graph::ReviewVerdict,
+        expected_revision: Option<u64>,
+    ) -> Result<serde_json::Value, OrchError> {
+        let claimed = self.authorize_work_scope(session_id, workspace)?;
+        let principal = super::graph::VerifiedPrincipal::from_auth(auth)?;
+        // The authorized scope is handed to the store, which re-checks it under
+        // the same lock that guards the mutation. Nothing here inspects the
+        // record first: a scope decision made outside that lock could be stale
+        // by the time the receipt lands.
+        let (item, block) = self.store.record_review_verdict(
+            work_id,
+            session_id,
+            &claimed,
+            &principal,
+            reviewer_id,
+            verdict,
+            expected_revision,
+            Utc::now(),
+        )?;
+        self.audit(
+            "ptah_record_work_review_verdict",
+            None,
+            Some(session_id),
+            Some(&claimed),
+            "ok",
+            None,
+            &format!("work {} is {}", item.work_id, block.as_str()),
+        );
+        Ok(json!({ "work": item, "admission": block }))
+    }
+
+    /// Withdraw the authenticated principal's own review verdict.
+    ///
+    /// Crate-internal for the same reason as
+    /// [`Self::record_work_review_verdict_scoped`].
+    #[allow(dead_code)]
+    pub(crate) fn revoke_work_review_verdict_scoped(
+        &self,
+        auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        work_id: &str,
+        reviewer_id: &str,
+        expected_revision: Option<u64>,
+    ) -> Result<serde_json::Value, OrchError> {
+        let claimed = self.authorize_work_scope(session_id, workspace)?;
+        let principal = super::graph::VerifiedPrincipal::from_auth(auth)?;
+        let (item, block) = self.store.revoke_review_verdict(
+            work_id,
+            session_id,
+            &claimed,
+            &principal,
+            reviewer_id,
+            expected_revision,
+            Utc::now(),
+        )?;
+        self.audit(
+            "ptah_revoke_work_review_verdict",
+            None,
+            Some(session_id),
+            Some(&claimed),
+            "ok",
+            None,
+            &format!("work {} is {}", item.work_id, block.as_str()),
+        );
+        Ok(json!({ "work": item, "admission": block }))
+    }
+
+    fn authorize_work_scope(
+        &self,
+        session_id: Uuid,
+        workspace: &Path,
+    ) -> Result<String, OrchError> {
+        let session = self.require_build_session(session_id)?;
+        let cwd = (!session.cwd.is_empty()).then(|| PathBuf::from(&session.cwd));
+        let allowlist = self.config.lock().allowlist.clone();
+        let claimed = require_workspace_match(&allowlist, cwd.as_deref(), workspace)?;
+        Ok(claimed.display().to_string())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn create_work(
         &self,
@@ -2858,13 +2997,17 @@ impl OrchestrationService {
         if let Err(error) = item.validate() {
             return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
         }
+        // The dependency-graph invariant is enforced by the store, inside the
+        // same lock that performs the write and scoped to this session and
+        // workspace. Validating here would be both racy and an existence
+        // oracle for work in other scopes.
         if let Err(error) = self.store.save_work_item(&item) {
             return Err(self.fail_claim(
                 &mut lease,
                 Some(item.work_id.clone()),
                 session_id,
                 &claimed,
-                OrchError::new(OrchErrorCode::Internal, error.to_string()),
+                OrchError::new(OrchErrorCode::InvalidRequest, error.to_string()),
             ));
         }
         let response = self.workload_value(item.clone(), false)?;
@@ -7906,5 +8049,338 @@ fn session_id_of(u: &crate::events::SessionUpdate) -> Option<Uuid> {
         | SteeringInjected { session_id, .. }
         | PromptQueueChanged { session_id, .. } => Some(*session_id),
         BackgroundTask { session_id, .. } => *session_id,
+    }
+}
+
+#[cfg(test)]
+mod review_control_surface_tests {
+    use super::*;
+    use crate::host::AgentHost;
+    use crate::orchestration::graph::{AdmissionBlock, ReviewVerdict, WorkReviewPolicy};
+    use crate::orchestration::types::{
+        AgentAuthorityPolicy, AgentMemoryPolicy, AgentModelSpec, AgentRecord, AgentSpec,
+        AgentState, RunBounds, AGENT_SPEC_SCHEMA_VERSION,
+    };
+    use crate::orchestration::workload::{WorkItem, WorkPolicy};
+    use crate::orchestration::OrchStore;
+    use crate::HostConfig;
+    use tempfile::TempDir;
+
+    struct Fixture {
+        _home: TempDir,
+        _workspace: TempDir,
+        /// Held so the host outlives the service under test.
+        _host: AgentHostHandle,
+        service: Arc<OrchestrationService>,
+        store: OrchStore,
+        session_id: Uuid,
+        workspace: PathBuf,
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            crate::set_grokptah_home_override(None);
+        }
+    }
+
+    fn fixture() -> Fixture {
+        let home = TempDir::new().unwrap();
+        crate::set_grokptah_home_override(Some(home.path().join(".grokptah")));
+        let workspace = TempDir::new().unwrap();
+        let host = AgentHost::create(HostConfig {
+            always_approve: true,
+            ..HostConfig::default()
+        });
+        host.start().unwrap();
+        let lane = host.session_new_kind(SessionKind::Build).unwrap();
+        host.session_set_cwd(lane.id, workspace.path()).unwrap();
+        let store = OrchStore::open(home.path().join("orchestration")).unwrap();
+        let service = OrchestrationService::new(
+            host.clone(),
+            host.event_bus(),
+            store.clone(),
+            OrchestrationConfig {
+                bearer_token: "review-surface-token".into(),
+                allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
+                max_concurrent_runs: 2,
+                bounds: RunBounds::default(),
+            },
+        );
+        let workspace_path = workspace.path().to_path_buf();
+        Fixture {
+            _home: home,
+            _workspace: workspace,
+            _host: host,
+            service,
+            store,
+            session_id: lane.id,
+            workspace: workspace_path,
+        }
+    }
+
+    /// A gated Work item with an accepted executor, which a verdict now requires.
+    fn gated_work(fixture: &Fixture, reviewers: &[&str], required: u32) -> WorkItem {
+        let mut work = WorkItem::new(
+            "verification",
+            "gated work",
+            fixture.session_id,
+            fixture.workspace.display().to_string(),
+            "creator",
+            WorkPolicy::default(),
+        )
+        .unwrap();
+        work.review = Some(WorkReviewPolicy {
+            reviewers: reviewers.iter().map(|r| (*r).to_string()).collect(),
+            required_approvals: required,
+            policy_revision: 1,
+        });
+        fixture.store.save_work_item(&work).unwrap();
+
+        let now = Utc::now();
+        let agent = AgentRecord {
+            agent_id: "agent-a".into(),
+            owner_principal_id: Some("owner-a".into()),
+            session_id: fixture.session_id,
+            lane_ids: vec![fixture.session_id],
+            lane_associations: Vec::new(),
+            workspace: work.workspace.clone(),
+            model: "xai/grok-4".into(),
+            spec: Some(AgentSpec {
+                schema_version: AGENT_SPEC_SCHEMA_VERSION,
+                revision: 1,
+                previous_revision: None,
+                display_name: "agent-a".into(),
+                role: "worker".into(),
+                source_workspace: work.workspace.clone(),
+                model: AgentModelSpec::from_selection_key("xai/grok-4").unwrap(),
+                default_run_bounds: RunBounds::default(),
+                authority: AgentAuthorityPolicy::default(),
+                memory: AgentMemoryPolicy::default(),
+                managed_execution: Default::default(),
+                created_at: now,
+                created_by: "tester".into(),
+            }),
+            state: AgentState::Waiting,
+            current_run_id: None,
+            last_run_id: None,
+            last_lane_id: Some(fixture.session_id),
+            latest_checkpoint_id: None,
+            continuation_ordinal: 0,
+            created_at: now,
+            updated_at: now,
+        };
+        fixture.store.save_agent(&agent).unwrap();
+        fixture
+            .store
+            .assign_work(&work.work_id, Some("agent-a".into()), Some(work.revision))
+            .unwrap()
+    }
+
+    fn auth(owner: &str) -> AuthContext {
+        AuthContext {
+            token_id: format!("token-{owner}"),
+            owner_id: owner.to_string(),
+        }
+    }
+
+    /// Within one authenticated context, a principal acts only as itself.
+    ///
+    /// This is what the control surface actually enforces: the reviewer
+    /// identity is taken from the authenticated context, never from the
+    /// argument, and a principal the gate does not name is refused. It is
+    /// deliberately *not* a proof against a forged context — see
+    /// [`the_review_seam_is_not_reachable_from_any_transport`].
+    #[test]
+    fn a_principal_may_only_cast_and_revoke_its_own_verdict() {
+        let fixture = fixture();
+        let work = gated_work(&fixture, &["alice", "bob"], 2);
+        let (alice, bob) = (auth("alice"), auth("bob"));
+
+        let error = fixture
+            .service
+            .record_work_review_verdict_scoped(
+                &alice,
+                fixture.session_id,
+                &fixture.workspace,
+                &work.work_id,
+                "bob",
+                ReviewVerdict::Approve,
+                None,
+            )
+            .expect_err("alice must not cast bob's verdict");
+        assert!(error.to_string().contains("only record its own"), "{error}");
+
+        let first = fixture
+            .service
+            .record_work_review_verdict_scoped(
+                &alice,
+                fixture.session_id,
+                &fixture.workspace,
+                &work.work_id,
+                "alice",
+                ReviewVerdict::Approve,
+                None,
+            )
+            .expect("alice records her own verdict");
+        assert_eq!(first["admission"], AdmissionBlock::ReviewPending.as_str());
+
+        let second = fixture
+            .service
+            .record_work_review_verdict_scoped(
+                &bob,
+                fixture.session_id,
+                &fixture.workspace,
+                &work.work_id,
+                "bob",
+                ReviewVerdict::Approve,
+                None,
+            )
+            .expect("bob records his own verdict");
+        assert_eq!(second["admission"], AdmissionBlock::Admissible.as_str());
+
+        assert!(
+            fixture
+                .service
+                .record_work_review_verdict_scoped(
+                    &auth("mallory"),
+                    fixture.session_id,
+                    &fixture.workspace,
+                    &work.work_id,
+                    "mallory",
+                    ReviewVerdict::Approve,
+                    None,
+                )
+                .is_err(),
+            "a principal the gate does not name must be refused"
+        );
+        assert!(
+            fixture
+                .service
+                .revoke_work_review_verdict_scoped(
+                    &alice,
+                    fixture.session_id,
+                    &fixture.workspace,
+                    &work.work_id,
+                    "bob",
+                    None,
+                )
+                .is_err(),
+            "alice must not revoke bob's verdict"
+        );
+    }
+
+    /// An `AuthContext` is an assertion the embedder constructs, so a caller
+    /// that can reach this seam can name any principal on it. That is why the
+    /// seam is crate-internal and exposed on no transport until #460 supplies
+    /// canonical generation, delegation and auth-epoch authority.
+    ///
+    /// The test states both halves honestly: forging succeeds in-crate, and no
+    /// control tool exists through which an external caller could do it. If
+    /// someone later wires a review-verdict tool up, this fails.
+    #[test]
+    fn the_review_seam_is_not_reachable_from_any_transport() {
+        let fixture = fixture();
+        let work = gated_work(&fixture, &["alice"], 1);
+
+        // Self-asserted, and accepted: the seam trusts its caller.
+        let forged = AuthContext {
+            token_id: "token-anything".into(),
+            owner_id: "alice".into(),
+        };
+        let approved = fixture
+            .service
+            .record_work_review_verdict_scoped(
+                &forged,
+                fixture.session_id,
+                &fixture.workspace,
+                &work.work_id,
+                "alice",
+                ReviewVerdict::Approve,
+                None,
+            )
+            .expect("an in-crate caller supplies its own context");
+        assert_eq!(approved["admission"], AdmissionBlock::Admissible.as_str());
+
+        // Which is exactly why nothing outside the crate can call it.
+        assert!(
+            !crate::orchestration::types::CONTROL_TOOLS
+                .iter()
+                .any(|tool| tool.contains("review_verdict")),
+            "no transport may expose the review seam before #460 canonical auth"
+        );
+    }
+
+    /// Scope is authorized before the mutation, and a foreign record answers
+    /// exactly as a missing one.
+    #[test]
+    fn a_cross_scope_verdict_is_refused_without_mutating_or_revealing_anything() {
+        let fixture = fixture();
+        let work = gated_work(&fixture, &["alice"], 1);
+        let foreign_session = Uuid::new_v4();
+
+        // A session the caller is not authorized for never reaches the store.
+        let wrong_session = fixture
+            .service
+            .record_work_review_verdict_scoped(
+                &auth("alice"),
+                foreign_session,
+                &fixture.workspace,
+                &work.work_id,
+                "alice",
+                ReviewVerdict::Approve,
+                None,
+            )
+            .expect_err("a foreign session must be refused");
+
+        // And a work id that does not exist at all answers identically at the
+        // store boundary, so neither is an existence oracle for the other.
+        let missing = fixture
+            .store
+            .record_review_verdict(
+                "work-does-not-exist",
+                fixture.session_id,
+                &fixture.workspace.display().to_string(),
+                &crate::orchestration::graph::VerifiedPrincipal::from_auth(&auth("alice")).unwrap(),
+                "alice",
+                ReviewVerdict::Approve,
+                None,
+                Utc::now(),
+            )
+            .expect_err("an unknown work id must be refused");
+        let foreign = fixture
+            .store
+            .record_review_verdict(
+                &work.work_id,
+                foreign_session,
+                &fixture.workspace.display().to_string(),
+                &crate::orchestration::graph::VerifiedPrincipal::from_auth(&auth("alice")).unwrap(),
+                "alice",
+                ReviewVerdict::Approve,
+                None,
+                Utc::now(),
+            )
+            .expect_err("a foreign scope must be refused");
+        assert_eq!(
+            foreign.to_string(),
+            missing.to_string(),
+            "foreign and unknown must be byte-identical"
+        );
+        assert_eq!(foreign.code, missing.code);
+        drop(wrong_session);
+
+        // Nothing was written on any refused path.
+        let stored = fixture
+            .store
+            .load_work_item(&work.work_id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            stored.review_receipts.is_empty(),
+            "a refused verdict must leave no receipt"
+        );
+        assert_eq!(
+            stored.revision, work.revision,
+            "a refused verdict must not consume a revision"
+        );
     }
 }
