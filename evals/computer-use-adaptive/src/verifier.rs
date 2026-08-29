@@ -1193,6 +1193,45 @@ fn verify_evidence_joins(report: &CampaignReport, set: &EvidenceSet, errors: &mu
                         ep.episode_id
                     ));
                 }
+                match crate::runner::run_episode(
+                    catalog()
+                        .iter()
+                        .find(|scenario| scenario.id == ep.scenario_id)
+                        .expect("catalog identity was validated before evidence replay"),
+                    ep.profile,
+                    ep.adapter,
+                    ep.repetition,
+                    report.seed,
+                ) {
+                    Ok(replayed) => {
+                        match (
+                            evidence_content_digest(&replayed.result),
+                            evidence_content_digest(ep),
+                        ) {
+                            (Ok(expected), Ok(actual)) if expected == actual => {}
+                            (Ok(_), Ok(_)) => errors.push(format!(
+                                "{} episode does not match deterministic typed replay",
+                                ep.episode_id
+                            )),
+                            (Err(err), _) | (_, Err(err)) => errors.push(err.to_string()),
+                        }
+                        match (
+                            evidence_body_digest(&replayed.evidence),
+                            evidence_body_digest(*ev),
+                        ) {
+                            (Ok(expected), Ok(actual)) if expected == actual => {}
+                            (Ok(_), Ok(_)) => errors.push(format!(
+                                "{} evidence does not match deterministic typed replay",
+                                ep.episode_id
+                            )),
+                            (Err(err), _) | (_, Err(err)) => errors.push(err.to_string()),
+                        }
+                    }
+                    Err(err) => errors.push(format!(
+                        "{} deterministic typed replay failed: {err}",
+                        ep.episode_id
+                    )),
+                }
                 let observation_ids = ev
                     .observations
                     .iter()
