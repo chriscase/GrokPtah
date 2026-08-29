@@ -91,9 +91,17 @@ Release happens only when all three hold:
 - the durable flush and every shutdown hook succeeded.
 
 If any of those fails, `process_lock_retained_for_safety` is set, the lock is
-kept, and a replacement process on that home is refused until this process
-exits. Refusing a replacement is always safer than handing it a home this
-process may still be writing.
+**quarantined**, and a replacement process on that home is refused until this
+process exits. Refusing a replacement is always safer than handing it a home
+this process may still be writing.
+
+Quarantine is what makes that promise true. Leaving the lock inside the runtime
+would only be a decision not to release it, and that decision lasts exactly as
+long as the object does — for a consuming `shutdown()`, until the call returns.
+Quarantining moves the lock out of the runtime and into process ownership, where
+nothing drops it: destroying the runtime, every handle, and every clone cannot
+hand the home on. `quarantined_process_lock_count()` reports how many homes this
+process is holding that way.
 
 The same rule governs `Drop`. `Drop` cannot await, so it has no way to join
 outstanding work; a runtime dropped with any supervised task still outstanding,
@@ -137,6 +145,7 @@ both surface on exit.
 | `lockRetainedForSafety=true`, non-empty `errors` | the durable flush or a shutdown hook failed | Exit the process, then check the home for the named failure before relaunching. |
 | "dropped without an ordered shutdown" | an embedder dropped `HostRuntime` instead of awaiting `shutdown()` | Fix the embedder to `await runtime.shutdown()`. |
 | A launch is refused with "another process holds the single-instance lock" | another live process owns the home — possibly one of the above still running | Find and exit that process. Never delete the lock file. |
+| A launch is refused because "a durable store under … is separately owned" | an offline maintenance handle holds a store root's own lock inside this home | Stop the process or handle holding that root; a runtime must not take a home whose stores another writer owns. |
 
 Restarting the process always clears a retained lock, because the advisory lock
 is released by the OS when the process exits. That is the intended recovery, and
@@ -149,5 +158,13 @@ The durable-write seal governs writes to the **home**. It does not govern
 effects outside it — a workspace edit, a physical provider send, Computer Use
 input. Those are bound to the runtime only through the **join**: an ordered
 shutdown joins the tasks that perform them before releasing the lock, and `Drop`
-retains the lock whenever any such task is outstanding. Binding every external
-effect to the same lifecycle is tracked separately (#454, #463).
+quarantines the lock whenever any such task is outstanding.
+
+Coverage of that join is the current limit. Supervised tasks, the desktop's
+direct Computer Use commands, and the orchestration/background/subagent paths
+are on the barrier. A future that no one registered — a raw `tokio::spawn`, a
+provider call outside those paths, a child process not tracked in
+`live_shells` — is not, and a clean report can be produced while it is still
+running. Binding every external effect to the same lifecycle is tracked
+separately (#454, #463); until then the join is a proxy for "no effect can still
+happen", not a proof of it.

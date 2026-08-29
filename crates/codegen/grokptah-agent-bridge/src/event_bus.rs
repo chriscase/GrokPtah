@@ -110,6 +110,34 @@ struct PersistenceHandle {
     gap_path: PathBuf,
 }
 
+impl EventBus {
+    /// Close the journal writer and join it, returning any persistence failure.
+    ///
+    /// Without this, a "clean" shutdown could be reported while journal entries
+    /// were still queued in the writer channel: the thread is joined only when
+    /// the last `PersistenceHandle` is dropped, which happens after the report
+    /// is produced — or not at all, if any clone of the bus outlives shutdown.
+    /// Entries lost that way would never appear in the report (#455).
+    ///
+    /// Idempotent: a second call finds the sender already taken and returns the
+    /// persistence error slot as it stands.
+    pub fn close_journal_writer(&self) -> Option<String> {
+        let handle = self.inner.lock().persistence.clone();
+        if let Some(handle) = handle {
+            // Dropping the sender is what tells the writer to finish its queue
+            // and exit; joining is what proves it did.
+            handle.tx.lock().take();
+            let join = handle.join.lock().take();
+            if let Some(join) = join {
+                if join.join().is_err() {
+                    return Some("the durable event-journal writer panicked".to_string());
+                }
+            }
+        }
+        self.persistence_error.lock().clone()
+    }
+}
+
 impl Drop for PersistenceHandle {
     fn drop(&mut self) {
         self.tx.lock().take();

@@ -233,7 +233,17 @@ async fn project_scope_matches_desktop_service_and_isolated_model_tools_across_r
         .is_err());
 
     drop(service);
-    drop(host);
+    // A process boundary is an *ordered* stop, not a bare drop. Dropping a
+    // runtime with supervised work still outstanding cannot join it, so the
+    // home stays quarantined for the life of the process and the restart below
+    // would be refused — which is the correct fail-closed answer, and the
+    // reason this models the boundary with `shutdown()` (#455).
+    let report = host.shutdown().await;
+    assert!(
+        report.is_clean(),
+        "the ordered stop must release the home: {}",
+        report.operator_summary()
+    );
 
     // Reopening the same GrokPtah home and durable session proves the source
     // address and all completed writes survive a process boundary.

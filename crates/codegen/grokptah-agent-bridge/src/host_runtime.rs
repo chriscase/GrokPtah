@@ -31,7 +31,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
@@ -56,6 +56,30 @@ use crate::mcp_control::ControlServerHandle;
 static CURRENT_OWNERS: std::sync::LazyLock<
     Mutex<HashMap<PathBuf, std::sync::Weak<HostLifecycle>>>,
 > = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Process locks this process refused to release because it could not prove a
+/// release was safe.
+///
+/// This exists because "retained on uncertainty" was not true without it. The
+/// lock used to live only inside the `HostLifecycle` `Arc`: retaining it meant
+/// *not taking it out of that object*, so the moment the last `Arc` was
+/// destroyed — a consuming `stop_and_wait`, a dropped runtime with no surviving
+/// handle — `InstanceLock`'s own `Drop` released the OS lock and a replacement
+/// could start beside work this process could not account for.
+///
+/// A quarantined lock is moved **out** of the runtime and into here, where
+/// nothing drops it. It is held until the process exits, which is what the
+/// operator contract promises. This is deliberately a leak: the whole point is
+/// that no object's destruction can hand the home on (#455).
+static QUARANTINED_LOCKS: std::sync::LazyLock<Mutex<Vec<InstanceLock>>> =
+    std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// How many process locks this process has quarantined. Test seam and operator
+/// signal; a non-zero value means this process will refuse its own homes until
+/// it exits.
+pub fn quarantined_process_lock_count() -> usize {
+    QUARANTINED_LOCKS.lock().len()
+}
 
 /// Registry key for a home.
 ///
@@ -222,6 +246,10 @@ pub(crate) struct HostLifecycle {
     /// duration, the window is scoped to the exact thread doing the flush. No
     /// other caller, stale or live, can be inside it.
     owner_flush_thread: parking_lot::Mutex<Option<std::thread::ThreadId>>,
+    /// Set when this home's lock was moved into process-owned quarantine. The
+    /// lock is gone from `instance_lock`, but the home is *more* firmly held,
+    /// not less — so ownership queries must still answer "held".
+    lock_quarantined: AtomicBool,
 }
 
 /// Proof that the runtime holding it still owns durable-write authority for its
@@ -325,6 +353,7 @@ impl HostLifecycle {
             writes_drained: parking_lot::Condvar::new(),
             writes_sealed: std::sync::atomic::AtomicBool::new(false),
             owner_flush_thread: parking_lot::Mutex::new(None),
+            lock_quarantined: AtomicBool::new(false),
         })
     }
 
@@ -354,7 +383,32 @@ impl HostLifecycle {
 
     /// Whether the advisory OS lock is still held right now.
     pub(crate) fn process_lock_held(&self) -> bool {
-        self.instance_lock.lock().is_some()
+        self.instance_lock.lock().is_some() || self.lock_quarantined.load(Ordering::Acquire)
+    }
+
+    /// Whether this home's lock was moved into process-owned quarantine.
+    pub(crate) fn lock_is_quarantined(&self) -> bool {
+        self.lock_quarantined.load(Ordering::Acquire)
+    }
+
+    /// Move the process lock out of this runtime and into process-owned
+    /// quarantine, so destroying this object — or every handle to it — cannot
+    /// release the home.
+    ///
+    /// Called on every path that declares uncertainty. It is the difference
+    /// between "we chose not to release" and "nothing can release": the former
+    /// lasts only as long as the object, the latter until the process exits.
+    fn quarantine_process_lock(&self) -> bool {
+        let held = self.instance_lock.lock().take();
+        match held {
+            Some(lock) => {
+                QUARANTINED_LOCKS.lock().push(lock);
+                self.lock_quarantined.store(true, Ordering::Release);
+                true
+            }
+            // Already quarantined by an earlier uncertain stop, or never held.
+            None => self.lock_quarantined.load(Ordering::Acquire),
+        }
     }
 
     pub(crate) fn lock_path(&self) -> &std::path::Path {
@@ -1129,7 +1183,18 @@ impl HostRuntime {
         // a replacement is always safer than handing it a home this process
         // may still be writing.
         let release_is_safe = durable_writes_sealed && !join_timed_out && flush_errors.is_empty();
-        let process_lock_released = release_is_safe && self.lifecycle.release_process_lock();
+        let process_lock_released = if release_is_safe {
+            self.lifecycle.release_process_lock()
+        } else {
+            // Not "decline to release" — *quarantine*. Leaving the lock inside
+            // this runtime would hand the home on the moment the last handle
+            // to it was destroyed, which for a consuming `stop_and_wait` is
+            // immediately after this function returns. Moving it into process
+            // ownership is what makes the retention outlive every object
+            // (#455).
+            self.lifecycle.quarantine_process_lock();
+            false
+        };
         let process_lock_held_after = self.lifecycle.process_lock_held();
 
         let report = HostShutdownReport {
@@ -1176,13 +1241,24 @@ impl Drop for HostRuntime {
     /// must — is make concurrent durable writers impossible before the lock
     /// becomes available: it closes the lifecycle, then seals durable-write
     /// authority and waits, bounded, for the writes already running. The lock
-    /// is released only if that seal holds. If it does not, the lock is
-    /// **retained** and a replacement process is refused, which is the safe
-    /// outcome; the OS reclaims it when this process exits.
+    /// is released only if that seal holds. If it does not, the lock is moved
+    /// into **process-owned quarantine** and a replacement process is refused
+    /// until this process exits.
+    ///
+    /// Quarantine, not mere retention, is what makes that promise true: the
+    /// lock no longer lives in any object a caller can destroy, so dropping
+    /// this runtime and every handle to it cannot hand the home on.
     ///
     /// Callers that need the full join barrier must await `shutdown()`.
     fn drop(&mut self) {
+        // An ordered shutdown already ran and reached its terminal state: it
+        // either released the lock (clean) or quarantined it (unclean), and in
+        // both cases the lock is no longer this object's to decide about.
         if self.lifecycle.phase() == HostPhase::Closed && self.lifecycle.durable_writes_sealed() {
+            debug_assert!(
+                !self.lifecycle.process_lock_held() || self.lifecycle.lock_is_quarantined(),
+                "a closed, sealed runtime must have released or quarantined its lock"
+            );
             return;
         }
         self.lifecycle.begin_quiesce();
@@ -1213,6 +1289,12 @@ impl Drop for HostRuntime {
         // refused. `shutdown().await` is the path that joins and releases.
         let outstanding_after = self.lifecycle.tasks().len();
         if !sealed || outstanding_after > 0 {
+            // Move the lock into process ownership before returning. `self` and
+            // every handle sharing this lifecycle may be destroyed moments from
+            // now; if the lock were still inside the lifecycle, that destruction
+            // would release it and admit exactly the replacement this branch
+            // exists to refuse.
+            self.lifecycle.quarantine_process_lock();
             eprintln!(
                 "[grokptah] host runtime for {} dropped without an ordered shutdown: \
                  {} durable write(s) in flight, {outstanding_after} supervised task(s) \

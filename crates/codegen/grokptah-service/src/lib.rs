@@ -406,9 +406,20 @@ pub async fn run_service(config: ServiceConfig) -> Result<()> {
         .context("wait for service shutdown signal")?;
     let report = handle.stop_and_wait().await;
     eprintln!(
-        "[grokptah-service] stopped: joined {} supervised task(s), instance lock released={}",
-        report.supervised_tasks_at_quiesce, report.process_lock_released
+        "[grokptah-service] stopped: {}",
+        report.operator_summary()
     );
+    // An unclean stop is an outcome, not a log line. The process lock is
+    // retained in that case, so the next launch on this home will be refused
+    // until this process exits — a supervisor that treated the exit as success
+    // would restart into a refusal and report the wrong cause (#455).
+    if !report.is_clean() {
+        anyhow::bail!(
+            "GrokPtah service shutdown was not clean: {}. The single-instance lock for this \
+             home is retained until this process exits.",
+            report.operator_summary()
+        );
+    }
     Ok(())
 }
 

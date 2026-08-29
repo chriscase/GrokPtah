@@ -21,7 +21,7 @@ mod host;
 mod host_helpers;
 mod host_runtime;
 mod instance_lock;
-pub use instance_lock::instance_lock_is_held;
+pub use instance_lock::{instance_lock_is_held, InstanceLock};
 mod isolation;
 mod lane;
 pub mod live_attestation;
@@ -133,8 +133,9 @@ pub use event_bus::{EventBus, EventReceiver, JournalEntry, JournalPage};
 pub use events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 pub use host::{AgentHost, AgentHostHandle, AgentStatus, HostConfig, WorkspaceUiState};
 pub use host_runtime::{
-    ControlServerRejected, DurableWriteLease, HostPhase, HostRuntime, HostShutdownReport,
-    ShutdownHook, DEFAULT_DURABLE_WRITE_SEAL_TIMEOUT, DEFAULT_SHUTDOWN_JOIN_TIMEOUT,
+    quarantined_process_lock_count, ControlServerRejected, DurableWriteLease, HostPhase,
+    HostRuntime, HostShutdownReport, ShutdownHook, DEFAULT_DURABLE_WRITE_SEAL_TIMEOUT,
+    DEFAULT_SHUTDOWN_JOIN_TIMEOUT,
 };
 pub use lane::{LaneSummary, RuntimeConnectionState, RuntimeTarget};
 pub use mcp_control::{
