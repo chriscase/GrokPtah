@@ -75,6 +75,10 @@ jobs:
           cargo fmt --manifest-path test-support/grokptah-test-gateway/Cargo.toml --all -- --check
           cargo clippy --manifest-path test-support/grokptah-test-gateway/Cargo.toml --locked --all-targets -- -D warnings
           cargo test --manifest-path test-support/grokptah-test-gateway/Cargo.toml --locked
+          # grokptah-service is a separate workspace that consumes this crate by
+          # path. Nothing else in CI builds it, so a breaking change to a bridge
+          # API reached it silently; this keeps its build honest.
+          cargo check --manifest-path ../grokptah-service/Cargo.toml --locked --tests
       - name: Offline parity oracles (no network)
         # Structured oracle unit tests + fixture selftests; live suite is on-demand.
         working-directory: crates/codegen/grokptah-agent-bridge

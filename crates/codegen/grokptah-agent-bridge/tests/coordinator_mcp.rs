@@ -51,10 +51,16 @@ async fn independent_worker_recovers_assignment_and_messages() {
             bounds: RunBounds::default(),
         },
     );
-    orch.set_auth_credentials(vec![
-        AuthCredential::new("primary", "coord-token-307").unwrap(),
-        AuthCredential::new("worker", "worker-token-307").unwrap(),
-    ])
+    let admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
+    orch.set_auth_credentials(
+        &admin,
+        vec![
+            AuthCredential::declare(&admin, "primary", "coord-token-307").unwrap(),
+            AuthCredential::declare(&admin, "worker", "worker-token-307").unwrap(),
+        ],
+    )
     .unwrap();
     let server = start_control_server(orch.clone(), 0).await.unwrap();
     let mut coordinator =
@@ -538,10 +544,16 @@ async fn coordinator_identity_and_scope_are_enforced() {
             bounds: RunBounds::default(),
         },
     );
-    orch.set_auth_credentials(vec![
-        AuthCredential::new("primary", "coord-token-307").unwrap(),
-        AuthCredential::new("worker", "worker-token-307").unwrap(),
-    ])
+    let admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
+    orch.set_auth_credentials(
+        &admin,
+        vec![
+            AuthCredential::declare(&admin, "primary", "coord-token-307").unwrap(),
+            AuthCredential::declare(&admin, "worker", "worker-token-307").unwrap(),
+        ],
+    )
     .unwrap();
     let server = start_control_server(orch.clone(), 0).await.unwrap();
     let mut coordinator =
@@ -591,7 +603,12 @@ async fn coordinator_identity_and_scope_are_enforced() {
         ack_err.contains("forbidden_scope") || ack_err.contains("403"),
         "cross-workspace ack must fail: {ack_err}"
     );
-    let stored = orch.store().load_message(&message_id).unwrap().unwrap();
+    let stored = orch
+        .store_for_admin(&admin)
+        .unwrap()
+        .load_message(&message_id)
+        .unwrap()
+        .unwrap();
     assert!(stored.acked_at.is_none());
     assert!(stored.acked_by.is_none());
 

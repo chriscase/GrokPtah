@@ -17,6 +17,32 @@ use grokptah_agent_bridge::{
     OrchestrationService, RuntimeHome, WorkspaceAllowlist,
 };
 
+/// A client credential as supplied on the command line or in the environment.
+///
+/// Startup configuration carries the raw material, not a minted credential:
+/// an [`AuthCredential`] is issued by the host that will honour it, against the
+/// one-shot admin capability, and cannot be constructed before that host exists
+/// (#477). Keeping the two apart means a parsed argument is inert data until
+/// the host adopts it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientCredentialSpec {
+    pub id: String,
+    pub token: String,
+}
+
+impl ClientCredentialSpec {
+    pub fn new(id: impl Into<String>, token: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            token: token.into(),
+        }
+    }
+
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+}
+
 pub const SERVICE_VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_LISTEN: &str = "127.0.0.1:39200";
 const DEFAULT_MAX_CONCURRENT: usize = 4;
@@ -32,7 +58,7 @@ pub struct ServiceConfig {
     pub request_timeout: Duration,
     /// Named device/client credentials. `primary` remains the compatibility
     /// credential represented by `token`.
-    pub client_credentials: Vec<AuthCredential>,
+    pub client_credentials: Vec<ClientCredentialSpec>,
     /// Account identity owning Agents on this service deployment. Multiple
     /// device credentials may share one owner while remaining attributable as
     /// distinct clients in audit and Run records.
@@ -62,8 +88,7 @@ impl ServiceConfig {
             client_credentials: if token.is_empty() {
                 Vec::new()
             } else {
-                vec![AuthCredential::new("primary", token)
-                    .map_err(|error| anyhow::anyhow!(error.message))?]
+                vec![ClientCredentialSpec::new("primary", token)]
             },
             agent_owner_id: "primary".into(),
             runtime_home: None,
@@ -94,8 +119,7 @@ impl ServiceConfig {
         let mut client_credentials = if token.trim().is_empty() {
             Vec::new()
         } else {
-            vec![AuthCredential::new("primary", token.trim())
-                .map_err(|error| anyhow::anyhow!(error.message))?]
+            vec![ClientCredentialSpec::new("primary", token.trim())]
         };
         if let Ok(value) = env::var("GROKPTAH_SERVICE_CLIENTS") {
             client_credentials.extend(parse_client_credentials(&value)?);
@@ -220,8 +244,7 @@ where
             }
             "--token" => {
                 config.token = next_value(&mut iter, "--token")?;
-                let primary = AuthCredential::new("primary", config.token.clone())
-                    .map_err(|error| anyhow::anyhow!(error.message))?;
+                let primary = ClientCredentialSpec::new("primary", config.token.clone());
                 if let Some(existing) = config
                     .client_credentials
                     .iter_mut()
@@ -286,14 +309,14 @@ fn env_bool(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn parse_client_credential(spec: &str) -> Result<AuthCredential> {
+fn parse_client_credential(spec: &str) -> Result<ClientCredentialSpec> {
     let (id, token) = spec
         .split_once('=')
         .with_context(|| "client credential must use ID=TOKEN format")?;
-    AuthCredential::new(id, token).map_err(|error| anyhow::anyhow!(error.message))
+    Ok(ClientCredentialSpec::new(id, token))
 }
 
-fn parse_client_credentials(value: &str) -> Result<Vec<AuthCredential>> {
+fn parse_client_credentials(value: &str) -> Result<Vec<ClientCredentialSpec>> {
     value
         .split(',')
         .filter(|entry| !entry.trim().is_empty())
@@ -310,6 +333,7 @@ pub struct ServiceHandle {
     pub token: String,
     server: Option<ControlServerHandle>,
     host: AgentHostHandle,
+    orch: std::sync::Arc<OrchestrationService>,
 }
 
 impl ServiceHandle {
@@ -320,6 +344,18 @@ impl ServiceHandle {
     /// durable state without opening a second orchestration ledger.
     pub fn host(&self) -> AgentHostHandle {
         self.host.clone()
+    }
+
+    /// Return the process-owned orchestration service.
+    ///
+    /// Counterpart to [`ServiceHandle::host`], for embedders and service-level
+    /// tests that need to resolve an identity — a durable record is bound to
+    /// the credential incarnation that wrote it (#477), so anything seeding
+    /// state must stamp the same lineage the service will authenticate as.
+    /// This grants no authority of its own: every read still goes through a
+    /// host-issued context.
+    pub fn orchestration(&self) -> std::sync::Arc<OrchestrationService> {
+        self.orch.clone()
     }
 
     pub async fn stop_and_wait(mut self) {
@@ -356,17 +392,33 @@ pub async fn start_service(config: ServiceConfig) -> Result<ServiceHandle> {
             bounds: Default::default(),
         },
     );
-    orch.set_auth_credentials(config.client_credentials.clone())
+    // This process constructed the service, so it is the host: it takes the
+    // one-shot admin capability and is the only party that can declare
+    // credentials or name the owning account (#477). The capability is dropped
+    // at the end of startup, so nothing served afterwards can mutate authority.
+    let admin = orch
+        .take_host_admin()
+        .context("the constructing host holds the one-shot admin capability")?;
+    let credentials = config
+        .client_credentials
+        .iter()
+        .map(|spec| {
+            AuthCredential::declare(&admin, &spec.id, &spec.token)
+                .map_err(|error| anyhow::anyhow!(error.message))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    orch.set_auth_credentials(&admin, credentials)
         .map_err(|error| anyhow::anyhow!(error.message))?;
-    orch.set_agent_owner_id(config.agent_owner_id.clone())
+    orch.set_agent_owner_id(&admin, config.agent_owner_id.clone())
         .map_err(|error| anyhow::anyhow!(error.message))?;
+    drop(admin);
     let limits = ControlServerLimits {
         max_concurrent: config.max_concurrent,
         request_timeout: config.request_timeout,
         inject_work_delay: None,
     };
     let server = start_control_server_with_bind(
-        orch,
+        orch.clone(),
         config.listen,
         limits,
         !config.listen.ip().is_loopback(),
@@ -378,6 +430,7 @@ pub async fn start_service(config: ServiceConfig) -> Result<ServiceHandle> {
         token: config.token,
         server: Some(server),
         host,
+        orch,
     })
 }
 
@@ -475,7 +528,7 @@ mod tests {
         let mut duplicate = config;
         duplicate
             .client_credentials
-            .push(AuthCredential::new("laptop", "another-token").unwrap());
+            .push(ClientCredentialSpec::new("laptop", "another-token"));
         assert!(duplicate.validate().is_err());
     }
 

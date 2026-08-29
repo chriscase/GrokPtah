@@ -36,6 +36,7 @@ fn seed_run(
     session_id: uuid::Uuid,
     workspace: &Path,
     state: RunState,
+    client_lineage: &str,
 ) {
     store
         .save_run(&RunRecord {
@@ -47,6 +48,7 @@ fn seed_run(
                 .to_string(),
             request_id: format!("{run_id}-request"),
             client_id: Some("mcp".into()),
+            client_lineage: Some(client_lineage.to_string()),
             state,
             purpose: Default::default(),
             agent_id: None,
@@ -147,26 +149,6 @@ async fn continuity_probe_is_evidence_first_and_recoverable() {
     let store = OrchStore::open(home.path().join("orch")).unwrap();
     let interrupted_run_id = "continuity-interrupted-source";
     let gap_run_id = "continuity-gap-source";
-    seed_run(
-        &store,
-        interrupted_run_id,
-        session.id,
-        workspace.path(),
-        RunState::Interrupted,
-    );
-    seed_run(
-        &store,
-        gap_run_id,
-        gap_session.id,
-        workspace.path(),
-        RunState::Running,
-    );
-    store
-        .update_run(gap_run_id, |run| {
-            run.start_seq = Some(gap_start_seq);
-            Ok(())
-        })
-        .unwrap();
     let service = OrchestrationService::new(
         host.clone(),
         host.event_bus(),
@@ -178,6 +160,51 @@ async fn continuity_probe_is_evidence_first_and_recoverable() {
             bounds: RunBounds::default(),
         },
     );
+    // Seed after the service exists so the records carry the credential
+    // registration the harness authenticates as. Durable records are bound to
+    // that registration (#477); a record seeded without one is quarantined, and
+    // the harness would then never reach its readiness marker.
+    let admin = service
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
+    let store = service
+        .store_for_admin(&admin)
+        .expect("admin capability authorizes this host")
+        .clone();
+    let seed_lineage = {
+        let auth = service
+            .auth_header(Some("Bearer continuity-probe-token"))
+            .expect("the configured bearer authenticates");
+        service
+            .scoped_reads(&auth, session.id, workspace.path())
+            .expect("the probe workspace is in the allowlist")
+            .identity()["lineage"]
+            .as_str()
+            .expect("the scoped identity projects its credential lineage")
+            .to_string()
+    };
+    seed_run(
+        &store,
+        interrupted_run_id,
+        session.id,
+        workspace.path(),
+        RunState::Interrupted,
+        &seed_lineage,
+    );
+    seed_run(
+        &store,
+        gap_run_id,
+        gap_session.id,
+        workspace.path(),
+        RunState::Running,
+        &seed_lineage,
+    );
+    store
+        .update_run(gap_run_id, |run| {
+            run.start_seq = Some(gap_start_seq);
+            Ok(())
+        })
+        .unwrap();
     let server = start_control_server(service, 0).await.unwrap();
     let ready_file = home.path().join("gap-ready");
     let release_file = home.path().join("gap-release");

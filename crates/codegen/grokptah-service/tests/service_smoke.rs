@@ -190,7 +190,26 @@ async fn service_mcp_contract_covers_scoped_live_reconnect_controls_and_restart(
     .unwrap();
     let handle = start_service(config).await.unwrap();
     let host = handle.host();
-    let (session_id, run_id, agent_id, first_seq) = seed_active_run(&host, &workspace_path);
+    // A durable record is bound to the credential incarnation that wrote it
+    // (#477), so the fixture stamps the lineage this service authenticates as.
+    // Seeded without it the record is quarantined — correctly — and the reads
+    // below would refuse it.
+    let orch = handle.orchestration();
+    let seed_session = host.session_new().unwrap();
+    host.session_set_cwd(seed_session.id, &workspace_path).unwrap();
+    let lineage = {
+        let auth = orch
+            .auth_header(Some(&format!("Bearer {token}")))
+            .expect("the configured service token authenticates");
+        orch.scoped_reads(&auth, seed_session.id, &workspace_path)
+            .expect("the service workspace is in the allowlist")
+            .identity()["lineage"]
+            .as_str()
+            .expect("the scoped identity projects its credential lineage")
+            .to_string()
+    };
+    let (session_id, run_id, agent_id, first_seq) =
+        seed_active_run(&host, &workspace_path, &lineage);
     let scope = RunScope {
         session_id,
         workspace: workspace_path.display().to_string(),
@@ -627,6 +646,7 @@ async fn service_capacity_and_scope_matrix_is_fail_closed() {
 fn seed_active_run(
     host: &AgentHostHandle,
     workspace: &std::path::Path,
+    client_lineage: &str,
 ) -> (Uuid, String, String, u64) {
     let session = host.session_new().unwrap();
     host.session_set_cwd(session.id, workspace).unwrap();
@@ -666,6 +686,7 @@ fn seed_active_run(
             workspace: workspace.display().to_string(),
             request_id: "service-e2e-request".into(),
             client_id: Some("mcp".into()),
+            client_lineage: Some(client_lineage.to_string()),
             state: RunState::Running,
             purpose: Default::default(),
             agent_id: Some(agent_id.clone()),

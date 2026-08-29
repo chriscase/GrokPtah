@@ -527,6 +527,7 @@ fn soak_restart_recovery_matrix() {
         workspace: ws.path().display().to_string(),
         request_id: format!("req-{partial_id}"),
         client_id: None,
+        client_lineage: None,
         state: RunState::Completed,
         purpose: Default::default(),
         agent_id: None,

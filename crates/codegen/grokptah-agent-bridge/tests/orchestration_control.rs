@@ -25,6 +25,60 @@ use uuid::Uuid;
 
 use common::ProcessEnvGuard;
 
+/// Take this host's one-shot admin capability and hand back its raw store.
+///
+/// Raw store access is admin-gated (#477): the capability is issued once, to
+/// whoever constructed the host. The harness caches the capability so repeated
+/// use inside one test does not re-take a one-shot, and re-takes it whenever
+/// the cached one is not this host's — several hosts are built per test binary.
+fn admin_store(orch: &OrchestrationService) -> grokptah_agent_bridge::orchestration::OrchStore {
+    thread_local! {
+        static ADMIN: std::cell::RefCell<
+            Option<grokptah_agent_bridge::orchestration::HostAdmin>,
+        > = const { std::cell::RefCell::new(None) };
+    }
+    ADMIN.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if let Some(admin) = slot.as_ref() {
+            if let Ok(store) = orch.store_for_admin(admin) {
+                return store.clone();
+            }
+        }
+        let admin = orch
+            .take_host_admin()
+            .expect("the constructing host holds the one-shot admin capability");
+        let store = orch
+            .store_for_admin(&admin)
+            .expect("a freshly taken capability authorizes its own host")
+            .clone();
+        *slot = Some(admin);
+        store
+    })
+}
+
+/// The credential lineage the `Bearer t` client authenticates as.
+///
+/// Durable records carry the credential registration that admitted them
+/// (#477), so a fixture must stamp the same lineage the host would. A record
+/// seeded without one is quarantined, which is the intended behaviour for
+/// genuinely unattributed legacy records but not for a fixture standing in for
+/// the caller's own prior work.
+fn client_lineage(
+    orch: &OrchestrationService,
+    session_id: uuid::Uuid,
+    workspace: &std::path::Path,
+) -> String {
+    let auth = orch
+        .auth_header(Some("Bearer t"))
+        .expect("the configured bearer authenticates");
+    orch.scoped_reads(&auth, session_id, workspace)
+        .expect("the test workspace is in the allowlist")
+        .identity()["lineage"]
+        .as_str()
+        .expect("the scoped identity projects its credential lineage")
+        .to_string()
+}
+
 /// Serializes home-override + instance-lock across tests (same as bridge lifecycle tests).
 fn setup_home() -> (tempfile::TempDir, ProcessEnvGuard) {
     let mut guard = ProcessEnvGuard::new();
@@ -1058,6 +1112,7 @@ fn restart_interrupted_no_auto_resume() {
         workspace: "/w".into(),
         request_id: "q".into(),
         client_id: None,
+        client_lineage: None,
         state: RunState::Running,
         purpose: Default::default(),
         agent_id: None,
@@ -1101,6 +1156,7 @@ fn restart_clears_queued_admission_position() {
         workspace: "/w".into(),
         request_id: "q-restart".into(),
         client_id: Some("mcp".into()),
+        client_lineage: None,
         state: RunState::Queued,
         purpose: Default::default(),
         agent_id: None,
@@ -1146,9 +1202,13 @@ async fn interrupted_run_retry_is_explicit_linked_and_idempotent() {
     let session = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(session.id, ws.path()).unwrap();
     let orch = orch_for(&host, &home, &ws, 2);
+    let admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
     let auth = orch.auth_header(Some("Bearer t")).unwrap();
     let source_id = "interrupted-source";
-    orch.store()
+    orch.store_for_admin(&admin)
+        .unwrap()
         .save_run(&RunRecord {
             run_id: source_id.into(),
             session_id: session.id,
@@ -1158,6 +1218,7 @@ async fn interrupted_run_retry_is_explicit_linked_and_idempotent() {
                 .to_string(),
             request_id: "source-request".into(),
             client_id: Some("mcp".into()),
+            client_lineage: Some(client_lineage(&orch, session.id, ws.path())),
             state: RunState::Interrupted,
             purpose: Default::default(),
             agent_id: None,
@@ -1804,6 +1865,9 @@ fn run_event_pages_filter_before_limit_across_sessions() {
     let session = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(session.id, ws.path()).unwrap();
     let orch = orch_for(&host, &home, &ws, 4);
+    let admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
     let auth = orch.auth_header(Some("Bearer t")).unwrap();
 
     let other_session = Uuid::new_v4();
@@ -1840,7 +1904,8 @@ fn run_event_pages_filter_before_limit_across_sessions() {
     let end_seq = bus.current_seq();
 
     let run_id = Uuid::new_v4().to_string();
-    orch.store()
+    orch.store_for_admin(&admin)
+        .unwrap()
         .save_run(&RunRecord {
             run_id: run_id.clone(),
             session_id: session.id,
@@ -1849,7 +1914,14 @@ fn run_event_pages_filter_before_limit_across_sessions() {
                 .display()
                 .to_string(),
             request_id: "event-page-test".into(),
-            client_id: None,
+            // The caller reading these pages authenticates with the primary
+            // credential, so the fixture stamps the run the way the service
+            // stamps a run that principal submitted. A record with no stamped
+            // principal is owned by nobody and is quarantined (#477); that is
+            // covered deliberately in tests/principal_authority.rs, and this
+            // test is about event-page filtering, not attribution.
+            client_id: Some("mcp".into()),
+            client_lineage: Some(client_lineage(&orch, session.id, ws.path())),
             state: RunState::Completed,
             purpose: Default::default(),
             agent_id: None,
@@ -2224,7 +2296,7 @@ async fn capacity_is_shared_across_control_service_instances() {
     let two = OrchestrationService::new(
         host.clone(),
         host.event_bus(),
-        one.store().clone(),
+        admin_store(&one),
         OrchestrationConfig {
             bearer_token: "t".into(),
             allowlist: WorkspaceAllowlist::new([ws.path().to_path_buf()]),
@@ -2284,7 +2356,7 @@ async fn pending_admission_bound_is_shared_across_control_services() {
     let two = OrchestrationService::new(
         host.clone(),
         host.event_bus(),
-        one.store().clone(),
+        admin_store(&one),
         OrchestrationConfig {
             bearer_token: "t".into(),
             allowlist: WorkspaceAllowlist::new([ws.path().to_path_buf()]),
@@ -2398,7 +2470,7 @@ async fn global_scheduler_fairness_spans_control_services() {
     let two = OrchestrationService::new(
         host.clone(),
         host.event_bus(),
-        one.store().clone(),
+        admin_store(&one),
         OrchestrationConfig {
             bearer_token: "t".into(),
             allowlist: WorkspaceAllowlist::new([ws.path().to_path_buf()]),
@@ -2561,7 +2633,7 @@ async fn dropping_control_service_releases_pending_admission_slot() {
     let queued_service = OrchestrationService::new(
         host.clone(),
         host.event_bus(),
-        primary.store().clone(),
+        admin_store(&primary),
         OrchestrationConfig {
             bearer_token: "t".into(),
             allowlist: WorkspaceAllowlist::new([ws.path().to_path_buf()]),

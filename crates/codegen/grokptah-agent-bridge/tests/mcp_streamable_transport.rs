@@ -23,6 +23,37 @@ use tempfile::tempdir;
 
 use common::ProcessEnvGuard;
 
+/// Take this host's one-shot admin capability and hand back its raw store.
+///
+/// Raw store access is admin-gated (#477): the capability is issued once, to
+/// whoever constructed the host. The harness caches the capability so repeated
+/// use inside one test does not re-take a one-shot, and re-takes it whenever
+/// the cached one is not this host's — several hosts are built per test binary.
+fn admin_store(orch: &OrchestrationService) -> grokptah_agent_bridge::orchestration::OrchStore {
+    thread_local! {
+        static ADMIN: std::cell::RefCell<
+            Option<grokptah_agent_bridge::orchestration::HostAdmin>,
+        > = const { std::cell::RefCell::new(None) };
+    }
+    ADMIN.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if let Some(admin) = slot.as_ref() {
+            if let Ok(store) = orch.store_for_admin(admin) {
+                return store.clone();
+            }
+        }
+        let admin = orch
+            .take_host_admin()
+            .expect("the constructing host holds the one-shot admin capability");
+        let store = orch
+            .store_for_admin(&admin)
+            .expect("a freshly taken capability authorizes its own host")
+            .clone();
+        *slot = Some(admin);
+        store
+    })
+}
+
 fn setup() -> (
     tempfile::TempDir,
     ProcessEnvGuard,
@@ -1717,7 +1748,22 @@ async fn http_retry_interrupted_run_is_explicit_and_idempotent() {
     let session = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(session.id, ws.path()).unwrap();
     let source_id = "http-interrupted-source";
-    orch.store()
+    // Durable records carry the credential lineage that admitted them (#477),
+    // so the fixture stamps the registration the client authenticates as. A
+    // record seeded with no lineage is quarantined and `ptah_retry_run`
+    // correctly refuses it.
+    let source_lineage = {
+        let auth = orch
+            .auth_header(Some("Bearer stream-token-200"))
+            .expect("the configured bearer authenticates");
+        orch.scoped_reads(&auth, session.id, ws.path())
+            .expect("the test workspace is in the allowlist")
+            .identity()["lineage"]
+            .as_str()
+            .expect("the scoped identity projects its credential lineage")
+            .to_string()
+    };
+    admin_store(&orch)
         .save_run(&RunRecord {
             run_id: source_id.into(),
             session_id: session.id,
@@ -1727,6 +1773,7 @@ async fn http_retry_interrupted_run_is_explicit_and_idempotent() {
                 .to_string(),
             request_id: "http-source-request".into(),
             client_id: Some("mcp".into()),
+            client_lineage: Some(source_lineage),
             state: RunState::Interrupted,
             purpose: Default::default(),
             agent_id: None,
@@ -1965,7 +2012,7 @@ async fn mcp_isolated_run_review_approval_and_restart_promotion() {
         .await;
     assert!(stale.is_err(), "tampered worktree must fail closed");
     std::fs::write(&isolated_file, "hello from isolated run").unwrap();
-    orch.store()
+    admin_store(&orch)
         .update_run(&run_id, |run| {
             run.approval.as_mut().unwrap().expires_at = Utc::now() - ChronoDuration::seconds(1);
             Ok(())
@@ -1984,7 +2031,7 @@ async fn mcp_isolated_run_review_approval_and_restart_promotion() {
         )
         .await;
     assert!(expired.is_err(), "expired approval must fail closed");
-    orch.store()
+    admin_store(&orch)
         .update_run(&run_id, |run| {
             run.approval.as_mut().unwrap().expires_at = Utc::now() + ChronoDuration::minutes(5);
             Ok(())
@@ -2061,7 +2108,7 @@ async fn mcp_isolated_run_review_approval_and_restart_promotion() {
         "hello from isolated run"
     );
     assert_eq!(
-        orch2.store().list_runs().unwrap().len(),
+        admin_store(&orch2).list_runs().unwrap().len(),
         1,
         "one durable MCP run, no desktop duplicate"
     );

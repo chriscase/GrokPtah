@@ -87,6 +87,28 @@ pub async fn start_isolated(
     start_service(config).await.expect("start service")
 }
 
+/// The credential incarnation this service authenticates as.
+///
+/// Durable records are bound to the incarnation that wrote them (#477), not to
+/// the stable wire alias, so a fixture planting a record the test will later
+/// read must stamp this value. A record seeded without it is quarantined —
+/// correctly — and every read of it refuses exactly like an unknown id.
+pub fn service_lineage(handle: &ServiceHandle, workspace: &Path) -> String {
+    let host = handle.host();
+    let session = host.session_new().unwrap();
+    host.session_set_cwd(session.id, workspace).unwrap();
+    let orch = handle.orchestration();
+    let auth = orch
+        .auth_header(Some(&format!("Bearer {}", handle.token)))
+        .expect("the configured service token authenticates");
+    orch.scoped_reads(&auth, session.id, workspace)
+        .expect("the fixture workspace is in the allowlist")
+        .identity()["lineage"]
+        .as_str()
+        .expect("the scoped identity projects its credential lineage")
+        .to_string()
+}
+
 pub async fn mcp_client(addr: SocketAddr) -> McpControlClient {
     let mut client = McpControlClient::new(format!("http://{addr}"), TOKEN);
     client.initialize().await.expect("initialize MCP client");
@@ -138,10 +160,12 @@ pub fn err_text<T: std::fmt::Debug>(result: &Result<T, impl ToString>) -> String
 }
 
 pub fn seed_active_run(
-    host: &AgentHostHandle,
+    handle: &ServiceHandle,
     workspace: &Path,
     run_id: &str,
 ) -> (Uuid, String, String, u64) {
+    let client_lineage = service_lineage(handle, workspace);
+    let host = handle.host();
     let session = host.session_new().unwrap();
     host.session_set_cwd(session.id, workspace).unwrap();
     let session_id = session.id;
@@ -179,6 +203,7 @@ pub fn seed_active_run(
             workspace: workspace.display().to_string(),
             request_id: format!("{run_id}-request"),
             client_id: Some("mcp".into()),
+            client_lineage: Some(client_lineage.clone()),
             state: RunState::Running,
             purpose: Default::default(),
             agent_id: Some(agent_id.clone()),
@@ -214,12 +239,14 @@ pub fn seed_active_run(
 }
 
 pub fn point_agent_at_new_run(
-    host: &AgentHostHandle,
+    handle: &ServiceHandle,
     session_id: Uuid,
     workspace: &Path,
     previous_run_id: &str,
     next_run_id: &str,
 ) {
+    let client_lineage = service_lineage(handle, workspace);
+    let host = handle.host();
     let store = host.ensure_orchestration_store().unwrap();
     if let Some(mut previous) = store.load_run(previous_run_id).unwrap() {
         previous.state = RunState::Cancelled;
@@ -235,6 +262,7 @@ pub fn point_agent_at_new_run(
             workspace: workspace.display().to_string(),
             request_id: format!("{next_run_id}-request"),
             client_id: Some("mcp".into()),
+            client_lineage: Some(client_lineage.clone()),
             state: RunState::Running,
             purpose: Default::default(),
             agent_id: None,

@@ -17,7 +17,9 @@ use crate::session::{SessionKind, WorkspaceStatus};
 
 use super::authz::{
     authenticate_bearer, canonical_workspace, require_workspace_match, AuthContext, AuthCredential,
-    WorkspaceAllowlist,
+    AuthGeneration, AuthorityOrigin, Delegation, DelegationLimit, DurableCredential, HostAdmin,
+    PrincipalProvenance, ReadinessAuthority, VerifiedPrincipal, WorkspaceAllowlist,
+    NATIVE_EXECUTOR_PRINCIPAL,
 };
 use super::managed::{
     assemble_managed_run_input, managed_execution_eligible, select_relevant_managed_messages,
@@ -90,6 +92,36 @@ pub struct OrchestrationService {
     store: OrchStore,
     config: Mutex<OrchestrationConfig>,
     auth_credentials: Mutex<Vec<AuthCredential>>,
+    /// The live authentication/policy generation for this host (#477).
+    ///
+    /// Every identity this host issues is stamped with the value read here, and
+    /// `require_current_auth` re-checks that stamp at every boundary. Credential
+    /// rotation, owner change and workspace-policy change advance it, which is
+    /// what makes an already-issued identity stop working.
+    ///
+    /// Lock order: acquire this before `config`, `auth_credentials` or
+    /// `agent_owner_id`; never the other way round.
+    auth_generation: Mutex<AuthGeneration>,
+    /// How this host's lineage was established at startup.
+    authority_origin: AuthorityOrigin,
+    /// Set when the host cannot make its authority durable (#477 P0-2).
+    ///
+    /// A host that cannot persist its lineage must not keep issuing identities:
+    /// a later restart would re-adopt an epoch that identities have already
+    /// been issued under, and records written meanwhile would be attributable
+    /// to a lineage no one can verify. While sealed, no identity is issued and
+    /// every guard refuses.
+    sealed: Mutex<Option<String>>,
+    /// Lineages whose durable work is quarantined pending explicit migration.
+    quarantined_lineages: Mutex<Vec<Uuid>>,
+    /// Identity of *this* service instance.
+    ///
+    /// Two services over one host share a durable store and therefore a
+    /// lineage, so the admin capability is bound to the instance instead: a
+    /// second service cannot mint a capability the first will honour.
+    instance: Uuid,
+    /// The one-shot host-admin capability, taken by whoever built this host.
+    host_admin: Mutex<Option<HostAdmin>>,
     agent_owner_id: Mutex<String>,
     self_ref: Weak<OrchestrationService>,
     pending_admissions: Mutex<AdmissionQueueState>,
@@ -113,6 +145,140 @@ pub(crate) struct LiveRunScope {
     pub run_id: String,
     pub start_seq: u64,
     pub end_seq: Option<u64>,
+}
+
+/// Stand-in lineage recorded when a persisted authority record exists but
+/// cannot be parsed. Its id is unknown, so this marks "there was a lineage here
+/// and we could not read it" — enough for the quarantine to refuse every record
+/// that predates the re-established lineage.
+const UNREADABLE_LINEAGE: Uuid = Uuid::nil();
+
+/// What `establish_authority` worked out at startup.
+struct EstablishedAuthority {
+    generation: AuthGeneration,
+    origin: AuthorityOrigin,
+    /// Set when the lineage could not be persisted; the host serves nothing.
+    sealed: Option<String>,
+    quarantined_lineages: Vec<Uuid>,
+}
+
+/// Why a durable record cannot be attributed to any live principal (#477).
+///
+/// Quarantined records are never handed to the current caller and never
+/// attributed to a hard-coded desktop or MCP principal. They stay on disk as
+/// evidence and are reported in aggregate through
+/// `OrchestrationService::quarantine_report` so an operator can migrate them
+/// deliberately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuarantineReason {
+    /// Written before client attribution existed: owned by nobody.
+    UnboundLegacyRecord,
+    /// Carries an attribution field that is present but empty, which no live
+    /// principal alias can ever equal.
+    BlankPrincipal,
+    /// Attributed to an alias but written before lineage binding existed, so
+    /// the exact credential registration that admitted it is unknown.
+    UnboundLineage,
+    /// Bound to a credential registration that is no longer live: the
+    /// credential was removed, its secret rotated, or its lineage
+    /// re-established. Re-registering the alias must not reach this work.
+    StaleLineage,
+}
+
+impl QuarantineReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UnboundLegacyRecord => "unbound_legacy_record",
+            Self::BlankPrincipal => "blank_principal",
+            Self::UnboundLineage => "unbound_lineage",
+            Self::StaleLineage => "stale_lineage",
+        }
+    }
+}
+
+/// Why `run` cannot be attributed, given the credential registrations that are
+/// live right now.
+///
+/// `live_lineages` is the set of incarnations currently bound to a credential.
+/// A record naming one of them is attributable; anything else is quarantined.
+fn run_quarantine_reason(run: &RunRecord, live_lineages: &[String]) -> Option<QuarantineReason> {
+    match run.client_id.as_deref() {
+        None => return Some(QuarantineReason::UnboundLegacyRecord),
+        Some(principal) if principal.trim().is_empty() => {
+            return Some(QuarantineReason::BlankPrincipal)
+        }
+        Some(_) => {}
+    }
+    match run.client_lineage.as_deref() {
+        None => Some(QuarantineReason::UnboundLineage),
+        Some(lineage) if !live_lineages.iter().any(|live| live == lineage) => {
+            Some(QuarantineReason::StaleLineage)
+        }
+        Some(_) => None,
+    }
+}
+
+/// The sanctioned public read surface for one verified principal.
+///
+/// Handed out by [`OrchestrationService::scoped_reads`]. It borrows the service
+/// but exposes only read DTOs: there is no method here that mutates the store,
+/// and it holds no store handle a caller could reach through. The scope it was
+/// built with is fixed at construction, so a caller cannot widen it by passing
+/// a different session or workspace to a later call.
+pub struct ScopedReads<'a> {
+    service: &'a OrchestrationService,
+    principal: VerifiedPrincipal,
+}
+
+impl ScopedReads<'_> {
+    /// The principal this client is bound to.
+    pub fn principal(&self) -> &VerifiedPrincipal {
+        &self.principal
+    }
+
+    /// Runs visible to this principal within its own session and workspace.
+    pub fn runs(&self) -> Result<serde_json::Value, OrchError> {
+        self.service.list_runs_scoped(
+            self.principal.auth(),
+            self.principal.session_id(),
+            self.principal.workspace(),
+        )
+    }
+
+    /// Work items visible to this principal within its own scope.
+    pub fn work(&self) -> Result<serde_json::Value, OrchError> {
+        self.service.list_work_scoped(
+            self.principal.auth(),
+            self.principal.session_id(),
+            self.principal.workspace(),
+        )
+    }
+
+    /// Routines visible to this principal within its own scope.
+    pub fn routines(&self) -> Result<serde_json::Value, OrchError> {
+        self.service.list_routines_scoped(
+            self.principal.auth(),
+            self.principal.session_id(),
+            self.principal.workspace(),
+        )
+    }
+
+    /// The opaque per-principal namespace and public workspace alias, with no
+    /// native path and no secret.
+    pub fn identity(&self) -> serde_json::Value {
+        json!({
+            "principal": self.principal.principal(),
+            "owner": self.principal.owner_id(),
+            "sessionId": self.principal.session_id(),
+            "workspaceAlias": self.principal.workspace_alias(),
+            "scope": self.principal.scope().as_str(),
+            // The credential registration durable records are stamped with.
+            // An identifier, not a capability: holding it grants nothing,
+            // because identities cannot be fabricated in the first place.
+            "lineage": self.principal.auth().credential_lineage(),
+            "provenance": self.principal.generation().provenance(),
+        })
+    }
 }
 
 impl Drop for OrchestrationService {
@@ -150,7 +316,7 @@ enum IdempotencyStart {
 }
 
 /// Coordinator vs worker identities for an assignment mutation.
-/// The authenticated principal remains `AuthContext.token_id`; these are
+/// The authenticated principal remains the `AuthContext`; these are
 /// durable Agent resources the principal is authorized to name.
 struct ScopedAssignment {
     worker: AgentRecord,
@@ -249,22 +415,32 @@ impl OrchestrationService {
         }
         config.max_concurrent_runs =
             host.configure_orchestration_capacity(config.max_concurrent_runs);
-        let auth_credentials = if config.bearer_token.is_empty() {
+        let mut auth_credentials = if config.bearer_token.is_empty() {
             Vec::new()
         } else {
-            vec![AuthCredential::new("primary", config.bearer_token.clone())
+            vec![AuthCredential::mint("primary", config.bearer_token.clone())
                 .expect("non-empty bearer token should form a primary credential")]
         };
         let workload_supervisor =
             WorkloadSupervisor::start(store.clone(), DEFAULT_WORKLOAD_RECONCILIATION_INTERVAL);
         let routine_supervisor =
             RoutineSupervisor::start(store.clone(), DEFAULT_ROUTINE_TICK_INTERVAL);
+        let instance = Uuid::new_v4();
+        let established = Self::establish_authority(&store, &mut auth_credentials);
+        let generation = established.generation;
+        let authority_origin = established.origin;
         let service = Arc::new_cyclic(|self_ref| Self {
             host,
             bus,
             store,
             config: Mutex::new(config),
             auth_credentials: Mutex::new(auth_credentials),
+            auth_generation: Mutex::new(generation),
+            authority_origin,
+            sealed: Mutex::new(established.sealed.clone()),
+            quarantined_lineages: Mutex::new(established.quarantined_lineages.clone()),
+            instance,
+            host_admin: Mutex::new(Some(HostAdmin::issue(instance))),
             agent_owner_id: Mutex::new("primary".into()),
             self_ref: self_ref.clone(),
             pending_admissions: Mutex::new(AdmissionQueueState::default()),
@@ -1327,10 +1503,7 @@ impl OrchestrationService {
         intent.attempt_id = Some(claim.attempt.attempt_id.clone());
         intent.updated_at = Utc::now();
         self.store.save_managed_intent(&intent)?;
-        let auth = AuthContext {
-            token_id: "native-executor".into(),
-            owner_id: owner_id.to_string(),
-        };
+        let auth = self.native_executor_context(owner_id);
         let bounds_json = serde_json::to_value(&bounds)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         let submitted = match self
@@ -1428,28 +1601,680 @@ impl OrchestrationService {
         self.manager_supervisor.lock().enabled = false;
     }
 
-    pub fn store(&self) -> &OrchStore {
-        &self.store
+    /// Raw, unscoped handle to the durable store, gated on host admin.
+    ///
+    /// **Not an SDK surface.** The sanctioned public read path is
+    /// [`OrchestrationService::scoped_reads`], which hands out read DTOs bound
+    /// to a verified principal and exposes no mutation at all. Raw store access
+    /// now requires the one-shot admin capability, so a component that can
+    /// reach the service but did not build the host cannot mutate records
+    /// behind the principal fence.
+    #[doc(hidden)]
+    pub fn store_for_admin(&self, admin: &HostAdmin) -> Result<&OrchStore, OrchError> {
+        self.require_host_admin(admin)?;
+        Ok(&self.store)
     }
 
-    pub fn set_token(&self, token: String) {
-        let token = token.trim().to_string();
-        if !token.is_empty() {
-            self.bus.add_control_secrets([token.clone()]);
+    // ── the one authority fence (#477) ─────────────────────────────────
+
+    /// Establish this host's authority lineage at startup.
+    ///
+    /// A persisted lineage is re-adopted, its epoch advanced once (so no
+    /// identity the previous process issued is current), and its credential
+    /// bindings carried forward onto the credentials this host was configured
+    /// with — but only where alias *and* secret digest both match, so adopting
+    /// a binding can never hand one credential another's durable work.
+    ///
+    /// Three failures are handled distinctly, because conflating them is how
+    /// old work gets silently re-attributed:
+    ///
+    /// * **missing** — a first run. Mint a lineage; there is no prior work.
+    /// * **unreadable** — a lineage exists but cannot be trusted. Mint a new
+    ///   one *and quarantine the old* by recording it, so every record written
+    ///   under it is refused until an operator migrates it explicitly. The
+    ///   quarantine is what stops the new lineage from reminting ownership over
+    ///   work it never admitted.
+    /// * **unpersistable** — the lineage cannot be written. Seal the host: it
+    ///   serves no identities at all rather than running undurably.
+    fn establish_authority(
+        store: &OrchStore,
+        credentials: &mut [AuthCredential],
+    ) -> EstablishedAuthority {
+        let mut quarantined_lineages = Vec::new();
+        let (generation, origin, adopt) = match store.load_authority() {
+            Ok(Some(record)) => match record.generation().next_epoch() {
+                Ok(next) => {
+                    quarantined_lineages.extend(record.quarantined_lineages.iter().copied());
+                    (next, AuthorityOrigin::Resumed, record.credentials.clone())
+                }
+                // A persisted epoch at the ceiling cannot be advanced. A new
+                // lineage invalidates strictly more than advancing would have,
+                // and the old lineage is quarantined rather than inherited.
+                Err(_) => {
+                    quarantined_lineages.extend(record.quarantined_lineages.iter().copied());
+                    quarantined_lineages.push(record.authority);
+                    (
+                        AuthGeneration::new_authority(),
+                        AuthorityOrigin::ReestablishedFailClosed,
+                        Vec::new(),
+                    )
+                }
+            },
+            Ok(None) => (
+                AuthGeneration::new_authority(),
+                AuthorityOrigin::Fresh,
+                Vec::new(),
+            ),
+            Err(unreadable) => {
+                // The bytes exist but cannot be parsed. Any lineage id they
+                // held is unknown, so every pre-existing record is quarantined
+                // by the sentinel below: nothing is adopted, and a record is
+                // only readable once its lineage is a live binding again.
+                quarantined_lineages.push(UNREADABLE_LINEAGE);
+                let _ = unreadable;
+                (
+                    AuthGeneration::new_authority(),
+                    AuthorityOrigin::ReestablishedFailClosed,
+                    Vec::new(),
+                )
+            }
+        };
+
+        // Carry a persisted incarnation forward only when the alias *and* the
+        // secret digest both match. A re-registered alias with a new secret —
+        // or an alias absent from the persisted set because it was removed —
+        // gets the fresh incarnation it was minted with.
+        for credential in credentials.iter_mut() {
+            let digest = credential.token_digest();
+            if let Some(binding) = adopt
+                .iter()
+                .find(|b| b.id == credential.id() && b.token_digest == digest)
+            {
+                credential.adopt_incarnation(binding.incarnation);
+            }
         }
-        self.config.lock().bearer_token = token.clone();
-        let credentials = if token.is_empty() {
+
+        let bindings: Vec<DurableCredential> =
+            credentials.iter().map(AuthCredential::to_durable).collect();
+        let sealed = store
+            .save_authority(generation.to_durable(bindings, quarantined_lineages.clone()))
+            .err()
+            .map(|error| {
+                format!(
+                    "authority lineage is not durable ({}); the host refuses to issue identities",
+                    error.message
+                )
+            });
+
+        EstablishedAuthority {
+            generation,
+            origin,
+            sealed,
+            quarantined_lineages,
+        }
+    }
+
+    /// Refuse everything while the host cannot make its authority durable.
+    fn check_seal(&self) -> Result<(), OrchError> {
+        match self.sealed.lock().as_deref() {
+            Some(reason) => Err(OrchError::new(OrchErrorCode::Internal, reason.to_string())),
+            None => Ok(()),
+        }
+    }
+
+    /// Take the one-shot host-admin capability.
+    ///
+    /// Returns `Some` exactly once, to whoever constructed this host. Every
+    /// later caller gets `None`, so a component that can reach the service but
+    /// did not build it cannot change who the host honours.
+    pub fn take_host_admin(&self) -> Option<HostAdmin> {
+        self.host_admin.lock().take()
+    }
+
+    /// Reject an admin capability that belongs to a different host.
+    fn require_host_admin(&self, admin: &HostAdmin) -> Result<(), OrchError> {
+        if admin.authorizes(self.instance) {
+            Ok(())
+        } else {
+            Err(OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "host admin capability was issued by a different host instance",
+            ))
+        }
+    }
+
+    /// How this host's authority lineage was established at startup.
+    pub fn authority_origin(&self) -> AuthorityOrigin {
+        self.authority_origin
+    }
+
+    /// Live authentication epoch, for diagnostics and provenance.
+    pub fn auth_epoch(&self) -> u64 {
+        self.auth_generation.lock().epoch()
+    }
+
+    /// Live policy revision, for diagnostics and provenance.
+    pub fn policy_revision(&self) -> u64 {
+        self.auth_generation.lock().policy_revision()
+    }
+
+    /// The provenance stamp for work admitted right now.
+    pub fn provenance(&self) -> PrincipalProvenance {
+        self.auth_generation.lock().provenance()
+    }
+
+    /// Reject any identity that is not current for this host.
+    ///
+    /// This is the single authority check every entry point runs before it
+    /// touches the store, the host or a provider. It rejects the classes of
+    /// identity the type system alone cannot:
+    ///
+    /// * identities issued before a credential rotation, an owner change or a
+    ///   policy change (stale generation),
+    /// * identities issued by a different host or a different authority lineage
+    ///   — including the same host before a restart,
+    /// * delegated identities whose grant has run out.
+    ///
+    /// It deliberately does not re-check the bearer token: the secret is not
+    /// carried in the identity, and re-deriving it would mean holding bearer
+    /// material past authentication.
+    pub(crate) fn require_current_auth(&self, auth: &AuthContext) -> Result<(), OrchError> {
+        self.check_seal()?;
+        let current = *self.auth_generation.lock();
+        if auth.generation() != current {
+            return Err(self.reject_auth("stale or foreign authentication identity"));
+        }
+        if let Err(error) = auth.check_delegation_window(Utc::now()) {
+            self.audit(
+                "auth",
+                None,
+                None,
+                None,
+                "rejected",
+                Some(error.code.as_str()),
+                "expired delegation",
+            );
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// The current-identity check for a boundary that causes an effect.
+    ///
+    /// Everything `require_current_auth` rejects, plus identities whose
+    /// delegation is read-only. Mutating entry points call this instead.
+    pub(crate) fn require_current_effect(&self, auth: &AuthContext) -> Result<(), OrchError> {
+        self.require_current_auth(auth)?;
+        if !auth.permits_effects() {
+            // Distinct from the stale-identity refusal on purpose. This one is
+            // only ever returned to a caller already holding a current identity
+            // it knows is delegated, so it reveals nothing they do not already
+            // know — and telling a legitimate delegate to "re-authenticate"
+            // would send it round a loop that can never succeed.
+            let error = OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "delegated identity is read-only within its grant",
+            );
+            self.audit(
+                "auth",
+                None,
+                None,
+                None,
+                "rejected",
+                Some(error.code.as_str()),
+                "delegated identity may not cross an effect boundary",
+            );
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// The one refusal every authority rejection uses.
+    ///
+    /// Byte-identical for a stale identity, a foreign lineage and an expired
+    /// delegation, so the refusal never reports which of those it was — none of
+    /// them should tell a caller whether the identity it presented ever existed
+    /// here.
+    fn reject_auth(&self, audit_note: &str) -> OrchError {
+        let error = OrchError::new(
+            OrchErrorCode::Unauthenticated,
+            "authentication context is no longer current; re-authenticate",
+        );
+        self.audit(
+            "auth",
+            None,
+            None,
+            None,
+            "rejected",
+            Some(error.code.as_str()),
+            audit_note,
+        );
+        error
+    }
+
+    /// Mint the scope-bound identity for a caller whose scope check has passed.
+    ///
+    /// `workspace` must be the canonical path that check returned, never a
+    /// caller-supplied string. This is the only place a `VerifiedPrincipal` is
+    /// created outside the fence's own module, and it is private: callers
+    /// receive one, they never build one.
+    fn bind_principal(
+        &self,
+        auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+    ) -> Result<VerifiedPrincipal, OrchError> {
+        // Re-check currency at binding time as well as at entry: a rotation
+        // that lands between the entry guard and the scope check must not
+        // produce a binding under the old authority.
+        self.require_current_auth(auth)?;
+        let principal = VerifiedPrincipal::bind(auth, session_id, workspace);
+        // A delegated identity reaches only the resource its grant named.
+        auth.check_delegation_resource(session_id, principal.workspace_alias())?;
+        Ok(principal)
+    }
+
+    /// The sanctioned public read surface: read DTOs scoped to one verified
+    /// principal, with no store mutation reachable through it.
+    pub fn scoped_reads(
+        &self,
+        auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+    ) -> Result<ScopedReads<'_>, OrchError> {
+        self.require_current_auth(auth)?;
+        let claimed = self.authorize_work_read_scope(session_id, workspace)?;
+        let principal = self.bind_principal(auth, session_id, &claimed)?;
+        Ok(ScopedReads {
+            service: self,
+            principal,
+        })
+    }
+
+    /// Principals whose runs every authenticated caller in scope may read.
+    ///
+    /// `native-executor` is the in-process managed executor: it submits runs on
+    /// behalf of durable work that an authenticated coordinator created, so its
+    /// runs are the coordinator's own work product under a service identity
+    /// rather than another principal's private activity. This is a deliberate,
+    /// operator-authorized exception and the only one; session and workspace
+    /// scope still apply to it in full.
+    const SHARED_RUN_PRINCIPALS: &'static [&'static str] = &[NATIVE_EXECUTOR_PRINCIPAL];
+
+    /// The denial used for unknown, malformed, quarantined and foreign runs
+    /// alike.
+    ///
+    /// All four must be byte-identical or the read paths become an existence
+    /// oracle: a caller could enumerate run ids and tell which ones exist by the
+    /// shape of the refusal.
+    fn unknown_run() -> OrchError {
+        OrchError::new(OrchErrorCode::InvalidRequest, "unknown run_id")
+    }
+
+    /// Enforce that `auth` owns `run`, or that the run belongs to a shared
+    /// service principal.
+    ///
+    /// Callers must already have passed `require_current_auth`; this adds the
+    /// principal dimension on top of the session and workspace scope that the
+    /// surrounding checks keep enforcing.
+    fn require_run_owner(&self, auth: &AuthContext, run: &RunRecord) -> Result<(), OrchError> {
+        self.require_run_owner_with(auth, run, &self.live_lineages())
+    }
+
+    /// The live credential registrations, as durable lineage strings.
+    ///
+    /// Read once per listing rather than per record, so a list of N runs does
+    /// not re-lock the credential set N times.
+    fn live_lineages(&self) -> Vec<String> {
+        let mut lineages: Vec<String> = self
+            .auth_credentials
+            .lock()
+            .iter()
+            .map(|credential| credential.incarnation().to_string())
+            .collect();
+        // Host-internal principals authenticate by construction and are
+        // re-derived from the live generation, so their lineage is live
+        // whenever the generation is.
+        lineages.push(
+            AuthContext::issue_internal(
+                NATIVE_EXECUTOR_PRINCIPAL,
+                &self.agent_owner_id(),
+                *self.auth_generation.lock(),
+            )
+            .credential_incarnation()
+            .to_string(),
+        );
+        lineages
+    }
+
+    fn require_run_owner_with(
+        &self,
+        auth: &AuthContext,
+        run: &RunRecord,
+        live_lineages: &[String],
+    ) -> Result<(), OrchError> {
+        if run_quarantine_reason(run, live_lineages).is_some() {
+            return Err(Self::unknown_run());
+        }
+        let owner = run.client_id.as_deref().unwrap_or_default();
+        // Alias *and* lineage must both match. The alias alone is stable across
+        // remove/re-add, so checking it alone would let a re-registered
+        // credential inherit the previous registration's work.
+        if owner != auth.principal() && !Self::SHARED_RUN_PRINCIPALS.contains(&owner) {
+            return Err(Self::unknown_run());
+        }
+        if Self::SHARED_RUN_PRINCIPALS.contains(&owner) {
+            return Ok(());
+        }
+        match run.client_lineage.as_deref() {
+            Some(lineage) if lineage == auth.credential_incarnation().to_string() => Ok(()),
+            _ => Err(Self::unknown_run()),
+        }
+    }
+
+    /// Counts of durable runs that cannot be attributed to any live principal.
+    ///
+    /// The explicit operator workflow for legacy and unbound records: an
+    /// authenticated operator can see how many quarantined records exist and
+    /// why, and can therefore decide to migrate them, but the report carries no
+    /// record contents and no attribution. Quarantined records are never
+    /// readable as the caller's own — `require_run_owner` refuses them with the
+    /// same denial it gives an unknown id.
+    pub fn quarantine_report(&self, auth: &AuthContext) -> Result<serde_json::Value, OrchError> {
+        self.require_current_auth(auth)?;
+        let runs = self
+            .store
+            .list_runs()
+            .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
+        let live = self.live_lineages();
+        let mut unbound = 0u64;
+        let mut blank = 0u64;
+        let mut unbound_lineage = 0u64;
+        let mut stale_lineage = 0u64;
+        for run in &runs {
+            match run_quarantine_reason(run, &live) {
+                Some(QuarantineReason::UnboundLegacyRecord) => unbound += 1,
+                Some(QuarantineReason::BlankPrincipal) => blank += 1,
+                Some(QuarantineReason::UnboundLineage) => unbound_lineage += 1,
+                Some(QuarantineReason::StaleLineage) => stale_lineage += 1,
+                None => {}
+            }
+        }
+        Ok(json!({
+            "quarantine": {
+                "authorityOrigin": self.authority_origin.as_str(),
+                "quarantinedLineages": self.quarantined_lineages.lock().len(),
+                "unboundLegacyRecords": unbound,
+                "blankPrincipalRecords": blank,
+                "unboundLineageRecords": unbound_lineage,
+                "staleLineageRecords": stale_lineage,
+                "total": unbound + blank + unbound_lineage + stale_lineage,
+            }
+        }))
+    }
+
+    /// The explicit operator workflow for quarantined records (#477).
+    ///
+    /// Re-binds records that are quarantined *only* because their lineage is
+    /// unknown or stale onto a named live credential registration. This is the
+    /// one way old work becomes reachable again, and it is deliberately an
+    /// administrative act with a named target: nothing is ever adopted
+    /// implicitly by whoever happens to hold the alias now.
+    ///
+    /// Records quarantined for having no principal at all are *not* migrated —
+    /// there is no evidence of who they belonged to, so inventing an owner
+    /// would be exactly the re-attribution this fence exists to prevent.
+    pub fn migrate_quarantined_lineage(
+        &self,
+        admin: &HostAdmin,
+        alias: &str,
+        onto_credential_id: &str,
+    ) -> Result<serde_json::Value, OrchError> {
+        self.require_host_admin(admin)?;
+        self.check_seal()?;
+        let target = self
+            .auth_credentials
+            .lock()
+            .iter()
+            .find(|credential| credential.id() == onto_credential_id)
+            .map(|credential| credential.incarnation().to_string())
+            .ok_or_else(|| {
+                OrchError::new(
+                    OrchErrorCode::InvalidRequest,
+                    "migration target must be a live credential registration",
+                )
+            })?;
+        let live = self.live_lineages();
+        let runs = self
+            .store
+            .list_runs()
+            .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
+        let mut migrated = 0u64;
+        for run in runs {
+            if run.client_id.as_deref() != Some(alias) {
+                continue;
+            }
+            if !matches!(
+                run_quarantine_reason(&run, &live),
+                Some(QuarantineReason::UnboundLineage | QuarantineReason::StaleLineage)
+            ) {
+                continue;
+            }
+            let run_id = run.run_id.clone();
+            self.store
+                .update_run(&run_id, |record| {
+                    record.client_lineage = Some(target.clone());
+                    Ok(())
+                })
+                .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
+            migrated += 1;
+        }
+        self.audit(
+            "auth_migrate_lineage",
+            None,
+            None,
+            None,
+            "accepted",
+            None,
+            &format!(
+                "migrated {migrated} quarantined records from {alias} onto {onto_credential_id}"
+            ),
+        );
+        Ok(json!({
+            "migrated": migrated,
+            "alias": alias,
+            "ontoCredentialId": onto_credential_id,
+        }))
+    }
+
+    /// Issue an identity for a host-internal principal that authenticates by
+    /// construction rather than by bearer token.
+    ///
+    /// Stamped with the live generation like any other identity, so an internal
+    /// principal is invalidated by rotation exactly as a client is, and marked
+    /// `ServiceInternal` so it can never be mistaken for a remote caller. This
+    /// is not a general-purpose escape hatch: the one caller below is the only
+    /// one, and it names a principal the host already acted as.
+    fn issue_internal_context(&self, principal: &str, owner_id: &str) -> AuthContext {
+        AuthContext::issue_internal(principal, owner_id, *self.auth_generation.lock())
+    }
+
+    /// Identity for the in-process native executor's own submissions.
+    fn native_executor_context(&self, owner_id: &str) -> AuthContext {
+        self.issue_internal_context(NATIVE_EXECUTOR_PRINCIPAL, owner_id)
+    }
+
+    /// Mint an explicit, expiring, non-widening grant from a current identity.
+    ///
+    /// The delegate inherits the delegator's owner, credential incarnation and
+    /// generation unchanged and additionally carries a limit that only narrows,
+    /// so a delegation can never reach anything the delegator could not. It is
+    /// bound to the generation it was minted under, so any rotation revokes it,
+    /// and it is audited at mint time.
+    #[allow(clippy::too_many_arguments)] // Every input is part of the grant.
+    pub fn delegate(
+        &self,
+        auth: &AuthContext,
+        delegate: &str,
+        limit: DelegationLimit,
+        ttl_seconds: i64,
+        session_id: Uuid,
+        workspace: &Path,
+    ) -> Result<AuthContext, OrchError> {
+        self.require_current_effect(auth)?;
+        // The delegator must itself be authorized for the resource it is
+        // delegating: you cannot grant reach you do not have.
+        let claimed = self.authorize_work_read_scope(session_id, workspace)?;
+        let scope = self.bind_principal(auth, session_id, &claimed)?;
+        let grant = Delegation::mint(
+            auth,
+            delegate,
+            limit,
+            ttl_seconds,
+            Utc::now(),
+            session_id,
+            scope.workspace_alias().to_string(),
+        )
+        .inspect_err(|error| {
+            self.audit(
+                "auth_delegate",
+                None,
+                None,
+                None,
+                "rejected",
+                Some(error.code.as_str()),
+                "delegation refused",
+            );
+        })?;
+        self.audit(
+            "auth_delegate",
+            None,
+            None,
+            None,
+            "accepted",
+            None,
+            &format!(
+                "delegated {} to {} ({}) until {}",
+                grant.delegator(),
+                grant.delegate(),
+                grant.limit().as_str(),
+                grant.expires_at().to_rfc3339()
+            ),
+        );
+        Ok(auth.delegated(grant))
+    }
+
+    /// Advance the generation, durably, before any authority state changes.
+    ///
+    /// Ordering is the whole point:
+    ///
+    /// 1. compute the next generation — an exhausted counter stops here and
+    ///    nothing at all has changed;
+    /// 2. persist it — an advance that cannot be made durable must not take
+    ///    effect in memory either, or a restart would re-adopt an epoch that
+    ///    identities have already been issued under;
+    /// 3. apply the caller's mutation;
+    /// 4. publish the new generation, which is the instant previously issued
+    ///    identities stop being current.
+    ///
+    /// The generation lock is held throughout, and every authentication takes
+    /// it too, so a rotation cannot interleave with an authentication and stamp
+    /// a revoked credential with the new generation.
+    /// Carry a live incarnation forward onto a replacement registration when
+    /// the alias *and* the secret digest both match.
+    ///
+    /// [`Self::establish_authority`] applies this rule at construction, against
+    /// what the store persisted. Re-registration needs it too: a host that
+    /// re-declares its unchanged credentials — which is what a service restart
+    /// does on every boot — must not orphan the durable records that same
+    /// credential already wrote. A changed secret still yields a fresh
+    /// incarnation, because the digest is half the key, so removal and re-add
+    /// under a new secret stays a different principal.
+    ///
+    /// Takes the credential lock and releases it before any caller advances the
+    /// generation, preserving the documented order (generation, then
+    /// credentials).
+    fn adopt_live_incarnations(&self, credentials: &mut [AuthCredential]) {
+        let live = self.auth_credentials.lock();
+        for credential in credentials.iter_mut() {
+            let digest = credential.token_digest();
+            if let Some(existing) = live
+                .iter()
+                .find(|c| c.id() == credential.id() && c.token_digest() == digest)
+            {
+                credential.adopt_incarnation(existing.incarnation());
+            }
+        }
+    }
+
+    fn advance_authority(
+        &self,
+        policy_change: bool,
+        next_credentials: Option<&[AuthCredential]>,
+        apply: impl FnOnce() -> Result<(), OrchError>,
+    ) -> Result<(), OrchError> {
+        self.check_seal()?;
+        let mut generation = self.auth_generation.lock();
+        let next = if policy_change {
+            generation.next_policy()?
+        } else {
+            generation.next_epoch()?
+        };
+        // Co-commit the generation with the credential bindings it authorizes.
+        // Persisting them separately would leave a window where the generation
+        // is durable but the registrations it admits are not, and a restart in
+        // that window would adopt an authority whose credentials it cannot
+        // reconstruct.
+        let bindings: Vec<DurableCredential> = match next_credentials {
+            Some(credentials) => credentials.iter().map(AuthCredential::to_durable).collect(),
+            None => self
+                .auth_credentials
+                .lock()
+                .iter()
+                .map(AuthCredential::to_durable)
+                .collect(),
+        };
+        let quarantined = self.quarantined_lineages.lock().clone();
+        self.store
+            .save_authority(next.to_durable(bindings, quarantined))?;
+        apply()?;
+        *generation = next;
+        Ok(())
+    }
+
+    /// Replace the primary bearer credential. Requires host-admin authority.
+    pub fn set_token(&self, admin: &HostAdmin, token: String) -> Result<(), OrchError> {
+        self.require_host_admin(admin)?;
+        let token = token.trim().to_string();
+        // Build and validate before advancing so a rejected token changes
+        // nothing, not even the generation.
+        let mut credentials = if token.is_empty() {
             Vec::new()
         } else {
-            vec![AuthCredential::new("primary", token)
-                .expect("non-empty bearer token should form a primary credential")]
+            vec![AuthCredential::mint("primary", token.clone())?]
         };
-        *self.auth_credentials.lock() = credentials;
+        // Re-setting the identical token is not a rotation: it keeps the
+        // incarnation. A different token changes the digest, so it does not.
+        self.adopt_live_incarnations(&mut credentials);
+        let bindings = credentials.clone();
+        self.advance_authority(false, Some(&bindings), || {
+            if !token.is_empty() {
+                self.bus.add_control_secrets([token.clone()]);
+            }
+            self.config.lock().bearer_token = token.clone();
+            *self.auth_credentials.lock() = credentials;
+            Ok(())
+        })
     }
 
     /// Install named device/client credentials while retaining the existing
     /// primary-token configuration field for compatibility with embedders.
-    pub fn set_auth_credentials(&self, credentials: Vec<AuthCredential>) -> Result<(), OrchError> {
+    pub fn set_auth_credentials(
+        &self,
+        admin: &HostAdmin,
+        credentials: Vec<AuthCredential>,
+    ) -> Result<(), OrchError> {
+        self.require_host_admin(admin)?;
         if credentials.is_empty() {
             return Err(OrchError::new(
                 OrchErrorCode::InvalidRequest,
@@ -1458,7 +2283,7 @@ impl OrchestrationService {
         }
         if !credentials
             .iter()
-            .any(|credential| credential.id == "primary")
+            .any(|credential| credential.id() == "primary")
         {
             return Err(OrchError::new(
                 OrchErrorCode::InvalidRequest,
@@ -1467,20 +2292,30 @@ impl OrchestrationService {
         }
         let primary_token = credentials
             .iter()
-            .find(|credential| credential.id == "primary")
+            .find(|credential| credential.id() == "primary")
             .expect("primary credential was checked above")
             .token()
             .to_string();
-        for credential in &credentials {
-            self.bus
-                .add_control_secrets([credential.token().to_string()]);
-        }
-        self.config.lock().bearer_token = primary_token;
-        *self.auth_credentials.lock() = credentials;
-        Ok(())
+        // An unchanged registration keeps the incarnation its records are bound
+        // to; only a changed secret gets a new one.
+        let mut credentials = credentials;
+        self.adopt_live_incarnations(&mut credentials);
+        let bindings = credentials.clone();
+        self.advance_authority(false, Some(&bindings), || {
+            for credential in &credentials {
+                self.bus
+                    .add_control_secrets([credential.token().to_string()]);
+            }
+            self.config.lock().bearer_token = primary_token;
+            *self.auth_credentials.lock() = credentials;
+            Ok(())
+        })
     }
 
-    pub fn set_agent_owner_id(&self, owner_id: String) -> Result<(), OrchError> {
+    /// Changing the owner identity re-binds what every future identity asserts,
+    /// so it is a policy rotation, not just a credential one.
+    pub fn set_agent_owner_id(&self, admin: &HostAdmin, owner_id: String) -> Result<(), OrchError> {
+        self.require_host_admin(admin)?;
         let owner_id = owner_id.trim().to_string();
         if owner_id.is_empty() || owner_id.len() > 128 {
             return Err(OrchError::new(
@@ -1488,16 +2323,28 @@ impl OrchestrationService {
                 "Agent owner id must be between 1 and 128 bytes",
             ));
         }
-        *self.agent_owner_id.lock() = owner_id;
-        Ok(())
+        self.advance_authority(true, None, || {
+            *self.agent_owner_id.lock() = owner_id;
+            Ok(())
+        })
     }
 
     fn agent_owner_id(&self) -> String {
         self.agent_owner_id.lock().clone()
     }
 
-    pub fn set_allowlist(&self, allowlist: WorkspaceAllowlist) {
-        self.config.lock().allowlist = allowlist;
+    /// Replacing the workspace allowlist is a policy rotation: identities issued
+    /// while the old allowlist was in force stop being current.
+    pub fn set_allowlist(
+        &self,
+        admin: &HostAdmin,
+        allowlist: WorkspaceAllowlist,
+    ) -> Result<(), OrchError> {
+        self.require_host_admin(admin)?;
+        self.advance_authority(true, None, || {
+            self.config.lock().allowlist = allowlist;
+            Ok(())
+        })
     }
 
     pub(crate) fn audit_transport_result(&self, tool: &str, error: Option<&OrchError>) {
@@ -1517,9 +2364,15 @@ impl OrchestrationService {
     }
 
     pub fn auth_header(&self, header: Option<&str>) -> Result<AuthContext, OrchError> {
-        let credentials = self.auth_credentials.lock().clone();
-        let owner_id = self.agent_owner_id();
-        let res = authenticate_bearer(header, &credentials, &owner_id);
+        // Hold the generation for the whole authentication so a rotation cannot
+        // interleave and stamp a revoked token with the new generation. Every
+        // rotation path takes this lock first as well.
+        let res = {
+            let generation = self.auth_generation.lock();
+            let credentials = self.auth_credentials.lock().clone();
+            let owner_id = self.agent_owner_id();
+            authenticate_bearer(header, &credentials, &owner_id, *generation)
+        };
         if let Err(ref e) = res {
             self.audit(
                 "auth",
@@ -1864,19 +2717,34 @@ impl OrchestrationService {
         h.retain(|j| !j.is_finished());
     }
 
-    /// Load run and verify workspace ownership against allowlist + session.
-    fn load_authorized_run(&self, run_id: &str) -> Result<RunRecord, OrchError> {
-        if safe_id_filename(run_id).is_err() {
-            return Err(OrchError::new(
-                OrchErrorCode::InvalidRequest,
-                "malformed run_id",
-            ));
-        }
-        let run = self
-            .store
-            .load_run(run_id)
-            .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?
-            .ok_or_else(|| OrchError::new(OrchErrorCode::InvalidRequest, "unknown run_id"))?;
+    /// Load run, check principal ownership, and verify workspace ownership
+    /// against allowlist + session.
+    ///
+    /// Malformed, absent, quarantined and foreign run ids all end in the same
+    /// [`Self::unknown_run`] value, and a malformed id still performs one store
+    /// lookup, so neither the bytes nor the work done distinguishes "no such
+    /// run" from "not yours" or "not a well-formed id".
+    fn load_authorized_run(
+        &self,
+        auth: &AuthContext,
+        run_id: &str,
+    ) -> Result<RunRecord, OrchError> {
+        let loaded = if safe_id_filename(run_id).is_ok() {
+            self.store
+                .load_run(run_id)
+                .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?
+        } else {
+            // Do the same lookup work for a malformed id so the refusal is not
+            // an id-shape oracle. The probe id is well-formed and random, so it
+            // can never hit.
+            let _ = self.store.load_run(&Uuid::new_v4().to_string());
+            None
+        };
+        let run = loaded.ok_or_else(Self::unknown_run)?;
+        // Ownership before scope: a run belonging to another principal must be
+        // indistinguishable from one that does not exist, whichever workspace it
+        // happens to sit in.
+        self.require_run_owner(auth, &run)?;
         let allowlist = self.config.lock().allowlist.clone();
         let ws = PathBuf::from(&run.workspace);
         if !allowlist.contains(&ws) {
@@ -1902,7 +2770,8 @@ impl OrchestrationService {
 
     // ── reads ──────────────────────────────────────────────────────────
 
-    pub fn list_sessions(&self, _auth: &AuthContext) -> Result<serde_json::Value, OrchError> {
+    pub fn list_sessions(&self, auth: &AuthContext) -> Result<serde_json::Value, OrchError> {
+        self.require_current_auth(auth)?;
         let allowlist = self.config.lock().allowlist.clone();
         let sessions = self.host.list_sessions_by_kind(SessionKind::Build, false);
         let rows: Vec<serde_json::Value> = sessions
@@ -1937,10 +2806,11 @@ impl OrchestrationService {
     /// the service host.
     pub fn create_session(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         workspace: &Path,
         title: Option<String>,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         let claimed = canonical_workspace(workspace)?;
         if !self.config.lock().allowlist.contains(&claimed) {
             return Err(OrchError::new(
@@ -1983,6 +2853,7 @@ impl OrchestrationService {
         &self,
         auth: &AuthContext,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_auth(auth)?;
         let allowlist = self.config.lock().allowlist.clone();
         let agents = self
             .host
@@ -1994,7 +2865,7 @@ impl OrchestrationService {
                     && agent
                         .owner_principal_id
                         .as_deref()
-                        .is_none_or(|owner| owner == auth.owner_id)
+                        .is_none_or(|owner| owner == auth.owner_id())
             })
             .collect::<Vec<_>>();
         Ok(json!({ "agents": agents }))
@@ -2007,18 +2878,35 @@ impl OrchestrationService {
     /// without exposing runs from another session or workspace.
     pub fn list_runs_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_auth(auth)?;
         let claimed = self.authorize_queue_request(session_id, workspace)?;
+        let live_lineages = self.live_lineages();
         let runs = self
             .store
             .list_runs()
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
             .into_iter()
             .filter(|run| {
-                run.session_id == session_id && run.workspace == claimed.display().to_string()
+                // Compare workspaces canonically, exactly as every other scope
+                // check in the tree does. An exact string compare silently
+                // hides a caller's *own* runs whenever the stored path and the
+                // claimed path differ only by canonicalization — which is the
+                // normal case wherever a temp or home directory is reached
+                // through a symlink (macOS `/var` -> `/private/var`).
+                run.session_id == session_id
+                    && super::workspaces_match(&run.workspace, &claimed.display().to_string())
+            })
+            // Listing is a read like any other: it must not surface runs the
+            // caller could not fetch individually, or it becomes the oracle the
+            // per-run denial is careful not to be. Quarantined records are
+            // excluded here too, by the same check.
+            .filter(|run| {
+                self.require_run_owner_with(auth, run, &live_lineages)
+                    .is_ok()
             })
             .collect::<Vec<_>>();
         Ok(json!({ "runs": runs }))
@@ -2134,10 +3022,11 @@ impl OrchestrationService {
 
     pub fn list_work_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_auth(auth)?;
         let claimed = self.authorize_work_read_scope(session_id, workspace)?;
         let work = self
             .store
@@ -2153,11 +3042,12 @@ impl OrchestrationService {
 
     pub fn get_work_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         work_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_auth(auth)?;
         let (item, _) = self.load_work_scoped(session_id, workspace, work_id, true)?;
         self.workload_value(item, true)
     }
@@ -2184,10 +3074,11 @@ impl OrchestrationService {
 
     pub fn list_manager_plans_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_auth(auth)?;
         let claimed = self.authorize_work_read_scope(session_id, workspace)?;
         let plans = self
             .store
@@ -2202,11 +3093,12 @@ impl OrchestrationService {
 
     pub fn get_manager_plan_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         plan_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_auth(auth)?;
         let (_, plan) = self.load_manager_plan_scoped(session_id, workspace, plan_id)?;
         Ok(json!({ "plan": plan }))
     }
@@ -2267,6 +3159,7 @@ impl OrchestrationService {
         max_replans: u32,
         autonomous: bool,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         let payload = json!({
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),
@@ -2338,7 +3231,7 @@ impl OrchestrationService {
             objective.clone(),
             session_id,
             claimed.display().to_string(),
-            &auth.token_id,
+            auth.credential_id(),
             WorkPolicy::default(),
         ) {
             Ok(root) => root,
@@ -2419,6 +3312,7 @@ impl OrchestrationService {
         plan_id: &str,
         expected_revision: Option<u64>,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         let payload = json!({
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),
@@ -2475,7 +3369,7 @@ impl OrchestrationService {
                 ))
             }
         };
-        let created = match plan.advance(&work_items, &auth.token_id, Utc::now()) {
+        let created = match plan.advance(&work_items, auth.credential_id(), Utc::now()) {
             Ok(created) => created,
             Err(error) => {
                 return Err(self.fail_claim(
@@ -2524,6 +3418,7 @@ impl OrchestrationService {
         plan_id: &str,
         expected_revision: Option<u64>,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         let payload = json!({
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),
@@ -2582,7 +3477,7 @@ impl OrchestrationService {
         };
         let now = Utc::now();
         let created = if plan.state == super::manager::ManagerPlanState::Active {
-            match plan.advance(&work_items, &auth.token_id, now) {
+            match plan.advance(&work_items, auth.credential_id(), now) {
                 Ok(created) => created,
                 Err(error) => {
                     return Err(self.fail_claim(
@@ -2604,7 +3499,7 @@ impl OrchestrationService {
             let message = match self.persist_manager_notification(
                 &plan,
                 &notification,
-                &auth.token_id,
+                auth.credential_id(),
                 Utc::now(),
             ) {
                 Ok(message) => message,
@@ -2669,7 +3564,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)]
     pub async fn replan_manager_plan(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -2678,6 +3573,7 @@ impl OrchestrationService {
         steps: Vec<ManagerStepSpec>,
         expected_revision: Option<u64>,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         let payload = json!({
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),
@@ -2819,6 +3715,7 @@ impl OrchestrationService {
         dependencies: Vec<WorkDependency>,
         policy: WorkPolicy,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         let tool = "ptah_create_work";
         let payload = json!({
             "sessionId": session_id,
@@ -2843,7 +3740,7 @@ impl OrchestrationService {
             objective,
             session_id,
             claimed.display().to_string(),
-            &auth.token_id,
+            auth.credential_id(),
             policy,
         ) {
             Ok(item) => item,
@@ -2896,6 +3793,7 @@ impl OrchestrationService {
         lease_ms: Option<u64>,
         agent_id: Option<String>,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         let tool = "ptah_claim_work";
         let payload = json!({
             "sessionId": session_id,
@@ -2927,7 +3825,7 @@ impl OrchestrationService {
                 return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
             }
         }
-        let claimant = agent_id.unwrap_or_else(|| auth.token_id.clone());
+        let claimant = agent_id.unwrap_or_else(|| auth.credential_id().to_string());
         let claim = match self.store.claim_work_with_lease_secret(
             work_id,
             &claimant,
@@ -2964,7 +3862,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)] // Mirrors the authenticated MCP lease-renewal contract.
     pub async fn renew_work(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -2973,6 +3871,7 @@ impl OrchestrationService {
         lease_token: &str,
         lease_ms: Option<u64>,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         self.work_lease_mutation(
             "ptah_renew_work",
             request_id,
@@ -3054,7 +3953,8 @@ impl OrchestrationService {
         lease_token: &str,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        let run = self.authorize_run_request(session_id, workspace, run_id)?;
+        self.require_current_effect(auth)?;
+        let run = self.authorize_run_request(auth, session_id, workspace, run_id)?;
         let response = self
             .work_lease_mutation(
                 "ptah_link_work_run",
@@ -3073,7 +3973,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)] // Mirrors the authenticated MCP progress-report contract.
     pub async fn report_work_progress(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -3083,6 +3983,7 @@ impl OrchestrationService {
         summary: String,
         percent: Option<u8>,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         let progress = WorkProgress {
             summary,
             percent,
@@ -3141,7 +4042,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)] // Mirrors the authenticated MCP lease-release contract.
     pub async fn release_work(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -3150,6 +4051,7 @@ impl OrchestrationService {
         lease_token: &str,
         reason: String,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         self.work_item_attempt_mutation(
             "ptah_release_work",
             request_id,
@@ -3165,7 +4067,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)] // Mirrors the authenticated MCP completion contract.
     pub async fn complete_work(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -3174,6 +4076,7 @@ impl OrchestrationService {
         lease_token: &str,
         result: WorkResult,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         self.work_item_attempt_mutation(
             "ptah_complete_work",
             request_id,
@@ -3189,7 +4092,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)] // Mirrors the authenticated MCP failure contract.
     pub async fn fail_work(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -3198,6 +4101,7 @@ impl OrchestrationService {
         lease_token: &str,
         result: WorkResult,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         self.work_item_attempt_mutation(
             "ptah_fail_work",
             request_id,
@@ -3264,7 +4168,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)] // Keeps the authenticated cancellation contract revision-fenced.
     pub async fn cancel_work(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -3272,6 +4176,7 @@ impl OrchestrationService {
         reason: String,
         expected_revision: Option<u64>,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         let tool = "ptah_cancel_work";
         let payload = json!({
             "sessionId": session_id,
@@ -3322,7 +4227,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)]
     pub async fn assign_work(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -3330,6 +4235,7 @@ impl OrchestrationService {
         assigned_agent_id: Option<String>,
         expected_revision: Option<u64>,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         self.work_item_mutation(
             "ptah_assign_work",
             request_id,
@@ -3383,10 +4289,11 @@ impl OrchestrationService {
 
     pub fn list_workers_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_auth(auth)?;
         let claimed = self.authorize_work_read_scope(session_id, workspace)?;
         let workers = self
             .store
@@ -3396,11 +4303,12 @@ impl OrchestrationService {
 
     pub fn get_worker_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         agent_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_auth(auth)?;
         let claimed = self.authorize_work_read_scope(session_id, workspace)?;
         let worker = self
             .store
@@ -3424,6 +4332,7 @@ impl OrchestrationService {
         agent_id: &str,
         host_kind: WorkerHostKind,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         let payload = json!({
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),
@@ -3445,7 +4354,7 @@ impl OrchestrationService {
         };
         let presence = match self.store.heartbeat_worker_scoped(
             agent_id,
-            &auth.token_id,
+            auth.credential_id(),
             host_kind,
             Utc::now(),
             session_id,
@@ -3484,6 +4393,7 @@ impl OrchestrationService {
         expected_revision: Option<u64>,
         manager_agent_id: Option<String>,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         let payload = json!({
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),
@@ -3527,7 +4437,7 @@ impl OrchestrationService {
         let (item, decision) = match self.store.offer_work(
             work_id,
             &actors.worker.agent_id,
-            &auth.token_id,
+            auth.credential_id(),
             manager_id.as_deref(),
             &reason,
             expected_revision,
@@ -3565,6 +4475,7 @@ impl OrchestrationService {
         reason: String,
         expected_revision: Option<u64>,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         self.worker_identity_mutation(
             "ptah_accept_work",
             auth,
@@ -3594,6 +4505,7 @@ impl OrchestrationService {
         reason: String,
         expected_revision: Option<u64>,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         self.worker_identity_mutation(
             "ptah_decline_work",
             auth,
@@ -3624,6 +4536,7 @@ impl OrchestrationService {
         expected_revision: Option<u64>,
         manager_agent_id: Option<String>,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         let payload = json!({
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),
@@ -3667,7 +4580,7 @@ impl OrchestrationService {
         let (item, decision) = match self.store.reassign_work(
             work_id,
             &actors.worker.agent_id,
-            &auth.token_id,
+            auth.credential_id(),
             manager_id.as_deref(),
             &reason,
             expected_revision,
@@ -3705,6 +4618,7 @@ impl OrchestrationService {
         reason: String,
         expected_revision: Option<u64>,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         self.work_item_mutation(
             "ptah_reprioritize_work",
             request_id,
@@ -3717,7 +4631,7 @@ impl OrchestrationService {
                     .reprioritize_work(
                         work_id,
                         priority,
-                        &auth.token_id,
+                        auth.credential_id(),
                         &reason,
                         expected_revision,
                         Utc::now(),
@@ -3739,6 +4653,7 @@ impl OrchestrationService {
         reason: String,
         expected_revision: Option<u64>,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         self.work_item_mutation(
             "ptah_block_work",
             request_id,
@@ -3750,7 +4665,7 @@ impl OrchestrationService {
                 store
                     .block_work(
                         work_id,
-                        &auth.token_id,
+                        auth.credential_id(),
                         &reason,
                         expected_revision,
                         Utc::now(),
@@ -3772,6 +4687,7 @@ impl OrchestrationService {
         reason: String,
         expected_revision: Option<u64>,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         self.work_item_mutation(
             "ptah_request_review",
             request_id,
@@ -3783,7 +4699,7 @@ impl OrchestrationService {
                 store
                     .request_work_review(
                         work_id,
-                        &auth.token_id,
+                        auth.credential_id(),
                         &reason,
                         expected_revision,
                         Utc::now(),
@@ -3796,11 +4712,12 @@ impl OrchestrationService {
 
     pub fn list_work_decisions_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         work_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_auth(auth)?;
         let (item, _) = self.load_work_scoped(session_id, workspace, work_id, true)?;
         let decisions = self.store.list_work_decisions(&item.work_id)?;
         Ok(json!({ "workId": item.work_id, "decisions": decisions }))
@@ -3823,6 +4740,7 @@ impl OrchestrationService {
         attempt_id: Option<String>,
         run_id: Option<String>,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         let idempotency = json!({
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),
@@ -3854,7 +4772,7 @@ impl OrchestrationService {
         }
         let mut message = match WorkMessage::new(
             kind,
-            auth.token_id.clone(),
+            auth.credential_id().to_string(),
             from_agent_id,
             to_agent_id,
             session_id,
@@ -3916,6 +4834,7 @@ impl OrchestrationService {
         workspace: &Path,
         message_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         let payload = json!({
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),
@@ -3936,7 +4855,7 @@ impl OrchestrationService {
         };
         let message = match self.store.ack_message_scoped(
             message_id,
-            &auth.token_id,
+            auth.credential_id(),
             Utc::now(),
             session_id,
             &claimed.display().to_string(),
@@ -3963,12 +4882,13 @@ impl OrchestrationService {
 
     pub fn list_inbox_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         agent_id: &str,
         after_seq: u64,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_auth(auth)?;
         let claimed = self.authorize_work_read_scope(session_id, workspace)?;
         let page = self.store.list_messages(
             session_id,
@@ -3983,12 +4903,13 @@ impl OrchestrationService {
 
     pub fn list_outbox_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         actor_id: &str,
         after_seq: u64,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_auth(auth)?;
         let claimed = self.authorize_work_read_scope(session_id, workspace)?;
         let page = self.store.list_messages(
             session_id,
@@ -4008,7 +4929,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)]
     pub async fn retry_work(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -4016,6 +4937,7 @@ impl OrchestrationService {
         reason: String,
         expected_revision: Option<u64>,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         self.work_item_mutation(
             "ptah_retry_work",
             request_id,
@@ -4042,6 +4964,7 @@ impl OrchestrationService {
         note: Option<String>,
         expected_revision: Option<u64>,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         self.work_item_attempt_mutation(
             "ptah_approve_work",
             request_id,
@@ -4049,11 +4972,11 @@ impl OrchestrationService {
             workspace,
             work_id,
             json!({
-                "reviewerId": auth.token_id,
+                "reviewerId": auth.credential_id(),
                 "note": note,
                 "expectedRevision": expected_revision,
             }),
-            |store| store.approve_work(work_id, &auth.token_id, note, expected_revision),
+            |store| store.approve_work(work_id, auth.credential_id(), note, expected_revision),
         )
         .await
     }
@@ -4117,10 +5040,11 @@ impl OrchestrationService {
 
     pub fn list_routines_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_auth(auth)?;
         let claimed = self.authorize_routine_read_scope(session_id, workspace)?;
         let routines = self
             .store
@@ -4136,22 +5060,24 @@ impl OrchestrationService {
 
     pub fn get_routine_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         routine_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_auth(auth)?;
         let (routine, _) = self.load_routine_scoped(session_id, workspace, routine_id, true)?;
         self.routine_value(routine, true)
     }
 
     pub fn list_activations_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         routine_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_auth(auth)?;
         let (routine, _) = self.load_routine_scoped(session_id, workspace, routine_id, true)?;
         let activations = self.store.list_activations(&routine.routine_id, 128)?;
         Ok(json!({
@@ -4175,6 +5101,7 @@ impl OrchestrationService {
         concurrency: RoutineConcurrencyPolicy,
         retry: RoutineRetryPolicy,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         let tool = "ptah_create_routine";
         let payload = json!({
             "sessionId": session_id,
@@ -4253,7 +5180,7 @@ impl OrchestrationService {
             missed_run_policy,
             concurrency,
             retry,
-            &auth.token_id,
+            auth.credential_id(),
             now,
         ) {
             Ok(routine) => routine,
@@ -4299,7 +5226,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)]
     pub async fn set_routine_lifecycle(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -4308,6 +5235,7 @@ impl OrchestrationService {
         expected_revision: Option<u64>,
         tool: &str,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         let payload = json!({
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),
@@ -4371,6 +5299,7 @@ impl OrchestrationService {
         routine_id: &str,
         payload: Option<serde_json::Value>,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         let tool = "ptah_fire_routine";
         let idempotency_payload = json!({
             "sessionId": session_id,
@@ -4404,7 +5333,7 @@ impl OrchestrationService {
             scheduled_at: now,
             received_at: now,
             payload,
-            created_by: auth.token_id.clone(),
+            created_by: auth.credential_id().to_string(),
         };
         let ceiling = self.config.lock().bounds.clone();
         let activation = match self
@@ -4544,7 +5473,7 @@ impl OrchestrationService {
         let (item, decision) = match operation(
             &self.store,
             agent_id,
-            &auth.token_id,
+            auth.credential_id(),
             &reason,
             expected_revision,
             Utc::now(),
@@ -4581,6 +5510,7 @@ impl OrchestrationService {
         workspace: &Path,
         agent_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_auth(auth)?;
         let _ =
             self.authorize_persistent_agent_request(auth, session_id, workspace, agent_id, false)?;
         let plan = self
@@ -4611,6 +5541,7 @@ impl OrchestrationService {
         prompt: String,
         max_rounds: Option<u32>,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         let tool = "ptah_resume_persistent_agent";
         let (agent, claimed) = match self
             .authorize_persistent_agent_request(auth, session_id, workspace, agent_id, true)
@@ -4673,7 +5604,22 @@ impl OrchestrationService {
         }
         let response = match self
             .host
-            .resume_agent_with_request_id(session_id, prompt, max_rounds, Some(request_id.into()))
+            .resume_agent_with_request_id_for_principal(
+                session_id,
+                prompt,
+                max_rounds,
+                Some(request_id.into()),
+                // The continuation Run the host is about to create is this
+                // caller's work. Stamp it with the same alias *and* credential
+                // lineage run ownership is checked against, so the coordinator
+                // owns the Run it just created instead of it landing on the
+                // desktop — and a later re-registration of the alias cannot
+                // inherit it.
+                Some((
+                    auth.principal().to_string(),
+                    auth.credential_incarnation().to_string(),
+                )),
+            )
             .await
         {
             Ok(response) => response,
@@ -4719,6 +5665,7 @@ impl OrchestrationService {
         agent_id: &str,
         policy: ManagedExecutionPolicy,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         policy.validate()?;
         let claimed = self.authorize_work_read_scope(session_id, workspace)?;
         let _ = self.store.require_agent_in_scope(
@@ -4734,7 +5681,7 @@ impl OrchestrationService {
         }
         let agent = self
             .store
-            .revise_agent_spec(agent_id, &auth.token_id, |spec| {
+            .revise_agent_spec(agent_id, auth.credential_id(), |spec| {
                 if policy.enabled && spec.authority.computer_use_allowed {
                     anyhow::bail!("managed execution cannot grant Computer Use");
                 }
@@ -4757,11 +5704,12 @@ impl OrchestrationService {
 
     pub fn get_managed_execution(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         agent_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_auth(auth)?;
         let claimed = self.authorize_work_read_scope(session_id, workspace)?;
         let agent = self.store.require_agent_in_scope(
             agent_id,
@@ -4787,6 +5735,7 @@ impl OrchestrationService {
         reason: String,
         expected_revision: Option<u64>,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         let payload = json!({
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),
@@ -4812,7 +5761,7 @@ impl OrchestrationService {
         }
         let (item, decision) = match self.store.authorize_work_execution(
             work_id,
-            &auth.token_id,
+            auth.credential_id(),
             None,
             &reason,
             expected_revision,
@@ -4840,10 +5789,11 @@ impl OrchestrationService {
 
     pub fn list_execution_intents_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_auth(auth)?;
         let claimed = self.authorize_work_read_scope(session_id, workspace)?;
         let intents = self
             .store
@@ -4859,12 +5809,13 @@ impl OrchestrationService {
 
     pub fn resolve_work_input(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         permission_id: Uuid,
         allow: bool,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         let claimed = self.authorize_work_mutation_scope(session_id, workspace)?;
         let claimed_text = claimed.display().to_string();
         let intent = self.store.inspect_parked_managed_permission(
@@ -4930,7 +5881,27 @@ impl OrchestrationService {
         }))
     }
 
-    pub fn get_capacity(&self, _auth: &AuthContext) -> Result<serde_json::Value, OrchError> {
+    pub fn get_capacity(&self, auth: &AuthContext) -> Result<serde_json::Value, OrchError> {
+        self.require_current_auth(auth)?;
+        Ok(self.capacity_snapshot())
+    }
+
+    /// Capacity for the host's own unauthenticated readiness probe.
+    ///
+    /// Takes the narrow [`ReadinessAuthority`] rather than an `AuthContext`.
+    /// The probe used to fabricate a public context with invented principal and
+    /// owner values, which meant an unauthenticated local probe held a value
+    /// indistinguishable from a real caller's identity. It now unlocks exactly
+    /// this one read and cannot be passed anywhere an `AuthContext` is
+    /// expected. The probe's observable behaviour is unchanged.
+    pub(crate) fn capacity_for_readiness(
+        &self,
+        _authority: &ReadinessAuthority,
+    ) -> serde_json::Value {
+        self.capacity_snapshot()
+    }
+
+    fn capacity_snapshot(&self) -> serde_json::Value {
         let max = self.host.orchestration_capacity_limit();
         let active = self.host.orchestration_active_count();
         let queued = self.host.orchestration_pending_count();
@@ -4973,7 +5944,7 @@ impl OrchestrationService {
             .last_error
             .as_deref()
             .map(|error| self.bus.redact_text(error, 500));
-        Ok(json!({
+        json!({
             "maxConcurrentRuns": max,
             "activeRuns": active,
             "available": max.saturating_sub(active),
@@ -4992,26 +5963,31 @@ impl OrchestrationService {
                 "managerSupervisor": manager_supervisor,
                 "nativeExecutorError": self.native_executor.lock().last_error.clone().map(|error| self.bus.redact_text(&error, 500)),
                 "nativeExecutor": self.native_executor.lock().clone(),
+                "authorityOrigin": self.authority_origin.as_str(),
+                "authEpoch": self.auth_epoch(),
+                "policyRevision": self.policy_revision(),
             },
-        }))
+        })
     }
 
     pub fn get_run(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        self.run_value(self.load_authorized_run(run_id)?)
+        self.require_current_auth(auth)?;
+        self.run_value(self.load_authorized_run(auth, run_id)?)
     }
 
     pub fn get_run_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        self.run_value(self.authorize_run_request(session_id, workspace, run_id)?)
+        self.require_current_auth(auth)?;
+        self.run_value(self.authorize_run_request(auth, session_id, workspace, run_id)?)
     }
 
     fn run_value(&self, mut run: RunRecord) -> Result<serde_json::Value, OrchError> {
@@ -5022,20 +5998,22 @@ impl OrchestrationService {
 
     pub fn get_progress(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        self.progress_value(self.load_authorized_run(run_id)?)
+        self.require_current_auth(auth)?;
+        self.progress_value(self.load_authorized_run(auth, run_id)?)
     }
 
     pub fn get_progress_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        self.progress_value(self.authorize_run_request(session_id, workspace, run_id)?)
+        self.require_current_auth(auth)?;
+        self.progress_value(self.authorize_run_request(auth, session_id, workspace, run_id)?)
     }
 
     fn progress_value(&self, mut run: RunRecord) -> Result<serde_json::Value, OrchError> {
@@ -5070,11 +6048,12 @@ impl OrchestrationService {
 
     pub fn get_events(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         run_id: Option<&str>,
         after_seq: u64,
         limit: usize,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_auth(auth)?;
         // run_id is required — never fall back to the global journal.
         let rid = run_id.ok_or_else(|| {
             OrchError::new(
@@ -5082,21 +6061,22 @@ impl OrchestrationService {
                 "run_id is required for get_events",
             )
         })?;
-        let run = self.load_authorized_run(rid)?;
+        let run = self.load_authorized_run(auth, rid)?;
         self.events_for_run(run, after_seq, limit)
     }
 
     pub fn get_events_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         run_id: &str,
         after_seq: u64,
         limit: usize,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_auth(auth)?;
         self.events_for_run(
-            self.authorize_run_request(session_id, workspace, run_id)?,
+            self.authorize_run_request(auth, session_id, workspace, run_id)?,
             after_seq,
             limit,
         )
@@ -5106,14 +6086,15 @@ impl OrchestrationService {
     /// durable page for the optional Streamable HTTP live channel.
     pub(crate) fn live_run_page(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         run_id: &str,
         after_seq: u64,
         limit: usize,
     ) -> Result<(LiveRunScope, JournalPage), OrchError> {
-        let run = self.authorize_run_request(session_id, workspace, run_id)?;
+        self.require_current_auth(auth)?;
+        let run = self.authorize_run_request(auth, session_id, workspace, run_id)?;
         let Some(start_seq) = run.start_seq else {
             return Err(OrchError::new(
                 OrchErrorCode::Conflict,
@@ -5198,10 +6179,11 @@ impl OrchestrationService {
 
     pub fn list_computer_runs_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_auth(auth)?;
         let reads = self.computer_reads()?;
         let claimed = self.authorize_computer_scope(session_id, workspace)?;
         let binding = crate::computer_use::ComputerReadBinding::new(session_id, &claimed);
@@ -5213,11 +6195,12 @@ impl OrchestrationService {
 
     pub fn get_computer_run_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_auth(auth)?;
         let reads = self.computer_reads()?;
         let claimed = self.authorize_computer_scope(session_id, workspace)?;
         let binding = crate::computer_use::ComputerReadBinding::new(session_id, &claimed);
@@ -5230,13 +6213,14 @@ impl OrchestrationService {
 
     pub fn get_computer_run_events_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         run_id: &str,
         after_seq: Option<u64>,
         limit: usize,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_auth(auth)?;
         let reads = self.computer_reads()?;
         let claimed = self.authorize_computer_scope(session_id, workspace)?;
         let binding = crate::computer_use::ComputerReadBinding::new(session_id, &claimed);
@@ -5263,10 +6247,11 @@ impl OrchestrationService {
 
     pub fn get_computer_capacity_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_auth(auth)?;
         let reads = self.computer_reads()?;
         let claimed = self.authorize_computer_scope(session_id, workspace)?;
         let binding = crate::computer_use::ComputerReadBinding::new(session_id, &claimed);
@@ -5320,20 +6305,22 @@ impl OrchestrationService {
 
     pub fn get_changes(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        self.changes_for_run(self.load_authorized_run(run_id)?)
+        self.require_current_auth(auth)?;
+        self.changes_for_run(self.load_authorized_run(auth, run_id)?)
     }
 
     pub fn get_changes_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        self.changes_for_run(self.authorize_run_request(session_id, workspace, run_id)?)
+        self.require_current_auth(auth)?;
+        self.changes_for_run(self.authorize_run_request(auth, session_id, workspace, run_id)?)
     }
 
     fn changes_for_run(&self, run: RunRecord) -> Result<serde_json::Value, OrchError> {
@@ -5358,20 +6345,22 @@ impl OrchestrationService {
 
     pub fn get_test_results(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        self.test_results_for_run(self.load_authorized_run(run_id)?)
+        self.require_current_auth(auth)?;
+        self.test_results_for_run(self.load_authorized_run(auth, run_id)?)
     }
 
     pub fn get_test_results_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        self.test_results_for_run(self.authorize_run_request(session_id, workspace, run_id)?)
+        self.require_current_auth(auth)?;
+        self.test_results_for_run(self.authorize_run_request(auth, session_id, workspace, run_id)?)
     }
 
     fn test_results_for_run(&self, run: RunRecord) -> Result<serde_json::Value, OrchError> {
@@ -5442,20 +6431,22 @@ impl OrchestrationService {
 
     pub fn get_handoff(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        self.handoff_for_run(self.load_authorized_run(run_id)?)
+        self.require_current_auth(auth)?;
+        self.handoff_for_run(self.load_authorized_run(auth, run_id)?)
     }
 
     pub fn get_handoff_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        self.handoff_for_run(self.authorize_run_request(session_id, workspace, run_id)?)
+        self.require_current_auth(auth)?;
+        self.handoff_for_run(self.authorize_run_request(auth, session_id, workspace, run_id)?)
     }
 
     fn handoff_for_run(&self, run: RunRecord) -> Result<serde_json::Value, OrchError> {
@@ -5529,11 +6520,12 @@ impl OrchestrationService {
 
     fn authorize_run_request(
         &self,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         run_id: &str,
     ) -> Result<RunRecord, OrchError> {
-        let run = self.load_authorized_run(run_id)?;
+        let run = self.load_authorized_run(auth, run_id)?;
         if run.session_id != session_id {
             return Err(OrchError::new(
                 OrchErrorCode::ForbiddenScope,
@@ -5585,7 +6577,7 @@ impl OrchestrationService {
         if agent
             .owner_principal_id
             .as_deref()
-            .is_some_and(|owner| owner != auth.owner_id)
+            .is_some_and(|owner| owner != auth.owner_id())
         {
             return Err(OrchError::new(
                 OrchErrorCode::ForbiddenScope,
@@ -5594,7 +6586,7 @@ impl OrchestrationService {
         }
         let agent = if claim_owner {
             self.store
-                .claim_agent_owner(&agent.agent_id, &auth.owner_id)
+                .claim_agent_owner(&agent.agent_id, auth.owner_id())
                 .map_err(|error| {
                     OrchError::new(
                         OrchErrorCode::ForbiddenScope,
@@ -5714,10 +6706,11 @@ impl OrchestrationService {
 
     pub fn get_queue(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_auth(auth)?;
         let claimed = self.authorize_queue_request(session_id, workspace)?;
         let snapshot = self
             .host
@@ -5734,7 +6727,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)]
     pub async fn edit_queue(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -5742,6 +6735,7 @@ impl OrchestrationService {
         version: u64,
         text: String,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         let tool = "ptah_edit_queue";
         if let Err(error) = reject_control_prompt(&text) {
             self.audit_err(
@@ -5810,13 +6804,14 @@ impl OrchestrationService {
 
     pub async fn remove_queue(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
         entry_id: &str,
         expected_version: u64,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         let tool = "ptah_remove_queue";
         let payload = json!({
             "sessionId": session_id,
@@ -5874,7 +6869,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)]
     pub async fn reorder_queue(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -5883,6 +6878,7 @@ impl OrchestrationService {
         expected_version: u64,
         expected_revision: u64,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         let tool = "ptah_reorder_queue";
         self.reject_selecting_control_entry(tool, request_id, session_id, workspace, entry_id)?;
         let payload = json!({
@@ -5948,11 +6944,12 @@ impl OrchestrationService {
 
     pub async fn clear_queue(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         let tool = "ptah_clear_queue";
         let payload = json!({
             "sessionId": session_id,
@@ -6064,13 +7061,14 @@ impl OrchestrationService {
 
     pub async fn run_next_queue(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
         entry_id: &str,
         expected_version: u64,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         let tool = "ptah_run_next";
         self.reject_selecting_control_entry(tool, request_id, session_id, workspace, entry_id)?;
         let payload = json!({
@@ -6134,13 +7132,14 @@ impl OrchestrationService {
 
     pub async fn steer_queued(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
         entry_id: &str,
         expected_version: u64,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         let tool = "ptah_steer_queued";
         self.reject_selecting_control_entry(tool, request_id, session_id, workspace, entry_id)?;
         let payload = json!({
@@ -6200,11 +7199,12 @@ impl OrchestrationService {
 
     fn isolated_review(
         &self,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         run_id: &str,
     ) -> Result<(RunRecord, crate::run_promotion::RunReview), OrchError> {
-        let run = self.authorize_run_request(session_id, workspace, run_id)?;
+        let run = self.authorize_run_request(auth, session_id, workspace, run_id)?;
         if run.state != RunState::Completed {
             return Err(OrchError::new(
                 OrchErrorCode::Conflict,
@@ -6240,12 +7240,13 @@ impl OrchestrationService {
 
     pub fn review_run(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        let (run, review) = self.isolated_review(session_id, workspace, run_id)?;
+        self.require_current_effect(auth)?;
+        let (run, review) = self.isolated_review(auth, session_id, workspace, run_id)?;
         Ok(json!({
             "runId": run.run_id,
             "sessionId": run.session_id,
@@ -6261,7 +7262,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)] // Keeps the approval scope explicit at the control boundary.
     pub async fn approve_run(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -6271,6 +7272,7 @@ impl OrchestrationService {
         changed_files: Vec<ChangeRecord>,
         ttl_ms: Option<u64>,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         const DEFAULT_TTL_MS: u64 = 5 * 60 * 1_000;
         const MAX_TTL_MS: u64 = 15 * 60 * 1_000;
         let tool = "ptah_approve_run";
@@ -6304,7 +7306,7 @@ impl OrchestrationService {
                 ),
             ));
         }
-        let run = match self.authorize_run_request(session_id, workspace, run_id) {
+        let run = match self.authorize_run_request(auth, session_id, workspace, run_id) {
             Ok(run) => run,
             Err(error) => return Err(fail(self, error)),
         };
@@ -6322,7 +7324,7 @@ impl OrchestrationService {
             Ok(IdempotencyStart::Perform(lease)) => lease,
             Err(error) => return Err(error),
         };
-        let (run, review) = match self.isolated_review(session_id, workspace, run_id) {
+        let (run, review) = match self.isolated_review(auth, session_id, workspace, run_id) {
             Ok(value) => value,
             Err(error) => {
                 return Err(self.fail_claim(
@@ -6421,13 +7423,14 @@ impl OrchestrationService {
 
     pub async fn promote_run(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
         run_id: &str,
         approval_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         let tool = "ptah_promote_run";
         let payload = json!({
             "sessionId": session_id,
@@ -6436,7 +7439,7 @@ impl OrchestrationService {
             "approvalId": approval_id,
         });
         let phash = hash_payload(&payload);
-        let run = self.authorize_run_request(session_id, workspace, run_id)?;
+        let run = self.authorize_run_request(auth, session_id, workspace, run_id)?;
         let mut lease = match self
             .begin_idempotency(
                 tool,
@@ -6474,12 +7477,13 @@ impl OrchestrationService {
 
     pub async fn discard_run(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         let tool = "ptah_discard_run";
         let payload = json!({
             "sessionId": session_id,
@@ -6487,7 +7491,7 @@ impl OrchestrationService {
             "runId": run_id,
         });
         let phash = hash_payload(&payload);
-        let run = self.authorize_run_request(session_id, workspace, run_id)?;
+        let run = self.authorize_run_request(auth, session_id, workspace, run_id)?;
         if !run.state.is_terminal() {
             return Err(OrchError::new(
                 OrchErrorCode::Conflict,
@@ -6536,6 +7540,7 @@ impl OrchestrationService {
         prompt: String,
         bounds_json: Option<serde_json::Value>,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         self.submit_task_with_execution_mode(
             auth,
             request_id,
@@ -6559,6 +7564,7 @@ impl OrchestrationService {
         bounds_json: Option<serde_json::Value>,
         execution_mode: RunExecutionMode,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         self.submit_task_with_execution_mode_and_queue(
             auth,
             request_id,
@@ -6584,6 +7590,7 @@ impl OrchestrationService {
         execution_mode: RunExecutionMode,
         allow_queue: bool,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         self.submit_task_with_execution_mode_and_queue_parent(
             auth,
             request_id,
@@ -6619,7 +7626,6 @@ impl OrchestrationService {
         expected_agent_spec_revision: Option<u64>,
         proposal_only: bool,
     ) -> Result<serde_json::Value, OrchError> {
-        let _ = auth;
         let tool = idempotency_tool;
         if proposal_only && allow_queue {
             return Err(OrchError::new(
@@ -6683,6 +7689,41 @@ impl OrchestrationService {
             Err(e) => return Err(finish_err(self, e)),
         };
 
+        // Ownership admission *before* any durable or effectful mutation
+        // (#477 P0-5). `begin_idempotency` writes a claim record and
+        // `ensure_session_agent` creates an Agent, so running the ownership
+        // check after them left a refused caller having already mutated the
+        // store. This read-only pre-check refuses first; the authoritative
+        // `claim_agent_owner` below still runs, so a racing owner change is
+        // caught too — but the ordinary refusal now costs nothing.
+        //
+        // The lookup goes through the durable store rather than the host: this
+        // path is also reached from the in-process native executor, which can
+        // already hold the host's state lock, and `parking_lot` mutexes are not
+        // re-entrant — taking it again here would wedge the task holding it and
+        // with it the host's instance lock.
+        let foreign_owner = self
+            .store
+            .list_agents()
+            .unwrap_or_default()
+            .into_iter()
+            .any(|agent| {
+                agent.session_id == session_id
+                    && agent
+                        .owner_principal_id
+                        .as_deref()
+                        .is_some_and(|owner| owner != auth.owner_id())
+            });
+        if foreign_owner {
+            return Err(finish_err(
+                self,
+                OrchError::new(
+                    OrchErrorCode::ForbiddenScope,
+                    "session Agent is owned by a different service account",
+                ),
+            ));
+        }
+
         let mut lease = match self
             .begin_idempotency(tool, request_id, &phash, session_id, &claimed)
             .await?
@@ -6724,7 +7765,7 @@ impl OrchestrationService {
         }
         let agent = match self
             .store
-            .claim_agent_owner(&agent.agent_id, &auth.owner_id)
+            .claim_agent_owner(&agent.agent_id, auth.owner_id())
         {
             Ok(Some(agent)) => agent,
             Ok(None) => {
@@ -6809,14 +7850,13 @@ impl OrchestrationService {
             // Distinguish coordinator-owned work from desktop turns so the
             // desktop can surface external activity without guessing from
             // transport timing.
-            client_id: Some(if auth.token_id == "primary" {
-                // Preserve the established wire value for the compatibility
-                // credential; newly named device credentials are emitted by
-                // their stable IDs.
-                "mcp".into()
-            } else {
-                auth.token_id.clone()
-            }),
+            // `AuthContext::principal` is also what run reads check ownership
+            // against, so stamping and enforcement cannot drift apart.
+            client_id: Some(auth.principal().to_string()),
+            // The exact credential registration that admitted this Run. Without
+            // it the alias alone would let a re-registered credential inherit
+            // this work.
+            client_lineage: Some(auth.credential_incarnation().to_string()),
             state: if queued {
                 RunState::Queued
             } else {
@@ -6960,6 +8000,7 @@ impl OrchestrationService {
         execution_mode: Option<RunExecutionMode>,
         allow_queue: bool,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         let tool = "ptah_retry_run";
         let fail = |svc: &Self, error: OrchError| {
             svc.audit_err(
@@ -6971,7 +8012,7 @@ impl OrchestrationService {
             );
             error
         };
-        let source = match self.authorize_run_request(session_id, workspace, source_run_id) {
+        let source = match self.authorize_run_request(auth, session_id, workspace, source_run_id) {
             Ok(run) => run,
             Err(error) => return Err(fail(self, error)),
         };
@@ -7333,6 +8374,7 @@ impl OrchestrationService {
         prompt: String,
         priority: bool,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         let _ = auth;
         let tool = "ptah_queue_prompt";
         let payload = json!({
@@ -7433,6 +8475,7 @@ impl OrchestrationService {
         workspace: &Path,
         text: String,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         let _ = auth;
         let tool = "ptah_steer";
         let payload = json!({
@@ -7529,6 +8572,7 @@ impl OrchestrationService {
         workspace: &Path,
         run_id: Option<&str>,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_effect(auth)?;
         let _ = auth;
         let tool = "ptah_cancel";
         let payload = json!({
