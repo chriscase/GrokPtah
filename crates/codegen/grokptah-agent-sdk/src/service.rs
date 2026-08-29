@@ -138,6 +138,32 @@ impl TransportFault {
 /// Implementors own framing, authentication, timeouts, and body limits. They
 /// must return the `structuredContent` body of a successful `tools/call`, and
 /// a [`TransportFault`] for anything else.
+/// A shared transport is a transport.
+///
+/// Lets an embedder that must retain its own handle keep one, without the
+/// adapter handing its transport back out. `ServiceControlPlane` deliberately
+/// has **no** accessor for the transport it owns: returning one made every
+/// gate in this crate advisory, since a caller holding the raw transport can
+/// call any tool the host advertises and skip `require_tool`, the capability
+/// check, the read-only default and [`MutationAuthority`] together.
+///
+/// The honest limit, because it matters more than the removal: a consumer
+/// *supplies* its transport, so one that wants to call the host directly
+/// always can. What is closed is the adapter offering that as a supported
+/// operation and a plane received from elsewhere being unwrappable. The
+/// boundary that actually holds is the host's own authorization — which is why
+/// the tool list here is a compatibility check, never a permission.
+#[async_trait]
+impl<T: McpTransport + ?Sized> McpTransport for std::sync::Arc<T> {
+    async fn list_tools(&self) -> Result<Vec<String>, TransportFault> {
+        (**self).list_tools().await
+    }
+
+    async fn call_tool(&self, tool: &str, arguments: Value) -> Result<Value, TransportFault> {
+        (**self).call_tool(tool, arguments).await
+    }
+}
+
 #[async_trait]
 pub trait McpTransport: Send + Sync {
     /// `tools/list` — the host-owned tool registry. The adapter derives its
@@ -382,11 +408,6 @@ impl<T: McpTransport> ServiceControlPlane<T> {
 
     pub fn authority(&self) -> MutationAuthority {
         self.authority
-    }
-
-    /// Borrow the transport, for embedders that need to inspect or drive it.
-    pub fn transport(&self) -> &T {
-        &self.transport
     }
 
     /// How many workspaces the host has reported. Zero until the first

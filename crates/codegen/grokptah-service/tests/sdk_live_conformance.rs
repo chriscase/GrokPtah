@@ -315,15 +315,15 @@ async fn the_live_host_serves_redacted_receipts() {
     let service = start_isolated(&env, vec![env.workspace_path()], 4).await;
     let harness = live_harness(&env, service.addr, service.host()).await;
 
-    let advertised = harness
-        .plane
-        .transport()
-        .list_tools()
-        .await
-        .expect("tools/list");
+    // The capability document is the supported way to ask what a host offers.
+    // Reaching through the plane to its transport was the other way, and that
+    // accessor is gone: handing the raw transport back let any holder call any
+    // tool and skip `require_tool`, the capability check, the read-only
+    // default and `MutationAuthority` together.
+    let capabilities = harness.plane.connect().await.expect("connect");
     println!(
-        "host advertises ptah_list_receipts: {}",
-        advertised.iter().any(|t| t == "ptah_list_receipts")
+        "host advertises receipt listing: {}",
+        capabilities.require(&CapabilityId::ReceiptRead).is_ok()
     );
 
     let accepted = harness

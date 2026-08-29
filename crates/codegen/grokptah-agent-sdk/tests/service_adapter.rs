@@ -13,7 +13,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use grokptah_agent_sdk::conformance::{self, CheckOutcome, Harness};
@@ -630,15 +630,24 @@ fn journal() -> Vec<Value> {
 
 // ── Fixtures ──────────────────────────────────────────────────────────────
 
-fn operator(double: BridgeDouble) -> ServiceControlPlane<BridgeDouble> {
-    ServiceControlPlane::read_only(double).with_operator_authority()
+/// An operator-authority plane over a double the caller keeps a handle to.
+///
+/// The plane no longer hands its transport back — that accessor let any holder
+/// call the host directly and skip every gate in the crate — so a test that
+/// wants to inspect what was sent keeps its own `Arc` instead.
+fn operator(double: BridgeDouble) -> (ServiceControlPlane<Arc<BridgeDouble>>, Arc<BridgeDouble>) {
+    let double = Arc::new(double);
+    (
+        ServiceControlPlane::read_only(Arc::clone(&double)).with_operator_authority(),
+        double,
+    )
 }
 
 fn request_id(n: u64) -> RequestId {
     RequestId::new(format!("req-{n:04}")).expect("minted id is valid")
 }
 
-async fn seeded(plane: &ServiceControlPlane<BridgeDouble>) -> SessionView {
+async fn seeded(plane: &ServiceControlPlane<Arc<BridgeDouble>>) -> SessionView {
     plane
         .list_sessions(PageRequest::new())
         .await
@@ -665,7 +674,8 @@ fn submission(session: &SessionView, n: u64) -> TaskSubmission {
 
 #[tokio::test]
 async fn a_workspace_ref_can_only_come_from_the_host() {
-    let plane = ServiceControlPlane::read_only(BridgeDouble::new());
+    let double = Arc::new(BridgeDouble::new());
+    let plane = ServiceControlPlane::read_only(Arc::clone(&double));
     assert_eq!(plane.known_workspaces(), 0);
 
     // A well-formed ref the host never reported resolves to a workspace
@@ -688,7 +698,8 @@ async fn a_workspace_ref_can_only_come_from_the_host() {
 
 #[tokio::test]
 async fn no_absolute_path_survives_the_session_projection() {
-    let plane = ServiceControlPlane::read_only(BridgeDouble::new());
+    let double = Arc::new(BridgeDouble::new());
+    let plane = ServiceControlPlane::read_only(Arc::clone(&double));
     let session = seeded(&plane).await;
     let encoded = serde_json::to_string(&session).expect("serialize session");
     assert!(!encoded.contains(WORKSPACE), "{encoded}");
@@ -699,7 +710,7 @@ async fn no_absolute_path_survives_the_session_projection() {
 
 #[tokio::test]
 async fn every_call_binds_the_exact_scope_the_bridge_requires() {
-    let plane = operator(BridgeDouble::new());
+    let (plane, double) = operator(BridgeDouble::new());
     let session = seeded(&plane).await;
     let accepted = plane
         .submit_task(submission(&session, 1))
@@ -719,7 +730,7 @@ async fn every_call_binds_the_exact_scope_the_bridge_requires() {
     // `assert_schema_conformant` already ran inside the transport for every
     // call; this pins the scope triple explicitly.
     for tool in ["ptah_get_run", "ptah_get_events"] {
-        let args = plane.transport().calls_to(tool);
+        let args = double.calls_to(tool);
         assert_eq!(args.len(), 1, "{tool}");
         assert_eq!(args[0]["session_id"], json!(SESSION));
         assert_eq!(args[0]["workspace"], json!(WORKSPACE));
@@ -729,7 +740,7 @@ async fn every_call_binds_the_exact_scope_the_bridge_requires() {
 
 #[tokio::test]
 async fn a_token_ceiling_travels_outside_the_advertised_bounds_schema() {
-    let plane = operator(BridgeDouble::new());
+    let (plane, double) = operator(BridgeDouble::new());
     let session = seeded(&plane).await;
     plane
         .submit_task(TaskSubmission {
@@ -743,7 +754,7 @@ async fn a_token_ceiling_travels_outside_the_advertised_bounds_schema() {
         .await
         .expect("submit");
 
-    let args = plane.transport().calls_to("ptah_submit_task");
+    let args = double.calls_to("ptah_submit_task");
     let bounds = args[0]["bounds"].as_object().expect("bounds sent");
     assert_eq!(bounds["maxRounds"], json!(8));
     assert_eq!(bounds["maxTotalTokens"], json!(50_000));
@@ -760,7 +771,7 @@ async fn a_token_ceiling_travels_outside_the_advertised_bounds_schema() {
 
 #[tokio::test]
 async fn the_durable_record_is_projected_not_forwarded() {
-    let plane = operator(BridgeDouble::new());
+    let (plane, _double) = operator(BridgeDouble::new());
     let session = seeded(&plane).await;
     let accepted = plane
         .submit_task(submission(&session, 1))
@@ -803,7 +814,7 @@ async fn the_durable_record_is_projected_not_forwarded() {
 
 #[tokio::test]
 async fn event_pages_carry_no_transcript_and_still_advance() {
-    let plane = operator(BridgeDouble::new());
+    let (plane, _double) = operator(BridgeDouble::new());
     let session = seeded(&plane).await;
     let accepted = plane
         .submit_task(submission(&session, 1))
@@ -841,7 +852,7 @@ async fn a_page_of_pure_transcript_does_not_stall_the_cursor() {
     // The bridge journal is filtered by the *host* to a run range, so a page
     // can legitimately contain nothing this contract carries. The cursor must
     // still come from the raw page or paging deadlocks.
-    let plane = operator(BridgeDouble::new());
+    let (plane, _double) = operator(BridgeDouble::new());
     let session = seeded(&plane).await;
     let accepted = plane
         .submit_task(submission(&session, 1))
@@ -874,7 +885,7 @@ async fn a_page_of_pure_transcript_does_not_stall_the_cursor() {
 
 #[tokio::test]
 async fn the_test_report_artifact_drops_the_command_string() {
-    let plane = operator(BridgeDouble::new());
+    let (plane, _double) = operator(BridgeDouble::new());
     let session = seeded(&plane).await;
     let accepted = plane
         .submit_task(submission(&session, 1))
@@ -911,9 +922,10 @@ async fn the_test_report_artifact_drops_the_command_string() {
 
 #[tokio::test]
 async fn a_read_only_adapter_refuses_mutations_without_a_round_trip() {
-    let plane = ServiceControlPlane::read_only(BridgeDouble::new());
+    let double = Arc::new(BridgeDouble::new());
+    let plane = ServiceControlPlane::read_only(Arc::clone(&double));
     let session = seeded(&plane).await;
-    let before = plane.transport().call_count();
+    let before = double.call_count();
 
     let submit = plane
         .submit_task(submission(&session, 1))
@@ -936,7 +948,7 @@ async fn a_read_only_adapter_refuses_mutations_without_a_round_trip() {
     assert_eq!(cancel.code, SdkErrorCode::ForbiddenScope);
 
     assert_eq!(
-        plane.transport().call_count(),
+        double.call_count(),
         before,
         "a refused mutation must not reach the host"
     );
@@ -946,7 +958,8 @@ async fn a_read_only_adapter_refuses_mutations_without_a_round_trip() {
 
 #[tokio::test]
 async fn read_only_mode_is_discoverable_before_the_call() {
-    let observer = ServiceControlPlane::read_only(BridgeDouble::new());
+    let double = Arc::new(BridgeDouble::new());
+    let observer = ServiceControlPlane::read_only(Arc::clone(&double));
     let connected = observer.connect().await.expect("connect");
     assert_eq!(
         connected
@@ -957,7 +970,7 @@ async fn read_only_mode_is_discoverable_before_the_call() {
     );
     assert!(connected.require(&CapabilityId::RunObserve).is_ok());
 
-    let operator = operator(BridgeDouble::new());
+    let (operator, _double) = operator(BridgeDouble::new());
     let connected = operator.connect().await.expect("connect");
     assert!(connected.require(&CapabilityId::TaskSubmit).is_ok());
 }
@@ -966,7 +979,8 @@ async fn read_only_mode_is_discoverable_before_the_call() {
 
 #[tokio::test]
 async fn capabilities_follow_the_hosts_tool_registry() {
-    let plane = operator(BridgeDouble::new().without_tools(&["ptah_steer", "ptah_claim_work"]));
+    let (plane, _double) =
+        operator(BridgeDouble::new().without_tools(&["ptah_steer", "ptah_claim_work"]));
     let connected = plane.connect().await.expect("connect");
 
     assert_eq!(
@@ -991,7 +1005,7 @@ async fn tools_the_host_offers_but_the_contract_declines_stay_unmapped() {
     // The double advertises manager, managed-execution, and promotion tools.
     // None of them may become an available capability, and the adapter must
     // never call one — the double panics if it does.
-    let plane = operator(BridgeDouble::new());
+    let (plane, double) = operator(BridgeDouble::new());
     let connected = plane.connect().await.expect("connect");
 
     for id in [
@@ -1019,12 +1033,7 @@ async fn tools_the_host_offers_but_the_contract_declines_stay_unmapped() {
         .submit_task(submission(&session, 1))
         .await
         .expect("submit");
-    let called: Vec<String> = plane
-        .transport()
-        .calls()
-        .into_iter()
-        .map(|(t, _)| t)
-        .collect();
+    let called: Vec<String> = double.calls().into_iter().map(|(t, _)| t).collect();
     for forbidden in [
         "ptah_authorize_work_execution",
         "ptah_create_manager_plan",
@@ -1039,7 +1048,7 @@ async fn tools_the_host_offers_but_the_contract_declines_stay_unmapped() {
 
 #[tokio::test]
 async fn a_reused_key_replays_instead_of_doing_the_work_twice() {
-    let plane = operator(BridgeDouble::new());
+    let (plane, _double) = operator(BridgeDouble::new());
     let session = seeded(&plane).await;
 
     let first = plane
@@ -1070,11 +1079,9 @@ async fn a_reused_key_replays_instead_of_doing_the_work_twice() {
 
 #[tokio::test]
 async fn a_lost_connection_is_retryable_under_the_same_key() {
-    let plane = operator(BridgeDouble::new());
+    let (plane, double) = operator(BridgeDouble::new());
     let session = seeded(&plane).await;
-    plane
-        .transport()
-        .inject("ptah_submit_task", Fault::Unreachable);
+    double.inject("ptah_submit_task", Fault::Unreachable);
 
     let key = request_id(1);
     let error = plane
@@ -1096,11 +1103,10 @@ async fn a_lost_connection_is_retryable_under_the_same_key() {
 
 #[tokio::test]
 async fn typed_host_codes_cross_the_seam_unchanged() {
-    let plane = ServiceControlPlane::read_only(BridgeDouble::new());
+    let double = Arc::new(BridgeDouble::new());
+    let plane = ServiceControlPlane::read_only(Arc::clone(&double));
     let session = seeded(&plane).await;
-    plane
-        .transport()
-        .inject("ptah_list_sessions", Fault::Unauthenticated);
+    double.inject("ptah_list_sessions", Fault::Unauthenticated);
     let error = plane
         .list_sessions(PageRequest::new())
         .await
@@ -1108,9 +1114,7 @@ async fn typed_host_codes_cross_the_seam_unchanged() {
     assert_eq!(error.code, SdkErrorCode::Unauthenticated);
     assert_eq!(error.code.origin(), ErrorOrigin::Runtime);
 
-    plane
-        .transport()
-        .inject("ptah_get_events", Fault::CursorExpired);
+    double.inject("ptah_get_events", Fault::CursorExpired);
     let error = plane
         .stream_events(
             RunSelector {
@@ -1127,7 +1131,8 @@ async fn typed_host_codes_cross_the_seam_unchanged() {
 
 #[tokio::test]
 async fn unknown_and_cross_workspace_reads_are_indistinguishable() {
-    let plane = ServiceControlPlane::read_only(BridgeDouble::new());
+    let double = Arc::new(BridgeDouble::new());
+    let plane = ServiceControlPlane::read_only(Arc::clone(&double));
     let session = seeded(&plane).await;
 
     let unknown = plane
@@ -1156,9 +1161,9 @@ async fn unknown_and_cross_workspace_reads_are_indistinguishable() {
 
 #[tokio::test]
 async fn a_fence_this_host_cannot_honor_is_refused_not_dropped() {
-    let plane = operator(BridgeDouble::new());
+    let (plane, double) = operator(BridgeDouble::new());
     let session = seeded(&plane).await;
-    let before = plane.transport().call_count();
+    let before = double.call_count();
 
     let error = plane
         .request_follow_up(FollowUpRequest {
@@ -1172,7 +1177,7 @@ async fn a_fence_this_host_cannot_honor_is_refused_not_dropped() {
         .expect_err("ptah_steer has no compare-and-set");
     assert_eq!(error.code, SdkErrorCode::Unsupported);
     assert_eq!(
-        plane.transport().call_count(),
+        double.call_count(),
         before,
         "a fence the host cannot honor must not become an unfenced mutation"
     );
@@ -1197,7 +1202,7 @@ async fn a_fence_this_host_cannot_honor_is_refused_not_dropped() {
 
 #[tokio::test]
 async fn a_lease_credential_reaches_the_host_but_not_the_wire_projection() {
-    let plane = operator(BridgeDouble::new());
+    let (plane, double) = operator(BridgeDouble::new());
     let session = seeded(&plane).await;
     let work_id = WorkId::new("work-0001").unwrap();
 
@@ -1219,7 +1224,7 @@ async fn a_lease_credential_reaches_the_host_but_not_the_wire_projection() {
     assert!(!format!("{lease:?}").contains(&secret));
 
     // Releasing without the credential fails before the transport is used.
-    let calls = plane.transport().call_count();
+    let calls = double.call_count();
     let error = plane
         .release_control(ReleaseLeaseRequest {
             request_id: request_id(2),
@@ -1233,7 +1238,7 @@ async fn a_lease_credential_reaches_the_host_but_not_the_wire_projection() {
         .await
         .expect_err("holder-less release");
     assert_eq!(error.code, SdkErrorCode::InvalidRequest);
-    assert_eq!(plane.transport().call_count(), calls);
+    assert_eq!(double.call_count(), calls);
 
     plane
         .release_control(ReleaseLeaseRequest {
@@ -1249,7 +1254,7 @@ async fn a_lease_credential_reaches_the_host_but_not_the_wire_projection() {
         .expect("release");
 
     // The token did reach the host, under the argument name the tool requires.
-    let args = plane.transport().calls_to("ptah_release_work");
+    let args = double.calls_to("ptah_release_work");
     assert_eq!(args[0]["lease_token"], json!(secret));
     assert_eq!(args[0]["reason"], json!("done"));
 }
@@ -1258,13 +1263,13 @@ async fn a_lease_credential_reaches_the_host_but_not_the_wire_projection() {
 
 #[tokio::test]
 async fn an_older_host_reports_receipts_absent_rather_than_empty() {
-    let plane = operator(BridgeDouble::new());
+    let (plane, double) = operator(BridgeDouble::new());
     let session = seeded(&plane).await;
     let accepted = plane
         .submit_task(submission(&session, 1))
         .await
         .expect("submit");
-    let before = plane.transport().call_count();
+    let before = double.call_count();
 
     let error = plane
         .list_receipts(
@@ -1283,7 +1288,7 @@ async fn an_older_host_reports_receipts_absent_rather_than_empty() {
     assert_eq!(error.code, SdkErrorCode::Unsupported);
     assert_eq!(error.detail("capability"), Some("receipt.read"));
     assert_eq!(
-        plane.transport().call_count(),
+        double.call_count(),
         before,
         "refusing a capability the host lacks must not cost a round trip"
     );
@@ -1302,17 +1307,21 @@ async fn an_older_host_reports_receipts_absent_rather_than_empty() {
 // ── Public consumer parity ────────────────────────────────────────────────
 
 struct ServiceHarness {
-    plane: ServiceControlPlane<BridgeDouble>,
+    plane: ServiceControlPlane<Arc<BridgeDouble>>,
+    /// The harness keeps its own handle, because the plane no longer hands its
+    /// transport back — that accessor was a way past every gate in the crate.
+    double: Arc<BridgeDouble>,
     session: SessionView,
     next: AtomicU64,
 }
 
 impl ServiceHarness {
     async fn new() -> Self {
-        let plane = operator(BridgeDouble::new());
+        let (plane, double) = operator(BridgeDouble::new());
         let session = seeded(&plane).await;
         Self {
             plane,
+            double,
             session,
             next: AtomicU64::new(1),
         }
@@ -1335,9 +1344,7 @@ impl Harness for ServiceHarness {
     }
 
     async fn arm_lost_connection(&self) -> bool {
-        self.plane
-            .transport()
-            .inject("ptah_get_run", Fault::Unreachable);
+        self.double.inject("ptah_get_run", Fault::Unreachable);
         true
     }
 
@@ -1474,12 +1481,10 @@ async fn both_adapters_agree_on_the_checks_they_can_both_run() {
 /// host that predates the key.
 #[tokio::test]
 async fn a_dropped_create_is_uncertain_when_the_host_takes_no_key() {
-    let plane = operator(BridgeDouble::new());
+    let (plane, double) = operator(BridgeDouble::new());
     let session = seeded(&plane).await;
 
-    plane
-        .transport()
-        .inject("ptah_create_session", Fault::Unreachable);
+    double.inject("ptah_create_session", Fault::Unreachable);
 
     let error = plane
         .create_session(CreateSessionRequest {
