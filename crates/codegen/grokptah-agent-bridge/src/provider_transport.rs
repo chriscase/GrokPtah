@@ -69,6 +69,15 @@ pub(crate) struct ProviderTransportError {
     outcome: Option<SendOutcome>,
 }
 
+/// HTTP statuses whose response does not prove that a provider-side effect
+/// was absent. Callers must retain these attempts as ambiguous rather than
+/// interpreting the status as permission to spend a fresh attempt.
+pub(crate) fn is_retry_oriented_http_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status.as_u16() == 429
+        || status.is_server_error()
+}
+
 impl ProviderTransportError {
     fn before_dispatch(error: impl std::fmt::Display) -> Self {
         Self {
@@ -222,11 +231,11 @@ impl ProviderResponse {
         ProviderTransportError::settled(message, outcome)
     }
 
-    /// A retry-oriented HTTP status does not prove that the provider omitted
-    /// the requested effect. Keep the attempt ambiguous until an operator has
-    /// established provider truth instead of treating the response as a safe
-    /// invitation to spend a fresh permit.
-    pub(crate) fn settle_retryable_http_uncertain(
+    /// Settle a complete HTTP failure according to the status that was
+    /// physically observed. Retry-oriented statuses remain ambiguous because
+    /// they do not prove that the provider omitted the requested effect; other
+    /// complete HTTP refusals are definitive and may settle normally.
+    pub(crate) fn settle_http_failure(
         mut self,
         message: impl Into<String>,
     ) -> ProviderTransportError {
@@ -235,10 +244,13 @@ impl ProviderResponse {
                 "provider response no longer owns a send permit",
             );
         };
-        let outcome = self
-            .runtime
-            .authority
-            .settle_uncertain(permit, UncertainReason::ProtocolAfterPossibleEffect);
+        let outcome = if is_retry_oriented_http_status(self.response.status()) {
+            self.runtime
+                .authority
+                .settle_uncertain(permit, UncertainReason::ProtocolAfterPossibleEffect)
+        } else {
+            self.runtime.authority.settle_settled(permit)
+        };
         ProviderTransportError::settled(message, outcome)
     }
 
@@ -979,6 +991,61 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
+    async fn every_retry_oriented_http_status_is_uncertain_and_not_resendable() {
+        let home = tempfile::tempdir().unwrap();
+        let _serial = crate::discover::home_override_serial();
+        let _home = HomeOverride::install(home.path().to_path_buf());
+        let client = reqwest::Client::new();
+        let operator = reconciliation_authority();
+
+        for status in [408_u16, 429, 500, 502, 503, 504, 599] {
+            let response: reqwest::Response = axum::http::Response::builder()
+                .status(status)
+                .body("synthetic retry-oriented response")
+                .unwrap()
+                .into();
+            let dispatch = InjectedDispatch {
+                calls: AtomicUsize::new(0),
+                result: Mutex::new(Some(WireResult::Response(response))),
+            };
+            let response =
+                send_provider_request_with(&client, request(&client), scope(), None, &dispatch)
+                    .await
+                    .unwrap();
+            assert!(is_retry_oriented_http_status(response.status()));
+            let error = response.settle_http_failure(format!("HTTP {status}"));
+            assert!(error.is_uncertain());
+            assert!(!error.is_safe_to_resend());
+
+            let attempts = provider_attempts_requiring_reconciliation(&operator).unwrap();
+            assert_eq!(attempts.len(), 1);
+            reconcile_provider_attempt(&operator, attempts[0], false).unwrap();
+        }
+
+        let response: reqwest::Response = axum::http::Response::builder()
+            .status(400)
+            .body("synthetic definitive refusal")
+            .unwrap()
+            .into();
+        let dispatch = InjectedDispatch {
+            calls: AtomicUsize::new(0),
+            result: Mutex::new(Some(WireResult::Response(response))),
+        };
+        let response =
+            send_provider_request_with(&client, request(&client), scope(), None, &dispatch)
+                .await
+                .unwrap();
+        assert!(!is_retry_oriented_http_status(response.status()));
+        let error = response.settle_http_failure("HTTP 400");
+        assert!(!error.is_uncertain());
+        assert!(!error.is_safe_to_resend());
+        assert!(provider_attempts_requiring_reconciliation(&operator)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn cancellation_after_permit_is_uncertain_and_never_retryable() {
         let home = tempfile::tempdir().unwrap();
         let _serial = crate::discover::home_override_serial();
@@ -1100,6 +1167,8 @@ mod tests {
                 .len(),
             1
         );
+        let first = provider_attempts_requiring_reconciliation(&operator).unwrap();
+        reconcile_provider_attempt(&operator, first[0], false).unwrap();
 
         let response: reqwest::Response = axum::http::Response::builder()
             .status(200)
@@ -1125,8 +1194,10 @@ mod tests {
             provider_attempts_requiring_reconciliation(&operator)
                 .unwrap()
                 .len(),
-            2
+            1
         );
+        let second = provider_attempts_requiring_reconciliation(&operator).unwrap();
+        reconcile_provider_attempt(&operator, second[0], false).unwrap();
 
         let pending_stream = futures::stream::pending::<Result<Bytes, std::io::Error>>();
         let response: reqwest::Response = axum::http::Response::builder()
@@ -1154,7 +1225,7 @@ mod tests {
             provider_attempts_requiring_reconciliation(&operator)
                 .unwrap()
                 .len(),
-            3
+            1
         );
     }
 

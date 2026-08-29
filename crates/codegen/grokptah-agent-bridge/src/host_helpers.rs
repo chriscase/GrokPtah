@@ -2291,10 +2291,7 @@ where
         }
 
         let status = resp.status();
-        if status.as_u16() == 429
-            || status.is_server_error()
-            || status == reqwest::StatusCode::REQUEST_TIMEOUT
-        {
+        if crate::provider_transport::is_retry_oriented_http_status(status) {
             let headers = resp.headers().clone();
             let text = read_bounded_response_body(&mut resp, cancel).await?;
             let (content_class, framing) = response_shape(&headers, text.len() as u64);
@@ -2325,9 +2322,9 @@ where
             } else {
                 format!("HTTP {status}: {clipped}")
             };
-            return Err(anyhow::Error::new(resp.settle_retryable_http_uncertain(
-                format!("{message}; explicit reconciliation required before another send"),
-            )));
+            return Err(anyhow::Error::new(resp.settle_http_failure(format!(
+                "{message}; explicit reconciliation required before another send"
+            ))));
         }
 
         if !status.is_success() {
@@ -3818,6 +3815,13 @@ pub(crate) async fn call_xai_chat(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = read_bounded_response_body(&mut resp, &CancellationToken::new()).await?;
+        if crate::provider_transport::is_retry_oriented_http_status(status) {
+            return Err(anyhow::Error::new(resp.settle_http_failure(
+                format!(
+                    "provider returned retry-oriented HTTP {status}; explicit reconciliation required before another send"
+                ),
+            )));
+        }
         resp.settle_success().map_err(anyhow::Error::new)?;
         if is_compatible {
             bail!("configured provider returned HTTP {status}");

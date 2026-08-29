@@ -88,11 +88,8 @@ pub async fn discover_profile_models(profile_id: &str) -> Result<Vec<ProviderMod
             }
         };
         if !status.is_success() {
-            if status == reqwest::StatusCode::REQUEST_TIMEOUT
-                || status.as_u16() == 429
-                || status.is_server_error()
-            {
-                return Err(anyhow!(response.settle_retryable_http_uncertain(format!(
+            if crate::provider_transport::is_retry_oriented_http_status(status) {
+                return Err(anyhow!(response.settle_http_failure(format!(
                     "provider catalog returned retry-oriented HTTP {status}; explicit reconciliation required"
                 ))));
             }

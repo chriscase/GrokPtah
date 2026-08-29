@@ -734,11 +734,8 @@ async fn completion(
             removed_tool_choice = true;
             continue;
         }
-        if status == reqwest::StatusCode::REQUEST_TIMEOUT
-            || status.as_u16() == 429
-            || status.is_server_error()
-        {
-            return Err(anyhow!(response.settle_retryable_http_uncertain(format!(
+        if crate::provider_transport::is_retry_oriented_http_status(status) {
+            return Err(anyhow!(response.settle_http_failure(format!(
                 "provider returned retry-oriented HTTP {status}; explicit reconciliation required"
             ))));
         }
@@ -812,11 +809,8 @@ async fn streaming_probe(
     if !response.status().is_success() {
         let status = response.status();
         let _ = read_body(&mut response).await?;
-        if status == reqwest::StatusCode::REQUEST_TIMEOUT
-            || status.as_u16() == 429
-            || status.is_server_error()
-        {
-            return Err(anyhow!(response.settle_retryable_http_uncertain(format!(
+        if crate::provider_transport::is_retry_oriented_http_status(status) {
+            return Err(anyhow!(response.settle_http_failure(format!(
                 "provider stream returned retry-oriented HTTP {status}; explicit reconciliation required"
             ))));
         }

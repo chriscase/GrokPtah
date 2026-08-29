@@ -1333,6 +1333,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tower",
+ "url",
  "uuid",
  "walkdir",
  "xai-host-authority",
