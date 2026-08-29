@@ -160,6 +160,10 @@ impl HostAuthority {
                 .ok_or(AuthorityError::UnknownResource)?
                 .clone();
 
+            // A lease is a narrower grant than its capability, never a longer
+            // one: outliving the capability would let a spent or expired grant
+            // keep authorising work.
+            let expires_at_ms = expires_at_ms.min(stored.expires_at_ms);
             let id = EffectLeaseId::mint();
             state.leases.insert(
                 id.to_hex(),
@@ -249,6 +253,8 @@ impl HostAuthority {
         // Step 1: consume the lease and record the attempt, atomically.
         let admitted = self.with_state(|state| {
             require_current_state(state, auth)?;
+            let capability_generation = state.capability_generation;
+            let control_epoch = state.control_epoch;
             let stored = state
                 .leases
                 .get(&lease.id.to_hex())
@@ -319,11 +325,29 @@ impl HostAuthority {
                 return Err(AuthorityError::StaleObservation);
             }
 
+            // The parent capability is revalidated and consumed here, in the
+            // same transaction that spends the lease. Minting several leases
+            // from one capability before spending any would otherwise let that
+            // single grant authorise several sends.
+            let capability = state
+                .capabilities
+                .get_mut(&stored.capability_id)
+                .ok_or(AuthorityError::StaleCapability)?;
+            if capability.consumed {
+                return Err(AuthorityError::AlreadyConsumed);
+            }
+            if capability.expires_at_ms <= now {
+                return Err(AuthorityError::Expired);
+            }
+            if capability.capability_generation != capability_generation
+                || capability.control_epoch != control_epoch
+            {
+                return Err(AuthorityError::StaleCapability);
+            }
+            capability.consumed = true;
+
             // One-use: the lease is spent whether or not the send succeeds.
             state.leases.remove(&lease.id.to_hex());
-            if let Some(cap) = state.capabilities.get_mut(&stored.capability_id) {
-                cap.consumed = true;
-            }
 
             let attempt = AttemptId::mint();
             state.attempts.insert(
@@ -451,6 +475,26 @@ impl HostAuthority {
             Some(Err(reason)) => format!("{reason:?}"),
         };
 
+        // Audit before state, deliberately. If either write fails the durable
+        // record still reads `sending`, which is exactly what this function
+        // reports and exactly what recovery will conclude. The other order can
+        // leave a caller holding `Uncertain` while the record says `settled`,
+        // which reconciliation would then refuse to touch.
+        let audited = self.append_audit(
+            epoch,
+            AuditEvent::SendOutcome {
+                attempt: attempt.public_handle(),
+                outcome: outcome_label.to_string(),
+                detail: detail_text.clone(),
+            },
+        );
+        if audited.is_err() {
+            return SendOutcome::Uncertain {
+                attempt,
+                reason: UncertainReason::AuditNotDurableAfterDispatch,
+            };
+        }
+
         let persisted =
             self.with_state(|state| {
                 let record = state.attempts.get_mut(&attempt.to_hex()).ok_or(
@@ -461,21 +505,6 @@ impl HostAuthority {
                 Ok(())
             });
         if persisted.is_err() {
-            return SendOutcome::Uncertain {
-                attempt,
-                reason: UncertainReason::AuditNotDurableAfterDispatch,
-            };
-        }
-
-        let audited = self.append_audit(
-            epoch,
-            AuditEvent::SendOutcome {
-                attempt: attempt.public_handle(),
-                outcome: outcome_label.to_string(),
-                detail: detail_text,
-            },
-        );
-        if audited.is_err() {
             return SendOutcome::Uncertain {
                 attempt,
                 reason: UncertainReason::AuditNotDurableAfterDispatch,
@@ -555,8 +584,11 @@ impl HostAuthority {
                 .attempts
                 .get_mut(&attempt.to_hex())
                 .ok_or(AuthorityError::UnknownResource)?;
-            if record.state != STATE_UNCERTAIN {
-                return Err(AuthorityError::Invalid("attempt is not uncertain"));
+            // `sending` is accepted as well as `uncertain`: a settlement whose
+            // write failed leaves the record in flight while the caller was
+            // told Uncertain, and that caller must still be able to reconcile.
+            if record.state != STATE_UNCERTAIN && record.state != STATE_SENDING {
+                return Err(AuthorityError::Invalid("attempt is already settled"));
             }
             record.state = if took_effect {
                 STATE_SETTLED

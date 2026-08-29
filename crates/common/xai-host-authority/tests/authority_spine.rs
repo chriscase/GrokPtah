@@ -746,8 +746,10 @@ fn a_truncated_audit_log_is_detected() {
     // Drop a record from the middle: the chain must no longer verify.
     lines.remove(1);
     std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+    let root = f.root.clone();
+    drop(f.authority);
 
-    let (reopened, reopened_admin) = HostAuthority::open(&f.root, OWNER).unwrap();
+    let (reopened, reopened_admin) = HostAuthority::open(&root, OWNER).unwrap();
     assert!(
         !reopened.audit_chain_intact(&reopened_admin).unwrap(),
         "removing a record must break the audit hash chain"
@@ -822,7 +824,9 @@ fn a_corrupt_authority_root_refuses_service_rather_than_inventing_authority() {
         r#"{"schema_version":1,"owner_id":"account-1"}"#,
     )
     .unwrap();
-    let reopened = HostAuthority::open(&f.root, OWNER);
+    let root = f.root.clone();
+    drop(f.authority);
+    let reopened = HostAuthority::open(&root, OWNER);
     // Opening cannot repair it, and nothing downstream gets authority.
     match reopened {
         Err(AuthorityError::CorruptState(_)) => {}
@@ -960,9 +964,15 @@ fn a_planted_old_resource_record_cannot_be_used_after_rotation() {
     )
     .unwrap();
 
+    // Release the root first: admin authority is exclusive, so a second live
+    // holder is refused outright.
+    // Only the store is released; the fixture's other fields stay usable.
+    let root = f.root.clone();
+    drop(f.authority);
+
     // It is present again, but bound to an incarnation that no longer exists,
     // so the current principal cannot read or act on it.
-    let (reopened, reopened_admin) = HostAuthority::open(&f.root, OWNER).unwrap();
+    let (reopened, reopened_admin) = HostAuthority::open(&root, OWNER).unwrap();
     let _ = &reopened_admin;
     let current = reopened.authenticate("rotated-secret").unwrap();
     assert!(
@@ -1173,4 +1183,177 @@ fn a_lease_actor_must_match_the_capability_it_came_from() {
             .mint_lease(&f.auth, &cap, observation("act"), 60_000),
         Err(AuthorityError::ResourceOwnershipMismatch)
     ));
+}
+
+// ───────────────────── Probes for the exact-head audit findings ─────────────────────
+
+#[test]
+fn admin_authority_is_scarce() {
+    // Opening a root hands out admin, so a second holder would be a second
+    // admin over the same state. Any `&HostAuthority` could otherwise mint one
+    // simply by opening the root it already knows.
+    let f = fixture();
+    let error = HostAuthority::open(&f.root, OWNER)
+        .expect_err("a second holder must be refused while the first is live");
+    assert!(
+        matches!(error, AuthorityError::Durability(_)),
+        "expected an exclusivity refusal, got {error:?}"
+    );
+
+    // Released, the root can be taken again — by exactly one holder.
+    let root = f.root.clone();
+    drop(f.authority);
+    let (reopened, _admin) = HostAuthority::open(&root, OWNER).unwrap();
+    assert!(HostAuthority::open(&root, OWNER).is_err());
+    drop(reopened);
+}
+
+#[test]
+fn a_root_cannot_be_opened_under_a_different_owner() {
+    // The stored owner is the root's identity; accepting a caller-supplied one
+    // would let anybody name themselves the owner of someone else's root.
+    let f = fixture();
+    let root = f.root.clone();
+    drop(f.authority);
+
+    let error =
+        HostAuthority::open(&root, "someone-else").expect_err("a different owner must be refused");
+    assert!(
+        matches!(error, AuthorityError::CorruptState(_)),
+        "expected an owner mismatch, got {error:?}"
+    );
+    assert!(HostAuthority::open(&root, OWNER).is_ok());
+}
+
+#[test]
+fn one_capability_cannot_authorise_two_sends() {
+    // Minting several leases before spending any must not turn one grant into
+    // several physical sends.
+    let f = fixture();
+    let first = request(b"one");
+    let second = request(b"two");
+    let capability = f
+        .authority
+        .seal_capability(
+            &f.auth,
+            f.resource,
+            ActorClass::VerifiedOperator,
+            EffectClass::ProviderSend,
+            60_000,
+        )
+        .unwrap();
+    let lease_a = f
+        .authority
+        .mint_lease(&f.auth, &capability, first.digest(), 60_000)
+        .unwrap();
+    let lease_b = f
+        .authority
+        .mint_lease(&f.auth, &capability, second.digest(), 60_000)
+        .unwrap();
+
+    let permit = f.authority.begin_send(&f.auth, lease_a, &first).unwrap();
+    let _ = f.authority.settle_settled(permit);
+
+    assert!(
+        matches!(
+            f.authority.begin_send(&f.auth, lease_b, &second),
+            Err(AuthorityError::AlreadyConsumed)
+        ),
+        "the capability was spent by the first send"
+    );
+}
+
+#[test]
+fn a_lease_cannot_outlive_its_capability() {
+    let f = fixture();
+    let req = request(b"body");
+    let capability = f
+        .authority
+        .seal_capability(
+            &f.auth,
+            f.resource,
+            ActorClass::VerifiedOperator,
+            EffectClass::ProviderSend,
+            30,
+        )
+        .unwrap();
+    // Ask for a lease that would outlast the grant it came from.
+    let lease = f
+        .authority
+        .mint_lease(&f.auth, &capability, req.digest(), 600_000)
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    assert!(
+        matches!(
+            f.authority.begin_send(&f.auth, lease, &req),
+            Err(AuthorityError::Expired)
+        ),
+        "a lease must expire with its capability, not outlast it"
+    );
+}
+
+#[test]
+fn an_uncertain_outcome_is_always_reconcilable() {
+    // A settlement whose write fails reports Uncertain. If the durable record
+    // said "settled", reconciliation would refuse the very attempt the caller
+    // was told to reconcile.
+    let f = fixture();
+    let req = request(b"body");
+    let lease = lease_for(&f, &req);
+    let permit = f.authority.begin_send(&f.auth, lease, &req).unwrap();
+    let attempt = permit.attempt();
+
+    // Break the audit log after admission, then settle.
+    let log = f.root.join("audit.log");
+    std::fs::remove_file(&log).unwrap();
+    std::fs::create_dir(&log).unwrap();
+
+    let outcome = f.authority.settle_settled(permit);
+    assert!(matches!(outcome, SendOutcome::Uncertain { .. }));
+
+    // Repair the log and reconcile the attempt the caller was handed.
+    std::fs::remove_dir(&log).unwrap();
+    f.authority
+        .reconcile_attempt(&f.admin, attempt, true)
+        .expect("the attempt the caller was told to reconcile must be reconcilable");
+}
+
+#[test]
+fn a_damaged_audit_log_is_never_resealed() {
+    // Dropped or torn evidence must not read as an intact chain, and must not
+    // let a later append reuse the missing record's sequence number.
+    let f = fixture();
+    let req = request(b"body");
+    let lease = lease_for(&f, &req);
+    let permit = f.authority.begin_send(&f.auth, lease, &req).unwrap();
+    let _ = f.authority.settle_settled(permit);
+
+    let path = f.root.join("audit.log");
+    let text = std::fs::read_to_string(&path).unwrap();
+    // Trailing damage, exactly what a crash mid-append leaves behind.
+    std::fs::write(&path, format!("{text}{{\"sequence\":")).unwrap();
+
+    let root = f.root.clone();
+    drop(f.authority);
+    let (reopened, admin) = HostAuthority::open(&root, OWNER).unwrap();
+
+    assert!(
+        !reopened.audit_chain_intact(&admin).unwrap(),
+        "a log with unparsable trailing content is not an intact chain"
+    );
+    assert!(
+        reopened.audit_records(&admin).is_err(),
+        "reading must not present the parsable prefix as the whole log"
+    );
+    // And nothing may be appended over the damage. Authentication itself
+    // records an entry, so even that fails closed rather than writing over the
+    // gap and resealing the chain around it.
+    assert!(
+        matches!(
+            reopened.authenticate(SECRET),
+            Err(AuthorityError::CorruptState(_))
+        ),
+        "a damaged log must not accept new records over the gap"
+    );
 }
