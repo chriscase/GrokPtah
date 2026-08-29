@@ -167,7 +167,7 @@ identical-call 16 · advancing has no stationarity ceiling.
 
 ### Already on `main` — tested, not reimplemented
 
-Two goal items turned out to be satisfied by code that already exists. Building
+Four goal items turned out to be satisfied by code that already exists. Building
 a second copy of either would have been the same duplication mistake in a new
 place, so this train tests them instead:
 
@@ -178,6 +178,27 @@ place, so this train tests them instead:
 - **Durable work claims and revisions.** `OrchStore::claim_work` is already
   durable, lease-scoped and revision-bearing. The evidence above is what this
   train adds.
+- **Bounded retries.** `WorkPolicy.retry.max_attempts` is validated (`> 0`,
+  `<= 100`) and enforced at `workload.rs:503`, and `ManagedRetryCause` is a
+  typed retry cause. An earlier revision of this branch shipped its own
+  `RetryBudget`; withdrawn as redundant.
+- **Run crash/restart recovery.** Reopening the store marks an in-flight run
+  `RunState::Interrupted` with `RunStopCause::Interrupted`, already covered by
+  the store's own tests. Effect-level recovery is the part that is missing, and
+  it needs durable effect records (#497 G4).
+
+### Uncertain / not-sent / settled
+
+`AttemptDisposition` on `main` is `{Completed, HttpError, TransportError,
+Timeout, Cancelled, ProtocolError}`. It classifies *what went wrong* and carries
+no delivery-knowledge dimension: a connection refused before any byte moved and
+a timeout that may have been fully delivered are both just failure kinds, even
+though one is provably safe to retry and the other must never auto-retry.
+
+That gap is recorded as a characterization test rather than closed here.
+Closing it means the `NotSent` / `Uncertain` / `Settled` split, which is #497's
+G3 — and a second lattice beside it is exactly what the audit of this branch
+rejected.
 
 ### Strict old/new protocol negotiation
 

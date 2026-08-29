@@ -14,6 +14,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 use grokptah_agent_bridge::orchestration::{OrchStore, WorkItem, WorkPolicy};
+use grokptah_agent_bridge::provider_observation::AttemptDisposition;
 use tempfile::tempdir;
 use uuid::Uuid;
 
@@ -206,4 +207,77 @@ fn walk(root: &std::path::Path) -> Vec<std::path::PathBuf> {
         }
     }
     out
+}
+
+/// Bounded retries. The work policy caps attempts, and the cap is validated
+/// rather than merely documented: zero and an over-large value are both
+/// refused, so a caller cannot configure an unbounded retry loop.
+#[test]
+fn retry_budgets_are_bounded_by_construction() {
+    let mut policy = WorkPolicy::default();
+    assert!(policy.retry.max_attempts > 0, "a default budget exists");
+    assert!(policy.validate().is_ok());
+
+    policy.retry.max_attempts = 0;
+    assert!(
+        policy.validate().is_err(),
+        "an unbounded-by-zero budget is refused"
+    );
+
+    policy.retry.max_attempts = 101;
+    assert!(
+        policy.validate().is_err(),
+        "a budget past the workload bound is refused"
+    );
+
+    policy.retry.max_attempts = 100;
+    assert!(policy.validate().is_ok(), "the bound itself is allowed");
+}
+
+/// **Characterization — uncertain and not-sent are not distinguished.**
+///
+/// `AttemptDisposition` classifies *what went wrong* and carries no
+/// delivery-knowledge dimension. A connection refused before any byte moved is
+/// `TransportError`; a timeout that may have been fully delivered is `Timeout`;
+/// neither says whether the provider saw the request. Two attempts with very
+/// different safe answers — one provably retryable, one that must never
+/// auto-retry — are therefore indistinguishable from the disposition alone.
+///
+/// This is the gap #478 names and #497's G3 lattice closes with an explicit
+/// `NotSent` / `Uncertain` / `Settled` split. It is recorded here rather than
+/// papered over with a second lattice, which is what the audit of this branch
+/// rejected.
+#[test]
+fn attempt_dispositions_do_not_yet_separate_not_sent_from_uncertain() {
+    // Every failure disposition today is just a failure kind.
+    let failures = [
+        AttemptDisposition::HttpError,
+        AttemptDisposition::TransportError,
+        AttemptDisposition::Timeout,
+        AttemptDisposition::Cancelled,
+        AttemptDisposition::ProtocolError,
+    ];
+    for disposition in failures {
+        assert_ne!(disposition, AttemptDisposition::Completed);
+    }
+
+    // The two that need opposite retry answers are the same shape of value:
+    // nothing on the type tells them apart by delivery.
+    assert_ne!(
+        AttemptDisposition::TransportError,
+        AttemptDisposition::Timeout,
+        "they are distinct variants"
+    );
+    let refused_connection = AttemptDisposition::TransportError;
+    let may_have_landed = AttemptDisposition::Timeout;
+    for disposition in [refused_connection, may_have_landed] {
+        // Neither carries, nor can be asked for, a delivery answer. The
+        // assertion that matters is what is *absent*: no `delivery_knowledge`,
+        // no `may_auto_retry`, no `NotSent` variant.
+        let rendered = format!("{disposition:?}").to_ascii_lowercase();
+        assert!(
+            !rendered.contains("sent") && !rendered.contains("uncertain"),
+            "delivery knowledge is not represented today: {rendered}"
+        );
+    }
 }
