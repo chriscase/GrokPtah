@@ -13,6 +13,7 @@ The name combines **Grok** (the agent lineage) with **Ptah** (Egyptian craftsman
 | **License** | [Apache License 2.0](LICENSE) |
 | **Repo** | [chriscase/GrokPtah](https://github.com/chriscase/GrokPtah) |
 | **Architecture** | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) |
+| **Embedding the harness** | [`docs/AGENT_SDK_SEAM.md`](docs/AGENT_SDK_SEAM.md) |
 | **Dev setup** | [`docs/DEV_SETUP.md`](docs/DEV_SETUP.md) |
 
 ---

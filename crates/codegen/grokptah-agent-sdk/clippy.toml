@@ -1,0 +1,3 @@
+# The SDK is a contract-only crate: it links no filesystem, process, or
+# network API. Keep it from inheriting the bridge's canonicalize bans, which
+# name methods that are intentionally not reachable here.
