@@ -304,9 +304,25 @@ These five are the recommended next promotion, **in this order**. They were simu
 **Local gate evidence (run in this session, in an isolated worktree, tests unmodified):**
 
 ```
-base        67e29bd34dc64049432c715c93c2cef2185c63ea
-simulated   #344 -> #345 -> #346 -> #347 -> #348   (all CLEAN)
-GATE_PLACEHOLDER
+base        67e29bd34dc64049432c715c93c2cef2185c63ea   (clean main)
+simulated   #344 -> #345 -> #346 -> #347 -> #348            all CLEAN
+
+Local gate, run in an isolated worktree with tests unmodified, on the
+14-PR superset that contains all five (see below):
+
+                              suites   passed   failed
+  clean 67e29bd (baseline)      29       713       1
+  67e29bd + 14 PRs              34      1000       1
+
+  cargo check --all-targets   ->  0 errors, 2 pre-existing warnings
+  cargo test --no-fail-fast -- --test-threads=1
+
+The single failure is identical on both sides:
+  continuity_probe_is_evidence_first_and_recoverable
+It fails on clean main in this container because it spawns a Node harness
+that cannot complete without network. It is pre-existing, not introduced.
+
+Net: +287 passing tests, +5 suites, zero new failures.
 ```
 
 **Two caveats that must travel with this recommendation.**
@@ -432,3 +448,54 @@ Stated plainly, because several of these bound how far the plan above can be tru
 7. **The #489-vs-#488 choice is not mine to make.** I can show they conflict on 7 files and that #489 matches issue #477's written donor plan more literally. Which spine is architecturally right is a human decision, and both are currently red.
 
 8. **`#471` and `#468` were in progress** when their checks were read; their rollup may have changed since.
+
+---
+
+## 9. Priority split (#424 and newer vs older)
+
+| | #424–#490 | #340–#423 |
+|---|---|---|
+| Open PRs | 48 | 81 |
+| Fork from current main | 32 | 51 |
+| Fork from stale `127ffaff` | 16 | 30 |
+| Merge clean into `67e29bd` | 32 | 51 |
+| KEEP WHOLE | 8 | 10 |
+| SELECTIVE DONOR | 7 | 0 |
+| SUPERSEDED | 10 | 42 |
+| REWRITE | 12 | 13 |
+| NEEDS QUALIFICATION | 11 | 16 |
+
+Every competing authority definition (§F3) is in the newer set. Every one of the older set's 42 superseded PRs is
+strictly contained in a newer head, which is why the older range is mostly a retirement question rather than a
+promotion question. Every base branch referenced by an open PR still exists on `origin` — there are no dangling bases.
+
+---
+
+## 10. Reproducing this
+
+The repository documents its supported gates in `docs/VERIFICATION.md`; the analysis below uses the "Agent bridge" row.
+
+```sh
+# 1. Anchor (fails closed if the object is absent)
+git cat-file -e 67e29bd34dc64049432c715c93c2cef2185c63ea^{commit}
+
+# 2. Evidence base: every PR head as a local ref
+git fetch origin '+refs/pull/*/head:refs/remotes/origin/pr/*'
+
+# 3. Merge state for one PR, without touching the working tree
+git merge-tree --write-tree --name-only 67e29bd34dc64049432c715c93c2cef2185c63ea refs/remotes/origin/pr/<N>
+#    exit 0 = clean, exit 1 = conflict (conflicted paths on stdout)
+
+# 4. Containment (supersession)
+git merge-base --is-ancestor refs/remotes/origin/pr/<OLD> refs/remotes/origin/pr/<NEW>
+
+# 5. Documented local gate for the bridge crate
+cd crates/codegen/grokptah-agent-bridge
+cargo fmt --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked -- --test-threads=1
+```
+
+Train states in §4 were built by chaining step 3 with `git commit-tree`, so each step's base is the previous step's
+merge result rather than `main`. That is what makes the ordering meaningful: a train is only "clean" if every PR in it
+merges onto the accumulated result of the ones before it.
