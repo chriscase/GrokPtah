@@ -248,7 +248,7 @@ impl OrchStore {
         store.recover_managed_finalization_intents()?;
         store.recover_manager_creation_intents()?;
         store.mark_unfinished_interrupted()?;
-        store.fail_orphaned_idempotency_claims()?;
+        store.settle_orphaned_idempotency_claims()?;
         store.reconcile_workloads()?;
         // Cleanup is best-effort at the record level, but directory access
         // failures still surface so a broken ledger cannot look healthy.
@@ -277,6 +277,19 @@ impl OrchStore {
             .root
             .join("idempotency")
             .join(format!("{}-{safe}.json", scope.as_str())))
+    }
+
+    /// Where a receipt for `request_id` lived **before scoping existed**.
+    ///
+    /// Only ever read, never written. A claim consults it to refuse a key that
+    /// was already used, rather than to serve what it holds.
+    fn legacy_idemp_path(&self, request_id: &str) -> Result<PathBuf, OrchError> {
+        let safe = safe_id_filename(request_id)?;
+        Ok(self
+            .inner
+            .root
+            .join("idempotency")
+            .join(format!("{safe}.json")))
     }
 
     fn finalization_path(&self, run_id: &str) -> Result<PathBuf, OrchError> {
@@ -5115,9 +5128,17 @@ impl OrchStore {
             let Ok(text) = fs::read_to_string(&path) else {
                 continue;
             };
-            let Ok(receipt) = serde_json::from_str::<IdempotencyReceipt>(&text) else {
-                continue;
-            };
+            // Corruption must not read as absence. A receipt that cannot be
+            // parsed is not a receipt that is not there, and a listing that
+            // quietly drops it tells the caller the mutation never happened.
+            let receipt = serde_json::from_str::<IdempotencyReceipt>(&text).map_err(|error| {
+                anyhow::anyhow!(
+                    "receipt {} is unreadable ({error}); refusing to report a \
+                     partial listing, because a dropped receipt is \
+                     indistinguishable from a mutation that never ran",
+                    path.display()
+                )
+            })?;
             if receipt.run_id.as_deref() != Some(run_id) {
                 continue;
             }
@@ -5212,6 +5233,31 @@ impl OrchStore {
                 )))),
                 _ => Ok(IdempotencyClaim::Pending),
             };
+        }
+
+        // A key used before scoping existed must not be handed out again.
+        //
+        // A legacy receipt lives at the unscoped path, so a scoped claim looks
+        // at a different file, finds nothing, and returns `Perform` — which
+        // re-runs a mutation that may already have committed. Treating that as
+        // "a new request" was the previous position here and it understated
+        // the case: it is not a new request, it is the same one, executed
+        // twice across an upgrade.
+        //
+        // The refusal uses the receipt's *existence* and never its contents,
+        // so nothing unattributable is served to anyone. `uncertain_outcome`
+        // is the honest code: the host cannot say whether that mutation
+        // applied, which is exactly what the caller needs to know.
+        if let Ok(legacy) = self.legacy_idemp_path(request_id) {
+            if legacy.is_file() {
+                return Err(OrchError::new(
+                    OrchErrorCode::UncertainOutcome,
+                    "this request_id was used before this host scoped its \
+                     receipts, and the earlier outcome cannot be attributed or \
+                     read; whether that mutation applied is unknown. Reconcile \
+                     against durable state before choosing a new key",
+                ));
+            }
         }
 
         let pending = IdempotencyReceipt {
@@ -5500,7 +5546,27 @@ impl OrchStore {
         Ok(recovered)
     }
 
-    fn fail_orphaned_idempotency_claims(&self) -> anyhow::Result<usize> {
+    /// Settle claims that were still pending when the host stopped.
+    ///
+    /// This used to mark them `failed` and tell the caller to *use a new
+    /// request id*. Both halves were wrong, and together they licensed exactly
+    /// the duplicate the receipt exists to prevent: a claim is written
+    /// **before** the mutation runs, so a claim still pending at restart may
+    /// have committed its effect and died before settling. "Interrupted" and
+    /// "did not happen" are different answers, and a caller told the second
+    /// one, then told to pick a fresh key, will do the work twice.
+    ///
+    /// The outcome is now `uncertain_outcome` — the one code the three-valued
+    /// retry disposition marks `Unsafe`, meaning reconcile before retrying —
+    /// and the message says so instead of inviting a new key.
+    ///
+    /// It also rewrote `created_at`. That is the mutable-ordering defect fixed
+    /// in `finish_idempotency`, still present in the recovery path: a receipt
+    /// pending across a restart jumped to the end of the page order and could
+    /// be delivered a second time across a cursor a caller was already
+    /// holding. Recovery is a settlement like any other, so it records
+    /// `settled_at` and leaves the claim time alone.
+    fn settle_orphaned_idempotency_claims(&self) -> anyhow::Result<usize> {
         let dir = self.inner.root.join("idempotency");
         let mut changed = 0;
         for entry in fs::read_dir(dir)? {
@@ -5519,10 +5585,13 @@ impl OrchStore {
             }
             receipt.status = "failed".into();
             receipt.error = Some(OrchError::new(
-                OrchErrorCode::Internal,
-                "mutation was interrupted before its durable receipt completed; use a new request_id",
+                OrchErrorCode::UncertainOutcome,
+                "the host stopped after this request was claimed and before its \
+                 outcome was recorded; the mutation may or may not have applied. \
+                 Reconcile against durable state before retrying, and retry under \
+                 the same request_id rather than a new one",
             ));
-            receipt.created_at = Utc::now();
+            receipt.settled_at = Some(Utc::now());
             atomic_write_json(&path, &receipt)?;
             changed += 1;
         }
@@ -6984,10 +7053,23 @@ mod tests {
                 .is_none(),
             "a scoped lookup must not reach an unscoped receipt"
         );
-        assert!(matches!(
-            store.claim_idempotency(&scope(), "t", "legacy-key", "h"),
-            Ok(IdempotencyClaim::Perform)
-        ));
+        // And the key itself is refused rather than re-run. Returning
+        // `Perform` here would execute a mutation that may already have
+        // committed before the upgrade — the same request twice, not a new
+        // one.
+        let refused = match store.claim_idempotency(&scope(), "t", "legacy-key", "h") {
+            Err(error) => error,
+            Ok(other) => panic!(
+                "a pre-scoping key must not be handed out again, got {}",
+                describe(&Ok(other))
+            ),
+        };
+        assert_eq!(refused.code, OrchErrorCode::UncertainOutcome);
+        assert!(
+            !refused.message.contains("written before scoping"),
+            "the refusal must not echo the stored receipt's contents: {}",
+            refused.message
+        );
         let (listed, _) = store
             .list_idempotency_for_run(&scope(), "run-legacy", None, 10)
             .unwrap();
@@ -7173,8 +7255,17 @@ mod tests {
             .is_some());
     }
 
+    /// A claim interrupted by a restart settles as **uncertain**, not failed.
+    ///
+    /// This test previously required the opposite, and required the message to
+    /// say "interrupted" while the code said `internal`. That pinned the
+    /// defect: a claim is written *before* its mutation runs, so one still
+    /// pending at restart may have committed its effect and died before
+    /// settling. Reporting that as a definite failure — and the old message
+    /// went on to say "use a new request_id" — is how a caller is talked into
+    /// doing the work twice.
     #[test]
-    fn restart_fails_orphaned_idempotency_claim() {
+    fn restart_settles_an_orphaned_claim_as_uncertain() {
         let d = tempdir().unwrap();
         let store = OrchStore::open(d.path()).unwrap();
         assert!(matches!(
@@ -7183,6 +7274,11 @@ mod tests {
                 .unwrap(),
             IdempotencyClaim::Perform
         ));
+        let claimed_at = store
+            .load_idempotency(&scope(), "orphan")
+            .unwrap()
+            .expect("pending claim")
+            .created_at;
         drop(store);
 
         let reopened = OrchStore::open(d.path()).unwrap();
@@ -7190,11 +7286,46 @@ mod tests {
             .claim_idempotency(&scope(), "t", "orphan", "h")
             .unwrap()
         {
-            IdempotencyClaim::Replay(Err(e)) => {
-                assert!(e.message.contains("interrupted"));
+            IdempotencyClaim::Replay(Err(error)) => {
+                assert_eq!(
+                    error.code,
+                    OrchErrorCode::UncertainOutcome,
+                    "an interrupted claim is not a definite failure"
+                );
+                assert!(
+                    !error.message.contains("new request_id"),
+                    "the message must not invite a fresh key, which is the \
+                     duplicate this receipt exists to prevent: {}",
+                    error.message
+                );
+                assert!(
+                    error.message.contains("same request_id"),
+                    "the message must say to retry under the same key: {}",
+                    error.message
+                );
             }
-            _ => panic!("orphan must become a durable failed receipt"),
+            other => panic!(
+                "an orphaned claim must settle durably, got {}",
+                describe(&Ok(other))
+            ),
         }
+
+        // Recovery is a settlement, so it must not move the receipt in the
+        // page order — the defect fixed in `finish_idempotency` was still
+        // present here.
+        let recovered = reopened
+            .load_idempotency(&scope(), "orphan")
+            .unwrap()
+            .expect("settled receipt");
+        assert_eq!(
+            recovered.created_at, claimed_at,
+            "recovery rewrote the ordering key, so a receipt pending across a \
+             restart can be delivered twice across an issued cursor"
+        );
+        assert!(
+            recovered.settled_at.is_some(),
+            "recovery must record when it settled the claim"
+        );
     }
 
     #[test]

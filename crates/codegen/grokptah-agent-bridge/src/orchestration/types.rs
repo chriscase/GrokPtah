@@ -1446,6 +1446,14 @@ pub enum OrchErrorCode {
     InvalidRequest,
     Unsupported,
     Conflict,
+    /// The mutation may or may not have applied.
+    ///
+    /// The one code a caller must never auto-retry on. It exists because
+    /// "interrupted" and "did not happen" are different answers: a claim that
+    /// was pending when the host died may have committed its effect first, and
+    /// reporting that as a definite failure is how a caller is talked into
+    /// doing the work twice.
+    UncertainOutcome,
 }
 
 impl OrchErrorCode {
@@ -1459,6 +1467,7 @@ impl OrchErrorCode {
             Self::StaleVersion => "stale_version",
             Self::CursorExpired => "cursor_expired",
             Self::Internal => "internal",
+            Self::UncertainOutcome => "uncertain_outcome",
             Self::Timeout => "timeout",
             Self::InvalidRequest => "invalid_request",
             Self::Unsupported => "unsupported",

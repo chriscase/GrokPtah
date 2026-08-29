@@ -272,6 +272,67 @@ change the Desktop UI consumes (`promptPreview`, `finalResponse` are read
 directly by `RunInspector`), so it belongs with that lane rather than to a
 unilateral narrowing here. Recorded as R13.
 
+### F-13 — A resume the host performed for a caller was not the caller's (fixed)
+
+Found by fixing F-12, which is the useful part: fencing the listing revealed a
+regression the *unfenced* listing had been hiding since F-0.
+
+`resume_persistent_agent` runs its turn through the host's own path, and the
+writer there stamps the literal `desktop` on the durable run. Once run reads
+began binding the principal, the caller that asked for the resume could no
+longer read the run it had just created — `principal_may_read` compares that
+exact value. Nothing failed visibly, because the listing answered without
+consulting the caller at all; the moment the listing started asking, the run
+disappeared from its own initiator's view.
+
+The repair is attribution rather than a wider fence. A turn the host performs
+**for** an authenticated caller belongs to that caller, so the caller's stamped
+id is threaded down to the one place that writes run ownership; a turn the
+Desktop performs for itself is still `desktop`, and
+`a_caller_can_read_the_run_a_resume_created_for_it` asserts both halves.
+
+The general lesson is worth keeping: a fence and the enumeration beside it have
+to be added together. Fencing one and not the other does not half-close the
+hole — it hides whether the other is even correct.
+
+### F-14 — Restart recovery licensed the duplicate the receipt exists to prevent (fixed)
+
+A claim is written **before** its mutation runs, so a claim still pending when
+the host stops may have committed its effect and died before settling.
+`fail_orphaned_idempotency_claims` marked every such claim `failed` with
+"use a new request_id". Both halves are wrong together: "interrupted" and "did
+not happen" are different answers, and a caller told the second and then told
+to pick a fresh key does the work twice — the exact duplicate the receipt
+exists to prevent.
+
+The outcome is now `uncertain_outcome`, the one code the three-valued retry
+disposition marks `Unsafe`, and the message says to reconcile against durable
+state and retry under the *same* key. `OrchErrorCode` gained that variant; the
+SDK already decoded it, because the vocabularies are decode-open.
+
+Recovery also rewrote `created_at` — the mutable-ordering defect F-10 fixed in
+`finish_idempotency`, still present in the recovery path, where a receipt
+pending across a restart jumped to the end of the page order and could be
+delivered twice across a cursor a caller was holding. One writer was fixed and
+the other missed. Recovery is a settlement like any other: it records
+`settled_at` and leaves the claim time alone.
+
+**The same shape, in the legacy path.** A receipt written before scoping lives
+at the unscoped filename, so a scoped claim looks at a different file, finds
+nothing, and returns `Perform` — re-running a mutation that may already have
+committed. R8 called this "a retry spanning the upgrade is treated as a new
+request", which understated it: it is not a new request, it is the same one
+executed twice across an upgrade. A claim now consults the legacy path and
+refuses the key with `uncertain_outcome`, using the receipt's *existence* and
+never its contents, so nothing unattributable is served while the duplicate is
+refused.
+
+**Corruption no longer reads as absence.** `list_idempotency_for_run` skipped
+any receipt it could not parse, so a damaged file made a mutation look as
+though it had never run — the one inference a receipt log must never invite.
+An unreadable receipt now fails the listing and says which file, because a
+partial listing presented as a complete one is worse than an error.
+
 ### F-11 — Five holes behind the seal, and one claim that was not true (fixed)
 
 An exact-delta review of the sealing commit found that sealing the *type* had
@@ -587,11 +648,13 @@ restart, or a broker. It is not yet the "second real consumer" ADR-002 §7
 step 4 requires.
 
 **R8 — Legacy idempotency receipts are drained, not migrated.** Receipts
-written before F-6 carry no scope, so they are served to nobody and age out
-under the existing retention policy. A retry that spans the upgrade is treated
-as a new request rather than replayed. This is deliberate — the alternative is
-to guess an owner for a record that has none — but it is a one-time behaviour
-change and a host operator should know it happens rather than discover it.
+written before F-6 carry no scope, so their contents are served to nobody and
+they age out under the existing retention policy. Their *keys* are not reusable
+while they remain: a claim on one is refused with `uncertain_outcome` rather
+than re-run (F-14), because the host cannot say whether the earlier mutation
+applied. The visible consequence, stated rather than discovered: for the length
+of the retention window after an upgrade, a caller reusing a pre-upgrade key
+gets a refusal it must reconcile rather than a replay.
 
 **R10 — The scope is derived from the stamped credential id, and that is
 provisional.** *(Partly narrowed by F-11: the reserved ids are now refused at

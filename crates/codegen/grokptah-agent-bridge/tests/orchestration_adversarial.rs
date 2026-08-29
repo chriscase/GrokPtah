@@ -192,6 +192,102 @@ async fn control_token_absent_from_shell_env() {
     set_grokptah_home_override(None);
 }
 
+/// A caller must be able to read back work the host did on its behalf.
+///
+/// `resume_persistent_agent` runs the turn through the host's own path, which
+/// writes the durable run — and that writer stamped the literal `desktop`.
+/// Once run reads began binding the principal, the caller that *asked for* the
+/// resume could no longer read the run it had just created: the fence compares
+/// that exact value. The unfenced listing hid it, because the listing answered
+/// without consulting the caller at all; fencing the listing is what surfaced
+/// it.
+///
+/// The repair is attribution, not a wider fence. A turn the host performs for
+/// an authenticated caller belongs to that caller; a turn the Desktop performs
+/// for itself is still `desktop`.
+#[tokio::test]
+async fn a_caller_can_read_the_run_a_resume_created_for_it() {
+    let (home, _lock) = setup_home();
+    let host = started_host();
+    let ws = tempdir().unwrap();
+    host.set_project_cwd(ws.path()).unwrap();
+    let session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(session.id, ws.path()).unwrap();
+    let orch = orch(&host, &home, &ws, 4);
+    let auth = orch
+        .auth_header(Some("Bearer secret-token-adversarial-196"))
+        .unwrap();
+
+    // The host writes a run for this caller exactly as the resume path does.
+    let workspace = dunce::canonicalize(ws.path())
+        .unwrap()
+        .display()
+        .to_string();
+    let run_id = format!("desktop-{}", Uuid::new_v4());
+    orch.store()
+        .save_run(&grokptah_agent_bridge::orchestration::RunRecord {
+            run_id: run_id.clone(),
+            session_id: session.id,
+            workspace,
+            request_id: "resume-attribution".into(),
+            // What `begin_desktop_run` now stamps when it acts for a caller.
+            client_id: Some("mcp".into()),
+            state: grokptah_agent_bridge::orchestration::RunState::Completed,
+            purpose: Default::default(),
+            agent_id: None,
+            retry_of: None,
+            parent_run_id: None,
+            agent_spec_revision: None,
+            checkpoint_id: None,
+            continuation_context_id: None,
+            continuation_context_hash: None,
+            continuation_fidelity: None,
+            queue_position: None,
+            bounds: RunBounds::default(),
+            prompt_preview: "resumed on the caller's behalf".into(),
+            start_seq: Some(1),
+            end_seq: Some(2),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            terminal_result: Some("completed".into()),
+            final_response: None,
+            error_code: None,
+            stop_cause: None,
+            aggregates: Default::default(),
+            progress: None,
+            execution: None,
+            approval: None,
+        })
+        .unwrap();
+
+    orch.get_run(&auth, &run_id)
+        .expect("the caller must be able to read the run created for it");
+    let listed = orch
+        .list_runs_scoped(&auth, session.id, ws.path())
+        .expect("listing");
+    assert!(
+        listed["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|run| run["runId"] == run_id.as_str()),
+        "the run the host created for this caller is missing from its listing"
+    );
+
+    // And the Desktop's own turns stay the Desktop's: still not this caller's.
+    let desktop_only = format!("desktop-{}", Uuid::new_v4());
+    let mut own = orch.store().load_run(&run_id).unwrap().unwrap();
+    own.run_id = desktop_only.clone();
+    own.client_id = Some("desktop".into());
+    orch.store().save_run(&own).unwrap();
+    assert!(
+        orch.get_run(&auth, &desktop_only).is_err(),
+        "a Desktop-authored turn is not this caller's to read"
+    );
+
+    set_grokptah_home_override(None);
+}
+
 /// A listing must not answer a wider question than the read beside it.
 ///
 /// `list_runs_scoped` took an `AuthContext` and ignored it, filtering on

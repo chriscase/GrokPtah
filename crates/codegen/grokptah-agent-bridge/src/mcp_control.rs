@@ -1792,6 +1792,10 @@ fn status_for(e: &OrchError) -> StatusCode {
         OrchErrorCode::CursorExpired => StatusCode::GONE,
         OrchErrorCode::SessionBusy | OrchErrorCode::CapacityExhausted => StatusCode::CONFLICT,
         OrchErrorCode::Timeout => StatusCode::GATEWAY_TIMEOUT,
+        // The host does not know whether the effect applied, which is what a
+        // 500 says. Named rather than left to the catch-all: a caller reading
+        // the typed code must find `uncertain_outcome` and not auto-retry.
+        OrchErrorCode::UncertainOutcome => StatusCode::INTERNAL_SERVER_ERROR,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }

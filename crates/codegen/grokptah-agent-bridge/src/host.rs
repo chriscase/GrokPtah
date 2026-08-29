@@ -2101,7 +2101,7 @@ impl AgentHostHandle {
         prompt: String,
         max_rounds: Option<u32>,
     ) -> Result<String> {
-        self.resume_agent_with_request_id(session_id, prompt, max_rounds, None)
+        self.resume_agent_with_request_id(session_id, prompt, max_rounds, None, None)
             .await
     }
 
@@ -2114,6 +2114,9 @@ impl AgentHostHandle {
         prompt: String,
         max_rounds: Option<u32>,
         request_id: Option<String>,
+        // The caller this resume is performed for, when there is one. The run
+        // the host writes belongs to them, not to the Desktop.
+        attributed_client: Option<String>,
     ) -> Result<String> {
         let store = self.ensure_orchestration_store()?;
         let request_id = request_id.unwrap_or_else(|| format!("resume-{}", Uuid::new_v4()));
@@ -2175,7 +2178,15 @@ impl AgentHostHandle {
                     .map(|run| run.run_id)
                     .collect();
                 let result = self
-                    .session_prompt_inner(session_id, prompt, max_rounds, None, None, Some(plan))
+                    .session_prompt_inner(
+                        session_id,
+                        prompt,
+                        max_rounds,
+                        None,
+                        None,
+                        Some(plan),
+                        attributed_client.as_deref(),
+                    )
                     .await;
                 let durable_run_id = store.list_runs()?.into_iter().find_map(|run| {
                     (!prior_run_ids.contains(&run.run_id)
@@ -2490,6 +2501,12 @@ impl AgentHostHandle {
         agent_spec_revision: Option<u64>,
         parent_run_id: Option<String>,
         continuation: Option<&AgentContinuationPlan>,
+        // Who this turn is being run *for*. `None` is the Desktop running its
+        // own turn, which is genuinely `desktop`. `Some` is the host acting on
+        // an authenticated caller's behalf, and the run belongs to that
+        // caller: stamping `desktop` there means the caller cannot read back
+        // work it just asked for, because the run fence compares this value.
+        attributed_client: Option<&str>,
     ) -> Option<(String, OrchStore)> {
         let store = match self.ensure_orchestration_store() {
             Ok(store) => store,
@@ -2509,7 +2526,7 @@ impl AgentHostHandle {
             session_id,
             workspace: durable_workspace,
             request_id: format!("desktop-turn-{turn_id}"),
-            client_id: Some("desktop".into()),
+            client_id: Some(attributed_client.unwrap_or("desktop").to_string()),
             state: RunState::Running,
             purpose: RunPurpose::Execution,
             agent_id: agent_id.clone(),
@@ -6825,7 +6842,7 @@ impl AgentHostHandle {
         prompt: String,
         max_rounds: Option<u32>,
     ) -> Result<String> {
-        self.session_prompt_inner(session_id, prompt, max_rounds, None, None, None)
+        self.session_prompt_inner(session_id, prompt, max_rounds, None, None, None, None)
             .await
     }
 
@@ -6837,8 +6854,16 @@ impl AgentHostHandle {
         max_rounds: Option<u32>,
         owner: &str,
     ) -> Result<String> {
-        self.session_prompt_inner(session_id, prompt, max_rounds, Some(owner), None, None)
-            .await
+        self.session_prompt_inner(
+            session_id,
+            prompt,
+            max_rounds,
+            Some(owner),
+            None,
+            None,
+            None,
+        )
+        .await
     }
 
     /// Start a reserved turn under a durable run identity owned by an
@@ -6863,10 +6888,16 @@ impl AgentHostHandle {
                 execution_mode,
             }),
             None,
+            None,
         )
         .await
     }
 
+    // Eight explicit turn inputs rather than a struct: each is consumed by a
+    // different stage of the turn, and bundling them hides which stage owns
+    // which — including `attributed_client`, whose whole point is being visible
+    // at the one place that stamps run ownership.
+    #[allow(clippy::too_many_arguments)]
     async fn session_prompt_inner(
         &self,
         session_id: Uuid,
@@ -6875,6 +6906,7 @@ impl AgentHostHandle {
         reservation_owner: Option<&str>,
         external_run: Option<ExternalRunContext>,
         resume: Option<AgentContinuationPlan>,
+        attributed_client: Option<&str>,
     ) -> Result<String> {
         self.ensure_session_accepts_new_work(session_id)?;
         self.ensure_transcript_loaded(session_id)?;
@@ -7180,6 +7212,7 @@ impl AgentHostHandle {
                     .and_then(|agent| agent.current_spec().ok().map(|spec| spec.revision)),
                 resume.as_ref().map(|plan| plan.parent_run_id.clone()),
                 resume.as_ref(),
+                attributed_client,
             )
         } else {
             None
@@ -11800,6 +11833,7 @@ mod tests {
                 "continue from the checkpoint".into(),
                 Some(1),
                 Some("resume-idempotency-test".into()),
+                None,
             )
             .await
             .unwrap_err()
@@ -11810,6 +11844,7 @@ mod tests {
                 "continue from the checkpoint".into(),
                 Some(1),
                 Some("resume-idempotency-test".into()),
+                None,
             )
             .await
             .unwrap_err()
@@ -11823,6 +11858,7 @@ mod tests {
                 "different payload".into(),
                 Some(1),
                 Some("resume-idempotency-test".into()),
+                None,
             )
             .await
             .unwrap_err()
@@ -11946,6 +11982,7 @@ mod tests {
                 "continue".into(),
                 Some(3),
                 Some("deterministic-continuation-replay".into()),
+                None,
             )
             .await
             .unwrap();
@@ -11956,6 +11993,7 @@ mod tests {
                 "continue".into(),
                 Some(3),
                 Some("deterministic-continuation-replay".into()),
+                None,
             )
             .await
             .unwrap();
@@ -12030,6 +12068,7 @@ mod tests {
                 None,
                 None,
                 Some(losing_plan),
+                None,
             )
             .await
             .unwrap_err()

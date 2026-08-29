@@ -4909,7 +4909,17 @@ impl OrchestrationService {
         }
         let response = match self
             .host
-            .resume_agent_with_request_id(session_id, prompt, max_rounds, Some(request_id.into()))
+            // Attribute the run to the caller who asked for it. Without this
+            // the host stamps its own `desktop` identity and the initiator
+            // cannot read back the run it just created — the principal fence
+            // compares this exact value.
+            .resume_agent_with_request_id(
+                session_id,
+                prompt,
+                max_rounds,
+                Some(request_id.into()),
+                Some(Self::stamped_client_id(auth)),
+            )
             .await
         {
             Ok(response) => response,
