@@ -788,6 +788,32 @@ byte-identical to `origin/main` — and failed identically there:
 All are Linux-container artifacts; the hosted `desktop` job runs macOS, where
 the native keychain backend applies and none reproduces.
 
+### Which consumers a local sweep actually covers
+
+Six crates depend on the bridge: the bridge itself, the SDK, the service, the
+reference consumer, `evals/certification-lab`, and `desktop/src-tauri`. The
+sweeps here cover the first five. **`desktop/src-tauri` cannot be built in this
+container** — it needs GTK/GDK system libraries (`gdk-3.0` is absent), so
+`cargo check` fails in `gdk-sys`'s build script before any of this repository's
+code is typechecked.
+
+That is a real hole and it has already cost a hosted run: changing the arity of
+`AgentHost::resume_agent_with_request_id` broke `desktop/src-tauri/src/commands.rs`,
+which nothing local compiles.
+
+Worse, the check that should have caught it *ran and found nothing for the
+wrong reason*. The grep for external callers was pointed at `crates/ src-tauri`
+with `2>/dev/null` — and `src-tauri` is at `desktop/src-tauri`, not the
+repository root. The path did not exist, the error was swallowed, and an empty
+result read as "no external callers". Same shape as the source guard that
+passed because its substring spanned lines: a check that cannot fail is worse
+than no check, because it is read as evidence.
+
+**So: any change to a `pub` signature in the bridge requires grepping
+`desktop/src-tauri` explicitly, and confirming the grep matched a directory
+that exists.** The compiler cannot do it here; that makes the manual step
+mandatory rather than optional.
+
 ### Service-crate clippy
 
 `cargo clippy --all-targets -D warnings` on `grokptah-service` reports two
