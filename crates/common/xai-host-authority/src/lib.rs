@@ -121,6 +121,34 @@
 //! let _ = ControlEpoch(9_999);
 //! ```
 //!
+//! Authority identity is not deserializable. A derived `Deserialize` would be
+//! a public constructor in disguise, letting downstream code mint an identity
+//! or claim a generation straight from JSON:
+//!
+//! ```compile_fail
+//! # use xai_host_authority::*;
+//! fn mintable<'de, T: serde::Deserialize<'de>>() {}
+//! mintable::<PrincipalId>();
+//! ```
+//!
+//! ```compile_fail
+//! # use xai_host_authority::*;
+//! fn mintable<'de, T: serde::Deserialize<'de>>() {}
+//! mintable::<AuthGeneration>();
+//! ```
+//!
+//! ```compile_fail
+//! # use xai_host_authority::*;
+//! fn mintable<'de, T: serde::Deserialize<'de>>() {}
+//! mintable::<ResourceIncarnation>();
+//! ```
+//!
+//! ```compile_fail
+//! # use xai_host_authority::*;
+//! fn mintable<'de, T: serde::Deserialize<'de>>() {}
+//! mintable::<ControlEpoch>();
+//! ```
+//!
 //! Administering the root requires a [`HostAdminAuthority`], which only
 //! [`HostAuthority::open`] produces. It cannot be forged:
 //!
