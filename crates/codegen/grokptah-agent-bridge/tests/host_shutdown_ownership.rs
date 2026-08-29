@@ -21,7 +21,7 @@ use grokptah_agent_bridge::orchestration::{
 };
 use grokptah_agent_bridge::{
     set_grokptah_home_override, start_control_server, AgentHost, HostConfig, HostPhase,
-    HostRuntime, McpControlClient, MemoryScope, SessionKind,
+    HostRuntime, McpControlClient, MemoryScope, SessionKind, SessionUpdate,
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -1739,6 +1739,309 @@ async fn a_dropped_runtime_retains_the_home_with_no_surviving_handle() {
         AgentHost::create(HostConfig::default()).is_err(),
         "a quarantined home stays quarantined for the life of the process"
     );
+}
+
+/// Registration must happen **before** the effect starts, not when its future
+/// is first polled.
+///
+/// A future registered at first poll has a window: it has been created and can
+/// be polled by any executor, while shutdown still counts zero. This asserts
+/// the count rises at construction, before anything has run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn an_effect_is_registered_before_it_starts() {
+    let lane = Lane::new();
+    let (runtime, _session_id) = lane.boot();
+    let handle = runtime.handle();
+    let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let polled_tx = polled.clone();
+    let before = runtime.supervised_task_count();
+    let tracked = handle
+        .track_supervised("an effect that has not started", async move {
+            polled_tx.store(true, std::sync::atomic::Ordering::Release);
+        })
+        .expect("a running host registers work");
+
+    assert_eq!(
+        runtime.supervised_task_count(),
+        before + 1,
+        "the barrier must count this effect before it has been polled once"
+    );
+    assert!(
+        !polled.load(std::sync::atomic::Ordering::Acquire),
+        "nothing has run yet; the registration is what is being asserted"
+    );
+
+    tracked.await;
+    assert!(polled.load(std::sync::atomic::Ordering::Acquire));
+    assert_clean_shutdown(&runtime.shutdown().await);
+}
+
+/// The race, not merely the refusal: an effect that is *in flight* when
+/// shutdown begins must hold the release until it finishes.
+///
+/// The refusal test proves a stopped runtime says no. This proves the other
+/// half — that shutdown cannot slip past an effect already running — by having
+/// the effect observe, at its own end, whether the home had already been handed
+/// on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::await_holding_lock)]
+async fn an_in_flight_effect_holds_the_release_until_it_finishes() {
+    let lane = Lane::new();
+    let (runtime, _session_id) = lane.boot();
+    let handle = runtime.handle();
+
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let home_was_free_at_the_end = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let entered_tx = entered.clone();
+    let finished_tx = finished.clone();
+    let observed = home_was_free_at_the_end.clone();
+    let lock_path = lane.instance_lock();
+    handle
+        .spawn_supervised("an effect racing shutdown", async move {
+            entered_tx.notify_one();
+            // Long enough that a shutdown which did not wait would have
+            // released and let a replacement in before this line.
+            for _ in 0..256 {
+                tokio::task::yield_now().await;
+            }
+            if !grokptah_agent_bridge::instance_lock_is_held(&lock_path) {
+                observed.store(true, std::sync::atomic::Ordering::Release);
+            }
+            finished_tx.store(true, std::sync::atomic::Ordering::Release);
+        })
+        .expect("a running host supervises work");
+    entered.notified().await;
+
+    // Shutdown starts with the effect already running.
+    let report = runtime.shutdown().await;
+    assert_clean_shutdown(&report);
+
+    assert!(
+        finished.load(std::sync::atomic::Ordering::Acquire),
+        "a clean shutdown must not return before an in-flight effect finished"
+    );
+    assert!(
+        !home_was_free_at_the_end.load(std::sync::atomic::Ordering::Acquire),
+        "the home must still have been owned while the effect was acting"
+    );
+
+    // Only now may a replacement take it.
+    let replacement = restart_same_home_now(&lane);
+    assert_clean_shutdown(&replacement.shutdown().await);
+}
+
+/// A durable write that fails for lack of space (or any I/O failure) must make
+/// the shutdown unclean and quarantine the home, never report a clean stop over
+/// a lost write.
+///
+/// The failure is injected by putting a directory where the audit ledger's file
+/// belongs, so the append fails with `EISDIR`. That is uid-independent — mode
+/// bits would not bite when the suite runs as root, and a test that silently
+/// stopped injecting anything would assert nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn a_failed_durable_flush_is_unclean_and_quarantines_the_home() {
+    let lane = Lane::new();
+    let quarantined_before = grokptah_agent_bridge::quarantined_process_lock_count();
+    let report = {
+        let (runtime, _session_id) = lane.boot();
+        let _store = runtime.ensure_orchestration_store().unwrap();
+        let audit_file = lane
+            .grokptah_home()
+            .join("orchestration")
+            .join("audit")
+            .join("audit.jsonl");
+        let _ = std::fs::remove_file(&audit_file);
+        std::fs::create_dir_all(&audit_file).unwrap();
+        runtime.shutdown().await
+    };
+
+    assert!(
+        !report.is_clean(),
+        "a durable write that could not land must not report a clean stop: {}",
+        report.operator_summary()
+    );
+    assert!(
+        !report.flush_errors.is_empty(),
+        "the failure must be reported, not swallowed: {}",
+        report.operator_summary()
+    );
+    assert!(
+        !report.process_lock_released && report.process_lock_retained_for_safety,
+        "a lost durable write must retain the home: {}",
+        report.operator_summary()
+    );
+    assert_eq!(
+        grokptah_agent_bridge::quarantined_process_lock_count(),
+        quarantined_before + 1,
+        "and the retention must be process-owned, surviving every handle"
+    );
+    assert!(
+        AgentHost::create(HostConfig::default()).is_err(),
+        "no replacement may take a home whose last write is unaccounted for"
+    );
+}
+
+/// The durable event journal must be closed and joined *inside* shutdown, so a
+/// clean report cannot precede a queued or failed journal write.
+///
+/// The writer thread is otherwise joined only when the last handle to the bus
+/// drops — after the report is produced, and possibly never if any clone
+/// outlives shutdown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn the_journal_writer_is_closed_and_joined_before_a_clean_report() {
+    let lane = Lane::new();
+    let (runtime, session_id) = lane.boot();
+
+    // Enough traffic that entries are genuinely queued behind the writer.
+    let bus = runtime.event_bus();
+    for i in 0..256 {
+        bus.publish(SessionUpdate::AgentMessageChunk {
+            session_id,
+            text: format!("journal-{i}"),
+        });
+    }
+    let last_seq = bus.current_seq();
+
+    // A clone of the bus deliberately outlives shutdown: without an explicit
+    // close the writer thread would still be alive here, because it is joined
+    // only when the last handle drops.
+    let surviving_clone = bus.clone();
+    assert!(surviving_clone.journal_writer_is_live());
+    assert_clean_shutdown(&runtime.shutdown().await);
+
+    // The discriminating assertion. A writer that merely kept up would still be
+    // live here; only an explicit close-and-join inside shutdown makes it false
+    // while a clone of the bus is still held.
+    assert!(
+        !surviving_clone.journal_writer_is_live(),
+        "shutdown must close and join the journal writer, not rely on the last \
+         handle being dropped afterwards"
+    );
+
+    // Everything published before the stop is on disk by the time the report
+    // said "clean".
+    let journal = lane
+        .grokptah_home()
+        .join("orchestration")
+        .join("event_journal.jsonl");
+    let written = std::fs::read_to_string(&journal).expect("the journal was persisted");
+    assert!(
+        written.lines().count() as u64 >= last_seq,
+        "a clean report must not precede the journal: {} lines for {last_seq} events",
+        written.lines().count()
+    );
+    assert!(
+        written.contains("journal-255"),
+        "the last queued entry must have been flushed before the report"
+    );
+
+    // Closing again is idempotent, and the surviving clone has no live writer.
+    assert!(surviving_clone.close_journal_writer().is_none());
+}
+
+/// Abrupt death, not an orderly stop: `SIGKILL` a real process mid-write and
+/// prove the home is takeable afterwards and the durable state is coherent.
+///
+/// Every other restart test in this file exercises an *orderly* stop, which is
+/// not crash evidence: an ordered shutdown releases the lock deliberately, so it
+/// says nothing about what happens when a process never gets to run any code.
+/// `flock` is released by the kernel on process death; this asserts that in
+/// practice, that the lock file survives, and that a replacement can open the
+/// same ledger and read what was committed before the kill.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn a_killed_owner_leaves_a_takeable_home_and_a_readable_ledger() {
+    if std::env::var_os(LOCK_HOLDER_ENV).is_some() {
+        return;
+    }
+    let lane = Lane::new();
+    let home = lane.grokptah_home();
+    std::fs::create_dir_all(&home).unwrap();
+    let release = home.join("release-the-lock");
+
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "holds_the_instance_lock_until_released",
+            "--nocapture",
+            "--test-threads=1",
+            "--ignored",
+        ])
+        .env(LOCK_HOLDER_ENV, "1")
+        .env("GROKPTAH_HOME", &home)
+        .env("GROKPTAH_LOCK_RELEASE", &release)
+        .spawn()
+        .expect("re-exec as the lock holder");
+
+    let lock_path = lane.instance_lock();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !grokptah_agent_bridge::instance_lock_is_held(&lock_path) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "child never took the lock"
+        );
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "child exited before taking the lock"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    // While that process owns the home, this one is refused — the precondition
+    // that makes the post-kill result meaningful.
+    assert!(AgentHost::create(HostConfig::default()).is_err());
+
+    // No shutdown, no unwinding, no destructors: the process is killed outright.
+    child.kill().expect("kill the owner");
+    let status = child.wait().expect("reap the killed owner");
+    assert!(
+        !status.success(),
+        "the owner was killed, not stopped: {status:?}"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            status.signal(),
+            Some(9),
+            "the owner must have died to SIGKILL, not exited on its own: {status:?}"
+        );
+    }
+
+    // The kernel released the advisory lock; the lock *file* is still there.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while grokptah_agent_bridge::instance_lock_is_held(&lock_path) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the kernel did not release the killed owner's lock"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        lock_path.is_file(),
+        "a crash must not remove the lock file; only the advisory lock is gone"
+    );
+
+    // A replacement takes the home with no cleanup step, opens the same ledger,
+    // and finds it coherent.
+    let replacement = AgentHost::create(HostConfig::default())
+        .expect("a crashed owner's home must be takeable without manual repair");
+    replacement.start().unwrap();
+    let store = replacement
+        .ensure_orchestration_store()
+        .expect("the ledger a killed process left behind must open");
+    let session = replacement.session_new_kind(SessionKind::Build).unwrap();
+    assert!(
+        probe_store_write(&store, session.id).is_ok(),
+        "and must be writable by the process that now owns it"
+    );
+    assert_clean_shutdown(&replacement.shutdown().await);
 }
 
 /// P1 — a lease may only be bound to a runtime that owns its home.

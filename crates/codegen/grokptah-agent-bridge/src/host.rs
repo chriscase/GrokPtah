@@ -7282,7 +7282,41 @@ impl AgentHostHandle {
         .await
     }
 
+    /// One prompt turn, registered on the shutdown join barrier **before** any
+    /// of it starts.
+    ///
+    /// A turn is the crate's largest external effect: it sends to the provider
+    /// over the network and runs tools that edit the user's workspace and spawn
+    /// child processes. It was supervised only when a caller happened to spawn
+    /// it inside a supervised task — the orchestration service does, but a
+    /// desktop Tauri command and a direct embedder call do not. Registration
+    /// therefore belongs at the effect, not at each call site: put here, the
+    /// turn is on the barrier before its first poll, so there is no window in
+    /// which it has started but shutdown cannot see it (#455).
     async fn session_prompt_inner(
+        &self,
+        session_id: Uuid,
+        prompt: String,
+        max_rounds: Option<u32>,
+        reservation_owner: Option<&str>,
+        external_run: Option<ExternalRunContext>,
+        resume: Option<AgentContinuationPlan>,
+    ) -> Result<String> {
+        let effect = self.session_prompt_effect(
+            session_id,
+            prompt,
+            max_rounds,
+            reservation_owner,
+            external_run,
+            resume,
+        );
+        // `track_supervised` registers before returning, so the count rises
+        // here rather than when the future is first polled.
+        self.track_supervised("running a prompt turn", effect)?
+            .await
+    }
+
+    async fn session_prompt_effect(
         &self,
         session_id: Uuid,
         prompt: String,

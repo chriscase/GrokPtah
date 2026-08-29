@@ -160,11 +160,47 @@ input. Those are bound to the runtime only through the **join**: an ordered
 shutdown joins the tasks that perform them before releasing the lock, and `Drop`
 quarantines the lock whenever any such task is outstanding.
 
-Coverage of that join is the current limit. Supervised tasks, the desktop's
-direct Computer Use commands, and the orchestration/background/subagent paths
-are on the barrier. A future that no one registered — a raw `tokio::spawn`, a
-provider call outside those paths, a child process not tracked in
-`live_shells` — is not, and a clean report can be produced while it is still
-running. Binding every external effect to the same lifecycle is tracked
-separately (#454, #463); until then the join is a proxy for "no effect can still
-happen", not a proof of it.
+Coverage of that join is the current limit, so here is the actual inventory
+rather than a general assurance. Every place the bridge starts work outside the
+caller's own task:
+
+| Site | Effect | On the barrier? |
+| --- | --- | --- |
+| `session_prompt_inner` | provider send, tool execution, workspace edits | **Yes** — registered before the turn starts, so no caller can begin one unsupervised |
+| `DesktopComputerUse` commands | permission, capture, input delivery | **Yes** — `track_supervised` around each |
+| orchestration run + aggregator tasks | durable runs | **Yes** — `spawn_supervised` |
+| background scans, shells, subagents | workspace, child processes | **Yes** — `spawn_supervised` |
+| scheduler / native / manager watchers | durable | **Yes** — supervised and joined |
+| `mcp_control` axum serve task | HTTP/SSE acceptance | **Yes**, by a different mechanism: owned in `ControlServerHandle` and joined by `stop_and_wait` |
+| `host_runtime` seal `spawn_blocking` | none (it *is* shutdown) | n/a |
+| `host.rs` workspace walk `spawn_blocking` | read-only | n/a |
+| `local_tools` stdout/stderr pumps | read pipes only; the child process is the effect, and it is tracked in `live_shells` and killed by `cancel_all_activity` | pumps: **no**; child: yes |
+| `computer_use/macos_native` `spawn_blocking` calls | accessibility permission, capture, native input | **No** — see below |
+| `eval_oracle` command runner | evaluation tooling, outside the host lifecycle | n/a |
+
+Two honest gaps in that table:
+
+1. **`spawn_blocking` is not cancellable and not joined.** The macOS native
+   Computer Use calls run inside a supervised future, so shutdown waits for the
+   *awaiter* — but if that awaiter is cancelled, the blocking task itself keeps
+   running to completion. A native input or capture can therefore outlive the
+   join by the length of one platform call.
+2. **Anything a future contributor adds with a bare `tokio::spawn`** is outside
+   the barrier by default. There is no compile-time enforcement here, unlike the
+   durable-write guard.
+
+Binding every external effect to the same lifecycle is tracked separately
+(#454, #463); until then the join is a proxy for "no effect can still happen",
+not a proof of it.
+
+Also unproven, and deliberately not claimed:
+
+- **Windows.** All of this is `flock` semantics on Unix. Windows lock, ACL and
+  reparse-point behaviour — including whether a refused contender can affect the
+  owner's lock file, and how a killed process's lock is reclaimed — is untested.
+- **Symlinked lock path.** `.instance.lock` still follows a pre-existing
+  same-user symlink; there are no `O_NOFOLLOW`/`openat` identity checks.
+- **Soak qualification.** Crash recovery is proven for one killed owner
+  (`a_killed_owner_leaves_a_takeable_home_and_a_readable_ledger`). That is not a
+  soak: repeated kills under concurrent load, and kills landing inside a
+  partially written durable record, are not covered here.
