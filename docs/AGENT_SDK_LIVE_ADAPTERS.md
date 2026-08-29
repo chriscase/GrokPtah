@@ -814,6 +814,15 @@ than no check, because it is read as evidence.
 that exists.** The compiler cannot do it here; that makes the manual step
 mandatory rather than optional.
 
+**And the grep must not be truncated.** Removing `ServiceControlPlane::transport()`
+was preceded by a search for callers whose output was piped through `head -10`;
+all ten lines came from one file, the service crate's use was cut off, and the
+result read as "only tests use this". That is the third time on this branch a
+check reported nothing because it could not report everything: a source guard
+whose substring spanned lines, a `grep` at a path that did not exist, and now a
+`head` that hid the matches that mattered. Count matches before reading a search
+as evidence of absence.
+
 ### Service-crate clippy
 
 `cargo clippy --all-targets -D warnings` on `grokptah-service` reports two
