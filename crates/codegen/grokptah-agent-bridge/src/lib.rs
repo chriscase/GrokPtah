@@ -8,6 +8,7 @@ mod auth_store;
 pub mod certification;
 mod completion;
 mod computer_agent;
+pub mod computer_profile;
 pub mod computer_use;
 mod discover;
 pub mod eval_oracle;
@@ -107,18 +108,27 @@ pub use completion::{
     CompletionUsage,
 };
 pub use computer_agent::{
-    accept_model_proposal, AcceptedIntent, AcceptedModelProposal, ComputerAgentEligibility,
-    ComputerAgentProposal, ModelProposalContext, RawModelProposal, PROPOSAL_SEAL_VERSION,
+    accept_model_proposal, enforce_profile_budget, render_computer_observation, AcceptedIntent,
+    AcceptedModelProposal, AdaptiveSealBinding, ComputerAgentEligibility, ComputerAgentProposal,
+    ModelProposalContext, ProposalAttempt, RawModelProposal, RenderedObservation,
+    PROPOSAL_SEAL_VERSION,
+};
+pub use computer_profile::{
+    classify_objective, classify_task, project_adaptive, AdaptiveLifecycle, AdaptiveProfile,
+    AdaptiveProfileProjection, AdaptiveRecord, CapabilityEvidence, CapabilityGeneration,
+    HostCapabilityEvidence, ModelCapabilityEvidence, ObservationFingerprint,
+    OperatorCapabilityPolicy, ProfileReason, ProfileTransition, RuntimeSignal, TaskRisk,
+    TerminalOutcome, TurnPermit, CANONICAL_PROFILE_NAMES, HOST_INDEPENDENT_VERIFIER_AVAILABLE,
 };
 pub use computer_use::{
     canonical_workspace_string, project_run_at, ActionClass, ActionGrant, ActionGrantSummary,
-    ActionOutcome, ActionOutcomeSummary, CompletionProof, ComputerAction, ComputerAuditEntry,
-    ComputerBackend, ComputerCapabilities, ComputerControlDisposition, ComputerError,
-    ComputerErrorCode, ComputerErrorSummary, ComputerObservation, ComputerObservationPlatform,
-    ComputerPermission, ComputerPermissionStatus, ComputerPlatformStatus, ComputerPolicy,
-    ComputerReadBinding, ComputerRun, ComputerRunCapacity, ComputerRunEventPage,
-    ComputerRunEventRange, ComputerRunProgress, ComputerRunProjection, ComputerRunReads,
-    ComputerRunState, ComputerScopeCapacity, ComputerStore, ComputerTarget,
+    ActionOutcome, ActionOutcomeSummary, AdaptiveAttemptOutcome, AdaptiveTurnRequest,
+    CompletionProof, ComputerAction, ComputerAuditEntry, ComputerBackend, ComputerCapabilities,
+    ComputerControlDisposition, ComputerError, ComputerErrorCode, ComputerErrorSummary,
+    ComputerObservation, ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
+    ComputerPlatformStatus, ComputerPolicy, ComputerReadBinding, ComputerRun, ComputerRunCapacity,
+    ComputerRunEventPage, ComputerRunEventRange, ComputerRunProgress, ComputerRunProjection,
+    ComputerRunReads, ComputerRunState, ComputerScopeCapacity, ComputerStore, ComputerTarget,
     ComputerTargetCandidate, ComputerTargetSummary, ComputerUseLimits, ComputerUseService,
     FrameIdentity, GrantIssuer, MacOsObservationPlatform, ObservationSummary,
     PostconditionExpectation, ReceiptVerification, SemanticAction, SimulatorBackend,

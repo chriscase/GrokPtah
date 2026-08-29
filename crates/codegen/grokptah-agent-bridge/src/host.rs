@@ -20,6 +20,10 @@ use crate::computer_agent::{
     propose_semantic_action, qualify_semantic_model, resolve_computer_eligibility,
     ComputerAgentEligibility,
 };
+use crate::computer_profile::{
+    CapabilityEvidence, CapabilityGeneration, HostCapabilityEvidence, ModelCapabilityEvidence,
+    OperatorCapabilityPolicy,
+};
 use crate::event_bus::{session_id_of, JournalPage};
 use crate::events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 use crate::host_helpers::{
@@ -1053,12 +1057,77 @@ impl AgentHostHandle {
     /// dispatch an OS action and it cannot stage one: the bytes carry no
     /// authority until [`crate::computer_agent::accept_model_proposal`] seals
     /// them against a live run (#457).
+    /// The capability evidence and generation in force for this session's
+    /// selected Computer model, right now.
+    ///
+    /// Re-derived on every call rather than cached. The adaptive record stores
+    /// the generation it was opened under and refuses to proceed when this
+    /// value disagrees, which is what turns a same-route tier downgrade,
+    /// provenance change, schema drift, credential rotation, or operator
+    /// policy edit into a stop instead of a silent reuse (#458).
+    pub fn computer_capability_evidence(
+        &self,
+        session_id: Uuid,
+        observation: &crate::computer_use::ComputerObservation,
+    ) -> Result<CapabilityEvidence> {
+        let (model, _) = self.selected_computer_model(session_id)?;
+        let credentials = crate::auth_store::resolve_wire_credentials_for_model(&model)
+            .map_err(anyhow::Error::msg)?
+            .ok_or_else(|| anyhow!(crate::auth_store::auth_help_message()))?;
+        let resolved = resolve_computer_eligibility(&credentials, &model)?;
+        let durable_authority =
+            resolved.eligibility.tier >= crate::gateway_config::ComputerUseTier::SemanticAct;
+        let session_authority = self
+            .inner
+            .lock()
+            .computer_agent_qualifications
+            .get(&(session_id, model.clone()))
+            .is_some_and(|record| record.route_fingerprint == resolved.route_fingerprint);
+        let policy = self.computer_capability_policy();
+        let credential_generation = CapabilityGeneration::credential_generation(
+            &credentials.provider_id,
+            &credentials.bearer,
+        );
+        Ok(CapabilityEvidence::new(
+            ModelCapabilityEvidence::from_model_capabilities(
+                &resolved.capabilities,
+                durable_authority,
+                session_authority,
+                &resolved.route_fingerprint,
+                &credential_generation,
+                &policy,
+            ),
+            HostCapabilityEvidence::observe(observation),
+        ))
+    }
+
+    /// Local operator policy over capability provenance.
+    ///
+    /// There is no configuration surface for this yet, so it returns the
+    /// conservative default: declared-only capability is observation-only, and
+    /// action authority requires measurement. Wiring an operator control is a
+    /// #458 follow-up; until then the safe answer is the only answer.
+    pub fn computer_capability_policy(&self) -> OperatorCapabilityPolicy {
+        OperatorCapabilityPolicy::default()
+    }
+
+    /// Ask the selected, qualified model for one bounded proposal under an
+    /// already-admitted adaptive turn. This method cannot dispatch an OS
+    /// action, and the bytes it returns carry no authority: they become an
+    /// `AcceptedModelProposal` only through `seal::accept_model_proposal`,
+    /// against the live record (#457).
+    ///
+    /// The returned [`ProposalAttempt`] always reports what the attempt cost,
+    /// including when it failed, so the caller can charge the run for a
+    /// timeout, a transport error, or a schema refusal exactly as it charges
+    /// for a success.
     pub async fn propose_computer_action(
         &self,
         session_id: Uuid,
         objective: &str,
         observation: &crate::computer_use::ComputerObservation,
-    ) -> Result<crate::computer_agent::RawModelProposal> {
+        permit: &crate::computer_profile::TurnPermit,
+    ) -> Result<crate::computer_agent::ProposalAttempt> {
         let (_operation_id, cancel, _guard) = self.begin_computer_agent_operation(session_id)?;
         let (model, effort) = self.selected_computer_model(session_id)?;
         let credentials = crate::auth_store::resolve_wire_credentials_for_model(&model)
@@ -1076,21 +1145,21 @@ impl AgentHostHandle {
         if !durable_authority && !session_authority {
             bail!("selected model is not qualified for semantic Computer actions");
         }
-        let proposal = propose_semantic_action(
+        let attempt = propose_semantic_action(
             &credentials,
             &model,
             effort,
             objective,
             observation,
+            permit,
             &cancel,
         )
-        .await
-        .context("selected model did not return a valid bounded Computer proposal")?;
+        .await?;
         if cancel.is_cancelled() {
             bail!("Computer model proposal was cancelled");
         }
         self.ensure_computer_route_unchanged(session_id, &model, &resolved.route_fingerprint)?;
-        Ok(proposal)
+        Ok(attempt)
     }
 
     /// Local Stop/Take over cancellation. It does not share the Build-turn

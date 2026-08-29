@@ -33,6 +33,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::computer_profile::{AdaptiveProfile, CapabilityGeneration, TurnPermit};
 use crate::computer_use::{
     action_fingerprint, ActionClass, CompletionProof, ComputerAction, ComputerCapabilities,
     ComputerError, ComputerErrorCode, ComputerObservation, ComputerResult, ComputerRun,
@@ -77,6 +78,77 @@ impl RawModelProposal {
     }
 }
 
+/// The adaptive authority a proposal was minted under, carried inside the seal.
+///
+/// Without this the seal proved only that the *kernel* had not moved: run
+/// version, control epoch, observation. The adaptive decision could change
+/// underneath it — a same-route tier downgrade, a credential rotation, a
+/// capability-schema drift, an operator policy edit, or an escalation to a
+/// different profile — all while the provider was still thinking, and the
+/// answer would still apply under authority that no longer existed.
+///
+/// Binding it closes that window. `permit_id` is the opaque identity of the
+/// admitted turn; `generation` is the #458 capability digest in force when it
+/// was admitted; `profile` is the profile whose budget the answer will be held
+/// to. All three are re-checked against the live record twice: once when the
+/// provider's answer is sealed, and again under the lock that guards the
+/// mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdaptiveSealBinding {
+    permit_id: String,
+    profile: AdaptiveProfile,
+    generation: CapabilityGeneration,
+}
+
+impl AdaptiveSealBinding {
+    pub fn profile(&self) -> AdaptiveProfile {
+        self.profile
+    }
+
+    /// Re-check this binding against a live run.
+    ///
+    /// Called both when the seal is minted and when it is spent. The record
+    /// must still exist, must still hold *this* turn as the admitted one, and
+    /// must still be at the profile and capability generation it was admitted
+    /// under.
+    ///
+    /// The record's `revision` is deliberately **not** bound. Revision is the
+    /// compare-and-swap witness for admission, and ordinary accounting — the
+    /// attempt counter, reported usage, the turn closing — advances it. Binding
+    /// it would conflate "this run spent money" with "this run's authority
+    /// changed", and every proposal would be refused. `active_permit` is the
+    /// authority witness: `begin_turn` is the only thing that writes it, and
+    /// every stop, escalation, completion, restart recovery, and subsequent
+    /// admission clears or replaces it.
+    fn still_holds(&self, run: &ComputerRun) -> ComputerResult<()> {
+        let record = run.adaptive.as_ref().ok_or_else(|| {
+            ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "the run's adaptive record is gone; its admitted turn cannot be spent",
+            )
+        })?;
+        if record.active_permit.as_deref() != Some(self.permit_id.as_str()) {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Conflict,
+                "the run is no longer serving the turn this proposal was admitted for",
+            ));
+        }
+        if record.profile != self.profile {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Conflict,
+                "the run's adaptive profile changed after the turn was admitted",
+            ));
+        }
+        if record.generation != self.generation {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "the run's capability generation changed after the turn was admitted",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// The complete live context one proposal is normalized against.
 ///
 /// Built from a run the caller has already proven it owns. Every field is read
@@ -93,6 +165,7 @@ pub struct ModelProposalContext {
     capabilities: ComputerCapabilities,
     limits: ComputerUseLimits,
     completion_evidence: Option<CompletionProof>,
+    adaptive: Option<AdaptiveSealBinding>,
 }
 
 impl ModelProposalContext {
@@ -105,6 +178,47 @@ impl ModelProposalContext {
         run: &ComputerRun,
         owner_session_id: Uuid,
         capabilities: ComputerCapabilities,
+    ) -> ComputerResult<Self> {
+        // A run under adaptive authority may only mint a proposal against a
+        // live turn permit. Allowing the permit-free path here would be a way
+        // to obtain an unbudgeted, unbound seal for an adaptive run, which is
+        // precisely the bypass this binding exists to close.
+        if run.adaptive.is_some() {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "this computer run is under adaptive authority; a proposal must be \
+                 sealed against the turn permit that admitted it",
+            ));
+        }
+        Self::build(run, owner_session_id, capabilities, None)
+    }
+
+    /// Derive the context for a run under adaptive authority, bound to the
+    /// turn permit that admitted the model call.
+    ///
+    /// This is the first of the two revalidations: it runs when the provider's
+    /// answer comes back, against the live record rather than the snapshot the
+    /// turn started from. Drift during inference is refused here.
+    pub fn from_run_with_permit(
+        run: &ComputerRun,
+        owner_session_id: Uuid,
+        capabilities: ComputerCapabilities,
+        permit: &TurnPermit,
+    ) -> ComputerResult<Self> {
+        let binding = AdaptiveSealBinding {
+            permit_id: permit.permit_id().to_string(),
+            profile: permit.profile,
+            generation: permit.generation().clone(),
+        };
+        binding.still_holds(run)?;
+        Self::build(run, owner_session_id, capabilities, Some(binding))
+    }
+
+    fn build(
+        run: &ComputerRun,
+        owner_session_id: Uuid,
+        capabilities: ComputerCapabilities,
+        adaptive: Option<AdaptiveSealBinding>,
     ) -> ComputerResult<Self> {
         if run.owner_session_id != owner_session_id {
             return Err(ComputerError::new(
@@ -147,6 +261,7 @@ impl ModelProposalContext {
             capabilities,
             limits: run.limits,
             completion_evidence,
+            adaptive,
         })
     }
 
@@ -197,6 +312,7 @@ pub struct AcceptedModelProposal {
     proposal_fingerprint: String,
     summary: String,
     intent: AcceptedIntent,
+    adaptive: Option<AdaptiveSealBinding>,
 }
 
 impl AcceptedModelProposal {
@@ -241,6 +357,18 @@ impl AcceptedModelProposal {
 
     pub fn intent(&self) -> &AcceptedIntent {
         &self.intent
+    }
+
+    /// The adaptive profile this proposal was admitted under, if the run is
+    /// under adaptive authority.
+    ///
+    /// Every application seam must hold the result to this profile's budget.
+    /// It comes from the seal rather than from a fresh read of the record, so
+    /// a caller cannot get a cheaper ceiling by re-reading a run that has since
+    /// been escalated — and `authorize_against` has already proven the live
+    /// record still agrees with it.
+    pub fn adaptive_profile(&self) -> Option<AdaptiveProfile> {
+        self.adaptive.as_ref().map(AdaptiveSealBinding::profile)
     }
 
     /// Authority-free projection for the cockpit and telemetry.
@@ -320,6 +448,21 @@ impl AcceptedModelProposal {
                 ComputerErrorCode::Unauthorized,
                 "computer-use grant was revoked",
             ));
+        }
+        // The second of the two adaptive revalidations, under whatever lock the
+        // caller holds to make this atomic with the mutation that follows.
+        match (&self.adaptive, run.adaptive.as_ref()) {
+            (Some(binding), _) => binding.still_holds(run)?,
+            (None, Some(_)) => {
+                // The run acquired adaptive authority after this proposal was
+                // sealed. A seal minted with no profile to answer to may not be
+                // spent against a run that now has one.
+                return Err(ComputerError::new(
+                    ComputerErrorCode::Unauthorized,
+                    "the run came under adaptive authority after the proposal was accepted",
+                ));
+            }
+            (None, None) => {}
         }
         match &self.intent {
             AcceptedIntent::Action {
@@ -445,6 +588,7 @@ pub fn accept_model_proposal(
         proposal_fingerprint: proposal_fingerprint(context, &intent),
         summary,
         intent,
+        adaptive: context.adaptive.clone(),
     })
 }
 

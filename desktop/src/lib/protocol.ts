@@ -1139,6 +1139,165 @@ export interface ComputerCockpitSnapshot {
   /** Local-only detail retained for approval rendering. */
   run?: ComputerRun | null;
   pendingApproval?: PendingComputerApproval | null;
+  /**
+   * Adaptive execution profile state (#435), read from the run's own durable
+   * record. `undefined` until a profile has been selected for this run.
+   */
+  adaptive?: AdaptiveProfileProjection | null;
+}
+
+/**
+ * The three canonical execution profiles. `efficient` and `frontier` are
+ * historical ingest-only aliases in the Rust layer and are never serialized,
+ * so they deliberately do not appear here.
+ */
+export type AdaptiveProfile = "economy" | "balanced" | "high_assurance";
+
+/** Where a run's durable adaptive lifecycle stands. */
+export type AdaptiveLifecycle =
+  | "idle"
+  | "in_flight"
+  | "stopped"
+  | "completed"
+  | "interrupted";
+
+/** Closed reason vocabulary shared by selection, escalation, and stops. */
+export type AdaptiveProfileReason =
+  | "routine_task"
+  | "text_oriented_model"
+  | "consequential_intent"
+  | "destructive_intent"
+  | "sensitive_surface"
+  | "ambiguous_observation"
+  | "missing_semantics"
+  | "repeated_stationarity"
+  | "repeated_uncertainty"
+  | "verification_failed"
+  | "insufficient_capability_for_risk"
+  | "capability_revoked"
+  | "escalation_ceiling_reached"
+  | "budget_exhausted"
+  | "independent_verifier_unavailable"
+  | "model_not_qualified"
+  | "capability_generation_changed"
+  | "higher_risk_objective"
+  | "turn_budget_exceeded"
+  | "run_interrupted"
+  | "record_invalid";
+
+export interface AdaptiveEscalation {
+  from: AdaptiveProfile;
+  to: AdaptiveProfile;
+  reason: AdaptiveProfileReason;
+  message: string;
+  revision: number;
+}
+
+/**
+ * What the run has spent. Host-measured fields are always present; provider
+ * fields are `null` until a provider actually reports usage. They are never
+ * zero-filled, and there is deliberately no cost-in-currency field.
+ */
+export interface AdaptiveCost {
+  /**
+   * Every provider attempt, including those that timed out, died in transport,
+   * returned prose, or failed schema validation. They all cost money, so they
+   * all appear here, and this is always accepted + failed.
+   */
+  providerAttempts: number;
+  acceptedAttempts: number;
+  failedAttempts: number;
+  observationBytes: number;
+  /** Structurally zero: screenshot bytes never cross the model boundary. */
+  screenshotBytes: number;
+  /** Preserved even for attempts whose bodies later failed to parse. */
+  promptTokens: number | null;
+  completionTokens: number | null;
+}
+
+export interface AdaptiveCapabilityEvidence {
+  tier: ComputerUseTier;
+  attribution: "unknown" | "declared" | "measured";
+  structuredTools: boolean;
+  imageInput: boolean;
+  qualifiedVisualPath: boolean;
+  durableAuthority: boolean;
+  sessionMeasured: boolean;
+  /** A simulator PASS is not live eligibility, and this is how it says so. */
+  syntheticOnly: boolean;
+  hostScreenshotCapture: boolean;
+  hostIndependentVerifier: boolean;
+  ceiling: AdaptiveProfile;
+  /**
+   * Short prefix of the secret-free capability generation this run was
+   * authorized under (#458). A change to it stops the run.
+   */
+  generation: string;
+  /**
+   * Whether local operator policy trusts declared-only capability. When false,
+   * a declared-only route may observe but never act.
+   */
+  declaredCapabilityTrusted: boolean;
+}
+
+/**
+ * Redaction-safe by construction: there is no field for an element label,
+ * value, geometry, evidence token, frame digest, or credential material.
+ */
+export interface AdaptiveProfileProjection {
+  profile: AdaptiveProfile;
+  profileDisplayName: string;
+  reason: AdaptiveProfileReason;
+  message: string;
+  risk: "routine" | "consequential" | "destructive";
+  capability: AdaptiveCapabilityEvidence;
+  budget: {
+    observationDetail:
+      | "semantic_only"
+      | "semantic_with_geometry"
+      | "semantic_with_evidence_ref";
+    maxObservationElements: number;
+    maxObservationBytes: number;
+    maxModelCalls: number;
+    maxTurnMillis: number;
+    pointerFallbackAllowed: boolean;
+    keyChordAllowed: boolean;
+  };
+  /** Identical for every profile; projected so an operator can verify that. */
+  safetyFloor: {
+    requiresHostVerification: boolean;
+    requiresFreshObservationBinding: boolean;
+    requiresCompletionBoundToCurrentObservation: boolean;
+    allowsScreenshotBytesToModel: boolean;
+    allowsFreeFormAction: boolean;
+    allowsAutomaticReplayAfterUncertainDispatch: boolean;
+    maxStationaryRepeats: number;
+    maxConsecutiveUncertainAnswers: number;
+    maxVerificationFailures: number;
+  };
+  escalations: AdaptiveEscalation[];
+  cost: AdaptiveCost;
+  stationaryRepeats: number;
+  observationTruncated: boolean;
+  requiresIndependentVerifier: boolean;
+  /**
+   * Durable lifecycle. A record found `in_flight` after a restart is a turn
+   * that was cut, not a clean stop.
+   */
+  lifecycle: AdaptiveLifecycle;
+  /**
+   * The highest risk class this run has been authorized for. A later objective
+   * above this stops the run rather than reusing its authority.
+   */
+  riskHighWater: "routine" | "consequential" | "destructive";
+  revision: number;
+  terminal?: {
+    kind: AdaptiveLifecycle;
+    reason: AdaptiveProfileReason;
+    message: string;
+    profile: AdaptiveProfile;
+    requiredProfile: AdaptiveProfile | null;
+  } | null;
 }
 
 export interface ComputerAgentEligibility {
