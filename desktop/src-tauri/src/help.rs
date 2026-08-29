@@ -189,7 +189,7 @@ impl Default for HelpState {
 /// names are accepted, which is the mapping the manifest exists to prevent.
 /// Context selection is therefore the host's, below.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HelpAskInput {
     pub session: String,
     pub question: String,
@@ -199,7 +199,7 @@ pub struct HelpAskInput {
 
 /// Poll or cancel an existing ask.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HelpHandleInput {
     pub session: String,
     pub handle: String,

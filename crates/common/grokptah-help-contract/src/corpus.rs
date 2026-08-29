@@ -16,6 +16,20 @@
 //! A citation span therefore commits to the bytes it indexes rather than to a
 //! name. Rebuild the corpus with different text and every span over it is
 //! invalidated instead of silently re-pointing at new content.
+//!
+//! Where a digest covers a *list*, it covers the list's identity and length as
+//! well as its items: each variable-length region is opened by its own label
+//! and element count (see [`region`]). Length prefixing alone makes a flat
+//! field list injective but records nothing about which sub-list a field came
+//! from, so concatenating an article's `aliases`, `keywords` and
+//! `capability_ids` digested identically however they were partitioned — and a
+//! capability moved into an alias left the article and corpus digests
+//! unchanged while removing the gate that `Authority::manifest_for` enforces.
+//!
+//! A chunk must also carry its article's visibility. `visible_corpus` selects
+//! chunks by article and `bundle_at` selects them by their own label, so a
+//! document where the two disagree is served differently by each; [`Corpus::verify`]
+//! refuses it rather than letting the two resolve it differently.
 
 use serde::{Deserialize, Serialize};
 
@@ -64,6 +78,7 @@ impl Visibility {
 
 /// A citation target: an exact repository path plus an exact heading.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SourceAnchor {
     /// Stable citation id used in answers, e.g. `provider.profiles`.
     pub id: String,
@@ -99,6 +114,7 @@ impl ChunkKind {
 /// A retrievable unit. Ids are stable across rebuilds because they derive from
 /// the article id, the chunk kind, and a stable ordinal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Chunk {
     /// `${article_id}#${kind}.${ordinal}` — stable and citable.
     pub id: String,
@@ -142,6 +158,7 @@ impl Topic {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Article {
     pub id: String,
     pub title: String,
@@ -162,6 +179,7 @@ pub struct Article {
 
 /// The frozen, digest-bound corpus handed to every retriever.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Corpus {
     pub schema_version: String,
     pub content_version: String,
@@ -221,6 +239,20 @@ pub enum CorpusError {
         article: String,
         source: String,
     },
+    /// A chunk names an article the document does not carry, so nothing
+    /// decides who may see it.
+    UnknownArticle {
+        chunk: String,
+        article: String,
+    },
+    /// A chunk's visibility disagrees with its article's. Filtering by article
+    /// and filtering by chunk would then serve different content.
+    ChunkVisibilityMismatch {
+        chunk: String,
+        article: String,
+        chunk_visibility: Visibility,
+        article_visibility: Visibility,
+    },
     SchemaVersion {
         found: String,
     },
@@ -248,6 +280,20 @@ impl std::fmt::Display for CorpusError {
                 f,
                 "article `{article}` is less restricted than the source `{source}` it cites"
             ),
+            Self::UnknownArticle { chunk, article } => {
+                write!(f, "chunk `{chunk}` names unknown article `{article}`")
+            }
+            Self::ChunkVisibilityMismatch {
+                chunk,
+                article,
+                chunk_visibility,
+                article_visibility,
+            } => write!(
+                f,
+                "chunk `{chunk}` is {} but its article `{article}` is {}",
+                chunk_visibility.as_str(),
+                article_visibility.as_str()
+            ),
             Self::SchemaVersion { found } => {
                 write!(f, "unsupported corpus schema version `{found}`")
             }
@@ -256,6 +302,128 @@ impl std::fmt::Display for CorpusError {
 }
 
 impl std::error::Error for CorpusError {}
+
+/// Labels that open each variable-length region of a digest.
+///
+/// Length prefixing makes a *flat* field list injective, but it says nothing
+/// about where one sub-list ends and the next begins. Concatenating
+/// `aliases ++ keywords ++ capability_ids` therefore digested the same bytes
+/// whichever list each item came from, so moving `computer.control` out of
+/// `capability_ids` and into `aliases` left the article digest — and the
+/// corpus digest above it — unchanged, and a capability gate could be removed
+/// from a document that still passed [`Corpus::verify`].
+///
+/// Each region is now opened by its own label and its own element count, so
+/// the partition is part of what is hashed. Repartitioning changes a label's
+/// count, reordering changes the element sequence, and omitting or duplicating
+/// an element changes the count: all four are visible to the digest.
+mod region {
+    pub const ALIASES: &str = "aliases";
+    pub const KEYWORDS: &str = "keywords";
+    pub const CAPABILITIES: &str = "capabilities";
+    pub const SOURCES: &str = "sources";
+    pub const ARTICLES: &str = "articles";
+    pub const CHUNKS: &str = "chunks";
+}
+
+/// Append one labelled, counted region to a field list.
+fn push_region<'a>(fields: &mut Vec<&'a str>, label: &'a str, count: &'a str, items: &[&'a str]) {
+    fields.push(label);
+    fields.push(count);
+    fields.extend_from_slice(items);
+}
+
+/// The one definition of an article digest.
+///
+/// `build` and [`Corpus::verify`] both call this. They previously assembled
+/// the field list separately, which is how the two could have drifted apart
+/// without any test noticing.
+///
+/// Public because `codegen` emits the cross-language parity vectors from it:
+/// TypeScript re-implements this encoding, and the vectors are what stop the
+/// two from agreeing only by intention.
+#[must_use]
+pub fn article_digest_of(
+    id: &str,
+    title: &str,
+    topic: &str,
+    summary: &str,
+    body: &str,
+    visibility: &str,
+    aliases: &[&str],
+    keywords: &[&str],
+    capability_ids: &[&str],
+    source_digests: &[&str],
+) -> String {
+    let counts = [
+        aliases.len().to_string(),
+        keywords.len().to_string(),
+        capability_ids.len().to_string(),
+        source_digests.len().to_string(),
+    ];
+    let mut fields: Vec<&str> = vec![id, title, topic, summary, body, visibility];
+    push_region(&mut fields, region::ALIASES, counts[0].as_str(), aliases);
+    push_region(&mut fields, region::KEYWORDS, counts[1].as_str(), keywords);
+    push_region(
+        &mut fields,
+        region::CAPABILITIES,
+        counts[2].as_str(),
+        capability_ids,
+    );
+    push_region(
+        &mut fields,
+        region::SOURCES,
+        counts[3].as_str(),
+        source_digests,
+    );
+    domain_digest(domain::ARTICLE, &fields)
+}
+
+/// The one definition of the set-level corpus digest.
+///
+/// The article and chunk lists are labelled and counted for the same reason
+/// the article's sub-lists are: so the boundary between them is hashed rather
+/// than inferred from where one kind of digest stops appearing.
+fn corpus_digest_of(
+    schema_version: &str,
+    content_version: &str,
+    article_digests: &[&str],
+    chunk_digests: &[&str],
+    source_digest: &str,
+) -> String {
+    let counts = [
+        article_digests.len().to_string(),
+        chunk_digests.len().to_string(),
+    ];
+    let mut fields: Vec<&str> = vec![schema_version, content_version];
+    push_region(
+        &mut fields,
+        region::ARTICLES,
+        counts[0].as_str(),
+        article_digests,
+    );
+    push_region(
+        &mut fields,
+        region::CHUNKS,
+        counts[1].as_str(),
+        chunk_digests,
+    );
+    fields.push(region::SOURCES);
+    fields.push(source_digest);
+    domain_digest(domain::CORPUS, &fields)
+}
+
+/// The digest over the cited `path#heading` set.
+fn source_set_digest_of(sources: &[SourceAnchor]) -> String {
+    let set: Vec<String> = sources
+        .iter()
+        .map(|source| format!("{}#{}", source.path, source.heading))
+        .collect();
+    domain_digest(
+        domain::SOURCE_SET,
+        &set.iter().map(String::as_str).collect::<Vec<_>>(),
+    )
+}
 
 fn source_digest_of(seed_id: &str, path: &str, heading: &str, visibility: Visibility) -> String {
     domain_digest(
@@ -371,22 +539,19 @@ pub fn build(
             cited.push(anchor);
         }
 
-        let ordinal_text = seed.topic.as_str();
-        let mut fields: Vec<&str> = vec![
+        let source_digests: Vec<&str> = cited.iter().map(|anchor| anchor.digest.as_str()).collect();
+        let article_digest = article_digest_of(
             seed.id,
             seed.title,
-            ordinal_text,
+            seed.topic.as_str(),
             seed.summary,
             seed.body,
             seed.visibility.as_str(),
-        ];
-        fields.extend(seed.aliases.iter().copied());
-        fields.extend(seed.keywords.iter().copied());
-        fields.extend(seed.capability_ids.iter().copied());
-        for anchor in &cited {
-            fields.push(&anchor.digest);
-        }
-        let article_digest = domain_digest(domain::ARTICLE, &fields);
+            seed.aliases,
+            seed.keywords,
+            seed.capability_ids,
+            &source_digests,
+        );
 
         let source_ids: Vec<String> = seed.source_ids.iter().map(|id| (*id).to_string()).collect();
 
@@ -453,24 +618,20 @@ pub fn build(
     articles.sort_by(|left, right| left.id.cmp(&right.id));
     chunks.sort_by(|left, right| left.id.cmp(&right.id));
 
-    let source_set: Vec<String> = sources
-        .iter()
-        .map(|source| format!("{}#{}", source.path, source.heading))
-        .collect();
-    let source_digest = domain_digest(
-        domain::SOURCE_SET,
-        &source_set.iter().map(String::as_str).collect::<Vec<_>>(),
+    let source_digest = source_set_digest_of(&sources);
+    let digest = corpus_digest_of(
+        SCHEMA_VERSION,
+        CONTENT_VERSION,
+        &articles
+            .iter()
+            .map(|article| article.digest.as_str())
+            .collect::<Vec<_>>(),
+        &chunks
+            .iter()
+            .map(|chunk| chunk.digest.as_str())
+            .collect::<Vec<_>>(),
+        &source_digest,
     );
-
-    let mut corpus_fields: Vec<&str> = vec![SCHEMA_VERSION, CONTENT_VERSION];
-    for article in &articles {
-        corpus_fields.push(&article.digest);
-    }
-    for chunk in &chunks {
-        corpus_fields.push(&chunk.digest);
-    }
-    corpus_fields.push(&source_digest);
-    let digest = domain_digest(domain::CORPUS, &corpus_fields);
 
     Ok(Corpus {
         schema_version: SCHEMA_VERSION.to_string(),
@@ -534,21 +695,33 @@ impl Corpus {
                     article: article.id.clone(),
                 });
             }
-            let mut fields: Vec<&str> = vec![
+            let actual = article_digest_of(
                 &article.id,
                 &article.title,
                 article.topic.as_str(),
                 &article.summary,
                 &article.body,
                 article.visibility.as_str(),
-            ];
-            fields.extend(article.aliases.iter().map(String::as_str));
-            fields.extend(article.keywords.iter().map(String::as_str));
-            fields.extend(article.capability_ids.iter().map(String::as_str));
-            for anchor in &cited {
-                fields.push(&anchor.digest);
-            }
-            let actual = domain_digest(domain::ARTICLE, &fields);
+                &article
+                    .aliases
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                &article
+                    .keywords
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                &article
+                    .capability_ids
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                &cited
+                    .iter()
+                    .map(|anchor| anchor.digest.as_str())
+                    .collect::<Vec<_>>(),
+            );
             if actual != article.digest {
                 return Err(CorpusError::DigestMismatch {
                     record: format!("article:{}", article.id),
@@ -558,6 +731,28 @@ impl Corpus {
             }
         }
         for chunk in &self.chunks {
+            // A chunk is only ever reachable through its article, so a chunk
+            // whose article is absent is content no manifest can account for.
+            let Some(article) = self.article(&chunk.article_id) else {
+                return Err(CorpusError::UnknownArticle {
+                    chunk: chunk.id.clone(),
+                    article: chunk.article_id.clone(),
+                });
+            };
+            // The builder gives a chunk its article's visibility, and both
+            // filters downstream depend on that holding: `visible_corpus`
+            // selects chunks by article, and `bundle_at` selects them by their
+            // own label. A document where the two disagree is served
+            // differently by each, so it is rejected here rather than
+            // resolved differently in two places.
+            if chunk.visibility != article.visibility {
+                return Err(CorpusError::ChunkVisibilityMismatch {
+                    chunk: chunk.id.clone(),
+                    article: article.id.clone(),
+                    chunk_visibility: chunk.visibility,
+                    article_visibility: article.visibility,
+                });
+            }
             let ordinal = chunk.ordinal.to_string();
             let mut fields: Vec<&str> = vec![
                 &chunk.id,
@@ -621,38 +816,55 @@ impl Corpus {
             .filter(|a| keep(a.visibility))
             .cloned()
             .collect();
+        // Both conditions, not either: a chunk labelled `public` under an
+        // article that did not survive would otherwise ship the text of a
+        // restricted article as a free-standing public chunk.
+        let retained: std::collections::BTreeSet<&str> =
+            articles.iter().map(|a| a.id.as_str()).collect();
         let chunks: Vec<Chunk> = self
             .chunks
             .iter()
-            .filter(|c| keep(c.visibility))
+            .filter(|c| keep(c.visibility) && retained.contains(c.article_id.as_str()))
             .cloned()
             .collect();
-        let source_set: Vec<String> = sources
-            .iter()
-            .map(|source| format!("{}#{}", source.path, source.heading))
-            .collect();
-        let source_digest = domain_digest(
-            domain::SOURCE_SET,
-            &source_set.iter().map(String::as_str).collect::<Vec<_>>(),
-        );
-        let mut fields: Vec<&str> = vec![SCHEMA_VERSION, CONTENT_VERSION];
-        for article in &articles {
-            fields.push(&article.digest);
-        }
-        for chunk in &chunks {
-            fields.push(&chunk.digest);
-        }
-        fields.push(&source_digest);
-        let digest = domain_digest(domain::CORPUS, &fields);
-        Corpus {
+        let mut bundle = Corpus {
             schema_version: self.schema_version.clone(),
             content_version: self.content_version.clone(),
             sources,
             articles,
             chunks,
-            digest,
-            source_digest,
-        }
+            digest: String::new(),
+            source_digest: String::new(),
+        };
+        bundle.rebind_set_digests();
+        bundle
+    }
+
+    /// Recompute the set-level digests from the records this document carries.
+    ///
+    /// A filtered view is honestly a different document, so its corpus-level
+    /// digest is recomputed while every record digest is preserved — a
+    /// citation into it still verifies against the full corpus. This is one
+    /// function because `bundle_at` and the host's `visible_corpus` must agree
+    /// about what a filtered document's digest is; when each derived it
+    /// separately they were free to diverge.
+    pub fn rebind_set_digests(&mut self) {
+        self.source_digest = source_set_digest_of(&self.sources);
+        self.digest = corpus_digest_of(
+            &self.schema_version,
+            &self.content_version,
+            &self
+                .articles
+                .iter()
+                .map(|article| article.digest.as_str())
+                .collect::<Vec<_>>(),
+            &self
+                .chunks
+                .iter()
+                .map(|chunk| chunk.digest.as_str())
+                .collect::<Vec<_>>(),
+            &self.source_digest,
+        );
     }
 
     /// Canonical JSON bytes of this corpus, the exact form written to disk.

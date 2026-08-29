@@ -11,7 +11,7 @@
       "capability_ids": [
         "computer.control"
       ],
-      "digest": "sha256:49b4f4a73bfbc4d797eb6600fa04e3398d8f5a20308e1c9bf4ddab5f12fcb6b9",
+      "digest": "sha256:cfc9e2c03a16e3aa330058e6372ef2396ad3c634d7b39812309d8d4591793f4d",
       "id": "computer-use.approval",
       "keywords": [
         "approve",
@@ -42,7 +42,7 @@
       ],
       "body": "Computer Use is bounded by an explicit target, a fresh observation, a one-use approval, and a postcondition. Stop and Take over revoke authority. Secure fields, stale observations, focus changes, raw global input, clipboard injection, shell control, and unattended actions fail closed or remain unsupported.",
       "capability_ids": [],
-      "digest": "sha256:0fa85a5a314f2dd087ac328e2c8a1a4270f5f326f18b83d058cdc50392e7c2f5",
+      "digest": "sha256:0937c68a3cedf5535144933816a5884e8813955df8a764f5f759b7392490f8a3",
       "id": "computer-use.boundaries",
       "keywords": [
         "agent",
@@ -75,7 +75,7 @@
       "capability_ids": [
         "computer.control"
       ],
-      "digest": "sha256:9a518b85000f42b04bbf6c7ecf504cf82f39fe70927a8303351171d5a6ad0394",
+      "digest": "sha256:78092fbc910cd8908afa38b78c3468833613c86f7372cc185611b35640a5f67d",
       "id": "computer-use.coordination",
       "keywords": [
         "multi-agent",
@@ -104,7 +104,7 @@
       "capability_ids": [
         "computer.observe"
       ],
-      "digest": "sha256:6f96f23bf952206a9a8cf429f755e2fa605d13186ac52da9c14649d63bf09d12",
+      "digest": "sha256:c7b9cc17893609bc69c0e727d0a732c347ad686636ec9fcb56e4f80a90d7bd56",
       "id": "computer-use.isolated-guest",
       "keywords": [
         "guest",
@@ -134,7 +134,7 @@
       ],
       "body": "Use the Sessions, Tools, Live, and Computer landmarks to move between work areas. Running state, permission requests, stale observations, and recovery actions are announced and stay visible. Reduced motion and large text preserve the same information hierarchy rather than hiding status.",
       "capability_ids": [],
-      "digest": "sha256:57f0c05ea19aa9de45467e81206fd101bda47180bd8a15d6db65999f08261370",
+      "digest": "sha256:33196fb6ffaa5e110eda269c906f04f30029de8a02d72b708deae67c1173010f",
       "id": "getting-started.accessibility",
       "keywords": [
         "accessibility",
@@ -164,7 +164,7 @@
       ],
       "body": "Type a question and Help searches the shipped corpus in your own process, with no network call. Asking for a written answer is a separate action: the host selects the passages, sends one bounded request, and shows the reply only after it has checked every claim against the exact corpus bytes. Claims that cannot be tied to a cited passage are dropped, and an answer with no supported claim is withheld rather than shown as a guess.",
       "capability_ids": [],
-      "digest": "sha256:1260255d6a1c47de7d762b2522bc57fdca1fc83f445bffb646fe9ea8df837709",
+      "digest": "sha256:e85711a895922fe8d059879aff3d50277d37d1fdb07916ec280bfdf2bc6c8877",
       "id": "getting-started.help-center",
       "keywords": [
         "help",
@@ -194,7 +194,7 @@
       ],
       "body": "Open Search from the Lanes sidebar. Hybrid search combines exact text with meaning-based ranking over the offline index; Keyword mode stays authoritative for commands and identifiers. Archived sessions are included only when you ask for them.",
       "capability_ids": [],
-      "digest": "sha256:43e95f0a8f8345d31f9c5a0f3698ea8ebe520e2c6a8ad77262ed047097fd009d",
+      "digest": "sha256:fda5661489776121aac079366509ac62f5e67c7e83a7ba5b1c7dc659fdfbafad",
       "id": "getting-started.search",
       "keywords": [
         "search",
@@ -222,7 +222,7 @@
       ],
       "body": "Builds are the tool-enabled workspace for repository work. Chats are separate conversations for planning or discussion. Use the Builds and Chats tabs to switch modes, and keep multiple lanes open when you need parallel work. Help is its own surface and does not open a chat on your behalf.",
       "capability_ids": [],
-      "digest": "sha256:fa7c206b7953147d002d82141349001ffef26386b97c15f7132763c42755f8aa",
+      "digest": "sha256:f2d8ffbe6ca5de20827dc4c1db085ebbfb523b4f1dce3589cae1c912d98febab",
       "id": "getting-started.sessions",
       "keywords": [
         "session",
@@ -250,7 +250,7 @@
       ],
       "body": "Durable runs expose a state, a cursor, and an evidence trail that survive an app restart. Reconnect from the advertised cursor, treat uncertain delivery as unknown, and use an explicit retry or continuation action. A restart is not permission to resend. Never infer that a linked session or a visible queue means a provider request was sent.",
       "capability_ids": [],
-      "digest": "sha256:6085c159f0bab52626b39e90547021a9aaebad79a5f3b28446056276e99b201c",
+      "digest": "sha256:a7e061880988b85d5103bc456451d41d54ed5f713a99d74073584a9ed79b5be8",
       "id": "operations.durable-recovery",
       "keywords": [
         "durable",
@@ -280,7 +280,7 @@
       ],
       "body": "A passing unit test proves an in-tree behavior on a named revision. It does not prove a live provider campaign, a packaged macOS identity, a multi-day operational soak, or a VM guest. Always read the exact revision, the evidence kind, the remaining gate, and whether the result is candidate-only.",
       "capability_ids": [],
-      "digest": "sha256:2543f4e80c0e27fe5ff49eeef06922540c72010de58b02734284c5cc3e23b5ac",
+      "digest": "sha256:c95e6b038d611e9c8b9ef0dfd5f3c645822597c52ece27c275b515bc43b9a662",
       "id": "operations.evidence",
       "keywords": [
         "evidence",
@@ -311,7 +311,7 @@
       "capability_ids": [
         "run.queue"
       ],
-      "digest": "sha256:80650a85b0fe71a999cf37c861b1625ad0955da45e7a6ff119bc3964a75e4024",
+      "digest": "sha256:80f44592d95f9430f27ae4424067e25ef383b78a1ce2eea442331836146ff3c6",
       "id": "operations.queue-and-steer",
       "keywords": [
         "queue",
@@ -341,7 +341,7 @@
       "capability_ids": [
         "run.review"
       ],
-      "digest": "sha256:690502f6a0d6fe684614f56d64a21925654f778919f5a2df9fd30c71a286346e",
+      "digest": "sha256:0243e83e0f8f136162a40d4475e49503447b0f5b3f943efc73196bb9b62e15a9",
       "id": "operations.retention",
       "keywords": [
         "retention",
@@ -368,7 +368,7 @@
       ],
       "body": "Run the supported per-package paths that CI runs. A root-wide workspace test invocation is unsupported here and a failure from it is not evidence about the code under review. Read the supported-paths list before quoting a command result as a gate.",
       "capability_ids": [],
-      "digest": "sha256:7f74b14192d47e36670a676f6a60f72a0be7275dead8bb0c99f57d5073c87e59",
+      "digest": "sha256:1a926093fc16740218371ac8d15250dcd2209ce58d601b7daa9779a1691d4c93",
       "id": "operations.verification-limits",
       "keywords": [
         "verification",
@@ -398,7 +398,7 @@
       "capability_ids": [
         "session.observe"
       ],
-      "digest": "sha256:2ec47bf3662e0ad823faba8dc50e43d5843385c1edc9a36c83d48847488da267",
+      "digest": "sha256:9047e1e33a8d562487b94ad88ebd73583ab3c16fcb4ba81724d28f7f4b014262",
       "id": "providers.browser-broker",
       "keywords": [
         "browser",
@@ -427,7 +427,7 @@
       ],
       "body": "Start by choosing the trust boundary, then take the transport-neutral clients that match it. Consumers discover capabilities, scope every run, and preserve the same approval, replay, and redaction rules. The published Help package ships offline retrieval, projections, validation, and rendering — never authority constructors, route selection, transport, or private corpus.",
       "capability_ids": [],
-      "digest": "sha256:8aa7dd3dd3136e2ba7ca033dd0427810f4612a5fb9a4c21953695053b882bc76",
+      "digest": "sha256:5a65cc5be246808e71005f07382bc5d3d50b66c69249eecd55d2ee3d3b0e3008",
       "id": "providers.embedding",
       "keywords": [
         "embed",
@@ -457,7 +457,7 @@
       "capability_ids": [
         "run.execute"
       ],
-      "digest": "sha256:e2438c6ea7e9613481fe41160635947a0a04bba29d14d758a01ee6a063c82259",
+      "digest": "sha256:6dbb038d8b97f5071df60cf35b16f1868f8b7df3159132fc9b12379632a190ba",
       "id": "providers.external-workers",
       "keywords": [
         "cloud",
@@ -484,7 +484,7 @@
       ],
       "body": "GrokPtah can use an explicitly configured Grok Build route, but a real quota claim requires a named live campaign and secret-free receipts. The local always-on soak uses a loopback provider and does not contact Grok Build. Grok Bot is a separate product and is not a runtime dependency or manager.",
       "capability_ids": [],
-      "digest": "sha256:0e59238b6b009fe365e72aa4045c211312716339724fcfc3d6978012ee934e04",
+      "digest": "sha256:e19585aa2f57ffff6b256d012a026ca8012b667bf246c36b89fd8ce900a810b7",
       "id": "providers.product-boundary",
       "keywords": [
         "grok",
@@ -513,7 +513,7 @@
       "capability_ids": [
         "run.review"
       ],
-      "digest": "sha256:4c8d6888c6a4f2475f6492a0a8f1a33804653d817d5f98044858d8e6a16524bc",
+      "digest": "sha256:e339e53742899ced4b4010b731ce3af661de73dd207540623976cd31ee5e52e2",
       "id": "providers.restricted-gateway-review",
       "keywords": [
         "company",
@@ -542,7 +542,7 @@
       ],
       "body": "Provider profiles describe the selected model, gateway, and capability evidence. A configured route is not a live certification, and GrokPtah does not synchronize a provider account balance. Readiness and quota observability are shown separately so evidence is not mistaken for a claim.",
       "capability_ids": [],
-      "digest": "sha256:9aad56daa7157e19f2385f82764bedee7dbadf48adbae3f499439d2209e3f4d4",
+      "digest": "sha256:b13ffeec6c5196b863e15ec872bd783ebfc353c2dfd718933a752623797a993f",
       "id": "providers.routes",
       "keywords": [
         "provider",
@@ -1344,7 +1344,7 @@
     }
   ],
   "content_version": "help-canonical-2026.08.1",
-  "digest": "sha256:80047d392d4e66c066763bce2b18bc3575c06b9c9f40b834966e82db14f3e42b",
+  "digest": "sha256:cc2617234dd4c52cf179e37f46513aa5d903df6d6240b9db350fa1cf4f58604c",
   "schema_version": "grokptah.help-canonical.v1",
   "source_digest": "sha256:2c08012dd080f0f978c72a822c10925afc868ad7e1136f73266ca430babfd305",
   "sources": [

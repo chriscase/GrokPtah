@@ -629,3 +629,25 @@ fn digest_labels_match_serde_labels() {
         assert_eq!(certainty.as_str(), serde_label(certainty));
     }
 }
+
+#[test]
+fn an_inbound_request_carrying_an_unknown_field_is_refused() {
+    // The renderer sends exactly the fields the contract names. A request
+    // carrying anything else is a request built against a different contract,
+    // so it is refused rather than silently accepted with the extra dropped.
+    let accepted: Result<crate::dto::HelpAsk, _> =
+        serde_json::from_str(r#"{"session":"s","question":"q"}"#);
+    assert!(accepted.is_ok(), "the declared shape still parses");
+
+    for payload in [
+        r#"{"session":"s","question":"q","capabilities":["run.execute"]}"#,
+        r#"{"session":"s","question":"q","visibilityCeiling":"operator"}"#,
+        r#"{"session":"s","handle":"h","chunkIds":["a#body.0"]}"#,
+    ] {
+        let refused: Result<crate::dto::HelpAsk, _> = serde_json::from_str(payload);
+        assert!(
+            refused.is_err(),
+            "an inbound request must not carry authority fields: {payload}"
+        );
+    }
+}

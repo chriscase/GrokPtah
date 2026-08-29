@@ -20,6 +20,20 @@ type ParityFile = {
     lengthPrefixed: string;
     digest: string;
   }>;
+  articleDigests: Array<{
+    name: string;
+    id: string;
+    title: string;
+    topic: string;
+    summary: string;
+    body: string;
+    visibility: string;
+    aliases: string[];
+    keywords: string[];
+    capabilityIds: string[];
+    sourceDigests: string[];
+    digest: string;
+  }>;
 };
 
 const vectors = parity as unknown as ParityFile;
@@ -61,5 +75,65 @@ describe("digest parity with the Rust implementation", () => {
     expect(domainDigest("grokptah.help.chunk.v1", ["same"])).not.toBe(
       domainDigest("grokptah.help.source.v1", ["same"]),
     );
+  });
+
+  /**
+   * Reproduce the article digest the way `canonical/verify.ts` does.
+   *
+   * Kept inline rather than imported so the vectors pin the *encoding* — the
+   * labelled, counted regions — and not merely whatever `verifyArticle`
+   * currently happens to do.
+   */
+  const region = (label: string, items: readonly string[]): string[] => [
+    label,
+    String(items.length),
+    ...items,
+  ];
+  const articleDigest = (vector: ParityFile["articleDigests"][number]): string =>
+    domainDigest("grokptah.help.article.v1", [
+      vector.id,
+      vector.title,
+      vector.topic,
+      vector.summary,
+      vector.body,
+      vector.visibility,
+      ...region("aliases", vector.aliases),
+      ...region("keywords", vector.keywords),
+      ...region("capabilities", vector.capabilityIds),
+      ...region("sources", vector.sourceDigests),
+    ]);
+
+  it("reproduces every article digest Rust emitted", () => {
+    expect(vectors.articleDigests.length).toBeGreaterThan(0);
+    for (const vector of vectors.articleDigests) {
+      expect(articleDigest(vector), vector.name).toBe(vector.digest);
+    }
+  });
+
+  it("gives every metadata mutation a digest of its own", () => {
+    // Repartition, reorder, omission and duplication must each be visible.
+    // Under the previous flat encoding `repartition-*` collided with `base`,
+    // which is how a capability could be moved into an alias and still verify.
+    const byName = new Map(vectors.articleDigests.map((v) => [v.name, v.digest]));
+    const base = byName.get("base");
+    expect(base).toBeDefined();
+
+    for (const name of [
+      "repartition-capability-into-aliases",
+      "repartition-capability-into-keywords",
+      "reorder-within-a-list",
+      "omit-a-capability",
+      "duplicate-a-capability",
+    ]) {
+      expect(byName.get(name), name).toBeDefined();
+      expect(byName.get(name), `${name} must not collide with base`).not.toBe(base);
+    }
+
+    // Empty is not absent: a list holding one empty string is a different list.
+    expect(byName.get("empty-lists")).not.toBe(byName.get("one-empty-string-alias"));
+
+    // And no two vectors collide with each other.
+    const digests = vectors.articleDigests.map((v) => v.digest);
+    expect(new Set(digests).size).toBe(digests.length);
   });
 });

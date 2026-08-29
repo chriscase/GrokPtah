@@ -141,6 +141,26 @@ impl Authority {
         })
     }
 
+    /// Adopt a corpus *without* verifying it.
+    ///
+    /// Test-only, and deliberately so. `visible_corpus` filters chunks on
+    /// their own visibility as well as their article's, which is defence in
+    /// depth: `Corpus::verify` already refuses a document where the two
+    /// disagree, so no verified corpus can exercise the chunk-level filter.
+    /// A guard that only ever runs behind another guard is untested by
+    /// construction, and this is how the projection is tested on its own.
+    #[cfg(test)]
+    fn adopt_unverified(corpus: Corpus) -> Self {
+        Self {
+            corpus,
+            revision: 1,
+            sessions: BTreeMap::new(),
+            revoked_grants: BTreeSet::new(),
+            revoked_principals: BTreeSet::new(),
+            next_id: 1,
+        }
+    }
+
     /// The corpus this authority serves.
     #[must_use]
     pub fn corpus(&self) -> &Corpus {
@@ -283,13 +303,20 @@ impl Authority {
             .iter()
             .map(|entry| entry.article_id.as_str())
             .collect();
+        let ceiling = principal.visibility_ceiling;
         let mut filtered = self.corpus.clone();
         filtered
             .articles
             .retain(|article| allowed.contains(article.id.as_str()));
-        filtered
-            .chunks
-            .retain(|chunk| allowed.contains(chunk.article_id.as_str()));
+        // Both conditions. Selecting chunks by article alone trusted that a
+        // chunk carries its article's visibility; `Corpus::verify` now refuses
+        // a document where it does not, but a projection that only holds
+        // because verification held elsewhere is one edit away from being
+        // wrong. A chunk above this principal's ceiling is dropped here on its
+        // own label, whatever its article says.
+        filtered.chunks.retain(|chunk| {
+            allowed.contains(chunk.article_id.as_str()) && chunk.visibility.rank() <= ceiling.rank()
+        });
         let cited: std::collections::BTreeSet<&str> = filtered
             .articles
             .iter()
@@ -299,27 +326,9 @@ impl Authority {
             .sources
             .retain(|source| cited.contains(source.id.as_str()));
 
-        let source_set: Vec<String> = filtered
-            .sources
-            .iter()
-            .map(|source| format!("{}#{}", source.path, source.heading))
-            .collect();
-        filtered.source_digest = grokptah_help_contract::digest::domain_digest(
-            grokptah_help_contract::digest::domain::SOURCE_SET,
-            &source_set.iter().map(String::as_str).collect::<Vec<_>>(),
-        );
-        let mut fields: Vec<&str> = vec![&filtered.schema_version, &filtered.content_version];
-        for article in &filtered.articles {
-            fields.push(&article.digest);
-        }
-        for chunk in &filtered.chunks {
-            fields.push(&chunk.digest);
-        }
-        fields.push(&filtered.source_digest);
-        filtered.digest = grokptah_help_contract::digest::domain_digest(
-            grokptah_help_contract::digest::domain::CORPUS,
-            &fields,
-        );
+        // The contract owns what a filtered document's digest is, so the host
+        // asks it rather than re-deriving the rule alongside it.
+        filtered.rebind_set_digests();
         filtered
     }
 

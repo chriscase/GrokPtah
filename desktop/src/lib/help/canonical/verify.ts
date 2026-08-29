@@ -59,6 +59,32 @@ function verifyChunk(chunk: HelpChunk): void {
   }
 }
 
+/**
+ * Labels opening each variable-length region of a digest.
+ *
+ * Mirrors `region` in `crates/common/grokptah-help-contract/src/corpus.rs`.
+ * Length prefixing makes a flat field list injective but does not record where
+ * one sub-list ends and the next begins, so concatenating `aliases`,
+ * `keywords` and `capability_ids` hashed the same bytes whichever list each
+ * item came from — a capability could be moved into `aliases` and the article
+ * and corpus digests stayed identical. Each region now carries its own label
+ * and element count, so repartition, reorder, omission and duplication all
+ * change the digest.
+ */
+const REGION = Object.freeze({
+  aliases: "aliases",
+  keywords: "keywords",
+  capabilities: "capabilities",
+  sources: "sources",
+  articles: "articles",
+  chunks: "chunks",
+});
+
+/** One labelled, counted region of a field list. */
+function regionFields(label: string, items: readonly string[]): string[] {
+  return [label, String(items.length), ...items];
+}
+
 function verifyArticle(
   article: HelpArticle,
   sources: ReadonlyMap<string, HelpSourceAnchor>,
@@ -77,10 +103,13 @@ function verifyArticle(
     article.summary,
     article.body,
     article.visibility,
-    ...article.aliases,
-    ...article.keywords,
-    ...article.capability_ids,
-    ...cited.map((source) => source.digest),
+    ...regionFields(REGION.aliases, article.aliases),
+    ...regionFields(REGION.keywords, article.keywords),
+    ...regionFields(REGION.capabilities, article.capability_ids),
+    ...regionFields(
+      REGION.sources,
+      cited.map((source) => source.digest),
+    ),
   ]);
   if (actual !== article.digest) {
     throw new HelpCorpusDigestMismatchError(`article:${article.id}`, article.digest, actual);
@@ -96,9 +125,31 @@ function verifyArticle(
  */
 export function verifyHelpCorpus(corpus: HelpCorpus): void {
   const sources = new Map(corpus.sources.map((source) => [source.id, source]));
+  const articles = new Map(corpus.articles.map((article) => [article.id, article]));
   for (const source of corpus.sources) verifySource(source);
   for (const article of corpus.articles) verifyArticle(article, sources);
-  for (const chunk of corpus.chunks) verifyChunk(chunk);
+  for (const chunk of corpus.chunks) {
+    // A chunk is only reachable through its article, and a consumer that
+    // filters by article trusts the chunk to carry its article's visibility.
+    // A document where the two disagree is served differently depending on
+    // which of the two a reader's filter looks at, so it is refused.
+    const article = articles.get(chunk.article_id);
+    if (!article) {
+      throw new HelpCorpusDigestMismatchError(
+        `chunk:${chunk.id}`,
+        chunk.article_id,
+        "unknown article",
+      );
+    }
+    if (article.visibility !== chunk.visibility) {
+      throw new HelpCorpusDigestMismatchError(
+        `chunk:${chunk.id}`,
+        `article ${article.id} is ${article.visibility}`,
+        `chunk is ${chunk.visibility}`,
+      );
+    }
+    verifyChunk(chunk);
+  }
 
   const sourceDigest = domainDigest(
     HELP_DIGEST_DOMAINS.sourceSet,
@@ -111,8 +162,15 @@ export function verifyHelpCorpus(corpus: HelpCorpus): void {
   const digest = domainDigest(HELP_DIGEST_DOMAINS.corpus, [
     corpus.schema_version,
     corpus.content_version,
-    ...corpus.articles.map((article) => article.digest),
-    ...corpus.chunks.map((chunk) => chunk.digest),
+    ...regionFields(
+      REGION.articles,
+      corpus.articles.map((article) => article.digest),
+    ),
+    ...regionFields(
+      REGION.chunks,
+      corpus.chunks.map((chunk) => chunk.digest),
+    ),
+    REGION.sources,
     corpus.source_digest,
   ]);
   if (digest !== corpus.digest) {

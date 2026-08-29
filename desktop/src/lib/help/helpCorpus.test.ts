@@ -33,7 +33,8 @@ import {
   isPublicOnly,
   verifyHelpCorpus,
 } from "./canonical/verify";
-import type { HelpCorpus } from "./generated/contract";
+import { HELP_DIGEST_DOMAINS, domainDigest } from "./canonical/digest";
+import type { HelpChunk, HelpCorpus } from "./generated/contract";
 
 const FULL = fullCorpusJson as unknown as HelpCorpus;
 const PUBLIC = publicCorpusJson as unknown as HelpCorpus;
@@ -166,5 +167,179 @@ describe("what this bundle ships", () => {
     expect(chunksForPublicArticle(publicArticle.id).length).toBeGreaterThan(0);
     expect(getHelpChunk(PUBLIC.chunks[0].id)).toBeDefined();
     expect(getHelpSource(PUBLIC.sources[0].id)).toBeDefined();
+  });
+});
+
+/**
+ * Re-mint a chunk's own digest after editing it.
+ *
+ * Without this a test that re-labels a chunk trips `verifyChunk`'s digest
+ * check and passes for the wrong reason — it never reaches the rule it claims
+ * to be about. Mutating away that rule then leaves the test green.
+ */
+function remintChunk(chunk: HelpChunk): void {
+  chunk.digest = domainDigest(HELP_DIGEST_DOMAINS.chunk, [
+    chunk.id,
+    chunk.article_id,
+    chunk.kind,
+    String(chunk.ordinal),
+    chunk.locale,
+    chunk.text,
+    chunk.visibility,
+    ...chunk.source_ids,
+  ]);
+}
+
+/**
+ * Recompute the set-level digests, mirroring `Corpus::rebind_set_digests`.
+ *
+ * The region labels and counts are spelled out here rather than imported, so
+ * this states the expected encoding independently of the implementation under
+ * test.
+ */
+function rebindSetDigests(corpus: HelpCorpus): void {
+  const mutable = corpus as unknown as { source_digest: string; digest: string };
+  mutable.source_digest = domainDigest(
+    HELP_DIGEST_DOMAINS.sourceSet,
+    corpus.sources.map((source) => `${source.path}#${source.heading}`),
+  );
+  mutable.digest = domainDigest(HELP_DIGEST_DOMAINS.corpus, [
+    corpus.schema_version,
+    corpus.content_version,
+    "articles",
+    String(corpus.articles.length),
+    ...corpus.articles.map((article) => article.digest),
+    "chunks",
+    String(corpus.chunks.length),
+    ...corpus.chunks.map((chunk) => chunk.digest),
+    "sources",
+    mutable.source_digest,
+  ]);
+}
+
+/** The error `run` threw, or a failure if it threw nothing. */
+function rejection(run: () => void): HelpCorpusDigestMismatchError {
+  try {
+    run();
+  } catch (error) {
+    expect(error).toBeInstanceOf(HelpCorpusDigestMismatchError);
+    return error as HelpCorpusDigestMismatchError;
+  }
+  throw new Error("expected the corpus to be refused, but it verified");
+}
+
+describe("a tampered corpus is refused", () => {
+  it("rejects a capability folded into aliases", () => {
+    // The bypass this repair closes. The flat encoding hashed
+    // `aliases ++ keywords ++ capability_ids`, so folding the lists together
+    // left the article and corpus digests byte-identical while the capability
+    // gate was gone.
+    const tampered = clone(FULL);
+    const gated = tampered.articles.find((article) => article.capability_ids.length > 0);
+    expect(gated, "the corpus gates at least one article").toBeDefined();
+    if (!gated) return;
+    const mutable = gated as unknown as {
+      aliases: string[];
+      keywords: string[];
+      capability_ids: string[];
+    };
+    mutable.aliases = [...gated.aliases, ...gated.keywords, ...gated.capability_ids];
+    mutable.keywords = [];
+    mutable.capability_ids = [];
+
+    const error = rejection(() => verifyHelpCorpus(tampered));
+    expect(error.record).toBe(`article:${gated.id}`);
+  });
+
+  it("rejects a single keyword moved into aliases", () => {
+    const tampered = clone(FULL);
+    const article = tampered.articles.find((entry) => entry.keywords.length > 0);
+    expect(article).toBeDefined();
+    if (!article) return;
+    const mutable = article as unknown as { aliases: string[]; keywords: string[] };
+    mutable.aliases = [...article.aliases, article.keywords[0]];
+    mutable.keywords = article.keywords.slice(1);
+
+    expect(rejection(() => verifyHelpCorpus(tampered)).record).toBe(`article:${article.id}`);
+  });
+
+  it("rejects a reordered alias list", () => {
+    const tampered = clone(FULL);
+    const article = tampered.articles.find((entry) => entry.aliases.length > 1);
+    expect(article).toBeDefined();
+    if (!article) return;
+    (article as unknown as { aliases: string[] }).aliases = [...article.aliases].reverse();
+
+    expect(rejection(() => verifyHelpCorpus(tampered)).record).toBe(`article:${article.id}`);
+  });
+
+  it("rejects a duplicated capability", () => {
+    const tampered = clone(FULL);
+    const gated = tampered.articles.find((article) => article.capability_ids.length > 0);
+    expect(gated).toBeDefined();
+    if (!gated) return;
+    (gated as unknown as { capability_ids: string[] }).capability_ids = [
+      ...gated.capability_ids,
+      gated.capability_ids[0],
+    ];
+
+    expect(rejection(() => verifyHelpCorpus(tampered)).record).toBe(`article:${gated.id}`);
+  });
+
+  it("rejects a chunk more restricted than its article", () => {
+    // Every other digest is re-minted, so the visibility relationship is the
+    // only thing left wrong: this fails if that rule is removed.
+    const tampered = clone(FULL);
+    const publicArticle = tampered.articles.find((article) => article.visibility === "public");
+    expect(publicArticle).toBeDefined();
+    if (!publicArticle) return;
+    const chunk = tampered.chunks.find((entry) => entry.article_id === publicArticle.id);
+    expect(chunk).toBeDefined();
+    if (!chunk) return;
+    (chunk as unknown as { visibility: string }).visibility = "operator";
+    remintChunk(chunk);
+    rebindSetDigests(tampered);
+
+    const error = rejection(() => verifyHelpCorpus(tampered));
+    expect(error.record).toBe(`chunk:${chunk.id}`);
+    expect(error.expected).toContain(`article ${publicArticle.id} is public`);
+    expect(error.actual).toContain("chunk is operator");
+  });
+
+  it("rejects a chunk less restricted than its article", () => {
+    const tampered = clone(FULL);
+    const restricted = tampered.articles.find((article) => article.visibility === "operator");
+    expect(restricted).toBeDefined();
+    if (!restricted) return;
+    const chunk = tampered.chunks.find((entry) => entry.article_id === restricted.id);
+    expect(chunk).toBeDefined();
+    if (!chunk) return;
+    (chunk as unknown as { visibility: string }).visibility = "public";
+    remintChunk(chunk);
+    rebindSetDigests(tampered);
+
+    const error = rejection(() => verifyHelpCorpus(tampered));
+    expect(error.record).toBe(`chunk:${chunk.id}`);
+    expect(error.actual).toContain("chunk is public");
+  });
+
+  it("rejects a chunk whose article is absent", () => {
+    const tampered = clone(FULL);
+    const orphan = tampered.chunks[0];
+    tampered.articles = tampered.articles.filter((article) => article.id !== orphan.article_id);
+    rebindSetDigests(tampered);
+
+    const error = rejection(() => verifyHelpCorpus(tampered));
+    expect(error.record).toBe(`chunk:${orphan.id}`);
+    expect(error.actual).toBe("unknown article");
+  });
+
+  it("rejects a dropped record even though every surviving digest is intact", () => {
+    // The corpus digest counts its regions, so removing a chunk changes the
+    // document without touching any record digest.
+    const tampered = clone(FULL);
+    tampered.chunks = tampered.chunks.slice(0, -1);
+
+    expect(rejection(() => verifyHelpCorpus(tampered)).record).toBe("corpus");
   });
 });
