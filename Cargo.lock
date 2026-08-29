@@ -14163,6 +14163,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "xai-host-authority"
+version = "0.1.0"
+dependencies = [
+ "fs2",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
 name = "xai-hunk-tracker"
 version = "0.1.0"
 dependencies = [
