@@ -1348,6 +1348,9 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "grokptah-agent-bridge",
+ "grokptah-help-authority",
+ "grokptah-help-contract",
+ "grokptah-help-runtime",
  "parking_lot",
  "portable-pty",
  "serde",
@@ -1360,6 +1363,34 @@ dependencies = [
  "tokio",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "grokptah-help-authority"
+version = "0.1.0"
+dependencies = [
+ "grokptah-help-contract",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "grokptah-help-contract"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "grokptah-help-runtime"
+version = "0.1.0"
+dependencies = [
+ "grokptah-help-authority",
+ "grokptah-help-contract",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
