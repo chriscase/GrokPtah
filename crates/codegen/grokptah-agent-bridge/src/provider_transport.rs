@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use bytes::Bytes;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use xai_host_authority::{
@@ -28,13 +28,28 @@ const CUSTODY_FILE: &str = "authority/provider-send-v1.key";
 const SERVICE_CREDENTIAL_ID: &str = "provider-transport";
 const CAPABILITY_TTL_MS: u64 = 60_000;
 const LEASE_TTL_MS: u64 = 30_000;
+const IDEMPOTENCY_KEY_HEADER: HeaderName = HeaderName::from_static("idempotency-key");
 
 static AUTHORITIES: OnceLock<Mutex<HashMap<PathBuf, Arc<ProviderAuthority>>>> = OnceLock::new();
 
 struct ProviderAuthority {
+    root: PathBuf,
     authority: HostAuthority,
     admin: HostAdminAuthority,
     service_bearer: String,
+}
+
+/// Non-forgeable, non-cloneable proof that the caller authenticated with the
+/// provider-authority custody secret. The secret itself is never retained.
+#[must_use = "provider reconciliation requires an authenticated operator capability"]
+pub struct ProviderReconciliationAuthority {
+    root: PathBuf,
+}
+
+impl std::fmt::Debug for ProviderReconciliationAuthority {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ProviderReconciliationAuthority([redacted])")
+    }
 }
 
 /// Secret-bearing material used only to bind the permit to the exact wire
@@ -207,6 +222,26 @@ impl ProviderResponse {
         ProviderTransportError::settled(message, outcome)
     }
 
+    /// A retry-oriented HTTP status does not prove that the provider omitted
+    /// the requested effect. Keep the attempt ambiguous until an operator has
+    /// established provider truth instead of treating the response as a safe
+    /// invitation to spend a fresh permit.
+    pub(crate) fn settle_retryable_http_uncertain(
+        mut self,
+        message: impl Into<String>,
+    ) -> ProviderTransportError {
+        let Some(permit) = self.permit.take() else {
+            return ProviderTransportError::before_dispatch(
+                "provider response no longer owns a send permit",
+            );
+        };
+        let outcome = self
+            .runtime
+            .authority
+            .settle_uncertain(permit, UncertainReason::ProtocolAfterPossibleEffect);
+        ProviderTransportError::settled(message, outcome)
+    }
+
     fn settle_uncertain_error(
         &mut self,
         message: impl Into<String>,
@@ -277,7 +312,7 @@ async fn send_provider_request_with(
     cancel: Option<&CancellationToken>,
     dispatch: &dyn WireDispatch,
 ) -> Result<ProviderResponse, ProviderTransportError> {
-    let request = request
+    let mut request = request
         .build()
         .map_err(ProviderTransportError::before_dispatch)?;
     let body =
@@ -294,6 +329,12 @@ async fn send_provider_request_with(
     let permit = runtime
         .permit(&identity, scope.target_scope)
         .map_err(ProviderTransportError::before_dispatch)?;
+    if let Err(error) = bind_idempotency_key(&mut request, &identity, &permit) {
+        let outcome = runtime
+            .authority
+            .settle_failed_before_write(permit, FailedReason::DeniedBeforeDispatch);
+        return Err(ProviderTransportError::settled(error.to_string(), outcome));
+    }
 
     let result = if let Some(cancel) = cancel {
         tokio::select! {
@@ -345,25 +386,10 @@ fn validate_wire_request<'a>(
             .ok_or_else(|| anyhow!("provider request body is not immutable bytes"))?,
     };
 
-    let actual_authorization = request.headers().get(AUTHORIZATION);
-    if scope.credential_secret.is_empty() {
-        if actual_authorization.is_some() {
-            return Err(anyhow!(
-                "provider credential scope does not match request headers"
-            ));
-        }
-    } else {
-        let secret = std::str::from_utf8(scope.credential_secret)
-            .context("provider credential is not valid UTF-8")?;
-        let expected = format!("Bearer {secret}");
-        let actual = actual_authorization
-            .and_then(|value| value.to_str().ok())
-            .ok_or_else(|| anyhow!("provider request is missing its admitted credential"))?;
-        if actual.as_bytes() != expected.as_bytes() {
-            return Err(anyhow!(
-                "provider credential scope does not match request headers"
-            ));
-        }
+    if request.headers().contains_key(&IDEMPOTENCY_KEY_HEADER) {
+        return Err(anyhow!(
+            "provider caller must not supply or override the host idempotency key"
+        ));
     }
 
     let method = request.method();
@@ -375,6 +401,7 @@ fn validate_wire_request<'a>(
         .to_ascii_lowercase();
     match scope.dialect {
         "openai_model_catalog" => {
+            validate_bearer_credential(request, body, scope.credential_secret)?;
             if method != reqwest::Method::GET || !body.is_empty() || scope.model != "model-catalog"
             {
                 return Err(anyhow!(
@@ -392,8 +419,10 @@ fn validate_wire_request<'a>(
                     "OAuth refresh wire shape does not match its dialect"
                 ));
             }
+            validate_oauth_refresh_credential(request, body, scope.credential_secret)?;
         }
         "xai_chat_completions" | "openai_chat_completions" | "provider_qualification" => {
+            validate_bearer_credential(request, body, scope.credential_secret)?;
             if method != reqwest::Method::POST
                 || !content_type.starts_with("application/json")
                 || body.is_empty()
@@ -411,6 +440,106 @@ fn validate_wire_request<'a>(
         _ => return Err(anyhow!("unsupported provider wire dialect")),
     }
     Ok(body)
+}
+
+fn validate_bearer_credential(
+    request: &reqwest::Request,
+    body: &[u8],
+    credential_secret: &[u8],
+) -> anyhow::Result<()> {
+    let actual_authorization = request.headers().get(AUTHORIZATION);
+    if request.headers().get_all(AUTHORIZATION).iter().count() > 1 {
+        return Err(anyhow!("provider request repeats its Authorization header"));
+    }
+    if credential_secret.is_empty() {
+        if actual_authorization.is_some() {
+            return Err(anyhow!(
+                "provider credential scope does not match request headers"
+            ));
+        }
+        return Ok(());
+    }
+    let secret =
+        std::str::from_utf8(credential_secret).context("provider credential is not valid UTF-8")?;
+    let expected = format!("Bearer {secret}");
+    let actual = actual_authorization
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| anyhow!("provider request is missing its admitted credential"))?;
+    if actual.as_bytes() != expected.as_bytes() {
+        return Err(anyhow!(
+            "provider credential scope does not match request headers"
+        ));
+    }
+    if !body.is_empty()
+        && body
+            .windows(credential_secret.len())
+            .any(|window| window == credential_secret)
+    {
+        return Err(anyhow!(
+            "provider credential appears in more than one wire location"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_oauth_refresh_credential(
+    request: &reqwest::Request,
+    body: &[u8],
+    credential_secret: &[u8],
+) -> anyhow::Result<()> {
+    if request.headers().contains_key(AUTHORIZATION) {
+        return Err(anyhow!(
+            "OAuth refresh credential must not also appear in Authorization"
+        ));
+    }
+    if credential_secret.is_empty() {
+        return Err(anyhow!("OAuth refresh credential is absent"));
+    }
+    let expected = std::str::from_utf8(credential_secret)
+        .context("OAuth refresh credential is not valid UTF-8")?;
+    let mut refresh_tokens = url::form_urlencoded::parse(body)
+        .filter_map(|(key, value)| (key == "refresh_token").then_some(value.into_owned()));
+    let actual = refresh_tokens
+        .next()
+        .ok_or_else(|| anyhow!("OAuth refresh request is missing its admitted credential"))?;
+    if refresh_tokens.next().is_some() {
+        return Err(anyhow!("OAuth refresh request repeats its credential"));
+    }
+    if actual.as_bytes() != expected.as_bytes() {
+        return Err(anyhow!(
+            "OAuth refresh credential scope does not match request body"
+        ));
+    }
+    Ok(())
+}
+
+fn bind_idempotency_key(
+    request: &mut reqwest::Request,
+    identity: &RequestIdentity,
+    permit: &PhysicalSendPermit,
+) -> anyhow::Result<()> {
+    if permit.request_digest() != identity.digest() {
+        return Err(anyhow!(
+            "provider permit does not match the admitted request identity"
+        ));
+    }
+    if request.headers().contains_key(&IDEMPOTENCY_KEY_HEADER) {
+        return Err(anyhow!(
+            "provider request already contains an idempotency key"
+        ));
+    }
+    let value = HeaderValue::from_str(permit.idempotency_key())
+        .context("host idempotency key is not a valid header value")?;
+    request.headers_mut().insert(IDEMPOTENCY_KEY_HEADER, value);
+    if request
+        .headers()
+        .get(&IDEMPOTENCY_KEY_HEADER)
+        .and_then(|value| value.to_str().ok())
+        != Some(permit.idempotency_key())
+    {
+        return Err(anyhow!("provider idempotency binding mismatch"));
+    }
+    Ok(())
 }
 
 impl ProviderAuthority {
@@ -473,6 +602,7 @@ fn authority_runtime() -> anyhow::Result<Arc<ProviderAuthority>> {
         )?],
     )?;
     let runtime = Arc::new(ProviderAuthority {
+        root: root.clone(),
         authority,
         admin: admin_authority,
         service_bearer,
@@ -484,19 +614,65 @@ fn authority_runtime() -> anyhow::Result<Arc<ProviderAuthority>> {
 /// Resolve one previously ambiguous provider attempt from independently
 /// established operator/provider truth. No resend occurs here.
 pub(crate) fn reconcile_provider_attempt(
+    operator: &ProviderReconciliationAuthority,
     attempt: AttemptId,
     took_effect: bool,
 ) -> anyhow::Result<()> {
     let runtime = authority_runtime()?;
+    runtime.require_reconciliation_authority(operator)?;
     runtime
         .authority
         .reconcile_attempt(&runtime.admin, attempt, took_effect)?;
     Ok(())
 }
 
-pub(crate) fn provider_attempts_requiring_reconciliation() -> anyhow::Result<Vec<AttemptId>> {
+pub(crate) fn provider_attempts_requiring_reconciliation(
+    operator: &ProviderReconciliationAuthority,
+) -> anyhow::Result<Vec<AttemptId>> {
     let runtime = authority_runtime()?;
+    runtime.require_reconciliation_authority(operator)?;
     Ok(runtime.authority.ambiguous_attempts(&runtime.admin)?)
+}
+
+pub(crate) fn authenticate_provider_reconciliation(
+    custody_secret: &str,
+) -> anyhow::Result<ProviderReconciliationAuthority> {
+    let runtime = authority_runtime()?;
+    let expected = load_or_create_custody(&crate::discover::grokptah_home().join(CUSTODY_FILE))?;
+    if !constant_time_secret_eq(custody_secret.as_bytes(), expected.as_bytes()) {
+        return Err(anyhow!(
+            "provider reconciliation operator is unauthenticated"
+        ));
+    }
+    Ok(ProviderReconciliationAuthority {
+        root: runtime.root.clone(),
+    })
+}
+
+impl ProviderAuthority {
+    fn require_reconciliation_authority(
+        &self,
+        operator: &ProviderReconciliationAuthority,
+    ) -> anyhow::Result<()> {
+        if operator.root == self.root {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "provider reconciliation authority belongs to another root"
+            ))
+        }
+    }
+}
+
+fn constant_time_secret_eq(left: &[u8], right: &[u8]) -> bool {
+    let left = Sha256::digest(left);
+    let right = Sha256::digest(right);
+    left.iter()
+        .zip(right.iter())
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
 }
 
 fn secure_authority_directory(path: &Path) -> anyhow::Result<()> {
@@ -603,6 +779,10 @@ mod tests {
 
     struct PendingDispatch;
 
+    struct HeaderCaptureDispatch {
+        idempotency_key: Mutex<Option<String>>,
+    }
+
     #[async_trait]
     impl WireDispatch for PendingDispatch {
         async fn dispatch(
@@ -611,6 +791,22 @@ mod tests {
             _request: reqwest::Request,
         ) -> WireResult {
             std::future::pending::<WireResult>().await
+        }
+    }
+
+    #[async_trait]
+    impl WireDispatch for HeaderCaptureDispatch {
+        async fn dispatch(
+            &self,
+            _client: &reqwest::Client,
+            request: reqwest::Request,
+        ) -> WireResult {
+            *self.idempotency_key.lock().unwrap() = request
+                .headers()
+                .get(&IDEMPOTENCY_KEY_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            WireResult::RefusedBeforeWrite("synthetic refusal".into())
         }
     }
 
@@ -642,6 +838,12 @@ mod tests {
             .json(&serde_json::json!({"model": "synthetic-model"}))
     }
 
+    fn reconciliation_authority() -> ProviderReconciliationAuthority {
+        let custody =
+            load_or_create_custody(&crate::discover::grokptah_home().join(CUSTODY_FILE)).unwrap();
+        authenticate_provider_reconciliation(&custody).unwrap()
+    }
+
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn injected_prewrite_refusal_is_the_only_retryable_failure() {
@@ -658,6 +860,101 @@ mod tests {
             .unwrap_err();
         assert!(error.is_safe_to_resend());
         assert!(!error.is_uncertain());
+        assert_eq!(dispatch.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn host_binds_one_idempotency_key_and_rejects_caller_override() {
+        let home = tempfile::tempdir().unwrap();
+        let _serial = crate::discover::home_override_serial();
+        let _home = HomeOverride::install(home.path().to_path_buf());
+        let dispatch = HeaderCaptureDispatch {
+            idempotency_key: Mutex::new(None),
+        };
+        let client = reqwest::Client::new();
+        let error = send_provider_request_with(&client, request(&client), scope(), None, &dispatch)
+            .await
+            .unwrap_err();
+        assert!(error.is_safe_to_resend());
+        let key = dispatch.idempotency_key.lock().unwrap().clone().unwrap();
+        assert!(key.starts_with("grokptah-att_"));
+
+        let override_request = request(&client).header("Idempotency-Key", "caller-controlled");
+        let error = send_provider_request_with(&client, override_request, scope(), None, &dispatch)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("must not supply or override"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn oauth_refresh_credential_is_exactly_once_in_the_form() {
+        let home = tempfile::tempdir().unwrap();
+        let _serial = crate::discover::home_override_serial();
+        let _home = HomeOverride::install(home.path().to_path_buf());
+        let dispatch = InjectedDispatch {
+            calls: AtomicUsize::new(0),
+            result: Mutex::new(Some(WireResult::RefusedBeforeWrite("refused".into()))),
+        };
+        let client = reqwest::Client::new();
+        let oauth_scope = ProviderRequestScope {
+            credential_secret: b"synthetic-refresh-token",
+            dialect: "oauth2_refresh",
+            model: "oidc-token-refresh",
+            target_scope: "oidc-token-refresh",
+        };
+        let valid = client.post("http://127.0.0.1/token").form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", "synthetic-refresh-token"),
+        ]);
+        assert!(
+            send_provider_request_with(&client, valid, oauth_scope, None, &dispatch)
+                .await
+                .unwrap_err()
+                .is_safe_to_resend()
+        );
+        assert_eq!(dispatch.calls.load(Ordering::SeqCst), 1);
+
+        let duplicate_location = client
+            .post("http://127.0.0.1/token")
+            .bearer_auth("synthetic-refresh-token")
+            .form(&[("refresh_token", "synthetic-refresh-token")]);
+        let error = send_provider_request_with(
+            &client,
+            duplicate_location,
+            ProviderRequestScope {
+                credential_secret: b"synthetic-refresh-token",
+                dialect: "oauth2_refresh",
+                model: "oidc-token-refresh",
+                target_scope: "oidc-token-refresh",
+            },
+            None,
+            &dispatch,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("must not also appear"));
+
+        let duplicate_form = client
+            .post("http://127.0.0.1/token")
+            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body("refresh_token=synthetic-refresh-token&refresh_token=synthetic-refresh-token");
+        let error = send_provider_request_with(
+            &client,
+            duplicate_form,
+            ProviderRequestScope {
+                credential_secret: b"synthetic-refresh-token",
+                dialect: "oauth2_refresh",
+                model: "oidc-token-refresh",
+                target_scope: "oidc-token-refresh",
+            },
+            None,
+            &dispatch,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("repeats its credential"));
         assert_eq!(dispatch.calls.load(Ordering::SeqCst), 1);
     }
 
@@ -723,12 +1020,53 @@ mod tests {
                 .await
                 .unwrap();
         drop(response);
-        let ambiguous = provider_attempts_requiring_reconciliation().unwrap();
+        let operator = reconciliation_authority();
+        let ambiguous = provider_attempts_requiring_reconciliation(&operator).unwrap();
         assert_eq!(ambiguous.len(), 1);
-        reconcile_provider_attempt(ambiguous[0], true).unwrap();
-        assert!(provider_attempts_requiring_reconciliation()
+        reconcile_provider_attempt(&operator, ambiguous[0], true).unwrap();
+        assert!(provider_attempts_requiring_reconciliation(&operator)
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn unauthenticated_or_foreign_operator_cannot_reconcile_provider_attempts() {
+        let home = tempfile::tempdir().unwrap();
+        let _serial = crate::discover::home_override_serial();
+        let _home = HomeOverride::install(home.path().to_path_buf());
+        let response: reqwest::Response = axum::http::Response::builder()
+            .status(200)
+            .body("synthetic body")
+            .unwrap()
+            .into();
+        let dispatch = InjectedDispatch {
+            calls: AtomicUsize::new(0),
+            result: Mutex::new(Some(WireResult::Response(response))),
+        };
+        let client = reqwest::Client::new();
+        let response =
+            send_provider_request_with(&client, request(&client), scope(), None, &dispatch)
+                .await
+                .unwrap();
+        drop(response);
+        assert!(authenticate_provider_reconciliation("wrong-custody-secret").is_err());
+        let operator = reconciliation_authority();
+        let attempts = provider_attempts_requiring_reconciliation(&operator).unwrap();
+        assert_eq!(attempts.len(), 1);
+
+        let foreign = tempfile::tempdir().unwrap();
+        let foreign_operator = ProviderReconciliationAuthority {
+            root: foreign.path().to_path_buf(),
+        };
+        assert!(provider_attempts_requiring_reconciliation(&foreign_operator).is_err());
+        assert!(reconcile_provider_attempt(&foreign_operator, attempts[0], true).is_err());
+        assert_eq!(
+            provider_attempts_requiring_reconciliation(&operator)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -755,8 +1093,11 @@ mod tests {
                 .await
                 .unwrap();
         assert!(response.next_chunk(None).await.unwrap_err().is_uncertain());
+        let operator = reconciliation_authority();
         assert_eq!(
-            provider_attempts_requiring_reconciliation().unwrap().len(),
+            provider_attempts_requiring_reconciliation(&operator)
+                .unwrap()
+                .len(),
             1
         );
 
@@ -781,7 +1122,9 @@ mod tests {
         let error = response.settle_protocol_error("malformed provider JSON");
         assert!(error.is_uncertain());
         assert_eq!(
-            provider_attempts_requiring_reconciliation().unwrap().len(),
+            provider_attempts_requiring_reconciliation(&operator)
+                .unwrap()
+                .len(),
             2
         );
 
@@ -808,7 +1151,9 @@ mod tests {
             .unwrap_err()
             .is_uncertain());
         assert_eq!(
-            provider_attempts_requiring_reconciliation().unwrap().len(),
+            provider_attempts_requiring_reconciliation(&operator)
+                .unwrap()
+                .len(),
             3
         );
     }
@@ -845,6 +1190,32 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("credential scope")
+        );
+        let duplicate_header = client
+            .post("http://127.0.0.1/provider")
+            .header(AUTHORIZATION, "Bearer synthetic-provider-secret")
+            .header(AUTHORIZATION, "Bearer synthetic-provider-secret")
+            .json(&serde_json::json!({"model": "synthetic-model"}));
+        assert!(
+            send_provider_request_with(&client, duplicate_header, scope(), None, &dispatch,)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("repeats its Authorization")
+        );
+        let duplicated_in_body = client
+            .post("http://127.0.0.1/provider")
+            .bearer_auth("synthetic-provider-secret")
+            .json(&serde_json::json!({
+                "model": "synthetic-model",
+                "prompt": "synthetic-provider-secret"
+            }));
+        assert!(
+            send_provider_request_with(&client, duplicated_in_body, scope(), None, &dispatch,)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("more than one wire location")
         );
         let streamed_body = reqwest::Body::wrap_stream(futures::stream::once(async {
             Ok::<Bytes, std::io::Error>(Bytes::from_static(br#"{"model":"synthetic-model"}"#))
@@ -903,5 +1274,15 @@ mod tests {
         let this_module = include_str!("provider_transport.rs");
         let execute_needle = ["client.execute", "(request)"].concat();
         assert_eq!(this_module.matches(&execute_needle).count(), 1);
+
+        let public_surface = include_str!("lib.rs");
+        assert!(public_surface.contains(
+            "authority: &ProviderReconciliationAuthority,\n    attempt: ProviderAttemptId,"
+        ));
+        assert!(public_surface.contains(
+            "provider_attempts_requiring_reconciliation(\n    authority: &ProviderReconciliationAuthority,"
+        ));
+        assert!(!public_surface
+            .contains("reconcile_provider_attempt(\n    attempt: ProviderAttemptId,"));
     }
 }

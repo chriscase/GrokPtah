@@ -81,16 +81,26 @@ pub async fn discover_profile_models(profile_id: &str) -> Result<Vec<ProviderMod
         let body = match read_catalog_body(&mut response).await {
             Ok(body) => body,
             Err(error) => {
-                failures.push(format!("{}: {error}", redacted_path(&url)));
-                continue;
+                return Err(anyhow!(
+                    "{}: provider catalog response is uncertain: {error}",
+                    redacted_path(&url)
+                ));
             }
         };
         if !status.is_success() {
+            if status == reqwest::StatusCode::REQUEST_TIMEOUT
+                || status.as_u16() == 429
+                || status.is_server_error()
+            {
+                return Err(anyhow!(response.settle_retryable_http_uncertain(format!(
+                    "provider catalog returned retry-oriented HTTP {status}; explicit reconciliation required"
+                ))));
+            }
             let class = match status.as_u16() {
                 401 | 403 => "credential rejected",
-                429 => "rate limited",
                 _ => "request failed",
             };
+            response.settle_success().map_err(anyhow::Error::new)?;
             failures.push(format!("{}: {class} ({status})", redacted_path(&url)));
             continue;
         }

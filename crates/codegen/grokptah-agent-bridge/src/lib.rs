@@ -40,24 +40,41 @@ pub mod provider_observation;
 mod provider_qualification;
 mod provider_transport;
 
+/// Scarce proof required to inspect or resolve provider-send ambiguity. The
+/// bridge never substitutes its cached authority for this caller-supplied
+/// proof, and downstream code cannot construct or clone one.
+pub use provider_transport::ProviderReconciliationAuthority;
 /// Opaque identity of a provider send requiring reconciliation. It contains no
 /// provider request, credential, model, URL, content, or path material.
 pub use xai_host_authority::AttemptId as ProviderAttemptId;
 
-/// List provider sends whose outcome requires independent operator/provider
-/// truth. Listing never retries a request.
-pub fn provider_attempts_requiring_reconciliation() -> anyhow::Result<Vec<ProviderAttemptId>> {
-    provider_transport::provider_attempts_requiring_reconciliation()
+/// Authenticate an operator against the provider-send custody secret and mint
+/// a process-local, non-cloneable reconciliation capability. The secret is
+/// checked in constant time and is not retained by the capability.
+pub fn authenticate_provider_reconciliation(
+    custody_secret: &str,
+) -> anyhow::Result<ProviderReconciliationAuthority> {
+    provider_transport::authenticate_provider_reconciliation(custody_secret)
+}
+
+/// List provider sends whose outcome requires independently established
+/// operator/provider truth. Listing never retries a request.
+pub fn provider_attempts_requiring_reconciliation(
+    authority: &ProviderReconciliationAuthority,
+) -> anyhow::Result<Vec<ProviderAttemptId>> {
+    provider_transport::provider_attempts_requiring_reconciliation(authority)
 }
 
 /// Resolve one ambiguous provider send from independently established truth.
 /// This never performs or retries a physical provider request.
 pub fn reconcile_provider_attempt(
+    authority: &ProviderReconciliationAuthority,
     attempt: ProviderAttemptId,
     took_effect: bool,
 ) -> anyhow::Result<()> {
-    provider_transport::reconcile_provider_attempt(attempt, took_effect)
+    provider_transport::reconcile_provider_attempt(authority, attempt, took_effect)
 }
+
 pub mod reliability_eval;
 mod run_promotion;
 mod search_engine;

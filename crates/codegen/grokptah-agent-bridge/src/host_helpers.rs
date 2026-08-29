@@ -2297,7 +2297,6 @@ where
         {
             let headers = resp.headers().clone();
             let text = read_bounded_response_body(&mut resp, cancel).await?;
-            resp.settle_success().map_err(anyhow::Error::new)?;
             let (content_class, framing) = response_shape(&headers, text.len() as u64);
             if let Some((route, attempt)) = observation_attempt.take() {
                 record_provider_attempt(
@@ -2315,24 +2314,20 @@ where
             let clipped: String = text.chars().take(400).collect();
             let compatible =
                 target.dialect == crate::gateway_config::ProviderDialect::OpenAiChatCompletions;
-            last_err = Some(if status.as_u16() == 429 {
+            let message = if status.as_u16() == 429 {
                 if compatible {
                     "configured provider rate limited the request (HTTP 429)".into()
                 } else {
-                    format!("HTTP 429 rate limited (will retry): {clipped}")
+                    format!("HTTP 429 rate limited: {clipped}")
                 }
             } else if compatible {
                 format!("configured provider returned HTTP {status}")
             } else {
                 format!("HTTP {status}: {clipped}")
-            });
-            if allow_transient_retries && transient_retries < MAX_TRANSIENT_RETRIES {
-                let delay = 600 * (1 << transient_retries);
-                transient_retries += 1;
-                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-                continue;
-            }
-            bail!("{}", last_err.unwrap());
+            };
+            return Err(anyhow::Error::new(resp.settle_retryable_http_uncertain(
+                format!("{message}; explicit reconciliation required before another send"),
+            )));
         }
 
         if !status.is_success() {

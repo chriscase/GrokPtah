@@ -685,7 +685,6 @@ async fn completion(
 ) -> Result<serde_json::Value> {
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let mut removed_tool_choice = false;
-    let mut transient_retries = 0_u32;
     for _attempt in 0..5 {
         let mut request = client
             .post(&url)
@@ -735,11 +734,13 @@ async fn completion(
             removed_tool_choice = true;
             continue;
         }
-        if (status.as_u16() == 429 || status.is_server_error()) && transient_retries < 3 {
-            response.settle_success().map_err(anyhow::Error::new)?;
-            tokio::time::sleep(Duration::from_millis(100 * (1 << transient_retries))).await;
-            transient_retries += 1;
-            continue;
+        if status == reqwest::StatusCode::REQUEST_TIMEOUT
+            || status.as_u16() == 429
+            || status.is_server_error()
+        {
+            return Err(anyhow!(response.settle_retryable_http_uncertain(format!(
+                "provider returned retry-oriented HTTP {status}; explicit reconciliation required"
+            ))));
         }
         if !status.is_success() {
             response.settle_success().map_err(anyhow::Error::new)?;
@@ -811,6 +812,14 @@ async fn streaming_probe(
     if !response.status().is_success() {
         let status = response.status();
         let _ = read_body(&mut response).await?;
+        if status == reqwest::StatusCode::REQUEST_TIMEOUT
+            || status.as_u16() == 429
+            || status.is_server_error()
+        {
+            return Err(anyhow!(response.settle_retryable_http_uncertain(format!(
+                "provider stream returned retry-oriented HTTP {status}; explicit reconciliation required"
+            ))));
+        }
         response.settle_success().map_err(anyhow::Error::new)?;
         bail!("provider stream failed (HTTP {})", status.as_u16());
     }
@@ -1536,7 +1545,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn transient_rate_limits_retry_but_remain_bounded() {
+    async fn transient_rate_limit_is_uncertain_and_is_not_retried() {
         let rejections = Arc::new(AtomicUsize::new(2));
         let request_count = Arc::new(AtomicUsize::new(0));
         let (base_url, server) = start_gateway(GatewayState {
@@ -1552,33 +1561,6 @@ mod tests {
         let profile =
             crate::gateway_config::ProviderProfile::openai_compatible("test", "Test", &base_url);
         let mut credentials = QualificationCredentials::new(None, &profile).unwrap();
-        let value = completion(
-            &client,
-            &base_url,
-            &mut credentials,
-            serde_json::json!({
-                "model": "cheap-code-model",
-                "messages": [{"role": "user", "content": "synthetic"}],
-                "stream": false
-            }),
-            false,
-        )
-        .await
-        .unwrap();
-        assert_eq!(message_content(&value), Some(GENERATION_MARKER));
-        assert_eq!(request_count.load(Ordering::SeqCst), 3);
-        server.abort();
-
-        let request_count = Arc::new(AtomicUsize::new(0));
-        let (base_url, server) = start_gateway(GatewayState {
-            prose_tools: false,
-            json_for_stream: false,
-            reject_first_tool_choice: false,
-            tool_choice_rejections: Arc::new(AtomicUsize::new(0)),
-            rate_limits_remaining: Arc::new(AtomicUsize::new(20)),
-            request_count: request_count.clone(),
-        })
-        .await;
         let error = completion(
             &client,
             &base_url,
@@ -1593,7 +1575,10 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.to_string().contains("HTTP 429"));
-        assert_eq!(request_count.load(Ordering::SeqCst), 4);
+        assert!(error
+            .to_string()
+            .contains("explicit reconciliation required"));
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
         server.abort();
     }
 }
