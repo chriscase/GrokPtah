@@ -23,6 +23,21 @@ failure, target changes, or exhausted limits. Secure and system-restricted surfa
 even when a grant exists. Pointer fallback and key chords require separate action classes; a
 semantic-action grant cannot silently expand into raw input control.
 
+## Isolated visual substrate (#288)
+
+Arbitrary GUI apps that lack semantic Accessibility/DOM structure require a
+separate guest principal. `grokptah-isolated-visual` is the host-owned
+lifecycle for that substrate: hermetic source/image resolution, `create →
+ready → running → closing`, WorkAttempt-bound surface leases, bounded
+frame/input transport, and redacted projection.
+
+Hidden windows, Spaces, virtual displays, `CGEvent`, AppleScript, and
+clipboard routing do not qualify. `ComputerUseService::isolated_visual_admission`
+fails closed until Virtualization.framework preflight, signed helper/image
+artifacts, and the 25 GiB disk gate pass. Simulator and source-compilation
+evidence are ineligible for VM qualification. See
+[`docs/COMPUTER_USE_ISOLATED_VISUAL.md`](COMPUTER_USE_ISOLATED_VISUAL.md).
+
 ## Foundation (#268)
 
 `grokptah-agent-bridge::computer_use` provides:

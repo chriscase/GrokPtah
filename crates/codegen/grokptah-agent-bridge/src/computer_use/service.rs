@@ -38,6 +38,12 @@ impl ComputerUseService {
         self.backend.capabilities()
     }
 
+    /// Isolated visual remains unavailable until preflight allows a real
+    /// Virtualization.framework launch. Simulator evidence does not admit it.
+    pub fn isolated_visual_admission(&self) -> super::isolated_visual::IsolatedPreflight {
+        super::isolated_visual::isolated_visual_admission()
+    }
+
     pub fn list_runs(&self) -> ComputerResult<Vec<ComputerRun>> {
         self.store.list_runs()
     }
