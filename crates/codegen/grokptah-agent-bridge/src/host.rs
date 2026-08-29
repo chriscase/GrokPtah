@@ -23,20 +23,22 @@ use crate::computer_agent::{
 use crate::event_bus::{session_id_of, JournalPage};
 use crate::events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 use crate::host_helpers::{
-    action_stationarity_nudge, action_stationarity_stop_message, api_context_messages,
-    auto_cargo_reverify_command, build_agent_messages, build_compact_summary,
-    call_xai_agent_step_observed, call_xai_chat, cargo_test_failure_coaching,
+    action_inert_repeat_stop_message, action_stationarity_nudge, action_stationarity_stop_message,
+    api_context_messages, auto_cargo_reverify_command, build_agent_messages, build_compact_summary,
+    call_xai_agent_step_observed, call_xai_chat, canonical_tool_name, cargo_test_failure_coaching,
     cargo_test_output_failed, cargo_test_output_passed, cargo_test_reverify_coaching,
     coding_agent_tools, count_cargo_test_failures, emit_message, emit_thought,
     filter_tools_batch_edit_only, filter_tools_edit_and_shell, filter_tools_edit_only,
     is_incomplete_stop_message, is_round_limit_stop_message, is_true_noop_tool_step,
-    multi_failure_partial_edit_coaching, normalize_sandbox_profile, offline_plan_steps,
-    parse_effort_arg, post_cargo_failure_skip_message, propose_plan_with_model, push_assistant,
-    push_thought, push_tool, recovery_round_limit_stop_message, resolve_turn_max_rounds,
-    round_limit_stop_message, sandbox_blocks_shell, sandbox_is_readonly,
+    is_wait_shaped_call, multi_failure_partial_edit_coaching, normalize_sandbox_profile,
+    offline_plan_steps, parse_effort_arg, post_cargo_failure_skip_message, propose_plan_with_model,
+    push_assistant, push_thought, push_tool, recovery_round_limit_stop_message,
+    resolve_turn_max_rounds, round_is_witnessed_wait, round_limit_stop_message,
+    round_observation_digest, sandbox_blocks_shell, sandbox_is_readonly,
     should_auto_cargo_reverify_after_edit, should_skip_tool_after_cargo_failure,
-    surface_rate_limit_or_error, tool_kind, tool_step_signature, tool_web_fetch, AgentStep,
-    IdenticalToolCallRun, McpToolIndex,
+    surface_rate_limit_or_error, tool_kind, tool_step_signature, tool_web_fetch,
+    ActiveTaskWaitWitness, ActiveWaitState, AgentStep, IdenticalToolCallRun, McpToolIndex,
+    WITNESSED_WAIT_DEADLINE_MS,
 };
 use crate::lane::LaneSummary;
 use crate::local_tools;
@@ -49,8 +51,8 @@ use crate::orchestration::{
     ContinuationTestInput, MissedRunPolicy, OrchStore, PromotionState, RoutineConcurrencyPolicy,
     RoutineLifecycle, RoutineRecord, RoutineRetryPolicy, RoutineSnapshot, RoutineTrigger,
     RunAggregates, RunBounds, RunExecution, RunExecutionMode, RunPurpose, RunRecord, RunState,
-    RunStopCause, WorkAttemptView, WorkItem, WorkItemSnapshot, WorkPolicy, WorkTemplate,
-    DEFAULT_AGENT_TOOL_IDS,
+    RunStopCause, RunStopDetail, RunStopDetailKind, WorkAttemptView, WorkItem, WorkItemSnapshot,
+    WorkPolicy, WorkTemplate, DEFAULT_AGENT_TOOL_IDS,
 };
 use crate::permission::{
     evaluate_tool_gate, PendingPermissionView, PermissionDecision, PermissionRequest, ToolGate,
@@ -186,6 +188,18 @@ pub(crate) struct Inner {
     /// Per-subagent cancel tokens (#151/#152) — cancel one child without killing siblings.
     subagent_cancels: HashMap<String, CancellationToken>,
     background_tasks: Vec<BackgroundTask>,
+    /// Host-assigned generation per task/subagent id, with the identity
+    /// fingerprint the generation was issued for.
+    ///
+    /// One registry for background tasks and subagents alike. It is consulted
+    /// lazily at witness time rather than written at each creation site, so a
+    /// creation path that does not know about it — including one added later —
+    /// cannot bypass it. Registering an unseen id assigns a generation;
+    /// re-registering an id whose fingerprint changed means the id was recycled
+    /// onto different work and gets a new one, so a witness can never be
+    /// carried across identities.
+    wait_generations: std::collections::HashMap<String, (u64, String)>,
+    next_wait_generation: u64,
     /// Cancel tokens for in-flight background tasks (#52).
     background_cancels: HashMap<String, CancellationToken>,
     pending_permissions: HashMap<Uuid, PendingPermission>,
@@ -466,11 +480,27 @@ impl RunUsageTracker {
             .flatten()
     }
 
-    fn mark_host_stop(&self, cause: RunStopCause, code: &str) -> Result<()> {
+    /// Record a stop together with its structured qualifier.
+    ///
+    /// The cause and code are written exactly as before; the detail is purely
+    /// additive, so a stop that carries no detail is indistinguishable from one
+    /// recorded before this field existed.
+    fn mark_host_stop_detailed(
+        &self,
+        cause: RunStopCause,
+        code: &str,
+        detail: Option<RunStopDetail>,
+    ) -> Result<()> {
+        // A malformed detail must never block recording the stop itself: the
+        // cause is the fail-closed signal and takes priority over its label.
+        let detail = detail.filter(|detail| detail.validate().is_ok());
         self.store
             .update_run(&self.run_id, |run| {
                 run.error_code = Some(code.into());
                 run.stop_cause = Some(cause);
+                if detail.is_some() {
+                    run.stop_detail = detail.clone();
+                }
                 run.updated_at = Utc::now();
                 Ok(())
             })?
@@ -900,6 +930,8 @@ impl AgentHost {
             subagents: Vec::new(),
             subagent_cancels: HashMap::new(),
             background_tasks: Vec::new(),
+            wait_generations: std::collections::HashMap::new(),
+            next_wait_generation: 1,
             background_cancels: HashMap::new(),
             pending_permissions: HashMap::new(),
             turn_cancels: HashMap::new(),
@@ -2524,6 +2556,7 @@ impl AgentHostHandle {
             final_response: None,
             error_code: None,
             stop_cause: None,
+            stop_detail: None,
             aggregates: RunAggregates::default(),
             progress: None,
             execution,
@@ -4226,8 +4259,18 @@ impl AgentHostHandle {
     }
 
     fn mark_run_stop(&self, session_id: Uuid, cause: RunStopCause, code: &str) -> Result<()> {
+        self.mark_run_stop_detailed(session_id, cause, code, None)
+    }
+
+    fn mark_run_stop_detailed(
+        &self,
+        session_id: Uuid,
+        cause: RunStopCause,
+        code: &str,
+        detail: Option<RunStopDetail>,
+    ) -> Result<()> {
         if let Some(tracker) = self.run_usage_trackers.lock().get(&session_id).cloned() {
-            tracker.mark_host_stop(cause, code)?;
+            tracker.mark_host_stop_detailed(cause, code, detail)?;
         }
         Ok(())
     }
@@ -5004,6 +5047,111 @@ impl AgentHostHandle {
 
     pub fn background_tasks(&self) -> Vec<BackgroundTask> {
         self.inner.lock().background_tasks.clone()
+    }
+
+    /// Generation for an id under the identity the host currently holds for it.
+    ///
+    /// Assigns one on first sight and bumps it when the fingerprint changes,
+    /// which is what an id recycled onto different work looks like. Called only
+    /// for ids the host has already confirmed it owns.
+    fn wait_generation_for(&self, id: &str, fingerprint: &str) -> u64 {
+        let mut g = self.inner.lock();
+        if let Some((generation, seen)) = g.wait_generations.get(id) {
+            if seen == fingerprint {
+                return *generation;
+            }
+        }
+        let generation = g.next_wait_generation;
+        g.next_wait_generation = g.next_wait_generation.saturating_add(1);
+        g.wait_generations
+            .insert(id.to_string(), (generation, fingerprint.to_string()));
+        generation
+    }
+
+    /// Forget ids the host no longer holds, so the registry cannot grow without
+    /// bound across a long-lived session.
+    fn retire_absent_wait_identities(&self) {
+        let live: std::collections::HashSet<String> = self
+            .background_tasks()
+            .into_iter()
+            .map(|task| task.id)
+            .chain(self.subagents().into_iter().map(|sub| sub.id))
+            .collect();
+        self.inner
+            .lock()
+            .wait_generations
+            .retain(|id, _| live.contains(id));
+    }
+
+    /// Issue a witness for a dispatched wait call.
+    ///
+    /// Parses the id exactly as the dispatcher does, so the witness describes
+    /// the call the host actually served. A wait with no id is a *listing*, not
+    /// a wait on anything, and gets no witness.
+    fn witness_dispatched_wait(
+        &self,
+        session_id: Uuid,
+        arguments_json: &str,
+        elapsed_ms: u64,
+    ) -> Option<ActiveTaskWaitWitness> {
+        let args: serde_json::Value = serde_json::from_str(arguments_json).ok()?;
+        let id = args
+            .get("id")
+            .or_else(|| args.get("task_id"))
+            .and_then(|value| value.as_str())?;
+        self.issue_wait_witness(session_id, id, elapsed_ms)
+    }
+
+    /// Issue a wait witness for an id, or refuse.
+    ///
+    /// This is the whole of the exemption's authority. It answers only for ids
+    /// the host has registered, whose status is still outstanding, and whose
+    /// owning session is the one asking. An unknown id, a finished or failed
+    /// task, another session's task, or an id the host never registered all
+    /// return `None`, and the round is then treated as ordinary work.
+    fn issue_wait_witness(
+        &self,
+        session_id: Uuid,
+        id: &str,
+        elapsed_ms: u64,
+    ) -> Option<ActiveTaskWaitWitness> {
+        let owns = |owner: &Option<String>| {
+            owner
+                .as_deref()
+                .and_then(|value| Uuid::parse_str(value).ok())
+                .is_some_and(|owner| owner == session_id)
+        };
+        // Identity fingerprint from stable fields only. Status is deliberately
+        // excluded: a task moving from queued to running is the same work, and
+        // must not look like a recycled id.
+        let (state, fingerprint) =
+            if let Some(task) = self.background_tasks().into_iter().find(|t| t.id == id) {
+                if !owns(&task.session_id) {
+                    return None;
+                }
+                (
+                    ActiveWaitState::from_status(&task.status)?,
+                    format!("task\u{1f}{}\u{1f}{}", task.kind, task.title),
+                )
+            } else if let Some(sub) = self.subagents().into_iter().find(|s| s.id == id) {
+                if !owns(&sub.session_id) {
+                    return None;
+                }
+                (
+                    ActiveWaitState::from_status(&sub.status)?,
+                    format!("subagent\u{1f}{}\u{1f}{}", sub.kind, sub.title),
+                )
+            } else {
+                return None;
+            };
+        self.retire_absent_wait_identities();
+        Some(ActiveTaskWaitWitness {
+            task_id: id.to_string(),
+            state,
+            owner_session: session_id,
+            generation: self.wait_generation_for(id, &fingerprint),
+            deadline_ms: elapsed_ms.saturating_add(WITNESSED_WAIT_DEADLINE_MS),
+        })
     }
 
     pub fn cancel_background_task(&self, id: &str) -> Result<()> {
@@ -8464,6 +8612,9 @@ impl AgentHostHandle {
         // #168: at most one Stop-hook continue per user turn
         let mut stop_continued = false;
         let mut identical_tool_calls = IdenticalToolCallRun::default();
+        // Turn clock, so a witnessed wait has a bounded deadline rather than
+        // an open-ended exemption.
+        let turn_started = std::time::Instant::now();
         let mut test_failure_needs_edit = false;
         // Cargo failures since last successful edit while armed.
         let mut cargo_fails_since_edit: u32 = 0;
@@ -8501,9 +8652,44 @@ impl AgentHostHandle {
             // Give an explicit steering prompt one model boundary to break a
             // stationary run before applying the automatic stop.
             if steering_count == 0 {
+                // An observably inert repeat stops before the identical-call
+                // ceiling. A wait whose observation keeps changing is not inert
+                // and still gets the full budget it has today.
+                if let Some((run_len, tool_name)) = identical_tool_calls.inert_stop_info() {
+                    let msg = action_inert_repeat_stop_message(run_len, &tool_name);
+                    self.mark_run_stop_detailed(
+                        session_id,
+                        RunStopCause::Stationarity,
+                        "stationarity",
+                        Some(
+                            RunStopDetail::new(RunStopDetailKind::InertRepeat, run_len)
+                                .with_tool(&tool_name),
+                        ),
+                    )?;
+                    let _ = event_tx.send(SessionUpdate::AgentProgress {
+                        session_id,
+                        round: round as u32,
+                        max_rounds: visible_max_rounds as u32,
+                        last_tool: Some(tool_name),
+                        detail: msg.clone(),
+                    });
+                    emit_message(event_tx, session_id, &msg);
+                    push_assistant(self, session_id, &msg);
+                    return Ok(msg);
+                }
                 if let Some((run_len, tool_name, true_noop)) = identical_tool_calls.stop_info() {
                     let msg = action_stationarity_stop_message(run_len, &tool_name, true_noop);
-                    self.mark_run_stop(session_id, RunStopCause::Stationarity, "stationarity")?;
+                    let kind = if true_noop {
+                        RunStopDetailKind::TrueNoop
+                    } else {
+                        RunStopDetailKind::IdenticalCalls
+                    };
+                    self.mark_run_stop_detailed(
+                        session_id,
+                        RunStopCause::Stationarity,
+                        "stationarity",
+                        Some(RunStopDetail::new(kind, run_len).with_tool(&tool_name)),
+                    )?;
                     let _ = event_tx.send(SessionUpdate::AgentProgress {
                         session_id,
                         round: round as u32,
@@ -8814,6 +9000,9 @@ impl AgentHostHandle {
                     }));
 
                     let mut edited_while_needs_reverify = false;
+                    // Host-issued witnesses for this round's wait calls. Empty
+                    // unless the host itself vouches for an active task.
+                    let mut round_witnesses: Vec<ActiveTaskWaitWitness> = Vec::new();
                     for tc in &tool_calls {
                         if cancel.is_cancelled() {
                             break;
@@ -8842,17 +9031,34 @@ impl AgentHostHandle {
                             last_tool: Some(tc.name.clone()),
                             detail: format!("Tool `{}` (round {round})", tc.name),
                         });
+                        // Normalize the alias before dispatch so both spellings
+                        // take exactly one path.
+                        let dispatch_name = canonical_tool_name(&tc.name).to_string();
                         let output = self
                             .dispatch_agent_tool(
                                 session_id,
                                 cwd,
-                                &tc.name,
+                                &dispatch_name,
                                 &tc.arguments,
                                 cancel,
                                 event_tx,
                                 &mcp_index,
                             )
                             .await;
+                        // The witness is the host's answer about what that call
+                        // actually named, issued after the call settled. A wait
+                        // that failed, named nothing, named an unknown or
+                        // finished task, or reached for another session's work
+                        // yields no witness and earns no exemption.
+                        if is_wait_shaped_call(tc) && output.is_ok() {
+                            if let Some(witness) = self.witness_dispatched_wait(
+                                session_id,
+                                &tc.arguments,
+                                turn_started.elapsed().as_millis() as u64,
+                            ) {
+                                round_witnesses.push(witness);
+                            }
+                        }
                         let content = match &output {
                             Ok(s) => s.clone(),
                             Err(e) => format!("ERROR: {e}"),
@@ -9028,6 +9234,25 @@ impl AgentHostHandle {
                         tool_name,
                         is_true_noop_tool_step(&tool_calls),
                     );
+                    // The tool results for this round are already in the wire
+                    // context here, so the same call returning the same result
+                    // is detectable without waiting another boundary.
+                    //
+                    // A witnessed wait is exempt: a poll against work owned by
+                    // something else legitimately returns the same answer while
+                    // that work runs, and the deadline that owns it decides when
+                    // it ends. It stays bounded by the identical-call ceiling,
+                    // the round budget, and the duration budget.
+                    if round_is_witnessed_wait(
+                        &tool_calls,
+                        &round_witnesses,
+                        session_id,
+                        turn_started.elapsed().as_millis() as u64,
+                    ) {
+                        identical_tool_calls.observe_witnessed_wait();
+                    } else if let Some(observation) = round_observation_digest(&messages) {
+                        identical_tool_calls.observe_outcome(observation);
+                    }
                     // Usage belongs to the model boundary that produced these
                     // calls. Let every tool in that accepted response settle,
                     // then stop here so the final loop exit cannot overwrite a
@@ -11391,6 +11616,7 @@ mod tests {
             final_response: None,
             error_code: None,
             stop_cause: None,
+            stop_detail: None,
             aggregates: RunAggregates::default(),
             progress: None,
             execution: None,
@@ -11852,6 +12078,7 @@ mod tests {
             final_response: Some("Continue by implementing deterministic recovery.".into()),
             error_code: None,
             stop_cause: Some(RunStopCause::Completed),
+            stop_detail: None,
             aggregates: RunAggregates {
                 changes: vec![crate::orchestration::ChangeRecord {
                     path: "src/recovery.rs".into(),
@@ -11998,6 +12225,7 @@ mod tests {
             final_response: None,
             error_code: None,
             stop_cause: None,
+            stop_detail: None,
             aggregates: RunAggregates::default(),
             progress: None,
             execution: None,
@@ -12290,6 +12518,7 @@ mod tests {
             final_response: None,
             error_code: None,
             stop_cause: None,
+            stop_detail: None,
             aggregates: RunAggregates::default(),
             progress: None,
             execution: None,
@@ -12383,6 +12612,7 @@ mod tests {
             final_response: None,
             error_code: None,
             stop_cause: None,
+            stop_detail: None,
             aggregates: RunAggregates::default(),
             progress: None,
             execution: None,
@@ -12520,5 +12750,230 @@ mod tests {
         assert_eq!(runs[0].state, RunState::LimitReached);
         assert_eq!(runs[0].stop_cause, Some(RunStopCause::DurationLimit));
         assert_eq!(runs[0].bounds.max_duration_ms, 50);
+    }
+}
+
+/// Host-level tests for the active-task wait witness.
+///
+/// The witness is the whole authority behind the stationarity exemption, so
+/// these drive the real host registry rather than a stand-in: a subagent is
+/// registered the way the spawn paths register one, and the host is asked
+/// whether it will vouch for it.
+#[cfg(test)]
+mod wait_witness_tests {
+    use super::*;
+    use crate::host_helpers::AgentToolCall;
+
+    fn host() -> AgentHostHandle {
+        AgentHost::create(HostConfig::default())
+    }
+
+    fn register_subagent(
+        host: &AgentHostHandle,
+        id: &str,
+        session: Uuid,
+        status: &str,
+        kind: &str,
+    ) {
+        host.inner
+            .lock()
+            .subagents
+            .push(crate::types::SubagentInfo {
+                id: id.into(),
+                kind: kind.into(),
+                title: format!("{kind} work"),
+                status: status.into(),
+                session_id: Some(session.to_string()),
+                summary: None,
+                last_tool: None,
+                cwd: None,
+                execution_mode: crate::types::SubagentExecutionMode::default(),
+            });
+    }
+
+    /// A real subagent registered through the normal path is witnessable.
+    ///
+    /// This is the gap the re-review found: generations used to be written only
+    /// by `schedule_background_task`, so genuine subagent polling could never
+    /// be witnessed and was stopped as inert after four unchanged replies.
+    #[test]
+    fn a_registered_subagent_is_witnessed_for_its_owning_session() {
+        let host = host();
+        let session = Uuid::new_v4();
+        register_subagent(&host, "sub-1", session, "running", "explore");
+
+        let witness = host
+            .issue_wait_witness(session, "sub-1", 0)
+            .expect("a live same-session subagent must be witnessable");
+        assert_eq!(witness.task_id, "sub-1");
+        assert_eq!(witness.state, ActiveWaitState::Running);
+        assert_eq!(witness.owner_session, session);
+        assert!(witness.deadline_ms > 0);
+    }
+
+    /// Both dispatch spellings reach the same witness through the same id.
+    #[test]
+    fn either_alias_yields_the_same_witness() {
+        let host = host();
+        let session = Uuid::new_v4();
+        register_subagent(&host, "sub-alias", session, "running", "explore");
+
+        let args = r#"{"id":"sub-alias"}"#;
+        let from_canonical = host.witness_dispatched_wait(session, args, 0);
+        let from_alias = host.witness_dispatched_wait(session, args, 0);
+        assert_eq!(canonical_tool_name("get_task_output"), "task_output");
+        assert_eq!(from_canonical, from_alias);
+        assert!(from_canonical.is_some());
+    }
+
+    /// Negative controls: every one of these must refuse a witness.
+    #[test]
+    fn the_host_refuses_to_vouch_for_anything_it_does_not_own_and_outstanding() {
+        let host = host();
+        let session = Uuid::new_v4();
+        let foreign = Uuid::new_v4();
+
+        // Unknown id.
+        assert!(host.issue_wait_witness(session, "nobody", 0).is_none());
+
+        // Another session's subagent.
+        register_subagent(&host, "sub-foreign", foreign, "running", "explore");
+        assert!(host.issue_wait_witness(session, "sub-foreign", 0).is_none());
+
+        // Finished work, in every terminal spelling.
+        for (index, status) in ["done", "failed", "cancelled", "rejected"]
+            .iter()
+            .enumerate()
+        {
+            let id = format!("sub-term-{index}");
+            register_subagent(&host, &id, session, status, "explore");
+            assert!(
+                host.issue_wait_witness(session, &id, 0).is_none(),
+                "{status} is not outstanding work"
+            );
+        }
+
+        // No id at all: a listing, not a wait on anything.
+        assert!(host.witness_dispatched_wait(session, "{}", 0).is_none());
+        // Malformed arguments.
+        assert!(host
+            .witness_dispatched_wait(session, "not json", 0)
+            .is_none());
+    }
+
+    /// A recycled id gets a new generation, so a witness cannot be carried
+    /// across identities.
+    #[test]
+    fn recycling_an_id_onto_different_work_changes_the_generation() {
+        let host = host();
+        let session = Uuid::new_v4();
+        register_subagent(&host, "sub-recycled", session, "running", "explore");
+        let first = host
+            .issue_wait_witness(session, "sub-recycled", 0)
+            .expect("first identity");
+
+        // Same id, different work: replace the registry entry the way a
+        // restore or a reuse would.
+        host.inner.lock().subagents.clear();
+        register_subagent(&host, "sub-recycled", session, "running", "general_purpose");
+        let second = host
+            .issue_wait_witness(session, "sub-recycled", 0)
+            .expect("second identity");
+
+        assert_ne!(
+            first.generation, second.generation,
+            "a recycled id must not inherit the previous generation"
+        );
+    }
+
+    /// A status change is not a recycle: queued work that starts running is the
+    /// same work and keeps its generation.
+    #[test]
+    fn a_status_change_does_not_look_like_a_recycle() {
+        let host = host();
+        let session = Uuid::new_v4();
+        register_subagent(&host, "sub-progress", session, "accepted", "explore");
+        let queued = host
+            .issue_wait_witness(session, "sub-progress", 0)
+            .expect("queued is outstanding");
+        assert_eq!(queued.state, ActiveWaitState::Queued);
+
+        host.inner
+            .lock()
+            .subagents
+            .iter_mut()
+            .for_each(|sub| sub.status = "running".into());
+        let running = host
+            .issue_wait_witness(session, "sub-progress", 0)
+            .expect("still outstanding");
+        assert_eq!(running.state, ActiveWaitState::Running);
+        assert_eq!(
+            queued.generation, running.generation,
+            "the same work must keep its generation"
+        );
+    }
+
+    /// Repeated unchanged replies against a live subagent stay exempt, which is
+    /// the behaviour the whole witness exists to protect.
+    #[test]
+    fn repeated_unchanged_replies_from_a_live_subagent_are_never_inert() {
+        let host = host();
+        let session = Uuid::new_v4();
+        register_subagent(&host, "sub-poll", session, "running", "explore");
+
+        let calls = [AgentToolCall {
+            id: "c".into(),
+            name: "get_task_output".into(),
+            arguments: r#"{"id":"sub-poll"}"#.into(),
+        }];
+        let mut run = IdenticalToolCallRun::default();
+        for step in 0..12u32 {
+            let witness = host
+                .witness_dispatched_wait(session, &calls[0].arguments, u64::from(step))
+                .expect("the host still vouches for live work");
+            run.observe(&tool_step_signature(&calls), "task_output", false);
+            if round_is_witnessed_wait(&calls, &[witness], session, u64::from(step)) {
+                run.observe_witnessed_wait();
+            } else if let Some(digest) = round_observation_digest(&[
+                serde_json::json!({"role": "assistant", "content": ""}),
+                serde_json::json!({"role": "tool", "content": "subagent sub-poll status=running"}),
+            ]) {
+                run.observe_outcome(digest);
+            }
+            assert!(
+                run.inert_stop_info().is_none(),
+                "a live subagent poll was called inert at step {step}"
+            );
+        }
+    }
+
+    /// Once the deadline passes, the exemption lapses and the ordinary gates
+    /// resume — the wait is bounded, not open-ended.
+    #[test]
+    fn an_expired_witness_stops_exempting_the_round() {
+        let host = host();
+        let session = Uuid::new_v4();
+        register_subagent(&host, "sub-expiring", session, "running", "explore");
+        let witness = host
+            .issue_wait_witness(session, "sub-expiring", 0)
+            .expect("witnessable");
+
+        let calls = [AgentToolCall {
+            id: "c".into(),
+            name: "task_output".into(),
+            arguments: r#"{"id":"sub-expiring"}"#.into(),
+        }];
+        assert!(round_is_witnessed_wait(
+            &calls,
+            std::slice::from_ref(&witness),
+            session,
+            0
+        ));
+        assert!(!round_is_witnessed_wait(
+            &calls,
+            &[witness],
+            session,
+            WITNESSED_WAIT_DEADLINE_MS + 1
+        ));
     }
 }

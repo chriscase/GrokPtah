@@ -1079,6 +1079,7 @@ fn restart_interrupted_no_auto_resume() {
         final_response: None,
         error_code: None,
         stop_cause: None,
+        stop_detail: None,
         aggregates: Default::default(),
         progress: None,
         execution: None,
@@ -1122,6 +1123,7 @@ fn restart_clears_queued_admission_position() {
         final_response: None,
         error_code: None,
         stop_cause: None,
+        stop_detail: None,
         aggregates: Default::default(),
         progress: None,
         execution: None,
@@ -1184,6 +1186,7 @@ async fn interrupted_run_retry_is_explicit_linked_and_idempotent() {
             final_response: None,
             error_code: Some("interrupted".into()),
             stop_cause: None,
+            stop_detail: None,
             aggregates: Default::default(),
             progress: None,
             execution: None,
@@ -1871,6 +1874,7 @@ fn run_event_pages_filter_before_limit_across_sessions() {
             final_response: None,
             error_code: None,
             stop_cause: None,
+            stop_detail: None,
             aggregates: Default::default(),
             progress: None,
             execution: None,
@@ -2616,6 +2620,62 @@ async fn dropping_control_service_releases_pending_admission_slot() {
         .unwrap();
     set_grokptah_home_override(None);
     std::env::remove_var("GROKPTAH_AGENT_OFFLINE");
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn the_progress_projection_is_redacted_and_reports_the_stop_detail() {
+    let (home, _lock) = setup_home();
+    let host = started_host();
+    let ws = tempdir().unwrap();
+    host.set_project_cwd(ws.path()).unwrap();
+    let session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(session.id, ws.path()).unwrap();
+    let orch = orch_for(&host, &home, &ws, 2);
+    let auth = orch.auth_header(Some("Bearer t")).unwrap();
+
+    let secret_prompt = "SENSITIVE-PROMPT /home/someone/.ssh/id_ed25519 hunter2";
+    let accepted = orch
+        .submit_task(
+            &auth,
+            "redaction-1",
+            session.id,
+            ws.path(),
+            secret_prompt.into(),
+            None,
+        )
+        .await
+        .unwrap();
+    let run_id = accepted["runId"].as_str().unwrap().to_string();
+
+    let progress = orch.get_progress(&auth, &run_id).unwrap();
+    let encoded = serde_json::to_string(&progress).unwrap();
+
+    // The user's own prompt must not ride along on a status read.
+    assert!(
+        progress.get("promptPreview").is_none(),
+        "progress projection still exposes promptPreview"
+    );
+    for leak in ["SENSITIVE-PROMPT", "/home/someone", "id_ed25519", "hunter2"] {
+        assert!(!encoded.contains(leak), "progress projection leaked {leak}");
+    }
+
+    // What it does carry is the structured, operator-readable stop.
+    // The projection is versioned, so a consumer can tell shape 2 (redacted,
+    // with stopDetail) from the historical shape 1 that carried promptPreview.
+    assert_eq!(progress["schemaVersion"], 2);
+    // Detail-bearing assertions live in the in-crate contract module: a stop
+    // detail cannot be minted from outside the crate, which is the point.
+    orch.cancel(
+        &auth,
+        "redaction-cancel",
+        session.id,
+        ws.path(),
+        Some(&run_id),
+    )
+    .await
+    .unwrap();
+    set_grokptah_home_override(None);
 }
 
 #[tokio::test]

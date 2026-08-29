@@ -8,7 +8,8 @@ pub(crate) mod managed;
 mod manager;
 mod message;
 mod routine;
-mod service;
+pub(crate) mod service;
+mod stop_detail_contract;
 mod store;
 mod supervisor;
 mod types;
@@ -68,9 +69,11 @@ pub use types::{
     AgentModelSpec, AgentRecord, AgentResumePlan, AgentRuntimeState, AgentSpec, AgentState,
     AuditEntry, ChangeRecord, ContinuationCheckpoint, ContinuationReason, IdempotencyReceipt,
     OrchError, OrchErrorCode, PromotionState, RunAggregates, RunApproval, RunBounds, RunExecution,
-    RunExecutionMode, RunProgress, RunPurpose, RunRecord, RunState, RunStopCause, TestObservation,
-    AGENT_SPEC_SCHEMA_VERSION, CONTROL_TOOLS, DEFAULT_AGENT_TOOL_IDS,
-    DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS, FORBIDDEN_TOOLS, MAX_AGENT_CONTEXT_BYTES,
+    RunExecutionMode, RunProgress, RunPurpose, RunRecord, RunState, RunStopCause, RunStopDetail,
+    RunStopDetailKind, RunStopTool, TestObservation, AGENT_SPEC_SCHEMA_VERSION, CONTROL_TOOLS,
+    DEFAULT_AGENT_TOOL_IDS, DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS, FORBIDDEN_TOOLS,
+    MAX_AGENT_CONTEXT_BYTES, MIN_REPEATS_IDENTICAL_CALLS, MIN_REPEATS_INERT_REPEAT,
+    MIN_REPEATS_TRUE_NOOP, PROGRESS_PROJECTION_SCHEMA_VERSION,
 };
 pub use worker::{
     reject_privilege_amplification, MeasuredCapability, WorkerHostKind, WorkerLivenessState,

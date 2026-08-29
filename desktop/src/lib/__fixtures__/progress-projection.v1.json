@@ -1,0 +1,14 @@
+{
+  "bounds": {
+    "maxDurationMs": 900000,
+    "maxPromptBytes": 100000,
+    "maxRounds": 24,
+    "maxTotalTokens": null
+  },
+  "promptPreview": "the user's own prompt text",
+  "runId": "run-fixture",
+  "schemaVersion": 1,
+  "sessionId": "00000000-0000-4000-8000-000000000000",
+  "state": "limit_reached",
+  "stopCause": "stationarity"
+}

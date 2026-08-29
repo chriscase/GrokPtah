@@ -169,6 +169,69 @@ describe("RunInspector", () => {
     expect(screen.getByRole("status")).toHaveTextContent("Stop cause: token ceiling");
   });
 
+  it("renders the stationarity stop detail as operator-readable text", () => {
+    render(
+      <RunInspector
+        runs={[
+          run({
+            state: "limit_reached",
+            stopCause: "stationarity",
+            stopDetail: {
+              kind: "inert_repeat",
+              repeats: 4,
+              tool: "task_output",
+            },
+          }),
+        ]}
+        onRefresh={vi.fn()}
+        {...actions}
+      />,
+    );
+
+    const callout = screen.getByRole("status");
+    expect(callout).toHaveTextContent("Stop cause: stationarity");
+    // The kind must be distinguishable without reading the stop prose: an
+    // inert repeat is not the same problem as a plain identical-call run.
+    expect(callout).toHaveTextContent(
+      "4 identical calls that each returned the same result",
+    );
+    expect(callout).toHaveTextContent("task_output");
+  });
+
+  it("distinguishes a plain identical-call stop from an inert repeat", () => {
+    render(
+      <RunInspector
+        runs={[
+          run({
+            state: "limit_reached",
+            stopCause: "stationarity",
+            stopDetail: { kind: "identical_calls", repeats: 16, tool: "read_file" },
+          }),
+        ]}
+        onRefresh={vi.fn()}
+        {...actions}
+      />,
+    );
+
+    const callout = screen.getByRole("status");
+    expect(callout).toHaveTextContent("16 identical calls");
+    expect(callout.textContent).not.toContain("returned the same result");
+  });
+
+  it("renders no stop detail when the run carries none", () => {
+    render(
+      <RunInspector
+        runs={[run({ state: "limit_reached", stopCause: "round_limit" })]}
+        onRefresh={vi.fn()}
+        {...actions}
+      />,
+    );
+
+    const callout = screen.getByRole("status");
+    expect(callout).toHaveTextContent("Stop cause: round limit");
+    expect(callout.textContent).not.toContain("identical calls");
+  });
+
   it("renders live remote events and routes scoped controls", async () => {
     const onSteer = vi.fn(async () => undefined);
     const onCancel = vi.fn(async () => undefined);

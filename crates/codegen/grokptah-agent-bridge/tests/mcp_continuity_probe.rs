@@ -80,6 +80,7 @@ fn seed_run(
             final_response: None,
             error_code: (state == RunState::Interrupted).then(|| "interrupted".into()),
             stop_cause: None,
+            stop_detail: None,
             aggregates: Default::default(),
             progress: None,
             execution: None,

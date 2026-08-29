@@ -1753,6 +1753,7 @@ async fn http_retry_interrupted_run_is_explicit_and_idempotent() {
             final_response: None,
             error_code: Some("interrupted".into()),
             stop_cause: None,
+            stop_detail: None,
             aggregates: Default::default(),
             progress: None,
             execution: None,

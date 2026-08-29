@@ -49,6 +49,10 @@ struct OrchStoreInner {
     _store_lock: fs::File,
     lock: Mutex<()>,
     last_run_error: Mutex<Option<String>>,
+    /// Run records omitted from listings because they failed semantic
+    /// validation. Silence here would let a Run disappear with nothing
+    /// reporting it, so the count is observable.
+    malformed_run_records: Mutex<usize>,
     last_audit_error: Arc<Mutex<Option<String>>>,
     audit_file_lock: Arc<Mutex<()>>,
     audit_writer: AuditWriter,
@@ -222,6 +226,7 @@ impl OrchStore {
                 _store_lock: store_lock,
                 lock: Mutex::new(()),
                 last_run_error: Mutex::new(None),
+                malformed_run_records: Mutex::new(0),
                 last_audit_error,
                 audit_file_lock,
                 audit_writer: AuditWriter {
@@ -420,6 +425,13 @@ impl OrchStore {
     }
 
     pub fn save_run(&self, run: &RunRecord) -> anyhow::Result<()> {
+        // The cross-field invariant is restored here rather than enforced by
+        // refusal, so a cancel or interrupt on a run that had stopped for
+        // stationarity still writes. What remains after normalization must be
+        // well formed: a zero repeat count or an unattributed detail is a caller
+        // bug, not a transition, and is refused.
+        let run = prepared_run(run)?;
+        let run = &run;
         let _g = self.inner.lock.lock();
         let result = self
             .run_path(&run.run_id)
@@ -483,13 +495,14 @@ impl OrchStore {
         let intent_path = self
             .agent_activation_path(&run.run_id)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let run = prepared_run(run)?;
         let intent = AgentActivationIntent {
             run: run.clone(),
             activated_agent: agent.clone(),
             prior_run: None,
         };
         atomic_write_json(&intent_path, &intent)?;
-        if let Err(error) = atomic_write_json(&run_path, run) {
+        if let Err(error) = atomic_write_json(&run_path, &run) {
             let run_rollback = match fs::symlink_metadata(&run_path) {
                 Ok(_) => remove_file_durable(&run_path),
                 Err(metadata_error) if metadata_error.kind() == std::io::ErrorKind::NotFound => {
@@ -596,6 +609,8 @@ impl OrchStore {
         let intent_path = self
             .agent_activation_path(run_id)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let run = prepared_run(&run)?;
+        let prior_run = prepared_run(&prior_run)?;
         let intent = AgentActivationIntent {
             run: run.clone(),
             activated_agent: agent.clone(),
@@ -667,7 +682,13 @@ impl OrchStore {
             return Ok(None);
         }
         let text = fs::read_to_string(&path)?;
-        Ok(Some(serde_json::from_str(&text)?))
+        let run: RunRecord = serde_json::from_str(&text)?;
+        // Durable data is not automatically trustworthy: a record whose stop
+        // detail violates the contract is refused rather than handed to a
+        // caller that would render it as fact.
+        run.validate_stop_detail()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        Ok(Some(run))
     }
 
     /// Atomically read, mutate, and replace a run record.
@@ -680,6 +701,9 @@ impl OrchStore {
             return Ok(None);
         };
         update(&mut run)?;
+        // Same normalization as `save_run`: a closure that moves the cause off
+        // stationarity drops the detail with it.
+        let run = prepared_run(&run)?;
         let path = self
             .run_path(run_id)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
@@ -704,7 +728,29 @@ impl OrchStore {
             }
             if let Ok(text) = fs::read_to_string(e.path()) {
                 if let Ok(r) = serde_json::from_str::<RunRecord>(&text) {
-                    out.push(r);
+                    // Same rule as the single-record read: a record carrying a
+                    // malformed stop detail is omitted, never listed as fact.
+                    // Omission is reported rather than silent — a Run vanishing
+                    // from a listing with nothing to show for it is how a
+                    // durable defect stays invisible.
+                    match r.validate_stop_detail() {
+                        Ok(()) => out.push(r),
+                        Err(error) => {
+                            *self.inner.malformed_run_records.lock() += 1;
+                            *self.inner.last_run_error.lock() =
+                                Some(format!("run {} omitted: {error}", r.run_id));
+                            let _ = self.enqueue_audit(AuditEntry {
+                                ts: Utc::now(),
+                                tool: "store_health".into(),
+                                request_id: None,
+                                session_id: Some(r.session_id),
+                                workspace: Some(r.workspace.clone()),
+                                outcome: "malformed_run_omitted".into(),
+                                error_code: Some("invalid_stop_detail".into()),
+                                detail: format!("run {} failed semantic validation", r.run_id),
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -4756,7 +4802,15 @@ impl OrchStore {
                         if final_run.stop_cause == Some(RunStopCause::TokenAccountingUnavailable) {
                             let code = "max_total_tokens_usage_unavailable";
                             final_run.terminal_result = Some(code.into());
-                            final_run.error_code = Some(code.into());
+                            // The accounting override replaces the cause, so
+                            // the whole observation moves: a stationarity
+                            // detail attached to the cause it replaced would
+                            // otherwise install here and be refused on read.
+                            final_run.set_stop_observation(
+                                RunStopCause::TokenAccountingUnavailable,
+                                Some(code),
+                                None,
+                            );
                         } else {
                             final_run.terminal_result = current.terminal_result;
                             final_run.error_code = current.error_code;
@@ -4772,6 +4826,10 @@ impl OrchStore {
                 }
             }
         }
+        // Everything installed from here is prepared once, so the intent on
+        // disk and the record that replaces it are the same canonical shape and
+        // both are readable back by `load_run`.
+        let final_run = prepared_run(&final_run)?;
         let intent_path = self
             .finalization_path(&candidate.run_id)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
@@ -4983,6 +5041,13 @@ impl OrchStore {
         self.inner.last_audit_error.lock().clone()
     }
 
+    /// Number of Run records omitted from listings for failing semantic
+    /// validation since this store was opened. Non-zero means durable data is
+    /// inconsistent and something is not being shown.
+    pub fn malformed_run_records(&self) -> usize {
+        *self.inner.malformed_run_records.lock()
+    }
+
     pub fn last_run_error(&self) -> Option<String> {
         self.inner.last_run_error.lock().clone()
     }
@@ -5089,6 +5154,10 @@ impl OrchStore {
                     "Agent activation recovery conflicts with another active Run"
                 );
             }
+            validated_recovery_run(&intent.run, "Agent activation recovery Run")?;
+            if let Some(prior) = intent.prior_run.as_ref() {
+                validated_recovery_run(prior, "Agent activation recovery prior Run")?;
+            }
             atomic_write_json(&run_path, &intent.run)?;
             atomic_write_json(&agent_path, &intent.activated_agent)?;
             remove_file_durable(&path)?;
@@ -5107,6 +5176,7 @@ impl OrchStore {
             }
             let text = fs::read_to_string(&path)?;
             let candidate: RunRecord = serde_json::from_str(&text)?;
+            validated_recovery_run(&candidate, "finalization intent")?;
             self.persist_finalization(&candidate)?;
             recovered += 1;
         }
@@ -5151,6 +5221,32 @@ fn safe_to_expire_run(run: &RunRecord) -> bool {
         .as_ref()
         .map(|execution| !Path::new(&execution.execution_workspace).exists())
         .unwrap_or(true)
+}
+
+/// The one preparation boundary for durable Run writes.
+///
+/// Every path that installs a Run — save, update, agent activation, activation
+/// rollback, finalization, finalization intents, and both restart recovery
+/// passes — goes through here. A writer that bypasses it can persist a record
+/// that `load_run` will later refuse, which is how a Run becomes invisible to
+/// `list_runs` without anything reporting an error.
+fn prepared_run(run: &RunRecord) -> anyhow::Result<RunRecord> {
+    let mut prepared = run.clone();
+    prepared
+        .prepare_for_persist()
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    Ok(prepared)
+}
+
+/// Strict gate for a recovery intent read back off disk.
+///
+/// Recovery replays a record written before a crash. It is durable data of
+/// unknown age, so it is validated exactly rather than normalized: silently
+/// repairing a recovery intent would hide the very corruption recovery exists
+/// to surface.
+fn validated_recovery_run(run: &RunRecord, what: &str) -> anyhow::Result<()> {
+    run.validate_stop_detail()
+        .map_err(|error| anyhow::anyhow!("{what} is not a valid Run record: {error}"))
 }
 
 fn merge_run_observations(target: &mut RunRecord, current: &RunRecord) {
@@ -5369,6 +5465,7 @@ mod tests {
             final_response: Some("done".into()),
             error_code: None,
             stop_cause: None,
+            stop_detail: None,
             aggregates: Default::default(),
             progress: None,
             execution: None,
@@ -5427,6 +5524,7 @@ mod tests {
             final_response: None,
             error_code: None,
             stop_cause: None,
+            stop_detail: None,
             aggregates: Default::default(),
             progress: None,
             execution: None,
@@ -5793,6 +5891,7 @@ mod tests {
             final_response: None,
             error_code: None,
             stop_cause: None,
+            stop_detail: None,
             aggregates: Default::default(),
             progress: None,
             execution: None,
@@ -6028,6 +6127,7 @@ mod tests {
             final_response: None,
             error_code: None,
             stop_cause: None,
+            stop_detail: None,
             aggregates: Default::default(),
             progress: None,
             execution: None,

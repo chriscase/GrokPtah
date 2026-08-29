@@ -426,9 +426,30 @@ pub(crate) struct AgentToolCall {
 const MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS: u32 = 16;
 const NUDGE_AFTER_IDENTICAL_TOOL_CALLS: u32 = 8;
 const MAX_CONSECUTIVE_TRUE_NOOPS: u32 = 4;
+/// Ceiling for a repeat that is *also* observably inert: the same call
+/// signature returning the same observation.
+///
+/// Deliberately below every other ceiling. This threshold can only ever stop a
+/// turn sooner than the existing ones would have; it never extends one.
+const MAX_CONSECUTIVE_INERT_REPEATS: u32 = 4;
 
 const _: () = assert!(NUDGE_AFTER_IDENTICAL_TOOL_CALLS < MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS);
 const _: () = assert!(MAX_CONSECUTIVE_TRUE_NOOPS < NUDGE_AFTER_IDENTICAL_TOOL_CALLS);
+// The inert ceiling must never exceed any existing ceiling, or this would
+// become a way to run *longer* than the current gate allows. Enforced at
+// compile time so the relation cannot be edited away silently.
+const _: () = assert!(MAX_CONSECUTIVE_INERT_REPEATS <= MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS);
+const _: () = assert!(MAX_CONSECUTIVE_INERT_REPEATS <= MAX_CONSECUTIVE_TRUE_NOOPS);
+// The durable contract states the smallest repeat count each detector can
+// report. If a ceiling here moved without the contract moving with it, a
+// genuine stop would be rejected as unattributable, so the two are pinned
+// together at compile time.
+const _: () = assert!(
+    MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS == crate::orchestration::MIN_REPEATS_IDENTICAL_CALLS
+);
+const _: () = assert!(MAX_CONSECUTIVE_TRUE_NOOPS == crate::orchestration::MIN_REPEATS_TRUE_NOOP);
+const _: () =
+    assert!(MAX_CONSECUTIVE_INERT_REPEATS == crate::orchestration::MIN_REPEATS_INERT_REPEAT);
 
 /// Tracks action stationarity within one model turn (#209).
 ///
@@ -442,6 +463,14 @@ pub(crate) struct IdenticalToolCallRun {
     run_len: u32,
     is_true_noop_run: bool,
     nudged: bool,
+    /// Fingerprint of the observation the previous identical call produced.
+    /// In-process only; see [`ObservationDigest`].
+    last_observation: Option<ObservationDigest>,
+    /// Consecutive rounds where the call signature *and* its observation both
+    /// repeated. This is what separates a stuck loop from a productive wait:
+    /// polling that keeps returning fresh output is not inert, and keeps the
+    /// full identical-call budget it has today.
+    inert_run_len: u32,
 }
 
 impl IdenticalToolCallRun {
@@ -463,6 +492,8 @@ impl IdenticalToolCallRun {
             self.last_signature_hash = Some(hash);
             self.is_true_noop_run = is_true_noop;
             self.nudged = false;
+            self.last_observation = None;
+            self.inert_run_len = 0;
         }
         self.tool_name = tool_name.to_string();
         self.run_len
@@ -481,6 +512,42 @@ impl IdenticalToolCallRun {
 
     pub(crate) fn tool_name(&self) -> String {
         self.tool_name.clone()
+    }
+
+    /// Record what the round's tool calls actually produced.
+    ///
+    /// Called after [`Self::observe`] for the same round, once the tool results
+    /// are in the wire context. An observation that differs from the previous
+    /// one means something outside the model moved, so the inert run restarts.
+    pub(crate) fn observe_outcome(&mut self, observation: ObservationDigest) {
+        if self.last_observation == Some(observation) {
+            self.inert_run_len = self.inert_run_len.saturating_add(1);
+        } else {
+            self.inert_run_len = 1;
+        }
+        self.last_observation = Some(observation);
+    }
+
+    /// Exempt this round from the inert heuristic.
+    ///
+    /// A witnessed wait that returns the same thing is not stuck; whether it
+    /// should end is for the deadline that owns it to decide. The pre-existing
+    /// identical-call ceiling, nudge, round budget, and duration budget all
+    /// still apply, so the wait stays bounded by the authority that was already
+    /// there.
+    pub(crate) fn observe_witnessed_wait(&mut self) {
+        self.inert_run_len = 0;
+        self.last_observation = None;
+    }
+
+    /// The tighter stop: the same call returning the same observation.
+    ///
+    /// Checked before [`Self::stop_info`], and never instead of it — this can
+    /// only fire earlier than the identical-call ceiling, so no turn that stops
+    /// today survives longer because of it.
+    pub(crate) fn inert_stop_info(&self) -> Option<(u32, String)> {
+        (self.inert_run_len >= MAX_CONSECUTIVE_INERT_REPEATS)
+            .then(|| (self.inert_run_len, self.tool_name.clone()))
     }
 
     pub(crate) fn stop_info(&self) -> Option<(u32, String, bool)> {
@@ -518,7 +585,16 @@ pub(crate) fn is_true_noop_tool_step(tool_calls: &[AgentToolCall]) -> bool {
 pub(crate) fn tool_step_signature(tool_calls: &[AgentToolCall]) -> String {
     tool_calls
         .iter()
-        .map(|tool_call| format!("{}\u{1f}{}", tool_call.name, tool_call.arguments))
+        .map(|tool_call| {
+            // Canonical name, so alternating `task_output` and
+            // `get_task_output` produces one signature run rather than two
+            // that each reset the counter and never accumulate.
+            format!(
+                "{}\u{1f}{}",
+                canonical_tool_name(&tool_call.name),
+                tool_call.arguments
+            )
+        })
         .collect::<Vec<_>>()
         .join("\u{1e}")
 }
@@ -545,6 +621,183 @@ pub(crate) fn action_stationarity_stop_message(
         "Stopped after {run_len} consecutive {reason} (`{tool_name}`) without making progress. \
          Ask me to continue with a different approach."
     )
+}
+
+/// Stop message for an observably inert repeat.
+///
+/// Shares the `Stopped after ... without making progress.` shape of
+/// [`action_stationarity_stop_message`] so the existing incomplete-stop
+/// detection classifies it without modification, while still saying plainly
+/// that the observation never changed.
+pub(crate) fn action_inert_repeat_stop_message(run_len: u32, tool_name: &str) -> String {
+    format!(
+        "Stopped after {run_len} consecutive identical tool calls (`{tool_name}`) that each \
+         returned the same result, without making progress. Ask me to continue with a \
+         different approach."
+    )
+}
+
+/// Canonical name for a wait/status call.
+///
+/// The dispatcher accepts both `task_output` and `get_task_output`. Leaving the
+/// alias unnormalized meant the two produced different call signatures, so a
+/// model alternating them never accumulated a stationarity run at all, while
+/// only one of them was eligible for the wait exemption. Normalizing before the
+/// signature, the dispatch and the witness closes both halves of that.
+pub(crate) fn canonical_tool_name(name: &str) -> &str {
+    match name {
+        "get_task_output" => "task_output",
+        other => other,
+    }
+}
+
+/// Whether a call is *shaped* like a wait. Not sufficient for the exemption:
+/// the host still has to witness an authorized, active task behind it.
+pub(crate) fn is_wait_shaped_call(call: &AgentToolCall) -> bool {
+    canonical_tool_name(&call.name) == "task_output"
+}
+
+/// Typed active state of a task the host is willing to witness.
+///
+/// Only states in which work is genuinely outstanding. Completed, failed,
+/// cancelled and rejected tasks are absent by construction: there is nothing
+/// left to wait for, so a poll against one is an ordinary repeated call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ActiveWaitState {
+    Queued,
+    Running,
+}
+
+impl ActiveWaitState {
+    /// Map a host task status onto an active state, or `None` when the task is
+    /// not outstanding. Exact matches only.
+    pub(crate) fn from_status(status: &str) -> Option<Self> {
+        match status {
+            "running" => Some(Self::Running),
+            "accepted" | "proposed" => Some(Self::Queued),
+            _ => None,
+        }
+    }
+}
+
+/// Host-issued evidence that a wait call named real, authorized, outstanding
+/// work.
+///
+/// Issued by the dispatcher, which is the only place that can see the task
+/// registry. The model supplies an id; everything in here is the host's answer
+/// about that id, so a wait cannot be asserted into existence by naming one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ActiveTaskWaitWitness {
+    /// The exact id the host authorized, not the id the model asked for.
+    pub(crate) task_id: String,
+    pub(crate) state: ActiveWaitState,
+    /// Session that owns the task. A poll against another session's work is
+    /// not this run's wait.
+    pub(crate) owner_session: Uuid,
+    /// Host-assigned generation for this id. A recycled id gets a new
+    /// generation, so a witness cannot be carried across identities.
+    pub(crate) generation: u64,
+    /// Absolute deadline, in run-relative milliseconds, past which the wait is
+    /// no longer witnessed and the ordinary gates resume.
+    pub(crate) deadline_ms: u64,
+}
+
+/// Longest a single wait is witnessed before the ordinary stationarity gates
+/// resume. Bounded so an abandoned task cannot confer an unlimited exemption.
+pub(crate) const WITNESSED_WAIT_DEADLINE_MS: u64 = 10 * 60 * 1000;
+
+/// Whether a round earns the wait exemption.
+///
+/// Every call in the round must be wait-shaped *and* carry a witness, all
+/// witnesses must belong to the current session, and none may be past its
+/// deadline. A round mixing a poll with real work, naming an unknown or
+/// finished task, or reaching for another session's task fails all of these and
+/// is treated as an ordinary round.
+pub(crate) fn round_is_witnessed_wait(
+    tool_calls: &[AgentToolCall],
+    witnesses: &[ActiveTaskWaitWitness],
+    session_id: Uuid,
+    elapsed_ms: u64,
+) -> bool {
+    !tool_calls.is_empty()
+        && witnesses.len() == tool_calls.len()
+        && tool_calls.iter().all(is_wait_shaped_call)
+        && witnesses
+            .iter()
+            .all(|witness| witness.owner_session == session_id && elapsed_ms < witness.deadline_ms)
+}
+
+/// In-process fingerprint of a round's observations.
+///
+/// Deliberately opaque: no `Serialize`, no `Display`, no accessor to the bytes.
+/// The type system is what guarantees this never reaches a durable record or a
+/// read projection — it cannot be written to one. It exists only so two rounds
+/// in the same turn can be compared for equality.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ObservationDigest([u8; 32]);
+
+impl std::fmt::Debug for ObservationDigest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print the value: a debug log is an exposure channel too.
+        f.write_str("ObservationDigest(<redacted>)")
+    }
+}
+
+/// Exact fingerprint of the observations this round's tool calls produced.
+///
+/// This hashes the **full** tool-result content, not a summary of it. An earlier
+/// revision hashed a content-free feature vector (length, line count, digit
+/// histogram, emptiness) so the value would be safe to persist. That was wrong
+/// twice over: the vector is small enough to enumerate, so persisting it leaked
+/// more than claimed, and — far worse — it collided. Two equal-width results
+/// such as `"phase: build"` and `"phase: test"` produced the same fingerprint,
+/// so a status line that was genuinely advancing looked frozen and the turn was
+/// stopped with a message asserting every result had been identical. That
+/// assertion would have been false.
+///
+/// Hashing the real content removes the collision. It is safe precisely because
+/// the result never leaves the process: it is compared against the previous
+/// round and discarded, it is not persisted on the stop detail, and it is not
+/// projected. [`ObservationDigest`] cannot be serialized, so that is structural
+/// rather than a convention.
+///
+/// Each content is length-prefixed before hashing, so `["ab","c"]` and
+/// `["a","bc"]` cannot collide. Scope is this round only: the walk stops at the
+/// model boundary that issued the calls and skips host-authored coaching, which
+/// is not an observation. `None` when the round produced no tool result, which
+/// keeps an inert run from advancing on nothing.
+pub(crate) fn round_observation_digest(
+    messages: &[serde_json::Value],
+) -> Option<ObservationDigest> {
+    use sha2::{Digest, Sha256};
+
+    let mut contents: Vec<&str> = Vec::new();
+    for message in messages.iter().rev() {
+        match message.get("role").and_then(serde_json::Value::as_str) {
+            Some("tool") => {
+                contents.push(
+                    message
+                        .get("content")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or(""),
+                );
+            }
+            Some("system") => {}
+            _ => break,
+        }
+    }
+    if contents.is_empty() {
+        return None;
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"grokptah.observation.v2\n");
+    hasher.update((contents.len() as u64).to_be_bytes());
+    for content in contents.iter().rev() {
+        hasher.update((content.len() as u64).to_be_bytes());
+        hasher.update(content.as_bytes());
+    }
+    Some(ObservationDigest(hasher.finalize().into()))
 }
 
 pub(crate) enum AgentStep {
@@ -4267,5 +4520,593 @@ test result: FAILED. 0 passed; 3 failed; 0 ignored
         assert!(stationarity.contains("true no-op tool calls"));
         assert!(!is_round_limit_stop_message(&stationarity));
         assert!(round_limit_stop_message(4).contains("tool rounds without a final answer"));
+    }
+
+    // ---- observably inert repeats (productive wait vs stuck loop) ----
+
+    fn tool_msg(content: &str) -> serde_json::Value {
+        serde_json::json!({"role": "tool", "tool_call_id": "c", "content": content})
+    }
+
+    /// Drive one round: the model issues `sig`, and the tools return `observed`.
+    fn round(run: &mut IdenticalToolCallRun, sig: &str, observed: &str) {
+        run.observe(sig, "get_task_output", false);
+        let messages = vec![
+            serde_json::json!({"role": "assistant", "content": ""}),
+            tool_msg(observed),
+        ];
+        let digest = round_observation_digest(&messages).expect("round produced a result");
+        run.observe_outcome(digest);
+    }
+
+    #[test]
+    fn an_inert_repeat_stops_before_the_identical_call_ceiling() {
+        let mut run = IdenticalToolCallRun::default();
+        for _ in 1..MAX_CONSECUTIVE_INERT_REPEATS {
+            round(&mut run, "poll", "same output");
+        }
+        assert!(run.inert_stop_info().is_none(), "must not stop early");
+
+        round(&mut run, "poll", "same output");
+        let (run_len, tool_name) = run.inert_stop_info().expect("inert repeat must stop");
+        assert_eq!(run_len, MAX_CONSECUTIVE_INERT_REPEATS);
+        assert_eq!(tool_name, "get_task_output");
+        // It fired strictly before the pre-existing identical-call ceiling,
+        // which has not been reached yet.
+        assert!(run.run_len() < MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS);
+        assert!(run.stop_info().is_none());
+    }
+
+    #[test]
+    fn a_productive_wait_keeps_the_budget_it_already_had() {
+        let mut run = IdenticalToolCallRun::default();
+        // The same poll, but the world keeps moving underneath it.
+        for i in 0..MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS {
+            round(&mut run, "poll", &format!("built {i} of many"));
+            assert!(
+                run.inert_stop_info().is_none(),
+                "a wait with fresh output is not inert at step {i}"
+            );
+        }
+        // The existing identical-call gate is untouched and still fires.
+        assert_eq!(run.run_len(), MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS);
+        assert!(run.stop_info().is_some());
+    }
+
+    #[test]
+    fn one_fresh_observation_restarts_the_inert_run() {
+        let mut run = IdenticalToolCallRun::default();
+        round(&mut run, "poll", "same");
+        round(&mut run, "poll", "same");
+        round(&mut run, "poll", "same");
+        // Something outside finally moved.
+        round(&mut run, "poll", "progress!");
+        assert!(run.inert_stop_info().is_none());
+        // And it takes a full fresh inert run to trip again: the first round
+        // after the change only re-seeds the comparison.
+        for _ in 1..MAX_CONSECUTIVE_INERT_REPEATS {
+            round(&mut run, "poll", "stuck again");
+        }
+        assert!(
+            run.inert_stop_info().is_none(),
+            "a restarted inert run must not inherit the old count"
+        );
+        round(&mut run, "poll", "stuck again");
+        assert!(run.inert_stop_info().is_some());
+    }
+
+    #[test]
+    fn a_different_action_resets_the_inert_run() {
+        let mut run = IdenticalToolCallRun::default();
+        for _ in 0..MAX_CONSECUTIVE_INERT_REPEATS {
+            round(&mut run, "poll", "same");
+        }
+        assert!(run.inert_stop_info().is_some());
+        round(&mut run, "a different call", "same");
+        assert!(
+            run.inert_stop_info().is_none(),
+            "a new action is not a continuation of an inert run"
+        );
+    }
+
+    fn wait_call(id: &str) -> AgentToolCall {
+        tool_call("task_output", &format!("{{\"id\":\"{id}\"}}"))
+    }
+
+    fn witness(id: &str, session: Uuid, deadline_ms: u64) -> ActiveTaskWaitWitness {
+        ActiveTaskWaitWitness {
+            task_id: id.into(),
+            state: ActiveWaitState::Running,
+            owner_session: session,
+            generation: 1,
+            deadline_ms,
+        }
+    }
+
+    /// Drive one round the way the turn loop does, with host-issued witnesses.
+    fn wait_round(
+        run: &mut IdenticalToolCallRun,
+        calls: &[AgentToolCall],
+        witnesses: &[ActiveTaskWaitWitness],
+        session: Uuid,
+        elapsed_ms: u64,
+        observed: &str,
+    ) {
+        run.observe(&tool_step_signature(calls), &calls[0].name, false);
+        let messages = vec![
+            serde_json::json!({"role": "assistant", "content": ""}),
+            tool_msg(observed),
+        ];
+        if round_is_witnessed_wait(calls, witnesses, session, elapsed_ms) {
+            run.observe_witnessed_wait();
+        } else if let Some(digest) = round_observation_digest(&messages) {
+            run.observe_outcome(digest);
+        }
+    }
+
+    #[test]
+    fn equal_width_status_changes_never_trip_the_inert_gate() {
+        // The behavior the fingerprint fix exists for: a status line whose width
+        // never changes but whose content does is real progress.
+        let mut run = IdenticalToolCallRun::default();
+        let phases = [
+            "phase: resolve",
+            "phase: compile",
+            "phase: linking",
+            "phase: testing",
+            "phase: package",
+            "phase: publish",
+        ];
+        for (step, phase) in phases.iter().cycle().take(15).enumerate() {
+            round(&mut run, "poll", phase);
+            assert!(
+                run.inert_stop_info().is_none(),
+                "equal-width phase change at step {step} was called inert"
+            );
+        }
+    }
+
+    #[test]
+    fn a_long_unchanged_witnessed_wait_survives_past_the_inert_ceiling() {
+        // A poll against work the host vouches for returns the same answer for
+        // as long as that work runs. The deadline that owns it decides when it
+        // ends, so the inert heuristic must not.
+        let session = Uuid::new_v4();
+        let mut run = IdenticalToolCallRun::default();
+        let calls = [wait_call("task-1")];
+        let witnesses = [witness("task-1", session, WITNESSED_WAIT_DEADLINE_MS)];
+        for step in 0..(MAX_CONSECUTIVE_INERT_REPEATS * 3) {
+            wait_round(
+                &mut run,
+                &calls,
+                &witnesses,
+                session,
+                1_000,
+                "status: running",
+            );
+            assert!(
+                run.inert_stop_info().is_none(),
+                "witnessed wait was called inert at step {step}"
+            );
+        }
+        assert!(run.run_len() >= MAX_CONSECUTIVE_INERT_REPEATS * 3);
+    }
+
+    #[test]
+    fn an_unwitnessed_wait_is_ordinary_work() {
+        // The whole point: the *name* buys nothing. Without a host witness —
+        // unknown id, finished task, no id at all — the round is ordinary and
+        // an unchanging result still stops it.
+        let session = Uuid::new_v4();
+        let mut run = IdenticalToolCallRun::default();
+        let calls = [wait_call("ghost")];
+        for _ in 0..MAX_CONSECUTIVE_INERT_REPEATS {
+            wait_round(
+                &mut run,
+                &calls,
+                &[],
+                session,
+                0,
+                "ERROR: unknown task/subagent id ghost",
+            );
+        }
+        assert!(
+            run.inert_stop_info().is_some(),
+            "an unwitnessed poll must not borrow the exemption"
+        );
+    }
+
+    #[test]
+    fn a_round_only_earns_the_exemption_when_the_host_vouches_for_every_call() {
+        let session = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let now = 1_000;
+        let deadline = WITNESSED_WAIT_DEADLINE_MS;
+
+        // Fully witnessed.
+        assert!(round_is_witnessed_wait(
+            &[wait_call("a")],
+            &[witness("a", session, deadline)],
+            session,
+            now
+        ));
+
+        // Empty round.
+        assert!(!round_is_witnessed_wait(&[], &[], session, now));
+
+        // No witness at all: unknown, completed, failed or malformed.
+        assert!(!round_is_witnessed_wait(
+            &[wait_call("a")],
+            &[],
+            session,
+            now
+        ));
+
+        // Partially witnessed: two polls, one vouched for.
+        assert!(!round_is_witnessed_wait(
+            &[wait_call("a"), wait_call("b")],
+            &[witness("a", session, deadline)],
+            session,
+            now
+        ));
+
+        // Mixed with real work.
+        assert!(!round_is_witnessed_wait(
+            &[
+                wait_call("a"),
+                tool_call("run_terminal_cmd", r#"{"command":"make"}"#)
+            ],
+            &[witness("a", session, deadline)],
+            session,
+            now
+        ));
+
+        // Another session's task.
+        assert!(!round_is_witnessed_wait(
+            &[wait_call("a")],
+            &[witness("a", other, deadline)],
+            session,
+            now
+        ));
+
+        // Past its deadline: the exemption is bounded.
+        assert!(!round_is_witnessed_wait(
+            &[wait_call("a")],
+            &[witness("a", session, 500)],
+            session,
+            now
+        ));
+
+        // Not wait-shaped at all.
+        assert!(!round_is_witnessed_wait(
+            &[tool_call("read_file", "{}")],
+            &[witness("a", session, deadline)],
+            session,
+            now
+        ));
+    }
+
+    #[test]
+    fn only_outstanding_task_states_are_witnessable() {
+        // The witness exists to say work is still running. A finished, failed,
+        // cancelled or rejected task has nothing left to wait for, so polling
+        // it is ordinary repeated work and must not be exempt.
+        assert_eq!(
+            ActiveWaitState::from_status("running"),
+            Some(ActiveWaitState::Running)
+        );
+        assert_eq!(
+            ActiveWaitState::from_status("accepted"),
+            Some(ActiveWaitState::Queued)
+        );
+        assert_eq!(
+            ActiveWaitState::from_status("proposed"),
+            Some(ActiveWaitState::Queued)
+        );
+        for terminal in ["done", "failed", "cancelled", "rejected"] {
+            assert!(
+                ActiveWaitState::from_status(terminal).is_none(),
+                "{terminal} is not outstanding work"
+            );
+        }
+        // Exact matches only: a near-miss status is not a state.
+        for unknown in ["Running", "running ", "", "in_progress", "RUNNING"] {
+            assert!(
+                ActiveWaitState::from_status(unknown).is_none(),
+                "{unknown:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_dispatch_alias_cannot_evade_stationarity_or_split_identity() {
+        // Both spellings normalize, so alternating them is one signature run
+        // and one tool identity rather than two that each reset.
+        assert_eq!(canonical_tool_name("get_task_output"), "task_output");
+        assert_eq!(canonical_tool_name("task_output"), "task_output");
+        assert_eq!(canonical_tool_name("read_file"), "read_file");
+        assert!(is_wait_shaped_call(&tool_call("get_task_output", "{}")));
+        assert!(is_wait_shaped_call(&tool_call("task_output", "{}")));
+
+        let alias = tool_call("get_task_output", r#"{"id":"a"}"#);
+        let canonical = tool_call("task_output", r#"{"id":"a"}"#);
+        assert_eq!(
+            tool_step_signature(std::slice::from_ref(&alias)),
+            tool_step_signature(std::slice::from_ref(&canonical)),
+            "alias alternation must not produce two signatures"
+        );
+
+        // And an alias-alternating unwitnessed poll still accumulates.
+        let session = Uuid::new_v4();
+        let mut run = IdenticalToolCallRun::default();
+        for step in 0..MAX_CONSECUTIVE_INERT_REPEATS {
+            let calls = if step % 2 == 0 {
+                [tool_call("task_output", r#"{"id":"a"}"#)]
+            } else {
+                [tool_call("get_task_output", r#"{"id":"a"}"#)]
+            };
+            wait_round(&mut run, &calls, &[], session, 0, "status: unchanged");
+        }
+        assert!(run.inert_stop_info().is_some());
+    }
+
+    #[test]
+    fn genuinely_identical_non_wait_work_still_stops() {
+        // The case the gate is actually for: same call, byte-identical result,
+        // not a wait.
+        let mut run = IdenticalToolCallRun::default();
+        for _ in 0..MAX_CONSECUTIVE_INERT_REPEATS {
+            round(&mut run, "reread", "the same file contents");
+        }
+        let (repeats, tool) = run.inert_stop_info().expect("inert work must stop");
+        assert_eq!(repeats, MAX_CONSECUTIVE_INERT_REPEATS);
+        assert_eq!(tool, "get_task_output");
+    }
+
+    #[test]
+    fn a_small_model_campaign_alternating_wait_and_progress_is_never_stopped() {
+        // An Economy-tier shape: poll, poll, small edit, poll, poll, small edit.
+        // Nothing here is stuck, and repeating the campaign must not accumulate
+        // a stop across cycles.
+        let mut run = IdenticalToolCallRun::default();
+        let session = Uuid::new_v4();
+        let calls = [wait_call("build")];
+        let witnesses = [witness("build", session, WITNESSED_WAIT_DEADLINE_MS)];
+        for cycle in 0..6 {
+            wait_round(&mut run, &calls, &witnesses, session, 10, "status: running");
+            wait_round(&mut run, &calls, &witnesses, session, 20, "status: running");
+            round(
+                &mut run,
+                &format!("edit-{cycle}"),
+                &format!("wrote file {cycle}"),
+            );
+            assert!(
+                run.inert_stop_info().is_none(),
+                "campaign cycle {cycle} was called inert"
+            );
+        }
+    }
+
+    #[test]
+    fn a_small_model_campaign_that_truly_stalls_is_stopped() {
+        // Same tier, same shape, but the work stops changing anything. This is
+        // the failure the gate exists to catch, and it must still fire.
+        let mut run = IdenticalToolCallRun::default();
+        for _ in 0..MAX_CONSECUTIVE_INERT_REPEATS {
+            round(&mut run, "retry", "error: unchanged failure");
+        }
+        assert!(run.inert_stop_info().is_some());
+    }
+
+    #[test]
+    fn the_inert_gate_can_only_stop_sooner_than_the_existing_gate() {
+        // The guarantee that this change weakens nothing, asserted on behavior
+        // rather than on the constants: for an identical repeating call, the
+        // round at which the inert gate fires is never later than the round at
+        // which the pre-existing identical-call gate fires.
+        let mut inert = IdenticalToolCallRun::default();
+        let mut existing = IdenticalToolCallRun::default();
+        let mut inert_stop_round = None;
+        let mut existing_stop_round = None;
+
+        for step in 1..=MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS {
+            round(&mut inert, "poll", "same output");
+            existing.observe("poll", "get_task_output", false);
+            if inert_stop_round.is_none() && inert.inert_stop_info().is_some() {
+                inert_stop_round = Some(step);
+            }
+            if existing_stop_round.is_none() && existing.stop_info().is_some() {
+                existing_stop_round = Some(step);
+            }
+        }
+
+        let inert_stop = inert_stop_round.expect("an inert run must stop");
+        let existing_stop = existing_stop_round.expect("the existing gate must still stop");
+        assert!(
+            inert_stop <= existing_stop,
+            "inert gate fired at {inert_stop} but the existing gate fired at {existing_stop}"
+        );
+    }
+
+    #[test]
+    fn an_inert_stop_reads_as_an_incomplete_turn_not_a_round_limit() {
+        let msg = action_inert_repeat_stop_message(4, "get_task_output");
+        assert!(is_incomplete_stop_message(&msg));
+        assert!(!is_round_limit_stop_message(&msg));
+        assert!(msg.contains("returned the same result"));
+    }
+
+    #[test]
+    fn a_round_digest_covers_only_the_current_round() {
+        let earlier = vec![
+            serde_json::json!({"role": "assistant", "content": ""}),
+            tool_msg("OLD"),
+            serde_json::json!({"role": "assistant", "content": ""}),
+            tool_msg("NEW"),
+        ];
+        let only_new = vec![
+            serde_json::json!({"role": "assistant", "content": ""}),
+            tool_msg("NEW"),
+        ];
+        assert_eq!(
+            round_observation_digest(&earlier),
+            round_observation_digest(&only_new),
+            "a prior round's results must not leak into this round's digest"
+        );
+    }
+
+    #[test]
+    fn a_round_digest_ignores_interleaved_host_coaching() {
+        let plain = vec![
+            serde_json::json!({"role": "assistant", "content": ""}),
+            tool_msg("result"),
+        ];
+        let coached = vec![
+            serde_json::json!({"role": "assistant", "content": ""}),
+            serde_json::json!({"role": "system", "content": "coaching text"}),
+            tool_msg("result"),
+        ];
+        assert_eq!(
+            round_observation_digest(&plain),
+            round_observation_digest(&coached),
+            "host-authored coaching is not an observation"
+        );
+    }
+
+    #[test]
+    fn a_round_digest_distinguishes_different_results() {
+        let a = vec![
+            serde_json::json!({"role": "assistant", "content": ""}),
+            tool_msg("alpha"),
+        ];
+        let b = vec![
+            serde_json::json!({"role": "assistant", "content": ""}),
+            tool_msg("beta"),
+        ];
+        assert_ne!(round_observation_digest(&a), round_observation_digest(&b));
+    }
+
+    #[test]
+    fn a_round_with_no_tool_result_yields_no_observation() {
+        let messages = vec![serde_json::json!({"role": "assistant", "content": "text only"})];
+        assert!(round_observation_digest(&messages).is_none());
+    }
+
+    #[test]
+    fn multi_call_rounds_are_order_sensitive() {
+        // Order is encoded, so two results whose features differ cannot be
+        // swapped without changing the digest.
+        let forward = vec![
+            serde_json::json!({"role": "assistant", "content": ""}),
+            tool_msg("short"),
+            tool_msg("a much longer result"),
+        ];
+        let reversed = vec![
+            serde_json::json!({"role": "assistant", "content": ""}),
+            tool_msg("a much longer result"),
+            tool_msg("short"),
+        ];
+        assert_ne!(
+            round_observation_digest(&forward),
+            round_observation_digest(&reversed)
+        );
+    }
+
+    #[test]
+    fn a_counter_advancing_inside_a_fixed_width_line_is_not_inert() {
+        // The regression that motivated the digit histogram: a build poll whose
+        // line keeps its shape while its counter moves is real progress, and
+        // must not be mistaken for a frozen result.
+        let mut previous: Option<ObservationDigest> = None;
+        for i in 0..10 {
+            let messages = vec![
+                serde_json::json!({"role": "assistant", "content": ""}),
+                tool_msg(&format!("built {i} of many")),
+            ];
+            let digest = round_observation_digest(&messages).expect("digest");
+            assert_ne!(
+                previous,
+                Some(digest),
+                "step {i} looks inert but the counter advanced"
+            );
+            previous = Some(digest);
+        }
+    }
+
+    #[test]
+    fn equal_width_results_are_distinguished() {
+        // Regression for the collision an earlier content-free digest had.
+        // `"one"` and `"two"` share length, line count, digit count and
+        // emptiness; only the bytes differ. Treating them as identical let a
+        // status line that was genuinely advancing be stopped with a claim that
+        // every result had been the same.
+        for (a, b) in [
+            ("one", "two"),
+            ("phase: build", "phase: tests"),
+            ("status: RUNNING", "status: WAITING"),
+        ] {
+            let left = vec![
+                serde_json::json!({"role": "assistant", "content": ""}),
+                tool_msg(a),
+            ];
+            let right = vec![
+                serde_json::json!({"role": "assistant", "content": ""}),
+                tool_msg(b),
+            ];
+            assert_ne!(
+                round_observation_digest(&left),
+                round_observation_digest(&right),
+                "equal-width results {a:?} and {b:?} must not collide"
+            );
+        }
+    }
+
+    #[test]
+    fn the_digest_is_deterministic_within_a_process() {
+        let messages = vec![
+            serde_json::json!({"role": "assistant", "content": ""}),
+            tool_msg("stable"),
+        ];
+        assert_eq!(
+            round_observation_digest(&messages),
+            round_observation_digest(&messages),
+            "identical input must compare equal"
+        );
+    }
+
+    #[test]
+    fn the_digest_debug_output_reveals_nothing() {
+        // The value is never persisted or projected — the type cannot be
+        // serialized — but a debug log is an exposure channel too.
+        let secret = "AKIAIOSFODNN7EXAMPLE /home/someone/.ssh/id_ed25519 hunter2";
+        let messages = vec![
+            serde_json::json!({"role": "assistant", "content": ""}),
+            tool_msg(secret),
+        ];
+        let digest = round_observation_digest(&messages).expect("digest");
+        let rendered = format!("{digest:?}");
+        for fragment in ["AKIA", "id_ed25519", "hunter2", "/home/someone"] {
+            assert!(!rendered.contains(fragment), "debug leaked {fragment}");
+        }
+        assert_eq!(rendered, "ObservationDigest(<redacted>)");
+    }
+
+    #[test]
+    fn concatenation_cannot_forge_an_identical_observation() {
+        // "ab" + "c" must not digest the same as "a" + "bc".
+        let split_a = vec![
+            serde_json::json!({"role": "assistant", "content": ""}),
+            tool_msg("ab"),
+            tool_msg("c"),
+        ];
+        let split_b = vec![
+            serde_json::json!({"role": "assistant", "content": ""}),
+            tool_msg("a"),
+            tool_msg("bc"),
+        ];
+        assert_ne!(
+            round_observation_digest(&split_a),
+            round_observation_digest(&split_b)
+        );
     }
 }

@@ -342,6 +342,7 @@ fn run_for_intent(intent_id: &str, session: Uuid, workspace: &str, state: RunSta
         final_response: None,
         error_code: None,
         stop_cause: None,
+        stop_detail: None,
         aggregates: Default::default(),
         progress: None,
         execution: None,

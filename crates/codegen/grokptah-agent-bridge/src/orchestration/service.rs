@@ -5038,28 +5038,62 @@ impl OrchestrationService {
         self.progress_value(self.authorize_run_request(session_id, workspace, run_id)?)
     }
 
+    /// Redacted lifecycle/status projection.
+    ///
+    /// Deliberately carries no user or model content. `promptPreview` used to
+    /// be echoed here; it is the user's own prompt text and has no bearing on
+    /// lifecycle, so it is gone. Callers that legitimately need it still read
+    /// the full record through `ptah_get_run` / `ptah_list_runs`, which is
+    /// where the desktop inspector already gets it.
+    ///
+    /// What remains is bounded and safe: identity, lifecycle state, queue and
+    /// busy status, journal range, the declared bounds, the host-decided stop
+    /// cause plus its structured detail, and `progress`, whose `detail` field
+    /// is host-authored template text (`"Model step 3/24"`, `` "Tool `x`" ``),
+    /// never model prose or tool output.
     fn progress_value(&self, mut run: RunRecord) -> Result<serde_json::Value, OrchError> {
         self.refresh_queue_position(&mut run);
         let busy = self.host.session_busy(run.session_id);
+        project_progress(&run, run.queue_position, busy)
+    }
+}
+
+/// Build the redacted lifecycle/status projection.
+///
+/// Split from the service so the wire shape can be exercised without standing
+/// up a host: what this returns is the whole of what an untrusted reader sees.
+pub(crate) fn project_progress(
+    run: &RunRecord,
+    queue_position: Option<usize>,
+    busy: bool,
+) -> Result<serde_json::Value, OrchError> {
+    // The projection is a read surface, so it re-checks the contract rather
+    // than trusting whatever reached it. A malformed detail is refused here
+    // too, not rendered.
+    run.validate_stop_detail()?;
+    {
         Ok(json!({
+            "schemaVersion": PROGRESS_PROJECTION_SCHEMA_VERSION,
             "runId": run.run_id,
             "sessionId": run.session_id,
             "state": run.state,
-            "queuePosition": run.queue_position,
+            "queuePosition": queue_position,
             "busy": busy,
             "startSeq": run.start_seq,
             "endSeq": run.end_seq,
-            "promptPreview": run.prompt_preview,
             "progress": run.progress,
             "createdAt": run.created_at,
             "updatedAt": run.updated_at,
             "terminalResult": run.terminal_result,
             "stopCause": run.stop_cause,
+            "stopDetail": run.stop_detail,
             "bounds": run.bounds,
             "errorCode": run.error_code,
         }))
     }
+}
 
+impl OrchestrationService {
     fn refresh_queue_position(&self, run: &mut RunRecord) {
         run.queue_position = if run.state == RunState::Queued {
             self.host.orchestration_pending_position(&run.run_id)
@@ -6846,6 +6880,7 @@ impl OrchestrationService {
             final_response: None,
             error_code: None,
             stop_cause: None,
+            stop_detail: None,
             aggregates: RunAggregates::default(),
             progress: None,
             execution: None,

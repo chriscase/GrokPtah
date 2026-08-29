@@ -64,6 +64,248 @@ pub enum RunStopCause {
     Failed,
 }
 
+/// Wire version of the redacted progress/status projection.
+///
+/// 1 — the historical shape: carried `promptPreview` (the user's own prompt
+///     text) and had no stop detail.
+/// 2 — `promptPreview` removed, `stopDetail` added.
+///
+/// Emitted as `schemaVersion` so a consumer can tell the two apart instead of
+/// inferring it from a missing field. Bump this whenever the projection's shape
+/// changes, and update `desktop/src/lib/protocol.ts` in the same change.
+pub const PROGRESS_PROJECTION_SCHEMA_VERSION: u32 = 2;
+
+/// Which flavour of a host-decided stop fired.
+///
+/// This is a qualifier on [`RunStopCause`], never a replacement for it. The
+/// cause remains the single terminal authority; this only records the shape of
+/// the evidence so an operator does not have to read prose to tell a model that
+/// is repeating itself from one that is repeating itself and getting nowhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunStopDetailKind {
+    /// The same call signature repeated to the identical-call ceiling.
+    IdenticalCalls,
+    /// A `true` no-op chain.
+    TrueNoop,
+    /// The same call *and* the same observation: nothing outside moved.
+    InertRepeat,
+}
+
+impl RunStopDetailKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::IdenticalCalls => "identical_calls",
+            Self::TrueNoop => "true_noop",
+            Self::InertRepeat => "inert_repeat",
+        }
+    }
+}
+
+/// Closed, host-resolved identity of the tool a stationarity stop was observed
+/// on.
+///
+/// The previous revision persisted the raw tool name as a bounded string. That
+/// name comes from the model's tool call, so a truncated-but-arbitrary string —
+/// a path, a newline, credential-shaped text, MCP prose — was persisted,
+/// projected on a public read surface, and rendered in the desktop inspector.
+/// Bounding the length does not make model-controlled text safe to display.
+///
+/// The host now resolves the name against its own tool set before anything is
+/// stored. Every variant below is a name the host itself defines; anything it
+/// does not recognise — an MCP tool, a renamed tool, a name the model invented,
+/// hostile input — collapses to [`RunStopTool::Unresolved`]. The original text
+/// is never retained, so this cannot carry a payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunStopTool {
+    ApplyPatch,
+    GlobFiles,
+    Grep,
+    KillTask,
+    ListDir,
+    MemoryRead,
+    MemoryWrite,
+    ReadFile,
+    RunTerminalCmd,
+    SpawnExplore,
+    SpawnGeneralPurpose,
+    TaskOutput,
+    TodoWrite,
+    WebFetch,
+    WriteFile,
+    WriteFiles,
+    /// The host did not resolve the call to one of its own tools. A fixed,
+    /// content-free category: it deliberately says nothing about what the name
+    /// was.
+    Unresolved,
+}
+
+impl RunStopTool {
+    /// Resolve a model-supplied tool name to a host identity.
+    ///
+    /// Exact match against the host's own tool names only. No trimming, no case
+    /// folding, no prefix matching: a near-miss is not the tool, and treating it
+    /// as one would be the same mistake as trusting the name.
+    pub fn resolve(name: &str) -> Self {
+        match name {
+            "apply_patch" => Self::ApplyPatch,
+            "glob_files" => Self::GlobFiles,
+            "grep" => Self::Grep,
+            "kill_task" => Self::KillTask,
+            "list_dir" => Self::ListDir,
+            "memory_read" => Self::MemoryRead,
+            "memory_write" => Self::MemoryWrite,
+            "read_file" => Self::ReadFile,
+            "run_terminal_cmd" => Self::RunTerminalCmd,
+            "spawn_explore" => Self::SpawnExplore,
+            "spawn_general_purpose" => Self::SpawnGeneralPurpose,
+            // Both the canonical name and the dispatch alias resolve to the
+            // same identity, so alternating them cannot produce two labels.
+            "task_output" | "get_task_output" => Self::TaskOutput,
+            "todo_write" => Self::TodoWrite,
+            "web_fetch" => Self::WebFetch,
+            "write_file" => Self::WriteFile,
+            "write_files" => Self::WriteFiles,
+            _ => Self::Unresolved,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ApplyPatch => "apply_patch",
+            Self::GlobFiles => "glob_files",
+            Self::Grep => "grep",
+            Self::KillTask => "kill_task",
+            Self::ListDir => "list_dir",
+            Self::MemoryRead => "memory_read",
+            Self::MemoryWrite => "memory_write",
+            Self::ReadFile => "read_file",
+            Self::RunTerminalCmd => "run_terminal_cmd",
+            Self::SpawnExplore => "spawn_explore",
+            Self::SpawnGeneralPurpose => "spawn_general_purpose",
+            Self::TaskOutput => "task_output",
+            Self::TodoWrite => "todo_write",
+            Self::WebFetch => "web_fetch",
+            Self::WriteFile => "write_file",
+            Self::WriteFiles => "write_files",
+            Self::Unresolved => "unresolved",
+        }
+    }
+}
+
+/// Durable, operator-readable qualifier for a host-decided stop.
+///
+/// Every field is a counter, an enum, a bounded tool *name*, or a digest. It
+/// carries no prompt, model response, tool arguments, path, credential, or raw
+/// payload, so it is safe on a redacted read surface.
+/// Smallest repeat count each detector can legitimately report.
+///
+/// These mirror the turn-loop ceilings. A detail claiming fewer repeats than
+/// its own detector could have counted did not come from that detector, so the
+/// numbers are part of the contract rather than free-form metadata.
+pub const MIN_REPEATS_IDENTICAL_CALLS: u32 = 16;
+pub const MIN_REPEATS_TRUE_NOOP: u32 = 4;
+pub const MIN_REPEATS_INERT_REPEAT: u32 = 4;
+
+/// Durable, operator-readable qualifier for a host-decided stop.
+///
+/// A stop detail asserts that the host's own detector fired, and
+/// `ptah_get_progress` and the desktop inspector present it as exactly that, so
+/// authorship is constrained on three axes:
+///
+/// - fields and constructors are private, so no out-of-crate caller can mint
+///   one through the Rust API;
+/// - [`RunRecord::set_stop_observation`], the terminal-observation transition,
+///   is crate-private, so the cause/code/detail triple moves only inside the
+///   host;
+/// - [`RunStopDetail::validate`] binds the detail to its detector: the repeat
+///   count must be one that detector could have produced, and a true no-op can
+///   only be attributed to `run_terminal_cmd`.
+///
+/// What this does **not** close: `Deserialize` is derived because records are
+/// loaded from disk, so a caller holding store write access can still craft a
+/// semantically *consistent* detail as JSON. Closing that needs a
+/// host-authenticated terminal-observation receipt on the authority spine; it
+/// is tracked as a residual, not claimed here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunStopDetail {
+    kind: RunStopDetailKind,
+    /// Consecutive repeats observed when the stop fired.
+    repeats: u32,
+    /// Host-resolved tool identity. Never a model-supplied string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool: Option<RunStopTool>,
+}
+
+impl RunStopDetail {
+    pub fn kind(&self) -> RunStopDetailKind {
+        self.kind
+    }
+
+    pub fn repeats(&self) -> u32 {
+        self.repeats
+    }
+
+    pub fn tool(&self) -> Option<RunStopTool> {
+        self.tool
+    }
+
+    /// The minimum repeat count this kind's detector could have reported.
+    pub fn min_repeats_for(kind: RunStopDetailKind) -> u32 {
+        match kind {
+            RunStopDetailKind::IdenticalCalls => MIN_REPEATS_IDENTICAL_CALLS,
+            RunStopDetailKind::TrueNoop => MIN_REPEATS_TRUE_NOOP,
+            RunStopDetailKind::InertRepeat => MIN_REPEATS_INERT_REPEAT,
+        }
+    }
+
+    pub(crate) fn new(kind: RunStopDetailKind, repeats: u32) -> Self {
+        Self {
+            kind,
+            repeats,
+            tool: None,
+        }
+    }
+
+    /// Attach the tool the repeats were observed on, resolving the
+    /// model-supplied name to a host identity first.
+    pub(crate) fn with_tool(mut self, tool: &str) -> Self {
+        self.tool = Some(RunStopTool::resolve(tool));
+        self
+    }
+
+    /// Attach an already-resolved identity.
+    /// Reject anything that could smuggle content onto the read surface, or
+    /// assert a repeat count that never happened.
+    pub fn validate(&self) -> Result<(), OrchError> {
+        let minimum = Self::min_repeats_for(self.kind);
+        if self.repeats < minimum {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                format!(
+                    "{} stop reports {} repeats but its detector fires at {minimum}",
+                    self.kind.as_str(),
+                    self.repeats
+                ),
+            ));
+        }
+        // A true no-op is only ever detected for a single `run_terminal_cmd`
+        // whose command is `true`. Any other tool under that kind describes a
+        // detection that cannot have happened.
+        if self.kind == RunStopDetailKind::TrueNoop
+            && self.tool != Some(RunStopTool::RunTerminalCmd)
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "a true no-op stop can only be attributed to run_terminal_cmd",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunBounds {
@@ -464,6 +706,15 @@ pub struct RunRecord {
     pub error_code: Option<String>,
     #[serde(default)]
     pub stop_cause: Option<RunStopCause>,
+    /// Structured qualifier for `stop_cause`. Optional so records written
+    /// before this field existed still load unchanged.
+    ///
+    /// The field stays public so `RunRecord` remains constructible, but a
+    /// `RunStopDetail` cannot be *minted* outside this crate: its fields and
+    /// constructors are private. See the struct docs for what that does and
+    /// does not close.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_detail: Option<RunStopDetail>,
     /// Durable per-run aggregates for journal rollover (#196 residual).
     #[serde(default)]
     pub aggregates: RunAggregates,
@@ -501,10 +752,102 @@ impl RunRecord {
         if self.bounds.max_total_tokens.is_some() {
             let code = "max_total_tokens_usage_unavailable";
             self.terminal_result = Some(code.into());
-            self.error_code = Some(code.into());
-            self.stop_cause = Some(RunStopCause::TokenAccountingUnavailable);
+            // One observation: the accounting override replaces the cause, so
+            // any stationarity detail attached to the old cause goes with it.
+            self.set_stop_observation(RunStopCause::TokenAccountingUnavailable, Some(code), None);
         }
         true
+    }
+}
+
+impl RunRecord {
+    /// Set the terminal observation as one unit.
+    ///
+    /// Cause, error code and detail are a single fact about why a Run stopped,
+    /// and every writer that moves one must move the others. Setting the cause
+    /// on its own is what let a finalization replace `Stationarity` with
+    /// `TokenAccountingUnavailable` while the stationarity detail stayed
+    /// attached — a record that installed cleanly and was then refused by
+    /// `load_run` and silently dropped from `list_runs`.
+    pub(crate) fn set_stop_observation(
+        &mut self,
+        cause: RunStopCause,
+        code: Option<&str>,
+        detail: Option<RunStopDetail>,
+    ) {
+        self.stop_cause = Some(cause);
+        if let Some(code) = code {
+            self.error_code = Some(code.to_string());
+        }
+        self.stop_detail = detail;
+        self.normalize_stop_detail();
+    }
+
+    /// The single preparation boundary every durable Run write passes through.
+    ///
+    /// Normalizes what a legitimate transition may have invalidated, then
+    /// validates the exact record that is about to be installed. Anything that
+    /// survives this is guaranteed to be readable back by `load_run`, which is
+    /// what makes "persisted" and "readable" the same set.
+    pub fn prepare_for_persist(&mut self) -> Result<(), OrchError> {
+        self.normalize_stop_detail();
+        self.validate_stop_detail()
+    }
+
+    /// Read the structured qualifier, if the host attached one.
+    pub fn stop_detail(&self) -> Option<&RunStopDetail> {
+        self.stop_detail.as_ref()
+    }
+
+    /// Restore the cross-field invariant by construction.
+    ///
+    /// A detail qualifies a stationarity stop and means nothing without one, so
+    /// when the cause moves to anything else — a later cancel, an interrupt, a
+    /// budget stop — the detail is no longer true of the record and is dropped.
+    ///
+    /// This is deliberately a normalization on the write path rather than a
+    /// refusal. Refusing would make the record unwritable the moment a run that
+    /// had stopped for stationarity was cancelled, which strands the run and
+    /// breaks cancel: an invariant that can deadlock a legitimate transition is
+    /// the wrong invariant. Reads still verify strictly, so durable data that is
+    /// inconsistent — which now means tampered, not merely stale — fails closed.
+    ///
+    /// Returns whether anything was dropped.
+    pub fn normalize_stop_detail(&mut self) -> bool {
+        if self.stop_detail.is_some() && self.stop_cause != Some(RunStopCause::Stationarity) {
+            self.stop_detail = None;
+            return true;
+        }
+        false
+    }
+
+    /// Cross-field contract for the stop detail.
+    ///
+    /// A detail is a qualifier on a stationarity stop and means nothing without
+    /// one, so a record carrying a detail under any other cause — or under no
+    /// cause at all — is malformed and is refused rather than displayed. Kept
+    /// separate from the record's other invariants so store and projection can
+    /// both call it on exactly the same rule.
+    pub fn validate_stop_detail(&self) -> Result<(), OrchError> {
+        let Some(detail) = self.stop_detail.as_ref() else {
+            return Ok(());
+        };
+        detail.validate()?;
+        if self.stop_cause != Some(RunStopCause::Stationarity) {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "stop detail is only valid on a stationarity stop",
+            ));
+        }
+        // Kind-specific: an inert repeat and an identical-call run are both
+        // attributed to a tool, so an unattributed one is not reportable.
+        if detail.tool.is_none() {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "stop detail must name the tool the repeats were observed on",
+            ));
+        }
+        Ok(())
     }
 }
 
