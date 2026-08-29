@@ -24,6 +24,8 @@ use crate::session::{Session, SessionKind, TranscriptEntry};
 use crate::types::EffortLevel;
 use sha2::{Digest, Sha256};
 
+pub(crate) type ProviderAttemptContext = xai_provider_attempt::AttemptContext;
+
 pub(crate) fn push_assistant(host: &AgentHostHandle, session_id: Uuid, text: &str) {
     let mut g = host.inner.lock();
     if let Some(s) = g.sessions.get_mut(&session_id) {
@@ -1254,6 +1256,7 @@ pub(crate) async fn propose_plan_with_model(
     cwd: &Path,
     goal: &str,
     cancel: &CancellationToken,
+    provider_attempt: &ProviderAttemptContext,
 ) -> Result<(Vec<String>, Option<crate::completion::CompletionUsage>)> {
     if cancel.is_cancelled() {
         bail!("cancelled");
@@ -1270,6 +1273,7 @@ pub(crate) async fn propose_plan_with_model(
         None,
         cwd,
         SessionKind::Build,
+        provider_attempt,
     )
     .await?;
     let steps = parse_numbered_plan(&reply.text);
@@ -1958,6 +1962,103 @@ fn record_provider_attempt(
     let _ = attempt.notify(observation);
 }
 
+fn settle_provider_http_response(
+    provider_attempt: &ProviderAttemptContext,
+    permit: &mut Option<xai_provider_attempt::PhysicalSendPermit>,
+    status_code: u16,
+    response_bytes: &[u8],
+) -> Result<()> {
+    let Some(mut permit) = permit.take() else {
+        bail!("provider attempt permit was already consumed");
+    };
+    provider_attempt
+        .settle_http_response(&mut permit, status_code, response_bytes)
+        .map_err(|error| anyhow!("settle provider attempt: {error}"))
+}
+
+fn revalidate_provider_permit(
+    provider_attempt: &ProviderAttemptContext,
+    permit: &mut Option<xai_provider_attempt::PhysicalSendPermit>,
+) -> Result<()> {
+    let Some(permit_ref) = permit.as_ref() else {
+        bail!("provider attempt permit is unavailable");
+    };
+    if let Err(error) = provider_attempt.revalidate_before_physical_write(permit_ref) {
+        if let Some(mut permit) = permit.take() {
+            let _ = provider_attempt.transport_before_possible_write(&mut permit);
+        }
+        return Err(anyhow!(
+            "provider authority changed before physical send: {error}"
+        ));
+    }
+    Ok(())
+}
+
+fn mark_permit_transport_ambiguous(
+    provider_attempt: &ProviderAttemptContext,
+    permit: Option<xai_provider_attempt::PhysicalSendPermit>,
+) {
+    if let Some(mut permit) = permit {
+        let _ = provider_attempt.transport_after_possible_write(&mut permit);
+    }
+}
+
+fn mark_permit_cancelled_after_write(
+    provider_attempt: &ProviderAttemptContext,
+    permit: Option<xai_provider_attempt::PhysicalSendPermit>,
+) {
+    if let Some(mut permit) = permit {
+        let _ = provider_attempt.cancel_after_possible_write(&mut permit);
+    }
+}
+
+fn mark_permit_semantic_rejection(
+    provider_attempt: &ProviderAttemptContext,
+    permit: Option<xai_provider_attempt::PhysicalSendPermit>,
+    status_code: u16,
+) {
+    if let Some(mut permit) = permit {
+        let _ = provider_attempt.semantic_rejection(&mut permit, status_code);
+    }
+}
+
+fn restart_provider_attempt_after_body_change(
+    provider_attempt: &mut ProviderAttemptContext,
+    physical_permit: &mut Option<xai_provider_attempt::PhysicalSendPermit>,
+    provider_id: &str,
+    body: &[u8],
+    rejected_status: u16,
+) -> Result<String> {
+    if let Some(mut permit) = physical_permit.take() {
+        provider_attempt
+            .semantic_rejection(&mut permit, rejected_status)
+            .map_err(|error| anyhow!("record changed-body rejection: {error}"))?;
+    }
+    let next = provider_attempt
+        .acquire_next_effect_lease()
+        .map_err(|error| anyhow!("acquire fresh changed-body lease: {error}"))?;
+    let next_permit = next
+        .begin(provider_id, body, true)
+        .map_err(|error| anyhow!("admit changed-body provider attempt: {error}"))?;
+    let key = next_permit.idempotency_key().to_owned();
+    *provider_attempt = next;
+    *physical_permit = Some(next_permit);
+    Ok(key)
+}
+
+fn provider_attempt_provider_id(
+    creds: &crate::auth_store::WireCredentials,
+    target: &ResolvedModelTarget,
+) -> String {
+    format!(
+        "{}-{:?}-{}-{}",
+        creds.provider_id,
+        target.dialect,
+        xai_provider_attempt::AttemptSpec::fingerprint_bytes(target.base_url.as_bytes()),
+        creds.qualification_identity_fingerprint()
+    )
+}
+
 /// Stream one chat/completions step (tools + tokens).
 /// Content → `on_delta`; reasoning_content → `on_thought` (#149).
 /// Cancel aborts the HTTP body read within ~one chunk.
@@ -1970,6 +2071,7 @@ pub(crate) async fn call_xai_agent_step<F, G>(
     tools: &serde_json::Value,
     allow_transient_retries: bool,
     cancel: &CancellationToken,
+    provider_attempt: &ProviderAttemptContext,
     on_delta: F,
     on_thought: G,
 ) -> Result<AgentStep>
@@ -1986,6 +2088,7 @@ where
         allow_transient_retries,
         cancel,
         None,
+        provider_attempt,
         on_delta,
         on_thought,
     )
@@ -2005,6 +2108,7 @@ pub(crate) async fn call_xai_agent_step_observed<F, G>(
     allow_transient_retries: bool,
     cancel: &CancellationToken,
     observation: Option<&ProviderObservationContext>,
+    provider_attempt: &ProviderAttemptContext,
     on_delta: F,
     on_thought: G,
 ) -> Result<AgentStep>
@@ -2034,6 +2138,7 @@ where
         cancel,
         observation,
         observation_route,
+        provider_attempt,
         on_delta,
         on_thought,
     )
@@ -2051,6 +2156,7 @@ async fn call_provider_agent_step<F, G>(
     cancel: &CancellationToken,
     observation: Option<&ProviderObservationContext>,
     mut observation_route: Option<ProviderObservationRoute>,
+    provider_attempt: &ProviderAttemptContext,
     mut on_delta: F,
     mut on_thought: G,
 ) -> Result<AgentStep>
@@ -2089,6 +2195,20 @@ where
         body["stream_options"] = serde_json::json!({ "include_usage": true });
     }
     apply_effort_to_agent_body(&mut body, &target, effort)?;
+    let attempt_provider_id = provider_attempt_provider_id(&creds, &target);
+    let mut request_bytes = serde_json::to_vec(&body)
+        .map(|body| body.len() as u64)
+        .unwrap_or_default();
+    let mut provider_attempt = provider_attempt.clone();
+    let mut physical_permit = Some(provider_attempt.begin(
+        &attempt_provider_id,
+        &serde_json::to_vec(&body).unwrap_or_default(),
+        true,
+    )?);
+    let mut idempotency_key = physical_permit
+        .as_ref()
+        .map(|permit| permit.idempotency_key().to_owned())
+        .ok_or_else(|| anyhow!("provider attempt permit is unavailable"))?;
     let url = format!("{}/chat/completions", base.trim_end_matches('/'));
 
     // Three compatibility downgrades and up to three transient retries can all
@@ -2102,7 +2222,7 @@ where
         if cancel.is_cancelled() {
             bail!("cancelled");
         }
-        let send_once = |c: &crate::auth_store::WireCredentials| {
+        let send_once = |c: &crate::auth_store::WireCredentials, request_key: &str| {
             let mut req = client
                 .post(&url)
                 .header("Content-Type", "application/json")
@@ -2111,11 +2231,10 @@ where
                 req = req.header("x-grok-effort", effort.as_str());
             }
             let req = crate::auth_store::apply_auth_headers(req, c, &base);
+            let req = req.header(xai_provider_attempt::IDEMPOTENCY_KEY_HEADER, request_key);
+            let req = req.header("x-grok-req-id", request_key);
             req.json(&body)
         };
-        let request_bytes = serde_json::to_vec(&body)
-            .map(|body| body.len() as u64)
-            .unwrap_or_default();
         let mut observation_attempt =
             observation_route
                 .as_ref()
@@ -2124,9 +2243,11 @@ where
                     context.begin_attempt().ok().map(|attempt| (route, attempt))
                 });
 
+        revalidate_provider_permit(&provider_attempt, &mut physical_permit)?;
         let resp_result = tokio::select! {
-            r = send_once(&creds).send() => r,
+            r = send_once(&creds, &idempotency_key).send() => r,
             _ = cancel.cancelled() => {
+                mark_permit_cancelled_after_write(&provider_attempt, physical_permit.take());
                 if let Some((route, attempt)) = observation_attempt.take() {
                     record_provider_attempt(
                         Some(attempt),
@@ -2146,6 +2267,7 @@ where
         let mut resp = match resp_result {
             Ok(r) => r,
             Err(e) => {
+                mark_permit_transport_ambiguous(&provider_attempt, physical_permit.take());
                 if let Some((route, attempt)) = observation_attempt.take() {
                     record_provider_attempt(
                         Some(attempt),
@@ -2178,12 +2300,10 @@ where
                         format!("request error: {e}")
                     },
                 );
-                if allow_transient_retries && transient_retries < MAX_TRANSIENT_RETRIES {
-                    let delay = 400 * (1 << transient_retries);
-                    transient_retries += 1;
-                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-                    continue;
-                }
+                // Once reqwest has been asked to write a credential-bearing
+                // request, a transport error cannot prove that no bytes were
+                // accepted. The durable attempt is therefore Uncertain and
+                // retry loops must stop.
                 bail!("{}", last_err.unwrap());
             }
         };
@@ -2204,6 +2324,16 @@ where
             }
             match crate::auth_store::force_refresh(&creds).await {
                 Ok(fresh) => {
+                    if fresh.qualification_identity_fingerprint()
+                        != creds.qualification_identity_fingerprint()
+                    {
+                        mark_permit_semantic_rejection(
+                            &provider_attempt,
+                            physical_permit.take(),
+                            401,
+                        );
+                        bail!("HTTP 401 (credential principal changed during refresh)");
+                    }
                     creds = fresh;
                     let refreshed_binding = crate::live_attestation::attest_grok_build_oidc(
                         &target.wire_model,
@@ -2221,8 +2351,9 @@ where
                             .and_then(|(route, context)| {
                                 context.begin_attempt().ok().map(|attempt| (route, attempt))
                             });
+                    revalidate_provider_permit(&provider_attempt, &mut physical_permit)?;
                     resp = tokio::select! {
-                        r = send_once(&creds).send() => match r {
+                        r = send_once(&creds, &idempotency_key).send() => match r {
                             Ok(response) => response,
                             Err(error) => {
                                 if let Some((route, attempt)) = observation_attempt.take() {
@@ -2255,6 +2386,7 @@ where
                             }
                         },
                         _ = cancel.cancelled() => {
+                            mark_permit_cancelled_after_write(&provider_attempt, physical_permit.take());
                             if let Some((route, attempt)) = observation_attempt.take() {
                                 record_provider_attempt(
                                     Some(attempt),
@@ -2273,6 +2405,7 @@ where
                     };
                 }
                 Err(error) => {
+                    mark_permit_semantic_rejection(&provider_attempt, physical_permit.take(), 401);
                     bail!("HTTP 401 (OIDC refresh refused: {})", error.code());
                 }
             }
@@ -2283,6 +2416,9 @@ where
             || status.is_server_error()
             || status == reqwest::StatusCode::REQUEST_TIMEOUT
         {
+            if status.is_server_error() || status == reqwest::StatusCode::REQUEST_TIMEOUT {
+                mark_permit_transport_ambiguous(&provider_attempt, physical_permit.take());
+            }
             let headers = resp.headers().clone();
             let text = read_bounded_response_body(resp, cancel)
                 .await
@@ -2315,11 +2451,21 @@ where
             } else {
                 format!("HTTP {status}: {clipped}")
             });
-            if allow_transient_retries && transient_retries < MAX_TRANSIENT_RETRIES {
+            if status.as_u16() == 429
+                && allow_transient_retries
+                && transient_retries < MAX_TRANSIENT_RETRIES
+            {
                 let delay = 600 * (1 << transient_retries);
                 transient_retries += 1;
                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                 continue;
+            }
+            if status.as_u16() == 429 {
+                mark_permit_semantic_rejection(
+                    &provider_attempt,
+                    physical_permit.take(),
+                    status.as_u16(),
+                );
             }
             bail!("{}", last_err.unwrap());
         }
@@ -2353,7 +2499,15 @@ where
                 if let Some(object) = body.as_object_mut() {
                     object.remove("stream_options");
                 }
-                last_err = Some("HTTP 400 (will retry without stream_options)".into());
+                idempotency_key = restart_provider_attempt_after_body_change(
+                    &mut provider_attempt,
+                    &mut physical_permit,
+                    &attempt_provider_id,
+                    &serde_json::to_vec(&body)?,
+                    status.as_u16(),
+                )?;
+                request_bytes = serde_json::to_vec(&body)?.len() as u64;
+                last_err = Some("HTTP 400 (new attempt without stream_options)".into());
                 continue;
             }
             // Some compatible gateways support native tools but reject the
@@ -2366,7 +2520,15 @@ where
                 if let Some(object) = body.as_object_mut() {
                     object.remove("tool_choice");
                 }
-                last_err = Some("HTTP 400 (will retry without tool_choice)".into());
+                idempotency_key = restart_provider_attempt_after_body_change(
+                    &mut provider_attempt,
+                    &mut physical_permit,
+                    &attempt_provider_id,
+                    &serde_json::to_vec(&body)?,
+                    status.as_u16(),
+                )?;
+                request_bytes = serde_json::to_vec(&body)?.len() as u64;
+                last_err = Some("HTTP 400 (new attempt without tool_choice)".into());
                 continue;
             }
             // Some proxies reject stream+tools — fall back to non-stream once.
@@ -2377,15 +2539,33 @@ where
                 if let Some(object) = body.as_object_mut() {
                     object.remove("stream_options");
                 }
+                idempotency_key = restart_provider_attempt_after_body_change(
+                    &mut provider_attempt,
+                    &mut physical_permit,
+                    &attempt_provider_id,
+                    &serde_json::to_vec(&body)?,
+                    status.as_u16(),
+                )?;
+                request_bytes = serde_json::to_vec(&body)?.len() as u64;
                 last_err = Some(format!(
-                    "HTTP {status} (will retry non-stream): {}",
+                    "HTTP {status} (new attempt non-stream): {}",
                     text.chars().take(200).collect::<String>()
                 ));
                 continue;
             }
             if target.dialect == crate::gateway_config::ProviderDialect::OpenAiChatCompletions {
+                mark_permit_semantic_rejection(
+                    &provider_attempt,
+                    physical_permit.take(),
+                    status.as_u16(),
+                );
                 bail!("configured provider returned HTTP {status}");
             }
+            mark_permit_semantic_rejection(
+                &provider_attempt,
+                physical_permit.take(),
+                status.as_u16(),
+            );
             bail!(
                 "HTTP {status}: {}",
                 text.chars().take(800).collect::<String>()
@@ -2394,6 +2574,11 @@ where
 
         // Non-stream JSON body (fallback path). Some compatible gateways also
         // return this shape despite accepting `stream=true`.
+        if let Some(permit) = physical_permit.as_mut() {
+            provider_attempt
+                .mark_response_started(permit)
+                .map_err(|error| anyhow!("record provider response start: {error}"))?;
+        }
         let headers = resp.headers().clone();
         let content_type = headers
             .get(reqwest::header::CONTENT_TYPE)
@@ -2460,6 +2645,12 @@ where
                     usage.as_ref(),
                 );
             }
+            settle_provider_http_response(
+                &provider_attempt,
+                &mut physical_permit,
+                status.as_u16(),
+                raw.as_bytes(),
+            )?;
             return Ok(step);
         }
         if content_type.contains("application/json") {
@@ -2522,6 +2713,12 @@ where
                     usage.as_ref(),
                 );
             }
+            settle_provider_http_response(
+                &provider_attempt,
+                &mut physical_permit,
+                status.as_u16(),
+                raw.as_bytes(),
+            )?;
             return Ok(step);
         }
 
@@ -2529,6 +2726,7 @@ where
         let mut stream = resp.bytes_stream();
         let mut decoder = crate::sse::SseLineDecoder::new();
         let mut full_body = crate::sse::BoundedBodyAccumulator::new();
+        let mut settlement_body = crate::sse::BoundedBodyAccumulator::new();
         let mut acc = AgentSseAccumulator::default();
         let mut done = false;
         let mut response_bytes = 0u64;
@@ -2577,6 +2775,7 @@ where
                 }
             };
             response_bytes = response_bytes.saturating_add(bytes.len() as u64);
+            settlement_body.push(&bytes)?;
             if !acc.saw_data {
                 full_body.push(&bytes)?;
             }
@@ -2596,6 +2795,7 @@ where
                 done = apply_agent_sse_line(&trailing, &mut acc, &mut on_delta, &mut on_thought)?;
             }
         }
+        let settlement_evidence = settlement_body.finish()?;
         if !acc.saw_data {
             let raw = full_body.finish()?;
             let value: serde_json::Value = match serde_json::from_str(raw.trim()) {
@@ -2657,6 +2857,12 @@ where
                     usage.as_ref(),
                 );
             }
+            settle_provider_http_response(
+                &provider_attempt,
+                &mut physical_permit,
+                status.as_u16(),
+                settlement_evidence.as_bytes(),
+            )?;
             return Ok(step);
         }
 
@@ -2722,6 +2928,12 @@ where
                     usage.as_ref(),
                 );
             }
+            settle_provider_http_response(
+                &provider_attempt,
+                &mut physical_permit,
+                status.as_u16(),
+                settlement_evidence.as_bytes(),
+            )?;
             return Ok(AgentStep::ToolCalls {
                 content: content_opt,
                 tool_calls,
@@ -2745,6 +2957,12 @@ where
                     usage.as_ref(),
                 );
             }
+            settle_provider_http_response(
+                &provider_attempt,
+                &mut physical_permit,
+                status.as_u16(),
+                settlement_evidence.as_bytes(),
+            )?;
             return Ok(AgentStep::Final {
                 text: acc.content,
                 streamed: acc.streamed_any,
@@ -2767,6 +2985,12 @@ where
                     usage.as_ref(),
                 );
             }
+            settle_provider_http_response(
+                &provider_attempt,
+                &mut physical_permit,
+                status.as_u16(),
+                settlement_evidence.as_bytes(),
+            )?;
             return Ok(AgentStep::Final {
                 text: String::new(),
                 streamed: true,
@@ -2790,6 +3014,12 @@ where
                 usage.as_ref(),
             );
         }
+        settle_provider_http_response(
+            &provider_attempt,
+            &mut physical_permit,
+            status.as_u16(),
+            settlement_evidence.as_bytes(),
+        )?;
         return Ok(AgentStep::Final {
             text: String::new(),
             streamed: acc.streamed_any,
@@ -2814,6 +3044,7 @@ pub async fn replay_xai_provider_contract_on_loopback(
     model: &str,
     messages: &[serde_json::Value],
     tools: &serde_json::Value,
+    provider_attempt: ProviderAttemptContext,
 ) -> Result<ProviderContractReplay> {
     let parsed = reqwest::Url::parse(base_url)
         .map_err(|error| anyhow!("invalid provider contract loopback URL: {error}"))?;
@@ -2878,6 +3109,7 @@ pub async fn replay_xai_provider_contract_on_loopback(
         &CancellationToken::new(),
         None,
         None,
+        &provider_attempt,
         |delta| deltas.push(delta.to_string()),
         |delta| thought_deltas.push(delta.to_string()),
     )
@@ -2911,7 +3143,7 @@ mod compatible_stream_tests {
 
     use axum::body::{Body, Bytes};
     use axum::extract::Json;
-    use axum::http::{header, Response, StatusCode};
+    use axum::http::{header, HeaderMap, Response, StatusCode};
     use axum::routing::post;
     use axum::Router;
     use futures::StreamExt;
@@ -2935,6 +3167,26 @@ mod compatible_stream_tests {
             principal_id: None,
             expires_at: None,
         }
+    }
+
+    fn provider_attempt_context() -> ProviderAttemptContext {
+        let root = std::env::temp_dir().join(format!("grokptah-provider-test-{}", Uuid::new_v4()));
+        let store = xai_provider_attempt::ProviderAttemptStore::open(&root).unwrap();
+        crate::host_authority::write_test_snapshot(
+            &root,
+            "provider-test-scope",
+            "provider-test",
+            1,
+            1,
+            "provider-test-lease",
+        )
+        .unwrap();
+        ProviderAttemptContext::from_host_ledger(
+            store,
+            "provider-test-operation",
+            "provider-test-scope",
+        )
+        .unwrap()
     }
 
     fn install_compatible_profile(home: &std::path::Path, base_url: &str) -> String {
@@ -3194,37 +3446,42 @@ mod compatible_stream_tests {
                 let handler_observed = Arc::clone(&observed);
                 let app = Router::new().route(
                     "/v1/chat/completions",
-                    post(move |Json(body): Json<serde_json::Value>| {
-                        let observed = Arc::clone(&handler_observed);
-                        async move {
-                            observed.lock().unwrap().push(body.clone());
-                            if body.get("stream_options").is_some()
-                                || body.get("tool_choice").is_some()
-                                || body.get("stream").and_then(serde_json::Value::as_bool)
-                                    == Some(true)
-                            {
-                                return Response::builder()
-                                    .status(StatusCode::BAD_REQUEST)
-                                    .body(Body::from("unsupported compatibility field"))
-                                    .unwrap();
+                    post(
+                        move |headers: HeaderMap, Json(mut body): Json<serde_json::Value>| {
+                            let observed = Arc::clone(&handler_observed);
+                            async move {
+                                body["_test_idempotency_key"] = serde_json::json!(headers
+                                    .get(xai_provider_attempt::IDEMPOTENCY_KEY_HEADER)
+                                    .and_then(|value| value.to_str().ok()));
+                                observed.lock().unwrap().push(body.clone());
+                                if body.get("stream_options").is_some()
+                                    || body.get("tool_choice").is_some()
+                                    || body.get("stream").and_then(serde_json::Value::as_bool)
+                                        == Some(true)
+                                {
+                                    return Response::builder()
+                                        .status(StatusCode::BAD_REQUEST)
+                                        .body(Body::from("unsupported compatibility field"))
+                                        .unwrap();
+                                }
+                                Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(header::CONTENT_TYPE, "application/json")
+                                    .body(Body::from(
+                                        serde_json::json!({
+                                            "choices": [{"message": {"content": "done"}}],
+                                            "usage": {
+                                                "prompt_tokens": 2,
+                                                "completion_tokens": 1,
+                                                "total_tokens": 3
+                                            }
+                                        })
+                                        .to_string(),
+                                    ))
+                                    .unwrap()
                             }
-                            Response::builder()
-                                .status(StatusCode::OK)
-                                .header(header::CONTENT_TYPE, "application/json")
-                                .body(Body::from(
-                                    serde_json::json!({
-                                        "choices": [{"message": {"content": "done"}}],
-                                        "usage": {
-                                            "prompt_tokens": 2,
-                                            "completion_tokens": 1,
-                                            "total_tokens": 3
-                                        }
-                                    })
-                                    .to_string(),
-                                ))
-                                .unwrap()
-                        }
-                    }),
+                        },
+                    ),
                 );
                 let server = tokio::spawn(async move {
                     axum::serve(listener, app).await.unwrap();
@@ -3258,6 +3515,7 @@ mod compatible_stream_tests {
                     true,
                     &CancellationToken::new(),
                     Some(&context),
+                    &provider_attempt_context(),
                     |_| {},
                     |_| {},
                 )
@@ -3289,6 +3547,15 @@ mod compatible_stream_tests {
 
                 let requests = observed.lock().unwrap();
                 assert_eq!(requests.len(), 4);
+                let keys = requests
+                    .iter()
+                    .map(|request| request["_test_idempotency_key"].as_str().unwrap())
+                    .collect::<std::collections::HashSet<_>>();
+                assert_eq!(
+                    keys.len(),
+                    4,
+                    "changed qualification bodies need new attempts"
+                );
                 assert!(requests[0].get("stream_options").is_some());
                 assert!(requests[1].get("stream_options").is_none());
                 assert!(requests[1].get("tool_choice").is_some());
@@ -3344,6 +3611,7 @@ mod compatible_stream_tests {
                     &serde_json::json!([]),
                     true,
                     &CancellationToken::new(),
+                    &provider_attempt_context(),
                     |_| {},
                     |_| {},
                 )
@@ -3408,6 +3676,7 @@ mod compatible_stream_tests {
                         &serde_json::json!([]),
                         true,
                         &cancel,
+                        &provider_attempt_context(),
                         move |_| cancel_after_delta.cancel(),
                         |_| {},
                     ),
@@ -3445,6 +3714,7 @@ mod compatible_stream_tests {
                     None,
                     temp.path(),
                     SessionKind::Chat,
+                    &provider_attempt_context(),
                 )
                 .await;
                 let error = match result {
@@ -3650,6 +3920,7 @@ pub(crate) async fn call_xai_chat(
     compacted_summary: Option<&str>,
     cwd: &Path,
     kind: SessionKind,
+    provider_attempt: &ProviderAttemptContext,
 ) -> Result<ChatReply> {
     // Prefer a non-expired / refreshed OIDC access token before the first call.
     let mut creds = crate::auth_store::ensure_fresh_credentials(creds.clone()).await;
@@ -3726,15 +3997,29 @@ pub(crate) async fn call_xai_chat(
         "messages": messages,
         "stream": false
     });
+    let request_bytes = serde_json::to_vec(&body).unwrap_or_default();
+    let mut physical_permit =
+        Some(provider_attempt.begin(&creds.provider_id, &request_bytes, true)?);
+    let idempotency_key = physical_permit
+        .as_ref()
+        .map(|permit| permit.idempotency_key().to_owned())
+        .ok_or_else(|| anyhow!("provider attempt permit is unavailable"))?;
     let url = format!("{}/chat/completions", base.trim_end_matches('/'));
 
     let send_once = |c: &crate::auth_store::WireCredentials| {
         let req = client.post(&url).header("Content-Type", "application/json");
         let req = crate::auth_store::apply_auth_headers(req, c, &base);
-        req.json(&body)
+        req.header(
+            xai_provider_attempt::IDEMPOTENCY_KEY_HEADER,
+            &idempotency_key,
+        )
+        .header("x-grok-req-id", &idempotency_key)
+        .json(&body)
     };
 
+    revalidate_provider_permit(provider_attempt, &mut physical_permit)?;
     let mut resp = send_once(&creds).send().await.map_err(|e| {
+        mark_permit_transport_ambiguous(provider_attempt, physical_permit.take());
         // Surface classify-able transport failures (DNS, TLS, timeout) so the
         // UI is not a vague "error sending request".
         let kind = if e.is_timeout() {
@@ -3763,7 +4048,9 @@ pub(crate) async fn call_xai_chat(
         match crate::auth_store::force_refresh(&creds).await {
             Ok(fresh) => {
                 creds = fresh;
+                revalidate_provider_permit(provider_attempt, &mut physical_permit)?;
                 resp = send_once(&creds).send().await.map_err(|error| {
+                    mark_permit_transport_ambiguous(provider_attempt, physical_permit.take());
                     let class = if error.is_timeout() {
                         "timeout"
                     } else if error.is_connect() {
@@ -3775,6 +4062,7 @@ pub(crate) async fn call_xai_chat(
                 })?;
             }
             Err(error) => {
+                mark_permit_semantic_rejection(provider_attempt, physical_permit.take(), 401);
                 bail!(
                     "HTTP 401 Unauthorized (OIDC refresh refused: {}). \
                      Run `grok login` to re-authenticate.",
@@ -3786,6 +4074,15 @@ pub(crate) async fn call_xai_chat(
 
     if !resp.status().is_success() {
         let status = resp.status();
+        if status.is_server_error() {
+            mark_permit_transport_ambiguous(provider_attempt, physical_permit.take());
+        } else {
+            mark_permit_semantic_rejection(
+                provider_attempt,
+                physical_permit.take(),
+                status.as_u16(),
+            );
+        }
         if is_compatible {
             bail!("configured provider returned HTTP {status}");
         }
@@ -3795,6 +4092,11 @@ pub(crate) async fn call_xai_chat(
         let clipped: String = text.chars().take(800).collect();
         bail!("HTTP {status}: {clipped}");
     }
+    if let Some(permit) = physical_permit.as_mut() {
+        provider_attempt
+            .mark_response_started(permit)
+            .map_err(|error| anyhow!("record provider response start: {error}"))?;
+    }
     let raw = read_bounded_response_body(resp, &CancellationToken::new()).await?;
     let v: serde_json::Value =
         serde_json::from_str(&raw).map_err(|error| anyhow!("provider JSON: {error}"))?;
@@ -3802,6 +4104,12 @@ pub(crate) async fn call_xai_chat(
     // chat/completions shape
     if let Some(content) = v["choices"][0]["message"]["content"].as_str() {
         if !content.is_empty() {
+            settle_provider_http_response(
+                provider_attempt,
+                &mut physical_permit,
+                200,
+                raw.as_bytes(),
+            )?;
             return Ok(ChatReply {
                 text: content.to_string(),
                 usage,
@@ -3811,6 +4119,12 @@ pub(crate) async fn call_xai_chat(
     // responses API fallback (some catalog models use this backend)
     if let Some(content) = v["output_text"].as_str() {
         if !content.is_empty() {
+            settle_provider_http_response(
+                provider_attempt,
+                &mut physical_permit,
+                200,
+                raw.as_bytes(),
+            )?;
             return Ok(ChatReply {
                 text: content.to_string(),
                 usage,
@@ -3825,6 +4139,12 @@ pub(crate) async fn call_xai_chat(
             }
         }
         if !parts.is_empty() {
+            settle_provider_http_response(
+                provider_attempt,
+                &mut physical_permit,
+                200,
+                raw.as_bytes(),
+            )?;
             return Ok(ChatReply {
                 text: parts.join(""),
                 usage,

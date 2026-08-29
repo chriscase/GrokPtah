@@ -36,7 +36,7 @@ use crate::host_helpers::{
     round_limit_stop_message, sandbox_blocks_shell, sandbox_is_readonly,
     should_auto_cargo_reverify_after_edit, should_skip_tool_after_cargo_failure,
     surface_rate_limit_or_error, tool_kind, tool_step_signature, tool_web_fetch, AgentStep,
-    IdenticalToolCallRun, McpToolIndex,
+    IdenticalToolCallRun, McpToolIndex, ProviderAttemptContext,
 };
 use crate::lane::LaneSummary;
 use crate::local_tools;
@@ -44,13 +44,13 @@ use crate::memory::{MemoryAccess, MemoryAddress, MemoryScope};
 use crate::orchestration::{
     apply_run_aggregate, assemble_continuation_context, prompt_preview, AgentAuthorityPolicy,
     AgentContinuationPlan, AgentLaneAssociation, AgentRecord, AgentResumePlan, AgentSpec,
-    AgentState, ContinuationCheckpoint, ContinuationMemoryFact, ContinuationMemoryInput,
-    ContinuationMemoryScope, ContinuationReason, ContinuationReasonCode, ContinuationRunInput,
-    ContinuationTestInput, MissedRunPolicy, OrchStore, PromotionState, RoutineConcurrencyPolicy,
-    RoutineLifecycle, RoutineRecord, RoutineRetryPolicy, RoutineSnapshot, RoutineTrigger,
-    RunAggregates, RunBounds, RunExecution, RunExecutionMode, RunPurpose, RunRecord, RunState,
-    RunStopCause, WorkAttemptView, WorkItem, WorkItemSnapshot, WorkPolicy, WorkTemplate,
-    DEFAULT_AGENT_TOOL_IDS,
+    AgentState, AuthContext, ContinuationCheckpoint, ContinuationMemoryFact,
+    ContinuationMemoryInput, ContinuationMemoryScope, ContinuationReason, ContinuationReasonCode,
+    ContinuationRunInput, ContinuationTestInput, MissedRunPolicy, OrchStore, PromotionState,
+    RoutineConcurrencyPolicy, RoutineLifecycle, RoutineRecord, RoutineRetryPolicy, RoutineSnapshot,
+    RoutineTrigger, RunAggregates, RunBounds, RunExecution, RunExecutionMode, RunPurpose,
+    RunRecord, RunState, RunStopCause, WorkAttemptView, WorkItem, WorkItemSnapshot, WorkPolicy,
+    WorkTemplate, DEFAULT_AGENT_TOOL_IDS,
 };
 use crate::permission::{
     evaluate_tool_gate, PendingPermissionView, PermissionDecision, PermissionRequest, ToolGate,
@@ -90,6 +90,50 @@ pub struct WorkspaceUiState {
     pub sessions: Vec<SessionSummary>,
     #[serde(default)]
     pub lanes: Vec<LaneSummary>,
+}
+
+/// Provider receipt produced by a provider-specific reconciliation adapter.
+/// Its fields are private so callers cannot fabricate provider truth.
+#[derive(Clone)]
+pub struct VerifiedProviderReceipt {
+    provider_request_id: String,
+    provider_effect_id: Option<String>,
+}
+
+impl std::fmt::Debug for VerifiedProviderReceipt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("VerifiedProviderReceipt([redacted])")
+    }
+}
+
+impl VerifiedProviderReceipt {
+    #[allow(dead_code)]
+    pub(crate) fn from_provider_response(
+        provider_request_id: impl Into<String>,
+        provider_effect_id: Option<impl Into<String>>,
+    ) -> Result<Self> {
+        let provider_request_id = provider_request_id.into();
+        let provider_effect_id = provider_effect_id.map(Into::into);
+        if provider_request_id.trim().is_empty()
+            || provider_effect_id
+                .as_deref()
+                .is_some_and(|effect_id| effect_id.trim().is_empty())
+        {
+            bail!("provider receipt identity is incomplete");
+        }
+        Ok(Self {
+            provider_request_id,
+            provider_effect_id,
+        })
+    }
+
+    pub(crate) fn provider_request_id(&self) -> &str {
+        &self.provider_request_id
+    }
+
+    pub(crate) fn provider_effect_id(&self) -> Option<&str> {
+        self.provider_effect_id.as_deref()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -748,6 +792,10 @@ pub struct AgentHostHandle {
     /// children it spawns. A session counter is not a safe run identity.
     run_usage_trackers: Arc<Mutex<HashMap<Uuid, Arc<RunUsageTracker>>>>,
     provider_observation: Option<ProviderObservationSession>,
+    /// The single durable authority for all provider physical sends made by
+    /// this host. It is optional only when opening the ledger failed; callers
+    /// then fail closed before constructing a credential-bearing request.
+    provider_attempt_store: Option<xai_provider_attempt::ProviderAttemptStore>,
     /// Exclusive lock on `~/.grokptah` — kept alive for the process (#119).
     _instance_lock: Option<Arc<crate::instance_lock::InstanceLock>>,
     /// Selects the durable root for legacy modules that still resolve paths
@@ -778,6 +826,18 @@ impl AgentHost {
         runtime_home: crate::discover::RuntimeHome,
     ) -> AgentHostHandle {
         let runtime_home_context = Arc::new(runtime_home.install());
+        let provider_attempt_root = runtime_home.orchestration_root().join("provider-attempts");
+        let provider_attempt_store = match crate::host_authority::initialize(&provider_attempt_root)
+            .and_then(|_| {
+                xai_provider_attempt::ProviderAttemptStore::open(&provider_attempt_root)
+                    .map_err(|error| anyhow!(error.to_string()))
+            }) {
+            Ok(store) => Some(store),
+            Err(error) => {
+                eprintln!("[grokptah] provider-attempt ledger unavailable: {error}");
+                None
+            }
+        };
         // Single-instance guard before any GC or writes that could race another process.
         let instance_lock = match crate::instance_lock::InstanceLock::try_acquire_at(&runtime_home)
         {
@@ -933,6 +993,7 @@ impl AgentHost {
             orchestration_wakeup: Arc::new(Notify::new()),
             run_usage_trackers: Arc::new(Mutex::new(HashMap::new())),
             provider_observation: config.provider_observation,
+            provider_attempt_store,
             _instance_lock: instance_lock,
             runtime_home,
             _runtime_home_context: runtime_home_context,
@@ -950,6 +1011,112 @@ impl AgentHostHandle {
         let session = self.provider_observation.as_ref()?;
         let tracker = self.run_usage_trackers.lock().get(&session_id).cloned()?;
         session.context(tracker.run_id(), session_id).ok()
+    }
+
+    /// Build a host-owned provider authority context from the durable
+    /// assembled #477/#458 authority record. The common adapter re-reads that
+    /// host-owned record at every effect boundary; no caller callback is
+    /// accepted.
+    fn provider_attempt_context(&self, session_id: Uuid) -> Result<ProviderAttemptContext> {
+        let store = self
+            .provider_attempt_store
+            .clone()
+            .ok_or_else(|| anyhow!("provider-attempt ledger is unavailable"))?;
+        let effect_scope = crate::host_authority::scope(session_id);
+        let (agent_id, model, turn_generation) = {
+            let inner = self.inner.lock();
+            let session = inner
+                .sessions
+                .get(&session_id)
+                .ok_or_else(|| anyhow!("unknown session"))?;
+            (
+                session.agent_id.clone(),
+                session.model.clone(),
+                inner
+                    .turn_generations
+                    .get(&session_id)
+                    .copied()
+                    .unwrap_or(1),
+            )
+        };
+        crate::host_authority::assemble(
+            session_id,
+            agent_id.as_deref(),
+            &model,
+            turn_generation,
+            self.orchestration_store.lock().clone(),
+            &self
+                .runtime_home
+                .orchestration_root()
+                .join("provider-attempts"),
+        )?;
+        let operation_id = self
+            .run_usage_trackers
+            .lock()
+            .get(&session_id)
+            .map(|tracker| tracker.run_id().to_owned())
+            .unwrap_or_else(|| format!("desktop-chat-{session_id}"));
+        ProviderAttemptContext::from_host_ledger(store, operation_id, effect_scope)
+            .map_err(|error| anyhow!("construct provider attempt context: {error}"))
+    }
+
+    fn refresh_provider_authorities(&self) {
+        let Some(_store) = self.provider_attempt_store.as_ref() else {
+            return;
+        };
+        let sessions = {
+            let inner = self.inner.lock();
+            inner
+                .sessions
+                .iter()
+                .map(|(session_id, session)| {
+                    (
+                        *session_id,
+                        session.agent_id.clone(),
+                        session.model.clone(),
+                        inner.turn_generations.get(session_id).copied().unwrap_or(1),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let root = self
+            .runtime_home
+            .orchestration_root()
+            .join("provider-attempts");
+        let store = self.orchestration_store.lock().clone();
+        for (session_id, agent_id, model, turn_generation) in sessions {
+            let scope = crate::host_authority::scope(session_id);
+            let _ = crate::host_authority::refresh(
+                agent_id.as_deref(),
+                &model,
+                turn_generation,
+                store.clone(),
+                &root,
+                &scope,
+                true,
+            );
+        }
+    }
+
+    fn revoke_provider_authorities(&self) {
+        let Some(_store) = self.provider_attempt_store.as_ref() else {
+            return;
+        };
+        let session_ids = self
+            .inner
+            .lock()
+            .sessions
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        let root = self
+            .runtime_home
+            .orchestration_root()
+            .join("provider-attempts");
+        for session_id in session_ids {
+            let scope = crate::host_authority::scope(session_id);
+            let _ = crate::host_authority::revoke_scope(&root, &scope);
+        }
     }
 
     pub fn take_event_receiver(&self) -> Option<crate::event_bus::EventReceiver> {
@@ -1017,7 +1184,8 @@ impl AgentHostHandle {
         if resolved.eligibility.tier >= crate::gateway_config::ComputerUseTier::SemanticAct {
             return Ok(resolved.eligibility);
         }
-        qualify_semantic_model(&credentials, &model, effort, &cancel)
+        let provider_attempt = self.provider_attempt_context(session_id)?;
+        qualify_semantic_model(&credentials, &model, effort, &cancel, &provider_attempt)
             .await
             .context("selected model did not pass bounded Computer qualification")?;
         if cancel.is_cancelled() {
@@ -1072,6 +1240,7 @@ impl AgentHostHandle {
         if !durable_authority && !session_authority {
             bail!("selected model is not qualified for semantic Computer actions");
         }
+        let provider_attempt = self.provider_attempt_context(session_id)?;
         let proposal = propose_semantic_action(
             &credentials,
             &model,
@@ -1079,6 +1248,7 @@ impl AgentHostHandle {
             objective,
             observation,
             &cancel,
+            &provider_attempt,
         )
         .await
         .context("selected model did not return a valid bounded Computer proposal")?;
@@ -3163,6 +3333,20 @@ impl AgentHostHandle {
         g.turn_cancels.contains_key(&id) || g.turn_reservations.contains_key(&id)
     }
 
+    pub fn orchestration_reservation_for_session(&self, id: Uuid) -> Option<String> {
+        self.inner.lock().turn_reservations.get(&id).cloned()
+    }
+
+    pub async fn wait_for_orchestration_release(&self, id: Uuid) {
+        loop {
+            let notified = self.orchestration_wakeup.notified();
+            if !self.session_busy(id) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     pub fn reserve_orchestration_turn(&self, run_id: &str, session_id: Uuid) -> Result<()> {
         self.ensure_session_accepts_new_work(session_id)?;
         let mut g = self.inner.lock();
@@ -3914,6 +4098,7 @@ impl AgentHostHandle {
             if !call_allowed {
                 None
             } else {
+                let provider_attempt = self.provider_attempt_context(id)?;
                 match call_xai_chat(
                     &creds,
                     &model,
@@ -3921,6 +4106,7 @@ impl AgentHostHandle {
                     None,
                     &cwd,
                     SessionKind::Build,
+                    &provider_attempt,
                 )
                 .await
                 {
@@ -4143,6 +4329,7 @@ impl AgentHostHandle {
             self.invalidate_computer_agent_authority();
         }
         self.inner.lock().model = model;
+        self.refresh_provider_authorities();
         self.persist_chrome();
     }
 
@@ -4286,11 +4473,13 @@ impl AgentHostHandle {
             "default".into()
         };
         drop(g);
+        self.refresh_provider_authorities();
         self.persist_chrome();
     }
 
     pub fn set_sandbox(&self, profile: String) {
         self.inner.lock().sandbox_profile = normalize_sandbox_profile(&profile).to_string();
+        self.refresh_provider_authorities();
         self.persist_chrome();
     }
 
@@ -4318,6 +4507,7 @@ impl AgentHostHandle {
         };
         g.always_approve = bypass;
         drop(g);
+        self.refresh_provider_authorities();
         self.persist_chrome();
     }
 
@@ -4325,6 +4515,8 @@ impl AgentHostHandle {
         let mut g = self.inner.lock();
         g.allow_rules = allow;
         g.deny_rules = deny;
+        drop(g);
+        self.refresh_provider_authorities();
     }
 
     fn session_agent_spec(&self, session_id: Uuid) -> Result<Option<AgentSpec>> {
@@ -4647,6 +4839,7 @@ impl AgentHostHandle {
         let state =
             crate::auth_store::store_api_key(&api_key, &display_name).map_err(|e| anyhow!(e))?;
         self.inner.lock().auth = state.clone();
+        self.refresh_provider_authorities();
         Ok(state)
     }
 
@@ -4655,6 +4848,7 @@ impl AgentHostHandle {
     }
 
     pub fn sign_out(&self) -> AuthState {
+        self.revoke_provider_authorities();
         let state = crate::auth_store::clear_credentials();
         self.inner.lock().auth = state.clone();
         state
@@ -5758,7 +5952,73 @@ impl AgentHostHandle {
         provider_id: &str,
         model_id: &str,
     ) -> Result<crate::provider_qualification::ProviderQualificationReport> {
-        crate::provider_qualification::qualify_provider_model(provider_id, model_id).await
+        let session_id = self
+            .inner
+            .lock()
+            .active_session
+            .ok_or_else(|| anyhow!("provider qualification requires an active Lane"))?;
+        let provider_attempt = self.provider_attempt_context(session_id)?;
+        crate::provider_qualification::qualify_provider_model_admitted(
+            provider_id,
+            model_id,
+            &provider_attempt,
+        )
+        .await
+    }
+
+    /// Consume a receipt produced by the provider-specific reconciliation
+    /// adapter. The receipt is opaque outside this crate and its request id
+    /// must match the durable attempt before an operator grant is recorded.
+    pub fn reconcile_provider_attempt(
+        &self,
+        session_id: Uuid,
+        attempt_id: &str,
+        operator: &AuthContext,
+        receipt: VerifiedProviderReceipt,
+    ) -> Result<()> {
+        let provider_attempt = self.provider_attempt_context(session_id)?;
+        let store = self
+            .provider_attempt_store
+            .clone()
+            .ok_or_else(|| anyhow!("provider-attempt ledger is unavailable"))?;
+        let attempt = store
+            .load(attempt_id)
+            .map_err(|error| anyhow!("load provider attempt: {error}"))?
+            .ok_or_else(|| anyhow!("provider attempt does not exist"))?;
+        if attempt
+            .provider_request_id()
+            .map_err(|error| anyhow!("read provider request identity: {error}"))?
+            != receipt.provider_request_id()
+        {
+            bail!("provider reconciliation request identity does not match attempt");
+        }
+        if let Some(agent_id) = self
+            .inner
+            .lock()
+            .sessions
+            .get(&session_id)
+            .and_then(|session| session.agent_id.as_deref())
+        {
+            let agent = self
+                .orchestration_store
+                .lock()
+                .clone()
+                .and_then(|store| store.load_agent(agent_id).ok().flatten())
+                .ok_or_else(|| anyhow!("canonical Agent authority is unavailable"))?;
+            if agent.owner_principal_id.as_deref() != Some(operator.owner_id.as_str()) {
+                bail!("operator is not the Agent owner");
+            }
+        }
+        let root = self
+            .runtime_home
+            .orchestration_root()
+            .join("provider-attempts");
+        crate::host_authority::write_verified_reconciliation(
+            &root, attempt_id, operator, &receipt,
+        )?;
+        provider_attempt
+            .reconcile_from_host_ledger(&attempt)
+            .map_err(|error| anyhow!("reconcile provider attempt: {error}"))
     }
 
     pub fn delete_provider_profile(&self, provider_id: &str) -> Result<()> {
@@ -7567,6 +7827,7 @@ impl AgentHostHandle {
                 crate::auth_store::resolve_wire_credentials_for_model(model)
                     .map_err(anyhow::Error::msg)?
             {
+                let provider_attempt = self.provider_attempt_context(session_id)?;
                 match call_xai_chat(
                     &creds,
                     model,
@@ -7574,6 +7835,7 @@ impl AgentHostHandle {
                     compacted_summary.as_deref(),
                     cwd,
                     SessionKind::Chat,
+                    &provider_attempt,
                 )
                 .await
                 {
@@ -7625,7 +7887,17 @@ impl AgentHostHandle {
                 if plan_token_stop.is_some() {
                     offline_plan_steps(&goal)
                 } else {
-                    match propose_plan_with_model(&creds, model, cwd, &goal, &cancel).await {
+                    let provider_attempt = self.provider_attempt_context(session_id)?;
+                    match propose_plan_with_model(
+                        &creds,
+                        model,
+                        cwd,
+                        &goal,
+                        &cancel,
+                        &provider_attempt,
+                    )
+                    .await
+                    {
                         Ok((steps, usage)) if !steps.is_empty() => {
                             plan_token_stop = self.finish_provider_attempt(
                                 session_id,
@@ -8625,6 +8897,7 @@ impl AgentHostHandle {
                 }
             };
             let provider_observation = self.provider_observation_context(session_id);
+            let provider_attempt = self.provider_attempt_context(session_id)?;
             let step = match call_xai_agent_step_observed(
                 creds,
                 model,
@@ -8634,6 +8907,7 @@ impl AgentHostHandle {
                 !self.run_tokens_bounded(session_id),
                 cancel,
                 provider_observation.as_ref(),
+                &provider_attempt,
                 |delta| {
                     emit_message(event_tx, session_id, delta);
                 },
@@ -9786,6 +10060,7 @@ impl AgentHostHandle {
                 if usage_attempt.is_some()
                     || self.run_token_stop_before_request(session_id).is_none()
                 {
+                    let provider_attempt = self.provider_attempt_context(session_id)?;
                     match call_xai_chat(
                         &creds,
                         &model,
@@ -9793,6 +10068,7 @@ impl AgentHostHandle {
                         None,
                         cwd,
                         SessionKind::Build,
+                        &provider_attempt,
                     )
                     .await
                     {
@@ -10149,6 +10425,13 @@ impl AgentHostHandle {
                     }
                 };
             let provider_observation = self.provider_observation_context(session_id);
+            let provider_attempt = match self.provider_attempt_context(session_id) {
+                Ok(context) => context,
+                Err(error) => {
+                    last = format!("GP subagent provider admission failed: {error:#}");
+                    break;
+                }
+            };
             let step = call_xai_agent_step_observed(
                 &creds,
                 &model,
@@ -10160,6 +10443,7 @@ impl AgentHostHandle {
                     .is_some_and(|tracker| tracker.is_bounded()),
                 &cancel,
                 provider_observation.as_ref(),
+                &provider_attempt,
                 |_d| {},
                 |_t| {},
             )

@@ -311,7 +311,7 @@ async fn compatible_model_completes_a_multi_round_edit_and_test_task() {
     host.set_model(model_selection_key("env-grokptah", "synthetic-cheap-code"));
     let session = host.session_new().unwrap();
 
-    timeout(
+    let reply = timeout(
         Duration::from_secs(10),
         host.session_prompt(
             session.id,
@@ -323,10 +323,14 @@ async fn compatible_model_completes_a_multi_round_edit_and_test_task() {
     .unwrap();
     let updates = drain_until_turn_complete(&mut events).await;
 
-    assert_eq!(
-        std::fs::read_to_string(workspace.path().join("provider-proof.txt")).unwrap(),
-        "compatible agent wrote this\n"
-    );
+    let proof = std::fs::read_to_string(workspace.path().join("provider-proof.txt"))
+        .unwrap_or_else(|error| {
+            panic!(
+                "provider proof missing after {} model requests: {error}; reply={reply}",
+                state.requests.load(Ordering::SeqCst),
+            )
+        });
+    assert_eq!(proof, "compatible agent wrote this\n");
     assert_eq!(state.requests.load(Ordering::SeqCst), 3);
     assert!(state.saw_write_result.load(Ordering::SeqCst));
     assert!(state.saw_test_result.load(Ordering::SeqCst));

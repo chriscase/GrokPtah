@@ -211,6 +211,15 @@ pub(crate) async fn run_request_task(
                 }
             }
             AttemptOutcome::Failed { error } => {
+                if client.provider_attempt_is_configured() && error.is_provider_attempt_ambiguous()
+                {
+                    let guarded = SamplingError::Auth(
+                        "provider attempt is uncertain; explicit reconciliation is required".into(),
+                    );
+                    emit_failed(&event_tx, &request_id, &guarded);
+                    send_completion(&mut completion_tx, Err(guarded));
+                    return request_id;
+                }
                 // Doom-loop resamples run on their own budget and never
                 // consult the transport classifier, so no classifier change
                 // can silently debit the transport budget for a doom failure.
@@ -257,6 +266,15 @@ pub(crate) async fn run_request_task(
                 return request_id;
             }
             AttemptOutcome::InitFailed { error } => {
+                if client.provider_attempt_is_configured() && error.is_provider_attempt_ambiguous()
+                {
+                    let guarded = SamplingError::Auth(
+                        "provider attempt is uncertain; explicit reconciliation is required".into(),
+                    );
+                    emit_failed(&event_tx, &request_id, &guarded);
+                    send_completion(&mut completion_tx, Err(guarded));
+                    return request_id;
+                }
                 if !apply_retry_decision(
                     &error,
                     &mut retry_count,

@@ -1,0 +1,5 @@
+error[E0422]: cannot find struct, variant or union type `CanonicalHostAuthority` in crate `xai_provider_attempt`
+ --> tests/ui/forged_struct_literal.rs:2:35
+  |
+2 |     let _ = xai_provider_attempt::CanonicalHostAuthority {
+  |                                   ^^^^^^^^^^^^^^^^^^^^^^ not found in `xai_provider_attempt`

@@ -255,6 +255,20 @@ impl SamplingError {
         }
     }
 
+    /// A response/body failure after a guarded physical send may have happened
+    /// at the provider. The durable attempt adapter uses this to suppress the
+    /// sampler's otherwise-valid transport retry loop.
+    pub fn is_provider_attempt_ambiguous(&self) -> bool {
+        match self {
+            SamplingError::Http(_)
+            | SamplingError::EventStreamError(_)
+            | SamplingError::StreamError { .. }
+            | SamplingError::IdleTimeout { .. } => true,
+            SamplingError::Api { status, .. } => status.is_server_error(),
+            _ => false,
+        }
+    }
+
     pub fn model_metadata(&self) -> Option<&ResponseModelMetadata> {
         match self {
             SamplingError::Api { model_metadata, .. } => model_metadata.as_ref(),

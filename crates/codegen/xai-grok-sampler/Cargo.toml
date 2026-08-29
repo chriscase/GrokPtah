@@ -8,6 +8,7 @@ description = "Actor-based sampling/inference layer for xAI grok (HTTP streaming
 [dependencies]
 # Internal
 xai-grok-sampling-types = { path = "../xai-grok-sampling-types" }
+xai-provider-attempt = { path = "../../common/xai-provider-attempt" }
 xai-grok-version = { workspace = true }
 
 # External
@@ -41,6 +42,7 @@ tokio = { workspace = true, features = [
     "net",
     "rt-multi-thread",
 ] }
+ed25519-dalek = "3.0.0"
 
 [lints]
 workspace = true
