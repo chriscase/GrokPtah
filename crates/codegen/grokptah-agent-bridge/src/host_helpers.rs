@@ -3773,7 +3773,6 @@ mod efficiency_tests {
             class: crate::durable::progress::RepeatClass::TrueNoop,
             repeats: 4,
             tool_name: "run_terminal_cmd".into(),
-            observation_fingerprint: None,
         })
     }
 

@@ -1,17 +1,13 @@
-//! Adversarial tests for the durable agent / self-hosting train.
+//! Adversarial tests for the durable-agent stationarity slice.
 //!
 //! Every test here is deterministic and offline. Nothing contacts a provider,
 //! reads a credential, opens a socket, or sleeps.
 
 use grokptah_agent_bridge::durable::{
-    self, cancel::CancelReason, claim::ClaimError, effects::EffectError, effects::EffectKind,
-    effects::EffectState, journal::AppendRefusal, progress::RepeatClass, progress::StopDecision,
-    retry::StandDownReason, sdk::BoundaryError, sdk::Capability, sdk::GrantProvenance,
-    sdk::NegotiationError, sdk::ProtocolVersion, send::DeliveryKnowledge, send::SendError,
-    send::SendState, send::TransportEvidence, BoundedEventLog, CancelStatus, CancellationLedger,
-    ClaimLedger, ClaimRecord, EffectRegistry, ManagerSession, ProgressLedger, RawObservation,
-    RawObservationDigest, RetryBudget, RetryDecision, Revision, SendAttempt, SendLedger,
+    self, progress::RepeatClass, progress::StopDecision, ActiveTaskWaitWitness, ActiveWaitState,
+    ProgressLedger, RawObservation, RawObservationDigest,
 };
+use uuid::Uuid;
 
 /// The byte cap `host.rs` applies to one tool result before the model wire.
 const WIRE_BOUND: usize = 24_000;
@@ -20,12 +16,12 @@ const WIRE_BOUND: usize = 24_000;
 // Raw digests before bounded projections
 // ---------------------------------------------------------------------------
 
-/// The regression this train exists for.
+/// The regression this slice exists for.
 ///
 /// Two tool results that differ only *after* the 24,000-byte wire bound project
-/// to byte-identical text. A digest taken from the projection therefore reports
-/// them as the same observation, which is what turns an advancing run into a
-/// false inert repeat. The raw digest must still tell them apart.
+/// to byte-identical text. A digest taken from the projection reports them as
+/// the same observation, which is what turns an advancing run into a false
+/// inert repeat. The raw digest must still tell them apart.
 #[test]
 fn a_suffix_change_beyond_the_wire_bound_still_changes_the_raw_digest() {
     let head = "A".repeat(WIRE_BOUND);
@@ -79,17 +75,35 @@ fn digests_are_domain_separated_and_length_prefixed() {
     assert!(RawObservationDigest::of_digests(&[]).is_none());
 }
 
+/// The digest is taken over real tool-result content, so it must never reach a
+/// log line, a durable record, or a read projection.
 #[test]
-fn a_digest_never_renders_in_full_through_debug() {
+fn a_digest_never_renders_its_value_and_cannot_be_serialized() {
     let digest = RawObservationDigest::of_raw(b"secret-shaped output");
-    let rendered = format!("{digest:?}");
-    let full = serde_json::to_string(&digest).expect("digest serializes");
-    let full = full.trim_matches('"');
-    assert!(
-        !rendered.contains(full),
-        "Debug must not print the whole digest"
-    );
-    assert!(rendered.contains(&digest.fingerprint()));
+    assert_eq!(format!("{digest:?}"), "RawObservationDigest(<redacted>)");
+
+    // Source guard: the opacity is a property of the type, not of its callers.
+    let source = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/durable/observation.rs"
+    ))
+    .expect("source is readable");
+    let code: String = source
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for forbidden in [
+        "Serialize",
+        "Deserialize",
+        "impl fmt::Display",
+        "pub fn as_bytes",
+    ] {
+        assert!(
+            !code.contains(forbidden),
+            "the observation digest must not gain `{forbidden}`"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -106,36 +120,26 @@ fn poll_round(ledger: &mut ProgressLedger, output: &str) {
 #[test]
 fn an_advancing_poll_is_never_stopped_as_stationary() {
     let mut ledger = ProgressLedger::new();
-    for round in 0..32 {
+    for round in 0..40 {
         poll_round(&mut ledger, &format!("building… {round} of many"));
-        assert_eq!(
-            ledger.class(),
-            if round == 0 {
-                RepeatClass::Fresh
-            } else {
-                RepeatClass::Advancing
-            }
-        );
         assert_eq!(
             ledger.decide(),
             StopDecision::Continue,
             "round {round} advanced its output and is not stationary"
         );
     }
+    assert_eq!(ledger.class(), RepeatClass::Advancing);
 }
 
-/// The same advancing poll, but the advance is past the wire bound. This is the
-/// end-to-end form of the digest ordering rule.
+/// The advance is past the wire bound. End-to-end form of the ordering rule.
 #[test]
 fn a_poll_whose_output_only_changes_past_the_wire_bound_is_not_inert() {
     let head = "A".repeat(WIRE_BOUND);
     let mut raw_ledger = ProgressLedger::new();
     let mut projection_ledger = ProgressLedger::new();
 
-    // Long enough for the post-bound digest to reach the inert ceiling.
     for round in 0..durable::progress::MAX_INERT_REPEATS {
-        let raw = format!("{head}progress-{round}");
-        let observation = RawObservation::capture(&raw);
+        let observation = RawObservation::capture(format!("{head}progress-{round}"));
         let projected = observation.project(WIRE_BOUND);
 
         raw_ledger.observe_call("poll", "get_task_output", false);
@@ -155,25 +159,47 @@ fn a_poll_whose_output_only_changes_past_the_wire_bound_is_not_inert() {
     assert!(matches!(projection_ledger.decide(), StopDecision::Stop(_)));
 }
 
+/// Regression: a run that moved once and then froze must still reach the inert
+/// ceiling. An earlier revision kept a sticky "saw advance" flag for the whole
+/// signature run, so `A,B,B,B,…` classified as advancing forever and never
+/// stopped — a stuck loop that changed its output exactly once was immortal.
+#[test]
+fn a_run_that_advances_once_and_then_freezes_still_reaches_the_inert_stop() {
+    let mut ledger = ProgressLedger::new();
+    poll_round(&mut ledger, "phase: build");
+    poll_round(&mut ledger, "phase: test");
+    assert_eq!(ledger.class(), RepeatClass::Advancing);
+
+    let mut stopped_after = None;
+    for frozen in 1..=durable::progress::MAX_INERT_REPEATS + 4 {
+        poll_round(&mut ledger, "phase: test");
+        if let StopDecision::Stop(detail) = ledger.decide() {
+            stopped_after = Some(frozen);
+            assert_eq!(detail.class, RepeatClass::Inert);
+            break;
+        }
+    }
+    assert_eq!(
+        stopped_after,
+        Some(durable::progress::MAX_INERT_REPEATS - 1),
+        "the unchanged suffix restarts at the change, then reaches the ceiling"
+    );
+}
+
 #[test]
 fn an_inert_repeat_stops_at_the_inert_ceiling() {
     let mut ledger = ProgressLedger::new();
     let mut stopped_at: Option<u32> = None;
-    for round in 1..=16u32 {
+    for round in 1..=20u32 {
         poll_round(&mut ledger, "queued; nothing to report");
         if let StopDecision::Stop(detail) = ledger.decide() {
             stopped_at = Some(round);
             assert_eq!(detail.class, RepeatClass::Inert);
             assert_eq!(detail.tool_name, "get_task_output");
-            assert!(detail.observation_fingerprint.is_some());
             break;
         }
     }
-    assert_eq!(
-        stopped_at,
-        Some(durable::progress::MAX_INERT_REPEATS),
-        "an inert repeat stops on the Nth identical observation, not later"
-    );
+    assert_eq!(stopped_at, Some(durable::progress::MAX_INERT_REPEATS));
 }
 
 /// A small model that keeps emitting a no-op shell call must stop quickly, and
@@ -225,7 +251,7 @@ fn an_identical_run_nudges_exactly_once_at_eight() {
 #[test]
 fn an_unobserved_repeat_still_stops_at_the_identical_call_ceiling() {
     let mut ledger = ProgressLedger::new();
-    for round in 1..durable::progress::MAX_UNOBSERVED_REPEATS {
+    for round in 1..durable::progress::MAX_IDENTICAL_CALLS {
         ledger.observe_call("poll", "get_task_output", false);
         assert_eq!(ledger.decide(), StopDecision::Continue, "round {round}");
     }
@@ -234,7 +260,7 @@ fn an_unobserved_repeat_still_stops_at_the_identical_call_ceiling() {
         panic!("an unobserved repeat run must still be bounded");
     };
     assert_eq!(detail.class, RepeatClass::Unobserved);
-    assert_eq!(detail.repeats, durable::progress::MAX_UNOBSERVED_REPEATS);
+    assert_eq!(detail.repeats, durable::progress::MAX_IDENTICAL_CALLS);
 }
 
 #[test]
@@ -252,880 +278,197 @@ fn a_stationarity_stop_message_reads_as_incomplete_not_as_a_round_limit() {
     assert!(!message.contains("tool rounds"));
 }
 
-// ---------------------------------------------------------------------------
-// One provider-send lattice
-// ---------------------------------------------------------------------------
-
-fn digest(label: &str) -> RawObservationDigest {
-    RawObservationDigest::of_raw(label.as_bytes())
-}
-
+/// The stop detail is durable, so it must carry no part of the observation.
 #[test]
-fn only_a_refused_connection_proves_a_request_was_not_sent() {
-    for (evidence, expected) in [
-        (TransportEvidence::ConnectionRefused, SendState::NotSent),
-        (TransportEvidence::TimedOut, SendState::Uncertain),
-        (TransportEvidence::ResetAfterWrite, SendState::Uncertain),
-        (TransportEvidence::DecodeFailed, SendState::Uncertain),
-        (TransportEvidence::ReaderAbandoned, SendState::Uncertain),
-        (TransportEvidence::ResponseHeaders, SendState::Acknowledged),
-        (TransportEvidence::ResponseBytes, SendState::Responding),
-        (TransportEvidence::ResponseComplete, SendState::Settled),
-        (TransportEvidence::ProviderRejected, SendState::Settled),
-    ] {
-        assert_eq!(
-            evidence.classify(SendState::Sending),
-            expected,
-            "{evidence:?} must classify as {expected}"
-        );
+fn a_stop_detail_carries_no_observation_material() {
+    let mut ledger = ProgressLedger::new();
+    for _ in 0..durable::progress::MAX_INERT_REPEATS {
+        poll_round(&mut ledger, "sensitive-looking build output");
     }
-}
-
-#[test]
-fn cancelling_before_dispatch_proves_not_sent_but_after_it_does_not() {
+    let StopDecision::Stop(detail) = ledger.decide() else {
+        panic!("expected a stop");
+    };
+    let encoded = serde_json::to_string(&detail).expect("stop detail serializes");
+    assert!(!encoded.contains("sensitive"));
+    // Only the three host-authored fields.
     assert_eq!(
-        TransportEvidence::CancelledBeforeDispatch.classify(SendState::Preparing),
-        SendState::NotSent
-    );
-    assert_eq!(
-        TransportEvidence::CancelledBeforeDispatch.classify(SendState::Sending),
-        SendState::Uncertain
-    );
-}
-
-#[test]
-fn delivery_knowledge_preserves_not_sent_uncertain_and_settled() {
-    assert_eq!(
-        SendState::Preparing.delivery_knowledge(),
-        DeliveryKnowledge::KnownNotDelivered
-    );
-    assert_eq!(
-        SendState::NotSent.delivery_knowledge(),
-        DeliveryKnowledge::KnownNotDelivered
-    );
-    assert_eq!(
-        SendState::Sending.delivery_knowledge(),
-        DeliveryKnowledge::Unknown
-    );
-    assert_eq!(
-        SendState::Uncertain.delivery_knowledge(),
-        DeliveryKnowledge::Unknown
-    );
-    assert_eq!(
-        SendState::Settled.delivery_knowledge(),
-        DeliveryKnowledge::KnownDelivered
-    );
-    assert!(SendState::NotSent.may_auto_retry());
-    for state in [
-        SendState::Sending,
-        SendState::Uncertain,
-        SendState::Acknowledged,
-        SendState::Responding,
-        SendState::Settled,
-    ] {
-        assert!(!state.may_auto_retry(), "{state} must not auto-retry");
-    }
-}
-
-#[test]
-fn an_uncertain_attempt_blocks_a_fresh_ordinal_until_explicitly_resolved() {
-    let mut ledger = SendLedger::new();
-    let permit = ledger.begin(digest("req-1")).expect("first send admitted");
-    ledger.mark_sending(&permit).expect("marked sending");
-    assert_eq!(
-        ledger
-            .observe(&permit, TransportEvidence::ResetAfterWrite)
-            .expect("evidence applied"),
-        SendState::Uncertain
-    );
-
-    let blocked = ledger
-        .begin(digest("req-2"))
-        .expect_err("scope must be blocked");
-    assert_eq!(
-        blocked,
-        SendError::ScopeBlocked {
-            ordinal: 1,
-            state: SendState::Uncertain
-        }
-    );
-
-    // Resolution needs an explicit grant and never happens on its own.
-    assert_eq!(
-        ledger.resolve_uncertain(1, false, SendState::Settled),
-        Err(SendError::ResolutionNotGranted)
-    );
-    ledger
-        .resolve_uncertain(1, true, SendState::Settled)
-        .expect("granted resolution");
-    ledger
-        .begin(digest("req-2"))
-        .expect("scope reopens once settled");
-}
-
-#[test]
-fn a_settled_attempt_permits_a_new_ordinal() {
-    let mut ledger = SendLedger::new();
-    let first = ledger.begin(digest("a")).expect("admitted");
-    ledger.mark_sending(&first).unwrap();
-    ledger
-        .observe(&first, TransportEvidence::ResponseHeaders)
-        .unwrap();
-    ledger
-        .observe(&first, TransportEvidence::ResponseBytes)
-        .unwrap();
-    ledger
-        .settle(&first, Some("receipt-1".into()), true)
-        .expect("settled");
-    let second = ledger.begin(digest("b")).expect("new ordinal admitted");
-    assert_eq!(second.ordinal(), 2);
-}
-
-#[test]
-fn an_illegal_transition_is_refused_and_leaves_the_record_alone() {
-    let mut ledger = SendLedger::new();
-    let permit = ledger.begin(digest("a")).expect("admitted");
-    // Preparing cannot jump straight to Settled: only transport evidence gets
-    // there, and it can only arrive after the send future exists.
-    let err = ledger
-        .settle(&permit, None, false)
-        .expect_err("must be refused");
-    assert_eq!(
-        err,
-        SendError::IllegalTransition {
-            from: SendState::Preparing,
-            to: SendState::Settled
-        }
-    );
-    assert_eq!(
-        ledger.attempt(1).expect("record survives").state,
-        SendState::Preparing
-    );
-}
-
-#[test]
-fn a_contradictory_settlement_bundle_is_refused_before_it_is_written() {
-    let mut ledger = SendLedger::new();
-    let permit = ledger.begin(digest("a")).expect("admitted");
-    ledger.mark_sending(&permit).unwrap();
-    ledger
-        .observe(&permit, TransportEvidence::ResetAfterWrite)
-        .unwrap();
-    // Uncertain -> Settled is legal only through the granted resolution path,
-    // so settling it directly is refused rather than written.
-    assert!(matches!(
-        ledger.settle(&permit, Some("receipt".into()), true),
-        Ok(()) | Err(SendError::IllegalTransition { .. })
-    ));
-    // Whatever happened, the record never holds a receipt without delivery.
-    let attempt = ledger.attempt(1).expect("record exists");
-    if attempt.receipt.is_some() {
-        assert_eq!(
-            attempt.state.delivery_knowledge(),
-            DeliveryKnowledge::KnownDelivered
-        );
-    }
-}
-
-#[test]
-fn a_restart_reconstructs_the_maximum_ordinal_and_never_reissues_one() {
-    let recovered = SendLedger::recover([
-        SendAttempt {
-            ordinal: 1,
-            state: SendState::Settled,
-            request_digest: digest("a"),
-            receipt: Some("r1".into()),
-            audit_accounted: true,
-        },
-        SendAttempt {
-            ordinal: 7,
-            state: SendState::Settled,
-            request_digest: digest("b"),
-            receipt: None,
-            audit_accounted: true,
-        },
-    ]);
-    let mut ledger = recovered;
-    let permit = ledger.begin(digest("c")).expect("admitted after restart");
-    assert_eq!(
-        permit.ordinal(),
-        8,
-        "the next ordinal follows the maximum seen"
-    );
-}
-
-#[test]
-fn a_restart_that_finds_an_uncertain_attempt_refuses_to_reopen_the_scope() {
-    let mut ledger = SendLedger::recover([SendAttempt {
-        ordinal: 3,
-        state: SendState::Uncertain,
-        request_digest: digest("a"),
-        receipt: None,
-        audit_accounted: false,
-    }]);
-    assert_eq!(
-        ledger
-            .begin(digest("b"))
-            .expect_err("an uncertain scope stays blocked"),
-        SendError::ScopeBlocked {
-            ordinal: 3,
-            state: SendState::Uncertain
-        }
-    );
-}
-
-#[test]
-fn a_preparing_record_found_after_a_crash_proves_nothing_was_sent() {
-    let ledger = SendLedger::recover([SendAttempt {
-        ordinal: 1,
-        state: SendState::Preparing,
-        request_digest: digest("a"),
-        receipt: None,
-        audit_accounted: false,
-    }]);
-    let attempt = ledger.attempt(1).expect("record survives the crash cut");
-    assert_eq!(
-        attempt.state.delivery_knowledge(),
-        DeliveryKnowledge::KnownNotDelivered
-    );
-}
-
-#[test]
-fn retention_is_bounded_but_never_drops_a_non_terminal_attempt() {
-    let mut ledger = SendLedger::new();
-    // One unresolved attempt, then far more settled ones than the retention cap.
-    let stuck = ledger.begin(digest("stuck")).expect("admitted");
-    ledger.mark_sending(&stuck).unwrap();
-    ledger.observe(&stuck, TransportEvidence::TimedOut).unwrap();
-    ledger
-        .resolve_uncertain(1, true, SendState::Settled)
-        .unwrap();
-
-    let uncertain = ledger.begin(digest("uncertain")).expect("admitted");
-    ledger.mark_sending(&uncertain).unwrap();
-    ledger
-        .observe(&uncertain, TransportEvidence::TimedOut)
-        .unwrap();
-
-    // The scope is blocked, so growth is bounded by construction here; assert
-    // the invariant the pruner must never violate.
-    assert!(ledger.len() <= durable::send::MAX_RETAINED_ATTEMPTS);
-    assert_eq!(
-        ledger
-            .attempt(2)
-            .expect("the uncertain record is retained")
-            .state,
-        SendState::Uncertain
+        encoded,
+        r#"{"class":"inert","repeats":10,"toolName":"get_task_output"}"#
     );
 }
 
 // ---------------------------------------------------------------------------
-// Bounded retries
+// Host-issued wait witnesses
 // ---------------------------------------------------------------------------
 
+fn witness(session: Uuid, deadline_ms: u64) -> ActiveTaskWaitWitness {
+    ActiveTaskWaitWitness {
+        task_id: "task-1".into(),
+        state: ActiveWaitState::Running,
+        owner_session: session,
+        generation: 1,
+        deadline_ms,
+    }
+}
+
+/// A wait the host can see is still outstanding is not stuck, even when it
+/// returns the same bytes for far longer than the inert ceiling.
 #[test]
-fn a_retry_budget_is_bounded_even_when_misconfigured() {
-    let mut budget = RetryBudget::new(u32::MAX, 10);
-    assert_eq!(budget.max_attempts(), durable::retry::MAX_ATTEMPTS_CEILING);
-    let mut granted = 0;
-    for _ in 0..64 {
-        if budget.next(Ok(())).is_retry() {
-            granted += 1;
+fn a_long_unchanged_witnessed_wait_survives_past_the_inert_ceiling() {
+    let session = Uuid::new_v4();
+    let mut ledger = ProgressLedger::new();
+    for _ in 0..durable::progress::MAX_INERT_REPEATS + 4 {
+        ledger.observe_call("poll", "task_output", false);
+        assert!(durable::round_is_witnessed_wait(
+            &["task_output"],
+            &[witness(session, 600_000)],
+            session,
+            1_000,
+        ));
+        ledger.observe_witnessed_wait();
+        assert_eq!(ledger.decide(), StopDecision::Continue);
+    }
+}
+
+/// The exemption is from the inert ceiling only. The identical-call ceiling,
+/// which `main` already applied, still bounds the wait.
+#[test]
+fn a_witnessed_wait_is_still_bounded_by_the_identical_call_ceiling() {
+    let mut ledger = ProgressLedger::new();
+    let mut stopped_at = None;
+    for round in 1..=durable::progress::MAX_IDENTICAL_CALLS + 2 {
+        ledger.observe_call("poll", "task_output", false);
+        ledger.observe_witnessed_wait();
+        if let StopDecision::Stop(detail) = ledger.decide() {
+            stopped_at = Some(round);
+            assert_eq!(detail.class, RepeatClass::Unobserved);
+            break;
         }
     }
-    assert_eq!(granted, durable::retry::MAX_ATTEMPTS_CEILING);
-    assert!(matches!(
-        budget.next(Ok(())),
-        RetryDecision::Exhausted { .. }
+    assert_eq!(stopped_at, Some(durable::progress::MAX_IDENTICAL_CALLS));
+}
+
+#[test]
+fn an_unwitnessed_wait_is_ordinary_work() {
+    let session = Uuid::new_v4();
+    assert!(
+        !durable::round_is_witnessed_wait(&["task_output"], &[], session, 0),
+        "a wait with no host witness earns no exemption"
+    );
+}
+
+#[test]
+fn a_witness_from_another_session_earns_nothing() {
+    let mine = Uuid::new_v4();
+    let theirs = Uuid::new_v4();
+    assert!(!durable::round_is_witnessed_wait(
+        &["task_output"],
+        &[witness(theirs, 600_000)],
+        mine,
+        0,
     ));
 }
 
 #[test]
-fn a_refused_connection_spends_budget_but_an_uncertain_send_stands_down() {
-    let mut ledger = SendLedger::new();
-    let permit = ledger.begin(digest("a")).expect("admitted");
-    ledger.mark_sending(&permit).unwrap();
-    ledger
-        .observe(&permit, TransportEvidence::ConnectionRefused)
-        .unwrap();
-    let mut budget = RetryBudget::new(4, 10);
-    assert!(ledger.retry_decision(1, &mut budget).is_retry());
-
-    let mut ledger = SendLedger::new();
-    let permit = ledger.begin(digest("b")).expect("admitted");
-    ledger.mark_sending(&permit).unwrap();
-    ledger
-        .observe(&permit, TransportEvidence::ResetAfterWrite)
-        .unwrap();
-    let mut budget = RetryBudget::new(4, 10);
-    assert_eq!(
-        ledger.retry_decision(1, &mut budget),
-        RetryDecision::StandDown {
-            reason: StandDownReason::DeliveryUnproven
-        }
-    );
-    assert_eq!(budget.attempts_used(), 0, "a stand-down spends no budget");
-}
-
-#[test]
-fn a_delivered_send_never_auto_retries() {
-    let mut ledger = SendLedger::new();
-    let permit = ledger.begin(digest("a")).expect("admitted");
-    ledger.mark_sending(&permit).unwrap();
-    ledger
-        .observe(&permit, TransportEvidence::ProviderRejected)
-        .unwrap();
-    let mut budget = RetryBudget::new(4, 10);
-    assert_eq!(
-        ledger.retry_decision(1, &mut budget),
-        RetryDecision::StandDown {
-            reason: StandDownReason::AlreadyDelivered
-        }
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Durable claims and revisions
-// ---------------------------------------------------------------------------
-
-fn seeded_ledger() -> ClaimLedger {
-    let mut ledger = ClaimLedger::new();
-    ledger.insert(ClaimRecord::unclaimed("work-1"));
-    ledger
-}
-
-#[test]
-fn a_stale_revision_is_refused_and_names_the_current_one() {
-    let mut ledger = seeded_ledger();
-    let claimed = ledger
-        .claim("work-1", "worker-a", Revision(1), 0, 1_000)
-        .expect("claimed");
-    assert_eq!(claimed.revision, Revision(2));
-    let err = ledger
-        .claim("work-1", "worker-a", Revision(1), 10, 1_000)
-        .expect_err("the revision moved");
-    assert_eq!(
-        err,
-        ClaimError::StaleRevision {
-            expected: Revision(1),
-            actual: Revision(2)
-        }
-    );
-}
-
-#[test]
-fn a_duplicate_worker_cannot_take_a_live_lease() {
-    let mut ledger = seeded_ledger();
-    let first = ledger
-        .claim("work-1", "worker-a", Revision(1), 0, 1_000)
-        .expect("claimed");
-    let err = ledger
-        .claim("work-1", "worker-b", first.revision, 10, 1_000)
-        .expect_err("a second worker must be refused");
-    assert!(matches!(err, ClaimError::HeldByAnother { .. }));
-    // And the refusal does not reveal who holds it.
-    assert_eq!(err.to_string(), "work item is claimed");
-}
-
-#[test]
-fn the_same_worker_reclaiming_its_own_lease_is_idempotent() {
-    let mut ledger = seeded_ledger();
-    let first = ledger
-        .claim("work-1", "worker-a", Revision(1), 0, 1_000)
-        .expect("claimed");
-    assert!(!first.idempotent);
-    let again = ledger
-        .claim("work-1", "worker-a", first.revision, 10, 1_000)
-        .expect("the same worker may resume its own claim");
-    assert!(again.idempotent);
-    let holder = ledger
-        .get("work-1")
-        .and_then(|r| r.holder.clone())
-        .expect("held");
-    assert_eq!(holder.worker_id, "worker-a");
-    assert_eq!(
-        holder.reclaims, 1,
-        "a duplicate process is visible, not hidden"
-    );
-}
-
-#[test]
-fn an_expired_lease_returns_the_work_to_the_pool() {
-    let mut ledger = seeded_ledger();
-    let first = ledger
-        .claim("work-1", "worker-a", Revision(1), 0, 1_000)
-        .expect("claimed");
-    assert!(
-        ledger.expired(500).is_empty(),
-        "a live lease is not expired"
-    );
-    assert_eq!(ledger.expired(2_000).len(), 1);
-    let taken = ledger
-        .claim("work-1", "worker-b", first.revision, 2_000, 1_000)
-        .expect("an expired lease is reclaimable");
-    assert!(!taken.idempotent);
-}
-
-#[test]
-fn an_unknown_and_a_foreign_item_refuse_identically() {
-    let mut ledger = seeded_ledger();
-    ledger
-        .claim("work-1", "worker-a", Revision(1), 0, 1_000)
-        .expect("claimed");
-    let foreign = ledger
-        .claim("work-1", "worker-b", Revision(2), 0, 1_000)
-        .expect_err("held by another");
-    let unknown = ledger
-        .claim("work-missing", "worker-b", Revision(1), 0, 1_000)
-        .expect_err("unknown");
-    assert_eq!(
-        foreign.to_string(),
-        unknown.to_string(),
-        "a refusal must not be an existence oracle"
-    );
-}
-
-#[test]
-fn only_the_holder_may_heartbeat_complete_or_release() {
-    let mut ledger = seeded_ledger();
-    let claimed = ledger
-        .claim("work-1", "worker-a", Revision(1), 0, 1_000)
-        .expect("claimed");
-    assert_eq!(
-        ledger.heartbeat("work-1", "worker-b", 10, 1_000),
-        Err(ClaimError::NotHolder)
-    );
-    assert_eq!(
-        ledger.complete("work-1", "worker-b", claimed.revision),
-        Err(ClaimError::NotHolder)
-    );
-    assert_eq!(
-        ledger.release("work-1", "worker-b", claimed.revision),
-        Err(ClaimError::NotHolder)
-    );
-    let revision = ledger
-        .complete("work-1", "worker-a", claimed.revision)
-        .expect("completed");
-    assert_eq!(
-        ledger.claim("work-1", "worker-a", revision, 0, 1_000),
-        Err(ClaimError::AlreadyCompleted)
-    );
-}
-
-#[test]
-fn a_restart_recovers_claims_and_keeps_their_revisions() {
-    let mut ledger = seeded_ledger();
-    let claimed = ledger
-        .claim("work-1", "worker-a", Revision(1), 0, 1_000)
-        .expect("claimed");
-    let surviving: Vec<ClaimRecord> = vec![ledger.get("work-1").expect("present").clone()];
-    let recovered = ClaimLedger::recover(surviving);
-    assert_eq!(
-        recovered.get("work-1").expect("recovered").revision,
-        claimed.revision
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Registered-before-start effect supervision and crash recovery
-// ---------------------------------------------------------------------------
-
-#[test]
-fn an_effect_must_be_registered_before_it_can_start() {
-    let mut registry = EffectRegistry::new();
-    let ticket = registry
-        .register(EffectKind::ToolCall, "run_terminal_cmd")
-        .expect("registered");
-    assert_eq!(
-        registry.record(ticket.id()).expect("present").state,
-        EffectState::Registered
-    );
-    assert_eq!(registry.running_count(), 0);
-    registry.start(&ticket).expect("started");
-    assert_eq!(registry.running_count(), 1);
-    registry.finish(&ticket).expect("finished");
-    assert_eq!(registry.active_count(), 0);
-    // Starting twice is refused rather than double-counted.
-    assert!(matches!(
-        registry.start(&ticket),
-        Err(EffectError::IllegalTransition { .. })
+fn a_witness_past_its_deadline_stops_exempting() {
+    let session = Uuid::new_v4();
+    assert!(durable::round_is_witnessed_wait(
+        &["task_output"],
+        &[witness(session, 600_000)],
+        session,
+        599_999,
     ));
-}
-
-/// The crash cut. `Registered` proves nothing ran; `Running` is honestly
-/// indeterminate and is never auto-retried.
-#[test]
-fn recovery_distinguishes_never_started_from_indeterminate() {
-    let (_registry, report) = EffectRegistry::recover([
-        durable::effects::EffectRecord {
-            id: 1,
-            kind: EffectKind::ProviderSend,
-            state: EffectState::Registered,
-            label: "send".into(),
-        },
-        durable::effects::EffectRecord {
-            id: 2,
-            kind: EffectKind::ToolCall,
-            state: EffectState::Running,
-            label: "tool".into(),
-        },
-        durable::effects::EffectRecord {
-            id: 3,
-            kind: EffectKind::Subagent,
-            state: EffectState::Finished,
-            label: "sub".into(),
-        },
-    ]);
-    assert_eq!(report.never_started, vec![1]);
-    assert_eq!(report.indeterminate, vec![2]);
-    assert_eq!(report.settled, 1);
-    assert!(report.has_indeterminate());
+    assert!(
+        !durable::round_is_witnessed_wait(
+            &["task_output"],
+            &[witness(session, 600_000)],
+            session,
+            600_000,
+        ),
+        "an abandoned task must not confer an unlimited exemption"
+    );
 }
 
 #[test]
-fn effect_supervision_is_bounded() {
-    let mut registry = EffectRegistry::new();
-    let mut tickets = Vec::new();
-    for index in 0..durable::effects::MAX_SUPERVISED_EFFECTS {
-        tickets.push(
-            registry
-                .register(EffectKind::ToolCall, format!("tool-{index}"))
-                .expect("within capacity"),
+fn a_round_mixing_a_wait_with_real_work_is_not_exempt() {
+    let session = Uuid::new_v4();
+    assert!(!durable::round_is_witnessed_wait(
+        &["task_output", "run_terminal_cmd"],
+        &[witness(session, 600_000)],
+        session,
+        0,
+    ));
+    // Witness count must match call count, so one witness cannot cover two polls.
+    assert!(!durable::round_is_witnessed_wait(
+        &["task_output", "task_output"],
+        &[witness(session, 600_000)],
+        session,
+        0,
+    ));
+    assert!(!durable::round_is_witnessed_wait(&[], &[], session, 0,));
+}
+
+#[test]
+fn only_outstanding_task_states_are_witnessable() {
+    for status in ["running", "accepted", "proposed", "queued"] {
+        assert!(
+            ActiveWaitState::from_status(status).is_some(),
+            "`{status}` is outstanding work"
         );
     }
-    assert_eq!(
-        registry
-            .register(EffectKind::ToolCall, "one-too-many")
-            .expect_err("capacity is a hard bound"),
-        EffectError::AtCapacity
-    );
-    // Finishing one frees exactly one slot.
-    registry.start(&tickets[0]).unwrap();
-    registry.finish(&tickets[0]).unwrap();
-    registry
-        .register(EffectKind::ToolCall, "now-fits")
-        .expect("capacity freed");
-}
-
-// ---------------------------------------------------------------------------
-// Cancellation that proves the turn idle
-// ---------------------------------------------------------------------------
-
-#[test]
-fn a_cancel_during_an_active_provider_send_is_not_settled() {
-    let mut registry = EffectRegistry::new();
-    let send = registry
-        .register(EffectKind::ProviderSend, "chat")
-        .expect("registered");
-    registry.start(&send).expect("started");
-
-    let mut cancel = CancellationLedger::new();
-    cancel.request(CancelReason::Operator, &mut registry);
-
-    let status = cancel.status(&registry);
-    assert!(
-        !status.is_settled(),
-        "a live provider send is not an idle turn"
-    );
-    assert_eq!(
-        status,
-        CancelStatus::Pending {
-            active: 1,
-            running: 1,
-            externally_visible: 1
-        }
-    );
-    assert!(cancel.prove_idle(&registry).is_err());
-    assert_eq!(
-        cancel.blocking_kinds(&registry),
-        vec![EffectKind::ProviderSend]
-    );
-
-    registry.cancel(&send).expect("the send stopped");
-    let proof = cancel.prove_idle(&registry).expect("now provably idle");
-    assert_eq!(proof.reason, CancelReason::Operator);
-    assert_eq!(proof.effects_stopped, 1);
-}
-
-#[test]
-fn a_cancel_during_active_tool_work_is_not_settled_until_the_tool_stops() {
-    let mut registry = EffectRegistry::new();
-    let tool = registry
-        .register(EffectKind::ToolCall, "run_terminal_cmd")
-        .expect("registered");
-    registry.start(&tool).expect("started");
-    let mut cancel = CancellationLedger::new();
-    cancel.request(CancelReason::Shutdown, &mut registry);
-    assert!(!cancel.status(&registry).is_settled());
-    registry.cancel(&tool).expect("tool stopped");
-    assert!(cancel.status(&registry).is_settled());
-}
-
-/// A registered-but-never-started effect still blocks settlement, because the
-/// host cannot yet say it will not run.
-#[test]
-fn a_registered_effect_that_never_started_still_blocks_settlement() {
-    let mut registry = EffectRegistry::new();
-    let pending = registry
-        .register(EffectKind::ToolCall, "queued")
-        .expect("registered");
-    let mut cancel = CancellationLedger::new();
-    cancel.request(CancelReason::Operator, &mut registry);
-    assert!(!cancel.status(&registry).is_settled());
-    registry.cancel(&pending).expect("cancelled before start");
-    let proof = cancel.prove_idle(&registry).expect("idle");
-    assert_eq!(proof.effects_never_started, 1);
-    assert_eq!(proof.effects_stopped, 0);
-}
-
-#[test]
-fn cancellation_refuses_new_effects_immediately_and_keeps_the_first_reason() {
-    let mut registry = EffectRegistry::new();
-    let mut cancel = CancellationLedger::new();
-    cancel.request(CancelReason::Operator, &mut registry);
-    assert!(registry.is_quiescing());
-    assert_eq!(
-        registry
-            .register(EffectKind::ToolCall, "late")
-            .expect_err("quiescing refuses new effects"),
-        EffectError::Quiescing
-    );
-    // A shutdown racing the operator cancel does not rewrite the record.
-    cancel.request(CancelReason::Shutdown, &mut registry);
-    let proof = cancel.prove_idle(&registry).expect("idle");
-    assert_eq!(proof.reason, CancelReason::Operator);
-}
-
-#[test]
-fn a_turn_nobody_cancelled_is_not_reported_as_cancelled() {
-    let registry = EffectRegistry::new();
-    let cancel = CancellationLedger::new();
-    assert_eq!(cancel.status(&registry), CancelStatus::NotRequested);
-    assert!(!cancel.requested());
-}
-
-// ---------------------------------------------------------------------------
-// Bounded, crash-honest journals
-// ---------------------------------------------------------------------------
-
-#[derive(serde::Deserialize, Debug, PartialEq, Eq)]
-struct Row {
-    id: u64,
-}
-
-#[test]
-fn repeated_malformed_records_are_counted_and_the_scan_is_bounded() {
-    let mut input = String::new();
-    for _ in 0..(durable::journal::MAX_MALFORMED_RECORDS * 4) {
-        input.push_str("{not json\n");
-    }
-    let scan = durable::scan_ndjson::<Row>(&input);
-    assert!(scan.records.is_empty());
-    assert!(
-        scan.report.abandoned_on_malformed,
-        "the scan must give up, not spin"
-    );
-    assert_eq!(
-        scan.report.malformed,
-        durable::journal::MAX_MALFORMED_RECORDS
-    );
-    assert!(!scan.report.is_clean());
-    assert!(scan.report.operator_summary().contains("abandoned"));
-}
-
-#[test]
-fn a_few_malformed_records_are_surfaced_rather_than_silently_skipped() {
-    let scan = durable::scan_ndjson::<Row>("{\"id\":1}\n{bad}\n{\"id\":2}\n");
-    assert_eq!(scan.records, vec![Row { id: 1 }, Row { id: 2 }]);
-    assert_eq!(scan.report.malformed, 1);
-    assert_eq!(scan.report.accepted, 2);
-    assert!(!scan.report.is_clean());
-    assert!(scan.report.operator_summary().contains("1 malformed"));
-}
-
-/// A crash during an append leaves a final line with no newline. That is a
-/// different fault from corruption in the middle and must not be conflated.
-#[test]
-fn a_crash_cut_tail_is_not_reported_as_corruption() {
-    let scan = durable::scan_ndjson::<Row>("{\"id\":1}\n{\"id\":2}\n{\"id\"");
-    assert_eq!(scan.records, vec![Row { id: 1 }, Row { id: 2 }]);
-    assert!(scan.report.truncated_tail);
-    assert_eq!(scan.report.malformed, 0, "a crash cut is not corruption");
-    assert!(scan.report.operator_summary().contains("truncated tail"));
-}
-
-#[test]
-fn a_complete_journal_reports_clean() {
-    let scan = durable::scan_ndjson::<Row>("{\"id\":1}\n{\"id\":2}\n");
-    assert!(scan.report.is_clean());
-    assert_eq!(scan.report.operator_summary(), "2 records, journal clean");
-    assert!(durable::scan_ndjson::<Row>("").report.is_clean());
-}
-
-#[test]
-fn an_oversized_record_is_counted_not_silently_dropped() {
-    let big = format!(
-        "{{\"id\":1,\"pad\":\"{}\"}}\n",
-        "x".repeat(durable::journal::MAX_RECORD_BYTES)
-    );
-    let scan = durable::scan_ndjson::<Row>(&big);
-    assert_eq!(scan.report.oversized, 1);
-    assert!(scan.records.is_empty());
-    assert!(!scan.report.is_clean());
-}
-
-#[test]
-fn event_and_audit_growth_is_bounded_by_refusal_not_by_trimming() {
-    let mut log = BoundedEventLog::new(3, 1_000);
-    assert!(log.append(10).is_ok());
-    assert!(log.append(10).is_ok());
-    assert!(log.append(10).is_ok());
-    assert_eq!(log.append(10), Err(AppendRefusal::EventCeiling));
-    assert_eq!(log.events(), 3, "nothing already recorded is discarded");
-
-    let mut log = BoundedEventLog::new(100, 25);
-    assert!(log.append(20).is_ok());
-    assert_eq!(log.append(20), Err(AppendRefusal::ByteCeiling));
-    assert_eq!(log.remaining_events(), 99);
-
-    let mut log = BoundedEventLog::new(100, usize::MAX);
-    assert_eq!(
-        log.append(durable::journal::MAX_RECORD_BYTES + 1),
-        Err(AppendRefusal::RecordTooLarge)
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Provider-neutral embeddable manager / SDK boundary
-// ---------------------------------------------------------------------------
-
-#[test]
-fn strict_negotiation_refuses_an_unknown_version_even_beside_a_known_one() {
-    assert_eq!(
-        durable::negotiate(&["v1", "v99"]),
-        Err(NegotiationError::UnknownVersion {
-            name: "v99".to_string()
-        }),
-        "a client must not smuggle an unimplemented version past the host"
-    );
-    assert_eq!(durable::negotiate(&[]), Err(NegotiationError::Empty));
-}
-
-#[test]
-fn negotiation_picks_the_highest_mutually_supported_version() {
-    assert_eq!(durable::negotiate(&["v1", "v2"]), Ok(ProtocolVersion::V2));
-    assert_eq!(durable::negotiate(&["v2", "v1"]), Ok(ProtocolVersion::V2));
-    assert_eq!(durable::negotiate(&["v1"]), Ok(ProtocolVersion::V1));
-}
-
-#[test]
-fn an_old_client_cannot_reach_a_newer_operation() {
-    let old = ManagerSession::open(ProtocolVersion::V1, [Capability::ReadAudit]);
-    assert_eq!(
-        old.require_version(ProtocolVersion::V2),
-        Err(BoundaryError::NotAvailableAtVersion {
-            version: ProtocolVersion::V1
-        })
-    );
-    let new = ManagerSession::open(ProtocolVersion::V2, [Capability::ReadAudit]);
-    assert!(new.require_version(ProtocolVersion::V2).is_ok());
-}
-
-#[test]
-fn a_session_cannot_self_assert_operator_authority() {
-    let session = ManagerSession::open(
-        ProtocolVersion::V2,
-        [
-            Capability::ReadRuns,
-            Capability::SubmitWork,
-            Capability::CancelWork,
-            Capability::ReadAudit,
-        ],
-    );
-    // Holding every capability is still not operator authority.
-    assert!(!session.has_operator_authority());
-    assert_eq!(
-        session.require_operator().unwrap_err(),
-        BoundaryError::OperatorAuthorityRequired
-    );
-    // And a capability refusal is byte-identical to an operator refusal, so
-    // neither is an oracle for the other.
-    let narrow = ManagerSession::open(ProtocolVersion::V2, []);
-    assert_eq!(
-        narrow
-            .require(Capability::ReadRuns)
-            .unwrap_err()
-            .to_string(),
-        session.require_operator().unwrap_err().to_string()
-    );
-}
-
-#[test]
-fn a_host_issued_grant_records_whether_it_is_canonical() {
-    let session = ManagerSession::open(ProtocolVersion::V2, [Capability::ReadRuns]).with_operator(
-        durable::grant_operator_for_host(GrantProvenance::Provisional),
-    );
-    let grant = session.require_operator().expect("granted");
-    assert!(
-        !grant.is_canonical(),
-        "a provisional grant must never read as canonical"
-    );
-    assert_eq!(grant.provenance(), GrantProvenance::Provisional);
-}
-
-/// Read a Rust source file with comment lines removed, so a source guard tests
-/// the code rather than the prose describing it.
-fn code_only(path: &str) -> String {
-    std::fs::read_to_string(path)
-        .expect("source is readable")
-        .lines()
-        .filter(|line| !line.trim_start().starts_with("//"))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Source guard: the manager boundary must expose no raw transport, so that a
-/// provider swap is not a breaking change and an embedder never gets a socket.
-#[test]
-fn the_manager_boundary_exposes_no_raw_transport() {
-    let source = code_only(concat!(env!("CARGO_MANIFEST_DIR"), "/src/durable/sdk.rs"));
-    for forbidden in [
-        "reqwest",
-        "http://",
-        "https://",
-        "Authorization",
-        "bearer",
-        "TcpStream",
-        "header",
-        "api_key",
+    for status in [
+        "completed",
+        "failed",
+        "cancelled",
+        "rejected",
+        "done",
+        "Running",
+        "run",
     ] {
         assert!(
-            !source.contains(forbidden),
-            "the manager boundary must not name `{forbidden}`"
+            ActiveWaitState::from_status(status).is_none(),
+            "`{status}` must not be witnessable"
         );
     }
 }
 
-/// Source guard: the only public minting path for operator authority is the one
-/// documented choke point.
 #[test]
-fn operator_authority_has_exactly_one_public_minting_path() {
-    let source = code_only(concat!(env!("CARGO_MANIFEST_DIR"), "/src/durable/sdk.rs"));
-    let public_mints = source.matches("pub fn grant_operator_for_host").count();
-    assert_eq!(public_mints, 1);
-    assert!(
-        source.contains("pub(crate) fn issue"),
-        "OperatorGrant::issue must stay crate-internal"
-    );
-    assert!(
-        !source.contains("pub provenance"),
-        "OperatorGrant must have no public field to fill in"
-    );
+fn only_wait_shaped_tools_can_earn_the_exemption() {
+    assert!(durable::is_wait_shaped_tool("task_output"));
+    assert!(durable::is_wait_shaped_tool("get_task_output"));
+    for name in [
+        "run_terminal_cmd",
+        "read_file",
+        "apply_patch",
+        "task_outputs",
+    ] {
+        assert!(
+            !durable::is_wait_shaped_tool(name),
+            "`{name}` is not a wait"
+        );
+    }
 }
 
-/// The whole durable core must stay offline and transport-free.
+/// A campaign that alternates a witnessed wait with real progress is never
+/// stationary, and the wait never masks a genuinely stuck stretch afterwards.
 #[test]
-fn the_durable_core_contacts_nothing() {
+fn alternating_witnessed_waits_and_progress_are_never_stopped() {
+    let mut ledger = ProgressLedger::new();
+    for round in 0..12 {
+        if round % 2 == 0 {
+            ledger.observe_call("poll", "task_output", false);
+            ledger.observe_witnessed_wait();
+        } else {
+            ledger.observe_call(&format!("work-{round}"), "run_terminal_cmd", false);
+            ledger.observe_outcome(RawObservation::capture(format!("built {round}")).digest());
+        }
+        assert_eq!(ledger.decide(), StopDecision::Continue);
+    }
+}
+
+/// The durable core must stay offline and hold no authority of its own.
+#[test]
+fn the_durable_core_contacts_nothing_and_declares_no_authority() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/durable");
     let mut checked = 0;
     for entry in std::fs::read_dir(dir).expect("durable dir is readable") {
@@ -1133,23 +476,31 @@ fn the_durable_core_contacts_nothing() {
         if path.extension().and_then(|e| e.to_str()) != Some("rs") {
             continue;
         }
-        let source = code_only(path.to_str().expect("utf-8 path"));
+        let source = std::fs::read_to_string(&path).expect("source is readable");
+        let code: String = source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
         for forbidden in [
             "reqwest::",
             "std::net",
             "tokio::net",
             "std::process::Command",
+            // Authority belongs to the G1-G4 spine (#497); a second copy here
+            // is exactly what #478 and #492 exist to prevent.
+            "OperatorGrant",
+            "SendLedger",
+            "PhysicalSendPermit",
+            "Capability",
         ] {
             assert!(
-                !source.contains(forbidden),
-                "{} must not use {forbidden}",
+                !code.contains(forbidden),
+                "{} must not contain `{forbidden}`",
                 path.display()
             );
         }
         checked += 1;
     }
-    assert!(
-        checked >= 9,
-        "expected the whole durable core to be scanned"
-    );
+    assert_eq!(checked, 3, "expected exactly mod, observation and progress");
 }

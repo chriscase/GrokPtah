@@ -15,8 +15,6 @@
 
 use std::fmt;
 
-use serde::de::{Deserializer, Error as _};
-use serde::{Deserialize, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
 /// Domain separator. Bumping this invalidates comparison against digests
@@ -24,17 +22,17 @@ use sha2::{Digest, Sha256};
 /// digest means.
 const OBSERVATION_DOMAIN: &[u8] = b"grokptah.durable.observation.v1\n";
 
-/// Bytes of a digest fingerprint exposed in public projections.
-///
-/// A projection shows enough to correlate two observations and never enough to
-/// reconstruct one.
-const FINGERPRINT_BYTES: usize = 8;
-
 /// SHA-256 over the *raw* bytes of one observation.
 ///
-/// Deliberately not `Display`: rendering a full digest into operator prose is
-/// how a durable identifier ends up in a log line that outlives its retention
-/// policy. Use [`RawObservationDigest::fingerprint`] for anything public.
+/// Deliberately opaque: no `Serialize`, no `Deserialize`, no `Display`, and no
+/// accessor for the bytes. The type system is what keeps this out of a durable
+/// record or a read projection — it cannot be written to one.
+///
+/// That matters because the digest is taken over real tool-result content. A
+/// value that never leaves the process is only ever compared against the
+/// previous round; a value that can be persisted or projected is a confirmation
+/// oracle for anyone who can guess the output. Only the first property is
+/// claimed here, and only because the second is unreachable.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RawObservationDigest([u8; 32]);
 
@@ -81,56 +79,12 @@ impl RawObservationDigest {
         }
         Some(Self(hasher.finalize().into()))
     }
-
-    /// Short, non-invertible correlation handle for public projections.
-    pub fn fingerprint(&self) -> String {
-        self.0[..FINGERPRINT_BYTES].iter().fold(
-            String::with_capacity(FINGERPRINT_BYTES * 2),
-            |mut acc, b| {
-                use fmt::Write as _;
-                let _ = write!(acc, "{b:02x}");
-                acc
-            },
-        )
-    }
-
-    fn to_hex(self) -> String {
-        self.0.iter().fold(String::with_capacity(64), |mut acc, b| {
-            use fmt::Write as _;
-            let _ = write!(acc, "{b:02x}");
-            acc
-        })
-    }
-
-    fn from_hex(text: &str) -> Option<Self> {
-        if text.len() != 64 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return None;
-        }
-        let mut out = [0u8; 32];
-        for (index, slot) in out.iter_mut().enumerate() {
-            *slot = u8::from_str_radix(&text[index * 2..index * 2 + 2], 16).ok()?;
-        }
-        Some(Self(out))
-    }
 }
 
 impl fmt::Debug for RawObservationDigest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "RawObservationDigest({}…)", self.fingerprint())
-    }
-}
-
-impl Serialize for RawObservationDigest {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.to_hex())
-    }
-}
-
-impl<'de> Deserialize<'de> for RawObservationDigest {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let text = String::deserialize(deserializer)?;
-        Self::from_hex(&text)
-            .ok_or_else(|| D::Error::custom("observation digest must be 64 lowercase hex digits"))
+        // Never print the value: a debug log is an exposure channel too.
+        f.write_str("RawObservationDigest(<redacted>)")
     }
 }
 
@@ -231,81 +185,4 @@ impl BoundedProjection {
     pub fn truncated(&self) -> bool {
         self.truncated
     }
-}
-
-/// Why a bounded step ended, as a typed value rather than parsed prose.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
-pub enum TerminalObservation {
-    /// The step ran and produced output.
-    Produced {
-        digest: RawObservationDigest,
-        raw_len: usize,
-        truncated: bool,
-    },
-    /// The tool ran and reported its own failure.
-    ToolFailed {
-        digest: RawObservationDigest,
-        raw_len: usize,
-    },
-    /// The step was refused before it ran. Nothing executed.
-    Refused { reason: RefusalReason },
-    /// The step was cancelled. Whether it had already taken effect is recorded
-    /// separately; this value never asserts that it did not.
-    Cancelled { effect_may_have_landed: bool },
-}
-
-impl TerminalObservation {
-    /// Build the terminal observation for a step that produced output.
-    pub fn produced(projection: &BoundedProjection) -> Self {
-        Self::Produced {
-            digest: projection.raw_digest(),
-            raw_len: projection.raw_len(),
-            truncated: projection.truncated(),
-        }
-    }
-
-    /// Build the terminal observation for a tool that reported failure.
-    pub fn tool_failed(observation: &RawObservation) -> Self {
-        Self::ToolFailed {
-            digest: observation.digest(),
-            raw_len: observation.raw_len(),
-        }
-    }
-
-    /// The raw digest, when the step got far enough to have one.
-    pub fn digest(&self) -> Option<RawObservationDigest> {
-        match self {
-            Self::Produced { digest, .. } | Self::ToolFailed { digest, .. } => Some(*digest),
-            Self::Refused { .. } | Self::Cancelled { .. } => None,
-        }
-    }
-
-    /// Whether this step is known to have executed.
-    ///
-    /// `Cancelled` answers `false` only when the host can prove nothing landed;
-    /// otherwise it stays honest about not knowing.
-    pub fn definitely_did_not_execute(&self) -> bool {
-        match self {
-            Self::Refused { .. } => true,
-            Self::Cancelled {
-                effect_may_have_landed,
-            } => !effect_may_have_landed,
-            Self::Produced { .. } | Self::ToolFailed { .. } => false,
-        }
-    }
-}
-
-/// Why a step was refused before execution.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RefusalReason {
-    /// The caller holds no grant for this effect.
-    NotAuthorized,
-    /// A bound (rounds, duration, tokens, bytes) was already spent.
-    BoundExhausted,
-    /// The host is shutting down and refuses new admissions.
-    Quiescing,
-    /// The work item's revision moved under the caller.
-    StaleRevision,
 }

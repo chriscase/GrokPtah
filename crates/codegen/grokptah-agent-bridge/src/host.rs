@@ -185,6 +185,17 @@ pub(crate) struct Inner {
     /// Per-subagent cancel tokens (#151/#152) — cancel one child without killing siblings.
     subagent_cancels: HashMap<String, CancellationToken>,
     background_tasks: Vec<BackgroundTask>,
+    /// Host-assigned generation per task/subagent id, with the identity
+    /// fingerprint the generation was issued for.
+    ///
+    /// One registry for background tasks and subagents alike. It is consulted
+    /// lazily at witness time rather than written at each creation site, so a
+    /// creation path that does not know about it — including one added later —
+    /// cannot bypass it. Re-registering an id whose fingerprint changed means
+    /// the id was recycled onto different work and gets a new generation, so a
+    /// wait witness can never be carried across identities.
+    wait_generations: HashMap<String, (u64, String)>,
+    next_wait_generation: u64,
     /// Cancel tokens for in-flight background tasks (#52).
     background_cancels: HashMap<String, CancellationToken>,
     pending_permissions: HashMap<Uuid, PendingPermission>,
@@ -905,6 +916,8 @@ impl AgentHost {
             subagents: Vec::new(),
             subagent_cancels: HashMap::new(),
             background_tasks: Vec::new(),
+            wait_generations: HashMap::new(),
+            next_wait_generation: 1,
             background_cancels: HashMap::new(),
             pending_permissions: HashMap::new(),
             turn_cancels: HashMap::new(),
@@ -5007,6 +5020,97 @@ impl AgentHostHandle {
         g.subagents.extend(hist);
     }
 
+    /// Assign, or reuse, the host generation for a wait identity.
+    ///
+    /// A fingerprint change means the id was recycled onto different work, so
+    /// it earns a fresh generation and any witness held against the old one is
+    /// no longer the same identity.
+    fn wait_generation_for(&self, id: &str, fingerprint: &str) -> u64 {
+        let mut guard = self.inner.lock();
+        if let Some((generation, seen)) = guard.wait_generations.get(id) {
+            if seen == fingerprint {
+                return *generation;
+            }
+        }
+        let generation = guard.next_wait_generation;
+        guard.next_wait_generation = generation.saturating_add(1);
+        guard
+            .wait_generations
+            .insert(id.to_string(), (generation, fingerprint.to_string()));
+        generation
+    }
+
+    /// Issue a wait witness for an id, or refuse.
+    ///
+    /// This is the whole of the exemption's authority. It answers only for ids
+    /// the host has registered, whose status is still outstanding, and whose
+    /// owning session is the one asking. An unknown id, a finished or failed
+    /// task, another session's task, or an id the host never registered all
+    /// return `None`, and the round is then ordinary work.
+    fn issue_wait_witness(
+        &self,
+        session_id: Uuid,
+        id: &str,
+        elapsed_ms: u64,
+    ) -> Option<crate::durable::ActiveTaskWaitWitness> {
+        let owns = |owner: &Option<String>| {
+            owner
+                .as_deref()
+                .and_then(|value| Uuid::parse_str(value).ok())
+                .is_some_and(|owner| owner == session_id)
+        };
+        // Identity fingerprint from stable fields only. Status is deliberately
+        // excluded: a task moving from queued to running is the same work and
+        // must not look like a recycled id.
+        let (state, fingerprint) =
+            if let Some(task) = self.background_tasks().into_iter().find(|t| t.id == id) {
+                if !owns(&task.session_id) {
+                    return None;
+                }
+                (
+                    crate::durable::ActiveWaitState::from_status(&task.status)?,
+                    format!("task\u{1f}{}\u{1f}{}", task.kind, task.title),
+                )
+            } else if let Some(sub) = self.subagents().into_iter().find(|s| s.id == id) {
+                if !owns(&sub.session_id) {
+                    return None;
+                }
+                (
+                    crate::durable::ActiveWaitState::from_status(&sub.status)?,
+                    format!("subagent\u{1f}{}\u{1f}{}", sub.kind, sub.title),
+                )
+            } else {
+                return None;
+            };
+        Some(crate::durable::ActiveTaskWaitWitness {
+            task_id: id.to_string(),
+            state,
+            owner_session: session_id,
+            generation: self.wait_generation_for(id, &fingerprint),
+            deadline_ms: elapsed_ms
+                .saturating_add(crate::durable::progress::WITNESSED_WAIT_DEADLINE_MS),
+        })
+    }
+
+    /// Issue a witness for a dispatched wait call.
+    ///
+    /// Parses the id exactly as the dispatcher does, so the witness describes
+    /// the call the host actually served. A wait with no id is a *listing*, not
+    /// a wait on anything, and gets no witness.
+    fn witness_dispatched_wait(
+        &self,
+        session_id: Uuid,
+        arguments_json: &str,
+        elapsed_ms: u64,
+    ) -> Option<crate::durable::ActiveTaskWaitWitness> {
+        let args: serde_json::Value = serde_json::from_str(arguments_json).ok()?;
+        let id = args
+            .get("id")
+            .or_else(|| args.get("task_id"))
+            .and_then(|value| value.as_str())?;
+        self.issue_wait_witness(session_id, id, elapsed_ms)
+    }
+
     pub fn background_tasks(&self) -> Vec<BackgroundTask> {
         self.inner.lock().background_tasks.clone()
     }
@@ -8469,6 +8573,9 @@ impl AgentHostHandle {
         // #168: at most one Stop-hook continue per user turn
         let mut stop_continued = false;
         let mut identical_tool_calls = crate::durable::ProgressLedger::new();
+        // Turn clock, so a witnessed wait has a bounded deadline rather
+        // than an open-ended exemption.
+        let turn_started_at = std::time::Instant::now();
         let mut test_failure_needs_edit = false;
         // Cargo failures since last successful edit while armed.
         let mut cargo_fails_since_edit: u32 = 0;
@@ -8823,6 +8930,12 @@ impl AgentHostHandle {
                     // bounded projection of the tool output.
                     let mut round_raw_outputs: Vec<crate::durable::RawObservationDigest> =
                         Vec::new();
+                    // Host-issued witnesses for this round's wait calls. Empty
+                    // unless the host can see real, authorized, outstanding work
+                    // behind every call, so a wait cannot be asserted into
+                    // existence by naming a task id.
+                    let mut round_witnesses: Vec<crate::durable::ActiveTaskWaitWitness> =
+                        Vec::new();
                     for tc in &tool_calls {
                         if cancel.is_cancelled() {
                             break;
@@ -8873,6 +8986,18 @@ impl AgentHostHandle {
                         let observation = crate::durable::RawObservation::capture(content);
                         round_raw_outputs.push(observation.digest());
                         let content = observation.project(TOOL_OUTPUT_WIRE_BYTES).into_text();
+                        // The witness is the host's answer about the call it just
+                        // served. A wait naming an unknown, finished or foreign
+                        // task yields no witness and earns no exemption.
+                        if crate::durable::is_wait_shaped_tool(&tc.name) && output.is_ok() {
+                            if let Some(witness) = self.witness_dispatched_wait(
+                                session_id,
+                                &tc.arguments,
+                                turn_started_at.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                            ) {
+                                round_witnesses.push(witness);
+                            }
+                        }
                         // Under tight budgets, only clear the post-failure gate when cargo is
                         // green again. Clearing on edit alone allowed final answers without a
                         // re-run (#187 verified=false despite oracle pass via external check).
@@ -9030,11 +9155,27 @@ impl AgentHostHandle {
                         tool_name,
                         is_true_noop_tool_step(&tool_calls),
                     );
-                    // Judge the repeat by what it produced, not only by what it
-                    // asked for: a poll whose output keeps advancing is not
-                    // stationary and must not be stopped as a no-op.
-                    if let Some(digest) =
-                        crate::durable::RawObservationDigest::of_digests(&round_raw_outputs)
+                    // A witnessed wait is exempt: a poll against work the host
+                    // can see is still outstanding is not stuck, and when it
+                    // should end is for its own deadline to decide. The
+                    // identical-call ceiling, the nudge and the round and
+                    // duration budgets all still apply.
+                    let tool_names: Vec<&str> =
+                        tool_calls.iter().map(|call| call.name.as_str()).collect();
+                    if crate::durable::round_is_witnessed_wait(
+                        &tool_names,
+                        &round_witnesses,
+                        session_id,
+                        turn_started_at.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                    ) {
+                        identical_tool_calls.observe_witnessed_wait();
+                    } else if let Some(digest) =
+                        // Judge the repeat by what it produced, not only by what
+                        // it asked for: a poll whose output keeps advancing is
+                        // not stationary and must not be stopped as a no-op.
+                        crate::durable::RawObservationDigest::of_digests(
+                                &round_raw_outputs,
+                            )
                     {
                         identical_tool_calls.observe_outcome(digest);
                     }

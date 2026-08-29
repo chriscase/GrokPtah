@@ -60,19 +60,28 @@ the structural reason this train does not attempt a donor merge.
 
 ## 3. Where the G1–G4 boundary falls
 
-The G1–G4 host authority/effect train owns, and this train therefore **depends
-on but does not implement**:
+PR #497 (`claude/grokptah-authority-consolidation-ddsn7x`, head `10f9fab`, base
+`67e29bd`) is the canonical G1–G4 host authority spine. It owns, and this train
+therefore **does not implement in any form**:
 
-| Authority | Issues / PRs | Owner |
+| Gate | Authority | Owner |
 | --- | --- | --- |
-| Host lifecycle, process-lock ownership, ordered shutdown, durable-write sealing | #455 / #468 | G1 |
-| Canonical principal, auth generation, delegation | #477 / #460 | G2 |
-| Capability / effect generation, queue-ownership binding | #458 / #461 | G3 |
-| Audit v2 generations, intent/effect/outcome ledger | #462 / #469 | G4 |
+| G1 | Host-issued principal root, credential incarnations, auth generations | #497 |
+| G2 | Sealed capabilities and one-use leases, `ActorClass` | #497 |
+| G3 | The physical-send attempt lattice and `PhysicalSendPermit` | #497 |
+| G4 | Typed, hash-chained audit | #497 |
 
-This train binds those through **typed provisional seams** that record what is
-*not* yet authoritative, so that when G1–G4 lands only the mint path changes and
-no consumer contract breaks.
+An earlier revision of this train shipped its own `durable::send` lattice and a
+`durable::sdk` operator grant. Both were **withdrawn** after an exact-head
+audit: they were a second public send authority beside G3, and
+`grant_operator_for_host(GrantProvenance::Canonical)` was a public
+self-elevation path — the same defect #497 records as its own defect 5
+(self-asserted operator authority) and defect 4 (serde-minted authority). A
+second copy of an authority is exactly what #478 and #492 exist to prevent, and
+"provisional" markers do not make one safe. `durable::claim`, `durable::effects`,
+`durable::cancel` and `durable::journal` were withdrawn with them: their
+semantics are only safe once wired onto #497, #468 and #471, and shipping them
+unwired invited exactly that mistake.
 
 ## 4. Disposition
 
@@ -81,7 +90,9 @@ no consumer contract breaks.
 | #467 | `RunStopDetail` — structured stop reason next to `RunStopCause` | **KEEP (semantics)** | Correct: one terminal authority, a qualifier beside it, `#[serde(default)]` so old records load. Re-expressed here as `TerminalObservation` + `StopDetail` without adding a second state machine. |
 | #467 | SHA-256 content digest of the observation | **KEEP (algorithm)** | The published head hashes real content bytes with a domain separator. Sound, and stable across toolchains unlike `DefaultHasher`. |
 | #467 | Digest **call site** — `round_observation_digest(&messages)` | **REWRITE — defect** | `messages` holds tool content that `host.rs` already truncated to 24,000 bytes (`host.rs:8865`, `host.rs:8978`). Two rounds whose raw outputs differ only after byte 24,000 hash identically, are classified `inert_repeat`, and stop the run at the 4-round inert ceiling while it is genuinely progressing. The digest must be taken from the **raw** output before any bounded projection. |
-| #467 | Content-free shape digest (length / line count / digit histogram) | **REJECT** | Superseded on the donor's own head. It carried an acknowledged collision residual that a raw-content digest removes outright. |
+| #467 | Content-free shape digest (length / line count / digit histogram) | **REJECT** | Superseded on the donor's own head, which documents why: the vector collided, so `"phase: build"` and `"phase: test"` were indistinguishable and an advancing status line read as frozen. |
+| #467 | `ObservationDigest` opacity — no `Serialize`, no `Display`, no byte accessor, `Debug` redacted | **KEEP (adopted)** | Correct, and better than this train's first revision, which derived `Serialize` over a full SHA-256 and then claimed in its own PR body that the digest was never published. Adopted verbatim in intent. |
+| #467 | `ActiveTaskWaitWitness`, `ActiveWaitState`, `round_is_witnessed_wait` | **KEEP (rewritten)** | The right shape for the wait exemption: host-issued, outstanding-only, session-bound, generation-bound, deadline-bounded, and exempting the inert ceiling only. **This train's first revision missed it entirely** — the donor was surveyed for its digest and not for its stop/wait evidence — so a legitimate long wait would have stopped at the inert ceiling. Recorded as an error in this map's first pass. |
 | #467 | PR-body claim that the digest is "content-free features only" | **STALE** | Does not describe head `b75100c`, which hashes full content bytes. Recorded so the next reviewer does not trust the body over the code. |
 | #468 | Ordered shutdown, `HostRuntime` non-`Clone`, `DurableWriteGuard`, `WriteLease`, canonical `owner_key` | **REJECT for this train — G1** | This is the G1 authority itself. Duplicating it here would create the second lifecycle authority #492 exists to prevent. |
 | #468 | `register_shutdown_hook` seam; run stopped by shutdown finalizes `Interrupted`; bounded finalize retry | **KEEP (dependency)** | This train's effect supervision registers *before* start so a G1 shutdown join has something to join, and its retry budgets are bounded by construction. |
@@ -99,30 +110,55 @@ no consumer contract breaks.
 
 ## 5. What this train implements
 
-A provider-neutral, transport-free core in
-`crates/codegen/grokptah-agent-bridge/src/durable/`, plus the minimum wiring
-that closes the one live defect above.
+One module pair in `crates/codegen/grokptah-agent-bridge/src/durable/`, holding
+no authority of its own, plus the host wiring that closes the live defect.
 
-1. **Typed terminal observations and retry decisions** — `TerminalObservation`
-   and `RetryDecision` are derived from evidence, never guessed.
-2. **Raw-output digests before bounded projections** — a `BoundedProjection`
-   can only be constructed *from* a `RawObservation` that has already been
-   digested, so the ordering is enforced by the type system rather than by
-   convention.
-3. **No false no-op / stationarity** — a repeat is inert only when the call
-   signature *and* the raw observation digest are both unchanged.
-4. **Durable work claims and revisions** — revision-CAS, stale-revision
-   refusal, duplicate-worker refusal, idempotent re-claim.
-5. **One provider-send lattice** — #494's semantics, with no second ledger.
-6. **Cancellation that proves the actual turn idle** — a cancel reports
-   `Cancelled` only once every registered lease is observed idle.
-7. **Registered-before-start effect supervision** — an effect that never
-   registered cannot start, so a crash always leaves a record to recover.
-8. **Crash/restart recovery** with malformed and truncated records counted and
-   surfaced instead of silently skipped.
-9. **Bounded retries, resources, and event/audit growth.**
-10. **A provider-neutral embeddable manager/SDK boundary** exposing no raw
-    transport and refusing a self-asserted operator escape.
+1. **Raw-output digests before bounded projections.** A `BoundedProjection` can
+   only be constructed *from* a `RawObservation` that has already been digested,
+   so the ordering is enforced by the type system rather than by convention.
+   This is the one place this train improves on #467, whose digest is taken from
+   the already-truncated transcript.
+2. **The digest is opaque.** No `Serialize`, no `Deserialize`, no `Display`, no
+   byte accessor, `Debug` redacted. It is compared in-process and discarded. A
+   digest over real tool output that could be persisted or projected would be a
+   confirmation oracle, so the type makes that unreachable rather than merely
+   discouraged. `StopDetail` carries no digest and no fingerprint.
+3. **No false no-op / stationarity.** A repeat is inert only when the call
+   signature *and* the raw observation are both unchanged. The unchanged suffix
+   restarts at each change, so a run that advances once and then freezes still
+   reaches the inert ceiling.
+4. **A host-issued wait witness**, rewritten from #467's design. The dispatcher
+   is the only place that can see the task registry, so the model cannot assert
+   a wait into existence by naming an id. A witness binds the host's own answer:
+   the authorized id, an outstanding-only state, the owning session, a
+   generation that changes when an id is recycled, and a bounded deadline. The
+   exemption lifts the *inert* ceiling only — the identical-call ceiling, the
+   nudge, and the round and duration budgets all still apply.
+
+Ceilings, ordered by strength of evidence: true no-op 4 · nudge 8 · inert 10 ·
+identical-call 16 · advancing has no stationarity ceiling and is bounded by the
+run's own budgets.
+
+## 5a. Exact-head audit, and what it changed
+
+An independent exact-head audit at `4178822` returned **REWRITE / selective
+stationarity donor**. Its findings were checked against this branch's own source
+rather than accepted or argued with, and all six held:
+
+| Finding | Verdict | Resolution |
+| --- | --- | --- |
+| `durable::send` is a second public send authority beside #497's G3 | correct | module withdrawn |
+| The send lattice was internally forgeable — `observe` terminalized without a receipt, `settle` took caller-supplied audit state, `resolve_uncertain(granted: bool)` was caller assertion, permits were not scope-bound, recovery accepted forged ordinals | correct, all five | module withdrawn |
+| Public `grant_operator_for_host(GrantProvenance::Canonical)` is self-elevation | correct | module withdrawn |
+| A sticky advance flag made `A,B,B,B…` advance forever | correct | unchanged suffix now restarts at each change; regression test added |
+| Host-witnessed active waits regressed against #467 and stopped at 10 | correct | #467's witness design rewritten in |
+| The digest derived `Serialize` and was serialized by `TerminalObservation`, contradicting the privacy claim | correct | digest made opaque; `TerminalObservation` withdrawn; `StopDetail` carries no fingerprint |
+
+The three withdrawn-module findings share one root cause worth recording: #497
+did not exist when this train's donor map was written, so its send and operator
+work was built as a "typed core awaiting G1–G4" rather than recognised as a
+duplicate of an authority that had since landed. A consolidation map is only as
+current as its last read of the open-PR set.
 
 ## 6. Nonclaims
 
