@@ -2,7 +2,11 @@
 
 Status: **PASS**
 
-Source gate: `c6f1cb23e9d6217005599850d9e0d6f7df64d5a1`
+Exact evaluated code head: `3cbd470e17597258293c3190f6eb95d26a03b5df`
+
+Exact evaluated tree: `b14c677400039e1abceca6614171080e0f437854`
+
+Base source gate: `c6f1cb23e9d6217005599850d9e0d6f7df64d5a1`
 
 | Metric | Value |
 | --- | --- |
@@ -24,10 +28,15 @@ Source gate: `c6f1cb23e9d6217005599850d9e0d6f7df64d5a1`
 | High Assurance observation bytes | 846565 |
 | Held-out | heldout.card2_ok |
 | Fixture hash | 614a8b4b0bf5d5f559764f894661475a11e75e1e40279bdbe5e48cf5387cc20a |
-| Campaign digest | 2fce11ff4e0de769267f4b22555a23029b34f7e3944679afffb1881489e74198 |
+| Campaign digest | f3965680c03a9b22a197ef7e934a558c0b25ad7e4611ffbfc0e737696315afcc |
 
 Regenerate:
 
 ```sh
-cargo run --locked --bin grokptah-cu-adaptive-eval -- --out campaign-out --repeats 5 --seed 435272
+REPO="$(git rev-parse --show-toplevel)"
+cargo run --locked --bin grokptah-cu-adaptive-eval -- \
+  --out campaign-out --repeats 5 --seed 435272 \
+  --repository "$REPO" \
+  --expected-head 3cbd470e17597258293c3190f6eb95d26a03b5df \
+  --source-gate c6f1cb23e9d6217005599850d9e0d6f7df64d5a1
 ```

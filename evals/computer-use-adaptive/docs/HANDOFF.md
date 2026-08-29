@@ -5,6 +5,8 @@
 | Field | Value |
 | --- | --- |
 | Exact base | `origin/main` `c6f1cb23e9d6217005599850d9e0d6f7df64d5a1` |
+| Exact evaluated code head | `3cbd470e17597258293c3190f6eb95d26a03b5df` (docs-only child may follow) |
+| Exact evaluated tree | `b14c677400039e1abceca6614171080e0f437854` |
 | Branch | `codex/reconstruct-adaptive-eval-newmain-v1` (current-main consolidation of drafts #446 and #448) |
 | Allowlist | `evals/computer-use-adaptive/**`, `docs/COMPUTER_USE_ADAPTIVE_EVAL.md`, `.github/workflows/desktop.yml` |
 | Production runtime edited | **none** |
@@ -14,7 +16,7 @@
 | Task success | **425 / 425** (repeats=5, seed=435272) |
 | Provider calls | **0** |
 | Cost USD | **null** (fake adapters; not fabricated) |
-| Campaign digest (repeats=5, seed=435272) | Regenerated per exact evaluated head; see `CAMPAIGN_SYNTHETIC_SUMMARY.md` |
+| Campaign digest (repeats=5, seed=435272) | `f3965680c03a9b22a197ef7e934a558c0b25ad7e4611ffbfc0e737696315afcc` |
 | Campaign digest (repeats=5, seed=435273) | Regenerate with the same mandatory source-binding flags |
 | Fixture hash | `614a8b4b0bf5d5f559764f894661475a11e75e1e40279bdbe5e48cf5387cc20a` |
 | Verifier | **ok**, independent matrix reconstruction; 0 errors |
