@@ -3,7 +3,6 @@
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
 use crate::computer_use::{ComputerBackend, ComputerUseLimits, SemanticAction, SimulatorBackend};
@@ -703,7 +702,7 @@ async fn completion(
             .get("model")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("qualification-probe");
-        let response = crate::provider_transport::send_provider_request(
+        let mut response = crate::provider_transport::send_provider_request(
             client,
             request.json(&body),
             crate::provider_transport::ProviderRequestScope {
@@ -717,15 +716,19 @@ async fn completion(
         .await
         .map_err(|error| anyhow!(error.to_string()))?;
         let status = response.status();
+        let raw = read_body(&mut response).await?;
         if status.is_redirection() {
+            response.settle_success().map_err(anyhow::Error::new)?;
             bail!("provider redirect refused");
         }
         if status == reqwest::StatusCode::UNAUTHORIZED
             && credentials.refresh_after_unauthorized().await?
         {
+            response.settle_success().map_err(anyhow::Error::new)?;
             continue;
         }
         if status.as_u16() == 400 && allow_tool_choice_fallback && !removed_tool_choice {
+            response.settle_success().map_err(anyhow::Error::new)?;
             if let Some(object) = body.as_object_mut() {
                 object.remove("tool_choice");
             }
@@ -733,15 +736,25 @@ async fn completion(
             continue;
         }
         if (status.as_u16() == 429 || status.is_server_error()) && transient_retries < 3 {
+            response.settle_success().map_err(anyhow::Error::new)?;
             tokio::time::sleep(Duration::from_millis(100 * (1 << transient_retries))).await;
             transient_retries += 1;
             continue;
         }
         if !status.is_success() {
+            response.settle_success().map_err(anyhow::Error::new)?;
             bail!("provider request failed (HTTP {})", status.as_u16());
         }
-        let raw = read_body(response).await?;
-        return serde_json::from_str(&raw).context("provider returned malformed JSON");
+        let value = match serde_json::from_str(&raw) {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(anyhow!(response.settle_protocol_error(format!(
+                    "provider returned malformed JSON: {error}"
+                ))));
+            }
+        };
+        response.settle_success().map_err(anyhow::Error::new)?;
+        return Ok(value);
     }
     bail!("provider request failed after bounded fallback")
 }
@@ -761,7 +774,7 @@ async fn streaming_probe(
         }],
         "stream": true
     });
-    let response = loop {
+    let mut response = loop {
         let mut request = client
             .post(&url)
             .header("Content-Type", "application/json")
@@ -773,7 +786,7 @@ async fn streaming_probe(
             .current()
             .map(|current| current.bearer.as_bytes())
             .unwrap_or_default();
-        let response = crate::provider_transport::send_provider_request(
+        let mut response = crate::provider_transport::send_provider_request(
             client,
             request.json(&body),
             crate::provider_transport::ProviderRequestScope {
@@ -789,15 +802,17 @@ async fn streaming_probe(
         if response.status() == reqwest::StatusCode::UNAUTHORIZED
             && credentials.refresh_after_unauthorized().await?
         {
+            let _ = read_body(&mut response).await?;
+            response.settle_success().map_err(anyhow::Error::new)?;
             continue;
         }
         break response;
     };
     if !response.status().is_success() {
-        bail!(
-            "provider stream failed (HTTP {})",
-            response.status().as_u16()
-        );
+        let status = response.status();
+        let _ = read_body(&mut response).await?;
+        response.settle_success().map_err(anyhow::Error::new)?;
+        bail!("provider stream failed (HTTP {})", status.as_u16());
     }
     let content_type = response
         .headers()
@@ -806,15 +821,15 @@ async fn streaming_probe(
         .unwrap_or_default()
         .to_ascii_lowercase();
     if content_type.contains("application/json") {
+        let _ = read_body(&mut response).await?;
+        response.settle_success().map_err(anyhow::Error::new)?;
         return Ok(false);
     }
     let mut decoder = crate::sse::SseLineDecoder::new();
     let mut full_body = crate::sse::BoundedBodyAccumulator::new();
     let mut content = String::new();
     let mut done = false;
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let bytes = chunk.map_err(classify_transport)?;
+    while let Some(bytes) = response.next_chunk(None).await? {
         full_body.push(&bytes)?;
         for line in decoder.push(&bytes)? {
             done |= apply_stream_probe_line(&line, &mut content)?;
@@ -824,7 +839,13 @@ async fn streaming_probe(
         done |= apply_stream_probe_line(&line, &mut content)?;
     }
     full_body.finish()?;
-    Ok(done && content.contains(GENERATION_MARKER))
+    if !done {
+        return Err(anyhow!(response.settle_protocol_error(
+            "provider stream ended without a terminal marker"
+        )));
+    }
+    response.settle_success().map_err(anyhow::Error::new)?;
+    Ok(content.contains(GENERATION_MARKER))
 }
 
 fn apply_stream_probe_line(line: &str, content: &mut String) -> Result<bool> {
@@ -845,23 +866,12 @@ fn apply_stream_probe_line(line: &str, content: &mut String) -> Result<bool> {
     Ok(false)
 }
 
-async fn read_body(response: reqwest::Response) -> Result<String> {
+async fn read_body(response: &mut crate::provider_transport::ProviderResponse) -> Result<String> {
     let mut body = crate::sse::BoundedBodyAccumulator::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        body.push(&chunk.map_err(classify_transport)?)?;
+    while let Some(chunk) = response.next_chunk(None).await? {
+        body.push(&chunk)?;
     }
     body.finish()
-}
-
-fn classify_transport(error: reqwest::Error) -> anyhow::Error {
-    if error.is_timeout() {
-        anyhow!("provider transport timed out")
-    } else if error.is_connect() {
-        anyhow!("provider transport could not connect")
-    } else {
-        anyhow!("provider transport failed")
-    }
 }
 
 #[cfg(test)]

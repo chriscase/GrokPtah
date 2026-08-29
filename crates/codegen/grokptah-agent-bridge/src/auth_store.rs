@@ -804,12 +804,13 @@ async fn refresh_oidc_inner(
         .map_err(|_| LiveSafetyError::RefreshTransportFailed)?;
 
     let discovery_url = format!("{XAI_OIDC_ISSUER}{OIDC_DISCOVERY_PATH}");
+    // authority-allow-unauthenticated-wire: OIDC discovery carries no token.
     let discovery_response = client
         .get(discovery_url)
         .send()
         .await
         .map_err(|_| LiveSafetyError::RefreshTransportFailed)?;
-    let discovery = bounded_refresh_json(discovery_response).await?;
+    let discovery = bounded_discovery_json(discovery_response).await?;
     validate_discovery_document(&discovery)?;
 
     let mut form = vec![
@@ -922,6 +923,45 @@ fn validate_token_endpoint(value: &str) -> Result<(), crate::live_attestation::L
 }
 
 async fn bounded_refresh_json(
+    mut response: crate::provider_transport::ProviderResponse,
+) -> Result<Value, crate::live_attestation::LiveSafetyError> {
+    use crate::live_attestation::LiveSafetyError;
+
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    validate_refresh_response_metadata(response.status(), content_type, response.content_length())?;
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .next_chunk(None)
+        .await
+        .map_err(|_| LiveSafetyError::RefreshTransportFailed)?
+    {
+        if body
+            .len()
+            .checked_add(chunk.len())
+            .is_none_or(|length| length > MAX_REFRESH_RESPONSE_BYTES)
+        {
+            return Err(LiveSafetyError::RefreshResponseTooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let value = match parse_refresh_json(&body) {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = response.settle_protocol_error("OAuth refresh response was malformed");
+            return Err(error);
+        }
+    };
+    response
+        .settle_success()
+        .map_err(|_| LiveSafetyError::RefreshTransportFailed)?;
+    Ok(value)
+}
+
+async fn bounded_discovery_json(
     mut response: reqwest::Response,
 ) -> Result<Value, crate::live_attestation::LiveSafetyError> {
     use crate::live_attestation::LiveSafetyError;

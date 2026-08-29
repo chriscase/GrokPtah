@@ -39,6 +39,25 @@ mod provider_discovery;
 pub mod provider_observation;
 mod provider_qualification;
 mod provider_transport;
+
+/// Opaque identity of a provider send requiring reconciliation. It contains no
+/// provider request, credential, model, URL, content, or path material.
+pub use xai_host_authority::AttemptId as ProviderAttemptId;
+
+/// List provider sends whose outcome requires independent operator/provider
+/// truth. Listing never retries a request.
+pub fn provider_attempts_requiring_reconciliation() -> anyhow::Result<Vec<ProviderAttemptId>> {
+    provider_transport::provider_attempts_requiring_reconciliation()
+}
+
+/// Resolve one ambiguous provider send from independently established truth.
+/// This never performs or retries a physical provider request.
+pub fn reconcile_provider_attempt(
+    attempt: ProviderAttemptId,
+    took_effect: bool,
+) -> anyhow::Result<()> {
+    provider_transport::reconcile_provider_attempt(attempt, took_effect)
+}
 pub mod reliability_eval;
 mod run_promotion;
 mod search_engine;

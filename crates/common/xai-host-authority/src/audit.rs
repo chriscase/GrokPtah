@@ -206,11 +206,13 @@ impl AuditLog {
         }
         std::fs::rename(&tmp, &self.head_path)
             .map_err(|e| AuthorityError::Durability(e.to_string()))?;
-        if let Some(root) = self.head_path.parent()
-            && let Ok(dir) = File::open(root)
-        {
-            let _ = dir.sync_all();
-        }
+        let root = self
+            .head_path
+            .parent()
+            .ok_or_else(|| AuthorityError::Durability("audit head has no parent".into()))?;
+        let dir = File::open(root).map_err(|e| AuthorityError::Durability(e.to_string()))?;
+        dir.sync_all()
+            .map_err(|e| AuthorityError::Durability(e.to_string()))?;
         Ok(())
     }
 

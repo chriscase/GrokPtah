@@ -351,6 +351,12 @@ pub enum UncertainReason {
     TransportAfterPossibleWrite,
     /// The caller cancelled after the request may have been written.
     CancelledAfterPossibleWrite,
+    /// Response headers arrived, but the response body failed, was truncated,
+    /// or was abandoned before the caller could validate the provider result.
+    ResponseBodyAfterPossibleEffect,
+    /// The complete response bytes were observed, but the provider protocol
+    /// could not be validated. The request may still have taken effect.
+    ProtocolAfterPossibleEffect,
     /// The process stopped between dispatch and settlement; recovery found the
     /// attempt still in flight.
     CrashBetweenDispatchAndSettlement,

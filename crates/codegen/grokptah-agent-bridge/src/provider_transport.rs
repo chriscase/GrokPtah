@@ -6,18 +6,21 @@
 //! permit is then consumed by exactly one terminal settlement.
 
 use std::collections::HashMap;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
+use bytes::Bytes;
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use xai_host_authority::{
-    ActorClass, ContentDigest, EffectClass, FailedReason, HostAdminCredential, HostAuthority,
-    HostCredential, PhysicalSendPermit, RequestIdentity, SendOutcome, UncertainReason,
+    ActorClass, AttemptId, ContentDigest, EffectClass, FailedReason, HostAdminAuthority,
+    HostAdminCredential, HostAuthority, HostCredential, PhysicalSendPermit, RequestIdentity,
+    SendOutcome, UncertainReason,
 };
 
 const AUTHORITY_DIR: &str = "authority/provider-send-v1";
@@ -30,6 +33,7 @@ static AUTHORITIES: OnceLock<Mutex<HashMap<PathBuf, Arc<ProviderAuthority>>>> = 
 
 struct ProviderAuthority {
     authority: HostAuthority,
+    admin: HostAdminAuthority,
     service_bearer: String,
 }
 
@@ -79,6 +83,14 @@ impl ProviderTransportError {
             .as_ref()
             .is_some_and(|outcome| matches!(outcome, SendOutcome::Uncertain { .. }))
     }
+
+    pub(crate) fn attempt_handle(&self) -> Option<String> {
+        self.outcome.as_ref().map(|outcome| match outcome {
+            SendOutcome::Settled { attempt }
+            | SendOutcome::Failed { attempt, .. }
+            | SendOutcome::Uncertain { attempt, .. } => attempt.public_handle(),
+        })
+    }
 }
 
 impl std::fmt::Display for ProviderTransportError {
@@ -95,26 +107,142 @@ enum WireResult {
     Ambiguous(String),
 }
 
+/// A response whose physical-send permit remains live until the caller has
+/// consumed and validated the complete provider protocol. Dropping it, losing
+/// the body, or abandoning a partial stream settles the attempt Uncertain.
+pub(crate) struct ProviderResponse {
+    response: reqwest::Response,
+    runtime: Arc<ProviderAuthority>,
+    permit: Option<PhysicalSendPermit>,
+}
+
+impl std::fmt::Debug for ProviderResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProviderResponse")
+            .field("status", &self.response.status())
+            .field(
+                "attempt",
+                &self.permit.as_ref().map(PhysicalSendPermit::attempt),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl ProviderResponse {
+    pub(crate) fn status(&self) -> reqwest::StatusCode {
+        self.response.status()
+    }
+
+    pub(crate) fn headers(&self) -> &reqwest::header::HeaderMap {
+        self.response.headers()
+    }
+
+    pub(crate) fn content_length(&self) -> Option<u64> {
+        self.response.content_length()
+    }
+
+    pub(crate) fn attempt_handle(&self) -> Option<String> {
+        self.permit
+            .as_ref()
+            .map(|permit| permit.attempt().public_handle())
+    }
+
+    pub(crate) async fn next_chunk(
+        &mut self,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<Option<Bytes>, ProviderTransportError> {
+        let result = if let Some(cancel) = cancel {
+            tokio::select! {
+                result = self.response.chunk() => result,
+                _ = cancel.cancelled() => {
+                    return Err(self.settle_uncertain_error(
+                        "provider response cancelled after response headers",
+                        UncertainReason::CancelledAfterPossibleWrite,
+                    ));
+                }
+            }
+        } else {
+            self.response.chunk().await
+        };
+        match result {
+            Ok(chunk) => Ok(chunk),
+            Err(_) => Err(self.settle_uncertain_error(
+                "provider response body failed after response headers",
+                UncertainReason::ResponseBodyAfterPossibleEffect,
+            )),
+        }
+    }
+
+    pub(crate) fn settle_success(mut self) -> Result<(), ProviderTransportError> {
+        let Some(permit) = self.permit.take() else {
+            return Err(ProviderTransportError::before_dispatch(
+                "provider response no longer owns a send permit",
+            ));
+        };
+        let outcome = self.runtime.authority.settle_settled(permit);
+        if matches!(outcome, SendOutcome::Settled { .. }) {
+            Ok(())
+        } else {
+            Err(ProviderTransportError::settled(
+                "provider response was validated but settlement is not durable",
+                outcome,
+            ))
+        }
+    }
+
+    pub(crate) fn settle_protocol_error(
+        mut self,
+        message: impl Into<String>,
+    ) -> ProviderTransportError {
+        let Some(permit) = self.permit.take() else {
+            return ProviderTransportError::before_dispatch(
+                "provider response no longer owns a send permit",
+            );
+        };
+        let outcome = self
+            .runtime
+            .authority
+            .settle_uncertain(permit, UncertainReason::ProtocolAfterPossibleEffect);
+        ProviderTransportError::settled(message, outcome)
+    }
+
+    fn settle_uncertain_error(
+        &mut self,
+        message: impl Into<String>,
+        reason: UncertainReason,
+    ) -> ProviderTransportError {
+        let Some(permit) = self.permit.take() else {
+            return ProviderTransportError::before_dispatch(
+                "provider response no longer owns a send permit",
+            );
+        };
+        let outcome = self.runtime.authority.settle_uncertain(permit, reason);
+        ProviderTransportError::settled(message, outcome)
+    }
+}
+
+impl Drop for ProviderResponse {
+    fn drop(&mut self) {
+        if let Some(permit) = self.permit.take() {
+            let _ = self
+                .runtime
+                .authority
+                .settle_uncertain(permit, UncertainReason::ResponseBodyAfterPossibleEffect);
+        }
+    }
+}
+
 #[async_trait]
 trait WireDispatch: Send + Sync {
-    async fn dispatch(
-        &self,
-        client: &reqwest::Client,
-        request: reqwest::Request,
-        permit: &PhysicalSendPermit,
-    ) -> WireResult;
+    async fn dispatch(&self, client: &reqwest::Client, request: reqwest::Request) -> WireResult;
 }
 
 struct ReqwestWireDispatch;
 
 #[async_trait]
 impl WireDispatch for ReqwestWireDispatch {
-    async fn dispatch(
-        &self,
-        client: &reqwest::Client,
-        request: reqwest::Request,
-        _permit: &PhysicalSendPermit,
-    ) -> WireResult {
+    async fn dispatch(&self, client: &reqwest::Client, request: reqwest::Request) -> WireResult {
         match client.execute(request).await {
             Ok(response) => WireResult::Response(response),
             Err(error) if error.is_connect() => {
@@ -130,15 +258,15 @@ impl WireDispatch for ReqwestWireDispatch {
 }
 
 /// Execute one credential-bearing request through the canonical physical-send
-/// lattice. The response is returned only if the `Settled` audit record is
-/// durable. Thus no caller can observe a response and silently bypass a failed
-/// settlement write.
+/// lattice. The returned response retains the one-use send permit until the
+/// caller consumes and validates the complete provider protocol, then settles
+/// it explicitly. Dropping or failing the body marks the attempt uncertain.
 pub(crate) async fn send_provider_request(
     client: &reqwest::Client,
     request: reqwest::RequestBuilder,
     scope: ProviderRequestScope<'_>,
     cancel: Option<&CancellationToken>,
-) -> Result<reqwest::Response, ProviderTransportError> {
+) -> Result<ProviderResponse, ProviderTransportError> {
     send_provider_request_with(client, request, scope, cancel, &ReqwestWireDispatch).await
 }
 
@@ -148,14 +276,12 @@ async fn send_provider_request_with(
     scope: ProviderRequestScope<'_>,
     cancel: Option<&CancellationToken>,
     dispatch: &dyn WireDispatch,
-) -> Result<reqwest::Response, ProviderTransportError> {
+) -> Result<ProviderResponse, ProviderTransportError> {
     let request = request
         .build()
         .map_err(ProviderTransportError::before_dispatch)?;
-    let body = request
-        .body()
-        .and_then(reqwest::Body::as_bytes)
-        .unwrap_or_default();
+    let body =
+        validate_wire_request(&request, &scope).map_err(ProviderTransportError::before_dispatch)?;
     let identity = RequestIdentity::new(
         request.url().as_str(),
         request.method().as_str(),
@@ -171,7 +297,7 @@ async fn send_provider_request_with(
 
     let result = if let Some(cancel) = cancel {
         tokio::select! {
-            result = dispatch.dispatch(client, request, &permit) => result,
+            result = dispatch.dispatch(client, request) => result,
             _ = cancel.cancelled() => {
                 let outcome = runtime.authority.settle_uncertain(
                     permit,
@@ -184,21 +310,15 @@ async fn send_provider_request_with(
             }
         }
     } else {
-        dispatch.dispatch(client, request, &permit).await
+        dispatch.dispatch(client, request).await
     };
 
     match result {
-        WireResult::Response(response) => {
-            let outcome = runtime.authority.settle_settled(permit);
-            if matches!(outcome, SendOutcome::Settled { .. }) {
-                Ok(response)
-            } else {
-                Err(ProviderTransportError::settled(
-                    "provider response arrived but settlement is not durable; outcome is uncertain",
-                    outcome,
-                ))
-            }
-        }
+        WireResult::Response(response) => Ok(ProviderResponse {
+            response,
+            runtime,
+            permit: Some(permit),
+        }),
         WireResult::RefusedBeforeWrite(message) => {
             let outcome = runtime
                 .authority
@@ -212,6 +332,85 @@ async fn send_provider_request_with(
             Err(ProviderTransportError::settled(message, outcome))
         }
     }
+}
+
+fn validate_wire_request<'a>(
+    request: &'a reqwest::Request,
+    scope: &ProviderRequestScope<'_>,
+) -> anyhow::Result<&'a [u8]> {
+    let body = match request.body() {
+        None => &[][..],
+        Some(body) => body
+            .as_bytes()
+            .ok_or_else(|| anyhow!("provider request body is not immutable bytes"))?,
+    };
+
+    let actual_authorization = request.headers().get(AUTHORIZATION);
+    if scope.credential_secret.is_empty() {
+        if actual_authorization.is_some() {
+            return Err(anyhow!(
+                "provider credential scope does not match request headers"
+            ));
+        }
+    } else {
+        let secret = std::str::from_utf8(scope.credential_secret)
+            .context("provider credential is not valid UTF-8")?;
+        let expected = format!("Bearer {secret}");
+        let actual = actual_authorization
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| anyhow!("provider request is missing its admitted credential"))?;
+        if actual.as_bytes() != expected.as_bytes() {
+            return Err(anyhow!(
+                "provider credential scope does not match request headers"
+            ));
+        }
+    }
+
+    let method = request.method();
+    let content_type = request
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match scope.dialect {
+        "openai_model_catalog" => {
+            if method != reqwest::Method::GET || !body.is_empty() || scope.model != "model-catalog"
+            {
+                return Err(anyhow!(
+                    "model-catalog wire shape does not match its dialect"
+                ));
+            }
+        }
+        "oauth2_refresh" => {
+            if method != reqwest::Method::POST
+                || !content_type.starts_with("application/x-www-form-urlencoded")
+                || body.is_empty()
+                || scope.model != "oidc-token-refresh"
+            {
+                return Err(anyhow!(
+                    "OAuth refresh wire shape does not match its dialect"
+                ));
+            }
+        }
+        "xai_chat_completions" | "openai_chat_completions" | "provider_qualification" => {
+            if method != reqwest::Method::POST
+                || !content_type.starts_with("application/json")
+                || body.is_empty()
+            {
+                return Err(anyhow!(
+                    "provider completion wire shape does not match its dialect"
+                ));
+            }
+            let value: serde_json::Value = serde_json::from_slice(body)
+                .context("provider request body is not canonical JSON")?;
+            if value.get("model").and_then(serde_json::Value::as_str) != Some(scope.model) {
+                return Err(anyhow!("provider model scope does not match request body"));
+            }
+        }
+        _ => return Err(anyhow!("unsupported provider wire dialect")),
+    }
+    Ok(body)
 }
 
 impl ProviderAuthority {
@@ -261,6 +460,10 @@ fn authority_runtime() -> anyhow::Result<Arc<ProviderAuthority>> {
     let custody = load_or_create_custody(&home.join(CUSTODY_FILE))?;
     let admin = HostAdminCredential::new(custody.clone())?;
     let (authority, admin_authority) = HostAuthority::open(&root, &admin)?;
+    // Crash-left sends must be classified before this incarnation can admit
+    // another provider effect. Recovery never resends; it publishes the
+    // attempts that require explicit operator reconciliation.
+    authority.recover_incomplete(&admin_authority)?;
     let service_bearer = derive_service_bearer(&custody);
     authority.set_credentials(
         &admin_authority,
@@ -271,10 +474,29 @@ fn authority_runtime() -> anyhow::Result<Arc<ProviderAuthority>> {
     )?;
     let runtime = Arc::new(ProviderAuthority {
         authority,
+        admin: admin_authority,
         service_bearer,
     });
     registry.insert(root, Arc::clone(&runtime));
     Ok(runtime)
+}
+
+/// Resolve one previously ambiguous provider attempt from independently
+/// established operator/provider truth. No resend occurs here.
+pub(crate) fn reconcile_provider_attempt(
+    attempt: AttemptId,
+    took_effect: bool,
+) -> anyhow::Result<()> {
+    let runtime = authority_runtime()?;
+    runtime
+        .authority
+        .reconcile_attempt(&runtime.admin, attempt, took_effect)?;
+    Ok(())
+}
+
+pub(crate) fn provider_attempts_requiring_reconciliation() -> anyhow::Result<Vec<AttemptId>> {
+    let runtime = authority_runtime()?;
+    Ok(runtime.authority.ambiguous_attempts(&runtime.admin)?)
 }
 
 fn secure_authority_directory(path: &Path) -> anyhow::Result<()> {
@@ -320,6 +542,13 @@ fn create_custody(path: &Path) -> std::io::Result<String> {
     );
     file.write_all(secret.as_bytes())?;
     file.sync_all()?;
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "provider custody path has no parent directory",
+        )
+    })?;
+    File::open(parent)?.sync_all()?;
     Ok(secret)
 }
 
@@ -380,7 +609,6 @@ mod tests {
             &self,
             _client: &reqwest::Client,
             _request: reqwest::Request,
-            _permit: &PhysicalSendPermit,
         ) -> WireResult {
             std::future::pending::<WireResult>().await
         }
@@ -392,7 +620,6 @@ mod tests {
             &self,
             _client: &reqwest::Client,
             _request: reqwest::Request,
-            _permit: &PhysicalSendPermit,
         ) -> WireResult {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.result.lock().unwrap().take().unwrap()
@@ -402,10 +629,17 @@ mod tests {
     fn scope() -> ProviderRequestScope<'static> {
         ProviderRequestScope {
             credential_secret: b"synthetic-provider-secret",
-            dialect: "test",
+            dialect: "openai_chat_completions",
             model: "synthetic-model",
             target_scope: "test-provider-send",
         }
+    }
+
+    fn request(client: &reqwest::Client) -> reqwest::RequestBuilder {
+        client
+            .post("http://127.0.0.1/provider")
+            .bearer_auth("synthetic-provider-secret")
+            .json(&serde_json::json!({"model": "synthetic-model"}))
     }
 
     #[tokio::test]
@@ -419,15 +653,9 @@ mod tests {
             result: Mutex::new(Some(WireResult::RefusedBeforeWrite("refused".into()))),
         };
         let client = reqwest::Client::new();
-        let error = send_provider_request_with(
-            &client,
-            client.post("http://127.0.0.1/provider").body("body"),
-            scope(),
-            None,
-            &dispatch,
-        )
-        .await
-        .unwrap_err();
+        let error = send_provider_request_with(&client, request(&client), scope(), None, &dispatch)
+            .await
+            .unwrap_err();
         assert!(error.is_safe_to_resend());
         assert!(!error.is_uncertain());
         assert_eq!(dispatch.calls.load(Ordering::SeqCst), 1);
@@ -444,15 +672,9 @@ mod tests {
             result: Mutex::new(Some(WireResult::Ambiguous("cut after write".into()))),
         };
         let client = reqwest::Client::new();
-        let error = send_provider_request_with(
-            &client,
-            client.post("http://127.0.0.1/provider").body("body"),
-            scope(),
-            None,
-            &dispatch,
-        )
-        .await
-        .unwrap_err();
+        let error = send_provider_request_with(&client, request(&client), scope(), None, &dispatch)
+            .await
+            .unwrap_err();
         assert!(error.is_uncertain());
         assert!(!error.is_safe_to_resend());
         assert_eq!(dispatch.calls.load(Ordering::SeqCst), 1);
@@ -469,7 +691,7 @@ mod tests {
         cancel.cancel();
         let error = send_provider_request_with(
             &client,
-            client.post("http://127.0.0.1/provider").body("body"),
+            request(&client),
             scope(),
             Some(&cancel),
             &PendingDispatch,
@@ -480,21 +702,204 @@ mod tests {
         assert!(!error.is_safe_to_resend());
     }
 
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn response_abandoned_after_headers_requires_reconciliation() {
+        let home = tempfile::tempdir().unwrap();
+        let _serial = crate::discover::home_override_serial();
+        let _home = HomeOverride::install(home.path().to_path_buf());
+        let response: reqwest::Response = axum::http::Response::builder()
+            .status(200)
+            .body("synthetic body")
+            .unwrap()
+            .into();
+        let dispatch = InjectedDispatch {
+            calls: AtomicUsize::new(0),
+            result: Mutex::new(Some(WireResult::Response(response))),
+        };
+        let client = reqwest::Client::new();
+        let response =
+            send_provider_request_with(&client, request(&client), scope(), None, &dispatch)
+                .await
+                .unwrap();
+        drop(response);
+        let ambiguous = provider_attempts_requiring_reconciliation().unwrap();
+        assert_eq!(ambiguous.len(), 1);
+        reconcile_provider_attempt(ambiguous[0], true).unwrap();
+        assert!(provider_attempts_requiring_reconciliation()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn response_body_failure_and_protocol_rejection_are_uncertain() {
+        let home = tempfile::tempdir().unwrap();
+        let _serial = crate::discover::home_override_serial();
+        let _home = HomeOverride::install(home.path().to_path_buf());
+        let error_stream = futures::stream::once(async {
+            Err::<Bytes, std::io::Error>(std::io::Error::other("cut after headers"))
+        });
+        let response: reqwest::Response = axum::http::Response::builder()
+            .status(200)
+            .body(reqwest::Body::wrap_stream(error_stream))
+            .unwrap()
+            .into();
+        let dispatch = InjectedDispatch {
+            calls: AtomicUsize::new(0),
+            result: Mutex::new(Some(WireResult::Response(response))),
+        };
+        let client = reqwest::Client::new();
+        let mut response =
+            send_provider_request_with(&client, request(&client), scope(), None, &dispatch)
+                .await
+                .unwrap();
+        assert!(response.next_chunk(None).await.unwrap_err().is_uncertain());
+        assert_eq!(
+            provider_attempts_requiring_reconciliation().unwrap().len(),
+            1
+        );
+
+        let response: reqwest::Response = axum::http::Response::builder()
+            .status(200)
+            .body("not-json")
+            .unwrap()
+            .into();
+        let dispatch = InjectedDispatch {
+            calls: AtomicUsize::new(0),
+            result: Mutex::new(Some(WireResult::Response(response))),
+        };
+        let mut response =
+            send_provider_request_with(&client, request(&client), scope(), None, &dispatch)
+                .await
+                .unwrap();
+        let mut body = Vec::new();
+        while let Some(chunk) = response.next_chunk(None).await.unwrap() {
+            body.extend_from_slice(&chunk);
+        }
+        assert!(serde_json::from_slice::<serde_json::Value>(&body).is_err());
+        let error = response.settle_protocol_error("malformed provider JSON");
+        assert!(error.is_uncertain());
+        assert_eq!(
+            provider_attempts_requiring_reconciliation().unwrap().len(),
+            2
+        );
+
+        let pending_stream = futures::stream::pending::<Result<Bytes, std::io::Error>>();
+        let response: reqwest::Response = axum::http::Response::builder()
+            .status(200)
+            .header(reqwest::header::CONTENT_TYPE, "text/event-stream")
+            .body(reqwest::Body::wrap_stream(pending_stream))
+            .unwrap()
+            .into();
+        let dispatch = InjectedDispatch {
+            calls: AtomicUsize::new(0),
+            result: Mutex::new(Some(WireResult::Response(response))),
+        };
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let mut response =
+            send_provider_request_with(&client, request(&client), scope(), None, &dispatch)
+                .await
+                .unwrap();
+        assert!(response
+            .next_chunk(Some(&cancel))
+            .await
+            .unwrap_err()
+            .is_uncertain());
+        assert_eq!(
+            provider_attempts_requiring_reconciliation().unwrap().len(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn mismatched_model_and_credential_are_refused_before_dispatch() {
+        let home = tempfile::tempdir().unwrap();
+        let _serial = crate::discover::home_override_serial();
+        let _home = HomeOverride::install(home.path().to_path_buf());
+        let dispatch = InjectedDispatch {
+            calls: AtomicUsize::new(0),
+            result: Mutex::new(Some(WireResult::RefusedBeforeWrite("unused".into()))),
+        };
+        let client = reqwest::Client::new();
+        let wrong_model = client
+            .post("http://127.0.0.1/provider")
+            .bearer_auth("synthetic-provider-secret")
+            .json(&serde_json::json!({"model": "other-model"}));
+        assert!(
+            send_provider_request_with(&client, wrong_model, scope(), None, &dispatch,)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("model scope")
+        );
+        let wrong_credential = client
+            .post("http://127.0.0.1/provider")
+            .bearer_auth("other-secret")
+            .json(&serde_json::json!({"model": "synthetic-model"}));
+        assert!(
+            send_provider_request_with(&client, wrong_credential, scope(), None, &dispatch,)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("credential scope")
+        );
+        let streamed_body = reqwest::Body::wrap_stream(futures::stream::once(async {
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(br#"{"model":"synthetic-model"}"#))
+        }));
+        let unsupported_stream = client
+            .post("http://127.0.0.1/provider")
+            .bearer_auth("synthetic-provider-secret")
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(streamed_body);
+        assert!(
+            send_provider_request_with(&client, unsupported_stream, scope(), None, &dispatch,)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("immutable bytes")
+        );
+        assert_eq!(dispatch.calls.load(Ordering::SeqCst), 0);
+    }
+
     #[test]
     fn credential_bearing_model_calls_have_no_raw_send_escape_hatch() {
-        let host_helpers = include_str!("host_helpers.rs");
-        let qualification = include_str!("provider_qualification.rs");
-        let discovery = include_str!("provider_discovery.rs");
-        let auth_store = include_str!("auth_store.rs");
         let raw_send = [".", "send()"].concat();
-        // The one remaining host_helpers call is the unauthenticated web-fetch
-        // tool; the one auth-store call is OIDC discovery before any refresh
-        // credential is attached. Every provider/model or secret-bearing call
-        // is forced through this module.
-        assert_eq!(host_helpers.matches(&raw_send).count(), 1);
-        assert_eq!(qualification.matches(&raw_send).count(), 0);
-        assert_eq!(discovery.matches(&raw_send).count(), 0);
-        assert_eq!(auth_store.matches(&raw_send).count(), 1);
+        let source_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        for entry in walkdir::WalkDir::new(source_root) {
+            let entry = entry.unwrap();
+            if !entry.file_type().is_file()
+                || entry.path().extension().and_then(|value| value.to_str()) != Some("rs")
+            {
+                continue;
+            }
+            let relative = entry
+                .path()
+                .strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                .unwrap();
+            let name = relative.to_string_lossy();
+            if name.ends_with("provider_transport.rs")
+                || name.ends_with("mcp_control.rs")
+                || name.ends_with("mcp_control_client.rs")
+            {
+                continue;
+            }
+            let source = std::fs::read_to_string(entry.path()).unwrap();
+            for (offset, _) in source.match_indices(&raw_send) {
+                let context = source[..offset]
+                    .lines()
+                    .rev()
+                    .take(10)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(
+                    context.contains("authority-allow-unauthenticated-wire"),
+                    "raw reqwest send outside provider authority in {name}"
+                );
+            }
+        }
         let this_module = include_str!("provider_transport.rs");
         let execute_needle = ["client.execute", "(request)"].concat();
         assert_eq!(this_module.matches(&execute_needle).count(), 1);

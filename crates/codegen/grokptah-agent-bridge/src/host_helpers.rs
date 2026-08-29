@@ -5,7 +5,6 @@ use std::path::Path;
 
 use anyhow::{anyhow, bail, Result};
 use chrono::Utc;
-use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -403,6 +402,7 @@ pub(crate) async fn tool_web_fetch(url: &str) -> Result<local_tools::ToolResult>
         .timeout(std::time::Duration::from_secs(20))
         .user_agent("GrokPtah/0.1 (web_fetch)")
         .build()?;
+    // authority-allow-unauthenticated-wire: bounded public web-fetch tool.
     let resp = client.get(url).send().await?;
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
@@ -1700,20 +1700,15 @@ where
 }
 
 async fn read_bounded_response_body(
-    response: reqwest::Response,
+    response: &mut crate::provider_transport::ProviderResponse,
     cancel: &CancellationToken,
 ) -> Result<String> {
     let mut body = crate::sse::BoundedBodyAccumulator::new();
-    let mut stream = response.bytes_stream();
-    loop {
-        let chunk = tokio::select! {
-            chunk = stream.next() => chunk,
-            _ = cancel.cancelled() => bail!("cancelled"),
-        };
-        let Some(chunk) = chunk else {
-            break;
-        };
-        body.push(&chunk.map_err(|error| anyhow!("provider response body: {error}"))?)?;
+    while let Some(chunk) = response.next_chunk(Some(cancel)).await? {
+        if chunk.is_empty() {
+            continue;
+        }
+        body.push(&chunk)?;
     }
     body.finish()
 }
@@ -1919,6 +1914,7 @@ fn record_provider_attempt(
     let Some(attempt) = attempt else {
         return;
     };
+    let authority_attempt = attempt.authority_attempt();
     let Ok(response) = ResponseMetadata::new(status_code, content_class, framing, disposition)
     else {
         return;
@@ -1955,7 +1951,7 @@ fn record_provider_attempt(
     ) else {
         return;
     };
-    let _ = attempt.notify(observation);
+    let _ = attempt.notify(observation.with_authority_attempt(authority_attempt));
 }
 
 /// Stream one chat/completions step (tools + tokens).
@@ -2143,6 +2139,13 @@ where
             Some(cancel),
         )
         .await;
+        if let Some((_, attempt)) = observation_attempt.as_mut() {
+            let authority_attempt = match &resp_result {
+                Ok(response) => response.attempt_handle(),
+                Err(error) => error.attempt_handle(),
+            };
+            attempt.bind_authority_attempt(authority_attempt);
+        }
         let mut resp = match resp_result {
             Ok(r) => r,
             Err(e) => {
@@ -2203,6 +2206,8 @@ where
                     None,
                 );
             }
+            let _ = read_bounded_response_body(&mut resp, cancel).await?;
+            resp.settle_success().map_err(anyhow::Error::new)?;
             match crate::auth_store::force_refresh(&creds).await {
                 Ok(fresh) => {
                     creds = fresh;
@@ -2222,7 +2227,7 @@ where
                             .and_then(|(route, context)| {
                                 context.begin_attempt().ok().map(|attempt| (route, attempt))
                             });
-                    resp = match crate::provider_transport::send_provider_request(
+                    let refreshed_result = crate::provider_transport::send_provider_request(
                         &client,
                         send_once(&creds),
                         crate::provider_transport::ProviderRequestScope {
@@ -2240,8 +2245,15 @@ where
                         },
                         Some(cancel),
                     )
-                    .await
-                    {
+                    .await;
+                    if let Some((_, attempt)) = observation_attempt.as_mut() {
+                        let authority_attempt = match &refreshed_result {
+                            Ok(response) => response.attempt_handle(),
+                            Err(error) => error.attempt_handle(),
+                        };
+                        attempt.bind_authority_attempt(authority_attempt);
+                    }
+                    resp = match refreshed_result {
                         Ok(response) => response,
                         Err(error) => {
                             if let Some((route, attempt)) = observation_attempt.take() {
@@ -2284,9 +2296,8 @@ where
             || status == reqwest::StatusCode::REQUEST_TIMEOUT
         {
             let headers = resp.headers().clone();
-            let text = read_bounded_response_body(resp, cancel)
-                .await
-                .unwrap_or_default();
+            let text = read_bounded_response_body(&mut resp, cancel).await?;
+            resp.settle_success().map_err(anyhow::Error::new)?;
             let (content_class, framing) = response_shape(&headers, text.len() as u64);
             if let Some((route, attempt)) = observation_attempt.take() {
                 record_provider_attempt(
@@ -2326,9 +2337,8 @@ where
 
         if !status.is_success() {
             let headers = resp.headers().clone();
-            let text = read_bounded_response_body(resp, cancel)
-                .await
-                .unwrap_or_default();
+            let text = read_bounded_response_body(&mut resp, cancel).await?;
+            resp.settle_success().map_err(anyhow::Error::new)?;
             let (content_class, framing) = response_shape(&headers, text.len() as u64);
             if let Some((route, attempt)) = observation_attempt.take() {
                 record_provider_attempt(
@@ -2401,7 +2411,7 @@ where
             .unwrap_or_default()
             .to_ascii_lowercase();
         if body.get("stream").and_then(|s| s.as_bool()) == Some(false) {
-            let raw = read_bounded_response_body(resp, cancel).await?;
+            let raw = read_bounded_response_body(&mut resp, cancel).await?;
             let (content_class, framing) = response_shape(&headers, raw.len() as u64);
             let v: serde_json::Value = match serde_json::from_str(&raw) {
                 Ok(value) => value,
@@ -2419,7 +2429,9 @@ where
                             None,
                         );
                     }
-                    return Err(anyhow!("provider JSON: {error}"));
+                    return Err(anyhow!(
+                        resp.settle_protocol_error(format!("provider JSON: {error}"))
+                    ));
                 }
             };
             let usage = parse_completion_usage(&v).unwrap_or(None);
@@ -2460,10 +2472,11 @@ where
                     usage.as_ref(),
                 );
             }
+            resp.settle_success().map_err(anyhow::Error::new)?;
             return Ok(step);
         }
         if content_type.contains("application/json") {
-            let raw = read_bounded_response_body(resp, cancel).await?;
+            let raw = read_bounded_response_body(&mut resp, cancel).await?;
             let (content_class, framing) = response_shape(&headers, raw.len() as u64);
             let value: serde_json::Value = match serde_json::from_str(&raw) {
                 Ok(value) => value,
@@ -2481,7 +2494,9 @@ where
                             None,
                         );
                     }
-                    return Err(anyhow!("provider JSON: {error}"));
+                    return Err(anyhow!(
+                        resp.settle_protocol_error(format!("provider JSON: {error}"))
+                    ));
                 }
             };
             let usage = parse_completion_usage(&value).unwrap_or(None);
@@ -2522,11 +2537,11 @@ where
                     usage.as_ref(),
                 );
             }
+            resp.settle_success().map_err(anyhow::Error::new)?;
             return Ok(step);
         }
 
         // SSE stream path — cancel kills the body read promptly.
-        let mut stream = resp.bytes_stream();
         let mut decoder = crate::sse::SseLineDecoder::new();
         let mut full_body = crate::sse::BoundedBodyAccumulator::new();
         let mut acc = AgentSseAccumulator::default();
@@ -2534,31 +2549,8 @@ where
         let mut response_bytes = 0u64;
 
         loop {
-            let chunk = tokio::select! {
-                c = stream.next() => c,
-                _ = cancel.cancelled() => {
-                    drop(stream);
-                    if let Some((route, attempt)) = observation_attempt.take() {
-                        record_provider_attempt(
-                            Some(attempt),
-                            route,
-                            None,
-                            None,
-                            ResponseFraming::None,
-                            ObservationAttemptDisposition::Cancelled,
-                            request_bytes,
-                            response_bytes,
-                            None,
-                        );
-                    }
-                    bail!("cancelled");
-                }
-            };
-            let Some(chunk) = chunk else {
-                break;
-            };
-            let bytes = match chunk {
-                Ok(bytes) => bytes,
+            let chunk = match resp.next_chunk(Some(cancel)).await {
+                Ok(chunk) => chunk,
                 Err(error) => {
                     if let Some((route, attempt)) = observation_attempt.take() {
                         record_provider_attempt(
@@ -2567,20 +2559,27 @@ where
                             None,
                             None,
                             ResponseFraming::None,
-                            ObservationAttemptDisposition::TransportError,
+                            if cancel.is_cancelled() {
+                                ObservationAttemptDisposition::Cancelled
+                            } else {
+                                ObservationAttemptDisposition::TransportError
+                            },
                             request_bytes,
                             response_bytes,
                             None,
                         );
                     }
-                    return Err(anyhow!("stream: {error}"));
+                    return Err(anyhow!(error));
                 }
             };
-            response_bytes = response_bytes.saturating_add(bytes.len() as u64);
+            let Some(chunk) = chunk else {
+                break;
+            };
+            response_bytes = response_bytes.saturating_add(chunk.len() as u64);
             if !acc.saw_data {
-                full_body.push(&bytes)?;
+                full_body.push(&chunk)?;
             }
-            for line in decoder.push(&bytes)? {
+            for line in decoder.push(&chunk)? {
                 if apply_agent_sse_line(&line, &mut acc, &mut on_delta, &mut on_thought)? {
                     done = true;
                     break;
@@ -2657,6 +2656,7 @@ where
                     usage.as_ref(),
                 );
             }
+            resp.settle_success().map_err(anyhow::Error::new)?;
             return Ok(step);
         }
 
@@ -2722,6 +2722,7 @@ where
                     usage.as_ref(),
                 );
             }
+            resp.settle_success().map_err(anyhow::Error::new)?;
             return Ok(AgentStep::ToolCalls {
                 content: content_opt,
                 tool_calls,
@@ -2745,6 +2746,7 @@ where
                     usage.as_ref(),
                 );
             }
+            resp.settle_success().map_err(anyhow::Error::new)?;
             return Ok(AgentStep::Final {
                 text: acc.content,
                 streamed: acc.streamed_any,
@@ -2767,6 +2769,7 @@ where
                     usage.as_ref(),
                 );
             }
+            resp.settle_success().map_err(anyhow::Error::new)?;
             return Ok(AgentStep::Final {
                 text: String::new(),
                 streamed: true,
@@ -2790,6 +2793,7 @@ where
                 usage.as_ref(),
             );
         }
+        resp.settle_success().map_err(anyhow::Error::new)?;
         return Ok(AgentStep::Final {
             text: String::new(),
             streamed: acc.streamed_any,
@@ -3774,6 +3778,8 @@ pub(crate) async fn call_xai_chat(
 
     // One retry after OIDC refresh on 401 (expired access token is common).
     if resp.status() == reqwest::StatusCode::UNAUTHORIZED && creds.oidc_token_auth {
+        let _ = read_bounded_response_body(&mut resp, &CancellationToken::new()).await?;
+        resp.settle_success().map_err(anyhow::Error::new)?;
         match crate::auth_store::force_refresh(&creds).await {
             Ok(fresh) => {
                 creds = fresh;
@@ -3816,18 +3822,24 @@ pub(crate) async fn call_xai_chat(
 
     if !resp.status().is_success() {
         let status = resp.status();
+        let text = read_bounded_response_body(&mut resp, &CancellationToken::new()).await?;
+        resp.settle_success().map_err(anyhow::Error::new)?;
         if is_compatible {
             bail!("configured provider returned HTTP {status}");
         }
-        let text = read_bounded_response_body(resp, &CancellationToken::new())
-            .await
-            .unwrap_or_default();
         let clipped: String = text.chars().take(800).collect();
         bail!("HTTP {status}: {clipped}");
     }
-    let raw = read_bounded_response_body(resp, &CancellationToken::new()).await?;
-    let v: serde_json::Value =
-        serde_json::from_str(&raw).map_err(|error| anyhow!("provider JSON: {error}"))?;
+    let raw = read_bounded_response_body(&mut resp, &CancellationToken::new()).await?;
+    let v: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(error) => {
+            return Err(anyhow!(
+                resp.settle_protocol_error(format!("provider JSON: {error}"))
+            ));
+        }
+    };
+    resp.settle_success().map_err(anyhow::Error::new)?;
     let usage = parse_completion_usage(&v).unwrap_or(None);
     // chat/completions shape
     if let Some(content) = v["choices"][0]["message"]["content"].as_str() {

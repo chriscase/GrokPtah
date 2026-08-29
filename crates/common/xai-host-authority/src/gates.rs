@@ -653,6 +653,26 @@ impl HostAuthority {
         Ok(ids)
     }
 
+    /// Return the opaque identities of attempts that require operator/provider
+    /// truth before any replay can be considered. The IDs contain no request,
+    /// credential, model, URL, content, or path material.
+    pub fn ambiguous_attempts(
+        &self,
+        admin: &HostAdminAuthority,
+    ) -> Result<Vec<AttemptId>, AuthorityError> {
+        self.require_admin(admin)?;
+        self.read(|state| {
+            state
+                .attempts
+                .iter()
+                .filter(|(_, record)| {
+                    record.state == STATE_SENDING || record.state == STATE_UNCERTAIN
+                })
+                .map(|(key, _)| decode_id(key, "attempt"))
+                .collect()
+        })
+    }
+
     /// Resolve an ambiguous attempt with established provider truth.
     ///
     /// This is the only exit from [`SendOutcome::Uncertain`], and it takes a

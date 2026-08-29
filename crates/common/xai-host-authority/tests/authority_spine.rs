@@ -1316,7 +1316,7 @@ fn a_lease_cannot_outlive_its_capability() {
             f.resource,
             ActorClass::VerifiedOperator,
             EffectClass::ProviderSend,
-            30,
+            500,
         )
         .unwrap();
     // Ask for a lease that would outlast the grant it came from.
@@ -1324,7 +1324,7 @@ fn a_lease_cannot_outlive_its_capability() {
         .authority
         .mint_lease(&f.auth, &capability, req.digest(), 600_000)
         .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    std::thread::sleep(std::time::Duration::from_millis(550));
 
     assert!(
         matches!(

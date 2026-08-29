@@ -4,7 +4,6 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use futures::StreamExt;
 
 use crate::gateway_config::{ProviderKind, ProviderModel};
 
@@ -45,7 +44,7 @@ pub async fn discover_profile_models(profile_id: &str) -> Result<Vec<ProviderMod
             .as_ref()
             .map(|credentials| credentials.bearer.as_bytes())
             .unwrap_or_default();
-        let response = match crate::provider_transport::send_provider_request(
+        let mut response = match crate::provider_transport::send_provider_request(
             &client,
             request,
             crate::provider_transport::ProviderRequestScope {
@@ -71,13 +70,15 @@ pub async fn discover_profile_models(profile_id: &str) -> Result<Vec<ProviderMod
         };
         let status = response.status();
         if status.is_redirection() {
+            let _ = read_catalog_body(&mut response).await?;
+            response.settle_success().map_err(anyhow::Error::new)?;
             failures.push(format!(
                 "{}: redirect refused ({status})",
                 redacted_path(&url)
             ));
             continue;
         }
-        let body = match read_catalog_body(response).await {
+        let body = match read_catalog_body(&mut response).await {
             Ok(body) => body,
             Err(error) => {
                 failures.push(format!("{}: {error}", redacted_path(&url)));
@@ -94,9 +95,16 @@ pub async fn discover_profile_models(profile_id: &str) -> Result<Vec<ProviderMod
             continue;
         }
         match parse_compatible_model_catalog(body.as_bytes()) {
-            Ok(models) if models.len() > best.len() => best = models,
-            Ok(_) => {}
-            Err(error) => failures.push(format!("{}: {error}", redacted_path(&url))),
+            Ok(models) => {
+                response.settle_success().map_err(anyhow::Error::new)?;
+                if models.len() > best.len() {
+                    best = models;
+                }
+            }
+            Err(error) => {
+                let error = response.settle_protocol_error(error.to_string());
+                return Err(anyhow!(error));
+            }
         }
     }
 
@@ -132,11 +140,12 @@ pub async fn discover_profile_models(profile_id: &str) -> Result<Vec<ProviderMod
     Ok(best)
 }
 
-async fn read_catalog_body(response: reqwest::Response) -> Result<String> {
+async fn read_catalog_body(
+    response: &mut crate::provider_transport::ProviderResponse,
+) -> Result<String> {
     let mut body = crate::sse::BoundedBodyAccumulator::with_max_bytes(MAX_CATALOG_BYTES);
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        body.push(&chunk.context("catalog transport failed")?)
+    while let Some(chunk) = response.next_chunk(None).await? {
+        body.push(&chunk)
             .context("catalog exceeds bounded response size")?;
     }
     body.finish().context("catalog is not valid UTF-8")

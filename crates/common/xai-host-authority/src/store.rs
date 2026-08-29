@@ -285,9 +285,9 @@ impl HostAuthority {
         std::fs::rename(&tmp, self.state_path())
             .map_err(|e| AuthorityError::Durability(e.to_string()))?;
         // fsync the directory so the rename itself is durable.
-        if let Ok(dir) = File::open(&self.root) {
-            let _ = dir.sync_all();
-        }
+        let dir = File::open(&self.root).map_err(|e| AuthorityError::Durability(e.to_string()))?;
+        dir.sync_all()
+            .map_err(|e| AuthorityError::Durability(e.to_string()))?;
         Ok(())
     }
 
