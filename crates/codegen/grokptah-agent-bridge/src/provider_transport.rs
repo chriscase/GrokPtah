@@ -477,7 +477,7 @@ fn validate_bearer_credential(
     let actual = actual_authorization
         .and_then(|value| value.to_str().ok())
         .ok_or_else(|| anyhow!("provider request is missing its admitted credential"))?;
-    if actual.as_bytes() != expected.as_bytes() {
+    if !constant_time_secret_eq(actual.as_bytes(), expected.as_bytes()) {
         return Err(anyhow!(
             "provider credential scope does not match request headers"
         ));
@@ -517,7 +517,7 @@ fn validate_oauth_refresh_credential(
     if refresh_tokens.next().is_some() {
         return Err(anyhow!("OAuth refresh request repeats its credential"));
     }
-    if actual.as_bytes() != expected.as_bytes() {
+    if !constant_time_secret_eq(actual.as_bytes(), expected.as_bytes()) {
         return Err(anyhow!(
             "OAuth refresh credential scope does not match request body"
         ));

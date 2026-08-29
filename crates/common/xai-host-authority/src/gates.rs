@@ -622,23 +622,22 @@ impl HostAuthority {
         admin: &HostAdminAuthority,
     ) -> Result<Vec<AttemptId>, AuthorityError> {
         self.require_admin(admin)?;
-        let recovered = self.with_state(|state| {
-            let mut out = Vec::new();
-            for (key, record) in state.attempts.iter_mut() {
-                if record.state == STATE_SENDING {
-                    record.state = STATE_UNCERTAIN.to_string();
-                    record.settlement = Some(format!(
-                        "{:?}",
-                        UncertainReason::CrashBetweenDispatchAndSettlement
-                    ));
-                    out.push(key.clone());
-                }
-            }
-            Ok(out)
+        // Write the recovery evidence before changing the snapshot. A crash
+        // after the snapshot rename but before the audit append would leave an
+        // ambiguous attempt with no durable explanation and nothing for the
+        // next open to replay. The authority root is held exclusively for this
+        // HostAuthority, so the two phases cannot race another live holder.
+        let recovered = self.read(|state| {
+            Ok(state
+                .attempts
+                .iter()
+                .filter(|(_, record)| record.state == STATE_SENDING)
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>())
         })?;
         let epoch = self.read(|state| Ok(state.control_epoch))?;
         let mut ids = Vec::with_capacity(recovered.len());
-        for key in recovered {
+        for key in &recovered {
             let id: AttemptId = decode_id(&key, "attempt")?;
             self.append_audit(
                 epoch,
@@ -650,6 +649,21 @@ impl HostAuthority {
             )?;
             ids.push(id);
         }
+        self.with_state(|state| {
+            for key in &recovered {
+                let record = state.attempts.get_mut(key).ok_or_else(|| {
+                    AuthorityError::CorruptState("attempt record vanished during recovery".into())
+                })?;
+                if record.state == STATE_SENDING {
+                    record.state = STATE_UNCERTAIN.to_string();
+                    record.settlement = Some(format!(
+                        "{:?}",
+                        UncertainReason::CrashBetweenDispatchAndSettlement
+                    ));
+                }
+            }
+            Ok(())
+        })?;
         Ok(ids)
     }
 
