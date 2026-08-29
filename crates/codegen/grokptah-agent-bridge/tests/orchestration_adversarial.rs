@@ -327,6 +327,245 @@ fn bounds_escalation_and_zero_rejected() {
     assert_eq!(ok.max_prompt_bytes, 1000);
 }
 
+/// The invariant the old `teardownComplete` silently depended on.
+///
+/// `ptah_cancel` used to report teardown complete whenever
+/// `release_turn_reservation` returned true, which is only sound while "a
+/// reservation exists" implies "its turn has not started". That coupling is
+/// maintained in `host.rs` — the reservation is consumed under the same lock
+/// that registers the turn — and nothing tied it to the claim in
+/// `service.rs`. `ptah_cancel` no longer depends on it, but the invariant is
+/// worth a guard: if a future change lets a reservation outlive the start of
+/// its turn, that is the moment the old inference would have become a lie, and
+/// this is where it shows up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn a_releasable_reservation_means_the_session_is_idle() {
+    let (_home, _lock) = setup_home();
+    let host = started_host();
+    let ws = tempdir().unwrap();
+    host.set_project_cwd(ws.path()).unwrap();
+    let session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(session.id, ws.path()).unwrap();
+
+    assert!(!host.session_busy(session.id));
+
+    // A reservation makes the session busy, and it is busy *because of* the
+    // reservation — so releasing it returns the session to idle with nothing
+    // left running. That is what makes "released" a usable signal at all.
+    host.reserve_orchestration_turn("guard-run", session.id)
+        .expect("an idle session accepts a reservation");
+    assert!(host.session_busy(session.id));
+
+    // A second reservation on the same session is refused, so a released
+    // reservation cannot be hiding another one underneath it.
+    assert!(
+        host.reserve_orchestration_turn("guard-run-2", session.id)
+            .is_err(),
+        "one reservation per session, or 'released' would not imply idle"
+    );
+
+    // Releasing with the wrong owner must not disturb it.
+    assert!(
+        !host.release_turn_reservation(session.id, "not-the-owner"),
+        "only the owner may release its reservation"
+    );
+    assert!(host.session_busy(session.id));
+
+    assert!(host.release_turn_reservation(session.id, "guard-run"));
+    assert!(
+        !host.session_busy(session.id),
+        "a released reservation must leave the session idle; if this ever fails, \
+         the old teardownComplete inference was unsound and any code still \
+         relying on it must be re-checked"
+    );
+
+    // Releasing twice is not a second proof of anything.
+    assert!(!host.release_turn_reservation(session.id, "guard-run"));
+
+    let report = host.shutdown().await;
+    assert!(report.is_clean(), "{}", report.operator_summary());
+}
+
+/// Comfortably under the 5s teardown timeout, so a pass means "returned without
+/// waiting" rather than "waited a bit less than the budget".
+const TEARDOWN_IDLE_BUDGET: Duration = Duration::from_secs(3);
+
+/// `teardownComplete` must mean the run's execution actually stopped, not that
+/// a bookkeeping step succeeded.
+///
+/// It used to be `true` whenever the run was de-queued or its reservation was
+/// released, without ever checking the session went idle. Both are reasons to
+/// *expect* idleness — a reservation is consumed under the same lock that
+/// registers the turn, so a released one implies the turn never started — but
+/// that invariant lives in another module and nothing enforces it. This covers
+/// the four shapes the receipt has to be honest about.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::await_holding_lock)]
+async fn cancel_teardown_is_reported_only_when_the_session_is_actually_idle() {
+    let (home, _lock) = setup_home();
+    let host = started_host();
+    let ws = tempdir().unwrap();
+    host.set_project_cwd(ws.path()).unwrap();
+    let session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(session.id, ws.path()).unwrap();
+    let orch = orch(&host, &home, &ws, 4);
+    let auth = orch
+        .auth_header(Some("Bearer secret-token-adversarial-196"))
+        .unwrap();
+
+    // 1. A genuinely running turn: a shell tool holding the session busy, with a
+    //    marker it would write if it were still alive after teardown claimed to
+    //    be finished.
+    let leaked = ws.path().join("acted-after-teardown.txt");
+    let running = orch
+        .submit_task(
+            &auth,
+            "teardown-running",
+            session.id,
+            ws.path(),
+            format!("sleep 2; echo leaked > {}", leaked.display()),
+            Some(json!({"maxDurationMs": 60000, "maxRounds": 8, "maxPromptBytes": 50000})),
+        )
+        .await
+        .unwrap();
+    let running_id = running["runId"].as_str().unwrap().to_string();
+    // Wait for the turn to be genuinely in flight rather than merely admitted.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !host.session_busy(session.id) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the run never became an in-flight turn"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let cancelled = orch
+        .cancel(
+            &auth,
+            "tc-running",
+            session.id,
+            ws.path(),
+            Some(&running_id),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cancelled["cancelled"], true);
+    assert_eq!(
+        cancelled["wasQueued"], false,
+        "this run was executing, not queued"
+    );
+    // The decisive property, asserted unconditionally rather than only when the
+    // receipt happens to claim completion: teardown of an executing run is
+    // reported complete, and when it is, the session is idle *now* — not "will
+    // be shortly". A receipt that says complete while the session is still busy
+    // is the defect this covers.
+    assert_eq!(
+        cancelled["teardownComplete"], true,
+        "cancelling an executing run must tear it down: {cancelled}"
+    );
+    assert!(
+        !host.session_busy(session.id),
+        "teardownComplete must not be reported while the session is still busy"
+    );
+    assert!(
+        !leaked.is_file(),
+        "the cancelled turn's tool must not have completed its write"
+    );
+
+    assert_eq!(
+        wait_terminal(&orch, &auth, &running_id).await,
+        grokptah_agent_bridge::RunState::Cancelled
+    );
+
+    // 2. Already idle: a fresh session, so nothing about the first run's agent
+    //    binding can colour the result. The session is idle at the moment of
+    //    cancellation, so proving it must be immediate rather than a wait
+    //    against the teardown timeout.
+    let idle_session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(idle_session.id, ws.path()).unwrap();
+    let idle = orch
+        .submit_task(
+            &auth,
+            "teardown-idle",
+            idle_session.id,
+            ws.path(),
+            "sleep 2; echo idle".to_string(),
+            Some(json!({"maxDurationMs": 60000, "maxRounds": 8, "maxPromptBytes": 50000})),
+        )
+        .await
+        // This is where a false `teardownComplete` shows its cost: the caller was
+        // told the previous run was torn down, so submitting the next one is the
+        // natural next move — and it is refused, because it was not.
+        .expect("a run whose teardown was reported complete must not still be active");
+    let idle_id = idle["runId"].as_str().unwrap().to_string();
+    let started = std::time::Instant::now();
+    let cancelled_idle = orch
+        .cancel(&auth, "tc-idle", idle_session.id, ws.path(), Some(&idle_id))
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(cancelled_idle["cancelled"], true);
+    assert_eq!(
+        cancelled_idle["teardownComplete"], true,
+        "an idle session must prove teardown, not merely assume it"
+    );
+    assert!(
+        elapsed < TEARDOWN_IDLE_BUDGET,
+        "proving idleness must be immediate, not a wait against the teardown \
+         timeout: took {elapsed:?}"
+    );
+    assert!(
+        !host.session_busy(idle_session.id),
+        "and the session must really be idle when that was reported"
+    );
+
+    // 3. Uncertainty is fail-closed: a receipt never claims completion it could
+    //    not prove. Whatever each branch above returned, a `true` implies an
+    //    idle session — asserted at each site — and a `false` is an honest
+    //    "could not prove it" rather than a block.
+    for receipt in [&cancelled, &cancelled_idle] {
+        assert!(
+            receipt["teardownComplete"].is_boolean(),
+            "the receipt must always carry a decided teardown claim: {receipt}"
+        );
+        assert_eq!(receipt["state"], "cancelled");
+    }
+
+    // 4. Restart: the cancellation is durable, and a replacement reading the
+    //    same home sees both runs terminal rather than resurrectable.
+    drop(orch);
+    let report = futures::executor::block_on(async { host.shutdown().await });
+    assert!(report.is_clean(), "{}", report.operator_summary());
+
+    let restarted = started_host();
+    // The service in this suite owns its own ledger root, so read the same one
+    // back rather than the host's; the point is that the cancellation is on
+    // disk, not which handle opens it.
+    let store = OrchStore::open(home.path().join("orch")).unwrap();
+    for run_id in [&running_id, &idle_id] {
+        let run = store
+            .load_run(run_id)
+            .unwrap()
+            .unwrap_or_else(|| panic!("run {run_id} survives restart"));
+        assert!(
+            run.state.is_terminal(),
+            "a cancelled run must still be terminal after restart: {run_id} is {:?}",
+            run.state
+        );
+    }
+    assert!(
+        !leaked.is_file(),
+        "nothing from the cancelled turn may land after a restart either"
+    );
+    let restart_report = restarted.shutdown().await;
+    assert!(
+        restart_report.is_clean(),
+        "{}",
+        restart_report.operator_summary()
+    );
+}
+
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn cancel_requires_matching_run_stays_cancelled() {

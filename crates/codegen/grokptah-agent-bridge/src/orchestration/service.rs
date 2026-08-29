@@ -53,6 +53,14 @@ use super::workload::{
 /// queued submissions into an unbounded in-memory prompt store.
 const MAX_PENDING_ADMISSIONS: usize = 32;
 
+/// How long `ptah_cancel` waits to *prove* a cancelled run's session went idle
+/// before reporting `teardownComplete: false`.
+///
+/// Bounded on purpose: an uncooperative turn must produce one honest "could not
+/// prove it" rather than block the caller, and `false` is the fail-closed answer
+/// the receipt is designed around (#455).
+const TEARDOWN_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[derive(Default)]
 struct AdmissionQueueState {
     pending: VecDeque<PendingRun>,
@@ -7779,11 +7787,38 @@ impl OrchestrationService {
 
         let was_pending = self.remove_pending(rid);
         let reservation_released = self.host.release_turn_reservation(session_id, rid);
-        let teardown_complete = if was_pending || reservation_released {
+        // `teardownComplete` claims this run's execution is finished. Neither a
+        // de-queued pending run nor a released reservation proves that. Both are
+        // reasons to *expect* the session to be idle, and that expectation rests
+        // on an invariant kept in a different module — a reservation is consumed
+        // under the same lock that registers the turn, so a released reservation
+        // implies the turn never started. That invariant holds today, but it is
+        // not local to this decision and nothing enforces it, so a change to the
+        // reservation lifecycle would silently turn this claim into a lie: the
+        // caller would be told teardown was complete while a provider request or
+        // a tool editing the workspace was still running.
+        //
+        // Proof is cheap, so the claim is proven rather than inferred:
+        // `wait_turn_idle` returns immediately when the session is already idle,
+        // which is exactly the case a released reservation is asserting, so the
+        // fast path stays fast while no longer being taken on trust. A run that
+        // had actually started is still cancelled first, the bounded timeout is
+        // unchanged, and `false` remains the fail-closed answer — "could not
+        // prove teardown finished" is honest where "teardown finished" is not.
+        //
+        // `was_pending` is deliberately *not* folded into that wait. It is
+        // run-scoped proof rather than a proxy: the run was still in the pending
+        // queue, so it was never admitted to a turn and has nothing to wait for.
+        // Session idleness is the wrong question for it — a queued run sits
+        // behind a *different* run's turn, so waiting would report `false` for a
+        // run that is provably torn down, purely because someone else is busy.
+        let teardown_complete = if was_pending {
             true
         } else {
-            tokio::time::timeout(Duration::from_secs(5), async {
-                let _ = self.host.cancel_turn_and_await(Some(session_id)).await;
+            tokio::time::timeout(TEARDOWN_IDLE_TIMEOUT, async {
+                if !reservation_released {
+                    let _ = self.host.cancel_turn_and_await(Some(session_id)).await;
+                }
                 self.host.wait_turn_idle(session_id).await;
             })
             .await
