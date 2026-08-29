@@ -369,7 +369,6 @@ const KERNEL_SCROLL_DELTA: i32 = 10_000;
 const KERNEL_LABEL_BYTES: u32 = crate::computer_use::MAX_LABEL_BYTES as u32;
 const KERNEL_SEMANTIC_ELEMENTS: u32 = 10_000;
 const KERNEL_SEMANTIC_BYTES: u64 = 8 * 1024 * 1024;
-const KERNEL_RETRIES_PER_ACTION: u32 = 5;
 const KERNEL_DURATION_MILLIS: u64 = 60 * 60 * 1_000;
 /// The wire schema bounds the operator-facing summary at 512 bytes.
 const OPERATOR_SUMMARY_BYTES: u32 = 512;
@@ -476,7 +475,6 @@ mod tests {
         assert_eq!(KERNEL_TEXT_ENTRY_BYTES, kernel.max_text_entry_bytes);
         assert_eq!(KERNEL_SEMANTIC_ELEMENTS, kernel.max_semantic_elements);
         assert_eq!(KERNEL_SEMANTIC_BYTES, kernel.max_semantic_bytes);
-        assert_eq!(KERNEL_RETRIES_PER_ACTION, kernel.max_retries_per_action);
         assert_eq!(
             KERNEL_DURATION_MILLIS,
             kernel.max_duration_secs.saturating_mul(1_000)

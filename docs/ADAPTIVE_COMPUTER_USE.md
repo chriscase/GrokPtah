@@ -16,11 +16,17 @@ small multimodal, or frontier campaign has run. See
 Canonical identifiers are `economy`, `balanced`, and `high_assurance`. There are
 three, and there will be three.
 
-| Profile | Observation the model sees | Model calls | Repairs | Screenshot capture | Pointer / key chord |
-| --- | --- | --- | --- | --- | --- |
-| Economy | 48 elements, 24 KiB, semantic only | 16 | 1 | no | no / no |
-| Balanced | 256 elements, 128 KiB, plus geometry | 48 | 2 | yes | yes / no |
-| High Assurance | 1024 elements, 512 KiB, plus a redacted capture reference | 96 | 3 | yes | yes / yes |
+| Profile | Observation the model sees | Model calls | Pointer / key chord |
+| --- | --- | --- | --- |
+| Economy | 48 elements, 24 KiB, semantic only | 16 | no / no |
+| Balanced | 256 elements, 128 KiB, plus geometry | 48 | yes / no |
+| High Assurance | 1024 elements, 512 KiB, plus a redacted capture reference | 96 | yes / yes |
+
+There is no repair budget and no screenshot-capture flag. Both were published
+numbers with nothing behind them: no production path ever spent a repair, and
+nothing consulted the capture flag before capturing. What actually bounds
+pixels is `observation_detail` and `SafetyFloor::allows_screenshot_bytes_to_model`,
+and both are enforced and proven at compile time.
 
 Every number above is an **efficiency budget**. None of them is a safety
 control. `ProfileBudget` and `SafetyFloor` are separate types precisely so that
@@ -197,8 +203,12 @@ once the seal and the profile budget have both had their say: a body that parsed
 and was then refused is a **failed** attempt, because charging it as accepted
 would let a model that reliably proposes forbidden actions look as productive as
 one that proposes valid ones — and would reset the consecutive-unusable-answer
-streak that exists to stop that loop. `provider_attempts` is always
-`accepted_attempts + failed_attempts`.
+streak that exists to stop that loop.
+
+At rest, `provider_attempts == accepted_attempts + failed_attempts`. While a
+turn is in flight — or after a restart cut one — exactly one attempt is counted
+and not yet resolved, because the attempt is counted before the request leaves.
+`check_invariants` allows that one outstanding attempt and no more.
 
 Provider-reported usage is recorded even when the body that carried it then
 failed to parse: it was still billed, and dropping it would make a misbehaving
@@ -207,15 +217,20 @@ cheap model look cheaper than it is.
 ## Budgets that are advertised are enforced
 
 `maxTurnMillis` wraps the provider call in a real timeout; exceeding it is a
-counted failed attempt, not a wait. `maxRepairs` is spent through
-`record_repair`, which returns `RepairBudgetExceeded` at the ceiling. A number
-in the projection that nothing reads is a claim, not a control, so any budget
-that could not be enforced was removed rather than published.
+counted failed attempt that also raises `TurnBudgetExceeded`, not a wait.
+`maxObservationElements`, `maxObservationBytes` and `maxElementTextBytes` bound
+what is rendered; `maxResponseBytes` bounds what comes back; `maxModelCalls` is
+checked at admission. A number in the projection that nothing reads is a claim,
+not a control, so any budget that could not be enforced was removed rather than
+published.
 
-The same rule removed two signals. `low_confidence` had no producer — the
+That rule has now removed four things. `low_confidence` had no producer — the
 proposal wire schema carries no confidence field — and `contradictory_semantics`
-needs an AX/pixel cross-check this build has no pixels for. Both are gone until
-something can raise them.
+needs an AX/pixel cross-check this build has no pixels for. `maxRepairs` and its
+`RepairBudgetExceeded` signal went the same way: no production path ever spent a
+repair, so the ceiling was a published number nothing could reach. And
+`allowsScreenshotCapture` claimed to gate whether the host spends a capture,
+while nothing consulted it before capturing.
 
 ## The safety floor is one constant
 
@@ -308,9 +323,17 @@ exactly one signal:
 | `capability_generation_changed` | the #458 digest moved under a live decision | always stop |
 | `capability_revoked` | operator takeover, stop, or authority withdrawal | always stop |
 | `higher_risk_objective` | a later objective above the run's risk high-water | always stop |
-| `turn_budget_exceeded` | `maxTurnMillis` elapsed | always stop |
-| `repair_budget_exceeded` | `maxRepairs` spent | always stop |
+| `turn_budget_exceeded` | `maxTurnMillis` elapsed on the provider call | always stop |
 | `budget_exhausted` | `maxModelCalls` spent | always stop |
+
+Every row names a path in production that raises it. That is the whole bar for
+appearing in this table: a signal with no producer is a claim, and the two that
+had none — `low_confidence` and `contradictory_semantics` — were removed rather
+than published, as was `repair_budget_exceeded` along with the repair budget
+itself.
+
+One terminal reason has no signal, because nothing raises it — it is discovered:
+`record_invalid`, when a durable record fails its own invariants on load.
 
 There is no "continue anyway" arm. `every_signal_resolves_to_escalate_or_stop_and_never_to_continue`
 asserts that exhaustively across the signal vocabulary and all three profiles.
