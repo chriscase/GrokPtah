@@ -12,7 +12,7 @@ adapters, native helpers, or VM backends.
 
 ## Source gate
 
-Exact tree: `origin/main` at `67e29bd34dc64049432c715c93c2cef2185c63ea`.
+Exact tree: `origin/main` at `c6f1cb23e9d6217005599850d9e0d6f7df64d5a1`.
 Unmerged adaptive runtime on developer checkouts is **not** authoritative.
 
 ## Commands

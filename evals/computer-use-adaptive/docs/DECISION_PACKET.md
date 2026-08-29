@@ -4,7 +4,7 @@
 
 - Repository: `chriscase/GrokPtah`
 - Base: `origin/main`
-- SHA: `67e29bd34dc64049432c715c93c2cef2185c63ea`
+- SHA: `c6f1cb23e9d6217005599850d9e0d6f7df64d5a1`
 - Subject: `Manager v2: autonomous durable coordination (#339)`
 - Unmerged adaptive-profile runtime (Efficient / Balanced / Frontier) on
   developer checkouts is **not** the evaluation authority.

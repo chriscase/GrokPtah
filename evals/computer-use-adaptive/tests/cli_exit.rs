@@ -74,6 +74,27 @@ fn shipped_unknown_arg_prints_terminal_malformed() {
 }
 
 #[test]
+fn shipped_cli_rejects_a_stale_source_gate_before_running() {
+    let out = out_dir("stale-source-gate");
+    let output = run_shipped(&[
+        "--out",
+        out.to_str().unwrap(),
+        "--source-gate",
+        "67e29bd34dc64049432c715c93c2cef2185c63ea",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(ProcessVerdict::Malformed.exit_code())
+    );
+    assert!(!out.join("campaign-report.json").exists());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(grokptah_cu_adaptive_eval::SOURCE_GATE_SHA),
+        "stderr={stderr:?}"
+    );
+}
+
+#[test]
 fn shipped_schema_extra_verify_prints_terminal_malformed() {
     let campaign = run_campaign(1, 435_272).unwrap();
     let json = to_canonical_json(&campaign.report).unwrap();

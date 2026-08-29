@@ -4,7 +4,7 @@
 
 | Field | Value |
 | --- | --- |
-| Exact base | `origin/main` `67e29bd34dc64049432c715c93c2cef2185c63ea` |
+| Exact base | `origin/main` `c6f1cb23e9d6217005599850d9e0d6f7df64d5a1` |
 | Branch | `grok/cu-adaptive-evaluator-authority-v2` (correction of #446; does not modify `grok/cu-adaptive-eval-harness-v1`) |
 | Allowlist | `evals/computer-use-adaptive/**`, `docs/COMPUTER_USE_ADAPTIVE_EVAL.md` |
 | Production runtime edited | **none** |

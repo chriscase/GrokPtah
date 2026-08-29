@@ -8,7 +8,7 @@ pub const SCENARIO_SCHEMA: &str = "grokptah.cu_eval_scenario.v1";
 pub const RESULT_SCHEMA: &str = "grokptah.cu_eval_episode_result.v1";
 pub const EVIDENCE_SCHEMA: &str = "grokptah.cu_eval_evidence.v1";
 pub const REPORT_SCHEMA: &str = "grokptah.cu_eval_campaign_report.v1";
-pub const SOURCE_GATE_SHA: &str = "67e29bd34dc64049432c715c93c2cef2185c63ea";
+pub const SOURCE_GATE_SHA: &str = "c6f1cb23e9d6217005599850d9e0d6f7df64d5a1";
 
 pub const MAX_STEPS: u32 = 12;
 pub const STATIONARITY_WINDOW: usize = 3;
