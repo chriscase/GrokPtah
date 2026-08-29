@@ -114,8 +114,6 @@ pub struct ProgressLedger {
     inert_run_len: u32,
     /// Whether any round in this signature run produced a different observation.
     saw_advance: bool,
-    /// Whether an observation was recorded for the current round.
-    observed_this_round: bool,
     nudged: bool,
 }
 
@@ -148,7 +146,6 @@ impl ProgressLedger {
             self.saw_advance = false;
             self.nudged = false;
         }
-        self.observed_this_round = false;
         self.tool_name = tool_name.to_string();
         self.signature_run_len
     }
@@ -159,7 +156,6 @@ impl ProgressLedger {
     /// projection. Passing a digest of already-truncated text reintroduces
     /// exactly the false-inert defect this ledger exists to remove.
     pub fn observe_outcome(&mut self, digest: RawObservationDigest) {
-        self.observed_this_round = true;
         match self.last_observation {
             Some(previous) if previous == digest && self.signature_run_len > 1 => {
                 self.inert_run_len = self.inert_run_len.saturating_add(1);
@@ -191,10 +187,9 @@ impl ProgressLedger {
         if self.inert_run_len > 0 {
             return RepeatClass::Inert;
         }
-        if self.observed_this_round {
-            // One observation recorded but no prior to compare against.
-            return RepeatClass::Unobserved;
-        }
+        // A repeat with no observation to compare against. Once a signature run
+        // has two observations they are either equal (inert) or not
+        // (advancing), so this is reached only when a round recorded none.
         RepeatClass::Unobserved
     }
 
