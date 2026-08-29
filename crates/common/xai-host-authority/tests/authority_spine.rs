@@ -10,6 +10,7 @@ struct Fixture {
     _dir: tempfile::TempDir,
     root: PathBuf,
     authority: HostAuthority,
+    admin: HostAdminAuthority,
     auth: AuthContext,
     session: SessionId,
     workspace: WorkspaceId,
@@ -37,9 +38,13 @@ fn request(body: &[u8]) -> RequestIdentity {
 fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_path_buf();
-    let authority = HostAuthority::open(&root, OWNER).unwrap();
+    let (authority, admin) = HostAuthority::open(&root, OWNER).unwrap();
     authority
-        .set_credentials(&[HostCredential::new("primary", SECRET).unwrap()], OWNER)
+        .set_credentials(
+            &admin,
+            &[HostCredential::new("primary", SECRET).unwrap()],
+            OWNER,
+        )
         .unwrap();
     let auth = authority.authenticate(SECRET).unwrap();
     let session = authority.issue_session(&auth).unwrap();
@@ -53,6 +58,7 @@ fn fixture() -> Fixture {
         _dir: dir,
         root,
         authority,
+        admin,
         auth,
         session,
         workspace,
@@ -99,6 +105,7 @@ fn rotating_a_secret_kills_the_previous_bearer_and_its_context() {
 
     f.authority
         .set_credentials(
+            &f.admin,
             &[HostCredential::new("primary", "rotated-secret").unwrap()],
             OWNER,
         )
@@ -124,10 +131,18 @@ fn reinstalling_the_same_credential_name_does_not_resurrect_old_authority() {
 
     // Rotate away and then back to the *original* secret under the same slot.
     f.authority
-        .set_credentials(&[HostCredential::new("primary", "interim").unwrap()], OWNER)
+        .set_credentials(
+            &f.admin,
+            &[HostCredential::new("primary", "interim").unwrap()],
+            OWNER,
+        )
         .unwrap();
     f.authority
-        .set_credentials(&[HostCredential::new("primary", SECRET).unwrap()], OWNER)
+        .set_credentials(
+            &f.admin,
+            &[HostCredential::new("primary", SECRET).unwrap()],
+            OWNER,
+        )
         .unwrap();
 
     // The secret authenticates again, but as a *new* incarnation.
@@ -154,6 +169,7 @@ fn removing_a_credential_revokes_everything_derived_from_it() {
     // A second slot replaces the first entirely.
     f.authority
         .set_credentials(
+            &f.admin,
             &[HostCredential::new("other", "another-secret").unwrap()],
             OWNER,
         )
@@ -193,9 +209,10 @@ fn a_resource_the_host_never_issued_cannot_be_claimed_by_naming_it() {
 #[test]
 fn a_second_principal_cannot_use_the_first_principals_resource() {
     let dir = tempfile::tempdir().unwrap();
-    let authority = HostAuthority::open(dir.path(), OWNER).unwrap();
+    let (authority, admin) = HostAuthority::open(dir.path(), OWNER).unwrap();
     authority
         .set_credentials(
+            &admin,
             &[
                 HostCredential::new("a", "secret-a").unwrap(),
                 HostCredential::new("b", "secret-b").unwrap(),
@@ -231,9 +248,10 @@ fn a_second_principal_cannot_use_the_first_principals_resource() {
 #[test]
 fn a_capability_cannot_be_leased_by_a_different_principal() {
     let dir = tempfile::tempdir().unwrap();
-    let authority = HostAuthority::open(dir.path(), OWNER).unwrap();
+    let (authority, admin) = HostAuthority::open(dir.path(), OWNER).unwrap();
     authority
         .set_credentials(
+            &admin,
             &[
                 HostCredential::new("a", "secret-a").unwrap(),
                 HostCredential::new("b", "secret-b").unwrap(),
@@ -304,7 +322,7 @@ fn rotating_the_capability_generation_invalidates_sealed_grants() {
         .authority
         .seal_capability(&f.auth, f.resource, EffectClass::ProviderSend, 60_000)
         .unwrap();
-    f.authority.rotate_capability_generation().unwrap();
+    f.authority.rotate_capability_generation(&f.admin).unwrap();
 
     // The old context is stale, and so is the grant.
     assert!(matches!(
@@ -448,7 +466,7 @@ fn rotating_the_control_epoch_retires_in_flight_admissions() {
     let f = fixture();
     let req = request(b"body");
     let lease = lease_for(&f, &req);
-    f.authority.rotate_control_epoch().unwrap();
+    f.authority.rotate_control_epoch(&f.admin).unwrap();
 
     let fresh = f.authority.authenticate(SECRET).unwrap();
     assert!(matches!(
@@ -475,12 +493,20 @@ fn ambiguity_after_dispatch_is_uncertain_and_offers_no_retry() {
         "an ambiguous attempt must never be advertised as safe to resend"
     );
 
-    let projection = f.authority.attempt_projection(attempt).unwrap().unwrap();
+    let projection = f
+        .authority
+        .attempt_projection(&f.auth, attempt)
+        .unwrap()
+        .unwrap();
     assert!(projection.ambiguous);
 
     // The only exit is an explicit reconciliation against provider truth.
     f.authority.reconcile_attempt(attempt, true).unwrap();
-    let projection = f.authority.attempt_projection(attempt).unwrap().unwrap();
+    let projection = f
+        .authority
+        .attempt_projection(&f.auth, attempt)
+        .unwrap()
+        .unwrap();
     assert!(!projection.ambiguous);
     // Reconciling twice is refused: the attempt is no longer uncertain.
     assert!(f.authority.reconcile_attempt(attempt, true).is_err());
@@ -507,9 +533,13 @@ fn a_crash_between_dispatch_and_settlement_settles_uncertain() {
     let root = dir.path().to_path_buf();
 
     let attempt = {
-        let authority = HostAuthority::open(&root, OWNER).unwrap();
+        let (authority, admin) = HostAuthority::open(&root, OWNER).unwrap();
         authority
-            .set_credentials(&[HostCredential::new("primary", SECRET).unwrap()], OWNER)
+            .set_credentials(
+                &admin,
+                &[HostCredential::new("primary", SECRET).unwrap()],
+                OWNER,
+            )
             .unwrap();
         let auth = authority.authenticate(SECRET).unwrap();
         let session = authority.issue_session(&auth).unwrap();
@@ -532,11 +562,16 @@ fn a_crash_between_dispatch_and_settlement_settles_uncertain() {
     };
 
     // A new host incarnation recovers.
-    let authority = HostAuthority::open(&root, OWNER).unwrap();
+    let (authority, admin) = HostAuthority::open(&root, OWNER).unwrap();
+    let _ = &admin;
     let recovered = authority.recover_incomplete().unwrap();
     assert_eq!(recovered, vec![attempt]);
+    let auth = authority.authenticate(SECRET).unwrap();
 
-    let projection = authority.attempt_projection(attempt).unwrap().unwrap();
+    let projection = authority
+        .attempt_projection(&auth, attempt)
+        .unwrap()
+        .unwrap();
     assert!(
         projection.ambiguous,
         "an attempt in flight at crash time must be ambiguous, never retried"
@@ -553,9 +588,14 @@ fn concurrent_spends_of_one_lease_admit_exactly_one() {
 
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_path_buf();
-    let authority = Arc::new(HostAuthority::open(&root, OWNER).unwrap());
+    let (authority, admin) = HostAuthority::open(&root, OWNER).unwrap();
+    let authority = Arc::new(authority);
     authority
-        .set_credentials(&[HostCredential::new("primary", SECRET).unwrap()], OWNER)
+        .set_credentials(
+            &admin,
+            &[HostCredential::new("primary", SECRET).unwrap()],
+            OWNER,
+        )
         .unwrap();
     let auth = authority.authenticate(SECRET).unwrap();
     let session = authority.issue_session(&auth).unwrap();
@@ -606,7 +646,7 @@ fn intent_is_recorded_before_the_outcome_and_the_chain_verifies() {
     let permit = f.authority.begin_send(&f.auth, lease, &req).unwrap();
     let _ = f.authority.settle_settled(permit);
 
-    let records = f.authority.audit_records().unwrap();
+    let records = f.authority.audit_records(&f.admin).unwrap();
     let intent = records
         .iter()
         .position(|r| matches!(r.event, AuditEvent::SendIntent { .. }))
@@ -619,7 +659,7 @@ fn intent_is_recorded_before_the_outcome_and_the_chain_verifies() {
         intent < outcome,
         "intent must be durable before the outcome is written"
     );
-    assert!(f.authority.audit_chain_intact().unwrap());
+    assert!(f.authority.audit_chain_intact(&f.admin).unwrap());
 
     // Sequence numbers are dense and monotonic.
     for (i, record) in records.iter().enumerate() {
@@ -642,9 +682,9 @@ fn a_truncated_audit_log_is_detected() {
     lines.remove(1);
     std::fs::write(&path, lines.join("\n") + "\n").unwrap();
 
-    let reopened = HostAuthority::open(&f.root, OWNER).unwrap();
+    let (reopened, reopened_admin) = HostAuthority::open(&f.root, OWNER).unwrap();
     assert!(
-        !reopened.audit_chain_intact().unwrap(),
+        !reopened.audit_chain_intact(&reopened_admin).unwrap(),
         "removing a record must break the audit hash chain"
     );
 }
@@ -669,8 +709,12 @@ fn public_projections_are_secret_content_and_path_free() {
     );
     let _ = f.authority.settle_settled(permit);
 
-    let projection = f.authority.attempt_projection(attempt).unwrap().unwrap();
-    let audit = serde_json::to_string(&f.authority.audit_records().unwrap()).unwrap();
+    let projection = f
+        .authority
+        .attempt_projection(&f.auth, attempt)
+        .unwrap()
+        .unwrap();
+    let audit = serde_json::to_string(&f.authority.audit_records(&f.admin).unwrap()).unwrap();
     let state = std::fs::read_to_string(f.root.join("authority.json")).unwrap();
     let haystacks = [
         rendered,
@@ -718,7 +762,7 @@ fn a_corrupt_authority_root_refuses_service_rather_than_inventing_authority() {
     match reopened {
         Err(AuthorityError::CorruptState(_)) => {}
         Err(other) => panic!("expected corrupt state, got {other:?}"),
-        Ok(authority) => {
+        Ok((authority, _admin)) => {
             assert!(matches!(
                 authority.authenticate(SECRET),
                 Err(AuthorityError::CorruptState(_)) | Err(AuthorityError::Unauthenticated)
@@ -738,7 +782,7 @@ fn a_send_intent_always_names_its_producing_principal_and_generations() {
     let permit = f.authority.begin_send(&f.auth, lease, &req).unwrap();
     let _ = f.authority.settle_settled(permit);
 
-    let records = f.authority.audit_records().unwrap();
+    let records = f.authority.audit_records(&f.admin).unwrap();
     let intent = records
         .iter()
         .find_map(|r| match &r.event {
@@ -776,12 +820,12 @@ fn there_is_no_unauthenticated_path_that_mutates_or_prunes_the_log() {
     // deletion, or compaction entry point at all, authenticated or otherwise,
     // so no operator act can drop evidence without leaving the chain broken.
     let f = fixture();
-    let before = f.authority.audit_records().unwrap().len();
+    let before = f.authority.audit_records(&f.admin).unwrap().len();
     assert!(before > 0);
     // Reading never mutates.
-    let _ = f.authority.audit_records().unwrap();
-    assert!(f.authority.audit_chain_intact().unwrap());
-    assert_eq!(f.authority.audit_records().unwrap().len(), before);
+    let _ = f.authority.audit_records(&f.admin).unwrap();
+    assert!(f.authority.audit_chain_intact(&f.admin).unwrap());
+    assert_eq!(f.authority.audit_records(&f.admin).unwrap().len(), before);
 }
 
 #[test]
@@ -799,7 +843,7 @@ fn a_refused_send_is_recorded_against_the_principal_that_asked() {
 
     let denied = f
         .authority
-        .audit_records()
+        .audit_records(&f.admin)
         .unwrap()
         .into_iter()
         .filter_map(|r| match r.event {
@@ -810,4 +854,121 @@ fn a_refused_send_is_recorded_against_the_principal_that_asked() {
         .expect("a refusal must be attributable");
     assert_eq!(denied.0, f.auth.principal().public_handle());
     assert!(denied.1.contains("AlreadyConsumed"), "got {}", denied.1);
+}
+
+// ─────────────────── Probes for the reviewed P0 defect classes ───────────────────
+
+#[test]
+fn a_planted_old_resource_record_cannot_be_used_after_rotation() {
+    // The attack: a record written under a previous credential incarnation
+    // survives (restored from a backup, or never pruned) and is presented to
+    // the current principal as its own work.
+    let f = fixture();
+    let planted = {
+        let raw = std::fs::read_to_string(f.root.join("authority.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        value["resources"].clone()
+    };
+    assert!(planted.as_object().is_some_and(|m| !m.is_empty()));
+
+    // Rotate the secret. The resource is revoked along with its incarnation.
+    f.authority
+        .set_credentials(
+            &f.admin,
+            &[HostCredential::new("primary", "rotated-secret").unwrap()],
+            OWNER,
+        )
+        .unwrap();
+    let after = f.authority.authenticate("rotated-secret").unwrap();
+    assert!(matches!(
+        f.authority.resource_binding(&after, f.resource),
+        Err(AuthorityError::UnknownResource)
+    ));
+
+    // Plant the stale record back into the durable root.
+    let raw = std::fs::read_to_string(f.root.join("authority.json")).unwrap();
+    let mut value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    value["resources"] = planted;
+    std::fs::write(
+        f.root.join("authority.json"),
+        serde_json::to_string_pretty(&value).unwrap(),
+    )
+    .unwrap();
+
+    // It is present again, but bound to an incarnation that no longer exists,
+    // so the current principal cannot read or act on it.
+    let (reopened, reopened_admin) = HostAuthority::open(&f.root, OWNER).unwrap();
+    let _ = &reopened_admin;
+    let current = reopened.authenticate("rotated-secret").unwrap();
+    assert!(
+        reopened.resource_binding(&current, f.resource).is_err(),
+        "a record from a dead incarnation must not become the caller's work"
+    );
+    assert!(
+        reopened
+            .seal_capability(&current, f.resource, EffectClass::ProviderSend, 60_000)
+            .is_err(),
+        "nor may it be used to seal a capability"
+    );
+}
+
+#[test]
+fn a_missing_authority_root_with_prior_evidence_refuses_service() {
+    // Deleting the root must not mint a fresh lineage: that would orphan every
+    // record the old lineage produced and let removed credentials return.
+    let f = fixture();
+    let req = request(b"body");
+    let lease = lease_for(&f, &req);
+    let permit = f.authority.begin_send(&f.auth, lease, &req).unwrap();
+    let _ = f.authority.settle_settled(permit);
+    drop(f.authority);
+
+    std::fs::remove_file(f.root.join("authority.json")).unwrap();
+    assert!(f.root.join("audit.log").exists());
+
+    match HostAuthority::open(&f.root, OWNER) {
+        Err(AuthorityError::CorruptState(_)) => {}
+        Err(other) => panic!("expected a refusal to re-establish, got {other:?}"),
+        Ok(_) => panic!("a deleted authority root must not silently mint a new lineage"),
+    }
+}
+
+#[test]
+fn one_principal_cannot_read_another_principals_attempt() {
+    let dir = tempfile::tempdir().unwrap();
+    let (authority, admin) = HostAuthority::open(dir.path(), OWNER).unwrap();
+    authority
+        .set_credentials(
+            &admin,
+            &[
+                HostCredential::new("a", "secret-a").unwrap(),
+                HostCredential::new("b", "secret-b").unwrap(),
+            ],
+            OWNER,
+        )
+        .unwrap();
+    let a = authority.authenticate("secret-a").unwrap();
+    let b = authority.authenticate("secret-b").unwrap();
+
+    let session = authority.issue_session(&a).unwrap();
+    let workspace = authority.issue_workspace(&a, dir.path()).unwrap();
+    let resource = authority
+        .issue_resource(&a, session, workspace, observation("frame-1"))
+        .unwrap();
+    let cap = authority
+        .seal_capability(&a, resource, EffectClass::ProviderSend, 60_000)
+        .unwrap();
+    let req = request(b"body");
+    let lease = authority
+        .mint_lease(&a, &cap, req.digest(), 60_000)
+        .unwrap();
+    let permit = authority.begin_send(&a, lease, &req).unwrap();
+    let attempt = permit.attempt();
+    let _ = authority.settle_settled(permit);
+
+    // The owner sees it.
+    assert!(authority.attempt_projection(&a, attempt).unwrap().is_some());
+    // Another principal sees exactly what it would see for an attempt that
+    // does not exist, so this is not an existence oracle.
+    assert!(authority.attempt_projection(&b, attempt).unwrap().is_none());
 }

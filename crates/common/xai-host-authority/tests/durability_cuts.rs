@@ -42,15 +42,20 @@ struct Ready {
     root: PathBuf,
     authority: HostAuthority,
     auth: AuthContext,
+    _admin: HostAdminAuthority,
     lease: EffectLease,
 }
 
 fn ready() -> Ready {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_path_buf();
-    let authority = HostAuthority::open(&root, OWNER).unwrap();
+    let (authority, admin) = HostAuthority::open(&root, OWNER).unwrap();
     authority
-        .set_credentials(&[HostCredential::new("primary", SECRET).unwrap()], OWNER)
+        .set_credentials(
+            &admin,
+            &[HostCredential::new("primary", SECRET).unwrap()],
+            OWNER,
+        )
         .unwrap();
     let auth = authority.authenticate(SECRET).unwrap();
     let session = authority.issue_session(&auth).unwrap();
@@ -74,6 +79,7 @@ fn ready() -> Ready {
         root,
         authority,
         auth,
+        _admin: admin,
         lease,
     }
 }

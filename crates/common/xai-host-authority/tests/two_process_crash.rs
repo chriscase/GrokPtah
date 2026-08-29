@@ -27,9 +27,13 @@ fn request(body: &[u8]) -> RequestIdentity {
 
 /// Everything the child does before it dies.
 fn child_take_permit_then_die(root: &Path) -> ! {
-    let authority = HostAuthority::open(root, OWNER).expect("child open");
+    let (authority, admin) = HostAuthority::open(root, OWNER).expect("child open");
     authority
-        .set_credentials(&[HostCredential::new("primary", SECRET).unwrap()], OWNER)
+        .set_credentials(
+            &admin,
+            &[HostCredential::new("primary", SECRET).unwrap()],
+            OWNER,
+        )
         .expect("child credentials");
     let auth = authority.authenticate(SECRET).expect("child authenticate");
     let session = authority.issue_session(&auth).expect("child session");
@@ -96,7 +100,8 @@ fn an_attempt_in_flight_when_the_process_dies_recovers_as_uncertain() {
     let handle = std::fs::read_to_string(&marker).unwrap();
 
     // A fresh host incarnation takes over.
-    let authority = HostAuthority::open(&root, OWNER).unwrap();
+    let (authority, admin) = HostAuthority::open(&root, OWNER).unwrap();
+    let auth = authority.authenticate(SECRET).unwrap();
     let recovered = authority.recover_incomplete().unwrap();
     assert_eq!(
         recovered.len(),
@@ -105,7 +110,10 @@ fn an_attempt_in_flight_when_the_process_dies_recovers_as_uncertain() {
     );
     assert_eq!(recovered[0].public_handle(), handle);
 
-    let projection = authority.attempt_projection(recovered[0]).unwrap().unwrap();
+    let projection = authority
+        .attempt_projection(&auth, recovered[0])
+        .unwrap()
+        .unwrap();
     assert!(
         projection.ambiguous,
         "an attempt cut short by a crash must be ambiguous"
@@ -119,8 +127,8 @@ fn an_attempt_in_flight_when_the_process_dies_recovers_as_uncertain() {
     assert!(authority.recover_incomplete().unwrap().is_empty());
 
     // The audit log survived the crash and still chains.
-    assert!(authority.audit_chain_intact().unwrap());
-    let records = authority.audit_records().unwrap();
+    assert!(authority.audit_chain_intact(&admin).unwrap());
+    let records = authority.audit_records(&admin).unwrap();
     assert!(
         records
             .iter()
