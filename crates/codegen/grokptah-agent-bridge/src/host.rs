@@ -1591,6 +1591,83 @@ impl AgentHostHandle {
         Some((run_id, store))
     }
 
+    /// Open the durable provider attempt for a desktop turn.
+    ///
+    /// The desktop Send button reaches a provider exactly as an orchestrated
+    /// run does, so it records the same evidence under the same lattice
+    /// ([`crate::attempt_binding`]) rather than a parallel one. Without this a
+    /// desktop send is invisible to crash recovery: nothing on disk says a
+    /// request was in flight, no idempotency key can be reproduced for it, and
+    /// the HTTP client's own retry loops — which stand down only for a bound
+    /// attempt — would repeat a request the provider may already have run.
+    ///
+    /// Opening is deliberately separated from crossing the send boundary. This
+    /// records a `known_not_sent` attempt, which is safe to abandon: anything
+    /// that fails between here and the dispatch leaves a record that is still
+    /// provably unsent. The transport is what moves it to `sending`, at the
+    /// instant it has a request to put on a socket.
+    ///
+    /// Returns the ledger when an attempt was recorded. `None` means no
+    /// provider can be reached at all, which is the one honest case for
+    /// sending nothing and recording nothing.
+    #[allow(clippy::too_many_arguments)] // Keeps every send-boundary binding explicit.
+    fn open_desktop_attempt(
+        &self,
+        session_id: Uuid,
+        cwd: &Path,
+        prompt: &str,
+        effort: EffortLevel,
+        turn_id: Uuid,
+        run_id: &str,
+        admission: &crate::launch_truth::Admission,
+    ) -> Result<Option<OrchStore>> {
+        let Some(facts) = admission.facts() else {
+            // An offline host resolves no credential and reaches no provider.
+            // Recording an attempt here would imply a request that cannot
+            // exist; see `Admission::NoProviderReachable`.
+            return Ok(None);
+        };
+        // Fail closed. Without the ledger this host cannot record that a
+        // request is in flight, so it must not put one there: an unrecorded
+        // send is exactly the ambiguity the attempt lattice exists to remove.
+        let store = self.ensure_orchestration_store().map_err(|error| {
+            anyhow!(
+                "refusing to send: the provider attempt ledger is unavailable, so this send \
+                 could not be recorded before it left ({error:#})"
+            )
+        })?;
+        let recorded = store.list_attempts_for_run(run_id).unwrap_or_default();
+        if !crate::attempt_binding::permits_new_request(&recorded) {
+            bail!("{}", crate::attempt_binding::UNRECONCILED_REFUSAL);
+        }
+        let ordinal = crate::attempt_binding::next_ordinal(&recorded);
+        let Some(attempt) = crate::attempt_binding::bind_attempt(
+            run_id,
+            ordinal,
+            &format!("desktop-turn-{turn_id}"),
+            prompt,
+            &crate::attempt_binding::RunPrincipalContext {
+                tenant: None,
+                project: None,
+                workspace: cwd.display().to_string(),
+                session: session_id,
+                authority: crate::attempt_binding::initial_authority(),
+            },
+            Some(facts),
+        ) else {
+            return Ok(None);
+        };
+        let attempt = crate::attempt_binding::with_selection(
+            attempt,
+            Some(facts.truth.provider.as_str()),
+            Some(effort.as_str()),
+        );
+        store
+            .open_attempt(&attempt)
+            .map_err(|error| anyhow!("refusing to send: {error:#}"))?;
+        Ok(Some(store))
+    }
+
     fn start_desktop_run_aggregator(
         &self,
         run_id: &str,
@@ -5430,6 +5507,23 @@ impl AgentHostHandle {
                 );
             }
         };
+        // An externally-owned run already recorded and scoped its attempt in
+        // the orchestrator before it called in here, so a second one would be
+        // a duplicate record for a single physical request. Everything else —
+        // the Send button in Chat and in Build, a queued or steered prompt, a
+        // plan-mode resume — is bound here or does not send at all.
+        let desktop_attempt_run = external_run.is_none().then(|| format!("desktop-{turn_id}"));
+        let desktop_attempt_store = match desktop_attempt_run.as_deref() {
+            Some(run_id) => {
+                let admission = admission
+                    .as_ref()
+                    .expect("every gated turn resolves an admission above");
+                self.open_desktop_attempt(
+                    session_id, &cwd, &prompt, effort, turn_id, run_id, admission,
+                )?
+            }
+            None => None,
+        };
         let requested_execution_mode = external_run
             .as_ref()
             .map(|run| run.execution_mode)
@@ -5522,19 +5616,39 @@ impl AgentHostHandle {
             turn_id,
         });
 
-        let result = self
-            .run_turn(
-                session_id,
-                &execution_cwd,
-                &model,
-                effort,
-                plan_mode,
-                kind,
-                &prompt,
-                cancel.clone(),
-                event_tx.clone(),
-            )
-            .await;
+        // Admit the send and hand the prepared attempt to the transport. The
+        // boundary itself is crossed inside the HTTP client, at the instant it
+        // has a request to put on a socket — a turn that answers locally never
+        // crosses it and is never recorded as having sent anything.
+        let boundary = match desktop_attempt_store
+            .as_ref()
+            .zip(desktop_attempt_run.as_deref())
+        {
+            Some((store, run_id)) => crate::attempt_binding::admit_send(store, run_id)
+                .map(|()| crate::attempt_binding::send_binding(store, run_id)),
+            None => Ok(None),
+        };
+        let result = match boundary {
+            Ok(send_binding) => {
+                let turn = self.run_turn(
+                    session_id,
+                    &execution_cwd,
+                    &model,
+                    effort,
+                    plan_mode,
+                    kind,
+                    &prompt,
+                    cancel.clone(),
+                    event_tx.clone(),
+                );
+                crate::physical_send::scope_optional(send_binding, turn).await
+            }
+            // A refused send boundary is a failed turn, not an early exit: the
+            // run record, its aggregator, any prepared worktree, and the
+            // transcript are finalised by the same path every other failure
+            // takes. Nothing was dispatched, so nothing needs reconciling.
+            Err(refusal) => Err(anyhow!(refusal)),
+        };
 
         // Append assistant turn(s) written by push_assistant.
         self.persist_session(session_id);
@@ -5627,6 +5741,19 @@ impl AgentHostHandle {
         } else {
             "completed"
         };
+        // Settle the durable attempt from what the turn actually did. A
+        // cancelled or failed in-flight request stays ambiguous rather than
+        // being quietly reopened as retryable.
+        if let Some((store, run_id)) = desktop_attempt_store
+            .as_ref()
+            .zip(desktop_attempt_run.as_deref())
+        {
+            crate::attempt_binding::settle_run(
+                store,
+                run_id,
+                crate::attempt_binding::usage_receipt(usage.prompt_tokens, usage.completion_tokens),
+            );
+        }
         let evidence = build_evidence(
             outcome,
             result.as_ref().ok().map(String::as_str),

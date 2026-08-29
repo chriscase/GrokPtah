@@ -1768,23 +1768,33 @@ where
             if target.dialect == crate::gateway_config::ProviderDialect::XaiChatCompletions {
                 req = req.header("x-grok-effort", effort.as_str());
             }
-            if let Some(key) = crate::physical_send::provider_request_id() {
+            if let Some(key) = crate::physical_send::wire_idempotency_key() {
                 req = req.header("Idempotency-Key", key);
             }
             let req = crate::auth_store::apply_auth_headers(req, c, &base);
             req.json(&body)
         };
 
+        // Durably cross the send boundary before the bytes move.
+        crate::physical_send::mark_sending();
         let resp_result = tokio::select! {
             r = send_once(&creds).send() => r,
             _ = cancel.cancelled() => bail!("cancelled"),
         };
         let mut resp = match resp_result {
             Ok(r) => {
-                crate::physical_send::mark_sent();
+                crate::physical_send::mark_sent(crate::physical_send::provider_request_id_from(
+                    r.headers(),
+                ));
                 r
             }
             Err(e) => {
+                // A request that timed out waiting for a reply has already
+                // left this host; a connect failure never did. Only the first
+                // is ambiguous, and only it is recorded as such.
+                if e.is_timeout() {
+                    crate::physical_send::mark_uncertain();
+                }
                 last_err = Some(
                     if target.dialect
                         == crate::gateway_config::ProviderDialect::OpenAiChatCompletions
@@ -1853,7 +1863,7 @@ where
             } else {
                 format!("HTTP {status}: {clipped}")
             });
-            if attempt < 3 && crate::physical_send::provider_request_id().is_none() {
+            if attempt < 3 && !crate::physical_send::is_bound() {
                 tokio::time::sleep(std::time::Duration::from_millis(600 * (1 << attempt))).await;
                 continue;
             }
@@ -1870,7 +1880,7 @@ where
             if status.as_u16() == 400
                 && target.dialect == crate::gateway_config::ProviderDialect::OpenAiChatCompletions
                 && body.get("tool_choice").is_some()
-                && crate::physical_send::provider_request_id().is_none()
+                && !crate::physical_send::is_bound()
             {
                 if let Some(object) = body.as_object_mut() {
                     object.remove("tool_choice");
@@ -1882,7 +1892,7 @@ where
             if attempt < 2
                 && status.as_u16() == 400
                 && body.get("stream").and_then(serde_json::Value::as_bool) == Some(true)
-                && crate::physical_send::provider_request_id().is_none()
+                && !crate::physical_send::is_bound()
             {
                 body["stream"] = serde_json::Value::Bool(false);
                 last_err = Some(format!(
@@ -2025,7 +2035,10 @@ where
             });
         }
         last_err = Some("empty stream response".into());
-        if attempt < 3 {
+        // Re-sending here is a second physical request for the same intent.
+        // A bound attempt has already crossed the send boundary, so it is
+        // reconciled against its recorded key rather than repeated.
+        if attempt < 3 && !crate::physical_send::is_bound() {
             body["stream"] = serde_json::Value::Bool(false);
             continue;
         }
@@ -2225,6 +2238,224 @@ mod compatible_stream_tests {
                 };
                 assert!(error.to_string().contains("cancelled"));
                 server.abort();
+            });
+        crate::discover::set_grokptah_home_override(None);
+    }
+
+    /// One attempt, bound to `dialect`, recorded in a real ledger.
+    ///
+    /// Only the dialect varies between the two wire tests below, so the
+    /// `Idempotency-Key` assertion isolates exactly the rule under test.
+    fn recorded_attempt(
+        store: &crate::orchestration::OrchStore,
+        run_id: &str,
+        dialect: grokptah_agent_sdk::launch::RequestDialect,
+    ) {
+        use grokptah_agent_sdk::account::{
+            AccountReference, AccountReferenceSource, CredentialMethod,
+        };
+        use grokptah_agent_sdk::attempt::{
+            AttemptIntent, AttemptRoute, AttemptSubject, AuthorityRevisions, BoundedId,
+            ProviderAttempt, Revision,
+        };
+        use grokptah_agent_sdk::launch::{BaseCategory, ModelReference, ProviderClass, RouteClass};
+
+        let bounded = |value: &str| BoundedId::new(value).expect("bounded test identifier");
+        let revision = Revision(1);
+        let attempt = ProviderAttempt::open(
+            bounded(&format!("att-{run_id}")),
+            bounded(run_id),
+            1,
+            AttemptSubject {
+                principal: None,
+                tenant: None,
+                project: None,
+                workspace: bounded("wsp:0a1b2c3d"),
+                session: bounded("ses:4e5f6a7b"),
+            },
+            AuthorityRevisions {
+                auth: revision,
+                policy: revision,
+                capability: revision,
+                credential: revision,
+            },
+            AttemptRoute {
+                provider: ProviderClass::Xai,
+                profile: Some(bounded("cancel-test")),
+                credential_method: CredentialMethod::ApiKey,
+                route: RouteClass::CompatibleProvider,
+                base: BaseCategory::CompatibleLoopback,
+                dialect,
+                model: ModelReference::new("test-model").expect("bounded model"),
+                effort: None,
+                account_reference: AccountReference::new(
+                    "usr-0a1b",
+                    AccountReferenceSource::UserId,
+                ),
+            },
+            AttemptIntent {
+                digest: bounded("sha256:0a1b2c3d"),
+                request_id: bounded("req-0001"),
+                provider_idempotency_key: crate::attempt_binding::provider_idempotency_key(
+                    run_id, 1,
+                ),
+            },
+        );
+        store.open_attempt(&attempt).expect("record the attempt");
+        crate::attempt_binding::admit_send(store, run_id).expect("admit the send");
+    }
+
+    /// A synthetic gateway that records the headers it was sent and answers
+    /// with one complete SSE reply.
+    fn capturing_gateway(
+        seen: std::sync::Arc<std::sync::Mutex<Option<axum::http::HeaderMap>>>,
+    ) -> Router {
+        Router::new().route(
+            "/v1/chat/completions",
+            post(move |headers: axum::http::HeaderMap| {
+                let seen = seen.clone();
+                async move {
+                    *seen.lock().unwrap() = Some(headers);
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .header("x-request-id", "req-provider-4242")
+                        .body(Body::from(
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n                             data: [DONE]\n\n",
+                        ))
+                        .unwrap()
+                }
+            }),
+        )
+    }
+
+    /// Drive one real request against the synthetic gateway under a binding.
+    ///
+    /// Returns the headers the gateway received and the attempt as the ledger
+    /// holds it afterwards.
+    async fn send_under_attempt(
+        temp: &std::path::Path,
+        run_id: &str,
+        dialect: grokptah_agent_sdk::launch::RequestDialect,
+    ) -> (
+        axum::http::HeaderMap,
+        grokptah_agent_sdk::attempt::ProviderAttempt,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let app = capturing_gateway(seen.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let model = install_compatible_profile(temp, &format!("http://{address}/v1"));
+        let store = crate::orchestration::OrchStore::open(temp.join("orch")).expect("ledger");
+        recorded_attempt(&store, run_id, dialect);
+        let binding = crate::attempt_binding::send_binding(&store, run_id).expect("bound attempt");
+
+        let cancel = CancellationToken::new();
+        let credentials = compatible_credentials("cancel-test");
+        let messages = [serde_json::json!({"role": "user", "content": "synthetic"})];
+        let tools = serde_json::json!([]);
+        let call = call_xai_agent_step(
+            &credentials,
+            &model,
+            EffortLevel::None,
+            &messages,
+            &tools,
+            &cancel,
+            |_| {},
+            |_| {},
+        );
+        crate::physical_send::scope_optional(Some(binding), call)
+            .await
+            .expect("the synthetic gateway answers");
+        server.abort();
+
+        let headers = seen.lock().unwrap().clone().expect("gateway saw a request");
+        let attempt = store
+            .list_attempts_for_run(run_id)
+            .expect("read the ledger")
+            .into_iter()
+            .next()
+            .expect("one attempt");
+        (headers, attempt)
+    }
+
+    /// The recorded key reaches the wire on a dialect that defines it, and the
+    /// durable record advances from what the transport actually did.
+    #[test]
+    fn a_supported_dialect_carries_the_recorded_key_on_the_wire() {
+        let _lock = crate::discover::home_override_serial();
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let temp = tempfile::tempdir().unwrap();
+                let run = "run-wire-supported";
+                let (headers, attempt) = send_under_attempt(
+                    temp.path(),
+                    run,
+                    grokptah_agent_sdk::launch::RequestDialect::XaiChatCompletions,
+                )
+                .await;
+
+                assert_eq!(
+                    headers
+                        .get("idempotency-key")
+                        .and_then(|value| value.to_str().ok()),
+                    Some(attempt.intent.provider_idempotency_key.as_str()),
+                    "the key on the wire must be the key the record can be reconciled by"
+                );
+                // Sent then responding, both from the real response.
+                assert_eq!(
+                    attempt.send_state,
+                    grokptah_agent_sdk::attempt::SendState::Responding
+                );
+                assert_eq!(
+                    attempt
+                        .receipts
+                        .request
+                        .as_ref()
+                        .map(grokptah_agent_sdk::attempt::BoundedId::as_str),
+                    Some("req-provider-4242"),
+                    "the receipt is the provider's identifier, not this host's key"
+                );
+            });
+        crate::discover::set_grokptah_home_override(None);
+    }
+
+    /// A compatible gateway publishes no idempotency contract, so no key is
+    /// sent — while the durable record advances exactly as it does elsewhere.
+    #[test]
+    fn an_unsupported_dialect_sends_no_idempotency_key() {
+        let _lock = crate::discover::home_override_serial();
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let temp = tempfile::tempdir().unwrap();
+                let run = "run-wire-unsupported";
+                let (headers, attempt) = send_under_attempt(
+                    temp.path(),
+                    run,
+                    grokptah_agent_sdk::launch::RequestDialect::OpenAiChatCompletions,
+                )
+                .await;
+
+                assert!(
+                    headers.get("idempotency-key").is_none(),
+                    "a key here would claim a deduplication the gateway never promised"
+                );
+                assert_eq!(
+                    attempt.send_state,
+                    grokptah_agent_sdk::attempt::SendState::Responding
+                );
+                // The key is still recorded, so a human can reconcile by hand.
+                assert!(attempt.intent.provider_idempotency_key.is_bounded());
             });
         crate::discover::set_grokptah_home_override(None);
     }
@@ -2532,13 +2763,15 @@ pub(crate) async fn call_xai_chat(
 
     let send_once = |c: &crate::auth_store::WireCredentials| {
         let mut req = client.post(&url).header("Content-Type", "application/json");
-        if let Some(key) = crate::physical_send::provider_request_id() {
+        if let Some(key) = crate::physical_send::wire_idempotency_key() {
             req = req.header("Idempotency-Key", key);
         }
         let req = crate::auth_store::apply_auth_headers(req, c, &base);
         req.json(&body)
     };
 
+    // Durably cross the send boundary before the bytes move.
+    crate::physical_send::mark_sending();
     let mut resp = send_once(&creds).send().await.map_err(|e| {
         // Surface classify-able transport failures (DNS, TLS, timeout) so the
         // UI is not a vague "error sending request".
@@ -2562,6 +2795,9 @@ pub(crate) async fn call_xai_chat(
             )
         }
     })?;
+    crate::physical_send::mark_sent(crate::physical_send::provider_request_id_from(
+        resp.headers(),
+    ));
 
     // One retry after OIDC refresh on 401 (expired access token is common).
     if resp.status() == reqwest::StatusCode::UNAUTHORIZED && creds.oidc_token_auth {
@@ -2597,6 +2833,7 @@ pub(crate) async fn call_xai_chat(
         let clipped: String = text.chars().take(800).collect();
         bail!("HTTP {status}: {clipped}");
     }
+    crate::physical_send::mark_responding();
     let raw = read_bounded_response_body(resp, &CancellationToken::new()).await?;
     let v: serde_json::Value =
         serde_json::from_str(&raw).map_err(|error| anyhow!("provider JSON: {error}"))?;

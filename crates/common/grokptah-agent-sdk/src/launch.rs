@@ -199,6 +199,29 @@ impl RequestDialect {
         Self::OpenAiChatCompletions,
         Self::Unrecognized,
     ];
+
+    /// Whether this dialect's published contract defines an idempotency key.
+    ///
+    /// A fact about the *contract*, not about any particular endpoint: it is
+    /// decided from the closed dialect vocabulary alone, never measured, and
+    /// never read from a response. Sending the header where it is not part of
+    /// the contract would be a claim this host cannot support — the request
+    /// would be replayable exactly as if no key had been sent, while the
+    /// durable record implied the provider could recognise the duplicate.
+    ///
+    /// `OpenAiChatCompletions` is the *generic compatible-gateway* dialect
+    /// here (see `ProviderKind::OpenAiCompatible`). An arbitrary compatible
+    /// gateway promises nothing about idempotency, so this returns `false` and
+    /// the host falls back to the protection it can actually enforce: an
+    /// unreconciled attempt is never retried automatically. That is weaker
+    /// than provider-side deduplication and is deliberately not disguised as
+    /// equivalent.
+    pub const fn permits_idempotency_key(self) -> bool {
+        match self {
+            Self::XaiChatCompletions => true,
+            Self::OpenAiChatCompletions | Self::Unrecognized => false,
+        }
+    }
 }
 
 /// Whether the resolved credential can be renewed without a human.
@@ -1026,6 +1049,28 @@ mod tests {
         AccountObservation, AccountReferenceSource, CredentialSource,
         GROK_ACCOUNT_CONTRACT_VERSION, GROK_ACCOUNT_SCHEMA_VERSION,
     };
+
+    /// Only a dialect whose published contract defines an idempotency key may
+    /// carry one.
+    ///
+    /// The generic compatible-gateway dialect must not: sending the header to
+    /// a gateway that ignores it would leave the request as replayable as if
+    /// no key had been sent, while every record downstream implied the
+    /// provider could recognise the duplicate.
+    #[test]
+    fn only_a_published_idempotency_contract_permits_a_wire_key() {
+        assert!(RequestDialect::XaiChatCompletions.permits_idempotency_key());
+        assert!(!RequestDialect::OpenAiChatCompletions.permits_idempotency_key());
+        assert!(!RequestDialect::Unrecognized.permits_idempotency_key());
+        // An unclassified dialect blocks a launch outright, so it must never
+        // be the one dialect that quietly gains a capability.
+        assert!(
+            RequestDialect::ALL
+                .iter()
+                .filter(|dialect| dialect.permits_idempotency_key())
+                .all(|dialect| *dialect != RequestDialect::Unrecognized)
+        );
+    }
 
     /// Fixed observation clock: 2026-08-25T00:00:00Z, matching the account
     /// contract tests, so no verdict below reads the wall clock.

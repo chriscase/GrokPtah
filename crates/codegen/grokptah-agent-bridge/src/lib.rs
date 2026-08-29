@@ -14,7 +14,8 @@ mod attempt_binding;
 /// ledger rather than only from inside the module that defines them.
 pub mod attempt_binding_testkit {
     pub use crate::attempt_binding::{
-        intent_digest, provider_idempotency_key, reconcile_interrupted, workspace_handle,
+        admit_send, intent_digest, provider_idempotency_key, reconcile_interrupted, send_binding,
+        settle_run, workspace_handle,
     };
 }
 mod auth_store;
@@ -45,6 +46,19 @@ mod models_catalog;
 pub mod orchestration;
 mod permission;
 mod physical_send;
+
+/// The physical-send binding, exposed for the crash-cut integration suite.
+///
+/// Mirrors [`attempt_binding_testkit`]: the contract between the HTTP client
+/// and the durable record is exercised against the real ledger, through a
+/// synthetic transport that makes the same calls the real one does, so a cut
+/// at any point in a send is a test rather than a production incident.
+pub mod physical_send_testkit {
+    pub use crate::physical_send::{
+        is_bound, mark_responding, mark_sending, mark_sent, mark_uncertain, scope_optional,
+        wire_idempotency_key, PhysicalSendBinding,
+    };
+}
 mod process_tree;
 mod project_context;
 mod prompt_combine;

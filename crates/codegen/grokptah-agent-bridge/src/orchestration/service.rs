@@ -10,7 +10,6 @@ use parking_lot::Mutex;
 use serde_json::json;
 use uuid::Uuid;
 
-use grokptah_agent_sdk::attempt::SendState;
 use grokptah_agent_sdk::launch::LaunchReason;
 use grokptah_agent_sdk::outcome::RunOutcomeClass;
 
@@ -368,38 +367,6 @@ impl OrchestrationService {
     }
 }
 
-/// Move this run's open attempt to `sending`.
-///
-/// Called immediately before the model turn, so the durable record crosses the
-/// send boundary at the same moment the request does. A run with no recorded
-/// attempt (an offline host) has nothing to advance and succeeds trivially.
-fn begin_send(store: &OrchStore, run_id: &str) -> Result<(), String> {
-    let attempts = store
-        .list_attempts_for_run(run_id)
-        .map_err(|error| error.to_string())?;
-    if !attempt_binding::permits_new_request(&attempts) {
-        return Err(
-            "an earlier provider attempt for this run is still unreconciled; reconcile it against \
-             its idempotency key before issuing an equivalent request"
-                .into(),
-        );
-    }
-    let Some(open) = attempts
-        .iter()
-        .find(|attempt| attempt.send_state == SendState::KnownNotSent)
-    else {
-        return Ok(());
-    };
-    store
-        .update_attempt(open.attempt_id.as_str(), |attempt| {
-            attempt
-                .advance(SendState::Sending)
-                .map_err(anyhow::Error::msg)
-        })
-        .map(|_| ())
-        .map_err(|error| error.to_string())
-}
-
 /// Record a refusal that happened at the send boundary itself.
 fn record_send_refusal(store: &OrchStore, run_id: &str, reason: &str) {
     let _ = store.update_run(run_id, |run| {
@@ -418,94 +385,6 @@ fn record_send_refusal(store: &OrchStore, run_id: &str, reason: &str) {
         run.updated_at = Utc::now();
         Ok(())
     });
-}
-
-/// Move any in-flight attempt for this run to `uncertain`.
-///
-/// A cancelled or abandoned in-flight request is exactly ambiguous: it may
-/// have executed. Recording that is what stops a later restart from quietly
-/// duplicating it.
-fn reconcile_run_attempts(store: &OrchStore, run_id: &str) {
-    let Ok(attempts) = store.list_attempts_for_run(run_id) else {
-        return;
-    };
-    for attempt in attempts {
-        if attempt.send_state != SendState::Sending {
-            continue;
-        }
-        let _ = store.update_attempt(attempt.attempt_id.as_str(), |attempt| {
-            attempt_binding::reconcile_interrupted(attempt).map_err(anyhow::Error::msg)
-        });
-    }
-}
-
-/// Settle this run's in-flight attempt once the turn is over.
-///
-/// A parsed reply is an acknowledgement. The lattice is one step per durable
-/// write: `Sending` becomes `Sent` then `Settled` on success, or `Uncertain`
-/// when we never learned whether the request executed. `Sent`/`Responding`
-/// always finish as `Settled` — they already left the host and must not be
-/// auto-retried.
-fn settle_run_attempts(
-    store: &OrchStore,
-    run_id: &str,
-    result: &Result<String, String>,
-    candidate: &RunRecord,
-) {
-    let Ok(attempts) = store.list_attempts_for_run(run_id) else {
-        return;
-    };
-    let usage = attempt_binding::usage_receipt(
-        candidate.aggregates.usage.prompt_tokens,
-        candidate.aggregates.usage.completion_tokens,
-    );
-    for attempt in attempts {
-        let id = attempt.attempt_id.as_str().to_string();
-        match result {
-            Ok(_) => {
-                let _ = store.update_attempt(&id, |attempt| {
-                    attempt.receipts = attempt_binding::replied(usage);
-                    match attempt.send_state {
-                        SendState::Sending => {
-                            attempt.advance(SendState::Sent).map_err(anyhow::Error::msg)
-                        }
-                        SendState::Sent | SendState::Responding | SendState::Uncertain => attempt
-                            .advance(SendState::Settled)
-                            .map_err(anyhow::Error::msg),
-                        _ => Ok(()),
-                    }
-                });
-                let _ = store.update_attempt(&id, |attempt| {
-                    if attempt.send_state == SendState::Sent
-                        || attempt.send_state == SendState::Responding
-                    {
-                        attempt
-                            .advance(SendState::Settled)
-                            .map_err(anyhow::Error::msg)
-                    } else {
-                        Ok(())
-                    }
-                });
-            }
-            Err(_) => match attempt.send_state {
-                SendState::Sending => {
-                    let _ = store.update_attempt(&id, |attempt| {
-                        attempt
-                            .advance(SendState::Uncertain)
-                            .map_err(anyhow::Error::msg)
-                    });
-                }
-                SendState::Sent | SendState::Responding => {
-                    let _ = store.update_attempt(&id, |attempt| {
-                        attempt
-                            .advance(SendState::Settled)
-                            .map_err(anyhow::Error::msg)
-                    });
-                }
-                _ => {}
-            },
-        }
-    }
 }
 
 /// Translate a fail-closed launch refusal into a share-safe orchestration
@@ -1308,8 +1187,15 @@ impl OrchestrationService {
             if let Some(latest) = attempts.last() {
                 value["sendState"] = serde_json::json!(latest.send_state.as_str());
                 value["attemptId"] = serde_json::json!(latest.attempt_id.as_str());
-                value["providerRequestId"] =
+                // The host's idempotency key is not a provider receipt. Naming
+                // it `providerRequestId` claimed the provider had identified a
+                // request it may never have seen — this projection reported one
+                // even while the send state was `known_not_sent`.
+                value["providerIdempotencyKey"] =
                     serde_json::json!(latest.intent.provider_idempotency_key.as_str());
+                if let Some(receipt) = latest.receipts.request.as_ref() {
+                    value["providerRequestId"] = serde_json::json!(receipt.as_str());
+                }
                 if latest.send_state.requires_reconciliation() {
                     value["requiredOperatorAction"] =
                         serde_json::json!("reconcile_uncertain_dispatch");
@@ -3475,33 +3361,19 @@ impl OrchestrationService {
             if let Err(reason) = launch_gate.admit(pinned.as_ref()).await {
                 agg_task.abort();
                 record_launch_drift(&store, &rid, reason);
-                reconcile_run_attempts(&store, &rid);
+                attempt_binding::reconcile_run(&store, &rid);
                 drop(admission_guard);
                 return;
             }
             // The send boundary. From here the request may reach a provider,
             // so it stops being safe to repeat on its own.
-            if let Err(error) = begin_send(&store, &rid) {
+            if let Err(error) = attempt_binding::admit_send(&store, &rid) {
                 agg_task.abort();
                 record_send_refusal(&store, &rid, &error);
                 drop(admission_guard);
                 return;
             }
-            let send_binding = store.list_attempts_for_run(&rid).ok().and_then(|attempts| {
-                attempts.into_iter().rev().find_map(|attempt| {
-                    (attempt.send_state == SendState::Sending).then(|| {
-                        crate::physical_send::PhysicalSendBinding {
-                            store: store.clone(),
-                            attempt_id: attempt.attempt_id.as_str().to_string(),
-                            provider_request_id: attempt
-                                .intent
-                                .provider_idempotency_key
-                                .as_str()
-                                .to_string(),
-                        }
-                    })
-                })
-            });
+            let send_binding = attempt_binding::send_binding(&store, &rid);
             let prompt_call = host.session_prompt_reserved_with_max_rounds_for_run(
                 session_id,
                 prompt,
@@ -3589,7 +3461,14 @@ impl OrchestrationService {
                     }
                 }
             }
-            settle_run_attempts(&store, &rid, &durable_result, &candidate);
+            attempt_binding::settle_run(
+                &store,
+                &rid,
+                attempt_binding::usage_receipt(
+                    candidate.aggregates.usage.prompt_tokens,
+                    candidate.aggregates.usage.completion_tokens,
+                ),
+            );
             if candidate.aggregates.verification.is_none() {
                 let observations = crate::completion::observations_from_run(
                     candidate.aggregates.changes.len(),
@@ -4015,7 +3894,7 @@ impl OrchestrationService {
         // request that already left. Any in-flight attempt becomes
         // `uncertain` so a later restart has to reconcile it rather than
         // silently issuing an equivalent one.
-        reconcile_run_attempts(&self.store, rid);
+        attempt_binding::reconcile_run(&self.store, rid);
         if !matches!(cancel_update, Ok(Some(_))) {
             let message = match cancel_update {
                 Ok(None) => "run record disappeared during cancel".into(),

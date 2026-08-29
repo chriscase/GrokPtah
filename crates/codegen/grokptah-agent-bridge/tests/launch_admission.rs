@@ -277,7 +277,11 @@ async fn an_admitted_run_records_the_exact_facts_it_was_admitted_on() {
         .expect("public run projection");
     assert_eq!(public["authority"]["grantClass"], "provider_run");
     assert_eq!(public["sendState"], "known_not_sent");
-    assert!(public["providerRequestId"].as_str().is_some());
+    assert!(public["providerIdempotencyKey"].as_str().is_some());
+    assert!(
+        public["providerRequestId"].is_null(),
+        "a request that provably never left cannot carry a provider receipt: {public}"
+    );
     let public_encoded = serde_json::to_string(&public).unwrap();
     for needle in [
         "hmac",
