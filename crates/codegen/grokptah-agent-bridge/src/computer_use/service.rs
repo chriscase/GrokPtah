@@ -410,6 +410,7 @@ impl ComputerUseService {
                         self.commit_action(run_id, &action, &observation, control_epoch, outcome)
                     }
                     Err(error) => {
+                        let error = classify_act_failure(error);
                         self.fail_inflight(run_id, "act", &error)?;
                         Err(error)
                     }
@@ -703,12 +704,19 @@ impl ComputerUseService {
                 run.last_error = Some(error.clone());
                 run.transition(ComputerRunState::Failed)?;
                 revoke_authority(run);
-                if error.code == ComputerErrorCode::UncertainOutcome {
+                // An ambiguous outcome is recorded as ambiguous in the audit
+                // trail too. Writing "failed" beside a control disposition of
+                // UncertainOutcome would leave the durable record disagreeing
+                // with itself about whether the effect may have happened.
+                let disposition = if error.code == ComputerErrorCode::UncertainOutcome {
                     run.set_control_disposition(ComputerControlDisposition::UncertainOutcome);
-                }
+                    "uncertain_outcome"
+                } else {
+                    "failed"
+                };
                 run.record_audit(
                     operation,
-                    "failed",
+                    disposition,
                     None,
                     run.current_observation
                         .as_ref()
@@ -773,6 +781,61 @@ impl ComputerUseService {
             Err(error) => Err(error.clone()),
         };
         self.store.complete_mutation(request_id, &encoded)
+    }
+}
+
+/// Classify a failure the backend reported *after* it was handed an action.
+///
+/// By this point the backend has already been asked to deliver a physical
+/// input event, and the trait gives us no way to ask whether it got as far as
+/// emitting one. An ordinary failure is therefore only truthful for codes that
+/// cannot be raised after emission — an admission or permission refusal, a
+/// target that was already gone, a backend that was never reached. Everything
+/// else may have landed on the surface, and reporting it as an ordinary
+/// failure would tell the caller the action definitely did not happen.
+///
+/// Promoting those to `UncertainOutcome` marks the run's control disposition
+/// and leaves the mutation receipt non-replayable, so the action is never
+/// retried automatically on the strength of a failure we cannot prove.
+fn classify_act_failure(error: ComputerError) -> ComputerError {
+    match error.code {
+        // Raised while admitting the action, before any event can be emitted.
+        ComputerErrorCode::InvalidRequest
+        | ComputerErrorCode::InvalidState
+        | ComputerErrorCode::Unauthorized
+        | ComputerErrorCode::PermissionRequired
+        | ComputerErrorCode::PermissionDenied
+        | ComputerErrorCode::PermissionRevoked
+        | ComputerErrorCode::UnsupportedPlatform
+        | ComputerErrorCode::ForbiddenTarget
+        | ComputerErrorCode::ForbiddenAction
+        | ComputerErrorCode::SensitiveSurface
+        | ComputerErrorCode::StaleObservation
+        | ComputerErrorCode::LimitReached
+        | ComputerErrorCode::Conflict
+        | ComputerErrorCode::BackendUnavailable
+        // Already ambiguous; keep the caller's own classification.
+        | ComputerErrorCode::UncertainOutcome => error,
+        // May have taken physical effect.
+        //
+        // `TargetChanged` and `TargetClosed` belong here, not above: on macOS
+        // the accessibility API can report either *after* the input event was
+        // dispatched — indeed a window closing is a plausible consequence of
+        // the very click that was sent. Without a dispatch-phase marker from
+        // the backend we cannot tell that from a pre-dispatch check, so the
+        // safe reading is that the action may have landed.
+        ComputerErrorCode::TargetChanged
+        | ComputerErrorCode::TargetClosed
+        | ComputerErrorCode::Pending
+        | ComputerErrorCode::Interrupted
+        | ComputerErrorCode::BackendFailure
+        | ComputerErrorCode::Internal => ComputerError::new(
+            ComputerErrorCode::UncertainOutcome,
+            format!(
+                "action outcome is uncertain after dispatch (backend reported {:?}); it will not be retried automatically",
+                error.code
+            ),
+        ),
     }
 }
 
@@ -843,6 +906,14 @@ mod tests {
     struct EvidenceBackend {
         inner: SimulatorBackend,
         bytes: parking_lot::Mutex<Vec<u8>>,
+    }
+
+    /// Observes normally, then fails in `act` with a chosen code, so the
+    /// service's post-dispatch classification can be exercised directly.
+    #[derive(Debug)]
+    struct FailingActBackend {
+        inner: SimulatorBackend,
+        code: ComputerErrorCode,
     }
 
     #[derive(Debug, Default)]
@@ -950,6 +1021,38 @@ mod tests {
     }
 
     #[async_trait::async_trait]
+    impl ComputerBackend for FailingActBackend {
+        fn capabilities(&self) -> ComputerCapabilities {
+            self.inner.capabilities()
+        }
+
+        async fn observe(
+            &self,
+            run_id: &str,
+            observation_id: &str,
+            target: &ComputerTarget,
+            limits: &ComputerUseLimits,
+        ) -> ComputerResult<ComputerObservation> {
+            self.inner
+                .observe(run_id, observation_id, target, limits)
+                .await
+        }
+
+        async fn act(
+            &self,
+            _run_id: &str,
+            _observation: &ComputerObservation,
+            _action: &ComputerAction,
+        ) -> ComputerResult<ActionOutcome> {
+            Err(ComputerError::new(self.code, "backend act failed"))
+        }
+
+        async fn cancel(&self, run_id: &str) -> ComputerResult<()> {
+            self.inner.cancel(run_id).await
+        }
+    }
+
+    #[async_trait::async_trait]
     impl ComputerBackend for MismatchedObservationBackend {
         fn capabilities(&self) -> ComputerCapabilities {
             self.inner.capabilities()
@@ -1050,6 +1153,177 @@ mod tests {
         ] {
             assert!(!encoded.contains("PRIVATE_BACKEND_OBSERVATION_ID"));
         }
+    }
+
+    /// Every error code must have a deliberate post-dispatch classification.
+    /// This match is exhaustive on purpose: adding a code forces a decision
+    /// about whether it can be raised after an input event was emitted.
+    #[test]
+    fn act_failures_that_may_have_landed_are_not_ordinary_failures() {
+        use ComputerErrorCode::*;
+
+        // Raised while admitting the action; nothing can have been emitted.
+        for code in [
+            InvalidRequest,
+            InvalidState,
+            Unauthorized,
+            PermissionRequired,
+            PermissionDenied,
+            PermissionRevoked,
+            UnsupportedPlatform,
+            ForbiddenTarget,
+            ForbiddenAction,
+            SensitiveSurface,
+            StaleObservation,
+            LimitReached,
+            Conflict,
+            BackendUnavailable,
+        ] {
+            let classified = classify_act_failure(ComputerError::new(code, "denied"));
+            assert_eq!(
+                classified.code, code,
+                "{code:?} is a pre-emission refusal and must stay an ordinary failure"
+            );
+        }
+
+        // May have taken physical effect before the error surfaced.
+        for code in [
+            TargetChanged,
+            TargetClosed,
+            Pending,
+            Interrupted,
+            BackendFailure,
+            Internal,
+        ] {
+            let classified = classify_act_failure(ComputerError::new(code, "boom"));
+            assert_eq!(
+                classified.code, UncertainOutcome,
+                "{code:?} can be raised after an event may have landed"
+            );
+            assert!(
+                !classified.message.contains("boom"),
+                "backend text must not be carried into the promoted error"
+            );
+        }
+
+        // An outcome the backend already called ambiguous is left alone.
+        let already = classify_act_failure(ComputerError::new(UncertainOutcome, "ambiguous"));
+        assert_eq!(already.code, UncertainOutcome);
+        assert_eq!(already.message, "ambiguous");
+    }
+
+    #[tokio::test]
+    async fn a_backend_failure_during_act_leaves_the_run_uncertain_not_failed() {
+        let dir = tempdir().unwrap().keep();
+        let backend = Arc::new(FailingActBackend {
+            inner: SimulatorBackend::new(),
+            code: ComputerErrorCode::BackendFailure,
+        });
+        let service = ComputerUseService::new(
+            backend,
+            ComputerStore::open(dir.join("computer-use")).unwrap(),
+        );
+        let run = service
+            .create_run(
+                "create-uncertain",
+                Uuid::new_v4(),
+                None,
+                SimulatorBackend::demo_target(),
+                ComputerUseLimits::default(),
+            )
+            .unwrap();
+        let run = service
+            .authorize("grant-uncertain", &run.run_id, run.version, grant(&run))
+            .unwrap();
+        let observation = service
+            .observe("observe-uncertain", &run.run_id, run.version)
+            .await
+            .unwrap();
+        let current = service.get_run(&run.run_id).unwrap().unwrap();
+
+        let error = service
+            .act(
+                "act-uncertain",
+                &run.run_id,
+                current.version,
+                &observation.observation_id,
+                ComputerAction::SetValue {
+                    element_id: format!("{}-name", observation.observation_id),
+                    text: "Ada".into(),
+                },
+            )
+            .await
+            .expect_err("the backend failed");
+
+        // The input may already have landed on the surface, so the caller must
+        // not be told the action definitely did not happen.
+        assert_eq!(error.code, ComputerErrorCode::UncertainOutcome);
+        let persisted = service.get_run(&run.run_id).unwrap().unwrap();
+        assert_eq!(
+            persisted.control_disposition,
+            ComputerControlDisposition::UncertainOutcome
+        );
+        assert_eq!(
+            persisted.last_error.as_ref().map(|error| error.code),
+            Some(ComputerErrorCode::UncertainOutcome)
+        );
+        assert!(persisted
+            .audit
+            .iter()
+            .any(|entry| entry.disposition == "uncertain_outcome"));
+    }
+
+    #[tokio::test]
+    async fn a_permission_refusal_during_act_stays_an_ordinary_failure() {
+        // The counterpart: a refusal the backend raises before emitting
+        // anything must not be inflated into an ambiguous outcome.
+        let dir = tempdir().unwrap().keep();
+        let backend = Arc::new(FailingActBackend {
+            inner: SimulatorBackend::new(),
+            code: ComputerErrorCode::PermissionRevoked,
+        });
+        let service = ComputerUseService::new(
+            backend,
+            ComputerStore::open(dir.join("computer-use")).unwrap(),
+        );
+        let run = service
+            .create_run(
+                "create-refused",
+                Uuid::new_v4(),
+                None,
+                SimulatorBackend::demo_target(),
+                ComputerUseLimits::default(),
+            )
+            .unwrap();
+        let run = service
+            .authorize("grant-refused", &run.run_id, run.version, grant(&run))
+            .unwrap();
+        let observation = service
+            .observe("observe-refused", &run.run_id, run.version)
+            .await
+            .unwrap();
+        let current = service.get_run(&run.run_id).unwrap().unwrap();
+
+        let error = service
+            .act(
+                "act-refused",
+                &run.run_id,
+                current.version,
+                &observation.observation_id,
+                ComputerAction::SetValue {
+                    element_id: format!("{}-name", observation.observation_id),
+                    text: "Ada".into(),
+                },
+            )
+            .await
+            .expect_err("the backend refused");
+        assert_eq!(error.code, ComputerErrorCode::PermissionRevoked);
+        let persisted = service.get_run(&run.run_id).unwrap().unwrap();
+        assert_eq!(persisted.state, ComputerRunState::Failed);
+        assert_ne!(
+            persisted.control_disposition,
+            ComputerControlDisposition::UncertainOutcome
+        );
     }
 
     #[tokio::test]
