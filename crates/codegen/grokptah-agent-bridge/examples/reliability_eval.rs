@@ -69,7 +69,7 @@ fn started_host(always_approve: bool) -> Result<HostRuntime> {
         always_approve,
         ..HostConfig::default()
     })
-    .expect("acquire the GrokPtah instance lock");
+    .context("acquire the GrokPtah instance lock")?;
     host.start()?;
     // Persisted chrome can outlive a scenario, so make policy explicit.
     host.set_always_approve(always_approve);

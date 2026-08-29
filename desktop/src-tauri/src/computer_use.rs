@@ -557,6 +557,27 @@ impl DesktopComputerUse {
         observation_id: &str,
         action: ComputerAction,
     ) -> Result<ComputerCockpitSnapshot, String> {
+        self.under_supervision(
+            "staging a Computer Use action",
+            self.stage_simulator_action_effect(
+                owner_session_id,
+                run_id,
+                expected_version,
+                observation_id,
+                action,
+            ),
+        )
+        .await
+    }
+
+    async fn stage_simulator_action_effect(
+        &self,
+        owner_session_id: Uuid,
+        run_id: &str,
+        expected_version: u64,
+        observation_id: &str,
+        action: ComputerAction,
+    ) -> Result<ComputerCockpitSnapshot, String> {
         let _guard = self.simulator_operation.lock().await;
         self.stage_action_locked(
             owner_session_id,
@@ -643,6 +664,27 @@ impl DesktopComputerUse {
     }
 
     pub async fn apply_model_proposal(
+        &self,
+        owner_session_id: Uuid,
+        run_id: &str,
+        expected_version: u64,
+        observation_id: &str,
+        proposal: ComputerAgentProposal,
+    ) -> Result<ComputerAgentProposalResult, String> {
+        self.under_supervision(
+            "applying a Computer Use model proposal",
+            self.apply_model_proposal_effect(
+                owner_session_id,
+                run_id,
+                expected_version,
+                observation_id,
+                proposal,
+            ),
+        )
+        .await
+    }
+
+    async fn apply_model_proposal_effect(
         &self,
         owner_session_id: Uuid,
         run_id: &str,
@@ -740,11 +782,27 @@ impl DesktopComputerUse {
         &self,
         owner_session_id: Uuid,
     ) -> Result<ComputerCockpitSnapshot, String> {
+        self.host
+            .ensure_effect_allowed("discarding a Computer Use approval")
+            .map_err(|error| format!("discarding a Computer Use approval is refused: {error:#}"))?;
         self.clear_pending_for_owner(owner_session_id)?;
         self.cockpit_snapshot(owner_session_id)
     }
 
     pub async fn pause_simulator(
+        &self,
+        owner_session_id: Uuid,
+        run_id: &str,
+        expected_version: u64,
+    ) -> Result<ComputerCockpitSnapshot, String> {
+        self.under_supervision(
+            "pausing a Computer Run",
+            self.pause_simulator_effect(owner_session_id, run_id, expected_version),
+        )
+        .await
+    }
+
+    async fn pause_simulator_effect(
         &self,
         owner_session_id: Uuid,
         run_id: &str,
@@ -765,6 +823,19 @@ impl DesktopComputerUse {
         run_id: &str,
         expected_version: u64,
     ) -> Result<ComputerCockpitSnapshot, String> {
+        self.under_supervision(
+            "taking over a Computer Run",
+            self.take_over_simulator_effect(owner_session_id, run_id, expected_version),
+        )
+        .await
+    }
+
+    async fn take_over_simulator_effect(
+        &self,
+        owner_session_id: Uuid,
+        run_id: &str,
+        expected_version: u64,
+    ) -> Result<ComputerCockpitSnapshot, String> {
         self.clear_pending_for_owner(owner_session_id)?;
         let (service, _) = self.owned_service(owner_session_id, run_id)?;
         service
@@ -775,6 +846,18 @@ impl DesktopComputerUse {
     }
 
     pub async fn stop_simulator(
+        &self,
+        owner_session_id: Uuid,
+        run_id: &str,
+    ) -> Result<ComputerCockpitSnapshot, String> {
+        self.under_supervision(
+            "stopping a Computer Run",
+            self.stop_simulator_effect(owner_session_id, run_id),
+        )
+        .await
+    }
+
+    async fn stop_simulator_effect(
         &self,
         owner_session_id: Uuid,
         run_id: &str,
@@ -1204,6 +1287,51 @@ mod tests {
         assert!(refused_action
             .expect_err("delivering input after shutdown must be refused")
             .contains("refused"),);
+
+        let refused_stage = desktop
+            .stage_simulator_action(
+                owner,
+                "stale-run",
+                1,
+                "stale-observation",
+                ComputerAction::ActivateTarget,
+            )
+            .await
+            .expect_err("staging after shutdown must be refused");
+        assert!(refused_stage.contains("refused"));
+        let refused_proposal = desktop
+            .apply_model_proposal(
+                owner,
+                "stale-run",
+                1,
+                "stale-observation",
+                ComputerAgentProposal::Complete {
+                    observation_id: "stale-observation".into(),
+                    summary: "done".into(),
+                },
+            )
+            .await
+            .expect_err("applying a proposal after shutdown must be refused");
+        assert!(refused_proposal.contains("refused"));
+        assert!(desktop
+            .pause_simulator(owner, "stale-run", 1)
+            .await
+            .expect_err("pausing after shutdown must be refused")
+            .contains("refused"));
+        assert!(desktop
+            .take_over_simulator(owner, "stale-run", 1)
+            .await
+            .expect_err("taking over after shutdown must be refused")
+            .contains("refused"));
+        assert!(desktop
+            .stop_simulator(owner, "stale-run")
+            .await
+            .expect_err("stopping after shutdown must be refused")
+            .contains("refused"));
+        assert!(desktop
+            .discard_simulator_approval(owner)
+            .expect_err("discarding after shutdown must be refused")
+            .contains("refused"));
     }
 
     fn test_desktop() -> (

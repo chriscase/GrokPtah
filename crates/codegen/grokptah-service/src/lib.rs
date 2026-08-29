@@ -344,9 +344,9 @@ pub async fn start_service(config: ServiceConfig) -> Result<ServiceHandle> {
 
     let runtime = match config.runtime_home.clone() {
         Some(home) => AgentHost::create_with_runtime_home(HostConfig::default(), home)
-            .expect("acquire the GrokPtah instance lock"),
+            .context("acquire the GrokPtah instance lock")?,
         None => AgentHost::create(HostConfig::default())
-            .expect("acquire the GrokPtah instance lock"),
+            .context("acquire the GrokPtah instance lock")?,
     };
     runtime.start().context("start GrokPtah agent host")?;
     let store: OrchStore = runtime
@@ -386,7 +386,10 @@ pub async fn start_service(config: ServiceConfig) -> Result<ServiceHandle> {
     // left serving a closed host.
     if let Err(rejected) = runtime.attach_control_server(server) {
         rejected.server.stop();
-        bail!("GrokPtah host runtime is {} and cannot own a control plane", rejected.phase.label());
+        bail!(
+            "GrokPtah host runtime is {} and cannot own a control plane",
+            rejected.phase.label()
+        );
     }
     Ok(ServiceHandle {
         addr,
@@ -405,10 +408,7 @@ pub async fn run_service(config: ServiceConfig) -> Result<()> {
         .await
         .context("wait for service shutdown signal")?;
     let report = handle.stop_and_wait().await;
-    eprintln!(
-        "[grokptah-service] stopped: {}",
-        report.operator_summary()
-    );
+    eprintln!("[grokptah-service] stopped: {}", report.operator_summary());
     // An unclean stop is an outcome, not a log line. The process lock is
     // retained in that case, so the next launch on this home will be refused
     // until this process exits — a supervisor that treated the exit as success

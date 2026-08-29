@@ -53,6 +53,10 @@ struct BusInner {
     persistence: Option<Arc<PersistenceHandle>>,
     /// Optional configured control secrets to scrub from durable text.
     control_secrets: Vec<String>,
+    /// Set atomically with taking the durable writer sender during ordered
+    /// shutdown. Once sealed, stale bus clones cannot accept an event that can
+    /// no longer reach the durable journal.
+    publications_sealed: bool,
 }
 
 /// Multi-subscriber event bus with monotonic sequence numbers.
@@ -135,16 +139,22 @@ impl EventBus {
     }
 
     pub fn close_journal_writer(&self) -> Option<String> {
-        let handle = self.inner.lock().persistence.clone();
-        if let Some(handle) = handle {
-            // Dropping the sender is what tells the writer to finish its queue
-            // and exit; joining is what proves it did.
-            handle.tx.lock().take();
-            let join = handle.join.lock().take();
-            if let Some(join) = join {
-                if join.join().is_err() {
-                    return Some("the durable event-journal writer panicked".to_string());
-                }
+        // Seal publication and detach the sender under the same BusInner lock
+        // used by `publish`. A publisher is therefore wholly before the close
+        // (and its entry is drained by the writer), or wholly after it (and is
+        // denied below); there is no writer-close/publication gap.
+        let join = {
+            let mut inner = self.inner.lock();
+            inner.publications_sealed = true;
+            let handle = inner.persistence.clone();
+            handle.as_ref().and_then(|handle| {
+                handle.tx.lock().take();
+                handle.join.lock().take()
+            })
+        };
+        if let Some(join) = join {
+            if join.join().is_err() {
+                return Some("the durable event-journal writer panicked".to_string());
             }
         }
         self.persistence_error.lock().clone()
@@ -322,6 +332,7 @@ impl EventBus {
                 oldest_seq: 1,
                 persistence: None,
                 control_secrets: Vec::new(),
+                publications_sealed: false,
             })),
             lagged_events: Arc::new(AtomicU64::new(0)),
             persistence_error: Arc::new(Mutex::new(None)),
@@ -501,6 +512,11 @@ impl EventBus {
     /// Publish: allocate seq + journal insert + fan-out under one lock (monotonic).
     pub fn publish(&self, update: SessionUpdate) {
         let mut g = self.inner.lock();
+        if g.publications_sealed {
+            *self.persistence_error.lock() =
+                Some("event publication refused after the durable journal was sealed".to_string());
+            return;
+        }
         if g.next_seq > g.reserved_through {
             if let Some(path) = g.sequence_path.clone() {
                 match reserve_sequence_range(&self.journal_lease(), &path, g.next_seq) {

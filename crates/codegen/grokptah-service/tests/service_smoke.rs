@@ -17,6 +17,38 @@ use uuid::Uuid;
 
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
+async fn a_second_service_on_the_same_home_returns_a_startup_error() {
+    let _serial = home_override_serial();
+    let home = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    set_grokptah_home_override(Some(home.path().to_path_buf()));
+    let config = ServiceConfig::new(
+        "127.0.0.1:0".parse().unwrap(),
+        "fallible-startup-token",
+        vec![workspace.path().to_path_buf()],
+        false,
+        1,
+        Duration::from_secs(5),
+    )
+    .unwrap()
+    .with_runtime_home(home.path())
+    .unwrap();
+
+    let owner = start_service(config.clone()).await.unwrap();
+    let error = match start_service(config).await {
+        Ok(_) => panic!("a second owner must be refused without panicking"),
+        Err(error) => error,
+    };
+    assert!(
+        format!("{error:#}").contains("acquire the GrokPtah instance lock"),
+        "startup refusal must retain useful context: {error:#}"
+    );
+    assert!(owner.stop_and_wait().await.is_clean());
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn standalone_service_exposes_authenticated_mcp_and_readiness() {
     let _serial = home_override_serial();
     let home = tempdir().unwrap();

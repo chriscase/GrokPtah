@@ -1147,6 +1147,13 @@ impl HostRuntime {
         let durable_writes_in_flight = self.lifecycle.in_flight_durable_writes();
 
         let mut flush_errors = writer_drain_errors;
+        if let Some(error) = self.handle().event_bus().last_persistence_error() {
+            let error =
+                format!("durable event journal degraded after sealing publication: {error}");
+            if !flush_errors.contains(&error) {
+                flush_errors.push(error);
+            }
+        }
         if join_timed_out {
             flush_errors.push(format!(
                 "{supervised_tasks_remaining} supervised task(s) did not finish within {:?}",
@@ -1189,6 +1196,18 @@ impl HostRuntime {
                  did not hold, so writing now could race a live writer",
                 hooks.len()
             ));
+        }
+
+        // A stale, unsupervised publisher racing the close is refused by the
+        // bus's publication seal and records a persistence error. Re-check at
+        // the final release boundary so even a race that lands after the first
+        // check prevents a falsely clean lock handoff.
+        if let Some(error) = self.handle().event_bus().last_persistence_error() {
+            let error =
+                format!("durable event journal degraded after sealing publication: {error}");
+            if !flush_errors.contains(&error) {
+                flush_errors.push(error);
+            }
         }
 
         // 7. Stale handles must fail closed before the lock can be re-acquired.
@@ -1279,6 +1298,7 @@ impl Drop for HostRuntime {
             return;
         }
         self.lifecycle.begin_quiesce();
+        let attached_control_servers = self.control_servers.get_mut().len();
         for server in self.control_servers.get_mut().drain(..) {
             server.stop();
         }
@@ -1305,7 +1325,7 @@ impl Drop for HostRuntime {
         // the lock when the process exits, and until then a replacement is
         // refused. `shutdown().await` is the path that joins and releases.
         let outstanding_after = self.lifecycle.tasks().len();
-        if !sealed || outstanding_after > 0 {
+        if !sealed || outstanding_after > 0 || attached_control_servers > 0 {
             // Move the lock into process ownership before returning. `self` and
             // every handle sharing this lifecycle may be destroyed moments from
             // now; if the lock were still inside the lifecycle, that destruction
@@ -1314,7 +1334,8 @@ impl Drop for HostRuntime {
             self.lifecycle.quarantine_process_lock();
             eprintln!(
                 "[grokptah] host runtime for {} dropped without an ordered shutdown: \
-                 {} durable write(s) in flight, {outstanding_after} supervised task(s) \
+                 {} durable write(s) in flight, {outstanding_after} supervised task(s), and \
+                 {attached_control_servers} unjoined control server(s) \
                  outstanding. The instance lock is RETAINED for the life of this process so \
                  no replacement can start beside work that may still act. Await \
                  HostRuntime::shutdown() for an ordered stop.",

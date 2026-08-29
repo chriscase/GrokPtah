@@ -1026,6 +1026,17 @@ impl AgentHostHandle {
         self.lifecycle.ensure_open(operation)
     }
 
+    /// Refuse an embedder-owned effect once ordered shutdown has begun.
+    ///
+    /// Async effects should normally use [`Self::track_supervised`] so the
+    /// runtime also joins them. This narrow synchronous gate is for local
+    /// state transitions that cannot be represented as a future (for example,
+    /// discarding a pending desktop approval). It grants no durable-write
+    /// authority and cannot reopen a quiescing runtime.
+    pub fn ensure_effect_allowed(&self, operation: &str) -> Result<()> {
+        self.lifecycle.ensure_open(operation)
+    }
+
     /// A token that can mint durable-write authority later, for operations
     /// that do slow work before their write (#455). Holding a guard across
     /// network I/O would let an ordinary slow request block the shutdown seal.

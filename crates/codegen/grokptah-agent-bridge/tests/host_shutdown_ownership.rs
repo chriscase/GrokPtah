@@ -118,6 +118,43 @@ async fn submit(
         .to_string()
 }
 
+/// Terminal Run persistence precedes clearing the durable Agent activation
+/// pointer by a few instructions. Wait on that real admission boundary rather
+/// than assuming the two files become visible atomically to this caller.
+async fn submit_after_terminal(
+    orch: &OrchestrationService,
+    auth: &AuthContext,
+    request_id: &str,
+    session_id: Uuid,
+    workspace: &Path,
+) -> String {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match orch
+            .submit_task(
+                auth,
+                request_id,
+                session_id,
+                workspace,
+                "list files please".into(),
+                Some(json!({"maxPromptBytes": 10_000, "maxRounds": 2, "maxDurationMs": 30_000})),
+            )
+            .await
+        {
+            Ok(value) => {
+                return value["runId"].as_str().expect("runId").to_string();
+            }
+            Err(error)
+                if error.message.contains("already has an active Run")
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::task::yield_now().await;
+            }
+            Err(error) => panic!("submit after terminal finalization: {error:?}"),
+        }
+    }
+}
+
 /// Bounded wait on durable run state. The poll interval is scheduling
 /// spacing, not the correctness mechanism: the assertion is on the durable
 /// record, and the deadline only bounds a hang.
@@ -342,7 +379,7 @@ async fn cancelled_and_steered_runs_release_authority_on_shutdown() {
 
     // A second run that is still in flight when shutdown starts: the ordered
     // stop must cancel it, finalize it durably, and join its task.
-    let second = submit(&orch, &auth, "in-flight", session_id, lane.ws()).await;
+    let second = submit_after_terminal(&orch, &auth, "in-flight", session_id, lane.ws()).await;
 
     let report = runtime.shutdown().await;
     assert_clean_shutdown(&report);
@@ -627,6 +664,37 @@ async fn late_control_server_attach_is_refused_and_handed_back() {
     assert!(replacement.session_load(session_id).is_ok());
     drop(orch);
     drop(replacement);
+}
+
+/// A synchronous `Drop` cannot await an axum serving task. It must therefore
+/// retain the home whenever a control server was attached, rather than merely
+/// signalling the server and releasing the lock while handlers may still be
+/// executing. Ordered `shutdown().await` is the only release path for an
+/// attached server because it performs the join.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn drop_with_an_attached_control_server_never_releases_an_unjoined_home() {
+    let lane = Lane::new();
+    let (runtime, _session_id) = lane.boot();
+    let orch = lane.orchestration(&runtime);
+    let server = start_control_server(orch.clone(), 0).await.unwrap();
+    runtime
+        .attach_control_server(server)
+        .unwrap_or_else(|_| panic!("a running runtime must accept its control server"));
+
+    let quarantined_before = grokptah_agent_bridge::quarantined_process_lock_count();
+    drop(runtime);
+
+    assert_eq!(
+        grokptah_agent_bridge::quarantined_process_lock_count(),
+        quarantined_before + 1,
+        "Drop must move the lock into process quarantine when it cannot join an attached server"
+    );
+    assert!(
+        AgentHost::create(HostConfig::default()).is_err(),
+        "a replacement must not acquire beside an unjoined control server"
+    );
+    drop(orch);
 }
 
 /// P0 from independent review: `Drop` must not create a split brain. With a
@@ -1943,6 +2011,54 @@ async fn the_journal_writer_is_closed_and_joined_before_a_clean_report() {
 
     // Closing again is idempotent, and the surviving clone has no live writer.
     assert!(surviving_clone.close_journal_writer().is_none());
+}
+
+/// The writer close and publication seal are one atomic boundary. If a stale
+/// publisher attempts an event after that boundary, the event is explicitly
+/// refused and ordered shutdown must observe the degradation before deciding
+/// whether to release the home.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn a_post_close_publication_cannot_hide_behind_a_clean_shutdown() {
+    let lane = Lane::new();
+    let (runtime, session_id) = lane.boot();
+    let bus = runtime.event_bus();
+    bus.publish(SessionUpdate::AgentMessageChunk {
+        session_id,
+        text: "before-close".into(),
+    });
+    assert!(bus.close_journal_writer().is_none());
+
+    bus.publish(SessionUpdate::AgentMessageChunk {
+        session_id,
+        text: "must-be-refused".into(),
+    });
+    assert!(
+        bus.last_persistence_error()
+            .is_some_and(|error| error.contains("publication refused")),
+        "a post-close publication must leave explicit durable-health evidence"
+    );
+
+    let quarantined_before = grokptah_agent_bridge::quarantined_process_lock_count();
+    let report = runtime.shutdown().await;
+    assert!(
+        !report.is_clean(),
+        "a refused durable event is not a clean stop"
+    );
+    assert!(
+        report
+            .flush_errors
+            .iter()
+            .any(|error| error.contains("publication refused")),
+        "the final release decision must re-check journal persistence health: {:?}",
+        report.flush_errors
+    );
+    assert!(!report.process_lock_released);
+    assert!(report.process_lock_retained_for_safety);
+    assert_eq!(
+        grokptah_agent_bridge::quarantined_process_lock_count(),
+        quarantined_before + 1
+    );
 }
 
 /// Abrupt death, not an orderly stop: `SIGKILL` a real process mid-write and
