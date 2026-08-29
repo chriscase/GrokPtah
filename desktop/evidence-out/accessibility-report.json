@@ -1,0 +1,77 @@
+{
+  "generatedFrom": "synthetic fixture corpus",
+  "report": [
+    {
+      "state": "browse",
+      "viewport": "desktop",
+      "screenshot": "evidence-out/help-browse-desktop.png",
+      "violations": []
+    },
+    {
+      "state": "answer",
+      "viewport": "desktop",
+      "screenshot": "evidence-out/help-answer-desktop.png",
+      "violations": []
+    },
+    {
+      "state": "ambiguous",
+      "viewport": "desktop",
+      "screenshot": "evidence-out/help-ambiguous-desktop.png",
+      "violations": []
+    },
+    {
+      "state": "low-confidence",
+      "viewport": "desktop",
+      "screenshot": "evidence-out/help-low-confidence-desktop.png",
+      "violations": []
+    },
+    {
+      "state": "no-match",
+      "viewport": "desktop",
+      "screenshot": "evidence-out/help-no-match-desktop.png",
+      "violations": []
+    },
+    {
+      "state": "rejected",
+      "viewport": "desktop",
+      "screenshot": "evidence-out/help-rejected-desktop.png",
+      "violations": []
+    },
+    {
+      "state": "browse",
+      "viewport": "narrow",
+      "screenshot": "evidence-out/help-browse-narrow.png",
+      "violations": []
+    },
+    {
+      "state": "answer",
+      "viewport": "narrow",
+      "screenshot": "evidence-out/help-answer-narrow.png",
+      "violations": []
+    },
+    {
+      "state": "ambiguous",
+      "viewport": "narrow",
+      "screenshot": "evidence-out/help-ambiguous-narrow.png",
+      "violations": []
+    },
+    {
+      "state": "low-confidence",
+      "viewport": "narrow",
+      "screenshot": "evidence-out/help-low-confidence-narrow.png",
+      "violations": []
+    },
+    {
+      "state": "no-match",
+      "viewport": "narrow",
+      "screenshot": "evidence-out/help-no-match-narrow.png",
+      "violations": []
+    },
+    {
+      "state": "rejected",
+      "viewport": "narrow",
+      "screenshot": "evidence-out/help-rejected-narrow.png",
+      "violations": []
+    }
+  ]
+}
