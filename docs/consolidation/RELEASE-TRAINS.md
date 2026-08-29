@@ -183,7 +183,7 @@ Seven trains, each rooted at `67e29bd`. Order **within** a train is load-bearing
 
 - **Dependencies:** none. Forks from `67e29bd`; no PR in this train touches a file another train needs first.
 - **Collision files:** none within the train. `#344` is confined to `evals/certification-lab/*` and its doc; `#345`–`#348` touch one file each.
-- **Collides outside the train:** `evals/certification-lab/src/probes.rs` is also rewritten by `#414` (T9). Promote T7 first; `#414` must then rebase.
+- **Collides outside the train:** `evals/certification-lab/src/probes.rs` is also rewritten by `#414` (Always-On certification, 223 files, `desktop` and `hosted-service` both red on `#418` in the same line). Promote T7 first; `#414` must then rebase.
 - **Required semantic review:** `#346` and `#348` change production code (`orchestration/manager.rs` +297, `orchestration/worker.rs` +185) — the directive-envelope parser and the privilege-amplification guard. These are authority-adjacent and must not be waved through on a green check.
 - **Hosted check:** `desktop` green on all five.
 - **Local gate:** `cd crates/codegen/grokptah-agent-bridge && cargo check --all-targets` then `cargo test --no-fail-fast`.
@@ -499,3 +499,31 @@ cargo test --locked -- --test-threads=1
 Train states in §4 were built by chaining step 3 with `git commit-tree`, so each step's base is the previous step's
 merge result rather than `main`. That is what makes the ordering meaningful: a train is only "clean" if every PR in it
 merges onto the accumulated result of the ones before it.
+
+---
+
+## 11. Analysis window and observed drift
+
+This repository is actively worked by concurrent sessions. The inventory is a **snapshot**, and drift was measured
+rather than assumed. Re-checked against `origin` after the analysis completed:
+
+| | At snapshot | After |
+|---|---|---|
+| `origin/main` | `67e29bd34dc64049432c715c93c2cef2185c63ea` | **unchanged** |
+| Open PRs | 129 | 132 (two opened by other sessions, plus this document's own PR) |
+| Branches on `origin` | 223 | 227 (four added, **none removed**) |
+
+**Two PR heads moved during the analysis window.** Both advanced by exactly one commit, both old heads are ancestors
+of the new heads, and both still fork from current `main` and still merge clean:
+
+| PR | Head at snapshot | Head after | New commits | Still merges clean | Files vs main |
+|---|---|---|---|---|---|
+| #469 | `039bafb7a324` | `dfa74fd22f12` | 1 | yes | 23 (unchanged) |
+| #471 | `22feee1f8458` | `e954bc22edb9` | 1 | yes | 48 (was 47) |
+
+`#469` appears in train T5. Its disposition and merge-cleanliness are unaffected, but **re-run the T5 simulation
+against `dfa74fd22f12` before promoting it** — the recorded simulation used the older head. The five PRs in §5, the
+recommended promotion, did **not** move: `#344`, `#345`, `#346`, `#347` and `#348` are all at the SHAs listed there.
+
+Every other head in this document was verified byte-identical between the local `refs/pull/*/head` fetch and the
+GitHub API at snapshot time — zero drift across all 129.
