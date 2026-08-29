@@ -184,10 +184,21 @@ pub enum TraceKind {
 #[serde(deny_unknown_fields)]
 pub struct PhysicalRecord {
     pub dispatch_id: String,
+    pub lease_id: String,
+    pub grant_id: Option<String>,
+    pub visual_grant_id: Option<String>,
     pub permitted: bool,
     pub agent_id: String,
     pub surface_id: String,
     pub conflict_domain: String,
+    pub observation_id: String,
+    pub observation_sequence: u64,
+    pub surface_generation: u64,
+    pub surface_incarnation: u64,
+    pub lease_incarnation: u64,
+    pub action_class: ActionClass,
+    pub grant_remaining_uses_before: Option<u32>,
+    pub grant_expires_at_ms: Option<u64>,
     pub clock_ms: u64,
 }
 
@@ -196,6 +207,11 @@ pub struct PhysicalRecord {
 #[serde(deny_unknown_fields)]
 pub struct ObservationRecord {
     pub observation_id: String,
+    pub sequence: u64,
+    pub surface_id: String,
+    pub generation: u64,
+    pub incarnation: u64,
+    pub captured_at_ms: u64,
     pub encoded_bytes: u64,
     pub image_bytes: u64,
 }
@@ -414,6 +430,11 @@ impl Host {
             .values()
             .map(|observation| ObservationRecord {
                 observation_id: observation.observation_id.clone(),
+                sequence: observation.sequence,
+                surface_id: observation.surface_id.clone(),
+                generation: observation.generation,
+                incarnation: observation.incarnation,
+                captured_at_ms: observation.captured_at_ms,
                 encoded_bytes: serde_json::to_vec(observation)
                     .map(|bytes| bytes.len() as u64)
                     .unwrap_or(0),
@@ -433,6 +454,9 @@ impl Host {
         let dispatch_id = format!("disp_injected_{}", self.dispatch_seq);
         self.physical.push(PhysicalRecord {
             dispatch_id: dispatch_id.clone(),
+            lease_id: "lease_injected_bypass".into(),
+            grant_id: self.grant.as_ref().map(|grant| grant.grant_id.clone()),
+            visual_grant_id: self.visual_grant_id.clone(),
             permitted: false,
             agent_id: self.primary_agent.clone(),
             surface_id: self.primary_surface.clone(),
@@ -441,6 +465,14 @@ impl Host {
                 .get(&self.primary_surface)
                 .map(|surface| surface.spec.conflict_domain.clone())
                 .unwrap_or_default(),
+            observation_id: "obs_injected_bypass".into(),
+            observation_sequence: 0,
+            surface_generation: 0,
+            surface_incarnation: 0,
+            lease_incarnation: 0,
+            action_class: ActionClass::Semantic,
+            grant_remaining_uses_before: self.grant.as_ref().and_then(|grant| grant.remaining_uses),
+            grant_expires_at_ms: self.grant.as_ref().map(|grant| grant.expires_at_ms),
             clock_ms: self.clock,
         });
         self.unauthorized = self.unauthorized.saturating_add(1);
@@ -893,12 +925,32 @@ impl Host {
             .get(lease_id)
             .map(|l| l.agent_id.clone())
             .unwrap_or_default();
+        let lease_incarnation = self
+            .leases
+            .get(lease_id)
+            .map(|lease| lease.incarnation)
+            .unwrap_or_default();
+        let grant_id = self.grant.as_ref().map(|grant| grant.grant_id.clone());
+        let grant_remaining_uses_before =
+            self.grant.as_ref().and_then(|grant| grant.remaining_uses);
+        let grant_expires_at_ms = self.grant.as_ref().map(|grant| grant.expires_at_ms);
         self.physical.push(PhysicalRecord {
             dispatch_id: dispatch_id.clone(),
+            lease_id: lease_id.to_string(),
+            grant_id,
+            visual_grant_id: self.visual_grant_id.clone(),
             permitted: true,
             agent_id,
             surface_id: surface_id.to_string(),
             conflict_domain: domain.clone(),
+            observation_id: observation_id.to_string(),
+            observation_sequence: obs.sequence,
+            surface_generation: obs.generation,
+            surface_incarnation: obs.incarnation,
+            lease_incarnation,
+            action_class: action.class(),
+            grant_remaining_uses_before,
+            grant_expires_at_ms,
             clock_ms: self.clock,
         });
         self.apply_action(surface_id, action);

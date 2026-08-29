@@ -34,9 +34,14 @@
       "type": "array",
       "items": {
         "type": "object", "additionalProperties": false,
-        "required": ["observationId", "encodedBytes", "imageBytes"],
+        "required": ["observationId", "sequence", "surfaceId", "generation", "incarnation", "capturedAtMs", "encodedBytes", "imageBytes"],
         "properties": {
           "observationId": { "type": "string", "minLength": 1 },
+          "sequence": { "type": "integer", "minimum": 1 },
+          "surfaceId": { "type": "string", "minLength": 1 },
+          "generation": { "type": "integer", "minimum": 1 },
+          "incarnation": { "type": "integer", "minimum": 1 },
+          "capturedAtMs": { "type": "integer", "minimum": 0 },
           "encodedBytes": { "type": "integer", "minimum": 0 },
           "imageBytes": { "type": "integer", "minimum": 0 }
         }
@@ -46,13 +51,24 @@
       "type": "array",
       "items": {
         "type": "object", "additionalProperties": false,
-        "required": ["dispatchId", "permitted", "agentId", "surfaceId", "conflictDomain", "clockMs"],
+        "required": ["dispatchId", "leaseId", "grantId", "visualGrantId", "permitted", "agentId", "surfaceId", "conflictDomain", "observationId", "observationSequence", "surfaceGeneration", "surfaceIncarnation", "leaseIncarnation", "actionClass", "grantRemainingUsesBefore", "grantExpiresAtMs", "clockMs"],
         "properties": {
           "dispatchId": { "type": "string", "minLength": 1 },
+          "leaseId": { "type": "string", "minLength": 1 },
+          "grantId": { "type": ["string", "null"] },
+          "visualGrantId": { "type": ["string", "null"] },
           "permitted": { "type": "boolean" },
           "agentId": { "type": "string" },
           "surfaceId": { "type": "string" },
           "conflictDomain": { "type": "string" },
+          "observationId": { "type": "string", "minLength": 1 },
+          "observationSequence": { "type": "integer", "minimum": 0 },
+          "surfaceGeneration": { "type": "integer", "minimum": 0 },
+          "surfaceIncarnation": { "type": "integer", "minimum": 0 },
+          "leaseIncarnation": { "type": "integer", "minimum": 0 },
+          "actionClass": { "type": "string", "enum": ["semantic", "text_entry", "key_chord", "pointer_fallback"] },
+          "grantRemainingUsesBefore": { "type": ["integer", "null"], "minimum": 0 },
+          "grantExpiresAtMs": { "type": ["integer", "null"], "minimum": 0 },
           "clockMs": { "type": "integer", "minimum": 0 }
         }
       }

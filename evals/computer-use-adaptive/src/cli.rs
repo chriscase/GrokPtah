@@ -29,6 +29,7 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<i32, (ProcessVerdict, S
     let mut expect_source_gate: Option<String> = None;
     let mut expect_head: Option<String> = None;
     let mut repository = PathBuf::from(".");
+    let mut repository_explicit = false;
     let mut verify_report_path: Option<PathBuf> = None;
     let mut verify_evidence_path: Option<PathBuf> = None;
     let mut argv = args.into_iter();
@@ -88,6 +89,7 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<i32, (ProcessVerdict, S
                 ))?);
             }
             "--repository" => {
+                repository_explicit = true;
                 repository = PathBuf::from(argv.next().ok_or((
                     ProcessVerdict::Malformed,
                     "--repository requires a path".into(),
@@ -95,8 +97,8 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<i32, (ProcessVerdict, S
             }
             "--help" => {
                 eprintln!(
-                    "grokptah-cu-adaptive-eval --out DIR [--repeats N] [--seed N] [--source-gate SHA]\n\
-                     grokptah-cu-adaptive-eval --verify-report FILE --verify-evidence FILE\n\
+                    "grokptah-cu-adaptive-eval --out DIR [--repeats N] [--seed N] --repository PATH --expected-head SHA --source-gate BASE_SHA\n\
+                     grokptah-cu-adaptive-eval --verify-report FILE --verify-evidence FILE --repository PATH --expected-head SHA --source-gate BASE_SHA\n\
                      Synthetic Computer Use adaptive evaluation. Zero provider calls by default.\n\
                      PASS is the only zero exit."
                 );
@@ -108,25 +110,27 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<i32, (ProcessVerdict, S
         }
     }
     if let (Some(report_path), Some(evidence_path)) = (&verify_report_path, &verify_evidence_path) {
+        if !repository_explicit || expect_head.is_none() || expect_source_gate.is_none() {
+            return Err((
+                ProcessVerdict::Malformed,
+                "verification requires --repository, --expected-head, and --source-gate".into(),
+            ));
+        }
         let report_text = fs::read_to_string(report_path)
             .map_err(|err| (ProcessVerdict::Malformed, err.to_string()))?;
         let evidence_text = fs::read_to_string(evidence_path)
             .map_err(|err| (ProcessVerdict::Malformed, err.to_string()))?;
-        if expect_head.is_some() || expect_source_gate.is_some() {
-            let report: crate::report::CampaignReport =
-                crate::schema::parse_strict(&report_text)
-                    .map_err(|err| (ProcessVerdict::Malformed, err.to_string()))?;
-            let expected_base = expect_source_gate.as_deref().unwrap_or(SOURCE_GATE_SHA);
-            let observed =
-                crate::source::observe_source(&repository, expect_head.as_deref(), expected_base)
-                    .map_err(|err| (ProcessVerdict::Malformed, err.to_string()))?;
-            if report.source_gate != observed {
-                return Err((
-                    ProcessVerdict::Malformed,
-                    "artifact source identity does not match independently observed repository"
-                        .into(),
-                ));
-            }
+        let report: crate::report::CampaignReport = crate::schema::parse_strict(&report_text)
+            .map_err(|err| (ProcessVerdict::Malformed, err.to_string()))?;
+        let expected_base = expect_source_gate.as_deref().unwrap_or(SOURCE_GATE_SHA);
+        let observed =
+            crate::source::observe_source(&repository, expect_head.as_deref(), expected_base)
+                .map_err(|err| (ProcessVerdict::Malformed, err.to_string()))?;
+        if report.source_gate != observed {
+            return Err((
+                ProcessVerdict::Malformed,
+                "artifact source identity does not match independently observed repository".into(),
+            ));
         }
         let verified = crate::verifier::verify_json_with_evidence(&report_text, &evidence_text)
             .map_err(|err| (ProcessVerdict::Malformed, err.to_string()))?;
@@ -152,6 +156,12 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<i32, (ProcessVerdict, S
     }
     if let Err(err) = refuse_if_not_explicitly_enabled() {
         return Err((ProcessVerdict::LiveRefused, err.to_string()));
+    }
+    if !repository_explicit || expect_head.is_none() || expect_source_gate.is_none() {
+        return Err((
+            ProcessVerdict::Malformed,
+            "campaign generation requires --repository, --expected-head, and --source-gate".into(),
+        ));
     }
     let expected_base = expect_source_gate.as_deref().unwrap_or(SOURCE_GATE_SHA);
     let source = crate::source::observe_source(&repository, expect_head.as_deref(), expected_base)

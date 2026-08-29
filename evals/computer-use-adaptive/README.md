@@ -20,16 +20,26 @@ Unmerged adaptive runtime on developer checkouts is **not** authoritative.
 Zero provider calls. Do not run a workspace-wide build.
 
 ```sh
+REPO="$(git rev-parse --show-toplevel)"
+EXPECTED_HEAD="$(git -C "$REPO" rev-parse HEAD)"
+EXPECTED_BASE=c6f1cb23e9d6217005599850d9e0d6f7df64d5a1
 cd evals/computer-use-adaptive
 cargo test --locked -- --test-threads=1
 cargo clippy --locked --all-targets -- -D warnings
-cargo run --locked --bin grokptah-cu-adaptive-eval -- --out campaign-out --repeats 5 --seed 435272 --source-gate c6f1cb23e9d6217005599850d9e0d6f7df64d5a1
+cargo run --locked --bin grokptah-cu-adaptive-eval -- \
+  --out campaign-out --repeats 5 --seed 435272 \
+  --repository "$REPO" --expected-head "$EXPECTED_HEAD" --source-gate "$EXPECTED_BASE"
 cargo run --locked --bin grokptah-cu-adaptive-eval -- \
   --verify-report campaign-out/campaign-report.json \
-  --verify-evidence campaign-out/campaign-evidence.json
+  --verify-evidence campaign-out/campaign-evidence.json \
+  --repository "$REPO" --expected-head "$EXPECTED_HEAD" --source-gate "$EXPECTED_BASE"
 ```
 
-`--repeats 0` and any result other than synthetic PASS exit nonzero. The verifier reconstructs the matrix and does not trust report totals.
+`--repository`, `--expected-head`, and `--source-gate` are mandatory for both
+generation and verification. Dirty worktrees, mismatched heads/trees/bases, and
+any result other than synthetic PASS fail closed. The verifier reconstructs the
+matrix and dispatch authority; it does not trust report totals or a physical
+record's own `permitted` flag.
 
 Optional live continuation (same schemas, still does not call a provider in this
 lane; the binary refuses unless you intended a later live adapter):

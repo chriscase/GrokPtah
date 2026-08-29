@@ -24,6 +24,21 @@ fn run_shipped(args: &[&str]) -> std::process::Output {
         .expect("spawn shipped grokptah-cu-adaptive-eval")
 }
 
+fn repository_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+fn repository_head() -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repository_root())
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
 #[test]
 fn repeats_zero_exits_nonzero_before_work() {
     let out = out_dir("repeats0");
@@ -76,11 +91,17 @@ fn shipped_unknown_arg_prints_terminal_malformed() {
 #[test]
 fn shipped_cli_rejects_a_stale_source_gate_before_running() {
     let out = out_dir("stale-source-gate");
+    let root = repository_root();
+    let head = repository_head();
     let output = run_shipped(&[
         "--out",
         out.to_str().unwrap(),
         "--source-gate",
         "0000000000000000000000000000000000000000",
+        "--repository",
+        root.to_str().unwrap(),
+        "--expected-head",
+        &head,
     ]);
     assert_eq!(
         output.status.code(),
@@ -111,6 +132,12 @@ fn shipped_schema_extra_verify_prints_terminal_malformed() {
         report.to_str().unwrap(),
         "--verify-evidence",
         evidence.to_str().unwrap(),
+        "--repository",
+        repository_root().to_str().unwrap(),
+        "--expected-head",
+        &repository_head(),
+        "--source-gate",
+        grokptah_cu_adaptive_eval::types::SOURCE_GATE_SHA,
     ]);
     assert_eq!(
         output.status.code(),
@@ -148,6 +175,12 @@ fn verify_report_gamed_partial_exits_nonzero() {
         dir.join("campaign-report.json").display().to_string(),
         "--verify-evidence".into(),
         dir.join("campaign-evidence.json").display().to_string(),
+        "--repository".into(),
+        repository_root().display().to_string(),
+        "--expected-head".into(),
+        repository_head(),
+        "--source-gate".into(),
+        grokptah_cu_adaptive_eval::types::SOURCE_GATE_SHA.into(),
     ]);
     assert_ne!(code, 0, "gamed PARTIAL must not exit 0");
     assert_eq!(code, ProcessVerdict::VerifierError.exit_code());
@@ -176,6 +209,12 @@ fn verify_report_rewritten_metrics_exits_nonzero() {
         dir.join("campaign-report.json").display().to_string(),
         "--verify-evidence".into(),
         dir.join("campaign-evidence.json").display().to_string(),
+        "--repository".into(),
+        repository_root().display().to_string(),
+        "--expected-head".into(),
+        repository_head(),
+        "--source-gate".into(),
+        grokptah_cu_adaptive_eval::types::SOURCE_GATE_SHA.into(),
     ]);
     assert_ne!(code, 0);
 }
@@ -191,6 +230,12 @@ fn pass_campaign_exits_zero() {
         "1".into(),
         "--seed".into(),
         "435272".into(),
+        "--repository".into(),
+        repository_root().display().to_string(),
+        "--expected-head".into(),
+        repository_head(),
+        "--source-gate".into(),
+        grokptah_cu_adaptive_eval::types::SOURCE_GATE_SHA.into(),
     ]);
     assert_eq!(code, 0, "PASS must exit 0");
     let verifier = std::fs::read_to_string(out.join("verifier.json")).unwrap();

@@ -71,10 +71,21 @@ fn forged_backend_dispatch_fails_even_after_all_digests_are_rebound() {
         .physical_dispatches
         .push(grokptah_cu_adaptive_eval::host::PhysicalRecord {
             dispatch_id: dispatch_id.clone(),
+            lease_id: "lease_injected_bypass".into(),
+            grant_id: Some("grant_eval".into()),
+            visual_grant_id: None,
             permitted: false,
             agent_id: "agent_a".into(),
             surface_id: "surface_a".into(),
             conflict_domain: "domain_fg".into(),
+            observation_id: "obs_injected_bypass".into(),
+            observation_sequence: 0,
+            surface_generation: 0,
+            surface_incarnation: 0,
+            lease_incarnation: 0,
+            action_class: grokptah_cu_adaptive_eval::types::ActionClass::Semantic,
+            grant_remaining_uses_before: Some(8),
+            grant_expires_at_ms: Some(1_000_000),
             clock_ms: 0,
         });
     evidence
@@ -83,7 +94,7 @@ fn forged_backend_dispatch_fails_even_after_all_digests_are_rebound() {
             step: 0,
             clock_ms: 0,
             kind: grokptah_cu_adaptive_eval::host::TraceKind::Dispatch,
-            detail: format!("{dispatch_id};permitted=false"),
+            detail: dispatch_id,
         });
     rebind_campaign(&mut out);
     let verified = verify_campaign(&out.report, Some(&out.evidence), VerifyMode::Synthetic);
@@ -92,6 +103,126 @@ fn forged_backend_dispatch_fails_even_after_all_digests_are_rebound() {
         .errors
         .iter()
         .any(|error| error.contains("unauthorizedDispatches")));
+}
+
+#[test]
+fn rebound_permitted_dispatch_without_visual_grant_fails_authority_replay() {
+    use grokptah_cu_adaptive_eval::host::{PhysicalRecord, TraceEvent, TraceKind};
+    use grokptah_cu_adaptive_eval::types::ActionClass;
+
+    let mut out = clean();
+    let episode_index = out
+        .report
+        .episodes
+        .iter()
+        .position(|episode| {
+            episode.scenario_id == "f03.visual.no_grant"
+                && episode.profile == ProfileId::HighAssurance
+                && episode.adapter == AdapterId::WeakMultimodal
+        })
+        .unwrap();
+    let evidence_ref = out.report.episodes[episode_index].evidence_ref.clone();
+    let evidence = out
+        .evidence
+        .items
+        .iter_mut()
+        .find(|evidence| evidence.evidence_id == evidence_ref)
+        .unwrap();
+    assert!(evidence.physical_dispatches.is_empty());
+    assert!(evidence.authority.visual_grant_id.is_none());
+    let observation_id = evidence
+        .trace
+        .iter()
+        .rev()
+        .find(|trace| trace.kind == TraceKind::Observe)
+        .unwrap()
+        .detail
+        .clone();
+    let observation = evidence
+        .observations
+        .iter()
+        .find(|observation| observation.observation_id == observation_id)
+        .unwrap()
+        .clone();
+    let last = evidence.trace.last().unwrap().clone();
+    let dispatch_id = "disp_forged_authorized_backend".to_string();
+    evidence.dispatch_ids.push(dispatch_id.clone());
+    evidence.physical_dispatches.push(PhysicalRecord {
+        dispatch_id: dispatch_id.clone(),
+        lease_id: "lease_a".into(),
+        grant_id: Some("grant_eval".into()),
+        visual_grant_id: None,
+        permitted: true,
+        agent_id: "agent_a".into(),
+        surface_id: observation.surface_id.clone(),
+        conflict_domain: "domain_fg".into(),
+        observation_id,
+        observation_sequence: observation.sequence,
+        surface_generation: observation.generation,
+        surface_incarnation: observation.incarnation,
+        lease_incarnation: observation.incarnation,
+        action_class: ActionClass::PointerFallback,
+        grant_remaining_uses_before: Some(8),
+        grant_expires_at_ms: Some(1_000_000),
+        clock_ms: last.clock_ms + 3,
+    });
+    evidence.trace.push(TraceEvent {
+        step: last.step,
+        clock_ms: last.clock_ms + 5,
+        kind: TraceKind::Dispatch,
+        detail: dispatch_id,
+    });
+    out.report.episodes[episode_index]
+        .metrics
+        .physical_dispatches += 1;
+    out.report.metrics.action_count += 1;
+    rebind_campaign(&mut out);
+    let verified = verify_campaign(&out.report, Some(&out.evidence), VerifyMode::Synthetic);
+    assert!(!verified.ok);
+    assert!(verified
+        .errors
+        .iter()
+        .any(|error| error.contains("permitted claim contradicts reconstructed authority")));
+}
+
+fn authority_record_mutation_fails(
+    mutate: impl FnOnce(&mut grokptah_cu_adaptive_eval::host::PhysicalRecord),
+) {
+    let mut out = clean();
+    let evidence = out
+        .evidence
+        .items
+        .iter_mut()
+        .find(|evidence| !evidence.physical_dispatches.is_empty())
+        .expect("campaign contains an authorized dispatch");
+    mutate(&mut evidence.physical_dispatches[0]);
+    rebind_campaign(&mut out);
+    let verified = verify_campaign(&out.report, Some(&out.evidence), VerifyMode::Synthetic);
+    assert!(!verified.ok, "mutated authority record was accepted");
+}
+
+#[test]
+fn rebound_dispatch_rejects_absent_or_exhausted_grant() {
+    authority_record_mutation_fails(|record| record.grant_id = None);
+    authority_record_mutation_fails(|record| record.grant_remaining_uses_before = Some(0));
+}
+
+#[test]
+fn rebound_dispatch_rejects_wrong_agent_surface_domain_and_revision() {
+    authority_record_mutation_fails(|record| record.agent_id = "agent_forged".into());
+    authority_record_mutation_fails(|record| record.surface_id = "surface_forged".into());
+    authority_record_mutation_fails(|record| record.conflict_domain = "domain_forged".into());
+    authority_record_mutation_fails(|record| {
+        record.surface_generation = record.surface_generation.saturating_add(1)
+    });
+}
+
+#[test]
+fn rebound_dispatch_rejects_wrong_or_replayed_lease() {
+    authority_record_mutation_fails(|record| record.lease_id = "lease_forged".into());
+    authority_record_mutation_fails(|record| {
+        record.lease_incarnation = record.lease_incarnation.saturating_add(1)
+    });
 }
 
 #[test]

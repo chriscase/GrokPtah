@@ -14,8 +14,8 @@
 | Task success | **425 / 425** (repeats=5, seed=435272) |
 | Provider calls | **0** |
 | Cost USD | **null** (fake adapters; not fabricated) |
-| Campaign digest (repeats=5, seed=435272) | `2fce11ff4e0de769267f4b22555a23029b34f7e3944679afffb1881489e74198` |
-| Campaign digest (repeats=5, seed=435273) | `5cfab2c5acb95cfdb97972de16a4317d835e09316ee815f6b3f0693dab94b9bc` |
+| Campaign digest (repeats=5, seed=435272) | Regenerated per exact evaluated head; see `CAMPAIGN_SYNTHETIC_SUMMARY.md` |
+| Campaign digest (repeats=5, seed=435273) | Regenerate with the same mandatory source-binding flags |
 | Fixture hash | `614a8b4b0bf5d5f559764f894661475a11e75e1e40279bdbe5e48cf5387cc20a` |
 | Verifier | **ok**, independent matrix reconstruction; 0 errors |
 | Live / packaged macOS | **not claimed** |
@@ -59,11 +59,19 @@ Recorded in `src/naming.rs` and every campaign report `naming` object.
 ## Commands (verified)
 
 ```sh
+REPO="$(git rev-parse --show-toplevel)"
+EXPECTED_HEAD="$(git -C "$REPO" rev-parse HEAD)"
+EXPECTED_BASE=c6f1cb23e9d6217005599850d9e0d6f7df64d5a1
 cd evals/computer-use-adaptive
 cargo test --locked -- --test-threads=1
 cargo clippy --locked --all-targets -- -D warnings
-cargo run --locked --bin grokptah-cu-adaptive-eval -- --out campaign-out --repeats 5 --seed 435272 --source-gate c6f1cb23e9d6217005599850d9e0d6f7df64d5a1
-cargo run --locked --bin grokptah-cu-adaptive-eval -- --verify-report campaign-out/campaign-report.json --verify-evidence campaign-out/campaign-evidence.json
+cargo run --locked --bin grokptah-cu-adaptive-eval -- \
+  --out campaign-out --repeats 5 --seed 435272 \
+  --repository "$REPO" --expected-head "$EXPECTED_HEAD" --source-gate "$EXPECTED_BASE"
+cargo run --locked --bin grokptah-cu-adaptive-eval -- \
+  --verify-report campaign-out/campaign-report.json \
+  --verify-evidence campaign-out/campaign-evidence.json \
+  --repository "$REPO" --expected-head "$EXPECTED_HEAD" --source-gate "$EXPECTED_BASE"
 ```
 
 Focused crate only. Do not `cargo test --workspace`, `cargo clean`, or overlap a
@@ -73,6 +81,7 @@ protected target.
 
 - Episodes: 2100 (12 families × variants × 3 profiles × 5 adapters × 5 repeats)
 - Outcomes: success 425, fail_closed 790, no_progress 375, escalate 195, uncertain 180, abstain 135
+- Escalation events: 205 (10 delegated visual specialists completed with a non-escalate terminal outcome)
 - Stale-action attempts: 330 (denied; never unauthorized)
 - Invalid actions: 3020 (malformed/denied; never unauthorized)
 - Recovery after two restarts: 60/60 converged
