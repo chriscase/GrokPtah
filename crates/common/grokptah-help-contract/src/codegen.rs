@@ -630,5 +630,133 @@ pub fn digest_parity_cases() -> serde_json::Value {
                  two implementations cannot drift.",
         "sha256": hashes,
         "domainDigests": emitted,
+        "articleDigests": article_digest_parity_cases(),
     })
+}
+
+/// Cross-language vectors for the article digest's labelled, counted regions.
+///
+/// The flat encoding these replace was injective per field but silent about
+/// which sub-list a field came from, so `capability_ids: ["cap.a"]` and
+/// `aliases: ["cap.a"]` produced the same digest and a capability gate could
+/// be removed from a document that still verified.
+///
+/// Each case below is the `base` article with exactly one thing done to it.
+/// `helpDigest.test.ts` asserts TypeScript reproduces every digest *and* that
+/// every mutation differs from the base, so a TypeScript port that dropped the
+/// labels or the counts would fail rather than silently re-admit the bypass.
+#[must_use]
+fn article_digest_parity_cases() -> serde_json::Value {
+    struct Case {
+        name: &'static str,
+        aliases: Vec<&'static str>,
+        keywords: Vec<&'static str>,
+        capability_ids: Vec<&'static str>,
+        source_digests: Vec<&'static str>,
+    }
+
+    let cases = vec![
+        Case {
+            name: "base",
+            aliases: vec!["alias.a"],
+            keywords: vec!["keyword.a"],
+            capability_ids: vec!["cap.a"],
+            source_digests: vec!["sha256:aa"],
+        },
+        // The bypass: every list folded into `aliases`. Under the flat
+        // encoding this was byte-identical to `base`.
+        Case {
+            name: "repartition-capability-into-aliases",
+            aliases: vec!["alias.a", "keyword.a", "cap.a"],
+            keywords: vec![],
+            capability_ids: vec![],
+            source_digests: vec!["sha256:aa"],
+        },
+        // One capability moved one list over.
+        Case {
+            name: "repartition-capability-into-keywords",
+            aliases: vec!["alias.a"],
+            keywords: vec!["keyword.a", "cap.a"],
+            capability_ids: vec![],
+            source_digests: vec!["sha256:aa"],
+        },
+        Case {
+            name: "reorder-within-a-list",
+            aliases: vec!["alias.b", "alias.a"],
+            keywords: vec!["keyword.a"],
+            capability_ids: vec!["cap.a"],
+            source_digests: vec!["sha256:aa"],
+        },
+        Case {
+            name: "omit-a-capability",
+            aliases: vec!["alias.a"],
+            keywords: vec!["keyword.a"],
+            capability_ids: vec![],
+            source_digests: vec!["sha256:aa"],
+        },
+        Case {
+            name: "duplicate-a-capability",
+            aliases: vec!["alias.a"],
+            keywords: vec!["keyword.a"],
+            capability_ids: vec!["cap.a", "cap.a"],
+            source_digests: vec!["sha256:aa"],
+        },
+        // Empty versus absent: a list holding one empty string is not a list
+        // holding nothing, and the count is what says so.
+        Case {
+            name: "empty-lists",
+            aliases: vec![],
+            keywords: vec![],
+            capability_ids: vec![],
+            source_digests: vec!["sha256:aa"],
+        },
+        Case {
+            name: "one-empty-string-alias",
+            aliases: vec![""],
+            keywords: vec![],
+            capability_ids: vec![],
+            source_digests: vec!["sha256:aa"],
+        },
+        // Multi-byte content, so the region counts cannot be confused with
+        // UTF-8 byte lengths by either implementation.
+        Case {
+            name: "multibyte-fields",
+            aliases: vec!["café", "\u{1F600}"],
+            keywords: vec!["naïve"],
+            capability_ids: vec!["cap.\u{1F600}"],
+            source_digests: vec!["sha256:aa"],
+        },
+    ];
+
+    let emitted: Vec<serde_json::Value> = cases
+        .into_iter()
+        .map(|case| {
+            serde_json::json!({
+                "name": case.name,
+                "id": "article.parity",
+                "title": "Parity article",
+                "topic": "operations",
+                "summary": "Summary.",
+                "body": "Body.",
+                "visibility": "gated",
+                "aliases": case.aliases,
+                "keywords": case.keywords,
+                "capabilityIds": case.capability_ids,
+                "sourceDigests": case.source_digests,
+                "digest": crate::corpus::article_digest_of(
+                    "article.parity",
+                    "Parity article",
+                    "operations",
+                    "Summary.",
+                    "Body.",
+                    "gated",
+                    &case.aliases,
+                    &case.keywords,
+                    &case.capability_ids,
+                    &case.source_digests,
+                ),
+            })
+        })
+        .collect();
+    serde_json::Value::Array(emitted)
 }

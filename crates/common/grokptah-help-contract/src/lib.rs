@@ -25,6 +25,8 @@ pub mod digest;
 pub mod dto;
 
 #[cfg(test)]
+mod corpus_tests;
+#[cfg(test)]
 mod dto_tests;
 
 /// Repository-relative path of the one canonical corpus artifact.

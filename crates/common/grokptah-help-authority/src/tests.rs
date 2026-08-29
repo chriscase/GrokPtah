@@ -677,3 +677,153 @@ fn an_operator_sees_more_than_a_public_reader() {
     let operator = authority.visible_corpus(&authority.principal_for("tok-operator").unwrap());
     assert!(operator.articles.len() > public.articles.len());
 }
+
+// ---------------------------------------------------------------------------
+// Crafted-corpus attacks on the boundary.
+// ---------------------------------------------------------------------------
+
+/// Re-label the first chunk of `article_id`, re-minting only that chunk's own
+/// digest so the document is internally consistent apart from the visibility
+/// rule under test.
+fn retag_first_chunk(
+    corpus: &mut grokptah_help_contract::corpus::Corpus,
+    article_id: &str,
+    visibility: Visibility,
+) -> String {
+    let mut retagged = String::new();
+    for chunk in &mut corpus.chunks {
+        if chunk.article_id == article_id && retagged.is_empty() {
+            chunk.visibility = visibility;
+            let ordinal = chunk.ordinal.to_string();
+            let mut fields: Vec<&str> = vec![
+                &chunk.id,
+                &chunk.article_id,
+                chunk.kind.as_str(),
+                &ordinal,
+                &chunk.locale,
+                &chunk.text,
+                chunk.visibility.as_str(),
+            ];
+            fields.extend(chunk.source_ids.iter().map(String::as_str));
+            chunk.digest = grokptah_help_contract::digest::domain_digest(
+                grokptah_help_contract::digest::domain::CHUNK,
+                &fields,
+            );
+            retagged = chunk.id.clone();
+        }
+    }
+    assert!(!retagged.is_empty(), "article `{article_id}` has a chunk");
+    corpus.rebind_set_digests();
+    retagged
+}
+
+#[test]
+fn a_corpus_with_a_repartitioned_capability_is_never_adopted() {
+    // The bypass this repair closes: folding `capability_ids` into `aliases`
+    // used to leave every digest identical, so a corpus that had lost a
+    // capability gate was adopted as authentic.
+    let mut tampered = build_corpus();
+    let target = tampered
+        .articles
+        .iter()
+        .find(|article| !article.capability_ids.is_empty())
+        .expect("a gated article")
+        .id
+        .clone();
+    for article in &mut tampered.articles {
+        if article.id == target {
+            let mut folded = article.aliases.clone();
+            folded.extend(article.keywords.clone());
+            folded.extend(article.capability_ids.clone());
+            article.aliases = folded;
+            article.keywords = Vec::new();
+            article.capability_ids = Vec::new();
+        }
+    }
+    assert!(
+        Authority::new(tampered).is_err(),
+        "a corpus whose capability gate was moved into aliases must not be adopted"
+    );
+}
+
+#[test]
+fn a_gated_chunk_injected_into_a_public_article_is_never_adopted() {
+    let mut crafted = build_corpus();
+    let public_article = crafted
+        .articles
+        .iter()
+        .find(|article| article.visibility == Visibility::Public)
+        .expect("a public article")
+        .id
+        .clone();
+    retag_first_chunk(&mut crafted, &public_article, Visibility::Operator);
+    assert!(
+        Authority::new(crafted).is_err(),
+        "a chunk more restricted than its article must not be adopted"
+    );
+}
+
+#[test]
+fn the_projection_drops_a_gated_chunk_even_if_verification_were_bypassed() {
+    // Defence in depth. `Authority::new` refuses the document above, so this
+    // reaches `visible_corpus` through the test-only unverified constructor:
+    // the chunk-level filter has to hold on its own, not because verification
+    // held first.
+    let mut crafted = build_corpus();
+    let public_article = crafted
+        .articles
+        .iter()
+        .find(|article| article.visibility == Visibility::Public)
+        .expect("a public article")
+        .id
+        .clone();
+    let smuggled = retag_first_chunk(&mut crafted, &public_article, Visibility::Operator);
+
+    let mut authority = Authority::adopt_unverified(crafted);
+    authority.register_session(session(
+        "tok-public",
+        "p-public",
+        "tenant-a",
+        PrincipalKind::Anonymous,
+        Visibility::Public,
+        &[],
+    ));
+    let public = authority.principal_for("tok-public").unwrap();
+    let visible = authority.visible_corpus(&public);
+
+    assert!(
+        !visible.chunks.iter().any(|chunk| chunk.id == smuggled),
+        "an operator chunk reached a public renderer through its public article"
+    );
+    for chunk in &visible.chunks {
+        assert_eq!(
+            chunk.visibility,
+            Visibility::Public,
+            "a restricted chunk crossed to a public renderer"
+        );
+    }
+    // The article itself is still served: only the smuggled chunk is dropped.
+    assert!(
+        visible
+            .articles
+            .iter()
+            .any(|article| article.id == public_article),
+        "the public article itself should still be visible"
+    );
+}
+
+#[test]
+fn an_operator_still_receives_a_chunk_a_public_reader_does_not() {
+    // The filter narrows by ceiling rather than dropping restricted chunks
+    // outright, so the entitled principal keeps what it is entitled to.
+    let authority = fixture();
+    let public = authority.principal_for("tok-public").unwrap();
+    let operator = authority.principal_for("tok-operator").unwrap();
+
+    let public_chunks = authority.visible_corpus(&public).chunks.len();
+    let operator_chunks = authority.visible_corpus(&operator).chunks.len();
+    assert!(
+        operator_chunks > public_chunks,
+        "an operator saw {operator_chunks} chunks, a public reader {public_chunks}"
+    );
+}

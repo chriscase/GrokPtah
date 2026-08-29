@@ -38,6 +38,7 @@ use crate::digest::{domain, domain_digest};
 /// principal, tenant, or capability by editing it, because the host resolves
 /// it against its own session table and ignores anything it does not know.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HelpAsk {
     pub session: String,
     pub question: String,
@@ -47,6 +48,7 @@ pub struct HelpAsk {
 
 /// Poll or resume an in-flight ask by its opaque handle.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HelpFollow {
     pub session: String,
     pub handle: String,
@@ -54,6 +56,7 @@ pub struct HelpFollow {
 
 /// Cancel an in-flight ask by its opaque handle.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HelpCancelRequest {
     pub session: String,
     pub handle: String,

@@ -1,4 +1,192 @@
 {
+  "articleDigests": [
+    {
+      "aliases": [
+        "alias.a"
+      ],
+      "body": "Body.",
+      "capabilityIds": [
+        "cap.a"
+      ],
+      "digest": "sha256:f151f1c3f9cf6850fd2cc122388e633a9c2e8300b1ac24c57750406402edbd27",
+      "id": "article.parity",
+      "keywords": [
+        "keyword.a"
+      ],
+      "name": "base",
+      "sourceDigests": [
+        "sha256:aa"
+      ],
+      "summary": "Summary.",
+      "title": "Parity article",
+      "topic": "operations",
+      "visibility": "gated"
+    },
+    {
+      "aliases": [
+        "alias.a",
+        "keyword.a",
+        "cap.a"
+      ],
+      "body": "Body.",
+      "capabilityIds": [],
+      "digest": "sha256:c81e2eefccf1bafc56febe6967113bfb31036a8d17c3db5b44fbca253858c290",
+      "id": "article.parity",
+      "keywords": [],
+      "name": "repartition-capability-into-aliases",
+      "sourceDigests": [
+        "sha256:aa"
+      ],
+      "summary": "Summary.",
+      "title": "Parity article",
+      "topic": "operations",
+      "visibility": "gated"
+    },
+    {
+      "aliases": [
+        "alias.a"
+      ],
+      "body": "Body.",
+      "capabilityIds": [],
+      "digest": "sha256:51b1625ad5e65b8ac5bbc70af42913f5dda89d24090f6ffd149ea726e0486a4c",
+      "id": "article.parity",
+      "keywords": [
+        "keyword.a",
+        "cap.a"
+      ],
+      "name": "repartition-capability-into-keywords",
+      "sourceDigests": [
+        "sha256:aa"
+      ],
+      "summary": "Summary.",
+      "title": "Parity article",
+      "topic": "operations",
+      "visibility": "gated"
+    },
+    {
+      "aliases": [
+        "alias.b",
+        "alias.a"
+      ],
+      "body": "Body.",
+      "capabilityIds": [
+        "cap.a"
+      ],
+      "digest": "sha256:bd7aaedb23dfae2ab79705301e70bd0df635076ee49590bf41cdf515026c019a",
+      "id": "article.parity",
+      "keywords": [
+        "keyword.a"
+      ],
+      "name": "reorder-within-a-list",
+      "sourceDigests": [
+        "sha256:aa"
+      ],
+      "summary": "Summary.",
+      "title": "Parity article",
+      "topic": "operations",
+      "visibility": "gated"
+    },
+    {
+      "aliases": [
+        "alias.a"
+      ],
+      "body": "Body.",
+      "capabilityIds": [],
+      "digest": "sha256:f2aa2caa13d8f72809ee1e5d48a393c2397751df12559f6895b10bba3f37b460",
+      "id": "article.parity",
+      "keywords": [
+        "keyword.a"
+      ],
+      "name": "omit-a-capability",
+      "sourceDigests": [
+        "sha256:aa"
+      ],
+      "summary": "Summary.",
+      "title": "Parity article",
+      "topic": "operations",
+      "visibility": "gated"
+    },
+    {
+      "aliases": [
+        "alias.a"
+      ],
+      "body": "Body.",
+      "capabilityIds": [
+        "cap.a",
+        "cap.a"
+      ],
+      "digest": "sha256:688ad615e9d40b1bc623031852f615d9823617b9665300ceab5b873c9873baea",
+      "id": "article.parity",
+      "keywords": [
+        "keyword.a"
+      ],
+      "name": "duplicate-a-capability",
+      "sourceDigests": [
+        "sha256:aa"
+      ],
+      "summary": "Summary.",
+      "title": "Parity article",
+      "topic": "operations",
+      "visibility": "gated"
+    },
+    {
+      "aliases": [],
+      "body": "Body.",
+      "capabilityIds": [],
+      "digest": "sha256:60ea8432f43e04bef5fc24dc7baaf2094a37e005a66a03274320cf860604d10b",
+      "id": "article.parity",
+      "keywords": [],
+      "name": "empty-lists",
+      "sourceDigests": [
+        "sha256:aa"
+      ],
+      "summary": "Summary.",
+      "title": "Parity article",
+      "topic": "operations",
+      "visibility": "gated"
+    },
+    {
+      "aliases": [
+        ""
+      ],
+      "body": "Body.",
+      "capabilityIds": [],
+      "digest": "sha256:f64c59d170d04ced4b85c18cabf1eb81d14f527bbcd6e33f643f967e7b472680",
+      "id": "article.parity",
+      "keywords": [],
+      "name": "one-empty-string-alias",
+      "sourceDigests": [
+        "sha256:aa"
+      ],
+      "summary": "Summary.",
+      "title": "Parity article",
+      "topic": "operations",
+      "visibility": "gated"
+    },
+    {
+      "aliases": [
+        "café",
+        "😀"
+      ],
+      "body": "Body.",
+      "capabilityIds": [
+        "cap.😀"
+      ],
+      "digest": "sha256:c71c0f54182edddf0ecf66edbc7093d3cfdd82e3c2e399b2fa8100cffb458767",
+      "id": "article.parity",
+      "keywords": [
+        "naïve"
+      ],
+      "name": "multibyte-fields",
+      "sourceDigests": [
+        "sha256:aa"
+      ],
+      "summary": "Summary.",
+      "title": "Parity article",
+      "topic": "operations",
+      "visibility": "gated"
+    }
+  ],
   "domainDigests": [
     {
       "digest": "sha256:3cfbbfe36a6508b24fe8b639206d42be08cd7164cef27028bed28643a614d7f0",
