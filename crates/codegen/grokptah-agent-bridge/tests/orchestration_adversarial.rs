@@ -192,6 +192,128 @@ async fn control_token_absent_from_shell_env() {
     set_grokptah_home_override(None);
 }
 
+/// A listing must not answer a wider question than the read beside it.
+///
+/// `list_runs_scoped` took an `AuthContext` and ignored it, filtering on
+/// session and workspace alone — both shared. So any credential that could
+/// reach the session enumerated **every** run in it and got the whole durable
+/// record back: prompt preview, final response, terminal result, absolute
+/// workspace path. Exact reads were fenced, which meant the fence decided how
+/// much work an enumeration took, not whether it was possible.
+///
+/// The assertion is on the **raw JSON that crosses the boundary**, not on a
+/// projected view: a field dropped by a client is a field that already left the
+/// host. So the run below carries a distinctive needle, and the test looks for
+/// that needle anywhere in the serialized bytes the second principal receives.
+#[tokio::test]
+async fn a_second_principal_cannot_enumerate_the_first_principals_runs() {
+    const NEEDLE: &str = "swordfish-prompt-that-must-not-travel";
+
+    let (home, _lock) = setup_home();
+    let host = started_host();
+    let ws = tempdir().unwrap();
+    host.set_project_cwd(ws.path()).unwrap();
+    let session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(session.id, ws.path()).unwrap();
+    let orch = orch(&host, &home, &ws, 4);
+
+    orch.set_auth_credentials(vec![
+        grokptah_agent_bridge::orchestration::AuthCredential::new(
+            "primary",
+            "secret-token-adversarial-196",
+        )
+        .unwrap(),
+        grokptah_agent_bridge::orchestration::AuthCredential::new(
+            "device-b",
+            "second-principal-token-with-entropy",
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+
+    let mine = orch
+        .auth_header(Some("Bearer secret-token-adversarial-196"))
+        .unwrap();
+    let theirs = orch
+        .auth_header(Some("Bearer second-principal-token-with-entropy"))
+        .unwrap();
+    assert_ne!(mine.token_id, theirs.token_id, "two distinct principals");
+
+    // A run owned by the first principal, carrying the needle in exactly the
+    // fields the durable record serializes verbatim.
+    let workspace = dunce::canonicalize(ws.path())
+        .unwrap()
+        .display()
+        .to_string();
+    let run_id = Uuid::new_v4().to_string();
+    orch.store()
+        .save_run(&grokptah_agent_bridge::orchestration::RunRecord {
+            run_id: run_id.clone(),
+            session_id: session.id,
+            workspace: workspace.clone(),
+            request_id: "enumeration-probe".into(),
+            client_id: Some("mcp".into()),
+            state: grokptah_agent_bridge::orchestration::RunState::Completed,
+            purpose: Default::default(),
+            agent_id: None,
+            retry_of: None,
+            parent_run_id: None,
+            agent_spec_revision: None,
+            checkpoint_id: None,
+            continuation_context_id: None,
+            continuation_context_hash: None,
+            continuation_fidelity: None,
+            queue_position: None,
+            bounds: RunBounds::default(),
+            prompt_preview: NEEDLE.into(),
+            start_seq: Some(1),
+            end_seq: Some(2),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            terminal_result: Some("completed".into()),
+            final_response: Some(NEEDLE.into()),
+            error_code: None,
+            stop_cause: None,
+            aggregates: Default::default(),
+            progress: None,
+            execution: None,
+            approval: None,
+        })
+        .unwrap();
+
+    // The owner sees it. Without this the test would pass even if the listing
+    // refused everyone.
+    let ours = orch
+        .list_runs_scoped(&mine, session.id, ws.path())
+        .expect("the owner lists its own runs");
+    assert!(
+        serde_json::to_string(&ours).unwrap().contains(NEEDLE),
+        "the owner must still see its own run"
+    );
+
+    // The second principal reaches the same session and the same allowlisted
+    // workspace, and must come back with nothing of the first principal's.
+    let foreign = orch
+        .list_runs_scoped(&theirs, session.id, ws.path())
+        .expect("a listing the caller may reach is not an error, just empty");
+    let raw = serde_json::to_string(&foreign).unwrap();
+    assert!(
+        !raw.contains(NEEDLE),
+        "another principal's prompt and response crossed the boundary: {raw}"
+    );
+    assert!(
+        !raw.contains(&run_id),
+        "another principal's run id crossed the boundary: {raw}"
+    );
+    assert_eq!(
+        foreign["runs"].as_array().map(Vec::len),
+        Some(0),
+        "the listing must be empty for a principal that owns nothing here"
+    );
+
+    set_grokptah_home_override(None);
+}
+
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn reads_require_run_ownership_no_global_events() {

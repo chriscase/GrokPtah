@@ -2196,9 +2196,24 @@ impl OrchestrationService {
     /// Persistent-agent records intentionally point at the current run only;
     /// this read keeps completed and cancelled remote history reviewable
     /// without exposing runs from another session or workspace.
+    /// The runs in this session **that belong to the caller**.
+    ///
+    /// This took an `AuthContext` and threw it away, filtering on session and
+    /// workspace alone. Both of those are shared: any credential that could
+    /// reach the session enumerated every run in it and got the whole durable
+    /// record back — prompt preview, final response, terminal result, absolute
+    /// workspace path. Exact reads were fenced; the listing beside them was
+    /// not, so the fence only decided how much work an enumeration took.
+    ///
+    /// It is the same defect as the six reads repaired earlier, and the guard
+    /// written then did not catch it: that guard watched callers of
+    /// `load_authorized_run`, and this path never called it — it went to the
+    /// store directly. A structural guard is only as wide as the shape it
+    /// knows to look for, so `no_read_reaches_a_run_without_binding_a_principal`
+    /// now watches the raw store reads too.
     pub fn list_runs_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
     ) -> Result<serde_json::Value, OrchError> {
@@ -2211,6 +2226,10 @@ impl OrchestrationService {
             .filter(|run| {
                 run.session_id == session_id && run.workspace == claimed.display().to_string()
             })
+            // The same decision the exact reads make, on the same value. A
+            // listing that answers a wider question than the read it precedes
+            // is a way around the read.
+            .filter(|run| self.principal_may_read(auth, run.client_id.as_deref()))
             .collect::<Vec<_>>();
         Ok(json!({ "runs": runs }))
     }
@@ -8275,6 +8294,10 @@ mod principal_fence_tests {
     #[test]
     fn no_read_reaches_a_run_without_binding_a_principal() {
         const ALLOWED: [&str; 2] = ["load_principal_bound_run", "authorize_run_request"];
+        /// Methods that legitimately read every run: host-internal
+        /// reconciliation and recovery, which run under host authority rather
+        /// than any caller's.
+        const ALLOWED_RAW_LIST: [&str; 0] = [];
 
         // Scan the production body only. This module mentions the symbol in
         // its own assertions, which would otherwise flag itself.
@@ -8312,6 +8335,66 @@ mod principal_fence_tests {
              route them through `load_principal_bound_run` or \
              `authorize_run_request` instead:\n  {}",
             offenders.join("\n  ")
+        );
+
+        // The same question for *collections*, which is the half this guard
+        // used to miss. `list_runs_scoped` never called `load_authorized_run`
+        // — it went to the store directly — so it passed the check above while
+        // handing every run in a shared session to any credential that could
+        // reach it. A guard is only as wide as the shape it knows to look for.
+        //
+        // Any method that reads runs straight from the store must decide
+        // ownership itself, with the same `principal_may_read` the exact reads
+        // use. This scans method bodies rather than call sites, so it holds for
+        // a method written later, too.
+        let mut raw_readers: Vec<String> = Vec::new();
+        let mut current = String::new();
+        let mut body = String::new();
+        // Whitespace-stripped, because the call is written across lines as
+        // `self` / `.store` / `.list_runs()` and a line-wise substring search
+        // silently matches nothing — which is exactly how the first version of
+        // this widening passed while the hole was still open.
+        let check = |name: &str, body: &str, out: &mut Vec<String>| {
+            let dense: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+            if dense.contains("store.list_runs()")
+                && !dense.contains("principal_may_read")
+                && !ALLOWED_RAW_LIST.contains(&name)
+            {
+                out.push(name.to_string());
+            }
+        };
+        for line in source.lines() {
+            let trimmed = line.trim_start();
+            let is_fn = trimmed.starts_with("fn ")
+                || trimmed.starts_with("pub fn ")
+                || trimmed.starts_with("pub(crate) fn ")
+                || trimmed.starts_with("async fn ")
+                || trimmed.starts_with("pub async fn ");
+            if is_fn {
+                check(&current, &body, &mut raw_readers);
+                current = trimmed
+                    .rsplit_once("fn ")
+                    .map(|(_, rest)| rest)
+                    .unwrap_or(trimmed)
+                    .split(['(', '<'])
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                body.clear();
+            }
+            body.push_str(line);
+            body.push('\n');
+        }
+        check(&current, &body, &mut raw_readers);
+
+        assert!(
+            raw_readers.is_empty(),
+            "these read runs straight from the store without deciding \
+             ownership; a listing that answers a wider question than the read \
+             beside it is a way around that read. Filter with \
+             `principal_may_read`:\n  {}",
+            raw_readers.join("\n  ")
         );
     }
 

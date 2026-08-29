@@ -225,6 +225,53 @@ child from `Drop`, so a failing assertion cannot leak a process that would hold
 a port, a home and the instance lock and make the *next* test fail for an
 unrelated reason.
 
+### F-12 — The listing beside the fenced read was not fenced (fixed)
+
+The most serious finding on this branch, reported in review at the
+hosted-green head, and squarely in the class F-0 claimed to have closed.
+
+`list_runs_scoped` took an `AuthContext` and threw it away. It filtered on
+session and workspace — both **shared** — and returned the whole durable
+`RunRecord` for every match. So any credential that could reach a session
+enumerated every run in it, including another principal's, and got back the
+prompt preview, the final response, the terminal result and the absolute
+workspace path. Exact reads were principal-bound; the listing next to them was
+not. A fence that guards `get_run` while `list_runs` answers freely does not
+decide whether an enumeration is possible, only how much work it takes.
+
+The read now makes the same ownership decision the exact reads make, on the
+same value, with the same `principal_may_read`.
+
+**Why the existing guard did not catch it.** F-0 added
+`no_read_reaches_a_run_without_binding_a_principal`, which watched callers of
+`load_authorized_run`. This path never called it — it went to the store
+directly — so it passed a check written for a shape it did not have. The guard
+now also scans method *bodies* for raw `store.list_runs()` reads that do not
+decide ownership, and names the offender.
+
+That widening itself failed the first time, silently: the call is written
+across lines as `self` / `.store` / `.list_runs()`, so a line-wise substring
+search matched nothing and the guard passed while the hole was still open. It
+now matches against a whitespace-stripped body. A guard that cannot fail is
+worth less than no guard, because it is read as evidence.
+
+The behavioural test asserts on **the raw JSON that crosses the boundary**, not
+on a projected view — a field dropped by a client is a field that already left
+the host. `a_second_principal_cannot_enumerate_the_first_principals_runs`
+plants a distinctive needle in `prompt_preview` and `final_response` and looks
+for it in the serialized bytes the second principal receives. Confirmed against
+the original code, which returned the needle, the run id, the client id and the
+absolute workspace path.
+
+**Not fixed here: the record is still the wire shape for its owner.**
+`run_value` serializes the full `RunRecord`, so `ptah_get_run` puts everything
+on the wire for the caller that owns the run. That is not a cross-principal
+disclosure, and the SDK already documents itself as the redaction boundary —
+but a built public projection would be the better shape. It is a contract
+change the Desktop UI consumes (`promptPreview`, `finalResponse` are read
+directly by `RunInspector`), so it belongs with that lane rather than to a
+unilateral narrowing here. Recorded as R13.
+
 ### F-11 — Five holes behind the seal, and one claim that was not true (fixed)
 
 An exact-delta review of the sealing commit found that sealing the *type* had
@@ -560,6 +607,13 @@ widened from 64 to 128 bits — enough is not the same as ample for a value that
 separates principals. `scope_follows_the_credential_and_records_how_it_was_derived`
 pins both consequences so neither is a surprise. **No consumer may read the
 current scope as canonical identity.**
+
+**R13 — Run reads still put the durable record on the wire.** `run_value`
+serializes the full `RunRecord` to its owner, so `prompt_preview`,
+`final_response` and the absolute `workspace` path cross the transport even
+though the SDK projects them away client-side. Cross-principal disclosure is
+closed (F-12); this is the defence-in-depth half. Narrowing it is a contract
+change the Desktop `RunInspector` consumes directly, so it belongs to that lane.
 
 **R11 — `AuthContext` is publicly constructible.** Sealing the receipt store
 does not by itself create a verified principal boundary: `AuthContext` is a
