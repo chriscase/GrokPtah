@@ -62,7 +62,7 @@
 
 ## 2. Structural findings
 
-### F1 — 46 of 129 open PRs fork from 127ffaff78b230dff7334ad692c382b66d1d1287, not from current main.  
+### F1 — 46 of 129 open PRs fork from 127ffaff78b230dff7334ad692c382b66d1d1287, not from current main.
 *Severity: critical*
 
 **Evidence.** git merge-base(head, 67e29bd) == 127ffaff for exactly those 46. Main carries 72 commits after 127ffaff touching 242 files.
@@ -75,35 +75,35 @@ stale-fork set are the same 46 PRs, exactly.
 > plus `CONFLICT (...)` descriptions) as if those lines were conflicted paths, inflating every count ≈3.5×. The
 > counting rule is now stated in §10. The conclusion is unchanged; only the magnitude was wrong.
 
-### F2 — codex/external-worker-hardening-v1 is a 132-commit / 293-file branch that has never had a pull request, yet 15 open PRs are based on it.  
+### F2 — codex/external-worker-hardening-v1 is a 132-commit / 293-file branch that has never had a pull request, yet 15 open PRs are based on it.
 *Severity: critical*
 
 **Evidence.** git ls-remote tip 8ad3be07eb27087acb67704fdf463ecb95b64505; merge-base with main 127ffaff; no ref under refs/pull/*/head resolves to it; not an ancestor of main.
 
 **Consequence.** Those 15 PRs' diffs are measured against unreviewed content. Their GitHub 'files changed' understates what reaching main would introduce.
 
-### F3 — Five open PRs independently define a competing host-authority type; they mutually conflict.  
+### F3 — Five open PRs independently define a competing host-authority type; they mutually conflict.
 *Severity: high*
 
 **Evidence.** #460 and #474 each define AuthEpoch; #470 defines VerifiedPrincipal; #472/#486/#490 define CapabilityGeneration; #489 defines AuthEpoch+PrincipalScope+VerifiedPrincipal; #488 is a second full G1-G4 spine. Pairwise merge-tree: #488x#489 conflict on 7 files, #460x#489 on 8, #486x#488 on 7.
 
 **Consequence.** Exactly the multi-identity-fence hazard issue #477 was opened to prevent. At most one may be promoted whole.
 
-### F4 — Both canonical-spine candidates are red.  
+### F4 — Both canonical-spine candidates are red.
 *Severity: high*
 
 **Evidence.** #489 desktop=failure (mergeable_state unstable); #488 desktop=failure (mergeable_state unstable).
 
 **Consequence.** No authority spine is currently promotable. The green authority-adjacent PRs (#482, #486) are capability-generation only, not the full spine.
 
-### F5 — #416 and #417 are the same commit.  
+### F5 — #416 and #417 are the same commit.
 *Severity: medium*
 
 **Evidence.** Both heads are 33b74ce6a7f4446303adbcb07dddd2913473108f with identical tree 0b7b1b03c0f1. Branches claude/external-worker-gate-4-zj3elc and claude/external-worker-gate-5-prod-surface point at the same object.
 
 **Consequence.** One is redundant. **RESOLVED since this snapshot: #416 was closed on 2026-08-29** (§11).
 
-### F6 — The hosted gate is a single job for most PRs.  
+### F6 — The hosted gate is a single job for most PRs.
 *Severity: medium*
 
 **Evidence.** Of the **33** PRs with observed checks, **30** have exactly one check run named `desktop`. Ten workflows
@@ -112,7 +112,7 @@ agree with §1.)*
 
 **Consequence.** Green CI here is weak evidence; it does not exercise packaged, live-provider, or isolated-VM claims.
 
-### F7 — 20 open PRs cite a commit SHA in their body that is not an ancestor of their current head.  
+### F7 — 20 open PRs cite a commit SHA in their body that is not an ancestor of their current head.
 *Severity: medium*
 
 **Evidence.** Contextual SHA extraction ('head/commit/base/at <sha>'), Actions run-ids excluded, resolved via git rev-parse against the fetched object store.
