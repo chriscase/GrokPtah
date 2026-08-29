@@ -7662,22 +7662,32 @@ impl OrchestrationService {
         // store. This read-only pre-check refuses first; the authoritative
         // `claim_agent_owner` below still runs, so a racing owner change is
         // caught too — but the ordinary refusal now costs nothing.
-        if let Some(agent_id) = self.host.existing_session_agent_id(session_id) {
-            if let Ok(Some(existing)) = self.store.load_agent(&agent_id) {
-                if existing
-                    .owner_principal_id
-                    .as_deref()
-                    .is_some_and(|owner| owner != auth.owner_id())
-                {
-                    return Err(finish_err(
-                        self,
-                        OrchError::new(
-                            OrchErrorCode::ForbiddenScope,
-                            "session Agent is owned by a different service account",
-                        ),
-                    ));
-                }
-            }
+        //
+        // The lookup goes through the durable store rather than the host: this
+        // path is also reached from the in-process native executor, which can
+        // already hold the host's state lock, and `parking_lot` mutexes are not
+        // re-entrant — taking it again here would wedge the task holding it and
+        // with it the host's instance lock.
+        let foreign_owner = self
+            .store
+            .list_agents()
+            .unwrap_or_default()
+            .into_iter()
+            .any(|agent| {
+                agent.session_id == session_id
+                    && agent
+                        .owner_principal_id
+                        .as_deref()
+                        .is_some_and(|owner| owner != auth.owner_id())
+            });
+        if foreign_owner {
+            return Err(finish_err(
+                self,
+                OrchError::new(
+                    OrchErrorCode::ForbiddenScope,
+                    "session Agent is owned by a different service account",
+                ),
+            ));
         }
 
         let mut lease = match self

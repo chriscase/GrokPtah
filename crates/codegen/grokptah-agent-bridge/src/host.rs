@@ -1243,20 +1243,6 @@ impl AgentHostHandle {
     /// Return or create the durable agent identity for a Build session. The
     /// session owns the binding, while the orchestration store owns lifecycle
     /// state; this keeps transport adapters from inventing identity.
-    /// The durable Agent id this session already has, without creating one.
-    ///
-    /// `ensure_session_agent` creates the Agent as a side effect, so an
-    /// ownership check that ran through it would already have mutated the store
-    /// before it could refuse. This read-only lookup exists so admission can
-    /// happen first (#477).
-    pub(crate) fn existing_session_agent_id(&self, session_id: Uuid) -> Option<String> {
-        self.inner
-            .lock()
-            .sessions
-            .get(&session_id)
-            .and_then(|session| session.agent_id.clone())
-    }
-
     pub fn ensure_session_agent(&self, session_id: Uuid) -> Result<AgentRecord> {
         let (cwd, model, kind, existing_id, authority, default_bounds) = {
             let g = self.inner.lock();
