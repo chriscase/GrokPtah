@@ -210,7 +210,7 @@ impl AuditLedger {
         // Take the barrier *before* the completeness checks. Checking first let
         // an intent open in the check-to-lock window, and the export would then
         // claim a completeness that was no longer true.
-        let mut tx = self.structural_tx();
+        let mut tx = self.structural_tx()?;
         if let Some(poison) = tx.poisoned() {
             return Err(AuditError::Poisoned(poison));
         }

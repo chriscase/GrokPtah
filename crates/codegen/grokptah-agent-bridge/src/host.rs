@@ -12595,13 +12595,20 @@ fn audit_key_custody(orchestration_root: &std::path::Path) -> AuditKeyCustody {
         };
     }
     // Packaged desktop, opt-in: the OS keychain.
+    //
+    // Explicit means explicit. This used to warn and fall back to the private
+    // key file, which is the wrong shape for a custody choice: an operator who
+    // asked for keychain custody would silently get file custody instead, and
+    // the fallback *creates* a local key — so the very outcome the choice was
+    // meant to avoid happens quietly on first run. Every other custody mode
+    // here fails closed on missing material; this one now does too.
     if std::env::var(KEYCHAIN_ENV).is_ok_and(|value| value == "1") {
-        if let Some(material) = crate::auth_store::audit_chain_key() {
-            return AuditKeyCustody::Provided(material);
-        }
-        // Refusing here would take the host down over a keychain that merely
-        // declined; the private file is still an authenticated ledger.
-        eprintln!("[grokptah] audit keychain custody unavailable; using the private key file");
+        return match crate::auth_store::audit_chain_key() {
+            Some(material) => AuditKeyCustody::Provided(material),
+            // An empty `Provided` fails closed inside the ledger with
+            // `key_unavailable`, and creates nothing on disk.
+            None => AuditKeyCustody::Provided(Vec::new()),
+        };
     }
     AuditKeyCustody::local_file_for(orchestration_root)
 }

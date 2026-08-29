@@ -17,7 +17,86 @@ use super::documents::*;
 use super::files;
 use super::keys::sha256_hex;
 use super::ledger::{AuditEntryInput, AuditLedger, CrashPoint};
-use super::{AuditError, AuditResult, PoisonReason, RefuseReason};
+use super::{AuditError, PoisonReason, RefuseReason};
+
+/// How far a retention transaction got, from the caller's point of view.
+///
+/// T3 — the tombstone commit — is the effect boundary. A bare `Err` on either
+/// side of it looks identical to a caller, which is exactly the thing an audit
+/// authority must not do: "nothing was deleted" and "the deletion is committed
+/// and may be half-applied" are different facts and demand different responses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetentionPhase {
+    /// The tombstone was never committed. The generation is untouched, and a
+    /// retry is a fresh attempt rather than a resumption.
+    NotCommitted,
+    /// The tombstone is committed and the bytes are gone.
+    Committed,
+    /// The tombstone is committed; whether the bytes are gone is unknown.
+    /// The deletion is authorized and permanent either way. The next open
+    /// resumes it, and a retry converges rather than deleting twice.
+    Uncertain,
+}
+
+impl RetentionPhase {
+    /// Stable, secret-free operator code.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::NotCommitted => "not_committed",
+            Self::Committed => "committed",
+            Self::Uncertain => "uncertain",
+        }
+    }
+}
+
+impl std::fmt::Display for RetentionPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A failed retention, carrying the phase it failed in.
+#[derive(Debug)]
+pub struct RetentionFailure {
+    pub phase: RetentionPhase,
+    pub source: AuditError,
+}
+
+impl RetentionFailure {
+    fn not_committed(source: AuditError) -> Self {
+        Self {
+            phase: RetentionPhase::NotCommitted,
+            source,
+        }
+    }
+
+    /// After T3 nothing can restore the range: the tombstone is committed and
+    /// the removal is authorized, so every later failure is `Uncertain`, never
+    /// a plain error the caller might read as "no effect".
+    fn uncertain(source: AuditError) -> Self {
+        Self {
+            phase: RetentionPhase::Uncertain,
+            source,
+        }
+    }
+
+    /// Stable, secret-free operator code for the underlying failure.
+    pub fn code(&self) -> &'static str {
+        self.source.code()
+    }
+}
+
+impl std::fmt::Display for RetentionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "retention {}: {}", self.phase, self.source.code())
+    }
+}
+
+impl std::error::Error for RetentionFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
 
 /// What entitles this deletion. There is no third option and no default:
 /// every call must say which one it is relying on.
@@ -72,6 +151,10 @@ impl RetentionRequest {
 
 #[derive(Debug, Clone)]
 pub struct RetentionReceipt {
+    /// Always [`RetentionPhase::Committed`] on the success path. Present so a
+    /// caller can log one field rather than inferring the phase from the
+    /// shape of the result.
+    pub phase: RetentionPhase,
     pub generation_id: String,
     pub first_seq: u64,
     pub last_seq: u64,
@@ -92,58 +175,86 @@ impl AuditLedger {
     /// Taking a manifest snapshot, verifying, then committing a manifest built
     /// from that snapshot let a rotation commit in between and be silently
     /// overwritten — dropping a committed generation and regressing the epoch.
-    pub fn retain(&self, request: RetentionRequest) -> AuditResult<RetentionReceipt> {
-        let mut tx = self.structural_tx();
+    pub fn retain(&self, request: RetentionRequest) -> Result<RetentionReceipt, RetentionFailure> {
+        let mut tx = self
+            .structural_tx()
+            .map_err(RetentionFailure::not_committed)?;
         if let Some(poison) = tx.poisoned() {
-            return Err(AuditError::Poisoned(poison));
+            return Err(RetentionFailure::not_committed(AuditError::Poisoned(
+                poison,
+            )));
         }
         let manifest = tx.manifest_clone();
         let descriptor = manifest
             .generation(&request.generation_id)
-            .ok_or(AuditError::Refused(RefuseReason::GenerationUnknown))?
+            .ok_or_else(|| {
+                RetentionFailure::not_committed(AuditError::Refused(
+                    RefuseReason::GenerationUnknown,
+                ))
+            })?
             .clone();
 
         // T0 preconditions.
         if descriptor.generation_id == manifest.active_generation_id {
-            return Err(AuditError::Refused(RefuseReason::GenerationIsActive));
+            return Err(RetentionFailure::not_committed(AuditError::Refused(
+                RefuseReason::GenerationIsActive,
+            )));
         }
         match descriptor.state {
             GenerationState::Active => {
-                return Err(AuditError::Refused(RefuseReason::GenerationIsActive))
+                return Err(RetentionFailure::not_committed(AuditError::Refused(
+                    RefuseReason::GenerationIsActive,
+                )))
             }
             GenerationState::Tombstoned => {
-                return Err(AuditError::Refused(RefuseReason::GenerationTombstoned))
+                return Err(RetentionFailure::not_committed(AuditError::Refused(
+                    RefuseReason::GenerationTombstoned,
+                )))
             }
             GenerationState::Sealed => {}
         }
-        let active = manifest.active()?;
+        let active = manifest.active().map_err(RetentionFailure::not_committed)?;
         if descriptor.index >= active.index {
-            return Err(AuditError::Refused(RefuseReason::GenerationIsActive));
+            return Err(RetentionFailure::not_committed(AuditError::Refused(
+                RefuseReason::GenerationIsActive,
+            )));
         }
         // T1: verify completely before promising anything about these bytes.
         let journal = Self::journal_path(self.root(), &descriptor.generation_id);
-        let bytes = files::read_bytes(&journal)?;
+        let bytes = files::read_bytes(&journal).map_err(RetentionFailure::not_committed)?;
         let journal_sha256 = sha256_hex(&bytes);
         if descriptor.journal_sha256.as_deref() != Some(journal_sha256.as_str()) {
-            return Err(AuditError::Poisoned(PoisonReason::SealedGenerationChanged));
+            return Err(RetentionFailure::not_committed(AuditError::Poisoned(
+                PoisonReason::SealedGenerationChanged,
+            )));
         }
-        let verification = tx.verify_generation(&descriptor.generation_id)?;
+        let verification = tx
+            .verify_generation(&descriptor.generation_id)
+            .map_err(RetentionFailure::not_committed)?;
         if verification.last_seq != descriptor.last_seq
             || verification.final_tag.as_str()
                 != descriptor.final_tag.as_deref().unwrap_or_default()
         {
-            return Err(AuditError::Poisoned(PoisonReason::SealedGenerationChanged));
+            return Err(RetentionFailure::not_committed(AuditError::Poisoned(
+                PoisonReason::SealedGenerationChanged,
+            )));
         }
         // The successor must still chain over the range about to become a hole.
         let successor = manifest
             .generations
             .iter()
             .find(|g| g.index == descriptor.index.saturating_add(1))
-            .ok_or(AuditError::Poisoned(PoisonReason::ChainDiscontinuity))?;
+            .ok_or_else(|| {
+                RetentionFailure::not_committed(AuditError::Poisoned(
+                    PoisonReason::ChainDiscontinuity,
+                ))
+            })?;
         if successor.chain_base.as_str() != verification.final_tag.as_str()
             || successor.first_seq != descriptor.last_seq.saturating_add(1)
         {
-            return Err(AuditError::Poisoned(PoisonReason::ChainDiscontinuity));
+            return Err(RetentionFailure::not_committed(AuditError::Poisoned(
+                PoisonReason::ChainDiscontinuity,
+            )));
         }
 
         // T1b: establish the authority *after* verifying, so a seal is matched
@@ -155,7 +266,11 @@ impl AuditLedger {
                     .seals
                     .iter()
                     .find(|seal| &seal.seal_id == seal_id)
-                    .ok_or(AuditError::Refused(RefuseReason::ExportSealUnknown))?;
+                    .ok_or_else(|| {
+                        RetentionFailure::not_committed(AuditError::Refused(
+                            RefuseReason::ExportSealUnknown,
+                        ))
+                    })?;
                 // Carrying the *range* is the claim. A seal whose coverage
                 // withheld or holed this generation proves nothing about it,
                 // and `carried` never records those elements at all.
@@ -163,7 +278,11 @@ impl AuditLedger {
                     .carried
                     .iter()
                     .find(|range| range.generation_id == descriptor.generation_id)
-                    .ok_or(AuditError::Refused(RefuseReason::ExportSealDoesNotCover))?;
+                    .ok_or_else(|| {
+                        RetentionFailure::not_committed(AuditError::Refused(
+                            RefuseReason::ExportSealDoesNotCover,
+                        ))
+                    })?;
                 if carried.first_seq != descriptor.first_seq
                     || carried.last_seq != verification.last_seq
                     || carried.final_tag != verification.final_tag
@@ -172,7 +291,9 @@ impl AuditLedger {
                 {
                     // The bytes changed since the export, so the export is not
                     // a copy of what is about to be deleted.
-                    return Err(AuditError::Refused(RefuseReason::ExportSealDoesNotCover));
+                    return Err(RetentionFailure::not_committed(AuditError::Refused(
+                        RefuseReason::ExportSealDoesNotCover,
+                    )));
                 }
                 Some(seal_id.clone())
             }
@@ -190,7 +311,8 @@ impl AuditLedger {
             .with_producer(&descriptor.generation_id)
             .with_scope(&descriptor.generation_id),
             None,
-        )?;
+        )
+        .map_err(RetentionFailure::not_committed)?;
 
         // T3: commit the tombstone. Bytes are still on disk after this returns.
         let mut manifest = tx.manifest_clone();
@@ -198,18 +320,20 @@ impl AuditLedger {
         // tombstone: never spent without the deletion, never deleted with the
         // grant still spendable.
         let consumed = match &request.basis {
-            RetentionBasis::Grant(grant) => Some(tx.stage_authority(
-                &mut manifest,
-                grant,
-                AuditCapability::RetainUnexported,
-                &descriptor.generation_id,
-            )?),
+            RetentionBasis::Grant(grant) => Some(
+                tx.stage_authority(
+                    &mut manifest,
+                    grant,
+                    AuditCapability::RetainUnexported,
+                    &descriptor.generation_id,
+                )
+                .map_err(RetentionFailure::not_committed)?,
+            ),
             RetentionBasis::ExportedUnder { .. } => None,
         };
-        manifest.retention_epoch = manifest
-            .retention_epoch
-            .checked_add(1)
-            .ok_or(AuditError::Poisoned(PoisonReason::SequenceExhausted))?;
+        manifest.retention_epoch = manifest.retention_epoch.checked_add(1).ok_or_else(|| {
+            RetentionFailure::not_committed(AuditError::Poisoned(PoisonReason::SequenceExhausted))
+        })?;
         let retention_epoch = manifest.retention_epoch;
         let now = Utc::now();
         manifest.tombstones.push(Tombstone {
@@ -235,21 +359,33 @@ impl AuditLedger {
         {
             let target = manifest
                 .generation_mut(&descriptor.generation_id)
-                .ok_or(AuditError::Poisoned(PoisonReason::ActiveGenerationInvalid))?;
+                .ok_or_else(|| {
+                    RetentionFailure::not_committed(AuditError::Poisoned(
+                        PoisonReason::ActiveGenerationInvalid,
+                    ))
+                })?;
             target.state = GenerationState::Tombstoned;
             target.tombstoned_at = Some(now);
         }
-        tx.commit_manifest(manifest)?;
-        tx.cut(CrashPoint::T3Committed)?;
+        // The effect boundary. Before this line nothing has happened; after
+        // it the deletion is authorized and permanent, so no later failure may
+        // present itself as "no effect".
+        tx.commit_manifest(manifest)
+            .map_err(RetentionFailure::not_committed)?;
+        tx.cut(CrashPoint::T3Committed)
+            .map_err(RetentionFailure::uncertain)?;
 
         // T4: remove the bytes the committed manifest authorized removing.
         let dir = Self::generation_dir(self.root(), &descriptor.generation_id);
         if dir.exists() {
-            std::fs::remove_dir_all(&dir)
-                .map_err(|error| AuditError::Io(format!("retention removal: {error}")))?;
-            files::fsync_dir(&self.root().join("generations"))?;
+            std::fs::remove_dir_all(&dir).map_err(|error| {
+                RetentionFailure::uncertain(AuditError::Io(format!("retention removal: {error}")))
+            })?;
+            files::fsync_dir(&self.root().join("generations"))
+                .map_err(RetentionFailure::uncertain)?;
         }
-        tx.cut(CrashPoint::T4Removed)?;
+        tx.cut(CrashPoint::T4Removed)
+            .map_err(RetentionFailure::uncertain)?;
 
         // T5: mark the removal complete.
         let mut manifest = tx.manifest_clone();
@@ -260,7 +396,8 @@ impl AuditLedger {
         {
             tombstone.removed_at = Some(Utc::now());
         }
-        tx.commit_manifest(manifest)?;
+        tx.commit_manifest(manifest)
+            .map_err(RetentionFailure::uncertain)?;
 
         // T6: pair the intent so open intents return to zero.
         tx.append(
@@ -273,9 +410,11 @@ impl AuditLedger {
             .with_producer(&descriptor.generation_id)
             .with_scope(&descriptor.generation_id),
             None,
-        )?;
+        )
+        .map_err(RetentionFailure::uncertain)?;
 
         Ok(RetentionReceipt {
+            phase: RetentionPhase::Committed,
             generation_id: descriptor.generation_id,
             first_seq: descriptor.first_seq,
             last_seq: descriptor.last_seq,

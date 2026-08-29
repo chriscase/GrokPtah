@@ -15,8 +15,8 @@ use uuid::Uuid;
 use crate::audit::{
     AuditAuthorityProvider, AuditCapability, AuditEntryInput, AuditKeyCustody, AuditLedger,
     AuditLedgerOptions, AuditStatus, AuditWitness, AuthorityGrant, EntryOutcome, EntryPhase,
-    EntryReason, ExportFormat, ExportReceipt, GenerationVerification, RetentionReceipt,
-    RetentionRequest, RotationReason,
+    EntryReason, ExportFormat, ExportReceipt, GenerationVerification, RetentionFailure,
+    RetentionReceipt, RetentionRequest, RotationReason,
 };
 
 use super::audit_bridge;
@@ -5229,11 +5229,12 @@ impl OrchStore {
     pub fn retain_audit_generation(
         &self,
         request: RetentionRequest,
-    ) -> anyhow::Result<RetentionReceipt> {
-        self.inner
-            .audit
-            .retain(request)
-            .map_err(|error| anyhow::anyhow!("audit retention: {}", error.code()))
+    ) -> Result<RetentionReceipt, RetentionFailure> {
+        // The failure is returned whole rather than flattened into an
+        // `anyhow` string: a caller must be able to tell "nothing was
+        // deleted" from "the deletion is committed and may be half applied",
+        // and a message cannot be branched on.
+        self.inner.audit.retain(request)
     }
 
     pub fn last_run_error(&self) -> Option<String> {

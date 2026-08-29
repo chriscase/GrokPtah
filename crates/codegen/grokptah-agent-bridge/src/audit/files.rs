@@ -10,7 +10,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use super::{AuditError, AuditResult};
+use super::{AuditError, AuditResult, PoisonReason};
 
 /// Temporary sibling used by [`atomic_write`].
 ///
@@ -152,4 +152,18 @@ pub(crate) fn size_and_digest(path: &Path) -> AuditResult<(u64, String)> {
     }
     let digest: [u8; 32] = hasher.finalize().into();
     Ok((total, super::keys::hex32(&digest)))
+}
+
+/// Reject a symlink at `path`, but tolerate the path not existing yet.
+///
+/// Used for lock files, which are created on first use.
+pub(crate) fn reject_symlink_if_present(path: &Path) -> AuditResult<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err(AuditError::Poisoned(PoisonReason::SymlinkedPath))
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(AuditError::Io(format!("lock path metadata: {error}"))),
+    }
 }

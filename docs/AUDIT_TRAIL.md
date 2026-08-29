@@ -160,6 +160,24 @@ closed rather than degrading to an unauthenticated ledger:
 Errors carry only a stable code (`key_unavailable`, `manifest_mac_mismatch`).
 No key path and no key bytes appear in any error, receipt, or health field.
 
+## Cross-process exclusion
+
+The manifest compare-and-swap is load, compare, atomic-rename — three steps,
+not one — so an in-process mutex alone left a window where two handles on one
+root could each read epoch N and each commit N+1. Every structural transaction
+now also holds an advisory exclusive lock on `structural.lock` in the ledger
+root, taken *between* the in-process mutex and the inner state lock so a waiter
+never holds `inner` while it blocks.
+
+`open` takes the same lock across recovery. Recovery is a mutating pass — it
+trims torn tails, resumes authorized removals, rewrites anchors and appends
+records — and running it unlocked let a ledger opened mid-rotation observe a
+generation directory the manifest did not yet name, or a journal still being
+written. That was the "raw ledger construction bypasses store locking" hole.
+
+This is exclusion between *ledger handles*, which is what the manifest CAS
+needed. It does not replace the `OrchStore` home lock.
+
 ## Concurrency
 
 Three separate mechanisms, because they defend against three different things.
@@ -210,6 +228,30 @@ The target is verified completely first — you may not tombstone evidence you
 cannot currently vouch for.
 
 `T1 verify → T2 intent → T3 commit tombstone → T4 remove bytes → T5 mark removed → T6 outcome`
+
+### The caller always learns which side of T3 it is on
+
+`retain` returns `Result<RetentionReceipt, RetentionFailure>`, and the failure
+carries a **phase**:
+
+| Phase | Meaning |
+| --- | --- |
+| `not_committed` | The tombstone was never committed. The generation is untouched; a retry is a fresh attempt. |
+| `committed` | The tombstone is committed and the bytes are gone. |
+| `uncertain` | The tombstone is committed; whether the bytes are gone is unknown. The deletion is authorized and permanent either way. |
+
+A bare `Err` on either side of T3 looks identical to a caller, which is exactly
+the thing an audit authority must not do: "nothing was deleted" and "the
+deletion is committed and may be half applied" are different facts that demand
+different responses. Every failure after the T3 commit is `uncertain`, never a
+plain error a caller might read as "no effect".
+
+Recovery converges from **both** sides of T4. Resume work is selected on
+`removedAt` alone, not on the generation directory still existing: a crash
+between removing the bytes and recording that removal leaves the directory gone
+and `removedAt` unset, and keying off the directory skipped exactly that case —
+so the tombstone read "committed but not removed" forever, a false statement
+about a completed deletion that `uncertain` could never resolve out of.
 
 T3 is the commit. A crash after it leaves a committed tombstone with the bytes
 still present; the next open resumes the removal, which is the only authorized

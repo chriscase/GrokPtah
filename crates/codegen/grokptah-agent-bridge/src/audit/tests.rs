@@ -17,7 +17,7 @@ use super::authority::{AuditCapability, AuthorityGrant, AuthoritySource, LocalOp
 use super::documents::*;
 use super::export::{verify_export, ExportFormat};
 use super::ledger::{AuditEntryInput, AuditLedger, AuditLedgerOptions, CrashPoint};
-use super::retention::RetentionRequest;
+use super::retention::{RetentionFailure, RetentionPhase, RetentionRequest};
 use super::witness::{AuditWitness, WitnessBeacon, WitnessState, WitnessVerdict};
 use super::{AuditError, AuditKeys, AuditResult, PoisonReason, RefuseReason};
 
@@ -101,6 +101,25 @@ fn raw_export_grant(ledger: &AuditLedger) -> AuthorityGrant {
             super::authority::PRIVILEGED_RAW_EXPORT_SUBJECT,
         )
         .expect("operator grant")
+}
+
+/// Unwrap a retention refusal, asserting nothing was committed.
+///
+/// Stronger than the plain refusal helper: it also pins the phase, so a
+/// refusal can never silently start reporting that it deleted something.
+fn retention_refusal(error: RetentionFailure) -> RefuseReason {
+    assert_eq!(
+        error.phase,
+        RetentionPhase::NotCommitted,
+        "a refused retention must report that nothing was committed"
+    );
+    refusal_of(error.source)
+}
+
+/// Unwrap a retention poison, asserting nothing was committed.
+fn retention_poison(error: RetentionFailure) -> PoisonReason {
+    assert_eq!(error.phase, RetentionPhase::NotCommitted);
+    poison_of(error.source)
 }
 
 fn journal_of(root: &Path, generation: &str) -> PathBuf {
@@ -562,7 +581,7 @@ fn retention_refuses_the_active_generation() {
     let error = ledger
         .retain(RetentionRequest::exported_under("g-000001", "seal-x"))
         .unwrap_err();
-    assert_eq!(refusal_of(error), RefuseReason::GenerationIsActive);
+    assert_eq!(retention_refusal(error), RefuseReason::GenerationIsActive);
 }
 
 #[test]
@@ -573,7 +592,7 @@ fn retention_refuses_a_seal_this_ledger_never_issued() {
     // A caller-supplied seal id is a lookup key, never a claim. Before the
     // registry existed, any non-empty string was accepted as proof of export.
     assert_eq!(
-        refusal_of(
+        retention_refusal(
             ledger
                 .retain(RetentionRequest::exported_under(
                     "g-000001",
@@ -748,7 +767,10 @@ fn retention_refuses_a_sealed_generation_whose_bytes_changed() {
             retain_grant(&ledger, "g-000001"),
         ))
         .unwrap_err();
-    assert_eq!(poison_of(error), PoisonReason::SealedGenerationChanged);
+    assert_eq!(
+        retention_poison(error),
+        PoisonReason::SealedGenerationChanged
+    );
     assert!(
         AuditLedger::generation_dir(dir.path(), "g-000001").exists(),
         "a refused retention never removes bytes"
@@ -1773,7 +1795,7 @@ fn retention_refuses_a_seal_whose_export_withheld_the_range() {
         .unwrap();
     assert!(receipt.withheld >= 1);
     assert_eq!(
-        refusal_of(
+        retention_refusal(
             ledger
                 .retain(RetentionRequest::exported_under(
                     "g-000001",
@@ -1804,7 +1826,7 @@ fn retention_accepts_only_the_exact_range_a_seal_carried() {
     ledger.append(entry("third.generation")).unwrap();
 
     assert_eq!(
-        refusal_of(
+        retention_refusal(
             ledger
                 .retain(RetentionRequest::exported_under("g-000002", &seal.seal_id))
                 .unwrap_err()
@@ -1887,7 +1909,7 @@ fn a_forged_grant_is_refused() {
     let forged: AuthorityGrant =
         serde_json::from_value(json_with_mac(&grant, "0".repeat(64))).unwrap();
     assert_eq!(
-        refusal_of(
+        retention_refusal(
             ledger
                 .retain(RetentionRequest::under_grant("g-000001", forged))
                 .unwrap_err()
@@ -1941,7 +1963,7 @@ fn a_grant_is_bound_to_the_generation_it_names() {
 
     let grant = retain_grant(&ledger, "g-000001");
     assert_eq!(
-        refusal_of(
+        retention_refusal(
             ledger
                 .retain(RetentionRequest::under_grant("g-000002", grant))
                 .unwrap_err()
@@ -2024,7 +2046,7 @@ fn a_grant_from_another_installation_is_refused() {
         .issue_authority(AuditCapability::RetainUnexported, "g-000001")
         .unwrap();
     assert_eq!(
-        refusal_of(
+        retention_refusal(
             ledger
                 .retain(RetentionRequest::under_grant("g-000001", stolen))
                 .unwrap_err()
@@ -2377,4 +2399,166 @@ fn the_reported_loss_bound_covers_the_entry_in_the_writers_hand() {
         .and_then(|gap| gap.max_lost_entries)
         .expect("a bounded gap");
     assert_eq!(bound, 257);
+}
+
+// ------------------------------------------- retention commit phase (P0)
+
+#[test]
+fn a_retention_that_fails_after_the_tombstone_reports_uncertain_not_failure() {
+    let dir = TempDir::new().unwrap();
+    let ledger = fresh_with_operator(dir.path()).with_crash_at(CrashPoint::T4Removed);
+    ledger.rotate(RotationReason::Operator).unwrap();
+    ledger.append(entry("after")).unwrap();
+    let grant = retain_grant(&ledger, "g-000001");
+
+    // The cut lands after the tombstone is committed. A bare `Err` here would
+    // be indistinguishable from "nothing was deleted", which is precisely the
+    // fact an audit authority must not blur.
+    let failure = ledger
+        .retain(RetentionRequest::under_grant("g-000001", grant))
+        .unwrap_err();
+    assert_eq!(failure.phase, RetentionPhase::Uncertain);
+
+    // And the claim is true: the tombstone really is committed.
+    let manifest = ledger.manifest_snapshot();
+    assert_eq!(manifest.tombstones.len(), 1);
+    assert_eq!(manifest.retention_epoch, 1);
+}
+
+#[test]
+fn an_interrupted_retention_converges_on_the_next_open() {
+    let dir = TempDir::new().unwrap();
+    {
+        let ledger = fresh_with_operator(dir.path()).with_crash_at(CrashPoint::T4Removed);
+        ledger.rotate(RotationReason::Operator).unwrap();
+        ledger.append(entry("after")).unwrap();
+        let grant = retain_grant(&ledger, "g-000001");
+        assert_eq!(
+            ledger
+                .retain(RetentionRequest::under_grant("g-000001", grant))
+                .unwrap_err()
+                .phase,
+            RetentionPhase::Uncertain
+        );
+    }
+
+    // Restart resumes the authorized removal and records that it finished, so
+    // the uncertainty the caller was handed actually resolves.
+    let ledger = operator_ledger(dir.path());
+    assert_eq!(ledger.status().recovery.resumed_removals, vec!["g-000001"]);
+    let tombstone = ledger.manifest_snapshot().tombstones[0].clone();
+    assert!(
+        tombstone.removed_at.is_some(),
+        "the removal must be recorded"
+    );
+    assert!(!AuditLedger::generation_dir(dir.path(), "g-000001").exists());
+    ledger.verify_all().unwrap();
+}
+
+#[test]
+fn a_removal_that_finished_without_being_recorded_still_converges() {
+    let dir = TempDir::new().unwrap();
+    {
+        let ledger = fresh_with_operator(dir.path()).with_crash_at(CrashPoint::T4Removed);
+        ledger.rotate(RotationReason::Operator).unwrap();
+        ledger.append(entry("after")).unwrap();
+        let grant = retain_grant(&ledger, "g-000001");
+        let _ = ledger.retain(RetentionRequest::under_grant("g-000001", grant));
+        // Simulate the crash landing *after* the bytes went but before the
+        // removal was recorded. Selecting resume work by "the directory still
+        // exists" skipped exactly this case, leaving `removedAt` unset forever
+        // — a false statement about a completed deletion.
+        let dir_path = AuditLedger::generation_dir(dir.path(), "g-000001");
+        if dir_path.exists() {
+            std::fs::remove_dir_all(&dir_path).unwrap();
+        }
+    }
+    let ledger = operator_ledger(dir.path());
+    assert!(ledger.manifest_snapshot().tombstones[0]
+        .removed_at
+        .is_some());
+    ledger.verify_all().unwrap();
+}
+
+#[test]
+fn a_refused_retention_reports_that_nothing_was_committed() {
+    let dir = TempDir::new().unwrap();
+    let ledger = fresh(dir.path());
+    ledger.rotate(RotationReason::Operator).unwrap();
+    let failure = ledger
+        .retain(RetentionRequest::exported_under(
+            "g-000001",
+            "seal-never-issued",
+        ))
+        .unwrap_err();
+    assert_eq!(failure.phase, RetentionPhase::NotCommitted);
+    assert_eq!(failure.code(), "export_seal_unknown");
+    assert!(ledger.manifest_snapshot().tombstones.is_empty());
+}
+
+// --------------------------------- cross-process structural exclusion (P0)
+
+#[test]
+fn a_second_ledger_on_one_root_cannot_commit_inside_another_transaction() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let dir = TempDir::new().unwrap();
+    let seed = fresh(dir.path());
+    seed.rotate(RotationReason::Operator).unwrap();
+    seed.append(entry("second")).unwrap();
+    drop(seed);
+
+    // Two independent ledger handles on one root, exactly as two processes
+    // would have. Both are opened up front so this measures the structural
+    // lock alone, not open-versus-rotate.
+    let peer = Arc::new(AuditLedger::open(dir.path(), keys()).unwrap());
+
+    // The manifest compare-and-swap is load / compare / atomic-rename -- three
+    // steps, not one -- so without a cross-process lock both handles could read
+    // epoch N and both commit N+1.
+    let peer_committed = Arc::new(AtomicBool::new(false));
+    let handle_slot: Arc<Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
+    let spawned = Arc::new(AtomicBool::new(false));
+
+    let flag = Arc::clone(&peer_committed);
+    let slot = Arc::clone(&handle_slot);
+    let once = Arc::clone(&spawned);
+    let observer = Arc::new(move |_: &AuditLedger| {
+        if once.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let peer = Arc::clone(&peer);
+        let done = Arc::clone(&flag);
+        // Spawned, never joined here: it blocks on the lock precisely because
+        // this transaction holds it, so joining inside the barrier would
+        // deadlock the test rather than prove anything.
+        *slot.lock() = Some(std::thread::spawn(move || {
+            let _ = peer.rotate(RotationReason::Operator);
+            done.store(true, Ordering::SeqCst);
+        }));
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "a peer committed while this transaction held the barrier"
+        );
+    });
+
+    let observed = AuditLedger::open(dir.path(), keys())
+        .unwrap()
+        .with_structural_observer(observer);
+    observed.rotate(RotationReason::Operator).unwrap();
+    if let Some(handle) = handle_slot.lock().take() {
+        handle.join().unwrap();
+    }
+
+    // Whichever order the two commits landed in, the generations still tile the
+    // sequence space contiguously: no epoch was overwritten, no generation
+    // dropped, and every sealed journal still matches its recorded digest.
+    let reopened = opened(dir.path());
+    let manifest = reopened.manifest_snapshot();
+    let mut expected = 1u64;
+    for generation in &manifest.generations {
+        assert_eq!(generation.first_seq, expected, "a generation was dropped");
+        expected = generation.last_seq + 1;
+    }
+    reopened.verify_all().unwrap();
 }

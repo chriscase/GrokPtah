@@ -77,7 +77,9 @@ pub use ledger::{
     AuditEntryInput, AuditLedger, AuditLedgerOptions, AuditStatus, GenerationVerification,
     RecoverySummary,
 };
-pub use retention::{RetentionReceipt, RetentionRequest};
+pub use retention::{
+    RetentionBasis, RetentionFailure, RetentionPhase, RetentionReceipt, RetentionRequest,
+};
 pub use witness::{AuditWitness, UnwitnessedBoundary, WitnessBeacon, WitnessState, WitnessVerdict};
 
 pub type AuditResult<T> = Result<T, AuditError>;

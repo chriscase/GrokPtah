@@ -234,6 +234,12 @@ pub(crate) struct StructuralTx<'a> {
     ledger: &'a AuditLedger,
     guard: parking_lot::MutexGuard<'a, Inner>,
     _structural: parking_lot::MutexGuard<'a, ()>,
+    /// Advisory exclusive lock on the ledger root, released with the
+    /// transaction. The in-process mutex above cannot serialise a *second
+    /// process*, and the manifest compare-and-swap is load / compare /
+    /// atomic-rename — three steps, not one — so two processes could each
+    /// read epoch N and each commit N+1. This is what closes that window.
+    _file: std::fs::File,
 }
 
 impl<'a> StructuralTx<'a> {
@@ -447,7 +453,17 @@ impl AuditLedger {
             #[cfg(test)]
             on_structural_barrier: None,
         };
-        ledger.recover()?;
+        // Recovery is a *mutating* pass: it trims torn tails, resumes
+        // authorized removals, rewrites anchors and appends records. Running
+        // it unlocked let a ledger opened while another process was mid
+        // rotation observe a generation directory the manifest did not yet
+        // name, or a journal still being written — which is the "raw ledger
+        // construction bypasses normal store locking" hole. It takes the same
+        // cross-process lock every structural transaction takes.
+        {
+            let _structural = ledger.lock_structural()?;
+            ledger.recover()?;
+        }
         Ok(ledger)
     }
 
@@ -484,9 +500,36 @@ impl AuditLedger {
         self.inner.try_lock().is_some()
     }
 
+    /// Path of the cross-process structural lock.
+    fn structural_lock_path(root: &Path) -> PathBuf {
+        root.join("structural.lock")
+    }
+
+    /// Acquire the cross-process structural lock.
+    ///
+    /// Taken *between* the in-process mutex and the inner state lock, so a
+    /// process waiting on a peer never holds `inner` while it waits.
+    fn lock_structural(&self) -> AuditResult<std::fs::File> {
+        use fs2::FileExt;
+
+        let path = Self::structural_lock_path(&self.root);
+        files::reject_symlink_if_present(&path)?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|error| AuditError::Io(format!("structural lock open: {error}")))?;
+        file.lock_exclusive()
+            .map_err(|error| AuditError::Io(format!("structural lock: {error}")))?;
+        Ok(file)
+    }
+
     /// Begin a structural mutation transaction.
-    pub(crate) fn structural_tx(&self) -> StructuralTx<'_> {
+    pub(crate) fn structural_tx(&self) -> AuditResult<StructuralTx<'_>> {
         let structural = self.structural.lock();
+        let file = self.lock_structural()?;
         let guard = self.inner.lock();
         #[cfg(test)]
         if let Some(observer) = self.on_structural_barrier.clone() {
@@ -494,11 +537,12 @@ impl AuditLedger {
             // test is a statement about the lock, not about timing.
             observer(self);
         }
-        StructuralTx {
+        Ok(StructuralTx {
             ledger: self,
             guard,
             _structural: structural,
-        }
+            _file: file,
+        })
     }
 
     #[cfg(test)]
@@ -1000,22 +1044,31 @@ impl AuditLedger {
     fn recover(&self) -> AuditResult<()> {
         let mut guard = self.inner.lock();
 
-        // Interrupted retention removal (crash cut T3): the committed manifest
-        // is the authorization, so resuming is the only legal deletion path.
+        // Interrupted retention removal (crash cut T3 or T4): the committed
+        // manifest is the authorization, so resuming is the only legal
+        // deletion path.
+        //
+        // Selection is on `removed_at` alone, not on the directory still being
+        // there. A crash between removing the bytes and recording that removal
+        // leaves the directory gone and `removedAt` unset; keying off the
+        // directory skipped exactly that case, so the tombstone read
+        // "committed but not removed" forever — a false statement about a
+        // completed deletion, and one the caller-visible `Uncertain` phase
+        // could never converge out of. Both sides of T4 converge here.
         loop {
             let pending = guard
                 .manifest
                 .tombstones
                 .iter()
-                .find(|t| {
-                    t.removed_at.is_none()
-                        && Self::generation_dir(&self.root, &t.generation_id).exists()
-                })
+                .find(|t| t.removed_at.is_none())
                 .map(|t| t.generation_id.clone());
             let Some(generation_id) = pending else { break };
-            std::fs::remove_dir_all(Self::generation_dir(&self.root, &generation_id))
-                .map_err(|error| AuditError::Io(format!("resume removal: {error}")))?;
-            files::fsync_dir(&self.root.join("generations"))?;
+            let dir = Self::generation_dir(&self.root, &generation_id);
+            if dir.exists() {
+                std::fs::remove_dir_all(&dir)
+                    .map_err(|error| AuditError::Io(format!("resume removal: {error}")))?;
+                files::fsync_dir(&self.root.join("generations"))?;
+            }
             if let Some(tombstone) = guard
                 .manifest
                 .tombstones
@@ -1635,7 +1688,7 @@ impl AuditLedger {
     /// being sealed, which stranded that entry outside the sealed range and
     /// duplicated its sequence as the next generation's `firstSeq`.
     pub fn rotate(&self, reason: RotationReason) -> AuditResult<String> {
-        let mut tx = self.structural_tx();
+        let mut tx = self.structural_tx()?;
         if let Some(poison) = tx.poisoned() {
             return Err(AuditError::Poisoned(poison));
         }
@@ -1946,7 +1999,7 @@ impl AuditLedger {
     /// seal id. Only ranges the export actually carried are recorded: a
     /// withheld or holed element is not evidence that anything was preserved.
     pub(crate) fn record_seal(&self, record: SealRecord) -> AuditResult<()> {
-        let mut tx = self.structural_tx();
+        let mut tx = self.structural_tx()?;
         let mut manifest = tx.manifest_clone();
         manifest.seals.push(record);
         let overflow = manifest.seals.len().saturating_sub(MAX_TRACKED_SEALS);

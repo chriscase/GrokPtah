@@ -1369,3 +1369,29 @@ fn a_v1_ledger_created_after_a_clean_cutover_is_recorded_as_divergent() {
     assert!(legacy_dir(dir.path()).join("audit.jsonl").exists());
     store.verify_audit().unwrap();
 }
+
+#[test]
+fn explicit_keychain_custody_that_cannot_be_satisfied_creates_no_local_key() {
+    let dir = TempDir::new().unwrap();
+    // Stand in for a keychain that declined: the caller opted into `Provided`
+    // custody and has no material. Silently falling back to a key file would
+    // create the very artefact the choice was meant to avoid, so this must
+    // fail closed and leave the disk untouched.
+    let error = open_error(OrchStore::open_with_audit(
+        dir.path(),
+        AuditKeyCustody::Provided(Vec::new()),
+        None,
+    ));
+    assert!(
+        format!("{error:#}").contains("key_unavailable"),
+        "{error:#}"
+    );
+    let key_path = dir.path().join("audit").join("v2").join("chain.key");
+    assert!(!key_path.exists(), "no key file may be created");
+    assert!(
+        !audit_root(dir.path()).join("manifest.json").exists(),
+        "no ledger may be initialised without usable key material"
+    );
+    // A stable code only: no path, no key bytes.
+    assert!(!format!("{error:#}").contains(&dir.path().display().to_string()));
+}
