@@ -169,6 +169,9 @@ impl std::fmt::Display for PoisonReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefuseReason {
     OpenIntentsPresent,
+    /// Entries were accepted by an async producer queue and are not yet
+    /// journaled. A structural transaction must not seal or export over them.
+    AcceptedWorkInFlight,
     GenerationUnknown,
     GenerationIsActive,
     GenerationTombstoned,
@@ -199,6 +202,7 @@ impl RefuseReason {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::OpenIntentsPresent => "open_intents_present",
+            Self::AcceptedWorkInFlight => "accepted_work_in_flight",
             Self::GenerationUnknown => "generation_unknown",
             Self::GenerationIsActive => "generation_is_active",
             Self::GenerationTombstoned => "generation_tombstoned",

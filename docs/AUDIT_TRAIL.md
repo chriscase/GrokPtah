@@ -351,14 +351,37 @@ queue drains through a durable append. One marker covers a whole burst, so a
 busy writer pays for it once.
 
 Finding a marker at open means a crash happened with entries in flight. Between
-zero and the queue capacity of them are gone and **nothing on disk can narrow
-that**, so recovery records the bound (`maxLostEntries`) rather than a number
-that would read as certainty, journals it under
+zero and `AUDIT_IN_FLIGHT_BOUND` of them are gone and **nothing on disk can
+narrow that**, so recovery records the bound (`maxLostEntries`) rather than a
+number that would read as certainty, journals it under
 `reason: "accepted_not_journaled"` with an uncertain outcome, and only then
 clears the marker. A crash in that window re-reports the same uncertainty,
 which over-states doubt; clearing first would lose the evidence entirely.
 `get_capacity` surfaces it as `acceptedNotJournaledEpisodes` and
 `maxAcceptedNotJournaled`.
+
+The bound is the channel capacity **plus one**. The writer `recv`s an entry —
+freeing its channel slot — before the append that makes it durable, so a crash
+at that instant leaves a full channel *and* the entry in the writer's hand.
+Reporting the capacity alone under-counted by exactly one, and an under-count
+of a loss bound is the direction that hides evidence.
+
+### Fencing structural work against the queue
+
+The marker makes a *crash* loss visible; it does nothing for a structural
+transaction taken right now. Export and rotation therefore refuse with
+`accepted_work_in_flight` while any accepted entry is unjournaled:
+
+- an **export** would otherwise seal a range and call it `complete` while
+  entries destined for it were still queued;
+- a **rotation** would otherwise strand them — the writer would append them to
+  the *next* generation, so the sealed range would silently omit work the
+  caller was already told was accepted.
+
+Lock order is `inner` before `pending` everywhere, which is what lets a
+structural transaction read the in-flight count at all. Holding `inner` across
+the whole of `note_accepted` also means a running transaction blocks new
+acceptances, so the count it reads cannot go stale underneath it.
 
 ## Counter exhaustion
 

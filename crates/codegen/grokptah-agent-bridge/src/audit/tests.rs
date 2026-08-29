@@ -2300,3 +2300,81 @@ fn a_substituted_manifest_inside_an_export_is_refused() {
         "a substituted manifest must not verify"
     );
 }
+
+// ------------------------------- fencing structural work against the queue
+
+#[test]
+fn an_export_is_refused_while_accepted_work_is_still_queued() {
+    let dir = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    let ledger = fresh(dir.path());
+    ledger.note_accepted(257).unwrap();
+
+    // The pending marker makes a *crash* loss visible. It does nothing for an
+    // export taken right now, which would seal a range and call it complete
+    // while entries destined for it are still in a queue.
+    assert_eq!(
+        refusal_of(
+            ledger
+                .export(&out.path().join("early"), ExportFormat::Auto)
+                .unwrap_err()
+        ),
+        RefuseReason::AcceptedWorkInFlight
+    );
+    assert!(
+        !out.path().join("early").exists(),
+        "a refused export leaves no destination behind"
+    );
+
+    // Once the queue settles, the same export succeeds and is complete.
+    ledger.append(entry("queued.one")).unwrap();
+    ledger.note_settled().unwrap();
+    let receipt = ledger
+        .export(&out.path().join("settled"), ExportFormat::Auto)
+        .unwrap();
+    assert!(receipt.complete);
+}
+
+#[test]
+fn a_rotation_is_refused_while_accepted_work_is_still_queued() {
+    let dir = TempDir::new().unwrap();
+    let ledger = fresh(dir.path());
+    ledger.note_accepted(257).unwrap();
+
+    // Sealing now would strand the queued entries: the writer would append
+    // them to the *next* generation, so the sealed range would silently omit
+    // work the caller was already told was accepted.
+    assert_eq!(
+        refusal_of(ledger.rotate(RotationReason::Operator).unwrap_err()),
+        RefuseReason::AcceptedWorkInFlight
+    );
+    assert_eq!(ledger.manifest_snapshot().generations.len(), 1);
+
+    ledger.append(entry("queued.one")).unwrap();
+    ledger.note_settled().unwrap();
+    ledger.rotate(RotationReason::Operator).expect("settled");
+    assert_eq!(ledger.manifest_snapshot().generations.len(), 2);
+}
+
+#[test]
+fn the_reported_loss_bound_covers_the_entry_in_the_writers_hand() {
+    let dir = TempDir::new().unwrap();
+    {
+        let ledger = fresh(dir.path());
+        // A writer thread `recv`s an entry -- freeing its channel slot --
+        // before the append that makes it durable, so a full 256-entry channel
+        // plus that one entry is 257 accepted events, not 256. Reporting the
+        // channel capacity alone under-counted the loss by exactly one.
+        ledger.note_accepted(257).unwrap();
+    }
+    let ledger = opened(dir.path());
+    let bound = ledger
+        .status()
+        .recovery
+        .durable_gaps
+        .iter()
+        .find(|gap| gap.reason == EntryReason::AcceptedNotJournaled)
+        .and_then(|gap| gap.max_lost_entries)
+        .expect("a bounded gap");
+    assert_eq!(bound, 257);
+}

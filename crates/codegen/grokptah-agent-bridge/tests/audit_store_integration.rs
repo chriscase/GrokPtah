@@ -39,12 +39,11 @@ fn entry(tool: &str, outcome: &str) -> AuditEntry {
 /// destroy or expose history are unreachable there. Every test that needs one
 /// has to say so, which is the boundary working.
 fn open_operator_store(root: &Path) -> OrchStore {
-    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    let custody = AuditKeyCustody::local_file_for(&root);
-    OrchStore::open_with_audit_authority(
-        &root,
-        custody,
-        None,
+    // `open_with_authority` derives custody the same way `open` does, so the
+    // test does not re-implement (and cannot get wrong) the canonicalize-then-
+    // derive ordering the key location depends on.
+    OrchStore::open_with_authority(
+        root,
         Some(Arc::new(LocalOperatorAuthority::new([
             AuditCapability::PrivilegedRawExport,
             AuditCapability::RetainUnexported,

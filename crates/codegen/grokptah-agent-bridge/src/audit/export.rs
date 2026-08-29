@@ -217,6 +217,13 @@ impl AuditLedger {
         if tx.open_intents() != 0 {
             return Err(AuditError::Refused(RefuseReason::OpenIntentsPresent));
         }
+        // Accepted-but-unjournaled work is a hole this export cannot see. The
+        // pending marker makes such a loss *visible after a crash*; it does
+        // nothing for an export taken right now, which would seal a range and
+        // call it complete while entries destined for it are still in a queue.
+        if tx.accepted_in_flight() != 0 {
+            return Err(AuditError::Refused(RefuseReason::AcceptedWorkInFlight));
+        }
         // Spend the grant *before* a single byte is copied. A crash after this
         // leaves the grant spent and no export, which is the safe direction;
         // spending it afterwards would leave a live grant beside a written

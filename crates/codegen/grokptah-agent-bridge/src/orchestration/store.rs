@@ -53,9 +53,17 @@ pub struct OrchStore {
     inner: Arc<OrchStoreInner>,
 }
 
-/// Bound on entries accepted by [`OrchStore::enqueue_audit`] but not yet
-/// journaled. Also the upper bound recovery reports for a crash mid-queue.
+/// Capacity of the channel between `enqueue_audit` and the writer thread.
 const AUDIT_QUEUE_CAPACITY: usize = 256;
+
+/// Upper bound on entries accepted but not yet journaled.
+///
+/// One more than the channel holds: the writer `recv`s an entry — freeing its
+/// slot — before the append that makes it durable, so a crash at that instant
+/// leaves a full channel *plus* the entry in the writer's hand. Reporting the
+/// channel capacity alone under-counted the loss by exactly one, and an
+/// under-count of a loss bound is the direction that hides evidence.
+const AUDIT_IN_FLIGHT_BOUND: u64 = AUDIT_QUEUE_CAPACITY as u64 + 1;
 
 struct OrchStoreInner {
     root: PathBuf,
@@ -200,16 +208,27 @@ impl OrchStore {
     ///
     /// Uses the default local-file audit key custody and no rollback witness.
     pub fn open(root: impl AsRef<Path>) -> anyhow::Result<Self> {
-        // Canonicalize before deriving the key location. `open_with_audit`
-        // canonicalizes the root, so deriving custody from the raw path would
-        // put the key somewhere else for a relative or symlinked root — and a
-        // key the next open cannot find is a manifest MAC mismatch, not a
-        // recoverable miss.
+        Self::open_with_authority(root, None)
+    }
+
+    /// Open with the default local-file audit key custody and an explicit
+    /// capability authority.
+    ///
+    /// Custody is derived exactly as [`Self::open`] derives it, which is the
+    /// point of having one function: the root is canonicalized *before* the
+    /// key location is computed. Deriving custody from the raw path would put
+    /// the key somewhere else for a relative or symlinked root, and a key the
+    /// next open cannot find is a manifest MAC mismatch, not a recoverable
+    /// miss.
+    pub fn open_with_authority(
+        root: impl AsRef<Path>,
+        authority: Option<Arc<dyn AuditAuthorityProvider>>,
+    ) -> anyhow::Result<Self> {
         let root = root.as_ref();
         fs::create_dir_all(root)?;
         let root = dunce::canonicalize(root)?;
         let custody = AuditKeyCustody::local_file_for(&root);
-        Self::open_with_audit(root, custody, None)
+        Self::open_with_audit_authority(root, custody, None, authority)
     }
 
     /// Open with explicit audit key custody and an optional rollback witness.
@@ -5096,7 +5115,7 @@ impl OrchStore {
         };
         // Durable *before* the entry can be taken by the writer, so the marker
         // can never trail the work it accounts for.
-        if let Err(error) = self.inner.audit.note_accepted(AUDIT_QUEUE_CAPACITY as u64) {
+        if let Err(error) = self.inner.audit.note_accepted(AUDIT_IN_FLIGHT_BOUND) {
             let code = error.code();
             *self.inner.last_audit_error.lock() = Some(code.to_string());
             let _ = self.inner.audit.record_dropped(1);

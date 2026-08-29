@@ -253,6 +253,14 @@ impl<'a> StructuralTx<'a> {
         self.guard.poisoned
     }
 
+    /// Entries accepted by an async producer queue that are not yet journaled.
+    ///
+    /// Safe to read here: this transaction already holds `inner`, and the
+    /// lock order is `inner` before `pending` everywhere.
+    pub(crate) fn accepted_in_flight(&self) -> u64 {
+        self.ledger.pending.lock().in_flight
+    }
+
     pub(crate) fn append(
         &mut self,
         entry: AuditEntryInput,
@@ -1634,6 +1642,13 @@ impl AuditLedger {
         if tx.open_intents() != 0 {
             return Err(AuditError::Refused(RefuseReason::OpenIntentsPresent));
         }
+        // Sealing a generation while accepted entries are still queued for it
+        // would strand them: the writer would append them to the *next*
+        // generation, so the sealed range would silently omit work the caller
+        // was already told was accepted.
+        if tx.accepted_in_flight() != 0 {
+            return Err(AuditError::Refused(RefuseReason::AcceptedWorkInFlight));
+        }
 
         // R0.5: the sealing record is the last entry of the outgoing generation.
         tx.append(
@@ -1953,13 +1968,20 @@ impl AuditLedger {
     /// covers a whole burst: it is written on the transition out of idle and
     /// removed when the queue drains, so a busy writer pays for it once.
     pub fn note_accepted(&self, queue_capacity: u64) -> AuditResult<()> {
+        // Lock order is always `inner` before `pending`, never the reverse.
+        // That is what lets a structural transaction — which holds `inner` for
+        // its whole extent — read the in-flight count to fence itself against
+        // accepted work without risking a cycle. Holding `inner` across the
+        // whole call also means a running transaction blocks new acceptances
+        // outright, so the count it reads cannot go stale under it.
+        let guard = self.inner.lock();
         let mut pending = self.pending.lock();
         if pending.in_flight == 0 {
-            let (generation_id, after_seq) = {
-                let guard = self.inner.lock();
-                (guard.live.generation_id.clone(), guard.live.last_seq)
-            };
-            let mut marker = PendingMarker::new(generation_id, after_seq, queue_capacity);
+            let mut marker = PendingMarker::new(
+                guard.live.generation_id.clone(),
+                guard.live.last_seq,
+                queue_capacity,
+            );
             marker.seal(&self.keys)?;
             let bytes = serde_json::to_vec(&marker)
                 .map_err(|error| AuditError::Io(format!("serialize pending marker: {error}")))?;
