@@ -107,8 +107,9 @@ pub use completion::{
     CompletionUsage,
 };
 pub use computer_agent::{
-    accept_model_proposal, AcceptedIntent, AcceptedModelProposal, ComputerAgentEligibility,
-    ComputerAgentProposal, ModelProposalContext, RawModelProposal, PROPOSAL_SEAL_VERSION,
+    accept_model_output, AcceptedIntent, AcceptedModelProposal, ComputerAgentEligibility,
+    ComputerAgentProposal, ModelProposalContext, ModelTurn, RawModelProposal, RouteBinding,
+    PROPOSAL_SEAL_VERSION,
 };
 pub use computer_use::{
     canonical_workspace_string, project_run_at, ActionClass, ActionGrant, ActionGrantSummary,
@@ -119,10 +120,11 @@ pub use computer_use::{
     ComputerReadBinding, ComputerRun, ComputerRunCapacity, ComputerRunEventPage,
     ComputerRunEventRange, ComputerRunProgress, ComputerRunProjection, ComputerRunReads,
     ComputerRunState, ComputerScopeCapacity, ComputerStore, ComputerTarget,
-    ComputerTargetCandidate, ComputerTargetSummary, ComputerUseLimits, ComputerUseService,
-    FrameIdentity, GrantIssuer, MacOsObservationPlatform, ObservationSummary,
-    PostconditionExpectation, ReceiptVerification, SemanticAction, SimulatorBackend,
-    ACTION_RECEIPT_VERSION, DEFAULT_EVENT_PAGE, MAX_EVENT_PAGE,
+    ComputerTargetCandidate, ComputerTargetSummary, ComputerTaskSpec, ComputerUseLimits,
+    ComputerUseService, ElementLocator, FrameIdentity, GrantIssuer, MacOsObservationPlatform,
+    ObservationSummary, PostconditionExpectation, ReceiptVerification, SemanticAction,
+    SimulatorBackend, TaskPredicate, ACTION_RECEIPT_VERSION, DEFAULT_EVENT_PAGE, MAX_EVENT_PAGE,
+    TASK_SPEC_VERSION,
 };
 pub use discover::{
     grokptah_home, home_override_serial, is_project_mcp_trusted, project_has_local_mcp_servers,

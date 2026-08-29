@@ -68,7 +68,7 @@ async fn main() -> Result<()> {
         .await
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let proposal_started = Instant::now();
-    let raw_proposal = host
+    let (raw_proposal, _route) = host
         .propose_computer_action(
             session.id,
             "Enter Ada Lovelace in the visible Name field. Do not submit yet.",

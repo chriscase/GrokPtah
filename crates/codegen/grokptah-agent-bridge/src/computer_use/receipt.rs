@@ -24,6 +24,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::objective::ElementLocator;
 use super::types::{
     ActionClass, ActionOutcome, ComputerAction, ComputerObservation, SemanticElement,
 };
@@ -59,46 +60,61 @@ impl FrameIdentity {
 
 /// What the host can re-check about a dispatched action on a later frame.
 ///
-/// Semantic element IDs are documented as ephemeral per observation, so an
-/// expectation is only *checkable* when the verifying frame happens to carry
-/// the same element ID. When it does, the check is mandatory and a mismatch
-/// destroys the receipt. When it does not, the proof rests on the host-issued
-/// dispatch → verifying-frame chain alone, which is why that chain is limited
-/// to exactly one frame.
+/// Addressed by [`ElementLocator`], not by element ID. Semantic element IDs are
+/// ephemeral per observation, so an ID-addressed expectation would stop
+/// resolving after any re-observation — and an expectation that cannot find its
+/// subject must never be read as met.
+///
+/// [`PostconditionExpectation::Opaque`] is the honest answer for an action
+/// whose effect a semantic frame cannot show. It can never be met, so such an
+/// action can never carry a completion proof. That is deliberate: the
+/// alternative is to let "we could not check" stand in for "it worked".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PostconditionExpectation {
-    /// The element, if still present under the same ID, must carry this value.
-    ElementValue { element_id: String, value: String },
-    /// Nothing about this action is re-checkable from a semantic frame.
+    /// The addressed element must resolve uniquely on the verifying frame and
+    /// carry exactly this value.
+    ElementValue {
+        locator: ElementLocator,
+        value: String,
+    },
+    /// Nothing about this action is checkable from a semantic frame. Never met.
     Opaque,
 }
 
 impl PostconditionExpectation {
-    fn derive(action: &ComputerAction) -> Self {
-        match action {
-            ComputerAction::SetValue { element_id, text } => Self::ElementValue {
-                element_id: element_id.clone(),
-                value: text.clone(),
-            },
-            _ => Self::Opaque,
+    /// Derive from the action and the frame it was authorized against, so the
+    /// locator is built from the element the operator actually approved.
+    fn derive(action: &ComputerAction, dispatch_frame: &ComputerObservation) -> Self {
+        let ComputerAction::SetValue { element_id, text } = action else {
+            return Self::Opaque;
+        };
+        let Some(element) = dispatch_frame.element(element_id) else {
+            return Self::Opaque;
+        };
+        let locator = ElementLocator::new(element.role.clone(), element.label.clone());
+        // A locator that is already ambiguous on the dispatch frame cannot be
+        // trusted to name one subject later either.
+        if locator.resolve(dispatch_frame).is_none() {
+            return Self::Opaque;
+        }
+        Self::ElementValue {
+            locator,
+            value: text.clone(),
         }
     }
 
-    /// `false` only when the expectation is checkable on this frame and fails.
+    /// Strictly positive: `true` only when the expectation is checkable on this
+    /// frame **and** holds. Opaque and unresolvable both answer `false`.
     fn holds_on(&self, observation: &ComputerObservation) -> bool {
-        let Self::ElementValue { element_id, value } = self else {
-            return true;
+        let Self::ElementValue { locator, value } = self else {
+            return false;
         };
-        match observation
-            .elements
-            .iter()
-            .find(|element: &&SemanticElement| &element.element_id == element_id)
-        {
-            Some(element) => element.value.as_deref() == Some(value.as_str()),
-            // Ephemeral IDs: absence is not a contradiction.
-            None => true,
-        }
+        locator
+            .resolve(observation)
+            .is_some_and(|element: &SemanticElement| {
+                element.value.as_deref() == Some(value.as_str())
+            })
     }
 }
 
@@ -145,7 +161,7 @@ impl ActionReceipt {
     pub(super) fn mint(
         receipt_id: String,
         run_id: &str,
-        dispatch_frame: FrameIdentity,
+        dispatch_observation: &ComputerObservation,
         action: &ComputerAction,
         control_epoch: u64,
         outcome: ActionOutcome,
@@ -154,13 +170,13 @@ impl ActionReceipt {
             receipt_version: ACTION_RECEIPT_VERSION,
             receipt_id,
             run_id: run_id.to_string(),
-            dispatch_frame,
+            dispatch_frame: FrameIdentity::of(dispatch_observation),
             action_fingerprint: action_fingerprint(run_id, action),
             action_class: action.class(),
             control_epoch,
             dispatched_at: Utc::now(),
             outcome,
-            expectation: PostconditionExpectation::derive(action),
+            expectation: PostconditionExpectation::derive(action, dispatch_observation),
             verification: ReceiptVerification::Pending,
         }
     }
@@ -287,7 +303,10 @@ mod tests {
         ComputerTarget, ObservationGeometry, SemanticAction, Sensitivity,
     };
 
-    fn frame(id: &str, sequence: u64, value: &str) -> ComputerObservation {
+    /// Element IDs differ on every frame, as a real accessibility adapter's do.
+    /// Anything that verifies here by remembering an ID is verifying by
+    /// accident.
+    fn frame(id: &str, sequence: u64, value: Option<&str>) -> ComputerObservation {
         ComputerObservation {
             observation_id: id.into(),
             sequence,
@@ -308,10 +327,10 @@ mod tests {
             },
             screenshot: None,
             elements: vec![SemanticElement {
-                element_id: "name".into(),
+                element_id: format!("ephemeral-{}", uuid::Uuid::new_v4()),
                 role: "text_field".into(),
-                label: None,
-                value: Some(value.into()),
+                label: Some("Name".into()),
+                value: value.map(Into::into),
                 bounds: None,
                 enabled: true,
                 focused: false,
@@ -323,15 +342,26 @@ mod tests {
         }
     }
 
+    fn empty_frame(id: &str, sequence: u64) -> ComputerObservation {
+        ComputerObservation {
+            elements: Vec::new(),
+            ..frame(id, sequence, None)
+        }
+    }
+
+    fn set_value_on(observation: &ComputerObservation, text: &str) -> ComputerAction {
+        ComputerAction::SetValue {
+            element_id: observation.elements[0].element_id.clone(),
+            text: text.into(),
+        }
+    }
+
     fn receipt(dispatch: &ComputerObservation) -> ActionReceipt {
         ActionReceipt::mint(
             "receipt-1".into(),
             "run-1",
-            FrameIdentity::of(dispatch),
-            &ComputerAction::SetValue {
-                element_id: "name".into(),
-                text: "Ada".into(),
-            },
+            dispatch,
+            &set_value_on(dispatch, "Ada"),
             3,
             ActionOutcome::bounded("set", Some(true)),
         )
@@ -339,63 +369,128 @@ mod tests {
 
     #[test]
     fn pending_receipt_never_authorizes_completion() {
-        let dispatch = frame("observation-1", 1, "");
+        let dispatch = frame("observation-1", 1, None);
         let receipt = receipt(&dispatch);
         assert!(!receipt.authorizes_completion("run-1", &dispatch, 3));
     }
 
     #[test]
     fn verified_receipt_authorizes_only_its_own_frame() {
-        let dispatch = frame("observation-1", 1, "");
-        let verifying = frame("observation-2", 2, "Ada");
+        let dispatch = frame("observation-1", 1, None);
+        let verifying = frame("observation-2", 2, Some("Ada"));
         let mut receipt = receipt(&dispatch);
         assert!(receipt.verify_with(&verifying, 3));
         assert!(receipt.authorizes_completion("run-1", &verifying, 3));
 
-        let later = frame("observation-3", 3, "Ada");
-        assert!(!receipt.authorizes_completion("run-1", &later, 3));
+        assert!(!receipt.authorizes_completion(
+            "run-1",
+            &frame("observation-3", 3, Some("Ada")),
+            3
+        ));
         assert!(!receipt.authorizes_completion("run-1", &verifying, 4));
         assert!(!receipt.authorizes_completion("run-2", &verifying, 3));
     }
 
     #[test]
     fn verification_is_single_use_and_epoch_bound() {
-        let dispatch = frame("observation-1", 1, "");
+        let dispatch = frame("observation-1", 1, None);
         let mut receipt = receipt(&dispatch);
-        assert!(!receipt.verify_with(&frame("observation-2", 2, "Ada"), 9));
-        assert!(receipt.verify_with(&frame("observation-2", 2, "Ada"), 3));
-        assert!(!receipt.verify_with(&frame("observation-3", 3, "Ada"), 3));
+        assert!(!receipt.verify_with(&frame("observation-2", 2, Some("Ada")), 9));
+        assert!(receipt.verify_with(&frame("observation-2", 2, Some("Ada")), 3));
+        assert!(!receipt.verify_with(&frame("observation-3", 3, Some("Ada")), 3));
     }
 
     #[test]
     fn negative_outcome_can_never_verify() {
-        let dispatch = frame("observation-1", 1, "");
+        let dispatch = frame("observation-1", 1, None);
         let mut receipt = ActionReceipt::mint(
             "receipt-1".into(),
             "run-1",
-            FrameIdentity::of(&dispatch),
-            &ComputerAction::ActivateTarget,
+            &dispatch,
+            &set_value_on(&dispatch, "Ada"),
             0,
             ActionOutcome::bounded("no postcondition", None),
         );
-        assert!(!receipt.verify_with(&frame("observation-2", 2, ""), 0));
-        assert!(!receipt.authorizes_completion("run-1", &frame("observation-2", 2, ""), 0));
+        let verifying = frame("observation-2", 2, Some("Ada"));
+        assert!(!receipt.verify_with(&verifying, 0));
+        assert!(!receipt.authorizes_completion("run-1", &verifying, 0));
+    }
+
+    /// An action whose effect a semantic frame cannot show is `Opaque`, and an
+    /// opaque expectation can never be met. "We could not check" must not stand
+    /// in for "it worked".
+    #[test]
+    fn an_opaque_expectation_can_never_verify() {
+        let dispatch = frame("observation-1", 1, None);
+        let mut receipt = ActionReceipt::mint(
+            "receipt-1".into(),
+            "run-1",
+            &dispatch,
+            &ComputerAction::ActivateTarget,
+            0,
+            ActionOutcome::bounded("activated", Some(true)),
+        );
+        assert_eq!(receipt.expectation, PostconditionExpectation::Opaque);
+        let verifying = frame("observation-2", 2, Some("Ada"));
+        assert!(!receipt.verify_with(&verifying, 0));
+        assert!(!receipt.authorizes_completion("run-1", &verifying, 0));
+    }
+
+    /// The locator addresses role and label, not the ephemeral element ID, so
+    /// it still resolves on a later frame.
+    #[test]
+    fn expectations_survive_ephemeral_element_ids() {
+        let dispatch = frame("observation-1", 1, None);
+        let verifying = frame("observation-2", 2, Some("Ada"));
+        assert_ne!(
+            dispatch.elements[0].element_id, verifying.elements[0].element_id,
+            "fixture must model ephemeral ids"
+        );
+        let mut receipt = receipt(&dispatch);
+        assert!(receipt.verify_with(&verifying, 3));
+    }
+
+    /// A subject that has vanished from the verifying frame is a failure, never
+    /// a pass: missing evidence is not success.
+    #[test]
+    fn a_vanished_subject_never_verifies() {
+        let dispatch = frame("observation-1", 1, None);
+        let mut receipt = receipt(&dispatch);
+        assert!(!receipt.verify_with(&empty_frame("observation-2", 2), 3));
+        assert!(!receipt.authorizes_completion("run-1", &empty_frame("observation-2", 2), 3));
     }
 
     #[test]
-    fn checkable_expectation_must_hold_on_the_verifying_frame() {
-        let dispatch = frame("observation-1", 1, "");
+    fn a_wrong_value_on_the_verifying_frame_never_verifies() {
+        let dispatch = frame("observation-1", 1, None);
         let mut receipt = receipt(&dispatch);
-        assert!(!receipt.verify_with(&frame("observation-2", 2, "Grace"), 3));
-        assert!(receipt.verify_with(&frame("observation-2", 2, "Ada"), 3));
+        assert!(!receipt.verify_with(&frame("observation-2", 2, Some("Grace")), 3));
+        assert!(receipt.verify_with(&frame("observation-2", 2, Some("Ada")), 3));
+    }
+
+    /// A verified receipt is re-checked against the frame it names, so a value
+    /// that changes back after verification stops authorizing completion.
+    #[test]
+    fn a_verified_receipt_is_rechecked_at_completion_time() {
+        let dispatch = frame("observation-1", 1, None);
+        let verifying = frame("observation-2", 2, Some("Ada"));
+        let mut receipt = receipt(&dispatch);
+        assert!(receipt.verify_with(&verifying, 3));
+
+        // Same frame identity, subject no longer carrying the value.
+        let tampered = ComputerObservation {
+            elements: Vec::new(),
+            ..verifying.clone()
+        };
+        assert!(!receipt.authorizes_completion("run-1", &tampered, 3));
     }
 
     #[test]
     fn nonmonotonic_and_repeated_frames_cannot_verify() {
-        let dispatch = frame("observation-2", 2, "");
+        let dispatch = frame("observation-2", 2, None);
         let mut receipt = receipt(&dispatch);
-        assert!(!receipt.verify_with(&frame("observation-1", 1, "Ada"), 3));
-        assert!(!receipt.verify_with(&frame("observation-2", 2, "Ada"), 3));
+        assert!(!receipt.verify_with(&frame("observation-1", 1, Some("Ada")), 3));
+        assert!(!receipt.verify_with(&frame("observation-2", 2, Some("Ada")), 3));
     }
 
     #[test]

@@ -13,6 +13,7 @@
 //! session-scoped; coordinator reads take [`ComputerReadBinding`].
 
 mod macos_observation;
+mod objective;
 mod platform;
 mod policy;
 mod projection;
@@ -24,6 +25,9 @@ mod store;
 mod types;
 
 pub use macos_observation::MacOsObservationPlatform;
+pub use objective::{
+    objective_digest, ComputerTaskSpec, ElementLocator, TaskPredicate, TASK_SPEC_VERSION,
+};
 pub use platform::{
     ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
     ComputerPlatformStatus, ComputerTargetCandidate,

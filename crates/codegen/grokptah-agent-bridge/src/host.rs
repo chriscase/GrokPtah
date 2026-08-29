@@ -1058,7 +1058,10 @@ impl AgentHostHandle {
         session_id: Uuid,
         objective: &str,
         observation: &crate::computer_use::ComputerObservation,
-    ) -> Result<crate::computer_agent::RawModelProposal> {
+    ) -> Result<(
+        crate::computer_agent::RawModelProposal,
+        crate::computer_agent::RouteBinding,
+    )> {
         let (_operation_id, cancel, _guard) = self.begin_computer_agent_operation(session_id)?;
         let (model, effort) = self.selected_computer_model(session_id)?;
         let credentials = crate::auth_store::resolve_wire_credentials_for_model(&model)
@@ -1090,7 +1093,13 @@ impl AgentHostHandle {
             bail!("Computer model proposal was cancelled");
         }
         self.ensure_computer_route_unchanged(session_id, &model, &resolved.route_fingerprint)?;
-        Ok(proposal)
+        // The route the proposal was actually requested over travels with the
+        // bytes, so the seal can bind it and refuse to apply under a different
+        // one. Capability generation (#458), adaptive profile (#435),
+        // principal generation (#477), and lease binding stay unbound until
+        // those authorities exist.
+        let route = crate::computer_agent::RouteBinding::new(resolved.route_fingerprint, model);
+        Ok((proposal, route))
     }
 
     /// Local Stop/Take over cancellation. It does not share the Build-turn

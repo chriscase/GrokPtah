@@ -12,8 +12,8 @@ use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 pub use seal::{
-    accept_model_proposal, AcceptedIntent, AcceptedModelProposal, ModelProposalContext,
-    RawModelProposal, PROPOSAL_SEAL_VERSION,
+    accept_model_output, AcceptedIntent, AcceptedModelProposal, ModelProposalContext, ModelTurn,
+    RawModelProposal, RouteBinding, PROPOSAL_SEAL_VERSION,
 };
 
 use crate::computer_use::{

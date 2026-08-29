@@ -952,6 +952,29 @@ export interface ComputerSemanticElement {
   actions: string[];
 }
 
+/** Stable, frame-independent address for one observed element. */
+export interface ComputerElementLocator {
+  role: string;
+  label?: string | null;
+}
+
+/**
+ * Closed grammar for "the operator's objective is visibly satisfied".
+ *
+ * Authored by the operator in the cockpit, never by a model: it is what decides
+ * whether the model's work is done, so a model-authored one would be circular.
+ */
+export type ComputerTaskPredicate =
+  | {
+      kind: "element_value_equals";
+      locator: ComputerElementLocator;
+      value: string;
+    }
+  | { kind: "element_enabled"; locator: ComputerElementLocator }
+  | { kind: "element_focused"; locator: ComputerElementLocator }
+  | { kind: "element_absent"; locator: ComputerElementLocator }
+  | { kind: "all"; clauses: ComputerTaskPredicate[] };
+
 export interface ComputerRun {
   runId: string;
   ownerSessionId: string;
@@ -964,6 +987,7 @@ export interface ComputerRun {
     | "stopped"
     | "interrupted"
     | "uncertain_outcome"
+    | "awaiting_review"
     | string;
   controlEpoch?: number;
   version: number;
@@ -1012,6 +1036,19 @@ export interface ComputerRun {
     controlEpoch: number;
     dispatchedAt: string;
     outcome: { summary: string; expectedPostconditionMet?: boolean | null };
+    /**
+     * What the host can re-check on a later frame. Addressed by role and label,
+     * never by the per-frame element ID, and `opaque` when the action's effect
+     * is not visible in a semantic frame at all — an opaque expectation can
+     * never be met, so such an action carries no completion proof.
+     */
+    expectation:
+      | {
+          kind: "element_value";
+          locator: { role: string; label?: string | null };
+          value: string;
+        }
+      | { kind: "opaque" };
     verification:
       | { state: "pending" }
       | {
@@ -1020,6 +1057,23 @@ export interface ComputerRun {
           verifiedAt: string;
         };
   } | null;
+  /**
+   * The operator-authored objective and the closed predicate that decides
+   * whether it is done (#456). A run without one can never be completed on a
+   * model's say-so, because nothing defines success for it. The objective text
+   * itself is never stored — only its digest.
+   */
+  taskSpec?: {
+    specVersion: number;
+    objectiveDigest: string;
+    predicate: ComputerTaskPredicate;
+    maxActions: number;
+  } | null;
+  /**
+   * Fingerprints of proposals that actually staged, oldest first. Durable and
+   * bounded, so a duplicate cannot be replayed across a process boundary.
+   */
+  appliedProposals?: string[];
   lastError?: { code: string; message: string } | null;
   audit: Array<{
     sequence: number;

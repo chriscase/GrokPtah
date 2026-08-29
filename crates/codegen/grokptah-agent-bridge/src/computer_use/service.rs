@@ -7,12 +7,13 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use super::objective::ComputerTaskSpec;
 use super::policy::ComputerPolicy;
 use super::projection::{
     not_available, project_events, project_run_at, ComputerRunCapacity, ComputerRunEventPage,
     ComputerRunProjection,
 };
-use super::receipt::{ActionReceipt, CompletionProof, FrameIdentity};
+use super::receipt::{ActionReceipt, CompletionProof};
 use super::store::{ComputerStore, MutationClaim};
 use super::types::{
     validate_id, ActionGrant, ActionOutcome, ComputerAction, ComputerBackend,
@@ -208,6 +209,96 @@ impl ComputerUseService {
         })();
         self.finish_mutation(request_id, &result)?;
         result
+    }
+
+    /// Bind an operator-authored objective and its success predicate to a run.
+    ///
+    /// Only accepted while the run is still awaiting authorization, so the
+    /// definition of "done" is fixed before any authority exists and cannot be
+    /// re-pointed mid-run. Setting it advances the run revision, which kills
+    /// every seal minted under the previous definition.
+    pub fn set_task_spec(
+        &self,
+        request_id: &str,
+        run_id: &str,
+        expected_version: u64,
+        spec: ComputerTaskSpec,
+    ) -> ComputerResult<ComputerRun> {
+        validate_id("run_id", run_id)?;
+        if spec.max_actions == 0 {
+            return Err(ComputerError::new(
+                ComputerErrorCode::InvalidRequest,
+                "task spec must authorize at least one action",
+            ));
+        }
+        let payload = json!({
+            "runId": run_id,
+            "expectedVersion": expected_version,
+            "spec": spec,
+        });
+        if let Some(replayed) = self.begin_mutation(request_id, "set_task_spec", &payload)? {
+            return replayed;
+        }
+        let result = self
+            .store
+            .update_run(run_id, |run| {
+                ensure_version(run, expected_version)?;
+                if run.state != ComputerRunState::AwaitingAuthorization {
+                    return Err(ComputerError::new(
+                        ComputerErrorCode::InvalidState,
+                        "a task objective can only be authored before authorization",
+                    ));
+                }
+                run.task_spec = Some(spec.clone());
+                run.version = run.version.saturating_add(1);
+                run.updated_at = Utc::now();
+                run.record_audit("set_task_spec", "accepted", None, None, None);
+                Ok(())
+            })
+            .and_then(|run| run.ok_or_else(unknown_run));
+        if let Err(error) = &result {
+            self.record_denial(run_id, "set_task_spec", None, error);
+        }
+        self.finish_mutation(request_id, &result)?;
+        result
+    }
+
+    /// Has this proposal already been applied to this run?
+    ///
+    /// A read-only early reject so a duplicate never reaches staging. The
+    /// authority is [`Self::commit_proposal_admission`], which re-checks
+    /// atomically; this only avoids doing work that will be undone.
+    pub fn proposal_already_applied(&self, run_id: &str, fingerprint: &str) -> bool {
+        self.store
+            .load_run(run_id)
+            .ok()
+            .flatten()
+            .is_some_and(|run| run.applied_proposals.iter().any(|seen| seen == fingerprint))
+    }
+
+    /// Durably record that a proposal actually staged.
+    ///
+    /// Called only *after* staging succeeds, so a refused or failed
+    /// application never burns a fingerprint and a legitimate retry is still
+    /// possible. Durable, so a duplicate cannot be replayed across a restart or
+    /// from another process holding the same ledger.
+    pub fn commit_proposal_admission(&self, run_id: &str, fingerprint: &str) -> ComputerResult<()> {
+        const MAX_TRACKED: usize = 256;
+        self.store.update_run(run_id, |run| {
+            if run.applied_proposals.iter().any(|seen| seen == fingerprint) {
+                return Err(ComputerError::new(
+                    ComputerErrorCode::DuplicateProposal,
+                    "this proposal was already applied for this run",
+                ));
+            }
+            if run.applied_proposals.len() >= MAX_TRACKED {
+                run.applied_proposals.remove(0);
+            }
+            run.applied_proposals.push(fingerprint.to_string());
+            run.updated_at = Utc::now();
+            Ok(())
+        })?;
+        Ok(())
     }
 
     pub fn authorize(
@@ -479,8 +570,16 @@ impl ComputerUseService {
                         outcome,
                     ),
                     Err(error) => {
-                        self.fail_inflight(run_id, "act", &error)?;
-                        Err(error)
+                        // The backend was already asked to act. Nothing it can
+                        // report distinguishes "refused before touching the
+                        // machine" from "mutated the UI and then failed", so
+                        // every failure from this point is classified
+                        // uncertain and needs operator reconciliation. Only a
+                        // denial raised *before* dispatch stays a clean
+                        // failure (see the arm below).
+                        let uncertain = post_effect_uncertain(&error);
+                        self.fail_inflight(run_id, "act", &uncertain)?;
+                        Err(uncertain)
                     }
                 }
             }
@@ -626,12 +725,52 @@ impl ComputerUseService {
         if let Some(replayed) = self.begin_mutation(request_id, "complete", &payload)? {
             return replayed;
         }
+        let mut review_error = None;
         let result = self
             .store
             .update_run(run_id, |run| {
                 ensure_version(run, expected_version)?;
+                // 1. Is the completion claim credible at all? A claim with no
+                //    qualifying receipt is noise: refuse it without touching
+                //    the run, so a model cannot halt a run by asserting
+                //    success repeatedly.
                 self.policy
                     .authorize_completion(run, evidence, Utc::now())?;
+
+                // 2. A credible claim still only proves that one approved
+                //    action ran and had a visible effect. Whether the
+                //    *operator's objective* is done is a separate question,
+                //    decided by their own closed predicate against the current
+                //    frame (#456).
+                let observation = run.current_observation.clone().ok_or_else(|| {
+                    ComputerError::new(
+                        ComputerErrorCode::UnverifiedCompletion,
+                        "computer run has no current observation",
+                    )
+                })?;
+                let Some(spec) = run.task_spec.clone() else {
+                    // No operator-authored objective means nothing defines
+                    // success for this run, so a model can never declare it.
+                    let error = ComputerError::new(
+                        ComputerErrorCode::UnverifiedCompletion,
+                        "run has no operator-authored objective to satisfy",
+                    );
+                    stop_for_review(run, &error, &observation.observation_id);
+                    review_error = Some(error);
+                    return Ok(());
+                };
+                if let Err(reason) = spec.evaluate(&observation) {
+                    // Credible claim, unmet objective: stop and hand it to a
+                    // person. This is explicitly not a success.
+                    let error = ComputerError::new(
+                        ComputerErrorCode::UnverifiedCompletion,
+                        format!("objective not satisfied: {reason}"),
+                    );
+                    stop_for_review(run, &error, &observation.observation_id);
+                    review_error = Some(error);
+                    return Ok(());
+                }
+
                 run.transition(ComputerRunState::Completed)?;
                 revoke_authority(run);
                 run.record_audit(
@@ -644,6 +783,10 @@ impl ComputerUseService {
                 Ok(())
             })
             .and_then(|run| run.ok_or_else(unknown_run));
+        let result = match (result, review_error) {
+            (Ok(_), Some(error)) => Err(error),
+            (other, _) => other,
+        };
         if let Err(error) = &result {
             self.record_denial(run_id, "complete", None, error);
         }
@@ -781,7 +924,7 @@ impl ComputerUseService {
                 run.last_receipt = Some(ActionReceipt::mint(
                     receipt_id.to_string(),
                     run_id,
-                    FrameIdentity::of(observation),
+                    observation,
                     action,
                     control_epoch,
                     outcome.clone(),
@@ -832,6 +975,12 @@ impl ComputerUseService {
                 run.last_error = Some(error.clone());
                 run.transition(ComputerRunState::Failed)?;
                 revoke_authority(run);
+                // The last recorded outcome is exactly what an in-flight
+                // failure puts in doubt. Keeping a positive one on a failed run
+                // is the same defect class as #456: a statement about the
+                // machine that nothing currently backs. Reconciliation starts
+                // from the journal, not from a stale summary.
+                run.last_outcome = None;
                 if error.code == ComputerErrorCode::UncertainOutcome {
                     run.set_control_disposition(ComputerControlDisposition::UncertainOutcome);
                 }
@@ -866,6 +1015,12 @@ impl ComputerUseService {
     /// authority, or evidence.
     pub fn record_proposal_refusal(&self, run_id: &str, operation: &str, error: &ComputerError) {
         let _ = self.store.update_run(run_id, |run| {
+            // Advancing the revision is the point, not bookkeeping: every seal
+            // is bound to a run version, so a refusal immediately invalidates
+            // the capability that was just refused and any sibling minted from
+            // the same snapshot. Without it a caller could retry a refused
+            // proposal indefinitely against an unchanged record.
+            run.version = run.version.saturating_add(1);
             run.updated_at = Utc::now();
             run.record_audit(operation, "refused", None, None, Some(error.code));
             Ok(())
@@ -962,6 +1117,68 @@ fn revoke_authority(run: &mut ComputerRun) {
     // bound to. Dropping the receipt here means no revocation path can leave a
     // usable proof behind (#456).
     run.last_receipt = None;
+}
+
+/// Halt a run for operator review without claiming success.
+///
+/// Used when a completion claim is credible — a real host-issued receipt
+/// verifies the current frame — but the operator's objective predicate does not
+/// hold. The run is paused, its authority revoked, and the disposition says a
+/// person needs to look; nothing about this path can reach `Completed`.
+fn stop_for_review(run: &mut ComputerRun, error: &ComputerError, observation_id: &str) {
+    run.last_error = Some(error.clone());
+    if run.transition(ComputerRunState::Paused).is_ok() {
+        revoke_authority(run);
+        run.set_control_disposition(ComputerControlDisposition::AwaitingReview);
+    }
+    run.record_audit(
+        "complete",
+        "stopped_for_review",
+        None,
+        Some(observation_id.to_string()),
+        Some(error.code),
+    );
+}
+
+/// Reclassify a backend action failure as an uncertain outcome unless it is
+/// one an adapter can only raise *before* touching the machine.
+///
+/// Once `ComputerBackend::act` has been entered the host generally cannot know
+/// whether anything happened, and letting such a failure read as a clean
+/// "failed" would let a run resume as if it had not. The exception is the
+/// authorization and admissibility class: an adapter checks permission, policy,
+/// target, and request shape before it acts, so those codes are a positive
+/// statement that nothing was touched — and they carry information the operator
+/// needs (a revoked permission must say so, not hide behind "uncertain").
+///
+/// Anything else, including a plain backend failure or a target that vanished
+/// mid-action, is uncertain and needs reconciliation.
+fn post_effect_uncertain(error: &ComputerError) -> ComputerError {
+    let pre_effect = matches!(
+        error.code,
+        ComputerErrorCode::PermissionRequired
+            | ComputerErrorCode::PermissionDenied
+            | ComputerErrorCode::PermissionRevoked
+            | ComputerErrorCode::Unauthorized
+            | ComputerErrorCode::ForbiddenTarget
+            | ComputerErrorCode::ForbiddenAction
+            | ComputerErrorCode::SensitiveSurface
+            | ComputerErrorCode::UnsupportedPlatform
+            | ComputerErrorCode::BackendUnavailable
+            | ComputerErrorCode::InvalidRequest
+            | ComputerErrorCode::InvalidState
+            | ComputerErrorCode::StaleObservation
+    );
+    if pre_effect || error.code == ComputerErrorCode::UncertainOutcome {
+        return error.clone();
+    }
+    ComputerError::new(
+        ComputerErrorCode::UncertainOutcome,
+        format!(
+            "computer action failed after dispatch began and its effect is unknown ({:?}); operator reconciliation required",
+            error.code
+        ),
+    )
 }
 
 fn unknown_run() -> ComputerError {
