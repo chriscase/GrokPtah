@@ -1339,8 +1339,36 @@ impl HostRuntime {
         // successful shutdown look unclean (and retain the process lock).
         let mut audit_writer_errors = Vec::new();
         if let Some(store) = self.handle().orchestration_store() {
-            if let Err(error) = store.close_audit_writer() {
-                audit_writer_errors.push(format!("close the durable orchestration audit: {error:#}"));
+            let audit_wait =
+                shutdown_deadline.saturating_duration_since(tokio::time::Instant::now());
+            let audit_join =
+                tokio::task::spawn_blocking(move || store.close_audit_writer_bounded(audit_wait));
+            let audit_report = match tokio::time::timeout_at(shutdown_deadline, audit_join).await {
+                Ok(Ok(report)) => report,
+                Ok(Err(error)) => crate::orchestration::AuditWriterStopReport {
+                    fully_stopped: false,
+                    errors: vec![format!("orchestration audit join task failed: {error}")],
+                },
+                Err(_) => crate::orchestration::AuditWriterStopReport {
+                    fully_stopped: false,
+                    errors: vec![format!(
+                        "durable orchestration audit writer did not stop within {:?}",
+                        self.join_timeout
+                    )],
+                },
+            };
+            if !audit_report.fully_stopped {
+                join_timed_out = true;
+            }
+            audit_writer_errors.extend(
+                audit_report
+                    .errors
+                    .into_iter()
+                    .map(|error| format!("close the durable orchestration audit: {error}")),
+            );
+            if !audit_report.fully_stopped && audit_writer_errors.is_empty() {
+                audit_writer_errors
+                    .push("close the durable orchestration audit: writer did not stop".to_string());
             }
         }
 

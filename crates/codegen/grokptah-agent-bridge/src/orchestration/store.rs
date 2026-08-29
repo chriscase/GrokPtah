@@ -9,7 +9,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use chrono::{Duration, Utc};
 use fs2::FileExt;
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use uuid::Uuid;
 
 use super::managed::{
@@ -202,31 +202,116 @@ pub struct RetentionReport {
 struct AuditWriter {
     tx: Mutex<Option<SyncSender<AuditEntry>>>,
     join: Mutex<Option<std::thread::JoinHandle<()>>>,
+    join_state: Arc<(Mutex<AuditWriterJoinState>, Condvar)>,
+    last_audit_error: Arc<Mutex<Option<String>>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[must_use = "audit-writer stop evidence must be checked before releasing host authority"]
+pub(crate) struct AuditWriterStopReport {
+    pub fully_stopped: bool,
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct AuditWriterJoinState {
+    started: bool,
+    outcome: Option<AuditWriterStopReport>,
 }
 
 impl AuditWriter {
-    /// Stop accepting audit entries and join the writer while its durable
-    /// authority is still live. Shutdown owns the final synchronous audit
-    /// append, so draining here prevents a queued entry from racing the
-    /// lifecycle seal and leaving a stale authority error behind.
-    fn close(&self) -> Result<(), String> {
+    /// Stop accepting audit entries and start a process-visible join monitor.
+    /// The monitor and its outcome survive cancellation of a shutdown waiter,
+    /// so an interrupted bounded wait cannot lose track of the writer.
+    fn begin_join(&self) {
         self.tx.lock().take();
+        let (state_lock, state_ready) = &*self.join_state;
+        let mut state = state_lock.lock();
+        if state.started {
+            return;
+        }
+        state.started = true;
         let Some(join) = self.join.lock().take() else {
-            return Ok(());
+            state.outcome = Some(AuditWriterStopReport {
+                fully_stopped: true,
+                errors: Vec::new(),
+            });
+            state_ready.notify_all();
+            return;
         };
-        join.join().map_err(|payload| {
-            payload
-                .downcast_ref::<&str>()
-                .map(|message| (*message).to_string())
-                .or_else(|| payload.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "non-string panic payload".to_string())
-        })
+        drop(state);
+
+        let join_state = self.join_state.clone();
+        let last_audit_error = self.last_audit_error.clone();
+        let monitor = std::thread::Builder::new()
+            .name("grokptah-orchestration-audit-join".into())
+            .spawn(move || {
+                let report = match join.join() {
+                    Ok(()) => AuditWriterStopReport {
+                        fully_stopped: true,
+                        errors: Vec::new(),
+                    },
+                    Err(payload) => {
+                        let error = payload
+                            .downcast_ref::<&str>()
+                            .map(|message| (*message).to_string())
+                            .or_else(|| payload.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "non-string panic payload".to_string());
+                        *last_audit_error.lock() = Some(error.clone());
+                        AuditWriterStopReport {
+                            fully_stopped: true,
+                            errors: vec![error],
+                        }
+                    }
+                };
+                let (state_lock, state_ready) = &*join_state;
+                state_lock.lock().outcome = Some(report);
+                state_ready.notify_all();
+            });
+        if let Err(error) = monitor {
+            let error = format!("failed to start the orchestration audit join monitor: {error}");
+            *self.last_audit_error.lock() = Some(error.clone());
+            let mut state = state_lock.lock();
+            state.outcome = Some(AuditWriterStopReport {
+                fully_stopped: false,
+                errors: vec![error],
+            });
+            state_ready.notify_all();
+        }
+    }
+
+    fn wait_bounded(&self, timeout: std::time::Duration) -> AuditWriterStopReport {
+        self.begin_join();
+        let (state_lock, state_ready) = &*self.join_state;
+        let mut state = state_lock.lock();
+        if state.outcome.is_none() {
+            let deadline = std::time::Instant::now() + timeout;
+            while state.outcome.is_none() {
+                if state_ready.wait_until(&mut state, deadline).timed_out()
+                    && state.outcome.is_none()
+                {
+                    return AuditWriterStopReport {
+                        fully_stopped: false,
+                        errors: vec![format!(
+                            "durable orchestration audit writer did not stop within {timeout:?}"
+                        )],
+                    };
+                }
+            }
+        }
+        state
+            .outcome
+            .clone()
+            .unwrap_or_else(|| AuditWriterStopReport {
+                fully_stopped: false,
+                errors: vec!["orchestration audit join outcome was unavailable".to_string()],
+            })
     }
 }
 
 impl Drop for AuditWriter {
     fn drop(&mut self) {
-        let _ = self.close();
+        let _ = self.wait_bounded(std::time::Duration::from_secs(30));
     }
 }
 
@@ -290,6 +375,7 @@ impl OrchStore {
         let audit_root = root.clone();
         let writer_error = last_audit_error.clone();
         let writer_lock = audit_file_lock.clone();
+        let join_state = Arc::new((Mutex::new(AuditWriterJoinState::default()), Condvar::new()));
         // The audit writer runs on its own thread and outlives any single
         // call, so it carries the same lease every other durable effect does.
         // The lease is shared, so rebinding the store rebinds the writer.
@@ -317,11 +403,13 @@ impl OrchStore {
                 _store_lock: store_lock,
                 lock: Mutex::new(()),
                 last_run_error: Mutex::new(None),
-                last_audit_error,
+                last_audit_error: last_audit_error.clone(),
                 audit_file_lock,
                 audit_writer: AuditWriter {
                     tx: Mutex::new(Some(audit_tx)),
                     join: Mutex::new(Some(audit_join)),
+                    join_state,
+                    last_audit_error: last_audit_error.clone(),
                 },
             }),
         };
@@ -5091,11 +5179,17 @@ impl OrchStore {
     /// seam: callers must invoke it before sealing the owning runtime's
     /// durable-write authority. The synchronous `append_audit` path remains
     /// available for the final host-shutdown record after the drain.
-    pub(crate) fn close_audit_writer(&self) -> anyhow::Result<()> {
-        self.inner
-            .audit_writer
-            .close()
-            .map_err(|error| anyhow::anyhow!("audit writer join failed: {error}"))
+    pub(crate) fn close_audit_writer_bounded(
+        &self,
+        timeout: std::time::Duration,
+    ) -> AuditWriterStopReport {
+        let mut report = self.inner.audit_writer.wait_bounded(timeout);
+        if let Some(error) = self.inner.last_audit_error.lock().clone() {
+            if !report.errors.contains(&error) {
+                report.errors.push(error);
+            }
+        }
+        report
     }
 
     pub fn last_audit_error(&self) -> Option<String> {
@@ -6236,9 +6330,41 @@ mod tests {
                 detail: "test".into(),
             })
             .unwrap();
+        let report = store.close_audit_writer_bounded(std::time::Duration::from_secs(1));
+        assert!(
+            report.fully_stopped,
+            "audit writer did not drain: {report:?}"
+        );
+        assert!(report.errors.is_empty(), "audit writer errors: {report:?}");
         drop(store);
         let body = fs::read_to_string(path).unwrap();
         assert!(body.contains("\"tool\":\"auth\""));
+    }
+
+    #[test]
+    fn audit_writer_timeout_is_reported_without_blocking_the_caller() {
+        let join_state = Arc::new((Mutex::new(AuditWriterJoinState::default()), Condvar::new()));
+        let last_audit_error = Arc::new(Mutex::new(None));
+        let writer = AuditWriter {
+            tx: Mutex::new(None),
+            join: Mutex::new(Some(
+                std::thread::Builder::new()
+                    .name("grokptah-test-uncooperative-audit".into())
+                    .spawn(|| std::thread::sleep(std::time::Duration::from_millis(100)))
+                    .unwrap(),
+            )),
+            join_state,
+            last_audit_error,
+        };
+        let started = std::time::Instant::now();
+        let report = writer.wait_bounded(std::time::Duration::from_millis(5));
+        assert!(!report.fully_stopped);
+        assert!(report
+            .errors
+            .iter()
+            .any(|error| error.contains("did not stop within")));
+        assert!(started.elapsed() < std::time::Duration::from_millis(80));
+        drop(writer);
     }
 
     #[test]

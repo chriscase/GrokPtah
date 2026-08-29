@@ -68,12 +68,17 @@ the next begins:
 3. **Cancel and JOIN** every supervised task: runs, background work, subagents,
    Computer Use operations, watchers. Cancel is not enough — the join is the
    guarantee.
-4. **Seal durable writes.** After the seal, no new `DurableWriteGuard` is ever
+4. **Drain the durable writers while authority is still live.** The event
+   journal and orchestration audit writer stop accepting new entries and are
+   joined with the shared shutdown deadline. A queued entry is therefore
+   either persisted before the seal or reported as an unclean stop; an
+   uncooperative writer cannot block shutdown indefinitely.
+5. **Seal durable writes.** After the seal, no new `DurableWriteGuard` is ever
    issued.
-5. **Flush durable state and run shutdown hooks** (audit ledger close and
-   friends) — only if the seal held.
-6. **Mark closed**, so every stale handle fails closed.
-7. **Release the advisory lock exactly once.** The lock *file* stays on disk;
+6. **Flush durable state and run shutdown hooks** (including the final audit
+   ledger record) — only if the seal held.
+7. **Mark closed**, so every stale handle fails closed.
+8. **Release the advisory lock exactly once.** The lock *file* stays on disk;
    only the advisory lock is released.
 
 A terminal run never counts as shutdown-complete while a spawned task or guard

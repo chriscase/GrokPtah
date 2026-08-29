@@ -148,6 +148,12 @@ jobs:
           cargo fmt --check
           cargo clippy --locked --all-targets -- -D warnings
           cargo test --locked -- --test-threads=1
+      - name: Pager fmt + clippy + tests
+        working-directory: crates/codegen/xai-grok-pager
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked --lib --tests -- --test-threads=1
       - name: Host authority spine (fmt + clippy + tests)
         working-directory: .
         run: |
