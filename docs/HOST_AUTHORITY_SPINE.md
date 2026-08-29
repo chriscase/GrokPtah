@@ -12,9 +12,12 @@ credential incarnations, authentication generations, sessions, workspaces and
 resource incarnations. A caller presents a bearer; it never mints identity.
 
 **G2 — sealed capabilities and one-use leases.** A capability's scope is fixed
-at issue time. An `EffectLease` authorises exactly one action, bound to that
-action's digest together with the observation revision and digest it was
-planned against.
+at issue time, including *who stands behind it*: sealing requires an
+`ActorClass` of `VerifiedOperator` or `VerifiedModel`, so there is no absent
+actor that could be read as operator authority by default. An `EffectLease`
+authorises exactly one action, bound to that action's digest together with the
+observation revision and digest it was planned against, and carries the actor
+forward unchanged.
 
 **G3 — the physical-send attempt lattice.** A physical provider send requires a
 `PhysicalSendPermit`. `HostAuthority::begin_send` is its only producer, and the
@@ -50,6 +53,7 @@ for one endpoint or one credential cannot be replayed against another.
 | Ambiguity never auto-retries | There is no retry API. `reconcile_attempt` is the only exit, and it takes provider truth the host established. |
 | Reads are scoped | `attempt_projection` reports another principal's attempt exactly as it reports a missing one, so it is not an existence oracle. |
 | Projections are secret-, content- and path-free | Identifiers render as truncated domain-separated digests. Bodies, URLs, credentials and paths are digested on the way in and never stored. |
+| A model proposal is never operator authority | The actor is fixed at seal time, has no setter, and must match the durable record. An unrecognised stored actor is corrupt state, never an implicit operator. |
 | A damaged root refuses service | Absent or unparsable state fails closed. A root that lost `authority.json` but kept audit evidence refuses rather than minting a fresh lineage. |
 | Concurrency is real | Every mutation and every audit append takes an exclusive `flock`, which is held per open file description and so serialises processes, not just threads. |
 

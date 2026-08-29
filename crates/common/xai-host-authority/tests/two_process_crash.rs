@@ -49,7 +49,13 @@ fn child_take_permit_then_die(root: &Path) -> ! {
         )
         .expect("child resource");
     let capability = authority
-        .seal_capability(&auth, resource, EffectClass::ProviderSend, 60_000)
+        .seal_capability(
+            &auth,
+            resource,
+            ActorClass::VerifiedOperator,
+            EffectClass::ProviderSend,
+            60_000,
+        )
         .expect("child capability");
     let req = request(b"body");
     let lease = authority

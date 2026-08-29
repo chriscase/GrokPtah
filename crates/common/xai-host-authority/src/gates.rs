@@ -34,6 +34,7 @@ impl HostAuthority {
         &self,
         auth: &AuthContext,
         resource: ResourceIncarnation,
+        actor: ActorClass,
         effect: EffectClass,
         ttl_ms: u64,
     ) -> Result<SealedCapability, AuthorityError> {
@@ -66,6 +67,7 @@ impl HostAuthority {
                     workspace: binding.workspace.to_hex(),
                     resource: binding.resource.to_hex(),
                     control_epoch: binding.control_epoch.raw(),
+                    actor: actor.as_str().to_string(),
                     effect: effect.as_str().to_string(),
                     expires_at_ms,
                     consumed: false,
@@ -75,6 +77,7 @@ impl HostAuthority {
                 SealedCapability {
                     id,
                     binding,
+                    actor,
                     effect,
                     expires_at_ms,
                 },
@@ -87,6 +90,7 @@ impl HostAuthority {
             AuditEvent::CapabilitySealed {
                 capability: capability.id.public_handle(),
                 principal: principal_handle,
+                actor: actor.as_str().to_string(),
                 effect: effect.as_str().to_string(),
             },
         )?;
@@ -140,6 +144,7 @@ impl HostAuthority {
                 || stored.workspace != capability.binding.workspace.to_hex()
                 || stored.resource != capability.binding.resource.to_hex()
                 || stored.effect != capability.effect.as_str()
+                || stored.actor != capability.actor.as_str()
             {
                 return Err(AuthorityError::ResourceOwnershipMismatch);
             }
@@ -172,6 +177,7 @@ impl HostAuthority {
                     observation_revision: resource.observation_revision,
                     observation_digest: resource.observation_digest.clone(),
                     action_digest: action_digest.to_hex(),
+                    actor: stored.actor.clone(),
                     effect: stored.effect.clone(),
                     expires_at_ms,
                     consumed: false,
@@ -184,6 +190,7 @@ impl HostAuthority {
                 observation_revision: ObservationRevision::from_raw(resource.observation_revision),
                 observation_digest: decode_digest(&resource.observation_digest, "observation")?,
                 action_digest,
+                actor: capability.actor,
                 effect: capability.effect,
                 expires_at_ms,
             })
@@ -290,6 +297,17 @@ impl HostAuthority {
                     ));
                 }
             }
+            // The actor must still parse and must be the one the lease claims.
+            // An unrecognised actor is corrupt state, never an implicit
+            // operator.
+            let Some(stored_actor) = ActorClass::parse(&stored.actor) else {
+                return Err(AuthorityError::CorruptState(
+                    "durable lease actor class is unknown".into(),
+                ));
+            };
+            if stored_actor != lease.actor {
+                return Err(AuthorityError::ResourceOwnershipMismatch);
+            }
             // The surface must not have moved since the lease was minted.
             let resource = state
                 .resources
@@ -321,6 +339,7 @@ impl HostAuthority {
                     workspace: stored.workspace.clone(),
                     resource: stored.resource.clone(),
                     control_epoch: stored.control_epoch,
+                    actor: stored.actor.clone(),
                     request_digest: request_digest.to_hex(),
                     body_digest: body_digest.to_hex(),
                     idempotency_key: idempotency_key_for(attempt),
@@ -360,6 +379,7 @@ impl HostAuthority {
                 session: binding.session.public_handle(),
                 workspace: binding.workspace.public_handle(),
                 resource: binding.resource.public_handle(),
+                actor: lease.actor.as_str().to_string(),
                 request_digest: request_digest.public_handle(),
                 body_digest: body_digest.public_handle(),
             },

@@ -187,8 +187,8 @@ pub use ids::{
     SessionId, WorkspaceId,
 };
 pub use receipt::{
-    AuthContext, AuthorityBinding, EffectClass, EffectLease, FailedReason, PhysicalSendPermit,
-    SealedCapability, SendOutcome, UncertainReason,
+    ActorClass, AuthContext, AuthorityBinding, EffectClass, EffectLease, FailedReason,
+    PhysicalSendPermit, SealedCapability, SendOutcome, UncertainReason,
 };
 pub use store::{HostAdminAuthority, HostAuthority, HostCredential};
 

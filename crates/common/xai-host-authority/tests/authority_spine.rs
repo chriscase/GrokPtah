@@ -70,7 +70,13 @@ fn fixture() -> Fixture {
 fn lease_for(f: &Fixture, req: &RequestIdentity) -> EffectLease {
     let cap = f
         .authority
-        .seal_capability(&f.auth, f.resource, EffectClass::ProviderSend, 60_000)
+        .seal_capability(
+            &f.auth,
+            f.resource,
+            ActorClass::VerifiedOperator,
+            EffectClass::ProviderSend,
+            60_000,
+        )
         .unwrap();
     f.authority
         .mint_lease(&f.auth, &cap, req.digest(), 60_000)
@@ -163,7 +169,13 @@ fn removing_a_credential_revokes_everything_derived_from_it() {
     let f = fixture();
     let cap = f
         .authority
-        .seal_capability(&f.auth, f.resource, EffectClass::ProviderSend, 60_000)
+        .seal_capability(
+            &f.auth,
+            f.resource,
+            ActorClass::VerifiedOperator,
+            EffectClass::ProviderSend,
+            60_000,
+        )
         .unwrap();
 
     // A second slot replaces the first entirely.
@@ -200,8 +212,13 @@ fn a_resource_the_host_never_issued_cannot_be_claimed_by_naming_it() {
         Err(AuthorityError::UnknownResource)
     ));
     assert!(matches!(
-        f.authority
-            .seal_capability(&f.auth, other.resource, EffectClass::ProviderSend, 60_000),
+        f.authority.seal_capability(
+            &f.auth,
+            other.resource,
+            ActorClass::VerifiedOperator,
+            EffectClass::ProviderSend,
+            60_000
+        ),
         Err(AuthorityError::UnknownResource)
     ));
 }
@@ -236,7 +253,13 @@ fn a_second_principal_cannot_use_the_first_principals_resource() {
         Err(AuthorityError::ResourceOwnershipMismatch)
     ));
     assert!(matches!(
-        authority.seal_capability(&b, resource, EffectClass::ProviderSend, 60_000),
+        authority.seal_capability(
+            &b,
+            resource,
+            ActorClass::VerifiedOperator,
+            EffectClass::ProviderSend,
+            60_000
+        ),
         Err(AuthorityError::ResourceOwnershipMismatch)
     ));
     assert!(matches!(
@@ -267,7 +290,13 @@ fn a_capability_cannot_be_leased_by_a_different_principal() {
         .issue_resource(&a, session, workspace, observation("frame-1"))
         .unwrap();
     let cap = authority
-        .seal_capability(&a, resource, EffectClass::ProviderSend, 60_000)
+        .seal_capability(
+            &a,
+            resource,
+            ActorClass::VerifiedOperator,
+            EffectClass::ProviderSend,
+            60_000,
+        )
         .unwrap();
 
     assert!(matches!(
@@ -305,7 +334,13 @@ fn an_expired_capability_cannot_be_leased() {
     let f = fixture();
     let cap = f
         .authority
-        .seal_capability(&f.auth, f.resource, EffectClass::ProviderSend, 1)
+        .seal_capability(
+            &f.auth,
+            f.resource,
+            ActorClass::VerifiedOperator,
+            EffectClass::ProviderSend,
+            1,
+        )
         .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(5));
     assert!(matches!(
@@ -320,7 +355,13 @@ fn rotating_the_capability_generation_invalidates_sealed_grants() {
     let f = fixture();
     let cap = f
         .authority
-        .seal_capability(&f.auth, f.resource, EffectClass::ProviderSend, 60_000)
+        .seal_capability(
+            &f.auth,
+            f.resource,
+            ActorClass::VerifiedOperator,
+            EffectClass::ProviderSend,
+            60_000,
+        )
         .unwrap();
     f.authority.rotate_capability_generation(&f.admin).unwrap();
 
@@ -343,7 +384,13 @@ fn a_capability_for_one_effect_class_does_not_authorise_another() {
     let req = request(b"body");
     let cap = f
         .authority
-        .seal_capability(&f.auth, f.resource, EffectClass::ComputerUseAct, 60_000)
+        .seal_capability(
+            &f.auth,
+            f.resource,
+            ActorClass::VerifiedOperator,
+            EffectClass::ComputerUseAct,
+            60_000,
+        )
         .unwrap();
     let lease = f
         .authority
@@ -548,7 +595,13 @@ fn a_crash_between_dispatch_and_settlement_settles_uncertain() {
             .issue_resource(&auth, session, workspace, observation("frame-1"))
             .unwrap();
         let cap = authority
-            .seal_capability(&auth, resource, EffectClass::ProviderSend, 60_000)
+            .seal_capability(
+                &auth,
+                resource,
+                ActorClass::VerifiedOperator,
+                EffectClass::ProviderSend,
+                60_000,
+            )
             .unwrap();
         let req = request(b"body");
         let lease = authority
@@ -604,7 +657,13 @@ fn concurrent_spends_of_one_lease_admit_exactly_one() {
         .issue_resource(&auth, session, workspace, observation("frame-1"))
         .unwrap();
     let cap = authority
-        .seal_capability(&auth, resource, EffectClass::ProviderSend, 60_000)
+        .seal_capability(
+            &auth,
+            resource,
+            ActorClass::VerifiedOperator,
+            EffectClass::ProviderSend,
+            60_000,
+        )
         .unwrap();
     let req = request(b"body");
     let lease = authority
@@ -906,7 +965,13 @@ fn a_planted_old_resource_record_cannot_be_used_after_rotation() {
     );
     assert!(
         reopened
-            .seal_capability(&current, f.resource, EffectClass::ProviderSend, 60_000)
+            .seal_capability(
+                &current,
+                f.resource,
+                ActorClass::VerifiedOperator,
+                EffectClass::ProviderSend,
+                60_000
+            )
             .is_err(),
         "nor may it be used to seal a capability"
     );
@@ -956,7 +1021,13 @@ fn one_principal_cannot_read_another_principals_attempt() {
         .issue_resource(&a, session, workspace, observation("frame-1"))
         .unwrap();
     let cap = authority
-        .seal_capability(&a, resource, EffectClass::ProviderSend, 60_000)
+        .seal_capability(
+            &a,
+            resource,
+            ActorClass::VerifiedOperator,
+            EffectClass::ProviderSend,
+            60_000,
+        )
         .unwrap();
     let req = request(b"body");
     let lease = authority
@@ -971,4 +1042,129 @@ fn one_principal_cannot_read_another_principals_attempt() {
     // Another principal sees exactly what it would see for an attempt that
     // does not exist, so this is not an existence oracle.
     assert!(authority.attempt_projection(&b, attempt).unwrap().is_none());
+}
+
+#[test]
+fn a_model_sealed_capability_is_never_operator_authority() {
+    let f = fixture();
+    let model = f
+        .authority
+        .seal_capability(
+            &f.auth,
+            f.resource,
+            ActorClass::VerifiedModel,
+            EffectClass::ProviderSend,
+            60_000,
+        )
+        .unwrap();
+    assert_eq!(model.actor(), ActorClass::VerifiedModel);
+    assert!(
+        !model.actor().is_operator(),
+        "a model proposal must never read as operator authority"
+    );
+
+    // The actor is carried onto the lease and cannot be swapped there.
+    let req = request(b"body");
+    let lease = f
+        .authority
+        .mint_lease(&f.auth, &model, req.digest(), 60_000)
+        .unwrap();
+    assert_eq!(lease.actor(), ActorClass::VerifiedModel);
+
+    // And it reaches the audit trail, so an auditor can tell which grants a
+    // human stood behind.
+    let sealed_actors: Vec<String> = f
+        .authority
+        .audit_records(&f.admin)
+        .unwrap()
+        .into_iter()
+        .filter_map(|r| match r.event {
+            AuditEvent::CapabilitySealed { actor, .. } => Some(actor),
+            _ => None,
+        })
+        .collect();
+    assert!(sealed_actors.contains(&"verified_model".to_string()));
+
+    let permit = f.authority.begin_send(&f.auth, lease, &req).unwrap();
+    let _ = f.authority.settle_settled(permit);
+    let intent_actors: Vec<String> = f
+        .authority
+        .audit_records(&f.admin)
+        .unwrap()
+        .into_iter()
+        .filter_map(|r| match r.event {
+            AuditEvent::SendIntent { actor, .. } => Some(actor),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(intent_actors, vec!["verified_model".to_string()]);
+}
+
+#[test]
+fn an_unrecognised_durable_actor_is_corrupt_state_not_an_implicit_operator() {
+    let f = fixture();
+    let cap = f
+        .authority
+        .seal_capability(
+            &f.auth,
+            f.resource,
+            ActorClass::VerifiedModel,
+            EffectClass::ProviderSend,
+            60_000,
+        )
+        .unwrap();
+    let req = request(b"body");
+    let lease = f
+        .authority
+        .mint_lease(&f.auth, &cap, req.digest(), 60_000)
+        .unwrap();
+
+    // Rewrite the stored lease's actor to something this build does not know.
+    let path = f.root.join("authority.json");
+    let mut value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    for (_, stored) in value["leases"].as_object_mut().unwrap().iter_mut() {
+        stored["actor"] = serde_json::Value::String("some_future_actor".into());
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+
+    let error = f
+        .authority
+        .begin_send(&f.auth, lease, &req)
+        .expect_err("an unknown actor must not authorise a send");
+    assert!(
+        matches!(error, AuthorityError::CorruptState(_)),
+        "expected corrupt state, got {error:?}"
+    );
+}
+
+#[test]
+fn a_lease_actor_must_match_the_capability_it_came_from() {
+    // Seal as operator, then rewrite the durable capability to claim the model
+    // actor: the presented capability and the record must agree in full.
+    let f = fixture();
+    let cap = f
+        .authority
+        .seal_capability(
+            &f.auth,
+            f.resource,
+            ActorClass::VerifiedOperator,
+            EffectClass::ProviderSend,
+            60_000,
+        )
+        .unwrap();
+
+    let path = f.root.join("authority.json");
+    let mut value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    for (_, stored) in value["capabilities"].as_object_mut().unwrap().iter_mut() {
+        stored["actor"] = serde_json::Value::String("verified_model".into());
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+
+    assert!(matches!(
+        f.authority
+            .mint_lease(&f.auth, &cap, observation("act"), 60_000),
+        Err(AuthorityError::ResourceOwnershipMismatch)
+    ));
 }

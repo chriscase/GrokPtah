@@ -69,6 +69,9 @@ pub(crate) struct StoredCapability {
     pub(crate) workspace: String,
     pub(crate) resource: String,
     pub(crate) control_epoch: u64,
+    /// Who stands behind this grant. Required: a record without it does not
+    /// parse, rather than defaulting to operator authority.
+    pub(crate) actor: String,
     /// Effect class this grant covers.
     pub(crate) effect: String,
     /// Wall-clock expiry, milliseconds since the Unix epoch.
@@ -95,6 +98,7 @@ pub(crate) struct StoredLease {
     pub(crate) observation_digest: String,
     /// Digest of the exact action this lease authorises.
     pub(crate) action_digest: String,
+    pub(crate) actor: String,
     pub(crate) effect: String,
     pub(crate) expires_at_ms: u64,
     pub(crate) consumed: bool,
@@ -118,6 +122,7 @@ pub(crate) struct StoredAttempt {
     pub(crate) request_digest: String,
     /// Body digest alone, for audit correlation.
     pub(crate) body_digest: String,
+    pub(crate) actor: String,
     /// Idempotency key offered to the provider, when it supports one.
     pub(crate) idempotency_key: String,
     pub(crate) state: String,
