@@ -695,11 +695,27 @@ async fn completion(
         if let Some(credentials) = credentials.current() {
             request = crate::auth_store::apply_auth_headers(request, credentials, base_url);
         }
-        let response = request
-            .json(&body)
-            .send()
-            .await
-            .map_err(classify_transport)?;
+        let credential_secret = credentials
+            .current()
+            .map(|current| current.bearer.as_bytes())
+            .unwrap_or_default();
+        let model = body
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("qualification-probe");
+        let response = crate::provider_transport::send_provider_request(
+            client,
+            request.json(&body),
+            crate::provider_transport::ProviderRequestScope {
+                credential_secret,
+                dialect: "provider_qualification",
+                model,
+                target_scope: "provider-qualification-completion",
+            },
+            None,
+        )
+        .await
+        .map_err(|error| anyhow!(error.to_string()))?;
         let status = response.status();
         if status.is_redirection() {
             bail!("provider redirect refused");
@@ -753,11 +769,23 @@ async fn streaming_probe(
         if let Some(current) = credentials.current() {
             request = crate::auth_store::apply_auth_headers(request, current, base_url);
         }
-        let response = request
-            .json(&body)
-            .send()
-            .await
-            .map_err(classify_transport)?;
+        let credential_secret = credentials
+            .current()
+            .map(|current| current.bearer.as_bytes())
+            .unwrap_or_default();
+        let response = crate::provider_transport::send_provider_request(
+            client,
+            request.json(&body),
+            crate::provider_transport::ProviderRequestScope {
+                credential_secret,
+                dialect: "provider_qualification",
+                model: model_id,
+                target_scope: "provider-qualification-stream",
+            },
+            None,
+        )
+        .await
+        .map_err(|error| anyhow!(error.to_string()))?;
         if response.status() == reqwest::StatusCode::UNAUTHORIZED
             && credentials.refresh_after_unauthorized().await?
         {

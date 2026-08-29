@@ -49,7 +49,7 @@ for one endpoint or one credential cannot be replayed against another.
 | Invariant | How |
 | --- | --- |
 | No caller-forgeable approvals | Every receipt has private fields and `pub(crate)` construction. Compile-fail doctests pin it. |
-| No permit forgery inside the spine | A send permit has private fields; `begin_send` is its only producer. The production HTTP transport must still be reconstructed to consume it at the actual credential-bearing write boundary before global no-bypass is qualified. |
+| No permit forgery or model-send bypass | A send permit has private fields; `begin_send` is its only producer. `provider_transport` is the sole credential-bearing model wire boundary and consumes a fresh permit before its single `Client::execute` call. Host chat, agent-step, provider-qualification, and OIDC token refresh traffic all route through it; a static source guard pins those call sites. |
 | Administration is not ambient | Replacing credentials, rotating epochs or generations, exporting the log, crash recovery, and resolving an ambiguous effect all need a root-bound `HostAdminAuthority`, returned only after `open` proves the host custody secret and not `Clone`. |
 | Authority identity is not deserializable | No identifier or generation derives `Deserialize`; a derived one would be a public constructor in disguise. Durable records carry hex strings that only this crate decodes. |
 | Pre-effect persistence failure prevents dispatch | The attempt record and the intent audit record must both be durable *before* the permit is constructed. No permit, no dispatch. |

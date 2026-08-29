@@ -829,12 +829,19 @@ async fn refresh_oidc_inner(
         }
         form.push(("principal_id", principal_id));
     }
-    let token_response = client
-        .post(XAI_OIDC_TOKEN_ENDPOINT)
-        .form(&form)
-        .send()
-        .await
-        .map_err(|_| LiveSafetyError::RefreshTransportFailed)?;
+    let token_response = crate::provider_transport::send_provider_request(
+        &client,
+        client.post(XAI_OIDC_TOKEN_ENDPOINT).form(&form),
+        crate::provider_transport::ProviderRequestScope {
+            credential_secret: refresh.as_bytes(),
+            dialect: "oauth2_refresh",
+            model: "oidc-token-refresh",
+            target_scope: "oidc-token-refresh",
+        },
+        None,
+    )
+    .await
+    .map_err(|_| LiveSafetyError::RefreshTransportFailed)?;
     let tokens = bounded_refresh_json(token_response).await?;
     let access = bounded_refresh_string(&tokens, "access_token")?;
     let new_refresh = match tokens.get("refresh_token") {

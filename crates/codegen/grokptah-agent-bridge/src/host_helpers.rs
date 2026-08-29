@@ -2124,25 +2124,25 @@ where
                     context.begin_attempt().ok().map(|attempt| (route, attempt))
                 });
 
-        let resp_result = tokio::select! {
-            r = send_once(&creds).send() => r,
-            _ = cancel.cancelled() => {
-                if let Some((route, attempt)) = observation_attempt.take() {
-                    record_provider_attempt(
-                        Some(attempt),
-                        route,
-                        None,
-                        None,
-                        ResponseFraming::None,
-                        ObservationAttemptDisposition::Cancelled,
-                        request_bytes,
-                        0,
-                        None,
-                    );
-                }
-                bail!("cancelled")
+        let resp_result = crate::provider_transport::send_provider_request(
+            &client,
+            send_once(&creds),
+            crate::provider_transport::ProviderRequestScope {
+                credential_secret: creds.bearer.as_bytes(),
+                dialect: match target.dialect {
+                    crate::gateway_config::ProviderDialect::XaiChatCompletions => {
+                        "xai_chat_completions"
+                    }
+                    crate::gateway_config::ProviderDialect::OpenAiChatCompletions => {
+                        "openai_chat_completions"
+                    }
+                },
+                model: &target.wire_model,
+                target_scope: "agent-step",
             },
-        };
+            Some(cancel),
+        )
+        .await;
         let mut resp = match resp_result {
             Ok(r) => r,
             Err(e) => {
@@ -2153,7 +2153,7 @@ where
                         None,
                         None,
                         ResponseFraming::None,
-                        if e.is_timeout() {
+                        if e.is_uncertain() {
                             ObservationAttemptDisposition::Timeout
                         } else {
                             ObservationAttemptDisposition::TransportError
@@ -2167,18 +2167,19 @@ where
                     if target.dialect
                         == crate::gateway_config::ProviderDialect::OpenAiChatCompletions
                     {
-                        if e.is_timeout() {
-                            "configured provider request timed out".into()
-                        } else if e.is_connect() {
+                        if e.is_safe_to_resend() {
                             "configured provider could not connect".into()
                         } else {
-                            "configured provider request failed".into()
+                            format!("configured provider request failed: {e}")
                         }
                     } else {
                         format!("request error: {e}")
                     },
                 );
-                if allow_transient_retries && transient_retries < MAX_TRANSIENT_RETRIES {
+                if e.is_safe_to_resend()
+                    && allow_transient_retries
+                    && transient_retries < MAX_TRANSIENT_RETRIES
+                {
                     let delay = 400 * (1 << transient_retries);
                     transient_retries += 1;
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
@@ -2221,40 +2222,28 @@ where
                             .and_then(|(route, context)| {
                                 context.begin_attempt().ok().map(|attempt| (route, attempt))
                             });
-                    resp = tokio::select! {
-                        r = send_once(&creds).send() => match r {
-                            Ok(response) => response,
-                            Err(error) => {
-                                if let Some((route, attempt)) = observation_attempt.take() {
-                                    record_provider_attempt(
-                                        Some(attempt),
-                                        route,
-                                        None,
-                                        None,
-                                        ResponseFraming::None,
-                                        if error.is_timeout() {
-                                            ObservationAttemptDisposition::Timeout
-                                        } else {
-                                            ObservationAttemptDisposition::TransportError
-                                        },
-                                        request_bytes,
-                                        0,
-                                        None,
-                                    );
+                    resp = match crate::provider_transport::send_provider_request(
+                        &client,
+                        send_once(&creds),
+                        crate::provider_transport::ProviderRequestScope {
+                            credential_secret: creds.bearer.as_bytes(),
+                            dialect: match target.dialect {
+                                crate::gateway_config::ProviderDialect::XaiChatCompletions => {
+                                    "xai_chat_completions"
                                 }
-                                let class = if error.is_timeout() {
-                                    "timeout"
-                                } else if error.is_connect() {
-                                    "connect"
-                                } else {
-                                    "transport"
-                                };
-                                return Err(anyhow!(
-                                    "request after OIDC refresh failed ({class})"
-                                ));
-                            }
+                                crate::gateway_config::ProviderDialect::OpenAiChatCompletions => {
+                                    "openai_chat_completions"
+                                }
+                            },
+                            model: &target.wire_model,
+                            target_scope: "agent-step-oidc-refresh",
                         },
-                        _ = cancel.cancelled() => {
+                        Some(cancel),
+                    )
+                    .await
+                    {
+                        Ok(response) => response,
+                        Err(error) => {
                             if let Some((route, attempt)) = observation_attempt.take() {
                                 record_provider_attempt(
                                     Some(attempt),
@@ -2262,14 +2251,25 @@ where
                                     None,
                                     None,
                                     ResponseFraming::None,
-                                    ObservationAttemptDisposition::Cancelled,
+                                    if error.is_uncertain() {
+                                        ObservationAttemptDisposition::Timeout
+                                    } else {
+                                        ObservationAttemptDisposition::TransportError
+                                    },
                                     request_bytes,
                                     0,
                                     None,
                                 );
                             }
-                            bail!("cancelled")
-                        },
+                            let class = if error.is_safe_to_resend() {
+                                "connect"
+                            } else if error.is_uncertain() {
+                                "uncertain"
+                            } else {
+                                "authority"
+                            };
+                            return Err(anyhow!("request after OIDC refresh failed ({class})"));
+                        }
                     };
                 }
                 Err(error) => {
@@ -3734,17 +3734,31 @@ pub(crate) async fn call_xai_chat(
         req.json(&body)
     };
 
-    let mut resp = send_once(&creds).send().await.map_err(|e| {
+    let mut resp = crate::provider_transport::send_provider_request(
+        &client,
+        send_once(&creds),
+        crate::provider_transport::ProviderRequestScope {
+            credential_secret: creds.bearer.as_bytes(),
+            dialect: if is_compatible {
+                "openai_chat_completions"
+            } else {
+                "xai_chat_completions"
+            },
+            model: &model_id,
+            target_scope: "chat",
+        },
+        None,
+    )
+    .await
+    .map_err(|e| {
         // Surface classify-able transport failures (DNS, TLS, timeout) so the
         // UI is not a vague "error sending request".
-        let kind = if e.is_timeout() {
-            "timeout"
-        } else if e.is_connect() {
+        let kind = if e.is_safe_to_resend() {
             "connect"
-        } else if e.is_request() {
-            "request"
+        } else if e.is_uncertain() {
+            "uncertain"
         } else {
-            "network"
+            "authority"
         };
         if is_compatible {
             anyhow!(
@@ -3763,13 +3777,29 @@ pub(crate) async fn call_xai_chat(
         match crate::auth_store::force_refresh(&creds).await {
             Ok(fresh) => {
                 creds = fresh;
-                resp = send_once(&creds).send().await.map_err(|error| {
-                    let class = if error.is_timeout() {
-                        "timeout"
-                    } else if error.is_connect() {
+                resp = crate::provider_transport::send_provider_request(
+                    &client,
+                    send_once(&creds),
+                    crate::provider_transport::ProviderRequestScope {
+                        credential_secret: creds.bearer.as_bytes(),
+                        dialect: if is_compatible {
+                            "openai_chat_completions"
+                        } else {
+                            "xai_chat_completions"
+                        },
+                        model: &model_id,
+                        target_scope: "chat-oidc-refresh",
+                    },
+                    None,
+                )
+                .await
+                .map_err(|error| {
+                    let class = if error.is_safe_to_resend() {
                         "connect"
+                    } else if error.is_uncertain() {
+                        "uncertain"
                     } else {
-                        "transport"
+                        "authority"
                     };
                     anyhow!("request after OIDC refresh failed ({class})")
                 })?;
