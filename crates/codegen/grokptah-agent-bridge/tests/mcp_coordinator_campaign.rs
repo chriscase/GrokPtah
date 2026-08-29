@@ -80,7 +80,8 @@ async fn reference_coordinator_campaign_is_protocol_complete() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host.start().unwrap();
     let session = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(session.id, workspace.path()).unwrap();

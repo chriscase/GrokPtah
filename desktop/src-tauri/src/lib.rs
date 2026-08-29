@@ -6,34 +6,47 @@ mod event_forward;
 mod pty_host;
 mod remote_service;
 
-use std::sync::Mutex;
-
-use grokptah_agent_bridge::{start_control_from_env, AgentHost, ControlServerHandle, HostConfig};
+use anyhow::Context;
+use grokptah_agent_bridge::{
+    start_control_from_env, AgentHost, ControlServerHandle, HostConfig, HostRuntime,
+};
 use tauri::Manager;
 
 pub struct AppState {
+    /// Cloneable *request handle* used by every command. It carries no process
+    /// authority of its own and fails closed after shutdown (#455).
     pub host: grokptah_agent_bridge::AgentHostHandle,
+    /// The single non-cloneable owner of the process instance lock and of the
+    /// task supervisor. Held in app state so it outlives setup and so exit can
+    /// run the ordered shutdown (#455).
+    pub runtime: HostRuntime,
     pub pty: pty_host::PtyHub,
-    /// Loopback MCP control plane (#196); optional when token not configured.
-    pub control: Mutex<Option<ControlServerHandle>>,
     pub computer_use: computer_use::DesktopComputerUse,
     pub remote_service: std::sync::Arc<remote_service::RemoteServiceState>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let host = AgentHost::create(HostConfig::default());
-    // Prefer fan-out subscribe so MCP can also attach; fall back to take for compat.
-    let event_rx = host.subscribe_events();
-    let _primary = host.take_event_receiver();
+    if let Err(error) = run_inner() {
+        eprintln!("[grokptah] desktop startup refused: {error:#}");
+    }
+}
 
-    tauri::Builder::default()
+fn run_inner() -> anyhow::Result<()> {
+    let runtime =
+        AgentHost::create(HostConfig::default()).context("acquire the GrokPtah instance lock")?;
+    // Prefer fan-out subscribe so MCP can also attach; fall back to take for compat.
+    let event_rx = runtime.subscribe_events();
+    let _primary = runtime.take_event_receiver();
+    let host = runtime.handle();
+
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
         .manage(AppState {
             host: host.clone(),
+            runtime,
             pty: pty_host::PtyHub::new(),
-            control: Mutex::new(None),
             computer_use: computer_use::DesktopComputerUse::new(&host),
             remote_service: remote_service::RemoteServiceState::new(),
         })
@@ -44,19 +57,48 @@ pub fn run() {
             event_forward::spawn_event_forwarder(handle, event_rx);
 
             // Start authenticated loopback MCP control plane when token is set.
+            //
+            // The bootstrap is *tracked* on the host's shutdown join barrier
+            // even though it runs on the Tauri async runtime (#455). Without
+            // that, an exit racing this task could finish its ordered shutdown,
+            // release the instance lock, and only then have the bootstrap
+            // publish a live listener into `AppState.control` — serving a
+            // closed runtime whose home another process now owns.
             let host2 = host.clone();
             let app_handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                if let Some(srv) = start_embedded_control(host2).await {
-                    eprintln!(
-                        "[grokptah] MCP control plane listening on http://{}/mcp",
-                        srv.addr
-                    );
-                    if let Some(state) = app_handle.try_state::<AppState>() {
-                        *state.control.lock().unwrap() = Some(srv);
+            let bootstrap = async move {
+                let Some(srv) = start_embedded_control(host2).await else {
+                    return;
+                };
+                let addr = srv.addr;
+                let Some(state) = app_handle.try_state::<AppState>() else {
+                    srv.stop();
+                    return;
+                };
+                // The runtime is the authority on whether a control plane may
+                // still be adopted. A refusal hands the server back so the
+                // listener we just bound is stopped rather than orphaned.
+                match state.runtime.attach_control_server(srv) {
+                    Ok(()) => {
+                        eprintln!("[grokptah] MCP control plane listening on http://{addr}/mcp");
+                    }
+                    Err(rejected) => {
+                        eprintln!(
+                            "[grokptah] MCP control plane bootstrap refused: host runtime is {}",
+                            rejected.phase.label()
+                        );
+                        rejected.server.stop();
                     }
                 }
-            });
+            };
+            match host.track_supervised("bootstrapping the MCP control plane", bootstrap) {
+                Ok(tracked) => {
+                    tauri::async_runtime::spawn(tracked);
+                }
+                Err(error) => {
+                    eprintln!("[grokptah] MCP control plane bootstrap refused: {error:#}");
+                }
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -241,8 +283,27 @@ pub fn run() {
             commands::pty_backlog,
             commands::pty_create_command,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running GrokPtah");
+        .build(tauri::generate_context!())
+        .context("build the GrokPtah desktop runtime")?;
+    app.run(|app_handle, event| {
+        // Ordered shutdown on exit (#455): stop and join the control plane
+        // first, then let the runtime cancel and join every supervised
+        // task, flush durable state, and release the single-instance lock
+        // exactly once. Without this the next launch could find
+        // `.instance.lock` still held.
+        if matches!(event, tauri::RunEvent::Exit) {
+            let Some(state) = app_handle.try_state::<AppState>() else {
+                return;
+            };
+            // The runtime owns the control plane, so one ordered shutdown
+            // stops HTTP/SSE acceptance, joins every supervised task
+            // (including a bootstrap still in flight), flushes durable
+            // state and releases the instance lock exactly once.
+            let report = tauri::async_runtime::block_on(state.runtime.shutdown());
+            eprintln!("[grokptah] host shutdown: {}", report.operator_summary());
+        }
+    });
+    Ok(())
 }
 
 /// Start control plane when `GROKPTAH_CONTROL_TOKEN` is set (loopback only).

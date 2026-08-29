@@ -136,7 +136,110 @@ impl DesktopComputerUse {
         }
     }
 
+    /// Run one effectful Computer Use operation under the host's join barrier.
+    ///
+    /// These run on the Tauri command's own task rather than a spawned one, so
+    /// nothing would otherwise register them with the runtime: an ordered
+    /// shutdown could join zero supervised tasks, report clean, release the
+    /// process lock, and a replacement could start while this process was still
+    /// delivering physical input or holding a native capture session.
+    ///
+    /// Tracking the future in place puts it on the same barrier a spawned task
+    /// is on — shutdown waits for it — and refuses it outright once the runtime
+    /// has stopped accepting work (#455).
+    async fn under_supervision<F, T>(&self, operation: &str, future: F) -> Result<T, String>
+    where
+        F: std::future::Future<Output = Result<T, String>>,
+    {
+        match self.host.track_supervised(operation, future) {
+            Ok(tracked) => tracked.await,
+            Err(error) => Err(format!("{operation} is refused: {error:#}")),
+        }
+    }
+
     pub async fn request_permission(
+        &self,
+        permission: ComputerPermission,
+    ) -> Result<ComputerPermissionStatus, String> {
+        self.under_supervision(
+            "requesting a Computer Use permission",
+            self.request_permission_effect(permission),
+        )
+        .await
+    }
+
+    pub async fn list_targets(&self) -> Result<Vec<ComputerTargetCandidate>, String> {
+        self.under_supervision(
+            "enumerating Computer Use targets",
+            self.list_targets_effect(),
+        )
+        .await
+    }
+
+    pub async fn observe_once(
+        &self,
+        selection_token: &str,
+        owner_session_id: Uuid,
+    ) -> Result<ObservationPreview, String> {
+        self.under_supervision(
+            "capturing a Computer Use observation",
+            self.observe_once_effect(selection_token, owner_session_id),
+        )
+        .await
+    }
+
+    pub async fn start_simulator(
+        &self,
+        owner_session_id: Uuid,
+        reviewed_target_app_id: &str,
+    ) -> Result<ComputerCockpitSnapshot, String> {
+        self.under_supervision(
+            "starting a simulated Computer Run",
+            self.start_simulator_effect(owner_session_id, reviewed_target_app_id),
+        )
+        .await
+    }
+
+    pub async fn start_native(
+        &self,
+        owner_session_id: Uuid,
+        selection_token: &str,
+        reviewed_target_app_id: &str,
+    ) -> Result<ComputerCockpitSnapshot, String> {
+        self.under_supervision(
+            "starting a native Computer Run",
+            self.start_native_effect(owner_session_id, selection_token, reviewed_target_app_id),
+        )
+        .await
+    }
+
+    pub async fn refresh_simulator(
+        &self,
+        owner_session_id: Uuid,
+        run_id: &str,
+        expected_version: u64,
+    ) -> Result<ComputerCockpitSnapshot, String> {
+        self.under_supervision(
+            "refreshing a Computer Run observation",
+            self.refresh_simulator_effect(owner_session_id, run_id, expected_version),
+        )
+        .await
+    }
+
+    pub async fn approve_simulator_action(
+        &self,
+        owner_session_id: Uuid,
+        approval_id: &str,
+        request_id: &str,
+    ) -> Result<ComputerCockpitSnapshot, String> {
+        self.under_supervision(
+            "delivering an approved Computer Use action",
+            self.approve_simulator_action_effect(owner_session_id, approval_id, request_id),
+        )
+        .await
+    }
+
+    async fn request_permission_effect(
         &self,
         permission: ComputerPermission,
     ) -> Result<ComputerPermissionStatus, String> {
@@ -148,7 +251,7 @@ impl DesktopComputerUse {
             .map_err(|error| error.to_string())
     }
 
-    pub async fn list_targets(&self) -> Result<Vec<ComputerTargetCandidate>, String> {
+    async fn list_targets_effect(&self) -> Result<Vec<ComputerTargetCandidate>, String> {
         let _guard = self.operation.lock().await;
         self.selections
             .lock()
@@ -173,7 +276,7 @@ impl DesktopComputerUse {
 
     /// Performs one explicitly requested, read-only observation and then
     /// destroys the backend evidence. No action API is exposed to Tauri.
-    pub async fn observe_once(
+    async fn observe_once_effect(
         &self,
         selection_token: &str,
         owner_session_id: Uuid,
@@ -314,7 +417,7 @@ impl DesktopComputerUse {
         })
     }
 
-    pub async fn start_simulator(
+    async fn start_simulator_effect(
         &self,
         owner_session_id: Uuid,
         reviewed_target_app_id: &str,
@@ -354,7 +457,7 @@ impl DesktopComputerUse {
         self.cockpit_snapshot(owner_session_id)
     }
 
-    pub async fn start_native(
+    async fn start_native_effect(
         &self,
         owner_session_id: Uuid,
         selection_token: &str,
@@ -422,7 +525,7 @@ impl DesktopComputerUse {
         self.cockpit_snapshot(owner_session_id)
     }
 
-    pub async fn refresh_simulator(
+    async fn refresh_simulator_effect(
         &self,
         owner_session_id: Uuid,
         run_id: &str,
@@ -447,6 +550,27 @@ impl DesktopComputerUse {
     }
 
     pub async fn stage_simulator_action(
+        &self,
+        owner_session_id: Uuid,
+        run_id: &str,
+        expected_version: u64,
+        observation_id: &str,
+        action: ComputerAction,
+    ) -> Result<ComputerCockpitSnapshot, String> {
+        self.under_supervision(
+            "staging a Computer Use action",
+            self.stage_simulator_action_effect(
+                owner_session_id,
+                run_id,
+                expected_version,
+                observation_id,
+                action,
+            ),
+        )
+        .await
+    }
+
+    async fn stage_simulator_action_effect(
         &self,
         owner_session_id: Uuid,
         run_id: &str,
@@ -547,6 +671,27 @@ impl DesktopComputerUse {
         observation_id: &str,
         proposal: ComputerAgentProposal,
     ) -> Result<ComputerAgentProposalResult, String> {
+        self.under_supervision(
+            "applying a Computer Use model proposal",
+            self.apply_model_proposal_effect(
+                owner_session_id,
+                run_id,
+                expected_version,
+                observation_id,
+                proposal,
+            ),
+        )
+        .await
+    }
+
+    async fn apply_model_proposal_effect(
+        &self,
+        owner_session_id: Uuid,
+        run_id: &str,
+        expected_version: u64,
+        observation_id: &str,
+        proposal: ComputerAgentProposal,
+    ) -> Result<ComputerAgentProposalResult, String> {
         let _guard = self.simulator_operation.lock().await;
         if proposal.observation_id() != observation_id {
             return Err("The model proposal does not match the requested observation".into());
@@ -592,7 +737,7 @@ impl DesktopComputerUse {
         }
     }
 
-    pub async fn approve_simulator_action(
+    async fn approve_simulator_action_effect(
         &self,
         owner_session_id: Uuid,
         approval_id: &str,
@@ -637,11 +782,27 @@ impl DesktopComputerUse {
         &self,
         owner_session_id: Uuid,
     ) -> Result<ComputerCockpitSnapshot, String> {
+        self.host
+            .ensure_effect_allowed("discarding a Computer Use approval")
+            .map_err(|error| format!("discarding a Computer Use approval is refused: {error:#}"))?;
         self.clear_pending_for_owner(owner_session_id)?;
         self.cockpit_snapshot(owner_session_id)
     }
 
     pub async fn pause_simulator(
+        &self,
+        owner_session_id: Uuid,
+        run_id: &str,
+        expected_version: u64,
+    ) -> Result<ComputerCockpitSnapshot, String> {
+        self.under_supervision(
+            "pausing a Computer Run",
+            self.pause_simulator_effect(owner_session_id, run_id, expected_version),
+        )
+        .await
+    }
+
+    async fn pause_simulator_effect(
         &self,
         owner_session_id: Uuid,
         run_id: &str,
@@ -662,6 +823,19 @@ impl DesktopComputerUse {
         run_id: &str,
         expected_version: u64,
     ) -> Result<ComputerCockpitSnapshot, String> {
+        self.under_supervision(
+            "taking over a Computer Run",
+            self.take_over_simulator_effect(owner_session_id, run_id, expected_version),
+        )
+        .await
+    }
+
+    async fn take_over_simulator_effect(
+        &self,
+        owner_session_id: Uuid,
+        run_id: &str,
+        expected_version: u64,
+    ) -> Result<ComputerCockpitSnapshot, String> {
         self.clear_pending_for_owner(owner_session_id)?;
         let (service, _) = self.owned_service(owner_session_id, run_id)?;
         service
@@ -672,6 +846,18 @@ impl DesktopComputerUse {
     }
 
     pub async fn stop_simulator(
+        &self,
+        owner_session_id: Uuid,
+        run_id: &str,
+    ) -> Result<ComputerCockpitSnapshot, String> {
+        self.under_supervision(
+            "stopping a Computer Run",
+            self.stop_simulator_effect(owner_session_id, run_id),
+        )
+        .await
+    }
+
+    async fn stop_simulator_effect(
         &self,
         owner_session_id: Uuid,
         run_id: &str,
@@ -1051,15 +1237,108 @@ mod tests {
     /// Host fixture with its persist directories bound under the disposable
     /// fixture directory. The process-global home override is serialized and
     /// restored so parallel tests never touch the real user home.
-    fn test_host(dir: &std::path::Path) -> AgentHostHandle {
+    fn test_host(dir: &std::path::Path) -> grokptah_agent_bridge::HostRuntime {
         let _guard = grokptah_agent_bridge::home_override_serial();
         grokptah_agent_bridge::set_grokptah_home_override(Some(dir.join(".grokptah")));
-        let host = grokptah_agent_bridge::AgentHost::create(Default::default());
+        let host = grokptah_agent_bridge::AgentHost::create(Default::default())
+            .expect("acquire the GrokPtah instance lock");
         grokptah_agent_bridge::set_grokptah_home_override(None);
         host
     }
 
-    fn test_desktop() -> (tempfile::TempDir, DesktopComputerUse) {
+    /// The `HostRuntime` is returned so each test keeps the single owner
+    /// of the process lock and task supervisor alive: dropping it closes
+    /// the lifecycle and every request handle then fails closed (#455).
+    /// P0 — a direct Tauri Computer Use command is a physical effect and must
+    /// be on the runtime's join barrier.
+    ///
+    /// These commands run on the Tauri task, not a spawned one, so nothing
+    /// registered them with the runtime: an ordered shutdown could join zero
+    /// supervised tasks, report clean, release the process lock, and a
+    /// replacement could start while this process was still delivering input.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn computer_use_commands_are_supervised_and_refused_after_shutdown() {
+        let (_dir, runtime, desktop) = test_desktop();
+        let owner = Uuid::new_v4();
+        let target = SimulatorBackend::demo_target();
+
+        // Live: the command is admitted and runs.
+        let started = desktop.start_simulator(owner, &target.app_id).await;
+        assert!(
+            started.is_ok(),
+            "a live runtime admits the command: {started:?}"
+        );
+
+        // Ordered shutdown; the barrier had nothing outstanding, so it is clean.
+        let report = runtime.shutdown().await;
+        assert!(report.is_clean(), "{}", report.operator_summary());
+
+        // Stopped: the same command is refused rather than silently acting on a
+        // machine whose home a replacement may already own.
+        let refused = desktop.start_simulator(owner, &target.app_id).await;
+        let error = refused.expect_err("a stopped runtime must refuse a physical command");
+        assert!(
+            error.contains("refused"),
+            "the refusal must say so plainly: {error}"
+        );
+        let refused_action = desktop
+            .approve_simulator_action(owner, "any-approval", "any-request")
+            .await;
+        assert!(refused_action
+            .expect_err("delivering input after shutdown must be refused")
+            .contains("refused"),);
+
+        let refused_stage = desktop
+            .stage_simulator_action(
+                owner,
+                "stale-run",
+                1,
+                "stale-observation",
+                ComputerAction::ActivateTarget,
+            )
+            .await
+            .expect_err("staging after shutdown must be refused");
+        assert!(refused_stage.contains("refused"));
+        let refused_proposal = desktop
+            .apply_model_proposal(
+                owner,
+                "stale-run",
+                1,
+                "stale-observation",
+                ComputerAgentProposal::Complete {
+                    observation_id: "stale-observation".into(),
+                    summary: "done".into(),
+                },
+            )
+            .await
+            .expect_err("applying a proposal after shutdown must be refused");
+        assert!(refused_proposal.contains("refused"));
+        assert!(desktop
+            .pause_simulator(owner, "stale-run", 1)
+            .await
+            .expect_err("pausing after shutdown must be refused")
+            .contains("refused"));
+        assert!(desktop
+            .take_over_simulator(owner, "stale-run", 1)
+            .await
+            .expect_err("taking over after shutdown must be refused")
+            .contains("refused"));
+        assert!(desktop
+            .stop_simulator(owner, "stale-run")
+            .await
+            .expect_err("stopping after shutdown must be refused")
+            .contains("refused"));
+        assert!(desktop
+            .discard_simulator_approval(owner)
+            .expect_err("discarding after shutdown must be refused")
+            .contains("refused"));
+    }
+
+    fn test_desktop() -> (
+        tempfile::TempDir,
+        grokptah_agent_bridge::HostRuntime,
+        DesktopComputerUse,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         // Tests deliberately open an isolated store in the fixture directory;
         // production `new()` must borrow the host's shared handle instead.
@@ -1069,9 +1348,11 @@ mod tests {
             store.clone(),
         ));
         // Build the host before `dir` moves into the returned tuple.
-        let host = test_host(dir.path());
+        let runtime = test_host(dir.path());
+        let host = runtime.handle();
         (
             dir,
+            runtime,
             DesktopComputerUse {
                 host,
                 platform: None,
@@ -1087,8 +1368,13 @@ mod tests {
         )
     }
 
-    fn native_test_desktop() -> (tempfile::TempDir, DesktopComputerUse, Arc<AtomicUsize>) {
-        let (dir, mut desktop) = test_desktop();
+    fn native_test_desktop() -> (
+        tempfile::TempDir,
+        grokptah_agent_bridge::HostRuntime,
+        DesktopComputerUse,
+        Arc<AtomicUsize>,
+    ) {
+        let (dir, runtime, mut desktop) = test_desktop();
         let actions = Arc::new(AtomicUsize::new(0));
         let target = ComputerTarget {
             app_id: NATIVE_TEST_APP_ID.into(),
@@ -1115,12 +1401,12 @@ mod tests {
             actions: actions.clone(),
             available: std::sync::Mutex::new(true),
         }));
-        (dir, desktop, actions)
+        (dir, runtime, desktop, actions)
     }
 
     #[tokio::test]
     async fn approval_is_exact_one_use_and_requires_reobservation() {
-        let (_dir, desktop) = test_desktop();
+        let (_dir, _runtime, desktop) = test_desktop();
         let owner = Uuid::new_v4();
         let target = SimulatorBackend::demo_target();
         let started = desktop
@@ -1174,7 +1460,7 @@ mod tests {
 
     #[tokio::test]
     async fn model_proposal_is_revalidated_and_staged_without_dispatch() {
-        let (_dir, desktop) = test_desktop();
+        let (_dir, _runtime, desktop) = test_desktop();
         let owner = Uuid::new_v4();
         let target = SimulatorBackend::demo_target();
         let started = desktop
@@ -1222,7 +1508,7 @@ mod tests {
 
     #[tokio::test]
     async fn model_completion_only_revokes_authority_on_exact_current_frame() {
-        let (_dir, desktop) = test_desktop();
+        let (_dir, _runtime, desktop) = test_desktop();
         let owner = Uuid::new_v4();
         let target = SimulatorBackend::demo_target();
         let started = desktop
@@ -1256,7 +1542,7 @@ mod tests {
 
     #[tokio::test]
     async fn approval_cannot_cross_sessions_or_survive_takeover() {
-        let (_dir, desktop) = test_desktop();
+        let (_dir, _runtime, desktop) = test_desktop();
         let owner = Uuid::new_v4();
         let other = Uuid::new_v4();
         let target = SimulatorBackend::demo_target();
@@ -1315,7 +1601,7 @@ mod tests {
 
     #[tokio::test]
     async fn native_run_uses_the_same_exact_one_use_approval_path() {
-        let (_dir, desktop, actions) = native_test_desktop();
+        let (_dir, _runtime, desktop, actions) = native_test_desktop();
         let owner = Uuid::new_v4();
         let candidate = desktop.list_targets().await.unwrap().remove(0);
         let started = desktop
@@ -1358,7 +1644,7 @@ mod tests {
 
     #[tokio::test]
     async fn starting_a_native_run_prunes_terminal_native_backends() {
-        let (_dir, desktop, _actions) = native_test_desktop();
+        let (_dir, _runtime, desktop, _actions) = native_test_desktop();
         let first_owner = Uuid::new_v4();
         let candidate = desktop.list_targets().await.unwrap().remove(0);
         let first = desktop

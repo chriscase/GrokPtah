@@ -257,14 +257,24 @@ async fn run_one(
         Err(error) => return fail_early(task, t0, error, "workspace snapshot failed"),
     };
 
-    let host = AgentHost::create(HostConfig {
+    let host = match AgentHost::create(HostConfig {
         always_approve: true,
         provider_observation,
         // Align host loop budget with task max_turns so the model sees real scarcity
         // (CLI --max-turns) instead of the default 24-step ceiling (#187/#188).
         max_agent_rounds: Some(task.max_turns.max(1)),
         ..HostConfig::default()
-    });
+    }) {
+        Ok(host) => host,
+        Err(error) => {
+            return fail_early(
+                task,
+                t0,
+                error.to_string(),
+                "acquire the GrokPtah instance lock",
+            );
+        }
+    };
     let mut rx = match host.take_event_receiver() {
         Some(r) => r,
         None => {

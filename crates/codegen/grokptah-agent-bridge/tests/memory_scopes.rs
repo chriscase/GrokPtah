@@ -10,7 +10,7 @@ use grokptah_agent_bridge::orchestration::{
     RunState, WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
-    home_override_serial, set_grokptah_home_override, AgentHost, AgentHostHandle, HostConfig,
+    home_override_serial, set_grokptah_home_override, AgentHost, HostConfig, HostRuntime,
     MemoryScope, PermissionDecision, SessionUpdate,
 };
 
@@ -49,11 +49,12 @@ impl Drop for IsolatedProcess {
     }
 }
 
-fn started_host(workspace: &Path) -> AgentHostHandle {
+fn started_host(workspace: &Path) -> HostRuntime {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host.start().unwrap();
     host.set_project_cwd(workspace).unwrap();
     host
@@ -232,7 +233,17 @@ async fn project_scope_matches_desktop_service_and_isolated_model_tools_across_r
         .is_err());
 
     drop(service);
-    drop(host);
+    // A process boundary is an *ordered* stop, not a bare drop. Dropping a
+    // runtime with supervised work still outstanding cannot join it, so the
+    // home stays quarantined for the life of the process and the restart below
+    // would be refused — which is the correct fail-closed answer, and the
+    // reason this models the boundary with `shutdown()` (#455).
+    let report = host.shutdown().await;
+    assert!(
+        report.is_clean(),
+        "the ordered stop must release the home: {}",
+        report.operator_summary()
+    );
 
     // Reopening the same GrokPtah home and durable session proves the source
     // address and all completed writes survive a process boundary.
@@ -294,7 +305,8 @@ async fn memory_write_uses_the_permission_gate_and_honors_user_denial() {
     let host = AgentHost::create(HostConfig {
         always_approve: false,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     let mut events = host.take_event_receiver().unwrap();
     host.start().unwrap();
     host.set_project_cwd(workspace.path()).unwrap();

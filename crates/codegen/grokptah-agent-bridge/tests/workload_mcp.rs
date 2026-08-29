@@ -26,7 +26,8 @@ async fn workload_protocol_is_idempotent_scoped_and_lane_archive_safe() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host.start().unwrap();
     let lane = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(lane.id, workspace.path()).unwrap();

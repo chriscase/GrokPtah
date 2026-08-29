@@ -151,19 +151,22 @@ impl WorkloadSupervisor {
         self.state.lock().status.clone()
     }
 
-    pub fn stop_and_wait(&mut self) {
+    pub fn stop_and_wait(&mut self) -> Result<(), String> {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
         if let Some(task) = self.task.take() {
-            let _ = task.join();
+            task.join().map_err(|payload| {
+                format!("workload supervisor panicked: {}", panic_text(&payload))
+            })?;
         }
+        Ok(())
     }
 }
 
 impl Drop for WorkloadSupervisor {
     fn drop(&mut self) {
-        self.stop_and_wait();
+        let _ = self.stop_and_wait();
     }
 }
 
@@ -272,20 +275,31 @@ impl RoutineSupervisor {
         self.state.lock().status.clone()
     }
 
-    pub fn stop_and_wait(&mut self) {
+    pub fn stop_and_wait(&mut self) -> Result<(), String> {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
         if let Some(task) = self.task.take() {
-            let _ = task.join();
+            task.join().map_err(|payload| {
+                format!("routine supervisor panicked: {}", panic_text(&payload))
+            })?;
         }
+        Ok(())
     }
 }
 
 impl Drop for RoutineSupervisor {
     fn drop(&mut self) {
-        self.stop_and_wait();
+        let _ = self.stop_and_wait();
     }
+}
+
+fn panic_text(payload: &Box<dyn std::any::Any + Send + 'static>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_string())
 }
 
 fn fire_once(store: &OrchStore, state: &Arc<Mutex<RoutineSupervisorState>>, clock: &dyn Clock) {

@@ -26,7 +26,7 @@ use common::ProcessEnvGuard;
 fn setup() -> (
     tempfile::TempDir,
     ProcessEnvGuard,
-    grokptah_agent_bridge::AgentHostHandle,
+    grokptah_agent_bridge::HostRuntime,
     tempfile::TempDir,
     std::sync::Arc<OrchestrationService>,
 ) {
@@ -38,7 +38,8 @@ fn setup() -> (
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host.start().unwrap();
     host.set_project_cwd(ws.path()).unwrap();
     let orch = OrchestrationService::new(
@@ -214,7 +215,7 @@ async fn run_reads_require_exact_session_and_workspace_scope() {
         );
     }
 
-    srv.stop_and_wait().await;
+    assert!(srv.stop_and_wait().await.is_clean());
     set_grokptah_home_override(None);
     std::env::remove_var("GROKPTAH_AGENT_OFFLINE");
 }
@@ -1509,7 +1510,7 @@ async fn http_submit_allow_queue_and_cancel_queued_run() {
     assert_eq!(visible_cancelled.structured["state"], "cancelled");
     assert!(visible_cancelled.structured["queuePosition"].is_null());
 
-    srv.stop_and_wait().await;
+    assert!(srv.stop_and_wait().await.is_clean());
     set_grokptah_home_override(None);
 }
 
@@ -1823,7 +1824,7 @@ async fn http_retry_interrupted_run_is_explicit_and_idempotent() {
         .await
         .is_err());
 
-    srv.stop_and_wait().await;
+    assert!(srv.stop_and_wait().await.is_clean());
     set_grokptah_home_override(None);
     std::env::remove_var("GROKPTAH_AGENT_OFFLINE");
 }
@@ -1991,8 +1992,11 @@ async fn mcp_isolated_run_review_approval_and_restart_promotion() {
         })
         .unwrap();
     client.close_session().await.unwrap();
-    srv.stop_and_wait().await;
+    let server_stop = srv.stop_and_wait().await;
+    assert!(server_stop.fully_stopped, "{:?}", server_stop.errors);
     drop(orch);
+    let shutdown = host.shutdown().await;
+    assert!(shutdown.is_clean(), "{}", shutdown.operator_summary());
     drop(host);
 
     // Reopen the same durable home. The approval must remain usable without
@@ -2000,7 +2004,8 @@ async fn mcp_isolated_run_review_approval_and_restart_promotion() {
     let host2 = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host2.start().unwrap();
     let orch2 = OrchestrationService::new(
         host2.clone(),
@@ -2080,7 +2085,7 @@ async fn mcp_isolated_run_review_approval_and_restart_promotion() {
         .unwrap();
     assert_eq!(replay.structured["runId"], promoted.structured["runId"]);
     client2.close_session().await.unwrap();
-    srv2.stop_and_wait().await;
+    assert!(srv2.stop_and_wait().await.is_clean());
     set_grokptah_home_override(None);
     std::env::remove_var("GROKPTAH_AGENT_OFFLINE");
 }
@@ -2577,7 +2582,8 @@ async fn live_desktop_bootstrap_node_smoke() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host.start().unwrap();
     host.set_project_cwd(ws.path()).unwrap();
     let session = host.session_new_kind(SessionKind::Build).unwrap();
@@ -2726,7 +2732,8 @@ async fn live_computer_reads_node_smoke() {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
-    });
+    })
+    .expect("acquire the GrokPtah instance lock");
     host.start().unwrap();
     host.set_project_cwd(ws.path()).unwrap();
     let session = host.session_new_kind(SessionKind::Build).unwrap();
@@ -2863,7 +2870,7 @@ async fn live_computer_reads_node_smoke() {
     // Durable transcript for verifiers (`--nocapture`).
     eprintln!("LIVE_COMPUTER_READS_SMOKE_REPORT {report}");
 
-    srv.stop_and_wait().await;
+    assert!(srv.stop_and_wait().await.is_clean());
     set_grokptah_home_override(None);
     drop(env);
 }

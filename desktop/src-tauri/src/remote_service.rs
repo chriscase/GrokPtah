@@ -4,9 +4,9 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use grokptah_agent_bridge::orchestration::WorkPolicy;
 use grokptah_agent_bridge::{
-    ActivationRecord, AgentRecord, AgentResumePlan, JournalPage, McpControlClient,
-    RoutineRecord, RoutineSnapshot, RunExecutionMode, RunRecord, RunScope, RunState,
-    RuntimeConnectionState, RuntimeTarget, SessionUpdate, WorkAttemptView, WorkItem,
+    ActivationRecord, AgentRecord, AgentResumePlan, JournalPage, McpControlClient, RoutineRecord,
+    RoutineSnapshot, RunExecutionMode, RunRecord, RunScope, RunState, RuntimeConnectionState,
+    RuntimeTarget, SessionUpdate, WorkAttemptView, WorkItem,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -528,7 +528,12 @@ impl RemoteServiceState {
         };
         Ok(Some(
             client
-                .fire_routine(session_id, workspace, routine_id, Uuid::new_v4().to_string())
+                .fire_routine(
+                    session_id,
+                    workspace,
+                    routine_id,
+                    Uuid::new_v4().to_string(),
+                )
                 .await?,
         ))
     }
@@ -1705,7 +1710,8 @@ mod tests {
         let host = AgentHost::create(HostConfig {
             always_approve: true,
             ..HostConfig::default()
-        });
+        })
+        .expect("acquire the GrokPtah instance lock");
         let orch = OrchestrationService::new(
             host.clone(),
             host.event_bus(),
@@ -1757,7 +1763,7 @@ mod tests {
             .is_err());
 
         let address = first_server.addr;
-        first_server.stop_and_wait().await;
+        assert!(first_server.stop_and_wait().await.is_clean());
         let restarted_server = start_control_server_with_bind(
             orch,
             address,
@@ -1779,7 +1785,7 @@ mod tests {
             .unwrap()
             .iter()
             .any(|run| run.run_id == submission.run_id));
-        restarted_server.stop_and_wait().await;
+        assert!(restarted_server.stop_and_wait().await.is_clean());
         set_grokptah_home_override(None);
     }
 }

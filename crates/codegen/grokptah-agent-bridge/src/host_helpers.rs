@@ -2949,7 +2949,11 @@ mod compatible_stream_tests {
             Some(crate::gateway_config::CAPABILITY_QUALIFICATION_SCHEMA.into());
         profile.upsert_model(model);
         config.upsert_profile(profile).unwrap();
-        crate::gateway_config::save(&config).unwrap();
+        crate::gateway_config::save(
+            &crate::host_runtime::DurableWriteGuard::unowned_for_test(),
+            &config,
+        )
+        .unwrap();
         crate::gateway_config::model_selection_key("cancel-test", "test-model")
     }
 
