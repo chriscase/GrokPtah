@@ -14,7 +14,11 @@ use std::path::{Path, PathBuf};
 
 use xai_host_authority::*;
 
-const OWNER: &str = "account-1";
+const ADMIN_SECRET: &str = "host-admin-custody-secret-32-bytes-minimum-v1";
+
+fn admin_credential() -> HostAdminCredential {
+    HostAdminCredential::new(ADMIN_SECRET).unwrap()
+}
 const SECRET: &str = "s3cret-bearer-value";
 
 fn request(body: &[u8]) -> RequestIdentity {
@@ -49,13 +53,9 @@ struct Ready {
 fn ready() -> Ready {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_path_buf();
-    let (authority, admin) = HostAuthority::open(&root, OWNER).unwrap();
+    let (authority, admin) = HostAuthority::open(&root, &admin_credential()).unwrap();
     authority
-        .set_credentials(
-            &admin,
-            &[HostCredential::new("primary", SECRET).unwrap()],
-            OWNER,
-        )
+        .set_credentials(&admin, &[HostCredential::new("primary", SECRET).unwrap()])
         .unwrap();
     let auth = authority.authenticate(SECRET).unwrap();
     let session = authority.issue_session(&auth).unwrap();

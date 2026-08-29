@@ -22,6 +22,94 @@ pub(crate) const STATE_FAILED: &str = "failed";
 pub(crate) const STATE_UNCERTAIN: &str = "uncertain";
 
 impl HostAuthority {
+    /// Replay terminal attempt records from the verified audit WAL into the
+    /// state snapshot.
+    ///
+    /// Settlement deliberately appends the audit outcome before updating the
+    /// snapshot: failure before the append leaves `sending`, while failure of
+    /// the later snapshot write leaves a durable WAL record that this method
+    /// applies on the next open. This makes either cut replay-safe without
+    /// pretending two filesystem files can be atomically renamed together.
+    pub(crate) fn replay_attempt_settlements(&self) -> Result<(), AuthorityError> {
+        let records = {
+            let log = self
+                .audit
+                .lock()
+                .map_err(|_| AuthorityError::Durability("audit log lock poisoned".into()))?;
+            // A damaged log remains inspectable by the operator but is never
+            // used as a replay source and remains unappendable. Open must not
+            // turn evidence damage into silent state mutation.
+            if !log.verify_chain()? {
+                return Ok(());
+            }
+            log.records()?
+        };
+
+        let mut outcomes = std::collections::BTreeMap::<String, (String, String)>::new();
+        for record in records {
+            match record.event {
+                AuditEvent::SendOutcome {
+                    attempt,
+                    outcome,
+                    detail,
+                } => {
+                    let state = match outcome.as_str() {
+                        "settled" => STATE_SETTLED,
+                        "failed" => STATE_FAILED,
+                        "uncertain" => STATE_UNCERTAIN,
+                        _ => {
+                            return Err(AuthorityError::CorruptState(format!(
+                                "unknown audited attempt outcome {outcome}"
+                            )));
+                        }
+                    };
+                    outcomes.insert(attempt, (state.to_string(), detail));
+                }
+                AuditEvent::AttemptReconciled { attempt, truth } => {
+                    let state = match truth.as_str() {
+                        "took_effect" => STATE_SETTLED,
+                        "no_effect" => STATE_FAILED,
+                        _ => {
+                            return Err(AuthorityError::CorruptState(format!(
+                                "unknown audited reconciliation truth {truth}"
+                            )));
+                        }
+                    };
+                    outcomes.insert(attempt, (state.to_string(), "reconciled".into()));
+                }
+                _ => {}
+            }
+        }
+
+        self.with_state(|state| {
+            let mut by_handle = std::collections::BTreeMap::<String, String>::new();
+            for key in state.attempts.keys() {
+                let attempt: AttemptId = decode_id(key, "attempt")?;
+                if by_handle
+                    .insert(attempt.public_handle(), key.clone())
+                    .is_some()
+                {
+                    return Err(AuthorityError::CorruptState(
+                        "attempt public-handle collision".into(),
+                    ));
+                }
+            }
+            for (handle, (outcome, detail)) in outcomes {
+                let key = by_handle.get(&handle).ok_or_else(|| {
+                    AuthorityError::CorruptState(format!(
+                        "audit outcome references unknown attempt {handle}"
+                    ))
+                })?;
+                let attempt = state.attempts.get_mut(key).ok_or_else(|| {
+                    AuthorityError::CorruptState("attempt index changed during replay".into())
+                })?;
+                attempt.state = outcome;
+                attempt.settlement = Some(detail);
+            }
+            Ok(())
+        })
+    }
+
     // ────────────────── Gate 2: sealed capabilities and leases ──────────────────
 
     /// Seal a capability for a host-issued resource.
@@ -457,9 +545,10 @@ impl HostAuthority {
     ///
     /// Persistence trouble here happens *after* dispatch was already possible,
     /// so it can never downgrade to an ordinary failure: it settles
-    /// [`UncertainReason::AuditNotDurableAfterDispatch`]. That also keeps the
-    /// returned outcome consistent with what recovery will conclude from the
-    /// durable record, which still reads `sending`.
+    /// [`UncertainReason::AuditNotDurableAfterDispatch`] when the WAL append
+    /// fails, or [`UncertainReason::StateNotDurableAfterDispatch`] when the
+    /// WAL is durable but its derived snapshot cannot be updated. The latter
+    /// converges from the WAL on the next open.
     fn settle(
         &self,
         permit: PhysicalSendPermit,
@@ -475,11 +564,11 @@ impl HostAuthority {
             Some(Err(reason)) => format!("{reason:?}"),
         };
 
-        // Audit before state, deliberately. If either write fails the durable
-        // record still reads `sending`, which is exactly what this function
-        // reports and exactly what recovery will conclude. The other order can
-        // leave a caller holding `Uncertain` while the record says `settled`,
-        // which reconciliation would then refuse to touch.
+        // Audit before state, deliberately. Failure before the WAL append
+        // leaves the attempt sending. Failure after the WAL append leaves a
+        // replayable terminal record that the next open applies before crash
+        // recovery can classify the attempt. State-before-audit cannot offer
+        // that guarantee: it can publish a terminal state with no evidence.
         let audited = self.append_audit(
             epoch,
             AuditEvent::SendOutcome {
@@ -507,7 +596,7 @@ impl HostAuthority {
         if persisted.is_err() {
             return SendOutcome::Uncertain {
                 attempt,
-                reason: UncertainReason::AuditNotDurableAfterDispatch,
+                reason: UncertainReason::StateNotDurableAfterDispatch,
             };
         }
 
@@ -530,8 +619,9 @@ impl HostAuthority {
     /// a request may do to work already in flight.
     pub fn recover_incomplete(
         &self,
-        _admin: &HostAdminAuthority,
+        admin: &HostAdminAuthority,
     ) -> Result<Vec<AttemptId>, AuthorityError> {
+        self.require_admin(admin)?;
         let recovered = self.with_state(|state| {
             let mut out = Vec::new();
             for (key, record) in state.attempts.iter_mut() {
@@ -574,15 +664,15 @@ impl HostAuthority {
     /// `&HostAuthority` is entitled to make it.
     pub fn reconcile_attempt(
         &self,
-        _admin: &HostAdminAuthority,
+        admin: &HostAdminAuthority,
         attempt: AttemptId,
         took_effect: bool,
     ) -> Result<(), AuthorityError> {
-        let epoch = self.with_state(|state| {
-            let epoch = state.control_epoch;
+        self.require_admin(admin)?;
+        let epoch = self.read(|state| {
             let record = state
                 .attempts
-                .get_mut(&attempt.to_hex())
+                .get(&attempt.to_hex())
                 .ok_or(AuthorityError::UnknownResource)?;
             // `sending` is accepted as well as `uncertain`: a settlement whose
             // write failed leaves the record in flight while the caller was
@@ -590,15 +680,11 @@ impl HostAuthority {
             if record.state != STATE_UNCERTAIN && record.state != STATE_SENDING {
                 return Err(AuthorityError::Invalid("attempt is already settled"));
             }
-            record.state = if took_effect {
-                STATE_SETTLED
-            } else {
-                STATE_FAILED
-            }
-            .to_string();
-            record.settlement = Some("reconciled".to_string());
-            Ok(epoch)
+            Ok(state.control_epoch)
         })?;
+        // WAL first. If this append fails, state remains ambiguous. If the
+        // following snapshot write fails, open-time replay applies this exact
+        // operator truth before recovery is allowed to classify anything.
         self.append_audit(
             epoch,
             AuditEvent::AttemptReconciled {
@@ -610,7 +696,21 @@ impl HostAuthority {
                 }
                 .to_string(),
             },
-        )
+        )?;
+        self.with_state(|state| {
+            let record = state
+                .attempts
+                .get_mut(&attempt.to_hex())
+                .ok_or(AuthorityError::UnknownResource)?;
+            record.state = if took_effect {
+                STATE_SETTLED
+            } else {
+                STATE_FAILED
+            }
+            .to_string();
+            record.settlement = Some("reconciled".to_string());
+            Ok(())
+        })
     }
 
     /// A secret-, content-, and path-free view of an attempt.
@@ -666,8 +766,9 @@ impl HostAuthority {
     /// request can do: it spans every principal this root has served.
     pub fn audit_records(
         &self,
-        _admin: &HostAdminAuthority,
+        admin: &HostAdminAuthority,
     ) -> Result<Vec<crate::audit::AuditRecord>, AuthorityError> {
+        self.require_admin(admin)?;
         let log = self
             .audit
             .lock()
@@ -676,7 +777,8 @@ impl HostAuthority {
     }
 
     /// Whether the audit hash chain is intact. An operator read.
-    pub fn audit_chain_intact(&self, _admin: &HostAdminAuthority) -> Result<bool, AuthorityError> {
+    pub fn audit_chain_intact(&self, admin: &HostAdminAuthority) -> Result<bool, AuthorityError> {
+        self.require_admin(admin)?;
         let log = self
             .audit
             .lock()

@@ -10,6 +10,9 @@ happen" — rather than several stores that can disagree.
 **G1 — host-issued principal root.** The host mints principal identity,
 credential incarnations, authentication generations, sessions, workspaces and
 resource incarnations. A caller presents a bearer; it never mints identity.
+Administrative custody is established with a separate high-entropy host secret
+whose fingerprint is pinned in the root. Reopening requires possession of that
+secret, not repeating a caller-selected owner label.
 
 **G2 — sealed capabilities and one-use leases.** A capability's scope is fixed
 at issue time, including *who stands behind it*: sealing requires an
@@ -46,17 +49,17 @@ for one endpoint or one credential cannot be replayed against another.
 | Invariant | How |
 | --- | --- |
 | No caller-forgeable approvals | Every receipt has private fields and `pub(crate)` construction. Compile-fail doctests pin it. |
-| No ordinary send bypass | A send needs a permit; `begin_send` is its only producer. There is no raw store accessor of any kind. |
-| Administration is not ambient | Replacing credentials, rotating epochs or generations, exporting the log, crash recovery, and resolving an ambiguous effect all need a `HostAdminAuthority`, returned only by `open` and not `Clone`. |
+| No permit forgery inside the spine | A send permit has private fields; `begin_send` is its only producer. The production HTTP transport must still be reconstructed to consume it at the actual credential-bearing write boundary before global no-bypass is qualified. |
+| Administration is not ambient | Replacing credentials, rotating epochs or generations, exporting the log, crash recovery, and resolving an ambiguous effect all need a root-bound `HostAdminAuthority`, returned only after `open` proves the host custody secret and not `Clone`. |
 | Authority identity is not deserializable | No identifier or generation derives `Deserialize`; a derived one would be a public constructor in disguise. Durable records carry hex strings that only this crate decodes. |
 | Pre-effect persistence failure prevents dispatch | The attempt record and the intent audit record must both be durable *before* the permit is constructed. No permit, no dispatch. |
-| A possible effect never reports ordinary failure | Any settlement whose persistence fails returns `Uncertain`, because the durable record still reads `sending` and recovery will conclude the same. |
+| A possible effect never reports ordinary failure | An audit failure leaves `sending`; a later state-snapshot failure leaves a durable outcome in the audit WAL. Both return `Uncertain`, and open-time replay applies the latter before recovery. |
 | Ambiguity never auto-retries | There is no retry API. `reconcile_attempt` is the only exit, and it takes provider truth the host established. |
 | Reads are scoped | `attempt_projection` reports another principal's attempt exactly as it reports a missing one, so it is not an existence oracle. |
 | Projections are secret-, content- and path-free | Identifiers render as truncated domain-separated digests. Bodies, URLs, credentials and paths are digested on the way in and never stored. |
 | A model proposal is never operator authority | The actor is fixed at seal time, has no setter, and must match the durable record. An unrecognised stored actor is corrupt state, never an implicit operator. |
 | A damaged root refuses service | Absent or unparsable state fails closed. A root that lost `authority.json` but kept audit evidence refuses rather than minting a fresh lineage. |
-| Concurrency is real | Every mutation and every audit append takes an exclusive `flock`, which is held per open file description and so serialises processes, not just threads. |
+| Concurrency is real | The host holds an exclusive lifetime `flock` over administrative custody, and mutations/audit appends use their own exclusive locks. Multi-process tests race live contenders against the holder and prove only the original custody secret can resume after release. |
 
 ## Two defects this design closes by construction
 
@@ -68,9 +71,8 @@ name it.
 **Stale-bearer resurrection.** A durable credential record always pins the
 secret it authenticates — there is no "fingerprint absent, accept anything"
 branch, and no caller-supplied credential list to match against. Any secret
-change, removal and re-add, or owner change mints a fresh incarnation and
-generation and invalidates every capability, lease and resource derived from
-the old one.
+change or removal and re-add mints a fresh incarnation and generation and
+invalidates every capability, lease and resource derived from the old one.
 
 ## What is deliberately absent
 

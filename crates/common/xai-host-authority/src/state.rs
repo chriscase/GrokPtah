@@ -135,7 +135,12 @@ pub(crate) struct StoredAttempt {
 #[serde(deny_unknown_fields)]
 pub(crate) struct StoredAuthority {
     pub(crate) schema_version: u32,
+    /// Opaque, host-minted identity for this authority root. It is not a
+    /// caller-selected account name.
     pub(crate) owner_id: String,
+    /// Fingerprint of the host custody secret required to reopen this root.
+    /// The secret itself is never persisted.
+    pub(crate) admin_credential_fingerprint: String,
     /// Advances whenever the host control plane re-arms.
     pub(crate) control_epoch: u64,
     /// Advances on capability policy rotation or revocation.
@@ -150,10 +155,11 @@ pub(crate) struct StoredAuthority {
 }
 
 impl StoredAuthority {
-    pub(crate) fn new(owner_id: &str) -> Self {
+    pub(crate) fn new(owner_id: String, admin_credential_fingerprint: String) -> Self {
         Self {
             schema_version: SCHEMA_VERSION,
-            owner_id: owner_id.to_string(),
+            owner_id,
+            admin_credential_fingerprint,
             control_epoch: 1,
             capability_generation: 1,
             next_auth_generation: 1,

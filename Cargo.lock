@@ -14166,6 +14166,7 @@ dependencies = [
 name = "xai-host-authority"
 version = "0.1.0"
 dependencies = [
+ "dunce",
  "fs2",
  "serde",
  "serde_json",

@@ -20,8 +20,11 @@
 //!
 //! * **No caller-forgeable approvals.** Every receipt has private fields and
 //!   `pub(crate)` construction. `tests/ui` pins this with compile-fail cases.
-//! * **No ordinary send bypass.** A physical send requires a permit, and
-//!   [`HostAuthority::begin_send`] is its only producer.
+//! * **No permit forgery inside the spine.** A physical send permit has no
+//!   public constructor, and [`HostAuthority::begin_send`] is its only
+//!   producer. Production transport qualification additionally requires the
+//!   credential-bearing write boundary to consume this permit; this crate
+//!   cannot make an unrelated HTTP client disappear by type alone.
 //! * **Pre-effect persistence failure prevents dispatch.** The permit is
 //!   constructed only after the attempt record and the intent audit record are
 //!   both durable.
@@ -184,7 +187,7 @@
 //! ```compile_fail
 //! # use xai_host_authority::*;
 //! fn replace(authority: &HostAuthority, credentials: &[HostCredential]) {
-//!     let _ = authority.set_credentials(credentials, "account-1");
+//!     let _ = authority.set_credentials(credentials);
 //! }
 //! ```
 //!
@@ -229,6 +232,6 @@ pub use receipt::{
     ActorClass, AuthContext, AuthorityBinding, EffectClass, EffectLease, FailedReason,
     PhysicalSendPermit, SealedCapability, SendOutcome, UncertainReason,
 };
-pub use store::{HostAdminAuthority, HostAuthority, HostCredential};
+pub use store::{HostAdminAuthority, HostAdminCredential, HostAuthority, HostCredential};
 
 pub(crate) use store::unix_time_millis;

@@ -10,7 +10,11 @@ use std::process::Command;
 
 use xai_host_authority::*;
 
-const OWNER: &str = "account-1";
+const ADMIN_SECRET: &str = "host-admin-custody-secret-32-bytes-minimum-v1";
+
+fn admin_credential() -> HostAdminCredential {
+    HostAdminCredential::new(ADMIN_SECRET).unwrap()
+}
 const SECRET: &str = "s3cret-bearer-value";
 const CHILD_ENV: &str = "XAI_HOST_AUTHORITY_CRASH_CHILD_ROOT";
 
@@ -27,13 +31,9 @@ fn request(body: &[u8]) -> RequestIdentity {
 
 /// Everything the child does before it dies.
 fn child_take_permit_then_die(root: &Path) -> ! {
-    let (authority, admin) = HostAuthority::open(root, OWNER).expect("child open");
+    let (authority, admin) = HostAuthority::open(root, &admin_credential()).expect("child open");
     authority
-        .set_credentials(
-            &admin,
-            &[HostCredential::new("primary", SECRET).unwrap()],
-            OWNER,
-        )
+        .set_credentials(&admin, &[HostCredential::new("primary", SECRET).unwrap()])
         .expect("child credentials");
     let auth = authority.authenticate(SECRET).expect("child authenticate");
     let session = authority.issue_session(&auth).expect("child session");
@@ -106,7 +106,7 @@ fn an_attempt_in_flight_when_the_process_dies_recovers_as_uncertain() {
     let handle = std::fs::read_to_string(&marker).unwrap();
 
     // A fresh host incarnation takes over.
-    let (authority, admin) = HostAuthority::open(&root, OWNER).unwrap();
+    let (authority, admin) = HostAuthority::open(&root, &admin_credential()).unwrap();
     let auth = authority.authenticate(SECRET).unwrap();
     let recovered = authority.recover_incomplete(&admin).unwrap();
     assert_eq!(
@@ -144,6 +144,8 @@ fn an_attempt_in_flight_when_the_process_dies_recovers_as_uncertain() {
 }
 
 const RACE_ENV: &str = "XAI_HOST_AUTHORITY_RACE_CHILD_ROOT";
+const CUSTODY_ENV: &str = "XAI_HOST_AUTHORITY_CUSTODY_CHILD_ROOT";
+const CUSTODY_MODE: &str = "XAI_HOST_AUTHORITY_CUSTODY_CHILD_MODE";
 /// Appends each racing child makes. Every successful `authenticate` writes one
 /// audit record, so this is also the number of appends per child.
 const APPENDS_PER_CHILD: usize = 25;
@@ -157,7 +159,7 @@ fn child_race(root: &Path) -> ! {
     // processes, which is what the chain has to survive.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let authority = loop {
-        match HostAuthority::open(root, OWNER) {
+        match HostAuthority::open(root, &admin_credential()) {
             Ok((authority, _admin)) => break authority,
             Err(_) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(5));
@@ -181,13 +183,9 @@ fn concurrent_processes_cannot_fork_the_audit_chain() {
 
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_path_buf();
-    let (authority, admin) = HostAuthority::open(&root, OWNER).unwrap();
+    let (authority, admin) = HostAuthority::open(&root, &admin_credential()).unwrap();
     authority
-        .set_credentials(
-            &admin,
-            &[HostCredential::new("primary", SECRET).unwrap()],
-            OWNER,
-        )
+        .set_credentials(&admin, &[HostCredential::new("primary", SECRET).unwrap()])
         .unwrap();
     let before = authority.audit_records(&admin).unwrap().len();
     // Release the root so the children can take it; exclusivity is proven by
@@ -215,7 +213,7 @@ fn concurrent_processes_cannot_fork_the_audit_chain() {
         );
     }
 
-    let (reopened, reopened_admin) = HostAuthority::open(&root, OWNER).unwrap();
+    let (reopened, reopened_admin) = HostAuthority::open(&root, &admin_credential()).unwrap();
     let records = reopened.audit_records(&reopened_admin).unwrap();
 
     // Not one append lost, and not one sequence number reused: without
@@ -237,4 +235,66 @@ fn concurrent_processes_cannot_fork_the_audit_chain() {
         reopened.audit_chain_intact(&reopened_admin).unwrap(),
         "the hash chain must survive concurrent multi-process appends"
     );
+}
+
+#[test]
+fn administrative_custody_is_exclusive_and_authenticated_across_processes() {
+    if let Ok(root) = std::env::var(CUSTODY_ENV) {
+        let mode = std::env::var(CUSTODY_MODE).expect("custody child mode");
+        let credential = if mode == "wrong" {
+            HostAdminCredential::new("wrong-host-custody-secret-32-bytes-minimum").unwrap()
+        } else {
+            admin_credential()
+        };
+        let opened = HostAuthority::open(Path::new(&root), &credential);
+        let code = match (mode.as_str(), opened) {
+            ("contend", Err(AuthorityError::Durability(_))) => 41,
+            ("wrong", Err(AuthorityError::Unauthenticated)) => 42,
+            ("right", Ok((_authority, _admin))) => 43,
+            _ => 49,
+        };
+        std::process::exit(code);
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let (authority, _admin) = HostAuthority::open(&root, &admin_credential()).unwrap();
+
+    // These processes race while the parent genuinely holds the OS lock; none
+    // may mint a second admin token even with the correct custody secret.
+    let mut contenders = Vec::new();
+    for _ in 0..4 {
+        contenders.push(
+            Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("administrative_custody_is_exclusive_and_authenticated_across_processes")
+                .env(CUSTODY_ENV, &root)
+                .env(CUSTODY_MODE, "contend")
+                .spawn()
+                .unwrap(),
+        );
+    }
+    for mut contender in contenders {
+        assert_eq!(contender.wait().unwrap().code(), Some(41));
+    }
+    drop(authority);
+
+    // Once custody is released, path knowledge and a wrong secret remain
+    // insufficient, while the original host credential can resume custody.
+    let wrong = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("administrative_custody_is_exclusive_and_authenticated_across_processes")
+        .env(CUSTODY_ENV, &root)
+        .env(CUSTODY_MODE, "wrong")
+        .status()
+        .unwrap();
+    assert_eq!(wrong.code(), Some(42));
+    let right = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("administrative_custody_is_exclusive_and_authenticated_across_processes")
+        .env(CUSTODY_ENV, &root)
+        .env(CUSTODY_MODE, "right")
+        .status()
+        .unwrap();
+    assert_eq!(right.code(), Some(43));
 }

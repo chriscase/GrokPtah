@@ -361,4 +361,8 @@ pub enum UncertainReason {
     /// ordinary failure: the effect may have happened, so the outcome stays
     /// ambiguous even though the local error was "just" a write error.
     AuditNotDurableAfterDispatch,
+    /// The outcome audit record is durable, but the derived state snapshot
+    /// could not be updated. Open-time WAL replay will converge the snapshot;
+    /// until then the caller must treat the local view as ambiguous.
+    StateNotDurableAfterDispatch,
 }

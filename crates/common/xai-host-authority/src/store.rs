@@ -36,6 +36,10 @@ fn credential_fingerprint(secret: &str) -> String {
     ContentDigest::of_fields(&[("bearer", secret.as_bytes())]).to_hex()
 }
 
+fn admin_credential_fingerprint(secret: &str) -> String {
+    ContentDigest::of_fields(&[("host-admin-custody-v1", secret.as_bytes())]).to_hex()
+}
+
 /// Constant-time comparison for equal-length secrets.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -83,6 +87,36 @@ impl std::fmt::Debug for HostCredential {
     }
 }
 
+/// Host-owned secret used to establish and later reopen administrative
+/// custody of one authority root.
+///
+/// This is deliberately distinct from served principal credentials. The
+/// first opener must prove possession of this secret and only its fingerprint
+/// is persisted. Reopening with a caller-selected owner string is impossible.
+pub struct HostAdminCredential {
+    secret: String,
+}
+
+impl HostAdminCredential {
+    /// Construct a custody credential. Production callers should load at
+    /// least 32 bytes of random material from a mode-0600 host secret.
+    pub fn new(secret: impl Into<String>) -> Result<Self, AuthorityError> {
+        let secret = secret.into();
+        if secret.len() < 32 {
+            return Err(AuthorityError::Invalid(
+                "admin credential must contain at least 32 bytes",
+            ));
+        }
+        Ok(Self { secret })
+    }
+}
+
+impl std::fmt::Debug for HostAdminCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HostAdminCredential([redacted])")
+    }
+}
+
 /// Non-forgeable proof of host/operator admin authority.
 ///
 /// Returned exactly once, by [`HostAuthority::open`], and constructible
@@ -96,7 +130,7 @@ impl std::fmt::Debug for HostCredential {
 /// them, but cannot replace the authority root out from under them.
 #[must_use = "the admin authority is the only way to administer this root"]
 pub struct HostAdminAuthority {
-    _seal: (),
+    root_binding: ContentDigest,
 }
 
 /// A root already has a live holder. Admin authority is scarce: exactly one
@@ -111,12 +145,20 @@ impl std::fmt::Debug for HostAdminAuthority {
 }
 
 /// The canonical host authority.
-#[derive(Debug)]
 pub struct HostAuthority {
     pub(crate) root: PathBuf,
+    root_binding: ContentDigest,
     /// Held for this object's lifetime. Dropping it releases the root.
     _admin_lock: File,
     pub(crate) audit: std::sync::Mutex<AuditLog>,
+}
+
+impl std::fmt::Debug for HostAuthority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostAuthority")
+            .field("root", &"[opaque]")
+            .finish_non_exhaustive()
+    }
 }
 
 impl HostAuthority {
@@ -127,13 +169,18 @@ impl HostAuthority {
     /// authority only to the component that genuinely administers the root.
     pub fn open(
         root: impl AsRef<Path>,
-        owner_id: &str,
+        admin_credential: &HostAdminCredential,
     ) -> Result<(Self, HostAdminAuthority), AuthorityError> {
-        let root = root.as_ref().to_path_buf();
-        if owner_id.trim().is_empty() {
-            return Err(AuthorityError::Invalid("owner id"));
-        }
-        std::fs::create_dir_all(&root).map_err(|e| AuthorityError::Durability(e.to_string()))?;
+        let requested_root = root.as_ref();
+        let credential_fingerprint = admin_credential_fingerprint(&admin_credential.secret);
+        std::fs::create_dir_all(requested_root)
+            .map_err(|e| AuthorityError::Durability(e.to_string()))?;
+        let root = dunce::canonicalize(requested_root)
+            .map_err(|e| AuthorityError::Durability(e.to_string()))?;
+        let root_binding = ContentDigest::of_fields(&[
+            ("authority-root", root.as_os_str().as_encoded_bytes()),
+            ("custody", credential_fingerprint.as_bytes()),
+        ]);
         // Take the root exclusively before reading anything. Admin authority is
         // handed out by this call, so a second holder would be a second admin.
         let admin_lock = OpenOptions::new()
@@ -164,19 +211,25 @@ impl HostAuthority {
         }
         let this = Self {
             root,
+            root_binding,
             _admin_lock: admin_lock,
             audit: std::sync::Mutex::new(audit),
         };
         // Establish the root if absent, and advance the control epoch for this
         // host incarnation so work admitted by a previous one cannot complete.
-        this.with_state_init(owner_id, |state| {
+        this.with_state_init(&credential_fingerprint, |state| {
             state.control_epoch = state
                 .control_epoch
                 .checked_add(1)
                 .ok_or_else(|| AuthorityError::Durability("control epoch exhausted".into()))?;
             Ok(())
         })?;
-        Ok((this, HostAdminAuthority { _seal: () }))
+        // A previous post-dispatch audit append may have succeeded immediately
+        // before its state write failed. Replay the typed WAL before exposing
+        // this incarnation, so state and audit converge rather than recovery
+        // incorrectly downgrading a recorded outcome to crash ambiguity.
+        this.replay_attempt_settlements()?;
+        Ok((this, HostAdminAuthority { root_binding }))
     }
 
     pub(crate) fn state_path(&self) -> PathBuf {
@@ -240,27 +293,35 @@ impl HostAuthority {
 
     fn with_state_init<T>(
         &self,
-        owner_id: &str,
+        credential_fingerprint: &str,
         f: impl FnOnce(&mut StoredAuthority) -> Result<T, AuthorityError>,
     ) -> Result<T, AuthorityError> {
         let _guard = self.lock()?;
         let mut state = match self.read_state()? {
             Some(state) => {
-                // The stored owner is the root's identity. Opening it under a
-                // different one would let a caller name itself the owner and
-                // administer someone else's root.
-                if state.owner_id != owner_id {
-                    return Err(AuthorityError::CorruptState(
-                        "authority root belongs to a different owner".into(),
-                    ));
+                if !constant_time_eq(
+                    state.admin_credential_fingerprint.as_bytes(),
+                    credential_fingerprint.as_bytes(),
+                ) {
+                    return Err(AuthorityError::Unauthenticated);
                 }
                 state
             }
-            None => StoredAuthority::new(owner_id),
+            None => {
+                StoredAuthority::new(PrincipalId::mint().to_hex(), credential_fingerprint.into())
+            }
         };
         let out = f(&mut state)?;
         self.persist(&state)?;
         Ok(out)
+    }
+
+    pub(crate) fn require_admin(&self, admin: &HostAdminAuthority) -> Result<(), AuthorityError> {
+        if admin.root_binding == self.root_binding {
+            Ok(())
+        } else {
+            Err(AuthorityError::Unauthenticated)
+        }
     }
 
     /// Run a mutation under the lock against existing state.
@@ -307,15 +368,12 @@ impl HostAuthority {
     /// There is no path that adopts a new secret onto an existing generation.
     pub fn set_credentials(
         &self,
-        _admin: &HostAdminAuthority,
+        admin: &HostAdminAuthority,
         credentials: &[HostCredential],
-        owner_id: &str,
     ) -> Result<(), AuthorityError> {
+        self.require_admin(admin)?;
         if credentials.is_empty() {
             return Err(AuthorityError::Invalid("credential set"));
-        }
-        if owner_id.trim().is_empty() {
-            return Err(AuthorityError::Invalid("owner id"));
         }
         let mut seen = std::collections::BTreeSet::new();
         for c in credentials {
@@ -324,7 +382,6 @@ impl HostAuthority {
             }
         }
         self.with_state(|state| {
-            let owner_changed = state.owner_id != owner_id;
             let mut next: Vec<StoredCredential> = Vec::with_capacity(credentials.len());
             let mut invalidated: Vec<String> = Vec::new();
 
@@ -332,17 +389,13 @@ impl HostAuthority {
                 let fingerprint = credential_fingerprint(&credential.secret);
                 // Clone out first: allocating a generation needs `state`
                 // mutably, so no borrow of `state.credentials` may be live.
-                let existing = if owner_changed {
-                    None
-                } else {
-                    state
-                        .credentials
-                        .iter()
-                        .find(|r| r.credential_id == credential.id)
-                        .cloned()
-                };
+                let existing = state
+                    .credentials
+                    .iter()
+                    .find(|r| r.credential_id == credential.id)
+                    .cloned();
                 let record = match existing {
-                    // Same slot, same secret, same owner: authority continues.
+                    // Same slot and same secret: authority continues.
                     Some(r) if r.credential_fingerprint == fingerprint => r,
                     // Same slot, different secret: rotate incarnation and
                     // generation, and invalidate everything held under the old
@@ -356,10 +409,10 @@ impl HostAuthority {
                             incarnation: CredentialIncarnation::mint().to_hex(),
                             auth_generation: generation,
                             credential_fingerprint: fingerprint,
-                            owner_id: owner_id.to_string(),
+                            owner_id: state.owner_id.clone(),
                         }
                     }
-                    // New slot, or an owner change: a wholly new principal.
+                    // A new slot receives a wholly new principal.
                     None => {
                         let generation = allocate_auth_generation(state)?;
                         StoredCredential {
@@ -368,7 +421,7 @@ impl HostAuthority {
                             incarnation: CredentialIncarnation::mint().to_hex(),
                             auth_generation: generation,
                             credential_fingerprint: fingerprint,
-                            owner_id: owner_id.to_string(),
+                            owner_id: state.owner_id.clone(),
                         }
                     }
                 };
@@ -386,7 +439,6 @@ impl HostAuthority {
                 invalidate_incarnation(state, incarnation);
             }
 
-            state.owner_id = owner_id.to_string();
             state.credentials = next;
             Ok(())
         })
@@ -573,8 +625,9 @@ impl HostAuthority {
     /// Rotate the control epoch, retiring every in-flight admission.
     pub fn rotate_control_epoch(
         &self,
-        _admin: &HostAdminAuthority,
+        admin: &HostAdminAuthority,
     ) -> Result<ControlEpoch, AuthorityError> {
+        self.require_admin(admin)?;
         self.with_state(|state| {
             state.control_epoch = state
                 .control_epoch
@@ -589,8 +642,9 @@ impl HostAuthority {
     /// Rotate the capability generation, invalidating every sealed grant.
     pub fn rotate_capability_generation(
         &self,
-        _admin: &HostAdminAuthority,
+        admin: &HostAdminAuthority,
     ) -> Result<CapabilityGeneration, AuthorityError> {
+        self.require_admin(admin)?;
         self.with_state(|state| {
             state.capability_generation =
                 state.capability_generation.checked_add(1).ok_or_else(|| {
@@ -603,7 +657,8 @@ impl HostAuthority {
     }
 
     /// The owner account this root serves. An operator read.
-    pub fn owner_id(&self, _admin: &HostAdminAuthority) -> Result<String, AuthorityError> {
+    pub fn owner_id(&self, admin: &HostAdminAuthority) -> Result<String, AuthorityError> {
+        self.require_admin(admin)?;
         self.read(|state| Ok(state.owner_id.clone()))
     }
 }

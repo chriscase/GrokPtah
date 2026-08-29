@@ -114,6 +114,7 @@ pub struct AuditRecord {
 pub(crate) struct AuditLog {
     path: PathBuf,
     lock_path: PathBuf,
+    head_path: PathBuf,
     sequence: u64,
     previous_digest: String,
     /// Length of the log when the cached head was derived.
@@ -126,13 +127,22 @@ pub(crate) struct AuditLog {
 
 const GENESIS_DIGEST: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuditHead {
+    sequence: u64,
+    digest: String,
+}
+
 impl AuditLog {
     pub(crate) fn open(root: &Path) -> Result<Self, AuthorityError> {
         let path = root.join("audit.log");
         let lock_path = root.join("audit.lock");
+        let head_path = root.join("audit.head");
         let mut log = Self {
             path,
             lock_path,
+            head_path,
             sequence: 0,
             previous_digest: GENESIS_DIGEST.to_string(),
             observed_len: 0,
@@ -168,6 +178,49 @@ impl AuditLog {
         }
     }
 
+    fn read_head(&self) -> Result<Option<AuditHead>, AuthorityError> {
+        let text = match std::fs::read_to_string(&self.head_path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(AuthorityError::Durability(e.to_string())),
+        };
+        serde_json::from_str(&text)
+            .map(Some)
+            .map_err(|e| AuthorityError::CorruptState(format!("audit head is unreadable: {e}")))
+    }
+
+    fn persist_head(&self, sequence: u64, digest: &str) -> Result<(), AuthorityError> {
+        let text = serde_json::to_string(&AuditHead {
+            sequence,
+            digest: digest.to_string(),
+        })
+        .map_err(|e| AuthorityError::Durability(e.to_string()))?;
+        let tmp = self.head_path.with_extension("head.tmp");
+        {
+            let mut file =
+                File::create(&tmp).map_err(|e| AuthorityError::Durability(e.to_string()))?;
+            file.write_all(text.as_bytes())
+                .map_err(|e| AuthorityError::Durability(e.to_string()))?;
+            file.sync_all()
+                .map_err(|e| AuthorityError::Durability(e.to_string()))?;
+        }
+        std::fs::rename(&tmp, &self.head_path)
+            .map_err(|e| AuthorityError::Durability(e.to_string()))?;
+        if let Some(root) = self.head_path.parent()
+            && let Ok(dir) = File::open(root)
+        {
+            let _ = dir.sync_all();
+        }
+        Ok(())
+    }
+
+    fn head_matches(&self, sequence: u64, digest: &str) -> Result<bool, AuthorityError> {
+        match self.read_head()? {
+            None => Ok(sequence == 0 && digest == GENESIS_DIGEST),
+            Some(head) => Ok(head.sequence == sequence && head.digest == digest),
+        }
+    }
+
     /// Refresh the cached head if anyone else has appended.
     fn refresh_if_stale(&mut self) -> Result<(), AuthorityError> {
         if self.current_len()? != self.observed_len {
@@ -175,6 +228,8 @@ impl AuditLog {
             self.previous_digest = GENESIS_DIGEST.to_string();
             self.damaged = None;
             self.replay()?;
+        } else if !self.verify_chain_unlocked()? {
+            self.damaged = Some("audit log changed without advancing its durable head".into());
         }
         Ok(())
     }
@@ -224,6 +279,9 @@ impl AuditLog {
             self.sequence = record.sequence;
             self.previous_digest = record_digest(line);
         }
+        if self.damaged.is_none() && !self.head_matches(self.sequence, &self.previous_digest)? {
+            self.damaged = Some("audit log does not match its durable head checkpoint".into());
+        }
         self.observed_len = self.current_len()?;
         Ok(())
     }
@@ -268,8 +326,14 @@ impl AuditLog {
         file.sync_all()
             .map_err(|e| AuthorityError::Durability(e.to_string()))?;
 
+        let digest = record_digest(&line);
+        // The separately fsynced head makes a same-length rewrite of the last
+        // record detectable after restart. A crash between the log append and
+        // this checkpoint fails closed as damaged evidence; it never grants a
+        // permit on the strength of an unanchored intent.
+        self.persist_head(sequence, &digest)?;
         self.sequence = sequence;
-        self.previous_digest = record_digest(&line);
+        self.previous_digest = digest;
         self.observed_len = self.current_len()?;
         Ok(record)
     }
@@ -295,13 +359,30 @@ impl AuditLog {
             Err(e) => return Err(AuthorityError::Durability(e.to_string())),
         };
         let mut out = Vec::new();
+        let mut expected_prev = GENESIS_DIGEST.to_string();
+        let mut expected_seq = 1u64;
         for line in text.lines() {
             let line = line.trim();
             if line.is_empty() {
                 continue;
             }
             match serde_json::from_str::<AuditRecord>(line) {
-                Ok(record) => out.push(record),
+                Ok(record)
+                    if record.sequence == expected_seq
+                        && record.previous_digest == expected_prev =>
+                {
+                    expected_prev = record_digest(line);
+                    expected_seq = expected_seq.checked_add(1).ok_or_else(|| {
+                        AuthorityError::CorruptState("audit sequence exhausted".into())
+                    })?;
+                    out.push(record);
+                }
+                Ok(record) => {
+                    return Err(AuthorityError::CorruptState(format!(
+                        "audit chain mismatch at sequence {} (expected sequence {expected_seq})",
+                        record.sequence
+                    )));
+                }
                 // Returning the readable prefix would present a truncated log
                 // as the whole log.
                 Err(error) => {
@@ -312,12 +393,22 @@ impl AuditLog {
                 }
             }
         }
+        if !self.head_matches(expected_seq.saturating_sub(1), &expected_prev)? {
+            return Err(AuthorityError::CorruptState(
+                "audit log does not match its durable head checkpoint".into(),
+            ));
+        }
         Ok(out)
     }
 
     /// Verify the hash chain over the persisted records.
     pub(crate) fn verify_chain(&self) -> Result<bool, AuthorityError> {
         let _guard = self.lock()?;
+        self.verify_chain_unlocked()
+    }
+
+    /// Verify while the caller already holds `audit.lock`.
+    fn verify_chain_unlocked(&self) -> Result<bool, AuthorityError> {
         let text = match std::fs::read_to_string(&self.path) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
@@ -340,7 +431,7 @@ impl AuditLog {
             expected_prev = record_digest(line);
             expected_seq = expected_seq.saturating_add(1);
         }
-        Ok(true)
+        self.head_matches(expected_seq.saturating_sub(1), &expected_prev)
     }
 }
 

@@ -6,6 +6,7 @@ license.workspace = true
 description = "One canonical host-issued authority spine: principals, sealed capabilities, provider attempts, and typed audit"
 
 [dependencies]
+dunce = { workspace = true }
 fs2 = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

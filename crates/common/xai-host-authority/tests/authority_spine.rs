@@ -18,7 +18,11 @@ struct Fixture {
 }
 
 const SECRET: &str = "s3cret-bearer-value";
-const OWNER: &str = "account-1";
+const ADMIN_SECRET: &str = "host-admin-custody-secret-32-bytes-minimum-v1";
+
+fn admin_credential() -> HostAdminCredential {
+    HostAdminCredential::new(ADMIN_SECRET).unwrap()
+}
 
 fn observation(tag: &str) -> ContentDigest {
     ContentDigest::of_bytes(tag.as_bytes())
@@ -38,13 +42,9 @@ fn request(body: &[u8]) -> RequestIdentity {
 fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_path_buf();
-    let (authority, admin) = HostAuthority::open(&root, OWNER).unwrap();
+    let (authority, admin) = HostAuthority::open(&root, &admin_credential()).unwrap();
     authority
-        .set_credentials(
-            &admin,
-            &[HostCredential::new("primary", SECRET).unwrap()],
-            OWNER,
-        )
+        .set_credentials(&admin, &[HostCredential::new("primary", SECRET).unwrap()])
         .unwrap();
     let auth = authority.authenticate(SECRET).unwrap();
     let session = authority.issue_session(&auth).unwrap();
@@ -113,7 +113,6 @@ fn rotating_a_secret_kills_the_previous_bearer_and_its_context() {
         .set_credentials(
             &f.admin,
             &[HostCredential::new("primary", "rotated-secret").unwrap()],
-            OWNER,
         )
         .unwrap();
 
@@ -140,15 +139,10 @@ fn reinstalling_the_same_credential_name_does_not_resurrect_old_authority() {
         .set_credentials(
             &f.admin,
             &[HostCredential::new("primary", "interim").unwrap()],
-            OWNER,
         )
         .unwrap();
     f.authority
-        .set_credentials(
-            &f.admin,
-            &[HostCredential::new("primary", SECRET).unwrap()],
-            OWNER,
-        )
+        .set_credentials(&f.admin, &[HostCredential::new("primary", SECRET).unwrap()])
         .unwrap();
 
     // The secret authenticates again, but as a *new* incarnation.
@@ -183,7 +177,6 @@ fn removing_a_credential_revokes_everything_derived_from_it() {
         .set_credentials(
             &f.admin,
             &[HostCredential::new("other", "another-secret").unwrap()],
-            OWNER,
         )
         .unwrap();
 
@@ -226,7 +219,7 @@ fn a_resource_the_host_never_issued_cannot_be_claimed_by_naming_it() {
 #[test]
 fn a_second_principal_cannot_use_the_first_principals_resource() {
     let dir = tempfile::tempdir().unwrap();
-    let (authority, admin) = HostAuthority::open(dir.path(), OWNER).unwrap();
+    let (authority, admin) = HostAuthority::open(dir.path(), &admin_credential()).unwrap();
     authority
         .set_credentials(
             &admin,
@@ -234,7 +227,6 @@ fn a_second_principal_cannot_use_the_first_principals_resource() {
                 HostCredential::new("a", "secret-a").unwrap(),
                 HostCredential::new("b", "secret-b").unwrap(),
             ],
-            OWNER,
         )
         .unwrap();
     let a = authority.authenticate("secret-a").unwrap();
@@ -271,7 +263,7 @@ fn a_second_principal_cannot_use_the_first_principals_resource() {
 #[test]
 fn a_capability_cannot_be_leased_by_a_different_principal() {
     let dir = tempfile::tempdir().unwrap();
-    let (authority, admin) = HostAuthority::open(dir.path(), OWNER).unwrap();
+    let (authority, admin) = HostAuthority::open(dir.path(), &admin_credential()).unwrap();
     authority
         .set_credentials(
             &admin,
@@ -279,7 +271,6 @@ fn a_capability_cannot_be_leased_by_a_different_principal() {
                 HostCredential::new("a", "secret-a").unwrap(),
                 HostCredential::new("b", "secret-b").unwrap(),
             ],
-            OWNER,
         )
         .unwrap();
     let a = authority.authenticate("secret-a").unwrap();
@@ -586,13 +577,9 @@ fn a_crash_between_dispatch_and_settlement_settles_uncertain() {
     let root = dir.path().to_path_buf();
 
     let attempt = {
-        let (authority, admin) = HostAuthority::open(&root, OWNER).unwrap();
+        let (authority, admin) = HostAuthority::open(&root, &admin_credential()).unwrap();
         authority
-            .set_credentials(
-                &admin,
-                &[HostCredential::new("primary", SECRET).unwrap()],
-                OWNER,
-            )
+            .set_credentials(&admin, &[HostCredential::new("primary", SECRET).unwrap()])
             .unwrap();
         let auth = authority.authenticate(SECRET).unwrap();
         let session = authority.issue_session(&auth).unwrap();
@@ -621,7 +608,7 @@ fn a_crash_between_dispatch_and_settlement_settles_uncertain() {
     };
 
     // A new host incarnation recovers.
-    let (authority, admin) = HostAuthority::open(&root, OWNER).unwrap();
+    let (authority, admin) = HostAuthority::open(&root, &admin_credential()).unwrap();
     let _ = &admin;
     let recovered = authority.recover_incomplete(&admin).unwrap();
     assert_eq!(recovered, vec![attempt]);
@@ -647,14 +634,10 @@ fn concurrent_spends_of_one_lease_admit_exactly_one() {
 
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_path_buf();
-    let (authority, admin) = HostAuthority::open(&root, OWNER).unwrap();
+    let (authority, admin) = HostAuthority::open(&root, &admin_credential()).unwrap();
     let authority = Arc::new(authority);
     authority
-        .set_credentials(
-            &admin,
-            &[HostCredential::new("primary", SECRET).unwrap()],
-            OWNER,
-        )
+        .set_credentials(&admin, &[HostCredential::new("primary", SECRET).unwrap()])
         .unwrap();
     let auth = authority.authenticate(SECRET).unwrap();
     let session = authority.issue_session(&auth).unwrap();
@@ -749,10 +732,49 @@ fn a_truncated_audit_log_is_detected() {
     let root = f.root.clone();
     drop(f.authority);
 
-    let (reopened, reopened_admin) = HostAuthority::open(&root, OWNER).unwrap();
+    let (reopened, reopened_admin) = HostAuthority::open(&root, &admin_credential()).unwrap();
     assert!(
         !reopened.audit_chain_intact(&reopened_admin).unwrap(),
         "removing a record must break the audit hash chain"
+    );
+}
+
+#[test]
+fn audit_export_rejects_same_length_tampering() {
+    let f = fixture();
+    let req = request(b"body");
+    let lease = lease_for(&f, &req);
+    let permit = f.authority.begin_send(&f.auth, lease, &req).unwrap();
+    let _ = f.authority.settle_settled(permit);
+
+    let path = f.root.join("audit.log");
+    let original = std::fs::read_to_string(&path).unwrap();
+    let tampered = original.replacen("response observed", "response observeD", 1);
+    assert_ne!(
+        tampered, original,
+        "fixture must contain a settlement detail"
+    );
+    assert_eq!(
+        tampered.len(),
+        original.len(),
+        "the mutation must evade length-only cache invalidation"
+    );
+    std::fs::write(&path, tampered).unwrap();
+
+    assert!(!f.authority.audit_chain_intact(&f.admin).unwrap());
+    assert!(
+        matches!(
+            f.authority.audit_records(&f.admin),
+            Err(AuthorityError::CorruptState(_))
+        ),
+        "export must verify the dense sequence and previous-digest chain"
+    );
+    assert!(
+        matches!(
+            f.authority.authenticate(SECRET),
+            Err(AuthorityError::CorruptState(_))
+        ),
+        "same-length tampering must be detected before the next append"
     );
 }
 
@@ -826,7 +848,7 @@ fn a_corrupt_authority_root_refuses_service_rather_than_inventing_authority() {
     .unwrap();
     let root = f.root.clone();
     drop(f.authority);
-    let reopened = HostAuthority::open(&root, OWNER);
+    let reopened = HostAuthority::open(&root, &admin_credential());
     // Opening cannot repair it, and nothing downstream gets authority.
     match reopened {
         Err(AuthorityError::CorruptState(_)) => {}
@@ -945,7 +967,6 @@ fn a_planted_old_resource_record_cannot_be_used_after_rotation() {
         .set_credentials(
             &f.admin,
             &[HostCredential::new("primary", "rotated-secret").unwrap()],
-            OWNER,
         )
         .unwrap();
     let after = f.authority.authenticate("rotated-secret").unwrap();
@@ -972,7 +993,7 @@ fn a_planted_old_resource_record_cannot_be_used_after_rotation() {
 
     // It is present again, but bound to an incarnation that no longer exists,
     // so the current principal cannot read or act on it.
-    let (reopened, reopened_admin) = HostAuthority::open(&root, OWNER).unwrap();
+    let (reopened, reopened_admin) = HostAuthority::open(&root, &admin_credential()).unwrap();
     let _ = &reopened_admin;
     let current = reopened.authenticate("rotated-secret").unwrap();
     assert!(
@@ -1007,7 +1028,7 @@ fn a_missing_authority_root_with_prior_evidence_refuses_service() {
     std::fs::remove_file(f.root.join("authority.json")).unwrap();
     assert!(f.root.join("audit.log").exists());
 
-    match HostAuthority::open(&f.root, OWNER) {
+    match HostAuthority::open(&f.root, &admin_credential()) {
         Err(AuthorityError::CorruptState(_)) => {}
         Err(other) => panic!("expected a refusal to re-establish, got {other:?}"),
         Ok(_) => panic!("a deleted authority root must not silently mint a new lineage"),
@@ -1017,7 +1038,7 @@ fn a_missing_authority_root_with_prior_evidence_refuses_service() {
 #[test]
 fn one_principal_cannot_read_another_principals_attempt() {
     let dir = tempfile::tempdir().unwrap();
-    let (authority, admin) = HostAuthority::open(dir.path(), OWNER).unwrap();
+    let (authority, admin) = HostAuthority::open(dir.path(), &admin_credential()).unwrap();
     authority
         .set_credentials(
             &admin,
@@ -1025,7 +1046,6 @@ fn one_principal_cannot_read_another_principals_attempt() {
                 HostCredential::new("a", "secret-a").unwrap(),
                 HostCredential::new("b", "secret-b").unwrap(),
             ],
-            OWNER,
         )
         .unwrap();
     let a = authority.authenticate("secret-a").unwrap();
@@ -1193,7 +1213,7 @@ fn admin_authority_is_scarce() {
     // admin over the same state. Any `&HostAuthority` could otherwise mint one
     // simply by opening the root it already knows.
     let f = fixture();
-    let error = HostAuthority::open(&f.root, OWNER)
+    let error = HostAuthority::open(&f.root, &admin_credential())
         .expect_err("a second holder must be refused while the first is live");
     assert!(
         matches!(error, AuthorityError::Durability(_)),
@@ -1203,26 +1223,48 @@ fn admin_authority_is_scarce() {
     // Released, the root can be taken again — by exactly one holder.
     let root = f.root.clone();
     drop(f.authority);
-    let (reopened, _admin) = HostAuthority::open(&root, OWNER).unwrap();
-    assert!(HostAuthority::open(&root, OWNER).is_err());
+    let (reopened, _admin) = HostAuthority::open(&root, &admin_credential()).unwrap();
+    assert!(HostAuthority::open(&root, &admin_credential()).is_err());
     drop(reopened);
 }
 
 #[test]
-fn a_root_cannot_be_opened_under_a_different_owner() {
-    // The stored owner is the root's identity; accepting a caller-supplied one
-    // would let anybody name themselves the owner of someone else's root.
+fn a_root_cannot_be_opened_without_the_original_custody_secret() {
+    // Custody is proved by a host secret, not by repeating a caller-selected
+    // owner label. A process that only knows the path cannot become admin.
     let f = fixture();
     let root = f.root.clone();
     drop(f.authority);
 
+    let wrong = HostAdminCredential::new("different-host-custody-secret-32-bytes-minimum").unwrap();
     let error =
-        HostAuthority::open(&root, "someone-else").expect_err("a different owner must be refused");
+        HostAuthority::open(&root, &wrong).expect_err("a different custody secret must be refused");
     assert!(
-        matches!(error, AuthorityError::CorruptState(_)),
-        "expected an owner mismatch, got {error:?}"
+        matches!(error, AuthorityError::Unauthenticated),
+        "expected an authentication refusal, got {error:?}"
     );
-    assert!(HostAuthority::open(&root, OWNER).is_ok());
+    assert!(HostAuthority::open(&root, &admin_credential()).is_ok());
+}
+
+#[test]
+fn admin_tokens_are_bound_to_the_root_that_minted_them() {
+    let first = fixture();
+    let second = fixture();
+    let error = second
+        .authority
+        .rotate_control_epoch(&first.admin)
+        .expect_err("an admin token from another root must not administer this one");
+    assert!(matches!(error, AuthorityError::Unauthenticated));
+}
+
+#[test]
+fn host_authority_debug_is_path_opaque() {
+    let f = fixture();
+    let rendered = format!("{:?}", f.authority);
+    assert!(!rendered.contains(f.root.to_string_lossy().as_ref()));
+    assert!(!rendered.contains("audit.log"));
+    assert!(!rendered.contains("authority.json"));
+    assert_eq!(rendered, "HostAuthority { root: \"[opaque]\", .. }");
 }
 
 #[test]
@@ -1320,6 +1362,101 @@ fn an_uncertain_outcome_is_always_reconcilable() {
 }
 
 #[test]
+fn settlement_audit_replays_when_the_state_snapshot_write_fails() {
+    let f = fixture();
+    let req = request(b"body");
+    let lease = lease_for(&f, &req);
+    let permit = f.authority.begin_send(&f.auth, lease, &req).unwrap();
+    let attempt = permit.attempt();
+
+    // The WAL append remains writable, but the subsequent state snapshot
+    // cannot create its temporary file.
+    let state_tmp = f.root.join("authority.json.tmp");
+    std::fs::create_dir(&state_tmp).unwrap();
+    let outcome = f.authority.settle_settled(permit);
+    assert!(matches!(
+        outcome,
+        SendOutcome::Uncertain {
+            reason: UncertainReason::StateNotDurableAfterDispatch,
+            ..
+        }
+    ));
+    std::fs::remove_dir(&state_tmp).unwrap();
+
+    let root = f.root.clone();
+    drop(f.authority);
+    let (reopened, _admin) = HostAuthority::open(&root, &admin_credential()).unwrap();
+    let auth = reopened.authenticate(SECRET).unwrap();
+    let projection = reopened
+        .attempt_projection(&auth, attempt)
+        .unwrap()
+        .unwrap();
+    assert_eq!(projection.state, "settled");
+    assert!(projection.settled);
+    assert!(!projection.ambiguous);
+}
+
+#[test]
+fn reconciliation_audit_replays_when_the_state_snapshot_write_fails() {
+    let f = fixture();
+    let req = request(b"body");
+    let lease = lease_for(&f, &req);
+    let permit = f.authority.begin_send(&f.auth, lease, &req).unwrap();
+    let attempt = permit.attempt();
+    assert!(matches!(
+        f.authority
+            .settle_uncertain(permit, UncertainReason::TransportAfterPossibleWrite),
+        SendOutcome::Uncertain { .. }
+    ));
+
+    let state_tmp = f.root.join("authority.json.tmp");
+    std::fs::create_dir(&state_tmp).unwrap();
+    assert!(matches!(
+        f.authority.reconcile_attempt(&f.admin, attempt, true),
+        Err(AuthorityError::Durability(_))
+    ));
+    std::fs::remove_dir(&state_tmp).unwrap();
+
+    let root = f.root.clone();
+    drop(f.authority);
+    let (reopened, _admin) = HostAuthority::open(&root, &admin_credential()).unwrap();
+    let auth = reopened.authenticate(SECRET).unwrap();
+    let projection = reopened
+        .attempt_projection(&auth, attempt)
+        .unwrap()
+        .unwrap();
+    assert_eq!(projection.state, "settled");
+    assert!(!projection.ambiguous);
+}
+
+#[test]
+fn reconciliation_audit_failure_leaves_state_ambiguous() {
+    let f = fixture();
+    let req = request(b"body");
+    let lease = lease_for(&f, &req);
+    let permit = f.authority.begin_send(&f.auth, lease, &req).unwrap();
+    let attempt = permit.attempt();
+    let _ = f
+        .authority
+        .settle_uncertain(permit, UncertainReason::TransportAfterPossibleWrite);
+
+    let log = f.root.join("audit.log");
+    std::fs::remove_file(&log).unwrap();
+    std::fs::create_dir(&log).unwrap();
+    assert!(matches!(
+        f.authority.reconcile_attempt(&f.admin, attempt, true),
+        Err(AuthorityError::Durability(_))
+    ));
+    let projection = f
+        .authority
+        .attempt_projection(&f.auth, attempt)
+        .unwrap()
+        .unwrap();
+    assert_eq!(projection.state, "uncertain");
+    assert!(projection.ambiguous);
+}
+
+#[test]
 fn a_damaged_audit_log_is_never_resealed() {
     // Dropped or torn evidence must not read as an intact chain, and must not
     // let a later append reuse the missing record's sequence number.
@@ -1336,7 +1473,7 @@ fn a_damaged_audit_log_is_never_resealed() {
 
     let root = f.root.clone();
     drop(f.authority);
-    let (reopened, admin) = HostAuthority::open(&root, OWNER).unwrap();
+    let (reopened, admin) = HostAuthority::open(&root, &admin_credential()).unwrap();
 
     assert!(
         !reopened.audit_chain_intact(&admin).unwrap(),
