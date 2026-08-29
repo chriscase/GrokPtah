@@ -1,0 +1,26 @@
+[package]
+name = "grokptah-cu-adaptive-eval"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Provider-neutral deterministic evaluation harness for Computer Use adaptive Economy/Balanced/High-Assurance profiles (issues #435/#272/#274/#363). Evaluation fixtures, metrics, and reports only."
+authors = ["GrokPtah"]
+readme = "README.md"
+
+# Isolated crate: do not join the monorepo workspace. This crate must never
+# depend on grokptah-agent-bridge, desktop, native helpers, or VM backends.
+[workspace]
+
+[[bin]]
+name = "grokptah-cu-adaptive-eval"
+path = "src/bin/grokptah-cu-adaptive-eval.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+
+[dev-dependencies]
+serde_json = "1"

@@ -37,6 +37,9 @@ jobs:
         working-directory: desktop
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "20"
@@ -48,7 +51,7 @@ jobs:
           components: rustfmt, clippy
       - name: Configure compiler-cache namespace
         env:
-          SCCACHE_NAMESPACE: grokptah-v1-${{ runner.os }}-${{ runner.arch }}-rust-1.92-${{ hashFiles('desktop/src-tauri/Cargo.lock', 'crates/codegen/grokptah-agent-bridge/Cargo.lock', 'evals/certification-lab/Cargo.lock') }}
+          SCCACHE_NAMESPACE: grokptah-v1-${{ runner.os }}-${{ runner.arch }}-rust-1.92-${{ hashFiles('desktop/src-tauri/Cargo.lock', 'crates/codegen/grokptah-agent-bridge/Cargo.lock', 'evals/certification-lab/Cargo.lock', 'evals/computer-use-adaptive/Cargo.lock') }}
         run: echo "SCCACHE_GHA_VERSION=${SCCACHE_NAMESPACE}" >> "$GITHUB_ENV"
       - name: Install compiler cache
         uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
@@ -89,6 +92,28 @@ jobs:
           cargo run --locked -- replay --fixture "$GITHUB_WORKSPACE/evals/certification-lab/replay-fixtures/provider-behaviors.v1.json"
           cargo run --locked -- preflight --repository "$GITHUB_WORKSPACE" --output "$RUNNER_TEMP/grokptah-cert-output"
           cargo run --locked -- run --repository "$GITHUB_WORKSPACE" --output "$RUNNER_TEMP/grokptah-cert-output"
+      - name: Adaptive Computer Use evaluator (synthetic authority)
+        working-directory: evals/computer-use-adaptive
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+          EXPECTED_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked -- --test-threads=1
+          cargo run --locked --bin grokptah-cu-adaptive-eval -- \
+            --out "$RUNNER_TEMP/grokptah-cu-adaptive" \
+            --repeats 5 \
+            --seed 435272 \
+            --repository "$GITHUB_WORKSPACE" \
+            --expected-head "$EXPECTED_HEAD" \
+            --source-gate "$EXPECTED_BASE"
+          cargo run --locked --bin grokptah-cu-adaptive-eval -- \
+            --verify-report "$RUNNER_TEMP/grokptah-cu-adaptive/campaign-report.json" \
+            --verify-evidence "$RUNNER_TEMP/grokptah-cu-adaptive/campaign-evidence.json" \
+            --repository "$GITHUB_WORKSPACE" \
+            --expected-head "$EXPECTED_HEAD" \
+            --source-gate "$EXPECTED_BASE"
       - name: Offline oracle suite shape (repo root)
         working-directory: .
         run: |
