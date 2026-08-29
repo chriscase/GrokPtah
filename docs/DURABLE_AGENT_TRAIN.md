@@ -21,7 +21,15 @@ pairwise without replaying intermediate lineages.
 | #494 | `claude/grokptah-478-provider-attempt-mdmvq4` | `6b871d7` | `67e29bd` (= main) | 2 | 22 | +7927 / −685 |
 
 Every head above was verified against the branch as published, not against the
-PR body. All five agree with their PR-reported heads.
+PR body. All five agreed with their PR-reported heads at the time of analysis.
+
+**Observed drift.** `claude/host-runtime-shutdown-v1` (#468) advanced from
+`17e0760` to `459358d` while this train was being built. Nothing here is
+derived from that branch — its disposition is *not this train's* (see §4) — so
+the move does not invalidate any decision below. It is recorded because a
+consolidation map that silently goes stale is worse than one that says where it
+was taken from. The other four heads were unchanged, and `origin/main` was
+still `67e29bd34dc64049432c715c93c2cef2185c63ea`, when this train was pushed.
 
 ## 2. Exact changed-file overlap
 
