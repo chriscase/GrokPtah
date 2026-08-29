@@ -167,7 +167,8 @@ caller's own task:
 | Site | Effect | On the barrier? |
 | --- | --- | --- |
 | `session_prompt_inner` | provider send, tool execution, workspace edits | **Yes** — registered before the turn starts, so no caller can begin one unsupervised |
-| `DesktopComputerUse` commands | permission, capture, input delivery | **Yes** — `track_supervised` around each |
+| `DesktopComputerUse`: `request_permission`, `list_targets`, `observe_once`, `start_simulator`, `start_native`, `refresh_simulator`, `approve_simulator_action` | permission, enumeration, capture, run start, input delivery | **Yes** — `track_supervised` around each of these seven, and only these |
+| `DesktopComputerUse`: `stage_simulator_action`, `apply_model_proposal`, `pause_simulator`, `take_over_simulator`, `stop_simulator`, `discard_simulator_approval` | durable-only; no platform call | not tracked — the durable-write guard governs them |
 | orchestration run + aggregator tasks | durable runs | **Yes** — `spawn_supervised` |
 | background scans, shells, subagents | workspace, child processes | **Yes** — `spawn_supervised` |
 | scheduler / native / manager watchers | durable | **Yes** — supervised and joined |
