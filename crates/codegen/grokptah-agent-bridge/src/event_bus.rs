@@ -121,6 +121,19 @@ impl EventBus {
     ///
     /// Idempotent: a second call finds the sender already taken and returns the
     /// persistence error slot as it stands.
+    /// Whether the journal writer thread is still alive and accepting entries.
+    ///
+    /// After a clean shutdown this must be false even while clones of the bus
+    /// survive — that is the difference between "the writer happened to keep
+    /// up" and "shutdown closed and joined it".
+    pub fn journal_writer_is_live(&self) -> bool {
+        self.inner
+            .lock()
+            .persistence
+            .as_ref()
+            .is_some_and(|handle| handle.tx.lock().is_some())
+    }
+
     pub fn close_journal_writer(&self) -> Option<String> {
         let handle = self.inner.lock().persistence.clone();
         if let Some(handle) = handle {
