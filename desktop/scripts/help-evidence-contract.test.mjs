@@ -54,6 +54,23 @@ describe("Semantic Help evidence identity", () => {
     assert.throws(() => validate(forged), /names .*; expected evidence-out\/help-/);
   });
 
+  it("rejects distinct canonical filenames that resolve to identical screenshot bytes", () => {
+    const forged = report();
+    for (const row of forged.report) {
+      row.screenshotDigest = "sha256:one-image";
+    }
+    assert.throws(
+      () =>
+        validateHelpEvidenceReport(forged, {
+          publicCorpusDigest: "sha256:corpus",
+          evidenceBundleDigest: "sha256:harness",
+          evidenceAssets: assets,
+          screenshotDigest: () => "sha256:one-image",
+        }),
+      /duplicate screenshot bytes .* digest already used by/,
+    );
+  });
+
   it("rejects missing, duplicated, and digest-tampered rows", () => {
     const missing = report();
     missing.report.pop();

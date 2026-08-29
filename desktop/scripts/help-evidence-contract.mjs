@@ -51,6 +51,7 @@ export function validateHelpEvidenceReport(report, {
     ),
   );
   const seenScreenshots = new Set();
+  const seenScreenshotDigests = new Map();
   const screenshots = {};
   for (const entry of report.report) {
     const key = `${entry.state}:${entry.viewport}`;
@@ -71,6 +72,13 @@ export function validateHelpEvidenceReport(report, {
     if (entry.screenshotDigest !== actualDigest) {
       throw new Error(`screenshot digest mismatch for ${entry.screenshot}`);
     }
+    const reusedBy = seenScreenshotDigests.get(actualDigest);
+    if (reusedBy !== undefined) {
+      throw new Error(
+        `duplicate screenshot bytes for ${entry.screenshot}; digest already used by ${reusedBy}`,
+      );
+    }
+    seenScreenshotDigests.set(actualDigest, entry.screenshot);
     screenshots[entry.screenshot] = actualDigest;
   }
   if (expected.size > 0) {
