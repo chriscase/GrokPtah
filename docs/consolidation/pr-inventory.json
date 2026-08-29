@@ -1,5 +1,26 @@
 {
- "schema": "grokptah.consolidation.inventory/v1",
+ "schema": "grokptah.consolidation.inventory/v2",
+ "revised_at_utc": "2026-08-29T15:40:00+00:00",
+ "authority": {
+  "source_of_truth": "https://github.com/chriscase/GrokPtah/issues/492",
+  "this_document_is": "A dated, immutable, SUBORDINATE snapshot. It is evidence for issue #492 and is NOT merge authorization.",
+  "dispositions_are": "Planning classifications only. They do not authorize merge, close, undraft, retarget, or branch deletion.",
+  "on_conflict": "Issue #492 exact reviews win. Where they diverge from this snapshot, the per-PR authority_review field records the authoritative verdict.",
+  "retirement_gate": "Per #492: no PR closes and no branch is deleted until its replacement is published, green, independently reviewed, and its donor disposition is recorded in #492.",
+  "related_issues": {
+   "492": "consolidation source of truth",
+   "491": "Semantic Help source of truth (ISSUE, not a PR)",
+   "477": "multi-identity authority fence hazard (ISSUE)",
+   "458": "Computer Use acceptance criteria (ISSUE)"
+  }
+ },
+ "snapshot": {
+  "immutable": true,
+  "taken_at_utc": "2026-08-29T14:20:34.577039+00:00",
+  "anchor_main_sha": "67e29bd34dc64049432c715c93c2cef2185c63ea",
+  "open_prs_at_snapshot": 129,
+  "note": "Every record in pull_requests is frozen at taken_at_utc. Do not hand-patch them; regenerate. Live divergence is recorded in live_delta."
+ },
  "generated_at_utc": "2026-08-29T14:20:34.577039+00:00",
  "repository": "chriscase/GrokPtah",
  "anchor": {
@@ -12,7 +33,126 @@
   "pr_heads": "git fetch '+refs/pull/*/head:refs/remotes/origin/pr/*' (237 refs); every open PR head object verified present locally; zero drift vs GitHub API head SHAs",
   "merge_state": "git merge-tree --write-tree (non-destructive, object-only); intermediate train states materialised with git commit-tree",
   "supersession": "git merge-base --is-ancestor between open PR heads (exact containment, not heuristic)",
-  "no_mutation": "no merge, rebase, push to any PR branch, close, undraft, or delete performed"
+  "no_mutation": "no merge, rebase, push to any PR branch, close, undraft, or delete performed",
+  "merge_conflict_count_rule": "git merge-tree --write-tree --name-only <base> <head>: line 1 is the result tree OID; lines 2..N up to the FIRST BLANK LINE are the conflicted paths; everything after that blank line is an informational trailer ('Auto-merging <path>' for files that merged CLEANLY, and 'CONFLICT (...)' descriptions) and MUST NOT be counted. v1 of this file counted the whole trailer, inflating merge_conflict_count by ~3.5x (reported 107-116 where the true conflicted-path count is 31-33). v2 counts only the pre-blank-line block. The pairwise matrix in F3 always used the correct rule, so v1 carried two incompatible definitions; v2 uses one.",
+  "determinism": "Byte-identical regeneration requires pinning generated_at_utc and the git version (merge-tree output format is version-sensitive and is the root cause of the v1 counting defect). checks/ci_rollup are API-timing dependent and are not reproducible; 96 of 129 records were never queried and are recorded as 'none-observed', which means NOT QUERIED, not 'no checks exist'."
+ },
+ "live_delta": {
+  "as_of_utc": "2026-08-29T15:40:00+00:00",
+  "live_open_prs": 134,
+  "open_prs_at_snapshot": 129,
+  "closed_since_snapshot": [
+   416
+  ],
+  "opened_since_snapshot": [
+   493,
+   494,
+   495,
+   496,
+   497,
+   498
+  ],
+  "moved_heads": [
+   {
+    "pr": 468,
+    "head_at_snapshot": "68833c378445f7523c4c7da2c397179f267a5319",
+    "head_live": "459358d0310d092384f789b56a29a7502ebabb1d",
+    "append_only": false,
+    "note": "NOT a fast-forward - branch was rewritten; every recorded measurement for this PR is void"
+   },
+   {
+    "pr": 469,
+    "head_at_snapshot": "039bafb7a324703fe3983657b940d303fb5edf53",
+    "head_live": "dfa74fd22f12c53908a657944f3784895871de8c",
+    "append_only": true,
+    "note": "fast-forward; snapshot head is an ancestor of the live head"
+   },
+   {
+    "pr": 471,
+    "head_at_snapshot": "22feee1f8458b9e4019612b4566c0dd641846ed8",
+    "head_live": "2a952b4e90357a9b75b291b30085ddeb6f831c97",
+    "append_only": true,
+    "note": "fast-forward; snapshot head is an ancestor of the live head"
+   },
+   {
+    "pr": 472,
+    "head_at_snapshot": "a97a8ab221f6d7c24e26042f8983658e577a73df",
+    "head_live": "3701aa9f3eff2e809cf303f0d4b7a5b5e2f0b4c8",
+    "append_only": false,
+    "note": "NOT a fast-forward - branch was rewritten; every recorded measurement for this PR is void"
+   },
+   {
+    "pr": 489,
+    "head_at_snapshot": "dea8339e116694aaf0cd55565bb7902d5a1133bf",
+    "head_live": "0767e03d6f69dea55c4d94826bb5515caa10f57f",
+    "append_only": false,
+    "note": "NOT a fast-forward - branch was rewritten; every recorded measurement for this PR is void"
+   },
+   {
+    "pr": 490,
+    "head_at_snapshot": "464045e3430532a9be79d49603c2de0f4c5d6ca5",
+    "head_live": "c8cabde77b9a74c479741d41de27cbdedccead91",
+    "append_only": true,
+    "note": "fast-forward; snapshot head is an ancestor of the live head"
+   }
+  ],
+  "recommended_train_344_348_unmoved": true,
+  "superseded_conclusions": [
+   {
+    "section": "F4 / train T1 ('both canonical-spine candidates are red', 'no promotable authority head')",
+    "superseded_by": "PR #497 head 0133b0a124b1b578e4fab035ecd2699d395e942a - current-main G1-G4 authority reconstruction, hosted green, under independent audit",
+    "status": "the snapshot's T1 conclusion is HISTORICAL; do not act on it"
+   },
+   {
+    "section": "Semantic Help ('no promotable head at all'; 'rebuild from #419 content')",
+    "superseded_by": "PR #496 head 11d8ed780cf07123b16252fb607ea1f636146d03 - current-main Semantic Help reconstruction, hosted green. Issue #491 governs this work and names #428 (not #419) as the donor core.",
+    "status": "the snapshot's Semantic Help recommendation is HISTORICAL and mis-sourced; do not act on it"
+   },
+   {
+    "section": "train T5 ('READY'), and the 14-PR superset",
+    "superseded_by": "#453 is REJECT per issue #492 (P0: forgeable zero-action Complete); #469's head moved to dfa74fd22f12c53908a657944f3784895871de8c",
+    "status": "VOID as a promotion recommendation; re-simulate before any use"
+   },
+   {
+    "section": "F5 / 7c (#416 vs #417 duplicate)",
+    "superseded_by": "#416 closed 2026-08-29",
+    "status": "RESOLVED"
+   }
+  ]
+ },
+ "regeneration_policy": {
+  "regenerate_when": [
+   "origin/main moves off the anchor",
+   "any head in a recommended train moves",
+   "five or more PR heads drift",
+   "any PR head is rewritten (non-fast-forward)",
+   "24 hours elapse",
+   "issue #492 records a new exact review"
+  ],
+  "re_simulate_before_promotion": "Never promote on a recorded simulation. Chained-train cleanliness is a property of the accumulated tree, so one moved head voids every downstream step. Re-run the chain in §10 against the live heads immediately before promoting.",
+  "tier_1_git_derived": {
+   "fields": [
+    "ancestry",
+    "merge_base_with_main",
+    "merge_state_vs_main",
+    "merge_conflict_count",
+    "superseded_by_open_prs",
+    "changed_files*",
+    "files_already_byte_identical_in_main"
+   ],
+   "validity": "stable while the anchor holds AND the PR head has not moved; computed from immutable objects"
+  },
+  "tier_2_github_state": {
+   "fields": [
+    "checks",
+    "ci_rollup",
+    "draft",
+    "open-set membership",
+    "base_ref"
+   ],
+   "validity": "STALE ON ARRIVAL - non-authoritative; re-query before acting"
+  },
+  "authority_direction": "One-way: issue #492 ingests this file. This file must never be cited back as the reason for a disposition."
  },
  "counts": {
   "open_prs": 129,
@@ -35,11 +175,12 @@
   "hosted_check_success": 26,
   "hosted_check_failure": 5,
   "dispositions": {
-   "SELECTIVE DONOR": 7,
-   "KEEP WHOLE": 18,
    "SUPERSEDED": 52,
+   "KEEP WHOLE": 15,
    "NEEDS QUALIFICATION": 27,
-   "REWRITE": 25
+   "REWRITE": 25,
+   "REJECT": 1,
+   "SELECTIVE DONOR": 9
   },
   "domains": {
    "computer-use": 79,
@@ -57,6 +198,27 @@
    "source-only": 15,
    "packaged-claimed": 82,
    "live-gated": 11
+  },
+  "merge_conflict_paths": {
+   "min": 31,
+   "max": 33,
+   "median": 32,
+   "distribution": {
+    "31": 8,
+    "32": 22,
+    "33": 16
+   }
+  },
+  "hosted_check_in_progress": 2,
+  "hosted_check_none_observed": 96,
+  "hosted_check_single_desktop_job": 30,
+  "files_byte_identical_in_main": {
+   "prs_that_are_pure_no_ops": 0,
+   "prs_containing_at_least_one_file_identical_to_main": 46,
+   "per_pr_file_count_range": [
+    8,
+    11
+   ]
   }
  },
  "structural_findings": [
@@ -65,7 +227,7 @@
    "severity": "critical",
    "finding": "46 of 129 open PRs fork from 127ffaff78b230dff7334ad692c382b66d1d1287, not from current main.",
    "evidence": "git merge-base(head, 67e29bd) == 127ffaff for exactly those 46. Main carries 72 commits after 127ffaff touching 242 files.",
-   "consequence": "All 46 conflict against main (111-116 conflicted paths each). The CONFLICT set and the stale-fork set are the same 46 PRs, exactly."
+   "consequence": "All 46 conflict against main (31-33 conflicted paths each; median 32). The CONFLICT set and the stale-fork set are the same 46 PRs, exactly. NOTE: v1 of this document reported 111-116 here and 107-116 in the per-PR table; both were the inflated pre-fix metric. See method.merge_conflict_count_rule."
   },
   {
    "id": "F2",
@@ -93,13 +255,13 @@
    "severity": "medium",
    "finding": "#416 and #417 are the same commit.",
    "evidence": "Both heads are 33b74ce6a7f4446303adbcb07dddd2913473108f with identical tree 0b7b1b03c0f1. Branches claude/external-worker-gate-4-zj3elc and claude/external-worker-gate-5-prod-surface point at the same object.",
-   "consequence": "One is redundant."
+   "consequence": "One is redundant. RESOLVED since the snapshot: #416 was closed on 2026-08-29 (see live_delta)."
   },
   {
    "id": "F6",
    "severity": "medium",
    "finding": "The hosted gate is a single job for most PRs.",
-   "evidence": "Of 34 PRs with observed checks, 31 have exactly one check run named 'desktop'. Ten workflows exist in main but only 'desktop' runs on most PRs.",
+   "evidence": "Of the 33 PRs with observed checks, 30 have exactly one check run named 'desktop'. Ten workflows exist in main but only 'desktop' runs on most PRs. (v1 said 34/31; the correct figures are 33/30 and agree with counts.hosted_check_observed.)",
    "consequence": "Green CI here is weak evidence; it does not exercise packaged, live-provider, or isolated-VM claims."
   },
   {
@@ -112,8 +274,8 @@
   {
    "id": "F8",
    "severity": "low",
-   "finding": "No open PR contains content already byte-identical in main.",
-   "evidence": "For all 129, files_vs_main_tip is non-empty and head_is_ancestor_of_main is false; zero pure no-ops.",
+   "finding": "No open PR is a pure no-op; none is wholly contained in main.",
+   "evidence": "For all 129, changed_files_vs_main_tip is non-empty and head_is_ancestor_of_main is false; zero pure no-ops. However 46 PRs (the stale-127ffaff cohort) each contain 8-11 individual files already byte-identical to main - see per-PR files_already_byte_identical_in_main and counts.files_byte_identical_in_main. v1's headline ('No open PR contains content already byte-identical in main') over-claimed at the file level.",
    "consequence": "No PR can be closed on grounds of already being merged."
   }
  ],
@@ -163,7 +325,7 @@
     "synthetic"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [],
+   "body_references_issues_or_prs": [],
    "superseded_by_open_prs": [
     360,
     367,
@@ -243,7 +405,7 @@
     "source-only"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [],
+   "body_references_issues_or_prs": [],
    "superseded_by_open_prs": [],
    "disposition": "KEEP WHOLE",
    "disposition_evidence": "clean merge into 67e29bd, hosted check green, bounded surface",
@@ -304,7 +466,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [],
+   "body_references_issues_or_prs": [],
    "superseded_by_open_prs": [],
    "disposition": "KEEP WHOLE",
    "disposition_evidence": "clean merge into 67e29bd, hosted check green, bounded surface",
@@ -361,7 +523,7 @@
     "source-only"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [],
+   "body_references_issues_or_prs": [],
    "superseded_by_open_prs": [
     350,
     351,
@@ -449,7 +611,7 @@
     "source-only"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     337,
     338,
     339
@@ -517,7 +679,7 @@
     "synthetic"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     339,
     343,
     344
@@ -580,7 +742,7 @@
     "source-only"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     343,
     344,
     345
@@ -643,7 +805,7 @@
     "source-only"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [],
+   "body_references_issues_or_prs": [],
    "superseded_by_open_prs": [],
    "disposition": "KEEP WHOLE",
    "disposition_evidence": "clean merge into 67e29bd, hosted check green, bounded surface",
@@ -702,7 +864,7 @@
     "source-only"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     343,
     345,
     347
@@ -765,7 +927,7 @@
     "synthetic"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [],
+   "body_references_issues_or_prs": [],
    "superseded_by_open_prs": [],
    "disposition": "KEEP WHOLE",
    "disposition_evidence": "clean merge into 67e29bd, hosted check green, bounded surface",
@@ -827,7 +989,7 @@
     "synthetic"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     343
    ],
    "superseded_by_open_prs": [
@@ -925,7 +1087,7 @@
     "synthetic"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     343,
     350
    ],
@@ -1032,7 +1194,7 @@
     "68a6dc2bde9a4e05466f2520a8c26f59a0701dbc",
     "e1f92cbe14d8c0b4a2b2dd4cbbb87b71dd6e8cfa"
    ],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     340,
     342,
     343,
@@ -1163,7 +1325,7 @@
    "body_stale_sha_claims": [
     "4bd2081b2945e8ce881895f976bb7c8d88b929f2"
    ],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     269,
     270,
     271,
@@ -1267,7 +1429,7 @@
     "live-gated"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     352
    ],
    "superseded_by_open_prs": [
@@ -1405,7 +1567,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     352
    ],
    "superseded_by_open_prs": [
@@ -1511,7 +1673,7 @@
     "live-gated"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     352
    ],
    "superseded_by_open_prs": [
@@ -1595,7 +1757,7 @@
    "body_stale_sha_claims": [
     "4bd2081b2945e8ce881895f976bb7c8d88b929f2"
    ],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     288,
     305,
     308,
@@ -1676,7 +1838,7 @@
     "live-gated"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     352,
     358
    ],
@@ -1800,7 +1962,7 @@
     "synthetic"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     359
    ],
    "superseded_by_open_prs": [],
@@ -1866,7 +2028,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     340,
     341,
     342,
@@ -1959,7 +2121,7 @@
     "live-gated"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     352,
     356
    ],
@@ -2043,7 +2205,7 @@
     "source-only"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [],
+   "body_references_issues_or_prs": [],
    "superseded_by_open_prs": [
     369,
     374,
@@ -2130,7 +2292,7 @@
     "live-gated"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     354,
     358
    ],
@@ -2250,7 +2412,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     355,
     363
    ],
@@ -2355,7 +2517,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     340,
     341,
     342,
@@ -2448,7 +2610,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     366
    ],
    "superseded_by_open_prs": [
@@ -2553,7 +2715,7 @@
     "source-only"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     362
    ],
    "superseded_by_open_prs": [],
@@ -2626,7 +2788,7 @@
     "live-gated"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     356,
     361
    ],
@@ -2714,7 +2876,7 @@
     "live-gated"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [],
+   "body_references_issues_or_prs": [],
    "superseded_by_open_prs": [
     374,
     376,
@@ -2856,7 +3018,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     355,
     366,
     368
@@ -2967,7 +3129,7 @@
     "live-gated"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     371
    ],
    "superseded_by_open_prs": [],
@@ -3101,7 +3263,7 @@
    "body_stale_sha_claims": [
     "6c6d1e7"
    ],
-   "body_references_prs": [],
+   "body_references_issues_or_prs": [],
    "superseded_by_open_prs": [
     376,
     378,
@@ -3391,7 +3553,7 @@
    "body_stale_sha_claims": [
     "5d5aca54"
    ],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     340,
     341,
     342,
@@ -3476,7 +3638,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [],
+   "body_references_issues_or_prs": [],
    "superseded_by_open_prs": [],
    "disposition": "NEEDS QUALIFICATION",
    "disposition_evidence": "clean merge but unverified surface / no observed hosted check",
@@ -3755,7 +3917,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     360,
     367
    ],
@@ -3844,7 +4006,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     374
    ],
    "superseded_by_open_prs": [
@@ -4131,7 +4293,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     377
    ],
    "superseded_by_open_prs": [],
@@ -4217,7 +4379,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [],
+   "body_references_issues_or_prs": [],
    "superseded_by_open_prs": [
     392,
     393,
@@ -4272,7 +4434,7 @@
     "head_is_ancestor_of_main": false
    },
    "merge_state_vs_main": "CONFLICT",
-   "merge_conflict_count": 111,
+   "merge_conflict_count": 32,
    "merge_conflict_files_sample": [
     "README.md",
     "crates/codegen/grokptah-agent-bridge/Cargo.lock",
@@ -4313,7 +4475,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [],
+   "body_references_issues_or_prs": [],
    "superseded_by_open_prs": [
     394,
     396,
@@ -4475,7 +4637,7 @@
     "head_is_ancestor_of_main": false
    },
    "merge_state_vs_main": "CONFLICT",
-   "merge_conflict_count": 112,
+   "merge_conflict_count": 32,
    "merge_conflict_files_sample": [
     ".github/workflows/desktop-release-build.yml",
     "README.md",
@@ -4516,7 +4678,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     381
    ],
    "superseded_by_open_prs": [
@@ -4674,7 +4836,7 @@
     "head_is_ancestor_of_main": false
    },
    "merge_state_vs_main": "CONFLICT",
-   "merge_conflict_count": 115,
+   "merge_conflict_count": 33,
    "merge_conflict_files_sample": [
     ".github/workflows/desktop-release-build.yml",
     "README.md",
@@ -4715,7 +4877,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     382
    ],
    "superseded_by_open_prs": [
@@ -4882,7 +5044,7 @@
     "head_is_ancestor_of_main": false
    },
    "merge_state_vs_main": "CONFLICT",
-   "merge_conflict_count": 115,
+   "merge_conflict_count": 33,
    "merge_conflict_files_sample": [
     ".github/workflows/desktop-release-build.yml",
     "README.md",
@@ -4923,7 +5085,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     382
    ],
    "superseded_by_open_prs": [],
@@ -5080,7 +5242,7 @@
     "head_is_ancestor_of_main": false
    },
    "merge_state_vs_main": "CONFLICT",
-   "merge_conflict_count": 115,
+   "merge_conflict_count": 33,
    "merge_conflict_files_sample": [
     ".github/workflows/desktop-release-build.yml",
     "README.md",
@@ -5121,7 +5283,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     384
    ],
    "superseded_by_open_prs": [],
@@ -5278,7 +5440,7 @@
     "head_is_ancestor_of_main": false
    },
    "merge_state_vs_main": "CONFLICT",
-   "merge_conflict_count": 115,
+   "merge_conflict_count": 33,
    "merge_conflict_files_sample": [
     ".github/workflows/desktop-release-build.yml",
     "README.md",
@@ -5319,7 +5481,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     384
    ],
    "superseded_by_open_prs": [
@@ -5483,7 +5645,7 @@
     "head_is_ancestor_of_main": false
    },
    "merge_state_vs_main": "CONFLICT",
-   "merge_conflict_count": 115,
+   "merge_conflict_count": 33,
    "merge_conflict_files_sample": [
     ".github/workflows/desktop-release-build.yml",
     "README.md",
@@ -5524,7 +5686,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     387
    ],
    "superseded_by_open_prs": [
@@ -5684,7 +5846,7 @@
     "head_is_ancestor_of_main": false
    },
    "merge_state_vs_main": "CONFLICT",
-   "merge_conflict_count": 115,
+   "merge_conflict_count": 33,
    "merge_conflict_files_sample": [
     ".github/workflows/desktop-release-build.yml",
     "README.md",
@@ -5725,7 +5887,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [],
+   "body_references_issues_or_prs": [],
    "superseded_by_open_prs": [],
    "disposition": "REWRITE",
    "disposition_evidence": "forks at 127ffaff, missing 67 main commits; merge-tree CONFLICT on 115 files against 67e29bd",
@@ -5880,7 +6042,7 @@
     "head_is_ancestor_of_main": false
    },
    "merge_state_vs_main": "CONFLICT",
-   "merge_conflict_count": 115,
+   "merge_conflict_count": 33,
    "merge_conflict_files_sample": [
     ".github/workflows/desktop-release-build.yml",
     "README.md",
@@ -5921,7 +6083,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [],
+   "body_references_issues_or_prs": [],
    "superseded_by_open_prs": [],
    "disposition": "REWRITE",
    "disposition_evidence": "forks at 127ffaff, missing 67 main commits; merge-tree CONFLICT on 115 files against 67e29bd",
@@ -6076,7 +6238,7 @@
     "head_is_ancestor_of_main": false
    },
    "merge_state_vs_main": "CONFLICT",
-   "merge_conflict_count": 115,
+   "merge_conflict_count": 33,
    "merge_conflict_files_sample": [
     ".github/workflows/desktop-release-build.yml",
     "README.md",
@@ -6117,7 +6279,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     387
    ],
    "superseded_by_open_prs": [
@@ -6307,7 +6469,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     380
    ],
    "superseded_by_open_prs": [
@@ -6391,7 +6553,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     380,
     392
    ],
@@ -6449,7 +6611,7 @@
     "head_is_ancestor_of_main": false
    },
    "merge_state_vs_main": "CONFLICT",
-   "merge_conflict_count": 111,
+   "merge_conflict_count": 32,
    "merge_conflict_files_sample": [
     "README.md",
     "crates/codegen/grokptah-agent-bridge/Cargo.lock",
@@ -6490,7 +6652,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     381
    ],
    "superseded_by_open_prs": [
@@ -6681,7 +6843,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     380,
     392,
     393
@@ -6738,7 +6900,7 @@
     "head_is_ancestor_of_main": false
    },
    "merge_state_vs_main": "CONFLICT",
-   "merge_conflict_count": 111,
+   "merge_conflict_count": 32,
    "merge_conflict_files_sample": [
     "README.md",
     "crates/codegen/grokptah-agent-bridge/Cargo.lock",
@@ -6779,7 +6941,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     394
    ],
    "superseded_by_open_prs": [],
@@ -6941,7 +7103,7 @@
     "head_is_ancestor_of_main": false
    },
    "merge_state_vs_main": "CONFLICT",
-   "merge_conflict_count": 111,
+   "merge_conflict_count": 32,
    "merge_conflict_files_sample": [
     "README.md",
     "crates/codegen/grokptah-agent-bridge/Cargo.lock",
@@ -6982,7 +7144,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     381,
     394
    ],
@@ -7146,7 +7308,7 @@
     "head_is_ancestor_of_main": false
    },
    "merge_state_vs_main": "CONFLICT",
-   "merge_conflict_count": 111,
+   "merge_conflict_count": 32,
    "merge_conflict_files_sample": [
     "README.md",
     "crates/codegen/grokptah-agent-bridge/Cargo.lock",
@@ -7189,7 +7351,7 @@
    "body_stale_sha_claims": [
     "64bb98e4"
    ],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     381,
     394,
     397
@@ -7386,7 +7548,7 @@
    "body_stale_sha_claims": [
     "a4fa69c597daa827fe7e7b64fa940d1c138788e2"
    ],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     374,
     378
    ],
@@ -7648,7 +7810,7 @@
     "head_is_ancestor_of_main": false
    },
    "merge_state_vs_main": "CONFLICT",
-   "merge_conflict_count": 115,
+   "merge_conflict_count": 33,
    "merge_conflict_files_sample": [
     ".github/workflows/desktop-release-build.yml",
     "README.md",
@@ -7689,7 +7851,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     366,
     378,
     391,
@@ -7886,7 +8048,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     363,
     366,
     378,
@@ -7955,7 +8117,7 @@
     "head_is_ancestor_of_main": false
    },
    "merge_state_vs_main": "CONFLICT",
-   "merge_conflict_count": 115,
+   "merge_conflict_count": 33,
    "merge_conflict_files_sample": [
     ".github/workflows/desktop-release-build.yml",
     "README.md",
@@ -7996,7 +8158,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     391,
     399,
     400,
@@ -8163,7 +8325,7 @@
     "head_is_ancestor_of_main": false
    },
    "merge_state_vs_main": "CONFLICT",
-   "merge_conflict_count": 115,
+   "merge_conflict_count": 33,
    "merge_conflict_files_sample": [
     ".github/workflows/desktop-release-build.yml",
     "README.md",
@@ -8204,7 +8366,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     391,
     399,
     400,
@@ -8404,7 +8566,7 @@
    "body_stale_sha_claims": [
     "8af72f98"
    ],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     378,
     399,
     400,
@@ -8664,7 +8826,7 @@
     "head_is_ancestor_of_main": false
    },
    "merge_state_vs_main": "CONFLICT",
-   "merge_conflict_count": 112,
+   "merge_conflict_count": 32,
    "merge_conflict_files_sample": [
     "README.md",
     "crates/codegen/grokptah-agent-bridge/Cargo.lock",
@@ -8705,7 +8867,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [],
+   "body_references_issues_or_prs": [],
    "superseded_by_open_prs": [
     407
    ],
@@ -8891,7 +9053,7 @@
     "synthetic"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [],
+   "body_references_issues_or_prs": [],
    "superseded_by_open_prs": [],
    "disposition": "KEEP WHOLE",
    "disposition_evidence": "clean merge into 67e29bd, hosted check green, bounded surface",
@@ -8940,7 +9102,7 @@
     "head_is_ancestor_of_main": false
    },
    "merge_state_vs_main": "CONFLICT",
-   "merge_conflict_count": 112,
+   "merge_conflict_count": 32,
    "merge_conflict_files_sample": [
     "README.md",
     "crates/codegen/grokptah-agent-bridge/Cargo.lock",
@@ -8981,7 +9143,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     405
    ],
    "superseded_by_open_prs": [],
@@ -9169,7 +9331,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     399
    ],
    "superseded_by_open_prs": [],
@@ -9454,7 +9616,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     399,
     404
    ],
@@ -9741,7 +9903,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     399,
     404
    ],
@@ -9997,7 +10159,7 @@
     "head_is_ancestor_of_main": false
    },
    "merge_state_vs_main": "CONFLICT",
-   "merge_conflict_count": 113,
+   "merge_conflict_count": 33,
    "merge_conflict_files_sample": [
     "README.md",
     "crates/codegen/grokptah-agent-bridge/Cargo.lock",
@@ -10039,7 +10201,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [],
+   "body_references_issues_or_prs": [],
    "superseded_by_open_prs": [
     427,
     454
@@ -10203,7 +10365,7 @@
     "head_is_ancestor_of_main": false
    },
    "merge_state_vs_main": "CONFLICT",
-   "merge_conflict_count": 107,
+   "merge_conflict_count": 31,
    "merge_conflict_files_sample": [
     "README.md",
     "crates/codegen/grokptah-agent-bridge/src/computer_use/projection.rs",
@@ -10244,7 +10406,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [],
+   "body_references_issues_or_prs": [],
    "superseded_by_open_prs": [
     413,
     419,
@@ -10432,7 +10594,7 @@
     "head_is_ancestor_of_main": false
    },
    "merge_state_vs_main": "CONFLICT",
-   "merge_conflict_count": 109,
+   "merge_conflict_count": 31,
    "merge_conflict_files_sample": [
     "README.md",
     "crates/codegen/grokptah-agent-bridge/src/computer_use/projection.rs",
@@ -10474,7 +10636,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     412
    ],
    "superseded_by_open_prs": [
@@ -10719,7 +10881,7 @@
    "body_stale_sha_claims": [
     "699fb32"
    ],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     408
    ],
    "superseded_by_open_prs": [],
@@ -10977,7 +11139,7 @@
     "head_is_ancestor_of_main": false
    },
    "merge_state_vs_main": "CONFLICT",
-   "merge_conflict_count": 114,
+   "merge_conflict_count": 32,
    "merge_conflict_files_sample": [
     "README.md",
     "crates/codegen/grokptah-agent-bridge/Cargo.lock",
@@ -11021,7 +11183,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [],
+   "body_references_issues_or_prs": [],
    "superseded_by_open_prs": [],
    "disposition": "REWRITE",
    "disposition_evidence": "forks at 127ffaff, missing 67 main commits; merge-tree CONFLICT on 114 files against 67e29bd",
@@ -11187,7 +11349,7 @@
     "head_is_ancestor_of_main": false
    },
    "merge_state_vs_main": "CONFLICT",
-   "merge_conflict_count": 111,
+   "merge_conflict_count": 32,
    "merge_conflict_files_sample": [
     "README.md",
     "crates/codegen/grokptah-agent-bridge/Cargo.lock",
@@ -11230,7 +11392,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [],
+   "body_references_issues_or_prs": [],
    "superseded_by_open_prs": [
     417
    ],
@@ -11393,7 +11555,7 @@
     "head_is_ancestor_of_main": false
    },
    "merge_state_vs_main": "CONFLICT",
-   "merge_conflict_count": 111,
+   "merge_conflict_count": 32,
    "merge_conflict_files_sample": [
     "README.md",
     "crates/codegen/grokptah-agent-bridge/Cargo.lock",
@@ -11436,7 +11598,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     416
    ],
    "superseded_by_open_prs": [
@@ -11649,7 +11811,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     414
    ],
    "superseded_by_open_prs": [],
@@ -11904,7 +12066,7 @@
     "head_is_ancestor_of_main": false
    },
    "merge_state_vs_main": "CONFLICT",
-   "merge_conflict_count": 112,
+   "merge_conflict_count": 32,
    "merge_conflict_files_sample": [
     ".github/workflows/desktop-release-build.yml",
     "README.md",
@@ -11947,7 +12109,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     413
    ],
    "superseded_by_open_prs": [],
@@ -12184,7 +12346,7 @@
     "head_is_ancestor_of_main": false
    },
    "merge_state_vs_main": "CONFLICT",
-   "merge_conflict_count": 107,
+   "merge_conflict_count": 31,
    "merge_conflict_files_sample": [
     "README.md",
     "crates/codegen/grokptah-agent-bridge/src/computer_use/projection.rs",
@@ -12225,7 +12387,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     420
    ],
    "superseded_by_open_prs": [],
@@ -12391,7 +12553,7 @@
     "head_is_ancestor_of_main": false
    },
    "merge_state_vs_main": "CONFLICT",
-   "merge_conflict_count": 111,
+   "merge_conflict_count": 33,
    "merge_conflict_files_sample": [
     "README.md",
     "crates/codegen/grokptah-agent-bridge/src/computer_use/projection.rs",
@@ -12432,7 +12594,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [],
+   "body_references_issues_or_prs": [],
    "superseded_by_open_prs": [],
    "disposition": "REWRITE",
    "disposition_evidence": "forks at 127ffaff, missing 67 main commits; merge-tree CONFLICT on 111 files against 67e29bd",
@@ -12585,7 +12747,7 @@
     "head_is_ancestor_of_main": false
    },
    "merge_state_vs_main": "CONFLICT",
-   "merge_conflict_count": 107,
+   "merge_conflict_count": 31,
    "merge_conflict_files_sample": [
     "README.md",
     "crates/codegen/grokptah-agent-bridge/src/computer_use/projection.rs",
@@ -12627,7 +12789,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     412
    ],
    "superseded_by_open_prs": [],
@@ -12824,7 +12986,7 @@
     "head_is_ancestor_of_main": false
    },
    "merge_state_vs_main": "CONFLICT",
-   "merge_conflict_count": 111,
+   "merge_conflict_count": 32,
    "merge_conflict_files_sample": [
     "README.md",
     "crates/codegen/grokptah-agent-bridge/Cargo.lock",
@@ -12867,7 +13029,7 @@
    "body_stale_sha_claims": [
     "d564fbdf"
    ],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     405,
     407
    ],
@@ -13032,7 +13194,7 @@
     "head_is_ancestor_of_main": false
    },
    "merge_state_vs_main": "CONFLICT",
-   "merge_conflict_count": 111,
+   "merge_conflict_count": 32,
    "merge_conflict_files_sample": [
     "README.md",
     "crates/codegen/grokptah-agent-bridge/Cargo.lock",
@@ -13078,7 +13240,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     423
    ],
    "superseded_by_open_prs": [
@@ -13235,7 +13397,7 @@
     "head_is_ancestor_of_main": false
    },
    "merge_state_vs_main": "CONFLICT",
-   "merge_conflict_count": 111,
+   "merge_conflict_count": 32,
    "merge_conflict_files_sample": [
     "README.md",
     "crates/codegen/grokptah-agent-bridge/Cargo.lock",
@@ -13276,7 +13438,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     423
    ],
    "superseded_by_open_prs": [
@@ -13432,7 +13594,7 @@
     "head_is_ancestor_of_main": false
    },
    "merge_state_vs_main": "CONFLICT",
-   "merge_conflict_count": 114,
+   "merge_conflict_count": 33,
    "merge_conflict_files_sample": [
     "README.md",
     "crates/codegen/grokptah-agent-bridge/Cargo.lock",
@@ -13477,7 +13639,7 @@
    "body_stale_sha_claims": [
     "6c1c4c3c"
    ],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     424
    ],
    "superseded_by_open_prs": [],
@@ -13644,7 +13806,7 @@
     "head_is_ancestor_of_main": false
    },
    "merge_state_vs_main": "CONFLICT",
-   "merge_conflict_count": 116,
+   "merge_conflict_count": 33,
    "merge_conflict_files_sample": [
     "README.md",
     "crates/codegen/grokptah-agent-bridge/Cargo.lock",
@@ -13688,7 +13850,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     423,
     425
    ],
@@ -13873,7 +14035,7 @@
     "head_is_ancestor_of_main": false
    },
    "merge_state_vs_main": "CONFLICT",
-   "merge_conflict_count": 111,
+   "merge_conflict_count": 32,
    "merge_conflict_files_sample": [
     "README.md",
     "crates/codegen/grokptah-agent-bridge/Cargo.lock",
@@ -13915,7 +14077,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     412,
     419,
     422,
@@ -14104,7 +14266,7 @@
     "head_is_ancestor_of_main": false
    },
    "merge_state_vs_main": "CONFLICT",
-   "merge_conflict_count": 111,
+   "merge_conflict_count": 32,
    "merge_conflict_files_sample": [
     "README.md",
     "crates/codegen/grokptah-agent-bridge/Cargo.lock",
@@ -14150,7 +14312,7 @@
     "44a673b464406b93c64f1637398252aa9cbb3300",
     "932ac5884e0af2e404f29990bfa6e1e8740b94be"
    ],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     406,
     418,
     424
@@ -14317,7 +14479,7 @@
     "head_is_ancestor_of_main": false
    },
    "merge_state_vs_main": "CONFLICT",
-   "merge_conflict_count": 111,
+   "merge_conflict_count": 32,
    "merge_conflict_files_sample": [
     "README.md",
     "crates/codegen/grokptah-agent-bridge/Cargo.lock",
@@ -14360,7 +14522,7 @@
    "body_stale_sha_claims": [
     "295a4ff"
    ],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     424
    ],
    "superseded_by_open_prs": [
@@ -14586,7 +14748,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     337,
     338,
     339
@@ -14652,7 +14814,7 @@
     "head_is_ancestor_of_main": false
    },
    "merge_state_vs_main": "CONFLICT",
-   "merge_conflict_count": 111,
+   "merge_conflict_count": 32,
    "merge_conflict_files_sample": [
     "README.md",
     "crates/codegen/grokptah-agent-bridge/Cargo.lock",
@@ -14693,7 +14855,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     430
    ],
    "superseded_by_open_prs": [],
@@ -14920,7 +15082,7 @@
     "source-only"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [],
+   "body_references_issues_or_prs": [],
    "superseded_by_open_prs": [],
    "disposition": "KEEP WHOLE",
    "disposition_evidence": "clean merge into 67e29bd, hosted check green, bounded surface",
@@ -14957,7 +15119,7 @@
     "head_is_ancestor_of_main": false
    },
    "merge_state_vs_main": "CONFLICT",
-   "merge_conflict_count": 107,
+   "merge_conflict_count": 31,
    "merge_conflict_files_sample": [
     "README.md",
     "crates/codegen/grokptah-agent-bridge/src/computer_use/projection.rs",
@@ -14998,7 +15160,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [],
+   "body_references_issues_or_prs": [],
    "superseded_by_open_prs": [],
    "disposition": "REWRITE",
    "disposition_evidence": "forks at 127ffaff, missing 67 main commits; merge-tree CONFLICT on 107 files against 67e29bd",
@@ -15157,7 +15319,7 @@
     "head_is_ancestor_of_main": false
    },
    "merge_state_vs_main": "CONFLICT",
-   "merge_conflict_count": 107,
+   "merge_conflict_count": 31,
    "merge_conflict_files_sample": [
     "README.md",
     "crates/codegen/grokptah-agent-bridge/src/computer_use/projection.rs",
@@ -15198,7 +15360,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [],
+   "body_references_issues_or_prs": [],
    "superseded_by_open_prs": [],
    "disposition": "REWRITE",
    "disposition_evidence": "forks at 127ffaff, missing 67 main commits; merge-tree CONFLICT on 107 files against 67e29bd",
@@ -15361,7 +15523,7 @@
     "head_is_ancestor_of_main": false
    },
    "merge_state_vs_main": "CONFLICT",
-   "merge_conflict_count": 107,
+   "merge_conflict_count": 31,
    "merge_conflict_files_sample": [
     "README.md",
     "crates/codegen/grokptah-agent-bridge/src/computer_use/projection.rs",
@@ -15402,7 +15564,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [],
+   "body_references_issues_or_prs": [],
    "superseded_by_open_prs": [],
    "disposition": "REWRITE",
    "disposition_evidence": "forks at 127ffaff, missing 67 main commits; merge-tree CONFLICT on 107 files against 67e29bd",
@@ -15555,7 +15717,7 @@
     "head_is_ancestor_of_main": false
    },
    "merge_state_vs_main": "CONFLICT",
-   "merge_conflict_count": 110,
+   "merge_conflict_count": 32,
    "merge_conflict_files_sample": [
     "README.md",
     "crates/codegen/grokptah-agent-bridge/Cargo.lock",
@@ -15596,7 +15758,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [],
+   "body_references_issues_or_prs": [],
    "superseded_by_open_prs": [],
    "disposition": "REWRITE",
    "disposition_evidence": "forks at 127ffaff, missing 67 main commits; merge-tree CONFLICT on 110 files against 67e29bd",
@@ -15781,7 +15943,7 @@
    "body_stale_sha_claims": [
     "698e445e"
    ],
-   "body_references_prs": [],
+   "body_references_issues_or_prs": [],
    "superseded_by_open_prs": [],
    "disposition": "NEEDS QUALIFICATION",
    "disposition_evidence": "clean merge but unverified surface / no observed hosted check",
@@ -16074,7 +16236,7 @@
     "head_is_ancestor_of_main": false
    },
    "merge_state_vs_main": "CONFLICT",
-   "merge_conflict_count": 107,
+   "merge_conflict_count": 31,
    "merge_conflict_files_sample": [
     "README.md",
     "crates/codegen/grokptah-agent-bridge/src/computer_use/projection.rs",
@@ -16115,7 +16277,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [],
+   "body_references_issues_or_prs": [],
    "superseded_by_open_prs": [],
    "disposition": "REWRITE",
    "disposition_evidence": "forks at 127ffaff, missing 67 main commits; merge-tree CONFLICT on 107 files against 67e29bd",
@@ -16323,7 +16485,7 @@
     "head_is_ancestor_of_main": false
    },
    "merge_state_vs_main": "CONFLICT",
-   "merge_conflict_count": 111,
+   "merge_conflict_count": 32,
    "merge_conflict_files_sample": [
     "README.md",
     "crates/codegen/grokptah-agent-bridge/Cargo.lock",
@@ -16364,7 +16526,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [],
+   "body_references_issues_or_prs": [],
    "superseded_by_open_prs": [],
    "disposition": "REWRITE",
    "disposition_evidence": "forks at 127ffaff, missing 67 main commits; merge-tree CONFLICT on 111 files against 67e29bd",
@@ -16519,7 +16681,7 @@
     "head_is_ancestor_of_main": false
    },
    "merge_state_vs_main": "CONFLICT",
-   "merge_conflict_count": 110,
+   "merge_conflict_count": 32,
    "merge_conflict_files_sample": [
     "README.md",
     "crates/codegen/grokptah-agent-bridge/Cargo.lock",
@@ -16560,7 +16722,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [],
+   "body_references_issues_or_prs": [],
    "superseded_by_open_prs": [],
    "disposition": "REWRITE",
    "disposition_evidence": "forks at 127ffaff, missing 67 main commits; merge-tree CONFLICT on 110 files against 67e29bd",
@@ -16746,7 +16908,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     444
    ],
    "superseded_by_open_prs": [],
@@ -16827,7 +16989,7 @@
     "source-only"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     272,
     274,
     363,
@@ -16924,7 +17086,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     274,
     288,
     363,
@@ -17028,7 +17190,7 @@
     "source-only"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     272,
     435,
     446
@@ -17135,7 +17297,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     288,
     444,
     445,
@@ -17258,7 +17420,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     288,
     435,
     443,
@@ -17369,7 +17531,7 @@
     "source-only"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     363
    ],
    "superseded_by_open_prs": [],
@@ -17437,7 +17599,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     447,
     449,
     450
@@ -17568,15 +17730,17 @@
     "synthetic"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     272,
     435,
     446
    ],
    "superseded_by_open_prs": [],
-   "disposition": "KEEP WHOLE",
-   "disposition_evidence": "clean merge into 67e29bd, hosted check green, bounded surface",
-   "promotion_blocked_by": [],
+   "disposition": "REJECT",
+   "disposition_evidence": "issue #492 exact review of ca78af4f7c4b: REJECT as merge donor / HOLD despite hosted green. P0 reproduced by its own tests: public/deserializable ComputerAgentProposal::Complete reaches public apply_model_proposal and completes a fresh run with zero actions. Salvage is parser/fixture ideas only.",
+   "promotion_blocked_by": [
+    "issue #492 exact review: REJECT whole-PR merge (P0 forgeable Complete)"
+   ],
    "changed_files": [
     "crates/codegen/grokptah-agent-bridge/examples/computer_agent_live.rs",
     "crates/codegen/grokptah-agent-bridge/src/computer_agent.rs",
@@ -17590,7 +17754,9 @@
     "desktop/src-tauri/src/commands.rs",
     "desktop/src-tauri/src/computer_use.rs",
     "docs/COMPUTER_USE.md"
-   ]
+   ],
+   "disposition_prior_to_authority_reconciliation": "KEEP WHOLE",
+   "authority_review": "issue #492 exact review of ca78af4f7c4b: REJECT as merge donor / HOLD despite hosted green. P0 reproduced by its own tests: public/deserializable ComputerAgentProposal::Complete reaches public apply_model_proposal and completes a fresh run with zero actions. Salvage is parser/fixture ideas only."
   },
   {
    "number": 454,
@@ -17614,7 +17780,7 @@
     "head_is_ancestor_of_main": false
    },
    "merge_state_vs_main": "CONFLICT",
-   "merge_conflict_count": 116,
+   "merge_conflict_count": 33,
    "merge_conflict_files_sample": [
     "README.md",
     "crates/codegen/grokptah-agent-bridge/Cargo.lock",
@@ -17660,7 +17826,7 @@
    "body_stale_sha_claims": [
     "67e29bd34dc64049432c715c93c2cef2185c63ea"
    ],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     301,
     423,
     425,
@@ -17874,7 +18040,7 @@
     "live-gated"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     381
    ],
    "superseded_by_open_prs": [
@@ -17958,7 +18124,7 @@
     "synthetic"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     451
    ],
    "superseded_by_open_prs": [],
@@ -18033,7 +18199,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     449,
     452
    ],
@@ -18101,7 +18267,8 @@
     "evals/certification-lab/Cargo.lock",
     "scripts/check-adversarial-reachable.sh",
     "scripts/check-committed-lockfiles.sh"
-   ]
+   ],
+   "authority_review": "issue #492 exact review: REJECT whole-PR merge / selective donor only; run proves macOS source/tests and an honest 'unavailable' unsigned inspector, not packaged authority."
   },
   {
    "number": 467,
@@ -18157,7 +18324,7 @@
    "body_stale_sha_claims": [
     "e997c64"
    ],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     301,
     435,
     442,
@@ -18248,7 +18415,7 @@
     "live-gated"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     119,
     454,
     455,
@@ -18308,7 +18475,8 @@
     "desktop/src-tauri/src/remote_service.rs",
     "docs/HOST_RUNTIME_SHUTDOWN.md",
     "evals/certification-lab/src/local_service.rs"
-   ]
+   ],
+   "authority_review": "issue #492 exact review: reconstruct corrected process/home ownership and supervision semantics after canonical authority; not a second authority."
   },
   {
    "number": 469,
@@ -18366,7 +18534,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     301,
     443,
     454,
@@ -18380,9 +18548,11 @@
     478
    ],
    "superseded_by_open_prs": [],
-   "disposition": "KEEP WHOLE",
-   "disposition_evidence": "clean merge into 67e29bd, hosted check green, bounded surface",
-   "promotion_blocked_by": [],
+   "disposition": "SELECTIVE DONOR",
+   "disposition_evidence": "issue #492 exact review: strong ledger/privacy donor, but rewrite pre-effect intent / post-effect outcome, committed retention results, canonical authority, process exclusion, keychain fail-closed. Still requires authenticated G1 actor/effect ordering.",
+   "promotion_blocked_by": [
+    "issue #492: requires canonical G1 actor/effect ordering before promotion"
+   ],
    "changed_files": [
     "crates/codegen/grokptah-agent-bridge/src/audit/authority.rs",
     "crates/codegen/grokptah-agent-bridge/src/audit/canon.rs",
@@ -18407,7 +18577,9 @@
     "crates/codegen/grokptah-agent-bridge/tests/audit_store_integration.rs",
     "crates/codegen/grokptah-agent-bridge/tests/orchestration_adversarial.rs",
     "docs/AUDIT_TRAIL.md"
-   ]
+   ],
+   "disposition_prior_to_authority_reconciliation": "KEEP WHOLE",
+   "authority_review": "issue #492 exact review: strong ledger/privacy donor, but rewrite pre-effect intent / post-effect outcome, committed retention results, canonical authority, process exclusion, keychain fail-closed. Still requires authenticated G1 actor/effect ordering."
   },
   {
    "number": 470,
@@ -18464,7 +18636,7 @@
     "synthetic"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     454,
     455,
     458,
@@ -18489,7 +18661,8 @@
     "crates/codegen/grokptah-agent-bridge/tests/work_graph_authority.rs",
     "crates/codegen/grokptah-agent-bridge/tests/work_graph_service.rs",
     "crates/codegen/grokptah-agent-bridge/tests/workload_store.rs"
-   ]
+   ],
+   "authority_review": "issue #492 exact review: narrow cycle/admission core is a strong early donor; full review/quorum receipt waits for G1-G3."
   },
   {
    "number": 471,
@@ -18550,7 +18723,7 @@
    "body_stale_sha_claims": [
     "3a801b5e"
    ],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     271,
     301,
     431,
@@ -18617,7 +18790,8 @@
     "docs/AGENT_SDK_PORTABILITY.md",
     "docs/AGENT_SDK_SEAM.md",
     "docs/VERIFICATION.md"
-   ]
+   ],
+   "authority_review": "issue #492 exact review: contract-only read skeleton may extract early; live adapters/mutation wait for G1-G4 and an authenticated broker."
   },
   {
    "number": 472,
@@ -18672,7 +18846,7 @@
     "9c0837cd",
     "9c0837cd403718bd67d53fd8e948e0f2135f4242"
    ],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     272,
     435,
     458,
@@ -18718,7 +18892,8 @@
     "desktop/src/lib/protocol.ts",
     "docs/ADAPTIVE_COMPUTER_USE.md",
     "docs/COMPUTER_USE.md"
-   ]
+   ],
+   "authority_review": "issue #492 exact review: selective donor above #473; bind adaptive permit/generation/profile into seal and one application path."
   },
   {
    "number": 473,
@@ -18769,7 +18944,7 @@
    "body_stale_sha_claims": [
     "ca78af4f7c4b1678b160d7faf898d640df69bd07"
    ],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     274,
     363,
     435,
@@ -18813,7 +18988,7 @@
   },
   {
    "number": 474,
-   "title": "[REWRITE \u2014 donor hunks only] session prompt-queue principal ownership (#461)",
+   "title": "[REWRITE — donor hunks only] session prompt-queue principal ownership (#461)",
    "draft": true,
    "head_ref": "claude/session-queue-principal-ownership-v1-43b28s",
    "head_sha": "ef1469c8c7cee66bf77b7f90413be6a3520e3806",
@@ -18869,7 +19044,7 @@
     "synthetic"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     458,
     460,
     461,
@@ -18963,7 +19138,7 @@
     "synthetic"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     458,
     477,
     478
@@ -19067,7 +19242,7 @@
     "synthetic"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     477,
     486
    ],
@@ -19158,7 +19333,7 @@
    "body_stale_sha_claims": [
     "e90df6a5c6c0fb7e359bafc723e702c067084db0"
    ],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     478
    ],
    "superseded_by_open_prs": [],
@@ -19273,7 +19448,7 @@
     "packaged"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     455,
     469,
     484
@@ -19362,7 +19537,7 @@
     "synthetic"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [],
+   "body_references_issues_or_prs": [],
    "superseded_by_open_prs": [
     486
    ],
@@ -19454,7 +19629,7 @@
     "synthetic"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     477,
     485
    ],
@@ -19490,7 +19665,7 @@
   },
   {
    "number": 488,
-   "title": "Canonical host authority spine rewrite (G1\u2013G4)",
+   "title": "Canonical host authority spine rewrite (G1–G4)",
    "draft": true,
    "head_ref": "grok/canonical-authority-spine-g1g4-v1",
    "head_sha": "adbfc79702fc1a7e59ae2563dc92124ebe7a0064",
@@ -19543,7 +19718,7 @@
     "source-only"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     486
    ],
    "superseded_by_open_prs": [],
@@ -19629,7 +19804,7 @@
     "synthetic"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     454,
     455,
     458,
@@ -19642,10 +19817,12 @@
     478
    ],
    "superseded_by_open_prs": [],
-   "disposition": "KEEP WHOLE",
-   "disposition_evidence": "canonical #477 spine: defines AuthGeneration/AuthContext/VerifiedPrincipal/PrincipalScope under one private fence",
+   "disposition": "SELECTIVE DONOR",
+   "disposition_evidence": "issue #492 exact review of G1: selective donor / rewrite — public authority replacement, lineage resurrection, unscoped store/host bypasses, effect-before-ownership. Superseded as canonical spine candidate by current-main reconstruction PR #497.",
    "promotion_blocked_by": [
-    "hosted check `desktop` failing on current head"
+    "hosted check `desktop` failing on current head",
+    "issue #492: selective donor requiring canonical rewrite",
+    "superseded as spine candidate by PR #497"
    ],
    "changed_files": [
     "crates/codegen/grokptah-agent-bridge/src/host.rs",
@@ -19661,7 +19838,9 @@
     "crates/codegen/grokptah-agent-bridge/tests/orchestration_adversarial.rs",
     "crates/codegen/grokptah-agent-bridge/tests/orchestration_control.rs",
     "crates/codegen/grokptah-agent-bridge/tests/principal_authority.rs"
-   ]
+   ],
+   "disposition_prior_to_authority_reconciliation": "KEEP WHOLE",
+   "authority_review": "issue #492 exact review of G1: selective donor / rewrite — public authority replacement, lineage resurrection, unscoped store/host bypasses, effect-before-ownership. Superseded as canonical spine candidate by current-main reconstruction PR #497."
   },
   {
    "number": 490,
@@ -19720,7 +19899,7 @@
     "synthetic"
    ],
    "body_stale_sha_claims": [],
-   "body_references_prs": [
+   "body_references_issues_or_prs": [
     453,
     455,
     458,
@@ -19754,7 +19933,8 @@
     "desktop/src-tauri/src/computer_use.rs",
     "desktop/src/lib/protocol.ts",
     "docs/COMPUTER_USE.md"
-   ]
+   ],
+   "authority_review": "issue #492 exact review: selective donor / rewrite despite hosted green; caller-mintable registry/gate, no G1 binding. Canonical #497 reconstructs the core G2 invariant."
   }
  ]
 }

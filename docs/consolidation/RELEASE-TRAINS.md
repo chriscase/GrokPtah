@@ -4,6 +4,20 @@
 
 **Generated:** 2026-08-29T14:20:34.577039+00:00 · **Machine-readable companion:** `docs/consolidation/pr-inventory.json` (129 PR records)
 
+> ## Status: dated, immutable, **subordinate** snapshot — not merge authorization
+>
+> **Source of truth: [issue #492](https://github.com/chriscase/GrokPtah/issues/492).** This document is evidence
+> *for* #492, never authority over it. Its dispositions are planning classifications; they authorize no merge,
+> close, undraft, retarget, or branch deletion. Where this snapshot and #492's exact reviews disagree, **#492 wins**
+> — the divergences are recorded in §12 and in `authority_review` in the JSON.
+>
+> The PR records are **frozen** at the generation timestamp above and must not be hand-patched. Live divergence is
+> tracked in **§11 (drift)**; regeneration rules are in **§12**. Several headline conclusions below are already
+> **superseded** — they are kept as historical evidence and marked inline. Re-simulate before promoting anything.
+>
+> Retirement stays behind #492's gate: nothing closes until its replacement is published, green, independently
+> reviewed, and its donor disposition is recorded in #492.
+
 **Nothing was mutated.** No merge, rebase, force-push to a PR branch, close, undraft, retarget, branch deletion, worktree deletion, or test change was performed. All merge results below come from `git merge-tree --write-tree` (object-only, non-destructive); train states were materialised with `git commit-tree` and never written to a ref that leaves this branch.
 
 ---
@@ -26,19 +40,23 @@
 | Superseded by exact git ancestry | 52 |
 | PR body cites a non-ancestor SHA | 20 |
 | Content already byte-identical in main | 0 |
-| Hosted check observed / green / red | 33 / 26 / 5 |
+| Hosted check observed / green / red / in-progress | 33 / 26 / 5 / 2 |
+| Hosted check never queried (`none-observed` ≠ "no checks") | 96 |
 
 **Dispositions**
 
 | Disposition | Count |
 |---|---|
-| KEEP WHOLE | 18 |
-| SELECTIVE DONOR | 7 |
+| KEEP WHOLE | 15 |
+| SELECTIVE DONOR | 9 |
 | SUPERSEDED | 52 |
 | REWRITE | 25 |
 | NEEDS QUALIFICATION | 27 |
+| REJECT | 1 |
 
-> `REJECT` is folded into `SUPERSEDED` for #416/#417 (identical commits) — see F5.
+> **Reconciled with issue #492's exact reviews (§12).** `REJECT` is a first-class disposition again — it was wrongly
+> folded into `SUPERSEDED` in the first revision. #453 → `REJECT`; #469 and #489 → `SELECTIVE DONOR`. #416 (the
+> duplicate noted in F5) has since been **closed**, so that folding is moot.
 
 ---
 
@@ -49,7 +67,13 @@
 
 **Evidence.** git merge-base(head, 67e29bd) == 127ffaff for exactly those 46. Main carries 72 commits after 127ffaff touching 242 files.
 
-**Consequence.** All 46 conflict against main (111-116 conflicted paths each). The CONFLICT set and the stale-fork set are the same 46 PRs, exactly.
+**Consequence.** All 46 conflict against main — **31–33 conflicted paths each, median 32**. The CONFLICT set and the
+stale-fork set are the same 46 PRs, exactly.
+
+> **Corrected.** The first revision reported *111–116* here and *107–116* in §6b. Both were wrong: the parser counted
+> `git merge-tree --name-only`'s informational trailer (`Auto-merging <path>` lines — files that merged **cleanly** —
+> plus `CONFLICT (...)` descriptions) as if those lines were conflicted paths, inflating every count ≈3.5×. The
+> counting rule is now stated in §10. The conclusion is unchanged; only the magnitude was wrong.
 
 ### F2 — codex/external-worker-hardening-v1 is a 132-commit / 293-file branch that has never had a pull request, yet 15 open PRs are based on it.  
 *Severity: critical*
@@ -77,12 +101,14 @@
 
 **Evidence.** Both heads are 33b74ce6a7f4446303adbcb07dddd2913473108f with identical tree 0b7b1b03c0f1. Branches claude/external-worker-gate-4-zj3elc and claude/external-worker-gate-5-prod-surface point at the same object.
 
-**Consequence.** One is redundant.
+**Consequence.** One is redundant. **RESOLVED since this snapshot: #416 was closed on 2026-08-29** (§11).
 
 ### F6 — The hosted gate is a single job for most PRs.  
 *Severity: medium*
 
-**Evidence.** Of 34 PRs with observed checks, 31 have exactly one check run named 'desktop'. Ten workflows exist in main but only 'desktop' runs on most PRs.
+**Evidence.** Of the **33** PRs with observed checks, **30** have exactly one check run named `desktop`. Ten workflows
+exist in main but only `desktop` runs on most PRs. *(The first revision said 34/31; the correct figures are 33/30 and
+agree with §1.)*
 
 **Consequence.** Green CI here is weak evidence; it does not exercise packaged, live-provider, or isolated-VM claims.
 
@@ -93,12 +119,18 @@
 
 **Consequence.** PR bodies cannot be trusted as provenance without re-derivation.
 
-### F8 — No open PR contains content already byte-identical in main.  
+### F8 — No open PR is a pure no-op; none is wholly contained in main.
 *Severity: low*
 
-**Evidence.** For all 129, files_vs_main_tip is non-empty and head_is_ancestor_of_main is false; zero pure no-ops.
+**Evidence.** For all 129, `changed_files_vs_main_tip` is non-empty and `head_is_ancestor_of_main` is false — zero pure
+no-ops. **But 46 PRs (the stale cohort) each contain 8–11 individual files already byte-identical to main**, recorded
+per-PR in `files_already_byte_identical_in_main`.
 
-**Consequence.** No PR can be closed on grounds of already being merged.
+**Consequence.** No PR can be closed on grounds of already being merged *in whole*. Partial redundancy is real and is
+one more reason the stale cohort needs reconstruction rather than rebase.
+
+> **Corrected.** The first revision's headline — "No open PR contains content already byte-identical in main" — was
+> false at the file level, and contradicted this file's own data.
 
 ---
 
@@ -167,7 +199,14 @@ Each row: the older PR's head **is a git ancestor of** the newer PR's head, so t
 
 ## 4. Ordered promotion graph
 
-Seven trains, each rooted at `67e29bd`. Order **within** a train is load-bearing: it is the sequence that was simulated clean. Trains T1–T4 are blocked; T5–T7 are ready.
+Seven trains, each rooted at `67e29bd`. Order **within** a train is load-bearing: it is the sequence that was
+simulated clean.
+
+> **Superseded in part — read §11 and §12 before acting on any train here.** Since this snapshot: **T1 is superseded
+> by PR #497** (current-main G1–G4 reconstruction, hosted green); **T5 is void** (#453 is `REJECT` per #492, and
+> #469's head moved); the **Semantic Help** section is superseded by **PR #496** and mis-sourced its donor.
+> **Only T7 (`#344→#348`) and T6 remain valid as recorded**, and even those must be re-simulated immediately before
+> promotion. A recorded simulation is never a promotion licence (§12).
 
 ### T7 — Manager certification *(READY — simulated clean; 722 passed / 1 pre-existing failure locally)*
 
@@ -203,9 +242,22 @@ Seven trains, each rooted at `67e29bd`. Order **within** a train is load-bearing
 - **Required semantic review:** presentation-only; `#349` adds a *Readiness Center* that reports provider qualification — confirm it reports state rather than asserting qualification.
 - **Hosted check:** `desktop` green on all three.
 
-### T5 — Bounded runtime fixes *(READY — simulated clean)*
+### T5 — Bounded runtime fixes *(**VOID — do not promote as recorded**)*
 
-`#433 → #451 → #453 → #359 → #469 → #406`
+`#433 → #451 → ~~#453~~ → #359 → #469 → #406`
+
+> **This train is withdrawn as a recommendation.**
+> - **#453 is `REJECT`, not `KEEP WHOLE`.** Issue #492's exact review of `ca78af4f7c4b` reproduced a **P0 using
+>   #453's own tests**: a public, deserializable, constructible `ComputerAgentProposal::Complete` reaches public
+>   `apply_model_proposal` and completes a fresh run with **zero actions** and no host postcondition. Hosted green did
+>   not catch it. Only the strict-parsing / duplicate-key / truncation-refusal ideas and the adversarial fixtures are
+>   salvageable, and only rewritten on #473-style private single-use proposals.
+> - **#469's head moved** (`039bafb7a324` → `dfa74fd22f12`), so the recorded simulation no longer describes it, and
+>   #492 classifies it `SELECTIVE DONOR` pending authenticated G1 actor/effect ordering.
+>
+> For the record, re-simulated at repair time: `#433 → #451 → #359 → #469` (live head) `→ #406` is still mechanically
+> clean (60 files, +27,718/−592). **Mechanically clean is not promotable** — #469 remains blocked on canonical
+> authority. Nothing in this train should move before #497 lands.
 
 | PR | Head | Files | Hosted check | Claim class | Title |
 |---|---|---|---|---|---|
@@ -221,9 +273,16 @@ Seven trains, each rooted at `67e29bd`. Order **within** a train is load-bearing
 - **Required semantic review:** `#453` enforces a strict model-output action contract for Computer Use — this is an effect boundary; review against issue #458's acceptance criteria before promotion. `#469` claims the shipped audit ledger runs on the real host: confirm the claim is scoped to what the test actually exercises.
 - **Hosted check:** green on all six (`#406` via `crate`, the rest via `desktop`).
 
-### T1 — Canonical G1–G4 authority / effect spine *(BLOCKED — no promotable head)*
+### T1 — Canonical G1–G4 authority / effect spine *(**SUPERSEDED** — historical)*
 
-This is the train issue #477 exists to produce, and **it currently has no green head.**
+> **Superseded by PR #497**, head `0133b0a124b1b578e4fab035ecd2699d395e942a` — a current-main G1–G4 authority
+> reconstruction, hosted green and under independent audit. The `#488`-vs-`#489` question below is **moot as posed**:
+> #492 classifies **#489 as a selective donor requiring canonical rewrite** (public authority replacement, lineage
+> resurrection, unscoped store/host bypasses, effect-before-ownership), and **#489's head has since been rewritten**
+> (`dea8339e1166` → `0767e03d6f69`, not a fast-forward), voiding every measurement recorded for it here.
+> The pairwise conflict matrix remains valid as evidence that these definitions genuinely collide.
+
+This was the train issue #477 exists to produce. At snapshot time **it had no green head.**
 
 | PR | Head | Files | Hosted check | Defines | Title |
 |---|---|---|---|---|---|
@@ -276,30 +335,50 @@ Every external-worker PR is in the stale-`127ffaff` cohort and stacked on the ne
 
 ### T3 — Adaptive Computer Use *(BLOCKED)*
 
-`#453` is green and clean (promoted in T5). `#479` conflicts with `#453` on 6 files (`computer_agent.rs`, `computer_use/mod.rs`, `host.rs`, `lib.rs`, `desktop/src-tauri/src/commands.rs`, `desktop/src-tauri/src/computer_use.rs`). `#437` and `#438` are in the stale cohort. `#446`→`#448` are superseded/unqualified.
-- **Action:** promote `#453` alone; rebase `#479` onto it and re-review.
+`#453` is green and clean **but semantically rejected** (see T5) — green CI did not catch its P0. `#479` conflicts with `#453` on 6 files (`computer_agent.rs`, `computer_use/mod.rs`, `host.rs`, `lib.rs`, `desktop/src-tauri/src/commands.rs`, `desktop/src-tauri/src/computer_use.rs`). `#437` and `#438` are in the stale cohort. `#446`→`#448` are superseded/unqualified.
+- **Action (WITHDRAWN):** the original text recommended promoting `#453` alone. **Do not.** #453 is `REJECT` per
+  issue #492 — see T5. `#479` should be rebased onto the canonical authority spine (#497), not onto #453.
 
 ### T4 — Packaged / VM Computer Use *(BLOCKED — claim class outruns evidence)*
 
 `#445 → #449` conflicts immediately on 7 files including `computer_use/helper_authority.rs` and `package_identity.rs`. `#463`, `#449`, `#452`, `#450`, `#439` all carry packaged claims; the only hosted check any of them runs is `desktop`, which does not build, sign, or launch a package. **No packaged claim in this repository is currently qualified by a hosted gate.**
 
-### Semantic Help — *no promotable head at all*
+### Semantic Help — *(**SUPERSEDED** — historical, and mis-sourced as written)*
 
-All four Semantic Help PRs (`#412`, `#413`, `#419`, `#422`) are in the stale-`127ffaff` cohort with 107–112 conflicts each, and `#412`/`#413` are superseded by `#419`. The train must be rebuilt from `#419`'s content on current main.
+> **Superseded by PR #496**, head `11d8ed780cf07123b16252fb607ea1f636146d03` — a current-main Semantic Help
+> reconstruction, hosted green. **[Issue #491](https://github.com/chriscase/GrokPtah/issues/491) is the source of
+> truth for this work — it is an *issue*, not a PR** — and it names **#428** as the reusable donor core, **not #419**
+> as claimed below.
+>
+> **Name collision, now corrected.** Two different things were called "Semantic Help":
+> - the **Semantic Help feature** PRs — `#412`, `#413`, `#419`, `#422`, **and `#428`** — which the path/title
+>   classifier files under `product_domain: computer-use` (their `domains` array does carry `semantic-help`);
+> - the four PRs actually counted as `semantic-help: 4` in §1 — `#380`, `#392`, `#393`, `#395` — which are **Help
+>   Center accessibility** work, a different thing.
+>
+> The §1 count and the prose below therefore describe **disjoint sets**. Treat `product_domain` as a routing hint only.
+
+At snapshot time the four feature PRs `#412`, `#413`, `#419`, `#422` were in the stale-`127ffaff` cohort with 31–33
+conflicts each, and `#412`/`#413` were superseded by `#419`.
 
 ---
 
 ## 5. Next safe promotion candidates
+
+> **Still valid at repair time.** All five heads are **unmoved** (verified against `refs/pull/*/head`), `origin/main`
+> is still at the anchor, and the chained simulation was **re-run and is still clean** — 10 files, +1,984/−7. This is
+> the one recommendation in this document that survived the audit intact. It is still not a licence: **re-simulate
+> immediately before promoting** (§12), and both caveats below still stand.
 
 These five are the recommended next promotion, **in this order**. They were simulated as a sequence onto `67e29bd` with `git merge-tree` and every step came back clean; the resulting tree was then materialised and compiled.
 
 | # | PR | Head SHA | Files | Hosted check | Why it is safe |
 |---|---|---|---|---|---|
 | 1 | #344 | `122a792e7c81aefc3d81184fe29754644aabfb0f` | 6 | `desktop` green | 6 files, all under `evals/certification-lab/` plus one doc. No crate source touched. |
-| 2 | #345 | `e1f92cbe14d8c0b4a2b2dd4cbbb87b71dd6e8cfa` | 1 | `desktop` green | 1 file: `tests/manager_supervisor.rs` (+382). Test-only addition; adds coverage, removes none. |
-| 3 | #346 | `af0c307f0512ec6dec41ad6fe138b73d860721e1` | 1 | `desktop` green | 1 file: `src/orchestration/manager.rs` (+297). Strict directive-envelope parsing — narrows accepted input. |
-| 4 | #347 | `68a6dc2bde9a4e05466f2520a8c26f59a0701dbc` | 1 | `desktop` green | 1 file: `tests/manager_mcp.rs` (+236). Test-only addition. |
-| 5 | #348 | `41cba0cd680d73a9473a427c0be24f9b8fbf19cf` | 1 | `desktop` green | 1 file: `src/orchestration/worker.rs` (+185). Certifies the privilege-amplification guard. |
+| 2 | #345 | `e1f92cbe14d8c0b4a2b2dd4cbbb87b71dd6e8cfa` | 1 | `desktop` green | 1 file: `tests/manager_supervisor.rs` (+378/−4). Test-only addition; the 4 removed lines are `use`-statement reflow, **no coverage is removed**. |
+| 3 | #346 | `af0c307f0512ec6dec41ad6fe138b73d860721e1` | 1 | `desktop` green | 1 file: `src/orchestration/manager.rs` (+295/−2). Strict directive-envelope parsing — narrows accepted input. |
+| 4 | #347 | `68a6dc2bde9a4e05466f2520a8c26f59a0701dbc` | 1 | `desktop` green | 1 file: `tests/manager_mcp.rs` (+235/−1). Test-only addition; the removed line is `use`-statement reflow. |
+| 5 | #348 | `41cba0cd680d73a9473a427c0be24f9b8fbf19cf` | 1 | `desktop` green | 1 file: `src/orchestration/worker.rs` (+185/−0). Certifies the privilege-amplification guard. |
 
 **Local gate evidence (run in this session, in an isolated worktree, tests unmodified):**
 
@@ -332,7 +411,16 @@ Net for the 14-PR superset: +287 passing tests, +5 suites, zero new failures.
 
 2. Promoting `#344` rewrites `evals/certification-lab/src/probes.rs`, which `#414` also rewrites. `#414` will need a rebase afterwards.
 
-The wider 14-PR sequence `#344 #345 #346 #347 #348 #341 #342 #349 #433 #451 #453 #359 #469 #406` **also** simulated clean and compiled clean (91 files, +37,514/−1,063). It is recorded as evidence that the three ready trains do not collide with each other — not as a recommendation to promote fourteen drafts at once.
+The wider 14-PR sequence `#344 #345 #346 #347 #348 #341 #342 #349 #433 #451 #453 #359 #469 #406` **also** simulated
+clean and compiled clean (91 files, +37,514/−1,063) — recorded as evidence that the ready trains did not collide, never
+as a recommendation to promote fourteen drafts at once.
+
+> **This superset is now void as a recommendation**: it contains `#453` (`REJECT`) and the stale `#469` head. Dropping
+> `#453` and using #469's live head still simulates clean (81 files, +33,193/−830), but "merges cleanly" was never the
+> bar — #453 was mechanically clean *and* carried a P0.
+
+> **Note on the `+N` figures above.** In the first revision these were additions **plus** deletions, written with a
+> leading `+` as though they were insertions. They are now written `+adds/−dels`.
 
 ---
 
@@ -350,58 +438,59 @@ None is an ancestor of `main`. None has ever been opened as a pull request — n
 
 ### 6b. Stale-fork PR heads — 46 branches that cannot merge as they stand
 
-Every one forks at `127ffaff`, is missing 72 `main` commits, and conflicts on 107–116 paths. Listed by PR:
+Every one forks at `127ffaff`, is missing 72 `main` commits, and conflicts on **31–33 paths (median 32)** — see the
+counting rule in §10. Listed by PR:
 
 | PR | Branch | Head | Conflicts |
 |---|---|---|---|
-| #381 | `cursor/external-worker-hardening-b019` | `faaf4074b1c7` | 111 |
-| #382 | `codex/desktop-release-workflow-parser-fix-v1` | `aa70569b2c29` | 112 |
-| #384 | `codex/external-worker-monitor-recovery-v2` | `72ea28175f29` | 115 |
-| #385 | `cursor/bridge-nested-lockfile-sdk-0043` | `8b4f2ec57f4b` | 115 |
-| #386 | `cursor/strict-clippy-repair-8f65` | `6b1ec1d33681` | 115 |
-| #387 | `cursor/external-worker-list-archive-4bd3` | `c103594129c6` | 115 |
-| #388 | `cursor/strict-clippy-warnings-a464` | `60ecc2f2d800` | 115 |
-| #389 | `cursor/ledger-unavailable-public-taxonomy-b571` | `4631956c10e2` | 115 |
-| #390 | `cursor/hosted-gate-public-errors-63c4` | `b5dae13f6f2a` | 115 |
-| #391 | `cursor/sdk-root-charset-67bc` | `c7f28d81652e` | 115 |
-| #394 | `cursor/enterprise-gateway-evidence-0921` | `a248596297d4` | 111 |
-| #396 | `codex/pr394-release-workflow-context-v1` | `d1671b6b4a69` | 111 |
-| #397 | `cursor/enterprise-gateway-correction-5745` | `2daf89ad8cce` | 111 |
-| #398 | `cursor/enterprise-gateway-low-findings-3bd3` | `faa503633747` | 111 |
-| #400 | `cursor/consumer-conformance-b64a` | `4f158d119f8f` | 115 |
-| #402 | `cursor/consumer-conformance-fix-4aa5` | `f4a469759f42` | 115 |
-| #403 | `cursor/sdk-boundary-projections-606e` | `ba802ad549c1` | 115 |
-| #405 | `cursor/external-worker-production-path-ec26` | `697c28bdc2e4` | 112 |
-| #407 | `codex/pr405-unsupported-error-v1` | `d564fbdff3d6` | 112 |
-| #411 | `claude/grok-build-editor-readiness-v1-hcufhd` | `d7bde3ce39b7` | 113 |
-| #412 | `claude/semantic-help-core-v1-y53hgm` | `342a3bacca02` | 107 |
-| #413 | `claude/semantic-help-authority-v2-y53hgm` | `56146e4d893f` | 109 |
-| #415 | `claude/durable-agent-p0-reconstruction-v1-25y7yd` | `6cb00faf8fa4` | 114 |
-| #416 | `claude/external-worker-gate-4-zj3elc` | `33b74ce6a7f4` | 111 |
-| #417 | `claude/external-worker-gate-5-prod-surface` | `33b74ce6a7f4` | 111 |
-| #419 | `claude/semantic-help-authority-v3-y53hgm` | `d171216232b0` | 112 |
-| #420 | `cursor/grokptah-ui-passive-run-5a57` | `6ce8eb331630` | 107 |
-| #421 | `cursor/operator-consent-recovery-ux-772c` | `7fa04e353bae` | 111 |
-| #422 | `claude/semantic-help-domain-v1-y53hgm` | `e12a3396516f` | 107 |
-| #423 | `codex/desktop-agent-sdk-lock-repair-v1` | `712f41be6532` | 111 |
-| #424 | `codex/pr423-continuity-repair-v1` | `6c1c4c3cd8d0` | 111 |
-| #425 | `grok/self-host-continuity-v1` | `8827be56ac4f` | 111 |
-| #426 | `grok/self-host-alpha-v1-pr424` | `58bff58a047b` | 114 |
-| #427 | `grok/self-host-authority-v1` | `e616a2150ca2` | 116 |
-| #428 | `claude/semantic-help-authority-v1` | `d57ad0be3744` | 111 |
-| #429 | `claude/grokptah-durable-swarm-control-l8zy0m` | `437424c49df9` | 111 |
-| #430 | `claude/computer-use-substrate-pr424-obejz2` | `e732b5da3207` | 111 |
-| #432 | `claude/grokptah-packaged-qualification-vqk7rd` | `698e445e2fec` | 111 |
-| #434 | `claude/release-evidence-qualification-v1-ax0kb0` | `849f67625462` | 107 |
-| #436 | `claude/grokptah-computer-use-arch-783x6r` | `b0e9a75c494b` | 107 |
-| #437 | `claude/adaptive-small-model-controller-06t58u` | `46ab6c3682b2` | 107 |
-| #438 | `claude/grokptah-observation-grounding-2p4zlg` | `b0f41f462c22` | 110 |
-| #440 | `claude/grokptah-computer-use-benchmark-dyuhi7` | `84c362e954ee` | 107 |
-| #441 | `claude/sdk-service-adapter-qualification-8n5t72` | `29e005f46ae6` | 111 |
-| #442 | `claude/grokptah-agent-hardening-348i2w` | `e997c6436cb0` | 110 |
-| #454 | `claude/cloud-opus-self-host-4bxur7` | `1f99ffe735f4` | 116 |
+| #381 | `cursor/external-worker-hardening-b019` | `faaf4074b1c7` | 32 |
+| #382 | `codex/desktop-release-workflow-parser-fix-v1` | `aa70569b2c29` | 32 |
+| #384 | `codex/external-worker-monitor-recovery-v2` | `72ea28175f29` | 33 |
+| #385 | `cursor/bridge-nested-lockfile-sdk-0043` | `8b4f2ec57f4b` | 33 |
+| #386 | `cursor/strict-clippy-repair-8f65` | `6b1ec1d33681` | 33 |
+| #387 | `cursor/external-worker-list-archive-4bd3` | `c103594129c6` | 33 |
+| #388 | `cursor/strict-clippy-warnings-a464` | `60ecc2f2d800` | 33 |
+| #389 | `cursor/ledger-unavailable-public-taxonomy-b571` | `4631956c10e2` | 33 |
+| #390 | `cursor/hosted-gate-public-errors-63c4` | `b5dae13f6f2a` | 33 |
+| #391 | `cursor/sdk-root-charset-67bc` | `c7f28d81652e` | 33 |
+| #394 | `cursor/enterprise-gateway-evidence-0921` | `a248596297d4` | 32 |
+| #396 | `codex/pr394-release-workflow-context-v1` | `d1671b6b4a69` | 32 |
+| #397 | `cursor/enterprise-gateway-correction-5745` | `2daf89ad8cce` | 32 |
+| #398 | `cursor/enterprise-gateway-low-findings-3bd3` | `faa503633747` | 32 |
+| #400 | `cursor/consumer-conformance-b64a` | `4f158d119f8f` | 33 |
+| #402 | `cursor/consumer-conformance-fix-4aa5` | `f4a469759f42` | 33 |
+| #403 | `cursor/sdk-boundary-projections-606e` | `ba802ad549c1` | 33 |
+| #405 | `cursor/external-worker-production-path-ec26` | `697c28bdc2e4` | 32 |
+| #407 | `codex/pr405-unsupported-error-v1` | `d564fbdff3d6` | 32 |
+| #411 | `claude/grok-build-editor-readiness-v1-hcufhd` | `d7bde3ce39b7` | 33 |
+| #412 | `claude/semantic-help-core-v1-y53hgm` | `342a3bacca02` | 31 |
+| #413 | `claude/semantic-help-authority-v2-y53hgm` | `56146e4d893f` | 31 |
+| #415 | `claude/durable-agent-p0-reconstruction-v1-25y7yd` | `6cb00faf8fa4` | 32 |
+| #416 | `claude/external-worker-gate-4-zj3elc` | `33b74ce6a7f4` | 32 |
+| #417 | `claude/external-worker-gate-5-prod-surface` | `33b74ce6a7f4` | 32 |
+| #419 | `claude/semantic-help-authority-v3-y53hgm` | `d171216232b0` | 32 |
+| #420 | `cursor/grokptah-ui-passive-run-5a57` | `6ce8eb331630` | 31 |
+| #421 | `cursor/operator-consent-recovery-ux-772c` | `7fa04e353bae` | 33 |
+| #422 | `claude/semantic-help-domain-v1-y53hgm` | `e12a3396516f` | 31 |
+| #423 | `codex/desktop-agent-sdk-lock-repair-v1` | `712f41be6532` | 32 |
+| #424 | `codex/pr423-continuity-repair-v1` | `6c1c4c3cd8d0` | 32 |
+| #425 | `grok/self-host-continuity-v1` | `8827be56ac4f` | 32 |
+| #426 | `grok/self-host-alpha-v1-pr424` | `58bff58a047b` | 33 |
+| #427 | `grok/self-host-authority-v1` | `e616a2150ca2` | 33 |
+| #428 | `claude/semantic-help-authority-v1` | `d57ad0be3744` | 32 |
+| #429 | `claude/grokptah-durable-swarm-control-l8zy0m` | `437424c49df9` | 32 |
+| #430 | `claude/computer-use-substrate-pr424-obejz2` | `e732b5da3207` | 32 |
+| #432 | `claude/grokptah-packaged-qualification-vqk7rd` | `698e445e2fec` | 32 |
+| #434 | `claude/release-evidence-qualification-v1-ax0kb0` | `849f67625462` | 31 |
+| #436 | `claude/grokptah-computer-use-arch-783x6r` | `b0e9a75c494b` | 31 |
+| #437 | `claude/adaptive-small-model-controller-06t58u` | `46ab6c3682b2` | 31 |
+| #438 | `claude/grokptah-observation-grounding-2p4zlg` | `b0f41f462c22` | 32 |
+| #440 | `claude/grokptah-computer-use-benchmark-dyuhi7` | `84c362e954ee` | 31 |
+| #441 | `claude/sdk-service-adapter-qualification-8n5t72` | `29e005f46ae6` | 32 |
+| #442 | `claude/grokptah-agent-hardening-348i2w` | `e997c6436cb0` | 32 |
+| #454 | `claude/cloud-opus-self-host-4bxur7` | `1f99ffe735f4` | 33 |
 
-**46 branches.** `#416` and `#417` share the head `33b74ce6a7f4` — two PRs, one commit.
+**46 branches.** `#416` and `#417` shared the head `33b74ce6a7f4` — two PRs, one commit; **#416 has since been closed** (§11).
 
 ---
 
@@ -420,13 +509,15 @@ Each is strictly contained in a newer open PR — its head is a git ancestor of 
 These cannot be rebased mechanically — `codex/external-worker-hardening-v1` sits between them and `main`, and it has never been reviewed. Proposed sequence:
 
 1. Open a PR for `codex/external-worker-hardening-v1` itself so its 132 commits get a review surface, **or** declare it abandoned.
-2. Rebuild the four coherent lines on current main as fresh heads: external-worker (`#416`/`#417` content), Semantic Help (`#419` content), self-host authority (`#427`/`#454` content), isolated visual Computer Use (`#430`/`#432` content).
+2. Rebuild the four coherent lines on current main as fresh heads: external-worker (`#417` content — `#416` is now
+   closed), Semantic Help (**`#428` content per issue #491 — already done as PR #496**), self-host authority
+   (`#427`/`#454` content), isolated visual Computer Use (`#430`/`#432` content).
 3. Keep the 46 originals **open** until each replacement head is green. They are the only record of the reviewed intent.
 4. Retire the originals only after the replacements merge.
 
 ### 7c. Duplicate
 
-`#416` and `#417` are the same commit and the same tree. One should be closed in favour of the other — the human picks which title survives. Both are in the stale cohort, so this is a §7b item, not a today item.
+**RESOLVED.** `#416` and `#417` were the same commit and tree; **#416 was closed on 2026-08-29** (§11). `#417` remains open in the stale cohort and is a §7b item.
 
 ---
 
@@ -434,13 +525,18 @@ These cannot be rebased mechanically — `codex/external-worker-hardening-v1` si
 
 Stated plainly, because several of these bound how far the plan above can be trusted.
 
+0. **Several conclusions in this document are already superseded** — T1 by PR #497, Semantic Help by PR #496, T5 by
+   the #453 `REJECT`. See §11 and §12. The `#344→#348` train and the structural git analysis survived audit.
+
 1. **Hosted checks were observed for 33 of 129 PRs**, not all. I pulled check runs for the promotion pool and the prioritised set; the remaining 96 show `none-observed`, which means *I did not query them*, not that they have no checks. GitHub's `status:` search qualifier returns nothing for this repo because CI reports check-runs rather than commit statuses, so bulk bucketing was unavailable.
 
 2. **The local gate is Linux; the hosted gate is macOS.** `desktop/src-tauri` was not compiled here — its GTK/webkit and macOS system dependencies are unavailable in this container. `libdbus-1-dev` had to be installed before even the bridge crate would configure. A green local `cargo check` therefore says nothing about the desktop crate or about anything macOS-specific.
 
 3. **No packaged, live-provider, or isolated-VM claim was verified.** 82 of 129 PRs carry packaging markers and 11 carry live-gated markers. The only check most of them run is `desktop`. I classified claim *class* from diff content; I did not qualify any claim.
 
-4. **Domain classification is a path/title heuristic**, not a semantic reading. `computer-use` dominates (79) largely because the stale cohort shares one base branch that touches those paths. Treat the domain field as a routing hint.
+4. **Domain classification is a path/title heuristic**, not a semantic reading. `computer-use` dominates (79) largely
+   because the stale cohort shares one base branch that touches those paths. Treat the domain field as a routing hint.
+   It produced one real collision — the two disjoint "Semantic Help" sets, corrected in §4.
 
 5. **Supersession is containment, not equivalence.** A PR being an ancestor of another proves the content is present; it does not prove the successor's *additional* changes are wanted. Every close in §7a still needs a human to agree the successor is the intended direction.
 
@@ -448,7 +544,18 @@ Stated plainly, because several of these bound how far the plan above can be tru
 
 7. **The #489-vs-#488 choice is not mine to make.** I can show they conflict on 7 files and that #489 matches issue #477's written donor plan more literally. Which spine is architecturally right is a human decision, and both are currently red.
 
-8. **`#471` and `#468` were in progress** when their checks were read; their rollup may have changed since.
+8. **`#471` and `#468` were in progress** when their checks were read; their rollup may have changed since. Both have
+   since moved, and **#468's branch was rewritten** (§11).
+
+9. **Stale PR-body SHA detection (F7) over-reports.** The heuristic cannot tell a stale self-provenance claim from a
+   deliberate cross-reference. #352, for example, is flagged for five SHAs that sit in an explicit *"Cherry-picked
+   independent heads"* table under the column **"Original SHA"**, paired with their new cherry-pick SHAs — they are
+   *supposed* not to be ancestors of #352's head. F7's "PR bodies cannot be trusted as provenance" is too strong;
+   read each flagged body before acting on it.
+
+10. **`body_references_issues_or_prs` mixes issues and PRs.** It was named `body_references_prs` in the first
+    revision, but #458 (9 references) and #477 (7 references) are **issues**. The field is renamed; it still does not
+    distinguish the two.
 
 ---
 
@@ -485,7 +592,17 @@ git fetch origin '+refs/pull/*/head:refs/remotes/origin/pr/*'
 
 # 3. Merge state for one PR, without touching the working tree
 git merge-tree --write-tree --name-only 67e29bd34dc64049432c715c93c2cef2185c63ea refs/remotes/origin/pr/<N>
-#    exit 0 = clean, exit 1 = conflict (conflicted paths on stdout)
+#    exit 0 = clean, exit 1 = conflict
+#
+#    COUNTING RULE (this is what the first revision got wrong):
+#      line 1                      = result tree OID
+#      lines 2..N up to the FIRST BLANK LINE = the conflicted paths   <- count ONLY these
+#      everything after that blank line      = informational trailer  <- never count
+#        ("Auto-merging <path>" is a file that merged CLEANLY;
+#         "CONFLICT (content): ..." is a description, not a path)
+#    Counting the trailer inflated every stale-cohort count ~3.5x (107-116 reported vs 31-33 actual).
+#    Reproduce the corrected count with:
+#      git merge-tree --write-tree --name-only <base> <head> | tail -n +2 | sed '/^$/q' | sed '/^$/d' | wc -l
 
 # 4. Containment (supersession)
 git merge-base --is-ancestor refs/remotes/origin/pr/<OLD> refs/remotes/origin/pr/<NEW>
@@ -505,26 +622,104 @@ merges onto the accumulated result of the ones before it.
 
 ## 11. Analysis window and observed drift
 
-This repository is actively worked by concurrent sessions. The inventory is a **snapshot**, and drift was measured
-rather than assumed. Re-checked against `origin` after the analysis completed:
+This repository is actively worked by concurrent sessions. The inventory is a **snapshot**, and drift is measured
+rather than assumed. **Re-derived at repair time (2026-08-29T15:40Z) rather than hand-patched**, per the #492
+checkpoint requirement.
 
-| | At snapshot | After |
+| | At snapshot (14:20Z) | Re-derived (15:40Z) |
 |---|---|---|
 | `origin/main` | `67e29bd34dc64049432c715c93c2cef2185c63ea` | **unchanged** |
-| Open PRs | 129 | 132 (two opened by other sessions, plus this document's own PR) |
-| Branches on `origin` | 223 | 227 (four added, **none removed**) |
+| Open PRs | 129 | **134** |
+| Closed since snapshot | — | **#416** (exact duplicate of #417 — resolves F5 / §7c) |
+| Opened since snapshot | — | #493, #494, #495 *(this PR)*, #496, #497, #498 |
+| PR heads moved | 2 reported | **6** |
+| Of those, branch **rewritten** | 0 reported | **3** |
 
-**Two PR heads moved during the analysis window.** Both advanced by exactly one commit, both old heads are ancestors
-of the new heads, and both still fork from current `main` and still merge clean:
+### 11a. Moved heads
 
-| PR | Head at snapshot | Head after | New commits | Still merges clean | Files vs main |
-|---|---|---|---|---|---|
-| #469 | `039bafb7a324` | `dfa74fd22f12` | 1 | yes | 23 (unchanged) |
-| #471 | `22feee1f8458` | `e954bc22edb9` | 1 | yes | 48 (was 47) |
+| PR | Head at snapshot | Head now | Fast-forward? | Consequence |
+|---|---|---|---|---|
+| #468 | `68833c378445` | `459358d0310d` | **NO — rewritten** | every recorded measurement is void |
+| #469 | `039bafb7a324` | `dfa74fd22f12` | yes | recorded simulation is stale; re-simulate |
+| #471 | `22feee1f8458` | `2a952b4e9035` | yes | recorded file count (47) is stale |
+| #472 | `a97a8ab221f6` | `3701aa9f3eff` | **NO — rewritten** | every recorded measurement is void |
+| #489 | `dea8339e1166` | `0767e03d6f69` | **NO — rewritten** | every recorded measurement is void; T1 moot |
+| #490 | `464045e34305` | `c8cabde77b9a` | yes | recorded rollup is stale |
 
-`#469` appears in train T5. Its disposition and merge-cleanliness are unaffected, but **re-run the T5 simulation
-against `dfa74fd22f12` before promoting it** — the recorded simulation used the older head. The five PRs in §5, the
-recommended promotion, did **not** move: `#344`, `#345`, `#346`, `#347` and `#348` are all at the SHAs listed there.
+The first revision reported only #469 and #471 and asserted the drift was benign. **Three of the six are not
+fast-forwards** — those branches were rewritten, so for #468, #472 and #489 nothing recorded in this document is
+still measuring the current head.
 
-Every other head in this document was verified byte-identical between the local `refs/pull/*/head` fetch and the
-GitHub API at snapshot time — zero drift across all 129.
+**The five PRs in §5 did *not* move.** `#344`, `#345`, `#346`, `#347` and `#348` are all still at the SHAs listed
+there, verified against `refs/pull/*/head` at repair time, and their chained simulation was re-run clean.
+
+### 11b. Conclusions superseded since the snapshot
+
+| Section | Superseded by | Status |
+|---|---|---|
+| F4 / T1 — "both spine candidates red", "no promotable authority head" | **PR #497** `0133b0a124b1b` — current-main G1–G4 reconstruction, hosted green, under independent audit | historical; do not act on it |
+| Semantic Help — "no promotable head", "rebuild from #419" | **PR #496** `11d8ed780cf0` — current-main reconstruction, hosted green. **Issue #491** governs and names **#428** as donor core | historical **and** mis-sourced |
+| T5 "READY" and the 14-PR superset | #453 is `REJECT` per #492; #469's head moved | void as a recommendation |
+| F5 / §7c — #416 vs #417 duplicate | #416 closed | resolved |
+
+---
+
+## 12. Authority, regeneration, and the promotion rule
+
+### 12a. Authority
+
+**[Issue #492](https://github.com/chriscase/GrokPtah/issues/492) is the source of truth for repository
+consolidation.** This document is a dated, immutable, subordinate snapshot — evidence *for* #492, never authority
+over it, and never merge authorization. Authority flows one way: **#492 ingests this file; this file must never be
+cited back as the reason for a disposition.**
+
+Related issues, which are **issues and not PRs**: **#492** (consolidation), **#491** (Semantic Help), **#477**
+(authority-fence hazard), **#458** (Computer Use acceptance criteria).
+
+### 12b. Dispositions reconciled with #492's exact reviews
+
+`REJECT` is restored as a first-class disposition; folding it into `SUPERSEDED` was wrong.
+
+| PR | This snapshot said | #492 exact review | Now recorded |
+|---|---|---|---|
+| #453 | KEEP WHOLE | **REJECT** as merge donor / HOLD — P0 reproduced by its own tests | **REJECT** |
+| #469 | KEEP WHOLE | selective donor; needs authenticated G1 actor/effect ordering | **SELECTIVE DONOR** |
+| #489 | KEEP WHOLE | selective donor / rewrite; superseded as spine by #497 | **SELECTIVE DONOR** |
+
+Verdicts recorded **without** reclassifying, because they fall outside this repair's mandate — the divergence is
+visible in `authority_review` in the JSON rather than silently resolved: **#463** (#492: REJECT whole-PR merge /
+selective donor only; here `NEEDS QUALIFICATION`), **#468**, **#470**, **#471**, **#472**, **#490**.
+
+### 12c. Two tiers of validity
+
+- **Tier 1 — git-derived** (`ancestry`, `merge_base_with_main`, `merge_state_vs_main`, `merge_conflict_count`,
+  `superseded_by_open_prs`, `changed_files*`): computed from immutable objects. Valid while the anchor holds **and**
+  the head has not moved. Still true for the 123 PRs whose heads did not move.
+- **Tier 2 — GitHub state** (`checks`, `ci_rollup`, `draft`, open-set membership, `base_ref`): **stale on arrival,
+  non-authoritative.** `none-observed` on 96 records means **not queried**, not "no checks exist". Re-query before
+  acting.
+
+### 12d. Regenerate when
+
+- `origin/main` moves off the anchor;
+- any head in a recommended train moves;
+- five or more heads drift;
+- **any head is rewritten** (non-fast-forward) — a rewrite voids that PR's whole record;
+- 24 hours elapse;
+- issue #492 records a new exact review.
+
+Three of these have already fired since the snapshot.
+
+### 12e. Re-simulate before promotion — always
+
+**Never promote on a recorded simulation.** A chained train's cleanliness is a property of the accumulated tree, so
+one moved head voids every downstream step. Re-run the §10 chain against live heads immediately before promoting.
+
+And mechanical cleanliness is not semantic qualification: **#453 merged perfectly cleanly and carried a P0.** A clean
+merge and a green `desktop` check together prove only that the tree assembles and one job passed.
+
+### 12f. Deterministic regeneration
+
+Byte-identical regeneration requires pinning `generated_at_utc` **and the git version** — `merge-tree`'s output format
+is version-sensitive, and misreading it is exactly what produced the ≈3.5× conflict-count inflation corrected in this
+revision. `checks`/`ci_rollup` are API-timing dependent and are not reproducible.
