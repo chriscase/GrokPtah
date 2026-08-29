@@ -2105,6 +2105,16 @@ where
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                     continue;
                 }
+                // Say why there was no retry. Without this an operator sees a
+                // bare timeout where a retry used to happen and reads it as a
+                // regression rather than as the host declining to risk a
+                // duplicate request.
+                if !delivery.may_auto_retry() && allow_transient_retries {
+                    bail!(
+                        "{} (not retried: the request may already have reached the provider)",
+                        last_err.unwrap()
+                    );
+                }
                 bail!("{}", last_err.unwrap());
             }
         };

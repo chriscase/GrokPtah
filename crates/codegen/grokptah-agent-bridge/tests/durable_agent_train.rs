@@ -640,10 +640,16 @@ fn the_provider_retry_loop_stays_gated_on_proven_non_delivery() {
         code.contains("classify_transport_failure"),
         "the transport failure must still be classified before a retry"
     );
-    // Every transient-retry decision is guarded by the delivery answer.
-    let gated = code.matches("delivery.may_auto_retry()").count();
+    // The retry itself is guarded by the delivery answer. Counting the
+    // positive form specifically: the negative form (`!delivery...`) is the
+    // stand-down message and must not be mistaken for a second gate.
+    let gated = code.matches("if delivery.may_auto_retry()").count();
     assert_eq!(
         gated, 1,
         "exactly one transient-retry site is gated on proven non-delivery"
+    );
+    assert!(
+        code.contains("may already have reached the provider"),
+        "a stood-down retry must say why it did not retry"
     );
 }
