@@ -358,6 +358,26 @@ async fn service_mcp_contract_covers_scoped_live_reconnect_controls_and_restart(
         "cancel submitted task: {:?}",
         submitted_cancel.raw
     );
+    assert_eq!(submitted_cancel.structured["cancelled"], true);
+    assert_eq!(submitted_cancel.structured["wasQueued"], true);
+    assert_eq!(submitted_cancel.structured["teardownComplete"], true);
+    let submitted_after_cancel = client
+        .call_tool(
+            "ptah_get_run",
+            json!({
+                "session_id": submit_session_id,
+                "workspace": workspace_path,
+                "run_id": submitted_run_id,
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !submitted_after_cancel.is_error,
+        "cancelled queued run was not readable: {:?}",
+        submitted_after_cancel.raw
+    );
+    assert_eq!(submitted_after_cancel.structured["state"], "cancelled");
     host.release_orchestration_turn("service-e2e-submit-hold");
 
     let mut stream = client
