@@ -333,7 +333,7 @@
           "type": "string"
         },
         "source_digest": {
-          "description": "Digest over the cited `path#heading` set.",
+          "description": "Digest over the ordered source-record digests.",
           "type": "string"
         },
         "sources": {

@@ -22,6 +22,7 @@
 
 import publicCorpusJson from "./help-corpus-public.v1.json";
 import type { HelpArticle, HelpChunk, HelpCorpus, HelpSourceAnchor } from "../generated/contract";
+import { parseHelpCorpus } from "./schema";
 import { chunksForArticle, findArticle, findChunk, findSource, verifyHelpCorpus } from "./verify";
 
 export {
@@ -33,9 +34,10 @@ export {
   findChunk as findChunkIn,
   findSource as findSourceIn,
 } from "./verify";
+export { HelpCorpusSchemaError, parseHelpCorpus } from "./schema";
 
 /** The public Help corpus, verified at load. */
-export const HELP_PUBLIC_CORPUS: HelpCorpus = publicCorpusJson as HelpCorpus;
+export const HELP_PUBLIC_CORPUS: HelpCorpus = parseHelpCorpus(publicCorpusJson);
 
 verifyHelpCorpus(HELP_PUBLIC_CORPUS);
 

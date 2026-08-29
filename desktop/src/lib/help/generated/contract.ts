@@ -187,7 +187,7 @@ export type HelpCorpus = {
    */
   readonly digest: string;
   /**
-   * Digest over the cited `path#heading` set.
+   * Digest over the ordered source-record digests.
    */
   readonly source_digest: string;
 };

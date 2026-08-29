@@ -708,9 +708,9 @@
     }
   ],
   "content_version": "help-canonical-2026.08.1",
-  "digest": "sha256:865567f8015c0e6ce00317d457cda8faa18d489d7dfcaff62944e9b58d6196cc",
+  "digest": "sha256:885d161eacac9782edcc5f1503d5d2eb686b3fa023b799eb846063f8b3ef7592",
   "schema_version": "grokptah.help-canonical.v1",
-  "source_digest": "sha256:008fdad1ca3f984a632c988f6ee262ef799cc622ae00ed165c63ae82b0056f8d",
+  "source_digest": "sha256:acdd9ea1340fe45560b01f3892e9a4cfa13e8edfd75e8e08a11e343c3b1a49c5",
   "sources": [
     {
       "digest": "sha256:978f3d27956a505bd32e952402a02e7db2adfc2afcc8b0510ebaaba2101c2237",

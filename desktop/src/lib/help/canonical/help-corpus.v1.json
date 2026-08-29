@@ -1344,9 +1344,9 @@
     }
   ],
   "content_version": "help-canonical-2026.08.1",
-  "digest": "sha256:cc2617234dd4c52cf179e37f46513aa5d903df6d6240b9db350fa1cf4f58604c",
+  "digest": "sha256:1298f753e90de32672649efb733230922e3759632f46a1c86746a7317f152d57",
   "schema_version": "grokptah.help-canonical.v1",
-  "source_digest": "sha256:2c08012dd080f0f978c72a822c10925afc868ad7e1136f73266ca430babfd305",
+  "source_digest": "sha256:9acd359e0e17896d4f503352e0318f6071b7e2517f6ca64ccaf67dd55236c4ac",
   "sources": [
     {
       "digest": "sha256:5dabdd30a1c3ae170071eab9271542291534a27ee8d9c70a4c8a9cc5c2859eb1",

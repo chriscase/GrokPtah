@@ -188,7 +188,7 @@ pub struct Corpus {
     pub chunks: Vec<Chunk>,
     /// Digest over the article and chunk digests, in order.
     pub digest: String,
-    /// Digest over only the cited `path#heading` set, for anchor drift checks.
+    /// Digest over the ordered source-record digests, for anchor drift checks.
     pub source_digest: String,
 }
 
@@ -413,16 +413,17 @@ fn corpus_digest_of(
     domain_digest(domain::CORPUS, &fields)
 }
 
-/// The digest over the cited `path#heading` set.
-fn source_set_digest_of(sources: &[SourceAnchor]) -> String {
-    let set: Vec<String> = sources
-        .iter()
-        .map(|source| format!("{}#{}", source.path, source.heading))
-        .collect();
-    domain_digest(
-        domain::SOURCE_SET,
-        &set.iter().map(String::as_str).collect::<Vec<_>>(),
-    )
+/// The digest over the ordered source records.
+///
+/// Hashing `path#heading` strings made the set ambiguous: `a#b` + `c` and
+/// `a` + `b#c` produced the same input. Each source record already has an
+/// injective digest over id, path, heading, and visibility, so the set binds
+/// those record digests in a labelled, counted region instead.
+pub(crate) fn source_set_digest_of(sources: &[SourceAnchor]) -> String {
+    let count = sources.len().to_string();
+    let mut fields = vec![region::SOURCES, count.as_str()];
+    fields.extend(sources.iter().map(|source| source.digest.as_str()));
+    domain_digest(domain::SOURCE_SET, &fields)
 }
 
 fn source_digest_of(seed_id: &str, path: &str, heading: &str, visibility: Visibility) -> String {
@@ -618,6 +619,17 @@ pub fn build(
     articles.sort_by(|left, right| left.id.cmp(&right.id));
     chunks.sort_by(|left, right| left.id.cmp(&right.id));
 
+    // Record ids form one lookup namespace. In particular, a generated chunk
+    // id may not alias a source or article id even though those collections
+    // are stored separately.
+    for chunk in &chunks {
+        if !seen.insert(chunk.id.clone()) {
+            return Err(CorpusError::DuplicateId {
+                id: chunk.id.clone(),
+            });
+        }
+    }
+
     let source_digest = source_set_digest_of(&sources);
     let digest = corpus_digest_of(
         SCHEMA_VERSION,
@@ -660,6 +672,24 @@ impl Corpus {
                 found: self.schema_version.clone(),
             });
         }
+
+        // Reject ambiguity before performing any first-match lookup. Rust's
+        // iterator lookup and TypeScript's Map construction otherwise select
+        // different duplicate records, which can turn a restricted record
+        // into public content depending on which reader serves it.
+        let mut seen = std::collections::BTreeSet::new();
+        for id in self
+            .sources
+            .iter()
+            .map(|source| source.id.as_str())
+            .chain(self.articles.iter().map(|article| article.id.as_str()))
+            .chain(self.chunks.iter().map(|chunk| chunk.id.as_str()))
+        {
+            if !seen.insert(id) {
+                return Err(CorpusError::DuplicateId { id: id.to_string() });
+            }
+        }
+
         for source in &self.sources {
             let actual =
                 source_digest_of(&source.id, &source.path, &source.heading, source.visibility);
@@ -671,6 +701,16 @@ impl Corpus {
                 });
             }
         }
+
+        let actual_source_digest = source_set_digest_of(&self.sources);
+        if actual_source_digest != self.source_digest {
+            return Err(CorpusError::DigestMismatch {
+                record: "source-set".to_string(),
+                expected: self.source_digest.clone(),
+                actual: actual_source_digest,
+            });
+        }
+
         for article in &self.articles {
             let mut cited: Vec<&SourceAnchor> = Vec::new();
             for source_id in &article.source_ids {
@@ -772,6 +812,29 @@ impl Corpus {
                     actual,
                 });
             }
+        }
+
+        let actual_corpus_digest = corpus_digest_of(
+            &self.schema_version,
+            &self.content_version,
+            &self
+                .articles
+                .iter()
+                .map(|article| article.digest.as_str())
+                .collect::<Vec<_>>(),
+            &self
+                .chunks
+                .iter()
+                .map(|chunk| chunk.digest.as_str())
+                .collect::<Vec<_>>(),
+            &self.source_digest,
+        );
+        if actual_corpus_digest != self.digest {
+            return Err(CorpusError::DigestMismatch {
+                record: "corpus".to_string(),
+                expected: self.digest.clone(),
+                actual: actual_corpus_digest,
+            });
         }
         Ok(())
     }

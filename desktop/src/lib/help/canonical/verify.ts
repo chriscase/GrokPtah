@@ -89,10 +89,21 @@ function verifyArticle(
   article: HelpArticle,
   sources: ReadonlyMap<string, HelpSourceAnchor>,
 ): void {
+  if (article.source_ids.length === 0) {
+    throw new HelpCorpusDigestMismatchError(`article:${article.id}`, "at least one source", "empty");
+  }
   const cited = article.source_ids.map((id) => {
     const source = sources.get(id);
     if (!source) {
       throw new HelpCorpusDigestMismatchError(`article:${article.id}`, id, "unknown source");
+    }
+    const rank = { public: 0, gated: 1, operator: 2 } as const;
+    if (rank[source.visibility] > rank[article.visibility]) {
+      throw new HelpCorpusDigestMismatchError(
+        `article:${article.id}`,
+        `visibility at least ${source.visibility}`,
+        article.visibility,
+      );
     }
     return source;
   });
@@ -124,6 +135,27 @@ function verifyArticle(
  * published, or that the corpus a server sent is the one that server claims.
  */
 export function verifyHelpCorpus(corpus: HelpCorpus): void {
+  // Refuse ambiguity before Map construction or first-match lookup. A Map
+  // keeps the last duplicate while Rust's iterator lookup keeps the first;
+  // accepting duplicates therefore made visibility depend on the reader.
+  const seen = new Set<string>();
+  for (const [kind, records] of [
+    ["source", corpus.sources],
+    ["article", corpus.articles],
+    ["chunk", corpus.chunks],
+  ] as const) {
+    for (const record of records) {
+      if (seen.has(record.id)) {
+        throw new HelpCorpusDigestMismatchError(
+          `duplicate-${kind}:${record.id}`,
+          "globally unique record id",
+          record.id,
+        );
+      }
+      seen.add(record.id);
+    }
+  }
+
   const sources = new Map(corpus.sources.map((source) => [source.id, source]));
   const articles = new Map(corpus.articles.map((article) => [article.id, article]));
   for (const source of corpus.sources) verifySource(source);
@@ -153,7 +185,10 @@ export function verifyHelpCorpus(corpus: HelpCorpus): void {
 
   const sourceDigest = domainDigest(
     HELP_DIGEST_DOMAINS.sourceSet,
-    corpus.sources.map((source) => `${source.path}#${source.heading}`),
+    regionFields(
+      REGION.sources,
+      corpus.sources.map((source) => source.digest),
+    ),
   );
   if (sourceDigest !== corpus.source_digest) {
     throw new HelpCorpusDigestMismatchError("source-set", corpus.source_digest, sourceDigest);

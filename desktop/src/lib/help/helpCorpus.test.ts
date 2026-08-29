@@ -34,6 +34,7 @@ import {
   verifyHelpCorpus,
 } from "./canonical/verify";
 import { HELP_DIGEST_DOMAINS, domainDigest } from "./canonical/digest";
+import { HelpCorpusSchemaError, parseHelpCorpus } from "./canonical/schema";
 import type { HelpChunk, HelpCorpus } from "./generated/contract";
 
 const FULL = fullCorpusJson as unknown as HelpCorpus;
@@ -110,9 +111,59 @@ describe("the one canonical corpus", () => {
     expect(() => verifyHelpCorpus(tampered)).toThrow(HelpCorpusDigestMismatchError);
   });
 
+  it("rejects duplicate source, article, and chunk ids before lookup", () => {
+    for (const collection of ["sources", "articles", "chunks"] as const) {
+      const tampered = clone(FULL);
+      const records = [...tampered[collection], tampered[collection][0]];
+      (tampered as unknown as Record<typeof collection, readonly unknown[]>)[collection] = records;
+      expect(() => verifyHelpCorpus(tampered)).toThrow(HelpCorpusDigestMismatchError);
+    }
+  });
+
+  it("rejects a restricted article shadowing a public id", () => {
+    const tampered = clone(FULL);
+    const publicArticle = tampered.articles.find((article) => article.visibility === "public")!;
+    const restricted = tampered.articles.find((article) => article.visibility !== "public")!;
+    (tampered as unknown as { articles: unknown[] }).articles.push({
+      ...restricted,
+      id: publicArticle.id,
+    });
+    expect(() => verifyHelpCorpus(tampered)).toThrow(HelpCorpusDigestMismatchError);
+  });
+
   it("has restricted content, so the filtering gates prove something", () => {
     expect(FULL.chunks.some((chunk) => chunk.visibility !== "public")).toBe(true);
     expect(FULL.sources.some((source) => source.visibility !== "public")).toBe(true);
+  });
+});
+
+describe("the bundled JSON runtime boundary", () => {
+  it("accepts the generated public corpus without creating a second object", () => {
+    expect(parseHelpCorpus(publicCorpusJson)).toBe(publicCorpusJson);
+  });
+
+  it("rejects unknown and missing fields", () => {
+    const extra = JSON.parse(JSON.stringify(publicCorpusJson)) as Record<string, unknown>;
+    extra.injected = "payload";
+    expect(() => parseHelpCorpus(extra)).toThrow(HelpCorpusSchemaError);
+
+    const missing = JSON.parse(JSON.stringify(publicCorpusJson)) as Record<string, unknown>;
+    delete missing.digest;
+    expect(() => parseHelpCorpus(missing)).toThrow(HelpCorpusSchemaError);
+  });
+
+  it("rejects invalid nested scalar and enum values", () => {
+    const scalar = JSON.parse(JSON.stringify(publicCorpusJson)) as {
+      chunks: Array<Record<string, unknown>>;
+    };
+    scalar.chunks[0].ordinal = "0";
+    expect(() => parseHelpCorpus(scalar)).toThrow(HelpCorpusSchemaError);
+
+    const enumeration = JSON.parse(JSON.stringify(publicCorpusJson)) as {
+      articles: Array<Record<string, unknown>>;
+    };
+    enumeration.articles[0].visibility = "everyone";
+    expect(() => parseHelpCorpus(enumeration)).toThrow(HelpCorpusSchemaError);
   });
 });
 
@@ -201,7 +252,7 @@ function rebindSetDigests(corpus: HelpCorpus): void {
   const mutable = corpus as unknown as { source_digest: string; digest: string };
   mutable.source_digest = domainDigest(
     HELP_DIGEST_DOMAINS.sourceSet,
-    corpus.sources.map((source) => `${source.path}#${source.heading}`),
+    ["sources", String(corpus.sources.length), ...corpus.sources.map((source) => source.digest)],
   );
   mutable.digest = domainDigest(HELP_DIGEST_DOMAINS.corpus, [
     corpus.schema_version,

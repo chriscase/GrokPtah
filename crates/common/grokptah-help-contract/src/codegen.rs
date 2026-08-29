@@ -271,7 +271,7 @@ pub fn model() -> Vec<Decl> {
                 field(
                     "source_digest",
                     Str,
-                    "Digest over the cited `path#heading` set.",
+                    "Digest over the ordered source-record digests.",
                 ),
             ],
         },

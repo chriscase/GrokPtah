@@ -12,7 +12,9 @@
 //! repartition, reorder, omission, duplication — plus the empty-versus-absent
 //! case the counts exist to separate.
 
-use crate::corpus::{Chunk, Corpus, CorpusError, Visibility, article_digest_of};
+use crate::corpus::{
+    ArticleSeed, Chunk, Corpus, CorpusError, SourceSeed, Topic, Visibility, article_digest_of,
+};
 
 /// The digest inputs of one article, as a base for single-mutation cases.
 struct Article {
@@ -191,6 +193,136 @@ fn gated_article_id(corpus: &Corpus) -> String {
 #[test]
 fn the_authored_corpus_verifies() {
     corpus().verify().expect("authored corpus is consistent");
+}
+
+#[test]
+fn verify_rejects_a_stale_source_set_digest() {
+    let mut tampered = corpus();
+    tampered.source_digest = "sha256:stale".to_string();
+    let error = tampered
+        .verify()
+        .expect_err("the source-set digest is verified");
+    assert!(
+        matches!(error, CorpusError::DigestMismatch { ref record, .. } if record == "source-set"),
+        "expected a source-set mismatch, got {error:?}"
+    );
+}
+
+#[test]
+fn verify_rejects_a_stale_top_level_corpus_digest() {
+    let mut tampered = corpus();
+    tampered.content_version.push_str(".tampered");
+    let error = tampered
+        .verify()
+        .expect_err("the corpus digest is verified");
+    assert!(
+        matches!(error, CorpusError::DigestMismatch { ref record, .. } if record == "corpus"),
+        "expected a corpus mismatch, got {error:?}"
+    );
+}
+
+#[test]
+fn source_set_digest_has_no_path_heading_separator_alias() {
+    let left = crate::corpus::build(
+        &[SourceSeed {
+            id: "source",
+            path: "a#b",
+            heading: "c",
+            visibility: Visibility::Public,
+        }],
+        &[],
+    )
+    .expect("left corpus builds");
+    let right = crate::corpus::build(
+        &[SourceSeed {
+            id: "source",
+            path: "a",
+            heading: "b#c",
+            visibility: Visibility::Public,
+        }],
+        &[],
+    )
+    .expect("right corpus builds");
+    assert_ne!(left.source_digest, right.source_digest);
+}
+
+#[test]
+fn verify_rejects_duplicate_source_ids_before_lookup() {
+    let mut tampered = corpus();
+    tampered.sources.push(tampered.sources[0].clone());
+    let id = tampered.sources[0].id.clone();
+    let error = tampered
+        .verify()
+        .expect_err("duplicate sources are ambiguous");
+    assert_eq!(error, CorpusError::DuplicateId { id });
+}
+
+#[test]
+fn verify_rejects_duplicate_article_ids_before_visibility_projection() {
+    let mut tampered = corpus();
+    let public = tampered
+        .articles
+        .iter()
+        .find(|article| article.visibility == Visibility::Public)
+        .expect("public article")
+        .clone();
+    let mut restricted = tampered
+        .articles
+        .iter()
+        .find(|article| article.visibility != Visibility::Public)
+        .expect("restricted article")
+        .clone();
+    restricted.id.clone_from(&public.id);
+    tampered.articles.push(restricted);
+    let error = tampered
+        .verify()
+        .expect_err("a restricted duplicate cannot shadow a public record");
+    assert_eq!(error, CorpusError::DuplicateId { id: public.id });
+}
+
+#[test]
+fn verify_rejects_duplicate_chunk_ids_before_lookup() {
+    let mut tampered = corpus();
+    tampered.chunks.push(tampered.chunks[0].clone());
+    let id = tampered.chunks[0].id.clone();
+    let error = tampered
+        .verify()
+        .expect_err("duplicate chunks are ambiguous");
+    assert_eq!(error, CorpusError::DuplicateId { id });
+}
+
+#[test]
+fn builder_rejects_a_chunk_id_colliding_with_a_source_id() {
+    const ARTICLE_ID: &str = "article";
+    const COLLISION: &str = "article#title.0";
+    const SOURCE_IDS: &[&str] = &[COLLISION];
+    let error = crate::corpus::build(
+        &[SourceSeed {
+            id: COLLISION,
+            path: "README.md",
+            heading: "Help",
+            visibility: Visibility::Public,
+        }],
+        &[ArticleSeed {
+            id: ARTICLE_ID,
+            title: "Title",
+            topic: Topic::GettingStarted,
+            summary: "Summary.",
+            body: "Body.",
+            aliases: &[],
+            keywords: &[],
+            source_ids: SOURCE_IDS,
+            visibility: Visibility::Public,
+            capability_ids: &[],
+        }],
+    )
+    .expect_err("record ids share one namespace");
+    assert_eq!(
+        error,
+        CorpusError::DuplicateId {
+            id: COLLISION.to_string()
+        }
+    );
 }
 
 #[test]
