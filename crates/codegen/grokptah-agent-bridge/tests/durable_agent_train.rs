@@ -502,5 +502,8 @@ fn the_durable_core_contacts_nothing_and_declares_no_authority() {
         }
         checked += 1;
     }
-    assert_eq!(checked, 3, "expected exactly mod, observation and progress");
+    assert_eq!(
+        checked, 5,
+        "expected exactly mod, observation, progress, effects and cancel"
+    );
 }

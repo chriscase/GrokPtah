@@ -15,6 +15,13 @@
 //!   output, with the digest kept opaque so it can never reach a durable record.
 //! - [`progress`] — stationarity that separates a stuck turn from a productive
 //!   wait, using the raw observation and a host-issued wait witness.
+//! - [`effects`] — a turn's in-flight effects, registered before they start.
+//! - [`cancel`] — cancellation that reports a turn stopped only once those
+//!   effects are proven idle.
+//!
+//! The last two are crate-internal bookkeeping over the host's own work. They
+//! grant nothing and are deliberately unreachable from outside this crate, so
+//! they cannot be mistaken for, or presented as, authority.
 //!
 //! Both are synchronous, allocation-bounded and free of I/O, so they are
 //! exhaustively testable offline. Neither contacts a provider, reads a
@@ -25,6 +32,8 @@
 //! canonical G1-G4 host authority spine (#497), and a second public copy of any
 //! of them is precisely what #478 and #492 exist to prevent.
 
+pub(crate) mod cancel;
+pub(crate) mod effects;
 pub mod observation;
 pub mod progress;
 

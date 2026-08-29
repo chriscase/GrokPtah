@@ -110,34 +110,69 @@ unwired invited exactly that mistake.
 
 ## 5. What this train implements
 
-One module pair in `crates/codegen/grokptah-agent-bridge/src/durable/`, holding
-no authority of its own, plus the host wiring that closes the live defect.
+Held in `crates/codegen/grokptah-agent-bridge/src/durable/`, plus the host
+wiring. **No authority of its own**: nothing here mints, seals, or grants.
+
+### Public — the stationarity decision
 
 1. **Raw-output digests before bounded projections.** A `BoundedProjection` can
-   only be constructed *from* a `RawObservation` that has already been digested,
-   so the ordering is enforced by the type system rather than by convention.
-   This is the one place this train improves on #467, whose digest is taken from
-   the already-truncated transcript.
-2. **The digest is opaque.** No `Serialize`, no `Deserialize`, no `Display`, no
-   byte accessor, `Debug` redacted. It is compared in-process and discarded. A
-   digest over real tool output that could be persisted or projected would be a
-   confirmation oracle, so the type makes that unreachable rather than merely
-   discouraged. `StopDetail` carries no digest and no fingerprint.
-3. **No false no-op / stationarity.** A repeat is inert only when the call
-   signature *and* the raw observation are both unchanged. The unchanged suffix
-   restarts at each change, so a run that advances once and then freezes still
-   reaches the inert ceiling.
-4. **A host-issued wait witness**, rewritten from #467's design. The dispatcher
-   is the only place that can see the task registry, so the model cannot assert
-   a wait into existence by naming an id. A witness binds the host's own answer:
-   the authorized id, an outstanding-only state, the owning session, a
-   generation that changes when an id is recycled, and a bounded deadline. The
-   exemption lifts the *inert* ceiling only — the identical-call ceiling, the
-   nudge, and the round and duration budgets all still apply.
+   only be built *from* a `RawObservation` that has already been digested, so
+   the ordering is enforced by the type system. This is where this train
+   improves on #467, whose digest is taken from the already-truncated
+   transcript and so cannot see a change past 24,000 bytes.
+2. **The digest is opaque.** No `Serialize`, `Deserialize`, `Display` or byte
+   accessor; `Debug` redacted. Compared in-process and discarded. `StopDetail`
+   carries no digest and no fingerprint.
+3. **No false no-op / stationarity.** Inert requires the call signature *and*
+   the raw observation to be unchanged. The unchanged suffix restarts at each
+   change, so a run that advances once and then freezes still stops.
+4. **A host-issued wait witness**, rewritten from #467: authorized id,
+   outstanding-only state, owning session, a generation that changes when an id
+   is recycled, and a bounded deadline. Lifts the *inert* ceiling only.
+
+### Crate-internal — supervision of the host's own work
+
+5. **Registered-before-start effect supervision.** Every tool dispatch is
+   registered before it starts, so a turn always knows what is in flight.
+   `EffectRegistry::register` is the only source of an `EffectTicket` and
+   `start` requires one, so an unregistered start does not compile.
+6. **Cancellation that proves the turn idle.** Flipping the cancellation token
+   is the *request*. `turn_cancellation_settled` answers `Some(false)` while
+   registered effects are still active — the state `main` reports as
+   "cancelled" today — and `Some(true)` only once nothing is in flight. A
+   cancel also seals admission, so a racing round cannot start new work behind
+   a turn that is already stopping.
+
+Both are `pub(crate)`, unreachable from outside the crate, so they cannot be
+mistaken for or presented as authority.
+
+### Evidence about the ledger that already exists
+
+`tests/durable_work_adversarial.rs` drives the **real** `OrchStore` rather than
+a model of it, because a second claim ledger would be a second authority:
+
+- duplicate workers racing one item yield exactly one lease;
+- a claim survives a restart with its revision, and still refuses a second
+  claimant;
+- a malformed work record makes the store **fail closed at open** rather than
+  silently shrinking the ledger — including under repeated corruption;
+- **characterization:** `save_work_item` has no revision compare-and-set (the
+  store has one for manager plans, `save_manager_plan_with_work_cas`, but not
+  for work items), so a stale generic save still clobbers a newer revision.
+  #470 closes this; the test is written so a fix shows up as a deliberate
+  change rather than as silence.
 
 Ceilings, ordered by strength of evidence: true no-op 4 · nudge 8 · inert 10 ·
-identical-call 16 · advancing has no stationarity ceiling and is bounded by the
-run's own budgets.
+identical-call 16 · advancing has no stationarity ceiling.
+
+### Not here, and why
+
+| Goal item | Where it belongs |
+| --- | --- |
+| One provider-send lattice; uncertain/not-sent/settled | #497 **G3**. A second lattice is what #478 forbids, and the first attempt here was forgeable. |
+| Provider-neutral manager/SDK boundary, no operator escape | #497 **G1/G2**. Operator authority cannot be minted outside the authority root. |
+| Durable effect crash/restart recovery | Needs durable effect records, i.e. #497 **G4** audit. The registry is per-turn and in-memory, so there is nothing to recover *from* yet; recovery of durable **work** is covered above against the real store. |
+| Bounded event/audit growth; uniform malformed-record accounting | `store.rs` run and idempotency read paths, which are the four-donor collision surface and #470's seam. |
 
 ## 5a. Exact-head audit, and what it changed
 

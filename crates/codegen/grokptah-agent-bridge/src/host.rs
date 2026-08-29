@@ -202,6 +202,13 @@ pub(crate) struct Inner {
     /// Per-session turn cancellation so multiple sessions can run concurrently
     /// (Claude Code–style parallel build sessions).
     turn_cancels: HashMap<Uuid, CancellationToken>,
+    /// Per-turn effect supervision, created lazily on first registration and
+    /// cleared with the turn. Bookkeeping over this host's own work: it grants
+    /// nothing and is unreachable outside this crate.
+    turn_effects: HashMap<Uuid, crate::durable::effects::EffectRegistry>,
+    /// Per-turn cancellation, so a cancel can report the turn stopped only once
+    /// its effects are proven idle rather than when the token was flipped.
+    turn_cancel_ledgers: HashMap<Uuid, crate::durable::cancel::CancellationLedger>,
     /// Identity of the turn currently installed in `turn_cancels`, so a caller
     /// that observed a turn under the lock can prove the turn it is about to
     /// cancel is still that same turn. Without it, a turn that finishes while
@@ -650,6 +657,8 @@ impl Drop for TurnBusyGuard {
         let outcome = {
             let mut g = self.host.inner.lock();
             g.turn_cancels.remove(&self.session_id);
+            g.turn_effects.remove(&self.session_id);
+            g.turn_cancel_ledgers.remove(&self.session_id);
             g.turn_generations.remove(&self.session_id);
             g.turn_max_rounds.remove(&self.session_id);
             recover_pending_steering_locked(&mut g, self.session_id)
@@ -921,6 +930,8 @@ impl AgentHost {
             background_cancels: HashMap::new(),
             pending_permissions: HashMap::new(),
             turn_cancels: HashMap::new(),
+            turn_effects: HashMap::new(),
+            turn_cancel_ledgers: HashMap::new(),
             turn_generations: HashMap::new(),
             next_turn_generation: 0,
             computer_agent_operations: HashMap::new(),
@@ -4967,6 +4978,80 @@ impl AgentHostHandle {
         self.spawn_gp_subagent_parallel(session_id, &cwd, prompt, kind, &parent_cancel, &event_tx)
     }
 
+    /// Register an effect for this turn *before* it starts.
+    ///
+    /// Returns `None` when the turn is stopping, which is the caller's signal
+    /// not to start the effect at all.
+    fn register_turn_effect(
+        &self,
+        session_id: Uuid,
+        kind: crate::durable::effects::EffectKind,
+        label: &str,
+    ) -> Option<crate::durable::effects::EffectTicket> {
+        let mut g = self.inner.lock();
+        g.turn_effects
+            .entry(session_id)
+            .or_default()
+            .register(kind, label)
+            .ok()
+    }
+
+    fn start_turn_effect(&self, session_id: Uuid, ticket: &crate::durable::effects::EffectTicket) {
+        let mut g = self.inner.lock();
+        if let Some(registry) = g.turn_effects.get_mut(&session_id) {
+            let _ = registry.start(ticket);
+        }
+    }
+
+    fn finish_turn_effect(
+        &self,
+        session_id: Uuid,
+        ticket: &crate::durable::effects::EffectTicket,
+        cancelled: bool,
+    ) {
+        let mut g = self.inner.lock();
+        if let Some(registry) = g.turn_effects.get_mut(&session_id) {
+            let _ = if cancelled {
+                registry.cancel(ticket)
+            } else {
+                registry.finish(ticket)
+            };
+        }
+    }
+
+    /// Whether a cancelled turn is *provably* idle.
+    ///
+    /// `None` when no cancellation was requested for this session. `Some(false)`
+    /// means the token was flipped but effects from the turn are still active,
+    /// which is precisely the state `main` reports as "cancelled" today.
+    pub fn turn_cancellation_settled(&self, session_id: Uuid) -> Option<bool> {
+        let g = self.inner.lock();
+        let ledger = g.turn_cancel_ledgers.get(&session_id)?;
+        let empty = crate::durable::effects::EffectRegistry::default();
+        let registry = g.turn_effects.get(&session_id).unwrap_or(&empty);
+        if !ledger.requested() {
+            return None;
+        }
+        Some(ledger.status(registry).is_settled())
+    }
+
+    /// Effects still holding a turn open, for an operator projection.
+    ///
+    /// Names kinds only — never a path, prompt, argument or credential.
+    pub fn turn_active_effects(&self, session_id: Uuid) -> Vec<&'static str> {
+        let g = self.inner.lock();
+        let Some(registry) = g.turn_effects.get(&session_id) else {
+            return Vec::new();
+        };
+        let empty = crate::durable::cancel::CancellationLedger::default();
+        let ledger = g.turn_cancel_ledgers.get(&session_id).unwrap_or(&empty);
+        ledger
+            .blocking_kinds(registry)
+            .into_iter()
+            .map(|kind| kind.as_str())
+            .collect()
+    }
+
     /// Test helper: register a parent turn cancel token for `session_id`.
     pub fn begin_turn_for_test(&self, session_id: Uuid) {
         let mut g = self.inner.lock();
@@ -6861,6 +6946,18 @@ impl AgentHostHandle {
                     bail!("no active turn for session {id}");
                 };
                 c.cancel();
+                // Flipping the token is the request, not the outcome. Record it
+                // and seal admission so the turn can be reported stopped only
+                // once its registered effects are proven idle.
+                {
+                    let inner = &mut *g;
+                    let registry = inner.turn_effects.entry(id).or_default();
+                    inner
+                        .turn_cancel_ledgers
+                        .entry(id)
+                        .or_default()
+                        .request(registry);
+                }
                 let sid = id.to_string();
                 let child_ids: Vec<String> = g
                     .subagents
@@ -8964,6 +9061,18 @@ impl AgentHostHandle {
                             last_tool: Some(tc.name.clone()),
                             detail: format!("Tool `{}` (round {round})", tc.name),
                         });
+                        // Registered before the effect starts, so an
+                        // interrupted turn always leaves a record to recover
+                        // from, and a cancel can tell "still running" from
+                        // "actually idle".
+                        let effect = self.register_turn_effect(
+                            session_id,
+                            crate::durable::effects::EffectKind::ToolCall,
+                            &tc.name,
+                        );
+                        if let Some(ticket) = effect.as_ref() {
+                            self.start_turn_effect(session_id, ticket);
+                        }
                         let output = self
                             .dispatch_agent_tool(
                                 session_id,
@@ -8975,6 +9084,9 @@ impl AgentHostHandle {
                                 &mcp_index,
                             )
                             .await;
+                        if let Some(ticket) = effect.as_ref() {
+                            self.finish_turn_effect(session_id, ticket, cancel.is_cancelled());
+                        }
                         let content = match &output {
                             Ok(s) => s.clone(),
                             Err(e) => format!("ERROR: {e}"),
@@ -9086,6 +9198,14 @@ impl AgentHostHandle {
                                 }
                             }],
                         }));
+                        let effect = self.register_turn_effect(
+                            session_id,
+                            crate::durable::effects::EffectKind::ToolCall,
+                            "run_terminal_cmd",
+                        );
+                        if let Some(ticket) = effect.as_ref() {
+                            self.start_turn_effect(session_id, ticket);
+                        }
                         let output = self
                             .dispatch_agent_tool(
                                 session_id,
@@ -9097,6 +9217,9 @@ impl AgentHostHandle {
                                 &mcp_index,
                             )
                             .await;
+                        if let Some(ticket) = effect.as_ref() {
+                            self.finish_turn_effect(session_id, ticket, cancel.is_cancelled());
+                        }
                         let content = match &output {
                             Ok(s) => s.clone(),
                             Err(e) => format!("ERROR: {e}"),
@@ -11508,6 +11631,102 @@ mod tests {
             host,
             session.id,
         )
+    }
+
+    /// Flipping the cancellation token is a *request*. `main` reports the turn
+    /// stopped at that moment, while the tool subprocess it started is still
+    /// running. The turn is stopped only once its registered effects are idle.
+    #[test]
+    fn a_cancel_during_active_tool_work_is_not_reported_as_stopped() {
+        let (_home, host, session) = test_host();
+        host.begin_turn_for_test(session);
+
+        // Nobody has asked, so there is nothing to report.
+        assert_eq!(host.turn_cancellation_settled(session), None);
+
+        let ticket = host
+            .register_turn_effect(
+                session,
+                crate::durable::effects::EffectKind::ToolCall,
+                "run_terminal_cmd",
+            )
+            .expect("effect registered before it starts");
+        host.start_turn_effect(session, &ticket);
+
+        host.cancel_turn(Some(session)).expect("cancel accepted");
+
+        assert_eq!(
+            host.turn_cancellation_settled(session),
+            Some(false),
+            "a live tool call means the turn has not actually stopped"
+        );
+        assert_eq!(host.turn_active_effects(session), vec!["tool_call"]);
+
+        host.finish_turn_effect(session, &ticket, true);
+
+        assert_eq!(
+            host.turn_cancellation_settled(session),
+            Some(true),
+            "with nothing in flight the turn is provably idle"
+        );
+        assert!(host.turn_active_effects(session).is_empty());
+    }
+
+    /// An effect registered but never started still holds the turn open: the
+    /// host cannot yet say it will not run.
+    #[test]
+    fn a_registered_effect_that_never_started_still_holds_the_turn_open() {
+        let (_home, host, session) = test_host();
+        host.begin_turn_for_test(session);
+        let ticket = host
+            .register_turn_effect(
+                session,
+                crate::durable::effects::EffectKind::ToolCall,
+                "apply_patch",
+            )
+            .expect("registered");
+        host.cancel_turn(Some(session)).expect("cancel accepted");
+        assert_eq!(host.turn_cancellation_settled(session), Some(false));
+        host.finish_turn_effect(session, &ticket, true);
+        assert_eq!(host.turn_cancellation_settled(session), Some(true));
+    }
+
+    /// A cancel seals admission, so a racing round cannot start new work behind
+    /// a turn that is already stopping.
+    #[test]
+    fn a_cancelled_turn_refuses_to_register_new_effects() {
+        let (_home, host, session) = test_host();
+        host.begin_turn_for_test(session);
+        host.cancel_turn(Some(session)).expect("cancel accepted");
+        assert!(
+            host.register_turn_effect(
+                session,
+                crate::durable::effects::EffectKind::ToolCall,
+                "late",
+            )
+            .is_none(),
+            "admission is sealed once cancellation is requested"
+        );
+        assert_eq!(host.turn_cancellation_settled(session), Some(true));
+    }
+
+    #[test]
+    fn cancelling_an_unrelated_session_leaves_this_turn_alone() {
+        let (_home, host, session) = test_host();
+        host.begin_turn_for_test(session);
+        let ticket = host
+            .register_turn_effect(
+                session,
+                crate::durable::effects::EffectKind::ToolCall,
+                "read_file",
+            )
+            .expect("registered");
+        host.start_turn_effect(session, &ticket);
+        let other = Uuid::new_v4();
+        assert!(host.cancel_turn(Some(other)).is_err());
+        assert_eq!(host.turn_cancellation_settled(session), None);
+        assert_eq!(host.turn_cancellation_settled(other), None);
+        host.finish_turn_effect(session, &ticket, false);
     }
 
     fn usage_test_run(run_id: &str, max_total_tokens: Option<u64>) -> RunRecord {
