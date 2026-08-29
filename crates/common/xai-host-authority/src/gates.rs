@@ -681,6 +681,9 @@ impl HostAuthority {
                 .map(|(key, _)| key.clone())
                 .collect::<Vec<_>>())
         })?;
+        if recovered.is_empty() {
+            return Ok(Vec::new());
+        }
         let epoch = self.read(|state| Ok(state.control_epoch))?;
         let mut ids = Vec::with_capacity(recovered.len());
         for key in &recovered {

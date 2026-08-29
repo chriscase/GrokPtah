@@ -1445,6 +1445,55 @@ fn same_host_recovery_does_not_downgrade_an_audited_settlement() {
 }
 
 #[test]
+fn same_host_recovery_does_not_downgrade_an_audited_prewrite_failure() {
+    let f = fixture();
+    let req = request(b"body");
+    let lease = lease_for(&f, &req);
+    let permit = f.authority.begin_send(&f.auth, lease, &req).unwrap();
+    let attempt = permit.attempt();
+
+    let state_tmp = f.root.join("authority.json.tmp");
+    std::fs::create_dir(&state_tmp).unwrap();
+    assert!(matches!(
+        f.authority
+            .settle_failed_before_write(permit, FailedReason::ConnectRefusedBeforeWrite),
+        SendOutcome::Uncertain {
+            reason: UncertainReason::StateNotDurableAfterDispatch,
+            ..
+        }
+    ));
+    std::fs::remove_dir(&state_tmp).unwrap();
+
+    assert!(f.authority.recover_incomplete(&f.admin).unwrap().is_empty());
+    let projection = f
+        .authority
+        .attempt_projection(&f.auth, attempt)
+        .unwrap()
+        .unwrap();
+    assert_eq!(projection.state, "failed");
+    assert!(projection.settled);
+    assert!(!projection.ambiguous);
+
+    let handle = attempt.public_handle();
+    assert!(
+        !f.authority
+            .audit_records(&f.admin)
+            .unwrap()
+            .into_iter()
+            .any(|record| {
+                matches!(
+                    record.event,
+                    AuditEvent::SendOutcome {
+                        attempt,
+                        outcome,
+                        ..
+                    } if attempt == handle && outcome == "uncertain"
+                )
+            })
+    );
+}
+
+#[test]
 fn crash_recovery_audit_replays_when_the_state_snapshot_write_fails() {
     let f = fixture();
     let req = request(b"body");
@@ -1547,6 +1596,12 @@ fn crash_recovery_retry_on_the_same_authority_reuses_the_audited_outcome() {
         })
         .count();
     assert_eq!(recovery_records, 1, "same-host retry must reuse the WAL");
+
+    // Once converged, an empty recovery is read-only and remains successful
+    // even if a snapshot could not be written.
+    std::fs::create_dir(&state_tmp).unwrap();
+    assert!(f.authority.recover_incomplete(&f.admin).unwrap().is_empty());
+    std::fs::remove_dir(&state_tmp).unwrap();
 }
 
 #[test]
