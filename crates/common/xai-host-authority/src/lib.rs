@@ -121,6 +121,34 @@
 //! let _ = ControlEpoch(9_999);
 //! ```
 //!
+//! Administering the root requires a [`HostAdminAuthority`], which only
+//! [`HostAuthority::open`] produces. It cannot be forged:
+//!
+//! ```compile_fail
+//! # use xai_host_authority::*;
+//! let _ = HostAdminAuthority { _seal: () };
+//! ```
+//!
+//! It is not `Clone`, so it cannot be duplicated into a component that was
+//! only meant to serve requests:
+//!
+//! ```compile_fail
+//! # use xai_host_authority::*;
+//! fn duplicate(admin: &HostAdminAuthority) -> HostAdminAuthority {
+//!     admin.clone()
+//! }
+//! ```
+//!
+//! And a component holding only `&HostAuthority` cannot replace the
+//! credential set:
+//!
+//! ```compile_fail
+//! # use xai_host_authority::*;
+//! fn replace(authority: &HostAuthority, credentials: &[HostCredential]) {
+//!     let _ = authority.set_credentials(credentials, "account-1");
+//! }
+//! ```
+//!
 //! An ambiguous outcome cannot be downgraded to an ordinary failure: there is
 //! no conversion from [`UncertainReason`] to [`FailedReason`].
 //!
@@ -162,6 +190,6 @@ pub use receipt::{
     AuthContext, AuthorityBinding, EffectClass, EffectLease, FailedReason, PhysicalSendPermit,
     SealedCapability, SendOutcome, UncertainReason,
 };
-pub use store::{HostAuthority, HostCredential};
+pub use store::{HostAdminAuthority, HostAuthority, HostCredential};
 
 pub(crate) use store::unix_time_millis;

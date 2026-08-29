@@ -549,14 +549,25 @@ impl HostAuthority {
     }
 
     /// A secret-, content-, and path-free view of an attempt.
+    ///
+    /// Scoped: a principal sees only its own attempts. An attempt belonging to
+    /// another principal is reported exactly as a missing one, so this is not
+    /// an oracle for which attempt identifiers exist.
     pub fn attempt_projection(
         &self,
+        auth: &AuthContext,
         attempt: AttemptId,
     ) -> Result<Option<AttemptProjection>, AuthorityError> {
         self.read(|state| {
+            require_current_state(state, auth)?;
             let Some(record) = state.attempts.get(&attempt.to_hex()) else {
                 return Ok(None);
             };
+            if record.principal != auth.principal.to_hex()
+                || record.credential_incarnation != auth.incarnation.to_hex()
+            {
+                return Ok(None);
+            }
             Ok(Some(AttemptProjection {
                 attempt: attempt.public_handle(),
                 state: record.state.clone(),
@@ -585,7 +596,13 @@ impl HostAuthority {
     }
 
     /// Every audit record, oldest first.
-    pub fn audit_records(&self) -> Result<Vec<crate::audit::AuditRecord>, AuthorityError> {
+    ///
+    /// Exporting the whole log is an operator action, not something a served
+    /// request can do: it spans every principal this root has served.
+    pub fn audit_records(
+        &self,
+        _admin: &HostAdminAuthority,
+    ) -> Result<Vec<crate::audit::AuditRecord>, AuthorityError> {
         let log = self
             .audit
             .lock()
@@ -593,8 +610,8 @@ impl HostAuthority {
         log.records()
     }
 
-    /// Whether the audit hash chain is intact.
-    pub fn audit_chain_intact(&self) -> Result<bool, AuthorityError> {
+    /// Whether the audit hash chain is intact. An operator read.
+    pub fn audit_chain_intact(&self, _admin: &HostAdminAuthority) -> Result<bool, AuthorityError> {
         let log = self
             .audit
             .lock()

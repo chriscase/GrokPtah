@@ -83,6 +83,28 @@ impl std::fmt::Debug for HostCredential {
     }
 }
 
+/// Non-forgeable proof of host/operator admin authority.
+///
+/// Returned exactly once, by [`HostAuthority::open`], and constructible
+/// nowhere else: the field is private, and the type is deliberately neither
+/// `Clone` nor `Copy` so it cannot be duplicated into a component that was
+/// only meant to serve requests.
+///
+/// Replacing the credential set, rotating the control epoch or the capability
+/// generation, and exporting the audit log all require it. A component handed
+/// only a `&HostAuthority` can authenticate principals and issue work under
+/// them, but cannot replace the authority root out from under them.
+#[must_use = "the admin authority is the only way to administer this root"]
+pub struct HostAdminAuthority {
+    _seal: (),
+}
+
+impl std::fmt::Debug for HostAdminAuthority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HostAdminAuthority")
+    }
+}
+
 /// The canonical host authority.
 #[derive(Debug)]
 pub struct HostAuthority {
@@ -92,13 +114,29 @@ pub struct HostAuthority {
 
 impl HostAuthority {
     /// Open or create the authority root at `root`.
-    pub fn open(root: impl AsRef<Path>, owner_id: &str) -> Result<Self, AuthorityError> {
+    ///
+    /// Returns the store together with the single [`HostAdminAuthority`] for
+    /// this process. Hand out `&HostAuthority` freely; hand out the admin
+    /// authority only to the component that genuinely administers the root.
+    pub fn open(
+        root: impl AsRef<Path>,
+        owner_id: &str,
+    ) -> Result<(Self, HostAdminAuthority), AuthorityError> {
         let root = root.as_ref().to_path_buf();
         if owner_id.trim().is_empty() {
             return Err(AuthorityError::Invalid("owner id"));
         }
         std::fs::create_dir_all(&root).map_err(|e| AuthorityError::Durability(e.to_string()))?;
         let audit = AuditLog::open(&root)?;
+        // Evidence of prior service with no authority root means the root was
+        // removed under us. Minting a fresh lineage here would silently orphan
+        // every record the old lineage produced and let removed credentials
+        // come back as new ones, so refuse instead of quietly re-establishing.
+        if !root.join("authority.json").exists() && !audit.records()?.is_empty() {
+            return Err(AuthorityError::CorruptState(
+                "authority root is missing but prior audit evidence exists".into(),
+            ));
+        }
         let this = Self {
             root,
             audit: std::sync::Mutex::new(audit),
@@ -112,7 +150,7 @@ impl HostAuthority {
                 .ok_or_else(|| AuthorityError::Durability("control epoch exhausted".into()))?;
             Ok(())
         })?;
-        Ok(this)
+        Ok((this, HostAdminAuthority { _seal: () }))
     }
 
     pub(crate) fn state_path(&self) -> PathBuf {
@@ -233,6 +271,7 @@ impl HostAuthority {
     /// There is no path that adopts a new secret onto an existing generation.
     pub fn set_credentials(
         &self,
+        _admin: &HostAdminAuthority,
         credentials: &[HostCredential],
         owner_id: &str,
     ) -> Result<(), AuthorityError> {
@@ -496,7 +535,10 @@ impl HostAuthority {
     }
 
     /// Rotate the control epoch, retiring every in-flight admission.
-    pub fn rotate_control_epoch(&self) -> Result<ControlEpoch, AuthorityError> {
+    pub fn rotate_control_epoch(
+        &self,
+        _admin: &HostAdminAuthority,
+    ) -> Result<ControlEpoch, AuthorityError> {
         self.with_state(|state| {
             state.control_epoch = state
                 .control_epoch
@@ -509,7 +551,10 @@ impl HostAuthority {
     }
 
     /// Rotate the capability generation, invalidating every sealed grant.
-    pub fn rotate_capability_generation(&self) -> Result<CapabilityGeneration, AuthorityError> {
+    pub fn rotate_capability_generation(
+        &self,
+        _admin: &HostAdminAuthority,
+    ) -> Result<CapabilityGeneration, AuthorityError> {
         self.with_state(|state| {
             state.capability_generation =
                 state.capability_generation.checked_add(1).ok_or_else(|| {
@@ -521,8 +566,8 @@ impl HostAuthority {
         })
     }
 
-    /// The owner account this root serves.
-    pub fn owner_id(&self) -> Result<String, AuthorityError> {
+    /// The owner account this root serves. An operator read.
+    pub fn owner_id(&self, _admin: &HostAdminAuthority) -> Result<String, AuthorityError> {
         self.read(|state| Ok(state.owner_id.clone()))
     }
 }
