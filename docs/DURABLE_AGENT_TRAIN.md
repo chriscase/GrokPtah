@@ -189,35 +189,31 @@ place, so this train tests them instead:
 
 ### Uncertain / not-sent / settled
 
-`AttemptDisposition` on `main` is `{Completed, HttpError, TransportError,
-Timeout, Cancelled, ProtocolError}`. It classifies *what went wrong* and carries
-no delivery-knowledge dimension: a connection refused before any byte moved and
-a timeout that may have been fully delivered are both just failure kinds, even
-though one is provably safe to retry and the other must never auto-retry.
+`main` retried a provider request on **any** transport error. The retry site
+(`host_helpers.rs:2091`) even distinguished a timeout from a refused connection
+to word the error message, then retried both identically, up to three times.
 
-That gap is recorded as a characterization test rather than closed here.
-Closing it means the `NotSent` / `Uncertain` / `Settled` split, which is #497's
-G3 — and a second lattice beside it is exactly what the audit of this branch
-rejected.
+A timeout can happen after the request was fully written and the provider has
+already done the work, so re-sending it duplicates a model invocation rather
+than recovering a lost one. Only a connection that was never established proves
+no byte moved. That is #478's acceptance criterion — *automatic retries stand
+down for any attempt whose delivery is not proven NotSent* — and the retry site
+is now gated on it.
 
-### Strict old/new protocol negotiation
+`durable::delivery` holds the rule and nothing else: no state, no records, no
+permits, no ordinals, nothing to persist. The durable attempt lattice that does
+hold those is #497's G3, and this deliberately does not approximate it. A source
+guard keeps the gate in place.
 
-`tests/mcp_streamable_transport.rs` exercises the **real** MCP negotiation:
+The remaining half of the distinction — *settled*, and durably recording which
+attempt reached which state — is still #497's. `AttemptDisposition` on `main`
+(`{Completed, HttpError, TransportError, Timeout, Cancelled, ProtocolError}`)
+still classifies what went wrong without saying whether the request arrived; a
+characterization test pins that.
 
-- an old but supported version (`2024-10-07` … `2025-06-18`) is honoured
-  exactly, not quietly upgraded;
-- a header that disagrees with the body is refused, and an agreeing pair is
-  accepted;
-- **characterization:** the two negotiation paths disagree. The
-  `MCP-Protocol-Version` header check (`mcp_control.rs:1522`) *refuses* an
-  unsupported version with 400, while `handle_initialize` (`:1716`) *accepts*
-  the same string and silently substitutes the newest supported version.
-  Answering with a supported version is what the MCP spec calls for, so the
-  downgrade is defensible alone; the disagreement is not, and the
-  header-match check compares against the *requested* version rather than the
-  negotiated one, which traps an old client on its next request. Changing this
-  is wire-visible, so the test pins today's answer rather than asserting a
-  preferred one.
+The second retry site (`:2228`) is deliberately unchanged: it fires after the
+provider *answered* with an HTTP status, so the request demonstrably arrived and
+was refused rather than processed.
 
 ### Not here, and why
 

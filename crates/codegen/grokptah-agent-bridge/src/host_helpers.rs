@@ -2088,7 +2088,18 @@ where
                         format!("request error: {e}")
                     },
                 );
-                if allow_transient_retries && transient_retries < MAX_TRANSIENT_RETRIES {
+                // Only a connection that was never established proves no
+                // request byte moved. A timeout can happen after the request
+                // was fully written and the provider has already done the
+                // work, so re-sending it duplicates a model invocation rather
+                // than recovering a lost one (#478). Uncertainty is preserved
+                // by standing down, not by trying again.
+                let delivery =
+                    crate::durable::classify_transport_failure(e.is_connect(), e.is_timeout());
+                if delivery.may_auto_retry()
+                    && allow_transient_retries
+                    && transient_retries < MAX_TRANSIENT_RETRIES
+                {
                     let delay = 400 * (1 << transient_retries);
                     transient_retries += 1;
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;

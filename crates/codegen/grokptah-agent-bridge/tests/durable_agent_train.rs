@@ -6,8 +6,9 @@
 use grokptah_agent_bridge::orchestration::{CONTROL_TOOLS, FORBIDDEN_TOOLS};
 
 use grokptah_agent_bridge::durable::{
-    self, progress::RepeatClass, progress::StopDecision, ActiveTaskWaitWitness, ActiveWaitState,
-    ProgressLedger, RawObservation, RawObservationDigest,
+    self, classify_transport_failure, progress::RepeatClass, progress::StopDecision,
+    ActiveTaskWaitWitness, ActiveWaitState, DeliveryKnowledge, ProgressLedger, RawObservation,
+    RawObservationDigest,
 };
 use uuid::Uuid;
 
@@ -505,8 +506,8 @@ fn the_durable_core_contacts_nothing_and_declares_no_authority() {
         checked += 1;
     }
     assert_eq!(
-        checked, 5,
-        "expected exactly mod, observation, progress, effects and cancel"
+        checked, 6,
+        "expected mod, observation, progress, effects, cancel and delivery"
     );
 }
 
@@ -590,4 +591,59 @@ fn the_embeddable_control_surface_exposes_no_raw_transport_or_operator_escape() 
         );
     }
     assert!(!CONTROL_TOOLS.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Retries stand down unless non-delivery is proven
+// ---------------------------------------------------------------------------
+
+/// `main` retried a provider request on *any* transport error, timeouts
+/// included. A timeout can happen after the request was fully written and the
+/// provider has already done the work, so re-sending it duplicates a model
+/// invocation rather than recovering a lost one — up to three times, silently,
+/// in the middle of a long job.
+#[test]
+fn only_a_proven_undelivered_request_may_be_retried() {
+    // A refused connection is the one case that proves nothing moved.
+    assert!(classify_transport_failure(true, false).may_auto_retry());
+
+    // Everything else keeps its uncertainty.
+    for (is_connect, is_timeout, why) in [
+        (
+            false,
+            true,
+            "a timeout after the write may have been delivered",
+        ),
+        (true, true, "a connect timeout is not a refusal"),
+        (false, false, "a reset or decode failure says nothing"),
+    ] {
+        let knowledge = classify_transport_failure(is_connect, is_timeout);
+        assert_eq!(knowledge, DeliveryKnowledge::Unknown, "{why}");
+        assert!(!knowledge.may_auto_retry(), "{why}");
+    }
+}
+
+/// Source guard: the provider retry loop must stay gated on proven
+/// non-delivery. Removing the gate restores a silent duplicate-send.
+#[test]
+fn the_provider_retry_loop_stays_gated_on_proven_non_delivery() {
+    let source =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/host_helpers.rs"))
+            .expect("source is readable");
+    let code: String = source
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        code.contains("classify_transport_failure"),
+        "the transport failure must still be classified before a retry"
+    );
+    // Every transient-retry decision is guarded by the delivery answer.
+    let gated = code.matches("delivery.may_auto_retry()").count();
+    assert_eq!(
+        gated, 1,
+        "exactly one transient-retry site is gated on proven non-delivery"
+    );
 }
