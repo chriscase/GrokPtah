@@ -136,3 +136,87 @@ fn an_attempt_in_flight_when_the_process_dies_recovers_as_uncertain() {
         "the intent written before the crash must be durable"
     );
 }
+
+const RACE_ENV: &str = "XAI_HOST_AUTHORITY_RACE_CHILD_ROOT";
+/// Appends each racing child makes. Every successful `authenticate` writes one
+/// audit record, so this is also the number of appends per child.
+const APPENDS_PER_CHILD: usize = 25;
+const RACING_CHILDREN: usize = 4;
+
+/// One racing child: hammer the shared root with audit appends from its own
+/// process, then exit 21.
+fn child_race(root: &Path) -> ! {
+    let Ok((authority, _admin)) = HostAuthority::open(root, OWNER) else {
+        std::process::exit(30);
+    };
+    for _ in 0..APPENDS_PER_CHILD {
+        if authority.authenticate(SECRET).is_err() {
+            std::process::exit(31);
+        }
+    }
+    std::process::exit(21);
+}
+
+#[test]
+fn concurrent_processes_cannot_fork_the_audit_chain() {
+    if let Ok(root) = std::env::var(RACE_ENV) {
+        child_race(Path::new(&root));
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let (authority, admin) = HostAuthority::open(&root, OWNER).unwrap();
+    authority
+        .set_credentials(
+            &admin,
+            &[HostCredential::new("primary", SECRET).unwrap()],
+            OWNER,
+        )
+        .unwrap();
+    let before = authority.audit_records(&admin).unwrap().len();
+    drop(authority);
+
+    // Separate processes, so this is genuine cross-process exclusion rather
+    // than an in-process mutex: `flock` is held per open file description.
+    let mut children = Vec::new();
+    for _ in 0..RACING_CHILDREN {
+        children.push(
+            Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("concurrent_processes_cannot_fork_the_audit_chain")
+                .env(RACE_ENV, &root)
+                .spawn()
+                .expect("spawn racing child"),
+        );
+    }
+    for mut child in children {
+        assert_eq!(
+            child.wait().unwrap().code(),
+            Some(21),
+            "every racing child must complete its appends"
+        );
+    }
+
+    let (reopened, reopened_admin) = HostAuthority::open(&root, OWNER).unwrap();
+    let records = reopened.audit_records(&reopened_admin).unwrap();
+
+    // Not one append lost, and not one sequence number reused: without
+    // cross-process serialisation the children would each have derived the
+    // same chain head and written over each other.
+    assert_eq!(
+        records.len(),
+        before + RACING_CHILDREN * APPENDS_PER_CHILD,
+        "every append from every process must survive"
+    );
+    for (i, record) in records.iter().enumerate() {
+        assert_eq!(
+            record.sequence,
+            i as u64 + 1,
+            "sequence numbers must be dense and unique across processes"
+        );
+    }
+    assert!(
+        reopened.audit_chain_intact(&reopened_admin).unwrap(),
+        "the hash chain must survive concurrent multi-process appends"
+    );
+}
