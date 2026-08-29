@@ -874,6 +874,27 @@ export type ComputerPermissionStatus =
   | "revoked"
   | "restricted";
 
+/** Which code identity TCC attached to. Never a readiness signal on its own. */
+export interface ComputerExecutorIdentity {
+  kind: "in_process_host" | "packaged_helper";
+  bundleId: string;
+  helperBundleId: string;
+  version: string;
+  helperVersion: string;
+  signingClass:
+    | "uninspected"
+    | "unsigned"
+    | "ad_hoc"
+    | "apple_development"
+    | "developer_id"
+    | "notarized_developer_id";
+  tccPrincipal: string;
+  /** Present only for a packaged helper backed by an admitted signature. */
+  teamId?: string;
+  /** Present only for a packaged helper backed by an admitted signature. */
+  designatedRequirement?: string;
+}
+
 export interface ComputerPlatformStatus {
   platformId: string;
   available: boolean;
@@ -881,6 +902,12 @@ export interface ComputerPlatformStatus {
   screenRecording: ComputerPermissionStatus;
   accessibility: ComputerPermissionStatus;
   detail?: string | null;
+  /**
+   * Absent when there is no usable platform, and therefore no executor. Absent
+   * does not mean "unknown, possibly packaged": packaged admission is decided
+   * by the host authority, never by a status a platform reports about itself.
+   */
+  executor?: ComputerExecutorIdentity;
 }
 
 export interface ComputerTargetCandidate {

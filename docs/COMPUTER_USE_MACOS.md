@@ -141,3 +141,31 @@ Use a stable, uniquely identified app process for GUI inspection and confirm tha
 GrokPtah process is running first. Keep the temporary home bounded and remove only that exact
 directory after the process exits. This boundary isolates session metadata and credentials; it
 does not grant either macOS permission or bypass the local Computer Run consent flow.
+
+## Packaged identity
+
+TCC Screen Recording and Accessibility attach to a *code identity*. Running
+Computer Use in-process means they attach to the GrokPtah app bundle; running it
+in the separately signed helper means they attach to
+`com.chriscase.grokptah.computer-use-helper`. Those are different grants, and a
+terminal-owned grant proves neither.
+
+`ComputerPlatformStatus::executor` reports which identity is actually in play, so
+a reader never has to infer it. Today it is always the in-process host identity:
+no signed helper has been assembled or inspected.
+
+How that identity is established, what an operator trust root must declare, and
+exactly what remains unqualified are covered in
+[COMPUTER_USE_PACKAGE_AUTHORITY.md](COMPUTER_USE_PACKAGE_AUTHORITY.md).
+
+To inspect a real packaged build (this never signs, never opens the Keychain,
+and never prompts for TCC):
+
+```sh
+GROKPTAH_PACKAGE_APP=/path/to/GrokPtah.app \
+GROKPTAH_COMPUTER_USE_TRUST_ROOT=/path/to/trust-root.json \
+  npm --prefix desktop run qualify:computer-use-package
+```
+
+Without both variables the inspector reports `unavailable` and names what was
+missing. It never reports `pass`.

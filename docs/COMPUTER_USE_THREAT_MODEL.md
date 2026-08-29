@@ -47,6 +47,21 @@ dispatch handle, host path, screenshot asset locator, credential, or general she
 | MCP Computer mutations, raw shell, clipboard, AppleScript, unattended control | Explicitly unsupported in this release; #271 is a later scoped interoperability phase | `CONTROL_TOOLS` boundary; `docs/COMPUTER_USE.md` non-goals |
 | Windows/Linux native control | Explicitly unsupported until their platform issues have native consent and evidence | #275 and #276 |
 
+## Packaged identity and cleanup accounting
+
+| Threat | Mitigation | Evidence |
+| --- | --- | --- |
+| A bundle vouches for its own signature via a text file it ships | Signing facts come only from a `CodeIdentityProbe` running pinned `codesign`/`spctl`; self-attestation filenames are recorded and never read | `packaged_authority::tests::a_planted_codesign_text_file_cannot_change_the_verdict`, `adversarial_matrix::a_bundle_local_attestation_file_is_recorded_and_never_read` |
+| The expected designated requirement is synthesized from the observed Team ID, making admission a tautology | Expectations load from an operator trust root outside the artifact root; the requirement is compared for exact equality and is never formatted from an observation | `trust_root::tests::*`, `adversarial_matrix::synthesized_designated_requirement_and_team_identity_are_refused` |
+| Negated signing text is read as a positive verdict | Classification reads only anchored `Key=Value` lines and refuses values carrying a negation token; notarization comes from Gatekeeper's `source=` | `code_identity::tests::negated_values_cannot_invert_into_a_positive_class`, `adversarial_matrix::negated_signing_text_cannot_invert_into_admission` |
+| A missing or symlinked entitlements plist silently defaults to a synthesized digest | `hash_file` fails closed on symlinks and non-files; there is no fallback digest | `adversarial_matrix::symlinked_entitlements_fail_closed` |
+| A discarded deletion error makes teardown look complete | Cleanup receipts are re-observed from the filesystem, guest handle, and occupancy store after teardown; unresolved cleanup is surfaced as `UncertainOutcome` and the guest is not marked clean | `adversarial_matrix::cleanup_that_leaves_a_resource_behind_is_uncertain` |
+| A fabricated receipt claims a clean teardown | Per-resource and whole-receipt digests must recompute, and the outcome must agree with the probe set | `adversarial_matrix::a_fabricated_cleanup_receipt_does_not_validate` |
+| A second helper-local state machine disagrees with the host about what was injected | Exactly one host-owned authority; a CI gate fails the build if a second one reappears | `scripts/check-adversarial-reachable.sh` |
+| A record that deserializes but is semantically invalid is trusted | Such records are quarantined on open alongside unreadable ones | `adversarial_matrix::a_torn_lease_record_is_quarantined_not_trusted` |
+| An unreadable occupancy record reads as free | Occupancy reads fail closed; unreadable means occupied | `occupancy::tests::a_corrupt_record_denies_rather_than_reading_as_clear` |
+| Injected input is replayed after a crash | Injected is durable before injection; a failed durable write refuses the dispatch, a failed post-injection write is Uncertain, and restarts never replay | `adversarial_matrix::two_restarts_after_injection_never_replay` |
+
 ## Release blockers still open
 
 - Run the three-action disposable macOS fixture proof through the packaged GrokPtah identity with
@@ -57,9 +72,21 @@ dispatch handle, host path, screenshot asset locator, credential, or general she
 - Keep #288 isolated visual execution disabled until a backend provides a genuinely separate input
   surface; hidden windows, separate Spaces, and global `CGEvent` injection do not qualify.
 
-## Verification command
+## Verification commands
 
 ```sh
+# Computer Use release gate (agent bridge)
 cargo test --locked --manifest-path crates/codegen/grokptah-agent-bridge/Cargo.toml \
   --test computer_use_release_gate -- --test-threads=1
+
+# Packaged authority: unit suites plus the adversarial matrix. This crate is its
+# own workspace root, so the bridge-wide `cargo test` does NOT run these.
+cargo test --locked --manifest-path crates/codegen/grokptah-isolated-visual/Cargo.toml \
+  -- --test-threads=1
+
+# Prove those suites are still reachable and no second authority reappeared.
+scripts/check-adversarial-reachable.sh
+
+# Every committed lockfile still resolves from this exact tree.
+scripts/check-committed-lockfiles.sh
 ```

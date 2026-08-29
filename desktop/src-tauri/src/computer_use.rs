@@ -129,6 +129,10 @@ impl DesktopComputerUse {
                 if let Some(error) = &self.initialization_error {
                     status.available = false;
                     status.detail = Some(error.clone());
+                    // The platform did not come up, so whatever executor it
+                    // described is not running. Clearing it keeps the status
+                    // from reporting an identity beside `available: false`.
+                    status.executor = None;
                 }
                 status
             }
@@ -893,6 +897,10 @@ fn unsupported_status(detail: Option<String>) -> ComputerPlatformStatus {
         screen_recording: ComputerPermissionStatus::Unsupported,
         accessibility: ComputerPermissionStatus::Unsupported,
         detail,
+        // No platform means Computer Use does not run here, so there is no
+        // code identity for TCC to attach to. Reporting an in-process host
+        // identity would assert an executor that does not exist.
+        executor: None,
     }
 }
 
@@ -902,7 +910,10 @@ mod tests {
 
     use async_trait::async_trait;
     use grokptah_agent_bridge::computer_use::{ObservationGeometry, SemanticElement, Sensitivity};
-    use grokptah_agent_bridge::{ActionOutcome, ComputerBackend, ComputerStore, ComputerTarget};
+    use grokptah_agent_bridge::{
+        ActionOutcome, ComputerBackend, ComputerExecutorIdentity, ComputerStore, ComputerTarget,
+        SigningClass,
+    };
 
     use super::*;
 
@@ -1014,6 +1025,13 @@ mod tests {
                 screen_recording: ComputerPermissionStatus::Granted,
                 accessibility: ComputerPermissionStatus::Granted,
                 detail: None,
+                // This fixture reports granted permissions, so it must say
+                // which identity they were granted to. The test binary runs
+                // in-process: these are app-bundle grants, and no packaged
+                // helper exists here.
+                executor: Some(ComputerExecutorIdentity::in_process_host(
+                    SigningClass::Uninspected,
+                )),
             }
         }
 

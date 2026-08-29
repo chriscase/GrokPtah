@@ -189,6 +189,23 @@ local one-use grant. It does not register a model action or MCP tool. See
 [Computer Use on macOS](COMPUTER_USE_MACOS.md) for the privacy boundary, dispatch attestation,
 packaging requirements, and disposable smoke fixture.
 
+## Packaged authority
+
+Whether packaged macOS Computer Use may run is decided by the authority in
+`crates/codegen/grokptah-isolated-visual`, described in
+[COMPUTER_USE_PACKAGE_AUTHORITY.md](COMPUTER_USE_PACKAGE_AUTHORITY.md).
+
+Two properties are worth stating here because they constrain everything above:
+code identity comes from `codesign`/`spctl`, never from a file inside the bundle
+being checked; and the expected designated requirement, Team ID, and image
+digests come from an operator trust root outside the artifact, never from the
+artifact itself.
+
+The current verdict is `unavailable`: no signed helper, no trust root, no TCC
+grants, no Virtualization.framework launch, and no hardware evidence exist.
+`ComputerUseService::packaged_authority_admission()` is reachable from any host
+and denies with stated reasons rather than enabling an unsupported environment.
+
 ## Deliberate non-goals of the current desktop slice
 
 - no Windows UI Automation or Linux portal adapter;

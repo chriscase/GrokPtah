@@ -11,18 +11,37 @@
 //! disagree about run state, control disposition, epoch, or event range.
 //! Which runs each surface may list is a separate gate: the cockpit is
 //! session-scoped; coordinator reads take [`ComputerReadBinding`].
+//!
+//! Packaged authority lives in `grokptah-isolated-visual`, reached through
+//! [`isolated_visual`]. There is exactly one lease/dispatch/receipt authority;
+//! this crate does not keep a second one.
 
+mod isolated_visual;
 mod macos_observation;
+mod package_identity;
 mod platform;
 mod policy;
 mod projection;
+mod qualification;
 mod reads;
 mod service;
 mod simulator;
 mod store;
 mod types;
 
+pub use isolated_visual::{
+    isolated_visual_admission, map_isolated_error, AdmittedGuestImage, AdmittedHelperIdentity,
+    ComputerSurfaceLease, DenyReason, IsolatedEvidenceClass, IsolatedPreflight, IsolatedVisualHost,
+    IsolatedVisualProjection, PackagedTrustRoot,
+};
 pub use macos_observation::MacOsObservationPlatform;
+pub use package_identity::{
+    documented_identity_json, versions_compatible, ComputerExecutorIdentity, ExecutorKind,
+    PackageIdentity, SigningClass, APP_BUNDLE_ID, APP_EXECUTABLE, APP_MINIMUM_OS, APP_PRODUCT_NAME,
+    APP_VERSION, COMPUTER_USE_MINIMUM_OS, DEMO_TARGET_BUNDLE_ID, HELPER_BUNDLE_ID,
+    HELPER_EXECUTABLE, HELPER_MINIMUM_OS, HELPER_NESTED_PATH, HELPER_PRODUCT_NAME, HELPER_VERSION,
+    PACKAGE_AUTHORITY_EVIDENCE_SCHEMA, PACKAGE_IDENTITY_SCHEMA,
+};
 pub use platform::{
     ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
     ComputerPlatformStatus, ComputerTargetCandidate,
@@ -33,6 +52,10 @@ pub use projection::{
     ComputerRunCapacity, ComputerRunEventPage, ComputerRunEventRange, ComputerRunProgress,
     ComputerRunProjection, ComputerScopeCapacity, ComputerTargetSummary, ObservationSummary,
     DEFAULT_EVENT_PAGE, MAX_EVENT_PAGE,
+};
+pub use qualification::{
+    run_synthetic_oracle, AuthorityVerdict, EvidenceAssembly, PackageAuthorityEvidence,
+    QualificationScenario, ScenarioResult, SyntheticOracleReport,
 };
 pub use reads::{ComputerReadBinding, ComputerRunReads};
 
