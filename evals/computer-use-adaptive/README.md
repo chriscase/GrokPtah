@@ -41,6 +41,18 @@ any result other than synthetic PASS fail closed. The verifier reconstructs the
 matrix and dispatch authority; it does not trust report totals or a physical
 record's own `permitted` flag.
 
+Library callers must supply the matching `EvidenceSet` to `verify_campaign` or
+use `verify_json_with_evidence`. The report-only `verify_report` and
+`verify_json` entry points are diagnostic parsers and deliberately return
+`VERIFIER_ERROR` even for an otherwise coherent report; a report without its
+typed evidence can never produce release PASS.
+
+The public `run_campaign` API likewise requires an explicit repository,
+expected candidate head, and expected base. It refuses a dirty tree or a head
+or ancestry mismatch. The lower-level pre-observed-source constructor is
+crate-private so callers cannot mint provenance and then ask the library to
+bless it.
+
 Optional live continuation (same schemas, still does not call a provider in this
 lane; the binary refuses unless you intended a later live adapter):
 

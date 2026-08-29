@@ -8,7 +8,7 @@ use crate::runner::{run_episode, EpisodeResult, EvidenceBundle};
 use crate::schema::to_canonical_json;
 use crate::types::{
     validate_repeats, AdapterId, CampaignStatus, Eligibility, EvalResult, FamilyId,
-    EVIDENCE_SET_SCHEMA, REPORT_SCHEMA, SOURCE_GATE_SHA,
+    EVIDENCE_SET_SCHEMA, REPORT_SCHEMA,
 };
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -129,12 +129,23 @@ pub struct CampaignOutput {
     pub evidence: EvidenceSet,
 }
 
-pub fn run_campaign(repeats: u32, seed: u64) -> EvalResult<CampaignOutput> {
-    let identity = crate::source::observe_source(std::path::Path::new("."), None, SOURCE_GATE_SHA)?;
+/// Run a source-qualified campaign against one exact, clean repository head.
+///
+/// This is the public library boundary. Callers cannot obtain a campaign that
+/// looks release-authoritative without naming the repository, candidate, and
+/// base whose bytes are actually executed.
+pub fn run_campaign(
+    repeats: u32,
+    seed: u64,
+    repository: &std::path::Path,
+    expected_head: &str,
+    expected_base: &str,
+) -> EvalResult<CampaignOutput> {
+    let identity = crate::source::observe_source(repository, Some(expected_head), expected_base)?;
     run_campaign_with_source(repeats, seed, identity)
 }
 
-pub fn run_campaign_with_source(
+pub(crate) fn run_campaign_with_source(
     repeats: u32,
     seed: u64,
     source_gate: SourceGate,
@@ -185,6 +196,22 @@ pub fn run_campaign_with_source(
         },
         report,
     })
+}
+
+#[cfg(test)]
+pub(crate) fn run_campaign_for_test(repeats: u32, seed: u64) -> EvalResult<CampaignOutput> {
+    run_campaign_with_source(
+        repeats,
+        seed,
+        SourceGate {
+            git_sha: crate::types::SOURCE_GATE_SHA.into(),
+            tree_sha: "0".repeat(40),
+            base_git_sha: crate::types::SOURCE_GATE_SHA.into(),
+            base_tree_sha: "0".repeat(40),
+            base_is_ancestor: true,
+            branch_note: "crate-private deterministic test fixture".into(),
+        },
+    )
 }
 
 pub fn assemble_report(

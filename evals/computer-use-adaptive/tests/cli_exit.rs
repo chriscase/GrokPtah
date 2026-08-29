@@ -1,5 +1,6 @@
 use grokptah_cu_adaptive_eval::cli;
-use grokptah_cu_adaptive_eval::report::run_campaign;
+mod common;
+use common::run_campaign;
 use grokptah_cu_adaptive_eval::schema::to_canonical_json;
 use grokptah_cu_adaptive_eval::types::{CampaignStatus, ProcessVerdict};
 

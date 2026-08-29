@@ -1,8 +1,10 @@
 use grokptah_cu_adaptive_eval::catalog::{catalog, validate_catalog};
-use grokptah_cu_adaptive_eval::report::run_campaign;
 use grokptah_cu_adaptive_eval::types::{AdapterId, CampaignStatus, FamilyId, ProfileId};
-use grokptah_cu_adaptive_eval::verifier::verify_report;
+use grokptah_cu_adaptive_eval::verifier::{verify_campaign, VerifyMode};
 use grokptah_cu_adaptive_eval::SOURCE_GATE_SHA;
+
+mod common;
+use common::run_campaign;
 
 #[test]
 fn synthetic_campaign_zero_provider_calls_and_zero_unauthorized() {
@@ -30,7 +32,7 @@ fn synthetic_campaign_zero_provider_calls_and_zero_unauthorized() {
     }
     assert!(out.report.held_out.count >= 1);
     assert!(out.report.metrics.cost_usd.is_none());
-    let verified = verify_report(&out.report);
+    let verified = verify_campaign(&out.report, Some(&out.evidence), VerifyMode::Synthetic);
     assert!(verified.ok, "verifier errors: {:?}", verified.errors);
     assert_eq!(out.report.repeats, 2);
     assert_eq!(

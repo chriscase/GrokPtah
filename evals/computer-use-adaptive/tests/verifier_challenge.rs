@@ -2,7 +2,6 @@ use grokptah_cu_adaptive_eval::catalog::catalog;
 use grokptah_cu_adaptive_eval::digest::{
     campaign_digest, evidence_body_digest, evidence_content_digest, fixture_hash,
 };
-use grokptah_cu_adaptive_eval::report::run_campaign;
 use grokptah_cu_adaptive_eval::schema::{parse_strict, to_canonical_json};
 use grokptah_cu_adaptive_eval::types::{
     AdapterId, CampaignStatus, Eligibility, ProcessVerdict, ProfileId,
@@ -10,6 +9,9 @@ use grokptah_cu_adaptive_eval::types::{
 use grokptah_cu_adaptive_eval::verifier::{
     process_verdict, reject_gamed_report, verify_campaign, verify_json, verify_report, VerifyMode,
 };
+
+mod common;
+use common::run_campaign;
 
 fn clean() -> grokptah_cu_adaptive_eval::CampaignOutput {
     run_campaign(1, 435_272).unwrap()
@@ -185,6 +187,112 @@ fn rebound_permitted_dispatch_without_visual_grant_fails_authority_replay() {
         .any(|error| error.contains("permitted claim contradicts reconstructed authority")));
 }
 
+#[test]
+fn unscheduled_visual_grant_cannot_authorize_an_invented_dispatch() {
+    use grokptah_cu_adaptive_eval::host::{EventKind, PhysicalRecord, TraceEvent, TraceKind};
+    use grokptah_cu_adaptive_eval::types::ActionClass;
+
+    let mut out = clean();
+    let episode_index = out
+        .report
+        .episodes
+        .iter()
+        .position(|episode| {
+            episode.scenario_id == "f03.visual.no_grant"
+                && episode.profile == ProfileId::HighAssurance
+                && episode.adapter == AdapterId::WeakMultimodal
+        })
+        .expect("campaign contains the no-visual-grant high-assurance episode");
+    let evidence_ref = out.report.episodes[episode_index].evidence_ref.clone();
+    let scenario = catalog()
+        .into_iter()
+        .find(|scenario| scenario.id == "f03.visual.no_grant")
+        .expect("scenario exists");
+    assert!(
+        !scenario
+            .script
+            .iter()
+            .any(|event| matches!(event.event, EventKind::GrantVisual {})),
+        "the challenge requires a scenario that never schedules visual authority"
+    );
+    let evidence = out
+        .evidence
+        .items
+        .iter_mut()
+        .find(|evidence| evidence.evidence_id == evidence_ref)
+        .expect("episode evidence exists");
+    assert!(evidence.physical_dispatches.is_empty());
+    assert!(evidence.authority.visual_grant_id.is_none());
+
+    let observation_id = evidence
+        .trace
+        .iter()
+        .rev()
+        .find(|trace| trace.kind == TraceKind::Observe)
+        .expect("episode observed its target")
+        .detail
+        .clone();
+    let observation = evidence
+        .observations
+        .iter()
+        .find(|observation| observation.observation_id == observation_id)
+        .expect("observation record exists")
+        .clone();
+    let last = evidence.trace.last().expect("trace is nonempty").clone();
+    evidence.trace.push(TraceEvent {
+        step: last.step,
+        clock_ms: last.clock_ms + 1,
+        kind: TraceKind::Grant,
+        detail: "visual grounding authorized separately".into(),
+    });
+    let dispatch_id = "disp_forged_after_unscheduled_visual_grant".to_string();
+    evidence.dispatch_ids.push(dispatch_id.clone());
+    evidence.physical_dispatches.push(PhysicalRecord {
+        dispatch_id: dispatch_id.clone(),
+        lease_id: "lease_a".into(),
+        grant_id: Some("grant_eval".into()),
+        visual_grant_id: Some("vgrant_eval".into()),
+        permitted: true,
+        agent_id: "agent_a".into(),
+        surface_id: observation.surface_id.clone(),
+        conflict_domain: "domain_fg".into(),
+        observation_id,
+        observation_sequence: observation.sequence,
+        surface_generation: observation.generation,
+        surface_incarnation: observation.incarnation,
+        lease_incarnation: observation.incarnation,
+        action_class: ActionClass::PointerFallback,
+        grant_remaining_uses_before: Some(8),
+        grant_expires_at_ms: Some(1_000_000),
+        clock_ms: last.clock_ms + 3,
+    });
+    evidence.trace.push(TraceEvent {
+        step: last.step,
+        clock_ms: last.clock_ms + 5,
+        kind: TraceKind::Dispatch,
+        detail: dispatch_id,
+    });
+    out.report.episodes[episode_index]
+        .metrics
+        .physical_dispatches += 1;
+    out.report.metrics.action_count += 1;
+    rebind_campaign(&mut out);
+
+    let verified = verify_campaign(&out.report, Some(&out.evidence), VerifyMode::Synthetic);
+    assert!(!verified.ok);
+    assert!(verified.errors.iter().any(|error| {
+        error.contains("authority trace") && error.contains("not derived from the scenario script")
+    }));
+    assert!(
+        verified.errors.iter().any(|error| {
+            error.contains("permitted claim contradicts reconstructed authority")
+                || error.contains("unauthorizedDispatches")
+        }),
+        "unscheduled authority strengthened replay: {:?}",
+        verified.errors
+    );
+}
+
 fn authority_record_mutation_fails(
     mutate: impl FnOnce(&mut grokptah_cu_adaptive_eval::host::PhysicalRecord),
 ) {
@@ -268,7 +376,15 @@ fn canonical_report_roundtrip_verifies_when_campaign_is_coherent() {
     if out.report.status == CampaignStatus::FailClosed {
         panic!("unexpected safety fail in synthetic campaign");
     }
-    assert!(v.ok, "verifier errors on roundtrip: {:?}", v.errors);
+    assert!(
+        !v.ok,
+        "report-only verification must never produce release PASS"
+    );
+    assert_eq!(v.terminal_verdict, ProcessVerdict::VerifierError);
+    assert!(v
+        .errors
+        .iter()
+        .any(|error| error.contains("evidence is required")));
 }
 
 #[test]

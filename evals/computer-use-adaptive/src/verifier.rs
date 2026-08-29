@@ -70,10 +70,18 @@ pub fn verify_campaign(
     mode: VerifyMode,
 ) -> VerifyReport {
     let items = catalog();
-    verify_against_catalog(report, evidence, &items, mode)
+    let mut verified = verify_against_catalog(report, evidence, &items, mode);
+    if evidence.is_none() {
+        verified
+            .errors
+            .push("report-only verification is non-authoritative; evidence is required".into());
+        verified.ok = false;
+        verified.terminal_verdict = ProcessVerdict::VerifierError;
+    }
+    verified
 }
 
-pub fn verify_against_catalog(
+pub(crate) fn verify_against_catalog(
     report: &CampaignReport,
     evidence: Option<&EvidenceSet>,
     items: &[Scenario],
@@ -950,15 +958,18 @@ fn reconstruct_dispatch_authority(
         previous_step = trace.step;
         previous_clock = trace.clock_ms;
 
-        if is_authority_trace(trace.kind)
-            && !scenario.script.iter().any(|scheduled| {
-                scheduled.at_step == trace.step && scheduled_trace_matches(scheduled.event, trace)
-            })
-        {
+        let scheduled_authority_trace = scenario.script.iter().any(|scheduled| {
+            scheduled.at_step == trace.step && scheduled_trace_matches(scheduled.event, trace)
+        });
+        if is_authority_trace(trace.kind) && !scheduled_authority_trace {
             errors.push(format!(
                 "{} authority trace at index {index} is not derived from the scenario script",
                 evidence.evidence_id
             ));
+            // A rejected trace is evidence of tampering, not an input to the
+            // reconstructed authority machine. Applying an unscheduled grant
+            // here would otherwise strengthen a later forged dispatch.
+            continue;
         }
 
         if trace.kind == TraceKind::Observe {
@@ -1384,11 +1395,11 @@ pub fn reject_gamed_report(mut report: CampaignReport) -> VerifyReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::report::run_campaign;
+    use crate::report::run_campaign_for_test;
 
     #[test]
     fn verifier_rejects_dropped_family() {
-        let out = run_campaign(1, crate::types::DEFAULT_SEED).unwrap();
+        let out = run_campaign_for_test(1, crate::types::DEFAULT_SEED).unwrap();
         let gamed = reject_gamed_report(out.report.clone());
         assert!(!gamed.ok);
         let clean = verify_campaign(&out.report, Some(&out.evidence), VerifyMode::Synthetic);

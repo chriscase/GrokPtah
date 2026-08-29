@@ -248,7 +248,7 @@ mod tests {
 
     #[test]
     fn closed_adapter_and_trace_enums_fail_closed_at_runtime_and_in_schema() {
-        let campaign = crate::report::run_campaign(1, crate::types::DEFAULT_SEED).unwrap();
+        let campaign = crate::report::run_campaign_for_test(1, crate::types::DEFAULT_SEED).unwrap();
         let mut report = serde_json::to_value(&campaign.report).unwrap();
         report["episodes"][0]["adapter"] = serde_json::json!("future_unreviewed_adapter");
         assert!(parse_strict::<crate::report::CampaignReport>(&report.to_string()).is_err());
