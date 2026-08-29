@@ -122,9 +122,19 @@ pub fn wire_idempotency_key() -> Option<String> {
 /// because an interrupted send is indistinguishable from a delivered one
 /// without asking the provider.
 ///
-/// Idempotent across the rounds of one turn: a tool loop that calls the
-/// provider repeatedly is one attempt, and every call after the first finds
-/// the boundary already crossed.
+/// # Known defect: this collapses a multi-round turn
+///
+/// A tool loop issues several physical requests, each with different
+/// serialized bytes, but they share one attempt. Only the first crosses the
+/// boundary; later calls find `sending`/`sent`/`responding`, the lattice
+/// refuses the move, and those sends are never durably represented. Worse,
+/// `wire_idempotency_key` keeps returning the same key, so distinct requests
+/// go out under one `Idempotency-Key` — against a provider that honors it,
+/// that is more dangerous than sending no key at all.
+///
+/// The fix is one attempt per exact serialized request plus ordinal, which is
+/// a redesign of attempt identity rather than a change here. Do not carry this
+/// function forward without it.
 pub fn mark_sending() {
     advance(SendState::Sending, |_| {});
 }
