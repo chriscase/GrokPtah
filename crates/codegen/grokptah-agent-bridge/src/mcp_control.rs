@@ -3776,7 +3776,10 @@ mod live_frame_authority {
 
         // Rotate. The second frame is still buffered — and must not be handed
         // out, because it was released under a generation that is now stale.
-        orch.set_token("live-frame-token".into()).unwrap();
+        let admin = orch
+            .take_host_admin()
+            .expect("the constructing host holds the one-shot admin capability");
+        orch.set_token(&admin, "live-frame-token".into()).unwrap();
 
         let next = live
             .next_frame()

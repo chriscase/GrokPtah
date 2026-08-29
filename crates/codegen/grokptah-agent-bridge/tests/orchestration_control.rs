@@ -25,6 +25,20 @@ use uuid::Uuid;
 
 use common::ProcessEnvGuard;
 
+/// Take this host's one-shot admin capability and hand back its raw store.
+///
+/// Raw store access is admin-gated (#477 P0-4): the capability is issued once,
+/// to whoever constructed the host, so a test that reaches behind the principal
+/// fence has to say so explicitly here.
+fn admin_store(orch: &OrchestrationService) -> grokptah_agent_bridge::orchestration::OrchStore {
+    let admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
+    orch.store_for_admin(&admin)
+        .expect("admin capability authorizes this host")
+        .clone()
+}
+
 /// Serializes home-override + instance-lock across tests (same as bridge lifecycle tests).
 fn setup_home() -> (tempfile::TempDir, ProcessEnvGuard) {
     let mut guard = ProcessEnvGuard::new();
@@ -270,6 +284,9 @@ async fn idempotency_conflict_and_replay() {
             bounds: RunBounds::default(),
         },
     );
+    let _admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
     let auth = orch.auth_header(Some("Bearer t")).unwrap();
     let r1 = orch
         .queue_prompt(
@@ -316,6 +333,12 @@ async fn mcp_queue_controls_are_scoped_versioned_and_replay_safe() {
     let session = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(session.id, ws.path()).unwrap();
     let orch = orch_for(&host, &home, &ws, 4);
+    let _admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
+    let _admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
     let auth = orch.auth_header(Some("Bearer t")).unwrap();
 
     let first = orch
@@ -432,6 +455,12 @@ async fn desktop_writes_invalidate_a_coordinators_stale_queue_mutations() {
     let session = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(session.id, ws.path()).unwrap();
     let orch = orch_for(&host, &home, &ws, 4);
+    let _admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
+    let _admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
     let auth = orch.auth_header(Some("Bearer t")).unwrap();
 
     for text in ["alpha", "beta", "gamma"] {
@@ -561,6 +590,12 @@ async fn a_coordinator_cannot_schedule_a_locally_authored_command_entry() {
     let session = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(session.id, ws.path()).unwrap();
     let orch = orch_for(&host, &home, &ws, 4);
+    let _admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
+    let _admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
     let auth = orch.auth_header(Some("Bearer t")).unwrap();
 
     // The desktop is allowed to author these; the control plane is not.
@@ -692,6 +727,9 @@ async fn selecting_a_command_in_another_workspace_is_not_an_oracle() {
             bounds: RunBounds::default(),
         },
     );
+    let _admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
     let auth = orch.auth_header(Some("Bearer t")).unwrap();
 
     let run_next = orch
@@ -758,6 +796,12 @@ async fn a_coordinator_run_next_invalidates_a_stale_desktop_reorder() {
     let session = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(session.id, ws.path()).unwrap();
     let orch = orch_for(&host, &home, &ws, 4);
+    let _admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
+    let _admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
     let auth = orch.auth_header(Some("Bearer t")).unwrap();
 
     for text in ["alpha", "beta", "gamma"] {
@@ -844,6 +888,12 @@ async fn every_queue_mutation_receipt_reports_its_revision() {
     let session = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(session.id, ws.path()).unwrap();
     let orch = orch_for(&host, &home, &ws, 4);
+    let _admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
+    let _admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
     let auth = orch.auth_header(Some("Bearer t")).unwrap();
 
     let mut revisions = Vec::new();
@@ -956,6 +1006,9 @@ async fn workspace_mismatch_fail_closed() {
             bounds: RunBounds::default(),
         },
     );
+    let _admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
     let auth = orch.auth_header(Some("Bearer t")).unwrap();
     let listed = orch.list_sessions(&auth).unwrap();
     assert_eq!(listed["sessions"][0]["workspaceStatus"], "ready");
@@ -987,6 +1040,9 @@ async fn missing_session_workspace_is_not_controllable() {
             bounds: RunBounds::default(),
         },
     );
+    let _admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
     drop(ws);
 
     let auth = orch.auth_header(Some("Bearer t")).unwrap();
@@ -1018,6 +1074,9 @@ async fn reject_shell_and_admin_prompts() {
             bounds: RunBounds::default(),
         },
     );
+    let _admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
     let auth = orch.auth_header(Some("Bearer t")).unwrap();
     assert!(orch
         .queue_prompt(&auth, "a", session.id, ws.path(), "!rm -rf /".into(), false)
@@ -1058,6 +1117,7 @@ fn restart_interrupted_no_auto_resume() {
         workspace: "/w".into(),
         request_id: "q".into(),
         client_id: None,
+        client_lineage: None,
         state: RunState::Running,
         purpose: Default::default(),
         agent_id: None,
@@ -1101,6 +1161,7 @@ fn restart_clears_queued_admission_position() {
         workspace: "/w".into(),
         request_id: "q-restart".into(),
         client_id: Some("mcp".into()),
+        client_lineage: None,
         state: RunState::Queued,
         purpose: Default::default(),
         agent_id: None,
@@ -1146,9 +1207,16 @@ async fn interrupted_run_retry_is_explicit_linked_and_idempotent() {
     let session = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(session.id, ws.path()).unwrap();
     let orch = orch_for(&host, &home, &ws, 2);
+    let _admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
+    let admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
     let auth = orch.auth_header(Some("Bearer t")).unwrap();
     let source_id = "interrupted-source";
-    orch.store_unscoped()
+    orch.store_for_admin(&admin)
+        .unwrap()
         .save_run(&RunRecord {
             run_id: source_id.into(),
             session_id: session.id,
@@ -1158,6 +1226,7 @@ async fn interrupted_run_retry_is_explicit_linked_and_idempotent() {
                 .to_string(),
             request_id: "source-request".into(),
             client_id: Some("mcp".into()),
+            client_lineage: None,
             state: RunState::Interrupted,
             purpose: Default::default(),
             agent_id: None,
@@ -1308,6 +1377,9 @@ async fn e2e_mcp_client_valid_and_invalid_token() {
             bounds: RunBounds::default(),
         },
     );
+    let _admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
     let srv = start_control_server(orch.clone(), 0).await.unwrap();
     let url = format!("http://{}/mcp", srv.addr);
     let client = reqwest::Client::new();
@@ -1453,6 +1525,12 @@ async fn submit_task_reaches_terminal_offline() {
     let session = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(session.id, ws.path()).unwrap();
     let orch = orch_for(&host, &home, &ws, 4);
+    let _admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
+    let _admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
     let auth = orch.auth_header(Some("Bearer t")).unwrap();
     let resp = orch
         .submit_task(
@@ -1569,6 +1647,12 @@ async fn submit_duration_limit_reached() {
     let session = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(session.id, ws.path()).unwrap();
     let orch = orch_for(&host, &home, &ws, 4);
+    let _admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
+    let _admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
     let auth = orch.auth_header(Some("Bearer t")).unwrap();
     let resp = orch
         .submit_task(
@@ -1599,6 +1683,12 @@ async fn submit_session_busy_and_capacity() {
     host.session_set_cwd(s1.id, ws.path()).unwrap();
     host.session_set_cwd(s2.id, ws.path()).unwrap();
     let orch = orch_for(&host, &home, &ws, 1);
+    let _admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
+    let _admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
     let auth = orch.auth_header(Some("Bearer t")).unwrap();
 
     let _r1 = orch
@@ -1654,6 +1744,12 @@ async fn cancel_isolates_sessions() {
     host.session_set_cwd(a.id, ws.path()).unwrap();
     host.session_set_cwd(b.id, ws.path()).unwrap();
     let orch = orch_for(&host, &home, &ws, 4);
+    let _admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
+    let _admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
     let auth = orch.auth_header(Some("Bearer t")).unwrap();
 
     let ra = orch
@@ -1708,6 +1804,12 @@ async fn steer_via_orchestration_service() {
     let session = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(session.id, ws.path()).unwrap();
     let orch = orch_for(&host, &_home, &ws, 4);
+    let _admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
+    let _admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
     let auth = orch.auth_header(Some("Bearer t")).unwrap();
 
     // Idle session → steer defers to queue (non-cancelling).
@@ -1804,6 +1906,12 @@ fn run_event_pages_filter_before_limit_across_sessions() {
     let session = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(session.id, ws.path()).unwrap();
     let orch = orch_for(&host, &home, &ws, 4);
+    let _admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
+    let admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
     let auth = orch.auth_header(Some("Bearer t")).unwrap();
 
     let other_session = Uuid::new_v4();
@@ -1840,7 +1948,8 @@ fn run_event_pages_filter_before_limit_across_sessions() {
     let end_seq = bus.current_seq();
 
     let run_id = Uuid::new_v4().to_string();
-    orch.store_unscoped()
+    orch.store_for_admin(&admin)
+        .unwrap()
         .save_run(&RunRecord {
             run_id: run_id.clone(),
             session_id: session.id,
@@ -1856,6 +1965,7 @@ fn run_event_pages_filter_before_limit_across_sessions() {
             // covered deliberately in tests/principal_authority.rs, and this
             // test is about event-page filtering, not attribution.
             client_id: Some("mcp".into()),
+            client_lineage: None,
             state: RunState::Completed,
             purpose: Default::default(),
             agent_id: None,
@@ -1916,6 +2026,12 @@ async fn capacity_race_against_real_submit_task() {
         sessions.push(s.id);
     }
     let orch = orch_for(&host, &home, &ws, 2);
+    let _admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
+    let _admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
     let auth = orch.auth_header(Some("Bearer t")).unwrap();
 
     let mut futs = Vec::new();
@@ -1973,6 +2089,12 @@ async fn queued_admission_is_bounded_fair_and_cancellable() {
         host.session_set_cwd(session.id, ws.path()).unwrap();
     }
     let orch = orch_for(&host, &home, &ws, 1);
+    let _admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
+    let _admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
     let auth = orch.auth_header(Some("Bearer t")).unwrap();
     let bounds = Some(json!({
         "maxPromptBytes": 10000,
@@ -2141,6 +2263,12 @@ async fn admitted_run_reserves_session_against_desktop_prompt() {
     let session = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(session.id, ws.path()).unwrap();
     let orch = orch_for(&host, &home, &ws, 2);
+    let _admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
+    let _admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
     let auth = orch.auth_header(Some("Bearer t")).unwrap();
     let accepted = orch
         .submit_task(
@@ -2174,6 +2302,12 @@ async fn concurrent_same_session_submits_accept_exactly_one() {
     let session = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(session.id, ws.path()).unwrap();
     let orch = orch_for(&host, &home, &ws, 4);
+    let _admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
+    let _admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
     let auth = orch.auth_header(Some("Bearer t")).unwrap();
     let one = orch.submit_task(
         &auth,
@@ -2230,7 +2364,7 @@ async fn capacity_is_shared_across_control_service_instances() {
     let two = OrchestrationService::new(
         host.clone(),
         host.event_bus(),
-        one.store_unscoped().clone(),
+        admin_store(&one),
         OrchestrationConfig {
             bearer_token: "t".into(),
             allowlist: WorkspaceAllowlist::new([ws.path().to_path_buf()]),
@@ -2290,7 +2424,7 @@ async fn pending_admission_bound_is_shared_across_control_services() {
     let two = OrchestrationService::new(
         host.clone(),
         host.event_bus(),
-        one.store_unscoped().clone(),
+        admin_store(&one),
         OrchestrationConfig {
             bearer_token: "t".into(),
             allowlist: WorkspaceAllowlist::new([ws.path().to_path_buf()]),
@@ -2404,7 +2538,7 @@ async fn global_scheduler_fairness_spans_control_services() {
     let two = OrchestrationService::new(
         host.clone(),
         host.event_bus(),
-        one.store_unscoped().clone(),
+        admin_store(&one),
         OrchestrationConfig {
             bearer_token: "t".into(),
             allowlist: WorkspaceAllowlist::new([ws.path().to_path_buf()]),
@@ -2567,7 +2701,7 @@ async fn dropping_control_service_releases_pending_admission_slot() {
     let queued_service = OrchestrationService::new(
         host.clone(),
         host.event_bus(),
-        primary.store_unscoped().clone(),
+        admin_store(&primary),
         OrchestrationConfig {
             bearer_token: "t".into(),
             allowlist: WorkspaceAllowlist::new([ws.path().to_path_buf()]),
@@ -2634,6 +2768,12 @@ async fn agent_progress_is_durable_outside_event_retention() {
     let session = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(session.id, ws.path()).unwrap();
     let orch = orch_for(&host, &home, &ws, 2);
+    let _admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
+    let _admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
     let auth = orch.auth_header(Some("Bearer t")).unwrap();
     let accepted = orch
         .submit_task(
@@ -2680,6 +2820,12 @@ async fn submit_round_limit_reached_via_wired_max_rounds() {
     let session = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(session.id, ws.path()).unwrap();
     let orch = orch_for(&host, &home, &ws, 4);
+    let _admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
+    let _admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
     let auth = orch.auth_header(Some("Bearer t")).unwrap();
     // Offline path honors turn_max_rounds for simulate_tool_rounds prompts.
     let resp = orch
@@ -2764,6 +2910,9 @@ async fn token_ceiling_wins_over_round_limit_after_last_round_tool_calls() {
             },
         },
     );
+    let _admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
     let auth = orch.auth_header(Some("Bearer t")).unwrap();
     let accepted = orch
         .submit_task(
@@ -2861,6 +3010,9 @@ async fn bounded_compaction_uses_durable_admission_and_stops_before_the_main_mod
             },
         },
     );
+    let _admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
     let auth = orch.auth_header(Some("Bearer t")).unwrap();
     let accepted = orch
         .submit_task(
@@ -2900,6 +3052,12 @@ async fn run_next_invalidates_a_stale_reorder_revision() {
     let session = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(session.id, ws.path()).unwrap();
     let orch = orch_for(&host, &home, &ws, 4);
+    let _admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
+    let _admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
     let auth = orch.auth_header(Some("Bearer t")).unwrap();
 
     for text in ["alpha", "beta", "gamma"] {

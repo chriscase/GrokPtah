@@ -36,6 +36,64 @@
 //! a lower one does not make it someone else's. (Concept taken from draft #474;
 //! its duplicate epoch type is deliberately not taken.)
 //!
+//! # What the compiler proves
+//!
+//! These are compile-time checks, not source-text scans: `cargo test` runs
+//! them as doc tests, and each one fails the build if the hostile call ever
+//! starts compiling.
+//!
+//! An identity cannot be fabricated by struct literal:
+//!
+//! ```compile_fail
+//! use grokptah_agent_bridge::orchestration::AuthContext;
+//! let _ = AuthContext { owner_id: "root".into() };
+//! ```
+//!
+//! Nor can a legitimately held identity be rewritten to name another
+//! principal:
+//!
+//! ```compile_fail
+//! fn impersonate(auth: &mut grokptah_agent_bridge::orchestration::AuthContext) {
+//!     auth.owner_id = "root".into();
+//! }
+//! ```
+//!
+//! A scope binding cannot be minted for a session nobody authorized:
+//!
+//! ```compile_fail
+//! use grokptah_agent_bridge::orchestration::VerifiedPrincipal;
+//! let _ = VerifiedPrincipal::bind(todo!(), uuid::Uuid::new_v4(), std::path::Path::new("/"));
+//! ```
+//!
+//! A credential cannot be minted without host-admin authority:
+//!
+//! ```compile_fail
+//! use grokptah_agent_bridge::orchestration::AuthCredential;
+//! let _ = AuthCredential::mint("primary", "secret");
+//! ```
+//!
+//! An admin capability cannot be conjured:
+//!
+//! ```compile_fail
+//! use grokptah_agent_bridge::orchestration::HostAdmin;
+//! let _ = HostAdmin::issue(uuid::Uuid::new_v4());
+//! ```
+//!
+//! Nor can a generation be advanced or adopted from outside the fence:
+//!
+//! ```compile_fail
+//! use grokptah_agent_bridge::orchestration::AuthGeneration;
+//! let _ = AuthGeneration::new_authority();
+//! ```
+//!
+//! And authority configuration cannot be replaced without the capability:
+//!
+//! ```compile_fail
+//! fn rotate(orch: &grokptah_agent_bridge::orchestration::OrchestrationService) {
+//!     orch.set_token("attacker-chosen".into()).unwrap();
+//! }
+//! ```
+//!
 //! # Restart
 //!
 //! The generation is durable. On restart the host re-adopts its authority
@@ -167,13 +225,23 @@ impl AuthGeneration {
         }
     }
 
-    /// Durable form. Crate-internal: this is the only way the lineage id leaves
-    /// the fence, and it goes straight to the host's own private state file.
-    pub(super) fn to_durable(self) -> DurableAuthority {
+    /// Durable form, co-committed with the credential bindings it authorizes.
+    ///
+    /// Crate-internal: this is the only way the lineage id leaves the fence,
+    /// and it goes straight to the host's own private state file. Taking the
+    /// bindings here rather than persisting them separately is what makes the
+    /// generation and the configuration it authorizes one atomic fact.
+    pub(super) fn to_durable(
+        self,
+        credentials: Vec<DurableCredential>,
+        quarantined_lineages: Vec<Uuid>,
+    ) -> DurableAuthority {
         DurableAuthority {
             authority: self.authority,
             epoch: self.epoch,
             policy_revision: self.policy_revision,
+            credentials,
+            quarantined_lineages,
         }
     }
 
@@ -203,16 +271,45 @@ impl AuthGeneration {
 /// Persisted under the orchestration store root so a restarted host keeps its
 /// lineage instead of silently becoming a different authority that old records
 /// would then be re-attributed to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DurableAuthority {
     pub authority: Uuid,
     pub epoch: u64,
     pub policy_revision: u64,
+    /// The credential bindings live under this lineage right now.
+    ///
+    /// This is what makes a credential *incarnation* survive a restart while
+    /// still dying on remove/re-add: a restart re-adopts the bindings recorded
+    /// here, and an alias that is not in this list has no incarnation to
+    /// inherit, so re-registering it mints a new one.
+    ///
+    /// Co-committed with the generation in a single atomic write, so the
+    /// generation can never be durable while the bindings it authorizes are
+    /// not (or the reverse).
+    #[serde(default)]
+    pub credentials: Vec<DurableCredential>,
+    /// Aliases whose durable work is quarantined pending an explicit operator
+    /// migration. Populated when a lineage is re-established, so records from
+    /// the previous lineage are never silently re-attributed.
+    #[serde(default)]
+    pub quarantined_lineages: Vec<Uuid>,
+}
+
+/// One credential binding as persisted under a lineage.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DurableCredential {
+    pub id: String,
+    pub incarnation: Uuid,
+    /// Digest of the secret this incarnation was minted for. A changed secret
+    /// is a different credential, so it cannot inherit the incarnation and
+    /// therefore cannot inherit the previous incarnation's durable work.
+    pub token_digest: String,
 }
 
 impl DurableAuthority {
-    pub(super) fn into_generation(self) -> AuthGeneration {
+    pub(super) fn generation(&self) -> AuthGeneration {
         AuthGeneration::adopt(self.authority, self.epoch, self.policy_revision)
     }
 }
@@ -282,7 +379,20 @@ impl std::fmt::Debug for AuthCredential {
 }
 
 impl AuthCredential {
-    pub fn new(id: impl Into<String>, token: impl Into<String>) -> Result<Self, OrchError> {
+    /// Declare a credential. Requires host-admin authority (#477 P0-3).
+    ///
+    /// Credentials are part of the authority configuration, so minting one is
+    /// an administrative act, not something any holder of the crate can do. The
+    /// admin capability is issued once to whoever constructed the host.
+    pub fn declare(
+        _admin: &HostAdmin,
+        id: impl Into<String>,
+        token: impl Into<String>,
+    ) -> Result<Self, OrchError> {
+        Self::mint(id, token)
+    }
+
+    pub(super) fn mint(id: impl Into<String>, token: impl Into<String>) -> Result<Self, OrchError> {
         let id = id.into().trim().to_string();
         let token = token.into().trim().to_string();
         if id.is_empty()
@@ -313,9 +423,39 @@ impl AuthCredential {
         &self.id
     }
 
-    /// This registration of the credential id. Not stable across remove/re-add.
+    /// This registration of the credential id.
+    ///
+    /// Stable across restart (the binding is persisted under the lineage) and
+    /// *not* stable across remove/re-add or a secret change: both mint a new
+    /// incarnation, so durable work bound to the previous one cannot be reached
+    /// by re-registering the alias.
     pub(super) fn incarnation(&self) -> Uuid {
         self.incarnation
+    }
+
+    /// Adopt a persisted incarnation for this credential.
+    ///
+    /// Only ever called with a binding whose alias *and* secret digest match,
+    /// so adopting cannot hand one credential another's durable work.
+    pub(super) fn adopt_incarnation(&mut self, incarnation: Uuid) {
+        self.incarnation = incarnation;
+    }
+
+    /// Digest of the secret, for durable binding. Never the secret itself.
+    pub(super) fn token_digest(&self) -> String {
+        let mut digest = Sha256::new();
+        digest.update(b"grokptah-credential-token-v1\0");
+        digest.update(self.token.as_bytes());
+        format!("ct1-{:x}", digest.finalize())
+    }
+
+    /// The durable binding for this credential under the current lineage.
+    pub(super) fn to_durable(&self) -> DurableCredential {
+        DurableCredential {
+            id: self.id.clone(),
+            incarnation: self.incarnation,
+            token_digest: self.token_digest(),
+        }
     }
 
     pub fn token(&self) -> &str {
@@ -433,15 +573,26 @@ pub struct Delegation {
     /// Generation the grant was minted under. A rotation invalidates the
     /// delegation exactly as it invalidates the delegator's own identity.
     generation: AuthGeneration,
+    /// The exact resource the grant reaches: one session in one workspace.
+    ///
+    /// Without this a delegation was principal-scoped only, so a grant made for
+    /// one session let the delegate read every session the delegator could.
+    /// Binding the resource at mint time makes the grant no wider than the
+    /// thing it was issued for.
+    session_id: Uuid,
+    workspace_alias: String,
 }
 
 impl Delegation {
+    #[allow(clippy::too_many_arguments)] // Every input is part of the grant.
     pub(super) fn mint(
         delegator: &AuthContext,
         delegate: impl Into<String>,
         limit: DelegationLimit,
         ttl_seconds: i64,
         now: DateTime<Utc>,
+        session_id: Uuid,
+        workspace_alias: String,
     ) -> Result<Self, OrchError> {
         let delegate = delegate.into().trim().to_string();
         if delegate.is_empty() || delegate.len() > 128 {
@@ -479,7 +630,23 @@ impl Delegation {
             limit,
             expires_at: now + ChronoDuration::seconds(ttl_seconds),
             generation: delegator.generation,
+            session_id,
+            workspace_alias,
         })
+    }
+
+    /// Whether this grant reaches the given resource. Anything else is refused
+    /// even though the delegate's identity is otherwise current.
+    pub(super) fn covers(&self, session_id: Uuid, workspace_alias: &str) -> bool {
+        self.session_id == session_id && self.workspace_alias == workspace_alias
+    }
+
+    pub fn session_id(&self) -> Uuid {
+        self.session_id
+    }
+
+    pub fn workspace_alias(&self) -> &str {
+        &self.workspace_alias
     }
 
     pub fn id(&self) -> Uuid {
@@ -605,6 +772,14 @@ impl AuthContext {
         self.credential_incarnation
     }
 
+    /// The credential registration durable records are stamped with.
+    ///
+    /// Projected so a caller can reason about which of its own records a
+    /// rotation or re-registration detached. An identifier, not a capability.
+    pub fn credential_lineage(&self) -> String {
+        self.credential_incarnation.to_string()
+    }
+
     pub fn owner_id(&self) -> &str {
         &self.owner_id
     }
@@ -628,6 +803,27 @@ impl AuthContext {
             .as_ref()
             .map(|d| d.limit.permits_effects())
             .unwrap_or(true)
+    }
+
+    /// Reject a delegated identity reaching outside the resource it was
+    /// granted for.
+    ///
+    /// A non-delegated identity is unaffected: its reach is decided by the
+    /// ordinary scope checks, not by a grant.
+    pub(super) fn check_delegation_resource(
+        &self,
+        session_id: Uuid,
+        workspace_alias: &str,
+    ) -> Result<(), OrchError> {
+        match self.delegation.as_ref() {
+            Some(delegation) if !delegation.covers(session_id, workspace_alias) => {
+                Err(OrchError::new(
+                    OrchErrorCode::ForbiddenScope,
+                    "delegated identity is bound to a different session or workspace",
+                ))
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Reject an identity whose delegation has run out.
@@ -920,6 +1116,42 @@ pub fn require_workspace_match(
 
 // ── narrow internal authority ───────────────────────────────────────────────
 
+/// The capability required to change a host's authority configuration (#477).
+///
+/// Credential install/rotation, owner change and workspace-policy change all
+/// replace *who* the host will honour, so they are administrative acts rather
+/// than ordinary API calls. Before this existed they were plain `pub` methods:
+/// anything holding an `Arc<OrchestrationService>` could install its own
+/// credential and then authenticate as a principal of its choosing, which made
+/// the whole fence bypassable from inside the process.
+///
+/// There is no public constructor. The host issues exactly one of these, to
+/// whoever constructed it, via `OrchestrationService::take_host_admin`. That is
+/// a one-shot: a second caller gets `None`, so a component that did not build
+/// the host cannot obtain admin authority even if it can reach the service.
+///
+/// The capability is bound to the *service instance*, not to its authority
+/// lineage. Two services constructed over one host share a durable store and
+/// therefore share a lineage, so a lineage-bound capability could be minted by
+/// standing up a second service and then used against the first. An
+/// instance-bound one cannot: each construction gets its own unguessable id.
+///
+/// It is deliberately neither `Clone` nor `Copy`.
+#[derive(Debug)]
+pub struct HostAdmin {
+    instance: Uuid,
+}
+
+impl HostAdmin {
+    pub(super) fn issue(instance: Uuid) -> Self {
+        Self { instance }
+    }
+
+    pub(super) fn authorizes(&self, instance: Uuid) -> bool {
+        self.instance == instance
+    }
+}
+
 /// Authority for the host's own unauthenticated readiness probe.
 ///
 /// Deliberately *not* an [`AuthContext`]. The readiness path used to fabricate
@@ -942,144 +1174,12 @@ impl ReadinessAuthority {
 }
 
 #[cfg(test)]
-mod fence_shape {
-    //! Mechanical proof that the identity types cannot be constructed by a
-    //! caller.
-    //!
-    //! Rust's own privacy rules are the real fence; this reads the module's
-    //! source so that *weakening* them is a test failure rather than a silent
-    //! change. A `pub` field on any identity type would let a holder of a
-    //! legitimate identity rewrite its owner or principal, and a public
-    //! constructor would let a caller assert an identity outright — both are
-    //! exactly the holes #477 exists to close, and neither produces a
-    //! compile error anywhere on its own.
-
-    /// This file minus this module and the behaviour tests below it, so the
-    /// assertions cannot match the string literals they are written with.
-    fn fence_source() -> &'static str {
-        let src = include_str!("authz.rs");
-        let cut = src
-            .find("mod fence_shape")
-            .expect("this module is declared in this file");
-        &src[..cut]
-    }
-
-    /// Every type whose construction must stay host-issued.
-    const IDENTITY_TYPES: &[&str] = &[
-        "AuthGeneration",
-        "AuthContext",
-        "VerifiedPrincipal",
-        "PrincipalScope",
-        "AuthCredential",
-        "Delegation",
-        "ReadinessAuthority",
-    ];
-
-    /// The field list of `name`, with the declaration itself removed so the
-    /// scan sees only what a caller could write to.
-    fn struct_fields(src: &str, name: &str) -> String {
-        let decl = format!("pub struct {name}");
-        let start = src
-            .find(&decl)
-            .unwrap_or_else(|| panic!("{name} must be declared in the fence"));
-        let rest = &src[start + decl.len()..];
-        let brace = rest.find('{');
-        let semi = rest.find(';');
-        match (brace, semi) {
-            // Tuple struct: the fields are inside the parentheses.
-            (brace, Some(sc)) if brace.is_none_or(|b| sc < b) => rest[..sc].to_string(),
-            (Some(b), _) => {
-                let end = rest[b..].find('}').expect("struct body must close") + b;
-                rest[b + 1..end].to_string()
-            }
-            _ => panic!("{name} declaration is not parseable"),
-        }
-    }
-
-    #[test]
-    fn identity_types_have_no_publicly_writable_fields() {
-        let src = fence_source();
-        for name in IDENTITY_TYPES {
-            let fields = struct_fields(src, name);
-            for line in fields.split([',', '\n']) {
-                let line = line.trim().trim_start_matches('(');
-                assert!(
-                    !line.starts_with("pub "),
-                    "{name} exposes a writable field `{line}`; a holder of a legitimate \
-                     identity could then rewrite it and impersonate another principal"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn identity_minting_is_never_public() {
-        let src = fence_source();
-        // Constructors and mutators that would let a caller assert, widen or
-        // rewind an identity. Each must be private or `pub(super)`.
-        const MINTERS: &[&str] = &[
-            "fn new_authority",
-            "fn adopt",
-            "fn next_epoch",
-            "fn next_policy",
-            "fn to_durable",
-            "fn issue_for_credential",
-            "fn issue_internal",
-            "fn delegated",
-            "fn bind",
-            "fn of",
-            "fn mint",
-            "fn authenticate_bearer",
-            "fn internal",
-        ];
-        for minter in MINTERS {
-            let mut found = false;
-            for line in src.lines() {
-                let line = line.trim();
-                if !line.contains(minter) {
-                    continue;
-                }
-                found = true;
-                assert!(
-                    !line.starts_with("pub fn"),
-                    "`{minter}` is publicly callable: `{line}`. Identity is issued, \
-                     never asserted, so every minting path must stay inside the fence"
-                );
-            }
-            assert!(
-                found,
-                "`{minter}` disappeared; update this list deliberately"
-            );
-        }
-    }
-
-    #[test]
-    fn accessors_never_hand_out_the_lineage_or_a_secret() {
-        let src = fence_source();
-        // `authority` is the lineage id and `token` is bearer material. Neither
-        // may leave through a public accessor: the lineage id would let a
-        // caller reconstruct a generation, and the token is the secret itself.
-        for banned in ["pub fn authority(", "pub fn token_of(", "pub fn secret("] {
-            assert!(
-                !src.contains(banned),
-                "`{banned}` would leak host-private material out of the fence"
-            );
-        }
-        assert!(
-            src.contains("pub fn token(&self)"),
-            "AuthCredential::token is the embedder's own configured secret and stays \
-             readable; if that changes, update this test deliberately"
-        );
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
 
     fn credential(id: &str, token: &str) -> AuthCredential {
-        AuthCredential::new(id, token).unwrap()
+        AuthCredential::mint(id, token).unwrap()
     }
 
     #[test]
@@ -1152,8 +1252,8 @@ mod tests {
         let b = AuthGeneration::new_authority();
         assert_ne!(a, b, "each lineage must be unique to its host");
 
-        let durable = a.next_epoch().unwrap().to_durable();
-        let resumed = durable.into_generation();
+        let durable = a.next_epoch().unwrap().to_durable(Vec::new(), Vec::new());
+        let resumed = durable.generation();
         assert_eq!(
             resumed,
             a.next_epoch().unwrap(),
@@ -1207,6 +1307,8 @@ mod tests {
         let delegator =
             AuthContext::issue_for_credential(&credential("laptop", "tok"), "acct", generation);
         let now = Utc::now();
+        let session = Uuid::new_v4();
+        let alias = workspace_alias(Path::new("/w"));
 
         assert!(
             Delegation::mint(
@@ -1214,7 +1316,9 @@ mod tests {
                 "helper",
                 DelegationLimit::ReadOnlyWithinScope,
                 0,
-                now
+                now,
+                session,
+                alias.clone(),
             )
             .is_err(),
             "a zero ttl is not a delegation"
@@ -1226,6 +1330,8 @@ mod tests {
                 DelegationLimit::ReadOnlyWithinScope,
                 MAX_DELEGATION_TTL_SECONDS + 1,
                 now,
+                session,
+                alias.clone(),
             )
             .is_err(),
             "ttl must be bounded"
@@ -1237,6 +1343,8 @@ mod tests {
                 DelegationLimit::ReadOnlyWithinScope,
                 60,
                 now,
+                session,
+                alias.clone(),
             )
             .is_err(),
             "delegating to yourself is not a narrowing"
@@ -1248,6 +1356,8 @@ mod tests {
             DelegationLimit::ReadOnlyWithinScope,
             60,
             now,
+            session,
+            alias.clone(),
         )
         .unwrap();
         let delegate = delegator.delegated(grant);
@@ -1282,7 +1392,9 @@ mod tests {
                 "third",
                 DelegationLimit::ReadOnlyWithinScope,
                 60,
-                now
+                now,
+                session,
+                alias.clone(),
             )
             .is_err(),
             "re-delegation would reset the expiry clock"

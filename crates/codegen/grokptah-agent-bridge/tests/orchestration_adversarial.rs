@@ -21,6 +21,20 @@ use uuid::Uuid;
 
 use common::ProcessEnvGuard;
 
+/// Take this host's one-shot admin capability and hand back its raw store.
+///
+/// Raw store access is admin-gated (#477 P0-4): the capability is issued once,
+/// to whoever constructed the host, so a test that reaches behind the principal
+/// fence has to say so explicitly here.
+fn admin_store(orch: &OrchestrationService) -> grokptah_agent_bridge::orchestration::OrchStore {
+    let admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
+    orch.store_for_admin(&admin)
+        .expect("admin capability authorizes this host")
+        .clone()
+}
+
 fn setup_home() -> (tempfile::TempDir, ProcessEnvGuard) {
     let mut guard = ProcessEnvGuard::new();
     let d = tempdir().unwrap();
@@ -239,7 +253,7 @@ async fn reads_require_run_ownership_no_global_events() {
     let foreign = OrchestrationService::new(
         host.clone(),
         host.event_bus(),
-        orch.store_unscoped().clone(),
+        admin_store(&orch),
         OrchestrationConfig {
             bearer_token: "secret-token-adversarial-196".into(),
             allowlist: WorkspaceAllowlist::new([other.path().to_path_buf()]),
@@ -590,7 +604,7 @@ async fn journal_rollover_preserves_durable_aggregates() {
     // Poll briefly for the production aggregator task to flush.
     let mut aggs_ok = false;
     for _ in 0..40 {
-        let run = orch.store_unscoped().load_run(&run_id).unwrap().unwrap();
+        let run = admin_store(&orch).load_run(&run_id).unwrap().unwrap();
         if !run.aggregates.changes.is_empty() {
             aggs_ok = true;
             break;
@@ -759,7 +773,7 @@ async fn control_secret_redacted_on_shared_host_bus() {
         });
     tokio::time::sleep(Duration::from_millis(100)).await;
     let run_id = accepted["runId"].as_str().unwrap();
-    let durable = serde_json::to_string(&orch.store_unscoped().load_run(run_id).unwrap()).unwrap();
+    let durable = serde_json::to_string(&admin_store(&orch).load_run(run_id).unwrap()).unwrap();
     assert!(
         !durable.contains(token),
         "control token leaked into run data"

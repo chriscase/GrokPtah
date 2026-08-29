@@ -92,7 +92,6 @@ async fn reference_coordinator_campaign_is_protocol_complete() {
         .unwrap();
     let interrupted_run_id = "coordinator-interrupted-source";
     let store = OrchStore::open(home.path().join("orch")).unwrap();
-    service_store_seed(&store, interrupted_run_id, session.id, workspace.path());
     let service = OrchestrationService::new(
         host.clone(),
         host.event_bus(),
@@ -107,6 +106,33 @@ async fn reference_coordinator_campaign_is_protocol_complete() {
             bounds: RunBounds::default(),
         },
     );
+    // Seed the interrupted source Run *after* the service exists, stamped with
+    // the credential registration the harness will authenticate as. Durable
+    // records carry the credential lineage (#477), so a record seeded with no
+    // lineage is quarantined and `ptah_retry_run` correctly refuses it — the
+    // fixture has to reproduce what the host itself writes.
+    {
+        let admin = service
+            .take_host_admin()
+            .expect("the constructing host holds the one-shot admin capability");
+        let auth = service
+            .auth_header(Some("Bearer coordinator-campaign-token"))
+            .expect("the configured bearer authenticates");
+        let lineage = service
+            .scoped_reads(&auth, session.id, workspace.path())
+            .expect("the campaign workspace is in the allowlist")
+            .identity()["lineage"]
+            .as_str()
+            .expect("the scoped identity projects its credential lineage")
+            .to_string();
+        service_store_seed(
+            service.store_for_admin(&admin).unwrap(),
+            interrupted_run_id,
+            session.id,
+            workspace.path(),
+            &lineage,
+        );
+    }
     let server = start_control_server(service, 0).await.unwrap();
     let harness = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/mcp_sdk_interop/run_coordinator_campaign.mjs");
@@ -180,6 +206,7 @@ fn service_store_seed(
     run_id: &str,
     session_id: uuid::Uuid,
     workspace: &std::path::Path,
+    client_lineage: &str,
 ) {
     store
         .save_run(&RunRecord {
@@ -191,6 +218,7 @@ fn service_store_seed(
                 .to_string(),
             request_id: "coordinator-interrupted-request".into(),
             client_id: Some("mcp".into()),
+            client_lineage: Some(client_lineage.to_string()),
             state: RunState::Interrupted,
             purpose: Default::default(),
             agent_id: None,

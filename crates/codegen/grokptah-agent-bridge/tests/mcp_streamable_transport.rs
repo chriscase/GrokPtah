@@ -23,6 +23,20 @@ use tempfile::tempdir;
 
 use common::ProcessEnvGuard;
 
+/// Take this host's one-shot admin capability and hand back its raw store.
+///
+/// Raw store access is admin-gated (#477): the capability is issued once, to
+/// whoever constructed the host, so reaching behind the principal fence is an
+/// explicit act at every call site.
+fn admin_store(orch: &OrchestrationService) -> grokptah_agent_bridge::orchestration::OrchStore {
+    let admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
+    orch.store_for_admin(&admin)
+        .expect("admin capability authorizes this host")
+        .clone()
+}
+
 fn setup() -> (
     tempfile::TempDir,
     ProcessEnvGuard,
@@ -52,6 +66,9 @@ fn setup() -> (
             bounds: RunBounds::default(),
         },
     );
+    let _admin = orch
+        .take_host_admin()
+        .expect("the constructing host holds the one-shot admin capability");
     guard.set("GROKPTAH_AGENT_OFFLINE", "1");
     (home, guard, host, ws, orch)
 }
@@ -1214,7 +1231,7 @@ async fn http_retry_interrupted_run_is_explicit_and_idempotent() {
     let session = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(session.id, ws.path()).unwrap();
     let source_id = "http-interrupted-source";
-    orch.store_unscoped()
+    admin_store(&orch)
         .save_run(&RunRecord {
             run_id: source_id.into(),
             session_id: session.id,
@@ -1224,6 +1241,7 @@ async fn http_retry_interrupted_run_is_explicit_and_idempotent() {
                 .to_string(),
             request_id: "http-source-request".into(),
             client_id: Some("mcp".into()),
+            client_lineage: None,
             state: RunState::Interrupted,
             purpose: Default::default(),
             agent_id: None,
@@ -1462,7 +1480,7 @@ async fn mcp_isolated_run_review_approval_and_restart_promotion() {
         .await;
     assert!(stale.is_err(), "tampered worktree must fail closed");
     std::fs::write(&isolated_file, "hello from isolated run").unwrap();
-    orch.store_unscoped()
+    admin_store(&orch)
         .update_run(&run_id, |run| {
             run.approval.as_mut().unwrap().expires_at = Utc::now() - ChronoDuration::seconds(1);
             Ok(())
@@ -1481,7 +1499,7 @@ async fn mcp_isolated_run_review_approval_and_restart_promotion() {
         )
         .await;
     assert!(expired.is_err(), "expired approval must fail closed");
-    orch.store_unscoped()
+    admin_store(&orch)
         .update_run(&run_id, |run| {
             run.approval.as_mut().unwrap().expires_at = Utc::now() + ChronoDuration::minutes(5);
             Ok(())
@@ -1558,7 +1576,7 @@ async fn mcp_isolated_run_review_approval_and_restart_promotion() {
         "hello from isolated run"
     );
     assert_eq!(
-        orch2.store_unscoped().list_runs().unwrap().len(),
+        admin_store(&orch2).list_runs().unwrap().len(),
         1,
         "one durable MCP run, no desktop duplicate"
     );

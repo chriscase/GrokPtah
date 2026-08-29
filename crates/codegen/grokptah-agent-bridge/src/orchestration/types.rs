@@ -419,6 +419,19 @@ pub struct RunRecord {
     pub workspace: String,
     pub request_id: String,
     pub client_id: Option<String>,
+    /// Credential *incarnation* that admitted this Run (#477).
+    ///
+    /// `client_id` alone is a stable alias, so a credential removed and
+    /// re-registered under the same alias would inherit the previous
+    /// registration's work. The lineage pins the record to the exact
+    /// registration that created it; a record whose lineage is not a live
+    /// binding is quarantined rather than attributed to whoever holds the
+    /// alias now.
+    ///
+    /// `None` marks a record written before lineage binding existed. Those are
+    /// quarantined too — never silently adopted.
+    #[serde(default)]
+    pub client_lineage: Option<String>,
     pub state: RunState,
     /// Immutable host-authored capability class for this Run.
     #[serde(default)]

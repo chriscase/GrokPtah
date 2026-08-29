@@ -17,8 +17,9 @@ use crate::session::{SessionKind, WorkspaceStatus};
 
 use super::authz::{
     authenticate_bearer, canonical_workspace, require_workspace_match, AuthContext, AuthCredential,
-    AuthGeneration, AuthorityOrigin, Delegation, DelegationLimit, PrincipalProvenance,
-    ReadinessAuthority, VerifiedPrincipal, WorkspaceAllowlist, NATIVE_EXECUTOR_PRINCIPAL,
+    AuthGeneration, AuthorityOrigin, Delegation, DelegationLimit, DurableCredential, HostAdmin,
+    PrincipalProvenance, ReadinessAuthority, VerifiedPrincipal, WorkspaceAllowlist,
+    NATIVE_EXECUTOR_PRINCIPAL,
 };
 use super::managed::{
     assemble_managed_run_input, managed_execution_eligible, select_relevant_managed_messages,
@@ -103,6 +104,24 @@ pub struct OrchestrationService {
     auth_generation: Mutex<AuthGeneration>,
     /// How this host's lineage was established at startup.
     authority_origin: AuthorityOrigin,
+    /// Set when the host cannot make its authority durable (#477 P0-2).
+    ///
+    /// A host that cannot persist its lineage must not keep issuing identities:
+    /// a later restart would re-adopt an epoch that identities have already
+    /// been issued under, and records written meanwhile would be attributable
+    /// to a lineage no one can verify. While sealed, no identity is issued and
+    /// every guard refuses.
+    sealed: Mutex<Option<String>>,
+    /// Lineages whose durable work is quarantined pending explicit migration.
+    quarantined_lineages: Mutex<Vec<Uuid>>,
+    /// Identity of *this* service instance.
+    ///
+    /// Two services over one host share a durable store and therefore a
+    /// lineage, so the admin capability is bound to the instance instead: a
+    /// second service cannot mint a capability the first will honour.
+    instance: Uuid,
+    /// The one-shot host-admin capability, taken by whoever built this host.
+    host_admin: Mutex<Option<HostAdmin>>,
     agent_owner_id: Mutex<String>,
     self_ref: Weak<OrchestrationService>,
     pending_admissions: Mutex<AdmissionQueueState>,
@@ -128,6 +147,21 @@ pub(crate) struct LiveRunScope {
     pub end_seq: Option<u64>,
 }
 
+/// Stand-in lineage recorded when a persisted authority record exists but
+/// cannot be parsed. Its id is unknown, so this marks "there was a lineage here
+/// and we could not read it" — enough for the quarantine to refuse every record
+/// that predates the re-established lineage.
+const UNREADABLE_LINEAGE: Uuid = Uuid::nil();
+
+/// What `establish_authority` worked out at startup.
+struct EstablishedAuthority {
+    generation: AuthGeneration,
+    origin: AuthorityOrigin,
+    /// Set when the lineage could not be persisted; the host serves nothing.
+    sealed: Option<String>,
+    quarantined_lineages: Vec<Uuid>,
+}
+
 /// Why a durable record cannot be attributed to any live principal (#477).
 ///
 /// Quarantined records are never handed to the current caller and never
@@ -142,12 +176,44 @@ pub enum QuarantineReason {
     /// Carries an attribution field that is present but empty, which no live
     /// principal alias can ever equal.
     BlankPrincipal,
+    /// Attributed to an alias but written before lineage binding existed, so
+    /// the exact credential registration that admitted it is unknown.
+    UnboundLineage,
+    /// Bound to a credential registration that is no longer live: the
+    /// credential was removed, its secret rotated, or its lineage
+    /// re-established. Re-registering the alias must not reach this work.
+    StaleLineage,
 }
 
-fn run_quarantine_reason(run: &RunRecord) -> Option<QuarantineReason> {
+impl QuarantineReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UnboundLegacyRecord => "unbound_legacy_record",
+            Self::BlankPrincipal => "blank_principal",
+            Self::UnboundLineage => "unbound_lineage",
+            Self::StaleLineage => "stale_lineage",
+        }
+    }
+}
+
+/// Why `run` cannot be attributed, given the credential registrations that are
+/// live right now.
+///
+/// `live_lineages` is the set of incarnations currently bound to a credential.
+/// A record naming one of them is attributable; anything else is quarantined.
+fn run_quarantine_reason(run: &RunRecord, live_lineages: &[String]) -> Option<QuarantineReason> {
     match run.client_id.as_deref() {
-        None => Some(QuarantineReason::UnboundLegacyRecord),
-        Some(principal) if principal.trim().is_empty() => Some(QuarantineReason::BlankPrincipal),
+        None => return Some(QuarantineReason::UnboundLegacyRecord),
+        Some(principal) if principal.trim().is_empty() => {
+            return Some(QuarantineReason::BlankPrincipal)
+        }
+        Some(_) => {}
+    }
+    match run.client_lineage.as_deref() {
+        None => Some(QuarantineReason::UnboundLineage),
+        Some(lineage) if !live_lineages.iter().any(|live| live == lineage) => {
+            Some(QuarantineReason::StaleLineage)
+        }
         Some(_) => None,
     }
 }
@@ -206,6 +272,10 @@ impl ScopedReads<'_> {
             "sessionId": self.principal.session_id(),
             "workspaceAlias": self.principal.workspace_alias(),
             "scope": self.principal.scope().as_str(),
+            // The credential registration durable records are stamped with.
+            // An identifier, not a capability: holding it grants nothing,
+            // because identities cannot be fabricated in the first place.
+            "lineage": self.principal.auth().credential_lineage(),
             "provenance": self.principal.generation().provenance(),
         })
     }
@@ -345,17 +415,20 @@ impl OrchestrationService {
         }
         config.max_concurrent_runs =
             host.configure_orchestration_capacity(config.max_concurrent_runs);
-        let auth_credentials = if config.bearer_token.is_empty() {
+        let mut auth_credentials = if config.bearer_token.is_empty() {
             Vec::new()
         } else {
-            vec![AuthCredential::new("primary", config.bearer_token.clone())
+            vec![AuthCredential::mint("primary", config.bearer_token.clone())
                 .expect("non-empty bearer token should form a primary credential")]
         };
         let workload_supervisor =
             WorkloadSupervisor::start(store.clone(), DEFAULT_WORKLOAD_RECONCILIATION_INTERVAL);
         let routine_supervisor =
             RoutineSupervisor::start(store.clone(), DEFAULT_ROUTINE_TICK_INTERVAL);
-        let (generation, authority_origin) = Self::establish_authority(&store);
+        let instance = Uuid::new_v4();
+        let established = Self::establish_authority(&store, &mut auth_credentials);
+        let generation = established.generation;
+        let authority_origin = established.origin;
         let service = Arc::new_cyclic(|self_ref| Self {
             host,
             bus,
@@ -364,6 +437,10 @@ impl OrchestrationService {
             auth_credentials: Mutex::new(auth_credentials),
             auth_generation: Mutex::new(generation),
             authority_origin,
+            sealed: Mutex::new(established.sealed.clone()),
+            quarantined_lineages: Mutex::new(established.quarantined_lineages.clone()),
+            instance,
+            host_admin: Mutex::new(Some(HostAdmin::issue(instance))),
             agent_owner_id: Mutex::new("primary".into()),
             self_ref: self_ref.clone(),
             pending_admissions: Mutex::new(AdmissionQueueState::default()),
@@ -1524,55 +1601,146 @@ impl OrchestrationService {
         self.manager_supervisor.lock().enabled = false;
     }
 
-    /// Raw, unscoped handle to the durable store.
+    /// Raw, unscoped handle to the durable store, gated on host admin.
     ///
     /// **Not an SDK surface.** The sanctioned public read path is
     /// [`OrchestrationService::scoped_reads`], which hands out read DTOs bound
-    /// to a verified principal and exposes no mutation at all. This accessor
-    /// exists for the in-process host and this crate's own test harness, is
-    /// `#[doc(hidden)]`, and is named so that reaching raw store mutation is a
-    /// visible, deliberate act at every call site rather than the default.
+    /// to a verified principal and exposes no mutation at all. Raw store access
+    /// now requires the one-shot admin capability, so a component that can
+    /// reach the service but did not build the host cannot mutate records
+    /// behind the principal fence.
     #[doc(hidden)]
-    pub fn store_unscoped(&self) -> &OrchStore {
-        &self.store
+    pub fn store_for_admin(&self, admin: &HostAdmin) -> Result<&OrchStore, OrchError> {
+        self.require_host_admin(admin)?;
+        Ok(&self.store)
     }
 
     // ── the one authority fence (#477) ─────────────────────────────────
 
     /// Establish this host's authority lineage at startup.
     ///
-    /// A persisted lineage is re-adopted and advanced once, so no identity the
-    /// previous process issued is current and no work bound to a removed
-    /// credential id can be revived by re-registering that id. A missing record
-    /// is a first run. A record that exists but cannot be read or parsed is
-    /// *not* treated as a first run: that would silently hand the previous
-    /// lineage's records to a new authority, so a brand-new lineage is minted
-    /// and the origin says so.
-    fn establish_authority(store: &OrchStore) -> (AuthGeneration, AuthorityOrigin) {
-        let (generation, origin) = match store.load_authority() {
-            Ok(Some(record)) => match record.into_generation().next_epoch() {
-                Ok(next) => (next, AuthorityOrigin::Resumed),
-                // A persisted epoch at the ceiling cannot be advanced. Minting
-                // a new lineage invalidates strictly more than advancing would
-                // have, so it is the fail-closed answer, not a weakening.
-                Err(_) => (
+    /// A persisted lineage is re-adopted, its epoch advanced once (so no
+    /// identity the previous process issued is current), and its credential
+    /// bindings carried forward onto the credentials this host was configured
+    /// with — but only where alias *and* secret digest both match, so adopting
+    /// a binding can never hand one credential another's durable work.
+    ///
+    /// Three failures are handled distinctly, because conflating them is how
+    /// old work gets silently re-attributed:
+    ///
+    /// * **missing** — a first run. Mint a lineage; there is no prior work.
+    /// * **unreadable** — a lineage exists but cannot be trusted. Mint a new
+    ///   one *and quarantine the old* by recording it, so every record written
+    ///   under it is refused until an operator migrates it explicitly. The
+    ///   quarantine is what stops the new lineage from reminting ownership over
+    ///   work it never admitted.
+    /// * **unpersistable** — the lineage cannot be written. Seal the host: it
+    ///   serves no identities at all rather than running undurably.
+    fn establish_authority(
+        store: &OrchStore,
+        credentials: &mut [AuthCredential],
+    ) -> EstablishedAuthority {
+        let mut quarantined_lineages = Vec::new();
+        let (generation, origin, adopt) = match store.load_authority() {
+            Ok(Some(record)) => match record.generation().next_epoch() {
+                Ok(next) => {
+                    quarantined_lineages.extend(record.quarantined_lineages.iter().copied());
+                    (next, AuthorityOrigin::Resumed, record.credentials.clone())
+                }
+                // A persisted epoch at the ceiling cannot be advanced. A new
+                // lineage invalidates strictly more than advancing would have,
+                // and the old lineage is quarantined rather than inherited.
+                Err(_) => {
+                    quarantined_lineages.extend(record.quarantined_lineages.iter().copied());
+                    quarantined_lineages.push(record.authority);
+                    (
+                        AuthGeneration::new_authority(),
+                        AuthorityOrigin::ReestablishedFailClosed,
+                        Vec::new(),
+                    )
+                }
+            },
+            Ok(None) => (
+                AuthGeneration::new_authority(),
+                AuthorityOrigin::Fresh,
+                Vec::new(),
+            ),
+            Err(unreadable) => {
+                // The bytes exist but cannot be parsed. Any lineage id they
+                // held is unknown, so every pre-existing record is quarantined
+                // by the sentinel below: nothing is adopted, and a record is
+                // only readable once its lineage is a live binding again.
+                quarantined_lineages.push(UNREADABLE_LINEAGE);
+                let _ = unreadable;
+                (
                     AuthGeneration::new_authority(),
                     AuthorityOrigin::ReestablishedFailClosed,
-                ),
-            },
-            Ok(None) => (AuthGeneration::new_authority(), AuthorityOrigin::Fresh),
-            Err(_) => (
-                AuthGeneration::new_authority(),
-                AuthorityOrigin::ReestablishedFailClosed,
-            ),
+                    Vec::new(),
+                )
+            }
         };
-        if store.save_authority(generation.to_durable()).is_err() {
-            // The lineage is live but not durable. Every rotation persists
-            // before it takes effect, so rotations will keep failing closed
-            // rather than drifting; the origin reports the degraded state.
-            return (generation, AuthorityOrigin::ReestablishedFailClosed);
+
+        // Carry a persisted incarnation forward only when the alias *and* the
+        // secret digest both match. A re-registered alias with a new secret —
+        // or an alias absent from the persisted set because it was removed —
+        // gets the fresh incarnation it was minted with.
+        for credential in credentials.iter_mut() {
+            let digest = credential.token_digest();
+            if let Some(binding) = adopt
+                .iter()
+                .find(|b| b.id == credential.id() && b.token_digest == digest)
+            {
+                credential.adopt_incarnation(binding.incarnation);
+            }
         }
-        (generation, origin)
+
+        let bindings: Vec<DurableCredential> =
+            credentials.iter().map(AuthCredential::to_durable).collect();
+        let sealed = store
+            .save_authority(generation.to_durable(bindings, quarantined_lineages.clone()))
+            .err()
+            .map(|error| {
+                format!(
+                    "authority lineage is not durable ({}); the host refuses to issue identities",
+                    error.message
+                )
+            });
+
+        EstablishedAuthority {
+            generation,
+            origin,
+            sealed,
+            quarantined_lineages,
+        }
+    }
+
+    /// Refuse everything while the host cannot make its authority durable.
+    fn check_seal(&self) -> Result<(), OrchError> {
+        match self.sealed.lock().as_deref() {
+            Some(reason) => Err(OrchError::new(OrchErrorCode::Internal, reason.to_string())),
+            None => Ok(()),
+        }
+    }
+
+    /// Take the one-shot host-admin capability.
+    ///
+    /// Returns `Some` exactly once, to whoever constructed this host. Every
+    /// later caller gets `None`, so a component that can reach the service but
+    /// did not build it cannot change who the host honours.
+    pub fn take_host_admin(&self) -> Option<HostAdmin> {
+        self.host_admin.lock().take()
+    }
+
+    /// Reject an admin capability that belongs to a different host.
+    fn require_host_admin(&self, admin: &HostAdmin) -> Result<(), OrchError> {
+        if admin.authorizes(self.instance) {
+            Ok(())
+        } else {
+            Err(OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "host admin capability was issued by a different host instance",
+            ))
+        }
     }
 
     /// How this host's authority lineage was established at startup.
@@ -1611,6 +1779,7 @@ impl OrchestrationService {
     /// carried in the identity, and re-deriving it would mean holding bearer
     /// material past authentication.
     pub(crate) fn require_current_auth(&self, auth: &AuthContext) -> Result<(), OrchError> {
+        self.check_seal()?;
         let current = *self.auth_generation.lock();
         if auth.generation() != current {
             return Err(self.reject_auth("stale or foreign authentication identity"));
@@ -1699,7 +1868,10 @@ impl OrchestrationService {
         // that lands between the entry guard and the scope check must not
         // produce a binding under the old authority.
         self.require_current_auth(auth)?;
-        Ok(VerifiedPrincipal::bind(auth, session_id, workspace))
+        let principal = VerifiedPrincipal::bind(auth, session_id, workspace);
+        // A delegated identity reaches only the resource its grant named.
+        auth.check_delegation_resource(session_id, principal.workspace_alias())?;
+        Ok(principal)
     }
 
     /// The sanctioned public read surface: read DTOs scoped to one verified
@@ -1746,16 +1918,57 @@ impl OrchestrationService {
     /// principal dimension on top of the session and workspace scope that the
     /// surrounding checks keep enforcing.
     fn require_run_owner(&self, auth: &AuthContext, run: &RunRecord) -> Result<(), OrchError> {
-        match run_quarantine_reason(run) {
-            Some(_) => Err(Self::unknown_run()),
-            None => {
-                let owner = run.client_id.as_deref().unwrap_or_default();
-                if owner == auth.principal() || Self::SHARED_RUN_PRINCIPALS.contains(&owner) {
-                    Ok(())
-                } else {
-                    Err(Self::unknown_run())
-                }
-            }
+        self.require_run_owner_with(auth, run, &self.live_lineages())
+    }
+
+    /// The live credential registrations, as durable lineage strings.
+    ///
+    /// Read once per listing rather than per record, so a list of N runs does
+    /// not re-lock the credential set N times.
+    fn live_lineages(&self) -> Vec<String> {
+        let mut lineages: Vec<String> = self
+            .auth_credentials
+            .lock()
+            .iter()
+            .map(|credential| credential.incarnation().to_string())
+            .collect();
+        // Host-internal principals authenticate by construction and are
+        // re-derived from the live generation, so their lineage is live
+        // whenever the generation is.
+        lineages.push(
+            AuthContext::issue_internal(
+                NATIVE_EXECUTOR_PRINCIPAL,
+                &self.agent_owner_id(),
+                *self.auth_generation.lock(),
+            )
+            .credential_incarnation()
+            .to_string(),
+        );
+        lineages
+    }
+
+    fn require_run_owner_with(
+        &self,
+        auth: &AuthContext,
+        run: &RunRecord,
+        live_lineages: &[String],
+    ) -> Result<(), OrchError> {
+        if run_quarantine_reason(run, live_lineages).is_some() {
+            return Err(Self::unknown_run());
+        }
+        let owner = run.client_id.as_deref().unwrap_or_default();
+        // Alias *and* lineage must both match. The alias alone is stable across
+        // remove/re-add, so checking it alone would let a re-registered
+        // credential inherit the previous registration's work.
+        if owner != auth.principal() && !Self::SHARED_RUN_PRINCIPALS.contains(&owner) {
+            return Err(Self::unknown_run());
+        }
+        if Self::SHARED_RUN_PRINCIPALS.contains(&owner) {
+            return Ok(());
+        }
+        match run.client_lineage.as_deref() {
+            Some(lineage) if lineage == auth.credential_incarnation().to_string() => Ok(()),
+            _ => Err(Self::unknown_run()),
         }
     }
 
@@ -1773,22 +1986,104 @@ impl OrchestrationService {
             .store
             .list_runs()
             .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
+        let live = self.live_lineages();
         let mut unbound = 0u64;
         let mut blank = 0u64;
+        let mut unbound_lineage = 0u64;
+        let mut stale_lineage = 0u64;
         for run in &runs {
-            match run_quarantine_reason(run) {
+            match run_quarantine_reason(run, &live) {
                 Some(QuarantineReason::UnboundLegacyRecord) => unbound += 1,
                 Some(QuarantineReason::BlankPrincipal) => blank += 1,
+                Some(QuarantineReason::UnboundLineage) => unbound_lineage += 1,
+                Some(QuarantineReason::StaleLineage) => stale_lineage += 1,
                 None => {}
             }
         }
         Ok(json!({
             "quarantine": {
                 "authorityOrigin": self.authority_origin.as_str(),
+                "quarantinedLineages": self.quarantined_lineages.lock().len(),
                 "unboundLegacyRecords": unbound,
                 "blankPrincipalRecords": blank,
-                "total": unbound + blank,
+                "unboundLineageRecords": unbound_lineage,
+                "staleLineageRecords": stale_lineage,
+                "total": unbound + blank + unbound_lineage + stale_lineage,
             }
+        }))
+    }
+
+    /// The explicit operator workflow for quarantined records (#477).
+    ///
+    /// Re-binds records that are quarantined *only* because their lineage is
+    /// unknown or stale onto a named live credential registration. This is the
+    /// one way old work becomes reachable again, and it is deliberately an
+    /// administrative act with a named target: nothing is ever adopted
+    /// implicitly by whoever happens to hold the alias now.
+    ///
+    /// Records quarantined for having no principal at all are *not* migrated —
+    /// there is no evidence of who they belonged to, so inventing an owner
+    /// would be exactly the re-attribution this fence exists to prevent.
+    pub fn migrate_quarantined_lineage(
+        &self,
+        admin: &HostAdmin,
+        alias: &str,
+        onto_credential_id: &str,
+    ) -> Result<serde_json::Value, OrchError> {
+        self.require_host_admin(admin)?;
+        self.check_seal()?;
+        let target = self
+            .auth_credentials
+            .lock()
+            .iter()
+            .find(|credential| credential.id() == onto_credential_id)
+            .map(|credential| credential.incarnation().to_string())
+            .ok_or_else(|| {
+                OrchError::new(
+                    OrchErrorCode::InvalidRequest,
+                    "migration target must be a live credential registration",
+                )
+            })?;
+        let live = self.live_lineages();
+        let runs = self
+            .store
+            .list_runs()
+            .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
+        let mut migrated = 0u64;
+        for run in runs {
+            if run.client_id.as_deref() != Some(alias) {
+                continue;
+            }
+            if !matches!(
+                run_quarantine_reason(&run, &live),
+                Some(QuarantineReason::UnboundLineage | QuarantineReason::StaleLineage)
+            ) {
+                continue;
+            }
+            let run_id = run.run_id.clone();
+            self.store
+                .update_run(&run_id, |record| {
+                    record.client_lineage = Some(target.clone());
+                    Ok(())
+                })
+                .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
+            migrated += 1;
+        }
+        self.audit(
+            "auth_migrate_lineage",
+            None,
+            None,
+            None,
+            "accepted",
+            None,
+            &format!(
+                "migrated {migrated} quarantined records from {alias} onto {onto_credential_id}"
+            ),
+        );
+        Ok(json!({
+            "migrated": migrated,
+            "alias": alias,
+            "ontoCredentialId": onto_credential_id,
         }))
     }
 
@@ -1816,27 +2111,41 @@ impl OrchestrationService {
     /// so a delegation can never reach anything the delegator could not. It is
     /// bound to the generation it was minted under, so any rotation revokes it,
     /// and it is audited at mint time.
+    #[allow(clippy::too_many_arguments)] // Every input is part of the grant.
     pub fn delegate(
         &self,
         auth: &AuthContext,
         delegate: &str,
         limit: DelegationLimit,
         ttl_seconds: i64,
+        session_id: Uuid,
+        workspace: &Path,
     ) -> Result<AuthContext, OrchError> {
         self.require_current_effect(auth)?;
-        let grant = Delegation::mint(auth, delegate, limit, ttl_seconds, Utc::now()).inspect_err(
-            |error| {
-                self.audit(
-                    "auth_delegate",
-                    None,
-                    None,
-                    None,
-                    "rejected",
-                    Some(error.code.as_str()),
-                    "delegation refused",
-                );
-            },
-        )?;
+        // The delegator must itself be authorized for the resource it is
+        // delegating: you cannot grant reach you do not have.
+        let claimed = self.authorize_work_read_scope(session_id, workspace)?;
+        let scope = self.bind_principal(auth, session_id, &claimed)?;
+        let grant = Delegation::mint(
+            auth,
+            delegate,
+            limit,
+            ttl_seconds,
+            Utc::now(),
+            session_id,
+            scope.workspace_alias().to_string(),
+        )
+        .inspect_err(|error| {
+            self.audit(
+                "auth_delegate",
+                None,
+                None,
+                None,
+                "rejected",
+                Some(error.code.as_str()),
+                "delegation refused",
+            );
+        })?;
         self.audit(
             "auth_delegate",
             None,
@@ -1874,30 +2183,51 @@ impl OrchestrationService {
     fn advance_authority(
         &self,
         policy_change: bool,
+        next_credentials: Option<&[AuthCredential]>,
         apply: impl FnOnce() -> Result<(), OrchError>,
     ) -> Result<(), OrchError> {
+        self.check_seal()?;
         let mut generation = self.auth_generation.lock();
         let next = if policy_change {
             generation.next_policy()?
         } else {
             generation.next_epoch()?
         };
-        self.store.save_authority(next.to_durable())?;
+        // Co-commit the generation with the credential bindings it authorizes.
+        // Persisting them separately would leave a window where the generation
+        // is durable but the registrations it admits are not, and a restart in
+        // that window would adopt an authority whose credentials it cannot
+        // reconstruct.
+        let bindings: Vec<DurableCredential> = match next_credentials {
+            Some(credentials) => credentials.iter().map(AuthCredential::to_durable).collect(),
+            None => self
+                .auth_credentials
+                .lock()
+                .iter()
+                .map(AuthCredential::to_durable)
+                .collect(),
+        };
+        let quarantined = self.quarantined_lineages.lock().clone();
+        self.store
+            .save_authority(next.to_durable(bindings, quarantined))?;
         apply()?;
         *generation = next;
         Ok(())
     }
 
-    pub fn set_token(&self, token: String) -> Result<(), OrchError> {
+    /// Replace the primary bearer credential. Requires host-admin authority.
+    pub fn set_token(&self, admin: &HostAdmin, token: String) -> Result<(), OrchError> {
+        self.require_host_admin(admin)?;
         let token = token.trim().to_string();
         // Build and validate before advancing so a rejected token changes
         // nothing, not even the generation.
         let credentials = if token.is_empty() {
             Vec::new()
         } else {
-            vec![AuthCredential::new("primary", token.clone())?]
+            vec![AuthCredential::mint("primary", token.clone())?]
         };
-        self.advance_authority(false, || {
+        let bindings = credentials.clone();
+        self.advance_authority(false, Some(&bindings), || {
             if !token.is_empty() {
                 self.bus.add_control_secrets([token.clone()]);
             }
@@ -1909,7 +2239,12 @@ impl OrchestrationService {
 
     /// Install named device/client credentials while retaining the existing
     /// primary-token configuration field for compatibility with embedders.
-    pub fn set_auth_credentials(&self, credentials: Vec<AuthCredential>) -> Result<(), OrchError> {
+    pub fn set_auth_credentials(
+        &self,
+        admin: &HostAdmin,
+        credentials: Vec<AuthCredential>,
+    ) -> Result<(), OrchError> {
+        self.require_host_admin(admin)?;
         if credentials.is_empty() {
             return Err(OrchError::new(
                 OrchErrorCode::InvalidRequest,
@@ -1931,7 +2266,8 @@ impl OrchestrationService {
             .expect("primary credential was checked above")
             .token()
             .to_string();
-        self.advance_authority(false, || {
+        let bindings = credentials.clone();
+        self.advance_authority(false, Some(&bindings), || {
             for credential in &credentials {
                 self.bus
                     .add_control_secrets([credential.token().to_string()]);
@@ -1944,7 +2280,8 @@ impl OrchestrationService {
 
     /// Changing the owner identity re-binds what every future identity asserts,
     /// so it is a policy rotation, not just a credential one.
-    pub fn set_agent_owner_id(&self, owner_id: String) -> Result<(), OrchError> {
+    pub fn set_agent_owner_id(&self, admin: &HostAdmin, owner_id: String) -> Result<(), OrchError> {
+        self.require_host_admin(admin)?;
         let owner_id = owner_id.trim().to_string();
         if owner_id.is_empty() || owner_id.len() > 128 {
             return Err(OrchError::new(
@@ -1952,7 +2289,7 @@ impl OrchestrationService {
                 "Agent owner id must be between 1 and 128 bytes",
             ));
         }
-        self.advance_authority(true, || {
+        self.advance_authority(true, None, || {
             *self.agent_owner_id.lock() = owner_id;
             Ok(())
         })
@@ -1964,8 +2301,13 @@ impl OrchestrationService {
 
     /// Replacing the workspace allowlist is a policy rotation: identities issued
     /// while the old allowlist was in force stop being current.
-    pub fn set_allowlist(&self, allowlist: WorkspaceAllowlist) -> Result<(), OrchError> {
-        self.advance_authority(true, || {
+    pub fn set_allowlist(
+        &self,
+        admin: &HostAdmin,
+        allowlist: WorkspaceAllowlist,
+    ) -> Result<(), OrchError> {
+        self.require_host_admin(admin)?;
+        self.advance_authority(true, None, || {
             self.config.lock().allowlist = allowlist;
             Ok(())
         })
@@ -2508,19 +2850,30 @@ impl OrchestrationService {
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
         let claimed = self.authorize_queue_request(session_id, workspace)?;
+        let live_lineages = self.live_lineages();
         let runs = self
             .store
             .list_runs()
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
             .into_iter()
             .filter(|run| {
-                run.session_id == session_id && run.workspace == claimed.display().to_string()
+                // Compare workspaces canonically, exactly as every other scope
+                // check in the tree does. An exact string compare silently
+                // hides a caller's *own* runs whenever the stored path and the
+                // claimed path differ only by canonicalization — which is the
+                // normal case wherever a temp or home directory is reached
+                // through a symlink (macOS `/var` -> `/private/var`).
+                run.session_id == session_id
+                    && super::workspaces_match(&run.workspace, &claimed.display().to_string())
             })
             // Listing is a read like any other: it must not surface runs the
             // caller could not fetch individually, or it becomes the oracle the
             // per-run denial is careful not to be. Quarantined records are
             // excluded here too, by the same check.
-            .filter(|run| self.require_run_owner(auth, run).is_ok())
+            .filter(|run| {
+                self.require_run_owner_with(auth, run, &live_lineages)
+                    .is_ok()
+            })
             .collect::<Vec<_>>();
         Ok(json!({ "runs": runs }))
     }
@@ -5223,10 +5576,15 @@ impl OrchestrationService {
                 max_rounds,
                 Some(request_id.into()),
                 // The continuation Run the host is about to create is this
-                // caller's work. Stamp it with the same public principal alias
-                // run ownership is checked against, so the coordinator owns the
-                // Run it just created instead of it landing on the desktop.
-                Some(auth.principal().to_string()),
+                // caller's work. Stamp it with the same alias *and* credential
+                // lineage run ownership is checked against, so the coordinator
+                // owns the Run it just created instead of it landing on the
+                // desktop — and a later re-registration of the alias cannot
+                // inherit it.
+                Some((
+                    auth.principal().to_string(),
+                    auth.credential_incarnation().to_string(),
+                )),
             )
             .await
         {
@@ -7234,7 +7592,6 @@ impl OrchestrationService {
         expected_agent_spec_revision: Option<u64>,
         proposal_only: bool,
     ) -> Result<serde_json::Value, OrchError> {
-        let _ = auth;
         let tool = idempotency_tool;
         if proposal_only && allow_queue {
             return Err(OrchError::new(
@@ -7297,6 +7654,31 @@ impl OrchestrationService {
             Ok(c) => c,
             Err(e) => return Err(finish_err(self, e)),
         };
+
+        // Ownership admission *before* any durable or effectful mutation
+        // (#477 P0-5). `begin_idempotency` writes a claim record and
+        // `ensure_session_agent` creates an Agent, so running the ownership
+        // check after them left a refused caller having already mutated the
+        // store. This read-only pre-check refuses first; the authoritative
+        // `claim_agent_owner` below still runs, so a racing owner change is
+        // caught too — but the ordinary refusal now costs nothing.
+        if let Some(agent_id) = self.host.existing_session_agent_id(session_id) {
+            if let Ok(Some(existing)) = self.store.load_agent(&agent_id) {
+                if existing
+                    .owner_principal_id
+                    .as_deref()
+                    .is_some_and(|owner| owner != auth.owner_id())
+                {
+                    return Err(finish_err(
+                        self,
+                        OrchError::new(
+                            OrchErrorCode::ForbiddenScope,
+                            "session Agent is owned by a different service account",
+                        ),
+                    ));
+                }
+            }
+        }
 
         let mut lease = match self
             .begin_idempotency(tool, request_id, &phash, session_id, &claimed)
@@ -7427,6 +7809,10 @@ impl OrchestrationService {
             // `AuthContext::principal` is also what run reads check ownership
             // against, so stamping and enforcement cannot drift apart.
             client_id: Some(auth.principal().to_string()),
+            // The exact credential registration that admitted this Run. Without
+            // it the alias alone would let a re-registered credential inherit
+            // this work.
+            client_lineage: Some(auth.credential_incarnation().to_string()),
             state: if queued {
                 RunState::Queued
             } else {
@@ -8520,221 +8906,5 @@ fn session_id_of(u: &crate::events::SessionUpdate) -> Option<Uuid> {
         | SteeringInjected { session_id, .. }
         | PromptQueueChanged { session_id, .. } => Some(*session_id),
         BackgroundTask { session_id, .. } => *session_id,
-    }
-}
-#[cfg(test)]
-mod auth_guard_coverage {
-    //! Mechanical guard-coverage check over this file's own source.
-    //!
-    //! Every entry point that accepts an `AuthContext` must call
-    //! `require_current_auth` or `require_current_effect` as its first
-    //! statement, before any store, provider or host access. A new entry point
-    //! that forgets the guard fails here rather than shipping a hole, which is
-    //! the only reason this test reads source text instead of exercising
-    //! behaviour: there are ~90 of them and no type-level way to require it.
-    //!
-    //! Private helpers are exempt — they are reachable only through a guarded
-    //! entry point. The exemption list is explicit so adding a private
-    //! `AuthContext` helper is a deliberate, reviewable act.
-    /// The guards themselves. They cannot guard on themselves, and
-    /// `require_current_effect` delegating to `require_current_auth` is the
-    /// intended shape, not a coincidence.
-    const GUARDS: &[&str] = &["require_current_auth", "require_current_effect"];
-
-    const UNGUARDED_PRIVATE_HELPERS: &[(&str, &str)] = &[
-        (
-            "reject_auth",
-            "the shared refusal itself; it is what a failed guard returns",
-        ),
-        (
-            "bind_principal",
-            "mints the scope binding; re-checks currency itself and is reached only from guarded entry points",
-        ),
-        (
-            "require_run_owner",
-            "the ownership primitive; runs after the generation guard",
-        ),
-        (
-            "load_authorized_run",
-            "run authorization primitive; every caller is a guarded entry point",
-        ),
-        (
-            "authorize_run_request",
-            "session/workspace-scoped wrapper over load_authorized_run",
-        ),
-        (
-            "isolated_review",
-            "shared body of review_run/approve_run; both guard on entry",
-        ),
-        (
-            "worker_identity_mutation",
-            "shared body of accept_work/decline_work; both guard on entry",
-        ),
-        (
-            "authorize_persistent_agent_request",
-            "shared body of get_persistent_agent_scoped/resume_persistent_agent",
-        ),
-        (
-            "submit_task_with_execution_mode_and_queue_parent",
-            "shared submit body; reached from guarded submit_task and from the native executor's own host-issued identity",
-        ),
-    ];
-
-    /// This file minus this test module, so the assertions below cannot match
-    /// the string literals they are written with.
-    fn production_source() -> &'static str {
-        let src = include_str!("service.rs");
-        let cut = src
-            .find("mod auth_guard_coverage")
-            .expect("this module is declared in this file");
-        &src[..cut]
-    }
-
-    struct Entry {
-        line: usize,
-        visibility: String,
-        name: String,
-        guarded: bool,
-    }
-
-    fn entry_points() -> Vec<Entry> {
-        let lines: Vec<&str> = production_source().lines().collect();
-        let mut entries = Vec::new();
-        let mut i = 0usize;
-        while i < lines.len() {
-            let trimmed = lines[i].trim_start();
-            let visibility = if let Some(rest) = trimmed.strip_prefix("pub(crate) ") {
-                if !rest.starts_with("fn ") && !rest.starts_with("async fn ") {
-                    i += 1;
-                    continue;
-                }
-                "pub(crate)"
-            } else if let Some(rest) = trimmed.strip_prefix("pub ") {
-                if !rest.starts_with("fn ") && !rest.starts_with("async fn ") {
-                    i += 1;
-                    continue;
-                }
-                "pub"
-            } else if trimmed.starts_with("fn ") || trimmed.starts_with("async fn ") {
-                "private"
-            } else {
-                i += 1;
-                continue;
-            };
-            let name = trimmed
-                .split("fn ")
-                .nth(1)
-                .unwrap_or("")
-                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                .next()
-                .unwrap_or("")
-                .to_string();
-
-            // The signature spans until parentheses balance, then until the
-            // line that opens the body.
-            let start = i;
-            let mut depth = 0i32;
-            let mut seen_paren = false;
-            while i < lines.len() {
-                depth += lines[i].matches('(').count() as i32;
-                depth -= lines[i].matches(')').count() as i32;
-                if lines[i].contains('(') {
-                    seen_paren = true;
-                }
-                if seen_paren && depth == 0 {
-                    break;
-                }
-                i += 1;
-            }
-            while i < lines.len() && !lines[i].trim_end().ends_with('{') {
-                i += 1;
-            }
-            let signature = lines[start..=i.min(lines.len() - 1)].join("\n");
-            if signature.contains("auth: &AuthContext") {
-                let first_statement = lines.get(i + 1).copied().unwrap_or("").trim();
-                entries.push(Entry {
-                    line: start + 1,
-                    visibility: visibility.to_string(),
-                    name,
-                    guarded: first_statement.starts_with("self.require_current_auth(auth)")
-                        || first_statement.starts_with("self.require_current_effect(auth)"),
-                });
-            }
-            i += 1;
-        }
-        entries
-    }
-
-    #[test]
-    fn every_auth_entry_point_checks_the_current_generation() {
-        let entries = entry_points();
-        assert!(
-            entries.len() > 80,
-            "source scan found only {} AuthContext entry points; the scanner is broken, \
-             not the service",
-            entries.len()
-        );
-
-        let missing: Vec<String> = entries
-            .iter()
-            .filter(|e| {
-                e.visibility != "private" && !e.guarded && !GUARDS.contains(&e.name.as_str())
-            })
-            .map(|e| format!("{}:{} {}", e.visibility, e.line, e.name))
-            .collect();
-        assert!(
-            missing.is_empty(),
-            "every AuthContext entry point must call the current-generation guard as its \
-             first statement, before any store/provider/host access: {missing:?}"
-        );
-
-        let unlisted: Vec<String> = entries
-            .iter()
-            .filter(|e| {
-                e.visibility == "private"
-                    && !e.guarded
-                    && !UNGUARDED_PRIVATE_HELPERS
-                        .iter()
-                        .any(|(name, _)| *name == e.name)
-            })
-            .map(|e| format!("{}:{} {}", e.visibility, e.line, e.name))
-            .collect();
-        assert!(
-            unlisted.is_empty(),
-            "private AuthContext helpers must either guard or be listed in \
-             UNGUARDED_PRIVATE_HELPERS with a note on which guarded entry point reaches them: \
-             {unlisted:?}"
-        );
-    }
-
-    /// A mutating entry point must take the effect guard, not the read guard,
-    /// or a read-only delegation would be able to cause an effect.
-    #[test]
-    fn async_entry_points_take_the_effect_guard() {
-        let src = production_source();
-        let lines: Vec<&str> = src.lines().collect();
-        let mut offenders = Vec::new();
-        for (index, line) in lines.iter().enumerate() {
-            let trimmed = line.trim_start();
-            if !(trimmed.starts_with("pub async fn") || trimmed.starts_with("pub(crate) async fn"))
-            {
-                continue;
-            }
-            // Find the guard within the first few body statements.
-            let window = lines[index..(index + 40).min(lines.len())].join("\n");
-            if !window.contains("auth: &AuthContext") {
-                continue;
-            }
-            if window.contains("self.require_current_auth(auth)?;")
-                && !window.contains("self.require_current_effect(auth)?;")
-            {
-                offenders.push(format!("{}: {}", index + 1, trimmed));
-            }
-        }
-        assert!(
-            offenders.is_empty(),
-            "these mutating entry points take the read guard; a read-only delegation could \
-             then cause an effect through them: {offenders:?}"
-        );
     }
 }

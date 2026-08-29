@@ -17,9 +17,10 @@ mod workload;
 
 pub use authz::{
     canonical_workspace, constant_time_eq, AuthContext, AuthCredential, AuthGeneration,
-    AuthorityOrigin, Delegation, DelegationLimit, DurableAuthority, PrincipalKind,
-    PrincipalProvenance, PrincipalScope, ReadinessAuthority, VerifiedPrincipal, WorkspaceAllowlist,
-    COMPAT_PRIMARY_PRINCIPAL, MAX_DELEGATION_TTL_SECONDS, NATIVE_EXECUTOR_PRINCIPAL,
+    AuthorityOrigin, Delegation, DelegationLimit, DurableAuthority, DurableCredential, HostAdmin,
+    PrincipalKind, PrincipalProvenance, PrincipalScope, ReadinessAuthority, VerifiedPrincipal,
+    WorkspaceAllowlist, COMPAT_PRIMARY_PRINCIPAL, MAX_DELEGATION_TTL_SECONDS,
+    NATIVE_EXECUTOR_PRINCIPAL,
 };
 pub use continuation::{
     assemble_continuation_context, AgentContinuationPlan, ContinuationAssemblyFailure,
@@ -55,7 +56,7 @@ pub use routine::{
     ROUTINE_SCHEMA_VERSION,
 };
 pub(crate) use service::apply_run_aggregate;
-pub use service::{OrchestrationConfig, OrchestrationService};
+pub use service::{OrchestrationConfig, OrchestrationService, QuarantineReason, ScopedReads};
 pub(crate) use store::workspaces_match;
 pub use store::{IdempotencyClaim, OrchStore, RetentionPolicy, RetentionReport};
 pub use supervisor::{

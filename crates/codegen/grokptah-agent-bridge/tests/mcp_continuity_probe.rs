@@ -47,6 +47,7 @@ fn seed_run(
                 .to_string(),
             request_id: format!("{run_id}-request"),
             client_id: Some("mcp".into()),
+            client_lineage: None,
             state,
             purpose: Default::default(),
             agent_id: None,

@@ -1243,6 +1243,20 @@ impl AgentHostHandle {
     /// Return or create the durable agent identity for a Build session. The
     /// session owns the binding, while the orchestration store owns lifecycle
     /// state; this keeps transport adapters from inventing identity.
+    /// The durable Agent id this session already has, without creating one.
+    ///
+    /// `ensure_session_agent` creates the Agent as a side effect, so an
+    /// ownership check that ran through it would already have mutated the store
+    /// before it could refuse. This read-only lookup exists so admission can
+    /// happen first (#477).
+    pub(crate) fn existing_session_agent_id(&self, session_id: Uuid) -> Option<String> {
+        self.inner
+            .lock()
+            .sessions
+            .get(&session_id)
+            .and_then(|session| session.agent_id.clone())
+    }
+
     pub fn ensure_session_agent(&self, session_id: Uuid) -> Result<AgentRecord> {
         let (cwd, model, kind, existing_id, authority, default_bounds) = {
             let g = self.inner.lock();
@@ -2134,7 +2148,7 @@ impl AgentHostHandle {
         prompt: String,
         max_rounds: Option<u32>,
         request_id: Option<String>,
-        run_principal: Option<String>,
+        run_principal: Option<(String, String)>,
     ) -> Result<String> {
         let store = self.ensure_orchestration_store()?;
         let request_id = request_id.unwrap_or_else(|| format!("resume-{}", Uuid::new_v4()));
@@ -2507,7 +2521,7 @@ impl AgentHostHandle {
         agent_spec_revision: Option<u64>,
         parent_run_id: Option<String>,
         continuation: Option<&AgentContinuationPlan>,
-        run_principal: Option<String>,
+        run_principal: Option<(String, String)>,
     ) -> Option<(String, OrchStore)> {
         let store = match self.ensure_orchestration_store() {
             Ok(store) => store,
@@ -2531,7 +2545,21 @@ impl AgentHostHandle {
             // started through the authenticated control plane is coordinator
             // work, so it is stamped with the principal that asked for it and
             // that caller owns the Run it just created.
-            client_id: Some(run_principal.unwrap_or_else(|| "desktop".into())),
+            // A turn the desktop started is the desktop's own; it authenticates
+            // by being in-process rather than by a bearer credential, so it
+            // carries the host's own marker for both alias and lineage.
+            client_id: Some(
+                run_principal
+                    .as_ref()
+                    .map(|(principal, _)| principal.clone())
+                    .unwrap_or_else(|| "desktop".into()),
+            ),
+            client_lineage: Some(
+                run_principal
+                    .as_ref()
+                    .map(|(_, lineage)| lineage.clone())
+                    .unwrap_or_else(|| "desktop".into()),
+            ),
             state: RunState::Running,
             purpose: RunPurpose::Execution,
             agent_id: agent_id.clone(),
@@ -6907,7 +6935,7 @@ impl AgentHostHandle {
         reservation_owner: Option<&str>,
         external_run: Option<ExternalRunContext>,
         resume: Option<AgentContinuationPlan>,
-        run_principal: Option<String>,
+        run_principal: Option<(String, String)>,
     ) -> Result<String> {
         self.ensure_session_accepts_new_work(session_id)?;
         self.ensure_transcript_loaded(session_id)?;
@@ -11413,6 +11441,7 @@ mod tests {
             workspace: "/tmp/project".into(),
             request_id: format!("request-{run_id}"),
             client_id: Some("test".into()),
+            client_lineage: None,
             state: RunState::Running,
             purpose: RunPurpose::Execution,
             agent_id: None,
@@ -11877,6 +11906,7 @@ mod tests {
             workspace: agent.workspace.clone(),
             request_id: "continuation-source-request".into(),
             client_id: Some("test".into()),
+            client_lineage: None,
             state: RunState::Completed,
             purpose: RunPurpose::Execution,
             agent_id: Some(agent.agent_id.clone()),
@@ -12019,6 +12049,7 @@ mod tests {
             workspace: current_agent.workspace.clone(),
             request_id: "competing-admission-request".into(),
             client_id: Some("test".into()),
+            client_lineage: None,
             state: RunState::Running,
             purpose: RunPurpose::Execution,
             agent_id: Some(current_agent.agent_id.clone()),
@@ -12316,6 +12347,7 @@ mod tests {
             workspace: agent.workspace.clone(),
             request_id: "frozen-spec-request".into(),
             client_id: Some("test".into()),
+            client_lineage: None,
             state: RunState::Running,
             purpose: RunPurpose::Execution,
             agent_id: Some(agent.agent_id.clone()),
@@ -12409,6 +12441,7 @@ mod tests {
             workspace: agent.workspace.clone(),
             request_id: "manager-proposal-intent".into(),
             client_id: Some("native-executor".into()),
+            client_lineage: None,
             state: RunState::Running,
             purpose: RunPurpose::ManagerProposal,
             agent_id: Some(agent.agent_id.clone()),
