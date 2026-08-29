@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use crate::computer_use::{
     ComputerAction, ComputerObservation, ComputerUseLimits, SemanticAction, SimulatorBackend,
 };
-use crate::gateway_config::{CapabilitySource, ComputerUseTier};
+use crate::gateway_config::ComputerUseTier;
 use crate::host_helpers::{call_xai_agent_step, resolve_model_target, AgentStep, AgentToolCall};
 use crate::types::EffortLevel;
 
@@ -54,12 +54,6 @@ impl ComputerAgentProposal {
     }
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct ResolvedComputerEligibility {
-    pub eligibility: ComputerAgentEligibility,
-    pub route_fingerprint: String,
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct QualificationArguments {
@@ -85,39 +79,43 @@ struct ProposalArguments {
     summary: String,
 }
 
-pub(crate) fn resolve_computer_eligibility(
+/// The route a Computer request would actually take: base URL, wire model and
+/// dialect.
+///
+/// This is the original session-qualification binding and it is preserved as
+/// written. It is deliberately *not* the whole story: a route fingerprint is
+/// stable across a tier downgrade, a provenance rewrite, a schema bump, a
+/// credential rotation and a policy change, which is why the capability
+/// generation in [`crate::capability_authority`] is checked alongside it
+/// (#458).
+pub(crate) fn resolve_computer_route_fingerprint(
     credentials: &crate::auth_store::WireCredentials,
     model: &str,
-) -> Result<ResolvedComputerEligibility> {
+) -> Result<String> {
     let target = resolve_model_target(credentials, model)?;
-    let tier = target.capabilities.effective_computer_use_tier();
-    let source = match target.capabilities.computer_capability_source {
-        CapabilitySource::Declared => "declared",
-        CapabilitySource::Measured => "measured",
-        CapabilitySource::Unknown => "unknown",
-    };
     let mut hasher = Sha256::new();
     hasher.update(target.base_url.as_bytes());
     hasher.update([0]);
     hasher.update(target.wire_model.as_bytes());
     hasher.update([0]);
     hasher.update(format!("{:?}", target.dialect).as_bytes());
-    Ok(ResolvedComputerEligibility {
-        eligibility: ComputerAgentEligibility {
-            model: model.to_string(),
-            tier,
-            source: source.into(),
-        },
-        route_fingerprint: format!("{:x}", hasher.finalize()),
-    })
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
+/// Runs the bounded local qualification and returns its transcript.
+///
+/// The transcript is the record of what the model actually demonstrated: the
+/// two observations it was shown and the two elements it correctly bound its
+/// calls to. It carries no observed application text, and the caller reduces
+/// it to a one-way digest before it becomes qualification evidence (#458), so
+/// a capability binding can prove "the same proof" without holding screen
+/// content.
 pub(crate) async fn qualify_semantic_model(
     credentials: &crate::auth_store::WireCredentials,
     model: &str,
     effort: EffortLevel,
     cancel: &CancellationToken,
-) -> Result<()> {
+) -> Result<String> {
     let simulator = SimulatorBackend::new();
     let target = SimulatorBackend::demo_target();
     let first = crate::computer_use::ComputerBackend::observe(
@@ -205,7 +203,15 @@ pub(crate) async fn qualify_semantic_model(
         &recovery_call,
         &second.observation_id,
         &second_element.element_id,
-    )
+    )?;
+    Ok(format!(
+        "{QUALIFICATION_TOOL}\u{0}{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}",
+        first.observation_id,
+        first_element.element_id,
+        second.observation_id,
+        second_element.element_id,
+        QUALIFICATION_TEXT,
+    ))
 }
 
 pub(crate) async fn propose_semantic_action(

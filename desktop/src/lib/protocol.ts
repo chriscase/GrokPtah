@@ -996,6 +996,23 @@ export interface ComputerRun {
     expectedPostconditionMet?: boolean | null;
   } | null;
   lastError?: { code: string; message: string } | null;
+  /**
+   * Grant the run was carrying when model authority was last bound (#458). A
+   * run whose binding is gone but whose grant id still matches this one had
+   * its authority stripped rather than handed back, and dispatches nothing.
+   */
+  modelAuthorityGrantId?: string | null;
+  /**
+   * Model authority this run is being driven under (#458). Absent on an
+   * operator-driven run. Secret-free and non-transferable: it names a binding
+   * the host holds in memory, so it confers nothing on its own and is refused
+   * after a restart.
+   */
+  capabilityBinding?: {
+    bindingId: string;
+    digest: string;
+    generation: number;
+  } | null;
   audit: Array<{
     sequence: number;
     at: string;

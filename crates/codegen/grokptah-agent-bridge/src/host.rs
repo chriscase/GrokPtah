@@ -12,12 +12,18 @@ use tokio::sync::{oneshot, Notify};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::capability_authority::{
+    AuthorityLineage, CapabilityAssessment, CapabilityBindingRef, CapabilityBoundary,
+    CapabilityDenied, CapabilityRegistry, CapabilityRequest, DispatchEffect, DispatchLease,
+    NormalizedRoute, QualificationEvidence, QualificationEvidenceKind, QualificationKey,
+    QualificationSchema,
+};
 use crate::completion::{
     build_evidence, enrich_terminal_handoff, observe_updates, CompletionObservations,
     CompletionUsage,
 };
 use crate::computer_agent::{
-    propose_semantic_action, qualify_semantic_model, resolve_computer_eligibility,
+    propose_semantic_action, qualify_semantic_model, resolve_computer_route_fingerprint,
     ComputerAgentEligibility, ComputerAgentProposal,
 };
 use crate::event_bus::{session_id_of, JournalPage};
@@ -156,7 +162,14 @@ struct OrchestrationPendingAdmission {
 
 #[derive(Debug, Clone)]
 struct SessionComputerQualification {
+    /// Preserved from the original session-qualification contract: the route
+    /// the probe actually ran against. It is still checked, and it is still
+    /// not sufficient on its own — see `binding`.
     route_fingerprint: String,
+    /// The capability generation this qualification is bound to (#458). A
+    /// route fingerprint survives a tier downgrade, a provenance rewrite, a
+    /// schema bump, a credential rotation and a policy change; this does not.
+    binding: CapabilityBindingRef,
 }
 
 pub(crate) struct Inner {
@@ -750,10 +763,108 @@ pub struct AgentHostHandle {
     provider_observation: Option<ProviderObservationSession>,
     /// Exclusive lock on `~/.grokptah` — kept alive for the process (#119).
     _instance_lock: Option<Arc<crate::instance_lock::InstanceLock>>,
+    /// The single fail-closed provider capability authority for this process
+    /// (#458). It is per-process by construction: its authority id is drawn at
+    /// startup, so nothing qualified by an earlier process is current here.
+    capability_registry: Arc<CapabilityRegistry>,
+    /// The upstream authority every capability generation descends from.
+    ///
+    /// The id is drawn at startup and the counter advances on every credential
+    /// or policy invalidation, so an upstream rotation retires capability
+    /// bindings rather than leaving them to be noticed later. This is the seam
+    /// a canonical principal/auth-epoch authority (#477/#460) plugs into; it
+    /// claims no verified principal, tenant, or scope today.
+    auth_lineage: Arc<(Uuid, std::sync::atomic::AtomicU64)>,
     /// Selects the durable root for legacy modules that still resolve paths
     /// through `grokptah_home()`. Shared by all host clones.
     runtime_home: crate::discover::RuntimeHome,
     _runtime_home_context: Arc<crate::discover::RuntimeHomeContext>,
+}
+
+/// The qualification contract this host proves Computer Use models against.
+///
+/// Bumping the version is how a change to what qualification *means* is made
+/// to invalidate every binding taken under the old meaning.
+pub(crate) fn computer_qualification_schema() -> QualificationSchema {
+    QualificationSchema::new("grokptah.computer-use.session-qualification", 1)
+}
+
+/// Connects the provider-neutral Computer Use kernel to this host's live
+/// capability authority (#458).
+///
+/// The kernel asks at its lease, live-frame and dispatch boundaries; this
+/// answers by re-deriving the capability from scratch each time. A run with no
+/// model authority attached is not this gate's business and passes through.
+#[derive(Clone)]
+pub(crate) struct HostComputerCapabilityGate {
+    host: AgentHostHandle,
+}
+
+impl std::fmt::Debug for HostComputerCapabilityGate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HostComputerCapabilityGate")
+    }
+}
+
+impl crate::computer_use::ComputerCapabilityGate for HostComputerCapabilityGate {
+    fn authorize(
+        &self,
+        boundary: CapabilityBoundary,
+        owner_session_id: Uuid,
+        actor: crate::computer_use::ComputerActor<'_>,
+    ) -> Result<(), crate::computer_use::ComputerError> {
+        match actor {
+            // An operator-driven run is proven by its own live one-use grant
+            // and needs no provider capability at all.
+            crate::computer_use::ComputerActor::Operator => Ok(()),
+            crate::computer_use::ComputerActor::Model(binding) => self
+                .host
+                .validate_capability_boundary(owner_session_id, binding, boundary)
+                .map_err(|_| crate::computer_use::capability_denied()),
+            // Model authority was stripped rather than handed back. Regaining
+            // manual control takes a fresh operator grant, not the one the
+            // model was driving under.
+            crate::computer_use::ComputerActor::Stripped => {
+                Err(crate::computer_use::capability_denied())
+            }
+        }
+    }
+
+    fn authorize_dispatch(
+        &self,
+        owner_session_id: Uuid,
+        actor: crate::computer_use::ComputerActor<'_>,
+        effect: &DispatchEffect,
+    ) -> Result<Option<DispatchLease>, crate::computer_use::ComputerError> {
+        match actor {
+            crate::computer_use::ComputerActor::Operator => Ok(None),
+            crate::computer_use::ComputerActor::Model(binding) => self
+                .host
+                .authorize_capability_dispatch(owner_session_id, binding, effect)
+                .map(Some)
+                .map_err(|_| crate::computer_use::capability_denied()),
+            crate::computer_use::ComputerActor::Stripped => {
+                Err(crate::computer_use::capability_denied())
+            }
+        }
+    }
+
+    fn redeem_dispatch(
+        &self,
+        owner_session_id: Uuid,
+        actor: crate::computer_use::ComputerActor<'_>,
+        lease: Option<DispatchLease>,
+        effect: &DispatchEffect,
+    ) -> Result<(), crate::computer_use::ComputerError> {
+        match (actor, lease) {
+            (crate::computer_use::ComputerActor::Operator, None) => Ok(()),
+            (crate::computer_use::ComputerActor::Model(_), Some(lease)) => self
+                .host
+                .redeem_capability_dispatch(owner_session_id, lease, effect)
+                .map_err(|_| crate::computer_use::capability_denied()),
+            _ => Err(crate::computer_use::capability_denied()),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -868,6 +979,17 @@ impl AgentHost {
                     .find_map(|(id, session)| (!session.archived).then_some(*id))
             });
         let prompt_queues = session_store::load_all_prompt_queues(sessions.keys().copied());
+        // Operator capability policy is read once, at startup. Changing it
+        // means restarting the host, which draws a new capability authority
+        // and therefore retires every binding taken under the old policy.
+        let (assurance_profile, declared_policy) = crate::capability_authority::operator_policy(
+            std::env::var(crate::capability_authority::ASSURANCE_PROFILE_ENV)
+                .ok()
+                .as_deref(),
+            std::env::var(crate::capability_authority::DECLARED_TRUST_ENV)
+                .ok()
+                .as_deref(),
+        );
         let inner = Inner {
             running: false,
             project_cwd,
@@ -934,6 +1056,12 @@ impl AgentHost {
             run_usage_trackers: Arc::new(Mutex::new(HashMap::new())),
             provider_observation: config.provider_observation,
             _instance_lock: instance_lock,
+            capability_registry: Arc::new(CapabilityRegistry::new(
+                assurance_profile,
+                declared_policy,
+                computer_qualification_schema(),
+            )),
+            auth_lineage: Arc::new((Uuid::new_v4(), std::sync::atomic::AtomicU64::new(0))),
             runtime_home,
             _runtime_home_context: runtime_home_context,
         }
@@ -966,9 +1094,156 @@ impl AgentHostHandle {
         self.inner.lock().event_tx.subscribe()
     }
 
-    /// Current model authority for the local Computer cockpit. Unknown models
-    /// remain manual-only unless a durable provider profile or this process's
-    /// explicit simulator qualification grants semantic authority.
+    /// Builds a Computer Use kernel wired to this host's capability authority
+    /// (#458).
+    ///
+    /// This is the only way to obtain a gated kernel. The authority itself is
+    /// never handed out: a caller that could reach it could mint the bindings
+    /// it exists to withhold, and a caller that could supply its own gate
+    /// could install an allow-all boundary. Both are crate-internal, and this
+    /// constructor is the seam between them.
+    pub fn computer_use_service(
+        &self,
+        backend: Arc<dyn crate::computer_use::ComputerBackend>,
+        store: crate::computer_use::ComputerStore,
+    ) -> crate::computer_use::ComputerUseService {
+        crate::computer_use::ComputerUseService::new(backend, store)
+            .with_capability_gate(Arc::new(HostComputerCapabilityGate { host: self.clone() }))
+    }
+
+    /// Derives the live capability facts for one model selection, right now.
+    ///
+    /// Every field is re-read: the credential principal, the resolved route,
+    /// the stored capability record, and the operator policy in force. The
+    /// credential is handed to the authority as it is read, so a rotation is
+    /// noticed here rather than at the next qualification.
+    pub(crate) fn assess_model_capability(&self, model: &str) -> Result<CapabilityAssessment> {
+        let credentials = crate::auth_store::resolve_wire_credentials_for_model(model)
+            .map_err(anyhow::Error::msg)?
+            .ok_or_else(|| anyhow!(crate::auth_store::auth_help_message()))?;
+        self.assess_model_capability_with(&credentials, model)
+    }
+
+    pub(crate) fn assess_model_capability_with(
+        &self,
+        credentials: &crate::auth_store::WireCredentials,
+        model: &str,
+    ) -> Result<CapabilityAssessment> {
+        let selection =
+            crate::gateway_config::parse_model_selection(model).map_err(anyhow::Error::msg)?;
+        let target = crate::host_helpers::resolve_model_target(credentials, model)?;
+        let fingerprint = credentials.qualification_identity_fingerprint();
+        self.capability_registry
+            .observe_credential(&selection.provider_id, &fingerprint)
+            .map_err(anyhow::Error::new)?;
+        let request = CapabilityRequest {
+            lineage: self.auth_lineage(),
+            route: NormalizedRoute::new(
+                selection.provider_id.clone(),
+                &target.base_url,
+                target.wire_model.clone(),
+                format!("{:?}", target.dialect),
+            ),
+            selection_key: model.to_string(),
+            source: target.capabilities.computer_capability_source,
+            claimed_tier: target.capabilities.effective_computer_use_tier(),
+            credential_fingerprint: fingerprint,
+        };
+        self.capability_registry
+            .assess(&request)
+            .map_err(anyhow::Error::new)
+    }
+
+    /// The upstream authority lineage every capability descends from.
+    fn auth_lineage(&self) -> AuthorityLineage {
+        AuthorityLineage {
+            authority: self.auth_lineage.0.to_string(),
+            generation: self
+                .auth_lineage
+                .1
+                .load(std::sync::atomic::Ordering::SeqCst),
+        }
+    }
+
+    /// Authorizes one exact physical effect and issues its single-use lease.
+    pub(crate) fn authorize_capability_dispatch(
+        &self,
+        session_id: Uuid,
+        binding: &CapabilityBindingRef,
+        effect: &DispatchEffect,
+    ) -> Result<DispatchLease, CapabilityDenied> {
+        let (model, _) = self
+            .selected_computer_model(session_id)
+            .map_err(|_| CapabilityDenied)?;
+        let key = QualificationKey::new(session_id, model.clone());
+        let live = self
+            .assess_model_capability(&model)
+            .map_err(|_| CapabilityDenied)?;
+        let outcome = self
+            .capability_registry
+            .authorize_dispatch(session_id, binding, &live, effect);
+        if outcome.is_err() {
+            self.capability_registry
+                .quarantine_if_unbound(&key, binding);
+        }
+        outcome
+    }
+
+    /// Consumes a dispatch lease immediately before the effect happens.
+    ///
+    /// The capability is re-derived here rather than reused, so the lease is
+    /// good only while the capability it was issued against is still exactly
+    /// the same one. A downgrade landing between issue and redemption changes
+    /// the digest and the lease stops redeeming.
+    pub(crate) fn redeem_capability_dispatch(
+        &self,
+        session_id: Uuid,
+        lease: DispatchLease,
+        effect: &DispatchEffect,
+    ) -> Result<(), CapabilityDenied> {
+        let (model, _) = self
+            .selected_computer_model(session_id)
+            .map_err(|_| CapabilityDenied)?;
+        let live = self
+            .assess_model_capability(&model)
+            .map_err(|_| CapabilityDenied)?;
+        lease.redeem(live.digest(), effect)
+    }
+
+    /// Validates a binding at one boundary against freshly derived facts.
+    ///
+    /// A reference this authority does not hold is quarantined on the way out:
+    /// a restored, copied, or otherwise unbound qualification is recorded as
+    /// needing explicit re-establishment rather than left looking like an
+    /// ordinary stale one.
+    pub(crate) fn validate_capability_boundary(
+        &self,
+        session_id: Uuid,
+        binding: &CapabilityBindingRef,
+        boundary: CapabilityBoundary,
+    ) -> Result<(), CapabilityDenied> {
+        let (model, _) = self
+            .selected_computer_model(session_id)
+            .map_err(|_| CapabilityDenied)?;
+        let key = QualificationKey::new(session_id, model.clone());
+        let live = self
+            .assess_model_capability(&model)
+            .map_err(|_| CapabilityDenied)?;
+        let outcome = self
+            .capability_registry
+            .validate(session_id, binding, boundary, &live);
+        if outcome.is_err() {
+            self.capability_registry
+                .quarantine_if_unbound(&key, binding);
+        }
+        outcome
+    }
+
+    /// Current model authority for the local Computer cockpit.
+    ///
+    /// The tier reported here is the tier after operator policy: a `Declared`
+    /// capability the deployment has not explicitly trusted reports as
+    /// observation, never as action authority.
     pub fn computer_agent_eligibility(&self, session_id: Uuid) -> Result<ComputerAgentEligibility> {
         if self
             .session_agent_authority(session_id)?
@@ -980,30 +1255,65 @@ impl AgentHostHandle {
         let credentials = crate::auth_store::resolve_wire_credentials_for_model(&model)
             .map_err(anyhow::Error::msg)?
             .ok_or_else(|| anyhow!(crate::auth_store::auth_help_message()))?;
-        let resolved = resolve_computer_eligibility(&credentials, &model)?;
-        if resolved.eligibility.tier >= crate::gateway_config::ComputerUseTier::SemanticAct {
-            return Ok(resolved.eligibility);
-        }
+        let route_fingerprint = resolve_computer_route_fingerprint(&credentials, &model)?;
+        let assessment = self.assess_model_capability_with(&credentials, &model)?;
+        // A session qualification only counts while its binding is still the
+        // current capability. A route fingerprint that still matches is not
+        // enough, and never was.
         let qualified = self
-            .inner
-            .lock()
-            .computer_agent_qualifications
-            .get(&(session_id, model.clone()))
-            .is_some_and(|record| record.route_fingerprint == resolved.route_fingerprint);
+            .session_capability_binding(session_id, &model, &route_fingerprint)
+            .is_some_and(|binding| {
+                self.capability_registry
+                    .validate(
+                        session_id,
+                        &binding,
+                        CapabilityBoundary::Qualification,
+                        &assessment,
+                    )
+                    .is_ok()
+            });
         if qualified {
             return Ok(ComputerAgentEligibility {
                 model,
-                tier: crate::gateway_config::ComputerUseTier::SemanticAct,
-                source: "session_measured".into(),
+                tier: assessment.tier(),
+                source: assessment.provenance().label().to_string(),
             });
         }
-        Ok(resolved.eligibility)
+        // Unqualified, the model may be observed but may not act — whatever
+        // the stored capability record claims. Action authority is something
+        // this authority grants, not something a configuration file asserts.
+        Ok(ComputerAgentEligibility {
+            model,
+            tier: assessment
+                .tier()
+                .min(crate::gateway_config::ComputerUseTier::Observe),
+            source: "unqualified".into(),
+        })
     }
 
-    /// Run the selected model against two deterministic simulator frames. No
-    /// proposed action executes, and success is scoped to this exact route for
-    /// the current process unless the provider profile already has a durable
-    /// measured capability.
+    /// The standing session qualification for `model`, if its route still
+    /// matches. Route identity is checked here so the original contract is
+    /// preserved; the caller still has to validate the binding.
+    fn session_capability_binding(
+        &self,
+        session_id: Uuid,
+        model: &str,
+        expected_route: &str,
+    ) -> Option<CapabilityBindingRef> {
+        self.inner
+            .lock()
+            .computer_agent_qualifications
+            .get(&(session_id, model.to_string()))
+            .filter(|record| record.route_fingerprint == expected_route)
+            .map(|record| record.binding.clone())
+    }
+
+    /// Run the selected model against two deterministic simulator frames.
+    ///
+    /// No proposed action executes. Success is bound to the exact capability
+    /// generation the probe ran under, so it stops meaning anything the moment
+    /// the tier, provenance, schema, credential, policy or route behind it
+    /// changes — not merely when the endpoint does.
     pub async fn qualify_computer_agent(
         &self,
         session_id: Uuid,
@@ -1013,33 +1323,53 @@ impl AgentHostHandle {
         let credentials = crate::auth_store::resolve_wire_credentials_for_model(&model)
             .map_err(anyhow::Error::msg)?
             .ok_or_else(|| anyhow!(crate::auth_store::auth_help_message()))?;
-        let resolved = resolve_computer_eligibility(&credentials, &model)?;
-        if resolved.eligibility.tier >= crate::gateway_config::ComputerUseTier::SemanticAct {
-            return Ok(resolved.eligibility);
-        }
-        qualify_semantic_model(&credentials, &model, effort, &cancel)
-            .await
-            .context("selected model did not pass bounded Computer qualification")?;
+        let route_fingerprint = resolve_computer_route_fingerprint(&credentials, &model)?;
+        let key = QualificationKey::new(session_id, model.clone());
+
+        // A stored capability record is not evidence. It is a file the
+        // operator's configuration can rewrite, so a record asserting
+        // `measured` cannot short-circuit into durable action authority: this
+        // authority only calls something measured when it measured it. The
+        // bounded probe below is that measurement, and its transcript is the
+        // evidence.
+        let transcript = match qualify_semantic_model(&credentials, &model, effort, &cancel).await {
+            Ok(transcript) => transcript,
+            Err(error) => {
+                // A failed re-proof retires whatever the last one established.
+                self.capability_registry
+                    .record_requalification_failure(&key)
+                    .map_err(anyhow::Error::new)?;
+                self.forget_session_qualification(session_id, &model);
+                return Err(error)
+                    .context("selected model did not pass bounded Computer qualification");
+            }
+        };
         if cancel.is_cancelled() {
             bail!("Computer model qualification was cancelled");
         }
-        self.ensure_computer_route_unchanged(session_id, &model, &resolved.route_fingerprint)?;
-        {
-            let mut inner = self.inner.lock();
-            if inner
-                .computer_agent_operations
-                .get(&session_id)
-                .is_none_or(|(current, _)| current != &operation_id)
-            {
-                bail!("Computer model qualification was superseded");
-            }
-            inner.computer_agent_qualifications.insert(
-                (session_id, model.clone()),
-                SessionComputerQualification {
-                    route_fingerprint: resolved.route_fingerprint,
-                },
-            );
-        }
+        self.ensure_computer_route_unchanged(session_id, &model, &route_fingerprint)?;
+        // Re-derive after the probe: the capability may have moved while the
+        // model was answering, and a probe that proved a capability that no
+        // longer exists proves nothing.
+        let assessment = self.assess_model_capability_with(&credentials, &model)?;
+        let binding = self
+            .capability_registry
+            .qualify(
+                &key,
+                &assessment,
+                &QualificationEvidence::of(
+                    QualificationEvidenceKind::Measured,
+                    transcript.as_bytes(),
+                ),
+            )
+            .map_err(anyhow::Error::new)?;
+        self.record_session_qualification(
+            session_id,
+            &model,
+            &operation_id,
+            route_fingerprint,
+            binding,
+        )?;
         Ok(ComputerAgentEligibility {
             model,
             tier: crate::gateway_config::ComputerUseTier::SemanticAct,
@@ -1047,8 +1377,45 @@ impl AgentHostHandle {
         })
     }
 
+    fn record_session_qualification(
+        &self,
+        session_id: Uuid,
+        model: &str,
+        operation_id: &str,
+        route_fingerprint: String,
+        binding: CapabilityBindingRef,
+    ) -> Result<()> {
+        let mut inner = self.inner.lock();
+        if inner
+            .computer_agent_operations
+            .get(&session_id)
+            .is_none_or(|(current, _)| current != operation_id)
+        {
+            bail!("Computer model qualification was superseded");
+        }
+        inner.computer_agent_qualifications.insert(
+            (session_id, model.to_string()),
+            SessionComputerQualification {
+                route_fingerprint,
+                binding,
+            },
+        );
+        Ok(())
+    }
+
+    fn forget_session_qualification(&self, session_id: Uuid, model: &str) {
+        self.inner
+            .lock()
+            .computer_agent_qualifications
+            .remove(&(session_id, model.to_string()));
+    }
+
     /// Ask the selected, qualified model for one bounded semantic proposal.
     /// This method cannot dispatch an OS action.
+    ///
+    /// The capability binding is validated before the model is asked and again
+    /// after it answers, so a downgrade or revocation that lands while the
+    /// model is thinking does not produce a proposal anyone can act on.
     pub async fn propose_computer_action(
         &self,
         session_id: Uuid,
@@ -1060,18 +1427,12 @@ impl AgentHostHandle {
         let credentials = crate::auth_store::resolve_wire_credentials_for_model(&model)
             .map_err(anyhow::Error::msg)?
             .ok_or_else(|| anyhow!(crate::auth_store::auth_help_message()))?;
-        let resolved = resolve_computer_eligibility(&credentials, &model)?;
-        let durable_authority =
-            resolved.eligibility.tier >= crate::gateway_config::ComputerUseTier::SemanticAct;
-        let session_authority = self
-            .inner
-            .lock()
-            .computer_agent_qualifications
-            .get(&(session_id, model.clone()))
-            .is_some_and(|record| record.route_fingerprint == resolved.route_fingerprint);
-        if !durable_authority && !session_authority {
-            bail!("selected model is not qualified for semantic Computer actions");
-        }
+        let route_fingerprint = resolve_computer_route_fingerprint(&credentials, &model)?;
+        let binding = self
+            .computer_action_binding(session_id, &model, &route_fingerprint)
+            .map_err(anyhow::Error::new)?;
+        self.validate_capability_boundary(session_id, &binding, CapabilityBoundary::Proposal)
+            .map_err(anyhow::Error::new)?;
         let proposal = propose_semantic_action(
             &credentials,
             &model,
@@ -1085,8 +1446,58 @@ impl AgentHostHandle {
         if cancel.is_cancelled() {
             bail!("Computer model proposal was cancelled");
         }
-        self.ensure_computer_route_unchanged(session_id, &model, &resolved.route_fingerprint)?;
+        self.ensure_computer_route_unchanged(session_id, &model, &route_fingerprint)?;
+        self.validate_capability_boundary(session_id, &binding, CapabilityBoundary::Proposal)
+            .map_err(anyhow::Error::new)?;
         Ok(proposal)
+    }
+
+    /// The binding a model-attributed action for this session must carry.
+    ///
+    /// Durable capability is bound the same way a session probe is: this
+    /// returns a binding only when one has actually been minted, so nothing
+    /// reaches an action boundary on a capability record alone.
+    fn computer_action_binding(
+        &self,
+        session_id: Uuid,
+        model: &str,
+        expected_route: &str,
+    ) -> Result<CapabilityBindingRef, CapabilityDenied> {
+        self.session_capability_binding(session_id, model, expected_route)
+            .ok_or(CapabilityDenied)
+    }
+
+    /// The binding the desktop cockpit stages a model proposal under (#458).
+    ///
+    /// Validated at the staging boundary before it is handed out, so a stale
+    /// capability never reaches the kernel as a staged action in the first
+    /// place.
+    pub fn computer_staging_binding(&self, session_id: Uuid) -> Result<CapabilityBindingRef> {
+        let (model, _) = self.selected_computer_model(session_id)?;
+        let credentials = crate::auth_store::resolve_wire_credentials_for_model(&model)
+            .map_err(anyhow::Error::msg)?
+            .ok_or_else(|| anyhow!(crate::auth_store::auth_help_message()))?;
+        let route_fingerprint = resolve_computer_route_fingerprint(&credentials, &model)?;
+        let binding = self
+            .computer_action_binding(session_id, &model, &route_fingerprint)
+            .map_err(anyhow::Error::new)?;
+        self.validate_capability_boundary(session_id, &binding, CapabilityBoundary::Staging)
+            .map_err(anyhow::Error::new)?;
+        Ok(binding)
+    }
+
+    /// Revalidates model authority as a local approval is resolved (#458).
+    ///
+    /// The operator approved one exact action against one exact capability.
+    /// If that capability moved between the approval being shown and the
+    /// operator pressing the button, the approval is not the one they gave.
+    pub fn authorize_computer_approval(
+        &self,
+        session_id: Uuid,
+        binding: &CapabilityBindingRef,
+    ) -> Result<()> {
+        self.validate_capability_boundary(session_id, binding, CapabilityBoundary::Approval)
+            .map_err(anyhow::Error::new)
     }
 
     /// Local Stop/Take over cancellation. It does not share the Build-turn
@@ -1106,7 +1517,21 @@ impl AgentHostHandle {
         }
     }
 
+    /// Explicit revocation of every standing Computer Use model authority.
+    ///
+    /// The in-memory qualification map is cleared *and* the capability
+    /// generation advances, so a binding already handed to a run — or to the
+    /// kernel — stops validating at its next boundary rather than at its next
+    /// qualification. Advance failure is the exhaustion case: nothing is
+    /// mutated in the authority, and every subsequent boundary refuses, which
+    /// is the same outcome a successful revocation would have produced.
     fn invalidate_computer_agent_authority(&self) {
+        // The upstream lineage moves first, so a binding is retired by the
+        // authority it descends from as well as by the capability generation.
+        self.auth_lineage
+            .1
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _ = self.capability_registry.revoke_all();
         let tokens = {
             let mut inner = self.inner.lock();
             inner.computer_agent_qualifications.clear();
@@ -1119,6 +1544,13 @@ impl AgentHostHandle {
         for token in tokens {
             token.cancel();
         }
+    }
+
+    /// Records an operator policy or allowlist change that a capability
+    /// depends on, then revokes.
+    fn invalidate_computer_agent_authority_on_policy_change(&self) {
+        let _ = self.capability_registry.bump_policy_revision();
+        self.invalidate_computer_agent_authority();
     }
 
     fn selected_computer_model(&self, session_id: Uuid) -> Result<(String, EffortLevel)> {
@@ -1182,8 +1614,8 @@ impl AgentHostHandle {
         let credentials = crate::auth_store::resolve_wire_credentials_for_model(&current_model)
             .map_err(anyhow::Error::msg)?
             .ok_or_else(|| anyhow!(crate::auth_store::auth_help_message()))?;
-        let current = resolve_computer_eligibility(&credentials, &current_model)?;
-        if current.route_fingerprint != expected_route {
+        let current = resolve_computer_route_fingerprint(&credentials, &current_model)?;
+        if current != expected_route {
             bail!("provider route changed while the Computer request was running");
         }
         Ok(())
@@ -3439,6 +3871,11 @@ impl AgentHostHandle {
 
     pub fn session_delete(&self, id: Uuid) -> Result<()> {
         self.cancel_computer_agent(id);
+        // Forgetting the host-side qualification map is not enough: a run
+        // record can still carry a binding reference. Retire the session's
+        // capability bindings in the authority so nothing left behind can
+        // validate against a session that no longer exists.
+        let _ = self.capability_registry.revoke_session(id);
         {
             let mut g = self.inner.lock();
             if !g.sessions.contains_key(&id) {
@@ -4140,7 +4577,7 @@ impl AgentHostHandle {
     pub fn set_model(&self, model: String) {
         let changed = self.inner.lock().model != model;
         if changed {
-            self.invalidate_computer_agent_authority();
+            self.invalidate_computer_agent_authority_on_policy_change();
         }
         self.inner.lock().model = model;
         self.persist_chrome();
@@ -5647,7 +6084,7 @@ impl AgentHostHandle {
         cfg.upsert_profile(profile).map_err(anyhow::Error::msg)?;
         cfg.active_profile_id = Some(provider_id.clone());
         crate::gateway_config::save(&cfg).map_err(|e| anyhow!("save gateway.json: {e}"))?;
-        self.invalidate_computer_agent_authority();
+        self.invalidate_computer_agent_authority_on_policy_change();
         self.set_model(crate::gateway_config::model_selection_key(
             &provider_id,
             &current_model_id,
@@ -5728,7 +6165,7 @@ impl AgentHostHandle {
         config.upsert_profile(profile).map_err(anyhow::Error::msg)?;
         config.active_profile_id = Some(provider_id.clone());
         crate::gateway_config::save(&config).context("save provider profile")?;
-        self.invalidate_computer_agent_authority();
+        self.invalidate_computer_agent_authority_on_policy_change();
         self.set_model(crate::gateway_config::model_selection_key(
             &provider_id,
             &model_id,
@@ -5779,7 +6216,12 @@ impl AgentHostHandle {
             config.clear_legacy_fields();
         }
         crate::gateway_config::save(&config).context("remove provider profile")?;
-        self.invalidate_computer_agent_authority();
+        // A removed profile takes its credential identity with it. The slot's
+        // incarnation advances rather than disappearing, so re-adding the same
+        // provider with byte-identical credential material cannot land back on
+        // the authority the deleted one had.
+        let _ = self.capability_registry.forget_credential(&provider_id);
+        self.invalidate_computer_agent_authority_on_policy_change();
 
         if let Some(reference) = profile.credential_ref.as_deref() {
             crate::auth_store::delete_provider_credential(&profile.id, reference)
@@ -11161,6 +11603,10 @@ mod computer_agent_host_tests {
             (first.id, model.clone()),
             SessionComputerQualification {
                 route_fingerprint: "route-a".into(),
+                // Deliberately unbound: this exercises session scoping, and an
+                // unbound qualification is exactly what must never be
+                // attributed to current capability authority.
+                binding: CapabilityBindingRef::unbound(),
             },
         );
 

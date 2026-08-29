@@ -276,6 +276,17 @@ pub enum ActionClass {
     PointerFallback,
 }
 
+impl ActionClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Semantic => "semantic",
+            Self::TextEntry => "text_entry",
+            Self::KeyChord => "key_chord",
+            Self::PointerFallback => "pointer_fallback",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GrantIssuer {
@@ -645,6 +656,30 @@ pub struct ComputerRun {
     pub last_outcome: Option<ActionOutcome>,
     pub audit: Vec<ComputerAuditEntry>,
     pub last_error: Option<ComputerError>,
+    /// Grant id the run was carrying when model authority was last bound to
+    /// it (#458).
+    ///
+    /// This is what stops a cleared binding from *widening* a run into the
+    /// operator path. Clearing model authority always revokes the grant with
+    /// it, so a run whose binding is gone but whose grant id still matches
+    /// this one has had its authority stripped rather than handed back: it
+    /// dispatches nothing. Regaining manual control means a fresh operator
+    /// grant, which no longer matches, and the run is honestly
+    /// operator-driven again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_authority_grant_id: Option<String>,
+    /// Model authority this run is being driven under, when it is being driven
+    /// by a model at all (#458).
+    ///
+    /// `None` is an operator-driven run and needs no provider capability.
+    /// `Some` is a claim that a provider capability generation authorized this
+    /// run, and the kernel refuses to lease, deliver a frame, or dispatch on it
+    /// unless a live capability authority still agrees. The reference is
+    /// secret-free and confers nothing on its own: after a restart it names a
+    /// binding no live authority holds, so a restored record cannot resume
+    /// model authority.
+    #[serde(default)]
+    pub capability_binding: Option<crate::capability_authority::CapabilityBindingRef>,
 }
 
 impl ComputerRun {
@@ -681,6 +716,8 @@ impl ComputerRun {
             last_outcome: None,
             audit: Vec::new(),
             last_error: None,
+            model_authority_grant_id: None,
+            capability_binding: None,
         })
     }
 

@@ -12,6 +12,7 @@
 //! Which runs each surface may list is a separate gate: the cockpit is
 //! session-scoped; coordinator reads take [`ComputerReadBinding`].
 
+mod capability_gate;
 mod macos_observation;
 mod platform;
 mod policy;
@@ -22,6 +23,7 @@ mod simulator;
 mod store;
 mod types;
 
+pub(crate) use capability_gate::{capability_denied, ComputerActor, ComputerCapabilityGate};
 pub use macos_observation::MacOsObservationPlatform;
 pub use platform::{
     ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
