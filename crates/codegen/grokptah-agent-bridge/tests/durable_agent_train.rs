@@ -132,7 +132,8 @@ fn a_poll_whose_output_only_changes_past_the_wire_bound_is_not_inert() {
     let mut raw_ledger = ProgressLedger::new();
     let mut projection_ledger = ProgressLedger::new();
 
-    for round in 0..8 {
+    // Long enough for the post-bound digest to reach the inert ceiling.
+    for round in 0..durable::progress::MAX_INERT_REPEATS {
         let raw = format!("{head}progress-{round}");
         let observation = RawObservation::capture(&raw);
         let projected = observation.project(WIRE_BOUND);
@@ -158,7 +159,7 @@ fn a_poll_whose_output_only_changes_past_the_wire_bound_is_not_inert() {
 fn an_inert_repeat_stops_at_the_inert_ceiling() {
     let mut ledger = ProgressLedger::new();
     let mut stopped_at: Option<u32> = None;
-    for round in 1..=8u32 {
+    for round in 1..=16u32 {
         poll_round(&mut ledger, "queued; nothing to report");
         if let StopDecision::Stop(detail) = ledger.decide() {
             stopped_at = Some(round);
@@ -239,7 +240,7 @@ fn an_unobserved_repeat_still_stops_at_the_identical_call_ceiling() {
 #[test]
 fn a_stationarity_stop_message_reads_as_incomplete_not_as_a_round_limit() {
     let mut ledger = ProgressLedger::new();
-    for _ in 0..5 {
+    for _ in 0..durable::progress::MAX_INERT_REPEATS {
         poll_round(&mut ledger, "unchanged");
     }
     let StopDecision::Stop(detail) = ledger.decide() else {

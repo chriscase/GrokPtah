@@ -18,18 +18,30 @@
 
 use super::observation::RawObservationDigest;
 
-/// Consecutive identical calls whose observations also never moved.
-pub const MAX_INERT_REPEATS: u32 = 4;
-/// Consecutive calls that are no-ops by construction.
+// Ceilings ordered by how strong the evidence of being stuck is. A call that
+// cannot accomplish anything stops soonest; a call the host has no observation
+// for keeps the historical identical-call ceiling; and an identical call whose
+// output keeps changing has no ceiling here at all, because it is bounded by
+// rounds, duration and tokens instead.
+
+/// Consecutive calls that are no-ops by construction. Nothing can change.
 pub const MAX_TRUE_NOOPS: u32 = 4;
-/// Consecutive identical calls for which no observation evidence exists.
-pub const MAX_UNOBSERVED_REPEATS: u32 = 16;
 /// Nudge the model once a repeat run reaches this length.
 pub const NUDGE_AFTER_REPEATS: u32 = 8;
+/// Consecutive identical calls whose observations also never moved.
+///
+/// Deliberately above [`NUDGE_AFTER_REPEATS`] so the one-shot nudge fires first
+/// and the model gets two rounds to change approach. A poll that answers
+/// "still running" with byte-identical output is a productive wait, not a stuck
+/// loop, and stopping it at the no-op ceiling would be exactly the false
+/// stationarity this ledger exists to remove.
+pub const MAX_INERT_REPEATS: u32 = 10;
+/// Consecutive identical calls for which no observation evidence exists.
+pub const MAX_UNOBSERVED_REPEATS: u32 = 16;
 
-const _: () = assert!(MAX_INERT_REPEATS < NUDGE_AFTER_REPEATS);
 const _: () = assert!(MAX_TRUE_NOOPS < NUDGE_AFTER_REPEATS);
-const _: () = assert!(NUDGE_AFTER_REPEATS < MAX_UNOBSERVED_REPEATS);
+const _: () = assert!(NUDGE_AFTER_REPEATS < MAX_INERT_REPEATS);
+const _: () = assert!(MAX_INERT_REPEATS < MAX_UNOBSERVED_REPEATS);
 
 /// What the evidence says about a run of repeated calls.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
