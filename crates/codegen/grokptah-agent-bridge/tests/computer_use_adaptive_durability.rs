@@ -696,3 +696,102 @@ async fn the_shared_run_projection_carries_the_durable_adaptive_record() {
     assert!(!wire.contains("lastFrameDigest"), "{wire}");
     assert!(!wire.contains("cred-1"), "{wire}");
 }
+
+/// **The wire shape is pinned, in Rust.**
+///
+/// `ComputerRunProjection` is the read shape the cockpit, the MCP surface, and
+/// SDK consumers all share, so adding a key to it changes a public contract.
+/// A Node conformance fixture already pins this set over real loopback HTTP,
+/// but that fixture needs an `npm ci`, so it only runs in CI — and adding
+/// `adaptive` to the projection sailed past every local check and broke it
+/// there. This gate is the same pin in the ordinary bridge suite: a new field
+/// on either shape fails here first, in a second, with the two lists to
+/// reconcile printed side by side.
+///
+/// If this fails, the fix is to decide whether the new key belongs on the wire
+/// at all, and if it does, to update **both** this list and `ADAPTIVE_KEYS` /
+/// `PROJECTION_KEYS` in `tests/mcp_sdk_interop/run_computer_reads_smoke.mjs`.
+#[tokio::test]
+async fn the_projection_wire_shape_is_pinned() {
+    /// Mirrors `PROJECTION_KEYS` in `run_computer_reads_smoke.mjs`.
+    const PROJECTION_KEYS: &[&str] = &[
+        "adaptive",
+        "agentActive",
+        "campaignId",
+        "controlDisposition",
+        "controlEpoch",
+        "createdAt",
+        "endedAt",
+        "eventRange",
+        "grant",
+        "lastError",
+        "lastOutcome",
+        "observation",
+        "ownerSessionId",
+        "parentRunId",
+        "progress",
+        "runId",
+        "startedAt",
+        "state",
+        "target",
+        "terminal",
+        "updatedAt",
+        "version",
+    ];
+    /// Mirrors `ADAPTIVE_KEYS` in `run_computer_reads_smoke.mjs`.
+    const ADAPTIVE_KEYS: &[&str] = &[
+        "budget",
+        "capability",
+        "cost",
+        "escalations",
+        "lifecycle",
+        "message",
+        "observationTruncated",
+        "profile",
+        "profileDisplayName",
+        "reason",
+        "requiresIndependentVerifier",
+        "revision",
+        "risk",
+        "riskHighWater",
+        "safetyFloor",
+        "stationaryRepeats",
+        "terminal",
+    ];
+
+    fn keys(value: &serde_json::Value) -> Vec<String> {
+        let mut keys: Vec<String> = value
+            .as_object()
+            .expect("an object")
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    let harness = Harness::new();
+    let run = harness.ready_run().await;
+    let evidence = evidence("route-1", "cred-1", true, true);
+    harness
+        .service
+        .begin_adaptive_turn(&run.run_id, harness.owner, &evidence, TaskRisk::Routine)
+        .expect("turn");
+
+    let projection = harness
+        .service
+        .project_session_run(harness.owner, &run.run_id, Utc::now())
+        .expect("project");
+    let wire = serde_json::to_value(&projection).expect("serialize");
+
+    assert_eq!(
+        keys(&wire),
+        PROJECTION_KEYS,
+        "the run projection's wire keys changed"
+    );
+    assert_eq!(
+        keys(&wire["adaptive"]),
+        ADAPTIVE_KEYS,
+        "the adaptive projection's wire keys changed"
+    );
+}

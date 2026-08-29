@@ -106,6 +106,14 @@ high-water, revision, lifecycle, spend, escalation history, stationarity state.
 - Operator takeover, stop, and any withdrawal of Computer authority end the
   record durably rather than dropping it, so the account of what happened
   survives.
+- **A refusal at selection is a record too.** When the policy engine refuses to
+  start a run at all, `AdaptiveRecord::stopped_at_selection` writes a stopped
+  record carrying the reason. Writing nothing there had two consequences: the
+  operator projection read `None` for a run the host had just refused, so the
+  reason survived only as an audit line; and the run still read "no adaptive
+  record", so the very next objective — at any lower risk — opened a fresh
+  selection on the same authorized run. That is the probe-then-proceed shape
+  this layer exists to refuse, so a stopped run now stays stopped.
 
 ## Every provider attempt is counted
 
@@ -311,6 +319,49 @@ It asserts three properties:
 
 A synthetic PASS means the code refuses what it says it refuses, on these
 fixtures. It is not evidence that a live model can drive a real application.
+
+## The whole path, end to end
+
+`tests/computer_use_adaptive_end_to_end.rs` walks the full sequence rather than
+any one stage of it:
+
+```text
+host admission -> provider -> seal -> profile budget
+               -> operator approval -> dispatch -> postcondition -> completion
+```
+
+Each gate asserts two things a single-stage test cannot. First, **which stage
+refused** — a test that only checks "this failed" cannot distinguish a budget
+rejection from a seal rejection, and that distinction is the safety argument:
+the seal refuses first, and the profile can only ever refuse *more*. Second,
+**zero dispatches on any refusal** — the fixture backend counts every `act` it
+is asked to perform, so a refusal anywhere before dispatch has to leave that
+counter untouched.
+
+The gates are: the happy path (exactly one dispatch, then a verified completion
+on the host-issued receipt); a forged completion refused at the seal; an
+oversized text entry the kernel would have accepted and the Economy budget does
+not; a declined operator approval; a later higher-risk objective stopped at
+admission before any spend; a stopped run that admits nothing afterwards; and a
+provider transport failure that is still a paid attempt.
+
+## The wire shape is pinned twice
+
+`ComputerRunProjection` is the read shape the cockpit, the MCP surface, and SDK
+consumers all share, so adding a key to it changes a public contract. It is
+pinned in two places, and both lists must be updated together:
+
+- `tests/mcp_sdk_interop/run_computer_reads_smoke.mjs` — `PROJECTION_KEYS` and
+  `ADAPTIVE_KEYS`, checked by an independent Node client over real loopback
+  HTTP;
+- `the_projection_wire_shape_is_pinned` in
+  `tests/computer_use_adaptive_durability.rs` — the same pin in the ordinary
+  bridge suite.
+
+The Rust pin exists because the Node one needs an `npm ci` behind it: adding
+`adaptive` to the projection passed every fast local check and was caught only
+by a hosted run. The Rust pin now fails first, in a second, with both lists
+printed.
 
 ## Relationship to the standalone evaluator
 

@@ -80,7 +80,7 @@ async function tool(id, name, args, options = {}) {
 
 // Wire-level redaction pins: these must match the Rust structural pins.
 const PROJECTION_KEYS = [
-  "agentActive", "campaignId", "controlDisposition", "controlEpoch",
+  "adaptive", "agentActive", "campaignId", "controlDisposition", "controlEpoch",
   "createdAt", "endedAt", "eventRange", "grant", "lastError", "lastOutcome",
   "observation", "ownerSessionId", "parentRunId", "progress", "runId",
   "startedAt", "state", "target", "terminal", "updatedAt", "version",
@@ -92,6 +92,17 @@ const OBSERVATION_KEYS = [
 const LAST_OUTCOME_KEYS = ["expectedPostconditionMet"];
 const LAST_ERROR_KEYS = ["code"];
 const CAPACITY_KEYS = ["boundActiveRuns", "boundRuns", "maxRunRecords"];
+// The adaptive profile projection (#435). Pinned like every other nested shape
+// on this wire, because the redaction argument for it is structural: an
+// operator-readable account of what a run cost and why it stopped must never
+// start carrying element labels, values, geometry, frame digests, or evidence
+// tokens. A new key here has to be added deliberately, and reviewed.
+const ADAPTIVE_KEYS = [
+  "budget", "capability", "cost", "escalations", "lifecycle", "message",
+  "observationTruncated", "profile", "profileDisplayName", "reason",
+  "requiresIndependentVerifier", "revision", "risk", "riskHighWater",
+  "safetyFloor", "stationaryRepeats", "terminal",
+];
 
 function pinProjection(name, projection) {
   check(
@@ -123,6 +134,22 @@ function pinProjection(name, projection) {
       Object.keys(projection.lastError).sort().join(","),
     );
   }
+  if (projection.adaptive) {
+    check(
+      `${name}: adaptive keys are pinned`,
+      JSON.stringify(Object.keys(projection.adaptive).sort()) ===
+        JSON.stringify(ADAPTIVE_KEYS),
+      Object.keys(projection.adaptive).sort().join(","),
+    );
+  }
+  // A run with no adaptive decision must read `null`, not `{}`. "No adaptive
+  // authority has been established" and "established, with nothing in it" are
+  // different states, and only one of them may spend a model call.
+  check(
+    `${name}: absent adaptive state is null, not an empty object`,
+    projection.adaptive === null || typeof projection.adaptive === "object",
+    JSON.stringify(projection.adaptive),
+  );
 }
 
 async function main() {

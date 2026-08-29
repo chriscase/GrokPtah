@@ -941,6 +941,18 @@ impl ComputerUseService {
                         ));
                     }
                     PolicyOutcome::Stop(stop) => {
+                        // Write the refusal as a durable stopped record rather
+                        // than only an audit line. Leaving `adaptive` as `None`
+                        // here would hide the stop reason from every reader of
+                        // the shared projection, and would let the next
+                        // objective open a fresh selection on a run the host
+                        // had already refused.
+                        run.adaptive = Some(AdaptiveRecord::stopped_at_selection(
+                            &stop,
+                            evidence.clone(),
+                            risk,
+                            evidence.model.generation.clone(),
+                        ));
                         run.record_audit(
                             "adaptive_select",
                             "refused",

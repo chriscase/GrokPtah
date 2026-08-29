@@ -28,8 +28,9 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::capability::CapabilityEvidence;
 use super::capability::CapabilityGeneration;
-use super::policy::{ProfileDecision, ProfileReason};
+use super::policy::{PolicyStop, ProfileDecision, ProfileReason};
 use super::profile::AdaptiveProfile;
 use super::risk::TaskRisk;
 
@@ -208,6 +209,45 @@ impl AdaptiveRecord {
             last_frame_digest: None,
             terminal: None,
         }
+    }
+
+    /// Opens a record for a run the policy engine refused before any profile
+    /// was ever in force.
+    ///
+    /// A selection-time stop used to write no record at all, and that had two
+    /// consequences. The operator's projection read `None` for a run the host
+    /// had just refused, so the stop reason survived only as an audit line and
+    /// never reached the cockpit, the MCP surface, or an SDK reader. And the
+    /// run still read "no adaptive record", so the very next objective — at any
+    /// lower risk — opened a fresh selection on the same authorized run, which
+    /// is exactly the probe-then-proceed shape this layer exists to refuse.
+    ///
+    /// Both are closed by making the refusal durable, which is what every other
+    /// terminal path here already does.
+    pub fn stopped_at_selection(
+        stop: &PolicyStop,
+        evidence: CapabilityEvidence,
+        risk: TaskRisk,
+        generation: CapabilityGeneration,
+    ) -> Self {
+        let mut record = Self::new(
+            ProfileDecision {
+                profile: stop.profile,
+                reason: stop.reason,
+                risk,
+                ceiling: stop.ceiling,
+                evidence,
+            },
+            generation,
+        );
+        record.lifecycle = AdaptiveLifecycle::Stopped;
+        record.terminal = Some(TerminalOutcome {
+            lifecycle: AdaptiveLifecycle::Stopped,
+            reason: stop.reason,
+            profile: stop.profile,
+            required_profile: stop.required_profile,
+        });
+        record
     }
 
     pub fn bump(&mut self) {
