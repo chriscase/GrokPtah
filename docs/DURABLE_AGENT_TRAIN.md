@@ -268,8 +268,49 @@ answer drives the retry decision and is then discarded.
 
 That last sentence is the honest shape of what remains: the live path has no
 durable attempt record at all. `ProviderAttemptEvidence` is a certification-lab
-artifact, not something the send path writes. Adding one is #497's G3, and a
-second attempt ledger beside it is what the audit of this branch rejected. Binding the
+artifact, not something the send path writes — it is constructed in exactly one
+place in this repository, a test.
+
+### Exactly what blocks the durable half
+
+Not "it belongs to #497" in the abstract. The blocker is checkable at #497's
+API:
+
+```rust
+pub fn begin_send(
+    &self,
+    auth: &AuthContext,
+    lease: EffectLease,
+    request: &RequestIdentity,
+) -> Result<PhysicalSendPermit, AuthorityError>
+```
+
+`AuthContext` has all-`pub(crate)` fields and no public constructor — by design,
+since minting authority from data is #497's own defect 4. So wiring the live
+send path to the permit requires, in order:
+
+1. a canonical **principal** for a live agent turn, authenticated against a
+   stored credential — the bridge has none today, and deciding what one *is* is
+   #460/#477, still open;
+2. a sealed **capability** and a one-use **`EffectLease`** per send;
+3. the host owning an **`AuthorityStore`** root, held exclusively for its
+   lifetime.
+
+That is adopting G1 and G2 into the live runtime, which is the "assembled
+mainline" work #478 describes and which #497 explicitly stops before — its
+residual 1 says no credential-bearing send in this repository is structurally
+guarded by it, and names the transport wiring as the next dependency.
+
+The tempting shortcut is to mint a *provisional* principal to satisfy the
+signature. That is the precise defect pattern already caught on this branch: a
+provisional identity frozen into a durable record, indistinguishable later from
+a canonical one. It is #497's defect 5, and it is why the earlier
+`GrantProvenance` marker here was withdrawn rather than kept.
+
+So the durable half waits on G1/G2 reaching the live runtime, not merely on G3
+existing. Everything in the lattice that does *not* need an authority root —
+the single-path gate, the retry rule, and the settled/uncertain answer on both
+existing records — is delivered above. Binding the
 qualification probes needs the attempt identity G3 provides, so it is named as
 the remaining work rather than approximated.
 
