@@ -798,10 +798,30 @@ struct SessionWorkspaceArgs {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ReceiptsArgs {
+    session_id: Uuid,
+    workspace: PathBuf,
+    run_id: String,
+    #[serde(default)]
+    after: Option<String>,
+    #[serde(default = "default_receipt_limit")]
+    limit: usize,
+}
+
+fn default_receipt_limit() -> usize {
+    50
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateSessionArgs {
     workspace: PathBuf,
     #[serde(default)]
     title: Option<String>,
+    /// Optional idempotency key. Absent keeps the pre-existing behavior;
+    /// present makes creation replayable and key reuse a conflict.
+    #[serde(default)]
+    request_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1772,6 +1792,10 @@ fn status_for(e: &OrchError) -> StatusCode {
         OrchErrorCode::CursorExpired => StatusCode::GONE,
         OrchErrorCode::SessionBusy | OrchErrorCode::CapacityExhausted => StatusCode::CONFLICT,
         OrchErrorCode::Timeout => StatusCode::GATEWAY_TIMEOUT,
+        // The host does not know whether the effect applied, which is what a
+        // 500 says. Named rather than left to the catch-all: a caller reading
+        // the typed code must find `uncertain_outcome` and not auto-retry.
+        OrchErrorCode::UncertainOutcome => StatusCode::INTERNAL_SERVER_ERROR,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -1830,11 +1854,19 @@ fn tool_input_schema(name: &str) -> Value {
         "properties": {
             "maxPromptBytes": {"type": "integer", "minimum": 1},
             "maxRounds": {"type": "integer", "minimum": 1, "maximum": 24},
-            "maxDurationMs": {"type": "integer", "minimum": 1}
+            "maxDurationMs": {"type": "integer", "minimum": 1},
+            // `merge_bounds` has always accepted this; leaving it out of the
+            // advertised schema while `additionalProperties` is false meant a
+            // schema-validating client was refused the one documented ceiling
+            // it most needs. The schema now says what the runtime does.
+            "maxTotalTokens": {"type": "integer", "minimum": 1}
         }
     });
     match name {
-        "ptah_list_sessions" | "ptah_list_persistent_agents" | "ptah_get_capacity" => json!({
+        "ptah_list_sessions"
+        | "ptah_list_persistent_agents"
+        | "ptah_get_capacity"
+        | "ptah_get_host_info" => json!({
             "type": "object",
             "properties": {},
             "additionalProperties": false
@@ -1845,7 +1877,8 @@ fn tool_input_schema(name: &str) -> Value {
             "additionalProperties": false,
             "properties": {
                 "workspace": workspace,
-                "title": {"type": "string", "minLength": 1, "maxLength": 160}
+                "title": {"type": "string", "minLength": 1, "maxLength": 160},
+                "request_id": req_id
             }
         }),
         "ptah_list_runs" => json!({
@@ -1906,6 +1939,22 @@ fn tool_input_schema(name: &str) -> Value {
                     "description": "Durable cursor. Omit to read from the start of the retained journal; a cursor below the retained window fails with cursor_expired and includes eventRange."
                 },
                 "limit": {"type": "integer", "minimum": 1, "maximum": 500}
+            }
+        }),
+        "ptah_list_receipts" => json!({
+            "type": "object",
+            "required": ["session_id", "workspace", "run_id"],
+            "additionalProperties": false,
+            "properties": {
+                "session_id": session,
+                "workspace": workspace,
+                "run_id": run_id,
+                "after": {
+                    "type": "string",
+                    "maxLength": 128,
+                    "description": "Opaque cursor from a previous page's nextCursor. Never construct one."
+                },
+                "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50}
             }
         }),
         "ptah_get_events" => json!({
@@ -2693,7 +2742,12 @@ async fn dispatch_tool(
         }
         "ptah_create_session" => {
             let args: CreateSessionArgs = parse_value(args)?;
-            orch.create_session(auth, &args.workspace, args.title)
+            orch.create_session_idempotent(auth, &args.workspace, args.title, args.request_id)
+                .await
+        }
+        "ptah_get_host_info" => {
+            let _: EmptyArgs = parse_value(args)?;
+            orch.host_info(auth)
         }
         "ptah_list_persistent_agents" => {
             let _: EmptyArgs = parse_value(args)?;
@@ -2737,6 +2791,24 @@ async fn dispatch_tool(
                 &args.workspace,
                 &args.run_id,
                 args.after_seq,
+                args.limit,
+            )
+        }
+        "ptah_list_receipts" => {
+            let args: ReceiptsArgs = parse_value(args)?;
+            require_nonempty(&args.run_id, "run_id")?;
+            if !(1..=200).contains(&args.limit) {
+                return Err(OrchError::new(
+                    OrchErrorCode::InvalidRequest,
+                    "limit must be between 1 and 200",
+                ));
+            }
+            orch.list_receipts_scoped(
+                auth,
+                args.session_id,
+                &args.workspace,
+                &args.run_id,
+                args.after,
                 args.limit,
             )
         }

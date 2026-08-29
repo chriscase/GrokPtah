@@ -1849,7 +1849,11 @@ fn run_event_pages_filter_before_limit_across_sessions() {
                 .display()
                 .to_string(),
             request_id: "event-page-test".into(),
-            client_id: None,
+            // Stamped with the owner `auth` maps to. A run saved without one
+            // is unattributed and no principal may read it — asserted below —
+            // so leaving this `None` would make the page assertions test the
+            // fence rather than pagination.
+            client_id: Some("mcp".into()),
             state: RunState::Completed,
             purpose: Default::default(),
             agent_id: None,
@@ -1892,6 +1896,27 @@ fn run_event_pages_filter_before_limit_across_sessions() {
         .unwrap();
     assert_eq!(next["entries"].as_array().unwrap().len(), 1);
     assert_eq!(next["entries"][0]["seq"], end_seq);
+
+    // The same events, behind a run nobody owns. An unattributed record cannot
+    // be shown to belong to this caller, so the read is refused — and refused
+    // identically to a run id that does not exist, or the denial itself would
+    // confirm the record is there.
+    let mut orphan = orch.store().load_run(&run_id).unwrap().unwrap();
+    orphan.run_id = Uuid::new_v4().to_string();
+    orphan.client_id = None;
+    orch.store().save_run(&orphan).unwrap();
+    let orphan_err = orch
+        .get_events(&auth, Some(&orphan.run_id), 0, 1)
+        .expect_err("an unattributed run must not be readable");
+    let absent_err = orch
+        .get_events(&auth, Some(&Uuid::new_v4().to_string()), 0, 1)
+        .expect_err("an unknown run must not be readable");
+    assert_eq!(orphan_err.code.as_str(), "forbidden_scope");
+    assert_eq!(
+        (orphan_err.code.as_str(), orphan_err.message.as_str()),
+        (absent_err.code.as_str(), absent_err.message.as_str()),
+        "unattributed and unknown must be indistinguishable"
+    );
     set_grokptah_home_override(None);
 }
 

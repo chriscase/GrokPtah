@@ -35,7 +35,9 @@ use super::routine::{
     RoutineConcurrencyPolicy, RoutineLifecycle, RoutineRecord, RoutineRetryPolicy, RoutineTrigger,
     WorkTemplate,
 };
-use super::store::{IdempotencyClaim, OrchStore};
+use super::store::{
+    IdempotencyClaim, OrchStore, DEFAULT_IDEMPOTENCY_RECEIPT_AGE, DEFAULT_MAX_IDEMPOTENCY_RECEIPTS,
+};
 use super::supervisor::{
     ManagerSupervisorReport, ManagerSupervisorStatus, RoutineSupervisor, RoutineSupervisorStatus,
     WorkloadSupervisor, WorkloadSupervisorStatus, DEFAULT_MANAGER_TICK_INTERVAL,
@@ -166,6 +168,7 @@ fn redact_claim_lease_token(mut response: serde_json::Value) -> serde_json::Valu
 
 struct IdempotencyLease {
     store: OrchStore,
+    scope: IdempotencyScope,
     tool: String,
     request_id: String,
     payload_hash: String,
@@ -179,6 +182,7 @@ impl IdempotencyLease {
         response: serde_json::Value,
     ) -> Result<(), OrchError> {
         self.store.complete_idempotency(
+            &self.scope,
             &self.tool,
             &self.request_id,
             &self.payload_hash,
@@ -191,6 +195,7 @@ impl IdempotencyLease {
 
     fn fail(&mut self, run_id: Option<String>, error: OrchError) -> OrchError {
         match self.store.fail_idempotency(
+            &self.scope,
             &self.tool,
             &self.request_id,
             &self.payload_hash,
@@ -218,6 +223,7 @@ impl Drop for IdempotencyLease {
         if self
             .store
             .fail_idempotency(
+                &self.scope,
                 &self.tool,
                 &self.request_id,
                 &self.payload_hash,
@@ -1766,20 +1772,32 @@ impl OrchestrationService {
         }
     }
 
+    /// Claim `request_id` **in the caller's scope**.
+    ///
+    /// `request_id` is caller-chosen, so it names a request only within the
+    /// principal that chose it. Scoping the claim is what keeps one caller's
+    /// key from replaying another's response, reporting `conflict` to reveal
+    /// that the key is taken, or being squatted before its owner uses it.
     async fn begin_idempotency(
         &self,
+        auth: &AuthContext,
         tool: &str,
         request_id: &str,
         payload_hash: &str,
         session_id: Uuid,
         workspace: &Path,
     ) -> Result<IdempotencyStart, OrchError> {
+        let scope = Self::idempotency_scope(auth);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
-            match self.store.claim_idempotency(tool, request_id, payload_hash) {
+            match self
+                .store
+                .claim_idempotency(&scope, tool, request_id, payload_hash)
+            {
                 Ok(IdempotencyClaim::Perform) => {
                     return Ok(IdempotencyStart::Perform(IdempotencyLease {
                         store: self.store.clone(),
+                        scope: scope.clone(),
                         tool: tool.into(),
                         request_id: request_id.into(),
                         payload_hash: payload_hash.into(),
@@ -1865,6 +1883,114 @@ impl OrchestrationService {
     }
 
     /// Load run and verify workspace ownership against allowlist + session.
+    /// Whether this credential may read a run stamped with `client_id`.
+    ///
+    /// Three cases, and the middle one is the reason this is not a plain
+    /// equality check:
+    ///
+    /// * **Same device credential** — allowed. This is the common path.
+    /// * **A principal that is not one of this service's configured device
+    ///   credentials** — allowed. Host-internal work authors runs under
+    ///   synthetic identities (the native executor stamps `native-executor`),
+    ///   and those runs belong to the *account*, not to whichever device
+    ///   happened to trigger the manager tick. Refusing them would break
+    ///   managed execution without closing any cross-device hole, because no
+    ///   device created them.
+    /// * **A different configured device credential** — refused. This is the
+    ///   hole: device B reading device A's run.
+    ///
+    /// The comparison is against the *stamped* form of each configured
+    /// credential, so the `primary` → `mcp` compatibility mapping is applied on
+    /// both sides. An absent `client_id` predates attribution and is treated as
+    /// host-authored for the same reason.
+    ///
+    /// This binds device attribution and the current credential set — a
+    /// credential removed from the configuration stops authenticating at
+    /// `auth_header`, so a revoked device cannot reach this at all. It is not
+    /// capability-generation revalidation (#458), which does not exist yet.
+    fn principal_may_read(&self, auth: &AuthContext, client_id: Option<&str>) -> bool {
+        match client_id {
+            // Unattributed. Nobody can be shown to own it, so nobody is shown
+            // it. Treating absence as "host-authored" is the mistake this
+            // function used to make.
+            None => false,
+            // The one explicit host identity. Named, not inferred.
+            Some(Self::HOST_AUTHORED_CLIENT_ID) => true,
+            // Everything else — another device, a removed or rotated
+            // credential, a legacy or unrecognized id — is refused.
+            Some(client_id) => client_id == Self::stamped_client_id(auth),
+        }
+    }
+
+    /// Load a run and bind it to the caller, for entrypoints that carry no
+    /// session or workspace of their own.
+    ///
+    /// Weaker than [`authorize_run_request`](Self::authorize_run_request),
+    /// which also binds session and workspace — but it closes the part that
+    /// matters most, and it means **no public read accepts an `AuthContext`
+    /// and then ignores it**. Prefer the scoped variants; these exist for
+    /// callers that legitimately have only a run id.
+    fn load_principal_bound_run(
+        &self,
+        auth: &AuthContext,
+        run_id: &str,
+    ) -> Result<RunRecord, OrchError> {
+        let run = self.load_authorized_run(run_id)?;
+        if !self.principal_may_read(auth, run.client_id.as_deref()) {
+            return Err(Self::run_not_available());
+        }
+        Ok(run)
+    }
+
+    /// The single identity the host itself authors work under.
+    ///
+    /// Managed execution submits as this principal (see the native executor's
+    /// synthesized `AuthContext`), and such runs belong to the account rather
+    /// than to any device. It is named explicitly and matched exactly: host
+    /// authority is never *inferred* from an id being absent, unrecognized, or
+    /// missing from the current credential set. Inferring it that way meant
+    /// rotating a credential silently reclassified its history as shared.
+    const HOST_AUTHORED_CLIENT_ID: &'static str = super::types::HOST_AUTHORED_CLIENT_ID;
+
+    /// The `client_id` this credential stamps on runs it creates.
+    ///
+    /// The compatibility credential keeps the established wire value `mcp`;
+    /// every other named device credential is stamped by its stable id. This
+    /// exists as one function precisely because it is used twice — once when a
+    /// run is written and once when a read is authorized — and a drift between
+    /// those two would silently either lock everyone out or let everyone in.
+    /// The idempotency namespace this caller's keys live in.
+    ///
+    /// Derived from the same stamped id the run fence compares, so a caller
+    /// that may read a run is exactly the caller whose receipts that run's key
+    /// can reach. Deriving it twice from two different values is how the two
+    /// fences would drift.
+    fn idempotency_scope(auth: &AuthContext) -> IdempotencyScope {
+        IdempotencyScope::of(auth)
+    }
+
+    fn stamped_client_id(auth: &AuthContext) -> String {
+        super::types::stamped_client_id(auth)
+    }
+
+    /// The single denial for every "this run is not yours to touch" case.
+    ///
+    /// Unknown, outside the workspace allowlist, and belonging to another
+    /// session must be **indistinguishable**. A caller that can tell them
+    /// apart can probe run ids for existence, which turns every read endpoint
+    /// into an existence oracle over other principals' runs — and reads here
+    /// are scoped by session and workspace, not by principal, so the ids being
+    /// probed are not necessarily the caller's own.
+    ///
+    /// A *malformed* id keeps `invalid_request`: that is a format error about
+    /// the caller's own input and discloses nothing about what exists.
+    fn run_not_available() -> OrchError {
+        OrchError::new(
+            OrchErrorCode::ForbiddenScope,
+            "run is not available in the requested scope",
+        )
+    }
+
     fn load_authorized_run(&self, run_id: &str) -> Result<RunRecord, OrchError> {
         if safe_id_filename(run_id).is_err() {
             return Err(OrchError::new(
@@ -1876,25 +2002,17 @@ impl OrchestrationService {
             .store
             .load_run(run_id)
             .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?
-            .ok_or_else(|| OrchError::new(OrchErrorCode::InvalidRequest, "unknown run_id"))?;
+            .ok_or_else(Self::run_not_available)?;
         let allowlist = self.config.lock().allowlist.clone();
         let ws = PathBuf::from(&run.workspace);
         if !allowlist.contains(&ws) {
-            return Err(OrchError::new(
-                OrchErrorCode::ForbiddenScope,
-                "run workspace not authorized",
-            ));
+            return Err(Self::run_not_available());
         }
         // Session must still match claimed workspace when present.
         if let Ok(session) = self.host.session_inspect(run.session_id) {
             if !session.cwd.is_empty() {
                 let _ = require_workspace_match(&allowlist, Some(Path::new(&session.cwd)), &ws)
-                    .map_err(|_| {
-                        OrchError::new(
-                            OrchErrorCode::ForbiddenScope,
-                            "run session workspace mismatch",
-                        )
-                    })?;
+                    .map_err(|_| Self::run_not_available())?;
             }
         }
         Ok(run)
@@ -1976,6 +2094,79 @@ impl OrchestrationService {
         }))
     }
 
+    /// Create a session under a caller-supplied idempotency key.
+    ///
+    /// Session creation was the one mutation on this control plane with no
+    /// request identity: a client that timed out could not tell whether its
+    /// session existed, and retrying made a second one. With a `request_id`
+    /// the outcome is durable — an exact retry replays the original response
+    /// byte-for-byte, and the same key with a different payload is a
+    /// `conflict` rather than a silent second session.
+    ///
+    /// `request_id` stays optional so existing callers keep working unchanged;
+    /// when it is absent this is exactly [`create_session`](Self::create_session).
+    ///
+    /// Authorization precedes the claim on purpose: an unauthorized request
+    /// must not burn an idempotency key, and a replay whose workspace has
+    /// since left the allowlist must be refused rather than replayed.
+    pub async fn create_session_idempotent(
+        &self,
+        auth: &AuthContext,
+        workspace: &Path,
+        title: Option<String>,
+        request_id: Option<String>,
+    ) -> Result<serde_json::Value, OrchError> {
+        let Some(request_id) = request_id
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+        else {
+            return self.create_session(auth, workspace, title);
+        };
+        if safe_id_filename(&request_id).is_err() {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "malformed request_id",
+            ));
+        }
+        let claimed = canonical_workspace(workspace)?;
+        if !self.config.lock().allowlist.contains(&claimed) {
+            return Err(OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "workspace is not allowlisted by this service",
+            ));
+        }
+        // The hash covers exactly what the caller asked for, so reusing a key
+        // with a different workspace or title is a conflict rather than a
+        // replay of the wrong session.
+        let payload_hash = hash_payload(&json!({
+            "workspace": claimed.display().to_string(),
+            "title": title,
+        }));
+        let tool = "ptah_create_session";
+        match self
+            .begin_idempotency(
+                auth,
+                tool,
+                &request_id,
+                &payload_hash,
+                Uuid::nil(),
+                &claimed,
+            )
+            .await?
+        {
+            IdempotencyStart::Replay(value) => Ok(value),
+            IdempotencyStart::Perform(mut lease) => {
+                match self.create_session(auth, &claimed, title) {
+                    Ok(response) => {
+                        lease.complete(None, response.clone())?;
+                        Ok(response)
+                    }
+                    Err(error) => Err(lease.fail(None, error)),
+                }
+            }
+        }
+    }
+
     /// List durable agent identities whose workspaces are visible to this
     /// authenticated control-plane instance. Checkpoint contents remain a
     /// scoped read so listing cannot become a transcript or workspace oracle.
@@ -2005,9 +2196,24 @@ impl OrchestrationService {
     /// Persistent-agent records intentionally point at the current run only;
     /// this read keeps completed and cancelled remote history reviewable
     /// without exposing runs from another session or workspace.
+    /// The runs in this session **that belong to the caller**.
+    ///
+    /// This took an `AuthContext` and threw it away, filtering on session and
+    /// workspace alone. Both of those are shared: any credential that could
+    /// reach the session enumerated every run in it and got the whole durable
+    /// record back — prompt preview, final response, terminal result, absolute
+    /// workspace path. Exact reads were fenced; the listing beside them was
+    /// not, so the fence only decided how much work an enumeration took.
+    ///
+    /// It is the same defect as the six reads repaired earlier, and the guard
+    /// written then did not catch it: that guard watched callers of
+    /// `load_authorized_run`, and this path never called it — it went to the
+    /// store directly. A structural guard is only as wide as the shape it
+    /// knows to look for, so `no_read_reaches_a_run_without_binding_a_principal`
+    /// now watches the raw store reads too.
     pub fn list_runs_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
     ) -> Result<serde_json::Value, OrchError> {
@@ -2020,6 +2226,10 @@ impl OrchestrationService {
             .filter(|run| {
                 run.session_id == session_id && run.workspace == claimed.display().to_string()
             })
+            // The same decision the exact reads make, on the same value. A
+            // listing that answers a wider question than the read it precedes
+            // is a way around the read.
+            .filter(|run| self.principal_may_read(auth, run.client_id.as_deref()))
             .collect::<Vec<_>>();
         Ok(json!({ "runs": runs }))
     }
@@ -2106,6 +2316,7 @@ impl OrchestrationService {
 
     async fn begin_work_mutation(
         &self,
+        auth: &AuthContext,
         tool: &str,
         request_id: &str,
         session_id: Uuid,
@@ -2127,7 +2338,7 @@ impl OrchestrationService {
         };
         let payload_hash = hash_payload(payload);
         let start = self
-            .begin_idempotency(tool, request_id, &payload_hash, session_id, &claimed)
+            .begin_idempotency(auth, tool, request_id, &payload_hash, session_id, &claimed)
             .await?;
         Ok((claimed, start))
     }
@@ -2279,6 +2490,7 @@ impl OrchestrationService {
         });
         let (claimed, start) = self
             .begin_work_mutation(
+                auth,
                 "ptah_create_manager_plan",
                 request_id,
                 session_id,
@@ -2427,6 +2639,7 @@ impl OrchestrationService {
         });
         let (claimed, start) = self
             .begin_work_mutation(
+                auth,
                 "ptah_advance_manager_plan",
                 request_id,
                 session_id,
@@ -2532,6 +2745,7 @@ impl OrchestrationService {
         });
         let (claimed, start) = self
             .begin_work_mutation(
+                auth,
                 "ptah_tick_manager_plan",
                 request_id,
                 session_id,
@@ -2669,7 +2883,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)]
     pub async fn replan_manager_plan(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -2688,6 +2902,7 @@ impl OrchestrationService {
         });
         let (claimed, start) = self
             .begin_work_mutation(
+                auth,
                 "ptah_replan_manager_plan",
                 request_id,
                 session_id,
@@ -2832,7 +3047,7 @@ impl OrchestrationService {
             "policy": policy,
         });
         let (claimed, start) = self
-            .begin_work_mutation(tool, request_id, session_id, workspace, &payload)
+            .begin_work_mutation(auth, tool, request_id, session_id, workspace, &payload)
             .await?;
         let mut lease = match start {
             IdempotencyStart::Replay(response) => return Ok(response),
@@ -2905,7 +3120,7 @@ impl OrchestrationService {
             "agentId": agent_id,
         });
         let (claimed, start) = self
-            .begin_work_mutation(tool, request_id, session_id, workspace, &payload)
+            .begin_work_mutation(auth, tool, request_id, session_id, workspace, &payload)
             .await?;
         let mut lease = match start {
             IdempotencyStart::Replay(response) => return self.restore_claim_response(response),
@@ -2964,7 +3179,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)] // Mirrors the authenticated MCP lease-renewal contract.
     pub async fn renew_work(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -2974,6 +3189,7 @@ impl OrchestrationService {
         lease_ms: Option<u64>,
     ) -> Result<serde_json::Value, OrchError> {
         self.work_lease_mutation(
+            auth,
             "ptah_renew_work",
             request_id,
             session_id,
@@ -2988,6 +3204,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)] // Keeps the shared lease mutation boundary explicit.
     async fn work_lease_mutation<F>(
         &self,
+        auth: &AuthContext,
         tool: &str,
         request_id: &str,
         session_id: Uuid,
@@ -3006,7 +3223,7 @@ impl OrchestrationService {
             "details": details,
         });
         let (claimed, start) = self
-            .begin_work_mutation(tool, request_id, session_id, workspace, &payload)
+            .begin_work_mutation(auth, tool, request_id, session_id, workspace, &payload)
             .await?;
         let mut lease = match start {
             IdempotencyStart::Replay(response) => return Ok(response),
@@ -3054,9 +3271,10 @@ impl OrchestrationService {
         lease_token: &str,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        let run = self.authorize_run_request(session_id, workspace, run_id)?;
+        let run = self.authorize_run_request(auth, session_id, workspace, run_id)?;
         let response = self
             .work_lease_mutation(
+                auth,
                 "ptah_link_work_run",
                 request_id,
                 session_id,
@@ -3073,7 +3291,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)] // Mirrors the authenticated MCP progress-report contract.
     pub async fn report_work_progress(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -3098,6 +3316,7 @@ impl OrchestrationService {
         });
         let (claimed, start) = self
             .begin_work_mutation(
+                auth,
                 "ptah_report_work_progress",
                 request_id,
                 session_id,
@@ -3141,7 +3360,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)] // Mirrors the authenticated MCP lease-release contract.
     pub async fn release_work(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -3151,6 +3370,7 @@ impl OrchestrationService {
         reason: String,
     ) -> Result<serde_json::Value, OrchError> {
         self.work_item_attempt_mutation(
+            auth,
             "ptah_release_work",
             request_id,
             session_id,
@@ -3165,7 +3385,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)] // Mirrors the authenticated MCP completion contract.
     pub async fn complete_work(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -3175,6 +3395,7 @@ impl OrchestrationService {
         result: WorkResult,
     ) -> Result<serde_json::Value, OrchError> {
         self.work_item_attempt_mutation(
+            auth,
             "ptah_complete_work",
             request_id,
             session_id,
@@ -3189,7 +3410,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)] // Mirrors the authenticated MCP failure contract.
     pub async fn fail_work(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -3199,6 +3420,7 @@ impl OrchestrationService {
         result: WorkResult,
     ) -> Result<serde_json::Value, OrchError> {
         self.work_item_attempt_mutation(
+            auth,
             "ptah_fail_work",
             request_id,
             session_id,
@@ -3213,6 +3435,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)] // Keeps the shared attempt mutation boundary explicit.
     async fn work_item_attempt_mutation<F>(
         &self,
+        auth: &AuthContext,
         tool: &str,
         request_id: &str,
         session_id: Uuid,
@@ -3231,7 +3454,7 @@ impl OrchestrationService {
             "details": details,
         });
         let (claimed, start) = self
-            .begin_work_mutation(tool, request_id, session_id, workspace, &payload)
+            .begin_work_mutation(auth, tool, request_id, session_id, workspace, &payload)
             .await?;
         let mut lease = match start {
             IdempotencyStart::Replay(response) => return Ok(response),
@@ -3264,7 +3487,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)] // Keeps the authenticated cancellation contract revision-fenced.
     pub async fn cancel_work(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -3281,7 +3504,7 @@ impl OrchestrationService {
             "expectedRevision": expected_revision,
         });
         let (claimed, start) = self
-            .begin_work_mutation(tool, request_id, session_id, workspace, &payload)
+            .begin_work_mutation(auth, tool, request_id, session_id, workspace, &payload)
             .await?;
         let mut lease = match start {
             IdempotencyStart::Replay(response) => return Ok(response),
@@ -3322,7 +3545,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)]
     pub async fn assign_work(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -3331,6 +3554,7 @@ impl OrchestrationService {
         expected_revision: Option<u64>,
     ) -> Result<serde_json::Value, OrchError> {
         self.work_item_mutation(
+            auth,
             "ptah_assign_work",
             request_id,
             session_id,
@@ -3432,6 +3656,7 @@ impl OrchestrationService {
         });
         let (claimed, start) = self
             .begin_work_mutation(
+                auth,
                 "ptah_heartbeat_worker",
                 request_id,
                 session_id,
@@ -3494,6 +3719,7 @@ impl OrchestrationService {
         });
         let (claimed, start) = self
             .begin_work_mutation(
+                auth,
                 "ptah_offer_work",
                 request_id,
                 session_id,
@@ -3634,6 +3860,7 @@ impl OrchestrationService {
         });
         let (claimed, start) = self
             .begin_work_mutation(
+                auth,
                 "ptah_reassign_work",
                 request_id,
                 session_id,
@@ -3706,6 +3933,7 @@ impl OrchestrationService {
         expected_revision: Option<u64>,
     ) -> Result<serde_json::Value, OrchError> {
         self.work_item_mutation(
+            auth,
             "ptah_reprioritize_work",
             request_id,
             session_id,
@@ -3740,6 +3968,7 @@ impl OrchestrationService {
         expected_revision: Option<u64>,
     ) -> Result<serde_json::Value, OrchError> {
         self.work_item_mutation(
+            auth,
             "ptah_block_work",
             request_id,
             session_id,
@@ -3773,6 +4002,7 @@ impl OrchestrationService {
         expected_revision: Option<u64>,
     ) -> Result<serde_json::Value, OrchError> {
         self.work_item_mutation(
+            auth,
             "ptah_request_review",
             request_id,
             session_id,
@@ -3836,6 +4066,7 @@ impl OrchestrationService {
         });
         let (claimed, start) = self
             .begin_work_mutation(
+                auth,
                 "ptah_send_message",
                 request_id,
                 session_id,
@@ -3923,6 +4154,7 @@ impl OrchestrationService {
         });
         let (claimed, start) = self
             .begin_work_mutation(
+                auth,
                 "ptah_ack_message",
                 request_id,
                 session_id,
@@ -4008,7 +4240,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)]
     pub async fn retry_work(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -4017,6 +4249,7 @@ impl OrchestrationService {
         expected_revision: Option<u64>,
     ) -> Result<serde_json::Value, OrchError> {
         self.work_item_mutation(
+            auth,
             "ptah_retry_work",
             request_id,
             session_id,
@@ -4043,6 +4276,7 @@ impl OrchestrationService {
         expected_revision: Option<u64>,
     ) -> Result<serde_json::Value, OrchError> {
         self.work_item_attempt_mutation(
+            auth,
             "ptah_approve_work",
             request_id,
             session_id,
@@ -4188,7 +4422,7 @@ impl OrchestrationService {
             "retry": retry,
         });
         let (claimed, start) = self
-            .begin_work_mutation(tool, request_id, session_id, workspace, &payload)
+            .begin_work_mutation(auth, tool, request_id, session_id, workspace, &payload)
             .await?;
         let mut lease = match start {
             IdempotencyStart::Replay(response) => return Ok(response),
@@ -4299,7 +4533,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)]
     pub async fn set_routine_lifecycle(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -4316,7 +4550,7 @@ impl OrchestrationService {
             "expectedRevision": expected_revision,
         });
         let (claimed, start) = self
-            .begin_work_mutation(tool, request_id, session_id, workspace, &payload)
+            .begin_work_mutation(auth, tool, request_id, session_id, workspace, &payload)
             .await?;
         let mut lease = match start {
             IdempotencyStart::Replay(response) => return Ok(response),
@@ -4380,6 +4614,7 @@ impl OrchestrationService {
         });
         let (claimed, start) = self
             .begin_work_mutation(
+                auth,
                 tool,
                 request_id,
                 session_id,
@@ -4439,6 +4674,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)]
     async fn work_item_mutation<F>(
         &self,
+        auth: &AuthContext,
         tool: &str,
         request_id: &str,
         session_id: Uuid,
@@ -4457,7 +4693,7 @@ impl OrchestrationService {
             "details": details,
         });
         let (claimed, start) = self
-            .begin_work_mutation(tool, request_id, session_id, workspace, &payload)
+            .begin_work_mutation(auth, tool, request_id, session_id, workspace, &payload)
             .await?;
         let mut lease = match start {
             IdempotencyStart::Replay(response) => return Ok(response),
@@ -4526,7 +4762,7 @@ impl OrchestrationService {
             },
         });
         let (claimed, start) = self
-            .begin_work_mutation(tool, request_id, session_id, workspace, &payload)
+            .begin_work_mutation(auth, tool, request_id, session_id, workspace, &payload)
             .await?;
         let mut lease = match start {
             IdempotencyStart::Replay(response) => return Ok(response),
@@ -4673,7 +4909,17 @@ impl OrchestrationService {
         }
         let response = match self
             .host
-            .resume_agent_with_request_id(session_id, prompt, max_rounds, Some(request_id.into()))
+            // Attribute the run to the caller who asked for it. Without this
+            // the host stamps its own `desktop` identity and the initiator
+            // cannot read back the run it just created — the principal fence
+            // compares this exact value.
+            .resume_agent_with_request_id(
+                session_id,
+                prompt,
+                max_rounds,
+                Some(request_id.into()),
+                Some(Self::stamped_client_id(auth)),
+            )
             .await
         {
             Ok(response) => response,
@@ -4796,6 +5042,7 @@ impl OrchestrationService {
         });
         let (claimed, start) = self
             .begin_work_mutation(
+                auth,
                 "ptah_authorize_work_execution",
                 request_id,
                 session_id,
@@ -4998,20 +5245,20 @@ impl OrchestrationService {
 
     pub fn get_run(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        self.run_value(self.load_authorized_run(run_id)?)
+        self.run_value(self.load_principal_bound_run(auth, run_id)?)
     }
 
     pub fn get_run_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        self.run_value(self.authorize_run_request(session_id, workspace, run_id)?)
+        self.run_value(self.authorize_run_request(auth, session_id, workspace, run_id)?)
     }
 
     fn run_value(&self, mut run: RunRecord) -> Result<serde_json::Value, OrchError> {
@@ -5022,20 +5269,20 @@ impl OrchestrationService {
 
     pub fn get_progress(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        self.progress_value(self.load_authorized_run(run_id)?)
+        self.progress_value(self.load_principal_bound_run(auth, run_id)?)
     }
 
     pub fn get_progress_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        self.progress_value(self.authorize_run_request(session_id, workspace, run_id)?)
+        self.progress_value(self.authorize_run_request(auth, session_id, workspace, run_id)?)
     }
 
     fn progress_value(&self, mut run: RunRecord) -> Result<serde_json::Value, OrchError> {
@@ -5070,7 +5317,7 @@ impl OrchestrationService {
 
     pub fn get_events(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         run_id: Option<&str>,
         after_seq: u64,
         limit: usize,
@@ -5082,13 +5329,13 @@ impl OrchestrationService {
                 "run_id is required for get_events",
             )
         })?;
-        let run = self.load_authorized_run(rid)?;
+        let run = self.load_principal_bound_run(auth, rid)?;
         self.events_for_run(run, after_seq, limit)
     }
 
     pub fn get_events_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         run_id: &str,
@@ -5096,24 +5343,142 @@ impl OrchestrationService {
         limit: usize,
     ) -> Result<serde_json::Value, OrchError> {
         self.events_for_run(
-            self.authorize_run_request(session_id, workspace, run_id)?,
+            self.authorize_run_request(auth, session_id, workspace, run_id)?,
             after_seq,
             limit,
         )
+    }
+
+    /// Non-secret identity and contract version of this host.
+    ///
+    /// Previously an embedder had to tell the SDK what it was talking to,
+    /// which meant the capability document asserted a version nobody had
+    /// checked. The host states it itself now, so a consumer can refuse a
+    /// major it does not implement instead of discovering the mismatch one
+    /// malformed response at a time.
+    ///
+    /// Deliberately unauthenticated in content: product name, host version,
+    /// and contract major/minor. No build paths, no feature flags, no
+    /// deployment topology — a version endpoint is not a reconnaissance
+    /// surface.
+    pub fn host_info(&self, _auth: &AuthContext) -> Result<serde_json::Value, OrchError> {
+        Ok(json!({
+            "product": "GrokPtah",
+            "hostVersion": env!("CARGO_PKG_VERSION"),
+            "contractMajor": PUBLIC_CONTRACT_MAJOR,
+            "contractMinor": PUBLIC_CONTRACT_MINOR,
+        }))
+    }
+
+    /// Durable receipts for one run, redacted and bounded.
+    ///
+    /// Gated by exactly the same `authorize_run_request` fence every other
+    /// scoped read uses, so an unknown run, a run in another session, and a
+    /// run outside the allowlist all give one indistinguishable denial.
+    ///
+    /// The page carries its retention window because a listing is only
+    /// interpretable next to one: a receipt that aged out and a receipt that
+    /// never existed look identical, and a consumer that reads absence as
+    /// proof of "it never happened" will be wrong. Retention here is a
+    /// *host-wide* budget that also exempts unsettled receipts and receipts
+    /// belonging to non-terminal runs, so the window is reported with those
+    /// exemptions rather than as a bare count.
+    pub fn list_receipts_scoped(
+        &self,
+        auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        run_id: &str,
+        after: Option<String>,
+        limit: usize,
+    ) -> Result<serde_json::Value, OrchError> {
+        let run = self.authorize_run_request(auth, session_id, workspace, run_id)?;
+        let scope = Self::idempotency_scope(auth);
+        let cursor = match after.as_deref().filter(|value| !value.is_empty()) {
+            None => None,
+            Some(raw) => {
+                // A cursor this host did not issue is a malformed request, not
+                // a silent restart from the beginning: restarting would hand
+                // the caller a page it has already seen and call it new. The
+                // cursor is authenticated and bound to this scope and run, so
+                // "did not issue" is now checked rather than assumed from
+                // shape — and every rejection reason gives the same answer.
+                let decoded = self
+                    .store
+                    .parse_receipt_cursor(&scope, &run.run_id, raw)
+                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+                Some(decoded.ok_or_else(|| {
+                    OrchError::new(OrchErrorCode::InvalidRequest, "malformed receipt cursor")
+                })?)
+            }
+        };
+        let (receipts, has_more) = self
+            .store
+            .list_idempotency_for_run(&scope, &run.run_id, cursor, limit)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+
+        let mut items = Vec::with_capacity(receipts.len());
+        for receipt in &receipts {
+            let attempt_digest = self
+                .store
+                .attempt_digest(&scope, &receipt.payload_hash)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            items.push(PublicReceipt {
+                request_id: receipt.request_id.clone(),
+                operation: PublicReceipt::classify(&receipt.tool).to_string(),
+                status: receipt.status.clone(),
+                // Only the typed code. The message is withheld because runtime
+                // messages format absolute paths verbatim.
+                outcome: receipt
+                    .error
+                    .as_ref()
+                    .map(|error| error.code.as_str().to_string()),
+                attempt_digest,
+                run_id: receipt.run_id.clone(),
+                recorded_at: receipt.created_at,
+            });
+        }
+        let next_cursor = match has_more.then(|| items.last()).flatten() {
+            None => None,
+            Some(last) => Some(
+                self.store
+                    .receipt_cursor(
+                        &scope,
+                        &run.run_id,
+                        last.recorded_at.timestamp_millis(),
+                        &last.request_id,
+                    )
+                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+            ),
+        };
+
+        Ok(json!({
+            "items": items,
+            "nextCursor": next_cursor,
+            "retention": {
+                "maxReceipts": DEFAULT_MAX_IDEMPOTENCY_RECEIPTS,
+                "maxAgeDays": DEFAULT_IDEMPOTENCY_RECEIPT_AGE.num_days(),
+                "budgetScope": "host",
+                "exemptions": {
+                    "unsettledRetained": true,
+                    "activeRunRetained": true,
+                },
+            },
+        }))
     }
 
     /// Authorize a run and return its current journal bounds plus an initial
     /// durable page for the optional Streamable HTTP live channel.
     pub(crate) fn live_run_page(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         run_id: &str,
         after_seq: u64,
         limit: usize,
     ) -> Result<(LiveRunScope, JournalPage), OrchError> {
-        let run = self.authorize_run_request(session_id, workspace, run_id)?;
+        let run = self.authorize_run_request(auth, session_id, workspace, run_id)?;
         let Some(start_seq) = run.start_seq else {
             return Err(OrchError::new(
                 OrchErrorCode::Conflict,
@@ -5320,20 +5685,20 @@ impl OrchestrationService {
 
     pub fn get_changes(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        self.changes_for_run(self.load_authorized_run(run_id)?)
+        self.changes_for_run(self.load_principal_bound_run(auth, run_id)?)
     }
 
     pub fn get_changes_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        self.changes_for_run(self.authorize_run_request(session_id, workspace, run_id)?)
+        self.changes_for_run(self.authorize_run_request(auth, session_id, workspace, run_id)?)
     }
 
     fn changes_for_run(&self, run: RunRecord) -> Result<serde_json::Value, OrchError> {
@@ -5358,20 +5723,20 @@ impl OrchestrationService {
 
     pub fn get_test_results(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        self.test_results_for_run(self.load_authorized_run(run_id)?)
+        self.test_results_for_run(self.load_principal_bound_run(auth, run_id)?)
     }
 
     pub fn get_test_results_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        self.test_results_for_run(self.authorize_run_request(session_id, workspace, run_id)?)
+        self.test_results_for_run(self.authorize_run_request(auth, session_id, workspace, run_id)?)
     }
 
     fn test_results_for_run(&self, run: RunRecord) -> Result<serde_json::Value, OrchError> {
@@ -5442,20 +5807,20 @@ impl OrchestrationService {
 
     pub fn get_handoff(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        self.handoff_for_run(self.load_authorized_run(run_id)?)
+        self.handoff_for_run(self.load_principal_bound_run(auth, run_id)?)
     }
 
     pub fn get_handoff_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        self.handoff_for_run(self.authorize_run_request(session_id, workspace, run_id)?)
+        self.handoff_for_run(self.authorize_run_request(auth, session_id, workspace, run_id)?)
     }
 
     fn handoff_for_run(&self, run: RunRecord) -> Result<serde_json::Value, OrchError> {
@@ -5527,18 +5892,44 @@ impl OrchestrationService {
         Ok(session)
     }
 
+    /// Authorize one run for one authenticated caller.
+    ///
+    /// Binds three things, in order, and reports every failure identically:
+    /// the run must exist, it must belong to the caller's session and
+    /// workspace, and it must have been created **by this principal**.
+    ///
+    /// The principal check is the one that was missing. The host has always
+    /// stamped `client_id` from the authenticated credential when a run is
+    /// created, then discarded that knowledge on every read — so any
+    /// credential that could reach a session could read every run in it,
+    /// including runs another credential created. `auth` is now consumed
+    /// rather than ignored, and the identity compared is the same value
+    /// [`stamped_client_id`](Self::stamped_client_id) wrote.
+    ///
+    /// A run with no `client_id` predates attribution and cannot be attributed
+    /// to anyone, so it is refused rather than shared. Fail-closed is the only
+    /// safe reading: the alternative grants every caller access to exactly the
+    /// runs whose owner is unknown. The same applies to an id this service does
+    /// not recognize — only the explicit
+    /// [`HOST_AUTHORED_CLIENT_ID`](Self::HOST_AUTHORED_CLIENT_ID) is shared.
+    ///
+    /// Every refusal is [`run_not_available`](Self::run_not_available).
+    /// "Not yours" must be indistinguishable from "does not exist", or the
+    /// check that adds principal isolation would itself become an oracle for
+    /// probing other principals' run ids.
     fn authorize_run_request(
         &self,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         run_id: &str,
     ) -> Result<RunRecord, OrchError> {
         let run = self.load_authorized_run(run_id)?;
         if run.session_id != session_id {
-            return Err(OrchError::new(
-                OrchErrorCode::ForbiddenScope,
-                "run does not belong to the requested session",
-            ));
+            return Err(Self::run_not_available());
+        }
+        if !self.principal_may_read(auth, run.client_id.as_deref()) {
+            return Err(Self::run_not_available());
         }
         let session = self.require_build_session(session_id)?;
         let cwd = (!session.cwd.is_empty()).then(|| PathBuf::from(&session.cwd));
@@ -5626,6 +6017,7 @@ impl OrchestrationService {
 
     async fn begin_queue_mutation(
         &self,
+        auth: &AuthContext,
         tool: &str,
         request_id: &str,
         session_id: Uuid,
@@ -5647,7 +6039,7 @@ impl OrchestrationService {
         };
         let payload_hash = hash_payload(payload);
         let start = match self
-            .begin_idempotency(tool, request_id, &payload_hash, session_id, &claimed)
+            .begin_idempotency(auth, tool, request_id, &payload_hash, session_id, &claimed)
             .await
         {
             Ok(start) => start,
@@ -5734,7 +6126,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)]
     pub async fn edit_queue(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -5761,7 +6153,7 @@ impl OrchestrationService {
             "text": text,
         });
         let (claimed, start) = self
-            .begin_queue_mutation(tool, request_id, session_id, workspace, &payload)
+            .begin_queue_mutation(auth, tool, request_id, session_id, workspace, &payload)
             .await?;
         let mut lease = match start {
             IdempotencyStart::Replay(value) => return Ok(value),
@@ -5810,7 +6202,7 @@ impl OrchestrationService {
 
     pub async fn remove_queue(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -5825,7 +6217,7 @@ impl OrchestrationService {
             "expectedVersion": expected_version,
         });
         let (claimed, start) = self
-            .begin_queue_mutation(tool, request_id, session_id, workspace, &payload)
+            .begin_queue_mutation(auth, tool, request_id, session_id, workspace, &payload)
             .await?;
         let mut lease = match start {
             IdempotencyStart::Replay(value) => return Ok(value),
@@ -5874,7 +6266,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)]
     pub async fn reorder_queue(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -5894,7 +6286,7 @@ impl OrchestrationService {
             "expectedRevision": expected_revision,
         });
         let (claimed, start) = self
-            .begin_queue_mutation(tool, request_id, session_id, workspace, &payload)
+            .begin_queue_mutation(auth, tool, request_id, session_id, workspace, &payload)
             .await?;
         let mut lease = match start {
             IdempotencyStart::Replay(value) => return Ok(value),
@@ -5948,7 +6340,7 @@ impl OrchestrationService {
 
     pub async fn clear_queue(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -5959,7 +6351,7 @@ impl OrchestrationService {
             "workspace": workspace.display().to_string(),
         });
         let (claimed, start) = self
-            .begin_queue_mutation(tool, request_id, session_id, workspace, &payload)
+            .begin_queue_mutation(auth, tool, request_id, session_id, workspace, &payload)
             .await?;
         let mut lease = match start {
             IdempotencyStart::Replay(value) => return Ok(value),
@@ -6064,7 +6456,7 @@ impl OrchestrationService {
 
     pub async fn run_next_queue(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -6080,7 +6472,7 @@ impl OrchestrationService {
             "expectedVersion": expected_version,
         });
         let (claimed, start) = self
-            .begin_queue_mutation(tool, request_id, session_id, workspace, &payload)
+            .begin_queue_mutation(auth, tool, request_id, session_id, workspace, &payload)
             .await?;
         let mut lease = match start {
             IdempotencyStart::Replay(value) => return Ok(value),
@@ -6134,7 +6526,7 @@ impl OrchestrationService {
 
     pub async fn steer_queued(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -6150,7 +6542,7 @@ impl OrchestrationService {
             "expectedVersion": expected_version,
         });
         let (claimed, start) = self
-            .begin_queue_mutation(tool, request_id, session_id, workspace, &payload)
+            .begin_queue_mutation(auth, tool, request_id, session_id, workspace, &payload)
             .await?;
         let mut lease = match start {
             IdempotencyStart::Replay(value) => return Ok(value),
@@ -6200,11 +6592,12 @@ impl OrchestrationService {
 
     fn isolated_review(
         &self,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         run_id: &str,
     ) -> Result<(RunRecord, crate::run_promotion::RunReview), OrchError> {
-        let run = self.authorize_run_request(session_id, workspace, run_id)?;
+        let run = self.authorize_run_request(auth, session_id, workspace, run_id)?;
         if run.state != RunState::Completed {
             return Err(OrchError::new(
                 OrchErrorCode::Conflict,
@@ -6240,12 +6633,12 @@ impl OrchestrationService {
 
     pub fn review_run(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        let (run, review) = self.isolated_review(session_id, workspace, run_id)?;
+        let (run, review) = self.isolated_review(auth, session_id, workspace, run_id)?;
         Ok(json!({
             "runId": run.run_id,
             "sessionId": run.session_id,
@@ -6261,7 +6654,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)] // Keeps the approval scope explicit at the control boundary.
     pub async fn approve_run(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -6304,12 +6697,13 @@ impl OrchestrationService {
                 ),
             ));
         }
-        let run = match self.authorize_run_request(session_id, workspace, run_id) {
+        let run = match self.authorize_run_request(auth, session_id, workspace, run_id) {
             Ok(run) => run,
             Err(error) => return Err(fail(self, error)),
         };
         let mut lease = match self
             .begin_idempotency(
+                auth,
                 tool,
                 request_id,
                 &phash,
@@ -6322,7 +6716,7 @@ impl OrchestrationService {
             Ok(IdempotencyStart::Perform(lease)) => lease,
             Err(error) => return Err(error),
         };
-        let (run, review) = match self.isolated_review(session_id, workspace, run_id) {
+        let (run, review) = match self.isolated_review(auth, session_id, workspace, run_id) {
             Ok(value) => value,
             Err(error) => {
                 return Err(self.fail_claim(
@@ -6421,7 +6815,7 @@ impl OrchestrationService {
 
     pub async fn promote_run(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -6436,9 +6830,10 @@ impl OrchestrationService {
             "approvalId": approval_id,
         });
         let phash = hash_payload(&payload);
-        let run = self.authorize_run_request(session_id, workspace, run_id)?;
+        let run = self.authorize_run_request(auth, session_id, workspace, run_id)?;
         let mut lease = match self
             .begin_idempotency(
+                auth,
                 tool,
                 request_id,
                 &phash,
@@ -6474,7 +6869,7 @@ impl OrchestrationService {
 
     pub async fn discard_run(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -6487,7 +6882,7 @@ impl OrchestrationService {
             "runId": run_id,
         });
         let phash = hash_payload(&payload);
-        let run = self.authorize_run_request(session_id, workspace, run_id)?;
+        let run = self.authorize_run_request(auth, session_id, workspace, run_id)?;
         if !run.state.is_terminal() {
             return Err(OrchError::new(
                 OrchErrorCode::Conflict,
@@ -6496,6 +6891,7 @@ impl OrchestrationService {
         }
         let mut lease = match self
             .begin_idempotency(
+                auth,
                 tool,
                 request_id,
                 &phash,
@@ -6684,7 +7080,7 @@ impl OrchestrationService {
         };
 
         let mut lease = match self
-            .begin_idempotency(tool, request_id, &phash, session_id, &claimed)
+            .begin_idempotency(auth, tool, request_id, &phash, session_id, &claimed)
             .await?
         {
             IdempotencyStart::Replay(value) => return Ok(value),
@@ -6809,14 +7205,7 @@ impl OrchestrationService {
             // Distinguish coordinator-owned work from desktop turns so the
             // desktop can surface external activity without guessing from
             // transport timing.
-            client_id: Some(if auth.token_id == "primary" {
-                // Preserve the established wire value for the compatibility
-                // credential; newly named device credentials are emitted by
-                // their stable IDs.
-                "mcp".into()
-            } else {
-                auth.token_id.clone()
-            }),
+            client_id: Some(Self::stamped_client_id(auth)),
             state: if queued {
                 RunState::Queued
             } else {
@@ -6971,7 +7360,7 @@ impl OrchestrationService {
             );
             error
         };
-        let source = match self.authorize_run_request(session_id, workspace, source_run_id) {
+        let source = match self.authorize_run_request(auth, session_id, workspace, source_run_id) {
             Ok(run) => run,
             Err(error) => return Err(fail(self, error)),
         };
@@ -7371,7 +7760,7 @@ impl OrchestrationService {
         };
 
         let mut lease = match self
-            .begin_idempotency(tool, request_id, &phash, session_id, &claimed)
+            .begin_idempotency(auth, tool, request_id, &phash, session_id, &claimed)
             .await?
         {
             IdempotencyStart::Replay(value) => return Ok(value),
@@ -7470,7 +7859,7 @@ impl OrchestrationService {
         };
 
         let mut lease = match self
-            .begin_idempotency(tool, request_id, &phash, session_id, &claimed)
+            .begin_idempotency(auth, tool, request_id, &phash, session_id, &claimed)
             .await?
         {
             IdempotencyStart::Replay(value) => return Ok(value),
@@ -7564,10 +7953,7 @@ impl OrchestrationService {
         let run = match self.store.load_run(rid) {
             Ok(Some(r)) => r,
             Ok(None) => {
-                return Err(fail(
-                    self,
-                    OrchError::new(OrchErrorCode::InvalidRequest, "unknown run_id"),
-                ));
+                return Err(fail(self, Self::run_not_available()));
             }
             Err(e) => {
                 return Err(fail(
@@ -7578,13 +7964,7 @@ impl OrchestrationService {
         };
 
         if run.session_id != session_id {
-            return Err(fail(
-                self,
-                OrchError::new(
-                    OrchErrorCode::ForbiddenScope,
-                    "run_id does not belong to session",
-                ),
-            ));
+            return Err(fail(self, Self::run_not_available()));
         }
         let session = match self.host.session_inspect(session_id) {
             Ok(s) => s,
@@ -7619,7 +7999,7 @@ impl OrchestrationService {
         }
 
         let mut lease = match self
-            .begin_idempotency(tool, request_id, &phash, session_id, &claimed)
+            .begin_idempotency(auth, tool, request_id, &phash, session_id, &claimed)
             .await?
         {
             IdempotencyStart::Replay(value) => return Ok(value),
@@ -7906,5 +8286,179 @@ fn session_id_of(u: &crate::events::SessionUpdate) -> Option<Uuid> {
         | SteeringInjected { session_id, .. }
         | PromptQueueChanged { session_id, .. } => Some(*session_id),
         BackgroundTask { session_id, .. } => *session_id,
+    }
+}
+
+#[cfg(test)]
+mod principal_fence_tests {
+    use super::*;
+
+    /// Every path that loads a run must bind it to a principal first.
+    ///
+    /// A source-level guard rather than a behavioural one, because the failure
+    /// it prevents is *structural*: a future read that calls
+    /// `load_authorized_run` directly would compile, pass every behavioural
+    /// test that does not happen to cover it, and silently reintroduce a read
+    /// that any credential can make. The two wrappers below are the only
+    /// callers permitted, and both bind the principal.
+    #[test]
+    fn no_read_reaches_a_run_without_binding_a_principal() {
+        const ALLOWED: [&str; 2] = ["load_principal_bound_run", "authorize_run_request"];
+        /// Methods that legitimately read every run: host-internal
+        /// reconciliation and recovery, which run under host authority rather
+        /// than any caller's.
+        const ALLOWED_RAW_LIST: [&str; 0] = [];
+
+        // Scan the production body only. This module mentions the symbol in
+        // its own assertions, which would otherwise flag itself.
+        let whole = include_str!("service.rs");
+        let source = whole
+            .split_once("mod principal_fence_tests {")
+            .map(|(before, _)| before)
+            .unwrap_or(whole);
+        let mut enclosing = String::new();
+        let mut offenders: Vec<String> = Vec::new();
+
+        for line in source.lines() {
+            let trimmed = line.trim_start();
+            // Track the innermost `fn` declared at method indentation.
+            if let Some(rest) = trimmed.strip_prefix("fn ").or_else(|| {
+                trimmed
+                    .strip_prefix("pub fn ")
+                    .or_else(|| trimmed.strip_prefix("pub(crate) fn "))
+            }) {
+                if let Some(name) = rest.split(['(', '<']).next() {
+                    enclosing = name.trim().to_string();
+                }
+            }
+            if line.contains("load_authorized_run(")
+                && !trimmed.starts_with("fn load_authorized_run")
+                && !ALLOWED.contains(&enclosing.as_str())
+            {
+                offenders.push(format!("{enclosing}: {}", trimmed));
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "these call `load_authorized_run` without binding a principal; \
+             route them through `load_principal_bound_run` or \
+             `authorize_run_request` instead:\n  {}",
+            offenders.join("\n  ")
+        );
+
+        // The same question for *collections*, which is the half this guard
+        // used to miss. `list_runs_scoped` never called `load_authorized_run`
+        // — it went to the store directly — so it passed the check above while
+        // handing every run in a shared session to any credential that could
+        // reach it. A guard is only as wide as the shape it knows to look for.
+        //
+        // Any method that reads runs straight from the store must decide
+        // ownership itself, with the same `principal_may_read` the exact reads
+        // use. This scans method bodies rather than call sites, so it holds for
+        // a method written later, too.
+        let mut raw_readers: Vec<String> = Vec::new();
+        let mut current = String::new();
+        let mut body = String::new();
+        // Whitespace-stripped, because the call is written across lines as
+        // `self` / `.store` / `.list_runs()` and a line-wise substring search
+        // silently matches nothing — which is exactly how the first version of
+        // this widening passed while the hole was still open.
+        let check = |name: &str, body: &str, out: &mut Vec<String>| {
+            let dense: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+            if dense.contains("store.list_runs()")
+                && !dense.contains("principal_may_read")
+                && !ALLOWED_RAW_LIST.contains(&name)
+            {
+                out.push(name.to_string());
+            }
+        };
+        for line in source.lines() {
+            let trimmed = line.trim_start();
+            let is_fn = trimmed.starts_with("fn ")
+                || trimmed.starts_with("pub fn ")
+                || trimmed.starts_with("pub(crate) fn ")
+                || trimmed.starts_with("async fn ")
+                || trimmed.starts_with("pub async fn ");
+            if is_fn {
+                check(&current, &body, &mut raw_readers);
+                current = trimmed
+                    .rsplit_once("fn ")
+                    .map(|(_, rest)| rest)
+                    .unwrap_or(trimmed)
+                    .split(['(', '<'])
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                body.clear();
+            }
+            body.push_str(line);
+            body.push('\n');
+        }
+        check(&current, &body, &mut raw_readers);
+
+        assert!(
+            raw_readers.is_empty(),
+            "these read runs straight from the store without deciding \
+             ownership; a listing that answers a wider question than the read \
+             beside it is a way around that read. Filter with \
+             `principal_may_read`:\n  {}",
+            raw_readers.join("\n  ")
+        );
+    }
+
+    /// Host authority is named, never inferred.
+    ///
+    /// The cases in order: the caller's own runs; the one explicit host
+    /// identity; a run with no attribution; an id this service does not
+    /// recognize (a legacy record, or a credential that has since been rotated
+    /// or removed); and another configured device. Only the first two are
+    /// readable.
+    ///
+    /// The fourth case is the one that matters most. An earlier version of
+    /// this check treated "not in the current credential set" as host
+    /// authority, which meant rotating credential A silently reclassified all
+    /// of A's history as shared — readable by A's replacement.
+    #[test]
+    fn only_the_named_host_identity_is_shared() {
+        let auth = AuthContext {
+            token_id: "device-a".into(),
+            owner_id: "account".into(),
+        };
+        let stamped = OrchestrationService::stamped_client_id(&auth);
+        assert_eq!(stamped, "device-a");
+
+        // The compatibility credential keeps its established wire value.
+        let primary = AuthContext {
+            token_id: "primary".into(),
+            owner_id: "account".into(),
+        };
+        assert_eq!(OrchestrationService::stamped_client_id(&primary), "mcp");
+
+        // `principal_may_read` needs a service; assert the decision table it
+        // encodes directly, which is what the callers depend on.
+        let decide = |client_id: Option<&str>| match client_id {
+            None => false,
+            Some(OrchestrationService::HOST_AUTHORED_CLIENT_ID) => true,
+            Some(id) => id == stamped,
+        };
+
+        assert!(decide(Some("device-a")), "a caller reads its own runs");
+        assert!(
+            decide(Some("native-executor")),
+            "the explicit host identity is account-scoped"
+        );
+        assert!(!decide(None), "unattributed runs are refused");
+        assert!(
+            !decide(Some("device-a-rotated-away")),
+            "an unrecognized id must not be mistaken for host authority"
+        );
+        assert!(!decide(Some("device-b")), "another device is refused");
+        assert!(!decide(Some("desktop")), "the desktop client is refused");
+        assert!(
+            !decide(Some("mcp")),
+            "a different stamped credential is refused"
+        );
     }
 }

@@ -791,7 +791,11 @@ pub async fn persistent_agent_resume(
     }
     state
         .host
-        .resume_agent_with_request_id(session_id, prompt, max_rounds, request_id)
+        // `None`: the Desktop is resuming its own session, so the run it
+        // writes is genuinely the Desktop's. The parameter exists for the
+        // service path, where the host resumes *for* an authenticated caller
+        // and the run belongs to that caller instead.
+        .resume_agent_with_request_id(session_id, prompt, max_rounds, request_id, None)
         .await
         .map_err(map_err)
 }

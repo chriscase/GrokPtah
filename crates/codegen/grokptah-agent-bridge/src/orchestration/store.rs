@@ -7,7 +7,7 @@ use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::Arc;
 
 use anyhow::Context;
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use fs2::FileExt;
 use parking_lot::Mutex;
 use uuid::Uuid;
@@ -27,9 +27,10 @@ use super::routine::{
     ROUTINE_SCHEMA_VERSION,
 };
 use super::types::{
-    safe_id_filename, AgentRecord, AgentSpec, AgentState, AuditEntry, ContinuationCheckpoint,
-    IdempotencyReceipt, OrchError, OrchErrorCode, PromotionState, RunBounds, RunRecord, RunState,
-    RunStopCause,
+    constant_time_eq, hex_decode, hex_encode, hex_sha256, hmac_sha256_hex, safe_id_filename,
+    AgentRecord, AgentSpec, AgentState, AuditEntry, ContinuationCheckpoint, IdempotencyReceipt,
+    IdempotencyScope, OrchError, OrchErrorCode, PromotionState, RunBounds, RunRecord, RunState,
+    RunStopCause, SCOPE_DERIVATION_VERSION,
 };
 use super::worker::{WorkerHostKind, WorkerPresence, WorkerProjection};
 use super::workload::{
@@ -49,6 +50,15 @@ struct OrchStoreInner {
     _store_lock: fs::File,
     lock: Mutex<()>,
     last_run_error: Mutex<Option<String>>,
+    /// The per-home digest/cursor secret, read once.
+    ///
+    /// Cached so provisioning happens exactly once per store rather than on
+    /// every digest and every cursor, which is also what keeps the create race
+    /// to a single window instead of one per call.
+    receipt_salt: Mutex<Option<Vec<u8>>>,
+    /// The last millisecond a receipt was claimed at, so the next claim is
+    /// strictly after it. `None` until seeded from what is already on disk.
+    last_claim_millis: Mutex<Option<i64>>,
     last_audit_error: Arc<Mutex<Option<String>>>,
     audit_file_lock: Arc<Mutex<()>>,
     audit_writer: AuditWriter,
@@ -222,6 +232,8 @@ impl OrchStore {
                 _store_lock: store_lock,
                 lock: Mutex::new(()),
                 last_run_error: Mutex::new(None),
+                receipt_salt: Mutex::new(None),
+                last_claim_millis: Mutex::new(None),
                 last_audit_error,
                 audit_file_lock,
                 audit_writer: AuditWriter {
@@ -236,7 +248,7 @@ impl OrchStore {
         store.recover_managed_finalization_intents()?;
         store.recover_manager_creation_intents()?;
         store.mark_unfinished_interrupted()?;
-        store.fail_orphaned_idempotency_claims()?;
+        store.settle_orphaned_idempotency_claims()?;
         store.reconcile_workloads()?;
         // Cleanup is best-effort at the record level, but directory access
         // failures still surface so a broken ledger cannot look healthy.
@@ -253,7 +265,25 @@ impl OrchStore {
         Ok(self.inner.root.join("runs").join(format!("{safe}.json")))
     }
 
-    fn idemp_path(&self, request_id: &str) -> Result<PathBuf, OrchError> {
+    /// Where a receipt for `request_id` lives **in `scope`**.
+    ///
+    /// The scope prefix is fixed-width hex, so the name parses by position and
+    /// a caller-chosen `request_id` cannot forge one. A receipt written before
+    /// scoping existed has no prefix and no scoped lookup reaches it.
+    fn idemp_path(&self, scope: &IdempotencyScope, request_id: &str) -> Result<PathBuf, OrchError> {
+        let safe = safe_id_filename(request_id)?;
+        Ok(self
+            .inner
+            .root
+            .join("idempotency")
+            .join(format!("{}-{safe}.json", scope.as_str())))
+    }
+
+    /// Where a receipt for `request_id` lived **before scoping existed**.
+    ///
+    /// Only ever read, never written. A claim consults it to refuse a key that
+    /// was already used, rather than to serve what it holds.
+    fn legacy_idemp_path(&self, request_id: &str) -> Result<PathBuf, OrchError> {
         let safe = safe_id_filename(request_id)?;
         Ok(self
             .inner
@@ -3113,7 +3143,10 @@ impl OrchStore {
                 .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
         } else {
             let from_receipt = self
-                .load_idempotency(&intent.intent_id)
+                // Managed intents are submitted by the native executor under
+                // the host identity, and `intent_id` is host-minted, so the
+                // host scope is the only one that can hold this receipt.
+                .load_idempotency(&IdempotencyScope::host(), &intent.intent_id)
                 .ok()
                 .flatten()
                 .and_then(|receipt| receipt.run_id);
@@ -4681,11 +4714,15 @@ impl OrchStore {
             }
             receipts.push((path, receipt));
         }
-        receipts.sort_by(|(_, a), (_, b)| b.created_at.cmp(&a.created_at));
+        // Retention still ranks by *settlement*, falling back to the claim for
+        // a receipt that never settled. Ranking a settled receipt by its claim
+        // time would age it from a moment before the work even started.
+        let rank = |receipt: &IdempotencyReceipt| receipt.settled_at.unwrap_or(receipt.created_at);
+        receipts.sort_by(|(_, a), (_, b)| rank(b).cmp(&rank(a)));
         for (index, (path, receipt)) in receipts.iter().enumerate() {
             let over_count = index >= policy.max_idempotency_receipts;
             let over_age =
-                now.signed_duration_since(receipt.created_at) >= policy.idempotency_receipt_age;
+                now.signed_duration_since(rank(receipt)) >= policy.idempotency_receipt_age;
             if !over_count && !over_age {
                 continue;
             }
@@ -4788,16 +4825,364 @@ impl OrchStore {
         result.map(|_| final_run)
     }
 
-    pub fn save_idempotency(&self, receipt: &IdempotencyReceipt) -> anyhow::Result<()> {
+    /// Write a receipt into the scope it names.
+    ///
+    /// A receipt with no scope is legacy by definition and cannot be written
+    /// through this path: refusing is what keeps "unattributed" a read-only
+    /// state that retention drains rather than one new writes can re-enter.
+    ///
+    /// `#[cfg(test)]` on purpose, and this is a property rather than an
+    /// accident of who happens to call it. In production a receipt can only
+    /// come into existence through `claim_idempotency` and only change through
+    /// `finish_idempotency`; that pair is what makes the claim exclusive and
+    /// the settlement single. A general "write this receipt" is precisely the
+    /// door through which one could be fabricated or overwritten, so it exists
+    /// only where a test needs a shape the claim path cannot produce — a
+    /// legacy record, a pinned instant, a stranded pending claim.
+    #[cfg(test)]
+    pub(crate) fn save_idempotency(&self, receipt: &IdempotencyReceipt) -> anyhow::Result<()> {
+        let scope = receipt
+            .scope
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("idempotency receipt has no scope"))?;
         let _g = self.inner.lock.lock();
         let path = self
-            .idemp_path(&receipt.request_id)
+            .idemp_path(&IdempotencyScope::from_stored(scope), &receipt.request_id)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         atomic_write_json(&path, receipt)
     }
 
-    pub fn load_idempotency(&self, request_id: &str) -> anyhow::Result<Option<IdempotencyReceipt>> {
-        let path = match self.idemp_path(request_id) {
+    /// Per-home secret used to derive opaque attempt digests.
+    ///
+    /// The stored `payload_hash` is an unkeyed `SHA-256` of the serialized
+    /// request, and for `ptah_submit_task` that request contains the prompt.
+    /// Publishing it — even to a bearer holder — would hand out a
+    /// prompt-confirmation oracle: guess the text, hash it, compare. Reads on
+    /// this control plane are scoped by session and workspace rather than by
+    /// principal, so that oracle would work across credentials sharing a
+    /// session, not only on the caller's own traffic.
+    ///
+    /// The salt is persisted so digests stay comparable across restarts, and
+    /// is created 0600 on first use. It never leaves the host.
+    /// **Create-new-or-read, never truncate.**
+    ///
+    /// The first version was read-or-create with `truncate(true)`, which loses
+    /// in two ways. Two processes racing a cold start both miss the read and
+    /// both write, and the second silently replaces the first's secret —
+    /// invalidating every cursor and digest already issued under it, including
+    /// ones a caller is holding. And a torn write leaving fewer than 32 bytes
+    /// sent the *next* call down the same truncating path, turning one bad
+    /// write into a permanent reset.
+    ///
+    /// `create_new` is `O_EXCL`: exactly one creator wins and everyone else
+    /// reads what the winner wrote. A short file is now an error rather than an
+    /// invitation to overwrite, because silently reissuing the key is the
+    /// failure, not the diagnosis.
+    fn receipt_digest_salt(&self) -> anyhow::Result<Vec<u8>> {
+        if let Some(cached) = self.inner.receipt_salt.lock().clone() {
+            return Ok(cached);
+        }
+        let path = self.inner.root.join("receipt-digest.key");
+        let secret = Self::provision_receipt_salt(&path)?;
+        *self.inner.receipt_salt.lock() = Some(secret.clone());
+        Ok(secret)
+    }
+
+    /// The instant to stamp on the next claim: strictly after the last one.
+    ///
+    /// The page order and its cursor are `(created_at_millis, request_id)`, and
+    /// a wall clock does not order claims. Two receipts claimed inside one
+    /// millisecond order by request id, so a claim that arrives *later* with a
+    /// lexically smaller id sorts *before* a cursor already handed out — and is
+    /// then skipped on every subsequent page, permanently. Losing a receipt is
+    /// the one thing a receipt log must not do.
+    ///
+    /// So the claim clock is monotonic: never repeating, never going backwards,
+    /// and seeded from what is already on disk so a restart cannot regress into
+    /// a range already issued. The cost, stated rather than hidden: under a
+    /// burst of claims inside one millisecond the stamp runs up to one
+    /// millisecond per claim ahead of the wall clock. `recorded_at` is still
+    /// the claim time, accurate to within that burst; it is not a wall-clock
+    /// reading to measure against another host's.
+    ///
+    /// Caller must hold `inner.lock`.
+    fn next_claim_instant(&self) -> DateTime<Utc> {
+        let mut last = self.inner.last_claim_millis.lock();
+        if last.is_none() {
+            *last = Some(self.highest_claim_millis_on_disk());
+        }
+        let previous = last.expect("seeded above");
+        let millis = Utc::now().timestamp_millis().max(previous + 1);
+        *last = Some(millis);
+        DateTime::from_timestamp_millis(millis).unwrap_or_else(Utc::now)
+    }
+
+    /// The largest claim millisecond already recorded, or 0.
+    ///
+    /// Read once per store. A restart that began numbering from the wall clock
+    /// again could re-enter a millisecond range it has already issued cursors
+    /// for, which is the same loss one process-lifetime later.
+    fn highest_claim_millis_on_disk(&self) -> i64 {
+        let dir = self.inner.root.join("idempotency");
+        let Ok(entries) = fs::read_dir(&dir) else {
+            return 0;
+        };
+        entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("json"))
+            .filter_map(|path| fs::read_to_string(path).ok())
+            .filter_map(|text| serde_json::from_str::<IdempotencyReceipt>(&text).ok())
+            .map(|receipt| receipt.created_at.timestamp_millis())
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn provision_receipt_salt(path: &Path) -> anyhow::Result<Vec<u8>> {
+        if let Ok(existing) = fs::read(path) {
+            if existing.len() >= 32 {
+                return Ok(existing);
+            }
+            if !existing.is_empty() {
+                anyhow::bail!(
+                    "receipt digest key at {} is truncated; refusing to reissue it, \
+                     because a new key silently invalidates every cursor and digest \
+                     already handed out",
+                    path.display()
+                );
+            }
+        }
+        let mut secret = Vec::with_capacity(32);
+        secret.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+        secret.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(path) {
+            Ok(mut file) => {
+                std::io::Write::write_all(&mut file, &secret)?;
+                file.sync_all()?;
+                Ok(secret)
+            }
+            // Another process won the race. Its key is the key.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let existing = fs::read(path)?;
+                anyhow::ensure!(
+                    existing.len() >= 32,
+                    "receipt digest key at {} is short after a creation race",
+                    path.display()
+                );
+                Ok(existing)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Opaque, host-issued attempt digest for a stored receipt.
+    ///
+    /// Equal payloads **within one principal's scope** agree; nothing else
+    /// survives. A caller cannot test a guessed prompt without the salt, and
+    /// two homes never agree on the same payload.
+    ///
+    /// The scope is in the hash, and that is the point rather than a detail.
+    /// Without it two principals submitting the same payload get the *same*
+    /// digest, so a digest one caller can see confirms what another caller
+    /// sent — exactly the correlation the salt exists to prevent. The SDK's
+    /// contract already said "principal-scoped" while the host hashed only the
+    /// salt and the payload; the code now matches the contract rather than the
+    /// contract being corrected down to the code.
+    pub(crate) fn attempt_digest(
+        &self,
+        scope: &IdempotencyScope,
+        payload_hash: &str,
+    ) -> anyhow::Result<String> {
+        use sha2::{Digest, Sha256};
+        let salt = self.receipt_digest_salt()?;
+        let mut hasher = Sha256::new();
+        hasher.update(&salt);
+        hasher.update([0u8]);
+        hasher.update(scope.as_str().as_bytes());
+        hasher.update([0u8]);
+        hasher.update(payload_hash.as_bytes());
+        Ok(hex_sha256(&hasher.finalize())[..32].to_string())
+    }
+
+    /// Mint the opaque page cursor for a receipt boundary.
+    ///
+    /// The old cursor was the raw `millis:request_id` pair, and parsing it
+    /// checked only that it *looked* like one — while the contract said a
+    /// cursor this host did not issue is refused. Any caller could therefore
+    /// seek to a position the host never handed out, and consumers could parse
+    /// a shape they were promised was opaque.
+    ///
+    /// A cursor is now authenticated with the same per-home secret the attempt
+    /// digest uses, and bound to the scope and run it was issued for, so it
+    /// cannot be forged, cannot be replayed against another run, and cannot be
+    /// read as anything but bytes. Hex throughout, so the tag is fixed-width
+    /// and no delimiter can be confused with payload.
+    pub(crate) fn receipt_cursor(
+        &self,
+        scope: &IdempotencyScope,
+        run_id: &str,
+        millis: i64,
+        request_id: &str,
+    ) -> anyhow::Result<String> {
+        let payload = format!("{millis}:{request_id}");
+        let tag = self.receipt_cursor_tag(scope, run_id, &payload)?;
+        Ok(format!("{tag}{}", hex_encode(payload.as_bytes())))
+    }
+
+    /// Verify and decode a cursor this host issued.
+    ///
+    /// Every failure — wrong length, non-hex, bad tag, unparseable payload —
+    /// returns the same `None`, so a caller cannot learn *why* a cursor was
+    /// rejected and use that as an oracle. The caller sees one refusal.
+    pub(crate) fn parse_receipt_cursor(
+        &self,
+        scope: &IdempotencyScope,
+        run_id: &str,
+        raw: &str,
+    ) -> anyhow::Result<Option<(i64, String)>> {
+        const TAG_HEX: usize = 32;
+        if raw.len() <= TAG_HEX {
+            return Ok(None);
+        }
+        let (tag, body) = raw.split_at(TAG_HEX);
+        let Some(bytes) = hex_decode(body) else {
+            return Ok(None);
+        };
+        let Ok(payload) = String::from_utf8(bytes) else {
+            return Ok(None);
+        };
+        let expected = self.receipt_cursor_tag(scope, run_id, &payload)?;
+        if !constant_time_eq(tag.as_bytes(), expected.as_bytes()) {
+            return Ok(None);
+        }
+        let Some((millis, request_id)) = payload.split_once(':') else {
+            return Ok(None);
+        };
+        let Ok(millis) = millis.parse::<i64>() else {
+            return Ok(None);
+        };
+        Ok(Some((millis, request_id.to_string())))
+    }
+
+    /// The authentication tag over one cursor payload.
+    ///
+    /// HMAC-SHA256 rather than `SHA256(secret ‖ message)`: the latter is
+    /// length-extendable, and a construction that happens to be safe because of
+    /// what the surrounding format forbids is a construction that breaks when
+    /// the format changes.
+    fn receipt_cursor_tag(
+        &self,
+        scope: &IdempotencyScope,
+        run_id: &str,
+        payload: &str,
+    ) -> anyhow::Result<String> {
+        let salt = self.receipt_digest_salt()?;
+        let mut message = Vec::new();
+        message.extend_from_slice(b"receipt-cursor");
+        message.push(0);
+        message.extend_from_slice(scope.as_str().as_bytes());
+        message.push(0);
+        message.extend_from_slice(run_id.as_bytes());
+        message.push(0);
+        message.extend_from_slice(payload.as_bytes());
+        Ok(hmac_sha256_hex(&salt, &message)[..32].to_string())
+    }
+
+    /// Receipts belonging to one run, ordered `(created_at, request_id)`.
+    ///
+    /// Ordering is total and deterministic so a paged walk yields exactly the
+    /// unpaged order; the request id breaks ties inside a single millisecond
+    /// so no receipt is dropped or repeated at a page boundary. `after` is the
+    /// last `(created_at_millis, request_id)` the caller saw.
+    ///
+    /// Reads only. Receipt *writers* stay private to the idempotency path.
+    pub(crate) fn list_idempotency_for_run(
+        &self,
+        scope: &IdempotencyScope,
+        run_id: &str,
+        after: Option<(i64, String)>,
+        limit: usize,
+    ) -> anyhow::Result<(Vec<IdempotencyReceipt>, bool)> {
+        let dir = self.inner.root.join("idempotency");
+        let mut found: Vec<IdempotencyReceipt> = Vec::new();
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            // A home that has never recorded a receipt is empty, not broken.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((found, false))
+            }
+            Err(error) => return Err(error.into()),
+        };
+        for entry in entries {
+            let path = entry?.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+            // Corruption must not read as absence. A receipt that cannot be
+            // parsed is not a receipt that is not there, and a listing that
+            // quietly drops it tells the caller the mutation never happened.
+            let receipt = serde_json::from_str::<IdempotencyReceipt>(&text).map_err(|error| {
+                anyhow::anyhow!(
+                    "receipt {} is unreadable ({error}); refusing to report a \
+                     partial listing, because a dropped receipt is \
+                     indistinguishable from a mutation that never ran",
+                    path.display()
+                )
+            })?;
+            if receipt.run_id.as_deref() != Some(run_id) {
+                continue;
+            }
+            // The caller already passed the run fence to reach this listing,
+            // so a foreign receipt should not be here at all. Filtering anyway
+            // means a receipt is never served out of the scope it was claimed
+            // in even if a future caller reaches this with a wider run.
+            // Legacy receipts carry no scope and match nothing.
+            if receipt.scope.as_deref() != Some(scope.as_str()) {
+                continue;
+            }
+            found.push(receipt);
+        }
+        // Order on exactly the key the cursor encodes.
+        //
+        // Sorting by the full `created_at` while the cursor carries only
+        // milliseconds is not a cosmetic mismatch: two receipts inside one
+        // millisecond whose sub-millisecond order is the inverse of their
+        // request-id order straddle the boundary, and the second is skipped on
+        // resume. Truncating here makes the comparison the pager performs and
+        // the comparison the ordering performs the same comparison.
+        found.sort_by(|a, b| {
+            a.created_at
+                .timestamp_millis()
+                .cmp(&b.created_at.timestamp_millis())
+                .then_with(|| a.request_id.cmp(&b.request_id))
+        });
+        if let Some((millis, request_id)) = after {
+            found.retain(|r| {
+                let key = (r.created_at.timestamp_millis(), r.request_id.clone());
+                key > (millis, request_id.clone())
+            });
+        }
+        let has_more = found.len() > limit;
+        found.truncate(limit);
+        Ok((found, has_more))
+    }
+
+    pub(crate) fn load_idempotency(
+        &self,
+        scope: &IdempotencyScope,
+        request_id: &str,
+    ) -> anyhow::Result<Option<IdempotencyReceipt>> {
+        let path = match self.idemp_path(scope, request_id) {
             Ok(p) => p,
             Err(_) => return Ok(None),
         };
@@ -4813,20 +5198,26 @@ impl OrchStore {
     /// - Existing complete receipt with different hash → Conflict
     /// - Existing pending → `Pending` (callers wait asynchronously)
     /// - None → create pending claim (exclusive)
-    pub fn claim_idempotency(
+    pub(crate) fn claim_idempotency(
         &self,
+        scope: &IdempotencyScope,
         tool: &str,
         request_id: &str,
         payload_hash: &str,
     ) -> Result<IdempotencyClaim, OrchError> {
-        let path = self.idemp_path(request_id)?;
+        let path = self.idemp_path(scope, request_id)?;
         let _g = self.inner.lock.lock();
         if path.is_file() {
             let text = fs::read_to_string(&path)
                 .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
             let prev: IdempotencyReceipt = serde_json::from_str(&text)
                 .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
-            if prev.request_id != request_id
+            // Defence in depth. The path already separates scopes; this
+            // refuses to replay a receipt whose recorded scope is not the one
+            // being claimed, so a legacy (unscoped) receipt can never be
+            // reached even by a name that happens to collide.
+            if prev.scope.as_deref() != Some(scope.as_str())
+                || prev.request_id != request_id
                 || prev.tool != tool
                 || prev.payload_hash != payload_hash
             {
@@ -4844,14 +5235,42 @@ impl OrchStore {
             };
         }
 
+        // A key used before scoping existed must not be handed out again.
+        //
+        // A legacy receipt lives at the unscoped path, so a scoped claim looks
+        // at a different file, finds nothing, and returns `Perform` — which
+        // re-runs a mutation that may already have committed. Treating that as
+        // "a new request" was the previous position here and it understated
+        // the case: it is not a new request, it is the same one, executed
+        // twice across an upgrade.
+        //
+        // The refusal uses the receipt's *existence* and never its contents,
+        // so nothing unattributable is served to anyone. `uncertain_outcome`
+        // is the honest code: the host cannot say whether that mutation
+        // applied, which is exactly what the caller needs to know.
+        if let Ok(legacy) = self.legacy_idemp_path(request_id) {
+            if legacy.is_file() {
+                return Err(OrchError::new(
+                    OrchErrorCode::UncertainOutcome,
+                    "this request_id was used before this host scoped its \
+                     receipts, and the earlier outcome cannot be attributed or \
+                     read; whether that mutation applied is unknown. Reconcile \
+                     against durable state before choosing a new key",
+                ));
+            }
+        }
+
         let pending = IdempotencyReceipt {
             request_id: request_id.into(),
+            created_at: self.next_claim_instant(),
+            scope: Some(scope.as_str().to_string()),
+            scope_version: Some(SCOPE_DERIVATION_VERSION),
             payload_hash: payload_hash.into(),
             run_id: None,
             tool: tool.into(),
             response: serde_json::Value::Null,
             error: None,
-            created_at: Utc::now(),
+            settled_at: None,
             status: "pending".into(),
         };
         match write_json_exclusive(&path, &pending) {
@@ -4863,8 +5282,9 @@ impl OrchStore {
         }
     }
 
-    pub fn complete_idempotency(
+    pub(crate) fn complete_idempotency(
         &self,
+        scope: &IdempotencyScope,
         tool: &str,
         request_id: &str,
         payload_hash: &str,
@@ -4872,6 +5292,7 @@ impl OrchStore {
         response: serde_json::Value,
     ) -> Result<(), OrchError> {
         self.finish_idempotency(
+            scope,
             tool,
             request_id,
             payload_hash,
@@ -4882,8 +5303,9 @@ impl OrchStore {
         )
     }
 
-    pub fn fail_idempotency(
+    pub(crate) fn fail_idempotency(
         &self,
+        scope: &IdempotencyScope,
         tool: &str,
         request_id: &str,
         payload_hash: &str,
@@ -4891,6 +5313,7 @@ impl OrchStore {
         error: OrchError,
     ) -> Result<(), OrchError> {
         self.finish_idempotency(
+            scope,
             tool,
             request_id,
             payload_hash,
@@ -4904,6 +5327,7 @@ impl OrchStore {
     #[allow(clippy::too_many_arguments)]
     fn finish_idempotency(
         &self,
+        scope: &IdempotencyScope,
         tool: &str,
         request_id: &str,
         payload_hash: &str,
@@ -4912,7 +5336,7 @@ impl OrchStore {
         error: Option<OrchError>,
         status: &str,
     ) -> Result<(), OrchError> {
-        let path = self.idemp_path(request_id)?;
+        let path = self.idemp_path(scope, request_id)?;
         let _g = self.inner.lock.lock();
         if !path.is_file() {
             return Err(OrchError::new(
@@ -4924,7 +5348,8 @@ impl OrchStore {
             .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
         let previous: IdempotencyReceipt = serde_json::from_str(&text)
             .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
-        if previous.request_id != request_id
+        if previous.scope.as_deref() != Some(scope.as_str())
+            || previous.request_id != request_id
             || previous.tool != tool
             || previous.payload_hash != payload_hash
         {
@@ -4941,12 +5366,20 @@ impl OrchStore {
         }
         let receipt = IdempotencyReceipt {
             request_id: request_id.into(),
+            scope: Some(scope.as_str().to_string()),
+            // Carried, not re-stamped: a receipt records the rule that
+            // produced the scope it was *claimed* under.
+            scope_version: previous.scope_version,
             payload_hash: payload_hash.into(),
             run_id,
             tool: tool.into(),
             response,
             error,
-            created_at: Utc::now(),
+            // The claim time, carried forward. Settling a receipt must not
+            // move it in the page order: a caller mid-walk holds a cursor over
+            // this key, and a receipt that jumps past it is handed out twice.
+            created_at: previous.created_at,
+            settled_at: Some(Utc::now()),
             status: status.into(),
         };
         atomic_write_json(&path, &receipt)
@@ -5113,7 +5546,27 @@ impl OrchStore {
         Ok(recovered)
     }
 
-    fn fail_orphaned_idempotency_claims(&self) -> anyhow::Result<usize> {
+    /// Settle claims that were still pending when the host stopped.
+    ///
+    /// This used to mark them `failed` and tell the caller to *use a new
+    /// request id*. Both halves were wrong, and together they licensed exactly
+    /// the duplicate the receipt exists to prevent: a claim is written
+    /// **before** the mutation runs, so a claim still pending at restart may
+    /// have committed its effect and died before settling. "Interrupted" and
+    /// "did not happen" are different answers, and a caller told the second
+    /// one, then told to pick a fresh key, will do the work twice.
+    ///
+    /// The outcome is now `uncertain_outcome` — the one code the three-valued
+    /// retry disposition marks `Unsafe`, meaning reconcile before retrying —
+    /// and the message says so instead of inviting a new key.
+    ///
+    /// It also rewrote `created_at`. That is the mutable-ordering defect fixed
+    /// in `finish_idempotency`, still present in the recovery path: a receipt
+    /// pending across a restart jumped to the end of the page order and could
+    /// be delivered a second time across a cursor a caller was already
+    /// holding. Recovery is a settlement like any other, so it records
+    /// `settled_at` and leaves the claim time alone.
+    fn settle_orphaned_idempotency_claims(&self) -> anyhow::Result<usize> {
         let dir = self.inner.root.join("idempotency");
         let mut changed = 0;
         for entry in fs::read_dir(dir)? {
@@ -5132,10 +5585,13 @@ impl OrchStore {
             }
             receipt.status = "failed".into();
             receipt.error = Some(OrchError::new(
-                OrchErrorCode::Internal,
-                "mutation was interrupted before its durable receipt completed; use a new request_id",
+                OrchErrorCode::UncertainOutcome,
+                "the host stopped after this request was claimed and before its \
+                 outcome was recorded; the mutation may or may not have applied. \
+                 Reconcile against durable state before retrying, and retry under \
+                 the same request_id rather than a new one",
             ));
-            receipt.created_at = Utc::now();
+            receipt.settled_at = Some(Utc::now());
             atomic_write_json(&path, &receipt)?;
             changed += 1;
         }
@@ -5333,6 +5789,114 @@ fn write_json_exclusive<T: serde::Serialize>(path: &Path, value: &T) -> std::io:
 
 #[cfg(test)]
 mod tests {
+    use super::IdempotencyScope;
+    use crate::orchestration::types::HOST_AUTHORED_CLIENT_ID;
+
+    /// The scope these tests claim in. One value, so a test that writes and a
+    /// test that reads are the same principal — which is the point: a
+    /// different scope must find nothing, and `receipts_are_scoped_per_principal`
+    /// asserts exactly that.
+    fn scope() -> IdempotencyScope {
+        IdempotencyScope::of(&principal("test-principal"))
+    }
+
+    /// A scope cannot be built from a bare string any more, so a test that
+    /// wants a second principal has to produce a second *principal*. That is
+    /// the sealing working: naming another caller's namespace requires that
+    /// caller's authenticated context.
+    fn principal(token_id: &str) -> crate::orchestration::AuthContext {
+        crate::orchestration::AuthContext {
+            token_id: token_id.into(),
+            owner_id: "test-account".into(),
+        }
+    }
+
+    /// `IdempotencyClaim` carries an `OrchError` and is not `Debug`; name the
+    /// variant so a failure says which one came back.
+    fn describe(claim: &Result<IdempotencyClaim, OrchError>) -> String {
+        match claim {
+            Ok(IdempotencyClaim::Perform) => "Perform".into(),
+            Ok(IdempotencyClaim::Pending) => "Pending".into(),
+            Ok(IdempotencyClaim::Replay(Ok(value))) => format!("Replay(ok {value})"),
+            Ok(IdempotencyClaim::Replay(Err(error))) => {
+                format!("Replay(err {})", error.code.as_str())
+            }
+            Err(error) => format!("Err({})", error.code.as_str()),
+        }
+    }
+
+    /// Two receipts in the same millisecond, whose sub-millisecond order is the
+    /// inverse of their request-id order, must both survive a paged walk.
+    ///
+    /// This is the exact shape the old code lost. Ordering compared the full
+    /// `created_at` while the cursor carried only milliseconds, so the pair
+    /// straddled the page boundary in opposite directions and the second was
+    /// skipped on resume. Ordering and paging now use the same truncated key.
+    #[test]
+    fn same_millisecond_receipts_with_inverse_ids_are_never_skipped() {
+        let root = tempfile::tempdir().expect("temp root");
+        let store = OrchStore::open(root.path()).expect("open store");
+
+        // `bbb` is earlier in the millisecond but later by id; `aaa` is later
+        // in the millisecond but earlier by id. Under the old comparison these
+        // disagreed and one fell through the boundary.
+        // Pinned to a millisecond boundary so the sub-millisecond offset
+        // cannot spill into the next millisecond and dissolve the fixture.
+        let base = chrono::DateTime::from_timestamp_millis(1_700_000_000_000)
+            .expect("fixed millisecond boundary");
+        let earlier_sub_ms = base;
+        let later_sub_ms = base + Duration::nanoseconds(400_000);
+        assert_eq!(
+            earlier_sub_ms.timestamp_millis(),
+            later_sub_ms.timestamp_millis(),
+            "the fixture must place both inside one millisecond"
+        );
+
+        for (request_id, created_at) in [("bbb", earlier_sub_ms), ("aaa", later_sub_ms)] {
+            store
+                .save_idempotency(&IdempotencyReceipt {
+                    scope: Some(scope().as_str().to_string()),
+                    scope_version: Some(SCOPE_DERIVATION_VERSION),
+                    request_id: request_id.into(),
+                    payload_hash: format!("{request_id}-hash"),
+                    run_id: Some("run-precision".into()),
+                    tool: "ptah_submit_task".into(),
+                    response: serde_json::json!({}),
+                    error: None,
+                    created_at,
+                    settled_at: None,
+                    status: "complete".into(),
+                })
+                .expect("save receipt");
+        }
+
+        // Walk one at a time, exactly as a paging consumer would.
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor: Option<(i64, String)> = None;
+        for _ in 0..8 {
+            let (page, has_more) = store
+                .list_idempotency_for_run(&scope(), "run-precision", cursor.clone(), 1)
+                .expect("list page");
+            let Some(receipt) = page.into_iter().next() else {
+                break;
+            };
+            cursor = Some((
+                receipt.created_at.timestamp_millis(),
+                receipt.request_id.clone(),
+            ));
+            seen.push(receipt.request_id);
+            if !has_more {
+                break;
+            }
+        }
+
+        assert_eq!(
+            seen,
+            vec!["aaa".to_string(), "bbb".to_string()],
+            "a one-at-a-time walk must return both receipts, in the cursor's own order"
+        );
+    }
+
     use super::*;
     use crate::orchestration::types::RunPurpose;
     use crate::orchestration::types::{
@@ -5812,18 +6376,707 @@ mod tests {
     fn idempotency_claim_exclusive() {
         let d = tempdir().unwrap();
         let store = OrchStore::open(d.path()).unwrap();
-        match store.claim_idempotency("t", "req", "h").unwrap() {
+        match store.claim_idempotency(&scope(), "t", "req", "h").unwrap() {
             IdempotencyClaim::Perform => {}
             _ => panic!("first claim should perform"),
         }
         store
-            .complete_idempotency("t", "req", "h", None, serde_json::json!({"ok": true}))
+            .complete_idempotency(
+                &scope(),
+                "t",
+                "req",
+                "h",
+                None,
+                serde_json::json!({"ok": true}),
+            )
             .unwrap();
-        match store.claim_idempotency("t", "req", "h").unwrap() {
+        match store.claim_idempotency(&scope(), "t", "req", "h").unwrap() {
             IdempotencyClaim::Replay(Ok(v)) => assert_eq!(v["ok"], true),
             _ => panic!("replay"),
         }
-        assert!(store.claim_idempotency("t", "req", "other").is_err());
+        assert!(store
+            .claim_idempotency(&scope(), "t", "req", "other")
+            .is_err());
+    }
+
+    /// One caller's idempotency key must not reach another caller's receipt.
+    ///
+    /// `request_id` is chosen by the caller, so before scoping existed the two
+    /// principals here shared one namespace and the second got three things it
+    /// should never have had: the first's stored response on a matching payload
+    /// hash, a `conflict` that confirmed the key was taken on a differing one,
+    /// and the ability to squat a key before its owner used it. Each assertion
+    /// below is one of those.
+    #[test]
+    fn receipts_are_scoped_per_principal() {
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+        let first = IdempotencyScope::of(&principal("device-a"));
+        let second = IdempotencyScope::of(&principal("device-b"));
+
+        assert!(matches!(
+            store.claim_idempotency(&first, "t", "shared-key", "hash-a"),
+            Ok(IdempotencyClaim::Perform)
+        ));
+        store
+            .complete_idempotency(
+                &first,
+                "t",
+                "shared-key",
+                "hash-a",
+                Some("run-a".into()),
+                serde_json::json!({"secret": "first caller only"}),
+            )
+            .unwrap();
+
+        // Same key, same payload. The old namespace replayed the first
+        // caller's response here — a straight cross-principal read.
+        match store.claim_idempotency(&second, "t", "shared-key", "hash-a") {
+            Ok(IdempotencyClaim::Perform) => {}
+            other => panic!("a foreign key must look unused, got {}", describe(&other)),
+        }
+
+        // Same key, different payload. The old namespace answered `conflict`,
+        // which told the second caller the key was taken.
+        let other_home = tempdir().unwrap();
+        let fresh = OrchStore::open(other_home.path()).unwrap();
+        fresh
+            .claim_idempotency(&first, "t", "shared-key", "hash-a")
+            .unwrap();
+        match fresh.claim_idempotency(&second, "t", "shared-key", "hash-b") {
+            Ok(IdempotencyClaim::Perform) => {}
+            other => panic!(
+                "a foreign key must not report a conflict, got {}",
+                describe(&other)
+            ),
+        }
+
+        // The second caller completing its own claim leaves the first intact.
+        store
+            .complete_idempotency(
+                &second,
+                "t",
+                "shared-key",
+                "hash-a",
+                Some("run-b".into()),
+                serde_json::json!({"secret": "second caller only"}),
+            )
+            .unwrap();
+        match store
+            .claim_idempotency(&first, "t", "shared-key", "hash-a")
+            .unwrap()
+        {
+            IdempotencyClaim::Replay(Ok(value)) => {
+                assert_eq!(value["secret"], "first caller only")
+            }
+            other => panic!(
+                "the owner must still replay its own outcome, got {}",
+                describe(&Ok(other))
+            ),
+        }
+
+        // And a run-scoped listing never crosses the boundary either.
+        let (mine, _) = store
+            .list_idempotency_for_run(&first, "run-b", None, 10)
+            .unwrap();
+        assert!(
+            mine.is_empty(),
+            "a receipt must not be listed outside the scope that claimed it"
+        );
+    }
+
+    /// A receipt claimed later must never sort before one already paged past.
+    ///
+    /// The page key is `(created_at_millis, request_id)`. With a wall clock,
+    /// two claims inside one millisecond order by request id — so a claim that
+    /// *arrives later* with a lexically smaller id sorts *before* a cursor
+    /// already handed out, and is skipped on that page and every page after
+    /// it. Not delayed: lost.
+    ///
+    /// The claim clock is monotonic, so the shape below cannot arise. This
+    /// test writes it as a caller would meet it — claim `zzz`, page past it,
+    /// then claim `aaa` — rather than as a property about timestamps.
+    #[test]
+    fn a_later_claim_is_never_skipped_by_an_earlier_cursor() {
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+        let scope = scope();
+
+        let settle = |id: &str| {
+            store.claim_idempotency(&scope, "t", id, "h").unwrap();
+            store
+                .complete_idempotency(
+                    &scope,
+                    "t",
+                    id,
+                    "h",
+                    Some("run-order".into()),
+                    serde_json::json!({ "id": id }),
+                )
+                .unwrap();
+        };
+
+        settle("zzz");
+        let (first, _) = store
+            .list_idempotency_for_run(&scope, "run-order", None, 10)
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        let cursor = (
+            first[0].created_at.timestamp_millis(),
+            first[0].request_id.clone(),
+        );
+
+        // Force the collision rather than hoping for it. Two real claims land
+        // in one millisecond only when the machine is fast enough, so a test
+        // that just claims twice passes under the bug on most runs — as this
+        // one did before it was written this way. Winding the monotonic floor
+        // back to the first claim's millisecond reproduces exactly the state a
+        // same-millisecond pair produces, every time.
+        *store.inner.last_claim_millis.lock() = Some(cursor.0 - 1);
+        settle("aaa");
+
+        let (after, _) = store
+            .list_idempotency_for_run(&scope, "run-order", Some(cursor), 10)
+            .unwrap();
+        let names: Vec<_> = after.iter().map(|r| r.request_id.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["aaa"],
+            "a receipt claimed after the cursor was issued must still be reachable"
+        );
+
+        // The invariant behind it, asserted where no timing can hide it: the
+        // claim clock never repeats and never regresses, whatever the wall
+        // clock says. Wind the floor far ahead and the next claim must still
+        // come after it.
+        let ahead = Utc::now().timestamp_millis() + 10_000;
+        *store.inner.last_claim_millis.lock() = Some(ahead);
+        store
+            .claim_idempotency(&scope, "t", "after-a-jump", "h")
+            .unwrap();
+        let jumped = store
+            .load_idempotency(&scope, "after-a-jump")
+            .unwrap()
+            .expect("claimed");
+        assert!(
+            jumped.created_at.timestamp_millis() > ahead,
+            "the claim clock regressed into a range it had already issued: {} <= {ahead}",
+            jumped.created_at.timestamp_millis()
+        );
+
+        let (all, _) = store
+            .list_idempotency_for_run(&scope, "run-order", None, 10)
+            .unwrap();
+        let stamps: Vec<i64> = all
+            .iter()
+            .map(|r| r.created_at.timestamp_millis())
+            .collect();
+        let mut sorted = stamps.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            stamps.len(),
+            sorted.len(),
+            "claim stamps must be distinct, or the id becomes the tiebreak again"
+        );
+    }
+
+    /// Reissuing the digest key would invalidate every cursor already handed
+    /// out, so provisioning must be create-once and never truncate.
+    #[test]
+    fn the_digest_key_is_provisioned_once_and_never_reissued() {
+        let d = tempdir().unwrap();
+        let key = d.path().join("receipt-digest.key");
+
+        let first = OrchStore::provision_receipt_salt(&key).unwrap();
+        assert_eq!(first.len(), 32);
+        let second = OrchStore::provision_receipt_salt(&key).unwrap();
+        assert_eq!(
+            first, second,
+            "a second provisioning replaced the key; every cursor issued under \
+             the first is now invalid"
+        );
+
+        // A torn write is a diagnosis, not an invitation to overwrite.
+        std::fs::write(&key, b"short").unwrap();
+        assert!(
+            OrchStore::provision_receipt_salt(&key).is_err(),
+            "a truncated key must fail closed rather than be silently reissued"
+        );
+        assert_eq!(
+            std::fs::read(&key).unwrap(),
+            b"short",
+            "the failing path must not have rewritten the key"
+        );
+    }
+
+    /// Two principals sending the same payload must not get the same digest.
+    ///
+    /// The digest is what a caller sees in place of the payload hash, and the
+    /// contract calls it principal-scoped. While the host hashed only the salt
+    /// and the payload, equal digests across principals confirmed that another
+    /// caller had sent an identical payload — the correlation the salt exists
+    /// to prevent.
+    #[test]
+    fn the_attempt_digest_does_not_correlate_across_principals() {
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+        let mine = IdempotencyScope::of(&principal("device-a"));
+        let theirs = IdempotencyScope::of(&principal("device-b"));
+        let payload = "a".repeat(64);
+
+        let ours = store.attempt_digest(&mine, &payload).unwrap();
+        assert_ne!(
+            ours,
+            store.attempt_digest(&theirs, &payload).unwrap(),
+            "the same payload produced the same digest for two principals"
+        );
+        assert_eq!(
+            ours,
+            store.attempt_digest(&mine, &payload).unwrap(),
+            "a principal's own equal payloads must still agree"
+        );
+        assert_ne!(
+            ours,
+            store.attempt_digest(&mine, &"b".repeat(64)).unwrap(),
+            "different payloads must differ"
+        );
+    }
+
+    /// The receipt surface must stay sealed inside this crate.
+    ///
+    /// An in-process or out-of-tree caller that could name a scope could read,
+    /// claim, settle and list any principal's receipts, and mint cursors for
+    /// them — the HTTP fence would be decorative. Two properties keep that
+    /// shut, and both are structural rather than behavioural, so a behavioural
+    /// test would not notice either one being undone:
+    ///
+    /// 1. no `pub fn` here takes an `IdempotencyScope`;
+    /// 2. the scope type and the host identity are not re-exported from the
+    ///    crate root, so no caller outside this crate can name either.
+    ///
+    /// Deliberately a source scan. A future `pub fn` handed a scope would
+    /// compile and pass every functional test in this file.
+    #[test]
+    fn no_public_function_accepts_a_scope() {
+        let whole = include_str!("store.rs");
+        // Scan the production body only; this module names the symbol in its
+        // own assertions and would otherwise flag itself.
+        let source = whole
+            .split_once("#[cfg(test)]")
+            .map(|(before, _)| before)
+            .unwrap_or(whole);
+
+        let offenders: Vec<&str> = source
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                trimmed.starts_with("pub fn ") || trimmed.starts_with("pub async fn ")
+            })
+            .filter(|line| line.contains("IdempotencyScope"))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "these are publicly callable and take a scope; make them \
+             `pub(crate)`:\n  {}",
+            offenders.join("\n  ")
+        );
+
+        // Multi-line signatures put the parameter on its own line, so also
+        // check the parameter lists of every `pub fn` in the file.
+        let mut public_depth: Option<usize> = None;
+        let mut leaked: Vec<String> = Vec::new();
+        let mut current = String::new();
+        for line in source.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("pub fn ") || trimmed.starts_with("pub async fn ") {
+                public_depth = Some(0);
+                current = trimmed.to_string();
+            }
+            if public_depth.is_some() {
+                if trimmed.contains("IdempotencyScope") {
+                    leaked.push(current.clone());
+                }
+                if line.contains(") ->") || line.trim_end().ends_with(") {") {
+                    public_depth = None;
+                }
+            }
+        }
+        assert!(
+            leaked.is_empty(),
+            "these public signatures accept a scope:\n  {}",
+            leaked.join("\n  ")
+        );
+
+        // And the crate root must not re-export the scope, the host identity,
+        // or the stored receipt — which carries the full replayed response and
+        // an error with its message, and is exactly what `PublicReceipt`
+        // exists to project away from.
+        let root = include_str!("mod.rs");
+        for symbol in [
+            "IdempotencyScope",
+            "HOST_AUTHORED_CLIENT_ID",
+            "IdempotencyReceipt",
+        ] {
+            assert!(
+                !root.contains(symbol),
+                "`{symbol}` is re-exported from the crate root; a caller \
+                 outside this crate can then name a namespace it does not own"
+            );
+        }
+    }
+
+    /// Settling a receipt must not move it in the page order.
+    ///
+    /// `finish_idempotency` used to stamp `created_at = now`, which made the
+    /// ordering key mutable. The failure is precise: a caller takes page one
+    /// and holds a cursor at the receipt it just saw; that receipt is still
+    /// pending; it settles; its key jumps to *after* the cursor; page two
+    /// hands the caller the same receipt again.
+    ///
+    /// So the shape here is the failing one, not merely a plausible one —
+    /// the receipt that settles mid-walk is the one page one already returned.
+    /// The claim time is now immutable and settlement is recorded separately.
+    #[test]
+    fn settling_a_receipt_does_not_move_it_past_an_issued_cursor() {
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+        let scope = scope();
+
+        // Claimed first and left pending: this is the receipt page one returns
+        // and the one that would move.
+        store.claim_idempotency(&scope, "t", "alpha", "h").unwrap();
+        let mut pending = store
+            .load_idempotency(&scope, "alpha")
+            .unwrap()
+            .expect("the owner can read its own pending claim");
+        pending.run_id = Some("run-walk".into());
+        store.save_idempotency(&pending).unwrap();
+
+        // Claimed after, and settled straight away.
+        store.claim_idempotency(&scope, "t", "beta", "h").unwrap();
+        store
+            .complete_idempotency(
+                &scope,
+                "t",
+                "beta",
+                "h",
+                Some("run-walk".into()),
+                serde_json::json!({ "id": "beta" }),
+            )
+            .unwrap();
+
+        let (first, has_more) = store
+            .list_idempotency_for_run(&scope, "run-walk", None, 1)
+            .unwrap();
+        assert!(has_more, "two receipts, page size one");
+        assert_eq!(
+            first[0].request_id, "alpha",
+            "the earliest claim must come first"
+        );
+        let cursor = (first[0].created_at.timestamp_millis(), "alpha".to_string());
+
+        // The mid-walk settlement. Under the old code this moved `alpha` to
+        // `now`, past the cursor the caller is holding.
+        store
+            .complete_idempotency(
+                &scope,
+                "t",
+                "alpha",
+                "h",
+                Some("run-walk".into()),
+                serde_json::json!({ "id": "alpha" }),
+            )
+            .unwrap();
+
+        let (rest, _) = store
+            .list_idempotency_for_run(&scope, "run-walk", Some(cursor.clone()), 10)
+            .unwrap();
+        let names: Vec<_> = rest.iter().map(|r| r.request_id.as_str()).collect();
+        assert!(
+            !names.contains(&"alpha"),
+            "a receipt page one already returned came back after settling: {names:?}"
+        );
+        assert_eq!(names, vec!["beta"], "the walk must see each receipt once");
+
+        // The settled receipt kept its claim time and gained a settlement time.
+        let alpha = store
+            .load_idempotency(&scope, "alpha")
+            .unwrap()
+            .expect("settled receipt is still readable");
+        assert_eq!(alpha.status, "complete");
+        assert_eq!(
+            alpha.created_at.timestamp_millis(),
+            cursor.0,
+            "settlement rewrote the ordering key"
+        );
+        assert!(
+            alpha.settled_at.is_some_and(|at| at >= alpha.created_at),
+            "settlement must be recorded, and cannot precede the claim"
+        );
+    }
+
+    /// A page cursor must be one this host issued, and checked as such.
+    ///
+    /// The contract said "a cursor this host did not issue is
+    /// `invalid_request`" while the code checked only that the string *looked*
+    /// like `millis:request_id`. Any caller could seek to a position never
+    /// handed out, and a consumer could parse a value it was promised was
+    /// opaque. The tag closes both: it is bound to the scope and the run, so a
+    /// cursor cannot be forged, cannot be replayed onto another run, and
+    /// carries no readable structure.
+    #[test]
+    fn a_receipt_cursor_is_authenticated_and_bound() {
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+        let mine = IdempotencyScope::of(&principal("device-a"));
+        let theirs = IdempotencyScope::of(&principal("device-b"));
+
+        let cursor = store
+            .receipt_cursor(&mine, "run-1", 1_700_000_000_000, "req-7")
+            .unwrap();
+
+        // Round-trips for the scope and run it was issued for.
+        assert_eq!(
+            store
+                .parse_receipt_cursor(&mine, "run-1", &cursor)
+                .unwrap()
+                .unwrap(),
+            (1_700_000_000_000, "req-7".to_string())
+        );
+
+        // Opaque: the position it encodes must not be readable off the wire.
+        assert!(
+            !cursor.contains("1700000000000") && !cursor.contains("req-7"),
+            "the cursor leaks its own contents: {cursor}"
+        );
+
+        // Not transferable across runs or principals.
+        assert!(store
+            .parse_receipt_cursor(&mine, "run-2", &cursor)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .parse_receipt_cursor(&theirs, "run-1", &cursor)
+            .unwrap()
+            .is_none());
+
+        // Not forgeable. The old parser accepted every one of these.
+        for forged in [
+            "0:req-7",
+            "1700000000000:req-7",
+            "",
+            "zz",
+            &"0".repeat(64),
+            &format!("{}{}", "0".repeat(32), hex_encode(b"0:req-7")),
+        ] {
+            assert!(
+                store
+                    .parse_receipt_cursor(&mine, "run-1", forged)
+                    .unwrap()
+                    .is_none(),
+                "a forged cursor was accepted: {forged}"
+            );
+        }
+
+        // A tampered tag is refused even though the payload is genuine.
+        let (_, body) = cursor.split_at(32);
+        let tampered = format!("{}{body}", "f".repeat(32));
+        assert!(store
+            .parse_receipt_cursor(&mine, "run-1", &tampered)
+            .unwrap()
+            .is_none());
+    }
+
+    /// HMAC-SHA256 against the RFC 4231 vectors.
+    ///
+    /// The construction is written out here rather than pulled from a crate,
+    /// so it is checked against the published vectors rather than trusted.
+    #[test]
+    fn hmac_matches_the_published_vectors() {
+        assert_eq!(
+            hmac_sha256_hex(&[0x0b; 20], b"Hi There"),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+        assert_eq!(
+            hmac_sha256_hex(b"Jefe", b"what do ya want for nothing?"),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+        // A key longer than the 64-byte block is hashed first.
+        assert_eq!(
+            hmac_sha256_hex(
+                &[0xaa; 131],
+                b"Test Using Larger Than Block-Size Key - Hash Key First"
+            ),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+        );
+    }
+
+    #[test]
+    fn hex_round_trips_and_rejects_non_hex() {
+        assert_eq!(hex_decode(&hex_encode(b"0:req-7")).unwrap(), b"0:req-7");
+        assert!(hex_decode("abc").is_none(), "odd length");
+        assert!(hex_decode("zz").is_none(), "not hex");
+        assert!(hex_decode("AB").is_none(), "uppercase is not what we emit");
+    }
+
+    /// The host's own namespace is not reachable by naming it.
+    ///
+    /// `HOST_AUTHORED_CLIENT_ID` is a known string. If a scope could be built
+    /// from one, any caller could claim, settle or read the host's receipts by
+    /// spelling it — which is why `of` takes an `AuthContext` and the only
+    /// other constructor is `host()` itself.
+    ///
+    /// A credential *named* `native-executor` is the sharp case: it stamps
+    /// that value, so it does land in the host scope. That is a deployment
+    /// constraint on credential naming, not a hole this type can close, and it
+    /// is asserted here so the constraint is visible rather than assumed.
+    #[test]
+    fn the_host_namespace_is_not_reachable_by_spelling_its_name() {
+        let host = IdempotencyScope::host();
+
+        // An ordinary caller lands nowhere near it.
+        assert_ne!(IdempotencyScope::of(&principal("device-a")), host);
+        assert_ne!(IdempotencyScope::of(&principal("primary")), host);
+        assert_ne!(IdempotencyScope::of(&principal("desktop")), host);
+
+        // The one credential id that would collide, stated rather than hidden.
+        assert_eq!(
+            IdempotencyScope::of(&principal(HOST_AUTHORED_CLIENT_ID)),
+            host,
+            "a credential named after the host identity shares its scope; \
+             credential naming must exclude this value"
+        );
+    }
+
+    /// Rotating a credential must not hand its receipts to the replacement,
+    /// and renaming one must not silently orphan them without trace.
+    ///
+    /// Scope follows the *stamped credential id*, which is provisional: the
+    /// canonical binding is #460 principal identity plus an auth generation.
+    /// Both consequences of the provisional rule are pinned here so neither is
+    /// a surprise — a different id cannot read the old receipts, and the
+    /// derivation version that produced them is recorded on the receipt so a
+    /// later canonical binding is a migration rather than a silent orphaning.
+    #[test]
+    fn scope_follows_the_credential_and_records_how_it_was_derived() {
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+        let before = IdempotencyScope::of(&principal("device-a"));
+        let after = IdempotencyScope::of(&principal("device-a-rotated"));
+        assert_ne!(
+            before, after,
+            "a rotated credential is a different principal"
+        );
+
+        store
+            .claim_idempotency(&before, "t", "key", "h")
+            .expect("the original credential claims");
+        store
+            .complete_idempotency(
+                &before,
+                "t",
+                "key",
+                "h",
+                Some("run-a".into()),
+                serde_json::json!({"secret": "before rotation"}),
+            )
+            .unwrap();
+
+        // The replacement sees an unused key, never the predecessor's outcome.
+        // Read before claiming: claiming would create a receipt of its own and
+        // the assertion would then be about the test's own write.
+        assert!(store.load_idempotency(&after, "key").unwrap().is_none());
+        assert!(matches!(
+            store.claim_idempotency(&after, "t", "key", "h"),
+            Ok(IdempotencyClaim::Perform)
+        ));
+
+        // And the receipt records which rule produced its scope.
+        let receipt = store
+            .load_idempotency(&before, "key")
+            .unwrap()
+            .expect("the owner still reads its own");
+        assert_eq!(
+            receipt.scope.as_deref(),
+            Some(before.as_str()),
+            "the stored scope must be the one that claimed it"
+        );
+        assert_eq!(
+            before.as_str().len(),
+            IdempotencyScope::WIDTH,
+            "scope width is fixed so the on-disk name parses by position"
+        );
+        assert_eq!(
+            IdempotencyScope::of(&principal("device-a")),
+            before,
+            "derivation must be deterministic across calls"
+        );
+    }
+
+    /// A receipt written before scoping existed is served to nobody.
+    ///
+    /// It cannot be attributed to a principal, so — exactly as with a run whose
+    /// `client_id` is absent — it is refused rather than shared, and the
+    /// existing retention policy drains it. The visible consequence is that a
+    /// retry spanning the upgrade is treated as a new request.
+    #[test]
+    fn a_legacy_unscoped_receipt_is_unreachable() {
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+        // At the exact name the pre-scoping code would have written: the id is
+        // hashed by `safe_id_filename`, so a hand-written "legacy-key.json"
+        // would not be the file that scheme produced.
+        let legacy = d
+            .path()
+            .join("idempotency")
+            .join(format!("{}.json", safe_id_filename("legacy-key").unwrap()));
+        std::fs::write(
+            &legacy,
+            serde_json::json!({
+                "requestId": "legacy-key",
+                "payloadHash": "h",
+                "runId": "run-legacy",
+                "tool": "t",
+                "response": {"secret": "written before scoping"},
+                "createdAt": Utc::now(),
+                "status": "complete",
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert!(
+            store
+                .load_idempotency(&scope(), "legacy-key")
+                .unwrap()
+                .is_none(),
+            "a scoped lookup must not reach an unscoped receipt"
+        );
+        // And the key itself is refused rather than re-run. Returning
+        // `Perform` here would execute a mutation that may already have
+        // committed before the upgrade — the same request twice, not a new
+        // one.
+        let refused = match store.claim_idempotency(&scope(), "t", "legacy-key", "h") {
+            Err(error) => error,
+            Ok(other) => panic!(
+                "a pre-scoping key must not be handed out again, got {}",
+                describe(&Ok(other))
+            ),
+        };
+        assert_eq!(refused.code, OrchErrorCode::UncertainOutcome);
+        assert!(
+            !refused.message.contains("written before scoping"),
+            "the refusal must not echo the stored receipt's contents: {}",
+            refused.message
+        );
+        let (listed, _) = store
+            .list_idempotency_for_run(&scope(), "run-legacy", None, 10)
+            .unwrap();
+        assert!(
+            listed.is_empty(),
+            "an unattributed receipt must not be listed for anyone"
+        );
     }
 
     #[test]
@@ -5831,17 +7084,29 @@ mod tests {
         let d = tempdir().unwrap();
         let store = OrchStore::open(d.path()).unwrap();
         assert!(matches!(
-            store.claim_idempotency("t", "failed", "h").unwrap(),
+            store
+                .claim_idempotency(&scope(), "t", "failed", "h")
+                .unwrap(),
             IdempotencyClaim::Perform
         ));
         let error = OrchError::new(OrchErrorCode::Internal, "failed once");
         store
-            .fail_idempotency("t", "failed", "h", None, error.clone())
+            .fail_idempotency(&scope(), "t", "failed", "h", None, error.clone())
             .unwrap();
         assert!(store
-            .complete_idempotency("t", "failed", "h", None, serde_json::json!({"ok": true}))
+            .complete_idempotency(
+                &scope(),
+                "t",
+                "failed",
+                "h",
+                None,
+                serde_json::json!({"ok": true})
+            )
             .is_err());
-        match store.claim_idempotency("t", "failed", "h").unwrap() {
+        match store
+            .claim_idempotency(&scope(), "t", "failed", "h")
+            .unwrap()
+        {
             IdempotencyClaim::Replay(Err(replayed)) => {
                 assert_eq!(replayed.code.as_str(), error.code.as_str());
                 assert_eq!(replayed.message, error.message);
@@ -5891,6 +7156,8 @@ mod tests {
 
         store
             .save_idempotency(&IdempotencyReceipt {
+                scope: Some(scope().as_str().to_string()),
+                scope_version: Some(SCOPE_DERIVATION_VERSION),
                 request_id: "old-receipt".into(),
                 payload_hash: "hash".into(),
                 run_id: None,
@@ -5898,6 +7165,7 @@ mod tests {
                 response: serde_json::json!({"runId": "old-shared"}),
                 error: None,
                 created_at: Utc::now() - Duration::days(10),
+                settled_at: None,
                 status: "complete".into(),
             })
             .unwrap();
@@ -5917,7 +7185,10 @@ mod tests {
         assert!(store.load_run("retry-child").unwrap().is_some());
         assert!(store.load_run("active").unwrap().is_some());
         assert!(store.load_run("isolated-live").unwrap().is_some());
-        assert!(store.load_idempotency("old-receipt").unwrap().is_none());
+        assert!(store
+            .load_idempotency(&scope(), "old-receipt")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -5949,6 +7220,8 @@ mod tests {
         let store = OrchStore::open(d.path()).unwrap();
         store
             .save_idempotency(&IdempotencyReceipt {
+                scope: Some(scope().as_str().to_string()),
+                scope_version: Some(SCOPE_DERIVATION_VERSION),
                 request_id: "unknown-status".into(),
                 payload_hash: "hash".into(),
                 run_id: None,
@@ -5956,6 +7229,7 @@ mod tests {
                 response: serde_json::Value::Null,
                 error: None,
                 created_at: Utc::now() - Duration::days(10),
+                settled_at: None,
                 status: "future_status".into(),
             })
             .unwrap();
@@ -5975,26 +7249,83 @@ mod tests {
             .unwrap();
         assert_eq!(report.idempotency_files_removed, 0);
         assert!(report.skipped_files >= 1);
-        assert!(store.load_idempotency("unknown-status").unwrap().is_some());
+        assert!(store
+            .load_idempotency(&scope(), "unknown-status")
+            .unwrap()
+            .is_some());
     }
 
+    /// A claim interrupted by a restart settles as **uncertain**, not failed.
+    ///
+    /// This test previously required the opposite, and required the message to
+    /// say "interrupted" while the code said `internal`. That pinned the
+    /// defect: a claim is written *before* its mutation runs, so one still
+    /// pending at restart may have committed its effect and died before
+    /// settling. Reporting that as a definite failure — and the old message
+    /// went on to say "use a new request_id" — is how a caller is talked into
+    /// doing the work twice.
     #[test]
-    fn restart_fails_orphaned_idempotency_claim() {
+    fn restart_settles_an_orphaned_claim_as_uncertain() {
         let d = tempdir().unwrap();
         let store = OrchStore::open(d.path()).unwrap();
         assert!(matches!(
-            store.claim_idempotency("t", "orphan", "h").unwrap(),
+            store
+                .claim_idempotency(&scope(), "t", "orphan", "h")
+                .unwrap(),
             IdempotencyClaim::Perform
         ));
+        let claimed_at = store
+            .load_idempotency(&scope(), "orphan")
+            .unwrap()
+            .expect("pending claim")
+            .created_at;
         drop(store);
 
         let reopened = OrchStore::open(d.path()).unwrap();
-        match reopened.claim_idempotency("t", "orphan", "h").unwrap() {
-            IdempotencyClaim::Replay(Err(e)) => {
-                assert!(e.message.contains("interrupted"));
+        match reopened
+            .claim_idempotency(&scope(), "t", "orphan", "h")
+            .unwrap()
+        {
+            IdempotencyClaim::Replay(Err(error)) => {
+                assert_eq!(
+                    error.code,
+                    OrchErrorCode::UncertainOutcome,
+                    "an interrupted claim is not a definite failure"
+                );
+                assert!(
+                    !error.message.contains("new request_id"),
+                    "the message must not invite a fresh key, which is the \
+                     duplicate this receipt exists to prevent: {}",
+                    error.message
+                );
+                assert!(
+                    error.message.contains("same request_id"),
+                    "the message must say to retry under the same key: {}",
+                    error.message
+                );
             }
-            _ => panic!("orphan must become a durable failed receipt"),
+            other => panic!(
+                "an orphaned claim must settle durably, got {}",
+                describe(&Ok(other))
+            ),
         }
+
+        // Recovery is a settlement, so it must not move the receipt in the
+        // page order — the defect fixed in `finish_idempotency` was still
+        // present here.
+        let recovered = reopened
+            .load_idempotency(&scope(), "orphan")
+            .unwrap()
+            .expect("settled receipt");
+        assert_eq!(
+            recovered.created_at, claimed_at,
+            "recovery rewrote the ordering key, so a receipt pending across a \
+             restart can be delivered twice across an issued cursor"
+        );
+        assert!(
+            recovered.settled_at.is_some(),
+            "recovery must record when it settled the claim"
+        );
     }
 
     #[test]
@@ -6051,7 +7382,7 @@ mod tests {
     fn traversal_id_rejected() {
         let d = tempdir().unwrap();
         let store = OrchStore::open(d.path()).unwrap();
-        assert!(store.claim_idempotency("t", "../x", "h").is_err());
+        assert!(store.claim_idempotency(&scope(), "t", "../x", "h").is_err());
     }
 
     #[test]

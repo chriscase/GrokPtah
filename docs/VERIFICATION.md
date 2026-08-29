@@ -2,8 +2,8 @@
 
 This repository vendors xAI's `grok-build` crate tree (`crates/codegen/xai-*`,
 `crates/common/*`) alongside the fork's own code (`desktop/`,
-`crates/codegen/grokptah-agent-bridge`). The upstream crates are developed and
-tested in xAI's **Bazel** monorepo; this fork verifies the code it owns with
+`crates/codegen/grokptah-agent-bridge`, `crates/codegen/grokptah-agent-sdk`). The
+upstream crates are developed and tested in xAI's **Bazel** monorepo; this fork verifies the code it owns with
 `cargo` + `npm`. Those two facts determine which commands are supported.
 
 ## Supported paths (what CI runs, and what you should run)
@@ -16,6 +16,7 @@ All are runnable from a clean clone with caches disabled
 | Frontend | `npm ci && npm run typecheck && npm test` | `desktop` |
 | Desktop shell | `cargo test --locked` | `desktop/src-tauri` |
 | Agent bridge | `cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked -- --test-threads=1` | `crates/codegen/grokptah-agent-bridge` |
+| Agent SDK (public seam) | `cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked && cargo build --locked --no-default-features` | `crates/codegen/grokptah-agent-sdk` |
 | Offline oracles | `cargo test --locked eval_oracle -- --nocapture` | `crates/codegen/grokptah-agent-bridge` |
 | Focused upstream support | `cargo fmt -p xai-grok-env -p xai-grok-shell-base -- --check && cargo clippy -p xai-grok-env -p xai-grok-shell-base --all-targets --all-features --locked -- -D warnings && cargo test -p xai-grok-shell-base --all-features --locked` | repository root |
 

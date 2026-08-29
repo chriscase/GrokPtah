@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::authz::AuthContext;
 use crate::completion::{CompletionEvidence, CompletionUsage};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1228,10 +1229,164 @@ fn validate_bounded_string(value: &str, max_bytes: usize, field: &str) -> Result
     Ok(())
 }
 
+/// The namespace an idempotency key lives in.
+///
+/// `request_id` is chosen by the caller, so it cannot be an identity on its
+/// own: two principals may pick the same string, and before this type existed
+/// they shared one global namespace. That gave the second caller three things
+/// it should never have had — the first caller's stored response on a matching
+/// payload hash, a `conflict` that confirmed the key was taken on a differing
+/// one, and the ability to squat a key before its owner used it.
+///
+/// Identity is therefore `(scope, request_id)`. The wire value is untouched:
+/// callers still send, and receipts still report, exactly the `request_id`
+/// they chose. Only where the receipt is stored, and which receipts a lookup
+/// can reach, are scoped.
+///
+/// The scope is derived from the **same** value the run fence compares —
+/// `OrchestrationService::stamped_client_id` — so run ownership and receipt
+/// ownership cannot drift apart. The tenant
+/// boundary is structural: a store root belongs to one account, and every
+/// `AuthContext` this service issues carries that account's `owner_id`, so
+/// hashing the owner in as well would separate nothing the directory does not
+/// already separate while giving the two fences different keys.
+///
+/// # Sealing
+///
+/// A scope is **not constructible from a string**. The only two ways to obtain
+/// one are [`of`](Self::of), which requires the caller's own [`AuthContext`],
+/// and [`host`](Self::host), the single named host identity. Nothing — inside
+/// this crate or outside it — can name another principal's namespace without
+/// holding that principal's authenticated context, and the type is not
+/// re-exported from the crate root at all.
+///
+/// That is the difference between a fence and a convention. A `for_client_id`
+/// taking `&str` would have let any in-process caller mint any scope, which
+/// makes the storage boundary decorative however carefully the HTTP surface
+/// is gated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IdempotencyScope(String);
+
+impl IdempotencyScope {
+    /// Width of the on-disk prefix. Fixed, so a stored name parses by position.
+    ///
+    /// 32 hex characters — 128 bits of the digest. The first cut took 64, which
+    /// is more than enough against accident and less than one wants for a value
+    /// that separates principals.
+    pub(crate) const WIDTH: usize = 32;
+
+    /// The scope of work this host authored for itself (the native executor,
+    /// managed intents, in-process resume). Named, never inferred from absence.
+    pub(crate) fn host() -> Self {
+        Self::derive(HOST_AUTHORED_CLIENT_ID)
+    }
+
+    /// The scope belonging to an authenticated caller.
+    ///
+    /// Takes the `AuthContext` rather than a client id so a scope cannot be
+    /// named without the authority it stands for.
+    pub(crate) fn of(auth: &AuthContext) -> Self {
+        Self::derive(&stamped_client_id(auth))
+    }
+
+    /// Private on purpose: the two entry points above are the whole API.
+    fn derive(client_id: &str) -> Self {
+        use sha2::{Digest, Sha256};
+        let digest = hex_sha256(&Sha256::digest(
+            format!("{SCOPE_DERIVATION_VERSION}\u{1f}{client_id}").as_bytes(),
+        ));
+        Self(digest[..Self::WIDTH].to_string())
+    }
+
+    /// Re-wrap a scope value read back from a stored receipt.
+    ///
+    /// `#[cfg(test)]`, with `save_idempotency`, its only caller. Production
+    /// code never needs to reconstruct a scope from a stored string: it
+    /// derives one from the authority it already holds. Keeping this available
+    /// outside tests would put back the string-to-scope door that `of` and
+    /// `host` exist to close.
+    #[cfg(test)]
+    pub(crate) fn from_stored(value: &str) -> Self {
+        Self(value.to_string())
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Which rule produced a scope value.
+///
+/// Recorded in every receipt so a later change to the derivation — binding to
+/// canonical #460 principal identity, an auth generation, a delegation chain —
+/// is a **deliberate migration** with a readable before and after, rather than
+/// a silent orphaning of every receipt written under the old rule.
+///
+/// `1` is the provisional rule: the stamped credential id. It is not canonical
+/// authority and this crate does not claim it is.
+pub(crate) const SCOPE_DERIVATION_VERSION: u32 = 1;
+
+/// The `client_id` a credential stamps on the runs and receipts it creates.
+///
+/// Lives here, beside the scope that consumes it, because the run fence and
+/// the receipt fence must not derive ownership from two different values. The
+/// compatibility credential keeps the established wire value `mcp`; every other
+/// named device credential is stamped by its stable id.
+pub(crate) fn stamped_client_id(auth: &AuthContext) -> String {
+    if auth.token_id == "primary" {
+        "mcp".into()
+    } else {
+        auth.token_id.clone()
+    }
+}
+
+/// The single identity this host authors work under.
+///
+/// Declared here because both the run fence and the idempotency scope depend
+/// on it, and a second definition is how the two would drift.
+pub(crate) const HOST_AUTHORED_CLIENT_ID: &str = "native-executor";
+
+/// Credential ids no device may be admitted under.
+///
+/// `stamped_client_id` maps a credential id straight through, so a credential
+/// *named* `native-executor` would stamp the host identity and land in the
+/// host's scope — reading host-authored runs and claiming in the host's
+/// receipt namespace. Documenting that as a deployment constraint left the
+/// door open; refusing it at admission closes it. `mcp` is reserved for the
+/// same reason: it is the wire value the compatibility credential stamps, so
+/// a second credential carrying it would land in `primary`'s scope.
+pub(crate) const RESERVED_CREDENTIAL_IDS: [&str; 2] = [HOST_AUTHORED_CLIENT_ID, "mcp"];
+
+/// A durable receipt, as stored.
+///
+/// `pub(crate)` with the rest of the receipt surface. It carries the full
+/// replayed `response` and an `error` with its message, so it is the thing the
+/// projection exists to avoid handing out: [`PublicReceipt`] is what leaves
+/// this host. Exporting the type while every method that produces one is
+/// crate-private would advertise an affordance that does not exist.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct IdempotencyReceipt {
+pub(crate) struct IdempotencyReceipt {
     pub request_id: String,
+    /// The scope this receipt was claimed in.
+    ///
+    /// `None` marks a receipt written before scoping existed. Such a receipt
+    /// cannot be attributed to any principal, so — exactly as with a run whose
+    /// `client_id` is absent — it is served to none and ages out under the
+    /// existing retention policy. The one visible consequence is that a retry
+    /// spanning the upgrade is treated as a new request rather than replayed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// Which derivation rule produced `scope`.
+    ///
+    /// Stored, not merely folded into the digest. Folding the version into the
+    /// hash makes a new rule produce different *values*; it does not let
+    /// anything read a stored receipt and say which rule made it. Without this
+    /// field a migration to canonical identity could only guess, and "every
+    /// receipt records its derivation version" would be a claim about intent
+    /// rather than about data — which is what it was until this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_version: Option<u32>,
     pub payload_hash: String,
     pub run_id: Option<String>,
     pub tool: String,
@@ -1239,7 +1394,20 @@ pub struct IdempotencyReceipt {
     /// Durable rejected/failed outcome. Exact retries replay this error.
     #[serde(default)]
     pub error: Option<OrchError>,
+    /// When the key was **claimed**. Immutable for the receipt's whole life.
+    ///
+    /// Settlement used to overwrite this with `Utc::now()`, which made the
+    /// page ordering mutable: a pending receipt claimed before an issued
+    /// cursor would settle, jump ahead of that cursor, and be handed to the
+    /// caller a second time on the next page. A key that orders a listing has
+    /// to be one the listing cannot change underneath a walk.
     pub created_at: DateTime<Utc>,
+    /// When the receipt reached `complete` or `failed`. `None` while pending.
+    ///
+    /// Separated from `created_at` rather than replacing it, so settlement can
+    /// be observed without moving the receipt in the order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settled_at: Option<DateTime<Utc>>,
     /// pending | complete | failed
     #[serde(default = "default_receipt_status")]
     pub status: String,
@@ -1278,6 +1446,14 @@ pub enum OrchErrorCode {
     InvalidRequest,
     Unsupported,
     Conflict,
+    /// The mutation may or may not have applied.
+    ///
+    /// The one code a caller must never auto-retry on. It exists because
+    /// "interrupted" and "did not happen" are different answers: a claim that
+    /// was pending when the host died may have committed its effect first, and
+    /// reporting that as a definite failure is how a caller is talked into
+    /// doing the work twice.
+    UncertainOutcome,
 }
 
 impl OrchErrorCode {
@@ -1291,6 +1467,7 @@ impl OrchErrorCode {
             Self::StaleVersion => "stale_version",
             Self::CursorExpired => "cursor_expired",
             Self::Internal => "internal",
+            Self::UncertainOutcome => "uncertain_outcome",
             Self::Timeout => "timeout",
             Self::InvalidRequest => "invalid_request",
             Self::Unsupported => "unsupported",
@@ -1394,7 +1571,89 @@ pub fn safe_id_filename(id: &str) -> Result<String, OrchError> {
     Ok(hex_sha256(&Sha256::digest(id.as_bytes())))
 }
 
-fn hex_sha256(bytes: &[u8]) -> String {
+/// Lowercase hex for arbitrary bytes.
+///
+/// Same alphabet as [`hex_sha256`], but that one takes a digest and this one
+/// takes a payload; keeping them separate stops a digest being hexed twice.
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
+    hex_sha256(bytes)
+}
+
+/// Decode lowercase hex. `None` for anything that is not exactly that.
+///
+/// Strict about case on purpose. An opaque token should have exactly one
+/// representation: accepting uppercase would make two different strings decode
+/// to the same cursor, and a token that is malleable in any way invites being
+/// treated as one that can be edited.
+pub(crate) fn hex_decode(text: &str) -> Option<Vec<u8>> {
+    fn nibble(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            _ => None,
+        }
+    }
+    if !text.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(text.len() / 2);
+    for pair in text.as_bytes().chunks(2) {
+        out.push(nibble(pair[0])? * 16 + nibble(pair[1])?);
+    }
+    Some(out)
+}
+
+/// HMAC-SHA256, hex encoded.
+///
+/// Written out rather than pulled in: the bridge already depends on `sha2` and
+/// nothing else here needs a MAC, so this avoids a dependency and a lockfile
+/// change for thirty lines of a fully specified construction (RFC 2104).
+pub(crate) fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    const BLOCK: usize = 64;
+
+    let mut block = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        let digest = Sha256::digest(key);
+        block[..digest.len()].copy_from_slice(&digest);
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+
+    let mut inner_pad = [0x36u8; BLOCK];
+    let mut outer_pad = [0x5cu8; BLOCK];
+    for index in 0..BLOCK {
+        inner_pad[index] ^= block[index];
+        outer_pad[index] ^= block[index];
+    }
+
+    let mut inner = Sha256::new();
+    inner.update(inner_pad);
+    inner.update(message);
+    let inner = inner.finalize();
+
+    let mut outer = Sha256::new();
+    outer.update(outer_pad);
+    outer.update(inner);
+    hex_sha256(&outer.finalize())
+}
+
+/// Compare two byte strings without leaking where they first differ.
+///
+/// A cursor tag is compared against one the host computed; a short-circuiting
+/// `==` would let a caller recover the tag a byte at a time.
+pub(crate) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut difference = 0u8;
+    for (a, b) in left.iter().zip(right.iter()) {
+        difference |= a ^ b;
+    }
+    difference == 0
+}
+
+pub(crate) fn hex_sha256(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         use std::fmt::Write;
@@ -1437,6 +1696,64 @@ pub fn is_recognized_test_command(command: &str) -> bool {
 }
 
 /// Tools exposed by the control plane (schema snapshot source of truth).
+/// What an external observer may learn about a durable mutation attempt.
+///
+/// The stored [`IdempotencyReceipt`] is not safe to publish: `response` is the
+/// full replayed body (prompts, absolute workspace paths, queue entries),
+/// `error` carries a message that formats absolute paths verbatim, and `tool`
+/// is host vocabulary that changes whenever a tool is added. None of them
+/// exist on this type, so no projection bug can leak one.
+///
+/// What remains is enough to answer the only question an observer has a right
+/// to ask: *did this request happen, did it settle, and if it failed, what
+/// class of failure was it?*
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicReceipt {
+    pub request_id: String,
+    /// Stable classification, never the raw tool name.
+    pub operation: String,
+    /// `pending` | `complete` | `failed`. `pending` is the uncertain-send
+    /// fence in durable form and must never be read as an outcome.
+    pub status: String,
+    /// Typed failure code only, present on `failed`. The message is withheld.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    /// Host-issued opaque attempt digest. Equal payloads under this home
+    /// agree; the unkeyed payload hash never crosses.
+    pub attempt_digest: String,
+    pub run_id: Option<String>,
+    pub recorded_at: DateTime<Utc>,
+}
+
+impl PublicReceipt {
+    /// Classify a host tool into the contract's fixed vocabulary.
+    ///
+    /// Closed on purpose: a tool this build does not know becomes `other`
+    /// rather than putting an arbitrary host string in front of a consumer
+    /// that believes it is reading a classification.
+    pub fn classify(tool: &str) -> &'static str {
+        match tool {
+            "ptah_create_session" => "create_session",
+            "ptah_submit_task" | "ptah_resume_persistent_agent" => "submit_task",
+            "ptah_steer" => "follow_up",
+            "ptah_cancel_run" => "cancel",
+            "ptah_claim_work" => "acquire_lease",
+            "ptah_release_work" => "release_lease",
+            _ => "other",
+        }
+    }
+}
+
+/// The public capability contract this runtime implements.
+///
+/// Bump the **major** when an existing field, tool, error code, or capability
+/// identifier is removed or reshaped; bump the **minor** for additive changes
+/// — a new tool, a new optional field, a new word in an existing vocabulary.
+/// Consumers negotiate against this and refuse a major they do not implement.
+pub const PUBLIC_CONTRACT_MAJOR: u32 = 1;
+pub const PUBLIC_CONTRACT_MINOR: u32 = 2;
+
 pub const CONTROL_TOOLS: &[&str] = &[
     "ptah_list_sessions",
     "ptah_create_session",
@@ -1447,6 +1764,8 @@ pub const CONTROL_TOOLS: &[&str] = &[
     "ptah_get_run",
     "ptah_get_progress",
     "ptah_get_events",
+    "ptah_list_receipts",
+    "ptah_get_host_info",
     "ptah_get_changes",
     "ptah_get_test_results",
     "ptah_get_handoff",

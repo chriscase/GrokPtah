@@ -1,0 +1,20 @@
+[package]
+name = "grokptah-sdk-reference-consumer"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Disposable reference consumer of the public GrokPtah agent SDK seam"
+# Never published. This crate exists to be *checked*, not shipped.
+publish = false
+
+[workspace]
+
+[dependencies]
+# The entire dependency surface a consumer is permitted. If this list ever
+# grows a runtime edge to the bridge, the seam has failed at its one job and
+# `no_internal_dependency_is_reachable` will say so.
+grokptah-agent-sdk = { path = "../grokptah-agent-sdk" }
+
+[dev-dependencies]
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt"] }

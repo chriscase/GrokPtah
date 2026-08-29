@@ -107,6 +107,33 @@ async function call(name, args, id) {
   );
 }
 
+/// Wait until the host reports this session is free to take new work.
+///
+/// `ptah_cancel` answers `teardownComplete: true` as soon as it has released
+/// the run's *reservation*, which is not the same as the session being idle:
+/// a run that had already started still holds the turn, and the next submit to
+/// that session is refused `session_busy`. So the campaign waits for the
+/// condition it actually depends on — the host reporting the session not busy
+/// — rather than assuming the cancel response implies it.
+///
+/// This is a bounded wait on a proven condition, not a sleep: it polls the
+/// host's own signal and fails loudly if the condition never arrives.
+async function waitSessionIdle(sessionId, timeoutMs = 15_000) {
+  const started = Date.now();
+  let last = null;
+  while (Date.now() - started < timeoutMs) {
+    const response = await call("ptah_list_sessions", {});
+    const list = structured(response.json)?.sessions ?? [];
+    last = list.find((item) => String(item.sessionId) === String(sessionId)) ?? null;
+    if (last && last.busy === false) {
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 40));
+  }
+  log("FAIL", "waitSessionIdle", { sessionId, last });
+  return false;
+}
+
 async function pollTerminal(
   runId,
   timeoutMs = 15_000,
@@ -434,6 +461,9 @@ try {
 
   // Isolated execution proves bounded diff review, exact approval scope, and promotion.
   const isolatedFile = path.join(workspace, "coordinator-campaign.txt");
+  // The cancel above frees the session asynchronously; wait for the host to
+  // say so before submitting again, or this races `session_busy`.
+  const idleBeforeIsolated = await waitSessionIdle(hostSessionId);
   const isolatedSubmit = await call("ptah_submit_task", {
     request_id: `${prefix}-isolated-submit`,
     session_id: hostSessionId,
@@ -448,7 +478,18 @@ try {
   record(
     "isolatedRun",
     isolatedSubmit.status === 200 && isolatedTerminal?.state === "completed" && isolated.executionMode === "isolated_worktree",
-    { runId: isolatedRunId, state: isolatedTerminal?.state }
+    // Report the status and the host's own error, not just the absent runId.
+    // A `runId: undefined` says the submit produced nothing and nothing about
+    // why, which makes a hosted failure unactionable — and this check feeds
+    // `durableReadAfterReconnect`, so one silent failure reads as two.
+    {
+      runId: isolatedRunId,
+      state: isolatedTerminal?.state,
+      submitStatus: isolatedSubmit.status,
+      executionMode: isolated?.executionMode,
+      sessionIdleBeforeSubmit: idleBeforeIsolated,
+      error: isolatedSubmit.status === 200 ? null : isolatedSubmit.json?.error ?? isolatedSubmit.json,
+    }
   );
   if (isolatedRunId) {
     const reviewResponse = await call("ptah_review_run", { run_id: isolatedRunId });
@@ -616,6 +657,8 @@ try {
     clientInfo: { name: "grokptah-reference-coordinator-reconnect", version: "1.0.0" },
   });
   mcpSession = reconnect.sessionId;
+  // Cascades from `isolatedRun`: with no run id there is nothing to read, so a
+  // failure here may simply be that one reported twice. `dependsOn` says which.
   const reconnectRead = isolatedRunId
     ? await call("ptah_get_run", { run_id: isolatedRunId })
     : { status: 0, json: null };
@@ -623,7 +666,14 @@ try {
     "durableReadAfterReconnect",
     reconnect.status === 200 && !!mcpSession && reconnectRead.status === 200 &&
       structured(reconnectRead.json)?.runId === isolatedRunId,
-    { sessionId: mcpSession, runId: isolatedRunId }
+    {
+      sessionId: mcpSession,
+      runId: isolatedRunId,
+      readStatus: reconnectRead.status,
+      // `0` means this never ran: `isolatedRun` produced no run id, so this
+      // failure is that one restated rather than an independent defect.
+      dependsOn: isolatedRunId ? null : "isolatedRun",
+    }
   );
 
   clearTimeout(watchdog);

@@ -13,7 +13,13 @@ grokptah-agent-bridge = { path = "../grokptah-agent-bridge" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 
 [dev-dependencies]
+async-trait = "0.1"
 chrono = { version = "0.4", features = ["clock"] }
+# The public SDK seam under test. A dev-dependency only: the service does not
+# depend on the SDK at runtime, and the SDK still has no dependency on the
+# bridge in either direction, so this edge cannot smuggle runtime coupling
+# into the contract it is here to exercise.
+grokptah-agent-sdk = { path = "../grokptah-agent-sdk" }
 dunce = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde_json = "1"
