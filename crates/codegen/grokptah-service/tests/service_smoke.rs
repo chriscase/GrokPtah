@@ -49,21 +49,52 @@ async fn standalone_service_exposes_authenticated_mcp_and_readiness() {
         .unwrap();
     assert_eq!(unauthenticated.status(), reqwest::StatusCode::UNAUTHORIZED);
 
+    // The unauthenticated loopback projection carries no diagnostics, but it
+    // reports the real verdict: a healthy service answers 200 and an unhealthy
+    // one would answer 503, so this can never be a fabricated liveness 200.
     let readiness = reqwest::get(format!("{base}/ready")).await.unwrap();
     assert_eq!(readiness.status(), reqwest::StatusCode::OK);
     let readiness_json: serde_json::Value = readiness.json().await.unwrap();
+    assert_eq!(readiness_json["ok"], true);
     assert_eq!(readiness_json["ready"], true);
+    assert_eq!(readiness_json["status"], "ready");
+    assert_eq!(readiness_json["authoritative"], true);
+    assert!(readiness_json.get("capacity").is_none());
+
+    // A valid bearer reaches the authoritative readiness result, diagnostics
+    // included.
+    let authenticated = reqwest::Client::new()
+        .get(format!("{base}/ready"))
+        .bearer_auth("standalone-service-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(authenticated.status(), reqwest::StatusCode::OK);
+    let authenticated_json: serde_json::Value = authenticated.json().await.unwrap();
+    assert_eq!(authenticated_json["ready"], true);
+    assert_eq!(authenticated_json["authoritative"], true);
     assert_eq!(
-        readiness_json["capacity"]["health"]["workloadSupervisor"]["enabled"],
+        authenticated_json["capacity"]["health"]["workloadSupervisor"]["enabled"],
         true
     );
     assert!(
-        readiness_json["capacity"]["health"]["workloadSupervisor"]["lastSuccessAt"].is_string()
+        authenticated_json["capacity"]["health"]["workloadSupervisor"]["lastSuccessAt"].is_string()
     );
     assert_eq!(
-        readiness_json["capacity"]["health"]["routineSupervisor"]["enabled"],
+        authenticated_json["capacity"]["health"]["routineSupervisor"]["enabled"],
         true
     );
+    // Both projections must agree on the verdict.
+    assert_eq!(authenticated_json["ready"], readiness_json["ready"]);
+
+    // An invalid bearer is refused rather than downgraded to the open probe.
+    let bad_credential = reqwest::Client::new()
+        .get(format!("{base}/ready"))
+        .bearer_auth("not-the-service-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_credential.status(), reqwest::StatusCode::UNAUTHORIZED);
 
     let mut client = McpControlClient::new(base, "standalone-service-token");
     client.initialize().await.unwrap();
