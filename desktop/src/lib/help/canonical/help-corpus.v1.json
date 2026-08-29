@@ -1,0 +1,1499 @@
+{
+  "articles": [
+    {
+      "aliases": [
+        "computer approval",
+        "take over agent",
+        "visual action consent",
+        "postcondition"
+      ],
+      "body": "Observation and control are separate capabilities. Before a semantic action, verify the fresh target, scope, lease, and postcondition, and approve only the action class you intend. Outdated visual state, secure fields, focus changes, and cleanup uncertainty revoke authority or fail closed. A focused window is not proof that a target is safe.",
+      "capability_ids": [
+        "computer.control"
+      ],
+      "digest": "sha256:cfc9e2c03a16e3aa330058e6372ef2396ad3c634d7b39812309d8d4591793f4d",
+      "id": "computer-use.approval",
+      "keywords": [
+        "approve",
+        "consent",
+        "lease",
+        "postcondition",
+        "takeover",
+        "cleanup"
+      ],
+      "source_ids": [
+        "computer-use.safety",
+        "computer-use.trust"
+      ],
+      "summary": "Understand the one-use consent, postcondition, and takeover controls.",
+      "title": "Approve a Computer Use action",
+      "topic": "computer-use",
+      "visibility": "gated"
+    },
+    {
+      "aliases": [
+        "computer control",
+        "clicking",
+        "screen access",
+        "safe automation",
+        "mouse and keyboard",
+        "can the agent click for me",
+        "is it safe to let it click"
+      ],
+      "body": "Computer Use is bounded by an explicit target, a fresh observation, a one-use approval, and a postcondition. Stop and Take over revoke authority. Secure fields, stale observations, focus changes, raw global input, clipboard injection, shell control, and unattended actions fail closed or remain unsupported.",
+      "capability_ids": [],
+      "digest": "sha256:0937c68a3cedf5535144933816a5884e8813955df8a764f5f759b7392490f8a3",
+      "id": "computer-use.boundaries",
+      "keywords": [
+        "agent",
+        "click",
+        "safety",
+        "computer",
+        "consent",
+        "observation",
+        "approval",
+        "stop",
+        "takeover"
+      ],
+      "source_ids": [
+        "computer-use.safety",
+        "computer-use.non-goals"
+      ],
+      "summary": "Understand what Computer Use can observe or do, and what it refuses.",
+      "title": "Computer Use: consent and boundaries",
+      "topic": "computer-use",
+      "visibility": "public"
+    },
+    {
+      "aliases": [
+        "two agents one screen",
+        "multiple agents",
+        "agent contention",
+        "coordinate computer agents"
+      ],
+      "body": "Coordination is lease-based: an agent must hold the exact guest or session authority and revision before it can act. A second agent, a stale observation, the wrong session, Stop, or Take over must be denied without mutation. Separate guests or explicitly disjoint scopes are required for parallel work.",
+      "capability_ids": [
+        "computer.control"
+      ],
+      "digest": "sha256:78092fbc910cd8908afa38b78c3468833613c86f7372cc185611b35640a5f67d",
+      "id": "computer-use.coordination",
+      "keywords": [
+        "multi-agent",
+        "coordination",
+        "lease",
+        "revision",
+        "stale",
+        "contention"
+      ],
+      "source_ids": [
+        "computer-use.evidence"
+      ],
+      "summary": "Keep simultaneous agents from fighting over the same visual surface.",
+      "title": "Coordinate multiple Computer Use agents",
+      "topic": "computer-use",
+      "visibility": "operator"
+    },
+    {
+      "aliases": [
+        "vm computer use",
+        "virtual machine screen",
+        "sandboxed desktop",
+        "guest computer"
+      ],
+      "body": "An isolated guest is a planned separate visual surface for bounded Computer Use, and it is not qualified for use in this release. The helper and guest image still need review and signing, one agent lease must control a guest at a time, frames must be redacted, and host clipboard, shares, raw global input, and guest networking remain denied. Source-level lease and projection tests do not prove a packaged VM, a guest boot, rendered frames, or host input.",
+      "capability_ids": [
+        "computer.observe"
+      ],
+      "digest": "sha256:c7b9cc17893609bc69c0e727d0a732c347ad686636ec9fcb56e4f80a90d7bd56",
+      "id": "computer-use.isolated-guest",
+      "keywords": [
+        "guest",
+        "vm",
+        "isolated",
+        "helper",
+        "lease",
+        "frame",
+        "redaction"
+      ],
+      "source_ids": [
+        "computer-use.blockers",
+        "computer-use.trust"
+      ],
+      "summary": "Understand the isolated guest boundary without treating source proof as a usable VM.",
+      "title": "Isolated guest Computer Use",
+      "topic": "computer-use",
+      "visibility": "gated"
+    },
+    {
+      "aliases": [
+        "keyboard shortcuts",
+        "screen reader",
+        "accessible",
+        "focus order",
+        "reduced motion"
+      ],
+      "body": "Use the Sessions, Tools, Live, and Computer landmarks to move between work areas. Running state, permission requests, stale observations, and recovery actions are announced and stay visible. Reduced motion and large text preserve the same information hierarchy rather than hiding status.",
+      "capability_ids": [],
+      "digest": "sha256:33196fb6ffaa5e110eda269c906f04f30029de8a02d72b708deae67c1173010f",
+      "id": "getting-started.accessibility",
+      "keywords": [
+        "accessibility",
+        "keyboard",
+        "focus",
+        "contrast",
+        "aria",
+        "landmark"
+      ],
+      "source_ids": [
+        "embedding.primitives",
+        "product.readme.features"
+      ],
+      "summary": "Power-user speed and accessibility are designed together: named landmarks, predictable focus, and visible state.",
+      "title": "Work quickly with keyboard and screen reader",
+      "topic": "getting-started",
+      "visibility": "public"
+    },
+    {
+      "aliases": [
+        "ai help",
+        "ask product questions",
+        "grounded assistant",
+        "help chatbot",
+        "cited answer",
+        "how do i"
+      ],
+      "body": "Type a question and Help searches the shipped corpus in your own process, with no network call. Asking for a written answer is a separate action: the host selects the passages, sends one bounded request, and shows the reply only after it has checked every claim against the exact corpus bytes. Claims that cannot be tied to a cited passage are dropped, and an answer with no supported claim is withheld rather than shown as a guess.",
+      "capability_ids": [],
+      "digest": "sha256:e85711a895922fe8d059879aff3d50277d37d1fdb07916ec280bfdf2bc6c8877",
+      "id": "getting-started.help-center",
+      "keywords": [
+        "help",
+        "citation",
+        "offline",
+        "assistant",
+        "draft",
+        "grounded",
+        "abstain"
+      ],
+      "source_ids": [
+        "product.readme.features",
+        "embedding.primitives"
+      ],
+      "summary": "Help retrieval runs offline; a cited answer is an extra, explicit step.",
+      "title": "Search Help and read a cited answer",
+      "topic": "getting-started",
+      "visibility": "public"
+    },
+    {
+      "aliases": [
+        "search history",
+        "find conversation",
+        "look up a build",
+        "semantic search",
+        "search old work"
+      ],
+      "body": "Open Search from the Lanes sidebar. Hybrid search combines exact text with meaning-based ranking over the offline index; Keyword mode stays authoritative for commands and identifiers. Archived sessions are included only when you ask for them.",
+      "capability_ids": [],
+      "digest": "sha256:fda5661489776121aac079366509ac62f5e67c7e83a7ba5b1c7dc659fdfbafad",
+      "id": "getting-started.search",
+      "keywords": [
+        "search",
+        "archive",
+        "hybrid",
+        "keyword",
+        "semantic",
+        "session"
+      ],
+      "source_ids": [
+        "product.readme.features"
+      ],
+      "summary": "Search titles, messages, tags, and folders across your saved sessions.",
+      "title": "Find an earlier run",
+      "topic": "getting-started",
+      "visibility": "public"
+    },
+    {
+      "aliases": [
+        "coding lane",
+        "conversation",
+        "parallel agents",
+        "new build",
+        "new chat"
+      ],
+      "body": "Builds are the tool-enabled workspace for repository work. Chats are separate conversations for planning or discussion. Use the Builds and Chats tabs to switch modes, and keep multiple lanes open when you need parallel work. Help is its own surface and does not open a chat on your behalf.",
+      "capability_ids": [],
+      "digest": "sha256:f2d8ffbe6ca5de20827dc4c1db085ebbfb523b4f1dce3589cae1c912d98febab",
+      "id": "getting-started.sessions",
+      "keywords": [
+        "session",
+        "build",
+        "chat",
+        "lane",
+        "workspace"
+      ],
+      "source_ids": [
+        "product.readme.quickstart",
+        "product.readme.features"
+      ],
+      "summary": "Keep coding builds and ordinary chats separate while working in parallel.",
+      "title": "Sessions, builds, and chats",
+      "topic": "getting-started",
+      "visibility": "public"
+    },
+    {
+      "aliases": [
+        "restart a run",
+        "recover interrupted agent",
+        "resume after crash",
+        "unknown send",
+        "duplicate send"
+      ],
+      "body": "Durable runs expose a state, a cursor, and an evidence trail that survive an app restart. Reconnect from the advertised cursor, treat uncertain delivery as unknown, and use an explicit retry or continuation action. A restart is not permission to resend. Never infer that a linked session or a visible queue means a provider request was sent.",
+      "capability_ids": [],
+      "digest": "sha256:a7e061880988b85d5103bc456451d41d54ed5f713a99d74073584a9ed79b5be8",
+      "id": "operations.durable-recovery",
+      "keywords": [
+        "durable",
+        "restart",
+        "recover",
+        "checkpoint",
+        "cursor",
+        "retry",
+        "uncertain"
+      ],
+      "source_ids": [
+        "durable.lifecycle",
+        "durable.bounds"
+      ],
+      "summary": "Resume from an explicit checkpoint without guessing whether a send happened.",
+      "title": "Recover a durable run safely",
+      "topic": "operations",
+      "visibility": "public"
+    },
+    {
+      "aliases": [
+        "is this certified",
+        "what does pass mean",
+        "qualification",
+        "proof",
+        "release gate"
+      ],
+      "body": "A passing unit test proves an in-tree behavior on a named revision. It does not prove a live provider campaign, a packaged macOS identity, a multi-day operational soak, or a VM guest. Always read the exact revision, the evidence kind, the remaining gate, and whether the result is candidate-only.",
+      "capability_ids": [],
+      "digest": "sha256:c95e6b038d611e9c8b9ef0dfd5f3c645822597c52ece27c275b515bc43b9a662",
+      "id": "operations.evidence",
+      "keywords": [
+        "evidence",
+        "test",
+        "live",
+        "soak",
+        "certified",
+        "qualification",
+        "release"
+      ],
+      "source_ids": [
+        "verification.paths"
+      ],
+      "summary": "Separate deterministic tests, live-provider evidence, hardware proof, and soak reports.",
+      "title": "Read progress and evidence correctly",
+      "topic": "operations",
+      "visibility": "public"
+    },
+    {
+      "aliases": [
+        "prompt queue",
+        "steer agent",
+        "send next prompt",
+        "cancel a run",
+        "deferred steering"
+      ],
+      "body": "Queue and steer are separate bounded operations, not hidden prompt injection. Use a fresh idempotency key for each intent, preserve the run and workspace identity, and reconcile the queue revision before editing or removing an entry. A retry after an uncertain response is allowed only when the durable oracle proves the original request was not accepted.",
+      "capability_ids": [
+        "run.queue"
+      ],
+      "digest": "sha256:80f44592d95f9430f27ae4424067e25ef383b78a1ce2eea442331836146ff3c6",
+      "id": "operations.queue-and-steer",
+      "keywords": [
+        "queue",
+        "steer",
+        "idempotency",
+        "revision",
+        "retry",
+        "scope"
+      ],
+      "source_ids": [
+        "mcp.coordinator",
+        "durable.lifecycle"
+      ],
+      "summary": "Queue, steer, or cancel a run with explicit request ids and the same fences.",
+      "title": "Queue and steer work without losing scope",
+      "topic": "operations",
+      "visibility": "gated"
+    },
+    {
+      "aliases": [
+        "replay window",
+        "event retention",
+        "cursor expired",
+        "how far back"
+      ],
+      "body": "The coordinator retains a bounded event window per session. A cursor older than the retained window cannot be resumed and must be reported as a recovery condition rather than silently restarted from zero. Retention limits are an operational setting and are visible to operators only.",
+      "capability_ids": [
+        "run.review"
+      ],
+      "digest": "sha256:0243e83e0f8f136162a40d4475e49503447b0f5b3f943efc73196bb9b62e15a9",
+      "id": "operations.retention",
+      "keywords": [
+        "retention",
+        "replay",
+        "cursor",
+        "window",
+        "recovery",
+        "coordinator"
+      ],
+      "source_ids": [
+        "mcp.retention"
+      ],
+      "summary": "Retention decides how far back a reconnecting client may resume.",
+      "title": "Understand durable retention and replay windows",
+      "topic": "operations",
+      "visibility": "operator"
+    },
+    {
+      "aliases": [
+        "cargo test workspace",
+        "which tests to run",
+        "ci commands",
+        "unsupported command"
+      ],
+      "body": "Run the supported per-package paths that CI runs. A root-wide workspace test invocation is unsupported here and a failure from it is not evidence about the code under review. Read the supported-paths list before quoting a command result as a gate.",
+      "capability_ids": [],
+      "digest": "sha256:1a926093fc16740218371ac8d15250dcd2209ce58d601b7daa9779a1691d4c93",
+      "id": "operations.verification-limits",
+      "keywords": [
+        "verification",
+        "cargo",
+        "workspace",
+        "unsupported",
+        "ci",
+        "gate"
+      ],
+      "source_ids": [
+        "verification.unsupported",
+        "verification.paths"
+      ],
+      "summary": "Some whole-workspace commands are explicitly unsupported and prove nothing.",
+      "title": "Know which verification commands are supported",
+      "topic": "operations",
+      "visibility": "gated"
+    },
+    {
+      "aliases": [
+        "war room",
+        "browser client",
+        "web ui integration",
+        "broker"
+      ],
+      "body": "A browser client uses an authenticated session, opaque binding and run identifiers, CSRF protection, and idempotency keys. The broker owns provider credentials and re-checks user, team, workspace, capability, and run scope on every call. Browser code never receives a bearer token, a raw path, or native Computer Use authority.",
+      "capability_ids": [
+        "session.observe"
+      ],
+      "digest": "sha256:9047e1e33a8d562487b94ad88ebd73583ab3c16fcb4ba81724d28f7f4b014262",
+      "id": "providers.browser-broker",
+      "keywords": [
+        "browser",
+        "broker",
+        "opaque",
+        "csrf",
+        "credential",
+        "scope"
+      ],
+      "source_ids": [
+        "embedding.broker",
+        "embedding.trust"
+      ],
+      "summary": "A browser UI reaches GrokPtah through a broker that keeps authority server-side.",
+      "title": "Give a browser observe and review powers",
+      "topic": "providers",
+      "visibility": "gated"
+    },
+    {
+      "aliases": [
+        "embed grokptah",
+        "sdk",
+        "integration",
+        "published package",
+        "reuse"
+      ],
+      "body": "Start by choosing the trust boundary, then take the transport-neutral clients that match it. Consumers discover capabilities, scope every run, and preserve the same approval, replay, and redaction rules. The published Help package ships offline retrieval, projections, validation, and rendering — never authority constructors, route selection, transport, or private corpus.",
+      "capability_ids": [],
+      "digest": "sha256:5a65cc5be246808e71005f07382bc5d3d50b66c69249eecd55d2ee3d3b0e3008",
+      "id": "providers.embedding",
+      "keywords": [
+        "embed",
+        "sdk",
+        "package",
+        "broker",
+        "contract",
+        "boundary"
+      ],
+      "source_ids": [
+        "embedding.trust",
+        "embedding.primitives"
+      ],
+      "summary": "Embed the versioned contracts in a desktop app, web broker, or service.",
+      "title": "Use GrokPtah from another project",
+      "topic": "providers",
+      "visibility": "public"
+    },
+    {
+      "aliases": [
+        "cloud agent",
+        "external coding agent",
+        "remote worker",
+        "agent harness"
+      ],
+      "body": "External workers use the provider-neutral contract: pin the exact repository and starting ref, require isolated execution, monitor redacted status and cursor recovery, and collect only bounded relative artifacts. Creating a draft pull request never approves or merges changes; review receipts and the human promotion gate stay separate.",
+      "capability_ids": [
+        "run.execute"
+      ],
+      "digest": "sha256:6dbb038d8b97f5071df60cf35b16f1868f8b7df3159132fc9b12379632a190ba",
+      "id": "providers.external-workers",
+      "keywords": [
+        "cloud",
+        "worker",
+        "external",
+        "isolated",
+        "artifact",
+        "promotion"
+      ],
+      "source_ids": [
+        "embedding.workers"
+      ],
+      "summary": "Spin up an isolated external coding agent and review its bounded evidence.",
+      "title": "Launch and monitor a cloud coding worker",
+      "topic": "providers",
+      "visibility": "gated"
+    },
+    {
+      "aliases": [
+        "grok build vs grok bot",
+        "grokbot",
+        "which grok",
+        "external coding tools"
+      ],
+      "body": "GrokPtah can use an explicitly configured Grok Build route, but a real quota claim requires a named live campaign and secret-free receipts. The local always-on soak uses a loopback provider and does not contact Grok Build. Grok Bot is a separate product and is not a runtime dependency or manager.",
+      "capability_ids": [],
+      "digest": "sha256:e19585aa2f57ffff6b256d012a026ca8012b667bf246c36b89fd8ce900a810b7",
+      "id": "providers.product-boundary",
+      "keywords": [
+        "grok",
+        "bot",
+        "boundary",
+        "external",
+        "loopback"
+      ],
+      "source_ids": [
+        "provider.boundaries",
+        "provider.bot-boundary"
+      ],
+      "summary": "Keep the Grok Build route separate from Grok Bot and development-tool usage.",
+      "title": "Grok Build, Grok Bot, and external tools",
+      "topic": "providers",
+      "visibility": "public"
+    },
+    {
+      "aliases": [
+        "weak gateway code review",
+        "restricted AI policy",
+        "enterprise review",
+        "use the model we have"
+      ],
+      "body": "A company gateway can still run a bounded, read-only code review when the route, tenant, model, and authority policy are fixed. Preserve useful partial findings on throttles or timeouts, never silently fall back, and show whether the evidence is a configured route, a live receipt, or only a local test.",
+      "capability_ids": [
+        "run.review"
+      ],
+      "digest": "sha256:e339e53742899ced4b4010b731ce3af661de73dd207540623976cd31ee5e52e2",
+      "id": "providers.restricted-gateway-review",
+      "keywords": [
+        "company",
+        "restricted",
+        "review",
+        "read-only",
+        "fallback",
+        "tenant"
+      ],
+      "source_ids": [
+        "provider.profiles",
+        "provider.qualify"
+      ],
+      "summary": "Use a permitted gateway for code review while preserving evidence and policy boundaries.",
+      "title": "Review code through a restricted company gateway",
+      "topic": "providers",
+      "visibility": "gated"
+    },
+    {
+      "aliases": [
+        "company gateway",
+        "restricted model",
+        "weaker model",
+        "quota",
+        "provider settings"
+      ],
+      "body": "Provider profiles describe the selected model, gateway, and capability evidence. A configured route is not a live certification, and GrokPtah does not synchronize a provider account balance. Readiness and quota observability are shown separately so evidence is not mistaken for a claim.",
+      "capability_ids": [],
+      "digest": "sha256:b13ffeec6c5196b863e15ec872bd783ebfc353c2dfd718933a752623797a993f",
+      "id": "providers.routes",
+      "keywords": [
+        "provider",
+        "gateway",
+        "route",
+        "model",
+        "quota",
+        "readiness"
+      ],
+      "source_ids": [
+        "provider.profiles"
+      ],
+      "summary": "Choose an explicit provider route and see what is actually qualified.",
+      "title": "Provider routes and gateway policy",
+      "topic": "providers",
+      "visibility": "public"
+    }
+  ],
+  "chunks": [
+    {
+      "article_id": "computer-use.approval",
+      "digest": "sha256:ff990302b4e58bb59e06fa1b5db219714c59e329a27951e88d2f714028856f5c",
+      "id": "computer-use.approval#body.0",
+      "kind": "body",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "computer-use.safety",
+        "computer-use.trust"
+      ],
+      "text": "Observation and control are separate capabilities. Before a semantic action, verify the fresh target, scope, lease, and postcondition, and approve only the action class you intend. Outdated visual state, secure fields, focus changes, and cleanup uncertainty revoke authority or fail closed. A focused window is not proof that a target is safe.",
+      "visibility": "gated"
+    },
+    {
+      "article_id": "computer-use.approval",
+      "digest": "sha256:6270495cd7735d46872f04996d121ede4b66300ebbf3e30be00fbaf6f8ec429d",
+      "id": "computer-use.approval#summary.0",
+      "kind": "summary",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "computer-use.safety",
+        "computer-use.trust"
+      ],
+      "text": "Understand the one-use consent, postcondition, and takeover controls.",
+      "visibility": "gated"
+    },
+    {
+      "article_id": "computer-use.approval",
+      "digest": "sha256:0bce1d3106199b91c409fa6c38331ab5446db8eefc48de718996c46b15b6326f",
+      "id": "computer-use.approval#title.0",
+      "kind": "title",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "computer-use.safety",
+        "computer-use.trust"
+      ],
+      "text": "Approve a Computer Use action",
+      "visibility": "gated"
+    },
+    {
+      "article_id": "computer-use.boundaries",
+      "digest": "sha256:df2eb19038adfcf7461da781de76720a8dd93f05ef82eed2e93bee911e0da6da",
+      "id": "computer-use.boundaries#body.0",
+      "kind": "body",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "computer-use.safety",
+        "computer-use.non-goals"
+      ],
+      "text": "Computer Use is bounded by an explicit target, a fresh observation, a one-use approval, and a postcondition. Stop and Take over revoke authority. Secure fields, stale observations, focus changes, raw global input, clipboard injection, shell control, and unattended actions fail closed or remain unsupported.",
+      "visibility": "public"
+    },
+    {
+      "article_id": "computer-use.boundaries",
+      "digest": "sha256:ef4af882f45f8c20413b482dd2c0b353a8da698db3dd5fb51c7083bb2db067ce",
+      "id": "computer-use.boundaries#summary.0",
+      "kind": "summary",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "computer-use.safety",
+        "computer-use.non-goals"
+      ],
+      "text": "Understand what Computer Use can observe or do, and what it refuses.",
+      "visibility": "public"
+    },
+    {
+      "article_id": "computer-use.boundaries",
+      "digest": "sha256:09118610196ab54eeba4af03e3b6cf6472129e7045e762fe53f8837da6d3541b",
+      "id": "computer-use.boundaries#title.0",
+      "kind": "title",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "computer-use.safety",
+        "computer-use.non-goals"
+      ],
+      "text": "Computer Use: consent and boundaries",
+      "visibility": "public"
+    },
+    {
+      "article_id": "computer-use.coordination",
+      "digest": "sha256:4d37e09f073766b4e176c730314c7875b2193a7619c8bfe0c61df6ccaf5abccd",
+      "id": "computer-use.coordination#body.0",
+      "kind": "body",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "computer-use.evidence"
+      ],
+      "text": "Coordination is lease-based: an agent must hold the exact guest or session authority and revision before it can act. A second agent, a stale observation, the wrong session, Stop, or Take over must be denied without mutation. Separate guests or explicitly disjoint scopes are required for parallel work.",
+      "visibility": "operator"
+    },
+    {
+      "article_id": "computer-use.coordination",
+      "digest": "sha256:47b53a86596abdd96e877bf1ac44950c16a717bbddebc14dae8a909dfa147aad",
+      "id": "computer-use.coordination#summary.0",
+      "kind": "summary",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "computer-use.evidence"
+      ],
+      "text": "Keep simultaneous agents from fighting over the same visual surface.",
+      "visibility": "operator"
+    },
+    {
+      "article_id": "computer-use.coordination",
+      "digest": "sha256:48391f160832c0fdbdd67bf8e07a09d29df7eb7e89b4c35cb78e0e1e8f779687",
+      "id": "computer-use.coordination#title.0",
+      "kind": "title",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "computer-use.evidence"
+      ],
+      "text": "Coordinate multiple Computer Use agents",
+      "visibility": "operator"
+    },
+    {
+      "article_id": "computer-use.isolated-guest",
+      "digest": "sha256:03c55b8f6b94da2187d8b7388c5588f49333453158fc2e2c54a7b7844b9b1f2d",
+      "id": "computer-use.isolated-guest#body.0",
+      "kind": "body",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "computer-use.blockers",
+        "computer-use.trust"
+      ],
+      "text": "An isolated guest is a planned separate visual surface for bounded Computer Use, and it is not qualified for use in this release. The helper and guest image still need review and signing, one agent lease must control a guest at a time, frames must be redacted, and host clipboard, shares, raw global input, and guest networking remain denied. Source-level lease and projection tests do not prove a packaged VM, a guest boot, rendered frames, or host input.",
+      "visibility": "gated"
+    },
+    {
+      "article_id": "computer-use.isolated-guest",
+      "digest": "sha256:615c8deafa5f2854db691869d11a58cc0a60202475215bdeef9bb1df1ea01ac6",
+      "id": "computer-use.isolated-guest#summary.0",
+      "kind": "summary",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "computer-use.blockers",
+        "computer-use.trust"
+      ],
+      "text": "Understand the isolated guest boundary without treating source proof as a usable VM.",
+      "visibility": "gated"
+    },
+    {
+      "article_id": "computer-use.isolated-guest",
+      "digest": "sha256:6aa8edfc34b4b0457ecd550879c4c54225f7fc99b1387031d7a8bc0b28290c64",
+      "id": "computer-use.isolated-guest#title.0",
+      "kind": "title",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "computer-use.blockers",
+        "computer-use.trust"
+      ],
+      "text": "Isolated guest Computer Use",
+      "visibility": "gated"
+    },
+    {
+      "article_id": "getting-started.accessibility",
+      "digest": "sha256:a7e7f66ceb374fee4bcbc96fe3bb5cb2665f158f8851ea7f545ebb1e812b914b",
+      "id": "getting-started.accessibility#body.0",
+      "kind": "body",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "embedding.primitives",
+        "product.readme.features"
+      ],
+      "text": "Use the Sessions, Tools, Live, and Computer landmarks to move between work areas. Running state, permission requests, stale observations, and recovery actions are announced and stay visible. Reduced motion and large text preserve the same information hierarchy rather than hiding status.",
+      "visibility": "public"
+    },
+    {
+      "article_id": "getting-started.accessibility",
+      "digest": "sha256:37ff3407eae0ed87fc34b57a59c7b08db6df7d33fb4d66a9cdbef7d989960043",
+      "id": "getting-started.accessibility#summary.0",
+      "kind": "summary",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "embedding.primitives",
+        "product.readme.features"
+      ],
+      "text": "Power-user speed and accessibility are designed together: named landmarks, predictable focus, and visible state.",
+      "visibility": "public"
+    },
+    {
+      "article_id": "getting-started.accessibility",
+      "digest": "sha256:6eb6f818f137f045a2f92508eb72812ea2c74c2e8b02e50864ee13db517edbed",
+      "id": "getting-started.accessibility#title.0",
+      "kind": "title",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "embedding.primitives",
+        "product.readme.features"
+      ],
+      "text": "Work quickly with keyboard and screen reader",
+      "visibility": "public"
+    },
+    {
+      "article_id": "getting-started.help-center",
+      "digest": "sha256:2fdc6a76ce106d13161d94b2b97f91a6c3b0d62f2f7fb98cfb121504d3710c8d",
+      "id": "getting-started.help-center#body.0",
+      "kind": "body",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "product.readme.features",
+        "embedding.primitives"
+      ],
+      "text": "Type a question and Help searches the shipped corpus in your own process, with no network call. Asking for a written answer is a separate action: the host selects the passages, sends one bounded request, and shows the reply only after it has checked every claim against the exact corpus bytes. Claims that cannot be tied to a cited passage are dropped, and an answer with no supported claim is withheld rather than shown as a guess.",
+      "visibility": "public"
+    },
+    {
+      "article_id": "getting-started.help-center",
+      "digest": "sha256:39e20edefb49bec169f1ae6ff5f1cf57b4793638bc3c155b99fdb7d2f56e76ac",
+      "id": "getting-started.help-center#summary.0",
+      "kind": "summary",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "product.readme.features",
+        "embedding.primitives"
+      ],
+      "text": "Help retrieval runs offline; a cited answer is an extra, explicit step.",
+      "visibility": "public"
+    },
+    {
+      "article_id": "getting-started.help-center",
+      "digest": "sha256:74e83bca7a10e08c45d313366f6bda63fd860253daa7638528712f90ec1ce105",
+      "id": "getting-started.help-center#title.0",
+      "kind": "title",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "product.readme.features",
+        "embedding.primitives"
+      ],
+      "text": "Search Help and read a cited answer",
+      "visibility": "public"
+    },
+    {
+      "article_id": "getting-started.search",
+      "digest": "sha256:296af4574bfad715b8d6d0a1df6fb2b15378a018da59dffa68e20bf89ed093a0",
+      "id": "getting-started.search#body.0",
+      "kind": "body",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "product.readme.features"
+      ],
+      "text": "Open Search from the Lanes sidebar. Hybrid search combines exact text with meaning-based ranking over the offline index; Keyword mode stays authoritative for commands and identifiers. Archived sessions are included only when you ask for them.",
+      "visibility": "public"
+    },
+    {
+      "article_id": "getting-started.search",
+      "digest": "sha256:110ed486ca4441a4cf2aed110e3c89d4e4537982c45ca4e4e543d9d96b7420ec",
+      "id": "getting-started.search#summary.0",
+      "kind": "summary",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "product.readme.features"
+      ],
+      "text": "Search titles, messages, tags, and folders across your saved sessions.",
+      "visibility": "public"
+    },
+    {
+      "article_id": "getting-started.search",
+      "digest": "sha256:a78b8a611ea3eec3552847e2d6a6e99bd9fb6cf6085a58b0e2f7f60c2b6e6fdf",
+      "id": "getting-started.search#title.0",
+      "kind": "title",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "product.readme.features"
+      ],
+      "text": "Find an earlier run",
+      "visibility": "public"
+    },
+    {
+      "article_id": "getting-started.sessions",
+      "digest": "sha256:3dc9ef8a77f8232390ab9dd5cc90f941981e8ad9c924c1b129140f9b6ed047f1",
+      "id": "getting-started.sessions#body.0",
+      "kind": "body",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "product.readme.quickstart",
+        "product.readme.features"
+      ],
+      "text": "Builds are the tool-enabled workspace for repository work. Chats are separate conversations for planning or discussion. Use the Builds and Chats tabs to switch modes, and keep multiple lanes open when you need parallel work. Help is its own surface and does not open a chat on your behalf.",
+      "visibility": "public"
+    },
+    {
+      "article_id": "getting-started.sessions",
+      "digest": "sha256:d8093e19690d13ad6a0efb614b6171950cda43453dfe291deb99f3a98bca00ab",
+      "id": "getting-started.sessions#summary.0",
+      "kind": "summary",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "product.readme.quickstart",
+        "product.readme.features"
+      ],
+      "text": "Keep coding builds and ordinary chats separate while working in parallel.",
+      "visibility": "public"
+    },
+    {
+      "article_id": "getting-started.sessions",
+      "digest": "sha256:499e2c52ce9b359d76992b1fa1be87e2f6219ceec6b504afbfe621c3f3ea199e",
+      "id": "getting-started.sessions#title.0",
+      "kind": "title",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "product.readme.quickstart",
+        "product.readme.features"
+      ],
+      "text": "Sessions, builds, and chats",
+      "visibility": "public"
+    },
+    {
+      "article_id": "operations.durable-recovery",
+      "digest": "sha256:6b4f17d79742000c43d3d3e9250215c539289c393655f512500cb786bb952bab",
+      "id": "operations.durable-recovery#body.0",
+      "kind": "body",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "durable.lifecycle",
+        "durable.bounds"
+      ],
+      "text": "Durable runs expose a state, a cursor, and an evidence trail that survive an app restart. Reconnect from the advertised cursor, treat uncertain delivery as unknown, and use an explicit retry or continuation action. A restart is not permission to resend. Never infer that a linked session or a visible queue means a provider request was sent.",
+      "visibility": "public"
+    },
+    {
+      "article_id": "operations.durable-recovery",
+      "digest": "sha256:cead5ebbccd78e4abaae510238f6484c34f3299eec26c90115a51f89ac611d86",
+      "id": "operations.durable-recovery#summary.0",
+      "kind": "summary",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "durable.lifecycle",
+        "durable.bounds"
+      ],
+      "text": "Resume from an explicit checkpoint without guessing whether a send happened.",
+      "visibility": "public"
+    },
+    {
+      "article_id": "operations.durable-recovery",
+      "digest": "sha256:697f649eea025ef614daeab8b9fc34fd9470bf8766b679af983e493a57ebbfe2",
+      "id": "operations.durable-recovery#title.0",
+      "kind": "title",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "durable.lifecycle",
+        "durable.bounds"
+      ],
+      "text": "Recover a durable run safely",
+      "visibility": "public"
+    },
+    {
+      "article_id": "operations.evidence",
+      "digest": "sha256:4386adede3db573e3266340659ac2b3dca05b1ec3e9dfaaa1d30fa8bbb1d62e9",
+      "id": "operations.evidence#body.0",
+      "kind": "body",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "verification.paths"
+      ],
+      "text": "A passing unit test proves an in-tree behavior on a named revision. It does not prove a live provider campaign, a packaged macOS identity, a multi-day operational soak, or a VM guest. Always read the exact revision, the evidence kind, the remaining gate, and whether the result is candidate-only.",
+      "visibility": "public"
+    },
+    {
+      "article_id": "operations.evidence",
+      "digest": "sha256:46e5133d480f03df2fd4852598fd53b12b6b696e0c4889e916c36e8e3ae5b4f4",
+      "id": "operations.evidence#summary.0",
+      "kind": "summary",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "verification.paths"
+      ],
+      "text": "Separate deterministic tests, live-provider evidence, hardware proof, and soak reports.",
+      "visibility": "public"
+    },
+    {
+      "article_id": "operations.evidence",
+      "digest": "sha256:272b3866c757cfefec0120ab4343010b425a453893eef13bedbe09d19514a6b6",
+      "id": "operations.evidence#title.0",
+      "kind": "title",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "verification.paths"
+      ],
+      "text": "Read progress and evidence correctly",
+      "visibility": "public"
+    },
+    {
+      "article_id": "operations.queue-and-steer",
+      "digest": "sha256:b92b4788ef92df08e011a7ec1131ca3ca254122468404e37de89b5b0bb2813f1",
+      "id": "operations.queue-and-steer#body.0",
+      "kind": "body",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "mcp.coordinator",
+        "durable.lifecycle"
+      ],
+      "text": "Queue and steer are separate bounded operations, not hidden prompt injection. Use a fresh idempotency key for each intent, preserve the run and workspace identity, and reconcile the queue revision before editing or removing an entry. A retry after an uncertain response is allowed only when the durable oracle proves the original request was not accepted.",
+      "visibility": "gated"
+    },
+    {
+      "article_id": "operations.queue-and-steer",
+      "digest": "sha256:95a14ba68f284f9357a6c0bc47226ff69b97d5883061ad448409a165448e34e8",
+      "id": "operations.queue-and-steer#summary.0",
+      "kind": "summary",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "mcp.coordinator",
+        "durable.lifecycle"
+      ],
+      "text": "Queue, steer, or cancel a run with explicit request ids and the same fences.",
+      "visibility": "gated"
+    },
+    {
+      "article_id": "operations.queue-and-steer",
+      "digest": "sha256:143c6d99b3caa42836227d605820b5e433dbdbc0c723c517b64797926935b917",
+      "id": "operations.queue-and-steer#title.0",
+      "kind": "title",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "mcp.coordinator",
+        "durable.lifecycle"
+      ],
+      "text": "Queue and steer work without losing scope",
+      "visibility": "gated"
+    },
+    {
+      "article_id": "operations.retention",
+      "digest": "sha256:f82ecbaf17c6218023569a7bb6c0436350aa1d1a748018b69f9b9925996f0bd2",
+      "id": "operations.retention#body.0",
+      "kind": "body",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "mcp.retention"
+      ],
+      "text": "The coordinator retains a bounded event window per session. A cursor older than the retained window cannot be resumed and must be reported as a recovery condition rather than silently restarted from zero. Retention limits are an operational setting and are visible to operators only.",
+      "visibility": "operator"
+    },
+    {
+      "article_id": "operations.retention",
+      "digest": "sha256:08d72678ea486c825e061d69604609addf93330f67f1d8e1844642dfc708e03c",
+      "id": "operations.retention#summary.0",
+      "kind": "summary",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "mcp.retention"
+      ],
+      "text": "Retention decides how far back a reconnecting client may resume.",
+      "visibility": "operator"
+    },
+    {
+      "article_id": "operations.retention",
+      "digest": "sha256:02f2520785850b8bd66e441767149d9b2a7da0045bbc61442da3d4c78e2e59bb",
+      "id": "operations.retention#title.0",
+      "kind": "title",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "mcp.retention"
+      ],
+      "text": "Understand durable retention and replay windows",
+      "visibility": "operator"
+    },
+    {
+      "article_id": "operations.verification-limits",
+      "digest": "sha256:f8b61bb9d4d47fd0039c1e155d157fc0700ae59b32baa354d8c5a242b43205d6",
+      "id": "operations.verification-limits#body.0",
+      "kind": "body",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "verification.unsupported",
+        "verification.paths"
+      ],
+      "text": "Run the supported per-package paths that CI runs. A root-wide workspace test invocation is unsupported here and a failure from it is not evidence about the code under review. Read the supported-paths list before quoting a command result as a gate.",
+      "visibility": "gated"
+    },
+    {
+      "article_id": "operations.verification-limits",
+      "digest": "sha256:b84d68bb9dcb384e41d3e8dd5d34bbbddf699e1a1840d5c1e76b3b7fc09e8712",
+      "id": "operations.verification-limits#summary.0",
+      "kind": "summary",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "verification.unsupported",
+        "verification.paths"
+      ],
+      "text": "Some whole-workspace commands are explicitly unsupported and prove nothing.",
+      "visibility": "gated"
+    },
+    {
+      "article_id": "operations.verification-limits",
+      "digest": "sha256:fbf0af8358a043fe10ba5f1d3b588c5fa32c0e9d55eb73fead7afbaa210ead60",
+      "id": "operations.verification-limits#title.0",
+      "kind": "title",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "verification.unsupported",
+        "verification.paths"
+      ],
+      "text": "Know which verification commands are supported",
+      "visibility": "gated"
+    },
+    {
+      "article_id": "providers.browser-broker",
+      "digest": "sha256:301422b237a8e6e818d2231ce7a31444ee4c66faf7dd040ce1b22293867c5a8e",
+      "id": "providers.browser-broker#body.0",
+      "kind": "body",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "embedding.broker",
+        "embedding.trust"
+      ],
+      "text": "A browser client uses an authenticated session, opaque binding and run identifiers, CSRF protection, and idempotency keys. The broker owns provider credentials and re-checks user, team, workspace, capability, and run scope on every call. Browser code never receives a bearer token, a raw path, or native Computer Use authority.",
+      "visibility": "gated"
+    },
+    {
+      "article_id": "providers.browser-broker",
+      "digest": "sha256:14d913aaf0f71a528f0d55209843857e2eb5490f3469ed69035a195471fd48d2",
+      "id": "providers.browser-broker#summary.0",
+      "kind": "summary",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "embedding.broker",
+        "embedding.trust"
+      ],
+      "text": "A browser UI reaches GrokPtah through a broker that keeps authority server-side.",
+      "visibility": "gated"
+    },
+    {
+      "article_id": "providers.browser-broker",
+      "digest": "sha256:2a75c377359c360101871acbc47962dd38cd7cc5a2dba53a526cdb6c2b4907ac",
+      "id": "providers.browser-broker#title.0",
+      "kind": "title",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "embedding.broker",
+        "embedding.trust"
+      ],
+      "text": "Give a browser observe and review powers",
+      "visibility": "gated"
+    },
+    {
+      "article_id": "providers.embedding",
+      "digest": "sha256:e53cabcd71a47e505e19be3e968a1b99093e9821f05ed0d9196f6f1b8e1e43f2",
+      "id": "providers.embedding#body.0",
+      "kind": "body",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "embedding.trust",
+        "embedding.primitives"
+      ],
+      "text": "Start by choosing the trust boundary, then take the transport-neutral clients that match it. Consumers discover capabilities, scope every run, and preserve the same approval, replay, and redaction rules. The published Help package ships offline retrieval, projections, validation, and rendering — never authority constructors, route selection, transport, or private corpus.",
+      "visibility": "public"
+    },
+    {
+      "article_id": "providers.embedding",
+      "digest": "sha256:2ad69e5366377333e8866ef086c3f14827d7b1b90da265704e90174bc960dcb9",
+      "id": "providers.embedding#summary.0",
+      "kind": "summary",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "embedding.trust",
+        "embedding.primitives"
+      ],
+      "text": "Embed the versioned contracts in a desktop app, web broker, or service.",
+      "visibility": "public"
+    },
+    {
+      "article_id": "providers.embedding",
+      "digest": "sha256:1ec9e393081676391cfc1b8f93d140fb7a3d935e38a4d07937a562fd4eff7540",
+      "id": "providers.embedding#title.0",
+      "kind": "title",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "embedding.trust",
+        "embedding.primitives"
+      ],
+      "text": "Use GrokPtah from another project",
+      "visibility": "public"
+    },
+    {
+      "article_id": "providers.external-workers",
+      "digest": "sha256:0e4acc815997e5612b9ba7daf4c7fec5a56f54a452a5f557ba2e3300c21ae6f6",
+      "id": "providers.external-workers#body.0",
+      "kind": "body",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "embedding.workers"
+      ],
+      "text": "External workers use the provider-neutral contract: pin the exact repository and starting ref, require isolated execution, monitor redacted status and cursor recovery, and collect only bounded relative artifacts. Creating a draft pull request never approves or merges changes; review receipts and the human promotion gate stay separate.",
+      "visibility": "gated"
+    },
+    {
+      "article_id": "providers.external-workers",
+      "digest": "sha256:a05a54f6147fbe078791b93f305eaafac0d37aa4d2f4055347313695ed69d02a",
+      "id": "providers.external-workers#summary.0",
+      "kind": "summary",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "embedding.workers"
+      ],
+      "text": "Spin up an isolated external coding agent and review its bounded evidence.",
+      "visibility": "gated"
+    },
+    {
+      "article_id": "providers.external-workers",
+      "digest": "sha256:9468768c24ea1ccec31d60e436d558181aa0da11eeeaa6da6bfb52f2ed58507d",
+      "id": "providers.external-workers#title.0",
+      "kind": "title",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "embedding.workers"
+      ],
+      "text": "Launch and monitor a cloud coding worker",
+      "visibility": "gated"
+    },
+    {
+      "article_id": "providers.product-boundary",
+      "digest": "sha256:48e4ddbca91bd16d39f44973f08390580c19f8722d790067af900104f733a872",
+      "id": "providers.product-boundary#body.0",
+      "kind": "body",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "provider.boundaries",
+        "provider.bot-boundary"
+      ],
+      "text": "GrokPtah can use an explicitly configured Grok Build route, but a real quota claim requires a named live campaign and secret-free receipts. The local always-on soak uses a loopback provider and does not contact Grok Build. Grok Bot is a separate product and is not a runtime dependency or manager.",
+      "visibility": "public"
+    },
+    {
+      "article_id": "providers.product-boundary",
+      "digest": "sha256:fa6b25db35f7def83ab28905c8f5f95c27b6257b5c4bc645f006855dc2ea7bba",
+      "id": "providers.product-boundary#summary.0",
+      "kind": "summary",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "provider.boundaries",
+        "provider.bot-boundary"
+      ],
+      "text": "Keep the Grok Build route separate from Grok Bot and development-tool usage.",
+      "visibility": "public"
+    },
+    {
+      "article_id": "providers.product-boundary",
+      "digest": "sha256:0c5394247354d89f23c5485fb8be60663459037c6d6ea4353b19488ee133ddf9",
+      "id": "providers.product-boundary#title.0",
+      "kind": "title",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "provider.boundaries",
+        "provider.bot-boundary"
+      ],
+      "text": "Grok Build, Grok Bot, and external tools",
+      "visibility": "public"
+    },
+    {
+      "article_id": "providers.restricted-gateway-review",
+      "digest": "sha256:dbbb1af8544df8c48779a2604abfc6df01acd048f2dcc6d3bc05ebe8862e6d36",
+      "id": "providers.restricted-gateway-review#body.0",
+      "kind": "body",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "provider.profiles",
+        "provider.qualify"
+      ],
+      "text": "A company gateway can still run a bounded, read-only code review when the route, tenant, model, and authority policy are fixed. Preserve useful partial findings on throttles or timeouts, never silently fall back, and show whether the evidence is a configured route, a live receipt, or only a local test.",
+      "visibility": "gated"
+    },
+    {
+      "article_id": "providers.restricted-gateway-review",
+      "digest": "sha256:2ecab808b2815ddcb25cb34c666b6ddb12d3275c7bfe0adcf9a6333bf466dba3",
+      "id": "providers.restricted-gateway-review#summary.0",
+      "kind": "summary",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "provider.profiles",
+        "provider.qualify"
+      ],
+      "text": "Use a permitted gateway for code review while preserving evidence and policy boundaries.",
+      "visibility": "gated"
+    },
+    {
+      "article_id": "providers.restricted-gateway-review",
+      "digest": "sha256:24ca15c790391be0df864baa4e559b7bf53213a859e0661e734978697d8bcab3",
+      "id": "providers.restricted-gateway-review#title.0",
+      "kind": "title",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "provider.profiles",
+        "provider.qualify"
+      ],
+      "text": "Review code through a restricted company gateway",
+      "visibility": "gated"
+    },
+    {
+      "article_id": "providers.routes",
+      "digest": "sha256:c91e588ecd8f2f9e86de41a6bd3972f07adcff59b31ba0aa8d91eed5cd0fc1c5",
+      "id": "providers.routes#body.0",
+      "kind": "body",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "provider.profiles"
+      ],
+      "text": "Provider profiles describe the selected model, gateway, and capability evidence. A configured route is not a live certification, and GrokPtah does not synchronize a provider account balance. Readiness and quota observability are shown separately so evidence is not mistaken for a claim.",
+      "visibility": "public"
+    },
+    {
+      "article_id": "providers.routes",
+      "digest": "sha256:33f68ecb0e5020ab7bc6c4c4a4f528d480e5462ceefd9149afee424e408ec824",
+      "id": "providers.routes#summary.0",
+      "kind": "summary",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "provider.profiles"
+      ],
+      "text": "Choose an explicit provider route and see what is actually qualified.",
+      "visibility": "public"
+    },
+    {
+      "article_id": "providers.routes",
+      "digest": "sha256:15f74842a539a44ceb206337dddc1dd122ca52fd70fbce1be74a687fa07f933c",
+      "id": "providers.routes#title.0",
+      "kind": "title",
+      "locale": "en",
+      "ordinal": 0,
+      "source_ids": [
+        "provider.profiles"
+      ],
+      "text": "Provider routes and gateway policy",
+      "visibility": "public"
+    }
+  ],
+  "content_version": "help-canonical-2026.08.1",
+  "digest": "sha256:cc2617234dd4c52cf179e37f46513aa5d903df6d6240b9db350fa1cf4f58604c",
+  "schema_version": "grokptah.help-canonical.v1",
+  "source_digest": "sha256:2c08012dd080f0f978c72a822c10925afc868ad7e1136f73266ca430babfd305",
+  "sources": [
+    {
+      "digest": "sha256:5dabdd30a1c3ae170071eab9271542291534a27ee8d9c70a4c8a9cc5c2859eb1",
+      "heading": "Release blockers still open",
+      "id": "computer-use.blockers",
+      "path": "docs/COMPUTER_USE_THREAT_MODEL.md",
+      "visibility": "gated"
+    },
+    {
+      "digest": "sha256:9391bbfe61638b3fd3f0566ec44db898bbaebfc1f9dc616df6b98e3c5e3f3c98",
+      "heading": "Evidence matrix",
+      "id": "computer-use.evidence",
+      "path": "docs/COMPUTER_USE_THREAT_MODEL.md",
+      "visibility": "operator"
+    },
+    {
+      "digest": "sha256:978f3d27956a505bd32e952402a02e7db2adfc2afcc8b0510ebaaba2101c2237",
+      "heading": "Deliberate non-goals of the current desktop slice",
+      "id": "computer-use.non-goals",
+      "path": "docs/COMPUTER_USE.md",
+      "visibility": "public"
+    },
+    {
+      "digest": "sha256:a1c65291bbebc9c3115272a42fc0e6aac3efdd20100e0eccea04ed066048f7bc",
+      "heading": "Safety boundary",
+      "id": "computer-use.safety",
+      "path": "docs/COMPUTER_USE.md",
+      "visibility": "public"
+    },
+    {
+      "digest": "sha256:bcbec5bed1bd7e1a7018ab08a5a5e831b2c22e93dccb4741c6a2d5c85621f779",
+      "heading": "Trust boundaries",
+      "id": "computer-use.trust",
+      "path": "docs/COMPUTER_USE_THREAT_MODEL.md",
+      "visibility": "gated"
+    },
+    {
+      "digest": "sha256:afa6667a2365f7b68a0d6864ab1d89a78678ba8c3cc8cd72f0eac072a05926ba",
+      "heading": "Privacy and bounds",
+      "id": "durable.bounds",
+      "path": "docs/DURABLE_RUNS.md",
+      "visibility": "public"
+    },
+    {
+      "digest": "sha256:9b9d042645b536ab99231fd1261ef6a15fd870e03fde5cd962af97d49330bce3",
+      "heading": "Lifecycle",
+      "id": "durable.lifecycle",
+      "path": "docs/DURABLE_RUNS.md",
+      "visibility": "public"
+    },
+    {
+      "digest": "sha256:5d3527a5470493eb6f9b99c0d5a0bb2eccddf4b47eb52c25ed70e49d5dfc038f",
+      "heading": "Browser / War Room example",
+      "id": "embedding.broker",
+      "path": "docs/EMBEDDING.md",
+      "visibility": "gated"
+    },
+    {
+      "digest": "sha256:4ab068af9a4e250c37d60893766964fef89a9f64437848d6db8dc19598da4d3b",
+      "heading": "Headless UI primitives",
+      "id": "embedding.primitives",
+      "path": "docs/EMBEDDING.md",
+      "visibility": "public"
+    },
+    {
+      "digest": "sha256:701c2556fc3e5438e37b8bf22e8485830c3c96caf533cfd597b267e383d23896",
+      "heading": "Choose the trust boundary first",
+      "id": "embedding.trust",
+      "path": "docs/EMBEDDING.md",
+      "visibility": "public"
+    },
+    {
+      "digest": "sha256:334af2d0662f72bfbde5c71a62f65246ec99e2406c4603d00221caebab387327",
+      "heading": "External cloud workers",
+      "id": "embedding.workers",
+      "path": "docs/EMBEDDING.md",
+      "visibility": "gated"
+    },
+    {
+      "digest": "sha256:9ac7f0f327a5bb8fab952132eb77c4efcd30ab148028d397b666da4f15c0ed9a",
+      "heading": "Launch (desktop / production)",
+      "id": "mcp.coordinator",
+      "path": "docs/MCP_CONTROL_COORDINATOR.md",
+      "visibility": "gated"
+    },
+    {
+      "digest": "sha256:40416bf53438d9d43f8e1cc42d67f62a33c33f51e20d98987133ac8e0769ecf1",
+      "heading": "Durable retention",
+      "id": "mcp.retention",
+      "path": "docs/MCP_CONTROL_COORDINATOR.md",
+      "visibility": "operator"
+    },
+    {
+      "digest": "sha256:07ce1afbca91d19af56f24d1e04756cd5d370f6881ed34038a7855d937b61eec",
+      "heading": "Features (desktop)",
+      "id": "product.readme.features",
+      "path": "README.md",
+      "visibility": "public"
+    },
+    {
+      "digest": "sha256:f2b6b052e178ce14b4d5869ce9e2f4ee8e82d6c66966363a36efbf1ec2cc2818",
+      "heading": "Quick start",
+      "id": "product.readme.quickstart",
+      "path": "README.md",
+      "visibility": "public"
+    },
+    {
+      "digest": "sha256:531a1671fb3a9f41e68f4138b06512e4a8df333226f48acc49dafb545efb9abd",
+      "heading": "Grok Bot boundary",
+      "id": "provider.bot-boundary",
+      "path": "docs/PROVIDER_PRODUCT_BOUNDARIES.md",
+      "visibility": "public"
+    },
+    {
+      "digest": "sha256:be1037b7a1f46b4ab20b8ceeb254422186488bb77a202530573430ab2056031c",
+      "heading": "Grok Build route",
+      "id": "provider.boundaries",
+      "path": "docs/PROVIDER_PRODUCT_BOUNDARIES.md",
+      "visibility": "public"
+    },
+    {
+      "digest": "sha256:9d72c211a7e43e3b87a1952eacdf7385b2326737bdbec310f0c6969866ac380a",
+      "heading": "Configure a provider",
+      "id": "provider.profiles",
+      "path": "docs/PROVIDER_PROFILES.md",
+      "visibility": "public"
+    },
+    {
+      "digest": "sha256:1358b5ecf9084f8fa6e1fa067d9b6dac8a3cb6161ce46ea0a35bf5e1852ad68f",
+      "heading": "Qualify a model",
+      "id": "provider.qualify",
+      "path": "docs/PROVIDER_PROFILES.md",
+      "visibility": "gated"
+    },
+    {
+      "digest": "sha256:0581800fcd13296f59632d911262073dbd03a3726ebbedebd07c376a5aafa18f",
+      "heading": "Supported paths (what CI runs, and what you should run)",
+      "id": "verification.paths",
+      "path": "docs/VERIFICATION.md",
+      "visibility": "public"
+    },
+    {
+      "digest": "sha256:9eec4f5a91219356a4594af26877d0cf994e7ef221905dab9792f72a2494b892",
+      "heading": "Unsupported: root-wide `cargo test` / `cargo test --workspace [--no-run]`",
+      "id": "verification.unsupported",
+      "path": "docs/VERIFICATION.md",
+      "visibility": "gated"
+    }
+  ]
+}

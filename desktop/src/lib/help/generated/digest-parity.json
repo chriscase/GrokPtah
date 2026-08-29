@@ -1,0 +1,319 @@
+{
+  "articleDigests": [
+    {
+      "aliases": [
+        "alias.a"
+      ],
+      "body": "Body.",
+      "capabilityIds": [
+        "cap.a"
+      ],
+      "digest": "sha256:f151f1c3f9cf6850fd2cc122388e633a9c2e8300b1ac24c57750406402edbd27",
+      "id": "article.parity",
+      "keywords": [
+        "keyword.a"
+      ],
+      "name": "base",
+      "sourceDigests": [
+        "sha256:aa"
+      ],
+      "summary": "Summary.",
+      "title": "Parity article",
+      "topic": "operations",
+      "visibility": "gated"
+    },
+    {
+      "aliases": [
+        "alias.a",
+        "keyword.a",
+        "cap.a"
+      ],
+      "body": "Body.",
+      "capabilityIds": [],
+      "digest": "sha256:c81e2eefccf1bafc56febe6967113bfb31036a8d17c3db5b44fbca253858c290",
+      "id": "article.parity",
+      "keywords": [],
+      "name": "repartition-capability-into-aliases",
+      "sourceDigests": [
+        "sha256:aa"
+      ],
+      "summary": "Summary.",
+      "title": "Parity article",
+      "topic": "operations",
+      "visibility": "gated"
+    },
+    {
+      "aliases": [
+        "alias.a"
+      ],
+      "body": "Body.",
+      "capabilityIds": [],
+      "digest": "sha256:51b1625ad5e65b8ac5bbc70af42913f5dda89d24090f6ffd149ea726e0486a4c",
+      "id": "article.parity",
+      "keywords": [
+        "keyword.a",
+        "cap.a"
+      ],
+      "name": "repartition-capability-into-keywords",
+      "sourceDigests": [
+        "sha256:aa"
+      ],
+      "summary": "Summary.",
+      "title": "Parity article",
+      "topic": "operations",
+      "visibility": "gated"
+    },
+    {
+      "aliases": [
+        "alias.b",
+        "alias.a"
+      ],
+      "body": "Body.",
+      "capabilityIds": [
+        "cap.a"
+      ],
+      "digest": "sha256:bd7aaedb23dfae2ab79705301e70bd0df635076ee49590bf41cdf515026c019a",
+      "id": "article.parity",
+      "keywords": [
+        "keyword.a"
+      ],
+      "name": "reorder-within-a-list",
+      "sourceDigests": [
+        "sha256:aa"
+      ],
+      "summary": "Summary.",
+      "title": "Parity article",
+      "topic": "operations",
+      "visibility": "gated"
+    },
+    {
+      "aliases": [
+        "alias.a"
+      ],
+      "body": "Body.",
+      "capabilityIds": [],
+      "digest": "sha256:f2aa2caa13d8f72809ee1e5d48a393c2397751df12559f6895b10bba3f37b460",
+      "id": "article.parity",
+      "keywords": [
+        "keyword.a"
+      ],
+      "name": "omit-a-capability",
+      "sourceDigests": [
+        "sha256:aa"
+      ],
+      "summary": "Summary.",
+      "title": "Parity article",
+      "topic": "operations",
+      "visibility": "gated"
+    },
+    {
+      "aliases": [
+        "alias.a"
+      ],
+      "body": "Body.",
+      "capabilityIds": [
+        "cap.a",
+        "cap.a"
+      ],
+      "digest": "sha256:688ad615e9d40b1bc623031852f615d9823617b9665300ceab5b873c9873baea",
+      "id": "article.parity",
+      "keywords": [
+        "keyword.a"
+      ],
+      "name": "duplicate-a-capability",
+      "sourceDigests": [
+        "sha256:aa"
+      ],
+      "summary": "Summary.",
+      "title": "Parity article",
+      "topic": "operations",
+      "visibility": "gated"
+    },
+    {
+      "aliases": [],
+      "body": "Body.",
+      "capabilityIds": [],
+      "digest": "sha256:60ea8432f43e04bef5fc24dc7baaf2094a37e005a66a03274320cf860604d10b",
+      "id": "article.parity",
+      "keywords": [],
+      "name": "empty-lists",
+      "sourceDigests": [
+        "sha256:aa"
+      ],
+      "summary": "Summary.",
+      "title": "Parity article",
+      "topic": "operations",
+      "visibility": "gated"
+    },
+    {
+      "aliases": [
+        ""
+      ],
+      "body": "Body.",
+      "capabilityIds": [],
+      "digest": "sha256:f64c59d170d04ced4b85c18cabf1eb81d14f527bbcd6e33f643f967e7b472680",
+      "id": "article.parity",
+      "keywords": [],
+      "name": "one-empty-string-alias",
+      "sourceDigests": [
+        "sha256:aa"
+      ],
+      "summary": "Summary.",
+      "title": "Parity article",
+      "topic": "operations",
+      "visibility": "gated"
+    },
+    {
+      "aliases": [
+        "café",
+        "😀"
+      ],
+      "body": "Body.",
+      "capabilityIds": [
+        "cap.😀"
+      ],
+      "digest": "sha256:c71c0f54182edddf0ecf66edbc7093d3cfdd82e3c2e399b2fa8100cffb458767",
+      "id": "article.parity",
+      "keywords": [
+        "naïve"
+      ],
+      "name": "multibyte-fields",
+      "sourceDigests": [
+        "sha256:aa"
+      ],
+      "summary": "Summary.",
+      "title": "Parity article",
+      "topic": "operations",
+      "visibility": "gated"
+    }
+  ],
+  "domainDigests": [
+    {
+      "digest": "sha256:3cfbbfe36a6508b24fe8b639206d42be08cd7164cef27028bed28643a614d7f0",
+      "domain": "grokptah.help.source.v1",
+      "fields": [
+        "provider.profiles",
+        "docs/P.md",
+        "Configure"
+      ],
+      "lengthPrefixed": "17:provider.profiles9:docs/P.md9:Configure"
+    },
+    {
+      "digest": "sha256:16451098ceee0ba71d5b61773f138974c45b716618d83aa57d3fddfb8324948b",
+      "domain": "grokptah.help.chunk.v1",
+      "fields": [
+        "provider.profiles",
+        "docs/P.md",
+        "Configure"
+      ],
+      "lengthPrefixed": "17:provider.profiles9:docs/P.md9:Configure"
+    },
+    {
+      "digest": "sha256:6f401513ae6074259ffae708a2d4798160b0e4831aa874ad73103d36abae3ee7",
+      "domain": "grokptah.help.article.v1",
+      "fields": [],
+      "lengthPrefixed": ""
+    },
+    {
+      "digest": "sha256:fe0c63e9f2d16d70bfd38ae99effa6614d026e767959737111497b0f4bfa09a9",
+      "domain": "grokptah.help.article.v1",
+      "fields": [
+        ""
+      ],
+      "lengthPrefixed": "0:"
+    },
+    {
+      "digest": "sha256:0982c7bf358c7f242715dc1de7bbe4f4a1f3ac09eb36f9efc3237922b2b2ece8",
+      "domain": "grokptah.help.article.v1",
+      "fields": [
+        "",
+        ""
+      ],
+      "lengthPrefixed": "0:0:"
+    },
+    {
+      "digest": "sha256:b8500d30e5558d2ed91c1e1a050115b034d827f2b9ddb2421f0b0a7c461d7403",
+      "domain": "grokptah.help.request.v1",
+      "fields": [
+        "a|b"
+      ],
+      "lengthPrefixed": "3:a|b"
+    },
+    {
+      "digest": "sha256:0371ca6ea63968d0611e5e8ebf9f83336afbced01f23c16e40f9a4fdce4fb8f1",
+      "domain": "grokptah.help.request.v1",
+      "fields": [
+        "a",
+        "b"
+      ],
+      "lengthPrefixed": "1:a1:b"
+    },
+    {
+      "digest": "sha256:22e812469a2b81b31fa5ef5d77dc810da481fb11311c8b8a31d3d97381e56ba3",
+      "domain": "grokptah.help.claim.v1",
+      "fields": [
+        "😀"
+      ],
+      "lengthPrefixed": "4:😀"
+    },
+    {
+      "digest": "sha256:4f3c36b0cf8625757f165001d581b8124c0b955a599ced1311a6136624a2f0ea",
+      "domain": "grokptah.help.claim.v1",
+      "fields": [
+        "café",
+        "naïve"
+      ],
+      "lengthPrefixed": "5:café6:naïve"
+    },
+    {
+      "digest": "sha256:f1cd932809e0cc4c55b2d8fc0176cca68f511d4bfd57e3606a833dfcc35da953",
+      "domain": "grokptah.help.grant.v1",
+      "fields": [
+        "1:2",
+        "3"
+      ],
+      "lengthPrefixed": "3:1:21:3"
+    },
+    {
+      "digest": "sha256:0eca026952d5994ed409518e0a04a3ac7d8b132c92493c978b870cb94bb59fab",
+      "domain": "grokptah.help.receipt.v1",
+      "fields": [
+        "line\nbreak",
+        "tab\there"
+      ],
+      "lengthPrefixed": "10:line\nbreak8:tab\there"
+    },
+    {
+      "digest": "sha256:356e826776c181f044a65e3496f5a65948998aecc159231bf63c5257fc6c9417",
+      "domain": "grokptah.help.manifest.v1",
+      "fields": [
+        "\"quoted\"",
+        "back\\slash"
+      ],
+      "lengthPrefixed": "8:\"quoted\"10:back\\slash"
+    }
+  ],
+  "note": "Generated by help-codegen. Asserted by the TypeScript digest tests so the two implementations cannot drift.",
+  "sha256": [
+    {
+      "input": "",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "input": "abc",
+      "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    },
+    {
+      "input": "café",
+      "sha256": "850f7dc43910ff890f8879c0ed26fe697c93a067ad93a7d50f466a7028a9bf4e"
+    },
+    {
+      "input": "😀",
+      "sha256": "f0443a342c5ef54783a111b51ba56c938e474c32324d90c3a60c9c8e3a37e2d9"
+    },
+    {
+      "input": "a\nb",
+      "sha256": "7e18f737311b2dc3b2f269dd78396b0351f14fb66efa879f768cb23181883c78"
+    }
+  ]
+}
