@@ -317,7 +317,7 @@ Local gate, run in isolated worktrees with tests unmodified:
   cargo check --all-targets   ->  0 errors, 2 pre-existing warnings
   cargo test --no-fail-fast -- --test-threads=1
 
-The single failure is identical on both sides:
+The single failure is identical in all three runs:
   continuity_probe_is_evidence_first_and_recoverable
 It fails on clean main in this container because it spawns a Node harness
 that cannot complete without network. It is pre-existing, not introduced.
