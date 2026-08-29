@@ -532,16 +532,24 @@ async fn authenticate_request(
             ),
         );
     }
-    // Health/readiness are unauthenticated only for loopback listeners. A
-    // service explicitly exposed beyond the host must authenticate probes too.
-    if matches!(request.uri().path(), "/health" | "/ready") && !state.health_requires_auth {
-        return next.run(request).await;
-    }
     let auth_header = request
         .headers()
         .get(axum::http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok());
-    match state.orch.auth_header(auth_header) {
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    // Health/readiness may be probed without credentials on a loopback
+    // listener. A caller that *does* present a bearer is still authenticated
+    // here, so a credentialed probe reaches the authoritative readiness result
+    // instead of being pinned to the unauthenticated projection — and a bad
+    // credential is rejected rather than silently downgraded. A service
+    // explicitly exposed beyond the host must authenticate probes too.
+    if matches!(request.uri().path(), "/health" | "/ready")
+        && !state.health_requires_auth
+        && auth_header.is_none()
+    {
+        return next.run(request).await;
+    }
+    match state.orch.auth_header(auth_header.as_deref()) {
         Ok(auth) => {
             request.extensions_mut().insert(auth);
             next.run(request).await
@@ -582,49 +590,102 @@ struct ReadinessSnapshot {
     payload: Value,
 }
 
+/// Health keys that, when populated, mean this process is not ready to serve.
+const READINESS_BLOCKING_HEALTH_KEYS: &[&str] = &[
+    "eventJournalPersistenceError",
+    "auditPersistenceError",
+    "runPersistenceError",
+    "workloadSupervisorError",
+    "routineSupervisorError",
+    "managerSupervisorError",
+    "nativeExecutorError",
+    "serviceError",
+];
+
+/// The readiness verdict for a capacity payload: ready only when no
+/// persistence or supervisor fault is reported.
+fn payload_is_ready(payload: &Value) -> bool {
+    let health = payload.get("health").cloned().unwrap_or_else(|| json!({}));
+    READINESS_BLOCKING_HEALTH_KEYS
+        .iter()
+        .all(|key| health.get(*key).is_none_or(Value::is_null))
+}
+
+fn readiness_status(ready: bool) -> StatusCode {
+    if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
 fn readiness_snapshot(state: &AppState, auth: &AuthContext) -> ReadinessSnapshot {
     let payload = state
         .orch
         .get_capacity(auth)
         .unwrap_or_else(|error| json!({"health": {"serviceError": error.message}}));
-    let health = payload.get("health").cloned().unwrap_or_else(|| json!({}));
-    let ready = [
-        "eventJournalPersistenceError",
-        "auditPersistenceError",
-        "runPersistenceError",
-        "workloadSupervisorError",
-        "routineSupervisorError",
-        "managerSupervisorError",
-        "nativeExecutorError",
-        "serviceError",
-    ]
-    .iter()
-    .all(|key| health.get(*key).is_none_or(Value::is_null));
+    let ready = payload_is_ready(&payload);
     ReadinessSnapshot { ready, payload }
+}
+
+/// Readiness verdict for a caller that presented no credential.
+///
+/// Readiness is a property of this process, not of the caller, and
+/// [`OrchestrationService::get_capacity`] ignores the context it is handed.
+/// The placeholder below therefore records no authorization decision; it only
+/// satisfies that signature while the authority spine is consolidated
+/// elsewhere. This returns a bare `bool` by construction: the diagnostic
+/// payload is dropped inside this function and cannot reach an unauthenticated
+/// response. Should `get_capacity` ever start refusing the placeholder, the
+/// error path marks the service not ready, which fails closed.
+fn unauthenticated_readiness_verdict(state: &AppState) -> bool {
+    let probe = AuthContext {
+        token_id: "loopback-readiness-probe".into(),
+        owner_id: "loopback-readiness-probe".into(),
+    };
+    readiness_snapshot(state, &probe).ready
 }
 
 async fn ready_handler(
     State(state): State<AppState>,
     auth: Option<Extension<AuthContext>>,
 ) -> Response {
+    // Readiness must never lie. The unauthenticated loopback projection is
+    // secret-free — no capacity payload, no error strings, no session or
+    // filesystem telemetry — but it still reports the real verdict, so a probe
+    // cannot see 200 while persistence or a supervisor is failing. Callers that
+    // need the diagnostics behind the verdict authenticate and get them below.
     let Some(Extension(auth)) = auth else {
-        return (StatusCode::OK, Json(public_probe_payload())).into_response();
+        let ready = unauthenticated_readiness_verdict(&state);
+        return (
+            readiness_status(ready),
+            Json(readiness_envelope(ready, None)),
+        )
+            .into_response();
     };
     let snapshot = readiness_snapshot(&state, &auth);
-    let status = if snapshot.ready {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
-    };
     (
-        status,
-        Json(json!({
-            "ok": snapshot.ready,
-            "ready": snapshot.ready,
-            "capacity": snapshot.payload,
-        })),
+        readiness_status(snapshot.ready),
+        Json(readiness_envelope(snapshot.ready, Some(snapshot.payload))),
     )
         .into_response()
+}
+
+/// Readiness response body. `authoritative` describes the *verdict*, which is
+/// always real; `capacity` is present only for an authenticated caller.
+fn readiness_envelope(ready: bool, capacity: Option<Value>) -> Value {
+    let mut body = json!({
+        "ok": ready,
+        "ready": ready,
+        "status": if ready { "ready" } else { "not_ready" },
+        "authoritative": true,
+        "service": "grokptah-control",
+        "transport": "mcp-streamable-http",
+    });
+    if let Some(capacity) = capacity {
+        body["capacity"] = capacity;
+    }
+    body
 }
 
 fn public_probe_payload() -> Value {
@@ -637,29 +698,152 @@ fn public_probe_payload() -> Value {
     })
 }
 
-fn loopback_request_allowed(request: &axum::extract::Request) -> bool {
-    request
-        .headers()
-        .get(axum::http::header::HOST)
-        .is_none_or(loopback_host_header)
-        && request
-            .headers()
-            .get(axum::http::header::ORIGIN)
-            .is_none_or(loopback_origin_header)
+/// One normalized authority (`host` plus optional `port`) taken from a request.
+///
+/// Normalization happens once, up front, so that later comparisons and the
+/// loopback test cannot be fooled by ASCII case, IPv6 spelling, or brackets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RequestAuthority {
+    /// Lowercased registered name, or an IPv6 literal in canonical `[..]` form.
+    host: String,
+    port: Option<u16>,
 }
 
-fn loopback_host_header(value: &HeaderValue) -> bool {
-    value
-        .to_str()
-        .ok()
-        .and_then(|raw| raw.parse::<Authority>().ok())
-        .is_some_and(|authority| is_loopback_host(authority.host()))
+impl RequestAuthority {
+    /// Parse one `host[:port]` authority, or return `None` for anything this
+    /// listener refuses to interpret.
+    fn parse(raw: &str) -> Option<Self> {
+        // Userinfo is never sent by a browser and is the classic
+        // `http://127.0.0.1@attacker.example/` confusion vector: reject it
+        // before the permissive `Authority` grammar silently strips it.
+        if raw.contains('@') {
+            return None;
+        }
+        let authority: Authority = raw.parse().ok()?;
+        let host = authority.host();
+        let port = authority.port();
+        // `Authority::host` stops at the first `]`, so `[::1]attacker.example`
+        // would otherwise present itself as the loopback `[::1]`. Require the
+        // value to be exactly `host` or `host:port`, with nothing left over.
+        let accounted = host.len() + port.as_ref().map_or(0, |port| 1 + port.as_str().len());
+        if authority.as_str().len() != accounted {
+            return None;
+        }
+        Some(Self {
+            host: normalize_authority_host(host)?,
+            port: port.map(|port| port.as_u16()),
+        })
+    }
+
+    /// True only for a real loopback destination.
+    ///
+    /// `localhost` is accepted as the reserved name (RFC 6761); any other
+    /// registered name — including rebinding shapes such as
+    /// `localhost.attacker.example` or `attacker.localhost` — is not, because
+    /// its resolution is attacker-controlled.
+    fn is_loopback(&self) -> bool {
+        if self.host == "localhost" {
+            return true;
+        }
+        match self
+            .host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+        {
+            Some(inner) => inner
+                .parse::<std::net::Ipv6Addr>()
+                .is_ok_and(|ip| ip.is_loopback()),
+            // An IPv6 literal must be bracketed in an authority; a bare `::1`
+            // here is malformed, so only dotted-quad IPv4 is accepted.
+            None => self
+                .host
+                .parse::<std::net::Ipv4Addr>()
+                .is_ok_and(|ip| ip.is_loopback()),
+        }
+    }
+}
+
+/// Normalize the host portion of an authority, rejecting malformed shapes.
+fn normalize_authority_host(host: &str) -> Option<String> {
+    if host.is_empty() {
+        return None;
+    }
+    if let Some(inner) = host.strip_prefix('[') {
+        // Only an IPv6 literal may be bracketed, and it must parse.
+        let ip: std::net::Ipv6Addr = inner.strip_suffix(']')?.parse().ok()?;
+        return Some(format!("[{ip}]"));
+    }
+    // A stray bracket or colon outside a bracketed literal is malformed.
+    if host.contains(':') || host.contains(']') {
+        return None;
+    }
+    Some(host.to_ascii_lowercase())
+}
+
+/// Decide whether a request may be served by a loopback listener.
+///
+/// Browser code can reach a loopback listener, so every authority the request
+/// carries has to name this host. Checking `Host` alone is bypassable: an
+/// absolute-form request target (`GET http://attacker.example/ HTTP/1.1`) and
+/// an HTTP/2 `:authority` both land on [`Uri`] rather than in a header, and
+/// either one can carry a hostile name — or arrive with no `Host` at all. So
+/// the effective request authority is validated together with `Host`, the two
+/// must agree when both are present, and duplicate or absent inputs fail
+/// closed rather than letting an intermediary pick the value.
+fn loopback_request_allowed(request: &axum::extract::Request) -> bool {
+    let headers = request.headers();
+
+    // Duplicate authority inputs are ambiguous: two intermediaries may read
+    // different values from the same request, so refuse instead of choosing.
+    if headers.get_all(axum::http::header::HOST).iter().count() > 1
+        || headers.get_all(axum::http::header::ORIGIN).iter().count() > 1
+    {
+        return false;
+    }
+
+    // Effective request authority: present for an absolute-form target and for
+    // HTTP/2 `:authority`, absent for an ordinary origin-form HTTP/1.1 request.
+    let mut targets: Vec<RequestAuthority> = Vec::new();
+    if let Some(authority) = request.uri().authority() {
+        match RequestAuthority::parse(authority.as_str()) {
+            Some(parsed) => targets.push(parsed),
+            None => return false,
+        }
+    }
+    if let Some(value) = headers.get(axum::http::header::HOST) {
+        match value.to_str().ok().and_then(RequestAuthority::parse) {
+            Some(parsed) => targets.push(parsed),
+            None => return false,
+        }
+    }
+
+    // A request that names no authority cannot be attributed to this listener.
+    let Some(first) = targets.first() else {
+        return false;
+    };
+    // RFC 9112 3.2.1: a target authority and a `Host` that disagree are a
+    // smuggling or rebinding attempt, not something to guess about.
+    if targets.iter().any(|authority| authority != first) {
+        return false;
+    }
+    if !first.is_loopback() {
+        return false;
+    }
+
+    // `Origin` names the calling document rather than this listener, so it
+    // carries its own scheme and may legitimately use a different loopback
+    // port. It still must be a loopback origin.
+    match headers.get(axum::http::header::ORIGIN) {
+        Some(value) => loopback_origin_header(value),
+        None => true,
+    }
 }
 
 fn loopback_origin_header(value: &HeaderValue) -> bool {
     let Ok(raw) = value.to_str() else {
         return false;
     };
+    // `Origin: null` and every other opaque origin are not this host.
     let Ok(origin) = raw.parse::<Uri>() else {
         return false;
     };
@@ -669,16 +853,15 @@ fn loopback_origin_header(value: &HeaderValue) -> bool {
     if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
         return false;
     }
+    // A serialized origin is scheme + authority only; anything richer is not
+    // an origin a browser produced.
+    if !matches!(origin.path(), "" | "/") || origin.query().is_some() {
+        return false;
+    }
     origin
         .authority()
-        .is_some_and(|authority| is_loopback_host(authority.host()))
-}
-
-fn is_loopback_host(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
+        .and_then(|authority| RequestAuthority::parse(authority.as_str()))
+        .is_some_and(|authority| authority.is_loopback())
 }
 
 async fn fail_closed_fallback() -> impl IntoResponse {
@@ -3745,6 +3928,183 @@ mod tests {
     use crate::{home_override_serial, set_grokptah_home_override};
     use chrono::Utc;
     use tempfile::tempdir;
+
+    fn authority(raw: &str) -> Option<RequestAuthority> {
+        RequestAuthority::parse(raw)
+    }
+
+    fn origin_allowed(raw: &str) -> bool {
+        loopback_origin_header(&HeaderValue::from_str(raw).unwrap())
+    }
+
+    #[test]
+    fn authority_accepts_only_true_loopback_destinations() {
+        for raw in [
+            "127.0.0.1",
+            "127.0.0.1:8080",
+            "127.1.2.3:8080",
+            "LOCALHOST:8080",
+            "localhost",
+            "[::1]",
+            "[::1]:8080",
+            "[0:0:0:0:0:0:0:1]:8080",
+        ] {
+            assert!(
+                authority(raw).is_some_and(|parsed| parsed.is_loopback()),
+                "expected loopback: {raw}"
+            );
+        }
+
+        for raw in [
+            // Routable and unspecified addresses are not this host.
+            "10.0.0.1:8080",
+            "0.0.0.0:8080",
+            "[::]:8080",
+            "[2001:db8::1]:8080",
+            // An IPv4-mapped address is not an IPv6 loopback address.
+            "[::ffff:127.0.0.1]:8080",
+            // DNS rebinding shapes: resolution is attacker-controlled.
+            "localhost.attacker.example",
+            "attacker.localhost",
+            "localhost.",
+            "127.0.0.1.attacker.example",
+            "attacker.example",
+        ] {
+            assert!(
+                !authority(raw).is_some_and(|parsed| parsed.is_loopback()),
+                "expected rejection: {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn authority_rejects_userinfo_and_malformed_values() {
+        for raw in [
+            // Userinfo must never make an authority look like loopback.
+            "127.0.0.1@attacker.example",
+            "attacker.example@127.0.0.1",
+            "user:pass@localhost:8080",
+            // Malformed or ambiguous shapes.
+            "",
+            ":8080",
+            "[::1",
+            "::1]",
+            "[not-an-ip]",
+            "[::1]extra",
+            // A bare IPv6 literal must be bracketed inside an authority.
+            "::1",
+            "127.0.0.1:notaport",
+            "127.0.0.1/../evil",
+            "127.0.0.1 attacker.example",
+            "127.0.0.1,attacker.example",
+        ] {
+            assert!(
+                !authority(raw).is_some_and(|parsed| parsed.is_loopback()),
+                "expected rejection: {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn authority_normalization_makes_equal_authorities_compare_equal() {
+        assert_eq!(authority("LocalHost:7331"), authority("localhost:7331"));
+        assert_eq!(authority("[0:0:0:0:0:0:0:1]:7331"), authority("[::1]:7331"));
+        // A differing port is a differing authority.
+        assert_ne!(authority("localhost:7331"), authority("localhost:7332"));
+        assert_ne!(authority("localhost:7331"), authority("127.0.0.1:7331"));
+    }
+
+    #[test]
+    fn origin_header_policy_is_closed() {
+        for raw in [
+            "http://127.0.0.1:8080",
+            "https://localhost",
+            "http://[::1]:8080",
+        ] {
+            assert!(origin_allowed(raw), "expected allowed origin: {raw}");
+        }
+        for raw in [
+            "null",
+            "http://attacker.example",
+            "https://localhost.attacker.example",
+            // Non-HTTP(S) schemes are not loopback origins.
+            "file://localhost",
+            "chrome-extension://localhost",
+            // Userinfo and non-origin shapes.
+            "http://attacker.example@127.0.0.1",
+            "http://127.0.0.1:8080/path",
+            "http://127.0.0.1:8080/?q=1",
+            "127.0.0.1:8080",
+        ] {
+            assert!(!origin_allowed(raw), "expected rejected origin: {raw}");
+        }
+    }
+
+    #[test]
+    fn readiness_verdict_tracks_persistence_and_supervisor_faults() {
+        assert!(payload_is_ready(&json!({"health": {}})));
+        assert!(payload_is_ready(&json!({})));
+        // A populated non-blocking key does not make the service unready.
+        assert!(payload_is_ready(
+            &json!({"health": {"laggedLiveEvents": 12}})
+        ));
+        // Explicit nulls mean "no fault recorded".
+        assert!(payload_is_ready(
+            &json!({"health": {"runPersistenceError": null}})
+        ));
+
+        for key in READINESS_BLOCKING_HEALTH_KEYS {
+            let payload = json!({"health": {*key: "boom"}});
+            assert!(!payload_is_ready(&payload), "{key} must block readiness");
+            assert_eq!(
+                readiness_status(payload_is_ready(&payload)),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{key} must map to 503"
+            );
+        }
+        assert_eq!(readiness_status(true), StatusCode::OK);
+    }
+
+    #[test]
+    fn readiness_envelope_is_truthful_and_secret_free_without_capacity() {
+        let unhealthy = readiness_envelope(false, None);
+        assert_eq!(unhealthy["ok"], false);
+        assert_eq!(unhealthy["ready"], false);
+        assert_eq!(unhealthy["status"], "not_ready");
+        assert_eq!(unhealthy["authoritative"], true);
+        assert!(unhealthy.get("capacity").is_none());
+        let rendered = unhealthy.to_string().to_ascii_lowercase();
+        for needle in [
+            "capacity",
+            "credential",
+            "error",
+            "path",
+            "persistence",
+            "secret",
+            "session",
+            "supervisor",
+            "token",
+            "workspace",
+        ] {
+            assert!(!rendered.contains(needle), "leaked {needle}: {unhealthy}");
+        }
+
+        let healthy = readiness_envelope(true, Some(json!({"health": {}})));
+        assert_eq!(healthy["ok"], true);
+        assert_eq!(healthy["status"], "ready");
+        assert_eq!(healthy["capacity"], json!({"health": {}}));
+    }
+
+    #[test]
+    fn public_health_probe_is_a_closed_liveness_envelope() {
+        let payload = public_probe_payload();
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["status"], "alive");
+        assert_eq!(payload["authoritative"], false);
+        // Liveness asserts nothing about readiness.
+        assert!(payload.get("ready").is_none());
+        assert!(payload.get("capacity").is_none());
+    }
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]

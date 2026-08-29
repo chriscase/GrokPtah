@@ -336,6 +336,38 @@ function finish(ok) {
   process.exit(ok && failed.length === 0 ? 0 : 1);
 }
 
+/// Readiness must never answer 200 while the service is unready. The
+/// unauthenticated projection withholds diagnostics but reports the real
+/// verdict; a bearer reaches the authoritative result, and both must agree.
+async function recordReadinessTruthfulness(mode) {
+  const ready = await fetch(`${base}/ready`);
+  const rj = await ready.json();
+  record(
+    `readinessTruthful_${mode}`,
+    ready.status === 200 &&
+      rj.ok === true &&
+      rj.ready === true &&
+      rj.status === "ready" &&
+      rj.authoritative === true &&
+      rj.capacity === undefined,
+    rj
+  );
+  const authed = await fetch(`${base}/ready`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const aj = await authed.json();
+  record(
+    `authenticatedReadinessIsAuthoritative_${mode}`,
+    authed.status === 200 &&
+      aj.ready === true &&
+      aj.authoritative === true &&
+      !!aj.capacity &&
+      typeof aj.capacity.health === "object" &&
+      aj.ready === rj.ready,
+    { ready: aj.ready, authoritative: aj.authoritative }
+  );
+}
+
 async function runCapacity429Mode() {
   sampleResources("capacity429_start");
   const health = await fetch(`${base}/health`);
@@ -349,6 +381,15 @@ async function runCapacity429Mode() {
       hj.capacity === undefined,
     hj
   );
+  // The configured bound is still asserted — an authenticated probe carries it.
+  const authedHealth = await fetch(`${base}/health`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const ahj = await authedHealth.json();
+  record("loweredCapacityConfigured", Number(ahj.maxConcurrent) === 2, {
+    maxConcurrent: ahj.maxConcurrent,
+  });
+  await recordReadinessTruthfulness("capacity429");
   // Hold 2 permits (inject ~400ms, timeout 5s) then overflow must 429.
   const holders = [1, 2].map((id) =>
     mcpFetch("tools/list", {}, { id, timeoutMs: 8000 }).catch((e) => ({
@@ -384,6 +425,7 @@ async function runCapacityTimeoutMode() {
       hj.capacity === undefined,
     hj
   );
+  await recordReadinessTruthfulness("timeout");
   // inject 500ms > request timeout 80ms → 504 timeout
   const timed = await mcpFetch("tools/list", {}, { id: 100, timeoutMs: 5000 }).catch((e) => ({
     status: 0,
@@ -420,6 +462,7 @@ async function runFullMode() {
       hj.capacity === undefined,
     hj
   );
+  await recordReadinessTruthfulness("full");
   record(
     "loopbackOnlyBind",
     ["127.0.0.1", "localhost"].includes(new URL(base).hostname),

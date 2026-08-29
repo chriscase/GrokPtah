@@ -161,7 +161,7 @@ event has been delivered.
 | Paths | `POST/GET/DELETE /mcp` (Streamable HTTP); `POST /` legacy alias; `GET /health` |
 | Auth | `Authorization: Bearer <token>` on every `/mcp` request |
 | Auth order | Middleware authenticates **before** body work / tool dispatch |
-| Loopback request policy | Host must be loopback (or absent); Origin must be absent or loopback |
+| Loopback request policy | Every authority the request carries must name this host: the effective request authority (absolute-form target / HTTP2 `:authority`) **and** `Host` must agree and be loopback, `Origin` must be absent or a loopback `http(s)` origin. Duplicate `Host`/`Origin`, userinfo, a missing authority, and malformed values are refused with **400** before authentication. |
 | Body limit | **256 KiB** (`DefaultBodyLimit` + handler check) |
 | Concurrent MCP requests | Default **32** → HTTP **429** + JSON-RPC error `data.code=capacity_exhausted` |
 | Request timeout | Default **120 s** → HTTP **504** + `data.code=timeout` |
@@ -169,19 +169,50 @@ event has been delivered.
 | Protocol versions | `2025-11-25`, `2025-06-18`, `2025-03-26`, `2024-11-05`, `2024-10-07` |
 | Content | JSON responses preferred; scoped GET may open a bounded SSE run stream |
 
-### Health/readiness (unauthenticated, loopback)
+### Health and readiness
+
+`/health` is liveness. Unauthenticated loopback probes get a closed,
+non-authoritative envelope that asserts nothing about readiness and never
+carries host-wide capacity or session telemetry, persistence/supervisor
+errors, or filesystem details:
 
 ```http
 GET /health
 → 200 {"ok":true,"status":"alive","authoritative":false,"transport":"mcp-streamable-http",...}
 ```
 
-Loopback probes intentionally expose only a closed, non-authoritative
-liveness envelope; they do not assert a `ready` value. They never include host-wide capacity or session
-telemetry, persistence/supervisor errors, or filesystem details. `/ready` has
-the same projection for unauthenticated loopback callers. Deployments that
-need an authoritative readiness result must bind remotely with authenticated
-health probes.
+`/ready` is readiness, and it never reports a healthy status it has not
+verified. The unauthenticated loopback projection withholds the same
+diagnostics `/health` does, but its verdict — and therefore its status code —
+is the real one:
+
+```http
+GET /ready
+→ 200 {"ok":true,"ready":true,"status":"ready","authoritative":true,...}
+→ 503 {"ok":false,"ready":false,"status":"not_ready","authoritative":true,...}
+```
+
+A request is not ready while any of `eventJournalPersistenceError`,
+`auditPersistenceError`, `runPersistenceError`, `workloadSupervisorError`,
+`routineSupervisorError`, `managerSupervisorError`, `nativeExecutorError`, or
+`serviceError` is populated.
+
+A caller that presents a valid bearer gets the authoritative result with its
+diagnostics — on a loopback listener too, so an operator is never forced to
+choose between an open probe and a truthful one. The same bearer turns
+`/health` into the detailed envelope (capacity, sessions, concurrency bounds).
+An invalid bearer on either route is rejected with **401** rather than
+downgraded to the unauthenticated projection:
+
+```http
+GET /ready
+Authorization: Bearer <token>
+→ 200 {"ok":true,"ready":true,"authoritative":true,"capacity":{"health":{...},...}}
+```
+
+Non-loopback listeners must be started with authenticated health probes
+(`health_requires_auth`), so every probe there is authenticated and
+authoritative.
 
 ### Lifecycle
 
