@@ -2044,6 +2044,70 @@ async fn a_killed_owner_leaves_a_takeable_home_and_a_readable_ledger() {
     assert_clean_shutdown(&replacement.shutdown().await);
 }
 
+/// The other half of the drain: once the seal holds, no writer can still land a
+/// journal entry — including one handed to a bus clone that outlived shutdown.
+///
+/// Draining before the seal is what lets the writer finish its work; this is
+/// what stops that ordering from becoming a hole. A clone of the bus is kept
+/// alive on purpose and published through after the stop, because that is the
+/// shape a stale supervisor or a cached handle takes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn no_journal_write_can_land_after_the_seal() {
+    let lane = Lane::new();
+    let (runtime, session_id) = lane.boot();
+    let bus = runtime.event_bus();
+    for i in 0..64 {
+        bus.publish(SessionUpdate::AgentMessageChunk {
+            session_id,
+            text: format!("before-{i}"),
+        });
+    }
+
+    assert_clean_shutdown(&runtime.shutdown().await);
+
+    let journal = lane
+        .grokptah_home()
+        .join("orchestration")
+        .join("event_journal.jsonl");
+    let sealed_bytes = std::fs::read(&journal).expect("the journal was persisted before the seal");
+    assert!(
+        !sealed_bytes.is_empty(),
+        "the pre-seal traffic must have been written, or this proves nothing"
+    );
+    assert!(!bus.journal_writer_is_live());
+
+    // A stale clone publishing after the stop must not reach the journal.
+    for i in 0..64 {
+        bus.publish(SessionUpdate::AgentMessageChunk {
+            session_id,
+            text: format!("after-{i}"),
+        });
+    }
+    let after_bytes = std::fs::read(&journal).unwrap();
+    assert_eq!(
+        after_bytes, sealed_bytes,
+        "no journal byte may be written after the durable-write seal"
+    );
+    let text = String::from_utf8_lossy(&after_bytes);
+    assert!(text.contains("before-63"), "pre-seal traffic is present");
+    assert!(
+        !text.contains("after-"),
+        "post-seal traffic must never appear in the journal"
+    );
+
+    // And the seal really did complete: the home is takeable.
+    let replacement = restart_same_home_now(&lane);
+    let replacement_journal =
+        std::fs::read(&journal).expect("a replacement opens the same journal");
+    assert!(
+        replacement_journal.starts_with(&sealed_bytes)
+            || replacement_journal.len() >= sealed_bytes.len(),
+        "the replacement owns the journal; it does not lose what the last owner sealed"
+    );
+    assert_clean_shutdown(&replacement.shutdown().await);
+}
+
 /// P1 — a lease may only be bound to a runtime that owns its home.
 ///
 /// Binding is refused across homes, and — the part that matters — the refusal
