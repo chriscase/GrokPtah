@@ -334,7 +334,7 @@ impl HostAuthority {
             return Err(AuthorityError::Unauthenticated);
         }
         let fingerprint = credential_fingerprint(token);
-        self.read(|state| {
+        let auth = self.read(|state| {
             if state.credentials.is_empty() {
                 return Err(AuthorityError::Unauthenticated);
             }
@@ -354,7 +354,16 @@ impl HostAuthority {
                 credential_id: record.credential_id.clone(),
                 owner_id: record.owner_id.clone(),
             })
-        })
+        })?;
+        // An authentication that cannot be recorded grants nothing: the
+        // context is discarded rather than returned unaudited.
+        self.append_audit(
+            auth.control_epoch.raw(),
+            crate::audit::AuditEvent::Authenticated {
+                principal: auth.principal.public_handle(),
+            },
+        )?;
+        Ok(auth)
     }
 
     /// Confirm a previously minted context is still current.
@@ -406,7 +415,7 @@ impl HostAuthority {
         workspace: WorkspaceId,
         initial_observation: ContentDigest,
     ) -> Result<ResourceIncarnation, AuthorityError> {
-        self.with_state(|state| {
+        let issued = self.with_state(|state| {
             require_current_state(state, auth)?;
             let incarnation = ResourceIncarnation::mint();
             let record = StoredResource {
@@ -421,8 +430,19 @@ impl HostAuthority {
                 observation_digest: initial_observation.to_hex(),
             };
             state.resources.insert(incarnation.to_hex(), record);
-            Ok(incarnation)
-        })
+            Ok((incarnation, session, workspace))
+        })?;
+        let (incarnation, session, workspace) = issued;
+        self.append_audit(
+            auth.control_epoch.raw(),
+            crate::audit::AuditEvent::ResourceIssued {
+                resource: incarnation.public_handle(),
+                principal: auth.principal.public_handle(),
+                session: session.public_handle(),
+                workspace: workspace.public_handle(),
+            },
+        )?;
+        Ok(incarnation)
     }
 
     /// The binding a host-issued resource carries.
