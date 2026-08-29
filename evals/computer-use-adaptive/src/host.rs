@@ -92,7 +92,7 @@ pub struct AgentSpec {
 pub struct WorldSpec {
     pub run_id: String,
     pub surfaces: Vec<SurfaceSpec>,
-    pub grant: GrantSpec,
+    pub grant: Option<GrantSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visual_grant: Option<VisualGrant>,
     pub agents: Vec<AgentSpec>,
@@ -155,11 +155,33 @@ pub struct ScheduledEvent {
 pub struct TraceEvent {
     pub step: u32,
     pub clock_ms: u64,
-    pub kind: String,
+    pub kind: TraceKind,
     pub detail: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceKind {
+    Agent,
+    Cancel,
+    Contention,
+    Crash,
+    Deny,
+    Dispatch,
+    Downgrade,
+    Grant,
+    Observe,
+    Overlap,
+    Restart,
+    Takeover,
+    Target,
+    Timeout,
+    Uncertain,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct PhysicalRecord {
     pub dispatch_id: String,
     pub permitted: bool,
@@ -167,6 +189,15 @@ pub struct PhysicalRecord {
     pub surface_id: String,
     pub conflict_domain: String,
     pub clock_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ObservationRecord {
+    pub observation_id: String,
+    pub encoded_bytes: u64,
+    pub image_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -196,7 +227,7 @@ pub struct Host {
     pub caps: ModelCapability,
     pub run_id: String,
     surfaces: BTreeMap<String, SurfaceState>,
-    grant: GrantSpec,
+    grant: Option<GrantSpec>,
     visual_grant: bool,
     visual_grant_id: Option<String>,
     leases: BTreeMap<String, LeaseRec>,
@@ -348,16 +379,72 @@ impl Host {
     }
 
     fn log(&mut self, kind: &str, detail: impl Into<String>) {
+        let kind = match kind {
+            "agent" => TraceKind::Agent,
+            "cancel" => TraceKind::Cancel,
+            "contention" => TraceKind::Contention,
+            "crash" => TraceKind::Crash,
+            "deny" => TraceKind::Deny,
+            "dispatch" => TraceKind::Dispatch,
+            "downgrade" => TraceKind::Downgrade,
+            "grant" => TraceKind::Grant,
+            "observe" => TraceKind::Observe,
+            "overlap" => TraceKind::Overlap,
+            "restart" => TraceKind::Restart,
+            "takeover" => TraceKind::Takeover,
+            "target" => TraceKind::Target,
+            "timeout" => TraceKind::Timeout,
+            "uncertain" => TraceKind::Uncertain,
+            other => panic!("untyped trace kind: {other}"),
+        };
         self.trace.push(TraceEvent {
             step: self.step,
             clock_ms: self.clock,
-            kind: kind.into(),
+            kind,
             detail: {
                 let mut d = detail.into();
                 d.truncate(256);
                 d
             },
         });
+    }
+
+    pub fn observation_records(&self) -> Vec<ObservationRecord> {
+        self.observations
+            .values()
+            .map(|observation| ObservationRecord {
+                observation_id: observation.observation_id.clone(),
+                encoded_bytes: serde_json::to_vec(observation)
+                    .map(|bytes| bytes.len() as u64)
+                    .unwrap_or(0),
+                image_bytes: observation.image_bytes,
+            })
+            .collect()
+    }
+
+    pub fn physical_records(&self) -> Vec<PhysicalRecord> {
+        self.physical.clone()
+    }
+
+    /// Test/evaluator fault injection: simulates a backend that mutates despite
+    /// a denied kernel decision. The evidence oracle must always detect this.
+    pub fn inject_unauthorized_backend_mutation(&mut self) {
+        self.dispatch_seq += 1;
+        let dispatch_id = format!("disp_injected_{}", self.dispatch_seq);
+        self.physical.push(PhysicalRecord {
+            dispatch_id: dispatch_id.clone(),
+            permitted: false,
+            agent_id: self.primary_agent.clone(),
+            surface_id: self.primary_surface.clone(),
+            conflict_domain: self
+                .surfaces
+                .get(&self.primary_surface)
+                .map(|surface| surface.spec.conflict_domain.clone())
+                .unwrap_or_default(),
+            clock_ms: self.clock,
+        });
+        self.unauthorized = self.unauthorized.saturating_add(1);
+        self.log("dispatch", format!("{dispatch_id};permitted=false"));
     }
 
     pub fn apply_script(&mut self, phase: EventPhase) {
@@ -459,7 +546,9 @@ impl Host {
                 self.log("grant", "visual grounding authorized separately");
             }
             EventKind::ExpireGrant {} => {
-                self.grant.expires_at_ms = self.clock;
+                if let Some(grant) = self.grant.as_mut() {
+                    grant.expires_at_ms = self.clock;
+                }
                 self.log("grant", "expired");
             }
             EventKind::SecondAgentSameDomain {} => {
@@ -706,9 +795,17 @@ impl Host {
             cancelled: self.cancelled,
             timeout_before_send: matches!(self.timeout, Some(TimeoutClass::DefinitelyBeforeSend))
                 || matches!(self.crash, Some(CrashCut::BeforeSend)),
-            grant_present: true,
-            grant_expired: self.clock >= self.grant.expires_at_ms,
-            grant_classes: self.grant.action_classes.clone(),
+            grant_present: self.grant.is_some(),
+            grant_expired: self
+                .grant
+                .as_ref()
+                .is_some_and(|grant| self.clock >= grant.expires_at_ms),
+            grant_exhausted: self.grant.as_ref().and_then(|grant| grant.remaining_uses) == Some(0),
+            grant_classes: self
+                .grant
+                .as_ref()
+                .map(|grant| grant.action_classes.clone())
+                .unwrap_or_default(),
             visual_granted: self.visual_grant,
             lease_granted: lease.map(|l| l.granted && !l.revoked).unwrap_or(false),
             domain_busy: busy,
@@ -820,8 +917,10 @@ impl Host {
             lease.dispatching = false;
         }
         self.domain_busy.remove(&domain);
-        if let Some(uses) = self.grant.remaining_uses {
-            self.grant.remaining_uses = Some(uses.saturating_sub(1));
+        if let Some(grant) = self.grant.as_mut() {
+            if let Some(uses) = grant.remaining_uses {
+                grant.remaining_uses = Some(uses.saturating_sub(1));
+            }
         }
         self.log("dispatch", dispatch_id.clone());
         Ok(dispatch_id)
@@ -997,8 +1096,8 @@ impl Host {
         Some(!orphan_grant && !dup)
     }
 
-    pub fn grant_id(&self) -> &str {
-        &self.grant.grant_id
+    pub fn grant_id(&self) -> Option<&str> {
+        self.grant.as_ref().map(|grant| grant.grant_id.as_str())
     }
 
     pub fn visual_grant_id(&self) -> Option<&str> {
@@ -1077,12 +1176,12 @@ mod tests {
                 }],
                 frame_regions: vec![],
             }],
-            grant: GrantSpec {
+            grant: Some(GrantSpec {
                 grant_id: "grant_a".into(),
                 action_classes: vec![ActionClass::Semantic, ActionClass::TextEntry],
                 expires_at_ms: 1_000_000,
                 remaining_uses: Some(8),
-            },
+            }),
             visual_grant: None,
             agents: vec![AgentSpec {
                 agent_id: "agent_a".into(),

@@ -33,7 +33,7 @@
     "family": { "type": "string" },
     "variant": { "type": "string" },
     "profile": { "type": "string", "enum": ["economy", "balanced", "high_assurance"] },
-    "adapter": { "type": "string" },
+    "adapter": { "type": "string", "enum": ["text_only_tools", "weak_multimodal", "malformed_overconfident", "stationarity_loop", "frontier_multimodal"] },
     "repetition": { "type": "integer", "minimum": 0 },
     "seed": { "type": "integer", "minimum": 0 },
     "providerCalls": { "type": "integer", "minimum": 0 },

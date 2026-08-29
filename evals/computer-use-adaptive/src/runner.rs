@@ -77,6 +77,8 @@ pub struct EvidenceBundle {
     pub repetition: u32,
     pub observation_ids: Vec<String>,
     pub dispatch_ids: Vec<String>,
+    pub observations: Vec<crate::host::ObservationRecord>,
+    pub physical_dispatches: Vec<crate::host::PhysicalRecord>,
     pub authority: AuthorityEvidence,
     pub trace: Vec<crate::host::TraceEvent>,
     pub redacted: bool,
@@ -88,7 +90,7 @@ pub struct EvidenceBundle {
 #[serde(deny_unknown_fields)]
 pub struct AuthorityEvidence {
     pub run_id: String,
-    pub grant_id: String,
+    pub grant_id: Option<String>,
     pub lease_ids: Vec<String>,
     pub visual_grant_id: Option<String>,
 }
@@ -322,9 +324,11 @@ pub fn run_episode(
         repetition,
         observation_ids: host.observation_ids(),
         dispatch_ids: host.dispatch_ids(),
+        observations: host.observation_records(),
+        physical_dispatches: host.physical_records(),
         authority: AuthorityEvidence {
             run_id: host.run_id.clone(),
-            grant_id: host.grant_id().to_string(),
+            grant_id: host.grant_id().map(str::to_string),
             lease_ids: host.lease_ids(),
             visual_grant_id: host.visual_grant_id().map(str::to_string),
         },

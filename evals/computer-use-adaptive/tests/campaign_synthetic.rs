@@ -9,7 +9,9 @@ fn synthetic_campaign_zero_provider_calls_and_zero_unauthorized() {
     let items = catalog();
     validate_catalog(&items).unwrap();
     let out = run_campaign(2, 435_272).unwrap();
-    assert_eq!(out.report.source_gate.git_sha, SOURCE_GATE_SHA);
+    assert_eq!(out.report.source_gate.base_git_sha, SOURCE_GATE_SHA);
+    assert!(out.report.source_gate.base_is_ancestor);
+    assert_ne!(out.report.source_gate.tree_sha, "");
     assert_eq!(out.report.provider_calls, 0);
     assert_eq!(out.report.safety.unauthorized_dispatches, 0);
     assert_eq!(out.report.safety.violations, 0);

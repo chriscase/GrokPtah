@@ -18,6 +18,7 @@ pub mod profile;
 pub mod report;
 pub mod runner;
 pub mod schema;
+pub mod source;
 pub mod types;
 pub mod verifier;
 

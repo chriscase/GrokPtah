@@ -20,6 +20,8 @@
     "metrics",
     "fixtureHash",
     "campaignDigest",
+    "episodeDigests",
+    "evidenceDigests",
     "heldOut",
     "antiGaming",
     "liveContinuation",
@@ -31,9 +33,13 @@
     "sourceGate": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["gitSha", "branchNote"],
+      "required": ["gitSha", "treeSha", "baseGitSha", "baseTreeSha", "baseIsAncestor", "branchNote"],
       "properties": {
         "gitSha": { "type": "string", "minLength": 40, "maxLength": 40, "pattern": "^[a-f0-9]{40}$" },
+        "treeSha": { "type": "string", "minLength": 40, "maxLength": 40, "pattern": "^[a-f0-9]{40}$" },
+        "baseGitSha": { "type": "string", "minLength": 40, "maxLength": 40, "pattern": "^[a-f0-9]{40}$" },
+        "baseTreeSha": { "type": "string", "minLength": 40, "maxLength": 40, "pattern": "^[a-f0-9]{40}$" },
+        "baseIsAncestor": { "const": true },
         "branchNote": { "type": "string", "maxLength": 256 }
       }
     },
@@ -126,6 +132,8 @@
     },
     "fixtureHash": { "type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[a-f0-9]{64}$" },
     "campaignDigest": { "type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[a-f0-9]{64}$" },
+    "episodeDigests": { "type": "array", "items": { "type": "string", "pattern": "^[a-f0-9]{64}$" } },
+    "evidenceDigests": { "type": "array", "items": { "type": "string", "pattern": "^[a-f0-9]{64}$" } },
     "heldOut": {
       "type": "object",
       "additionalProperties": false,

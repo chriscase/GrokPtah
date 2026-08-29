@@ -1,5 +1,7 @@
 use grokptah_cu_adaptive_eval::catalog::catalog;
-use grokptah_cu_adaptive_eval::digest::fixture_hash;
+use grokptah_cu_adaptive_eval::digest::{
+    campaign_digest, evidence_body_digest, evidence_content_digest, fixture_hash,
+};
 use grokptah_cu_adaptive_eval::report::run_campaign;
 use grokptah_cu_adaptive_eval::schema::{parse_strict, to_canonical_json};
 use grokptah_cu_adaptive_eval::types::{
@@ -11,6 +13,85 @@ use grokptah_cu_adaptive_eval::verifier::{
 
 fn clean() -> grokptah_cu_adaptive_eval::CampaignOutput {
     run_campaign(1, 435_272).unwrap()
+}
+
+fn rebind_campaign(out: &mut grokptah_cu_adaptive_eval::CampaignOutput) {
+    out.report.episode_digests = out
+        .report
+        .episodes
+        .iter()
+        .map(|episode| evidence_content_digest(episode).unwrap())
+        .collect();
+    out.report.evidence_digests = out
+        .evidence
+        .items
+        .iter_mut()
+        .map(|evidence| {
+            evidence.content_sha256 = evidence_body_digest(evidence).unwrap();
+            evidence.content_sha256.clone()
+        })
+        .collect();
+    out.report.campaign_digest = campaign_digest(
+        &out.report.fixture_hash,
+        out.report.repeats,
+        out.report.seed,
+        out.report.episodes.len() as u64,
+        &out.report.naming,
+        &out.report.episode_digests,
+        &out.report.evidence_digests,
+        &out.report.source_gate.git_sha,
+        &out.report.source_gate.tree_sha,
+        &out.report.source_gate.base_git_sha,
+    )
+    .unwrap();
+    out.evidence.campaign_digest = out.report.campaign_digest.clone();
+}
+
+#[test]
+fn forged_observation_metrics_fail_even_after_all_digests_are_rebound() {
+    let mut out = clean();
+    out.report.episodes[0].metrics.observation_bytes += 123;
+    out.report.metrics.observation_bytes += 123;
+    rebind_campaign(&mut out);
+    let verified = verify_campaign(&out.report, Some(&out.evidence), VerifyMode::Synthetic);
+    assert!(!verified.ok);
+    assert!(verified
+        .errors
+        .iter()
+        .any(|error| error.contains("observationBytes")));
+}
+
+#[test]
+fn forged_backend_dispatch_fails_even_after_all_digests_are_rebound() {
+    let mut out = clean();
+    let evidence = &mut out.evidence.items[0];
+    let dispatch_id = "disp_forged_backend".to_string();
+    evidence.dispatch_ids.push(dispatch_id.clone());
+    evidence
+        .physical_dispatches
+        .push(grokptah_cu_adaptive_eval::host::PhysicalRecord {
+            dispatch_id: dispatch_id.clone(),
+            permitted: false,
+            agent_id: "agent_a".into(),
+            surface_id: "surface_a".into(),
+            conflict_domain: "domain_fg".into(),
+            clock_ms: 0,
+        });
+    evidence
+        .trace
+        .push(grokptah_cu_adaptive_eval::host::TraceEvent {
+            step: 0,
+            clock_ms: 0,
+            kind: grokptah_cu_adaptive_eval::host::TraceKind::Dispatch,
+            detail: format!("{dispatch_id};permitted=false"),
+        });
+    rebind_campaign(&mut out);
+    let verified = verify_campaign(&out.report, Some(&out.evidence), VerifyMode::Synthetic);
+    assert!(!verified.ok);
+    assert!(verified
+        .errors
+        .iter()
+        .any(|error| error.contains("unauthorizedDispatches")));
 }
 
 #[test]

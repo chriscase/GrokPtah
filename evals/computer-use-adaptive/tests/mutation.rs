@@ -39,12 +39,12 @@ fn world() -> WorldSpec {
             }],
             frame_regions: vec![],
         }],
-        grant: GrantSpec {
+        grant: Some(GrantSpec {
             grant_id: "grant_a".into(),
             action_classes: vec![ActionClass::Semantic],
             expires_at_ms: 50_000,
             remaining_uses: Some(4),
-        },
+        }),
         visual_grant: None,
         agents: vec![AgentSpec {
             agent_id: "agent_a".into(),
@@ -137,6 +137,45 @@ fn takeover_and_expired_grant_are_denied_on_every_profile() {
         assert!(err.is_err());
         assert!(h.physical.is_empty());
     }
+}
+
+#[test]
+fn missing_and_exhausted_grants_never_dispatch() {
+    for profile in ProfileId::ALL {
+        for grant in [None, Some(0)] {
+            let mut spec = world();
+            spec.grant = grant.map(|remaining| GrantSpec {
+                grant_id: "grant_limited".into(),
+                action_classes: vec![ActionClass::Semantic],
+                expires_at_ms: 50_000,
+                remaining_uses: Some(remaining),
+            });
+            let mut h = Host::new(
+                spec,
+                profile,
+                AdapterId::TextOnlyTools.capabilities(),
+                7,
+                vec![],
+            );
+            let obs = h.observe("surface_a").unwrap();
+            let action = TypedAction::Invoke {
+                element_id: obs.elements[0].element_id.clone(),
+            };
+            assert!(h
+                .try_dispatch("surface_a", "lease_a", &obs.observation_id, &action)
+                .is_err());
+            assert!(h.physical.is_empty());
+        }
+    }
+}
+
+#[test]
+fn unauthorized_backend_mutation_is_detectable() {
+    let mut h = host(ProfileId::Balanced);
+    h.inject_unauthorized_backend_mutation();
+    assert_eq!(h.unauthorized, 1);
+    assert_eq!(h.physical.len(), 1);
+    assert!(!h.physical[0].permitted);
 }
 
 #[test]

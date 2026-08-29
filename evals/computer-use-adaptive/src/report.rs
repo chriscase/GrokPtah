@@ -1,7 +1,7 @@
 //! Aggregate campaign report. Cost stays null for fake adapters.
 
 use crate::catalog::{catalog, validate_catalog, Scenario};
-use crate::digest::{campaign_digest, fixture_hash};
+use crate::digest::{campaign_digest, evidence_content_digest, fixture_hash};
 use crate::matrix::expected_matrix;
 use crate::naming::NamingRecord;
 use crate::runner::{run_episode, EpisodeResult, EvidenceBundle};
@@ -29,17 +29,23 @@ pub struct CampaignReport {
     pub metrics: CampaignMetrics,
     pub fixture_hash: String,
     pub campaign_digest: String,
+    pub episode_digests: Vec<String>,
+    pub evidence_digests: Vec<String>,
     pub held_out: HeldOutSummary,
     pub anti_gaming: AntiGaming,
     pub live_continuation: LiveContinuation,
     pub episodes: Vec<EpisodeResult>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct SourceGate {
     pub git_sha: String,
+    pub tree_sha: String,
+    pub base_git_sha: String,
+    pub base_tree_sha: String,
+    pub base_is_ancestor: bool,
     pub branch_note: String,
 }
 
@@ -124,6 +130,15 @@ pub struct CampaignOutput {
 }
 
 pub fn run_campaign(repeats: u32, seed: u64) -> EvalResult<CampaignOutput> {
+    let identity = crate::source::observe_source(std::path::Path::new("."), None, SOURCE_GATE_SHA)?;
+    run_campaign_with_source(repeats, seed, identity)
+}
+
+pub fn run_campaign_with_source(
+    repeats: u32,
+    seed: u64,
+    source_gate: SourceGate,
+) -> EvalResult<CampaignOutput> {
     validate_repeats(repeats)?;
     let items = catalog();
     validate_catalog(&items)?;
@@ -150,7 +165,18 @@ pub fn run_campaign(repeats: u32, seed: u64) -> EvalResult<CampaignOutput> {
         episodes.push(bundle.result);
         evidence_items.push(bundle.evidence);
     }
-    let report = assemble_report(repeats, seed, &items, episodes)?;
+    let evidence_digests = evidence_items
+        .iter()
+        .map(|e| e.content_sha256.clone())
+        .collect::<Vec<_>>();
+    let report = assemble_report(
+        repeats,
+        seed,
+        &items,
+        episodes,
+        evidence_digests,
+        source_gate,
+    )?;
     Ok(CampaignOutput {
         evidence: EvidenceSet {
             schema_version: EVIDENCE_SET_SCHEMA.into(),
@@ -166,6 +192,8 @@ pub fn assemble_report(
     seed: u64,
     items: &[Scenario],
     episodes: Vec<EpisodeResult>,
+    evidence_digests: Vec<String>,
+    source_gate: SourceGate,
 ) -> EvalResult<CampaignReport> {
     let mut num = 0_u64;
     let mut den = 0_u64;
@@ -254,15 +282,26 @@ pub fn assemble_report(
     };
     let naming = NamingRecord::decision_packet();
     let fixture = fixture_hash(items)?;
-    let digest = campaign_digest(&fixture, repeats, seed, episodes.len() as u64, &naming)?;
+    let episode_digests = episodes
+        .iter()
+        .map(evidence_content_digest)
+        .collect::<EvalResult<Vec<_>>>()?;
+    let digest = campaign_digest(
+        &fixture,
+        repeats,
+        seed,
+        episodes.len() as u64,
+        &naming,
+        &episode_digests,
+        &evidence_digests,
+        &source_gate.git_sha,
+        &source_gate.tree_sha,
+        &source_gate.base_git_sha,
+    )?;
     Ok(CampaignReport {
         schema_version: REPORT_SCHEMA.into(),
-        campaign_id: format!("cu-adaptive-eval-{SOURCE_GATE_SHA:.12}"),
-        source_gate: SourceGate {
-            git_sha: SOURCE_GATE_SHA.into(),
-            branch_note: "origin/main exact gate; unmerged adaptive runtime is not authoritative"
-                .into(),
-        },
+        campaign_id: format!("cu-adaptive-eval-{:.12}", source_gate.git_sha),
+        source_gate,
         naming,
         repeats,
         seed,
@@ -281,6 +320,8 @@ pub fn assemble_report(
         metrics,
         fixture_hash: fixture,
         campaign_digest: digest,
+        episode_digests,
+        evidence_digests,
         held_out: HeldOutSummary {
             count: held.len() as u64,
             ids: held,

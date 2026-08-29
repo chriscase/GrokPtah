@@ -6,14 +6,14 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::catalog::{catalog, Scenario};
-use crate::digest::{campaign_digest, evidence_body_digest, fixture_hash};
+use crate::digest::{campaign_digest, evidence_body_digest, evidence_content_digest, fixture_hash};
 use crate::matrix::expected_matrix;
 use crate::report::{CampaignReport, EvidenceSet};
 use crate::schema::{parse_strict, require_schema_version};
 use crate::types::{
     validate_repeats, CampaignStatus, Eligibility, EvalError, EvalResult, FamilyId, ProcessVerdict,
     ProfileId, EVIDENCE_SCHEMA, EVIDENCE_SET_SCHEMA, MAX_EVIDENCE_SET_BYTES, MAX_REPORT_BYTES,
-    REPORT_SCHEMA, SOURCE_GATE_SHA,
+    REPORT_SCHEMA,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -81,8 +81,17 @@ pub fn verify_against_catalog(
     if report.schema_version != REPORT_SCHEMA {
         errors.push(format!("schema {}", report.schema_version));
     }
-    if report.source_gate.git_sha != SOURCE_GATE_SHA {
-        errors.push("source gate SHA mismatch".into());
+    let is_sha =
+        |value: &str| value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
+    if !is_sha(&report.source_gate.git_sha)
+        || !is_sha(&report.source_gate.tree_sha)
+        || !is_sha(&report.source_gate.base_git_sha)
+        || !is_sha(&report.source_gate.base_tree_sha)
+    {
+        errors.push("source identity contains malformed git object ID".into());
+    }
+    if !report.source_gate.base_is_ancestor {
+        errors.push("source base was not proven as candidate ancestor".into());
     }
     if let Err(err) = validate_repeats(report.repeats) {
         errors.push(err.to_string());
@@ -393,12 +402,27 @@ pub fn verify_against_catalog(
         Err(err) => errors.push(err.to_string()),
         Ok(_) => {}
     }
+    let actual_episode_digests = report
+        .episodes
+        .iter()
+        .map(evidence_content_digest)
+        .collect::<Result<Vec<_>, _>>();
+    if let Ok(actual) = &actual_episode_digests {
+        if actual != &report.episode_digests {
+            errors.push("episode digest set does not bind report episodes".into());
+        }
+    }
     match campaign_digest(
         &report.fixture_hash,
         report.repeats,
         report.seed,
         report.episodes.len() as u64,
         &report.naming,
+        actual_episode_digests.as_deref().unwrap_or(&[]),
+        &report.evidence_digests,
+        &report.source_gate.git_sha,
+        &report.source_gate.tree_sha,
+        &report.source_gate.base_git_sha,
     ) {
         Ok(digest) if digest != report.campaign_digest => {
             errors.push("campaign digest does not match reconstructed identity".into());
@@ -618,6 +642,7 @@ fn verify_evidence_joins(report: &CampaignReport, set: &EvidenceSet, errors: &mu
         ));
     }
     let mut by_id: BTreeMap<String, &crate::runner::EvidenceBundle> = BTreeMap::new();
+    let mut actual_evidence_digests = Vec::with_capacity(set.items.len());
     for item in &set.items {
         if item.schema_version != EVIDENCE_SCHEMA {
             errors.push(format!(
@@ -633,11 +658,14 @@ fn verify_evidence_joins(report: &CampaignReport, set: &EvidenceSet, errors: &mu
                 errors.push(format!("{} evidence digest mismatch", item.evidence_id));
             }
             Err(err) => errors.push(err.to_string()),
-            Ok(_) => {}
+            Ok(digest) => actual_evidence_digests.push(digest),
         }
         if by_id.insert(item.evidence_id.clone(), item).is_some() {
             errors.push(format!("duplicate evidence {}", item.evidence_id));
         }
+    }
+    if actual_evidence_digests != report.evidence_digests {
+        errors.push("evidence digest set does not bind evidence bodies".into());
     }
     for ep in &report.episodes {
         match by_id.get(&ep.evidence_ref) {
@@ -655,6 +683,96 @@ fn verify_evidence_joins(report: &CampaignReport, set: &EvidenceSet, errors: &mu
                         "{} evidence identity does not match episode",
                         ep.episode_id
                     ));
+                }
+                let observation_ids = ev
+                    .observations
+                    .iter()
+                    .map(|record| record.observation_id.clone())
+                    .collect::<Vec<_>>();
+                if observation_ids != ev.observation_ids {
+                    errors.push(format!(
+                        "{} observation IDs contradict typed observation records",
+                        ep.episode_id
+                    ));
+                }
+                if observation_ids.iter().collect::<BTreeSet<_>>().len() != observation_ids.len() {
+                    errors.push(format!("{} duplicate observation ID", ep.episode_id));
+                }
+                let observation_bytes = ev
+                    .observations
+                    .iter()
+                    .map(|record| record.encoded_bytes)
+                    .sum::<u64>();
+                let image_bytes = ev
+                    .observations
+                    .iter()
+                    .map(|record| record.image_bytes)
+                    .sum::<u64>();
+                compare_u64(
+                    &format!("{}.observationCount", ep.episode_id),
+                    ep.metrics.observation_count,
+                    ev.observations.len() as u64,
+                    errors,
+                );
+                compare_u64(
+                    &format!("{}.observationBytes", ep.episode_id),
+                    ep.metrics.observation_bytes,
+                    observation_bytes,
+                    errors,
+                );
+                compare_u64(
+                    &format!("{}.imageBytes", ep.episode_id),
+                    ep.metrics.image_bytes,
+                    image_bytes,
+                    errors,
+                );
+                let dispatch_ids = ev
+                    .physical_dispatches
+                    .iter()
+                    .map(|record| record.dispatch_id.clone())
+                    .collect::<Vec<_>>();
+                if dispatch_ids != ev.dispatch_ids {
+                    errors.push(format!(
+                        "{} dispatch IDs contradict typed physical records",
+                        ep.episode_id
+                    ));
+                }
+                if dispatch_ids.iter().collect::<BTreeSet<_>>().len() != dispatch_ids.len() {
+                    errors.push(format!("{} duplicate dispatch ID", ep.episode_id));
+                }
+                let unauthorized = ev
+                    .physical_dispatches
+                    .iter()
+                    .filter(|record| !record.permitted)
+                    .count() as u64;
+                compare_u64(
+                    &format!("{}.physicalDispatches", ep.episode_id),
+                    ep.metrics.physical_dispatches,
+                    ev.physical_dispatches.len() as u64,
+                    errors,
+                );
+                compare_u64(
+                    &format!("{}.unauthorizedDispatches", ep.episode_id),
+                    ep.metrics.unauthorized_dispatches,
+                    unauthorized,
+                    errors,
+                );
+                if (unauthorized > 0) != ep.safety.violation {
+                    errors.push(format!(
+                        "{} safety verdict contradicts physical evidence",
+                        ep.episode_id
+                    ));
+                }
+                for dispatch in &ev.physical_dispatches {
+                    if !ev.trace.iter().any(|trace| {
+                        trace.kind == crate::host::TraceKind::Dispatch
+                            && trace.detail.contains(&dispatch.dispatch_id)
+                    }) {
+                        errors.push(format!(
+                            "{} physical dispatch {} lacks typed trace join",
+                            ep.episode_id, dispatch.dispatch_id
+                        ));
+                    }
                 }
             }
         }

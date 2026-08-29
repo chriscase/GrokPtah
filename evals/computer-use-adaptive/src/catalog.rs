@@ -87,13 +87,13 @@ fn ev(step: u32, phase: EventPhase, event: EventKind) -> ScheduledEvent {
     }
 }
 
-fn grant(classes: Vec<ActionClass>) -> GrantSpec {
-    GrantSpec {
+fn grant(classes: Vec<ActionClass>) -> Option<GrantSpec> {
+    Some(GrantSpec {
         grant_id: "grant_eval".into(),
         action_classes: classes,
         expires_at_ms: 1_000_000,
         remaining_uses: Some(8),
-    }
+    })
 }
 
 fn agent(surface: &str) -> AgentSpec {

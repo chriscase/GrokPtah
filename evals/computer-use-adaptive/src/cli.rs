@@ -4,7 +4,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::live::refuse_if_not_explicitly_enabled;
-use crate::report::{markdown_report, run_campaign};
+use crate::report::{markdown_report, run_campaign_with_source};
 use crate::schema::to_canonical_json;
 use crate::types::{
     validate_repeats, ProcessVerdict, DEFAULT_REPEATS, DEFAULT_SEED, SOURCE_GATE_SHA,
@@ -27,6 +27,8 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<i32, (ProcessVerdict, S
     let mut repeats = DEFAULT_REPEATS;
     let mut seed = DEFAULT_SEED;
     let mut expect_source_gate: Option<String> = None;
+    let mut expect_head: Option<String> = None;
+    let mut repository = PathBuf::from(".");
     let mut verify_report_path: Option<PathBuf> = None;
     let mut verify_evidence_path: Option<PathBuf> = None;
     let mut argv = args.into_iter();
@@ -79,6 +81,18 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<i32, (ProcessVerdict, S
                     "--source-gate requires a SHA".into(),
                 ))?);
             }
+            "--expected-head" => {
+                expect_head = Some(argv.next().ok_or((
+                    ProcessVerdict::Malformed,
+                    "--expected-head requires a SHA".into(),
+                ))?);
+            }
+            "--repository" => {
+                repository = PathBuf::from(argv.next().ok_or((
+                    ProcessVerdict::Malformed,
+                    "--repository requires a path".into(),
+                ))?);
+            }
             "--help" => {
                 eprintln!(
                     "grokptah-cu-adaptive-eval --out DIR [--repeats N] [--seed N] [--source-gate SHA]\n\
@@ -98,6 +112,22 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<i32, (ProcessVerdict, S
             .map_err(|err| (ProcessVerdict::Malformed, err.to_string()))?;
         let evidence_text = fs::read_to_string(evidence_path)
             .map_err(|err| (ProcessVerdict::Malformed, err.to_string()))?;
+        if expect_head.is_some() || expect_source_gate.is_some() {
+            let report: crate::report::CampaignReport =
+                crate::schema::parse_strict(&report_text)
+                    .map_err(|err| (ProcessVerdict::Malformed, err.to_string()))?;
+            let expected_base = expect_source_gate.as_deref().unwrap_or(SOURCE_GATE_SHA);
+            let observed =
+                crate::source::observe_source(&repository, expect_head.as_deref(), expected_base)
+                    .map_err(|err| (ProcessVerdict::Malformed, err.to_string()))?;
+            if report.source_gate != observed {
+                return Err((
+                    ProcessVerdict::Malformed,
+                    "artifact source identity does not match independently observed repository"
+                        .into(),
+                ));
+            }
+        }
         let verified = crate::verifier::verify_json_with_evidence(&report_text, &evidence_text)
             .map_err(|err| (ProcessVerdict::Malformed, err.to_string()))?;
         println!(
@@ -123,16 +153,11 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<i32, (ProcessVerdict, S
     if let Err(err) = refuse_if_not_explicitly_enabled() {
         return Err((ProcessVerdict::LiveRefused, err.to_string()));
     }
-    if let Some(expected) = &expect_source_gate {
-        if expected != SOURCE_GATE_SHA {
-            return Err((
-                ProcessVerdict::Malformed,
-                format!("source-gate {expected} != {SOURCE_GATE_SHA}"),
-            ));
-        }
-    }
-    let campaign =
-        run_campaign(repeats, seed).map_err(|err| (ProcessVerdict::Malformed, err.to_string()))?;
+    let expected_base = expect_source_gate.as_deref().unwrap_or(SOURCE_GATE_SHA);
+    let source = crate::source::observe_source(&repository, expect_head.as_deref(), expected_base)
+        .map_err(|err| (ProcessVerdict::Malformed, err.to_string()))?;
+    let campaign = run_campaign_with_source(repeats, seed, source)
+        .map_err(|err| (ProcessVerdict::Malformed, err.to_string()))?;
     let verified = verify_campaign(
         &campaign.report,
         Some(&campaign.evidence),

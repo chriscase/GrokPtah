@@ -37,6 +37,9 @@ jobs:
         working-directory: desktop
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "20"
@@ -91,6 +94,9 @@ jobs:
           cargo run --locked -- run --repository "$GITHUB_WORKSPACE" --output "$RUNNER_TEMP/grokptah-cert-output"
       - name: Adaptive Computer Use evaluator (synthetic authority)
         working-directory: evals/computer-use-adaptive
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+          EXPECTED_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
           cargo fmt --check
           cargo clippy --locked --all-targets -- -D warnings
@@ -99,10 +105,15 @@ jobs:
             --out "$RUNNER_TEMP/grokptah-cu-adaptive" \
             --repeats 5 \
             --seed 435272 \
-            --source-gate c6f1cb23e9d6217005599850d9e0d6f7df64d5a1
+            --repository "$GITHUB_WORKSPACE" \
+            --expected-head "$EXPECTED_HEAD" \
+            --source-gate "$EXPECTED_BASE"
           cargo run --locked --bin grokptah-cu-adaptive-eval -- \
             --verify-report "$RUNNER_TEMP/grokptah-cu-adaptive/campaign-report.json" \
-            --verify-evidence "$RUNNER_TEMP/grokptah-cu-adaptive/campaign-evidence.json"
+            --verify-evidence "$RUNNER_TEMP/grokptah-cu-adaptive/campaign-evidence.json" \
+            --repository "$GITHUB_WORKSPACE" \
+            --expected-head "$EXPECTED_HEAD" \
+            --source-gate "$EXPECTED_BASE"
       - name: Offline oracle suite shape (repo root)
         working-directory: .
         run: |

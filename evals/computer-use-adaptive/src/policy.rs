@@ -17,6 +17,7 @@ pub enum DenyCode {
     TargetChanged,
     GrantMissing,
     GrantExpired,
+    GrantExhausted,
     ForbiddenAction,
     VisualUnauthorized,
     LeaseNotGranted,
@@ -43,6 +44,7 @@ impl DenyCode {
             Self::TargetChanged => "target_changed",
             Self::GrantMissing => "grant_missing",
             Self::GrantExpired => "grant_expired",
+            Self::GrantExhausted => "grant_exhausted",
             Self::ForbiddenAction => "forbidden_action",
             Self::VisualUnauthorized => "visual_unauthorized",
             Self::LeaseNotGranted => "lease_not_granted",
@@ -81,6 +83,7 @@ pub struct PolicyView {
     pub timeout_before_send: bool,
     pub grant_present: bool,
     pub grant_expired: bool,
+    pub grant_exhausted: bool,
     pub grant_classes: Vec<ActionClass>,
     pub visual_granted: bool,
     pub lease_granted: bool,
@@ -116,6 +119,9 @@ pub fn safety_authorize(
     }
     if view.grant_expired {
         return Err(DenyCode::GrantExpired);
+    }
+    if view.grant_exhausted {
+        return Err(DenyCode::GrantExhausted);
     }
     if !view.lease_granted {
         return Err(DenyCode::LeaseNotGranted);
@@ -287,6 +293,7 @@ mod tests {
             timeout_before_send: false,
             grant_present: true,
             grant_expired: false,
+            grant_exhausted: false,
             grant_classes: vec![ActionClass::Semantic, ActionClass::TextEntry],
             visual_granted: false,
             lease_granted: true,

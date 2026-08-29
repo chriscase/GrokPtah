@@ -247,6 +247,23 @@ mod tests {
     }
 
     #[test]
+    fn closed_adapter_and_trace_enums_fail_closed_at_runtime_and_in_schema() {
+        let campaign = crate::report::run_campaign(1, crate::types::DEFAULT_SEED).unwrap();
+        let mut report = serde_json::to_value(&campaign.report).unwrap();
+        report["episodes"][0]["adapter"] = serde_json::json!("future_unreviewed_adapter");
+        assert!(parse_strict::<crate::report::CampaignReport>(&report.to_string()).is_err());
+
+        let mut evidence = serde_json::to_value(&campaign.evidence).unwrap();
+        evidence["items"][0]["trace"][0]["kind"] = serde_json::json!("untyped_event");
+        assert!(parse_strict::<crate::report::EvidenceSet>(&evidence.to_string()).is_err());
+
+        for schema in [RESULT_SCHEMA_JSON, EVIDENCE_SCHEMA_JSON] {
+            assert!(schema.contains("frontier_multimodal"));
+            assert!(!schema.contains("\"adapter\": { \"type\": \"string\" }"));
+        }
+    }
+
+    #[test]
     fn element_schema_required_null_fields_match_element_spec() {
         let schema: serde_json::Value = serde_json::from_str(SCENARIO_SCHEMA_JSON).unwrap();
         let required: Vec<&str> = schema["$defs"]["element"]["required"]
