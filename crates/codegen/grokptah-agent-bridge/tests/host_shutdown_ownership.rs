@@ -118,43 +118,6 @@ async fn submit(
         .to_string()
 }
 
-/// Terminal Run persistence precedes clearing the durable Agent activation
-/// pointer by a few instructions. Wait on that real admission boundary rather
-/// than assuming the two files become visible atomically to this caller.
-async fn submit_after_terminal(
-    orch: &OrchestrationService,
-    auth: &AuthContext,
-    request_id: &str,
-    session_id: Uuid,
-    workspace: &Path,
-) -> String {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        match orch
-            .submit_task(
-                auth,
-                request_id,
-                session_id,
-                workspace,
-                "list files please".into(),
-                Some(json!({"maxPromptBytes": 10_000, "maxRounds": 2, "maxDurationMs": 30_000})),
-            )
-            .await
-        {
-            Ok(value) => {
-                return value["runId"].as_str().expect("runId").to_string();
-            }
-            Err(error)
-                if error.message.contains("already has an active Run")
-                    && tokio::time::Instant::now() < deadline =>
-            {
-                tokio::task::yield_now().await;
-            }
-            Err(error) => panic!("submit after terminal finalization: {error:?}"),
-        }
-    }
-}
-
 /// Bounded wait on durable run state. The poll interval is scheduling
 /// spacing, not the correctness mechanism: the assertion is on the durable
 /// record, and the deadline only bounds a hang.
@@ -377,13 +340,35 @@ async fn cancelled_and_steered_runs_release_authority_on_shutdown() {
         "unexpected terminal state {cancelled_state}"
     );
 
-    // A second run that is still in flight when shutdown starts: the ordered
-    // stop must cancel it, finalize it durably, and join its task.
-    let second = submit_after_terminal(&orch, &auth, "in-flight", session_id, lane.ws()).await;
-
     let report = runtime.shutdown().await;
     assert_clean_shutdown(&report);
-    let after = orch.get_run(&auth, &second).expect("run still readable");
+    let after = orch.get_run(&auth, &first).expect("run still readable");
+    assert!(
+        after["state"].as_str().is_some(),
+        "the cancelled run must retain a durable record across shutdown"
+    );
+
+    let replacement = restart_same_home_now(&lane);
+    drop(orch);
+    drop(replacement);
+}
+
+/// A Run that is still in flight when shutdown starts must be cancelled,
+/// finalized durably, and joined without relying on a preceding Run's
+/// terminal projection as proof that its execution task has already exited.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::await_holding_lock)]
+async fn in_flight_run_is_finalized_before_shutdown_releases_authority() {
+    let lane = Lane::new();
+    let (runtime, session_id) = lane.boot();
+    let orch = lane.orchestration(&runtime);
+    let auth = orch.auth_header(Some(&format!("Bearer {TOKEN}"))).unwrap();
+
+    let run_id = submit(&orch, &auth, "in-flight", session_id, lane.ws()).await;
+    let report = runtime.shutdown().await;
+    assert_clean_shutdown(&report);
+
+    let after = orch.get_run(&auth, &run_id).expect("run still readable");
     assert!(
         after["state"].as_str().is_some(),
         "the in-flight run must retain a durable record across shutdown"
