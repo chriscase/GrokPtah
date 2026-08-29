@@ -13,6 +13,24 @@ use grokptah_test_gateway::{split_at, MockGateway, Response, Step};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+/// A real bound send context for the conformance replay.
+///
+/// The replay is a physical send like any other, so it carries a binding: the
+/// harness cannot reach the wire on a path production code could not.
+fn replay_send_context(
+    root: &std::path::Path,
+    session: &str,
+) -> grokptah_agent_bridge::provider_send::ProviderSendContext {
+    grokptah_agent_bridge::provider_send::ProviderSendContext::for_root(
+        root.join("provider-attempts"),
+        "provider-wire-conformance",
+        session,
+        grokptah_agent_bridge::provider_send::SendOrigin::Qualification,
+        grokptah_agent_bridge::provider_send::CallSiteFamily::ProviderQualificationProbe,
+    )
+    .expect("ledger")
+}
+
 const FIXTURE_SCHEMA: &str = "grokptah.provider_contract_fixture.v1";
 const MAX_FIXTURE_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -117,7 +135,9 @@ async fn synthetic_xai_fixture_replays_through_the_production_provider_path() {
         {"role": "user", "content": "Return the fixture marker."}
     ]);
     let tools = serde_json::json!([]);
+    let ledger_root = tempfile::tempdir().expect("tmp");
     let replay = replay_xai_provider_contract_on_loopback(
+        &replay_send_context(ledger_root.path(), "fixture-replay"),
         &format!("{}/v1", gateway.base_url()),
         "grok-fixture",
         messages.as_array().unwrap(),
@@ -178,7 +198,9 @@ async fn production_provider_path_rejects_a_fixture_without_its_terminal_marker(
         &[1, truncated.len() - 1],
     )))])
     .await;
+    let ledger_root = tempfile::tempdir().expect("tmp");
     let error = replay_xai_provider_contract_on_loopback(
+        &replay_send_context(ledger_root.path(), "truncated-stream"),
         &format!("{}/v1", gateway.base_url()),
         "grok-fixture",
         &[serde_json::json!({"role": "user", "content": "synthetic"})],
@@ -191,7 +213,9 @@ async fn production_provider_path_rejects_a_fixture_without_its_terminal_marker(
 
 #[tokio::test]
 async fn provider_contract_replay_refuses_non_loopback_authority() {
+    let ledger_root = tempfile::tempdir().expect("tmp");
     let error = replay_xai_provider_contract_on_loopback(
+        &replay_send_context(ledger_root.path(), "non-loopback"),
         "https://api.x.ai/v1",
         "grok-fixture",
         &[serde_json::json!({"role": "user", "content": "synthetic"})],

@@ -52,6 +52,11 @@ impl RuntimeHome {
         self.root.join("orchestration")
     }
 
+    /// Durable root for the one provider-send attempt ledger (#478).
+    pub fn provider_attempts_root(&self) -> PathBuf {
+        self.root.join("provider-attempts")
+    }
+
     pub fn computer_root(&self) -> PathBuf {
         self.root.join("computer-use")
     }

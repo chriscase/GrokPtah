@@ -113,6 +113,7 @@ pub(crate) fn resolve_computer_eligibility(
 }
 
 pub(crate) async fn qualify_semantic_model(
+    send: &crate::provider_send::ProviderSendContext,
     credentials: &crate::auth_store::WireCredentials,
     model: &str,
     effort: EffortLevel,
@@ -139,6 +140,7 @@ pub(crate) async fn qualify_semantic_model(
     ];
     let first_call = one_tool_call(
         call_xai_agent_step(
+            send,
             credentials,
             model,
             effort,
@@ -188,6 +190,7 @@ pub(crate) async fn qualify_semantic_model(
     ];
     let recovery_call = one_tool_call(
         call_xai_agent_step(
+            send,
             credentials,
             model,
             effort,
@@ -208,7 +211,9 @@ pub(crate) async fn qualify_semantic_model(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn propose_semantic_action(
+    send: &crate::provider_send::ProviderSendContext,
     credentials: &crate::auth_store::WireCredentials,
     model: &str,
     effort: EffortLevel,
@@ -231,6 +236,7 @@ pub(crate) async fn propose_semantic_action(
     ];
     let call = one_tool_call(
         call_xai_agent_step(
+            send,
             credentials,
             model,
             effort,

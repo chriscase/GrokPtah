@@ -5,7 +5,6 @@ use std::path::Path;
 
 use anyhow::{anyhow, bail, Result};
 use chrono::Utc;
-use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -19,6 +18,10 @@ use crate::provider_observation::{
     ProviderObservationAttempt, ProviderObservationContext, ProviderRouteClass as ObservationRoute,
     PublicModelId, RequestHeaderName, RequestRouteIdentity, ResponseContentClass, ResponseFraming,
     ResponseMetadata,
+};
+use crate::provider_send::{
+    DeliveryKnowledge as SendDeliveryKnowledge, ProviderSendContext,
+    SettlementOutcome as SendSettlementOutcome, UncertaintyClass as SendUncertaintyClass,
 };
 use crate::session::{Session, SessionKind, TranscriptEntry};
 use crate::types::EffortLevel;
@@ -1249,6 +1252,7 @@ pub(crate) fn parse_effort_arg(raw: &str) -> EffortLevel {
 
 /// Ask the model for a short numbered plan (no tools).
 pub(crate) async fn propose_plan_with_model(
+    send: &ProviderSendContext,
     creds: &crate::auth_store::WireCredentials,
     model: &str,
     cwd: &Path,
@@ -1264,6 +1268,7 @@ pub(crate) async fn propose_plan_with_model(
         cwd.display()
     );
     let reply = call_xai_chat(
+        send,
         creds,
         model,
         &[("user".into(), prompt)],
@@ -1699,25 +1704,6 @@ where
     Ok(false)
 }
 
-async fn read_bounded_response_body(
-    response: reqwest::Response,
-    cancel: &CancellationToken,
-) -> Result<String> {
-    let mut body = crate::sse::BoundedBodyAccumulator::new();
-    let mut stream = response.bytes_stream();
-    loop {
-        let chunk = tokio::select! {
-            chunk = stream.next() => chunk,
-            _ = cancel.cancelled() => bail!("cancelled"),
-        };
-        let Some(chunk) = chunk else {
-            break;
-        };
-        body.push(&chunk.map_err(|error| anyhow!("provider response body: {error}"))?)?;
-    }
-    body.finish()
-}
-
 fn finish_streamed_tool_calls(
     tool_calls: std::collections::BTreeMap<u32, (String, String, String)>,
     stream_completed: bool,
@@ -1751,6 +1737,7 @@ fn ensure_stream_completed(saw_data: bool, stream_completed: bool) -> Result<()>
     Ok(())
 }
 
+#[derive(Clone)]
 struct ProviderObservationRoute {
     route_class: ObservationRoute,
     dialect: ObservationDialect,
@@ -1841,7 +1828,10 @@ fn provider_observation_route(
         return None;
     }
     let model = opaque_identity(&format!("model:{}", target.wire_model))?;
-    let route = opaque_identity(&format!("route:{base}/chat/completions"))?;
+    let route = opaque_identity(&format!(
+        "route:{}",
+        crate::provider_send::transport::completions_url(base)
+    ))?;
     Some(ProviderObservationRoute {
         route_class: ObservationRoute::CompatibleGateway,
         dialect: ObservationDialect::OpenaiCompatible,
@@ -1963,6 +1953,7 @@ fn record_provider_attempt(
 /// Cancel aborts the HTTP body read within ~one chunk.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn call_xai_agent_step<F, G>(
+    send: &ProviderSendContext,
     creds: &crate::auth_store::WireCredentials,
     model: &str,
     effort: EffortLevel,
@@ -1978,6 +1969,7 @@ where
     G: FnMut(&str),
 {
     call_xai_agent_step_observed(
+        send,
         creds,
         model,
         effort,
@@ -1997,6 +1989,7 @@ where
 /// provider execution and failures in the recorder never affect the result.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn call_xai_agent_step_observed<F, G>(
+    send: &ProviderSendContext,
     creds: &crate::auth_store::WireCredentials,
     model: &str,
     effort: EffortLevel,
@@ -2025,6 +2018,7 @@ where
     let observation_route =
         observation.and_then(|_| provider_observation_route(&creds, &target, credential_binding));
     call_provider_agent_step(
+        send,
         creds,
         target,
         effort,
@@ -2041,7 +2035,96 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Project one physical attempt into the certification observation recorder.
+///
+/// The recorder is fed from the lattice's own view of the attempt, so it is a
+/// projection rather than a second ledger tracking the same sends. It maps the
+/// lattice's delivery vocabulary onto the recorder's disposition vocabulary and
+/// adds nothing of its own.
+fn observation_sink(
+    observation: Option<&ProviderObservationContext>,
+    route: Option<&ProviderObservationRoute>,
+) -> Option<crate::provider_send::transport::ObservationSink> {
+    let (context, route) = observation.zip(route)?;
+    let attempt = context.begin_observation().ok()?;
+    let route = route.clone();
+    // The recorder consumes the attempt, so it is handed over exactly once.
+    let cell = std::sync::Mutex::new(Some((route, attempt)));
+    Some(std::sync::Arc::new(
+        move |observed: &crate::provider_send::transport::ObservedAttempt| {
+            let Some((route, attempt)) = cell.lock().ok().and_then(|mut slot| slot.take()) else {
+                return;
+            };
+            let disposition = if observed.protocol_error {
+                ObservationAttemptDisposition::ProtocolError
+            } else {
+                match (observed.outcome, observed.uncertainty) {
+                    (Some(SendSettlementOutcome::Completed), _) => {
+                        ObservationAttemptDisposition::Completed
+                    }
+                    (Some(SendSettlementOutcome::ProviderRejected), _) => {
+                        ObservationAttemptDisposition::HttpError
+                    }
+                    (_, Some(SendUncertaintyClass::Timeout)) => {
+                        ObservationAttemptDisposition::Timeout
+                    }
+                    (_, Some(SendUncertaintyClass::CancelledAfterDispatch)) => {
+                        ObservationAttemptDisposition::Cancelled
+                    }
+                    (_, Some(SendUncertaintyClass::ResponseParse)) => {
+                        ObservationAttemptDisposition::ProtocolError
+                    }
+                    _ => ObservationAttemptDisposition::TransportError,
+                }
+            };
+            let (content_class, framing) = match observed.headers.as_ref() {
+                Some(headers) => response_shape(headers, observed.response_bytes),
+                None => (None, ResponseFraming::None),
+            };
+            let usage =
+                observed
+                    .prompt_tokens
+                    .map(|prompt_tokens| crate::completion::CompletionUsage {
+                        prompt_tokens,
+                        completion_tokens: observed.completion_tokens.unwrap_or_default(),
+                        total_tokens: observed.total_tokens.unwrap_or(
+                            prompt_tokens + observed.completion_tokens.unwrap_or_default(),
+                        ),
+                        requests: 1,
+                    });
+            record_provider_attempt(
+                Some(attempt),
+                &route,
+                observed.status,
+                content_class,
+                framing,
+                disposition,
+                observed.request_bytes,
+                observed.response_bytes,
+                usage.as_ref(),
+            );
+        },
+    ))
+}
+
+/// Redact a send failure for a configured (operator-supplied) provider, whose
+/// endpoint and diagnostics are private.
+fn redact_send_error(error: &crate::provider_send::ProviderSendError, compatible: bool) -> String {
+    if compatible {
+        match error.delivery() {
+            SendDeliveryKnowledge::Unknown => {
+                "configured provider request may have been sent; its outcome is unknown".into()
+            }
+            _ => "configured provider request failed".into(),
+        }
+    } else {
+        error.to_string()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn call_provider_agent_step<F, G>(
+    send: &crate::provider_send::ProviderSendContext,
     mut creds: crate::auth_store::WireCredentials,
     target: ResolvedModelTarget,
     effort: EffortLevel,
@@ -2058,6 +2141,8 @@ where
     F: FnMut(&str),
     G: FnMut(&str),
 {
+    use crate::provider_send::{ProviderRequestSpec, ResponseAccept, WireDialect};
+
     if !target.capabilities.tools {
         bail!(
             "provider model `{}` is not qualified for coding tools; use Chat or qualify native tool calling first",
@@ -2067,16 +2152,9 @@ where
     let base = target.base_url.clone();
     let model_id = target.wire_model.clone();
     let request_timeout = target.deadline_class.agent_timeout();
-    let client = reqwest::Client::builder()
-        .timeout(request_timeout)
-        .connect_timeout(std::time::Duration::from_secs(20))
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent(format!(
-            "grok/{} (GrokPtah)",
-            crate::auth_store::client_version_header()
-        ))
-        .build()
-        .map_err(|e| anyhow!(e))?;
+    let dialect = WireDialect::from(target.dialect);
+    let compatible =
+        target.dialect == crate::gateway_config::ProviderDialect::OpenAiChatCompletions;
 
     let mut body = serde_json::json!({
         "model": model_id,
@@ -2089,119 +2167,73 @@ where
         body["stream_options"] = serde_json::json!({ "include_usage": true });
     }
     apply_effort_to_agent_body(&mut body, &target, effort)?;
-    let url = format!("{}/chat/completions", base.trim_end_matches('/'));
 
     // Three compatibility downgrades and up to three transient retries can all
     // be needed by the same provider. Keep each downgrade independently
-    // eligible while retaining a hard cap on total loop attempts.
+    // eligible while retaining a hard cap on total loop attempts. An OIDC
+    // refresh does not spend that budget, matching the pre-lattice transport,
+    // which retried once after refresh inside each iteration.
     const MAX_REQUEST_ATTEMPTS: u32 = 7;
     const MAX_TRANSIENT_RETRIES: u32 = 3;
+    let mut request_attempts = 0u32;
+    let mut auth_refreshes = 0u32;
     let mut transient_retries = 0u32;
     let mut last_err = None::<String>;
-    for _request_attempt in 0..MAX_REQUEST_ATTEMPTS {
+
+    while request_attempts < MAX_REQUEST_ATTEMPTS {
         if cancel.is_cancelled() {
             bail!("cancelled");
         }
-        let send_once = |c: &crate::auth_store::WireCredentials| {
-            let mut req = client
-                .post(&url)
-                .header("Content-Type", "application/json")
-                .header("Accept", "text/event-stream");
-            if target.dialect == crate::gateway_config::ProviderDialect::XaiChatCompletions {
-                req = req.header("x-grok-effort", effort.as_str());
-            }
-            let req = crate::auth_store::apply_auth_headers(req, c, &base);
-            req.json(&body)
+        let credential_incarnation = creds.qualification_identity_fingerprint();
+        let effort_header = (target.dialect
+            == crate::gateway_config::ProviderDialect::XaiChatCompletions)
+            .then(|| effort.as_str());
+        let spec = ProviderRequestSpec {
+            credentials: Some(&creds),
+            base_url: &base,
+            wire_model: &model_id,
+            dialect,
+            credential_binding: Some(credential_incarnation.as_str()),
+            body: &body,
+            accept: ResponseAccept::EventStream,
+            effort_header,
+            request_timeout,
+            observation: observation_sink(observation, observation_route.as_ref()),
         };
-        let request_bytes = serde_json::to_vec(&body)
-            .map(|body| body.len() as u64)
-            .unwrap_or_default();
-        let mut observation_attempt =
-            observation_route
-                .as_ref()
-                .zip(observation)
-                .and_then(|(route, context)| {
-                    context.begin_attempt().ok().map(|attempt| (route, attempt))
-                });
 
-        let resp_result = tokio::select! {
-            r = send_once(&creds).send() => r,
-            _ = cancel.cancelled() => {
-                if let Some((route, attempt)) = observation_attempt.take() {
-                    record_provider_attempt(
-                        Some(attempt),
-                        route,
-                        None,
-                        None,
-                        ResponseFraming::None,
-                        ObservationAttemptDisposition::Cancelled,
-                        request_bytes,
-                        0,
-                        None,
-                    );
-                }
-                bail!("cancelled")
-            },
-        };
-        let mut resp = match resp_result {
-            Ok(r) => r,
-            Err(e) => {
-                if let Some((route, attempt)) = observation_attempt.take() {
-                    record_provider_attempt(
-                        Some(attempt),
-                        route,
-                        None,
-                        None,
-                        ResponseFraming::None,
-                        if e.is_timeout() {
-                            ObservationAttemptDisposition::Timeout
-                        } else {
-                            ObservationAttemptDisposition::TransportError
-                        },
-                        request_bytes,
-                        0,
-                        None,
-                    );
-                }
-                last_err = Some(
-                    if target.dialect
-                        == crate::gateway_config::ProviderDialect::OpenAiChatCompletions
-                    {
-                        if e.is_timeout() {
-                            "configured provider request timed out".into()
-                        } else if e.is_connect() {
-                            "configured provider could not connect".into()
-                        } else {
-                            "configured provider request failed".into()
-                        }
-                    } else {
-                        format!("request error: {e}")
-                    },
-                );
-                if allow_transient_retries && transient_retries < MAX_TRANSIENT_RETRIES {
+        let sent = match crate::provider_send::dispatch(send, spec, cancel).await {
+            Ok(sent) => sent,
+            Err(error) => {
+                // The single retry rule: stand down unless the lattice proved
+                // the request never reached the provider.
+                let retryable = error.may_auto_retry();
+                last_err = Some(redact_send_error(&error, compatible));
+                if retryable && allow_transient_retries && transient_retries < MAX_TRANSIENT_RETRIES
+                {
                     let delay = 400 * (1 << transient_retries);
                     transient_retries += 1;
+                    request_attempts += 1;
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                     continue;
                 }
-                bail!("{}", last_err.unwrap());
+                bail!("{}", last_err.take().unwrap_or_else(|| error.to_string()));
             }
         };
 
-        if resp.status() == reqwest::StatusCode::UNAUTHORIZED && creds.oidc_token_auth {
-            if let Some((route, attempt)) = observation_attempt.take() {
-                record_provider_attempt(
-                    Some(attempt),
-                    route,
-                    Some(resp.status().as_u16()),
-                    None,
-                    ResponseFraming::None,
-                    ObservationAttemptDisposition::HttpError,
-                    request_bytes,
-                    0,
-                    None,
-                );
-            }
+        let status = sent.status();
+        let content_type = sent.content_type();
+        let mut reader = sent.into_reader();
+
+        // One retry after OIDC refresh on 401 (an expired access token is
+        // common). The rejected attempt settles first: the provider answered,
+        // so the refreshed request is a new attempt with its own ordinal, never
+        // a silent reuse of this one.
+        if status == reqwest::StatusCode::UNAUTHORIZED
+            && creds.oidc_token_auth
+            && auth_refreshes < MAX_REQUEST_ATTEMPTS
+        {
+            let _ = drain_and_reject(&mut reader, cancel).await;
+            drop(reader);
             match crate::auth_store::force_refresh(&creds).await {
                 Ok(fresh) => {
                     creds = fresh;
@@ -2214,63 +2246,8 @@ where
                     observation_route = observation.and_then(|_| {
                         provider_observation_route(&creds, &target, refreshed_binding)
                     });
-                    observation_attempt =
-                        observation_route
-                            .as_ref()
-                            .zip(observation)
-                            .and_then(|(route, context)| {
-                                context.begin_attempt().ok().map(|attempt| (route, attempt))
-                            });
-                    resp = tokio::select! {
-                        r = send_once(&creds).send() => match r {
-                            Ok(response) => response,
-                            Err(error) => {
-                                if let Some((route, attempt)) = observation_attempt.take() {
-                                    record_provider_attempt(
-                                        Some(attempt),
-                                        route,
-                                        None,
-                                        None,
-                                        ResponseFraming::None,
-                                        if error.is_timeout() {
-                                            ObservationAttemptDisposition::Timeout
-                                        } else {
-                                            ObservationAttemptDisposition::TransportError
-                                        },
-                                        request_bytes,
-                                        0,
-                                        None,
-                                    );
-                                }
-                                let class = if error.is_timeout() {
-                                    "timeout"
-                                } else if error.is_connect() {
-                                    "connect"
-                                } else {
-                                    "transport"
-                                };
-                                return Err(anyhow!(
-                                    "request after OIDC refresh failed ({class})"
-                                ));
-                            }
-                        },
-                        _ = cancel.cancelled() => {
-                            if let Some((route, attempt)) = observation_attempt.take() {
-                                record_provider_attempt(
-                                    Some(attempt),
-                                    route,
-                                    None,
-                                    None,
-                                    ResponseFraming::None,
-                                    ObservationAttemptDisposition::Cancelled,
-                                    request_bytes,
-                                    0,
-                                    None,
-                                );
-                            }
-                            bail!("cancelled")
-                        },
-                    };
+                    auth_refreshes += 1;
+                    continue;
                 }
                 Err(error) => {
                     bail!("HTTP 401 (OIDC refresh refused: {})", error.code());
@@ -2278,32 +2255,13 @@ where
             }
         }
 
-        let status = resp.status();
         if status.as_u16() == 429
             || status.is_server_error()
             || status == reqwest::StatusCode::REQUEST_TIMEOUT
         {
-            let headers = resp.headers().clone();
-            let text = read_bounded_response_body(resp, cancel)
-                .await
-                .unwrap_or_default();
-            let (content_class, framing) = response_shape(&headers, text.len() as u64);
-            if let Some((route, attempt)) = observation_attempt.take() {
-                record_provider_attempt(
-                    Some(attempt),
-                    route,
-                    Some(status.as_u16()),
-                    content_class,
-                    framing,
-                    ObservationAttemptDisposition::HttpError,
-                    request_bytes,
-                    text.len() as u64,
-                    None,
-                );
-            }
+            let text = drain_and_reject(&mut reader, cancel).await?;
+            drop(reader);
             let clipped: String = text.chars().take(400).collect();
-            let compatible =
-                target.dialect == crate::gateway_config::ProviderDialect::OpenAiChatCompletions;
             last_err = Some(if status.as_u16() == 429 {
                 if compatible {
                     "configured provider rate limited the request (HTTP 429)".into()
@@ -2318,55 +2276,36 @@ where
             if allow_transient_retries && transient_retries < MAX_TRANSIENT_RETRIES {
                 let delay = 600 * (1 << transient_retries);
                 transient_retries += 1;
+                request_attempts += 1;
                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                 continue;
             }
-            bail!("{}", last_err.unwrap());
+            bail!("{}", last_err.take().unwrap_or_default());
         }
 
         if !status.is_success() {
-            let headers = resp.headers().clone();
-            let text = read_bounded_response_body(resp, cancel)
-                .await
-                .unwrap_or_default();
-            let (content_class, framing) = response_shape(&headers, text.len() as u64);
-            if let Some((route, attempt)) = observation_attempt.take() {
-                record_provider_attempt(
-                    Some(attempt),
-                    route,
-                    Some(status.as_u16()),
-                    content_class,
-                    framing,
-                    ObservationAttemptDisposition::HttpError,
-                    request_bytes,
-                    text.len() as u64,
-                    None,
-                );
-            }
+            let text = drain_and_reject(&mut reader, cancel).await?;
+            drop(reader);
             // Some OpenAI-compatible gateways support streaming but reject
             // `stream_options`. Retry once without usage metadata; bounded
             // runs will then stop fail-closed at the response boundary.
-            if status.as_u16() == 400
-                && target.dialect == crate::gateway_config::ProviderDialect::OpenAiChatCompletions
-                && body.get("stream_options").is_some()
-            {
+            if status.as_u16() == 400 && compatible && body.get("stream_options").is_some() {
                 if let Some(object) = body.as_object_mut() {
                     object.remove("stream_options");
                 }
                 last_err = Some("HTTP 400 (will retry without stream_options)".into());
+                request_attempts += 1;
                 continue;
             }
             // Some compatible gateways support native tools but reject the
             // optional tool_choice field. Retry once without that foreign
             // field before changing the streaming contract.
-            if status.as_u16() == 400
-                && target.dialect == crate::gateway_config::ProviderDialect::OpenAiChatCompletions
-                && body.get("tool_choice").is_some()
-            {
+            if status.as_u16() == 400 && compatible && body.get("tool_choice").is_some() {
                 if let Some(object) = body.as_object_mut() {
                     object.remove("tool_choice");
                 }
                 last_err = Some("HTTP 400 (will retry without tool_choice)".into());
+                request_attempts += 1;
                 continue;
             }
             // Some proxies reject stream+tools — fall back to non-stream once.
@@ -2381,9 +2320,10 @@ where
                     "HTTP {status} (will retry non-stream): {}",
                     text.chars().take(200).collect::<String>()
                 ));
+                request_attempts += 1;
                 continue;
             }
-            if target.dialect == crate::gateway_config::ProviderDialect::OpenAiChatCompletions {
+            if compatible {
                 bail!("configured provider returned HTTP {status}");
             }
             bail!(
@@ -2394,93 +2334,16 @@ where
 
         // Non-stream JSON body (fallback path). Some compatible gateways also
         // return this shape despite accepting `stream=true`.
-        let headers = resp.headers().clone();
-        let content_type = headers
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        if body.get("stream").and_then(|s| s.as_bool()) == Some(false) {
-            let raw = read_bounded_response_body(resp, cancel).await?;
-            let (content_class, framing) = response_shape(&headers, raw.len() as u64);
-            let v: serde_json::Value = match serde_json::from_str(&raw) {
+        if body.get("stream").and_then(|s| s.as_bool()) == Some(false)
+            || content_type.contains("application/json")
+        {
+            let raw = read_settled_body(&mut reader, cancel).await?;
+            let value = match serde_json::from_str::<serde_json::Value>(&raw) {
                 Ok(value) => value,
                 Err(error) => {
-                    if let Some((route, attempt)) = observation_attempt.take() {
-                        record_provider_attempt(
-                            Some(attempt),
-                            route,
-                            Some(status.as_u16()),
-                            content_class,
-                            framing,
-                            ObservationAttemptDisposition::ProtocolError,
-                            request_bytes,
-                            raw.len() as u64,
-                            None,
-                        );
-                    }
-                    return Err(anyhow!("provider JSON: {error}"));
-                }
-            };
-            let usage = parse_completion_usage(&v).unwrap_or(None);
-            let step = match parse_agent_step_from_message(
-                &v["choices"][0]["message"],
-                false,
-                &mut on_delta,
-                &mut on_thought,
-            ) {
-                Ok(step) => step.with_usage(usage.clone()),
-                Err(error) => {
-                    if let Some((route, attempt)) = observation_attempt.take() {
-                        record_provider_attempt(
-                            Some(attempt),
-                            route,
-                            Some(status.as_u16()),
-                            content_class,
-                            framing,
-                            ObservationAttemptDisposition::ProtocolError,
-                            request_bytes,
-                            raw.len() as u64,
-                            usage.as_ref(),
-                        );
-                    }
-                    return Err(error);
-                }
-            };
-            if let Some((route, attempt)) = observation_attempt.take() {
-                record_provider_attempt(
-                    Some(attempt),
-                    route,
-                    Some(status.as_u16()),
-                    content_class,
-                    framing,
-                    ObservationAttemptDisposition::Completed,
-                    request_bytes,
-                    raw.len() as u64,
-                    usage.as_ref(),
-                );
-            }
-            return Ok(step);
-        }
-        if content_type.contains("application/json") {
-            let raw = read_bounded_response_body(resp, cancel).await?;
-            let (content_class, framing) = response_shape(&headers, raw.len() as u64);
-            let value: serde_json::Value = match serde_json::from_str(&raw) {
-                Ok(value) => value,
-                Err(error) => {
-                    if let Some((route, attempt)) = observation_attempt.take() {
-                        record_provider_attempt(
-                            Some(attempt),
-                            route,
-                            Some(status.as_u16()),
-                            content_class,
-                            framing,
-                            ObservationAttemptDisposition::ProtocolError,
-                            request_bytes,
-                            raw.len() as u64,
-                            None,
-                        );
-                    }
+                    // A response we cannot read tells us nothing about whether
+                    // the provider acted on the request.
+                    let _ = reader.settle_uncertain(SendUncertaintyClass::ResponseParse);
                     return Err(anyhow!("provider JSON: {error}"));
                 }
             };
@@ -2493,90 +2356,35 @@ where
             ) {
                 Ok(step) => step.with_usage(usage.clone()),
                 Err(error) => {
-                    if let Some((route, attempt)) = observation_attempt.take() {
-                        record_provider_attempt(
-                            Some(attempt),
-                            route,
-                            Some(status.as_u16()),
-                            content_class,
-                            framing,
-                            ObservationAttemptDisposition::ProtocolError,
-                            request_bytes,
-                            raw.len() as u64,
-                            usage.as_ref(),
-                        );
-                    }
+                    let _ = reader.settle_uncertain(SendUncertaintyClass::ResponseParse);
                     return Err(error);
                 }
             };
-            if let Some((route, attempt)) = observation_attempt.take() {
-                record_provider_attempt(
-                    Some(attempt),
-                    route,
-                    Some(status.as_u16()),
-                    content_class,
-                    framing,
-                    ObservationAttemptDisposition::Completed,
-                    request_bytes,
-                    raw.len() as u64,
-                    usage.as_ref(),
-                );
-            }
+            settle_completed_step(&mut reader, &value, usage.as_ref())?;
             return Ok(step);
         }
 
         // SSE stream path — cancel kills the body read promptly.
-        let mut stream = resp.bytes_stream();
         let mut decoder = crate::sse::SseLineDecoder::new();
         let mut full_body = crate::sse::BoundedBodyAccumulator::new();
         let mut acc = AgentSseAccumulator::default();
         let mut done = false;
-        let mut response_bytes = 0u64;
 
         loop {
-            let chunk = tokio::select! {
-                c = stream.next() => c,
-                _ = cancel.cancelled() => {
-                    drop(stream);
-                    if let Some((route, attempt)) = observation_attempt.take() {
-                        record_provider_attempt(
-                            Some(attempt),
-                            route,
-                            None,
-                            None,
-                            ResponseFraming::None,
-                            ObservationAttemptDisposition::Cancelled,
-                            request_bytes,
-                            response_bytes,
-                            None,
-                        );
-                    }
-                    bail!("cancelled");
-                }
-            };
-            let Some(chunk) = chunk else {
+            let Some(chunk) = reader.next_chunk(cancel).await else {
                 break;
             };
             let bytes = match chunk {
                 Ok(bytes) => bytes,
                 Err(error) => {
-                    if let Some((route, attempt)) = observation_attempt.take() {
-                        record_provider_attempt(
-                            Some(attempt),
-                            route,
-                            None,
-                            None,
-                            ResponseFraming::None,
-                            ObservationAttemptDisposition::TransportError,
-                            request_bytes,
-                            response_bytes,
-                            None,
-                        );
-                    }
+                    let _ = reader.settle_uncertain(
+                        error
+                            .uncertainty()
+                            .unwrap_or(SendUncertaintyClass::TransportError),
+                    );
                     return Err(anyhow!("stream: {error}"));
                 }
             };
-            response_bytes = response_bytes.saturating_add(bytes.len() as u64);
             if !acc.saw_data {
                 full_body.push(&bytes)?;
             }
@@ -2598,22 +2406,10 @@ where
         }
         if !acc.saw_data {
             let raw = full_body.finish()?;
-            let value: serde_json::Value = match serde_json::from_str(raw.trim()) {
+            let value = match serde_json::from_str::<serde_json::Value>(raw.trim()) {
                 Ok(value) => value,
                 Err(error) => {
-                    if let Some((route, attempt)) = observation_attempt.take() {
-                        record_provider_attempt(
-                            Some(attempt),
-                            route,
-                            Some(status.as_u16()),
-                            Some(ResponseContentClass::Other),
-                            ResponseFraming::Chunked,
-                            ObservationAttemptDisposition::ProtocolError,
-                            request_bytes,
-                            response_bytes,
-                            None,
-                        );
-                    }
+                    let _ = reader.settle_uncertain(SendUncertaintyClass::ResponseParse);
                     return Err(anyhow!(
                         "provider returned neither SSE nor valid JSON: {error}"
                     ));
@@ -2628,70 +2424,22 @@ where
             ) {
                 Ok(step) => step.with_usage(usage.clone()),
                 Err(error) => {
-                    if let Some((route, attempt)) = observation_attempt.take() {
-                        record_provider_attempt(
-                            Some(attempt),
-                            route,
-                            Some(status.as_u16()),
-                            Some(ResponseContentClass::Other),
-                            ResponseFraming::Chunked,
-                            ObservationAttemptDisposition::ProtocolError,
-                            request_bytes,
-                            response_bytes,
-                            usage.as_ref(),
-                        );
-                    }
+                    let _ = reader.settle_uncertain(SendUncertaintyClass::ResponseParse);
                     return Err(error);
                 }
             };
-            if let Some((route, attempt)) = observation_attempt.take() {
-                record_provider_attempt(
-                    Some(attempt),
-                    route,
-                    Some(status.as_u16()),
-                    Some(ResponseContentClass::Other),
-                    ResponseFraming::Chunked,
-                    ObservationAttemptDisposition::Completed,
-                    request_bytes,
-                    response_bytes,
-                    usage.as_ref(),
-                );
-            }
+            settle_completed_step(&mut reader, &value, usage.as_ref())?;
             return Ok(step);
         }
 
         if let Err(error) = ensure_stream_completed(acc.saw_data, done) {
-            if let Some((route, attempt)) = observation_attempt.take() {
-                record_provider_attempt(
-                    Some(attempt),
-                    route,
-                    Some(status.as_u16()),
-                    Some(ResponseContentClass::EventStream),
-                    ResponseFraming::ServerSentEvents,
-                    ObservationAttemptDisposition::ProtocolError,
-                    request_bytes,
-                    response_bytes,
-                    acc.usage.as_ref(),
-                );
-            }
+            let _ = reader.settle_uncertain(SendUncertaintyClass::UnexpectedEof);
             return Err(error);
         }
         let tool_calls = match finish_streamed_tool_calls(acc.tool_calls, done) {
             Ok(tool_calls) => tool_calls,
             Err(error) => {
-                if let Some((route, attempt)) = observation_attempt.take() {
-                    record_provider_attempt(
-                        Some(attempt),
-                        route,
-                        Some(status.as_u16()),
-                        Some(ResponseContentClass::EventStream),
-                        ResponseFraming::ServerSentEvents,
-                        ObservationAttemptDisposition::ProtocolError,
-                        request_bytes,
-                        response_bytes,
-                        acc.usage.as_ref(),
-                    );
-                }
+                let _ = reader.settle_uncertain(SendUncertaintyClass::ResponseParse);
                 return Err(error);
             }
         };
@@ -2702,6 +2450,7 @@ where
             Some(acc.reasoning)
         };
         let usage = if acc.usage_invalid { None } else { acc.usage };
+        settle_completed_stream(&mut reader, usage.as_ref())?;
 
         if !tool_calls.is_empty() {
             let content_opt = if acc.content.trim().is_empty() {
@@ -2709,19 +2458,6 @@ where
             } else {
                 Some(acc.content)
             };
-            if let Some((route, attempt)) = observation_attempt.take() {
-                record_provider_attempt(
-                    Some(attempt),
-                    route,
-                    Some(status.as_u16()),
-                    Some(ResponseContentClass::EventStream),
-                    ResponseFraming::ServerSentEvents,
-                    ObservationAttemptDisposition::Completed,
-                    request_bytes,
-                    response_bytes,
-                    usage.as_ref(),
-                );
-            }
             return Ok(AgentStep::ToolCalls {
                 content: content_opt,
                 tool_calls,
@@ -2732,19 +2468,6 @@ where
         }
 
         if !acc.content.trim().is_empty() {
-            if let Some((route, attempt)) = observation_attempt.take() {
-                record_provider_attempt(
-                    Some(attempt),
-                    route,
-                    Some(status.as_u16()),
-                    Some(ResponseContentClass::EventStream),
-                    ResponseFraming::ServerSentEvents,
-                    ObservationAttemptDisposition::Completed,
-                    request_bytes,
-                    response_bytes,
-                    usage.as_ref(),
-                );
-            }
             return Ok(AgentStep::Final {
                 text: acc.content,
                 streamed: acc.streamed_any,
@@ -2754,19 +2477,6 @@ where
         }
         if let Some(r) = reasoning_opt {
             // Reasoning-only: already streamed via on_thought; no assistant text.
-            if let Some((route, attempt)) = observation_attempt.take() {
-                record_provider_attempt(
-                    Some(attempt),
-                    route,
-                    Some(status.as_u16()),
-                    Some(ResponseContentClass::EventStream),
-                    ResponseFraming::ServerSentEvents,
-                    ObservationAttemptDisposition::Completed,
-                    request_bytes,
-                    response_bytes,
-                    usage.as_ref(),
-                );
-            }
             return Ok(AgentStep::Final {
                 text: String::new(),
                 streamed: true,
@@ -2777,19 +2487,6 @@ where
         // A successful stream may legitimately carry only usage metadata.
         // It is still a billable provider response, so never hide it behind
         // an internal retry that the run ledger cannot observe.
-        if let Some((route, attempt)) = observation_attempt.take() {
-            record_provider_attempt(
-                Some(attempt),
-                route,
-                Some(status.as_u16()),
-                Some(ResponseContentClass::EventStream),
-                ResponseFraming::ServerSentEvents,
-                ObservationAttemptDisposition::Completed,
-                request_bytes,
-                response_bytes,
-                usage.as_ref(),
-            );
-        }
         return Ok(AgentStep::Final {
             text: String::new(),
             streamed: acc.streamed_any,
@@ -2803,13 +2500,93 @@ where
     );
 }
 
+/// Read an error body and settle the attempt as a provider rejection.
+///
+/// The provider answered, so this is not uncertainty — but a body that ends
+/// badly still leaves delivery of the *response* unknown, and the reader
+/// records that on its own.
+async fn drain_and_reject(
+    reader: &mut crate::provider_send::ResponseReader,
+    cancel: &CancellationToken,
+) -> Result<String> {
+    match reader.read_to_string(cancel).await {
+        Ok(text) => {
+            let _ = reader.settle_rejected();
+            Ok(text)
+        }
+        Err(error) => {
+            let _ = reader.settle_uncertain(
+                error
+                    .uncertainty()
+                    .unwrap_or(SendUncertaintyClass::TransportError),
+            );
+            Err(anyhow!("{error}"))
+        }
+    }
+}
+
+/// Read a success body, preserving uncertainty if it does not complete.
+async fn read_settled_body(
+    reader: &mut crate::provider_send::ResponseReader,
+    cancel: &CancellationToken,
+) -> Result<String> {
+    match reader.read_to_string(cancel).await {
+        Ok(text) => Ok(text),
+        Err(error) => {
+            let _ = reader.settle_uncertain(
+                error
+                    .uncertainty()
+                    .unwrap_or(SendUncertaintyClass::TransportError),
+            );
+            Err(anyhow!("{error}"))
+        }
+    }
+}
+
+fn provider_receipt_of(value: &serde_json::Value) -> Option<&str> {
+    value.get("id").and_then(serde_json::Value::as_str)
+}
+
+fn settle_completed_step(
+    reader: &mut crate::provider_send::ResponseReader,
+    value: &serde_json::Value,
+    usage: Option<&crate::completion::CompletionUsage>,
+) -> Result<()> {
+    reader
+        .settle_completed(
+            provider_receipt_of(value),
+            usage.map(|usage| usage.prompt_tokens),
+            usage.map(|usage| usage.completion_tokens),
+            usage.map(|usage| usage.total_tokens),
+        )
+        .map_err(|error| anyhow!("{error}"))
+}
+
+fn settle_completed_stream(
+    reader: &mut crate::provider_send::ResponseReader,
+    usage: Option<&crate::completion::CompletionUsage>,
+) -> Result<()> {
+    reader
+        .settle_completed(
+            None,
+            usage.map(|usage| usage.prompt_tokens),
+            usage.map(|usage| usage.completion_tokens),
+            usage.map(|usage| usage.total_tokens),
+        )
+        .map_err(|error| anyhow!("{error}"))
+}
+
 /// Exercise the production xAI request builder, HTTP streaming path, SSE
 /// decoder, terminal-marker validation, and usage extraction against a local
 /// scripted gateway. The endpoint must be an explicit HTTP loopback URL whose
 /// path is `/v1`; fixed synthetic Grok Build credentials are the only
 /// credentials this helper can send.
+/// The replay is a real physical send, so it takes a real binding: a
+/// conformance harness must not be able to reach the wire on a path production
+/// code could not.
 #[doc(hidden)]
 pub async fn replay_xai_provider_contract_on_loopback(
+    send: &ProviderSendContext,
     base_url: &str,
     model: &str,
     messages: &[serde_json::Value],
@@ -2869,6 +2646,7 @@ pub async fn replay_xai_provider_contract_on_loopback(
     let mut deltas = Vec::new();
     let mut thought_deltas = Vec::new();
     let step = call_provider_agent_step(
+        send,
         credentials,
         target,
         EffortLevel::None,
@@ -2918,6 +2696,22 @@ mod compatible_stream_tests {
 
     use super::*;
 
+    /// A real bound send context for the in-crate transport tests.
+    ///
+    /// Deliberately not a stub: these tests exercise the same admission,
+    /// ordinal, and settlement path as production, which is what makes the
+    /// retry stand-down assertions below meaningful.
+    fn test_send_context(root: &std::path::Path, session: &str) -> ProviderSendContext {
+        ProviderSendContext::for_root(
+            root.join("provider-attempts"),
+            "in-crate-transport-test",
+            session,
+            crate::provider_send::SendOrigin::Desktop,
+            crate::provider_send::CallSiteFamily::DesktopBuildRound,
+        )
+        .expect("ledger")
+    }
+
     fn compatible_credentials(provider_id: &str) -> crate::auth_store::WireCredentials {
         crate::auth_store::WireCredentials {
             provider_id: provider_id.into(),
@@ -2955,6 +2749,133 @@ mod compatible_stream_tests {
         config.upsert_profile(profile).unwrap();
         crate::gateway_config::save(&config).unwrap();
         crate::gateway_config::model_selection_key("cancel-test", "test-model")
+    }
+
+    /// The single retry rule, exercised through the production transport.
+    ///
+    /// A connection that was refused is the one classification that proves the
+    /// request never left the host, so the bounded transient retries stay live.
+    #[tokio::test(flavor = "multi_thread")]
+    // Deliberate: the home override is process-global, so the guard has to
+    // outlive the awaits it is protecting.
+    #[allow(clippy::await_holding_lock)]
+    async fn a_refused_connection_still_spends_the_transient_retry_budget() {
+        let _lock = crate::discover::home_override_serial();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+
+        let temp = tempfile::tempdir().unwrap();
+        let model = install_compatible_profile(temp.path(), &format!("http://{address}/v1"));
+        let send = test_send_context(temp.path(), "refused-retries");
+
+        let started = std::time::Instant::now();
+        let result = call_xai_agent_step(
+            &send,
+            &compatible_credentials("cancel-test"),
+            &model,
+            EffortLevel::None,
+            &[serde_json::json!({"role": "user", "content": "synthetic"})],
+            &serde_json::json!([]),
+            true,
+            &CancellationToken::new(),
+            |_| {},
+            |_| {},
+        )
+        .await;
+        crate::discover::set_grokptah_home_override(None);
+
+        assert!(result.is_err(), "a closed port cannot produce a step");
+        // Three transient retries at 400/800/1600ms: the budget was actually
+        // spent, which is what distinguishes "retried" from "stood down".
+        assert!(
+            started.elapsed() >= Duration::from_millis(2_800),
+            "proven non-delivery must still use the bounded retry budget"
+        );
+
+        let scope = send.scope();
+        let attempts = send.ledger().list_scope(&scope).unwrap();
+        assert_eq!(attempts.len(), 4, "one initial attempt plus three retries");
+        for attempt in &attempts {
+            assert_eq!(
+                attempt.state,
+                crate::provider_send::ProviderAttemptState::NotSent,
+                "a refused connection is proven non-delivery"
+            );
+        }
+        // Ordinals are monotonic and never reused.
+        let ordinals: Vec<u64> = attempts.iter().map(|a| a.ordinal()).collect();
+        assert_eq!(ordinals, vec![1, 2, 3, 4]);
+    }
+
+    /// A reset *after* the request may have been written is not retryable, and
+    /// the durable record says so rather than guessing.
+    #[tokio::test(flavor = "multi_thread")]
+    // Deliberate: the home override is process-global, so the guard has to
+    // outlive the awaits it is protecting.
+    #[allow(clippy::await_holding_lock)]
+    async fn a_reset_after_the_write_stands_down_and_stays_uncertain() {
+        let _lock = crate::discover::home_override_serial();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let server_accepted = accepted.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                server_accepted.fetch_add(1, Ordering::SeqCst);
+                // Read the request, then abort the connection: the provider may
+                // well have received it.
+                let mut stream = stream;
+                let mut buffer = [0_u8; 1024];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buffer).await;
+                // Drop without responding: the peer sees the connection die
+                // after the request was written, which is exactly the case the
+                // lattice must not resolve as non-delivery.
+                drop(stream);
+            }
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        let model = install_compatible_profile(temp.path(), &format!("http://{address}/v1"));
+        let send = test_send_context(temp.path(), "reset-standdown");
+
+        let result = call_xai_agent_step(
+            &send,
+            &compatible_credentials("cancel-test"),
+            &model,
+            EffortLevel::None,
+            &[serde_json::json!({"role": "user", "content": "synthetic"})],
+            &serde_json::json!([]),
+            true,
+            &CancellationToken::new(),
+            |_| {},
+            |_| {},
+        )
+        .await;
+        crate::discover::set_grokptah_home_override(None);
+        server.abort();
+
+        assert!(result.is_err());
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "an attempt that may have been written must not be re-sent automatically"
+        );
+
+        let attempts = send.ledger().list_scope(&send.scope()).unwrap();
+        assert_eq!(attempts.len(), 1, "no second ordinal may be opened");
+        assert_eq!(
+            attempts[0].state,
+            crate::provider_send::ProviderAttemptState::Uncertain
+        );
+        assert_eq!(
+            attempts[0].delivery_knowledge(),
+            crate::provider_send::DeliveryKnowledge::Unknown
+        );
+        assert!(!attempts[0].may_auto_retry());
     }
 
     #[test]
@@ -3249,7 +3170,9 @@ mod compatible_stream_tests {
                         Uuid::parse_str("018f1234-5678-7abc-8def-0123456789ad").unwrap(),
                     )
                     .unwrap();
+                let send = test_send_context(temp.path(), "observed-downgrade");
                 let result = call_xai_agent_step_observed(
+                    &send,
                     &compatible_credentials("cancel-test"),
                     &model,
                     EffortLevel::None,
@@ -3336,7 +3259,9 @@ mod compatible_stream_tests {
                 let temp = tempfile::tempdir().unwrap();
                 let model =
                     install_compatible_profile(temp.path(), &format!("http://{address}/v1"));
+                let send = test_send_context(temp.path(), "usage-only-stream");
                 let result = call_xai_agent_step(
+                    &send,
                     &compatible_credentials("cancel-test"),
                     &model,
                     EffortLevel::None,
@@ -3401,6 +3326,7 @@ mod compatible_stream_tests {
                 let result = tokio::time::timeout(
                     Duration::from_secs(1),
                     call_xai_agent_step(
+                        &test_send_context(temp.path(), "stalled-stream"),
                         &credentials,
                         &model,
                         EffortLevel::None,
@@ -3438,7 +3364,9 @@ mod compatible_stream_tests {
                 let temp = tempfile::tempdir().unwrap();
                 let model =
                     install_compatible_profile(temp.path(), &format!("http://{address}/v1"));
+                let send = test_send_context(temp.path(), "redacted-endpoint");
                 let result = call_xai_chat(
+                    &send,
                     &compatible_credentials("cancel-test"),
                     &model,
                     &[("user".into(), "synthetic".into())],
@@ -3644,6 +3572,7 @@ pub(crate) fn api_context_messages(session: &Session) -> Vec<(String, String)> {
 /// typically the current user prompt. `compacted_summary` is the extractive
 /// stand-in for local-only prefix that left the context window.
 pub(crate) async fn call_xai_chat(
+    send: &ProviderSendContext,
     creds: &crate::auth_store::WireCredentials,
     model: &str,
     history: &[(String, String)],
@@ -3675,17 +3604,6 @@ pub(crate) async fn call_xai_chat(
             cwd.display()
         ),
     };
-    let client = reqwest::Client::builder()
-        .timeout(request_timeout)
-        .connect_timeout(std::time::Duration::from_secs(20))
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent(format!(
-            "grok/{} (GrokPtah)",
-            crate::auth_store::client_version_header()
-        ))
-        .build()
-        .map_err(|e| anyhow!(e))?;
-
     let mut messages = Vec::with_capacity(history.len() + 2);
     messages.push(serde_json::json!({
         "role": "system",
@@ -3726,79 +3644,90 @@ pub(crate) async fn call_xai_chat(
         "messages": messages,
         "stream": false
     });
-    let url = format!("{}/chat/completions", base.trim_end_matches('/'));
+    // The request is described here and constructed by the chokepoint; the URL
+    // and the HTTP client both belong to `provider_send::transport`.
+    let cancel = CancellationToken::new();
+    let dialect = crate::provider_send::WireDialect::from(target.dialect);
+    let mut reader = {
+        let mut refreshed_once = false;
+        loop {
+            let credential_incarnation = creds.qualification_identity_fingerprint();
+            let spec = crate::provider_send::ProviderRequestSpec {
+                credentials: Some(&creds),
+                base_url: &base,
+                wire_model: &model_id,
+                dialect,
+                credential_binding: Some(credential_incarnation.as_str()),
+                body: &body,
+                accept: crate::provider_send::ResponseAccept::Json,
+                effort_header: None,
+                request_timeout,
+                observation: None,
+            };
+            let sent = crate::provider_send::dispatch(send, spec, &cancel)
+                .await
+                .map_err(|error| {
+                    // Never flatten "may have been written" into a plain
+                    // failure: the caller and the UI both need that distinction.
+                    if is_compatible {
+                        anyhow!("{}", redact_send_error(&error, true))
+                    } else {
+                        anyhow!("{error}")
+                    }
+                })?;
+            let status = sent.status();
+            let mut reader = sent.into_reader();
 
-    let send_once = |c: &crate::auth_store::WireCredentials| {
-        let req = client.post(&url).header("Content-Type", "application/json");
-        let req = crate::auth_store::apply_auth_headers(req, c, &base);
-        req.json(&body)
+            // One retry after OIDC refresh on 401 (expired access token is
+            // common). The rejected attempt settles first, so the refreshed
+            // request is a new attempt with its own ordinal.
+            if status == reqwest::StatusCode::UNAUTHORIZED
+                && creds.oidc_token_auth
+                && !refreshed_once
+            {
+                let _ = drain_and_reject(&mut reader, &cancel).await;
+                drop(reader);
+                match crate::auth_store::force_refresh(&creds).await {
+                    Ok(fresh) => {
+                        creds = fresh;
+                        refreshed_once = true;
+                        continue;
+                    }
+                    Err(error) => {
+                        bail!(
+                            "HTTP 401 Unauthorized (OIDC refresh refused: {}). \
+                             Run `grok login` to re-authenticate.",
+                            error.code()
+                        );
+                    }
+                }
+            }
+
+            if !status.is_success() {
+                let text = drain_and_reject(&mut reader, &cancel)
+                    .await
+                    .unwrap_or_default();
+                drop(reader);
+                if is_compatible {
+                    bail!("configured provider returned HTTP {status}");
+                }
+                let clipped: String = text.chars().take(800).collect();
+                bail!("HTTP {status}: {clipped}");
+            }
+            break reader;
+        }
     };
 
-    let mut resp = send_once(&creds).send().await.map_err(|e| {
-        // Surface classify-able transport failures (DNS, TLS, timeout) so the
-        // UI is not a vague "error sending request".
-        let kind = if e.is_timeout() {
-            "timeout"
-        } else if e.is_connect() {
-            "connect"
-        } else if e.is_request() {
-            "request"
-        } else {
-            "network"
-        };
-        if is_compatible {
-            anyhow!(
-                "configured provider request failed ({kind}); check its connection and request budget"
-            )
-        } else {
-            anyhow!(
-                "request error ({kind}) for {url}: {e}. \
-                 Check network, VPN, and that cli-chat-proxy is reachable."
-            )
+    let raw = read_settled_body(&mut reader, &cancel).await?;
+    let v: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = reader.settle_uncertain(SendUncertaintyClass::ResponseParse);
+            bail!("provider JSON: {error}");
         }
-    })?;
-
-    // One retry after OIDC refresh on 401 (expired access token is common).
-    if resp.status() == reqwest::StatusCode::UNAUTHORIZED && creds.oidc_token_auth {
-        match crate::auth_store::force_refresh(&creds).await {
-            Ok(fresh) => {
-                creds = fresh;
-                resp = send_once(&creds).send().await.map_err(|error| {
-                    let class = if error.is_timeout() {
-                        "timeout"
-                    } else if error.is_connect() {
-                        "connect"
-                    } else {
-                        "transport"
-                    };
-                    anyhow!("request after OIDC refresh failed ({class})")
-                })?;
-            }
-            Err(error) => {
-                bail!(
-                    "HTTP 401 Unauthorized (OIDC refresh refused: {}). \
-                     Run `grok login` to re-authenticate.",
-                    error.code()
-                );
-            }
-        }
-    }
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        if is_compatible {
-            bail!("configured provider returned HTTP {status}");
-        }
-        let text = read_bounded_response_body(resp, &CancellationToken::new())
-            .await
-            .unwrap_or_default();
-        let clipped: String = text.chars().take(800).collect();
-        bail!("HTTP {status}: {clipped}");
-    }
-    let raw = read_bounded_response_body(resp, &CancellationToken::new()).await?;
-    let v: serde_json::Value =
-        serde_json::from_str(&raw).map_err(|error| anyhow!("provider JSON: {error}"))?;
+    };
     let usage = parse_completion_usage(&v).unwrap_or(None);
+    settle_completed_step(&mut reader, &v, usage.as_ref())?;
     // chat/completions shape
     if let Some(content) = v["choices"][0]["message"]["content"].as_str() {
         if !content.is_empty() {
