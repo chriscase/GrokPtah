@@ -21,8 +21,10 @@ mod version;
 
 pub use capability::{Capabilities, CapabilityState};
 pub use dto::{
-    EventPage, EventRange, HostCapacity, HostHealth, PublicEvent, PublicEventKind, RunBoundsView,
-    RunView, SessionView, UsageView,
+    EventPage, EventRange, HostCapacity, HostHealth, PublicEvent, PublicEventKind,
+    PublicRunHandoffV1, PublicRunListV1, PublicRunProgressV1, PublicRunState, PublicRunV1,
+    RunBoundsView, RunView, SessionView, UsageView, parse_public_run_handoff_v1,
+    parse_public_run_list_v1, parse_public_run_progress_v1, parse_public_run_v1,
 };
 pub use error::SdkError;
 pub use ids::{RunId, SessionId, WorkspaceRef};
@@ -32,5 +34,5 @@ pub use service::ReadObservatory;
 pub use transport::{McpTool, McpTransport, TransportError};
 pub use version::{
     CONTRACT_VERSION, EVENT_PAGE_LIMIT_DEFAULT, EVENT_PAGE_LIMIT_MAX, EVENT_PAGE_LIMIT_MIN,
-    contract_version,
+    PUBLIC_RUN_SCHEMA_VERSION, contract_version,
 };

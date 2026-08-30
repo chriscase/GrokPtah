@@ -4,6 +4,8 @@ use crate::page::RetainedRange;
 
 /// Fail-closed SDK error. Variants match current MCP `error.data.code` values
 /// listed in the read-seam contract. Unknown host codes collapse to [`Self::Internal`].
+/// Staged `grokptah.public-run.v1` decode and unknown-version failures also
+/// collapse to [`Self::Internal`] without forwarding serde payloads or field values.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SdkError {
     #[error("unauthenticated")]
