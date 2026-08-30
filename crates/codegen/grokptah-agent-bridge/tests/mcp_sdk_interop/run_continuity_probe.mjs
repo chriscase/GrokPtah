@@ -20,9 +20,19 @@ const interruptedRunId = process.env.GROKPTAH_MCP_INTERRUPTED_RUN_ID;
 const gapRunId = process.env.GROKPTAH_MCP_GAP_RUN_ID;
 const gapReadyFile = process.env.GROKPTAH_MCP_GAP_READY_FILE;
 const gapReleaseFile = process.env.GROKPTAH_MCP_GAP_RELEASE_FILE;
-if (!url || !token || !sessionId || !gapSessionId || !workspace || !interruptedRunId || !gapRunId || !gapReadyFile || !gapReleaseFile) {
+// Offline parser regression mode. The Rust harness spawns this script with no
+// arguments, so the live probe path below is unchanged.
+const selfTest = process.argv.includes("--self-test");
+if (!selfTest && (!url || !token || !sessionId || !gapSessionId || !workspace || !interruptedRunId || !gapRunId || !gapReadyFile || !gapReleaseFile)) {
   console.error("continuity probe environment is incomplete");
   process.exit(2);
+}
+
+if (selfTest) {
+  // Parser-only regression: no environment, no network, no server. The helper
+  // declarations it uses are hoisted, so this runs before any live-probe
+  // constant is derived from the (deliberately absent) environment.
+  process.exit((await runSelfTest()) ? 0 : 1);
 }
 
 const endpoint = url.endsWith("/mcp") ? url : `${url.replace(/\/$/, "")}/mcp`;
@@ -235,6 +245,13 @@ async function nextFrame(reader, pending = "") {
           body: JSON.parse(data),
         };
       }
+      // A complete data-less frame (an SSE comment or keep-alive) was just
+      // consumed. Re-scan the remainder before blocking on the reader: the
+      // next frame may already be buffered, and a clean EOF would otherwise
+      // be misreported as a stream that closed before the expected frame.
+      // Every pass through this branch drops at least two characters, so the
+      // re-scan always terminates.
+      continue;
     }
     const next = await reader.read();
     if (next.done) throw new Error("SSE stream closed before the expected frame");
@@ -250,6 +267,91 @@ async function waitForRecovery(reader, buffer = "") {
     if (next.body?.method === "notifications/ptah_recovery") return next;
   }
   throw new Error("SSE stream did not surface a recovery notification");
+}
+
+// Deterministic, offline coverage for the SSE frame parser above. `nextFrame`
+// used to drop a complete data-less keep-alive frame and then block on
+// `reader.read()` without re-scanning the buffer, so an already-buffered
+// recovery frame was skipped and a clean EOF was reported as a stream that
+// closed before the expected frame. These cases pin that behaviour without a
+// server, and still require the parser to fail closed on a genuine EOF.
+function selfTestReader(chunks) {
+  let index = 0;
+  return {
+    async read() {
+      if (index >= chunks.length) return { done: true, value: undefined };
+      return { done: false, value: new TextEncoder().encode(chunks[index++]) };
+    },
+  };
+}
+
+async function runSelfTest() {
+  const results = [];
+  const expect = (name, ok, detail = null) => {
+    results.push({ name, ok: Boolean(ok), detail });
+    log(ok ? "ok" : "FAIL", name, detail ?? "");
+  };
+  const recoveryFrame =
+    'id: 7\ndata: {"method":"notifications/ptah_recovery","params":{"pollTool":"ptah_get_events"}}\n\n';
+  const eventFrame = 'id: 6\ndata: {"method":"notifications/ptah_event"}\n\n';
+
+  // The regression: a keep-alive must not shadow a frame already in buffer.
+  try {
+    const framed = await nextFrame(selfTestReader([`: keep-alive\n\n${recoveryFrame}`]));
+    expect(
+      "keepAliveDoesNotSkipBufferedFrame",
+      framed.body?.method === "notifications/ptah_recovery" && framed.id === 7,
+      { method: framed.body?.method, id: framed.id }
+    );
+  } catch (error) {
+    expect("keepAliveDoesNotSkipBufferedFrame", false, String(error));
+  }
+
+  // waitForRecovery must still reach a recovery frame that sits behind a
+  // keep-alive and an ordinary event delivered in the same chunk.
+  try {
+    const framed = await waitForRecovery(selfTestReader([`: keep-alive\n\n${eventFrame}${recoveryFrame}`]));
+    expect(
+      "bufferedRecoveryFollowsKeepAliveAndEvent",
+      framed.body?.method === "notifications/ptah_recovery" && framed.id === 7,
+      { method: framed.body?.method, id: framed.id }
+    );
+  } catch (error) {
+    expect("bufferedRecoveryFollowsKeepAliveAndEvent", false, String(error));
+  }
+
+  // Frames arriving across chunk boundaries must still parse.
+  try {
+    const framed = await nextFrame(selfTestReader([
+      ': keep-alive\n\nid: 7\ndata: {"method":"notifications',
+      '/ptah_recovery"}\n\n',
+    ]));
+    expect(
+      "splitFrameAfterKeepAliveStillParses",
+      framed.body?.method === "notifications/ptah_recovery" && framed.id === 7,
+      { method: framed.body?.method, id: framed.id }
+    );
+  } catch (error) {
+    expect("splitFrameAfterKeepAliveStillParses", false, String(error));
+  }
+
+  // Fail closed: a stream that truly ends without a data frame must still
+  // throw, and the re-scan must terminate rather than spin.
+  let closed = null;
+  try {
+    await nextFrame(selfTestReader([": keep-alive\n\n: keep-alive\n\n"]));
+  } catch (error) {
+    closed = String(error);
+  }
+  expect(
+    "dataLessStreamStillFailsClosed",
+    Boolean(closed?.includes("SSE stream closed before the expected frame")),
+    closed
+  );
+
+  const failed = results.filter((item) => !item.ok).map((item) => item.name);
+  console.log(JSON.stringify({ ok: failed.length === 0, mode: "self-test", failed, results }));
+  return failed.length === 0;
 }
 
 async function waitForRelease() {
