@@ -242,8 +242,7 @@ async function nextFrame(reader, pending = "") {
   }
 }
 
-async function waitForRecovery(reader) {
-  let buffer = "";
+async function waitForRecovery(reader, buffer = "") {
   let frames = 0;
   while (frames++ < 20_000) {
     const next = await nextFrame(reader, buffer);
@@ -457,9 +456,15 @@ try {
   // the coordinator reconstructs state with the durable read tool.
   const gapStream = await openLive(gapRunId, null, gapSessionId);
   if (gapStream.status !== 200) throw new Error(`gap stream HTTP ${gapStream.status}`);
+  const gapReader = gapStream.body.getReader();
   fs.writeFileSync(gapReadyFile, "ready");
+  // Consume one frame to keep the HTTP transport healthy, then deliberately
+  // stop reading while the Rust driver floods the bounded subscriber. This
+  // preserves the lag/recovery condition without overflowing a client-side
+  // unread-body buffer before the recovery frame can be observed.
+  const heldFrame = await nextFrame(gapReader);
   await waitForRelease();
-  const recovery = await waitForRecovery(gapStream.body.getReader());
+  const recovery = await waitForRecovery(gapReader, heldFrame.buffer);
   const gapRead = await call("ptah_get_events", {
     session_id: gapSessionId,
     workspace,
