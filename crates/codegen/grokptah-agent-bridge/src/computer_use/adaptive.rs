@@ -336,9 +336,14 @@ impl AdaptiveReason {
 /// and observation.
 ///
 /// This type is intentionally not serializable and its fields are private.
-/// Only trusted host code inside this crate can mint an answer, so planner or
-/// model JSON cannot turn `approved: true` into a human underwrite. The
-/// binding is what stops an answer being banked and spent later: a token
+/// Planner or model JSON cannot turn `approved: true` into a human
+/// underwrite. A production host that already holds the operator's yes/no
+/// mints one through
+/// [`super::service::ComputerUseService::mint_host_adaptive_approval`], which
+/// binds that boolean to the live stored run. This crate does not collect
+/// the decision, prompt an operator, or accept a token from the wire.
+///
+/// The binding is what stops an answer being banked and spent later: a token
 /// minted for one observation cannot authorize the next one, and one minted
 /// before a takeover cannot authorize anything after it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -352,8 +357,9 @@ pub struct AdaptiveApproval {
 impl AdaptiveApproval {
     /// Mint an approval from a trusted host decision. This is crate-private
     /// by design; public callers must never be able to construct one from
-    /// wire data.
-    #[allow(dead_code)]
+    /// wire data. Production minting goes through
+    /// [`super::service::ComputerUseService::mint_host_adaptive_approval`] so
+    /// the binding is the live stored run, not a caller-supplied snapshot.
     pub(crate) fn host_mint(
         run: &ComputerRun,
         observation: &ComputerObservation,
@@ -365,6 +371,30 @@ impl AdaptiveApproval {
             observation_id: observation.observation_id.clone(),
             approved,
         }
+    }
+
+    /// Non-secret fingerprint of the hidden run/epoch/observation binding.
+    ///
+    /// Uses the same payload hash as mutation receipts so the marker is
+    /// deterministic. The digest is not a capability: it cannot reconstitute
+    /// this token, is never accepted as input, and does not include the
+    /// yes/no decision. Raw identities never appear on the mutation payload.
+    pub(crate) fn binding_fingerprint(&self) -> String {
+        crate::orchestration::hash_payload(&serde_json::json!({
+            "runId": self.run_id,
+            "controlEpoch": self.control_epoch,
+            "observationId": self.observation_id,
+        }))
+    }
+
+    /// Mutation-replay marker: host decision plus the binding fingerprint.
+    /// Distinct hidden bindings therefore cannot collide merely because both
+    /// tokens were approved or both were denied.
+    pub(crate) fn replay_marker(&self) -> serde_json::Value {
+        serde_json::json!({
+            "approved": self.approved,
+            "binding": self.binding_fingerprint(),
+        })
     }
 
     fn matches(&self, run: &ComputerRun, observation: &ComputerObservation) -> bool {
@@ -391,17 +421,18 @@ pub struct AdaptiveClaim {
     pub observed_sequence: u64,
     /// A local approval answer, if one has been collected. It is intentionally
     /// skipped on the public wire: untrusted claims can never deserialize a
-    /// successful approval. Trusted host code may set it after minting an
-    /// opaque [`AdaptiveApproval`].
+    /// successful approval. Trusted host code may set it after
+    /// [`super::service::ComputerUseService::mint_host_adaptive_approval`].
     #[serde(skip)]
     pub approval: Option<AdaptiveApproval>,
 }
 
 impl AdaptiveClaim {
-    /// Internal replay marker for the opaque approval. The decision is part of
-    /// the mutation identity without serializing the approval token itself.
-    pub(crate) fn approval_marker(&self) -> Option<bool> {
-        self.approval.as_ref().map(|approval| approval.approved)
+    /// Internal replay marker for the opaque approval. The decision and a
+    /// non-secret binding fingerprint are part of the mutation identity
+    /// without serializing the approval token or its raw ids.
+    pub(crate) fn approval_marker(&self) -> Option<serde_json::Value> {
+        self.approval.as_ref().map(AdaptiveApproval::replay_marker)
     }
 }
 
@@ -1079,6 +1110,65 @@ mod tests {
                 "{reason:?} has no kernel code of its own"
             );
         }
+    }
+
+    #[test]
+    fn approval_replay_markers_distinguish_hidden_bindings() {
+        let now = Utc::now();
+        let run = run(now);
+        let observation = observation(now);
+        let approved = AdaptiveApproval::host_mint(&run, &observation, true);
+        let denied = AdaptiveApproval::host_mint(&run, &observation, false);
+        assert_eq!(
+            approved.binding_fingerprint(),
+            denied.binding_fingerprint(),
+            "the fingerprint is the binding, not the yes/no"
+        );
+        assert_ne!(
+            approved.replay_marker(),
+            denied.replay_marker(),
+            "approve and deny of one binding must not collide"
+        );
+
+        let mut other_observation = observation.clone();
+        other_observation.observation_id = "obs-2".into();
+        let mut other_epoch = run.clone();
+        other_epoch.control_epoch += 1;
+        let mut other_run = run.clone();
+        other_run.run_id = "another-run".into();
+        let other_bindings = [
+            AdaptiveApproval::host_mint(&run, &other_observation, true),
+            AdaptiveApproval::host_mint(&other_epoch, &observation, true),
+            AdaptiveApproval::host_mint(&other_run, &observation, true),
+        ];
+        for other in other_bindings {
+            assert_ne!(approved.binding_fingerprint(), other.binding_fingerprint());
+            assert_ne!(approved.replay_marker(), other.replay_marker());
+            assert_eq!(other.replay_marker()["approved"], serde_json::json!(true));
+        }
+    }
+
+    #[test]
+    fn approval_binding_fingerprint_does_not_carry_raw_ids() {
+        let now = Utc::now();
+        let run = run(now);
+        let observation = observation(now);
+        let approval = AdaptiveApproval::host_mint(&run, &observation, true);
+        let fingerprint = approval.binding_fingerprint();
+        assert_eq!(fingerprint.len(), 64);
+        assert!(fingerprint.chars().all(|ch| ch.is_ascii_hexdigit()));
+        assert!(
+            !fingerprint.contains(&run.run_id),
+            "fingerprint leaked the run id"
+        );
+        assert!(
+            !fingerprint.contains(&observation.observation_id),
+            "fingerprint leaked the observation id"
+        );
+        let marker = serde_json::to_string(&approval.replay_marker()).unwrap();
+        assert!(!marker.contains(&run.run_id));
+        assert!(!marker.contains(&observation.observation_id));
+        assert!(!marker.contains("obs-1"));
     }
 
     #[test]

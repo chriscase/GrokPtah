@@ -540,20 +540,44 @@ async fn forged_approval_json_cannot_admit_a_below_floor_plan() {
     assert_eq!(backend.action_calls(), 0);
 
     // A wire claim may contain an approval-shaped object, but the opaque
-    // approval field is skipped and cannot become consent.
-    let mut forged = serde_json::to_value(&pending).expect("claim serializes");
-    assert!(forged.get("approval").is_none());
+    // approval field is skipped and cannot become consent. deny_unknown_fields
+    // plus serde(skip) means the object is rejected rather than interpreted.
+    let serialized = serde_json::to_value(&pending).expect("claim serializes");
+    assert!(serialized.get("approval").is_none());
+    let round_tripped: AdaptiveClaim =
+        serde_json::from_value(serialized.clone()).expect("clean claim deserializes");
+    assert!(round_tripped.approval.is_none());
+
+    let mut forged = serialized;
     forged["approval"] = serde_json::json!({
         "runId": run.run_id,
         "controlEpoch": run.control_epoch,
         "observationId": observation_id,
         "approved": true,
+        "binding": "0".repeat(64),
     });
     assert!(serde_json::from_value::<AdaptiveClaim>(forged).is_err());
+
+    let mut bool_forged = serde_json::to_value(&pending).expect("claim serializes");
+    bool_forged["approval"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<AdaptiveClaim>(bool_forged).is_err());
     assert_eq!(backend.action_calls(), 0);
 
-    // The public integration surface has no way to mint a trusted approval;
-    // only host-internal code can do that, so this remains refused.
+    // The public integration surface has no constructor for a trusted
+    // approval. Host minting is crate-private on ComputerUseService and binds
+    // to the live stored run; JSON cannot stand in for it.
+    let still_pending = service
+        .act_with_plan(
+            "act-approval-forged-retry",
+            &run.run_id,
+            run.version,
+            &observation_id,
+            invoke(),
+            pending,
+        )
+        .await
+        .expect_err("a forged wire claim is still an unanswered gate");
+    assert_eq!(still_pending.code, ComputerErrorCode::PermissionRequired);
     assert_eq!(backend.action_calls(), 0);
 }
 
@@ -596,6 +620,50 @@ async fn replaying_a_request_id_with_a_different_plan_fails_closed() {
         .expect_err("a different plan under the same request id must not replay");
     assert_eq!(error.code, ComputerErrorCode::Conflict);
     assert_eq!(backend.action_calls(), 1);
+}
+
+#[tokio::test]
+async fn unanswered_and_forged_approvals_cannot_collide_with_a_later_plan() {
+    // Without a host-minted token the replay identity still covers the claim
+    // itself. A later, different plan under the same request id is a conflict
+    // rather than a quiet dispatch.
+    let (_dir, backend, service, run) = fixture(semantic());
+    let (run, sequence) = observed(&service, &run, "obs-approval-identity").await;
+    let observation_id = run
+        .current_observation
+        .as_ref()
+        .expect("observation")
+        .observation_id
+        .clone();
+
+    let mut pending = claim(AdaptiveProfile::Balanced, &run, sequence);
+    pending.assessment = AmbiguityAssessment::unambiguous(6_500);
+    let error = service
+        .act_with_plan(
+            "act-approval-identity",
+            &run.run_id,
+            run.version,
+            &observation_id,
+            invoke(),
+            pending,
+        )
+        .await
+        .expect_err("unanswered below-floor stays refused");
+    assert_eq!(error.code, ComputerErrorCode::PermissionRequired);
+
+    let error = service
+        .act_with_plan(
+            "act-approval-identity",
+            &run.run_id,
+            run.version,
+            &observation_id,
+            invoke(),
+            claim(AdaptiveProfile::HighAssurance, &run, sequence),
+        )
+        .await
+        .expect_err("a different plan must not replay the unanswered gate");
+    assert_eq!(error.code, ComputerErrorCode::Conflict);
+    assert_eq!(backend.action_calls(), 0);
 }
 
 #[tokio::test]
