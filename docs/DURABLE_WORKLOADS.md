@@ -95,12 +95,16 @@ Mutation tools:
 - `ptah_cancel_work`
 - `ptah_retry_work` (explicitly reopens a failed item only within its retry budget)
 - `ptah_approve_work` (human decision for an approval-gated completion)
+- `ptah_block_work` (explicit human hold with durable provenance)
+- `ptah_unblock_work` (explicit human release guarded by the current revision)
 
 Mutating calls use the existing durable request-id/idempotency mechanism. A
 replayed request returns the original response; the same request ID with a
 different payload is rejected. The authenticated service currently exposes a
 single operator-equivalent bearer token, so claimant identity is the current
 auth token ID. Per-principal authorization is a separate security milestone.
+Human hold/release actions carry a revision fence; stale unblock attempts fail
+closed with `stale_version` and cannot silently overwrite a newer state.
 
 The desktop's remote-service adapter advertises and decodes the two read tools
 into typed `DurableWorkItem`, `DurableWorkAttempt`, and `RemoteWorkSnapshot`

@@ -527,8 +527,9 @@ pub fn evaluate_admission(
 
 /// One node of the lane-scoped operator view of the work graph.
 ///
-/// Every field here is either the caller's own lane coordinate or a typed
-/// enumeration. Deliberately absent, because an operator view is rendered
+/// Every field here is either the caller's own lane coordinate, a bounded
+/// state/admission value, or a deliberately limited operator-facing string.
+/// Deliberately absent, because an operator view is rendered
 /// wherever a client runs: the workspace path, the session id, the creating
 /// principal, the assigned agent, the free-text objective and progress and
 /// result (which carry paths, provider names, and tool names), the free-text
