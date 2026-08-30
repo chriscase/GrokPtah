@@ -328,7 +328,7 @@ try {
     let previous = 0;
     const sequences = [];
     let pages = 0;
-    let cursorExpired = false;
+    let pageInvalid = false;
     while (pages++ < 32) {
       const pageResponse = await call("ptah_get_events", {
         run_id: sharedRunId,
@@ -336,23 +336,26 @@ try {
         limit: 3,
       });
       const page = structured(pageResponse.json);
-      cursorExpired = page?.cursorExpired === true;
-      if (cursorExpired || pageResponse.status !== 200) break;
-      for (const entry of page?.entries ?? []) {
+      pageInvalid =
+        pageResponse.status !== 200 ||
+        page?.schemaVersion !== "grokptah.public-event.v1" ||
+        !Array.isArray(page?.events);
+      if (pageInvalid) break;
+      for (const entry of page.events) {
         if (typeof entry.seq !== "number" || entry.seq <= previous) {
-          cursorExpired = true;
+          pageInvalid = true;
           break;
         }
         previous = entry.seq;
         sequences.push(entry.seq);
       }
       const next = page?.nextCursor;
-      if (cursorExpired || next == null || next === after) break;
+      if (pageInvalid || next == null || next === after) break;
       after = next;
     }
-    record("cursorReplayNoGaps", !cursorExpired && sequences.length > 0, {
+    record("cursorReplayNoGaps", !pageInvalid && sequences.length > 0, {
       pages,
-      entries: sequences.length,
+      events: sequences.length,
       first: sequences[0],
       last: sequences.at(-1),
     });
@@ -594,14 +597,23 @@ try {
       })
     : { status: 0, json: null };
   const discarded = structured(discardedState.json);
+  const discardMutation = structured(discardResponse.json);
   record(
     "isolatedDiscard",
     discardSubmit.status === 200 &&
       discardTerminal?.state === "completed" &&
       discardResponse.status === 200 &&
-      discarded?.execution?.promotionState === "discarded" &&
+      discardMutation?.execution?.promotionState === "discarded" &&
+      discarded?.schemaVersion === "grokptah.public-run.v1" &&
+      discarded?.state === "completed" &&
+      discarded?.execution === undefined &&
       !fs.existsSync(discardFile),
-    { runId: discardRunId, state: discardTerminal?.state, discardStatus: discardResponse.status }
+    {
+      runId: discardRunId,
+      state: discardTerminal?.state,
+      discardStatus: discardResponse.status,
+      publicSchema: discarded?.schemaVersion,
+    }
   );
 
   // Idle steering is explicitly non-cancelling and becomes durable queue state.
