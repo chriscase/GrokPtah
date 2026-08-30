@@ -4,7 +4,8 @@
 //! `ptah_get_run`, `ptah_get_progress`, and `ptah_get_handoff`. Current MCP
 //! dispatch still serializes full `RunRecord` / ad-hoc JSON. Do not adopt this
 //! type on any one of those four tools until the others and their consumers
-//! switch in the same change.
+//! switch in the same change. Consumer inventory and staged order:
+//! `docs/PUBLIC_RUN_WIRE_MIGRATION.md`.
 
 use chrono::{DateTime, Utc};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
