@@ -1495,6 +1495,7 @@ pub const CONTROL_TOOLS: &[&str] = &[
     "ptah_reassign_work",
     "ptah_reprioritize_work",
     "ptah_block_work",
+    "ptah_unblock_work",
     "ptah_request_review",
     "ptah_list_work_decisions",
     "ptah_send_message",

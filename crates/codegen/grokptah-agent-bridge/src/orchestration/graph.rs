@@ -467,13 +467,9 @@ pub fn evaluate_admission(
         WorkState::Cancelled => return AdmissionBlock::Cancelled,
         _ => {}
     }
-    // A container is never executable whatever holds it, and `Container` is
-    // the more informative answer than any hold placed on it.
-    if item.is_container {
-        return AdmissionBlock::Container;
-    }
-    // An explicit block outranks everything below: a human who stopped this
-    // item is not overruled by dependencies becoming ready.
+    // An explicit block outranks everything below, including Container: a
+    // human who stopped this item is not overruled by it being a coordination
+    // container, and reconciliation must not re-queue it.
     //
     // Ambiguous provenance fails closed. A record written before provenance
     // was typed carries none, and reading it as derived would let an upgrade
@@ -483,6 +479,11 @@ pub fn evaluate_admission(
         && item.block_provenance.is_none_or(BlockProvenance::is_manual)
     {
         return AdmissionBlock::ManuallyBlocked;
+    }
+    // A container is never executable. Checked after a manual hold so a held
+    // container remains ManuallyBlocked until an authorized unblock.
+    if item.is_container {
+        return AdmissionBlock::Container;
     }
     if item.deadline.is_some_and(|deadline| deadline <= now) {
         return AdmissionBlock::DeadlineExceeded;

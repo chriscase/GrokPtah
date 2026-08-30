@@ -2672,7 +2672,7 @@ fn tool_input_schema(name: &str) -> Value {
                 "expected_revision": {"type": "integer", "minimum": 1}
             }
         }),
-        "ptah_block_work" | "ptah_request_review" => json!({
+        "ptah_block_work" | "ptah_unblock_work" | "ptah_request_review" => json!({
             "type": "object",
             "required": ["request_id", "session_id", "workspace", "work_id", "reason"],
             "additionalProperties": false,
@@ -3663,6 +3663,19 @@ async fn dispatch_tool(
         "ptah_block_work" => {
             let args: RetryWorkArgs = parse_value(args)?;
             orch.block_work(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                &args.work_id,
+                args.reason,
+                args.expected_revision,
+            )
+            .await
+        }
+        "ptah_unblock_work" => {
+            let args: RetryWorkArgs = parse_value(args)?;
+            orch.unblock_work(
                 auth,
                 &args.request_id,
                 args.session_id,

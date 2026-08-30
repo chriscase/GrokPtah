@@ -2974,10 +2974,12 @@ impl OrchestrationService {
             return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
         }
         // The work-graph authority runs before the first durable write, so a
-        // rejected graph leaves no record behind and no idempotency key
-        // consumed. `WorkItem::validate` sees one item and can only reject a
-        // self-edge; a ring, a dangling id, and an id belonging to another
-        // lane are all graph-level facts.
+        // rejected graph leaves no work record behind. The refusal is recorded
+        // under the idempotency key (`fail_claim`), so a replay is refused
+        // again rather than answering with a record that was never written.
+        // `WorkItem::validate` sees one item and can only reject a self-edge;
+        // a ring, a dangling id, and an id belonging to another lane are all
+        // graph-level facts.
         if !item.dependencies.is_empty() {
             let lane = match self.store.scoped_work_items(session_id, &item.workspace) {
                 Ok(lane) => lane,
@@ -3887,6 +3889,39 @@ impl OrchestrationService {
             move |store| {
                 store
                     .block_work(
+                        work_id,
+                        &auth.token_id,
+                        &reason,
+                        expected_revision,
+                        Utc::now(),
+                    )
+                    .map(|(item, _)| item)
+            },
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn unblock_work(
+        &self,
+        auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        work_id: &str,
+        reason: String,
+        expected_revision: Option<u64>,
+    ) -> Result<serde_json::Value, OrchError> {
+        self.work_item_mutation(
+            "ptah_unblock_work",
+            request_id,
+            session_id,
+            workspace,
+            work_id,
+            json!({"reason": reason, "expectedRevision": expected_revision}),
+            move |store| {
+                store
+                    .unblock_work(
                         work_id,
                         &auth.token_id,
                         &reason,

@@ -2,13 +2,15 @@
 //!
 //! `tests/work_graph_authority.rs` states the properties against the durable
 //! ledger. This file proves the authority actually runs on the path a caller
-//! reaches — before the first durable write, so a refused graph leaves nothing
-//! behind and costs the caller nothing but the error.
+//! reaches — before the first durable write, so a refused graph leaves no work
+//! record. The refusal is recorded under the idempotency key, so a replay is
+//! refused again rather than answering with a record that was never written.
 
 mod common;
 
 use grokptah_agent_bridge::orchestration::{
-    OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, WorkspaceAllowlist,
+    BlockProvenance, OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, WorkState,
+    WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
     set_grokptah_home_override, start_control_server, AgentHost, HostConfig, McpControlClient,
@@ -221,4 +223,240 @@ async fn the_control_plane_refuses_a_cross_lane_dependency_without_writing() {
             && node.get("attempts").is_none()
             && node.get("leaseToken").is_none()
     }));
+}
+
+/// `ptah_unblock_work` is the control-plane twin of `ptah_block_work`: same
+/// identity/session/workspace fence, same revision fence, same payload shape,
+/// and the same unknown vs cross-lane answers. The store already had the
+/// transition; this is the path a coordinator actually reaches.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn the_control_plane_unblocks_under_the_same_fences_as_block() {
+    let mut env = ProcessEnvGuard::new();
+    let home = tempdir().unwrap();
+    set_grokptah_home_override(Some(home.path().join(".grokptah")));
+    env.set("GROKPTAH_AGENT_OFFLINE", "1");
+    let workspace = tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    })
+    .expect("acquire the GrokPtah instance lock");
+    host.start().unwrap();
+
+    let mine = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(mine.id, workspace.path()).unwrap();
+    let theirs = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(theirs.id, workspace.path()).unwrap();
+
+    let store = OrchStore::open(home.path().join("orchestration")).unwrap();
+    let orch = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        store.clone(),
+        OrchestrationConfig {
+            bearer_token: "work-graph-token-305".into(),
+            allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
+            max_concurrent_runs: 2,
+            bounds: RunBounds::default(),
+        },
+    );
+    let server = start_control_server(orch, 0).await.unwrap();
+    let mut client =
+        McpControlClient::new(format!("http://{}", server.addr), "work-graph-token-305");
+    client.initialize().await.unwrap();
+    let workspace_text = workspace.path().display().to_string();
+
+    let tools = client.list_tools().await.unwrap();
+    let unblock = tools
+        .iter()
+        .find(|tool| tool.name == "ptah_unblock_work")
+        .expect("ptah_unblock_work must be advertised");
+    let block = tools
+        .iter()
+        .find(|tool| tool.name == "ptah_block_work")
+        .expect("ptah_block_work must be advertised");
+    assert_eq!(unblock.input_schema, block.input_schema);
+
+    let created = client
+        .call_tool(
+            "ptah_create_work",
+            json!({
+                "request_id": "unblock-create",
+                "session_id": mine.id,
+                "workspace": workspace_text,
+                "kind": "verification",
+                "objective": "held then released",
+            }),
+        )
+        .await
+        .unwrap();
+    let work_id = created.structured["work"]["workId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let revision = created.structured["work"]["revision"].as_u64().unwrap();
+
+    let blocked = client
+        .call_tool(
+            "ptah_block_work",
+            json!({
+                "request_id": "unblock-block",
+                "session_id": mine.id,
+                "workspace": workspace_text,
+                "work_id": work_id,
+                "reason": "stop for review",
+                "expected_revision": revision,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(blocked.structured["work"]["state"], "blocked");
+    assert_eq!(blocked.structured["work"]["blockProvenance"], "manual");
+    let blocked_revision = blocked.structured["work"]["revision"].as_u64().unwrap();
+
+    let stale = client
+        .call_tool(
+            "ptah_unblock_work",
+            json!({
+                "request_id": "unblock-stale",
+                "session_id": mine.id,
+                "workspace": workspace_text,
+                "work_id": work_id,
+                "reason": "stale fence",
+                "expected_revision": blocked_revision + 7,
+            }),
+        )
+        .await
+        .expect_err("a stale revision fence must refuse the write")
+        .to_string();
+    assert_eq!(stale, "MCP remote error: stale_version");
+    let still_held = store.load_work_item(&work_id).unwrap().unwrap();
+    assert_eq!(still_held.state, WorkState::Blocked);
+    assert_eq!(still_held.revision, blocked_revision);
+
+    let released = client
+        .call_tool(
+            "ptah_unblock_work",
+            json!({
+                "request_id": "unblock-release",
+                "session_id": mine.id,
+                "workspace": workspace_text,
+                "work_id": work_id,
+                "reason": "review complete",
+                "expected_revision": blocked_revision,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(released.structured["work"]["state"], "queued");
+    assert!(released.structured["work"].get("blockProvenance").is_none());
+    assert!(released.structured["work"].get("blockedReason").is_none());
+
+    let sibling = client
+        .call_tool(
+            "ptah_create_work",
+            json!({
+                "request_id": "unblock-sibling",
+                "session_id": theirs.id,
+                "workspace": workspace_text,
+                "kind": "verification",
+                "objective": "the other lane's work",
+            }),
+        )
+        .await
+        .unwrap();
+    let sibling_id = sibling.structured["work"]["workId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let unknown_args = |request_id: &str| {
+        json!({
+            "request_id": request_id,
+            "session_id": mine.id,
+            "workspace": workspace_text,
+            "work_id": "no-such-work",
+            "reason": "probe",
+        })
+    };
+    let cross_args = |request_id: &str| {
+        json!({
+            "request_id": request_id,
+            "session_id": mine.id,
+            "workspace": workspace_text,
+            "work_id": sibling_id,
+            "reason": "probe",
+        })
+    };
+
+    let unknown_block = client
+        .call_tool("ptah_block_work", unknown_args("unknown-block"))
+        .await
+        .expect_err("unknown work cannot be blocked")
+        .to_string();
+    let unknown_unblock = client
+        .call_tool("ptah_unblock_work", unknown_args("unknown-unblock"))
+        .await
+        .expect_err("unknown work cannot be unblocked")
+        .to_string();
+    assert_eq!(unknown_block, "MCP remote error: invalid_request");
+    assert_eq!(
+        unknown_unblock, unknown_block,
+        "unblock must not distinguish an absent work id from block"
+    );
+
+    let cross_block = client
+        .call_tool("ptah_block_work", cross_args("cross-block"))
+        .await
+        .expect_err("a sibling lane's work cannot be blocked from this lane")
+        .to_string();
+    let cross_unblock = client
+        .call_tool("ptah_unblock_work", cross_args("cross-unblock"))
+        .await
+        .expect_err("a sibling lane's work cannot be unblocked from this lane")
+        .to_string();
+    assert_eq!(
+        cross_unblock, cross_block,
+        "unblock must not distinguish a sibling's work from block"
+    );
+
+    // A derived dependency hold is reconciliation's, not an operator's to
+    // release. The control plane must not widen the store's provenance rule.
+    let waiting = client
+        .call_tool(
+            "ptah_create_work",
+            json!({
+                "request_id": "unblock-waiting",
+                "session_id": mine.id,
+                "workspace": workspace_text,
+                "kind": "verification",
+                "objective": "waits on the released item",
+                "dependencies": [{ "workId": work_id, "requiredState": "succeeded" }],
+            }),
+        )
+        .await
+        .unwrap();
+    let waiting_id = waiting.structured["work"]["workId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    store.reconcile_workloads().unwrap();
+    let derived = store.load_work_item(&waiting_id).unwrap().unwrap();
+    assert_eq!(derived.block_provenance, Some(BlockProvenance::Derived));
+    let denied = client
+        .call_tool(
+            "ptah_unblock_work",
+            json!({
+                "request_id": "unblock-derived",
+                "session_id": mine.id,
+                "workspace": workspace_text,
+                "work_id": waiting_id,
+                "reason": "impatience",
+            }),
+        )
+        .await
+        .expect_err("a dependency hold is not an operator's to release")
+        .to_string();
+    assert_eq!(denied, "MCP remote error: conflict");
 }

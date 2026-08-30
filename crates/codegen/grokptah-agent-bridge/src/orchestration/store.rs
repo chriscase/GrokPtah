@@ -2130,17 +2130,17 @@ impl OrchStore {
         item: &mut WorkItem,
         now: chrono::DateTime<Utc>,
     ) -> anyhow::Result<()> {
-        if item.state.is_terminal() || item.is_container {
+        if item.state.is_terminal() {
             return Ok(());
         }
         let states = self.resolve_dependencies_unlocked(item)?;
         let admission = super::graph::evaluate_admission(item, &states, now);
-        // A manual block outranks reconciliation's dependency transitions.
-        // The previous implementation lifted any `Blocked` item whose
-        // dependencies were satisfied, and an operator-blocked item has no
-        // dependencies to satisfy -- so the next tick silently re-queued, and
-        // then executed, work a human had stopped. The deadline below is not
-        // suspended by an operator hold: it is a hard bound.
+        // Admission is consulted before the container skip: a manual hold on a
+        // container remains ManuallyBlocked, and the re-queue branch below
+        // must not treat Container as "not waiting". The previous ordering
+        // returned Container first, so a held container looked ready to lift.
+        // The deadline below is not suspended by an operator hold: it is a
+        // hard bound. Containers themselves are still not executed.
         let manually_held = admission == super::graph::AdmissionBlock::ManuallyBlocked;
         let waiting = !manually_held
             && matches!(
@@ -2175,6 +2175,9 @@ impl OrchStore {
                 item.bump();
                 self.save_work_item_unlocked(item)?;
             }
+        }
+        if item.is_container || admission == super::graph::AdmissionBlock::Container {
+            return Ok(());
         }
         if item.deadline.is_some_and(|deadline| deadline <= now) && !item.state.is_terminal() {
             item.state = WorkState::Failed;

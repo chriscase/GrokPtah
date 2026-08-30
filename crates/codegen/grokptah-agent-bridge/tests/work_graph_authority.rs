@@ -398,6 +398,52 @@ fn a_manual_block_is_not_lifted_by_reconciliation() {
         .expect("released work is claimable");
 }
 
+/// A container is never executable, but a manual hold on one must still remain
+/// a hold. If `Container` outranks `ManuallyBlocked`, reconciliation treats the
+/// item as "not waiting" and re-queues work a human stopped.
+#[test]
+fn a_manual_block_on_a_container_is_not_lifted_by_reconciliation() {
+    let home = tempdir().unwrap();
+    let store = OrchStore::open(home.path()).unwrap();
+    let mut container = item_in(Uuid::new_v4(), WORKSPACE, "held-container", "coordination");
+    container.is_container = true;
+    store.save_work_item(&container).unwrap();
+
+    let now = Utc::now();
+    let (blocked, _) = store
+        .block_work(&container.work_id, "operator", "stop the plan", None, now)
+        .unwrap();
+    assert_eq!(blocked.state, WorkState::Blocked);
+    assert_eq!(blocked.block_provenance, Some(BlockProvenance::Manual));
+    assert!(blocked.is_container);
+
+    let states = resolve_dependency_states(&[], &blocked, GraphScope::of(&blocked));
+    assert_eq!(
+        evaluate_admission(&blocked, &states, now),
+        AdmissionBlock::ManuallyBlocked,
+        "a manual hold outranks Container"
+    );
+
+    let report = store.reconcile_workloads_at(now).unwrap();
+    assert_eq!(report.unblocked_items, 0);
+    let after = store.load_work_item(&container.work_id).unwrap().unwrap();
+    assert_eq!(after.state, WorkState::Blocked);
+    assert_eq!(after.block_provenance, Some(BlockProvenance::Manual));
+    assert_eq!(after.blocked_reason.as_deref(), Some("stop the plan"));
+    assert_eq!(after.revision, blocked.revision);
+    let after_states = resolve_dependency_states(&[], &after, GraphScope::of(&after));
+    assert_eq!(
+        evaluate_admission(&after, &after_states, now),
+        AdmissionBlock::ManuallyBlocked
+    );
+    assert!(
+        store
+            .claim_work(&container.work_id, "worker", None)
+            .is_err(),
+        "a held container must not become executable"
+    );
+}
+
 /// A record written before provenance was typed carries none. Reading that as
 /// "derived" would let an upgrade re-queue work a human had stopped, so the
 /// ambiguous case is read as manual and released only by hand.
