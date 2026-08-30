@@ -126,6 +126,76 @@ ordinary pause even though all three share the `paused` lifecycle state. A termi
 run is shown as ended rather than as live agent control, and a disposition this build does not
 recognize fails closed as "unrecognized control state" instead of rendering as an ordinary run.
 
+## Model-output boundary and adaptive vocabulary
+
+`grokptah-agent-bridge::computer_boundary` is the only place untrusted provider
+bytes become a typed proposal. It is a **narrowing** layer: it can reject, never
+widen. `ComputerPolicy` still revalidates every accepted action against the live
+run at dispatch and remains the single physical-action authority.
+
+### Host-minted, private challenge
+
+The host mints a `ProposalTicket` for exactly one observation of one run at one
+control epoch, carrying a random challenge that goes into the prompt and must be
+echoed back verbatim. The ticket implements neither `Serialize` nor
+`Deserialize` and its challenge field is private, so a ticket cannot be forged
+from wire bytes, replayed from a durable record, or leaked through a projection
+— it can only come from `ProposalTicket::mint` in this process.
+
+This challenge is **not** an authentication principal or an auth generation.
+Host identity, credential generations, and durable record authentication belong
+to the canonical authority spine (G1–G4) and are not reimplemented here.
+
+`LaunchEvidence` is host-recorded evidence of what was admitted. Its projection
+drops both the challenge digest and the action digest: a digest over live
+host-minted or model-authored material is still an oracle for it.
+
+### What the parser refuses
+
+Duplicate JSON keys at any depth (`serde_json` alone keeps the last, letting one
+body read one way to a human and another to the parser), trailing content after
+a complete value, prose and fenced blocks (no recovery, extraction, or repair is
+attempted), unknown fields at any level, type coercion, oversized bodies,
+elements absent from the exact current observation, a mismatched proposal id,
+challenge, observation id, or sequence, an expired ticket, a moved control
+epoch, and model-authored completion without an exact host verification of the
+postcondition.
+
+`pointer_click` and `key_chord` are real kernel actions but **operator-only** at
+this boundary, and are refused as such rather than as unknown actions.
+
+Budget and lease are checked *before* the body is parsed: a fenced or exhausted
+run does not pay to inspect untrusted bytes.
+
+### Canonical profile vocabulary (#435)
+
+Exactly three profiles: **Economy**, **Balanced**, **High Assurance**,
+serialized `economy` / `balanced` / `high_assurance`. The older candidate
+spellings `efficient` and `frontier` are **ingest-only aliases**: they
+deserialize, they never serialize, and they resolve to byte-identical budgets.
+
+A profile is an efficiency policy. `AdaptiveBudget` carries no field that can
+relax staleness, sensitivity, grant, target, or element authority, and
+`ComputerPolicy` never reads a profile. Economy is not a weaker-safety mode; it
+sends no pixels (`maxImageBytes` is `0`) and abstains more.
+
+`AdaptiveRecord` is durable on `ComputerRun` and `#[serde(default)]`. Absent
+means **no adaptive authority**, not "no constraints": a record written before
+the field existed deserializes to `None` and admits nothing. Stationarity
+strikes are durable, so a restart cannot reset a no-progress loop. Provider
+attempts are counted before a request leaves, so a refusal costs what a success
+costs, and `attempts == accepted + rejected` always.
+
+### Packaged and VM claims are fail-closed
+
+`PackagedQualification` has no public constructor that yields `partial` or
+`pass`. Both require host-observed evidence this build cannot produce — no
+signed helper was inspected, no operator trust root exists, no TCC grant was
+observed, Virtualization.framework was never launched, no guest image was
+verified, and no frame was captured. `from_simulator()` is permanently
+`unavailable` with those reasons named. Reasons are a closed enum, so one can
+never carry an observed string, a path, or a credential.
+
 ## Threat model
 
 See [Computer Use Threat Model and Release Gate](COMPUTER_USE_THREAT_MODEL.md) for the current

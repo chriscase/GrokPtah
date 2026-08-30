@@ -645,6 +645,11 @@ pub struct ComputerRun {
     pub last_outcome: Option<ActionOutcome>,
     pub audit: Vec<ComputerAuditEntry>,
     pub last_error: Option<ComputerError>,
+    /// Durable adaptive authority for this run. `None` on records written
+    /// before the field existed, and `None` means **no adaptive authority**
+    /// rather than "no constraints": the boundary admits nothing without it.
+    #[serde(default)]
+    pub adaptive: Option<super::adaptive::AdaptiveRecord>,
 }
 
 impl ComputerRun {
@@ -681,6 +686,7 @@ impl ComputerRun {
             last_outcome: None,
             audit: Vec::new(),
             last_error: None,
+            adaptive: None,
         })
     }
 

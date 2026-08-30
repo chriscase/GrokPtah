@@ -8,6 +8,7 @@ mod auth_store;
 pub mod certification;
 mod completion;
 mod computer_agent;
+pub mod computer_boundary;
 pub mod computer_use;
 mod discover;
 pub mod eval_oracle;

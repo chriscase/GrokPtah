@@ -80,10 +80,18 @@ async function tool(id, name, args, options = {}) {
 
 // Wire-level redaction pins: these must match the Rust structural pins.
 const PROJECTION_KEYS = [
-  "agentActive", "campaignId", "controlDisposition", "controlEpoch",
+  "adaptive", "agentActive", "campaignId", "controlDisposition", "controlEpoch",
   "createdAt", "endedAt", "eventRange", "grant", "lastError", "lastOutcome",
   "observation", "ownerSessionId", "parentRunId", "progress", "runId",
   "startedAt", "state", "target", "terminal", "updatedAt", "version",
+];
+// Adaptive state is absent on a run with no adaptive authority, but the key is
+// always present and null-valued, so it belongs in the pinned set above. When
+// it is populated these are its exact keys — no challenge, digest, label,
+// value, geometry, evidence token, or path may ever appear here.
+const ADAPTIVE_KEYS = [
+  "budget", "budgetExhausted", "ingestedAlias", "profile", "spend",
+  "stationaryStrikes",
 ];
 const OBSERVATION_KEYS = [
   "capturedAt", "elementCount", "elementsTruncated", "hasScreenshot",
@@ -99,6 +107,21 @@ function pinProjection(name, projection) {
     JSON.stringify(Object.keys(projection).sort()) === JSON.stringify(PROJECTION_KEYS),
     Object.keys(projection).sort().join(","),
   );
+  if (projection.adaptive) {
+    check(
+      `${name}: adaptive keys are pinned`,
+      JSON.stringify(Object.keys(projection.adaptive).sort()) ===
+        JSON.stringify(ADAPTIVE_KEYS),
+      Object.keys(projection.adaptive).sort().join(","),
+    );
+    check(
+      `${name}: adaptive profile is canonical, never an ingest alias`,
+      ["economy", "balanced", "high_assurance"].includes(
+        projection.adaptive.profile,
+      ),
+      String(projection.adaptive.profile),
+    );
+  }
   if (projection.observation) {
     check(
       `${name}: observation keys are pinned`,
