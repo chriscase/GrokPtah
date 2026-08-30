@@ -152,7 +152,9 @@ pub async fn remote_service_run_list(
 }
 
 /// Additive, allowlisted `grokptah.public-run.v1` list for one remote session.
-/// The legacy raw run command above remains unchanged for compatibility.
+/// The legacy `remote_service_run_list` command is retained as a compatibility
+/// symbol but now fails closed because it cannot decode the public wire as a
+/// private `RunRecord`.
 /// Poll-only: does not start `remote_service_watch_runs`.
 #[tauri::command]
 pub async fn remote_service_public_run_list(
@@ -619,7 +621,9 @@ pub async fn remote_service_run_get(
         .ok_or_else(|| "remote service is not connected".to_string())
 }
 
-/// Additive, allowlisted `grokptah.public-run.v1` get for one remote run.
+/// Additive, allowlisted `grokptah.public-run.v1` get for one remote run. The
+/// legacy `remote_service_run_get` command is retained as a compatibility
+/// symbol but now fails closed for the same reason.
 /// Poll-only: does not start `remote_service_watch_runs`.
 #[tauri::command]
 pub async fn remote_service_public_run_get(

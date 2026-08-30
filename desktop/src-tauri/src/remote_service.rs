@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use grokptah_agent_bridge::orchestration::WorkPolicy;
 use grokptah_agent_bridge::{
     ActivationRecord, AgentRecord, AgentResumePlan, JournalPage, McpControlClient, RoutineRecord,
@@ -300,6 +300,10 @@ impl RemoteServiceState {
         ))
     }
 
+    /// Retired compatibility list. Public MCP `ptah_list_runs` emits
+    /// `grokptah.public-run.v1` only; connected calls fail closed as a redacted
+    /// unsupported/legacy-wire error and do not invoke that tool. Use
+    /// [`Self::list_public_runs`]. Disconnected calls still return `None`.
     pub async fn list_runs(&self) -> Result<Option<Vec<RunRecord>>> {
         let mut client = self.client.lock().await;
         let Some(client) = client.as_mut() else {
@@ -586,6 +590,10 @@ impl RemoteServiceState {
         ))
     }
 
+    /// Retired compatibility get. Public MCP `ptah_get_run` emits
+    /// `grokptah.public-run.v1` only; connected calls fail closed as a redacted
+    /// unsupported/legacy-wire error and do not invoke that tool. Use
+    /// [`Self::get_public_run`]. Disconnected calls still return `None`.
     pub async fn get_run(
         &self,
         session_id: Uuid,
@@ -599,8 +607,8 @@ impl RemoteServiceState {
         Ok(Some(client.get_run(session_id, workspace, run_id).await?))
     }
 
-    /// Additive allowlisted public-run get. Legacy raw `get_run` remains
-    /// unchanged for existing desktop callers.
+    /// Additive allowlisted public-run get. Legacy raw [`Self::get_run`] is
+    /// retired/unsupported; callers must use this method.
     ///
     /// Poll-only: must not register [`Self::watch_runs`]. That path emits raw
     /// `SessionUpdate` journal bodies on `remote://run-event`, which this DTO
@@ -723,6 +731,10 @@ struct RemoteServiceClient {
     base_url: String,
     token: String,
     mcp: McpControlClient,
+    /// Test-only log of `tools/call` names. Legacy list/get must not append
+    /// `ptah_list_runs` / `ptah_get_run` when connected.
+    #[cfg(test)]
+    called_tools: Vec<String>,
 }
 
 impl RemoteServiceClient {
@@ -736,6 +748,8 @@ impl RemoteServiceClient {
             base_url: base_url.clone(),
             token: token.clone(),
             mcp: McpControlClient::new(base_url, token),
+            #[cfg(test)]
+            called_tools: Vec::new(),
         };
         client.reconnect().await?;
         let tools = client
@@ -788,6 +802,8 @@ impl RemoteServiceClient {
     }
 
     async fn call_tool(&mut self, name: &str, arguments: Value) -> Result<Value> {
+        #[cfg(test)]
+        self.called_tools.push(name.to_string());
         let first = self.mcp.call_tool(name, arguments.clone()).await;
         let result = match first {
             Ok(result) => result,
@@ -959,30 +975,10 @@ impl RemoteServiceClient {
             .ok_or_else(|| anyhow::anyhow!("remote resume response omitted response"))
     }
 
+    /// Retired `RunRecord` list. Does not call `ptah_list_runs`.
     async fn list_runs(&mut self) -> Result<Vec<RunRecord>> {
-        let sessions = self.list_sessions().await?;
-        let mut runs = Vec::new();
-        for session in sessions {
-            let value = self
-                .call_tool(
-                    "ptah_list_runs",
-                    json!({
-                        "session_id": session.session_id,
-                        "workspace": session.workspace,
-                    }),
-                )
-                .await?;
-            let mut scoped: Vec<RunRecord> = serde_json::from_value(
-                value
-                    .get("runs")
-                    .cloned()
-                    .ok_or_else(|| anyhow::anyhow!("remote run list omitted runs"))?,
-            )
-            .context("decode remote durable run list")?;
-            runs.append(&mut scoped);
-        }
-        runs.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-        Ok(runs)
+        let _ = self;
+        Err(legacy_remote_run_wire_unsupported())
     }
 
     async fn list_public_runs(
@@ -1339,23 +1335,15 @@ impl RemoteServiceClient {
         .context("decode remote routine fire")
     }
 
+    /// Retired `RunRecord` get. Does not call `ptah_get_run`.
     async fn get_run(
         &mut self,
         session_id: Uuid,
         workspace: String,
         run_id: String,
     ) -> Result<RunRecord> {
-        let value = self
-            .call_tool(
-                "ptah_get_run",
-                json!({
-                    "session_id": session_id,
-                    "workspace": workspace,
-                    "run_id": run_id,
-                }),
-            )
-            .await?;
-        serde_json::from_value(value).context("decode remote durable run")
+        let _ = (self, session_id, workspace, run_id);
+        Err(legacy_remote_run_wire_unsupported())
     }
 
     async fn get_public_run(
@@ -1695,6 +1683,10 @@ fn is_loopback_host(host: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
+fn legacy_remote_run_wire_unsupported() -> anyhow::Error {
+    anyhow!("unsupported: legacy-wire")
+}
+
 fn runtime_target_for_base_url(base_url: &str) -> RuntimeTarget {
     Url::parse(base_url)
         .ok()
@@ -1836,7 +1828,18 @@ mod tests {
                 .await
                 .unwrap();
         assert!(client.list_persistent_agents().await.unwrap().is_empty());
-        assert!(client.list_runs().await.unwrap().is_empty());
+        client.called_tools.clear();
+        assert!(client.list_runs().await.is_err());
+        assert!(client.called_tools.is_empty());
+        assert!(client
+            .get_run(
+                uuid::Uuid::nil(),
+                workspace.path().display().to_string(),
+                "run-legacy".into(),
+            )
+            .await
+            .is_err());
+        assert!(client.called_tools.is_empty());
         let session = client
             .create_session(
                 workspace.path().display().to_string(),
