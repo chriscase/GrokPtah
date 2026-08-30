@@ -1097,6 +1097,54 @@ export interface ComputerRunProjection {
   } | null;
   lastError?: { code: string } | null;
   eventRange?: { startSeq: number; endSeq: number } | null;
+  /**
+   * Redacted result of the most recent adaptive planner/executor review.
+   *
+   * Present only for actions dispatched with a planner claim; absent for every
+   * run driven through the plain action path. Dispositions, one closed reason,
+   * and integer confidence only — the same payload a coordinator receives, so
+   * the cockpit cannot show a decision an outside observer cannot.
+   *
+   * `admitted: false` means the review refused an action the policy layer had
+   * already authorized; the run's audit journal carries the matching
+   * `errorCode`.
+   */
+  adaptive?: AdaptiveDecisionSummary | null;
+}
+
+/** Rung of the adaptive disposition ladder, least to most conservative. */
+export type AdaptiveDisposition =
+  | "commit"
+  | "disambiguate"
+  | "request_approval"
+  | "escalate"
+  | "refuse";
+
+/** Explicitly selected efficiency profile. There is no implicit default. */
+export type AdaptiveProfile = "economy" | "balanced" | "high_assurance";
+
+/**
+ * Redacted view of one adaptive review. Mirrors the Rust
+ * `AdaptiveDecisionSummary` exactly.
+ */
+export interface AdaptiveDecisionSummary {
+  profile: AdaptiveProfile | string;
+  planner: AdaptiveDisposition | string;
+  executor: AdaptiveDisposition | string;
+  resolved: AdaptiveDisposition | string;
+  reason: string;
+  /** True when planner and executor did not reach the same rung. */
+  disagreed: boolean;
+  /** True when the review left the already-authorized action in place. */
+  admitted: boolean;
+  actionClass: string;
+  topConfidenceBps: number;
+  marginBps: number;
+  candidateCount: number;
+  /** Staleness bound actually enforced, after clamping to the run's own. */
+  appliedAgeBoundMillis: number;
+  controlEpoch: number;
+  decidedAt: string;
 }
 
 export interface ComputerCockpitSnapshot {
