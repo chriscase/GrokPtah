@@ -417,6 +417,7 @@ pub(crate) async fn tool_web_fetch(url: &str) -> Result<local_tools::ToolResult>
     ))
 }
 
+#[derive(Clone)]
 pub(crate) struct AgentToolCall {
     pub(crate) id: String,
     pub(crate) name: String,
@@ -511,6 +512,50 @@ fn progress_digest(signature: &str, raw_outputs: &[String], is_true_noop: bool) 
         }
     }
     hasher.finalize().into()
+}
+
+pub(crate) const TOOL_OUTPUT_WIRE_LIMIT_BYTES: usize = 24_000;
+
+/// Clip a tool result for the model wire. Stationarity hashes the raw
+/// result before this projection.
+pub(crate) fn clip_tool_output_for_wire(content: String) -> String {
+    if content.len() > TOOL_OUTPUT_WIRE_LIMIT_BYTES {
+        let orig_len = content.len();
+        format!(
+            "{}…\n(truncated {} bytes)",
+            crate::textutil::truncate_at_char_boundary(&content, TOOL_OUTPUT_WIRE_LIMIT_BYTES),
+            orig_len
+        )
+    } else {
+        content
+    }
+}
+
+/// Observe stationarity from tools actually accepted this step.
+///
+/// Cancelled remainder is omitted. Skip substitutions and host
+/// auto-reverify are included because they are accepted outputs.
+pub(crate) fn observe_accepted_tool_progress(
+    run: &mut IdenticalToolCallRun,
+    accepted_calls: &[AgentToolCall],
+    raw_outputs: &[String],
+) -> u32 {
+    debug_assert_eq!(
+        accepted_calls.len(),
+        raw_outputs.len(),
+        "stationarity digest requires one raw output per accepted tool"
+    );
+    let signature = tool_step_signature(accepted_calls);
+    let tool_name = accepted_calls
+        .first()
+        .map(|tool_call| tool_call.name.as_str())
+        .unwrap_or("");
+    run.observe_with_outputs(
+        &signature,
+        tool_name,
+        is_true_noop_tool_step(accepted_calls),
+        raw_outputs,
+    )
 }
 
 fn command_is_true(command: &str) -> bool {
@@ -4341,13 +4386,101 @@ test result: FAILED. 0 passed; 3 failed; 0 ignored
     }
 
     #[test]
-    fn raw_output_suffix_beyond_wire_limit_resets_stationarity() {
+    fn cancelled_partial_outputs_hash_only_accepted_tools() {
+        let first = tool_call("get_task_output", r#"{"task":"a"}"#);
+        let tail_a = tool_call("read_file", r#"{"path":"a"}"#);
+        let tail_b = tool_call("read_file", r#"{"path":"b"}"#);
+        let output = "task still running".to_string();
+        let accepted = [first.clone()];
+        let outputs = [output.clone()];
+
         let mut run = IdenticalToolCallRun::default();
+        assert_eq!(
+            observe_accepted_tool_progress(&mut run, &accepted, &outputs),
+            1
+        );
+        // Cancel after the first tool leaves a partial vector. A different
+        // unexecuted tail must not reset the accepted digest.
+        assert_eq!(
+            observe_accepted_tool_progress(&mut run, &accepted, &outputs),
+            2
+        );
+        assert!(run.stop_info().is_none());
+
+        let mut mismatched = IdenticalToolCallRun::default();
+        mismatched.observe_with_outputs(
+            &tool_step_signature(&[first.clone(), tail_a]),
+            "get_task_output",
+            false,
+            &outputs,
+        );
+        assert_eq!(
+            mismatched.observe_with_outputs(
+                &tool_step_signature(&[first, tail_b]),
+                "get_task_output",
+                false,
+                &outputs,
+            ),
+            1,
+            "pairing a cancelled tail into the signature would evade stationarity"
+        );
+    }
+
+    #[test]
+    fn skip_and_auto_reverify_outputs_are_in_the_progress_digest() {
+        let write = tool_call("write_files", r#"{"files":[]}"#);
+        let explore = tool_call("list_dir", r#"{}"#);
+        let skip = post_cargo_failure_skip_message("list_dir");
+        let reverify = AgentToolCall {
+            id: "auto-reverify-test".into(),
+            name: "run_terminal_cmd".into(),
+            arguments: serde_json::json!({ "command": auto_cargo_reverify_command() }).to_string(),
+        };
+        let write_out = "wrote files".to_string();
+        let reverify_fail = "test result: FAILED. 3 failed".to_string();
+        let reverify_pass = "test result: ok. 3 passed".to_string();
+        let accepted = [write.clone(), explore.clone(), reverify.clone()];
+        let failed = [write_out.clone(), skip.clone(), reverify_fail.clone()];
+        let passed = [write_out.clone(), skip.clone(), reverify_pass];
+
+        let mut run = IdenticalToolCallRun::default();
+        assert_eq!(
+            observe_accepted_tool_progress(&mut run, &accepted, &failed),
+            1
+        );
+        assert_eq!(
+            observe_accepted_tool_progress(&mut run, &accepted, &failed),
+            2
+        );
+        assert_eq!(
+            observe_accepted_tool_progress(&mut run, &accepted, &passed),
+            1,
+            "auto-reverify output must participate in the progress digest"
+        );
+
+        let without_skip = [write, reverify];
+        let without_skip_out = [write_out, reverify_fail];
+        assert_eq!(
+            observe_accepted_tool_progress(&mut run, &without_skip, &without_skip_out),
+            1,
+            "post-cargo skip output must participate in the progress digest"
+        );
+        assert!(skip.starts_with("SKIPPED `list_dir`"));
+    }
+
+    #[test]
+    fn raw_output_suffix_beyond_wire_limit_resets_stationarity() {
         let mut first = "same visible prefix".repeat(2_000);
         first.push('a');
         let mut second = "same visible prefix".repeat(2_000);
         second.push('b');
-        assert!(first.len() > 24_000);
+        assert!(first.len() > TOOL_OUTPUT_WIRE_LIMIT_BYTES);
+        let clipped_first = clip_tool_output_for_wire(first.clone());
+        let clipped_second = clip_tool_output_for_wire(second.clone());
+        assert_eq!(clipped_first, clipped_second);
+        assert_ne!(first, second);
+
+        let mut run = IdenticalToolCallRun::default();
         assert_eq!(
             run.observe_with_outputs("poll", "get_task_output", false, &[first]),
             1
@@ -4357,6 +4490,17 @@ test result: FAILED. 0 passed; 3 failed; 0 ignored
             1
         );
         assert!(run.stop_info().is_none());
+
+        let mut clipped_run = IdenticalToolCallRun::default();
+        assert_eq!(
+            clipped_run.observe_with_outputs("poll", "get_task_output", false, &[clipped_first]),
+            1
+        );
+        assert_eq!(
+            clipped_run.observe_with_outputs("poll", "get_task_output", false, &[clipped_second]),
+            2,
+            "ordinary wire clipping must not be what the digest hashes"
+        );
     }
 
     #[test]
@@ -4400,6 +4544,28 @@ test result: FAILED. 0 passed; 3 failed; 0 ignored
             );
         }
         assert_eq!(run.stop_info(), Some((4, "run_terminal_cmd".into(), true)));
+    }
+
+    #[test]
+    fn true_noop_threshold_unchanged_for_accepted_outputs() {
+        let mut run = IdenticalToolCallRun::default();
+        for i in 1..=MAX_CONSECUTIVE_TRUE_NOOPS {
+            let call = tool_call(
+                "run_terminal_cmd",
+                &format!(r#"{{"command":"true","n":{i}}}"#),
+            );
+            let output = format!("different output {i}");
+            assert_eq!(
+                observe_accepted_tool_progress(
+                    &mut run,
+                    std::slice::from_ref(&call),
+                    std::slice::from_ref(&output),
+                ),
+                i
+            );
+        }
+        assert_eq!(run.stop_info(), Some((4, "run_terminal_cmd".into(), true)));
+        assert_eq!(MAX_CONSECUTIVE_TRUE_NOOPS, 4);
     }
 
     #[test]

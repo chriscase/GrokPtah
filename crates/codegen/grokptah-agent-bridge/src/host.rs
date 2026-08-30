@@ -27,15 +27,15 @@ use crate::host_helpers::{
     auto_cargo_reverify_command, build_agent_messages, build_compact_summary,
     call_xai_agent_step_observed, call_xai_chat, cargo_test_failure_coaching,
     cargo_test_output_failed, cargo_test_output_passed, cargo_test_reverify_coaching,
-    coding_agent_tools, count_cargo_test_failures, emit_message, emit_thought,
-    filter_tools_batch_edit_only, filter_tools_edit_and_shell, filter_tools_edit_only,
-    is_incomplete_stop_message, is_round_limit_stop_message, is_true_noop_tool_step,
-    multi_failure_partial_edit_coaching, normalize_sandbox_profile, offline_plan_steps,
-    parse_effort_arg, post_cargo_failure_skip_message, propose_plan_with_model, push_assistant,
-    push_thought, push_tool, recovery_round_limit_stop_message, resolve_turn_max_rounds,
-    round_limit_stop_message, sandbox_blocks_shell, sandbox_is_readonly,
+    clip_tool_output_for_wire, coding_agent_tools, count_cargo_test_failures, emit_message,
+    emit_thought, filter_tools_batch_edit_only, filter_tools_edit_and_shell,
+    filter_tools_edit_only, is_incomplete_stop_message, is_round_limit_stop_message,
+    multi_failure_partial_edit_coaching, normalize_sandbox_profile, observe_accepted_tool_progress,
+    offline_plan_steps, parse_effort_arg, post_cargo_failure_skip_message, propose_plan_with_model,
+    push_assistant, push_thought, push_tool, recovery_round_limit_stop_message,
+    resolve_turn_max_rounds, round_limit_stop_message, sandbox_blocks_shell, sandbox_is_readonly,
     should_auto_cargo_reverify_after_edit, should_skip_tool_after_cargo_failure,
-    surface_rate_limit_or_error, tool_kind, tool_step_signature, tool_web_fetch, AgentStep,
+    surface_rate_limit_or_error, tool_kind, tool_web_fetch, AgentStep, AgentToolCall,
     IdenticalToolCallRun, McpToolIndex,
 };
 use crate::host_runtime::HostRuntime;
@@ -9310,6 +9310,7 @@ impl AgentHostHandle {
                     }));
 
                     let mut edited_while_needs_reverify = false;
+                    let mut accepted_calls = Vec::with_capacity(tool_calls.len());
                     let mut raw_tool_outputs = Vec::with_capacity(tool_calls.len());
                     for tc in &tool_calls {
                         if cancel.is_cancelled() {
@@ -9325,6 +9326,7 @@ impl AgentHostHandle {
                             had_edit_since_cargo_fail,
                         ) {
                             let content = post_cargo_failure_skip_message(&tc.name);
+                            accepted_calls.push(tc.clone());
                             raw_tool_outputs.push(content.clone());
                             messages.push(serde_json::json!({
                                 "role": "tool",
@@ -9355,18 +9357,9 @@ impl AgentHostHandle {
                             Ok(s) => s.clone(),
                             Err(e) => format!("ERROR: {e}"),
                         };
+                        accepted_calls.push(tc.clone());
                         raw_tool_outputs.push(content.clone());
-                        // Cap tool output size for the wire
-                        let content = if content.len() > 24_000 {
-                            let orig_len = content.len();
-                            format!(
-                                "{}…\n(truncated {} bytes)",
-                                crate::textutil::truncate_at_char_boundary(&content, 24_000),
-                                orig_len
-                            )
-                        } else {
-                            content
-                        };
+                        let content = clip_tool_output_for_wire(content);
                         // Under tight budgets, only clear the post-failure gate when cargo is
                         // green again. Clearing on edit alone allowed final answers without a
                         // re-run (#187 verified=false despite oracle pass via external check).
@@ -9470,17 +9463,13 @@ impl AgentHostHandle {
                             Ok(s) => s.clone(),
                             Err(e) => format!("ERROR: {e}"),
                         };
+                        accepted_calls.push(AgentToolCall {
+                            id: reverify_id.clone(),
+                            name: "run_terminal_cmd".into(),
+                            arguments: args.clone(),
+                        });
                         raw_tool_outputs.push(content.clone());
-                        let content = if content.len() > 24_000 {
-                            let orig_len = content.len();
-                            format!(
-                                "{}…\n(truncated {} bytes)",
-                                crate::textutil::truncate_at_char_boundary(&content, 24_000),
-                                orig_len
-                            )
-                        } else {
-                            content
-                        };
+                        let content = clip_tool_output_for_wire(content);
                         if cargo_test_output_failed(&content) {
                             test_failure_needs_edit = true;
                             cargo_fails_since_edit = cargo_fails_since_edit.saturating_add(1);
@@ -9518,15 +9507,9 @@ impl AgentHostHandle {
                         recovery_grace = true;
                     }
 
-                    let signature = tool_step_signature(&tool_calls);
-                    let tool_name = tool_calls
-                        .first()
-                        .map(|tool_call| tool_call.name.as_str())
-                        .unwrap_or("");
-                    identical_tool_calls.observe_with_outputs(
-                        &signature,
-                        tool_name,
-                        is_true_noop_tool_step(&tool_calls),
+                    observe_accepted_tool_progress(
+                        &mut identical_tool_calls,
+                        &accepted_calls,
                         &raw_tool_outputs,
                     );
                     // Usage belongs to the model boundary that produced these
