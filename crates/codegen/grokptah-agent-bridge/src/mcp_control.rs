@@ -4197,6 +4197,61 @@ mod tests {
         set_grokptah_home_override(None);
     }
 
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn closed_receiver_emits_recovery_before_stream_close() {
+        let _guard = home_override_serial();
+        let home = tempdir().unwrap();
+        set_grokptah_home_override(Some(home.path().join(".grokptah")));
+        let workspace = tempdir().unwrap();
+        let host = AgentHost::create(HostConfig {
+            always_approve: true,
+            ..HostConfig::default()
+        })
+        .expect("acquire the GrokPtah instance lock");
+        host.start().unwrap();
+        let session = host.session_new_kind(crate::SessionKind::Build).unwrap();
+        host.session_set_cwd(session.id, workspace.path()).unwrap();
+        let bus = Arc::new(crate::event_bus::EventBus::new(2));
+        let receiver = bus.subscribe();
+        drop(bus);
+        let orch = computer_orch(&host, home.path(), vec![workspace.path().to_path_buf()]);
+        let permit = Arc::new(Semaphore::new(1))
+            .try_acquire_owned()
+            .expect("test stream permit");
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
+        heartbeat.reset_after(Duration::from_secs(10));
+        let mut live = LiveStreamState {
+            orch,
+            auth: AuthContext {
+                token_id: "test-token".into(),
+                owner_id: "test-owner".into(),
+            },
+            session_id: session.id,
+            workspace: workspace.path().to_path_buf(),
+            run_id: "continuity-closed-receiver".into(),
+            start_seq: 1,
+            end_seq: None,
+            receiver,
+            last_seq: 0,
+            replay_cursor: None,
+            pending: VecDeque::new(),
+            heartbeat,
+            terminal_pending: false,
+            done: false,
+            shutdown: tokio_util::sync::CancellationToken::new(),
+            _permit: permit,
+        };
+
+        let recovery = live.next_frame().await.expect("recovery frame");
+        let recovery_text = String::from_utf8_lossy(&recovery);
+        assert!(recovery_text.contains("notifications/ptah_recovery"));
+        assert!(recovery_text.contains("live event receiver closed"));
+        assert!(live.done);
+        assert!(live.next_frame().await.is_none());
+        set_grokptah_home_override(None);
+    }
+
     #[test]
     fn authority_rejects_userinfo_and_malformed_values() {
         for raw in [
