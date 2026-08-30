@@ -238,6 +238,33 @@ impl WorkPolicy {
     }
 }
 
+/// Why a work item is in the [`WorkState::Blocked`] state.
+///
+/// Durable and typed, so reconciliation never has to infer provenance from the
+/// shape of a free-form string. A record written before this existed
+/// deserializes to `None`, which every reader treats as manual — see
+/// [`super::graph::evaluate_admission`] for why that direction is the safe one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockProvenance {
+    /// Reconciliation blocked it because a dependency was not satisfied. It is
+    /// lifted automatically when the dependency is.
+    Derived,
+    /// A human or coordinator blocked it explicitly. Reconciliation never
+    /// lifts it and never overwrites its reason; only `unblock_work` does.
+    Manual,
+}
+
+impl BlockProvenance {
+    pub fn is_manual(self) -> bool {
+        matches!(self, Self::Manual)
+    }
+
+    pub fn is_derived(self) -> bool {
+        matches!(self, Self::Derived)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkDependency {
@@ -398,6 +425,13 @@ pub struct WorkItem {
     pub assignment_status: AssignmentStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_reason: Option<String>,
+    /// Who placed the current block. Absent on records written before this
+    /// was typed, and on items that are not blocked. Adding it is a compatible
+    /// schema extension: existing items deserialize as `None`, and every
+    /// reader treats `None` on a blocked item as manual so an upgrade cannot
+    /// silently re-queue work a human stopped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_provenance: Option<BlockProvenance>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_decision_id: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -460,6 +494,7 @@ impl WorkItem {
             source_manager_step_id: None,
             assignment_status: AssignmentStatus::Unassigned,
             blocked_reason: None,
+            block_provenance: None,
             last_decision_id: None,
             created_at: now,
             updated_at: now,

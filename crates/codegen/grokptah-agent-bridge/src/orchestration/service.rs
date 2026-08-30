@@ -19,6 +19,7 @@ use super::authz::{
     authenticate_bearer, canonical_workspace, require_workspace_match, AuthContext, AuthCredential,
     WorkspaceAllowlist,
 };
+use super::graph::{validate_scoped_dependency_graph, GraphScope};
 use super::managed::{
     assemble_managed_run_input, managed_execution_eligible, select_relevant_managed_messages,
     ManagedExecutionIntent, ManagedExecutionPolicy, ManagedFinalizationOutcome, ManagedIntentState,
@@ -2243,14 +2244,26 @@ impl OrchestrationService {
         let claimed = self.authorize_work_read_scope(session_id, workspace)?;
         let work = self
             .store
-            .list_work_items()
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
-            .into_iter()
-            .filter(|item| {
-                item.session_id == session_id && item.workspace == claimed.display().to_string()
-            })
-            .collect::<Vec<_>>();
+            .scoped_work_items(session_id, &claimed.display().to_string())
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         Ok(json!({ "work": work }))
+    }
+
+    /// Return the lane-scoped redacted dependency graph. This is separate from
+    /// `ptah_list_work`, whose legacy payload intentionally contains the full
+    /// operator work item for trusted desktop callers.
+    pub fn get_work_graph_scoped(
+        &self,
+        _auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+    ) -> Result<serde_json::Value, OrchError> {
+        let claimed = self.authorize_work_read_scope(session_id, workspace)?;
+        let graph = self
+            .store
+            .work_graph_scoped(session_id, &claimed.display().to_string(), Utc::now())
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        Ok(json!({ "graph": graph }))
     }
 
     pub fn get_work_scoped(
@@ -2959,6 +2972,31 @@ impl OrchestrationService {
         item.dependencies = dependencies;
         if let Err(error) = item.validate() {
             return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+        }
+        // The work-graph authority runs before the first durable write, so a
+        // rejected graph leaves no work record behind. The refusal is recorded
+        // under the idempotency key (`fail_claim`), so a replay is refused
+        // again rather than answering with a record that was never written.
+        // `WorkItem::validate` sees one item and can only reject a self-edge;
+        // a ring, a dangling id, and an id belonging to another lane are all
+        // graph-level facts.
+        if !item.dependencies.is_empty() {
+            let lane = match self.store.scoped_work_items(session_id, &item.workspace) {
+                Ok(lane) => lane,
+                Err(error) => {
+                    return Err(self.fail_claim(
+                        &mut lease,
+                        None,
+                        session_id,
+                        &claimed,
+                        OrchError::new(OrchErrorCode::Internal, error.to_string()),
+                    ))
+                }
+            };
+            let scope = GraphScope::of(&item);
+            if let Err(error) = validate_scoped_dependency_graph(&lane, &item, scope) {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+            }
         }
         if let Err(error) = self.store.save_work_item(&item) {
             return Err(self.fail_claim(
@@ -3851,6 +3889,39 @@ impl OrchestrationService {
             move |store| {
                 store
                     .block_work(
+                        work_id,
+                        &auth.token_id,
+                        &reason,
+                        expected_revision,
+                        Utc::now(),
+                    )
+                    .map(|(item, _)| item)
+            },
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn unblock_work(
+        &self,
+        auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        work_id: &str,
+        reason: String,
+        expected_revision: Option<u64>,
+    ) -> Result<serde_json::Value, OrchError> {
+        self.work_item_mutation(
+            "ptah_unblock_work",
+            request_id,
+            session_id,
+            workspace,
+            work_id,
+            json!({"reason": reason, "expectedRevision": expected_revision}),
+            move |store| {
+                store
+                    .unblock_work(
                         work_id,
                         &auth.token_id,
                         &reason,

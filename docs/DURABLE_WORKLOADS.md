@@ -77,6 +77,9 @@ Read tools:
 
 - `ptah_list_work(session_id, workspace)`
 - `ptah_get_work(session_id, workspace, work_id)`
+- `ptah_get_work_graph(session_id, workspace)` — lane-scoped redacted
+  dependency graph (shape and admission/state only; no workspace path,
+  principal, agent, objective, attempt, claimant, or lease identifier)
 
 Mutation tools:
 

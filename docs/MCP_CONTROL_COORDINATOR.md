@@ -271,12 +271,14 @@ Source of truth: `orchestration::CONTROL_TOOLS` /
 | `ptah_list_workers` | read | `session_id`, `workspace` |
 | `ptah_get_worker` | read | `session_id`, `workspace`, `agent_id` |
 | `ptah_heartbeat_worker` | mutate | `request_id`, `session_id`, `workspace`, `agent_id` |
+| `ptah_get_work_graph` | read | `session_id`, `workspace` |
 | `ptah_offer_work` | mutate | `request_id`, `session_id`, `workspace`, `work_id`, `agent_id`, `reason` |
 | `ptah_accept_work` | mutate | `request_id`, `session_id`, `workspace`, `work_id`, `agent_id`, `reason` |
 | `ptah_decline_work` | mutate | `request_id`, `session_id`, `workspace`, `work_id`, `agent_id`, `reason` |
 | `ptah_reassign_work` | mutate | `request_id`, `session_id`, `workspace`, `work_id`, `agent_id`, `reason` |
 | `ptah_reprioritize_work` | mutate | `request_id`, `session_id`, `workspace`, `work_id`, `priority`, `reason` |
 | `ptah_block_work` | mutate | `request_id`, `session_id`, `workspace`, `work_id`, `reason` |
+| `ptah_unblock_work` | mutate | `request_id`, `session_id`, `workspace`, `work_id`, `reason` |
 | `ptah_request_review` | mutate | `request_id`, `session_id`, `workspace`, `work_id`, `reason` |
 | `ptah_list_work_decisions` | read | `session_id`, `workspace`, `work_id` |
 | `ptah_send_message` | mutate | `request_id`, `session_id`, `workspace`, `kind`, `body` |
