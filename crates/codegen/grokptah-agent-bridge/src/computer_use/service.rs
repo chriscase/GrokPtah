@@ -2687,10 +2687,7 @@ mod tests {
         let reminted = service
             .mint_host_adaptive_approval(&run.run_id, true)
             .unwrap();
-        assert_eq!(
-            reminted,
-            AdaptiveApproval::host_mint(&live, &next, true)
-        );
+        assert_eq!(reminted, AdaptiveApproval::host_mint(&live, &next, true));
         assert_ne!(minted.binding_fingerprint(), reminted.binding_fingerprint());
         assert_eq!(backend.action_calls(), 0);
     }
@@ -2798,12 +2795,9 @@ mod tests {
     #[tokio::test]
     async fn matching_host_approval_still_admits_only_after_policy() {
         let (backend, service) = counting_service();
-        let (run, observation) = authorized_observed_run(
-            &service,
-            "policy",
-            BTreeSet::from([ActionClass::Semantic]),
-        )
-        .await;
+        let (run, observation) =
+            authorized_observed_run(&service, "policy", BTreeSet::from([ActionClass::Semantic]))
+                .await;
         let approval = service
             .mint_host_adaptive_approval(&run.run_id, true)
             .unwrap();
