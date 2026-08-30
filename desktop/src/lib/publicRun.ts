@@ -2,10 +2,12 @@
  * Fail-closed parser for the allowlisted `grokptah.public-run.v1` document.
  *
  * Mirrors `orchestration::public_run` (deny unknown fields / unknown version).
- * Session and workspace scope stay on the request; this parser never reads them
- * from a remote document. Local host records stay on `DurableRun`.
+ * Session and workspace scope stay on the request; this parser never copies
+ * them from a remote body. Local host records stay on `DurableRun`.
  *
- * Not wired to MCP producers or `api.ts` remote reads.
+ * `parsePublicRunV1` is the MCP document. `parseRemotePublicRun` consumes the
+ * additive Tauri `remote_service_public_run_*` wrapper, which flattens
+ * request-stamped `sessionId`/`workspace` onto that document.
  */
 
 export const PUBLIC_RUN_SCHEMA_VERSION = "grokptah.public-run.v1" as const;
@@ -105,6 +107,24 @@ export interface PublicRunHandoffV1 {
   usageRequestCount: number;
   usageComplete: boolean;
   usagePendingRequestCount: number;
+}
+
+/**
+ * Request-stamped public-run row from `remote_service_public_run_get` /
+ * nested `remote_service_public_run_list` items. Scope fields are not part of
+ * the remote document.
+ */
+export interface RemotePublicRun extends PublicRunV1 {
+  sessionId: string;
+  workspace: string;
+}
+
+/** Request-stamped public-run list for one session/workspace. */
+export interface RemotePublicRunList {
+  schemaVersion: typeof PUBLIC_RUN_SCHEMA_VERSION;
+  sessionId: string;
+  workspace: string;
+  runs: RemotePublicRun[];
 }
 
 type JsonObject = Record<string, unknown>;
@@ -339,5 +359,61 @@ export function parsePublicRunHandoffV1(value: unknown): PublicRunHandoffV1 {
     usageRequestCount: u64Value(record.usageRequestCount),
     usageComplete: booleanValue(record.usageComplete),
     usagePendingRequestCount: u64Value(record.usagePendingRequestCount),
+  };
+}
+
+/**
+ * Drop request-wrapper keys without using their values. Additive Tauri
+ * commands flatten `sessionId`/`workspace` onto the public document; MCP
+ * bodies omit them. Either way the stamped result comes from `sessionId` /
+ * `workspace` arguments, never from `value`.
+ */
+function omitRequestScope(value: unknown): unknown {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return value;
+  }
+  const rest: JsonObject = { ...(value as JsonObject) };
+  delete rest.sessionId;
+  delete rest.workspace;
+  return rest;
+}
+
+function stampRemotePublicRun(
+  document: PublicRunV1,
+  sessionId: string,
+  workspace: string,
+): RemotePublicRun {
+  return { ...document, sessionId, workspace };
+}
+
+/** Parse one additive Tauri public-run get payload and stamp request scope. */
+export function parseRemotePublicRun(
+  value: unknown,
+  sessionId: string,
+  workspace: string,
+): RemotePublicRun {
+  return stampRemotePublicRun(parsePublicRunV1(omitRequestScope(value)), sessionId, workspace);
+}
+
+/** Parse one additive Tauri public-run list payload and stamp request scope. */
+export function parseRemotePublicRunList(
+  value: unknown,
+  sessionId: string,
+  workspace: string,
+): RemotePublicRunList {
+  const envelope = omitRequestScope(value);
+  if (envelope === null || typeof envelope !== "object" || Array.isArray(envelope)) {
+    throw decode("expected an object");
+  }
+  const record = envelope as JsonObject;
+  if (Array.isArray(record.runs)) {
+    record.runs = record.runs.map(omitRequestScope);
+  }
+  const parsed = parsePublicRunListV1(record);
+  return {
+    schemaVersion: parsed.schemaVersion,
+    sessionId,
+    workspace,
+    runs: parsed.runs.map((document) => stampRemotePublicRun(document, sessionId, workspace)),
   };
 }

@@ -495,7 +495,8 @@ export interface DurableRunEventPage {
 /**
  * Local in-process host Build-run record (`run_list` / `run_get`).
  * Remote `grokptah.public-run.v1` documents are a different contract; parse
- * them with `parsePublicRunV1` and stamp session/workspace from the request.
+ * them with `parsePublicRunV1` / `parseRemotePublicRun` and stamp
+ * session/workspace from the request. Do not map public DTOs onto this type.
  */
 export interface DurableRun {
   runId: string;
@@ -1191,6 +1192,8 @@ export {
   parsePublicRunListV1,
   parsePublicRunProgressV1,
   parsePublicRunV1,
+  parseRemotePublicRun,
+  parseRemotePublicRunList,
 } from "./publicRun";
 export type {
   PublicRunDtoErrorKind,
@@ -1199,6 +1202,8 @@ export type {
   PublicRunProgressV1,
   PublicRunState,
   PublicRunV1,
+  RemotePublicRun,
+  RemotePublicRunList,
 } from "./publicRun";
 
 export const SLASH_COMMANDS = [

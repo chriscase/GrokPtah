@@ -7,6 +7,8 @@ import {
   parsePublicRunListV1,
   parsePublicRunProgressV1,
   parsePublicRunV1,
+  parseRemotePublicRun,
+  parseRemotePublicRunList,
   type PublicRunHandoffV1,
   type PublicRunListV1,
   type PublicRunProgressV1,
@@ -20,6 +22,10 @@ const SECRET_CWD = "/tmp/secret-chat";
 const SECRET_TOOL = "cat /tmp/secret-chat/credentials.env";
 const OPAQUE_RUN = "run_public_dto_1";
 const TS = "2026-08-01T00:00:00Z";
+const REQUEST_SESSION = "11111111-1111-4111-8111-111111111111";
+const REQUEST_WORKSPACE = "/tmp/project";
+const BODY_SESSION = "22222222-2222-4222-8222-222222222222";
+const BODY_WORKSPACE = "/tmp/secret-chat";
 
 const PRIVATE_KEYS = [
   "promptPreview",
@@ -366,6 +372,179 @@ describe("public-run shape isolation", () => {
         expectDecode(error);
         expectNoSecrets(error);
       }
+    }
+  });
+});
+
+function tauriPublicRun(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    sessionId: BODY_SESSION,
+    workspace: BODY_WORKSPACE,
+    ...clone(publicRun()),
+    ...overrides,
+  };
+}
+
+function tauriPublicList(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    sessionId: BODY_SESSION,
+    workspace: BODY_WORKSPACE,
+    schemaVersion: PUBLIC_RUN_SCHEMA_VERSION,
+    runs: [tauriPublicRun()],
+    ...overrides,
+  };
+}
+
+function expectNoSensitiveFields(value: object): void {
+  const blob = JSON.stringify(value);
+  for (const key of PRIVATE_KEYS) {
+    if (key === "sessionId" || key === "workspace") continue;
+    expect(blob, `public DTO leaked ${key}`).not.toContain(`"${key}"`);
+  }
+  for (const needle of [SECRET_PROMPT, SECRET_RESPONSE, SECRET_PATH, SECRET_TOOL]) {
+    expect(blob, `public DTO leaked ${needle}`).not.toContain(needle);
+  }
+  expect(blob).not.toContain(BODY_SESSION);
+  expect(blob).not.toContain(BODY_WORKSPACE);
+  expect(blob).not.toContain(SECRET_CWD);
+}
+
+describe("parseRemotePublicRun", () => {
+  it("stamps request scope and ignores body session/workspace", () => {
+    const got = parseRemotePublicRun(tauriPublicRun(), REQUEST_SESSION, REQUEST_WORKSPACE);
+    expect(got.sessionId).toBe(REQUEST_SESSION);
+    expect(got.workspace).toBe(REQUEST_WORKSPACE);
+    expect(got.runId).toBe(OPAQUE_RUN);
+    expect(got.schemaVersion).toBe(PUBLIC_RUN_SCHEMA_VERSION);
+    expect(got.state).toBe("completed");
+    expect(got.eventStartSeq).toBe(3);
+    expectNoSensitiveFields(got);
+  });
+
+  it("stamps a raw MCP document that omitted scope keys", () => {
+    const got = parseRemotePublicRun(clone(publicRun()), REQUEST_SESSION, REQUEST_WORKSPACE);
+    expect(got.sessionId).toBe(REQUEST_SESSION);
+    expect(got.workspace).toBe(REQUEST_WORKSPACE);
+    expect(got.runId).toBe(OPAQUE_RUN);
+  });
+
+  it("rejects unknown schema version without leaking the body", () => {
+    const row = tauriPublicRun({
+      schemaVersion: "grokptah.public-run.v2",
+    });
+    try {
+      parseRemotePublicRun(row, REQUEST_SESSION, REQUEST_WORKSPACE);
+      throw new Error("expected unknown schema version");
+    } catch (error) {
+      expect(error).toBeInstanceOf(PublicRunDtoError);
+      const dtoError = error as PublicRunDtoError;
+      expect(dtoError.kind).toBe("unknown_schema_version");
+      expect(dtoError.schemaVersion).toBe("grokptah.public-run.v2");
+      expectNoSecrets(error);
+    }
+  });
+
+  it("rejects private and unknown keys without leaking values", () => {
+    for (const key of PRIVATE_KEYS) {
+      if (key === "sessionId" || key === "workspace") continue;
+      const row = tauriPublicRun({
+        [key]: key === "promptPreview" || key === "finalResponse" ? SECRET_PROMPT : SECRET_PATH,
+      });
+      try {
+        parseRemotePublicRun(row, REQUEST_SESSION, REQUEST_WORKSPACE);
+        throw new Error(`expected ${key} to be rejected`);
+      } catch (error) {
+        const dtoError = expectDecode(error);
+        expect(dtoError.problem).toBe("unknown field");
+        expectNoSecrets(error);
+      }
+    }
+  });
+
+  it("rejects current RunRecord wire", () => {
+    try {
+      parseRemotePublicRun(runRecordWire(), REQUEST_SESSION, REQUEST_WORKSPACE);
+      throw new Error("expected RunRecord rejection");
+    } catch (error) {
+      expectDecode(error);
+      expectNoSecrets(error);
+    }
+  });
+
+  it("rejects a missing required field", () => {
+    const row = tauriPublicRun();
+    delete row.runId;
+    try {
+      parseRemotePublicRun(row, REQUEST_SESSION, REQUEST_WORKSPACE);
+      throw new Error("expected missing required field");
+    } catch (error) {
+      const dtoError = expectDecode(error);
+      expect(dtoError.problem).toBe("missing required field");
+      expectNoSecrets(error);
+    }
+  });
+});
+
+describe("parseRemotePublicRunList", () => {
+  it("stamps every row from the request, never the body", () => {
+    const got = parseRemotePublicRunList(tauriPublicList(), REQUEST_SESSION, REQUEST_WORKSPACE);
+    expect(got.sessionId).toBe(REQUEST_SESSION);
+    expect(got.workspace).toBe(REQUEST_WORKSPACE);
+    expect(got.schemaVersion).toBe(PUBLIC_RUN_SCHEMA_VERSION);
+    expect(got.runs).toHaveLength(1);
+    expect(got.runs[0]?.sessionId).toBe(REQUEST_SESSION);
+    expect(got.runs[0]?.workspace).toBe(REQUEST_WORKSPACE);
+    expect(got.runs[0]?.runId).toBe(OPAQUE_RUN);
+    expectNoSensitiveFields(got);
+  });
+
+  it("rejects nested unknown schema versions", () => {
+    const envelope = tauriPublicList();
+    (envelope.runs as Array<Record<string, unknown>>)[0].schemaVersion = "grokptah.public-run.v0";
+    try {
+      parseRemotePublicRunList(envelope, REQUEST_SESSION, REQUEST_WORKSPACE);
+      throw new Error("expected nested unknown schema version");
+    } catch (error) {
+      expect(error).toBeInstanceOf(PublicRunDtoError);
+      const dtoError = error as PublicRunDtoError;
+      expect(dtoError.kind).toBe("unknown_schema_version");
+      expect(dtoError.schemaVersion).toBe("grokptah.public-run.v0");
+      expectNoSecrets(error);
+    }
+  });
+
+  it("rejects private keys on the envelope and nested runs", () => {
+    const envelope = tauriPublicList({ promptPreview: SECRET_PROMPT });
+    try {
+      parseRemotePublicRunList(envelope, REQUEST_SESSION, REQUEST_WORKSPACE);
+      throw new Error("expected list envelope rejection");
+    } catch (error) {
+      expectDecode(error);
+      expectNoSecrets(error);
+    }
+
+    const nested = tauriPublicList();
+    (nested.runs as Array<Record<string, unknown>>)[0].finalResponse = SECRET_RESPONSE;
+    try {
+      parseRemotePublicRunList(nested, REQUEST_SESSION, REQUEST_WORKSPACE);
+      throw new Error("expected nested private field rejection");
+    } catch (error) {
+      expectDecode(error);
+      expectNoSecrets(error);
+    }
+  });
+
+  it("rejects a legacy list envelope", () => {
+    try {
+      parseRemotePublicRunList(
+        { runs: [runRecordWire()] },
+        REQUEST_SESSION,
+        REQUEST_WORKSPACE,
+      );
+      throw new Error("expected legacy list rejection");
+    } catch (error) {
+      expectDecode(error);
+      expectNoSecrets(error);
     }
   });
 });
