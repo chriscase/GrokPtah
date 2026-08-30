@@ -1340,6 +1340,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "grokptah-agent-sdk"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "grokptah-desktop"
 version = "0.1.0"
 dependencies = [
@@ -1348,6 +1357,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "grokptah-agent-bridge",
+ "grokptah-agent-sdk",
  "grokptah-help-authority",
  "grokptah-help-contract",
  "grokptah-help-runtime",

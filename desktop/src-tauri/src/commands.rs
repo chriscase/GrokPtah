@@ -151,6 +151,23 @@ pub async fn remote_service_run_list(
         .ok_or_else(|| "remote service is not connected".to_string())
 }
 
+/// Additive, allowlisted `grokptah.public-run.v1` list for one remote session.
+/// The legacy raw run command above remains unchanged for compatibility.
+#[tauri::command]
+pub async fn remote_service_public_run_list(
+    state: State<'_, AppState>,
+    session_id: String,
+    workspace: String,
+) -> Result<crate::remote_public_run::RemotePublicRunList, String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    state
+        .remote_service
+        .list_public_runs(session_id, workspace)
+        .await
+        .map_err(map_err)?
+        .ok_or_else(|| "remote service is not connected".to_string())
+}
+
 #[tauri::command]
 pub async fn remote_service_work_list(
     state: State<'_, AppState>,
@@ -596,6 +613,23 @@ pub async fn remote_service_run_get(
     state
         .remote_service
         .get_run(session_id, workspace, run_id)
+        .await
+        .map_err(map_err)?
+        .ok_or_else(|| "remote service is not connected".to_string())
+}
+
+/// Additive, allowlisted `grokptah.public-run.v1` get for one remote run.
+#[tauri::command]
+pub async fn remote_service_public_run_get(
+    state: State<'_, AppState>,
+    session_id: String,
+    workspace: String,
+    run_id: String,
+) -> Result<crate::remote_public_run::RemotePublicRun, String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    state
+        .remote_service
+        .get_public_run(session_id, workspace, run_id)
         .await
         .map_err(map_err)?
         .ok_or_else(|| "remote service is not connected".to_string())
