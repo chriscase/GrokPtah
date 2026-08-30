@@ -914,6 +914,31 @@ impl OrchStore {
     fn save_work_item_unlocked(&self, item: &WorkItem) -> anyhow::Result<()> {
         item.validate()
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        // Every durable writer must enforce the lane-local dependency graph,
+        // not only the public create endpoint. Manager adoption, supervisor
+        // reconciliation, and host recovery all converge here. Exclude the
+        // current record when updating it so validation sees one candidate.
+        let previous_dependencies = self
+            .load_work_item_unlocked(&item.work_id)?
+            .map(|existing| existing.dependencies);
+        if !item.dependencies.is_empty()
+            && previous_dependencies.as_ref() != Some(&item.dependencies)
+        {
+            let scope = super::graph::GraphScope::of(item);
+            let mut lane = self.scoped_work_items_unlocked(super::graph::GraphScope::of(item))?;
+            lane.retain(|existing| existing.work_id != item.work_id && scope.contains(existing));
+            super::graph::validate_scoped_dependency_graph(&lane, item, scope)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        }
+        let path = self
+            .work_item_path(&item.work_id)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        atomic_write_json(&self.lease(), &path, item)
+    }
+
+    fn save_work_item_unchecked_unlocked(&self, item: &WorkItem) -> anyhow::Result<()> {
+        item.validate()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         let path = self
             .work_item_path(&item.work_id)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
@@ -999,6 +1024,14 @@ impl OrchStore {
         self.save_work_item_unlocked(item)
     }
 
+    /// Import a pre-existing record for migration/fixture setup without
+    /// re-validating edges against the rest of the ledger. Runtime mutation
+    /// paths must use [`Self::save_work_item`].
+    pub fn save_work_item_unchecked(&self, item: &WorkItem) -> anyhow::Result<()> {
+        let _guard = self.inner.lock.lock();
+        self.save_work_item_unchecked_unlocked(item)
+    }
+
     pub fn load_work_item(&self, work_id: &str) -> anyhow::Result<Option<WorkItem>> {
         let _guard = self.inner.lock.lock();
         self.load_work_item_unlocked(work_id)
@@ -1014,19 +1047,47 @@ impl OrchStore {
     /// This is what a writer validates a dependency graph against: it must see
     /// its own lane and nothing else, so a dependency declaration cannot be
     /// used to probe for work in another session or workspace.
+    fn scoped_work_items_unlocked(
+        &self,
+        scope: super::graph::GraphScope<'_>,
+    ) -> anyhow::Result<Vec<WorkItem>> {
+        let mut items = Vec::new();
+        let dir = self.inner.root.join("work-items");
+        if !dir.is_dir() {
+            return Ok(items);
+        }
+        for entry in fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let item: WorkItem = serde_json::from_str(&fs::read_to_string(path)?)?;
+            item.validate()
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            if scope.contains(&item) {
+                items.push(item);
+                if items.len() > super::graph::MAX_GRAPH_SCOPE_ITEMS {
+                    anyhow::bail!(
+                        "lane contains more than {} work items; bounded read refused",
+                        super::graph::MAX_GRAPH_SCOPE_ITEMS
+                    );
+                }
+            }
+        }
+        super::graph::order_work(&mut items);
+        Ok(items)
+    }
+
     pub fn scoped_work_items(
         &self,
         session_id: Uuid,
         workspace: &str,
     ) -> anyhow::Result<Vec<WorkItem>> {
         let _guard = self.inner.lock.lock();
-        let scope = super::graph::GraphScope {
+        self.scoped_work_items_unlocked(super::graph::GraphScope {
             session_id,
             workspace,
-        };
-        let mut items = self.list_work_items_unlocked()?;
-        items.retain(|item| scope.contains(item));
-        Ok(items)
+        })
     }
 
     /// The lane-scoped, redacted operator view of the durable work graph.
@@ -1040,11 +1101,11 @@ impl OrchStore {
         now: chrono::DateTime<Utc>,
     ) -> anyhow::Result<Vec<super::graph::WorkGraphNode>> {
         let _guard = self.inner.lock.lock();
-        let items = self.list_work_items_unlocked()?;
         let scope = super::graph::GraphScope {
             session_id,
             workspace,
         };
+        let items = self.scoped_work_items_unlocked(scope)?;
         Ok(super::graph::project_scoped_graph(&items, scope, now))
     }
 

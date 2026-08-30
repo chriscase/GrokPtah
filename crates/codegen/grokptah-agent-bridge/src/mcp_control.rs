@@ -2319,6 +2319,15 @@ fn tool_input_schema(name: &str) -> Value {
                 "workspace": workspace
             }
         }),
+        "ptah_get_work_graph" => json!({
+            "type": "object",
+            "required": ["session_id", "workspace"],
+            "additionalProperties": false,
+            "properties": {
+                "session_id": session,
+                "workspace": workspace
+            }
+        }),
         "ptah_get_work" => json!({
             "type": "object",
             "required": ["session_id", "workspace", "work_id"],
@@ -3177,6 +3186,10 @@ async fn dispatch_tool(
         "ptah_list_work" => {
             let args: WorkScopeArgs = parse_value(args)?;
             orch.list_work_scoped(auth, args.session_id, &args.workspace)
+        }
+        "ptah_get_work_graph" => {
+            let args: WorkScopeArgs = parse_value(args)?;
+            orch.get_work_graph_scoped(auth, args.session_id, &args.workspace)
         }
         "ptah_get_work" => {
             let args: WorkArgs = parse_value(args)?;

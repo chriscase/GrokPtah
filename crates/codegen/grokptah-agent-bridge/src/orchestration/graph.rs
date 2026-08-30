@@ -535,7 +535,7 @@ pub fn evaluate_admission(
 /// attempt, claimant, and lease identifier. A reader learns the shape of its
 /// own lane's graph and nothing about who or what is executing it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkGraphNode {
     pub work_id: String,
     pub kind: String,

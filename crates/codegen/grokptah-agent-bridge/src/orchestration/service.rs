@@ -2244,14 +2244,26 @@ impl OrchestrationService {
         let claimed = self.authorize_work_read_scope(session_id, workspace)?;
         let work = self
             .store
-            .list_work_items()
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
-            .into_iter()
-            .filter(|item| {
-                item.session_id == session_id && item.workspace == claimed.display().to_string()
-            })
-            .collect::<Vec<_>>();
+            .scoped_work_items(session_id, &claimed.display().to_string())
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         Ok(json!({ "work": work }))
+    }
+
+    /// Return the lane-scoped redacted dependency graph. This is separate from
+    /// `ptah_list_work`, whose legacy payload intentionally contains the full
+    /// operator work item for trusted desktop callers.
+    pub fn get_work_graph_scoped(
+        &self,
+        _auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+    ) -> Result<serde_json::Value, OrchError> {
+        let claimed = self.authorize_work_read_scope(session_id, workspace)?;
+        let graph = self
+            .store
+            .work_graph_scoped(session_id, &claimed.display().to_string(), Utc::now())
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        Ok(json!({ "graph": graph }))
     }
 
     pub fn get_work_scoped(

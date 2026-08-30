@@ -10,7 +10,7 @@ use chrono::{Duration as ChronoDuration, TimeZone, Utc};
 use grokptah_agent_bridge::orchestration::{
     evaluate_admission, order_work, resolve_dependency_states, validate_scoped_dependency_graph,
     AdmissionBlock, BlockProvenance, GraphScope, OrchErrorCode, OrchStore, WorkDecisionAction,
-    WorkDependency, WorkItem, WorkPolicy, WorkState,
+    WorkDependency, WorkItem, WorkPolicy, WorkState, MAX_GRAPH_SCOPE_ITEMS,
 };
 use tempfile::tempdir;
 use uuid::Uuid;
@@ -183,6 +183,35 @@ fn dependency_cycles_and_duplicate_edges_are_rejected() {
             .expect_err("a self edge must be rejected")
             .message,
         "work item depends on itself"
+    );
+}
+
+/// The durable store is the last writer shared by service, manager, and host
+/// recovery paths. A cycle introduced by an update must be rejected there as
+/// well, rather than relying on the create endpoint to have seen it.
+#[test]
+fn checked_store_write_rejects_a_new_cycle() {
+    let store = OrchStore::open(tempdir().unwrap().path()).unwrap();
+    let lane = Uuid::new_v4();
+    let mut first = item_in(lane, WORKSPACE, "store-a", "first");
+    store.save_work_item(&first).unwrap();
+
+    let mut second = item_in(lane, WORKSPACE, "store-b", "second");
+    depends_on(&mut second, &first.work_id);
+    store.save_work_item(&second).unwrap();
+
+    depends_on(&mut first, &second.work_id);
+    let error = store
+        .save_work_item(&first)
+        .expect_err("the store must refuse a cycle introduced by an update");
+    assert!(error.to_string().contains("work dependency cycle"));
+    assert_eq!(
+        store
+            .load_work_item("store-a")
+            .unwrap()
+            .unwrap()
+            .dependencies,
+        Vec::<WorkDependency>::new()
     );
 }
 
@@ -440,7 +469,7 @@ fn a_claim_consults_the_admission_evaluator_not_just_the_state() {
     // bypassing `create_work`; the claim path must still refuse it.
     let mut orphan = item_in(lane, WORKSPACE, "orphan", "depends on nothing visible");
     depends_on(&mut orphan, "work-in-another-lane");
-    store.save_work_item(&orphan).unwrap();
+    store.save_work_item_unchecked(&orphan).unwrap();
     assert_eq!(
         store
             .load_work_item(&orphan.work_id)
@@ -647,8 +676,8 @@ fn the_graph_projection_leaks_no_lane_workspace_or_lease_detail() {
     depends_on(&mut waiting, "sibling-secret");
     let sibling = item_in(theirs, WORKSPACE, "sibling-secret", "another lane's work");
     store.save_work_item(&visible).unwrap();
-    store.save_work_item(&waiting).unwrap();
-    store.save_work_item(&sibling).unwrap();
+    store.save_work_item_unchecked(&waiting).unwrap();
+    store.save_work_item_unchecked(&sibling).unwrap();
 
     let claim = store
         .claim_work(&visible.work_id, "worker-private", None)
@@ -696,6 +725,30 @@ fn the_graph_projection_leaks_no_lane_workspace_or_lease_detail() {
         .work_graph_scoped(Uuid::new_v4(), WORKSPACE, Utc::now())
         .unwrap();
     assert!(empty.is_empty());
+}
+
+#[test]
+fn scoped_reads_refuse_to_materialize_an_oversized_lane() {
+    let home = tempdir().unwrap();
+    let store = OrchStore::open(home.path()).unwrap();
+    let lane = Uuid::new_v4();
+    for index in 0..=MAX_GRAPH_SCOPE_ITEMS {
+        let item = item_in(
+            lane,
+            WORKSPACE,
+            &format!("ceiling-{index}"),
+            "bounded read fixture",
+        );
+        store.save_work_item_unchecked(&item).unwrap();
+    }
+    let error = store
+        .scoped_work_items(lane, WORKSPACE)
+        .expect_err("lane reads must refuse more than the graph ceiling");
+    assert!(error.to_string().contains("bounded read refused"));
+    let error = store
+        .work_graph_scoped(lane, WORKSPACE, Utc::now())
+        .expect_err("graph projections must use the same ceiling");
+    assert!(error.to_string().contains("bounded read refused"));
 }
 
 /// The lane-scoped read a writer validates against is the same lane the

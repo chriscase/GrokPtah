@@ -199,4 +199,26 @@ async fn the_control_plane_refuses_a_cross_lane_dependency_without_writing() {
         "a lane read must not include a sibling lane's work"
     );
     assert_eq!(listed.len(), 2);
+
+    // The public graph read is deliberately a separate, redacted projection:
+    // it exposes dependency/state shape without objectives, workspace paths,
+    // principals, agents, results, or lease/attempt material.
+    let graph = client
+        .call_tool(
+            "ptah_get_work_graph",
+            json!({ "session_id": mine.id, "workspace": workspace_text }),
+        )
+        .await
+        .unwrap();
+    let nodes = graph.structured["graph"].as_array().unwrap();
+    assert_eq!(nodes.len(), 2);
+    assert!(nodes.iter().all(|node| {
+        node.get("objective").is_none()
+            && node.get("workspace").is_none()
+            && node.get("createdBy").is_none()
+            && node.get("assignedAgentId").is_none()
+            && node.get("result").is_none()
+            && node.get("attempts").is_none()
+            && node.get("leaseToken").is_none()
+    }));
 }
