@@ -188,6 +188,7 @@ pub struct ComputerRunProjection {
     pub event_range: Option<ComputerRunEventRange>,
     /// The most recent adaptive review, when one ran. `None` for every run
     /// driven through the plain `act` path.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub adaptive: Option<AdaptiveDecisionSummary>,
 }
 
