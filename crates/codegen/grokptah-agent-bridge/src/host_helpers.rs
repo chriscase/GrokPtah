@@ -406,12 +406,13 @@ pub(crate) async fn tool_web_fetch(url: &str) -> Result<local_tools::ToolResult>
     let resp = client.get(url).send().await?;
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
-    let clipped: String = text.chars().take(24_000).collect();
+    let body = format!("HTTP {status}\n{text}");
+    let clipped = bounded_tool_output_with_integrity(&body, 24_000);
     Ok(local_tools::ToolResult::basic(
         format!("Fetch {url}"),
         ToolCallKind::Execute,
         serde_json::json!({ "url": url, "status": status.as_u16() }),
-        format!("HTTP {status}\n{clipped}"),
+        clipped,
         false,
         format!("web_fetch {url}"),
     ))
@@ -516,16 +517,56 @@ fn progress_digest(signature: &str, raw_outputs: &[String], is_true_noop: bool) 
 
 pub(crate) const TOOL_OUTPUT_WIRE_LIMIT_BYTES: usize = 24_000;
 
-/// Clip a tool result for the model wire. Stationarity hashes the raw
-/// result before this projection.
+const TOOL_OUTPUT_INTEGRITY_MARKER: &str = "[grokptah-output-integrity-v1";
+
+/// Return a bounded tool projection that carries a stable identity for the
+/// complete payload when the display cap is exceeded.  Producers use this
+/// before clipping so stationarity can distinguish changes in an omitted
+/// suffix without retaining or exposing that suffix.
+pub(crate) fn bounded_tool_output_with_integrity(content: &str, limit: usize) -> String {
+    let digest = Sha256::digest(content.as_bytes());
+    bounded_tool_output_with_digest(content, content.len(), digest.as_ref(), limit)
+}
+
+/// Project a bounded prefix when the caller has streamed the full payload
+/// through a digest and therefore cannot retain it in memory.
+pub(crate) fn bounded_tool_output_with_digest(
+    display_prefix: &str,
+    total_bytes: usize,
+    digest: &[u8],
+    limit: usize,
+) -> String {
+    if total_bytes <= limit {
+        return display_prefix.to_owned();
+    }
+    let digest_hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    let marker =
+        format!("{TOOL_OUTPUT_INTEGRITY_MARKER} bytes={total_bytes} sha256={digest_hex}]\n");
+    let suffix = "\n… (truncated)";
+    let body_budget = limit.saturating_sub(marker.len() + suffix.len());
+    let body = crate::textutil::truncate_at_char_boundary(display_prefix, body_budget);
+    format!("{marker}{body}{suffix}")
+}
+
+/// Clip a tool result for the model wire. If a producer already attached an
+/// integrity marker, preserve that marker at the front so a second projection
+/// cannot discard the pre-clip identity used by stationarity.
 pub(crate) fn clip_tool_output_for_wire(content: String) -> String {
     if content.len() > TOOL_OUTPUT_WIRE_LIMIT_BYTES {
-        let orig_len = content.len();
-        format!(
-            "{}…\n(truncated {} bytes)",
-            crate::textutil::truncate_at_char_boundary(&content, TOOL_OUTPUT_WIRE_LIMIT_BYTES),
-            orig_len
-        )
+        if let Some(marker_end) = content
+            .strip_prefix(TOOL_OUTPUT_INTEGRITY_MARKER)
+            .and_then(|rest| rest.find('\n'))
+        {
+            let marker_len = TOOL_OUTPUT_INTEGRITY_MARKER.len() + marker_end + 1;
+            let marker = &content[..marker_len];
+            let body = &content[marker_len..];
+            let suffix = "\n(truncated wire projection)";
+            let body_budget =
+                TOOL_OUTPUT_WIRE_LIMIT_BYTES.saturating_sub(marker.len() + suffix.len());
+            let body = crate::textutil::truncate_at_char_boundary(body, body_budget);
+            return format!("{marker}{body}{suffix}");
+        }
+        bounded_tool_output_with_integrity(&content, TOOL_OUTPUT_WIRE_LIMIT_BYTES)
     } else {
         content
     }
@@ -4477,7 +4518,11 @@ test result: FAILED. 0 passed; 3 failed; 0 ignored
         assert!(first.len() > TOOL_OUTPUT_WIRE_LIMIT_BYTES);
         let clipped_first = clip_tool_output_for_wire(first.clone());
         let clipped_second = clip_tool_output_for_wire(second.clone());
-        assert_eq!(clipped_first, clipped_second);
+        assert_ne!(clipped_first, clipped_second);
+        assert!(clipped_first.starts_with(TOOL_OUTPUT_INTEGRITY_MARKER));
+        assert!(clipped_second.starts_with(TOOL_OUTPUT_INTEGRITY_MARKER));
+        assert!(clipped_first.len() <= TOOL_OUTPUT_WIRE_LIMIT_BYTES);
+        assert!(clipped_second.len() <= TOOL_OUTPUT_WIRE_LIMIT_BYTES);
         assert_ne!(first, second);
 
         let mut run = IdenticalToolCallRun::default();
@@ -4498,8 +4543,8 @@ test result: FAILED. 0 passed; 3 failed; 0 ignored
         );
         assert_eq!(
             clipped_run.observe_with_outputs("poll", "get_task_output", false, &[clipped_second]),
-            2,
-            "ordinary wire clipping must not be what the digest hashes"
+            1,
+            "the pre-clip integrity marker must distinguish suffix changes"
         );
     }
 

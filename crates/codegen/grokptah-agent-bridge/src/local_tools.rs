@@ -5,6 +5,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex as TokioMutex;
@@ -12,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 use walkdir::WalkDir;
 
 use crate::events::ToolCallKind;
+use crate::host_helpers::bounded_tool_output_with_integrity;
 
 #[allow(dead_code)] // fields kept for API symmetry / future UI binding
 pub struct ToolResult {
@@ -107,11 +109,7 @@ pub async fn tool_read_file(cwd: &Path, path: &str) -> Result<ToolResult> {
     let text = tokio::fs::read_to_string(&full)
         .await
         .with_context(|| format!("read {}", full.display()))?;
-    let truncated = if text.len() > 32_000 {
-        crate::textutil::truncate_with_marker(&text, 32_000, "\n… (truncated)")
-    } else {
-        text
-    };
+    let truncated = bounded_tool_output_with_integrity(&text, 32_000);
     Ok(ToolResult::basic(
         format!("Read {path}"),
         ToolCallKind::Read,
@@ -335,6 +333,8 @@ where
     });
 
     let mut collected = String::new();
+    let mut full_digest = Sha256::new();
+    let mut full_len = 0usize;
     let mut cancelled = false;
     let mut exit_code: Option<i32> = None;
 
@@ -351,19 +351,15 @@ where
             msg = chunk_rx.recv() => {
                 match msg {
                     Some(s) => {
-                        if collected.len() >= 32_000 {
-                            // Already at cap — stop ingesting (avoid thrash truncate).
-                            continue;
-                        }
-                        collected.push_str(&s);
-                        if collected.len() > 32_000 {
-                            let head = crate::textutil::truncate_at_char_boundary(
-                                &collected,
-                                32_000,
-                            );
-                            collected = format!("{head}\n… (truncated)");
-                        } else {
-                            on_chunk(s);
+                        full_digest.update(s.as_bytes());
+                        full_len = full_len.saturating_add(s.len());
+                        if collected.len() < 32_000 {
+                            let remaining = 32_000 - collected.len();
+                            let visible = crate::textutil::truncate_at_char_boundary(&s, remaining);
+                            collected.push_str(visible);
+                            if !visible.is_empty() {
+                                on_chunk(visible.to_owned());
+                            }
                         }
                     }
                     None => {
@@ -383,8 +379,16 @@ where
 
     // Drain any remaining buffered chunks without blocking forever
     while let Ok(s) = chunk_rx.try_recv() {
-        collected.push_str(&s);
-        on_chunk(s);
+        full_digest.update(s.as_bytes());
+        full_len = full_len.saturating_add(s.len());
+        if collected.len() < 32_000 {
+            let remaining = 32_000 - collected.len();
+            let visible = crate::textutil::truncate_at_char_boundary(&s, remaining);
+            collected.push_str(visible);
+            if !visible.is_empty() {
+                on_chunk(visible.to_owned());
+            }
+        }
     }
 
     // Ensure this session's slot cleared
@@ -416,11 +420,36 @@ where
         }
     };
 
+    let status_suffix = if cancelled {
+        if full_len == 0 {
+            "(cancelled)".to_owned()
+        } else {
+            "\n(cancelled)".to_owned()
+        }
+    } else {
+        let exit_summary = exit_code
+            .map(|code| format!("(exit {code})"))
+            .unwrap_or_else(|| "(terminated without exit code)".into());
+        if full_len == 0 {
+            exit_summary
+        } else {
+            format!("\n{exit_summary}")
+        }
+    };
+    full_digest.update(status_suffix.as_bytes());
+    let total_len = full_len.saturating_add(status_suffix.len());
+    let display = crate::host_helpers::bounded_tool_output_with_digest(
+        &output,
+        total_len,
+        full_digest.finalize().as_ref(),
+        32_000,
+    );
+
     Ok(ToolResult {
         title: format!("$ {command}"),
         kind: ToolCallKind::Execute,
         input: serde_json::json!({ "command": command }),
-        output,
+        output: display,
         needs_permission: true,
         permission_summary: format!("Run shell: {command}"),
         cancelled,
@@ -580,6 +609,22 @@ mod tests {
         assert_eq!(std::fs::read(outside.path()).unwrap(), original);
     }
 
+    #[tokio::test]
+    async fn read_file_integrity_marker_distinguishes_suffix_beyond_cap() {
+        let project = tempfile::tempdir().unwrap();
+        let first = format!("{}A", "x".repeat(40_000));
+        let second = format!("{}B", "x".repeat(40_000));
+        std::fs::write(project.path().join("first.txt"), first).unwrap();
+        std::fs::write(project.path().join("second.txt"), second).unwrap();
+
+        let first = tool_read_file(project.path(), "first.txt").await.unwrap();
+        let second = tool_read_file(project.path(), "second.txt").await.unwrap();
+
+        assert!(first.output.len() <= 32_000);
+        assert!(first.output.starts_with("[grokptah-output-integrity-v1"));
+        assert_ne!(first.output, second.output);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn write_file_rejects_symlinked_parent_outside_project() {
@@ -654,6 +699,35 @@ mod tests {
         assert_eq!(result.exit_code, Some(2));
         assert!(!result.cancelled);
         assert_eq!(result.output, "failure\n(exit 2)");
+    }
+
+    #[tokio::test]
+    async fn shell_integrity_marker_survives_stream_cap_and_suffix_changes() {
+        let project = tempfile::tempdir().unwrap();
+        let first = tool_shell_streaming(
+            project.path(),
+            "head -c 40000 /dev/zero | tr '\\0' a; printf A",
+            CancellationToken::new(),
+            uuid::Uuid::new_v4(),
+            shell_map(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+        let second = tool_shell_streaming(
+            project.path(),
+            "head -c 40000 /dev/zero | tr '\\0' a; printf B",
+            CancellationToken::new(),
+            uuid::Uuid::new_v4(),
+            shell_map(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert!(first.output.len() <= 32_000);
+        assert!(first.output.starts_with("[grokptah-output-integrity-v1"));
+        assert_ne!(first.output, second.output);
     }
 
     #[tokio::test]
