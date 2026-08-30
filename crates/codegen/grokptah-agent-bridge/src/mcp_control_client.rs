@@ -94,8 +94,6 @@ pub struct RunScope {
     pub run_id: String,
 }
 
-
-
 /// A typed recovery notification. The coordinator must poll the durable event
 /// tool before opening another live stream when this is received.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

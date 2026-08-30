@@ -228,7 +228,9 @@ where
 
 fn require_known_version(version: &str) -> Result<(), PublicEventDtoError> {
     if version != PUBLIC_EVENT_SCHEMA_VERSION {
-        return Err(PublicEventDtoError::UnknownSchemaVersion(version.to_string()));
+        return Err(PublicEventDtoError::UnknownSchemaVersion(
+            version.to_string(),
+        ));
     }
     Ok(())
 }
@@ -461,7 +463,8 @@ mod tests {
 
     #[test]
     fn unknown_schema_version_is_denied() {
-        let mut value = serde_json::to_value(PublicEventV1::from_entry(&secret_entries()[0])).unwrap();
+        let mut value =
+            serde_json::to_value(PublicEventV1::from_entry(&secret_entries()[0])).unwrap();
         value["schemaVersion"] = json!("grokptah.public-event.v2");
         match parse_public_event_v1(&value) {
             Err(PublicEventDtoError::UnknownSchemaVersion(version)) => {
@@ -485,7 +488,8 @@ mod tests {
 
     #[test]
     fn unknown_fields_are_denied() {
-        let mut value = serde_json::to_value(PublicEventV1::from_entry(&secret_entries()[0])).unwrap();
+        let mut value =
+            serde_json::to_value(PublicEventV1::from_entry(&secret_entries()[0])).unwrap();
         value["text"] = json!(SECRET_PROMPT);
         match parse_public_event_v1(&value) {
             Err(PublicEventDtoError::Decode(message)) => {
@@ -500,7 +504,8 @@ mod tests {
 
     #[test]
     fn missing_schema_version_is_denied() {
-        let mut value = serde_json::to_value(PublicEventV1::from_entry(&secret_entries()[0])).unwrap();
+        let mut value =
+            serde_json::to_value(PublicEventV1::from_entry(&secret_entries()[0])).unwrap();
         value.as_object_mut().unwrap().remove("schemaVersion");
         assert!(matches!(
             parse_public_event_v1(&value),

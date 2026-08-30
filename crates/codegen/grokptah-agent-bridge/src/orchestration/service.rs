@@ -32,9 +32,7 @@ use super::manager::{
 };
 use super::message::{message_activation_unsupported, MessageKind, WorkMessage};
 use super::public_event::PublicEventPageV1;
-use super::public_run::{
-    PublicRunHandoffV1, PublicRunListV1, PublicRunProgressV1, PublicRunV1,
-};
+use super::public_run::{PublicRunHandoffV1, PublicRunListV1, PublicRunProgressV1, PublicRunV1};
 use super::routine::{
     manual_dedupe_key, ActivationCause, ActivationRequest, MissedRunPolicy,
     RoutineConcurrencyPolicy, RoutineLifecycle, RoutineRecord, RoutineRetryPolicy, RoutineTrigger,
