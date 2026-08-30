@@ -87,8 +87,64 @@ describe("remote public run API", () => {
     expect(got.sessionId).toBe(REQUEST_SESSION);
     expect(got.workspace).toBe(REQUEST_WORKSPACE);
     expect(got.runId).toBe(RUN_ID);
-    expect(invoke.mock.calls.map((call) => call[0])).not.toContain("remote_service_run_list");
-    expect(invoke.mock.calls.map((call) => call[0])).not.toContain("remote_service_run_get");
+    const commands = invoke.mock.calls.map((call) => call[0]);
+    expect(commands).not.toContain("remote_service_run_list");
+    expect(commands).not.toContain("remote_service_run_get");
+    expect(commands).not.toContain("remote_service_watch_runs");
+    expect(commands).not.toContain("remote_service_run_events");
+  });
+
+  it("does not start the raw watcher from public list or get", async () => {
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "remote_service_public_run_list") {
+        return { schemaVersion: PUBLIC_RUN_SCHEMA_VERSION, runs: [publicDocument()] };
+      }
+      if (command === "remote_service_public_run_get") {
+        return publicDocument();
+      }
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    await api.remoteServicePublicRunList(REQUEST_SESSION, REQUEST_WORKSPACE);
+    await api.remoteServicePublicRunGet(REQUEST_SESSION, REQUEST_WORKSPACE, RUN_ID);
+    expect(invoke.mock.calls.map((call) => call[0])).toEqual([
+      "remote_service_public_run_list",
+      "remote_service_public_run_get",
+    ]);
+  });
+
+  it("keeps local list, legacy watch, and remote steer/cancel on their existing commands", async () => {
+    invoke.mockResolvedValue(undefined);
+    const scopes = [
+      { sessionId: REQUEST_SESSION, workspace: REQUEST_WORKSPACE, runId: RUN_ID },
+    ];
+
+    await api.runList("local-session");
+    expect(invoke).toHaveBeenCalledWith("run_list", { sessionId: "local-session" });
+
+    invoke.mockClear();
+    await api.remoteServiceWatchRuns(scopes);
+    expect(invoke).toHaveBeenCalledWith("remote_service_watch_runs", { scopes });
+
+    invoke.mockClear();
+    await api.remoteServiceRunSteer(REQUEST_SESSION, REQUEST_WORKSPACE, "keep going");
+    expect(invoke).toHaveBeenCalledWith("remote_service_run_steer", {
+      sessionId: REQUEST_SESSION,
+      workspace: REQUEST_WORKSPACE,
+      text: "keep going",
+    });
+
+    invoke.mockClear();
+    await api.remoteServiceRunCancel(REQUEST_SESSION, REQUEST_WORKSPACE, RUN_ID);
+    expect(invoke).toHaveBeenCalledWith("remote_service_run_cancel", {
+      sessionId: REQUEST_SESSION,
+      workspace: REQUEST_WORKSPACE,
+      runId: RUN_ID,
+    });
+
+    expect(invoke.mock.calls.map((call) => call[0])).not.toContain(
+      "remote_service_public_run_list",
+    );
   });
 
   it("fails closed on private fields instead of mapping them", async () => {

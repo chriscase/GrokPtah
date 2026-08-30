@@ -153,6 +153,7 @@ pub async fn remote_service_run_list(
 
 /// Additive, allowlisted `grokptah.public-run.v1` list for one remote session.
 /// The legacy raw run command above remains unchanged for compatibility.
+/// Poll-only: does not start `remote_service_watch_runs`.
 #[tauri::command]
 pub async fn remote_service_public_run_list(
     state: State<'_, AppState>,
@@ -619,6 +620,7 @@ pub async fn remote_service_run_get(
 }
 
 /// Additive, allowlisted `grokptah.public-run.v1` get for one remote run.
+/// Poll-only: does not start `remote_service_watch_runs`.
 #[tauri::command]
 pub async fn remote_service_public_run_get(
     state: State<'_, AppState>,

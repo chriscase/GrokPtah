@@ -81,11 +81,10 @@ import {
 import { subscribeRemoteRunEvents } from "./lib/remoteRunEvents";
 import {
   isRemotePublicRun,
-  loadRemotePublicRun,
-  loadRemotePublicRunList,
+  loadPublicRemoteRunForRefresh,
+  loadPublicRemoteRunsForRefresh,
   remoteNotificationInScope,
   remotePublicRunScopeKey,
-  remotePublicWatchScopes,
   replaceScopedRemotePublicRun,
   type RemotePublicRun,
 } from "./lib/publicRun";
@@ -458,7 +457,7 @@ export default function App() {
       const target = remoteSessions.find((session) => session.sessionId === remoteTargetSessionId);
       if (!target) return;
       try {
-        const got = await loadRemotePublicRun({
+        const got = await loadPublicRemoteRunForRefresh({
           sessionId: target.sessionId,
           workspace: target.workspace,
           runId,
@@ -515,7 +514,7 @@ export default function App() {
     try {
       if (remote) {
         if (!remoteTarget) throw new Error("Remote public run list requires session and workspace scope");
-        const listed = await loadRemotePublicRunList({
+        const listed = await loadPublicRemoteRunsForRefresh({
           sessionId: remoteTarget.sessionId,
           workspace: remoteTarget.workspace,
           list: api.remoteServicePublicRunList,
@@ -524,11 +523,6 @@ export default function App() {
         setRuns(listed.runs);
         setRunsSessionId(scopeKey);
         setRunsError(null);
-        void api
-          .remoteServiceWatchRuns(
-            remotePublicWatchScopes(listed.runs, remoteTarget.sessionId, remoteTarget.workspace),
-          )
-          .catch((error) => console.warn("remote run watcher unavailable", error));
       } else {
         const nextRuns = await api.runList(sessionId!);
         if (!runsRefreshGuard.isCurrent(request)) return;

@@ -82,6 +82,7 @@ export const api = {
   /**
    * Allowlisted `grokptah.public-run.v1` list for one remote session/workspace.
    * Scope is taken from this request; the parser never copies it from the body.
+   * Poll-only: does not start `remote_service_watch_runs`.
    */
   remoteServicePublicRunList: async (
     sessionId: string,
@@ -303,6 +304,7 @@ export const api = {
   /**
    * Allowlisted `grokptah.public-run.v1` get for one remote run. Scope is
    * stamped from this request, never from the remote body.
+   * Poll-only: does not start `remote_service_watch_runs`.
    */
   remoteServicePublicRunGet: async (
     sessionId: string,

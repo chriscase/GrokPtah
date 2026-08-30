@@ -4,6 +4,8 @@ import {
   PUBLIC_RUN_SCHEMA_VERSION,
   PublicRunDtoError,
   isRemotePublicRun,
+  loadPublicRemoteRunForRefresh,
+  loadPublicRemoteRunsForRefresh,
   loadRemotePublicRun,
   loadRemotePublicRunList,
   parsePublicRunHandoffV1,
@@ -634,28 +636,46 @@ describe("request-scoped public run reads", () => {
     ).rejects.toThrow("Remote public run list requires session and workspace scope");
   });
 
-  it("watches only live in-scope runs that expose an event cursor", () => {
-    const scopes = remotePublicWatchScopes(
-      [
-        stampedRun({ runId: "live", state: "running", eventStartSeq: 4 }),
-        stampedRun({ runId: "queued", state: "queued", eventStartSeq: 1 }),
-        stampedRun({ runId: "done", state: "completed", eventStartSeq: 9 }),
-        stampedRun({ runId: "no-cursor", state: "running", eventStartSeq: null }),
-        stampedRun({
-          runId: "other-session",
-          state: "running",
-          eventStartSeq: 2,
-          sessionId: BODY_SESSION,
-          workspace: BODY_WORKSPACE,
-        }),
+  it("does not register the raw watcher on public list/get refresh", async () => {
+    const watchRuns = vi.fn(async () => {
+      throw new Error("raw watcher must not be registered from public-run refresh");
+    });
+    const list = vi.fn(async (sessionId: string, workspace: string) => ({
+      schemaVersion: PUBLIC_RUN_SCHEMA_VERSION,
+      sessionId,
+      workspace,
+      runs: [
+        stampedRun({ runId: "live", state: "running", eventStartSeq: 4, sessionId, workspace }),
+        stampedRun({ runId: "queued", state: "queued", eventStartSeq: 1, sessionId, workspace }),
       ],
-      REQUEST_SESSION,
-      REQUEST_WORKSPACE,
+    }));
+    const get = vi.fn(async (sessionId: string, workspace: string, runId: string) =>
+      stampedRun({ runId, state: "running", eventStartSeq: 4, sessionId, workspace }),
     );
-    expect(scopes).toEqual([
-      { sessionId: REQUEST_SESSION, workspace: REQUEST_WORKSPACE, runId: "live" },
-      { sessionId: REQUEST_SESSION, workspace: REQUEST_WORKSPACE, runId: "queued" },
-    ]);
+
+    const listed = await loadPublicRemoteRunsForRefresh({
+      sessionId: REQUEST_SESSION,
+      workspace: REQUEST_WORKSPACE,
+      list,
+      watchRuns,
+    });
+    expect(list).toHaveBeenCalledWith(REQUEST_SESSION, REQUEST_WORKSPACE);
+    expect(watchRuns).not.toHaveBeenCalled();
+    expect(listed.runs.map((run) => run.runId)).toEqual(["live", "queued"]);
+    expect(
+      remotePublicWatchScopes(listed.runs, REQUEST_SESSION, REQUEST_WORKSPACE),
+    ).toEqual([]);
+
+    const got = await loadPublicRemoteRunForRefresh({
+      sessionId: REQUEST_SESSION,
+      workspace: REQUEST_WORKSPACE,
+      runId: "live",
+      get,
+      watchRuns,
+    });
+    expect(get).toHaveBeenCalledWith(REQUEST_SESSION, REQUEST_WORKSPACE, "live");
+    expect(watchRuns).not.toHaveBeenCalled();
+    expect(got.runId).toBe("live");
     expect(remotePublicRunScopeKey(REQUEST_SESSION, REQUEST_WORKSPACE)).toBe(
       `remote:${REQUEST_SESSION}:${REQUEST_WORKSPACE}`,
     );

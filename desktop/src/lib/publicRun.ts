@@ -504,23 +504,57 @@ export async function loadRemotePublicRun(args: {
 }
 
 /**
- * Watch only live runs in the request scope that expose an event cursor.
- * Terminal runs and rows outside the request are dropped rather than guessed.
+ * Public-run list refresh is poll-only. The legacy raw watcher
+ * (`remoteServiceWatchRuns` / `run_watcher`) emits `SessionUpdate` journal
+ * bodies on `remote://run-event`, which this DTO redacts. Never register that
+ * watcher from this path, even when `watchRuns` is supplied.
+ */
+export async function loadPublicRemoteRunsForRefresh(args: {
+  sessionId: string;
+  workspace: string;
+  list: (sessionId: string, workspace: string) => Promise<RemotePublicRunList>;
+  watchRuns?: (scopes: Array<{ sessionId: string; workspace: string; runId: string }>) => Promise<unknown>;
+}): Promise<RemotePublicRunList> {
+  void args.watchRuns;
+  return loadRemotePublicRunList({
+    sessionId: args.sessionId,
+    workspace: args.workspace,
+    list: args.list,
+  });
+}
+
+/**
+ * Public-run get refresh is poll-only. Same fail-closed rule as list: do not
+ * register the raw event watcher from this path.
+ */
+export async function loadPublicRemoteRunForRefresh(args: {
+  sessionId: string;
+  workspace: string;
+  runId: string;
+  get: (sessionId: string, workspace: string, runId: string) => Promise<RemotePublicRun>;
+  watchRuns?: (scopes: Array<{ sessionId: string; workspace: string; runId: string }>) => Promise<unknown>;
+}): Promise<RemotePublicRun> {
+  void args.watchRuns;
+  return loadRemotePublicRun({
+    sessionId: args.sessionId,
+    workspace: args.workspace,
+    runId: args.runId,
+    get: args.get,
+  });
+}
+
+/**
+ * Public-run list/get must not start the legacy raw watcher. That path emits
+ * private journal bodies the public DTO redacts; a richer public event schema
+ * is out of scope. Always return no scopes, even for live in-scope rows.
  */
 export function remotePublicWatchScopes(
-  runs: RemotePublicRun[],
+  _runs: RemotePublicRun[],
   sessionId: string,
   workspace: string,
 ): Array<{ sessionId: string; workspace: string; runId: string }> {
   if (missingRemoteScope(sessionId, workspace)) return [];
-  const scopes: Array<{ sessionId: string; workspace: string; runId: string }> = [];
-  for (const run of runs) {
-    if (remoteScopeMismatch(run, sessionId, workspace)) continue;
-    if (run.eventStartSeq == null) continue;
-    if (run.state !== "running" && run.state !== "queued") continue;
-    scopes.push({ sessionId, workspace, runId: run.runId });
-  }
-  return scopes;
+  return [];
 }
 
 export function remoteNotificationInScope(

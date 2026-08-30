@@ -310,6 +310,10 @@ impl RemoteServiceState {
 
     /// Additive allowlisted public-run list. The request supplies the scope;
     /// no scope fields are accepted from the remote document.
+    ///
+    /// Poll-only: must not register [`Self::watch_runs`]. That path emits raw
+    /// `SessionUpdate` journal bodies on `remote://run-event`, which this DTO
+    /// redacts.
     pub async fn list_public_runs(
         &self,
         session_id: Uuid,
@@ -597,6 +601,10 @@ impl RemoteServiceState {
 
     /// Additive allowlisted public-run get. Legacy raw `get_run` remains
     /// unchanged for existing desktop callers.
+    ///
+    /// Poll-only: must not register [`Self::watch_runs`]. That path emits raw
+    /// `SessionUpdate` journal bodies on `remote://run-event`, which this DTO
+    /// redacts.
     pub async fn get_public_run(
         &self,
         session_id: Uuid,
@@ -665,6 +673,8 @@ impl RemoteServiceState {
         Ok(Some(()))
     }
 
+    /// Legacy raw-event watcher. Emits `SessionUpdate` journal bodies on
+    /// `remote://run-event`. Public-run list/get refresh must not call this.
     pub async fn watch_runs(
         self: &Arc<Self>,
         scopes: Vec<RemoteRunScope>,
@@ -1775,6 +1785,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disconnected_public_run_reads_do_not_register_run_watchers() {
+        let state = RemoteServiceState::new();
+        let session = uuid::Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        assert!(state
+            .list_public_runs(session, "/tmp/project".into())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(state
+            .get_public_run(session, "/tmp/project".into(), "run_public_dto_1".into())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(
+            state.watchers.lock().await.is_empty(),
+            "public-run list/get registered the raw run watcher while disconnected"
+        );
+    }
+
+    #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn remote_client_authenticates_and_reconnects_after_service_restart() {
         let _guard = home_override_serial();
@@ -1862,6 +1892,92 @@ mod tests {
             .iter()
             .any(|run| run.document.run_id == submission.run_id));
         assert!(restarted_server.stop_and_wait().await.is_clean());
+        set_grokptah_home_override(None);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn public_run_list_and_get_do_not_register_raw_run_watchers() {
+        let _guard = home_override_serial();
+        let home = tempdir().unwrap();
+        set_grokptah_home_override(Some(home.path().join(".grokptah")));
+        let workspace = tempdir().unwrap();
+        let host = AgentHost::create(HostConfig {
+            always_approve: true,
+            ..HostConfig::default()
+        })
+        .expect("acquire the GrokPtah instance lock");
+        let orch = OrchestrationService::new(
+            host.clone(),
+            host.event_bus(),
+            OrchStore::open(home.path().join("orch")).unwrap(),
+            OrchestrationConfig {
+                bearer_token: "desktop-remote-token".into(),
+                allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
+                max_concurrent_runs: 2,
+                bounds: RunBounds::default(),
+            },
+        );
+
+        let server = start_control_server(orch, 0).await.unwrap();
+        let base_url = format!("http://{}", server.addr);
+        host.start().unwrap();
+        let state = RemoteServiceState::new();
+        state
+            .connect(base_url, "desktop-remote-token".into())
+            .await
+            .unwrap();
+
+        let session = state
+            .create_session(
+                workspace.path().display().to_string(),
+                Some("Public run watcher isolation".into()),
+            )
+            .await
+            .unwrap()
+            .expect("remote service connected");
+        let submission = state
+            .submit_task(
+                session.session_id,
+                session.workspace.clone(),
+                "return a short acknowledgement and stop".into(),
+                RunExecutionMode::Shared,
+                true,
+            )
+            .await
+            .unwrap()
+            .expect("remote service connected");
+
+        let listed = state
+            .list_public_runs(session.session_id, session.workspace.clone())
+            .await
+            .unwrap()
+            .expect("remote service connected");
+        assert!(listed
+            .runs
+            .iter()
+            .any(|run| run.document.run_id == submission.run_id));
+        assert!(
+            state.watchers.lock().await.is_empty(),
+            "public-run list registered the raw run watcher"
+        );
+
+        let got = state
+            .get_public_run(
+                session.session_id,
+                session.workspace.clone(),
+                submission.run_id.clone(),
+            )
+            .await
+            .unwrap()
+            .expect("remote service connected");
+        assert_eq!(got.document.run_id, submission.run_id);
+        assert!(
+            state.watchers.lock().await.is_empty(),
+            "public-run get registered the raw run watcher"
+        );
+
+        assert!(server.stop_and_wait().await.is_clean());
         set_grokptah_home_override(None);
     }
 }
