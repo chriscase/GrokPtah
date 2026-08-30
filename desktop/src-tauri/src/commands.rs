@@ -665,6 +665,35 @@ pub async fn remote_service_run_events(
         .ok_or_else(|| "remote service is not connected".to_string())
 }
 
+/// Additive, allowlisted `grokptah.public-event.v1` page for one remote run.
+/// The legacy `remote_service_run_events` command is retained as a
+/// compatibility symbol but now fails closed because it cannot decode the
+/// public wire as a private `JournalPage`.
+/// Poll-only: does not start `remote_service_watch_runs`.
+#[tauri::command]
+pub async fn remote_service_public_run_events(
+    state: State<'_, AppState>,
+    session_id: String,
+    workspace: String,
+    run_id: String,
+    after_seq: Option<u64>,
+    limit: Option<usize>,
+) -> Result<crate::remote_public_event::RemotePublicEventPage, String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    state
+        .remote_service
+        .get_public_events(
+            session_id,
+            workspace,
+            run_id,
+            after_seq.unwrap_or(0),
+            limit.unwrap_or(80),
+        )
+        .await
+        .map_err(map_err)?
+        .ok_or_else(|| "remote service is not connected".to_string())
+}
+
 #[tauri::command]
 pub async fn remote_service_run_steer(
     state: State<'_, AppState>,

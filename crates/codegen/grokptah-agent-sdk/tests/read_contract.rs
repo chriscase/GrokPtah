@@ -1,19 +1,19 @@
 //! Contract tests against current-main `mcp_control` / OrchestrationService JSON.
 //!
 //! Fixtures copy wire keys from `orchestration/service.rs` (`list_sessions`,
-//! `get_capacity`) and `event_bus::JournalPage`, plus the `cursor_expired` +
+//! `get_capacity`) and `grokptah.public-event.v1`, plus the `cursor_expired` +
 //! `eventRange` envelope used by current MCP 410 responses. Public run list/get
 //! coverage lives in `public_run_observatory.rs`; legacy `list_runs` /
-//! `observe_run` are `unsupported` and must not call `ptah_list_runs` /
-//! `ptah_get_run`.
+//! `observe_run` / `stream_events` are `unsupported` and must not call
+//! `ptah_list_runs` / `ptah_get_run` / `ptah_get_events`.
 
 use std::sync::{Arc, Mutex};
 
 use grokptah_agent_sdk::{
-    CONTRACT_VERSION, CapabilityState, Cursor, EVENT_PAGE_LIMIT_DEFAULT, EVENT_PAGE_LIMIT_MAX,
-    EVENT_PAGE_LIMIT_MIN, EventQuery, McpTool, McpTransport, PublicEventKind, ReadObservatory,
-    RetainedRange, RunId, RunSelector, SdkError, SessionId, SessionScope, TransportError,
-    contract_version,
+    CONTRACT_VERSION, CapabilityState, EVENT_PAGE_LIMIT_DEFAULT, EVENT_PAGE_LIMIT_MAX,
+    EVENT_PAGE_LIMIT_MIN, EventQuery, McpTool, McpTransport, PUBLIC_EVENT_SCHEMA_VERSION,
+    PublicEventKindV1, ReadObservatory, RetainedRange, RunId, RunSelector, SdkError, SessionId,
+    SessionScope, TransportError, contract_version,
 };
 use serde_json::{Value, json};
 
@@ -150,60 +150,40 @@ fn run_wire() -> Value {
     })
 }
 
-/// `JournalPage` + current `SessionUpdate` tags (`type` snake_case).
+/// `grokptah.public-event.v1` page emitted by public `ptah_get_events`.
 fn events_wire() -> Value {
     json!({
-        "entries": [
+        "schemaVersion": PUBLIC_EVENT_SCHEMA_VERSION,
+        "events": [
             {
+                "schemaVersion": PUBLIC_EVENT_SCHEMA_VERSION,
                 "seq": 1,
                 "ts": "2026-08-01T00:00:01Z",
-                "update": {
-                    "type": "agent_message_chunk",
-                    "session_id": BUILD_SESSION,
-                    "text": SECRET_PROMPT
-                }
+                "kind": "agent_message"
             },
             {
+                "schemaVersion": PUBLIC_EVENT_SCHEMA_VERSION,
                 "seq": 2,
                 "ts": "2026-08-01T00:00:02Z",
-                "update": {
-                    "type": "tool_call",
-                    "session_id": BUILD_SESSION,
-                    "call_id": "c1",
-                    "title": "read_file",
-                    "kind": "read",
-                    "status": "running",
-                    "input": { "path": SECRET_PATH }
-                }
+                "kind": "tool_call",
+                "toolKind": "read",
+                "status": "running"
             },
             {
+                "schemaVersion": PUBLIC_EVENT_SCHEMA_VERSION,
                 "seq": 3,
                 "ts": "2026-08-01T00:00:03Z",
-                "update": {
-                    "type": "file_edit",
-                    "session_id": BUILD_SESSION,
-                    "path": SECRET_PATH,
-                    "summary": "edited secrets",
-                    "unified_diff": "--- a/credentials.env"
-                }
+                "kind": "file_edit"
             },
             {
+                "schemaVersion": PUBLIC_EVENT_SCHEMA_VERSION,
                 "seq": 4,
                 "ts": "2026-08-01T00:00:04Z",
-                "update": {
-                    "type": "prompt_queue_changed",
-                    "session_id": BUILD_SESSION,
-                    "revision": 3,
-                    "entries": [{ "text": SECRET_PROMPT, "source": "mcp" }],
-                    "action": "enqueue",
-                    "origin": "mcp",
-                    "changed_entry": null,
-                    "disposition": null
-                }
+                "kind": "prompt_queue_changed",
+                "revision": 3
             }
         ],
-        "nextCursor": 4,
-        "cursorExpired": false
+        "nextCursor": 4
     })
 }
 
@@ -312,14 +292,25 @@ async fn contract_version_is_1_0() {
         calls.lock().unwrap().is_empty(),
         "legacy list_runs/observe_run must not call transport"
     );
+    assert_eq!(
+        sdk.stream_events(&selector, EventQuery::default())
+            .await
+            .unwrap_err(),
+        SdkError::Unsupported
+    );
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "legacy stream_events must not call transport"
+    );
     let page = sdk
-        .stream_events(&selector, EventQuery::default())
+        .stream_public_events(&selector, EventQuery::default())
         .await
         .unwrap();
+    assert_eq!(page.schema_version, PUBLIC_EVENT_SCHEMA_VERSION);
     assert!(
         page.events
             .iter()
-            .all(|event| event.contract_version == "1.0")
+            .all(|event| event.schema_version == PUBLIC_EVENT_SCHEMA_VERSION)
     );
     let capacity = sdk.host_capacity().await.unwrap();
     assert_eq!(capacity.contract_version, "1.0");
@@ -455,24 +446,19 @@ async fn run_and_event_projections_drop_sensitive_fields() {
     );
 
     let page = sdk
-        .stream_events(&selector, EventQuery::default())
+        .stream_public_events(&selector, EventQuery::default())
         .await
         .unwrap();
+    assert_eq!(page.schema_version, PUBLIC_EVENT_SCHEMA_VERSION);
     assert_eq!(page.events.len(), 4);
-    assert_eq!(page.next_cursor, Some(Cursor::from_after_seq(4)));
-    assert!(matches!(page.events[0].kind, PublicEventKind::AgentMessage));
-    assert!(matches!(
-        page.events[1].kind,
-        PublicEventKind::ToolCall {
-            kind: Some(ref kind),
-            status: Some(ref status)
-        } if kind == "read" && status == "running"
-    ));
-    assert!(matches!(page.events[2].kind, PublicEventKind::FileEdit));
-    assert!(matches!(
-        page.events[3].kind,
-        PublicEventKind::PromptQueueChanged { revision: Some(3) }
-    ));
+    assert_eq!(page.next_cursor, Some(4));
+    assert_eq!(page.events[0].kind, PublicEventKindV1::AgentMessage);
+    assert_eq!(page.events[1].kind, PublicEventKindV1::ToolCall);
+    assert_eq!(page.events[1].tool_kind.as_deref(), Some("read"));
+    assert_eq!(page.events[1].status.as_deref(), Some("running"));
+    assert_eq!(page.events[2].kind, PublicEventKindV1::FileEdit);
+    assert_eq!(page.events[3].kind, PublicEventKindV1::PromptQueueChanged);
+    assert_eq!(page.events[3].revision, Some(3));
     assert_no_sensitive(&serde_json::to_value(&page).unwrap());
 }
 
@@ -521,7 +507,7 @@ async fn host_wire_still_receives_workspace_token_from_opaque_ref() {
         "legacy list_runs/observe_run must not call transport"
     );
     let _ = sdk
-        .stream_events(&selector, EventQuery::default())
+        .stream_public_events(&selector, EventQuery::default())
         .await
         .unwrap();
     let log = calls.lock().unwrap().clone();
@@ -600,7 +586,7 @@ async fn cursor_expired_carries_host_event_range() {
     let (sdk, _) = connect(transport).await;
     let session = sdk.list_sessions().await.unwrap().remove(0);
     let err = sdk
-        .stream_events(
+        .stream_public_events(
             &RunSelector::from_parts(&session, RunId::new(RUN_ID)),
             EventQuery {
                 after_seq: Some(0),
@@ -627,7 +613,7 @@ async fn event_page_bounds_are_the_host_1_to_500_range() {
     let session = sdk.list_sessions().await.unwrap().remove(0);
     let selector = RunSelector::from_parts(&session, RunId::new(RUN_ID));
     assert_eq!(
-        sdk.stream_events(
+        sdk.stream_public_events(
             &selector,
             EventQuery {
                 after_seq: None,
@@ -639,7 +625,7 @@ async fn event_page_bounds_are_the_host_1_to_500_range() {
         SdkError::InvalidRequest
     );
     assert_eq!(
-        sdk.stream_events(
+        sdk.stream_public_events(
             &selector,
             EventQuery {
                 after_seq: None,
@@ -668,7 +654,7 @@ async fn event_query_sends_host_after_seq_and_limit() {
     let (sdk, calls) = connect(transport).await;
     let session = sdk.list_sessions().await.unwrap().remove(0);
     let selector = RunSelector::from_parts(&session, RunId::new(RUN_ID));
-    sdk.stream_events(
+    sdk.stream_public_events(
         &selector,
         EventQuery {
             after_seq: Some(7),
@@ -677,7 +663,7 @@ async fn event_query_sends_host_after_seq_and_limit() {
     )
     .await
     .unwrap();
-    sdk.stream_events(&selector, EventQuery::default())
+    sdk.stream_public_events(&selector, EventQuery::default())
         .await
         .unwrap();
     let log = calls.lock().unwrap().clone();

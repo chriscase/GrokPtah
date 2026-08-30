@@ -1964,8 +1964,9 @@ fn run_event_pages_filter_before_limit_across_sessions() {
         .unwrap();
 
     let page = orch.get_events(&auth, Some(&run_id), 0, 1).unwrap();
-    assert_eq!(page["entries"].as_array().unwrap().len(), 1);
-    assert_eq!(page["entries"][0]["seq"], start_seq);
+    assert_eq!(page["schemaVersion"], "grokptah.public-event.v1");
+    assert_eq!(page["events"].as_array().unwrap().len(), 1);
+    assert_eq!(page["events"][0]["seq"], start_seq);
     assert_eq!(page["nextCursor"], start_seq);
     let next = orch
         .get_events(
@@ -1975,8 +1976,8 @@ fn run_event_pages_filter_before_limit_across_sessions() {
             1,
         )
         .unwrap();
-    assert_eq!(next["entries"].as_array().unwrap().len(), 1);
-    assert_eq!(next["entries"][0]["seq"], end_seq);
+    assert_eq!(next["events"].as_array().unwrap().len(), 1);
+    assert_eq!(next["events"][0]["seq"], end_seq);
     set_grokptah_home_override(None);
 }
 

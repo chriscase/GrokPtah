@@ -4,9 +4,9 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use grokptah_agent_bridge::orchestration::WorkPolicy;
 use grokptah_agent_bridge::{
-    ActivationRecord, AgentRecord, AgentResumePlan, JournalPage, McpControlClient, RoutineRecord,
-    RoutineSnapshot, RunExecutionMode, RunRecord, RunScope, RunState, RuntimeConnectionState,
-    RuntimeTarget, SessionUpdate, WorkAttemptView, WorkItem,
+    ActivationRecord, AgentRecord, AgentResumePlan, JournalPage, McpControlClient, PublicEventKindV1,
+    RoutineRecord, RoutineSnapshot, RunExecutionMode, RunRecord, RunScope, RunState,
+    RuntimeConnectionState, RuntimeTarget, SessionUpdate, WorkAttemptView, WorkItem,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -15,6 +15,9 @@ use tokio::sync::{watch, Mutex};
 use url::Url;
 use uuid::Uuid;
 
+use crate::remote_public_event::{
+    parse_remote_public_event_page, RemotePublicEventPage,
+};
 use crate::remote_public_run::{
     parse_remote_public_run, parse_remote_public_run_list, RemotePublicRun, RemotePublicRunList,
 };
@@ -87,6 +90,7 @@ impl From<RemoteSessionWire> for RemoteSessionTarget {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct RemoteRunEvent {
     pub run_id: String,
     pub session_id: Uuid,
@@ -628,6 +632,10 @@ impl RemoteServiceState {
         ))
     }
 
+    /// Retired compatibility events. Public MCP `ptah_get_events` emits
+    /// `grokptah.public-event.v1` only; connected calls fail closed as a redacted
+    /// unsupported/legacy-wire error and do not invoke that tool. Use
+    /// [`Self::get_public_events`]. Disconnected calls still return `None`.
     pub async fn get_events(
         &self,
         session_id: Uuid,
@@ -643,6 +651,30 @@ impl RemoteServiceState {
         Ok(Some(
             client
                 .get_events(session_id, workspace, run_id, after_seq, limit)
+                .await?,
+        ))
+    }
+
+    /// Additive allowlisted public-event page. Legacy raw [`Self::get_events`]
+    /// is retired/unsupported; callers must use this method.
+    ///
+    /// Poll-only: must not register [`Self::watch_runs`]. That path must not
+    /// reintroduce raw `SessionUpdate` journal delivery.
+    pub async fn get_public_events(
+        &self,
+        session_id: Uuid,
+        workspace: String,
+        run_id: String,
+        after_seq: u64,
+        limit: usize,
+    ) -> Result<Option<RemotePublicEventPage>> {
+        let mut client = self.client.lock().await;
+        let Some(client) = client.as_mut() else {
+            return Ok(None);
+        };
+        Ok(Some(
+            client
+                .get_public_events(session_id, workspace, run_id, after_seq, limit)
                 .await?,
         ))
     }
@@ -731,8 +763,8 @@ struct RemoteServiceClient {
     base_url: String,
     token: String,
     mcp: McpControlClient,
-    /// Test-only log of `tools/call` names. Legacy list/get must not append
-    /// `ptah_list_runs` / `ptah_get_run` when connected.
+    /// Test-only log of `tools/call` names. Legacy list/get/events must not
+    /// append `ptah_list_runs` / `ptah_get_run` / `ptah_get_events` when connected.
     #[cfg(test)]
     called_tools: Vec<String>,
 }
@@ -1346,6 +1378,42 @@ impl RemoteServiceClient {
         Err(legacy_remote_run_wire_unsupported())
     }
 
+    /// Retired `JournalPage` events. Does not call `ptah_get_events`.
+    async fn get_events(
+        &mut self,
+        session_id: Uuid,
+        workspace: String,
+        run_id: String,
+        after_seq: u64,
+        limit: usize,
+    ) -> Result<JournalPage> {
+        let _ = (self, session_id, workspace, run_id, after_seq, limit);
+        Err(legacy_remote_run_wire_unsupported())
+    }
+
+    async fn get_public_events(
+        &mut self,
+        session_id: Uuid,
+        workspace: String,
+        run_id: String,
+        after_seq: u64,
+        limit: usize,
+    ) -> Result<RemotePublicEventPage> {
+        let value = self
+            .call_tool(
+                "ptah_get_events",
+                json!({
+                    "session_id": session_id,
+                    "workspace": workspace,
+                    "run_id": run_id,
+                    "after_seq": after_seq,
+                    "limit": limit,
+                }),
+            )
+            .await?;
+        parse_remote_public_event_page(&value, session_id, &workspace)
+    }
+
     async fn get_public_run(
         &mut self,
         session_id: Uuid,
@@ -1363,29 +1431,6 @@ impl RemoteServiceClient {
             )
             .await?;
         parse_remote_public_run(&value, session_id, &workspace)
-    }
-
-    async fn get_events(
-        &mut self,
-        session_id: Uuid,
-        workspace: String,
-        run_id: String,
-        after_seq: u64,
-        limit: usize,
-    ) -> Result<JournalPage> {
-        let value = self
-            .call_tool(
-                "ptah_get_events",
-                json!({
-                    "session_id": session_id,
-                    "workspace": workspace,
-                    "run_id": run_id,
-                    "after_seq": after_seq,
-                    "limit": limit,
-                }),
-            )
-            .await?;
-        serde_json::from_value(value).context("decode remote durable event page")
     }
 
     async fn open_event_stream(
@@ -1461,18 +1506,7 @@ async fn run_watcher(
                     Ok(Some(frame)) => match frame.notification {
                         grokptah_agent_bridge::LiveNotification::Event(event) => {
                             cursor = cursor.max(event.seq);
-                            let update = RemoteRunEvent {
-                                run_id: event.run_id,
-                                session_id: event.session_id,
-                                workspace: event.workspace,
-                                seq: event.seq,
-                                ts: event.ts,
-                                update: event.update,
-                            };
-                            let terminal =
-                                matches!(update.update, SessionUpdate::TurnComplete { .. });
-                            let _ = app.emit("remote://run-event", update);
-                            if terminal {
+                            if event.kind == PublicEventKindV1::TurnComplete {
                                 return;
                             }
                         }

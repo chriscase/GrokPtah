@@ -18,7 +18,8 @@ into client capabilities and then exposes:
 | `observe_public_handoff` | `ptah_get_handoff` (`grokptah.public-run.v1`) |
 | `list_runs` | unsupported shim; does not call `ptah_list_runs` |
 | `observe_run` | unsupported shim; does not call `ptah_get_run` |
-| `stream_events` | `ptah_get_events` |
+| `stream_public_events` | `ptah_get_events` (`grokptah.public-event.v1`) |
+| `stream_events` | unsupported shim; does not call `ptah_get_events` |
 | `host_capacity` | `ptah_get_capacity` |
 
 Chosen split: public DTO consumers use the `*_public_*` methods. Legacy
@@ -49,10 +50,12 @@ JSON:
   and legacy `RunRecord` decode as redacted `internal`. `RunView` remains the
   unused legacy projection type; `list_runs` / `observe_run` return
   `unsupported` without calling the public tools.
-- Events: `JournalPage` `{ entries: [{ seq, ts, update }], nextCursor,
-  cursorExpired }`. `update` uses current `SessionUpdate` `type` tags. Public
-  events keep seq/ts/kind only; text, paths, commands, tool I/O, and queue
-  bodies are dropped.
+- Events: `grokptah.public-event.v1` `{ events: [{ seq, ts, kind, ... }],
+  nextCursor, schemaVersion }`. The allowlist keeps sequence/time, event kind,
+  and bounded status/count flags only; text, paths, commands, tool I/O, queue
+  bodies, session/workspace identifiers, and private `SessionUpdate` fields are
+  never exposed. Unknown fields/versions fail closed. Legacy `stream_events`
+  is an unsupported no-call shim.
 - Capacity: `maxConcurrentRuns`, `activeRuns`, `available`, `queuedRuns`,
   `queueLimit`, plus `health.*Error` / `laggedLiveEvents`. Supervisor and
   native-executor objects are not forwarded.
@@ -77,14 +80,14 @@ SDK is not a run-existence oracle. Host messages are not forwarded.
 - Read-only. No submit, cancel, queue, steer, review, promote, or work/manager
   mutations.
 - No Computer Run reads or controls (`ptah_*_computer_*` are not wired).
-- No live SSE (`GET /mcp` run stream). `stream_events` is `ptah_get_events`
-  paging.
+- The SDK exposes paged public events only; live SSE is a separate host/client
+  surface and its notifications use the same public-event allowlist.
 - No provider credential or computer-control APIs.
 - Not live/provider qualified. Consumers must still authenticate to a real
   control plane and treat this crate as a projection layer over current MCP.
 
 Residual risk: the host Build-run path still distinguishes unknown run_id
 (`invalid_request`) from cross-session (`forbidden_scope`) on the wire. The
-SDK collapses those two for `observe_public_run` / `stream_events` only.
+SDK collapses those two for `observe_public_run` / `stream_public_events` only.
 `observe_run` is an unsupported shim and is not a run-existence oracle.
 Direct MCP callers outside this crate still see the host distinction.

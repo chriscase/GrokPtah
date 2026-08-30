@@ -137,7 +137,11 @@ Accept: text/event-stream
 
 The server first replays the durable run journal, then follows live EventBus
 updates. Each event is an MCP `notifications/ptah_event` JSON-RPC notification
-with `sessionId`, `workspace`, `runId`, `seq`, `ts`, and typed `update` fields.
+with the versioned `grokptah.public-event.v1` allowlist: `schemaVersion`,
+`seq`, `ts`, `kind`, and bounded status/count flags. Session/workspace/run
+scope stays on the request and is never embedded in the event DTO; private
+`SessionUpdate` text, paths, commands, tool I/O, and queue bodies are not
+exposed.
 The SSE `id` is the durable sequence and can be sent back as `Last-Event-ID`
 on reconnect. The stream is authorized against the exact session/workspace/run
 triple and is independently bounded to 32 concurrent streams. The unscoped GET
@@ -521,10 +525,10 @@ coordinator wants a bounded admission queue for capacity or session contention.
 ### Events
 
 - `ptah_get_events` requires the exact owning `session_id`, `workspace`, and
-  `run_id`; returns `{ entries, nextCursor, cursorExpired }`. The server
-  filters the bounded journal to the caller-owned run before applying `limit`,
-  so activity from other sessions cannot advance the run cursor past relevant
-  events.
+  `run_id`; returns `{ schemaVersion: "grokptah.public-event.v1", events,
+  nextCursor }`. The server filters the bounded journal to the caller-owned run
+  before applying `limit`, so activity from other sessions cannot advance the
+  run cursor past relevant events. Unknown fields or versions fail closed.
 - Sequences are monotonic for a run-scoped journal page; expired cursors return
   `cursor_expired` (HTTP 410).
 

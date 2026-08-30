@@ -5,6 +5,7 @@ mod computer_use;
 mod event_forward;
 mod help;
 mod pty_host;
+mod remote_public_event;
 mod remote_public_run;
 mod remote_service;
 
@@ -149,6 +150,7 @@ fn run_inner() -> anyhow::Result<()> {
             commands::remote_service_run_get,
             commands::remote_service_public_run_get,
             commands::remote_service_run_events,
+            commands::remote_service_public_run_events,
             commands::remote_service_run_steer,
             commands::remote_service_run_cancel,
             commands::remote_service_watch_runs,

@@ -9,7 +9,7 @@ use grokptah_agent_bridge::orchestration::{
 };
 use grokptah_agent_bridge::{
     home_override_serial, set_grokptah_home_override, start_control_server, AgentHost, HostConfig,
-    LiveNotification, McpControlClient, RunScope, SessionKind, SessionUpdate,
+    LiveNotification, McpControlClient, PublicEventKindV1, RunScope, SessionKind,
 };
 use serde_json::{json, Value};
 use tempfile::tempdir;
@@ -253,7 +253,7 @@ async fn live_get_replays_scoped_events_and_resumes_after_last_event() {
     );
     let first = first_chunk(stream_response).await;
     assert!(first.contains("notifications/ptah_event"));
-    assert!(first.contains(&run_id));
+    assert!(first.contains("grokptah.public-event.v1"));
     let first_id = event_id(&first);
 
     // Reconnect with the last delivered event. The durable replay must not
@@ -270,7 +270,7 @@ async fn live_get_replays_scoped_events_and_resumes_after_last_event() {
     let next = first_chunk(resumed).await;
     assert!(next.contains("notifications/ptah_event"));
     assert!(event_id(&next) > first_id);
-    assert!(next.contains(&run_id));
+    assert!(next.contains("grokptah.public-event.v1"));
 
     // Reconnecting after the terminal sequence must close promptly instead
     // of leaving a completed run's stream open forever.
@@ -364,13 +364,13 @@ async fn reusable_client_reconnects_from_last_live_event() {
     let mut terminal_seen = matches!(
         next.notification,
         LiveNotification::Event(ref event)
-            if matches!(event.update, SessionUpdate::TurnComplete { .. })
+            if event.kind == PublicEventKindV1::TurnComplete
     );
     while let Some(frame) = resumed.next_notification().await.unwrap() {
         if matches!(
             frame.notification,
             LiveNotification::Event(ref event)
-                if matches!(event.update, SessionUpdate::TurnComplete { .. })
+                if event.kind == PublicEventKindV1::TurnComplete
         ) {
             terminal_seen = true;
         }

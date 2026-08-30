@@ -33,10 +33,10 @@ use uuid::Uuid;
 use crate::host::AgentHostHandle;
 use crate::orchestration::{
     AuthContext, ChangeRecord, ManagerStepSpec, MessageKind, MissedRunPolicy, OrchError,
-    OrchErrorCode, OrchestrationConfig, OrchestrationService, RoutineConcurrencyPolicy,
-    RoutineLifecycle, RoutineRetryPolicy, RoutineTrigger, RunExecutionMode, WorkArtifactRef,
-    WorkDependency, WorkPolicy, WorkResult, WorkTemplate, WorkerHostKind, WorkspaceAllowlist,
-    CONTROL_TOOLS, FORBIDDEN_TOOLS,
+    OrchErrorCode, OrchestrationConfig, OrchestrationService, PublicEventKindV1, PublicEventV1,
+    RoutineConcurrencyPolicy, RoutineLifecycle, RoutineRetryPolicy, RoutineTrigger,
+    RunExecutionMode, WorkArtifactRef, WorkDependency, WorkPolicy, WorkResult, WorkTemplate,
+    WorkerHostKind, WorkspaceAllowlist, CONTROL_TOOLS, FORBIDDEN_TOOLS,
 };
 use crate::{EventReceiver, JournalPage, SessionUpdate};
 
@@ -169,21 +169,15 @@ impl LiveStreamState {
                 return;
             }
         }
-        let terminal = matches!(&update, SessionUpdate::TurnComplete { .. });
+        let event = PublicEventV1::from_update(seq, ts, &update);
+        let terminal = event.kind == PublicEventKindV1::TurnComplete;
         self.last_seq = seq;
         self.pending.push_back(sse_message(
             Some(seq),
             json!({
                 "jsonrpc": "2.0",
                 "method": "notifications/ptah_event",
-                "params": {
-                    "sessionId": self.session_id,
-                    "workspace": self.workspace,
-                    "runId": self.run_id,
-                    "seq": seq,
-                    "ts": ts,
-                    "update": update,
-                }
+                "params": event,
             }),
         ));
         if terminal || self.end_seq == Some(seq) {

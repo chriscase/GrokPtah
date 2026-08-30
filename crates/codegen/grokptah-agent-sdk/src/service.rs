@@ -10,10 +10,10 @@ use crate::capability::{
     TOOL_LIST_SESSIONS,
 };
 use crate::dto::{
-    EventPage, HostCapacity, PublicRunHandoffV1, PublicRunListV1, PublicRunProgressV1, PublicRunV1,
-    RunView, SessionView, parse_public_run_handoff_v1, parse_public_run_list_v1,
-    parse_public_run_progress_v1, parse_public_run_v1, project_capacity, project_event_page,
-    project_sessions,
+    EventPage, HostCapacity, PublicEventPageV1, PublicRunHandoffV1, PublicRunListV1,
+    PublicRunProgressV1, PublicRunV1, RunView, SessionView, parse_public_event_page_v1,
+    parse_public_run_handoff_v1, parse_public_run_list_v1, parse_public_run_progress_v1,
+    parse_public_run_v1, project_capacity, project_sessions,
 };
 use crate::error::SdkError;
 use crate::observe::{EventQuery, RunSelector, SessionScope};
@@ -138,12 +138,25 @@ impl<T: McpTransport> ReadObservatory<T> {
         parse_public_run_handoff_v1(&body)
     }
 
-    /// Page `ptah_get_events`. `limit` is 1..=500 (host default 50).
+    /// Legacy `JournalPage` reader. Public MCP `ptah_get_events` emits
+    /// `grokptah.public-event.v1` only; this method does not call that tool and
+    /// returns [`SdkError::Unsupported`]. Use [`Self::stream_public_events`].
     pub async fn stream_events(
+        &self,
+        _selector: &RunSelector,
+        _query: EventQuery,
+    ) -> Result<EventPage, SdkError> {
+        let _ = self;
+        Err(SdkError::Unsupported)
+    }
+
+    /// Allowlisted `ptah_get_events` `grokptah.public-event.v1` page.
+    /// `limit` is 1..=500 (host default 50).
+    pub async fn stream_public_events(
         &self,
         selector: &RunSelector,
         query: EventQuery,
-    ) -> Result<EventPage, SdkError> {
+    ) -> Result<PublicEventPageV1, SdkError> {
         let limit = query.limit.unwrap_or(EVENT_PAGE_LIMIT_DEFAULT);
         if !(EVENT_PAGE_LIMIT_MIN..=EVENT_PAGE_LIMIT_MAX).contains(&limit) {
             return Err(SdkError::InvalidRequest);
@@ -157,7 +170,7 @@ impl<T: McpTransport> ReadObservatory<T> {
             .call_required(TOOL_GET_EVENTS, arguments)
             .await
             .map_err(SdkError::collapse_run_scope)?;
-        project_event_page(&body)
+        parse_public_event_page_v1(&body)
     }
 
     /// Occupancy and health flags from `ptah_get_capacity`.

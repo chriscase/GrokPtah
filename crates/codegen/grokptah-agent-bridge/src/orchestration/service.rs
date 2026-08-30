@@ -31,6 +31,7 @@ use super::manager::{
     ManagerDirective, ManagerPlan, ManagerPlanState, ManagerStepSpec, MANAGER_SCHEMA_VERSION,
 };
 use super::message::{message_activation_unsupported, MessageKind, WorkMessage};
+use super::public_event::PublicEventPageV1;
 use super::public_run::{
     PublicRunHandoffV1, PublicRunListV1, PublicRunProgressV1, PublicRunV1,
 };
@@ -5474,7 +5475,8 @@ impl OrchestrationService {
         after_seq: u64,
         limit: usize,
     ) -> Result<serde_json::Value, OrchError> {
-        serde_json::to_value(self.events_page_for_run(run, after_seq, limit)?)
+        let page = PublicEventPageV1::from_page(&self.events_page_for_run(run, after_seq, limit)?);
+        serde_json::to_value(page)
             .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))
     }
 

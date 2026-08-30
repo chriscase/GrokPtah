@@ -8,6 +8,7 @@ mod graph;
 pub(crate) mod managed;
 mod manager;
 mod message;
+mod public_event;
 mod public_run;
 mod routine;
 mod service;
@@ -69,6 +70,10 @@ pub use supervisor::{
     WorkloadSupervisor, WorkloadSupervisorStatus, DEFAULT_MANAGER_TICK_INTERVAL,
     DEFAULT_ROUTINE_TICK_INTERVAL, DEFAULT_WORKLOAD_RECONCILIATION_INTERVAL,
     MAX_MANAGER_OBSERVATIONS_PER_PASS, MAX_MANAGER_PLANS_PER_PASS,
+};
+pub use public_event::{
+    parse_public_event_page_v1, parse_public_event_v1, PublicEventDtoError, PublicEventKindV1,
+    PublicEventPageV1, PublicEventV1, PUBLIC_EVENT_SCHEMA_VERSION,
 };
 pub use public_run::{
     parse_public_run_handoff_v1, parse_public_run_list_v1, parse_public_run_progress_v1,
