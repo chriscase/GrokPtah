@@ -1,7 +1,7 @@
-//! Fail-closed parser tests for staged `grokptah.public-run.v1` documents.
+//! Fail-closed parser tests for `grokptah.public-run.v1` documents.
 //!
-//! Fixtures are synthetic JSON. Live MCP still emits `RunRecord`; these parsers
-//! are not wired to `ReadObservatory`.
+//! Fixtures are synthetic JSON. `ReadObservatory` public-run methods consume
+//! these parsers; legacy `list_runs` / `observe_run` still project `RunRecord`.
 
 use grokptah_agent_sdk::{
     PUBLIC_RUN_SCHEMA_VERSION, PublicRunHandoffV1, PublicRunListV1, PublicRunProgressV1,

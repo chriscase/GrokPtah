@@ -1,8 +1,14 @@
 //! Safe projections of current OrchestrationService / MCP structured content.
 //!
-//! [`PublicRunV1`] and `parse_public_run_*` are a staged fail-closed seam for
-//! `grokptah.public-run.v1`. They are not used by `project_run` or
-//! `ReadObservatory`; live MCP still emits `RunRecord`.
+//! [`PublicRunV1`] and `parse_public_run_*` are the fail-closed
+//! `grokptah.public-run.v1` seam used by
+//! [`crate::ReadObservatory::list_public_runs`],
+//! [`crate::ReadObservatory::observe_public_run`],
+//! [`crate::ReadObservatory::observe_public_progress`], and
+//! [`crate::ReadObservatory::observe_public_handoff`].
+//! Session and workspace stay on the request scope and are never read from
+//! these documents. Legacy `project_run` / `list_runs` / `observe_run` still
+//! project camelCase `RunRecord`.
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -572,13 +578,15 @@ fn json_string(value: Option<&Value>) -> Option<String> {
 
 /// Parse one `ptah_get_run` `grokptah.public-run.v1` document.
 ///
-/// Not wired to `project_run`. Unknown version/field maps to [`SdkError::Internal`]
-/// without forwarding serde payloads.
+/// Used by [`crate::ReadObservatory::observe_public_run`]. Unknown version/field
+/// maps to [`SdkError::Internal`] without forwarding serde payloads.
 pub fn parse_public_run_v1(value: &Value) -> Result<PublicRunV1, SdkError> {
     parse_versioned(value, |row: &PublicRunV1| row.schema_version.as_str())
 }
 
 /// Parse one `ptah_list_runs` `grokptah.public-run.v1` envelope.
+///
+/// Used by [`crate::ReadObservatory::list_public_runs`].
 pub fn parse_public_run_list_v1(value: &Value) -> Result<PublicRunListV1, SdkError> {
     let parsed = parse_versioned(value, |row: &PublicRunListV1| row.schema_version.as_str())?;
     for run in &parsed.runs {
@@ -588,6 +596,8 @@ pub fn parse_public_run_list_v1(value: &Value) -> Result<PublicRunListV1, SdkErr
 }
 
 /// Parse one `ptah_get_progress` `grokptah.public-run.v1` document.
+///
+/// Used by [`crate::ReadObservatory::observe_public_progress`].
 pub fn parse_public_run_progress_v1(value: &Value) -> Result<PublicRunProgressV1, SdkError> {
     parse_versioned(value, |row: &PublicRunProgressV1| {
         row.schema_version.as_str()
@@ -595,6 +605,8 @@ pub fn parse_public_run_progress_v1(value: &Value) -> Result<PublicRunProgressV1
 }
 
 /// Parse one `ptah_get_handoff` `grokptah.public-run.v1` document.
+///
+/// Used by [`crate::ReadObservatory::observe_public_handoff`].
 pub fn parse_public_run_handoff_v1(value: &Value) -> Result<PublicRunHandoffV1, SdkError> {
     parse_versioned(value, |row: &PublicRunHandoffV1| {
         row.schema_version.as_str()
