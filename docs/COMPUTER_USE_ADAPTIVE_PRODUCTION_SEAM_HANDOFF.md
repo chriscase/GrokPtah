@@ -6,7 +6,7 @@ Status: source candidate only; not live, packaged, VM, provider, or release qual
 
 - Base: `origin/main` at `948c30d2797f0080829e5ed829dcd25c8d8063e1`
 - Candidate branch: `codex/adaptive-production-current-main-v2`
-- Candidate head: `6261138f197f7b197fe8d3fb44cfc5438665a46a`
+- Candidate head: the immutable head recorded in the promotion handoff (this document is part of the candidate).
 
 The branch ports only the adaptive planner/executor review seam onto current main. The historical donor was used as read-only reference; its stale durable, wait, authority, provider, desktop, and VM work was not carried over.
 
