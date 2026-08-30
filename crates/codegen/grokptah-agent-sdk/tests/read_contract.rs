@@ -693,6 +693,10 @@ async fn transport_and_auth_errors_map_one_to_one() {
             SdkError::Conflict,
         ),
         (
+            TransportError::from_host_data(&json!({"code": "stale_version"})),
+            SdkError::Conflict,
+        ),
+        (
             TransportError::from_host_data(&json!({"code": "mystery_code"})),
             SdkError::Internal,
         ),
@@ -751,6 +755,12 @@ async fn host_data_codes_match_sdk_error_codes() {
         );
         assert_eq!(expected.code(), code);
     }
+    assert_eq!(
+        SdkError::from(TransportError::from_host_data(&json!({
+            "code": "stale_version"
+        }))),
+        SdkError::Conflict
+    );
     let expired = SdkError::from(TransportError::from_host_data(&json!({
         "code": "cursor_expired",
         "eventRange": { "startSeq": 2, "endSeq": 9 }
