@@ -1,0 +1,19 @@
+[package]
+name = "grokptah-agent-sdk"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "External read-only SDK seam over current GrokPtah MCP observatory tools"
+readme = false
+publish = false
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lints]
+workspace = true
