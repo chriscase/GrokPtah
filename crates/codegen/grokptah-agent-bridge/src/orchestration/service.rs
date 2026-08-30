@@ -19,6 +19,7 @@ use super::authz::{
     authenticate_bearer, canonical_workspace, require_workspace_match, AuthContext, AuthCredential,
     WorkspaceAllowlist,
 };
+use super::graph::{validate_scoped_dependency_graph, GraphScope};
 use super::managed::{
     assemble_managed_run_input, managed_execution_eligible, select_relevant_managed_messages,
     ManagedExecutionIntent, ManagedExecutionPolicy, ManagedFinalizationOutcome, ManagedIntentState,
@@ -2959,6 +2960,29 @@ impl OrchestrationService {
         item.dependencies = dependencies;
         if let Err(error) = item.validate() {
             return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+        }
+        // The work-graph authority runs before the first durable write, so a
+        // rejected graph leaves no record behind and no idempotency key
+        // consumed. `WorkItem::validate` sees one item and can only reject a
+        // self-edge; a ring, a dangling id, and an id belonging to another
+        // lane are all graph-level facts.
+        if !item.dependencies.is_empty() {
+            let lane = match self.store.scoped_work_items(session_id, &item.workspace) {
+                Ok(lane) => lane,
+                Err(error) => {
+                    return Err(self.fail_claim(
+                        &mut lease,
+                        None,
+                        session_id,
+                        &claimed,
+                        OrchError::new(OrchErrorCode::Internal, error.to_string()),
+                    ))
+                }
+            };
+            let scope = GraphScope::of(&item);
+            if let Err(error) = validate_scoped_dependency_graph(&lane, &item, scope) {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+            }
         }
         if let Err(error) = self.store.save_work_item(&item) {
             return Err(self.fail_claim(

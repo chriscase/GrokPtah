@@ -4,6 +4,7 @@
 
 mod authz;
 mod continuation;
+mod graph;
 pub(crate) mod managed;
 mod manager;
 mod message;
@@ -25,6 +26,11 @@ pub use continuation::{
     ContinuationMemoryInput, ContinuationMemoryScope, ContinuationOmission, ContinuationReasonCode,
     ContinuationRunInput, ContinuationTestInput, ContinuationWorkloadRef,
     CONTINUATION_ASSEMBLER_VERSION, CONTINUATION_SCHEMA_VERSION,
+};
+pub use graph::{
+    compare_work_order, evaluate_admission, order_work, project_scoped_graph,
+    resolve_dependency_states, validate_scoped_dependency_graph, AdmissionBlock, DependencyStates,
+    GraphScope, WorkGraphNode, MAX_GRAPH_EDGES, MAX_GRAPH_SCOPE_ITEMS,
 };
 pub use managed::{
     assemble_managed_run_input, intersect_run_bounds, managed_execution_eligible,
@@ -78,8 +84,8 @@ pub use worker::{
     WorkerPresence, WorkerProjection, DEFAULT_WORKER_STALE_AFTER_MS,
 };
 pub use workload::{
-    lease_duration, AssignmentStatus, AttemptState, WorkApproval, WorkArtifactRef, WorkAttempt,
-    WorkAttemptView, WorkClaim, WorkDecision, WorkDecisionAction, WorkDependency, WorkItem,
-    WorkItemSnapshot, WorkPolicy, WorkProgress, WorkResult, WorkRetryPolicy, WorkState,
+    lease_duration, AssignmentStatus, AttemptState, BlockProvenance, WorkApproval, WorkArtifactRef,
+    WorkAttempt, WorkAttemptView, WorkClaim, WorkDecision, WorkDecisionAction, WorkDependency,
+    WorkItem, WorkItemSnapshot, WorkPolicy, WorkProgress, WorkResult, WorkRetryPolicy, WorkState,
     WorkloadReconciliationReport, WORKLOAD_SCHEMA_VERSION,
 };

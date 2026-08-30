@@ -293,10 +293,15 @@ fn assignment_and_manual_retry_use_revision_fences_and_preserve_history() {
 fn dependency_blocks_then_unblocks_work() {
     let home = tempdir().unwrap();
     let store = OrchStore::open(home.path()).unwrap();
+    // One lane. A dependency is resolved inside the depending item's session
+    // and workspace, so both items are created in the same one; an edge that
+    // crossed sessions used to resolve, which is the leak
+    // `work_graph_authority.rs` now holds closed.
+    let lane = Uuid::new_v4();
     let dependency = WorkItem::new(
         "test",
         "dependency",
-        Uuid::new_v4(),
+        lane,
         "/tmp/project",
         "operator",
         WorkPolicy::default(),
@@ -306,7 +311,7 @@ fn dependency_blocks_then_unblocks_work() {
     let mut dependent = WorkItem::new(
         "test",
         "dependent",
-        Uuid::new_v4(),
+        lane,
         "/tmp/project",
         "operator",
         WorkPolicy::default(),
@@ -383,10 +388,11 @@ fn reconciliation_expires_leases_and_requeues_with_deterministic_time() {
 fn reconciliation_fails_deadlines_and_reports_dependency_transitions() {
     let home = tempdir().unwrap();
     let store = OrchStore::open(home.path()).unwrap();
+    let lane = Uuid::new_v4();
     let dependency = WorkItem::new(
         "test",
         "dependency",
-        Uuid::new_v4(),
+        lane,
         "/tmp/project",
         "operator",
         WorkPolicy::default(),
@@ -397,7 +403,7 @@ fn reconciliation_fails_deadlines_and_reports_dependency_transitions() {
     let mut dependent = WorkItem::new(
         "test",
         "dependent",
-        Uuid::new_v4(),
+        lane,
         "/tmp/project",
         "operator",
         WorkPolicy::default(),
@@ -420,6 +426,12 @@ fn reconciliation_fails_deadlines_and_reports_dependency_transitions() {
             .unwrap()
             .state,
         WorkState::Blocked
+    );
+    let held = store.load_work_item(&dependent.work_id).unwrap().unwrap();
+    assert_eq!(held.blocked_reason.as_deref(), Some("dependencies_pending"));
+    assert_eq!(
+        held.block_provenance,
+        Some(grokptah_agent_bridge::orchestration::BlockProvenance::Derived)
     );
 
     let dependency_claim = store
