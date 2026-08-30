@@ -1,18 +1,26 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   PUBLIC_RUN_SCHEMA_VERSION,
   PublicRunDtoError,
+  isRemotePublicRun,
+  loadRemotePublicRun,
+  loadRemotePublicRunList,
   parsePublicRunHandoffV1,
   parsePublicRunListV1,
   parsePublicRunProgressV1,
   parsePublicRunV1,
   parseRemotePublicRun,
   parseRemotePublicRunList,
+  remoteNotificationInScope,
+  remotePublicRunScopeKey,
+  remotePublicWatchScopes,
+  replaceScopedRemotePublicRun,
   type PublicRunHandoffV1,
   type PublicRunListV1,
   type PublicRunProgressV1,
   type PublicRunV1,
+  type RemotePublicRun,
 } from "./publicRun";
 
 const SECRET_PROMPT = "leak-prompt: rotate /tmp/secret-chat/credentials.env";
@@ -546,5 +554,150 @@ describe("parseRemotePublicRunList", () => {
       expectDecode(error);
       expectNoSecrets(error);
     }
+  });
+});
+
+function stampedRun(overrides: Partial<RemotePublicRun> = {}): RemotePublicRun {
+  return {
+    ...publicRun(),
+    sessionId: REQUEST_SESSION,
+    workspace: REQUEST_WORKSPACE,
+    ...overrides,
+  };
+}
+
+describe("request-scoped public run reads", () => {
+  it("loads list and get only with explicit request scope", async () => {
+    const list = vi.fn(async (sessionId: string, workspace: string) => ({
+      schemaVersion: PUBLIC_RUN_SCHEMA_VERSION,
+      sessionId,
+      workspace,
+      runs: [stampedRun({ sessionId, workspace })],
+    }));
+    const get = vi.fn(async (sessionId: string, workspace: string, runId: string) =>
+      stampedRun({ sessionId, workspace, runId }),
+    );
+
+    const listed = await loadRemotePublicRunList({
+      sessionId: REQUEST_SESSION,
+      workspace: REQUEST_WORKSPACE,
+      list,
+    });
+    expect(list).toHaveBeenCalledWith(REQUEST_SESSION, REQUEST_WORKSPACE);
+    expect(listed.sessionId).toBe(REQUEST_SESSION);
+    expect(listed.workspace).toBe(REQUEST_WORKSPACE);
+    expect(listed.runs[0]?.sessionId).toBe(REQUEST_SESSION);
+
+    const got = await loadRemotePublicRun({
+      sessionId: REQUEST_SESSION,
+      workspace: REQUEST_WORKSPACE,
+      runId: OPAQUE_RUN,
+      get,
+    });
+    expect(get).toHaveBeenCalledWith(REQUEST_SESSION, REQUEST_WORKSPACE, OPAQUE_RUN);
+    expect(got.runId).toBe(OPAQUE_RUN);
+    expect(got.sessionId).toBe(REQUEST_SESSION);
+    expectNoSensitiveFields(got);
+  });
+
+  it("fails closed when list or get stamps a different scope", async () => {
+    await expect(
+      loadRemotePublicRunList({
+        sessionId: REQUEST_SESSION,
+        workspace: REQUEST_WORKSPACE,
+        list: async () => ({
+          schemaVersion: PUBLIC_RUN_SCHEMA_VERSION,
+          sessionId: BODY_SESSION,
+          workspace: BODY_WORKSPACE,
+          runs: [stampedRun({ sessionId: BODY_SESSION, workspace: BODY_WORKSPACE })],
+        }),
+      }),
+    ).rejects.toThrow("Remote public run request scope mismatch");
+
+    await expect(
+      loadRemotePublicRun({
+        sessionId: REQUEST_SESSION,
+        workspace: REQUEST_WORKSPACE,
+        runId: OPAQUE_RUN,
+        get: async () => stampedRun({ sessionId: BODY_SESSION, workspace: BODY_WORKSPACE }),
+      }),
+    ).rejects.toThrow("Remote public run request scope mismatch");
+
+    await expect(
+      loadRemotePublicRunList({
+        sessionId: "",
+        workspace: REQUEST_WORKSPACE,
+        list: async () => {
+          throw new Error("list must not be called without scope");
+        },
+      }),
+    ).rejects.toThrow("Remote public run list requires session and workspace scope");
+  });
+
+  it("watches only live in-scope runs that expose an event cursor", () => {
+    const scopes = remotePublicWatchScopes(
+      [
+        stampedRun({ runId: "live", state: "running", eventStartSeq: 4 }),
+        stampedRun({ runId: "queued", state: "queued", eventStartSeq: 1 }),
+        stampedRun({ runId: "done", state: "completed", eventStartSeq: 9 }),
+        stampedRun({ runId: "no-cursor", state: "running", eventStartSeq: null }),
+        stampedRun({
+          runId: "other-session",
+          state: "running",
+          eventStartSeq: 2,
+          sessionId: BODY_SESSION,
+          workspace: BODY_WORKSPACE,
+        }),
+      ],
+      REQUEST_SESSION,
+      REQUEST_WORKSPACE,
+    );
+    expect(scopes).toEqual([
+      { sessionId: REQUEST_SESSION, workspace: REQUEST_WORKSPACE, runId: "live" },
+      { sessionId: REQUEST_SESSION, workspace: REQUEST_WORKSPACE, runId: "queued" },
+    ]);
+    expect(remotePublicRunScopeKey(REQUEST_SESSION, REQUEST_WORKSPACE)).toBe(
+      `remote:${REQUEST_SESSION}:${REQUEST_WORKSPACE}`,
+    );
+  });
+
+  it("ignores out-of-scope notifications and get merges", () => {
+    expect(
+      remoteNotificationInScope(
+        { sessionId: BODY_SESSION, workspace: BODY_WORKSPACE, runId: OPAQUE_RUN },
+        REQUEST_SESSION,
+        REQUEST_WORKSPACE,
+      ),
+    ).toBe(false);
+    expect(
+      remoteNotificationInScope(
+        { sessionId: REQUEST_SESSION, workspace: REQUEST_WORKSPACE, runId: OPAQUE_RUN },
+        REQUEST_SESSION,
+        REQUEST_WORKSPACE,
+      ),
+    ).toBe(true);
+
+    const current = [stampedRun({ runId: "kept" })];
+    expect(
+      replaceScopedRemotePublicRun(
+        current,
+        stampedRun({ runId: "intruder", sessionId: BODY_SESSION, workspace: BODY_WORKSPACE }),
+        REQUEST_SESSION,
+        REQUEST_WORKSPACE,
+      ),
+    ).toEqual(current);
+    expect(
+      replaceScopedRemotePublicRun(
+        current,
+        stampedRun({ runId: "kept", state: "running" }),
+        REQUEST_SESSION,
+        REQUEST_WORKSPACE,
+      )[0]?.state,
+    ).toBe("running");
+  });
+
+  it("does not treat a DurableRun-shaped object as a public run", () => {
+    expect(isRemotePublicRun(runRecordWire())).toBe(false);
+    expect(isRemotePublicRun(stampedRun())).toBe(true);
   });
 });

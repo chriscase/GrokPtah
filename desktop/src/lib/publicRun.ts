@@ -417,3 +417,131 @@ export function parseRemotePublicRunList(
     runs: parsed.runs.map((document) => stampRemotePublicRun(document, sessionId, workspace)),
   };
 }
+
+/** Stable inspector/App key for one request-scoped remote public-run list. */
+export function remotePublicRunScopeKey(sessionId: string, workspace: string): string {
+  return `remote:${sessionId}:${workspace}`;
+}
+
+export function isRemotePublicRun(value: object): value is RemotePublicRun {
+  return (
+    "schemaVersion" in value &&
+    (value as RemotePublicRun).schemaVersion === PUBLIC_RUN_SCHEMA_VERSION &&
+    typeof (value as RemotePublicRun).runId === "string" &&
+    typeof (value as RemotePublicRun).sessionId === "string" &&
+    typeof (value as RemotePublicRun).workspace === "string"
+  );
+}
+
+function missingRemoteScope(sessionId: string, workspace: string, runId?: string): boolean {
+  return !sessionId || !workspace || (runId !== undefined && !runId);
+}
+
+function remoteScopeMismatch(
+  actual: { sessionId: string; workspace: string; runId?: string },
+  sessionId: string,
+  workspace: string,
+  runId?: string,
+): boolean {
+  return (
+    actual.sessionId !== sessionId ||
+    actual.workspace !== workspace ||
+    (runId !== undefined && actual.runId !== runId)
+  );
+}
+
+/** Fail closed when a stamped list does not match the request that produced it. */
+export function requireRemotePublicRunListScope(
+  listed: RemotePublicRunList,
+  sessionId: string,
+  workspace: string,
+): RemotePublicRunList {
+  if (missingRemoteScope(sessionId, workspace) || remoteScopeMismatch(listed, sessionId, workspace)) {
+    throw new Error("Remote public run request scope mismatch");
+  }
+  if (listed.runs.some((run) => remoteScopeMismatch(run, sessionId, workspace))) {
+    throw new Error("Remote public run request scope mismatch");
+  }
+  return listed;
+}
+
+/** Fail closed when a stamped get does not match the request that produced it. */
+export function requireRemotePublicRunScope(
+  run: RemotePublicRun,
+  sessionId: string,
+  workspace: string,
+  runId: string,
+): RemotePublicRun {
+  if (missingRemoteScope(sessionId, workspace, runId) || remoteScopeMismatch(run, sessionId, workspace, runId)) {
+    throw new Error("Remote public run request scope mismatch");
+  }
+  return run;
+}
+
+export async function loadRemotePublicRunList(args: {
+  sessionId: string;
+  workspace: string;
+  list: (sessionId: string, workspace: string) => Promise<RemotePublicRunList>;
+}): Promise<RemotePublicRunList> {
+  if (missingRemoteScope(args.sessionId, args.workspace)) {
+    throw new Error("Remote public run list requires session and workspace scope");
+  }
+  const listed = await args.list(args.sessionId, args.workspace);
+  return requireRemotePublicRunListScope(listed, args.sessionId, args.workspace);
+}
+
+export async function loadRemotePublicRun(args: {
+  sessionId: string;
+  workspace: string;
+  runId: string;
+  get: (sessionId: string, workspace: string, runId: string) => Promise<RemotePublicRun>;
+}): Promise<RemotePublicRun> {
+  if (missingRemoteScope(args.sessionId, args.workspace, args.runId)) {
+    throw new Error("Remote public run get requires session, workspace, and run scope");
+  }
+  const got = await args.get(args.sessionId, args.workspace, args.runId);
+  return requireRemotePublicRunScope(got, args.sessionId, args.workspace, args.runId);
+}
+
+/**
+ * Watch only live runs in the request scope that expose an event cursor.
+ * Terminal runs and rows outside the request are dropped rather than guessed.
+ */
+export function remotePublicWatchScopes(
+  runs: RemotePublicRun[],
+  sessionId: string,
+  workspace: string,
+): Array<{ sessionId: string; workspace: string; runId: string }> {
+  if (missingRemoteScope(sessionId, workspace)) return [];
+  const scopes: Array<{ sessionId: string; workspace: string; runId: string }> = [];
+  for (const run of runs) {
+    if (remoteScopeMismatch(run, sessionId, workspace)) continue;
+    if (run.eventStartSeq == null) continue;
+    if (run.state !== "running" && run.state !== "queued") continue;
+    scopes.push({ sessionId, workspace, runId: run.runId });
+  }
+  return scopes;
+}
+
+export function remoteNotificationInScope(
+  payload: { sessionId: string; workspace: string; runId: string },
+  sessionId: string,
+  workspace: string,
+): boolean {
+  if (missingRemoteScope(sessionId, workspace, payload.runId)) return false;
+  return !remoteScopeMismatch(payload, sessionId, workspace);
+}
+
+export function replaceScopedRemotePublicRun(
+  runs: RemotePublicRun[],
+  next: RemotePublicRun,
+  sessionId: string,
+  workspace: string,
+): RemotePublicRun[] {
+  if (remoteScopeMismatch(next, sessionId, workspace)) return runs;
+  const index = runs.findIndex((run) => run.runId === next.runId);
+  if (index === -1) return [...runs, next];
+  const copy = runs.slice();
+  copy[index] = next;
+  return copy;
+}

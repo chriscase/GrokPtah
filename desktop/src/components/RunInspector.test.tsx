@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { DurableRun, DurableRunEventPage, RunReview } from "../lib/protocol";
+import { PUBLIC_RUN_SCHEMA_VERSION, type RemotePublicRun } from "../lib/publicRun";
 import { RunInspector } from "./RunInspector";
 
 afterEach(() => {
@@ -82,6 +83,40 @@ const eventPage: DurableRunEventPage = {
   nextCursor: 4,
   cursorExpired: false,
 };
+
+function publicRemoteRun(overrides: Partial<RemotePublicRun> = {}): RemotePublicRun {
+  return {
+    schemaVersion: PUBLIC_RUN_SCHEMA_VERSION,
+    runId: "public-run-1",
+    state: "completed",
+    createdAt: "2026-08-11T12:00:00Z",
+    updatedAt: "2026-08-11T12:01:00Z",
+    queuePosition: null,
+    eventStartSeq: 1,
+    eventEndSeq: 8,
+    changeCount: 1,
+    testCount: 1,
+    permissionRequestedCount: 2,
+    permissionGrantedCount: 1,
+    permissionDeniedCount: 1,
+    usagePromptTokens: 1,
+    usageCompletionTokens: 2,
+    usageTotalTokens: 3,
+    usageRequestCount: 1,
+    usageComplete: true,
+    usagePendingRequestCount: 0,
+    progressRound: 2,
+    progressMaxRounds: 8,
+    sessionId: "remote-session",
+    workspace: "/tmp/project",
+    ...overrides,
+  };
+}
+
+const SECRET_PROMPT = "leak-prompt: rotate /tmp/secret-chat/credentials.env";
+const SECRET_RESPONSE = "wrote tokens to /tmp/secret-chat/credentials.env";
+const SECRET_PATH = "/tmp/secret-chat/credentials.env";
+const SECRET_TOOL = "cat /tmp/secret-chat/credentials.env";
 
 const actions = {
   onReview: vi.fn(async () => review),
@@ -173,19 +208,13 @@ describe("RunInspector", () => {
     const onSteer = vi.fn(async () => undefined);
     const onCancel = vi.fn(async () => undefined);
     vi.spyOn(window, "confirm").mockReturnValue(true);
-    const remoteRun = run({
+    const remoteRun = publicRemoteRun({
       runId: "remote-run",
       sessionId: "remote-session",
-      workspace: "/tmp/remote",
+      workspace: "/tmp/project",
       state: "running",
-      clientId: "mcp",
-      progress: {
-        round: 1,
-        maxRounds: 4,
-        lastTool: "inspect",
-        detail: "Watching the remote workspace",
-        updatedAt: "2026-08-17T12:01:00Z",
-      },
+      progressRound: 1,
+      progressMaxRounds: 4,
     });
     render(
       <RunInspector
@@ -211,7 +240,10 @@ describe("RunInspector", () => {
       />,
     );
 
-    expect(await screen.findByText("Assistant · Remote progress")).toBeTruthy();
+    expect(screen.queryByText("Assistant · Remote progress")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Replay events" })).toBeNull();
+    expect(screen.getByText("Round 1/4")).toBeTruthy();
+    expect(screen.queryByText("inspect")).toBeNull();
     fireEvent.change(screen.getByLabelText("Steering prompt"), {
       target: { value: "Keep checking the workspace" },
     });
@@ -219,6 +251,7 @@ describe("RunInspector", () => {
     await waitFor(() => expect(onSteer).toHaveBeenCalledWith("remote-run", "Keep checking the workspace"));
     fireEvent.click(screen.getByRole("button", { name: "Cancel run" }));
     await waitFor(() => expect(onCancel).toHaveBeenCalledWith("remote-run"));
+    expect(actions.onEvents).not.toHaveBeenCalled();
   });
 
   it("labels coordinator-owned runs", () => {
@@ -237,19 +270,13 @@ describe("RunInspector", () => {
     render(
       <RunInspector
         runs={[
-          run({ runId: "history-complete", state: "completed", clientId: "mcp" }),
-          run({ runId: "history-cancel", state: "cancelled", clientId: "mcp" }),
-          run({
+          publicRemoteRun({ runId: "history-complete", state: "completed" }),
+          publicRemoteRun({ runId: "history-cancel", state: "cancelled" }),
+          publicRemoteRun({
             runId: "live-remote",
             state: "running",
-            clientId: "mcp",
-            progress: {
-              round: 1,
-              maxRounds: 4,
-              lastTool: "inspect",
-              detail: "New live run",
-              updatedAt: "2026-08-17T12:04:00Z",
-            },
+            progressRound: 1,
+            progressMaxRounds: 4,
           }),
         ]}
         remote
@@ -528,5 +555,195 @@ describe("RunInspector", () => {
     fireEvent.click(screen.getByRole("button", { name: "Replay events" }));
     expect(await screen.findByText(/Older events are no longer retained/)).toBeTruthy();
     expect(screen.getByText("Handoff")).toBeTruthy();
+  });
+
+  it("renders a truthful public-run summary from allowlisted fields only", () => {
+    render(
+      <RunInspector
+        runs={[
+          publicRemoteRun({
+            state: "queued",
+            queuePosition: 2,
+            usagePendingRequestCount: 1,
+            usageComplete: false,
+          }),
+        ]}
+        remote
+        onRefresh={vi.fn()}
+        {...actions}
+      />,
+    );
+
+    expect(screen.getByText("Queued")).toBeTruthy();
+    expect(screen.getByText("Run public-run-1")).toBeTruthy();
+    expect(screen.getByText("1 files")).toBeTruthy();
+    expect(screen.getByText("1 tests observed")).toBeTruthy();
+    expect(screen.getByText("3 tokens · measuring")).toBeTruthy();
+    expect(screen.getByText("Round 2/8")).toBeTruthy();
+    expect(screen.getByText("2 requested · 1 granted · 1 denied")).toBeTruthy();
+    expect(screen.getByRole("status")).toHaveTextContent("Waiting for an execution slot · position 2");
+    expect(screen.getByText(/prompt, response, paths, and promotion details are not included/i)).toBeTruthy();
+    expect(screen.queryByText("Fix the failing test")).toBeNull();
+    expect(screen.queryByText("Handoff")).toBeNull();
+    expect(screen.queryByText("Shared workspace")).toBeNull();
+    expect(screen.queryByText("Isolated worktree")).toBeNull();
+    expect(screen.queryByLabelText("Filter task runs by source")).toBeNull();
+    expect(screen.queryByText("Review diff")).toBeNull();
+    expect(screen.queryByText("Promote reviewed changes")).toBeNull();
+    expect(screen.queryByLabelText("Fresh recovery prompt")).toBeNull();
+  });
+
+  it("does not surface poisoned private fields on a remote public run", () => {
+    const poisoned = {
+      ...publicRemoteRun(),
+      promptPreview: SECRET_PROMPT,
+      finalResponse: SECRET_RESPONSE,
+      clientId: "mcp",
+      retryOf: "interrupted-source",
+      stopCause: "token_ceiling",
+      bounds: { maxTotalTokens: 500 },
+      aggregates: {
+        changes: [{ path: SECRET_PATH, summary: "leaked" }],
+        tests: [{ callId: "t1", command: SECRET_TOOL, status: "ended", exitCode: 0 }],
+        verification: { status: "verified" },
+      },
+      progress: {
+        round: 1,
+        maxRounds: 4,
+        lastTool: SECRET_TOOL,
+        detail: SECRET_PATH,
+      },
+      execution: {
+        mode: "isolated_worktree",
+        promotionState: "ready",
+      },
+    } as RemotePublicRun;
+
+    render(
+      <RunInspector runs={[poisoned]} remote onRefresh={vi.fn()} {...actions} />,
+    );
+
+    const body = document.body.textContent ?? "";
+    expect(body).not.toContain(SECRET_PROMPT);
+    expect(body).not.toContain(SECRET_RESPONSE);
+    expect(body).not.toContain(SECRET_PATH);
+    expect(body).not.toContain(SECRET_TOOL);
+    expect(screen.queryByText("Handoff")).toBeNull();
+    expect(screen.queryByText("Review diff")).toBeNull();
+    expect(screen.queryByText("Approve for promotion")).toBeNull();
+    expect(screen.queryByText("Promote reviewed changes")).toBeNull();
+    expect(screen.queryByText("Discard")).toBeNull();
+    expect(screen.queryByText("Verification: verified")).toBeNull();
+    expect(screen.queryByText("Stop cause: token ceiling")).toBeNull();
+    expect(screen.queryByText(/Explicit retry of interrupted run/)).toBeNull();
+    expect(screen.queryByText("1/1 tests passed")).toBeNull();
+    expect(screen.getByText("1 tests observed")).toBeTruthy();
+  });
+
+  it("does not render a legacy DurableRun through the remote public summary", () => {
+    render(
+      <RunInspector
+        runs={[run({ promptPreview: SECRET_PROMPT, finalResponse: SECRET_RESPONSE })]}
+        remote
+        onRefresh={vi.fn()}
+        {...actions}
+      />,
+    );
+
+    expect(screen.queryByText(SECRET_PROMPT)).toBeNull();
+    expect(screen.queryByText(SECRET_RESPONSE)).toBeNull();
+    expect(screen.queryByText("Handoff")).toBeNull();
+    expect(screen.getByText("No Runs match this filter")).toBeTruthy();
+  });
+
+  it("keeps local DurableRun prompt, handoff, and isolated promotion controls", async () => {
+    const isolated = run({
+      execution: {
+        mode: "isolated_worktree",
+        sourceWorkspace: "/tmp/demo",
+        executionWorkspace: "/tmp/demo/.grokptah/worktrees/runs/run-1",
+        baseRevision: "base",
+        sourceFingerprint: "source",
+        finalFingerprint: "abc123",
+        promotionState: "ready",
+        promotedAt: null,
+      },
+    });
+    render(<RunInspector runs={[isolated]} onRefresh={vi.fn()} {...actions} />);
+
+    expect(screen.getByText("Fix the failing test")).toBeTruthy();
+    expect(screen.getByText("Handoff")).toBeTruthy();
+    expect(screen.getByText("Isolated worktree", { selector: ".run-execution-mode" })).toBeTruthy();
+    expect(screen.getByLabelText("Filter task runs by source")).toBeTruthy();
+    fireEvent.click(screen.getByText("Review diff"));
+    expect(await screen.findByText("Promote reviewed changes")).toBeTruthy();
+  });
+
+  it("does not replay or render raw remote journal events", async () => {
+    const onEvents = vi.fn(async () => eventPage);
+    render(
+      <RunInspector
+        runs={[publicRemoteRun({ state: "running", runId: "remote-journal" })]}
+        remote
+        liveEvents={{
+          "remote-journal": [
+            {
+              seq: 4,
+              ts: "2026-08-11T12:00:04Z",
+              update: {
+                type: "agent_message_chunk",
+                session_id: "remote-session",
+                text: SECRET_RESPONSE,
+              },
+            },
+            {
+              seq: 5,
+              ts: "2026-08-11T12:00:05Z",
+              update: {
+                type: "file_edit",
+                path: SECRET_PATH,
+                summary: SECRET_PROMPT,
+              },
+            },
+          ],
+        }}
+        onRefresh={vi.fn()}
+        {...actions}
+        onEvents={onEvents}
+      />,
+    );
+
+    expect(screen.queryByRole("button", { name: "Replay events" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Refresh events" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Load more events" })).toBeNull();
+    expect(screen.queryByText(/Run timeline/)).toBeNull();
+    expect(screen.getByText(/event timeline is not included in this public summary/i)).toBeTruthy();
+    expect(screen.queryByText(SECRET_RESPONSE)).toBeNull();
+    expect(screen.queryByText(SECRET_PROMPT)).toBeNull();
+    expect(screen.queryByText(SECRET_PATH)).toBeNull();
+    expect(onEvents).not.toHaveBeenCalled();
+  });
+
+  it("does not enable retry or isolated mutation on a remote public run", () => {
+    render(
+      <RunInspector
+        runs={[
+          publicRemoteRun({
+            runId: "remote-interrupted",
+            state: "interrupted",
+          }),
+        ]}
+        remote
+        onRefresh={vi.fn()}
+        {...actions}
+      />,
+    );
+
+    expect(screen.getByText("Interrupted")).toBeTruthy();
+    expect(screen.queryByLabelText("Fresh recovery prompt")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Retry interrupted run" })).toBeNull();
+    expect(screen.queryByText("Review diff")).toBeNull();
+    expect(screen.queryByText("Discard")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Steer now" })).toBeNull();
   });
 });

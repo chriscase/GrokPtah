@@ -6,11 +6,16 @@ import type {
   RunReview,
   SessionUpdate,
 } from "../lib/protocol";
+import {
+  isRemotePublicRun,
+  type PublicRunV1,
+  type RemotePublicRun,
+} from "../lib/publicRun";
 import { LaneScopeLine, type LaneScope } from "./LaneScopeLine";
 import { StateCard } from "./StateCard";
 
 type RunInspectorProps = {
-  runs: DurableRun[];
+  runs: DurableRun[] | RemotePublicRun[];
   laneTitle?: string | null;
   runtimeLabel?: string | null;
   scope?: LaneScope;
@@ -72,6 +77,25 @@ function tokenLabel(run: DurableRun): string | null {
     return `${usage.totalTokens.toLocaleString()} / ${ceiling.toLocaleString()} tokens · ${measured}`;
   }
   return `${usage.totalTokens.toLocaleString()} tokens · ${measured}`;
+}
+
+function publicTokenLabel(run: PublicRunV1): string | null {
+  if (!run.usageRequestCount && run.usageComplete && run.usagePendingRequestCount === 0) return null;
+  const measured = run.usagePendingRequestCount
+    ? "measuring"
+    : run.usageComplete === false
+      ? "partial"
+      : "measured";
+  return `${run.usageTotalTokens.toLocaleString()} tokens · ${measured}`;
+}
+
+function publicProgressLabel(run: PublicRunV1): string | null {
+  if (run.progressRound == null && run.progressMaxRounds == null) return null;
+  if (run.progressRound != null && run.progressMaxRounds != null) {
+    return `Round ${run.progressRound}/${run.progressMaxRounds}`;
+  }
+  if (run.progressRound != null) return `Round ${run.progressRound}`;
+  return `Max rounds ${run.progressMaxRounds}`;
 }
 
 function stopCauseLabel(run: DurableRun): string | null {
@@ -178,7 +202,7 @@ export function RunInspector({
   const watchValue = watching ?? localWatching;
 
   useEffect(() => {
-    if (!liveEvents) return;
+    if (remote || !liveEvents) return;
     setEventPages((current) => {
       let changed = false;
       const next = { ...current };
@@ -206,12 +230,16 @@ export function RunInspector({
     onWatchingChange?.(next);
   }
 
-  const visibleRuns = runs.filter((run) => {
-    if (originFilter === "all") return true;
-    if (originFilter === "mcp") return run.clientId === "mcp";
-    if (originFilter === "desktop") return run.clientId === "desktop";
-    return run.clientId !== "mcp" && run.clientId !== "desktop";
-  });
+  const publicRuns = remote ? runs.filter(isRemotePublicRun) : [];
+  const localRuns = remote ? [] : (runs as DurableRun[]);
+  const visibleRuns = remote
+    ? publicRuns
+    : localRuns.filter((run) => {
+        if (originFilter === "all") return true;
+        if (originFilter === "mcp") return run.clientId === "mcp";
+        if (originFilter === "desktop") return run.clientId === "desktop";
+        return run.clientId !== "mcp" && run.clientId !== "desktop";
+      });
 
   async function review(runId: string) {
     setReviewing(runId);
@@ -306,7 +334,7 @@ export function RunInspector({
   }
 
   async function cancel(runId: string) {
-    if (!window.confirm("Cancel this MCP-owned run?")) return;
+    if (!window.confirm(remote ? "Cancel this remote run?" : "Cancel this MCP-owned run?")) return;
     setReviewing(runId);
     setActionError(null);
     try {
@@ -320,6 +348,7 @@ export function RunInspector({
   }
 
   async function loadEvents(runId: string, afterSeq = 0) {
+    if (remote) return;
     setEventLoading(runId);
     setEventErrors((current) => {
       const next = { ...current };
@@ -351,7 +380,9 @@ export function RunInspector({
         <div>
           <div className="section-title">Task runs</div>
           <p className="run-inspector-subtitle">
-            Durable progress and verification from desktop and MCP activity.
+            {remote
+              ? "Public run status and counts from the selected service-owned Lane."
+              : "Durable progress and verification from desktop and MCP activity."}
           </p>
           {scope ? (
             <LaneScopeLine scope={scope} compact />
@@ -374,21 +405,25 @@ export function RunInspector({
       </div>
 
       <div className="run-inspector-controls">
-        <label className="run-inspector-filter">
-          <span>Source</span>
-          <select
-            aria-label="Filter task runs by source"
-            value={originFilter}
-            onChange={(event) =>
-              setOriginFilter(event.target.value as typeof originFilter)
-            }
-          >
-            <option value="all">All sources</option>
-            <option value="desktop">Desktop</option>
-            <option value="mcp">MCP coordinator</option>
-            <option value="other">Other</option>
-          </select>
-        </label>
+        {remote ? (
+          <span className="run-inspector-filter">Source · Remote service</span>
+        ) : (
+          <label className="run-inspector-filter">
+            <span>Source</span>
+            <select
+              aria-label="Filter task runs by source"
+              value={originFilter}
+              onChange={(event) =>
+                setOriginFilter(event.target.value as typeof originFilter)
+              }
+            >
+              <option value="all">All sources</option>
+              <option value="desktop">Desktop</option>
+              <option value="mcp">MCP coordinator</option>
+              <option value="other">Other</option>
+            </select>
+          </label>
+        )}
         <label className="run-inspector-watch">
           <input
             type="checkbox"
@@ -431,7 +466,127 @@ export function RunInspector({
         />
       ) : (
         <div className="run-list">
-          {visibleRuns.map((run) => {
+          {remote
+            ? publicRuns.map((run) => {
+                const tokens = publicTokenLabel(run);
+                const progress = publicProgressLabel(run);
+                const live = run.state === "running" || run.state === "queued";
+                const permissions =
+                  run.permissionRequestedCount ||
+                  run.permissionGrantedCount ||
+                  run.permissionDeniedCount
+                    ? `${run.permissionRequestedCount} requested · ${run.permissionGrantedCount} granted · ${run.permissionDeniedCount} denied`
+                    : null;
+                return (
+                  <article className={`run-card state-${run.state}`} key={run.runId}>
+                    <div className="run-card-heading">
+                      <span className="run-state">
+                        <span className="run-state-dot" aria-hidden />
+                        {stateLabels[run.state]}
+                      </span>
+                      <span className="run-origin" title="Run submitted by Remote service">
+                        Remote service
+                      </span>
+                      <time dateTime={run.updatedAt}>{timeLabel(run.updatedAt)}</time>
+                    </div>
+                    <div
+                      className="run-prompt"
+                      title="Prompt is not included in the public run summary"
+                    >
+                      Run {run.runId}
+                    </div>
+                    <div className="run-callout" role="note">
+                      Public summary · prompt, response, paths, and promotion details are not
+                      included.
+                    </div>
+                    {progress && (
+                      <div className="run-progress" aria-label="Run progress">
+                        <div className="run-progress-label">
+                          <span>{progress}</span>
+                        </div>
+                        {run.progressRound != null &&
+                          run.progressMaxRounds != null &&
+                          run.progressMaxRounds > 0 && (
+                            <div className="run-progress-track" aria-hidden>
+                              <span
+                                style={{
+                                  width: `${Math.min(
+                                    100,
+                                    (run.progressRound / Math.max(1, run.progressMaxRounds)) * 100,
+                                  )}%`,
+                                }}
+                              />
+                            </div>
+                          )}
+                      </div>
+                    )}
+                    {run.state === "queued" && (
+                      <div className="run-queue-callout" role="status">
+                        Waiting for an execution slot
+                        {run.queuePosition != null ? ` · position ${run.queuePosition}` : ""}
+                      </div>
+                    )}
+                    <div className="run-metrics">
+                      <span>{run.changeCount} files</span>
+                      <span>
+                        {run.testCount === 0
+                          ? "No tests observed"
+                          : `${run.testCount} tests observed`}
+                      </span>
+                      {tokens && <span>{tokens}</span>}
+                      {permissions && <span>{permissions}</span>}
+                    </div>
+                    {run.state === "interrupted" && (
+                      <div className="run-callout" role="status">
+                        This run stopped after restart. Recovery and retry details are not included
+                        in this public summary.
+                      </div>
+                    )}
+                    <div className="run-callout" role="note">
+                      The event timeline is not included in this public summary.
+                    </div>
+                    {live && (
+                      <div className="run-control">
+                        <label htmlFor={`steer-prompt-${run.runId}`}>Steering prompt</label>
+                        <textarea
+                          id={`steer-prompt-${run.runId}`}
+                          value={steerPrompts[run.runId] ?? ""}
+                          onChange={(event) =>
+                            setSteerPrompts((current) => ({
+                              ...current,
+                              [run.runId]: event.target.value,
+                            }))
+                          }
+                          placeholder="Guide the current turn at its next safe boundary"
+                          rows={2}
+                          disabled={reviewing === run.runId}
+                        />
+                        <div className="run-actions">
+                          <button
+                            type="button"
+                            className="composer-chip"
+                            onClick={() => void steer(run.runId)}
+                            disabled={
+                              reviewing === run.runId || !(steerPrompts[run.runId] ?? "").trim()
+                            }
+                          >
+                            {reviewing === run.runId ? "Sending…" : "Steer now"}
+                          </button>
+                          <button
+                            type="button"
+                            className="composer-chip quiet"
+                            onClick={() => void cancel(run.runId)}
+                            disabled={reviewing === run.runId}
+                          >
+                            Cancel run
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </article>
+                );
+              })
+            : (visibleRuns as DurableRun[]).map((run) => {
             const verification = run.aggregates.verification;
             const eventPage = eventPages[run.runId];
             const eventError = eventErrors[run.runId];
