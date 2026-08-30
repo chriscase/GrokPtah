@@ -1,6 +1,6 @@
 # Public-run wire migration (staged history)
 
-> **Current status at consolidation `a259db2d12f7ec1e257d8552763d89b175d1928f`:**
+> **Current status at consolidation `ff1a8202cde192b4b14791130f6d9389ec9177c4`:**
 > The scoped MCP list/get/progress/handoff producers emit
 > `grokptah.public-run.v1`; the SDK, Tauri remote path, Node probes, bridge
 > tests, and certification probes consume the allowlisted document. Legacy raw
