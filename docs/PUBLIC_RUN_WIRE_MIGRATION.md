@@ -1,6 +1,16 @@
-# Public-run wire migration (staged)
+# Public-run wire migration (staged history)
 
-Status: **not switched**. Commit `4bbf0c499aa65a7ccfa4fa1f5578c65360ab501d`
+> **Current status at consolidation `a259db2d12f7ec1e257d8552763d89b175d1928f`:**
+> The scoped MCP list/get/progress/handoff producers emit
+> `grokptah.public-run.v1`; the SDK, Tauri remote path, Node probes, bridge
+> tests, and certification probes consume the allowlisted document. Legacy raw
+> readers fail closed without invoking a public tool. The remainder of this
+> file is historical staging context and must not be read as the current wire
+> contract. Public event history is separately versioned as
+> `grokptah.public-event.v1`.
+
+Historical status (before the local consolidation snapshot): **not switched**.
+Commit `4bbf0c499aa65a7ccfa4fa1f5578c65360ab501d`
 added `orchestration::public_run::{PublicRunV1, PublicRunListV1,
 PublicRunProgressV1, PublicRunHandoffV1}` with fail-closed parse
 (`schemaVersion = grokptah.public-run.v1`, `deny_unknown_fields`). MCP

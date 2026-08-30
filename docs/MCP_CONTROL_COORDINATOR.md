@@ -530,9 +530,11 @@ coordinator wants a bounded admission queue for capacity or session contention.
 
 ### Evidence-backed handoff
 
-`ptah_get_handoff` includes the model's final response plus bounded evidence
-derived from typed bridge events. Coordinators must treat `verification.status`
-as the trust signal, not the model's prose alone:
+`ptah_get_handoff` exposes bounded run metadata and usage counters only; the
+model's final response is intentionally not part of this public DTO. The
+versioned run and event documents are allowlisted and derived from typed
+bridge records. Coordinators must treat `verification.status` as the trust
+signal, not the model's prose alone:
 
 ```json
 {

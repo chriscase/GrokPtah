@@ -1,10 +1,9 @@
 //! Versioned public Build-run DTO seam.
 //!
-//! Allowlisted projection for a later coordinated switch of `ptah_list_runs`,
-//! `ptah_get_run`, `ptah_get_progress`, and `ptah_get_handoff`. Current MCP
-//! dispatch still serializes full `RunRecord` / ad-hoc JSON. Do not adopt this
-//! type on any one of those four tools until the others and their consumers
-//! switch in the same change. Consumer inventory and staged order:
+//! Allowlisted projection for `ptah_list_runs`, `ptah_get_run`,
+//! `ptah_get_progress`, and `ptah_get_handoff`. The scoped MCP producers and
+//! their migrated SDK/Tauri/certification consumers use this document; legacy
+//! raw readers fail closed. Historical staging notes are retained in
 //! `docs/PUBLIC_RUN_WIRE_MIGRATION.md`.
 
 use chrono::{DateTime, Utc};

@@ -1,6 +1,10 @@
 # Computer Use adaptive production seam handoff
 
 Status: source candidate only; not live, packaged, VM, provider, or release qualification.
+This provenance record describes the source candidate below; the code is also
+included in the local consolidation snapshot at
+`a259db2d12f7ec1e257d8552763d89b175d1928f`. The validation listed here belongs
+to the source candidate, not to a combined-branch run.
 
 ## Exact identity
 
