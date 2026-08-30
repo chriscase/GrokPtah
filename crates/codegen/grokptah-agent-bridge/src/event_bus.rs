@@ -420,6 +420,15 @@ impl EventReceiver {
         Ok((next.seq, next.update))
     }
 
+    /// Prime both lanes and report whether a subscriber gap is pending
+    /// without consuming a buffered event. Live transports use this when a
+    /// terminal frame is already queued so recovery cannot be skipped.
+    pub(crate) fn gap_pending(&mut self) -> bool {
+        self.fill_stream();
+        self.fill_critical();
+        self.pending_lagged > 0
+    }
+
     fn fill_stream(&mut self) {
         while self.pending_stream.is_none() && !self.stream_closed {
             match self.stream_rx.try_recv() {

@@ -140,6 +140,9 @@ struct LiveStreamState {
     replay_cursor: Option<u64>,
     pending: VecDeque<Bytes>,
     heartbeat: tokio::time::Interval,
+    /// A terminal event has been queued but must remain open long enough to
+    /// surface a subscriber gap that was observed on the other event lane.
+    terminal_pending: bool,
     done: bool,
     shutdown: tokio_util::sync::CancellationToken,
     _permit: tokio::sync::OwnedSemaphorePermit,
@@ -154,13 +157,13 @@ impl LiveStreamState {
             self.queue_entry(entry.seq, entry.ts, entry.update);
         }
         if self.end_seq.is_some_and(|end_seq| self.last_seq >= end_seq) {
-            self.done = true;
+            self.terminal_pending = true;
             self.replay_cursor = None;
         }
     }
 
     fn queue_entry(&mut self, seq: u64, ts: String, update: SessionUpdate) {
-        if seq <= self.last_seq || seq < self.start_seq {
+        if self.done || self.terminal_pending || seq <= self.last_seq || seq < self.start_seq {
             return;
         }
         if let Some(end_seq) = self.end_seq {
@@ -181,7 +184,7 @@ impl LiveStreamState {
             }),
         ));
         if terminal || self.end_seq == Some(seq) {
-            self.done = true;
+            self.terminal_pending = true;
             self.replay_cursor = None;
         }
     }
@@ -202,14 +205,41 @@ impl LiveStreamState {
                 }
             }),
         ));
+        self.terminal_pending = false;
         self.done = true;
         self.replay_cursor = None;
+    }
+
+    /// Detect a lag notice before closing after the terminal frame. Normal
+    /// events remain buffered in the receiver; only a gap changes the close
+    /// decision and queues an explicit durable-replay instruction.
+    fn receiver_gap_pending(&mut self) -> bool {
+        self.receiver.gap_pending()
+    }
+
+    fn finalize_terminal_if_ready(&mut self) -> bool {
+        if !self.terminal_pending || !self.pending.is_empty() {
+            return false;
+        }
+        self.terminal_pending = false;
+        if self.receiver_gap_pending() {
+            self.queue_recovery(
+                "live event subscriber lagged before terminal delivery; resynchronize from the durable journal",
+            );
+        } else {
+            self.done = true;
+        }
+        true
     }
 
     async fn next_frame(&mut self) -> Option<Bytes> {
         loop {
             if let Some(frame) = self.pending.pop_front() {
+                self.finalize_terminal_if_ready();
                 return Some(frame);
+            }
+            if self.finalize_terminal_if_ready() {
+                continue;
             }
             if self.done {
                 return None;
@@ -1073,6 +1103,7 @@ async fn streamable_get_handler(
         replay_cursor: None,
         pending: VecDeque::new(),
         heartbeat: tokio::time::interval(Duration::from_secs(10)),
+        terminal_pending: false,
         done: false,
         shutdown: state.shutdown.clone(),
         _permit: permit,
@@ -4081,6 +4112,83 @@ mod tests {
                 "expected rejection: {raw}"
             );
         }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn terminal_frame_surfaces_pending_gap_before_stream_close() {
+        let _guard = home_override_serial();
+        let home = tempdir().unwrap();
+        set_grokptah_home_override(Some(home.path().join(".grokptah")));
+        let workspace = tempdir().unwrap();
+        let host = AgentHost::create(HostConfig {
+            always_approve: true,
+            event_bus_capacity: Some(2),
+            ..HostConfig::default()
+        })
+        .expect("acquire the GrokPtah instance lock");
+        host.start().unwrap();
+        let session = host.session_new_kind(crate::SessionKind::Build).unwrap();
+        host.session_set_cwd(session.id, workspace.path()).unwrap();
+        let bus = Arc::new(crate::event_bus::EventBus::new(2));
+        let receiver = bus.subscribe();
+        let orch = computer_orch(&host, home.path(), vec![workspace.path().to_path_buf()]);
+        let permit = Arc::new(Semaphore::new(1))
+            .try_acquire_owned()
+            .expect("test stream permit");
+        let mut live = LiveStreamState {
+            orch,
+            auth: AuthContext {
+                token_id: "test-token".into(),
+                owner_id: "test-owner".into(),
+            },
+            session_id: session.id,
+            workspace: workspace.path().to_path_buf(),
+            run_id: "continuity-terminal-gap".into(),
+            start_seq: 1,
+            end_seq: None,
+            receiver,
+            last_seq: 0,
+            replay_cursor: None,
+            pending: VecDeque::new(),
+            heartbeat: tokio::time::interval(Duration::from_secs(10)),
+            terminal_pending: false,
+            done: false,
+            shutdown: tokio_util::sync::CancellationToken::new(),
+            _permit: permit,
+        };
+
+        for index in 0..1024 {
+            bus.publish(SessionUpdate::AgentMessageChunk {
+                session_id: session.id,
+                text: format!("gap-{index}"),
+            });
+        }
+        let terminal_seq = bus.current_seq().saturating_add(1);
+        live.queue_entry(
+            terminal_seq,
+            chrono::Utc::now().to_rfc3339(),
+            SessionUpdate::TurnComplete {
+                session_id: session.id,
+                cancelled: false,
+            },
+        );
+
+        let terminal = live.next_frame().await.expect("terminal frame");
+        let terminal_text = String::from_utf8_lossy(&terminal);
+        assert!(terminal_text.contains("turn_complete"));
+        assert_eq!(
+            live.pending.len(),
+            1,
+            "the gap recovery frame must be queued"
+        );
+
+        let recovery = live.next_frame().await.expect("recovery frame");
+        let recovery_text = String::from_utf8_lossy(&recovery);
+        assert!(recovery_text.contains("notifications/ptah_recovery"));
+        assert!(live.done);
+        assert!(live.next_frame().await.is_none());
+        set_grokptah_home_override(None);
     }
 
     #[test]
