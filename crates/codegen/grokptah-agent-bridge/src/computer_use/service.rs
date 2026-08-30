@@ -404,6 +404,13 @@ impl ComputerUseService {
                 )
             })?;
             payload["adaptiveClaim"] = encoded;
+            // The opaque approval itself never crosses the wire, but its
+            // yes/no decision remains part of the idempotency identity. A
+            // denied answer must not collide with a later trusted approval
+            // for the same request id.
+            if let Some(approved) = claim.approval_marker() {
+                payload["adaptiveApproval"] = json!(approved);
+            }
         }
         if let Some(replayed) = self.begin_mutation(request_id, "act", &payload)? {
             return replayed;

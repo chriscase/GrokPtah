@@ -332,22 +332,41 @@ impl AdaptiveReason {
     }
 }
 
-/// A local approval answer, bound to exactly one run, control epoch, and
-/// observation.
+/// An opaque local approval answer, bound to exactly one run, control epoch,
+/// and observation.
 ///
-/// The binding is what stops an answer being banked and spent later: a token
+/// This type is intentionally not serializable and its fields are private.
+/// Only trusted host code inside this crate can mint an answer, so planner or
+/// model JSON cannot turn `approved: true` into a human underwrite. The
+/// binding is what stops an answer being banked and spent later: a token
 /// minted for one observation cannot authorize the next one, and one minted
 /// before a takeover cannot authorize anything after it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdaptiveApproval {
-    pub run_id: String,
-    pub control_epoch: u64,
-    pub observation_id: String,
-    pub approved: bool,
+    run_id: String,
+    control_epoch: u64,
+    observation_id: String,
+    approved: bool,
 }
 
 impl AdaptiveApproval {
+    /// Mint an approval from a trusted host decision. This is crate-private
+    /// by design; public callers must never be able to construct one from
+    /// wire data.
+    #[allow(dead_code)]
+    pub(crate) fn host_mint(
+        run: &ComputerRun,
+        observation: &ComputerObservation,
+        approved: bool,
+    ) -> Self {
+        Self {
+            run_id: run.run_id.clone(),
+            control_epoch: run.control_epoch,
+            observation_id: observation.observation_id.clone(),
+            approved,
+        }
+    }
+
     fn matches(&self, run: &ComputerRun, observation: &ComputerObservation) -> bool {
         self.run_id == run.run_id
             && self.control_epoch == run.control_epoch
@@ -370,9 +389,20 @@ pub struct AdaptiveClaim {
     pub observed_control_epoch: u64,
     /// The observation sequence the planner decided against.
     pub observed_sequence: u64,
-    /// A local approval answer, if one has been collected.
-    #[serde(default)]
+    /// A local approval answer, if one has been collected. It is intentionally
+    /// skipped on the public wire: untrusted claims can never deserialize a
+    /// successful approval. Trusted host code may set it after minting an
+    /// opaque [`AdaptiveApproval`].
+    #[serde(skip)]
     pub approval: Option<AdaptiveApproval>,
+}
+
+impl AdaptiveClaim {
+    /// Internal replay marker for the opaque approval. The decision is part of
+    /// the mutation identity without serializing the approval token itself.
+    pub(crate) fn approval_marker(&self) -> Option<bool> {
+        self.approval.as_ref().map(|approval| approval.approved)
+    }
 }
 
 /// The durable, redacted record of one review.
@@ -951,45 +981,38 @@ mod tests {
     fn an_approval_authorizes_one_observation_at_one_epoch() {
         let now = Utc::now();
         let run = run(now);
+        let current_observation = observation(now);
         let mut low = claim(AdaptiveProfile::Balanced, &run);
         low.assessment = AmbiguityAssessment::unambiguous(6_500);
         // Unanswered: an outstanding requirement, not consent.
-        let outcome = review(&run, &observation(now), &action(), &low, now);
+        let outcome = review(&run, &current_observation, &action(), &low, now);
         assert_eq!(outcome.record().reason, AdaptiveReason::ApprovalRequired);
         assert_eq!(
             outcome.refusal().map(|error| error.code),
             Some(ComputerErrorCode::PermissionRequired)
         );
 
-        let answered = AdaptiveApproval {
-            run_id: run.run_id.clone(),
-            control_epoch: run.control_epoch,
-            observation_id: "obs-1".into(),
-            approved: true,
-        };
+        let answered = AdaptiveApproval::host_mint(&run, &current_observation, true);
         low.approval = Some(answered.clone());
-        assert!(review(&run, &observation(now), &action(), &low, now)
+        assert!(review(&run, &current_observation, &action(), &low, now)
             .refusal()
             .is_none());
 
         // Bound elsewhere: still an outstanding requirement.
+        let mut other_observation = current_observation.clone();
+        other_observation.observation_id = "obs-2".into();
+        let mut other_epoch = run.clone();
+        other_epoch.control_epoch += 1;
+        let mut other_run = run.clone();
+        other_run.run_id = "another-run".into();
         for wrong in [
-            AdaptiveApproval {
-                observation_id: "obs-2".into(),
-                ..answered.clone()
-            },
-            AdaptiveApproval {
-                control_epoch: answered.control_epoch + 1,
-                ..answered.clone()
-            },
-            AdaptiveApproval {
-                run_id: "another-run".into(),
-                ..answered.clone()
-            },
+            AdaptiveApproval::host_mint(&run, &other_observation, true),
+            AdaptiveApproval::host_mint(&other_epoch, &current_observation, true),
+            AdaptiveApproval::host_mint(&other_run, &current_observation, true),
         ] {
             low.approval = Some(wrong);
             assert_eq!(
-                review(&run, &observation(now), &action(), &low, now)
+                review(&run, &current_observation, &action(), &low, now)
                     .record()
                     .reason,
                 AdaptiveReason::ApprovalRequired
@@ -997,11 +1020,12 @@ mod tests {
         }
 
         // A refusal is distinguishable from a missing answer.
-        low.approval = Some(AdaptiveApproval {
-            approved: false,
-            ..answered
-        });
-        let refused = review(&run, &observation(now), &action(), &low, now);
+        low.approval = Some(AdaptiveApproval::host_mint(
+            &run,
+            &current_observation,
+            false,
+        ));
+        let refused = review(&run, &current_observation, &action(), &low, now);
         assert_eq!(refused.record().reason, AdaptiveReason::ApprovalDenied);
         assert_eq!(
             refused.refusal().map(|error| error.code),
@@ -1016,12 +1040,7 @@ mod tests {
         run.grant.as_mut().unwrap().revoked_at = Some(now);
         let mut low = claim(AdaptiveProfile::Balanced, &run);
         low.assessment = AmbiguityAssessment::unambiguous(6_500);
-        low.approval = Some(AdaptiveApproval {
-            run_id: run.run_id.clone(),
-            control_epoch: run.control_epoch,
-            observation_id: "obs-1".into(),
-            approved: true,
-        });
+        low.approval = Some(AdaptiveApproval::host_mint(&run, &observation(now), true));
         let outcome = review(&run, &observation(now), &action(), &low, now);
         assert_eq!(outcome.record().reason, AdaptiveReason::GrantNotHeld);
     }
