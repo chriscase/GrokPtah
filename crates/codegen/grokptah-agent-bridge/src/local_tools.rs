@@ -13,7 +13,9 @@ use tokio_util::sync::CancellationToken;
 use walkdir::WalkDir;
 
 use crate::events::ToolCallKind;
-use crate::host_helpers::bounded_tool_output_with_integrity;
+use crate::host_helpers::{
+    bounded_tool_output_with_digests, bounded_tool_output_with_integrity, StationarityNormalizer,
+};
 
 #[allow(dead_code)] // fields kept for API symmetry / future UI binding
 pub struct ToolResult {
@@ -334,6 +336,7 @@ where
 
     let mut collected = String::new();
     let mut full_digest = Sha256::new();
+    let mut stable_digest = StationarityNormalizer::default();
     let mut full_len = 0usize;
     let mut cancelled = false;
     let mut exit_code: Option<i32> = None;
@@ -352,6 +355,7 @@ where
                 match msg {
                     Some(s) => {
                         full_digest.update(s.as_bytes());
+                        stable_digest.feed(&s);
                         full_len = full_len.saturating_add(s.len());
                         if collected.len() < 32_000 {
                             let remaining = 32_000 - collected.len();
@@ -380,6 +384,7 @@ where
     // Drain any remaining buffered chunks without blocking forever
     while let Ok(s) = chunk_rx.try_recv() {
         full_digest.update(s.as_bytes());
+        stable_digest.feed(&s);
         full_len = full_len.saturating_add(s.len());
         if collected.len() < 32_000 {
             let remaining = 32_000 - collected.len();
@@ -437,11 +442,15 @@ where
         }
     };
     full_digest.update(status_suffix.as_bytes());
+    stable_digest.feed(&status_suffix);
     let total_len = full_len.saturating_add(status_suffix.len());
-    let display = crate::host_helpers::bounded_tool_output_with_digest(
+    let raw_digest = full_digest.finalize();
+    let stable_digest = stable_digest.finish();
+    let display = bounded_tool_output_with_digests(
         &output,
         total_len,
-        full_digest.finalize().as_ref(),
+        raw_digest.as_ref(),
+        stable_digest.as_ref(),
         32_000,
     );
 
@@ -728,6 +737,38 @@ mod tests {
         assert!(first.output.len() <= 32_000);
         assert!(first.output.starts_with("[grokptah-output-integrity-v1"));
         assert_ne!(first.output, second.output);
+    }
+
+    #[tokio::test]
+    async fn shell_integrity_marker_normalizes_volatile_metadata_streaming() {
+        let project = tempfile::tempdir().unwrap();
+        let first = tool_shell_streaming(
+            project.path(),
+            "printf 'timestamp=2026-08-30T21:00:00Z pid=1201 request_id=11111111-1111-1111-1111-111111111111 '; head -c 40000 /dev/zero | tr '\\0' a",
+            CancellationToken::new(),
+            uuid::Uuid::new_v4(),
+            shell_map(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+        let second = tool_shell_streaming(
+            project.path(),
+            "printf 'timestamp=2026-08-30T21:01:00Z pid=1202 request_id=22222222-2222-2222-2222-222222222222 '; head -c 40000 /dev/zero | tr '\\0' a",
+            CancellationToken::new(),
+            uuid::Uuid::new_v4(),
+            shell_map(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        let first_marker = first.output.lines().next().unwrap();
+        let second_marker = second.output.lines().next().unwrap();
+        assert_ne!(first_marker, second_marker);
+        let first_stable = first_marker.split(" stable_sha256=").nth(1).unwrap();
+        let second_stable = second_marker.split(" stable_sha256=").nth(1).unwrap();
+        assert_eq!(first_stable, second_stable);
     }
 
     #[tokio::test]

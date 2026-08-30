@@ -2,9 +2,11 @@
 //! Keep tool schemas, API wire, sandbox helpers, and transcript helpers here.
 
 use std::path::Path;
+use std::sync::OnceLock;
 
 use anyhow::{anyhow, bail, Result};
 use chrono::Utc;
+use regex::Regex;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -508,8 +510,9 @@ fn progress_digest(signature: &str, raw_outputs: &[String], is_true_noop: bool) 
         hasher.update(signature.as_bytes());
         for output in raw_outputs {
             hasher.update(b"\0output\0");
-            hasher.update((output.len() as u64).to_be_bytes());
-            hasher.update(output.as_bytes());
+            let stable = stationarity_output_projection(output);
+            hasher.update((stable.len() as u64).to_be_bytes());
+            hasher.update(stable.as_bytes());
         }
     }
     hasher.finalize().into()
@@ -519,29 +522,141 @@ pub(crate) const TOOL_OUTPUT_WIRE_LIMIT_BYTES: usize = 24_000;
 
 const TOOL_OUTPUT_INTEGRITY_MARKER: &str = "[grokptah-output-integrity-v1";
 
+const NORMALIZER_HOLD_BYTES: usize = 96;
+const NORMALIZER_CHUNK_BYTES: usize = 4_096;
+
+/// Replace only explicitly labelled runtime metadata.  Bare numbers, hashes,
+/// paths, and user content are intentionally left untouched.
+fn normalize_stationarity_text(input: &str) -> String {
+    static TIMESTAMP: OnceLock<Regex> = OnceLock::new();
+    static PID: OnceLock<Regex> = OnceLock::new();
+    static IDENTIFIER: OnceLock<Regex> = OnceLock::new();
+    let timestamp = TIMESTAMP.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(\b(?:timestamp|created_at|updated_at|started_at|finished_at|observed_at|wall_clock)\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,}\]]+)"#,
+        )
+        .expect("timestamp normalizer regex is valid")
+    });
+    let pid = PID.get_or_init(|| {
+        Regex::new(r#"(?i)(\b(?:pid|process_id|parent_pid)\s*[:=]\s*)\d+"#)
+            .expect("pid normalizer regex is valid")
+    });
+    let identifier = IDENTIFIER.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(\b(?:request_id|request-id|progress_id|progress-id|trace_id|trace-id|span_id|span-id|observation_id|observation-id|tool_call_id|tool-call-id|call_id|call-id|event_id|event-id)\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[0-9a-f-]{16,})"#,
+        )
+        .expect("identifier normalizer regex is valid")
+    });
+    let normalized = timestamp.replace_all(input, "$1<volatile-time>");
+    let normalized = pid.replace_all(&normalized, "$1<volatile-pid>");
+    identifier
+        .replace_all(&normalized, "$1<volatile-id>")
+        .into_owned()
+}
+
+/// Streaming normalizer used by the shell path so full output is hashed with
+/// bounded memory.  The small pending tail handles identifiers split across
+/// reader chunks.
+pub(crate) struct StationarityNormalizer {
+    pending: String,
+    hasher: Sha256,
+}
+
+impl Default for StationarityNormalizer {
+    fn default() -> Self {
+        Self {
+            pending: String::new(),
+            hasher: Sha256::new(),
+        }
+    }
+}
+
+impl StationarityNormalizer {
+    pub(crate) fn feed(&mut self, chunk: &str) {
+        self.pending.push_str(chunk);
+        while self.pending.len() > NORMALIZER_HOLD_BYTES + NORMALIZER_CHUNK_BYTES {
+            let split =
+                crate::textutil::truncate_at_char_boundary(&self.pending, NORMALIZER_CHUNK_BYTES)
+                    .len();
+            let prefix = self.pending[..split].to_owned();
+            self.pending.drain(..split);
+            self.hasher
+                .update(normalize_stationarity_text(&prefix).as_bytes());
+        }
+    }
+
+    pub(crate) fn finish(mut self) -> [u8; 32] {
+        self.hasher
+            .update(normalize_stationarity_text(&self.pending).as_bytes());
+        self.hasher.finalize().into()
+    }
+}
+
+fn normalized_digest(content: &str) -> [u8; 32] {
+    let mut normalizer = StationarityNormalizer::default();
+    normalizer.feed(content);
+    normalizer.finish()
+}
+
+fn stationarity_output_projection(output: &str) -> String {
+    let Some(line_end) = output.find('\n') else {
+        return normalize_stationarity_text(output);
+    };
+    let marker = &output[..line_end];
+    let Some(rest) = marker.strip_prefix(TOOL_OUTPUT_INTEGRITY_MARKER) else {
+        return normalize_stationarity_text(output);
+    };
+    let Some(stable) = rest.strip_prefix(" bytes=") else {
+        return normalize_stationarity_text(output);
+    };
+    let Some((bytes, rest)) = stable.split_once(" sha256=") else {
+        return normalize_stationarity_text(output);
+    };
+    let Some((_, stable)) = rest.split_once(" stable_sha256=") else {
+        return normalize_stationarity_text(output);
+    };
+    let Some(stable) = stable.strip_suffix(']') else {
+        return normalize_stationarity_text(output);
+    };
+    if bytes.is_empty() || stable.len() != 64 || !stable.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return normalize_stationarity_text(output);
+    }
+    format!("integrity bytes={bytes} stable_sha256={stable}")
+}
+
 /// Return a bounded tool projection that carries a stable identity for the
 /// complete payload when the display cap is exceeded.  Producers use this
 /// before clipping so stationarity can distinguish changes in an omitted
 /// suffix without retaining or exposing that suffix.
 pub(crate) fn bounded_tool_output_with_integrity(content: &str, limit: usize) -> String {
     let digest = Sha256::digest(content.as_bytes());
-    bounded_tool_output_with_digest(content, content.len(), digest.as_ref(), limit)
+    let stable = normalized_digest(content);
+    bounded_tool_output_with_digests(
+        content,
+        content.len(),
+        digest.as_ref(),
+        stable.as_ref(),
+        limit,
+    )
 }
 
-/// Project a bounded prefix when the caller has streamed the full payload
-/// through a digest and therefore cannot retain it in memory.
-pub(crate) fn bounded_tool_output_with_digest(
+pub(crate) fn bounded_tool_output_with_digests(
     display_prefix: &str,
     total_bytes: usize,
     digest: &[u8],
+    stable_digest: &[u8],
     limit: usize,
 ) -> String {
     if total_bytes <= limit {
         return display_prefix.to_owned();
     }
     let digest_hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    let stable_hex: String = stable_digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
     let marker =
-        format!("{TOOL_OUTPUT_INTEGRITY_MARKER} bytes={total_bytes} sha256={digest_hex}]\n");
+        format!("{TOOL_OUTPUT_INTEGRITY_MARKER} bytes={total_bytes} sha256={digest_hex} stable_sha256={stable_hex}]\n");
     let suffix = "\n… (truncated)";
     let body_budget = limit.saturating_sub(marker.len() + suffix.len());
     let body = crate::textutil::truncate_at_char_boundary(display_prefix, body_budget);
@@ -4545,6 +4660,69 @@ test result: FAILED. 0 passed; 3 failed; 0 ignored
             clipped_run.observe_with_outputs("poll", "get_task_output", false, &[clipped_second]),
             1,
             "the pre-clip integrity marker must distinguish suffix changes"
+        );
+    }
+
+    #[test]
+    fn volatile_runtime_metadata_does_not_reset_ordinary_stationarity() {
+        let first = "result=stable timestamp=2026-08-30T21:00:00Z pid=1201 request_id=11111111-1111-1111-1111-111111111111 progress_id=aaaa0000-0000-0000-0000-000000000000";
+        let second = "result=stable timestamp=2026-08-30T21:01:00Z pid=1202 request_id=22222222-2222-2222-2222-222222222222 progress_id=bbbb0000-0000-0000-0000-000000000000";
+        let mut run = IdenticalToolCallRun::default();
+        assert_eq!(
+            run.observe_with_outputs("poll", "get_task_output", false, &[first.into()]),
+            1
+        );
+        assert_eq!(
+            run.observe_with_outputs("poll", "get_task_output", false, &[second.into()]),
+            2,
+            "clearly labelled runtime metadata should not reset polling stationarity"
+        );
+    }
+
+    #[test]
+    fn substantive_output_still_resets_after_metadata_normalization() {
+        let first = "result=stable timestamp=2026-08-30T21:00:00Z pid=1201";
+        let second = "result=changed timestamp=2026-08-30T21:01:00Z pid=1202";
+        let mut run = IdenticalToolCallRun::default();
+        assert_eq!(
+            run.observe_with_outputs("poll", "get_task_output", false, &[first.into()]),
+            1
+        );
+        assert_eq!(
+            run.observe_with_outputs("poll", "get_task_output", false, &[second.into()]),
+            1
+        );
+    }
+
+    #[test]
+    fn normalized_integrity_marker_ignores_volatile_suffix_but_detects_real_suffix_change() {
+        let first = format!(
+            "timestamp=2026-08-30T21:00:00Z pid=1201 {}A",
+            "x".repeat(30_000)
+        );
+        let second = format!(
+            "timestamp=2026-08-30T21:01:00Z pid=1202 {}A",
+            "x".repeat(30_000)
+        );
+        let third = format!(
+            "timestamp=2026-08-30T21:02:00Z pid=1203 {}B",
+            "x".repeat(30_000)
+        );
+        let first = clip_tool_output_for_wire(bounded_tool_output_with_integrity(&first, 32_000));
+        let second = clip_tool_output_for_wire(bounded_tool_output_with_integrity(&second, 32_000));
+        let third = clip_tool_output_for_wire(bounded_tool_output_with_integrity(&third, 32_000));
+        let mut run = IdenticalToolCallRun::default();
+        assert_eq!(
+            run.observe_with_outputs("poll", "get_task_output", false, &[first]),
+            1
+        );
+        assert_eq!(
+            run.observe_with_outputs("poll", "get_task_output", false, &[second]),
+            2
+        );
+        assert_eq!(
+            run.observe_with_outputs("poll", "get_task_output", false, &[third]),
+            1
         );
     }
 
