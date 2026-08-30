@@ -133,6 +133,9 @@ fn assert_public_run_projection(value: &Value) {
         "bounds",
         "stopCause",
         "terminalResult",
+        "parentRunId",
+        "checkpointId",
+        "continuationContextId",
     ] {
         assert!(value.get(key).is_none(), "public run leaked {key}");
     }

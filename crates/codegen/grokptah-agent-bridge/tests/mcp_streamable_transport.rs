@@ -18,7 +18,7 @@ use grokptah_agent_bridge::{
     ActionGrant, AgentHost, ComputerRun, ComputerUseService, ControlServerLimits, GrantIssuer,
     HostConfig, McpControlClient, SessionKind, SimulatorBackend, CONTROL_TOOLS,
 };
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tempfile::tempdir;
 
 use common::ProcessEnvGuard;
@@ -76,6 +76,9 @@ fn assert_public_run_projection(value: &Value) {
         "bounds",
         "stopCause",
         "terminalResult",
+        "parentRunId",
+        "checkpointId",
+        "continuationContextId",
     ] {
         assert!(value.get(key).is_none(), "public run leaked {key}");
     }
@@ -1618,13 +1621,13 @@ async fn http_submit_durable_run_events_handoff_and_cancel() {
         .await
         .unwrap();
     assert!(!events.is_error);
+    assert_eq!(
+        events.structured["schemaVersion"],
+        "grokptah.public-event.v1"
+    );
+    assert!(events.structured.get("entries").is_none());
     // Event page is ordered; if present, sequences are non-decreasing.
-    if let Some(arr) = events
-        .structured
-        .get("events")
-        .or_else(|| events.structured.get("entries"))
-        .and_then(|v| v.as_array())
-    {
+    if let Some(arr) = events.structured.get("events").and_then(|v| v.as_array()) {
         let mut prev = 0u64;
         for e in arr {
             if let Some(seq) = e.get("seq").and_then(|s| s.as_u64()) {

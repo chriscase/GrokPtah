@@ -456,7 +456,12 @@ async fn soak_desktop_bootstrap_node_campaign() {
         .await
         .unwrap();
     assert!(!events.is_error);
-    assert!(!events.structured["entries"].as_array().unwrap().is_empty());
+    assert_eq!(
+        events.structured["schemaVersion"],
+        "grokptah.public-event.v1"
+    );
+    assert!(events.structured.get("entries").is_none());
+    assert!(!events.structured["events"].as_array().unwrap().is_empty());
 
     let handoff = mcp.call_tool("ptah_get_handoff", scoped).await.unwrap();
     assert!(!handoff.is_error);
