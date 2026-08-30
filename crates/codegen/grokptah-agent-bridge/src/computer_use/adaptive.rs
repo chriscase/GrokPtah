@@ -40,6 +40,8 @@
 //! byte-identical to its behaviour before this module existed. Only
 //! [`super::service::ComputerUseService::act_with_plan`] supplies a claim.
 
+use std::fmt;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -346,12 +348,22 @@ impl AdaptiveReason {
 /// The binding is what stops an answer being banked and spent later: a token
 /// minted for one observation cannot authorize the next one, and one minted
 /// before a takeover cannot authorize anything after it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AdaptiveApproval {
     run_id: String,
     control_epoch: u64,
     observation_id: String,
     approved: bool,
+}
+
+impl fmt::Debug for AdaptiveApproval {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AdaptiveApproval")
+            .field("approved", &self.approved)
+            .field("binding", &"<opaque>")
+            .finish()
+    }
 }
 
 impl AdaptiveApproval {
@@ -1169,6 +1181,18 @@ mod tests {
         assert!(!marker.contains(&run.run_id));
         assert!(!marker.contains(&observation.observation_id));
         assert!(!marker.contains("obs-1"));
+    }
+
+    #[test]
+    fn approval_debug_output_does_not_leak_raw_binding_ids() {
+        let now = Utc::now();
+        let run = run(now);
+        let observation = observation(now);
+        let approval = AdaptiveApproval::host_mint(&run, &observation, true);
+        let debug = format!("{approval:?}");
+        assert!(!debug.contains(&run.run_id));
+        assert!(!debug.contains(&observation.observation_id));
+        assert!(debug.contains("<opaque>"));
     }
 
     #[test]
