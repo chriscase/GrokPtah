@@ -12,8 +12,10 @@
 //!
 //! Additive `grokptah.public-run.v1` methods (`list_public_runs`,
 //! `observe_public_run`, `observe_public_progress`, `observe_public_handoff`)
-//! parse only the allowlisted document. Legacy `list_runs` / `observe_run`
-//! still project camelCase `RunRecord`.
+//! parse only the allowlisted document from `ptah_list_runs` / `ptah_get_run`
+//! / `ptah_get_progress` / `ptah_get_handoff`. Legacy `list_runs` /
+//! `observe_run` are unsupported shims: they do not call those public tools
+//! and do not deserialize the DTO as `RunRecord`.
 
 mod capability;
 mod dto;

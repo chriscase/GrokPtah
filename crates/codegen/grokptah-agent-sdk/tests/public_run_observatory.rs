@@ -1,7 +1,8 @@
 //! Additive `ReadObservatory` public-run methods over a synthetic `McpTransport`.
 //!
-//! These methods consume `grokptah.public-run.v1` only. Legacy `list_runs` /
-//! `observe_run` stay on the raw `RunRecord` projection.
+//! Public methods consume `grokptah.public-run.v1` only. Legacy `list_runs` /
+//! `observe_run` return `unsupported` and must not call `ptah_list_runs` /
+//! `ptah_get_run`.
 
 use std::sync::{Arc, Mutex};
 
@@ -40,6 +41,7 @@ const LEGACY_READ_TOOLS: &[&str] = &[
 ];
 
 type ToolHandler = dyn Fn(&str, &Value) -> Result<Value, TransportError> + Send + Sync;
+type ToolHandlerFn = fn(&str, &Value) -> Result<Value, TransportError>;
 
 struct ScriptedTransport {
     tools: Vec<String>,
@@ -407,72 +409,53 @@ async fn public_run_methods_reject_unknown_version_fields_and_legacy_record() {
 }
 
 #[tokio::test]
-async fn legacy_list_runs_and_observe_run_still_project_run_record() {
-    let tools: &[&str] = &[
-        "ptah_list_sessions",
-        "ptah_list_runs",
-        "ptah_get_run",
-        "ptah_get_progress",
-        "ptah_get_handoff",
-        "ptah_get_events",
-        "ptah_get_capacity",
+async fn legacy_list_runs_and_observe_run_are_unsupported_and_uninvoked() {
+    let cases: &[(&[&str], ToolHandlerFn)] = &[
+        (PUBLIC_RUN_TOOLS, public_run_handler),
+        (LEGACY_READ_TOOLS, legacy_run_handler),
     ];
-    let (sdk, calls) = connect(ScriptedTransport::new(tools, legacy_run_handler)).await;
-    let session = sdk.list_sessions().await.unwrap().remove(0);
-    let scope = SessionScope::from_session(&session);
-    let selector = RunSelector::from_parts(&session, RunId::new(RUN_ID));
+    for (tools, handler) in cases {
+        let handler = *handler;
+        let (sdk, calls) = connect(ScriptedTransport::new(tools, handler)).await;
+        let session = sdk.list_sessions().await.unwrap().remove(0);
+        let scope = SessionScope::from_session(&session);
+        let selector = RunSelector::from_parts(&session, RunId::new(RUN_ID));
+        calls.lock().unwrap().clear();
 
-    let runs = sdk.list_runs(&scope).await.unwrap();
-    assert_eq!(runs.len(), 1);
-    assert_eq!(runs[0].run_id.as_str(), RUN_ID);
-    assert_eq!(runs[0].session_id.as_str(), BUILD_SESSION);
-    assert_eq!(runs[0].state, "completed");
-    assert_eq!(runs[0].stop_cause.as_deref(), Some("completed"));
-    assert_eq!(runs[0].bounds.max_prompt_bytes, 1000);
+        let list_err = sdk.list_runs(&scope).await.unwrap_err();
+        let observe_err = sdk.observe_run(&selector).await.unwrap_err();
+        assert_eq!(list_err, SdkError::Unsupported);
+        assert_eq!(observe_err, SdkError::Unsupported);
+        assert_eq!(list_err.code(), "unsupported");
+        for err in [&list_err, &observe_err] {
+            let blob = error_blob(err);
+            for needle in [
+                SECRET_PROMPT,
+                SECRET_RESPONSE,
+                SECRET_PATH,
+                SECRET_CWD,
+                SECRET_TOOL,
+                SECRET_DETAIL,
+                BUILD_CWD,
+                BUILD_SESSION,
+                "promptPreview",
+                "finalResponse",
+                "ptah_list_runs",
+                "ptah_get_run",
+            ] {
+                assert!(
+                    !blob.contains(needle),
+                    "legacy unsupported error leaked {needle:?}: {blob}"
+                );
+            }
+        }
 
-    let observed = sdk.observe_run(&selector).await.unwrap();
-    assert_eq!(observed.run_id.as_str(), RUN_ID);
-    assert_eq!(observed.stop_cause.as_deref(), Some("completed"));
-
-    assert_redacted_internal(sdk.list_public_runs(&scope).await.unwrap_err());
-    assert_redacted_internal(sdk.observe_public_run(&selector).await.unwrap_err());
-    assert_redacted_internal(sdk.observe_public_progress(&selector).await.unwrap_err());
-    assert_redacted_internal(sdk.observe_public_handoff(&selector).await.unwrap_err());
-
-    let log = calls.lock().unwrap().clone();
-    assert_eq!(
-        call_named(&log, "ptah_list_runs"),
-        &json!({
-            "session_id": BUILD_SESSION,
-            "workspace": BUILD_CWD,
-        })
-    );
-    assert_eq!(
-        call_named(&log, "ptah_get_run"),
-        &json!({
-            "session_id": BUILD_SESSION,
-            "workspace": BUILD_CWD,
-            "run_id": RUN_ID,
-        })
-    );
-}
-
-#[tokio::test]
-async fn legacy_methods_are_unchanged_when_host_emits_v1() {
-    let (sdk, _) = connect(ScriptedTransport::new(
-        LEGACY_READ_TOOLS,
-        public_run_handler,
-    ))
-    .await;
-    let session = sdk.list_sessions().await.unwrap().remove(0);
-    let scope = SessionScope::from_session(&session);
-    let selector = RunSelector::from_parts(&session, RunId::new(RUN_ID));
-
-    assert_eq!(sdk.list_runs(&scope).await.unwrap_err(), SdkError::Internal);
-    assert_eq!(
-        sdk.observe_run(&selector).await.unwrap_err(),
-        SdkError::Internal
-    );
+        let log = calls.lock().unwrap().clone();
+        assert!(
+            log.is_empty(),
+            "legacy list_runs/observe_run must not call transport: {log:?}"
+        );
+    }
 }
 
 #[tokio::test]

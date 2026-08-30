@@ -1,7 +1,8 @@
 //! Fail-closed parser tests for `grokptah.public-run.v1` documents.
 //!
 //! Fixtures are synthetic JSON. `ReadObservatory` public-run methods consume
-//! these parsers; legacy `list_runs` / `observe_run` still project `RunRecord`.
+//! these parsers. Legacy `list_runs` / `observe_run` are unsupported and do
+//! not parse this document as `RunRecord`.
 
 use grokptah_agent_sdk::{
     PUBLIC_RUN_SCHEMA_VERSION, PublicRunHandoffV1, PublicRunListV1, PublicRunProgressV1,

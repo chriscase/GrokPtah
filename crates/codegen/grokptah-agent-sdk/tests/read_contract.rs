@@ -1,8 +1,11 @@
 //! Contract tests against current-main `mcp_control` / OrchestrationService JSON.
 //!
 //! Fixtures copy wire keys from `orchestration/service.rs` (`list_sessions`,
-//! `get_capacity`, `run_value`) and `event_bus::JournalPage`, plus the
-//! `cursor_expired` + `eventRange` envelope used by current MCP 410 responses.
+//! `get_capacity`) and `event_bus::JournalPage`, plus the `cursor_expired` +
+//! `eventRange` envelope used by current MCP 410 responses. Public run list/get
+//! coverage lives in `public_run_observatory.rs`; legacy `list_runs` /
+//! `observe_run` are `unsupported` and must not call `ptah_list_runs` /
+//! `ptah_get_run`.
 
 use std::sync::{Arc, Mutex};
 
@@ -291,15 +294,24 @@ async fn connect(
 async fn contract_version_is_1_0() {
     assert_eq!(contract_version(), "1.0");
     assert_eq!(CONTRACT_VERSION, "1.0");
-    let (sdk, _) = connect(ScriptedTransport::new(ALL_READ_TOOLS, default_handler)).await;
+    let (sdk, calls) = connect(ScriptedTransport::new(ALL_READ_TOOLS, default_handler)).await;
     let sessions = sdk.list_sessions().await.unwrap();
     assert_eq!(sessions[0].contract_version, "1.0");
     let scope = SessionScope::from_session(&sessions[0]);
-    let runs = sdk.list_runs(&scope).await.unwrap();
-    assert_eq!(runs[0].contract_version, "1.0");
-    let selector = RunSelector::from_parts(&sessions[0], runs[0].run_id.clone());
-    let observed = sdk.observe_run(&selector).await.unwrap();
-    assert_eq!(observed.contract_version, "1.0");
+    let selector = RunSelector::from_parts(&sessions[0], RunId::new(RUN_ID));
+    calls.lock().unwrap().clear();
+    assert_eq!(
+        sdk.list_runs(&scope).await.unwrap_err(),
+        SdkError::Unsupported
+    );
+    assert_eq!(
+        sdk.observe_run(&selector).await.unwrap_err(),
+        SdkError::Unsupported
+    );
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "legacy list_runs/observe_run must not call transport"
+    );
     let page = sdk
         .stream_events(&selector, EventQuery::default())
         .await
@@ -424,25 +436,23 @@ async fn build_only_session_filtering_hides_chat_rows() {
 
 #[tokio::test]
 async fn run_and_event_projections_drop_sensitive_fields() {
-    let (sdk, _) = connect(ScriptedTransport::new(ALL_READ_TOOLS, default_handler)).await;
+    let (sdk, calls) = connect(ScriptedTransport::new(ALL_READ_TOOLS, default_handler)).await;
     let session = sdk.list_sessions().await.unwrap().remove(0);
-    let runs = sdk
-        .list_runs(&SessionScope::from_session(&session))
-        .await
-        .unwrap();
-    assert_eq!(runs[0].run_id.as_str(), RUN_ID);
-    assert_eq!(runs[0].state, "completed");
-    assert_eq!(runs[0].stop_cause.as_deref(), Some("completed"));
-    assert_eq!(runs[0].bounds.max_prompt_bytes, 1000);
-    assert_eq!(runs[0].usage.total_tokens, 14);
-    assert!(runs[0].usage_complete);
-    assert_eq!(runs[0].event_range.unwrap().start_seq, Some(1));
-    assert_no_sensitive(&serde_json::to_value(&runs[0]).unwrap());
-    assert!(!format!("{:?}", runs[0]).contains(BUILD_CWD));
-
-    let selector = RunSelector::from_parts(&session, runs[0].run_id.clone());
-    let observed = sdk.observe_run(&selector).await.unwrap();
-    assert_no_sensitive(&serde_json::to_value(&observed).unwrap());
+    let scope = SessionScope::from_session(&session);
+    let selector = RunSelector::from_parts(&session, RunId::new(RUN_ID));
+    calls.lock().unwrap().clear();
+    assert_eq!(
+        sdk.list_runs(&scope).await.unwrap_err(),
+        SdkError::Unsupported
+    );
+    assert_eq!(
+        sdk.observe_run(&selector).await.unwrap_err(),
+        SdkError::Unsupported
+    );
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "legacy list_runs/observe_run must not call transport"
+    );
 
     let page = sdk
         .stream_events(&selector, EventQuery::default())
@@ -495,25 +505,38 @@ async fn host_wire_still_receives_workspace_token_from_opaque_ref() {
     let transport = ScriptedTransport::new(ALL_READ_TOOLS, default_handler);
     let (sdk, calls) = connect(transport).await;
     let session = sdk.list_sessions().await.unwrap().remove(0);
+    let scope = SessionScope::from_session(&session);
+    let selector = RunSelector::from_parts(&session, RunId::new(RUN_ID));
+    calls.lock().unwrap().clear();
+    assert_eq!(
+        sdk.list_runs(&scope).await.unwrap_err(),
+        SdkError::Unsupported
+    );
+    assert_eq!(
+        sdk.observe_run(&selector).await.unwrap_err(),
+        SdkError::Unsupported
+    );
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "legacy list_runs/observe_run must not call transport"
+    );
     let _ = sdk
-        .list_runs(&SessionScope::from_session(&session))
+        .stream_events(&selector, EventQuery::default())
         .await
         .unwrap();
-    let selector = RunSelector::from_parts(&session, RunId::new(RUN_ID));
-    let _ = sdk.observe_run(&selector).await.unwrap();
     let log = calls.lock().unwrap().clone();
-    let list_runs = log
+    assert!(
+        log.iter()
+            .all(|(name, _)| name != "ptah_list_runs" && name != "ptah_get_run"),
+        "legacy methods must not reach public run tools: {log:?}"
+    );
+    let get_events = log
         .iter()
-        .find(|(name, _)| name == "ptah_list_runs")
+        .find(|(name, _)| name == "ptah_get_events")
         .map(|(_, args)| args);
-    assert_eq!(list_runs.unwrap()["workspace"], BUILD_CWD);
-    assert_eq!(list_runs.unwrap()["session_id"], BUILD_SESSION);
-    let get_run = log
-        .iter()
-        .find(|(name, _)| name == "ptah_get_run")
-        .map(|(_, args)| args);
-    assert_eq!(get_run.unwrap()["run_id"], RUN_ID);
-    assert_eq!(get_run.unwrap()["workspace"], BUILD_CWD);
+    assert_eq!(get_events.unwrap()["workspace"], BUILD_CWD);
+    assert_eq!(get_events.unwrap()["session_id"], BUILD_SESSION);
+    assert_eq!(get_events.unwrap()["run_id"], RUN_ID);
 }
 
 #[tokio::test]
@@ -544,7 +567,7 @@ async fn scope_denial_unknown_and_cross_session_are_equal() {
     let (sdk, _) = connect(transport).await;
     let session = sdk.list_sessions().await.unwrap().remove(0);
     let unknown = sdk
-        .observe_run(&RunSelector::from_parts(
+        .observe_public_run(&RunSelector::from_parts(
             &session,
             RunId::new("no-such-run"),
         ))
@@ -553,7 +576,7 @@ async fn scope_denial_unknown_and_cross_session_are_equal() {
     let mut foreign = session.clone();
     foreign.session_id = SessionId::new(CHAT_SESSION);
     let cross = sdk
-        .observe_run(&RunSelector::from_parts(&foreign, RunId::new(RUN_ID)))
+        .observe_public_run(&RunSelector::from_parts(&foreign, RunId::new(RUN_ID)))
         .await
         .unwrap_err();
     assert_eq!(unknown, SdkError::ForbiddenScope);

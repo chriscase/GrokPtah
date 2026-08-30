@@ -12,13 +12,20 @@ into client capabilities and then exposes:
 | Method | Host tool |
 | --- | --- |
 | `list_sessions` | `ptah_list_sessions` |
-| `list_runs` | `ptah_list_runs` |
-| `observe_run` | `ptah_get_run` |
+| `list_public_runs` | `ptah_list_runs` (`grokptah.public-run.v1`) |
+| `observe_public_run` | `ptah_get_run` (`grokptah.public-run.v1`) |
+| `observe_public_progress` | `ptah_get_progress` (`grokptah.public-run.v1`) |
+| `observe_public_handoff` | `ptah_get_handoff` (`grokptah.public-run.v1`) |
+| `list_runs` | unsupported shim; does not call `ptah_list_runs` |
+| `observe_run` | unsupported shim; does not call `ptah_get_run` |
 | `stream_events` | `ptah_get_events` |
 | `host_capacity` | `ptah_get_capacity` |
 
-A missing tool is `unsupported`. The SDK never invents empty listings or empty
-run/event/capacity documents to cover an absent tool.
+Chosen split: public DTO consumers use the `*_public_*` methods. Legacy
+`list_runs` / `observe_run` fail closed as `unsupported` and never reach the
+transport, so they cannot deserialize `grokptah.public-run.v1` as `RunRecord`.
+A missing tool is also `unsupported`. The SDK never invents empty listings or
+empty run/event/capacity documents to cover an absent tool.
 
 This is **not** a host-issued capability document. `computer.control` and
 `provider.credentials` are permanently `Forbidden` in the client projection
@@ -35,12 +42,13 @@ JSON:
   `updatedAt`, `busy`. Only `kind == "build"` is kept. `cwd` is stored inside
   an opaque `WorkspaceRef` and is not displayed, serialized, or returned as a
   path.
-- Run records: camelCase `RunRecord` (`runId`, `sessionId`, `workspace`,
-  `state`, `bounds`, `promptPreview`, `startSeq`/`endSeq`, `stopCause`,
-  `aggregates.usage`, `aggregates.usageComplete`, `finalResponse`, optional
-  `execution` paths). The public `RunView` keeps lifecycle, bounds, usage,
-  stop cause, and event range. Prompt, final response, filesystem paths, and
-  change/test/path aggregates are dropped.
+- Public runs: `grokptah.public-run.v1` from `ptah_list_runs` / `ptah_get_run`
+  (`schemaVersion`, `runId`, `state`, timestamps, queue position, event seqs,
+  change/test/permission counts, usage totals). Session and workspace are
+  request-scoped and are never read from the document. Unknown version/field
+  and legacy `RunRecord` decode as redacted `internal`. `RunView` remains the
+  unused legacy projection type; `list_runs` / `observe_run` return
+  `unsupported` without calling the public tools.
 - Events: `JournalPage` `{ entries: [{ seq, ts, update }], nextCursor,
   cursorExpired }`. `update` uses current `SessionUpdate` `type` tags. Public
   events keep seq/ts/kind only; text, paths, commands, tool I/O, and queue
@@ -77,5 +85,6 @@ SDK is not a run-existence oracle. Host messages are not forwarded.
 
 Residual risk: the host Build-run path still distinguishes unknown run_id
 (`invalid_request`) from cross-session (`forbidden_scope`) on the wire. The
-SDK collapses those two for `observe_run` / `stream_events` only. Direct MCP
-callers outside this crate still see the host distinction.
+SDK collapses those two for `observe_public_run` / `stream_events` only.
+`observe_run` is an unsupported shim and is not a run-existence oracle.
+Direct MCP callers outside this crate still see the host distinction.

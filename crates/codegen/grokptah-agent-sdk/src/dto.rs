@@ -7,8 +7,10 @@
 //! [`crate::ReadObservatory::observe_public_progress`], and
 //! [`crate::ReadObservatory::observe_public_handoff`].
 //! Session and workspace stay on the request scope and are never read from
-//! these documents. Legacy `project_run` / `list_runs` / `observe_run` still
-//! project camelCase `RunRecord`.
+//! these documents. Legacy `project_run` is a unit parser for camelCase
+//! `RunRecord` JSON and is not a public MCP consumer. `list_runs` /
+//! `observe_run` return `unsupported` instead of calling `ptah_list_runs` /
+//! `ptah_get_run`.
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -314,6 +316,7 @@ pub(crate) fn project_sessions(body: &Value) -> Result<Vec<SessionView>, SdkErro
     Ok(out)
 }
 
+#[allow(dead_code)]
 pub(crate) fn project_runs(body: &Value) -> Result<Vec<RunView>, SdkError> {
     let rows = body
         .get("runs")
@@ -322,6 +325,7 @@ pub(crate) fn project_runs(body: &Value) -> Result<Vec<RunView>, SdkError> {
     rows.iter().map(project_run).collect()
 }
 
+#[allow(dead_code)]
 pub(crate) fn project_run(row: &Value) -> Result<RunView, SdkError> {
     let run_id = row
         .get("runId")
@@ -628,4 +632,84 @@ fn require_known_version(version: &str) -> Result<(), SdkError> {
         return Err(SdkError::Internal);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RunView, project_run, project_runs};
+    use crate::error::SdkError;
+    use crate::version::PUBLIC_RUN_SCHEMA_VERSION;
+    use serde_json::json;
+
+    fn run_record() -> serde_json::Value {
+        json!({
+            "runId": "run-legacy",
+            "sessionId": "11111111-1111-4111-8111-111111111111",
+            "workspace": "/tmp/project",
+            "state": "completed",
+            "bounds": {
+                "maxPromptBytes": 1000,
+                "maxRounds": 2,
+                "maxDurationMs": 1000
+            },
+            "promptPreview": "leak-prompt",
+            "startSeq": 1,
+            "endSeq": 4,
+            "createdAt": "2026-08-01T00:00:00Z",
+            "updatedAt": "2026-08-01T00:00:00Z",
+            "stopCause": "completed",
+            "aggregates": {
+                "usage": {
+                    "promptTokens": 10,
+                    "completionTokens": 4,
+                    "totalTokens": 14,
+                    "requests": 1
+                },
+                "usageComplete": true
+            }
+        })
+    }
+
+    fn public_run() -> serde_json::Value {
+        json!({
+            "schemaVersion": PUBLIC_RUN_SCHEMA_VERSION,
+            "runId": "run_public_dto_1",
+            "state": "completed",
+            "createdAt": "2026-08-01T00:00:00Z",
+            "updatedAt": "2026-08-01T00:00:00Z",
+            "changeCount": 1,
+            "testCount": 1,
+            "permissionRequestedCount": 0,
+            "permissionGrantedCount": 0,
+            "permissionDeniedCount": 0,
+            "usagePromptTokens": 10,
+            "usageCompletionTokens": 4,
+            "usageTotalTokens": 14,
+            "usageRequestCount": 1,
+            "usageComplete": true,
+            "usagePendingRequestCount": 0
+        })
+    }
+
+    #[test]
+    fn legacy_parser_still_projects_run_record() {
+        let view: RunView = project_run(&run_record()).unwrap();
+        assert_eq!(view.run_id.as_str(), "run-legacy");
+        assert_eq!(view.state, "completed");
+        let listed = project_runs(&json!({ "runs": [run_record()] })).unwrap();
+        assert_eq!(listed.len(), 1);
+    }
+
+    #[test]
+    fn legacy_parser_does_not_accept_public_run_dto() {
+        assert_eq!(project_run(&public_run()).unwrap_err(), SdkError::Internal);
+        assert_eq!(
+            project_runs(&json!({
+                "schemaVersion": PUBLIC_RUN_SCHEMA_VERSION,
+                "runs": [public_run()]
+            }))
+            .unwrap_err(),
+            SdkError::Internal
+        );
+    }
 }

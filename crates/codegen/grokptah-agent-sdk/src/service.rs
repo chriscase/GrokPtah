@@ -13,7 +13,7 @@ use crate::dto::{
     EventPage, HostCapacity, PublicRunHandoffV1, PublicRunListV1, PublicRunProgressV1, PublicRunV1,
     RunView, SessionView, parse_public_run_handoff_v1, parse_public_run_list_v1,
     parse_public_run_progress_v1, parse_public_run_v1, project_capacity, project_event_page,
-    project_run, project_runs, project_sessions,
+    project_sessions,
 };
 use crate::error::SdkError;
 use crate::observe::{EventQuery, RunSelector, SessionScope};
@@ -65,27 +65,20 @@ impl<T: McpTransport> ReadObservatory<T> {
         project_sessions(&body)
     }
 
-    /// Durable Build runs in one session/workspace. Missing tool → `unsupported`.
-    pub async fn list_runs(&self, scope: &SessionScope) -> Result<Vec<RunView>, SdkError> {
-        let body = self
-            .call_required(
-                TOOL_LIST_RUNS,
-                json!({
-                    "session_id": scope.session_id.as_str(),
-                    "workspace": scope.workspace.host_token(),
-                }),
-            )
-            .await?;
-        project_runs(&body)
+    /// Legacy `RunRecord` list. Public MCP `ptah_list_runs` emits
+    /// `grokptah.public-run.v1` only; this method does not call that tool and
+    /// returns [`SdkError::Unsupported`]. Use [`Self::list_public_runs`].
+    pub async fn list_runs(&self, _scope: &SessionScope) -> Result<Vec<RunView>, SdkError> {
+        let _ = self;
+        Err(SdkError::Unsupported)
     }
 
-    /// Project one run. Unknown and cross-scope denials are both `forbidden_scope`.
-    pub async fn observe_run(&self, selector: &RunSelector) -> Result<RunView, SdkError> {
-        let body = self
-            .call_required(TOOL_GET_RUN, run_args(selector))
-            .await
-            .map_err(SdkError::collapse_run_scope)?;
-        project_run(&body)
+    /// Legacy `RunRecord` get. Public MCP `ptah_get_run` emits
+    /// `grokptah.public-run.v1` only; this method does not call that tool and
+    /// returns [`SdkError::Unsupported`]. Use [`Self::observe_public_run`].
+    pub async fn observe_run(&self, _selector: &RunSelector) -> Result<RunView, SdkError> {
+        let _ = self;
+        Err(SdkError::Unsupported)
     }
 
     /// Allowlisted `grokptah.public-run.v1` list for one session/workspace.
