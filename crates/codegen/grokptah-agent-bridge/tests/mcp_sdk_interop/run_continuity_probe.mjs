@@ -464,7 +464,12 @@ try {
   // unread-body buffer before the recovery frame can be observed.
   const heldFrame = await nextFrame(gapReader);
   await waitForRelease();
-  const recovery = await waitForRecovery(gapReader, heldFrame.buffer);
+  // Recovery can legitimately be the first frame when the lag notice is
+  // observed before any ordinary event. Do not discard that frame and then
+  // mistake the correctly closed stream for a continuity failure.
+  const recovery = heldFrame.body?.method === "notifications/ptah_recovery"
+    ? heldFrame
+    : await waitForRecovery(gapReader, heldFrame.buffer);
   const gapRead = await call("ptah_get_events", {
     session_id: gapSessionId,
     workspace,

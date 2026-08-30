@@ -271,7 +271,13 @@ impl LiveStreamState {
             tokio::select! {
                 event = self.receiver.recv_with_seq() => {
                     let Some((seq, update)) = event else {
-                        self.done = true;
+                        // A closed event receiver is an abnormal transport
+                        // condition for a still-running scoped stream. Do not
+                        // silently turn it into EOF: the client must be told
+                        // to reconcile from the durable journal.
+                        self.queue_recovery(
+                            "live event receiver closed; resynchronize from the durable journal",
+                        );
                         continue;
                     };
                     if seq == 0 {
