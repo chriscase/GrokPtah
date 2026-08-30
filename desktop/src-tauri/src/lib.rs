@@ -5,6 +5,7 @@ mod computer_use;
 mod event_forward;
 mod help;
 mod pty_host;
+mod remote_public_run;
 mod remote_service;
 
 use anyhow::Context;
@@ -120,6 +121,7 @@ fn run_inner() -> anyhow::Result<()> {
             commands::remote_service_session_create,
             commands::remote_service_task_submit,
             commands::remote_service_run_list,
+            commands::remote_service_public_run_list,
             commands::remote_service_work_list,
             commands::remote_service_work_get,
             commands::remote_service_work_create,
@@ -145,6 +147,7 @@ fn run_inner() -> anyhow::Result<()> {
             commands::remote_service_routine_set_lifecycle,
             commands::remote_service_routine_fire,
             commands::remote_service_run_get,
+            commands::remote_service_public_run_get,
             commands::remote_service_run_events,
             commands::remote_service_run_steer,
             commands::remote_service_run_cancel,

@@ -492,6 +492,12 @@ export interface DurableRunEventPage {
   cursorExpired: boolean;
 }
 
+/**
+ * Local in-process host Build-run record (`run_list` / `run_get`).
+ * Remote `grokptah.public-run.v1` documents are a different contract; parse
+ * them with `parsePublicRunV1` / `parseRemotePublicRun` and stamp
+ * session/workspace from the request. Do not map public DTOs onto this type.
+ */
 export interface DurableRun {
   runId: string;
   sessionId: string;
@@ -1226,6 +1232,27 @@ export function normalizeSessionUpdate(raw: unknown): SessionUpdate | null {
   }
   return null;
 }
+
+export {
+  PUBLIC_RUN_SCHEMA_VERSION,
+  PublicRunDtoError,
+  parsePublicRunHandoffV1,
+  parsePublicRunListV1,
+  parsePublicRunProgressV1,
+  parsePublicRunV1,
+  parseRemotePublicRun,
+  parseRemotePublicRunList,
+} from "./publicRun";
+export type {
+  PublicRunDtoErrorKind,
+  PublicRunHandoffV1,
+  PublicRunListV1,
+  PublicRunProgressV1,
+  PublicRunState,
+  PublicRunV1,
+  RemotePublicRun,
+  RemotePublicRunList,
+} from "./publicRun";
 
 export const SLASH_COMMANDS = [
   { cmd: "/help", desc: "Show commands" },

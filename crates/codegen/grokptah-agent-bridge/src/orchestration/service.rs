@@ -31,6 +31,9 @@ use super::manager::{
     ManagerDirective, ManagerPlan, ManagerPlanState, ManagerStepSpec, MANAGER_SCHEMA_VERSION,
 };
 use super::message::{message_activation_unsupported, MessageKind, WorkMessage};
+use super::public_run::{
+    PublicRunHandoffV1, PublicRunListV1, PublicRunProgressV1, PublicRunV1,
+};
 use super::routine::{
     manual_dedupe_key, ActivationCause, ActivationRequest, MissedRunPolicy,
     RoutineConcurrencyPolicy, RoutineLifecycle, RoutineRecord, RoutineRetryPolicy, RoutineTrigger,
@@ -2115,7 +2118,7 @@ impl OrchestrationService {
         workspace: &Path,
     ) -> Result<serde_json::Value, OrchError> {
         let claimed = self.authorize_queue_request(session_id, workspace)?;
-        let runs = self
+        let mut runs = self
             .store
             .list_runs()
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
@@ -2124,7 +2127,11 @@ impl OrchestrationService {
                 run.session_id == session_id && run.workspace == claimed.display().to_string()
             })
             .collect::<Vec<_>>();
-        Ok(json!({ "runs": runs }))
+        for run in &mut runs {
+            self.refresh_queue_position(run);
+        }
+        serde_json::to_value(PublicRunListV1::from_runs(&runs))
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
     }
 
     // ── durable workloads ----------------------------------------------
@@ -5174,7 +5181,7 @@ impl OrchestrationService {
         _auth: &AuthContext,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        self.run_value(self.load_authorized_run(run_id)?)
+        self.raw_run_value(self.load_authorized_run(run_id)?)
     }
 
     pub fn get_run_scoped(
@@ -5187,9 +5194,15 @@ impl OrchestrationService {
         self.run_value(self.authorize_run_request(session_id, workspace, run_id)?)
     }
 
-    fn run_value(&self, mut run: RunRecord) -> Result<serde_json::Value, OrchError> {
+    fn raw_run_value(&self, mut run: RunRecord) -> Result<serde_json::Value, OrchError> {
         self.refresh_queue_position(&mut run);
         serde_json::to_value(run)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+    }
+
+    fn run_value(&self, mut run: RunRecord) -> Result<serde_json::Value, OrchError> {
+        self.refresh_queue_position(&mut run);
+        serde_json::to_value(PublicRunV1::from_run(&run))
             .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))
     }
 
@@ -5198,7 +5211,7 @@ impl OrchestrationService {
         _auth: &AuthContext,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        self.progress_value(self.load_authorized_run(run_id)?)
+        self.raw_progress_value(self.load_authorized_run(run_id)?)
     }
 
     pub fn get_progress_scoped(
@@ -5211,7 +5224,7 @@ impl OrchestrationService {
         self.progress_value(self.authorize_run_request(session_id, workspace, run_id)?)
     }
 
-    fn progress_value(&self, mut run: RunRecord) -> Result<serde_json::Value, OrchError> {
+    fn raw_progress_value(&self, mut run: RunRecord) -> Result<serde_json::Value, OrchError> {
         self.refresh_queue_position(&mut run);
         let busy = self.host.session_busy(run.session_id);
         Ok(json!({
@@ -5231,6 +5244,13 @@ impl OrchestrationService {
             "bounds": run.bounds,
             "errorCode": run.error_code,
         }))
+    }
+
+    fn progress_value(&self, mut run: RunRecord) -> Result<serde_json::Value, OrchError> {
+        self.refresh_queue_position(&mut run);
+        let busy = self.host.session_busy(run.session_id);
+        serde_json::to_value(PublicRunProgressV1::from_run(&run, busy))
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
     }
 
     fn refresh_queue_position(&self, run: &mut RunRecord) {
@@ -5618,7 +5638,7 @@ impl OrchestrationService {
         _auth: &AuthContext,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        self.handoff_for_run(self.load_authorized_run(run_id)?)
+        self.raw_handoff_for_run(self.load_authorized_run(run_id)?)
     }
 
     pub fn get_handoff_scoped(
@@ -5631,7 +5651,7 @@ impl OrchestrationService {
         self.handoff_for_run(self.authorize_run_request(session_id, workspace, run_id)?)
     }
 
-    fn handoff_for_run(&self, run: RunRecord) -> Result<serde_json::Value, OrchError> {
+    fn raw_handoff_for_run(&self, run: RunRecord) -> Result<serde_json::Value, OrchError> {
         Ok(json!({
             "runId": run.run_id,
             "sessionId": run.session_id,
@@ -5649,6 +5669,11 @@ impl OrchestrationService {
             "usageComplete": run.aggregates.usage_complete,
             "usagePendingRequests": run.aggregates.usage_pending_requests,
         }))
+    }
+
+    fn handoff_for_run(&self, run: RunRecord) -> Result<serde_json::Value, OrchError> {
+        serde_json::to_value(PublicRunHandoffV1::from_run(&run))
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
     }
 
     fn scoped_events_complete(

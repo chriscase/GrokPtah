@@ -15,6 +15,10 @@ use tokio::sync::{watch, Mutex};
 use url::Url;
 use uuid::Uuid;
 
+use crate::remote_public_run::{
+    parse_remote_public_run, parse_remote_public_run_list, RemotePublicRun, RemotePublicRunList,
+};
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteServiceStatus {
@@ -304,6 +308,20 @@ impl RemoteServiceState {
         Ok(Some(client.list_runs().await?))
     }
 
+    /// Additive allowlisted public-run list. The request supplies the scope;
+    /// no scope fields are accepted from the remote document.
+    pub async fn list_public_runs(
+        &self,
+        session_id: Uuid,
+        workspace: String,
+    ) -> Result<Option<RemotePublicRunList>> {
+        let mut client = self.client.lock().await;
+        let Some(client) = client.as_mut() else {
+            return Ok(None);
+        };
+        Ok(Some(client.list_public_runs(session_id, workspace).await?))
+    }
+
     pub async fn list_work(
         &self,
         session_id: Uuid,
@@ -575,6 +593,23 @@ impl RemoteServiceState {
             return Ok(None);
         };
         Ok(Some(client.get_run(session_id, workspace, run_id).await?))
+    }
+
+    /// Additive allowlisted public-run get. Legacy raw `get_run` remains
+    /// unchanged for existing desktop callers.
+    pub async fn get_public_run(
+        &self,
+        session_id: Uuid,
+        workspace: String,
+        run_id: String,
+    ) -> Result<Option<RemotePublicRun>> {
+        let mut client = self.client.lock().await;
+        let Some(client) = client.as_mut() else {
+            return Ok(None);
+        };
+        Ok(Some(
+            client.get_public_run(session_id, workspace, run_id).await?,
+        ))
     }
 
     pub async fn get_events(
@@ -940,6 +975,23 @@ impl RemoteServiceClient {
         Ok(runs)
     }
 
+    async fn list_public_runs(
+        &mut self,
+        session_id: Uuid,
+        workspace: String,
+    ) -> Result<RemotePublicRunList> {
+        let value = self
+            .call_tool(
+                "ptah_list_runs",
+                json!({
+                    "session_id": session_id,
+                    "workspace": workspace,
+                }),
+            )
+            .await?;
+        parse_remote_public_run_list(&value, session_id, &workspace)
+    }
+
     async fn list_work(&mut self, session_id: Uuid, workspace: String) -> Result<Vec<WorkItem>> {
         let value = self
             .call_tool(
@@ -975,6 +1027,7 @@ impl RemoteServiceClient {
         serde_json::from_value(value).context("decode remote durable work item")
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn create_work(
         &mut self,
         session_id: Uuid,
@@ -985,8 +1038,10 @@ impl RemoteServiceClient {
         requires_approval: bool,
         request_id: String,
     ) -> Result<WorkItem> {
-        let mut policy = WorkPolicy::default();
-        policy.requires_approval = requires_approval;
+        let policy = WorkPolicy {
+            requires_approval,
+            ..WorkPolicy::default()
+        };
         let value = self
             .call_tool(
                 "ptah_create_work",
@@ -1291,6 +1346,25 @@ impl RemoteServiceClient {
             )
             .await?;
         serde_json::from_value(value).context("decode remote durable run")
+    }
+
+    async fn get_public_run(
+        &mut self,
+        session_id: Uuid,
+        workspace: String,
+        run_id: String,
+    ) -> Result<RemotePublicRun> {
+        let value = self
+            .call_tool(
+                "ptah_get_run",
+                json!({
+                    "session_id": session_id,
+                    "workspace": workspace,
+                    "run_id": run_id,
+                }),
+            )
+            .await?;
+        parse_remote_public_run(&value, session_id, &workspace)
     }
 
     async fn get_events(
@@ -1753,11 +1827,12 @@ mod tests {
             .await
             .unwrap();
         assert!(client
-            .list_runs()
+            .list_public_runs(session.session_id, session.workspace.clone())
             .await
             .unwrap()
+            .runs
             .iter()
-            .any(|run| run.run_id == submission.run_id));
+            .any(|run| run.document.run_id == submission.run_id));
         assert!(RemoteServiceClient::connect(base_url, "wrong-token".into())
             .await
             .is_err());
@@ -1780,11 +1855,12 @@ mod tests {
         // its MCP session and transparently retries against the restarted service.
         assert!(!client.list_persistent_agents().await.unwrap().is_empty());
         assert!(client
-            .list_runs()
+            .list_public_runs(session.session_id, session.workspace)
             .await
             .unwrap()
+            .runs
             .iter()
-            .any(|run| run.run_id == submission.run_id));
+            .any(|run| run.document.run_id == submission.run_id));
         assert!(restarted_server.stop_and_wait().await.is_clean());
         set_grokptah_home_override(None);
     }

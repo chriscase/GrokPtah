@@ -15,6 +15,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 grokptah-agent-bridge = { path = "../../crates/codegen/grokptah-agent-bridge" }
+grokptah-agent-sdk = { path = "../../crates/codegen/grokptah-agent-sdk" }
 grokptah-help-authority = { path = "../../crates/common/grokptah-help-authority" }
 grokptah-help-contract = { path = "../../crates/common/grokptah-help-contract" }
 grokptah-help-runtime = { path = "../../crates/common/grokptah-help-runtime" }

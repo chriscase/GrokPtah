@@ -1,12 +1,23 @@
 //! Safe projections of current OrchestrationService / MCP structured content.
+//!
+//! [`PublicRunV1`] and `parse_public_run_*` are the fail-closed
+//! `grokptah.public-run.v1` seam used by
+//! [`crate::ReadObservatory::list_public_runs`],
+//! [`crate::ReadObservatory::observe_public_run`],
+//! [`crate::ReadObservatory::observe_public_progress`], and
+//! [`crate::ReadObservatory::observe_public_handoff`].
+//! Session and workspace stay on the request scope and are never read from
+//! these documents. Legacy `project_run` / `list_runs` / `observe_run` still
+//! project camelCase `RunRecord`.
 
-use serde::Serialize;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::SdkError;
 use crate::ids::{RunId, SessionId, WorkspaceRef};
 use crate::page::{Cursor, RetainedRange};
-use crate::version::CONTRACT_VERSION;
+use crate::version::{CONTRACT_VERSION, PUBLIC_RUN_SCHEMA_VERSION};
 
 /// One `ptah_get_events` page after stripping unsafe `SessionUpdate` bodies.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -71,6 +82,106 @@ pub struct UsageView {
 pub struct EventRange {
     pub start_seq: Option<u64>,
     pub end_seq: Option<u64>,
+}
+
+/// Lifecycle states allowlisted on `grokptah.public-run.v1`. Unknown values fail closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicRunState {
+    Queued,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+    Interrupted,
+    LimitReached,
+}
+
+/// Allowlisted `ptah_get_run` document. Session and workspace are request-scoped
+/// and are never deserialized from the remote body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PublicRunV1 {
+    pub schema_version: String,
+    pub run_id: String,
+    pub state: PublicRunState,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(default)]
+    pub queue_position: Option<u64>,
+    #[serde(default)]
+    pub event_start_seq: Option<u64>,
+    #[serde(default)]
+    pub event_end_seq: Option<u64>,
+    pub change_count: u64,
+    pub test_count: u64,
+    pub permission_requested_count: u64,
+    pub permission_granted_count: u64,
+    pub permission_denied_count: u64,
+    pub usage_prompt_tokens: u64,
+    pub usage_completion_tokens: u64,
+    pub usage_total_tokens: u64,
+    pub usage_request_count: u64,
+    pub usage_complete: bool,
+    pub usage_pending_request_count: u64,
+    #[serde(default)]
+    pub progress_round: Option<u32>,
+    #[serde(default)]
+    pub progress_max_rounds: Option<u32>,
+}
+
+/// Allowlisted `ptah_list_runs` envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PublicRunListV1 {
+    pub schema_version: String,
+    pub runs: Vec<PublicRunV1>,
+}
+
+/// Allowlisted `ptah_get_progress` document. Nested `progress` objects are rejected.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PublicRunProgressV1 {
+    pub schema_version: String,
+    pub run_id: String,
+    pub state: PublicRunState,
+    pub busy: bool,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(default)]
+    pub queue_position: Option<u64>,
+    #[serde(default)]
+    pub event_start_seq: Option<u64>,
+    #[serde(default)]
+    pub event_end_seq: Option<u64>,
+    #[serde(default)]
+    pub progress_round: Option<u32>,
+    #[serde(default)]
+    pub progress_max_rounds: Option<u32>,
+}
+
+/// Allowlisted `ptah_get_handoff` document. Prompt, response, and path aggregates
+/// are rejected.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PublicRunHandoffV1 {
+    pub schema_version: String,
+    pub run_id: String,
+    pub state: PublicRunState,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(default)]
+    pub event_start_seq: Option<u64>,
+    #[serde(default)]
+    pub event_end_seq: Option<u64>,
+    pub change_count: u64,
+    pub test_count: u64,
+    pub usage_prompt_tokens: u64,
+    pub usage_completion_tokens: u64,
+    pub usage_total_tokens: u64,
+    pub usage_request_count: u64,
+    pub usage_complete: bool,
+    pub usage_pending_request_count: u64,
 }
 
 /// Occupancy plus persistence/supervisor health flags. Supervisor objects are dropped.
@@ -463,4 +574,58 @@ fn json_string(value: Option<&Value>) -> Option<String> {
         Some(other) if !other.is_null() => Some(other.to_string()),
         _ => None,
     }
+}
+
+/// Parse one `ptah_get_run` `grokptah.public-run.v1` document.
+///
+/// Used by [`crate::ReadObservatory::observe_public_run`]. Unknown version/field
+/// maps to [`SdkError::Internal`] without forwarding serde payloads.
+pub fn parse_public_run_v1(value: &Value) -> Result<PublicRunV1, SdkError> {
+    parse_versioned(value, |row: &PublicRunV1| row.schema_version.as_str())
+}
+
+/// Parse one `ptah_list_runs` `grokptah.public-run.v1` envelope.
+///
+/// Used by [`crate::ReadObservatory::list_public_runs`].
+pub fn parse_public_run_list_v1(value: &Value) -> Result<PublicRunListV1, SdkError> {
+    let parsed = parse_versioned(value, |row: &PublicRunListV1| row.schema_version.as_str())?;
+    for run in &parsed.runs {
+        require_known_version(&run.schema_version)?;
+    }
+    Ok(parsed)
+}
+
+/// Parse one `ptah_get_progress` `grokptah.public-run.v1` document.
+///
+/// Used by [`crate::ReadObservatory::observe_public_progress`].
+pub fn parse_public_run_progress_v1(value: &Value) -> Result<PublicRunProgressV1, SdkError> {
+    parse_versioned(value, |row: &PublicRunProgressV1| {
+        row.schema_version.as_str()
+    })
+}
+
+/// Parse one `ptah_get_handoff` `grokptah.public-run.v1` document.
+///
+/// Used by [`crate::ReadObservatory::observe_public_handoff`].
+pub fn parse_public_run_handoff_v1(value: &Value) -> Result<PublicRunHandoffV1, SdkError> {
+    parse_versioned(value, |row: &PublicRunHandoffV1| {
+        row.schema_version.as_str()
+    })
+}
+
+fn parse_versioned<T, F>(value: &Value, version: F) -> Result<T, SdkError>
+where
+    T: DeserializeOwned,
+    F: FnOnce(&T) -> &str,
+{
+    let parsed = T::deserialize(value).map_err(|_| SdkError::Internal)?;
+    require_known_version(version(&parsed))?;
+    Ok(parsed)
+}
+
+fn require_known_version(version: &str) -> Result<(), SdkError> {
+    if version != PUBLIC_RUN_SCHEMA_VERSION {
+        return Err(SdkError::Internal);
+    }
+    Ok(())
 }
