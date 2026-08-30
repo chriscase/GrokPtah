@@ -437,7 +437,7 @@ const _: () = assert!(MAX_CONSECUTIVE_TRUE_NOOPS < NUDGE_AFTER_IDENTICAL_TOOL_CA
 /// retain their exact tool-and-arguments signature.
 #[derive(Default)]
 pub(crate) struct IdenticalToolCallRun {
-    last_signature_hash: Option<u64>,
+    last_progress_digest: Option<[u8; 32]>,
     tool_name: String,
     run_len: u32,
     is_true_noop_run: bool,
@@ -445,22 +445,22 @@ pub(crate) struct IdenticalToolCallRun {
 }
 
 impl IdenticalToolCallRun {
-    pub(crate) fn observe(&mut self, signature: &str, tool_name: &str, is_true_noop: bool) -> u32 {
-        use std::hash::{Hash, Hasher};
-
-        let signature = if is_true_noop {
-            "\0true_noop"
-        } else {
-            signature
-        };
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        signature.hash(&mut hasher);
-        let hash = hasher.finish();
-        if self.last_signature_hash == Some(hash) {
+    /// Observe a tool step using the complete, unclipped result. The result is
+    /// hashed in memory and is not retained by this ledger, so output changes
+    /// past the wire display cap still count as progress.
+    pub(crate) fn observe_with_outputs(
+        &mut self,
+        signature: &str,
+        tool_name: &str,
+        is_true_noop: bool,
+        raw_outputs: &[String],
+    ) -> u32 {
+        let digest = progress_digest(signature, raw_outputs, is_true_noop);
+        if self.last_progress_digest == Some(digest) {
             self.run_len += 1;
         } else {
             self.run_len = 1;
-            self.last_signature_hash = Some(hash);
+            self.last_progress_digest = Some(digest);
             self.is_true_noop_run = is_true_noop;
             self.nudged = false;
         }
@@ -492,6 +492,25 @@ impl IdenticalToolCallRun {
         (self.run_len >= threshold)
             .then(|| (self.run_len, self.tool_name.clone(), self.is_true_noop_run))
     }
+}
+
+fn progress_digest(signature: &str, raw_outputs: &[String], is_true_noop: bool) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    if is_true_noop {
+        // True no-ops remain broader than identical actions: changing their
+        // arguments or returned text must not evade the four-call stop.
+        hasher.update(b"grokptah-stationarity\0true-noop");
+    } else {
+        hasher.update(b"grokptah-stationarity\0action\0");
+        hasher.update((signature.len() as u64).to_be_bytes());
+        hasher.update(signature.as_bytes());
+        for output in raw_outputs {
+            hasher.update(b"\0output\0");
+            hasher.update((output.len() as u64).to_be_bytes());
+            hasher.update(output.as_bytes());
+        }
+    }
+    hasher.finalize().into()
 }
 
 fn command_is_true(command: &str) -> bool {
@@ -4259,9 +4278,9 @@ test result: FAILED. 0 passed; 3 failed; 0 ignored
     #[test]
     fn action_stationarity_resets_on_a_different_signature() {
         let mut run = IdenticalToolCallRun::default();
-        assert_eq!(run.observe("a", "read_file", false), 1);
-        assert_eq!(run.observe("a", "read_file", false), 2);
-        assert_eq!(run.observe("b", "read_file", false), 1);
+        assert_eq!(run.observe_with_outputs("a", "read_file", false, &[]), 1);
+        assert_eq!(run.observe_with_outputs("a", "read_file", false, &[]), 2);
+        assert_eq!(run.observe_with_outputs("b", "read_file", false, &[]), 1);
         assert!(run.stop_info().is_none());
     }
 
@@ -4269,10 +4288,16 @@ test result: FAILED. 0 passed; 3 failed; 0 ignored
     fn true_noops_chain_across_arguments_and_stop_at_four() {
         let mut run = IdenticalToolCallRun::default();
         for i in 1..=4 {
-            assert_eq!(run.observe(&format!("sig{i}"), "run_terminal_cmd", true), i);
+            assert_eq!(
+                run.observe_with_outputs(&format!("sig{i}"), "run_terminal_cmd", true, &[]),
+                i
+            );
         }
         assert_eq!(run.stop_info(), Some((4, "run_terminal_cmd".into(), true)));
-        assert_eq!(run.observe("different", "run_terminal_cmd", false), 1);
+        assert_eq!(
+            run.observe_with_outputs("different", "run_terminal_cmd", false, &[]),
+            1
+        );
         assert!(run.stop_info().is_none());
     }
 
@@ -4296,14 +4321,85 @@ test result: FAILED. 0 passed; 3 failed; 0 ignored
     fn identical_non_noop_run_nudges_once_at_eight() {
         let mut run = IdenticalToolCallRun::default();
         for i in 1..8 {
-            assert_eq!(run.observe("poll", "get_task_output", false), i);
+            assert_eq!(
+                run.observe_with_outputs("poll", "get_task_output", false, &[]),
+                i
+            );
             assert!(!run.take_nudge());
         }
-        assert_eq!(run.observe("poll", "get_task_output", false), 8);
+        assert_eq!(
+            run.observe_with_outputs("poll", "get_task_output", false, &[]),
+            8
+        );
         assert!(run.take_nudge());
         assert!(!run.take_nudge());
-        assert_eq!(run.observe("poll", "get_task_output", false), 9);
+        assert_eq!(
+            run.observe_with_outputs("poll", "get_task_output", false, &[]),
+            9
+        );
         assert!(!run.take_nudge());
+    }
+
+    #[test]
+    fn raw_output_suffix_beyond_wire_limit_resets_stationarity() {
+        let mut run = IdenticalToolCallRun::default();
+        let mut first = "same visible prefix".repeat(2_000);
+        first.push('a');
+        let mut second = "same visible prefix".repeat(2_000);
+        second.push('b');
+        assert!(first.len() > 24_000);
+        assert_eq!(
+            run.observe_with_outputs("poll", "get_task_output", false, &[first]),
+            1
+        );
+        assert_eq!(
+            run.observe_with_outputs("poll", "get_task_output", false, &[second]),
+            1
+        );
+        assert!(run.stop_info().is_none());
+    }
+
+    #[test]
+    fn frozen_raw_output_stops_at_the_existing_identical_threshold() {
+        let mut run = IdenticalToolCallRun::default();
+        let output = "unchanged output".to_string();
+        for i in 1..=MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS {
+            assert_eq!(
+                run.observe_with_outputs(
+                    "poll",
+                    "get_task_output",
+                    false,
+                    std::slice::from_ref(&output),
+                ),
+                i
+            );
+        }
+        assert_eq!(
+            run.stop_info(),
+            Some((
+                MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS,
+                "get_task_output".into(),
+                false,
+            ))
+        );
+    }
+
+    #[test]
+    fn true_noop_threshold_ignores_raw_output_changes() {
+        let mut run = IdenticalToolCallRun::default();
+        for i in 1..=MAX_CONSECUTIVE_TRUE_NOOPS {
+            let output = format!("different output {i}");
+            assert_eq!(
+                run.observe_with_outputs(
+                    &format!("different signature {i}"),
+                    "run_terminal_cmd",
+                    true,
+                    std::slice::from_ref(&output),
+                ),
+                i
+            );
+        }
+        assert_eq!(run.stop_info(), Some((4, "run_terminal_cmd".into(), true)));
     }
 
     #[test]

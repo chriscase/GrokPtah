@@ -9310,6 +9310,7 @@ impl AgentHostHandle {
                     }));
 
                     let mut edited_while_needs_reverify = false;
+                    let mut raw_tool_outputs = Vec::with_capacity(tool_calls.len());
                     for tc in &tool_calls {
                         if cancel.is_cancelled() {
                             break;
@@ -9324,6 +9325,7 @@ impl AgentHostHandle {
                             had_edit_since_cargo_fail,
                         ) {
                             let content = post_cargo_failure_skip_message(&tc.name);
+                            raw_tool_outputs.push(content.clone());
                             messages.push(serde_json::json!({
                                 "role": "tool",
                                 "tool_call_id": tc.id,
@@ -9353,6 +9355,7 @@ impl AgentHostHandle {
                             Ok(s) => s.clone(),
                             Err(e) => format!("ERROR: {e}"),
                         };
+                        raw_tool_outputs.push(content.clone());
                         // Cap tool output size for the wire
                         let content = if content.len() > 24_000 {
                             let orig_len = content.len();
@@ -9467,6 +9470,7 @@ impl AgentHostHandle {
                             Ok(s) => s.clone(),
                             Err(e) => format!("ERROR: {e}"),
                         };
+                        raw_tool_outputs.push(content.clone());
                         let content = if content.len() > 24_000 {
                             let orig_len = content.len();
                             format!(
@@ -9519,10 +9523,11 @@ impl AgentHostHandle {
                         .first()
                         .map(|tool_call| tool_call.name.as_str())
                         .unwrap_or("");
-                    identical_tool_calls.observe(
+                    identical_tool_calls.observe_with_outputs(
                         &signature,
                         tool_name,
                         is_true_noop_tool_step(&tool_calls),
+                        &raw_tool_outputs,
                     );
                     // Usage belongs to the model boundary that produced these
                     // calls. Let every tool in that accepted response settle,
