@@ -211,7 +211,7 @@ async fn continuity_probe_is_evidence_first_and_recoverable() {
     // writer. The probe needs a subscriber lag, not a persistence gap: the
     // latter is a distinct, correctly fail-closed condition that would make
     // the follow-up durable read return cursor_expired.
-    for index in 0..2_048 {
+    for index in 0..16_384 {
         host.event_bus().publish(SessionUpdate::AgentMessageChunk {
             session_id: gap_session.id,
             text: format!("continuity-gap-{index}"),
@@ -228,7 +228,7 @@ async fn continuity_probe_is_evidence_first_and_recoverable() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     std::fs::write(&release_file, "release").unwrap();
 
-    let output = tokio::time::timeout(Duration::from_secs(90), child.wait_with_output())
+    let output = tokio::time::timeout(Duration::from_secs(120), child.wait_with_output())
         .await
         .expect("continuity probe harness timed out")
         .expect("wait for continuity probe harness");

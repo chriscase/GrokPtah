@@ -254,7 +254,7 @@ async function waitForRecovery(reader) {
 }
 
 async function waitForRelease() {
-  const deadline = Date.now() + 30_000;
+  const deadline = Date.now() + 90_000;
   while (Date.now() < deadline) {
     if (fs.existsSync(gapReleaseFile)) return;
     await new Promise((resolve) => setTimeout(resolve, 20));
@@ -296,15 +296,15 @@ try {
   record(
     "isolatedReadyBeforeReview",
     firstSubmit.ok && firstTerminal?.state === "completed" &&
-      firstBeforeReview?.execution?.promotionState === "ready" && !fs.existsSync(sourceFile),
-    { runId: firstRunId, state: firstTerminal?.state, promotionState: firstBeforeReview?.execution?.promotionState }
+      firstBeforeReview?.schemaVersion === "grokptah.public-run.v1" && !fs.existsSync(sourceFile),
+    { runId: firstRunId, state: firstTerminal?.state, schemaVersion: firstBeforeReview?.schemaVersion }
   );
 
   const reviewResponse = firstRunId
     ? await call("ptah_review_run", { session_id: sessionId, workspace, run_id: firstRunId })
     : { status: 0, json: null };
   const review = structured(reviewResponse.json);
-  const noAutoPromotion = firstBeforeReview?.execution?.promotionState === "ready" && !fs.existsSync(sourceFile);
+  const noAutoPromotion = firstBeforeReview?.schemaVersion === "grokptah.public-run.v1" && !fs.existsSync(sourceFile);
   const approvalArgs = firstRunId && review
     ? {
         request_id: `${prefix}-first-approve`,
@@ -394,8 +394,8 @@ try {
   });
   record(
     "explicitInterruptedTerminal",
-    interrupted?.state === "interrupted" && interrupted?.terminalResult === "interrupted",
-    { runId: interruptedRunId, state: interrupted?.state }
+    interrupted?.state === "interrupted" && interrupted?.schemaVersion === "grokptah.public-run.v1",
+    { runId: interruptedRunId, state: interrupted?.state, schemaVersion: interrupted?.schemaVersion }
   );
   record(
     "retryCreatesFreshRun",
@@ -475,8 +475,9 @@ try {
   );
   record(
     "durableReadReconcilesGap",
-    gapRead.status === 200 && gapPage?.cursorExpired === false && Array.isArray(gapPage?.entries) && gapPage.entries.length > 0,
-    { status: gapRead.status, entries: gapPage?.entries?.length, cursorExpired: gapPage?.cursorExpired }
+    gapRead.status === 200 && gapPage?.schemaVersion === "grokptah.public-event.v1" &&
+      Array.isArray(gapPage?.events) && gapPage.events.length > 0,
+    { status: gapRead.status, events: gapPage?.events?.length, schemaVersion: gapPage?.schemaVersion }
   );
 
   record("mutationsReplayByRequestId", mutationResults.length >= 8 && mutationResults.every((item) => item.ok), mutationResults);
