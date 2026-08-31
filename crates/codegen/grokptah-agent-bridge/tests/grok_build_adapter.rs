@@ -263,6 +263,12 @@ for arg in "$@"; do
 done
 if [ -n "$session_id" ] && [ "$behavior" != 'complete-no-session' ]; then
   mkdir -p "$GROK_HOME/sessions/workspace/$session_id"
+  if [ "$behavior" = 'complete-root-index' ]; then
+    printf 'bounded index fixture\n' > "$GROK_HOME/sessions/session_search.sqlite"
+  fi
+  if [ "$behavior" = 'complete-unknown-root-file' ]; then
+    printf 'unknown surface\n' > "$GROK_HOME/sessions/future-index"
+  fi
   printf '{"method":"session/update","params":{"_meta":{},"sessionId":"%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"bounded advisory summary\\nGROK_BUILD_VERDICT=clean"}}},"timestamp":"2026-08-31T00:00:00Z"}\n' "$session_id" > "$GROK_HOME/sessions/workspace/$session_id/updates.jsonl"
   printf '{"method":"_x.ai/session/update","params":{"_meta":{},"sessionId":"%s","update":{"sessionUpdate":"turn_completed","stop_reason":"end_turn"}},"timestamp":"2026-08-31T00:00:01Z"}\n' "$session_id" >> "$GROK_HOME/sessions/workspace/$session_id/updates.jsonl"
   if [ "$behavior" = 'complete-bad-session' ]; then
@@ -308,7 +314,7 @@ if [ -n "$session_id" ] && [ "$behavior" != 'complete-no-session' ]; then
   fi
 fi
 case "$behavior" in
-  complete|complete-bad-session|complete-terminal-first|complete-empty-chunk|complete-mismatched-summary|complete-prefixed-summary|complete-duplicate-terminal|complete-integer-timestamp|complete-invalid-timestamp|complete-tool-transcript)
+  complete|complete-bad-session|complete-terminal-first|complete-empty-chunk|complete-mismatched-summary|complete-prefixed-summary|complete-duplicate-terminal|complete-integer-timestamp|complete-invalid-timestamp|complete-tool-transcript|complete-root-index|complete-unknown-root-file)
     printf '{"text":"bounded advisory summary\\nGROK_BUILD_VERDICT=clean","stopReason":"end_turn","sessionId":"%s","requestId":"11111111-1111-4111-8111-111111111111","thought":"","usage":{},"num_turns":1,"total_cost_usd":0.0,"total_cost_usd_ticks":0,"modelUsage":{}}\n' "$session_id"
     exit 0
     ;;
@@ -864,6 +870,7 @@ async fn terminal_marker_requires_summary_and_retained_session() {
         "complete-prefixed-summary",
         "complete-duplicate-terminal",
         "complete-invalid-timestamp",
+        "complete-unknown-root-file",
     ] {
         let fx = Fixture::new();
         fx.set_behavior(behavior);
@@ -977,4 +984,20 @@ async fn tool_using_transcript_binds_every_ordered_agent_chunk_to_stdout() {
             .summary(),
         "bounded advisory summary\nGROK_BUILD_VERDICT=clean"
     );
+}
+
+#[tokio::test]
+async fn current_session_search_index_is_allowed_but_unknown_root_files_fail_closed() {
+    let fx = Fixture::new();
+    fx.set_behavior("complete-root-index");
+    let outcome = launch_grok_build(
+        &fx.launch(GrokBuildMutationMode::IsolatedReview, 60_000),
+        &fx.host(),
+        &fx.resolver(),
+        CancellationToken::new(),
+    )
+    .await
+    .expect("known Grok session index");
+    assert_eq!(outcome.result().state, GrokBuildRunState::CompleteAdvisory);
+    assert!(outcome.advisory_evidence().is_some());
 }

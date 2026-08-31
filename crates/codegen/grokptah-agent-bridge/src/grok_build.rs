@@ -1467,7 +1467,11 @@ fn retained_session_evidence(
     let mut matches = Vec::new();
     for workspace in std::fs::read_dir(root).ok()? {
         let workspace = workspace.ok()?;
-        if !workspace.file_type().ok()?.is_dir() {
+        let file_type = workspace.file_type().ok()?;
+        if file_type.is_file() && allowed_session_root_metadata(&workspace.file_name()) {
+            continue;
+        }
+        if !file_type.is_dir() {
             return None;
         }
         let candidate = workspace.path().join(session_id);
@@ -1559,6 +1563,13 @@ fn retained_session_evidence(
     }
     (saw_terminal && saw_agent_message && agent_message_bytes == expected_summary.as_bytes())
         .then_some(bytes)
+}
+
+fn allowed_session_root_metadata(name: &OsStr) -> bool {
+    matches!(
+        name.to_str(),
+        Some("session_search.sqlite" | "session_search.sqlite-shm" | "session_search.sqlite-wal")
+    )
 }
 
 fn valid_session_timestamp(value: &serde_json::Value) -> bool {
