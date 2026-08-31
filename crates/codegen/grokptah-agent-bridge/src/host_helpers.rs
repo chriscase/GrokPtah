@@ -525,33 +525,89 @@ const TOOL_OUTPUT_INTEGRITY_MARKER: &str = "[grokptah-output-integrity-v1";
 const NORMALIZER_HOLD_BYTES: usize = 96;
 const NORMALIZER_CHUNK_BYTES: usize = 4_096;
 
+const STATIONARITY_TIME_KEYS: &str = "timestamp|created_at|createdAt|updated_at|updatedAt|started_at|startedAt|finished_at|finishedAt|observed_at|observedAt|wall_clock|wallClock";
+const STATIONARITY_PID_KEYS: &str = "pid|process_id|processId|parent_pid|parentPid";
+const STATIONARITY_ID_KEYS: &str = "request_id|request-id|requestId|progress_id|progress-id|progressId|trace_id|trace-id|traceId|span_id|span-id|spanId|observation_id|observation-id|observationId|tool_call_id|tool-call-id|toolCallId|call_id|call-id|callId|event_id|event-id|eventId";
+const STATIONARITY_HTTP_DATE: &str = r#"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),\s+[0-9]{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+[0-9]{4}\s+[0-9]{2}:[0-9]{2}:[0-9]{2}\s+GMT"#;
+const STATIONARITY_TIME_TOKEN: &str = r#"[0-9A-Za-z:+._-]+"#;
+const STATIONARITY_BARE_UUID: &str = r#"[0-9a-f-]{16,}"#;
+
+fn labelled_key_pattern(keys: &str) -> String {
+    format!(r#"(?:\"(?:{keys})\"|\b(?:{keys})\b)"#)
+}
+
+fn timestamp_regex() -> &'static Regex {
+    static TIMESTAMP: OnceLock<Regex> = OnceLock::new();
+    TIMESTAMP.get_or_init(|| {
+        let keys = labelled_key_pattern(STATIONARITY_TIME_KEYS);
+        Regex::new(&format!(
+            r#"(?i)({keys}\s*[:=]\s*)(?:{http_date}|\"[^\"]*\"|'[^']*'|{time_token})"#,
+            http_date = STATIONARITY_HTTP_DATE,
+            time_token = STATIONARITY_TIME_TOKEN,
+        ))
+        .expect("timestamp normalizer regex is valid")
+    })
+}
+
+fn pid_regex() -> &'static Regex {
+    static PID: OnceLock<Regex> = OnceLock::new();
+    PID.get_or_init(|| {
+        let keys = labelled_key_pattern(STATIONARITY_PID_KEYS);
+        Regex::new(&format!(r#"(?i)({keys}\s*[:=]\s*)\d+"#)).expect("pid normalizer regex is valid")
+    })
+}
+
+fn identifier_regex() -> &'static Regex {
+    static IDENTIFIER: OnceLock<Regex> = OnceLock::new();
+    IDENTIFIER.get_or_init(|| {
+        let keys = labelled_key_pattern(STATIONARITY_ID_KEYS);
+        Regex::new(&format!(
+            r#"(?i)({keys}\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|{uuid})"#,
+            uuid = STATIONARITY_BARE_UUID,
+        ))
+        .expect("identifier normalizer regex is valid")
+    })
+}
+
+fn volatile_label_regex() -> &'static Regex {
+    static LABEL: OnceLock<Regex> = OnceLock::new();
+    LABEL.get_or_init(|| {
+        let keys = labelled_key_pattern(&format!(
+            "{STATIONARITY_TIME_KEYS}|{STATIONARITY_PID_KEYS}|{STATIONARITY_ID_KEYS}"
+        ));
+        Regex::new(&format!(r#"(?i){keys}\s*[:=]"#)).expect("volatile label regex is valid")
+    })
+}
+
 /// Replace only explicitly labelled runtime metadata.  Bare numbers, hashes,
 /// paths, and user content are intentionally left untouched.
 fn normalize_stationarity_text(input: &str) -> String {
-    static TIMESTAMP: OnceLock<Regex> = OnceLock::new();
-    static PID: OnceLock<Regex> = OnceLock::new();
-    static IDENTIFIER: OnceLock<Regex> = OnceLock::new();
-    let timestamp = TIMESTAMP.get_or_init(|| {
-        Regex::new(
-            r#"(?i)(\b(?:timestamp|created_at|updated_at|started_at|finished_at|observed_at|wall_clock)\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,}\]]+)"#,
-        )
-        .expect("timestamp normalizer regex is valid")
-    });
-    let pid = PID.get_or_init(|| {
-        Regex::new(r#"(?i)(\b(?:pid|process_id|parent_pid)\s*[:=]\s*)\d+"#)
-            .expect("pid normalizer regex is valid")
-    });
-    let identifier = IDENTIFIER.get_or_init(|| {
-        Regex::new(
-            r#"(?i)(\b(?:request_id|request-id|progress_id|progress-id|trace_id|trace-id|span_id|span-id|observation_id|observation-id|tool_call_id|tool-call-id|call_id|call-id|event_id|event-id)\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[0-9a-f-]{16,})"#,
-        )
-        .expect("identifier normalizer regex is valid")
-    });
-    let normalized = timestamp.replace_all(input, "$1<volatile-time>");
-    let normalized = pid.replace_all(&normalized, "$1<volatile-pid>");
-    identifier
+    let normalized = timestamp_regex().replace_all(input, "$1<volatile-time>");
+    let normalized = pid_regex().replace_all(&normalized, "$1<volatile-pid>");
+    identifier_regex()
         .replace_all(&normalized, "$1<volatile-id>")
         .into_owned()
+}
+
+fn stationarity_commit_split(pending: &str) -> usize {
+    let split = crate::textutil::truncate_at_char_boundary(pending, NORMALIZER_CHUNK_BYTES).len();
+    if split == 0 || split >= pending.len() {
+        return split;
+    }
+    let window_start = split.saturating_sub(NORMALIZER_HOLD_BYTES);
+    let mut retracted = split;
+    for mat in volatile_label_regex().find_iter(&pending[window_start..]) {
+        let abs_start = window_start + mat.start();
+        if abs_start < split {
+            retracted = abs_start;
+            break;
+        }
+    }
+    if retracted == 0 {
+        split
+    } else {
+        retracted
+    }
 }
 
 /// Streaming normalizer used by the shell path so full output is hashed with
@@ -575,9 +631,10 @@ impl StationarityNormalizer {
     pub(crate) fn feed(&mut self, chunk: &str) {
         self.pending.push_str(chunk);
         while self.pending.len() > NORMALIZER_HOLD_BYTES + NORMALIZER_CHUNK_BYTES {
-            let split =
-                crate::textutil::truncate_at_char_boundary(&self.pending, NORMALIZER_CHUNK_BYTES)
-                    .len();
+            let split = stationarity_commit_split(&self.pending);
+            if split == 0 {
+                break;
+            }
             let prefix = self.pending[..split].to_owned();
             self.pending.drain(..split);
             self.hasher
@@ -621,7 +678,7 @@ fn stationarity_output_projection(output: &str) -> String {
     if bytes.is_empty() || stable.len() != 64 || !stable.chars().all(|ch| ch.is_ascii_hexdigit()) {
         return normalize_stationarity_text(output);
     }
-    format!("integrity bytes={bytes} stable_sha256={stable}")
+    format!("integrity bytes=<volatile-bytes> stable_sha256={stable}")
 }
 
 /// Return a bounded tool projection that carries a stable identity for the
@@ -4723,6 +4780,271 @@ test result: FAILED. 0 passed; 3 failed; 0 ignored
         assert_eq!(
             run.observe_with_outputs("poll", "get_task_output", false, &[third]),
             1
+        );
+    }
+
+    fn stationarity_digest(content: &str) -> [u8; 32] {
+        let mut normalizer = StationarityNormalizer::default();
+        normalizer.feed(content);
+        normalizer.finish()
+    }
+
+    fn stationarity_digest_chunked(content: &str, chunk_bytes: usize) -> [u8; 32] {
+        let mut normalizer = StationarityNormalizer::default();
+        let mut rest = content;
+        while !rest.is_empty() {
+            let n = crate::textutil::truncate_at_char_boundary(rest, chunk_bytes)
+                .len()
+                .max(1)
+                .min(rest.len());
+            normalizer.feed(&rest[..n]);
+            rest = &rest[n..];
+        }
+        normalizer.finish()
+    }
+
+    fn observe_poll(run: &mut IdenticalToolCallRun, output: &str) -> u32 {
+        run.observe_with_outputs("poll", "get_task_output", false, &[output.to_string()])
+    }
+
+    #[test]
+    fn unquoted_timestamp_does_not_consume_substantive_semicolon_or_ampersand_tails() {
+        assert_eq!(
+            normalize_stationarity_text("timestamp=2026-08-30T21:00:00Z;result=ok&path=/tmp/a"),
+            "timestamp=<volatile-time>;result=ok&path=/tmp/a"
+        );
+        assert_eq!(
+            normalize_stationarity_text("timestamp=2026-08-30T21:01:00Z;result=ok&path=/tmp/a"),
+            "timestamp=<volatile-time>;result=ok&path=/tmp/a"
+        );
+        assert_ne!(
+            normalize_stationarity_text("timestamp=2026-08-30T21:00:00Z;result=ok&path=/tmp/a"),
+            normalize_stationarity_text(
+                "timestamp=2026-08-30T21:00:00Z;result=changed&path=/tmp/a"
+            )
+        );
+        assert_ne!(
+            normalize_stationarity_text("timestamp=2026-08-30T21:00:00Z&status=idle"),
+            normalize_stationarity_text("timestamp=2026-08-30T21:00:00Z&status=busy")
+        );
+
+        let mut run = IdenticalToolCallRun::default();
+        assert_eq!(
+            observe_poll(
+                &mut run,
+                "timestamp=2026-08-30T21:00:00Z;result=ok&path=/tmp/a"
+            ),
+            1
+        );
+        assert_eq!(
+            observe_poll(
+                &mut run,
+                "timestamp=2026-08-30T21:01:00Z;result=ok&path=/tmp/a"
+            ),
+            2
+        );
+        assert_eq!(
+            observe_poll(
+                &mut run,
+                "timestamp=2026-08-30T21:02:00Z;result=changed&path=/tmp/a"
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn quoted_json_keys_normalize_only_recognized_fields() {
+        assert_eq!(
+            normalize_stationarity_text(
+                r#"{"timestamp":"2026-08-30T21:00:00Z","pid":1201,"request_id":"11111111-1111-1111-1111-111111111111","result":"stable"}"#
+            ),
+            r#"{"timestamp":<volatile-time>,"pid":<volatile-pid>,"request_id":<volatile-id>,"result":"stable"}"#
+        );
+        let mut run = IdenticalToolCallRun::default();
+        assert_eq!(
+            observe_poll(
+                &mut run,
+                r#"{"timestamp":"2026-08-30T21:00:00Z","pid":1201,"request_id":"11111111-1111-1111-1111-111111111111","result":"stable"}"#
+            ),
+            1
+        );
+        assert_eq!(
+            observe_poll(
+                &mut run,
+                r#"{"timestamp":"2026-08-30T21:01:00Z","pid":1202,"request_id":"22222222-2222-2222-2222-222222222222","result":"stable"}"#
+            ),
+            2
+        );
+        assert_eq!(
+            observe_poll(
+                &mut run,
+                r#"{"timestamp":"2026-08-30T21:02:00Z","pid":1203,"request_id":"33333333-3333-3333-3333-333333333333","result":"changed"}"#
+            ),
+            1
+        );
+        assert_ne!(
+            normalize_stationarity_text(r#"{"timestamp_extra":"2026-08-30T21:00:00Z"}"#),
+            normalize_stationarity_text(r#"{"timestamp_extra":"2026-08-30T21:01:00Z"}"#)
+        );
+    }
+
+    #[test]
+    fn camelcase_progress_http_date_and_bare_uuid_follow_existing_labels() {
+        assert_eq!(
+            normalize_stationarity_text(
+                "createdAt=2026-08-30T21:00:00Z requestId=11111111-1111-1111-1111-111111111111 progressId=aaaa0000-0000-0000-0000-000000000000 processId=1201"
+            ),
+            "createdAt=<volatile-time> requestId=<volatile-id> progressId=<volatile-id> processId=<volatile-pid>"
+        );
+        assert_eq!(
+            normalize_stationarity_text("timestamp: Wed, 21 Oct 2015 07:28:00 GMT result=stable"),
+            "timestamp: <volatile-time> result=stable"
+        );
+        assert_eq!(
+            normalize_stationarity_text(
+                r#"{"timestamp":"Thu, 22 Oct 2015 08:28:00 GMT","result":"stable"}"#
+            ),
+            r#"{"timestamp":<volatile-time>,"result":"stable"}"#
+        );
+
+        let mut run = IdenticalToolCallRun::default();
+        assert_eq!(
+            observe_poll(
+                &mut run,
+                "createdAt=2026-08-30T21:00:00Z requestId=11111111-1111-1111-1111-111111111111 progressId=aaaa0000-0000-0000-0000-000000000000 timestamp: Wed, 21 Oct 2015 07:28:00 GMT result=stable"
+            ),
+            1
+        );
+        assert_eq!(
+            observe_poll(
+                &mut run,
+                "createdAt=2026-08-30T21:01:00Z requestId=22222222-2222-2222-2222-222222222222 progressId=bbbb0000-0000-0000-0000-000000000000 timestamp: Thu, 22 Oct 2015 08:28:00 GMT result=stable"
+            ),
+            2
+        );
+    }
+
+    #[test]
+    fn integrity_projection_keeps_truthful_bytes_but_normalizes_them_in_the_digest() {
+        let first = format!(
+            "timestamp=2026-08-30T21:00:00Z pid=1201 {}A",
+            "x".repeat(30_000)
+        );
+        let second = format!(
+            "timestamp=2026-08-30T21:01:00.000Z pid=1202 {}A",
+            "x".repeat(30_000)
+        );
+        let third = format!(
+            "timestamp=2026-08-30T21:02:00Z pid=1203 {}B",
+            "x".repeat(30_000)
+        );
+        let first = clip_tool_output_for_wire(bounded_tool_output_with_integrity(&first, 32_000));
+        let second = clip_tool_output_for_wire(bounded_tool_output_with_integrity(&second, 32_000));
+        let third = clip_tool_output_for_wire(bounded_tool_output_with_integrity(&third, 32_000));
+        let first_marker = first.lines().next().unwrap();
+        let second_marker = second.lines().next().unwrap();
+        let first_bytes = first_marker
+            .split(" bytes=")
+            .nth(1)
+            .unwrap()
+            .split(' ')
+            .next()
+            .unwrap();
+        let second_bytes = second_marker
+            .split(" bytes=")
+            .nth(1)
+            .unwrap()
+            .split(' ')
+            .next()
+            .unwrap();
+        assert_ne!(first_bytes, second_bytes);
+        assert_ne!(first_marker, second_marker);
+        assert_eq!(
+            stationarity_output_projection(&first),
+            stationarity_output_projection(&second)
+        );
+        assert!(stationarity_output_projection(&first).contains("bytes=<volatile-bytes>"));
+        assert!(!stationarity_output_projection(&first).contains(&format!("bytes={first_bytes}")));
+
+        let mut run = IdenticalToolCallRun::default();
+        assert_eq!(observe_poll(&mut run, &first), 1);
+        assert_eq!(observe_poll(&mut run, &second), 2);
+        assert_eq!(observe_poll(&mut run, &third), 1);
+    }
+
+    #[test]
+    fn chunk_and_hold_boundaries_do_not_bisect_recognized_labels() {
+        let label_one = "timestamp=2026-08-30T21:00:00Z";
+        let label_two = "timestamp=2026-08-30T21:01:00Z";
+        let prefix = "x".repeat(NORMALIZER_CHUNK_BYTES - 6);
+        let suffix = format!(";result=ok{}", "z".repeat(NORMALIZER_HOLD_BYTES + 8));
+        let first = format!("{prefix}{label_one}{suffix}");
+        let second = format!("{prefix}{label_two}{suffix}");
+        let changed = format!(
+            "{prefix}{label_two};result=changed{}",
+            "z".repeat(NORMALIZER_HOLD_BYTES + 8)
+        );
+        assert!(first.len() > NORMALIZER_CHUNK_BYTES + NORMALIZER_HOLD_BYTES);
+        assert_eq!(stationarity_digest(&first), stationarity_digest(&second));
+        assert_eq!(
+            stationarity_digest(&first),
+            stationarity_digest_chunked(&first, 1_024)
+        );
+        assert_eq!(
+            stationarity_digest(&first),
+            stationarity_digest_chunked(&first, NORMALIZER_CHUNK_BYTES)
+        );
+        assert_eq!(
+            stationarity_digest_chunked(&first, NORMALIZER_CHUNK_BYTES),
+            stationarity_digest_chunked(&second, NORMALIZER_CHUNK_BYTES)
+        );
+        assert_ne!(stationarity_digest(&first), stationarity_digest(&changed));
+
+        let hold_prefix = "y".repeat(NORMALIZER_CHUNK_BYTES - NORMALIZER_HOLD_BYTES + 8);
+        let hold_first = format!("{hold_prefix}{label_one}{suffix}");
+        let hold_second = format!("{hold_prefix}{label_two}{suffix}");
+        assert_eq!(
+            stationarity_digest_chunked(&hold_first, NORMALIZER_CHUNK_BYTES),
+            stationarity_digest_chunked(&hold_second, NORMALIZER_CHUNK_BYTES)
+        );
+    }
+
+    #[test]
+    fn unrecognized_fields_and_substantive_command_changes_remain_different() {
+        assert_ne!(
+            normalize_stationarity_text("result=stable nonce=11111111-1111-1111-1111-111111111111"),
+            normalize_stationarity_text("result=stable nonce=22222222-2222-2222-2222-222222222222")
+        );
+        assert_ne!(
+            normalize_stationarity_text("progress=1 timestamp=2026-08-30T21:00:00Z"),
+            normalize_stationarity_text("progress=2 timestamp=2026-08-30T21:01:00Z")
+        );
+        assert_ne!(
+            normalize_stationarity_text("Date: Wed, 21 Oct 2015 07:28:00 GMT result=stable"),
+            normalize_stationarity_text("Date: Thu, 22 Oct 2015 07:28:00 GMT result=stable")
+        );
+
+        let mut run = IdenticalToolCallRun::default();
+        assert_eq!(observe_poll(&mut run, "output=alpha"), 1);
+        assert_eq!(observe_poll(&mut run, "output=beta"), 1);
+        assert_eq!(
+            run.observe_with_outputs(
+                "poll-a",
+                "get_task_output",
+                false,
+                &["output=alpha".to_string()]
+            ),
+            1
+        );
+        assert_eq!(
+            run.observe_with_outputs(
+                "poll-b",
+                "get_task_output",
+                false,
+                &["output=alpha".to_string()]
+            ),
+            1,
+            "a real command/signature change must reset stationarity"
         );
     }
 
