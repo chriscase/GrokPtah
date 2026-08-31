@@ -553,7 +553,8 @@ fn pid_regex() -> &'static Regex {
     static PID: OnceLock<Regex> = OnceLock::new();
     PID.get_or_init(|| {
         let keys = labelled_key_pattern(STATIONARITY_PID_KEYS);
-        Regex::new(&format!(r#"(?i)({keys}\s*[:=]\s*)\d+"#)).expect("pid normalizer regex is valid")
+        Regex::new(&format!(r#"(?i)({keys}\s*[:=]\s*)(?:\d+|"\d+"|'\d+')"#))
+            .expect("pid normalizer regex is valid")
     })
 }
 
@@ -594,11 +595,17 @@ fn stationarity_commit_split(pending: &str) -> usize {
     if split == 0 || split >= pending.len() {
         return split;
     }
-    let window_start = split.saturating_sub(NORMALIZER_HOLD_BYTES);
+    let desired_start = split.saturating_sub(NORMALIZER_HOLD_BYTES);
+    let window_start = crate::textutil::truncate_at_char_boundary(pending, desired_start).len();
+    let context_start = pending[..window_start]
+        .char_indices()
+        .next_back()
+        .map(|(index, _)| index)
+        .unwrap_or(0);
     let mut retracted = split;
-    for mat in volatile_label_regex().find_iter(&pending[window_start..]) {
-        let abs_start = window_start + mat.start();
-        if abs_start < split {
+    for mat in volatile_label_regex().find_iter(&pending[context_start..]) {
+        let abs_start = context_start + mat.start();
+        if abs_start >= window_start && abs_start < split {
             retracted = abs_start;
             break;
         }
@@ -4793,10 +4800,12 @@ test result: FAILED. 0 passed; 3 failed; 0 ignored
         let mut normalizer = StationarityNormalizer::default();
         let mut rest = content;
         while !rest.is_empty() {
-            let n = crate::textutil::truncate_at_char_boundary(rest, chunk_bytes)
-                .len()
-                .max(1)
-                .min(rest.len());
+            let bounded = crate::textutil::truncate_at_char_boundary(rest, chunk_bytes).len();
+            let n = if bounded == 0 {
+                rest.chars().next().unwrap().len_utf8()
+            } else {
+                bounded
+            };
             normalizer.feed(&rest[..n]);
             rest = &rest[n..];
         }
@@ -4856,7 +4865,7 @@ test result: FAILED. 0 passed; 3 failed; 0 ignored
     fn quoted_json_keys_normalize_only_recognized_fields() {
         assert_eq!(
             normalize_stationarity_text(
-                r#"{"timestamp":"2026-08-30T21:00:00Z","pid":1201,"request_id":"11111111-1111-1111-1111-111111111111","result":"stable"}"#
+                r#"{"timestamp":"2026-08-30T21:00:00Z","pid":"1201","request_id":"11111111-1111-1111-1111-111111111111","result":"stable"}"#
             ),
             r#"{"timestamp":<volatile-time>,"pid":<volatile-pid>,"request_id":<volatile-id>,"result":"stable"}"#
         );
@@ -4864,21 +4873,21 @@ test result: FAILED. 0 passed; 3 failed; 0 ignored
         assert_eq!(
             observe_poll(
                 &mut run,
-                r#"{"timestamp":"2026-08-30T21:00:00Z","pid":1201,"request_id":"11111111-1111-1111-1111-111111111111","result":"stable"}"#
+                r#"{"timestamp":"2026-08-30T21:00:00Z","pid":"1201","request_id":"11111111-1111-1111-1111-111111111111","result":"stable"}"#
             ),
             1
         );
         assert_eq!(
             observe_poll(
                 &mut run,
-                r#"{"timestamp":"2026-08-30T21:01:00Z","pid":1202,"request_id":"22222222-2222-2222-2222-222222222222","result":"stable"}"#
+                r#"{"timestamp":"2026-08-30T21:01:00Z","pid":"1202","request_id":"22222222-2222-2222-2222-222222222222","result":"stable"}"#
             ),
             2
         );
         assert_eq!(
             observe_poll(
                 &mut run,
-                r#"{"timestamp":"2026-08-30T21:02:00Z","pid":1203,"request_id":"33333333-3333-3333-3333-333333333333","result":"changed"}"#
+                r#"{"timestamp":"2026-08-30T21:02:00Z","pid":"1203","request_id":"33333333-3333-3333-3333-333333333333","result":"changed"}"#
             ),
             1
         );
@@ -4988,6 +4997,14 @@ test result: FAILED. 0 passed; 3 failed; 0 ignored
         assert_eq!(stationarity_digest(&first), stationarity_digest(&second));
         assert_eq!(
             stationarity_digest(&first),
+            stationarity_digest_chunked(&first, 1)
+        );
+        assert_eq!(
+            stationarity_digest(&first),
+            stationarity_digest_chunked(&first, NORMALIZER_HOLD_BYTES)
+        );
+        assert_eq!(
+            stationarity_digest(&first),
             stationarity_digest_chunked(&first, 1_024)
         );
         assert_eq!(
@@ -5009,6 +5026,50 @@ test result: FAILED. 0 passed; 3 failed; 0 ignored
         assert_eq!(
             stationarity_digest_chunked(&hold_first, NORMALIZER_CHUNK_BYTES),
             stationarity_digest_chunked(&hold_second, NORMALIZER_CHUNK_BYTES)
+        );
+        assert_ne!(
+            stationarity_digest_chunked(&hold_first, NORMALIZER_CHUNK_BYTES),
+            stationarity_digest_chunked(
+                &format!("{hold_prefix}{label_two};result=changed{}", "z".repeat(104)),
+                NORMALIZER_CHUNK_BYTES
+            )
+        );
+    }
+
+    #[test]
+    fn mixed_width_and_false_slice_boundaries_remain_safe_and_substantive() {
+        let mixed_prefix = format!(
+            "{}é{} ",
+            "x".repeat(NORMALIZER_CHUNK_BYTES - NORMALIZER_HOLD_BYTES - 1),
+            "y".repeat(NORMALIZER_HOLD_BYTES - 2)
+        );
+        let mixed_one = format!(
+            "{mixed_prefix}timestamp=2026-08-30T21:00:00Z;result=ok{}",
+            "🙂".repeat(40)
+        );
+        let mixed_two = format!(
+            "{mixed_prefix}timestamp=2026-08-30T21:01:00Z;result=ok{}",
+            "🙂".repeat(40)
+        );
+        assert_eq!(
+            stationarity_digest(&mixed_one),
+            stationarity_digest(&mixed_two)
+        );
+        for chunk in [1, NORMALIZER_HOLD_BYTES, NORMALIZER_CHUNK_BYTES, 4_192] {
+            assert_eq!(
+                stationarity_digest(&mixed_one),
+                stationarity_digest_chunked(&mixed_one, chunk),
+                "mixed-width digest must be chunk invariant at {chunk} bytes"
+            );
+        }
+
+        let fake_prefix = "q".repeat(NORMALIZER_CHUNK_BYTES - 4);
+        let fake_one = format!("{fake_prefix}rapid=1{}", "z".repeat(128));
+        let fake_two = format!("{fake_prefix}rapid=2{}", "z".repeat(128));
+        assert_ne!(
+            stationarity_digest_chunked(&fake_one, NORMALIZER_CHUNK_BYTES),
+            stationarity_digest_chunked(&fake_two, NORMALIZER_CHUNK_BYTES),
+            "a slice boundary must not fabricate a pid label inside rapid"
         );
     }
 
