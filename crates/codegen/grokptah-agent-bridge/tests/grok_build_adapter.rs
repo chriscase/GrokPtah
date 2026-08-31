@@ -251,27 +251,31 @@ for arg in "$@"; do
 done
 if [ -n "$session_id" ] && [ "$behavior" != 'complete-no-session' ]; then
   mkdir -p "$GROK_HOME/sessions/workspace/$session_id"
-  printf '%s\n' '{"event":"retained"}' > "$GROK_HOME/sessions/workspace/$session_id/updates.jsonl"
+  printf '{"method":"session/update","params":{"_meta":{},"sessionId":"%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"bounded advisory summary"}}},"timestamp":"2026-08-31T00:00:00Z"}\n' "$session_id" > "$GROK_HOME/sessions/workspace/$session_id/updates.jsonl"
+  printf '{"method":"_x.ai/session/update","params":{"_meta":{},"sessionId":"%s","update":{"sessionUpdate":"turn_completed","stop_reason":"end_turn"}},"timestamp":"2026-08-31T00:00:01Z"}\n' "$session_id" >> "$GROK_HOME/sessions/workspace/$session_id/updates.jsonl"
+  if [ "$behavior" = 'complete-bad-session' ]; then
+    printf '%s\n' '{"event":"unbound"}' > "$GROK_HOME/sessions/workspace/$session_id/updates.jsonl"
+  fi
 fi
 case "$behavior" in
-  complete)
-    printf '{"text":"bounded advisory summary\\nGROK_BUILD_VERDICT=clean","stopReason":"end_turn","sessionId":"%s","requestId":"request-1"}\n' "$session_id"
+  complete|complete-bad-session)
+    printf '{"text":"bounded advisory summary\\nGROK_BUILD_VERDICT=clean","stopReason":"end_turn","sessionId":"%s","requestId":"11111111-1111-4111-8111-111111111111","thought":"","usage":{},"num_turns":1,"total_cost_usd":0.0,"total_cost_usd_ticks":0,"modelUsage":{}}\n' "$session_id"
     exit 0
     ;;
   complete-no-session)
-    printf '{"text":"bounded advisory summary\\nGROK_BUILD_VERDICT=clean","stopReason":"end_turn","sessionId":"%s","requestId":"request-1"}\n' "$session_id"
+    printf '{"text":"bounded advisory summary\\nGROK_BUILD_VERDICT=clean","stopReason":"end_turn","sessionId":"%s","requestId":"11111111-1111-4111-8111-111111111111","thought":"","usage":{},"num_turns":1,"total_cost_usd":0.0,"total_cost_usd_ticks":0,"modelUsage":{}}\n' "$session_id"
     exit 0
     ;;
   marker-only)
-    printf '{"text":"GROK_BUILD_VERDICT=clean","stopReason":"end_turn","sessionId":"%s","requestId":"request-1"}\n' "$session_id"
+    printf '{"text":"GROK_BUILD_VERDICT=clean","stopReason":"end_turn","sessionId":"%s","requestId":"11111111-1111-4111-8111-111111111111","thought":"","usage":{},"num_turns":1,"total_cost_usd":0.0,"total_cost_usd_ticks":0,"modelUsage":{}}\n' "$session_id"
     exit 0
     ;;
   max-turns)
-    printf '{"text":"partial output","stopReason":"max_turn_requests","sessionId":"%s","requestId":"request-1"}\n' "$session_id"
+    printf '{"text":"partial output","stopReason":"max_turn_requests","sessionId":"%s","requestId":"11111111-1111-4111-8111-111111111111","thought":"","usage":{},"num_turns":8,"total_cost_usd":0.0,"total_cost_usd_ticks":0,"modelUsage":{}}\n' "$session_id"
     exit 0
     ;;
   partial)
-    printf '{"text":"partial output without verdict","stopReason":"end_turn","sessionId":"%s","requestId":"request-1"}\n' "$session_id"
+    printf '{"text":"partial output without verdict","stopReason":"end_turn","sessionId":"%s","requestId":"11111111-1111-4111-8111-111111111111","thought":"","usage":{},"num_turns":1,"total_cost_usd":0.0,"total_cost_usd_ticks":0,"modelUsage":{}}\n' "$session_id"
     exit 0
     ;;
   overflow)
@@ -289,27 +293,27 @@ case "$behavior" in
     printf 'committed mutation\n' > committed-by-child.txt
     /usr/bin/git add committed-by-child.txt
     /usr/bin/git -c user.name=test -c user.email=test@example.com commit -m mutation >/dev/null 2>&1
-    printf '{"text":"bounded advisory summary\\nGROK_BUILD_VERDICT=clean","stopReason":"end_turn","sessionId":"%s","requestId":"request-1"}\n' "$session_id"
+    printf '{"text":"bounded advisory summary\\nGROK_BUILD_VERDICT=clean","stopReason":"end_turn","sessionId":"%s","requestId":"11111111-1111-4111-8111-111111111111","thought":"","usage":{},"num_turns":1,"total_cost_usd":0.0,"total_cost_usd_ticks":0,"modelUsage":{}}\n' "$session_id"
     exit 0
     ;;
   mutate-ref)
     /usr/bin/git checkout --detach >/dev/null 2>&1
-    printf '{"text":"bounded advisory summary\\nGROK_BUILD_VERDICT=clean","stopReason":"end_turn","sessionId":"%s","requestId":"request-1"}\n' "$session_id"
+    printf '{"text":"bounded advisory summary\\nGROK_BUILD_VERDICT=clean","stopReason":"end_turn","sessionId":"%s","requestId":"11111111-1111-4111-8111-111111111111","thought":"","usage":{},"num_turns":1,"total_cost_usd":0.0,"total_cost_usd_ticks":0,"modelUsage":{}}\n' "$session_id"
     exit 0
     ;;
   mutate-ignored)
     mkdir -p ignored
     printf 'hidden mutation\n' > ignored/result
-    printf '{"text":"bounded advisory summary\\nGROK_BUILD_VERDICT=clean","stopReason":"end_turn","sessionId":"%s","requestId":"request-1"}\n' "$session_id"
+    printf '{"text":"bounded advisory summary\\nGROK_BUILD_VERDICT=clean","stopReason":"end_turn","sessionId":"%s","requestId":"11111111-1111-4111-8111-111111111111","thought":"","usage":{},"num_turns":1,"total_cost_usd":0.0,"total_cost_usd_ticks":0,"modelUsage":{}}\n' "$session_id"
     exit 0
     ;;
   mutate)
     printf 'mutated\n' > mutated-by-child.txt
-    printf '{"text":"bounded advisory summary\\nGROK_BUILD_VERDICT=clean","stopReason":"end_turn","sessionId":"%s","requestId":"request-1"}\n' "$session_id"
+    printf '{"text":"bounded advisory summary\\nGROK_BUILD_VERDICT=clean","stopReason":"end_turn","sessionId":"%s","requestId":"11111111-1111-4111-8111-111111111111","thought":"","usage":{},"num_turns":1,"total_cost_usd":0.0,"total_cost_usd_ticks":0,"modelUsage":{}}\n' "$session_id"
     exit 0
     ;;
   leak-secret)
-    printf '{"text":"sk-live-secret-not-real\\nbounded advisory summary\\nGROK_BUILD_VERDICT=clean","stopReason":"end_turn","sessionId":"%s","requestId":"request-1"}\n' "$session_id"
+    printf '{"text":"sk-live-secret-not-real\\nbounded advisory summary\\nGROK_BUILD_VERDICT=clean","stopReason":"end_turn","sessionId":"%s","requestId":"11111111-1111-4111-8111-111111111111","thought":"","usage":{},"num_turns":1,"total_cost_usd":0.0,"total_cost_usd_ticks":0,"modelUsage":{}}\n' "$session_id"
     exit 0
     ;;
 esac
@@ -539,6 +543,28 @@ async fn timeout_kills_process_tree_and_cleans_home() {
 }
 
 #[tokio::test]
+async fn cancellation_kills_process_tree_and_cleans_home() {
+    let fx = Fixture::new();
+    fx.set_behavior("sleep");
+    let cancel = CancellationToken::new();
+    let trigger = cancel.clone();
+    let launch = fx.launch(GrokBuildMutationMode::IsolatedReview, 60_000);
+    let host = fx.host();
+    let resolver = fx.resolver();
+    let ((), outcome) = tokio::join!(
+        async move {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            trigger.cancel();
+        },
+        launch_grok_build(&launch, &host, &resolver, cancel)
+    );
+    let outcome = outcome.expect("cancelled execution returns a closed outcome");
+    assert_eq!(outcome.result().state, GrokBuildRunState::FailedClosed);
+    assert!(outcome.advisory_evidence().is_none());
+    assert!(fx.isolate_children().is_empty());
+}
+
+#[tokio::test]
 async fn spawn_failure_cleans_isolated_home() {
     let fx = Fixture::new();
     let mut host = fx.host();
@@ -620,48 +646,43 @@ async fn secret_redaction_across_debug_and_public_result() {
 }
 
 #[tokio::test]
-async fn read_only_mutation_is_refused() {
+async fn read_only_mode_is_refused_without_observed_sandbox_authority() {
     let fx = Fixture::new();
-    fx.set_behavior("mutate");
-    let outcome = launch_grok_build(
+    fx.set_behavior("complete");
+    let error = launch_grok_build(
         &fx.launch(GrokBuildMutationMode::ReadOnly, 60_000),
         &fx.host(),
         &fx.resolver(),
         CancellationToken::new(),
     )
     .await
-    .expect("readonly");
-    assert_eq!(outcome.result().state, GrokBuildRunState::FailedClosed);
-    assert!(!outcome.receipt().permissions_ok);
-    assert_eq!(
-        outcome.receipt().permission_policy,
-        GrokBuildMutationMode::ReadOnly
-    );
-    let argv = fx.captured_argv();
-    assert!(argv.contains(&"plan".to_string()));
-    assert!(argv.contains(&"grokptah_read_only".to_string()));
-    assert!(!argv.contains(&"acceptEdits".to_string()));
+    .expect_err("read-only lacks an observable sandbox receipt");
+    assert_eq!(error, GrokBuildAdapterError::IsolationFailed);
+    assert!(!fx.fake_dir.path().join("captured-inspect-argv").exists());
+    assert!(!fx.fake_dir.path().join("captured-argv").exists());
+    assert!(fx.isolate_children().is_empty());
 }
 
 #[tokio::test]
-async fn read_only_clean_commit_ref_change_and_ignored_mutation_are_refused() {
+async fn read_only_never_reaches_a_mutating_child() {
     for behavior in ["mutate-commit", "mutate-ref", "mutate-ignored"] {
         let fx = Fixture::new();
         fx.set_behavior(behavior);
-        let outcome = launch_grok_build(
+        let error = launch_grok_build(
             &fx.launch(GrokBuildMutationMode::ReadOnly, 60_000),
             &fx.host(),
             &fx.resolver(),
             CancellationToken::new(),
         )
         .await
-        .expect("readonly result");
+        .expect_err("read-only must fail before spawn");
         assert_eq!(
-            outcome.result().state,
-            GrokBuildRunState::FailedClosed,
-            "behavior {behavior} escaped"
+            error,
+            GrokBuildAdapterError::IsolationFailed,
+            "behavior {behavior} reached the child"
         );
-        assert!(!outcome.receipt().permissions_ok);
+        assert!(!fx.fake_dir.path().join("captured-argv").exists());
+        assert!(fx.isolate_children().is_empty());
     }
 }
 
@@ -700,7 +721,7 @@ async fn partial_and_max_turn_are_nonresumable_and_fail_closed() {
 
 #[tokio::test]
 async fn terminal_marker_requires_summary_and_retained_session() {
-    for behavior in ["marker-only", "complete-no-session"] {
+    for behavior in ["marker-only", "complete-no-session", "complete-bad-session"] {
         let fx = Fixture::new();
         fx.set_behavior(behavior);
         let outcome = launch_grok_build(
@@ -749,6 +770,20 @@ async fn valid_complete_advisory_result() {
     assert_eq!(receipt.cleanup_state, GrokBuildCleanupState::Complete);
     assert!(receipt.credential_present);
     assert!(receipt.permissions_ok);
+    let evidence = outcome
+        .advisory_evidence()
+        .expect("completed advisory retains bounded host evidence");
+    assert_eq!(
+        evidence.cli_request_id(),
+        "11111111-1111-4111-8111-111111111111"
+    );
+    assert_eq!(
+        evidence.summary(),
+        "bounded advisory summary\nGROK_BUILD_VERDICT=clean"
+    );
+    assert!(!evidence.session_updates().is_empty());
+    assert_eq!(evidence.summary_ref(), result.evidence_refs[0]);
+    assert_eq!(evidence.session_ref(), result.evidence_refs[1]);
     result
         .validate_for_launch_and_receipt(&launch, receipt)
         .expect("lifecycle");

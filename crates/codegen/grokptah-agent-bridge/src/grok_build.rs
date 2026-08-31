@@ -39,6 +39,7 @@ const INSPECT_OUTPUT_MAX: usize = 262_144;
 const GIT_OUTPUT_MAX: usize = 32_768;
 const LEASE_FILE_MAX: u64 = 1_048_576;
 const SESSION_EVIDENCE_MAX: u64 = 8_388_608;
+const ADVISORY_SUMMARY_MAX: usize = 262_144;
 const OUTPUT_BYTES_MAX: usize = 4_194_304;
 const HOME_ALIAS_MAX: usize = 64;
 const AUTH_FILE_NAME: &str = "auth.json";
@@ -179,12 +180,72 @@ pub trait CredentialLeaseResolver: Send + Sync {
     fn resolve(&self, lease_id: &str) -> Result<CredentialLeaseHandle, GrokBuildAdapterError>;
 }
 
-/// Validated receipt/result pair. No raw stdout, stderr, paths, accounts,
-/// models, or provider text.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Bounded host-only evidence captured before the disposable Grok home is
+/// removed. This payload is deliberately not serializable and its `Debug`
+/// implementation reveals only sizes and digests. The orchestration owner may
+/// redact and persist the advisory into durable Work; public projections keep
+/// using the opaque refs in [`GrokBuildResult`].
+#[derive(Clone, PartialEq, Eq)]
+pub struct GrokBuildAdvisoryEvidence {
+    cli_request_id: String,
+    summary: String,
+    session_updates: Vec<u8>,
+    summary_ref: String,
+    session_ref: String,
+}
+
+impl fmt::Debug for GrokBuildAdvisoryEvidence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GrokBuildAdvisoryEvidence")
+            .field("cli_request_id_present", &!self.cli_request_id.is_empty())
+            .field("summary_bytes", &self.summary.len())
+            .field("session_bytes", &self.session_updates.len())
+            .field("summary_ref", &self.summary_ref)
+            .field("session_ref", &self.session_ref)
+            .finish()
+    }
+}
+
+impl GrokBuildAdvisoryEvidence {
+    pub fn cli_request_id(&self) -> &str {
+        &self.cli_request_id
+    }
+
+    pub fn summary(&self) -> &str {
+        &self.summary
+    }
+
+    pub fn session_updates(&self) -> &[u8] {
+        &self.session_updates
+    }
+
+    pub fn summary_ref(&self) -> &str {
+        &self.summary_ref
+    }
+
+    pub fn session_ref(&self) -> &str {
+        &self.session_ref
+    }
+}
+
+/// Validated receipt/result pair. Raw process output and credentials are never
+/// retained. A completed advisory carries a bounded host-only evidence payload
+/// whose digests exactly match the public result refs.
+#[derive(Clone, PartialEq, Eq)]
 pub struct GrokBuildAdapterOutcome {
     receipt: GrokBuildIsolationReceipt,
     result: GrokBuildResult,
+    advisory_evidence: Option<GrokBuildAdvisoryEvidence>,
+}
+
+impl fmt::Debug for GrokBuildAdapterOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GrokBuildAdapterOutcome")
+            .field("receipt", &self.receipt)
+            .field("result", &self.result)
+            .field("advisory_evidence", &self.advisory_evidence)
+            .finish()
+    }
 }
 
 impl GrokBuildAdapterOutcome {
@@ -194,6 +255,10 @@ impl GrokBuildAdapterOutcome {
 
     pub fn result(&self) -> &GrokBuildResult {
         &self.result
+    }
+
+    pub fn advisory_evidence(&self) -> Option<&GrokBuildAdvisoryEvidence> {
+        self.advisory_evidence.as_ref()
     }
 }
 
@@ -206,6 +271,14 @@ pub async fn launch_grok_build(
 ) -> Result<GrokBuildAdapterOutcome, GrokBuildAdapterError> {
     launch.validate().map_err(map_contract)?;
     host.validate()?;
+    // Grok 1.0.x accepts named sandbox profiles but `grok inspect --json`
+    // does not expose the active profile, writable roots, or network policy.
+    // Until the host can observe that enforcement, this adapter refuses to
+    // claim read-only execution. IsolatedReview remains available only for a
+    // disposable checkout whose exact mutation is reviewed by Work authority.
+    if launch.mutation_mode == GrokBuildMutationMode::ReadOnly {
+        return Err(GrokBuildAdapterError::IsolationFailed);
+    }
     if host.repository_id != launch.identity.repository_id {
         return Err(GrokBuildAdapterError::IdentityMismatch);
     }
@@ -360,8 +433,34 @@ impl IsolatedHome {
         cleaned
     }
 
-    fn retain_for_termination_investigation(&self) {
-        self.cleanup_on_drop.set(false);
+    /// Revoke path-based access to secrets before any uncertain termination
+    /// result is returned. Truncation affects an already-open descriptor on
+    /// Unix; unlinking prevents a surviving process from reopening it. The
+    /// final directory cleanup remains best-effort and never disables Drop.
+    fn revoke_sensitive_material(&self) -> bool {
+        let mut revoked = true;
+        for name in [AUTH_FILE_NAME, PROMPT_FILE_NAME] {
+            let path = self.path.join(name);
+            let mut options = OpenOptions::new();
+            options.write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+            }
+            let truncated = match options.open(&path) {
+                Ok(file) => file.set_len(0).and_then(|()| file.sync_all()).is_ok(),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+                Err(_) => false,
+            };
+            let unlinked = match std::fs::remove_file(&path) {
+                Ok(()) => true,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+                Err(_) => false,
+            };
+            revoked &= truncated && unlinked;
+        }
+        revoked
     }
 }
 
@@ -473,7 +572,8 @@ async fn verify_isolation(
     )
     .await;
     if harvest.kind == HarvestKind::TerminationUnproven {
-        isolated.retain_for_termination_investigation();
+        let _ = isolated.revoke_sensitive_material();
+        let _ = isolated.cleanup();
         return Err(GrokBuildAdapterError::TerminationUnproven);
     }
     if harvest.kind != HarvestKind::Exited(0) {
@@ -916,7 +1016,8 @@ async fn execute_allowlisted(
     )
     .await;
     if harvest.kind == HarvestKind::TerminationUnproven {
-        isolated.retain_for_termination_investigation();
+        let _ = isolated.revoke_sensitive_material();
+        let _ = isolated.cleanup();
         return Err(GrokBuildAdapterError::TerminationUnproven);
     }
 
@@ -956,7 +1057,7 @@ fn finish_outcome(
     }
 
     let evidence = match state {
-        GrokBuildRunState::CompleteAdvisory => classified.evidence_refs,
+        GrokBuildRunState::CompleteAdvisory => classified.evidence_refs.clone(),
         GrokBuildRunState::NeedsSynthesis => vec!["nonresumable-run".to_string()],
         GrokBuildRunState::FailedClosed | GrokBuildRunState::Running => {
             vec!["closed-run".to_string()]
@@ -990,7 +1091,16 @@ fn finish_outcome(
     result
         .validate_for_launch_and_receipt(launch, &receipt)
         .map_err(map_contract)?;
-    Ok(GrokBuildAdapterOutcome { receipt, result })
+    let advisory_evidence = if state == GrokBuildRunState::CompleteAdvisory {
+        classified.advisory_evidence
+    } else {
+        None
+    };
+    Ok(GrokBuildAdapterOutcome {
+        receipt,
+        result,
+        advisory_evidence,
+    })
 }
 
 struct Harvest {
@@ -1012,6 +1122,7 @@ struct ClassifiedRun {
     state: GrokBuildRunState,
     verdict: Option<GrokBuildVerdict>,
     evidence_refs: Vec<String>,
+    advisory_evidence: Option<GrokBuildAdvisoryEvidence>,
 }
 
 fn classify_harvest(
@@ -1025,6 +1136,7 @@ fn classify_harvest(
             state: GrokBuildRunState::FailedClosed,
             verdict: None,
             evidence_refs: Vec::new(),
+            advisory_evidence: None,
         };
     }
     match harvest.kind {
@@ -1035,6 +1147,7 @@ fn classify_harvest(
             state: GrokBuildRunState::FailedClosed,
             verdict: None,
             evidence_refs: Vec::new(),
+            advisory_evidence: None,
         },
         HarvestKind::Exited(code) => {
             if has_max_turns(&harvest.stdout, &harvest.stderr) {
@@ -1042,6 +1155,7 @@ fn classify_harvest(
                     state: GrokBuildRunState::FailedClosed,
                     verdict: None,
                     evidence_refs: Vec::new(),
+                    advisory_evidence: None,
                 };
             }
             if code != 0 {
@@ -1049,18 +1163,21 @@ fn classify_harvest(
                     state: GrokBuildRunState::FailedClosed,
                     verdict: None,
                     evidence_refs: Vec::new(),
+                    advisory_evidence: None,
                 };
             }
             match verified_advisory_evidence(&harvest.stdout, isolated, expected_session_id) {
-                Some((verdict, evidence_refs)) => ClassifiedRun {
+                Some((verdict, evidence)) => ClassifiedRun {
                     state: GrokBuildRunState::CompleteAdvisory,
                     verdict: Some(verdict),
-                    evidence_refs,
+                    evidence_refs: vec![evidence.summary_ref.clone(), evidence.session_ref.clone()],
+                    advisory_evidence: Some(evidence),
                 },
                 None => ClassifiedRun {
                     state: GrokBuildRunState::FailedClosed,
                     verdict: None,
                     evidence_refs: Vec::new(),
+                    advisory_evidence: None,
                 },
             }
         }
@@ -1071,16 +1188,41 @@ fn verified_advisory_evidence(
     stdout: &[u8],
     isolated: &IsolatedHome,
     expected_session_id: &str,
-) -> Option<(GrokBuildVerdict, Vec<String>)> {
+) -> Option<(GrokBuildVerdict, GrokBuildAdvisoryEvidence)> {
     let value: serde_json::Value = serde_json::from_slice(stdout).ok()?;
     let object = value.as_object()?;
+    require_exact_keys(
+        object,
+        &[
+            "text",
+            "stopReason",
+            "sessionId",
+            "requestId",
+            "thought",
+            "usage",
+            "num_turns",
+            "total_cost_usd",
+            "total_cost_usd_ticks",
+            "modelUsage",
+        ],
+    )
+    .ok()?;
     let text = object.get("text")?.as_str()?;
     if text.trim().is_empty()
+        || text.len() > ADVISORY_SUMMARY_MAX
         || object.get("stopReason")?.as_str()? != "end_turn"
         || object.get("sessionId")?.as_str()? != expected_session_id
     {
         return None;
     }
+    let cli_request_id = object.get("requestId")?.as_str()?;
+    Uuid::parse_str(cli_request_id).ok()?;
+    object.get("thought")?.as_str()?;
+    object.get("usage")?.as_object()?;
+    object.get("num_turns")?.as_u64()?;
+    object.get("total_cost_usd")?.as_f64()?;
+    object.get("total_cost_usd_ticks")?.as_u64()?;
+    object.get("modelUsage")?.as_object()?;
     let verdict = explicit_verdict(text.as_bytes(), &[])?;
     let summary_lines = text
         .as_bytes()
@@ -1094,17 +1236,22 @@ fn verified_advisory_evidence(
     if summary_lines == 0 {
         return None;
     }
-    let session_digest = retained_session_digest(isolated, expected_session_id)?;
+    let session_updates = retained_session_evidence(isolated, expected_session_id)?;
+    let summary_ref = sha256_evidence_ref("summary", text.as_bytes());
+    let session_ref = sha256_evidence_ref("session", &session_updates);
     Some((
         verdict,
-        vec![
-            sha256_evidence_ref("summary", text.as_bytes()),
-            session_digest,
-        ],
+        GrokBuildAdvisoryEvidence {
+            cli_request_id: cli_request_id.to_string(),
+            summary: text.to_string(),
+            session_updates,
+            summary_ref,
+            session_ref,
+        },
     ))
 }
 
-fn retained_session_digest(isolated: &IsolatedHome, session_id: &str) -> Option<String> {
+fn retained_session_evidence(isolated: &IsolatedHome, session_id: &str) -> Option<Vec<u8>> {
     let root = isolated.path.join("sessions");
     let mut matches = Vec::new();
     for workspace in std::fs::read_dir(root).ok()? {
@@ -1142,7 +1289,40 @@ fn retained_session_digest(isolated: &IsolatedHome, session_id: &str) -> Option<
     if bytes.len() as u64 != metadata.len() || bytes.len() as u64 > SESSION_EVIDENCE_MAX {
         return None;
     }
-    Some(sha256_evidence_ref("session", &bytes))
+    let mut saw_agent_message = false;
+    let mut saw_terminal = false;
+    for line in bytes.split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_slice(line).ok()?;
+        let object = value.as_object()?;
+        require_exact_keys(object, &["method", "params", "timestamp"]).ok()?;
+        object.get("timestamp")?.as_str()?;
+        let method = object.get("method")?.as_str()?;
+        if method != "session/update" && method != "_x.ai/session/update" {
+            return None;
+        }
+        let params = object.get("params")?.as_object()?;
+        require_exact_keys(params, &["_meta", "sessionId", "update"]).ok()?;
+        if params.get("sessionId")?.as_str()? != session_id {
+            return None;
+        }
+        let update = params.get("update")?.as_object()?;
+        let update_type = update.get("sessionUpdate")?.as_str()?;
+        if update_type == "agent_message_chunk" {
+            saw_agent_message = true;
+        }
+        if update_type == "turn_completed"
+            && update
+                .get("stop_reason")
+                .and_then(serde_json::Value::as_str)
+                == Some("end_turn")
+        {
+            saw_terminal = true;
+        }
+    }
+    (saw_agent_message && saw_terminal).then_some(bytes)
 }
 
 fn sha256_evidence_ref(kind: &str, bytes: &[u8]) -> String {
@@ -1337,6 +1517,18 @@ async fn harvest_child(
 
 async fn terminate_and_confirm(child: &mut tokio::process::Child) -> bool {
     let process_group = child.id();
+    #[cfg(windows)]
+    let tree_killed = if let Some(pid) = process_group {
+        let mut taskkill = Command::new("taskkill");
+        taskkill.args(["/PID", &pid.to_string(), "/T", "/F"]);
+        crate::spawn_env::scrub_tokio_command(&mut taskkill);
+        matches!(
+            tokio::time::timeout(Duration::from_secs(3), taskkill.status()).await,
+            Ok(Ok(status)) if status.success()
+        )
+    } else {
+        false
+    };
     crate::process_tree::terminate_now(child);
     let leader_reaped = matches!(
         tokio::time::timeout(Duration::from_secs(3), child.wait()).await,
@@ -1350,15 +1542,30 @@ async fn terminate_and_confirm(child: &mut tokio::process::Child) -> bool {
         let Some(process_group) = process_group else {
             return true;
         };
-        let status = unsafe { libc::kill(-(process_group as i32), 0) };
-        if status == 0 {
-            return false;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let status = unsafe { libc::kill(-(process_group as i32), 0) };
+            if status != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
     }
     #[cfg(not(unix))]
     {
-        true
+        #[cfg(windows)]
+        {
+            tree_killed
+        }
+        #[cfg(not(windows))]
+        {
+            // No platform tree-kill receipt is available. Reaping only the
+            // leader is not descendant proof, so retain a fail-closed result.
+            false
+        }
     }
 }
 
@@ -1714,5 +1921,21 @@ mod tests {
                 "{name}"
             );
         }
+
+        let mut open_auth = OpenOptions::new()
+            .read(true)
+            .open(isolated.path.join(AUTH_FILE_NAME))
+            .expect("open auth before revocation");
+        assert!(isolated.revoke_sensitive_material());
+        assert!(!isolated.path.join(AUTH_FILE_NAME).exists());
+        assert!(!isolated.path.join(PROMPT_FILE_NAME).exists());
+        let mut remaining = Vec::new();
+        open_auth
+            .read_to_end(&mut remaining)
+            .expect("read revoked descriptor");
+        assert!(
+            remaining.is_empty(),
+            "open auth descriptor was not truncated"
+        );
     }
 }
