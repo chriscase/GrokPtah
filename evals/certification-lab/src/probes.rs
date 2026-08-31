@@ -431,6 +431,21 @@ pub fn implementation_tools(probe_id: &str) -> Option<&'static [&'static str]> {
             "ptah_list_runs",
             "ptah_get_capacity",
         ]),
+        "always-on-grokbot-lifecycle-v1" => Some(&[
+            "ptah_create_session",
+            "ptah_submit_task",
+            "ptah_cancel",
+            "ptah_get_run",
+            "ptah_list_persistent_agents",
+            "ptah_set_managed_execution",
+            "ptah_create_manager_plan",
+            "ptah_tick_manager_plan",
+            "ptah_get_manager_plan",
+            "ptah_list_work",
+            "ptah_list_runs",
+            "ptah_list_execution_intents",
+            "ptah_get_capacity",
+        ]),
         _ => None,
     }
 }
@@ -474,6 +489,7 @@ pub async fn execute_minimal_probe(
         "native-interruption-retry-policy-v1" | "native-restart-intent-adoption-v1" => {
             Err(DiagnosticCode::ProbeImplementationUnavailable)
         }
+        "always-on-grokbot-lifecycle-v1" => always_on_grokbot(&mut probe).await,
         _ => Err(DiagnosticCode::ProbeImplementationUnavailable),
     };
     match outcome {
@@ -481,8 +497,351 @@ pub async fn execute_minimal_probe(
         Err(code) if code == DiagnosticCode::PermissionCapabilityAbsent => {
             probe.finish(ProbeStatus::Skipped, code)
         }
+        Err(code) if code == DiagnosticCode::RestartControlUnavailable => {
+            probe.finish(ProbeStatus::Skipped, code)
+        }
         Err(code) => probe.finish(ProbeStatus::Failed, code),
     }
+}
+
+async fn always_on_grokbot(probe: &mut ProbeBuilder<'_>) -> Result<(), DiagnosticCode> {
+    use crate::process_service::ProcessService;
+
+    let mut service =
+        ProcessService::spawn().map_err(|_| DiagnosticCode::RestartControlUnavailable)?;
+    let mut client = service
+        .client()
+        .await
+        .map_err(|_| DiagnosticCode::ServiceUnreachable)?;
+    let workspace = service.workspace.display().to_string();
+    let created = probe
+        .call(
+            &mut client,
+            TraceOperationCode::CreateSession,
+            "ptah_create_session",
+            json!({ "workspace": workspace, "title": SAFE_TITLE }),
+            vec![ArgumentFieldCode::Workspace],
+        )
+        .await?;
+    let session_id = required_string(&created, &["sessionId"])?;
+    let submitted = probe
+        .call(
+            &mut client,
+            TraceOperationCode::SubmitRun,
+            "ptah_submit_task",
+            json!({
+                "request_id": request_id("setup"),
+                "session_id": session_id,
+                "workspace": workspace,
+                "prompt": "GROKBOT_SETUP materialize the lane Agent"
+            }),
+            vec![
+                ArgumentFieldCode::RequestId,
+                ArgumentFieldCode::SessionId,
+                ArgumentFieldCode::Workspace,
+            ],
+        )
+        .await?;
+    let setup_run = required_string(&submitted, &["runId"])?;
+    wait_run_terminal(&mut client, &session_id, &workspace, &setup_run).await?;
+    let agents = probe
+        .call(
+            &mut client,
+            TraceOperationCode::ListAgents,
+            "ptah_list_persistent_agents",
+            json!({}),
+            vec![],
+        )
+        .await?;
+    let agent_id = agents["agents"]
+        .as_array()
+        .and_then(|items| items.first())
+        .and_then(|item| item["agentId"].as_str())
+        .filter(|value| !value.is_empty())
+        .ok_or(DiagnosticCode::McpResultMalformed)?
+        .to_string();
+    probe.retain_id(DurableIdKind::Agent, &agent_id);
+    let _ = probe
+        .call(
+            &mut client,
+            TraceOperationCode::SetManagedExecution,
+            "ptah_set_managed_execution",
+            json!({
+                "session_id": session_id,
+                "workspace": workspace,
+                "agent_id": agent_id,
+                "policy": {
+                    "enabled": true,
+                    "maxConcurrentRuns": 2,
+                    "bounds": {
+                        "maxPromptBytes": 16384,
+                        "maxRounds": 4,
+                        "maxDurationMs": 45000,
+                        "maxTotalTokens": 8000
+                    },
+                    "retryEligible": false,
+                    "requiresApprovalBeforeExecution": false
+                }
+            }),
+            vec![
+                ArgumentFieldCode::SessionId,
+                ArgumentFieldCode::Workspace,
+                ArgumentFieldCode::AgentId,
+            ],
+        )
+        .await?;
+    let created_plan = probe
+        .call(
+            &mut client,
+            TraceOperationCode::CreateManagerPlan,
+            "ptah_create_manager_plan",
+            json!({
+                "request_id": request_id("plan"),
+                "session_id": session_id,
+                "workspace": workspace,
+                "manager_agent_id": agent_id,
+                "objective": "always-on grokbot dependent DAG",
+                "autonomous": true,
+                "max_replans": 2,
+                "max_in_flight": 2,
+                "steps": [
+                    {
+                        "stepId": "step-a",
+                        "kind": "native",
+                        "objective": "GROKBOT_SUCCESS first native unit",
+                        "assignedAgentId": agent_id
+                    },
+                    {
+                        "stepId": "step-b",
+                        "kind": "native",
+                        "objective": "GROKBOT_FORCE_FAIL child that must be replaced",
+                        "dependencies": ["step-a"],
+                        "assignedAgentId": agent_id
+                    }
+                ]
+            }),
+            vec![
+                ArgumentFieldCode::RequestId,
+                ArgumentFieldCode::SessionId,
+                ArgumentFieldCode::Workspace,
+                ArgumentFieldCode::AgentId,
+            ],
+        )
+        .await?;
+    let plan_id = required_string(&created_plan, &["plan", "planId"])?;
+    for i in 0..2 {
+        let _ = probe
+            .call(
+                &mut client,
+                TraceOperationCode::TickManagerPlan,
+                "ptah_tick_manager_plan",
+                json!({
+                    "request_id": request_id(&format!("tick{i}")),
+                    "session_id": session_id,
+                    "workspace": workspace,
+                    "plan_id": plan_id
+                }),
+                vec![
+                    ArgumentFieldCode::RequestId,
+                    ArgumentFieldCode::SessionId,
+                    ArgumentFieldCode::Workspace,
+                ],
+            )
+            .await?;
+    }
+    service
+        .respawn()
+        .map_err(|_| DiagnosticCode::RestartRecoveryFailed)?;
+    probe.restart.attempted = true;
+    probe.restart.host_owned = true;
+    probe.counters.restarts = probe.counters.restarts.saturating_add(1);
+    client = service
+        .client()
+        .await
+        .map_err(|_| DiagnosticCode::ServiceUnreachable)?;
+    wait_plan_succeeded(&mut client, &session_id, &workspace, &plan_id).await?;
+    probe.restart.durable_read_recovered = true;
+    let work = probe
+        .call(
+            &mut client,
+            TraceOperationCode::ListWork,
+            "ptah_list_work",
+            json!({ "session_id": session_id, "workspace": workspace }),
+            vec![ArgumentFieldCode::SessionId, ArgumentFieldCode::Workspace],
+        )
+        .await?;
+    let runs = probe
+        .call(
+            &mut client,
+            TraceOperationCode::ListRuns,
+            "ptah_list_runs",
+            json!({ "session_id": session_id, "workspace": workspace }),
+            vec![ArgumentFieldCode::SessionId, ArgumentFieldCode::Workspace],
+        )
+        .await?;
+    let intents = probe
+        .call(
+            &mut client,
+            TraceOperationCode::ListExecutionIntents,
+            "ptah_list_execution_intents",
+            json!({ "session_id": session_id, "workspace": workspace }),
+            vec![ArgumentFieldCode::SessionId, ArgumentFieldCode::Workspace],
+        )
+        .await?;
+    let _ = probe
+        .call(
+            &mut client,
+            TraceOperationCode::GetCapacity,
+            "ptah_get_capacity",
+            json!({}),
+            vec![],
+        )
+        .await?;
+    let items = work
+        .get("work")
+        .and_then(Value::as_array)
+        .ok_or(DiagnosticCode::McpResultMalformed)?;
+    let decisions = items
+        .iter()
+        .filter(|item| item["kind"].as_str() == Some("manager-decision"))
+        .count();
+    if decisions != 1 {
+        return Err(DiagnosticCode::StateTransitionMismatch);
+    }
+    let interrupted_pending = runs["runs"]
+        .as_array()
+        .ok_or(DiagnosticCode::McpResultMalformed)?
+        .iter()
+        .any(|run| {
+            run["state"].as_str() == Some("interrupted")
+                && run
+                    .pointer("/aggregates/usagePendingRequests")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    > 0
+        });
+    if interrupted_pending {
+        return Err(DiagnosticCode::RestartRecoveryFailed);
+    }
+    let live_intents = intents["intents"]
+        .as_array()
+        .ok_or(DiagnosticCode::McpResultMalformed)?
+        .iter()
+        .filter(|intent| {
+            matches!(
+                intent["state"].as_str(),
+                Some("claiming" | "admitted" | "parked" | "resolving")
+            )
+        })
+        .count();
+    if live_intents != 0 {
+        return Err(DiagnosticCode::StateTransitionMismatch);
+    }
+    let _sends = service.send_count();
+    probe.transition(
+        EntityKind::Work,
+        DurableStateCode::Queued,
+        DurableStateCode::Succeeded,
+        None,
+    );
+    probe.transition(
+        EntityKind::Run,
+        DurableStateCode::Absent,
+        DurableStateCode::Completed,
+        None,
+    );
+    probe.transition(
+        EntityKind::Service,
+        DurableStateCode::Ready,
+        DurableStateCode::Starting,
+        None,
+    );
+    probe.transition(
+        EntityKind::Service,
+        DurableStateCode::Starting,
+        DurableStateCode::Ready,
+        None,
+    );
+    Ok(())
+}
+
+async fn wait_run_terminal(
+    client: &mut grokptah_agent_bridge::McpControlClient,
+    session_id: &str,
+    workspace: &str,
+    run_id: &str,
+) -> Result<(), DiagnosticCode> {
+    let deadline = Instant::now() + std::time::Duration::from_secs(60);
+    while Instant::now() < deadline {
+        match client
+            .call_tool(
+                "ptah_get_run",
+                json!({
+                    "session_id": session_id,
+                    "workspace": workspace,
+                    "run_id": run_id
+                }),
+            )
+            .await
+        {
+            Ok(result) if !result.is_error => {
+                let state = result
+                    .structured
+                    .pointer("/run/state")
+                    .and_then(Value::as_str)
+                    .or_else(|| result.structured["state"].as_str());
+                if matches!(
+                    state,
+                    Some("completed" | "failed" | "cancelled" | "interrupted")
+                ) {
+                    return Ok(());
+                }
+            }
+            _ => {}
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    Err(DiagnosticCode::Timeout)
+}
+
+async fn wait_plan_succeeded(
+    client: &mut grokptah_agent_bridge::McpControlClient,
+    session_id: &str,
+    workspace: &str,
+    plan_id: &str,
+) -> Result<(), DiagnosticCode> {
+    let deadline = Instant::now() + std::time::Duration::from_secs(90);
+    while Instant::now() < deadline {
+        let _ = client
+            .call_tool(
+                "ptah_tick_manager_plan",
+                json!({
+                    "request_id": request_id("tick"),
+                    "session_id": session_id,
+                    "workspace": workspace,
+                    "plan_id": plan_id
+                }),
+            )
+            .await;
+        if let Ok(result) = client
+            .call_tool(
+                "ptah_get_manager_plan",
+                json!({
+                    "session_id": session_id,
+                    "workspace": workspace,
+                    "plan_id": plan_id
+                }),
+            )
+            .await
+        {
+            if !result.is_error && result.structured["plan"]["state"].as_str() == Some("succeeded")
+            {
+                return Ok(());
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    Err(DiagnosticCode::Timeout)
 }
 
 async fn native_policy_default_off(

@@ -878,6 +878,9 @@ pub enum TraceOperationCode {
     AuthorizeWorkExecution,
     ResolveWorkInput,
     ListExecutionIntents,
+    CreateManagerPlan,
+    TickManagerPlan,
+    GetManagerPlan,
     Oracle,
 }
 

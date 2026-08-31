@@ -10,6 +10,7 @@ pub mod local_service;
 pub mod manifest;
 pub mod normalize;
 pub mod probes;
+pub mod process_service;
 pub mod report;
 pub mod runner;
 

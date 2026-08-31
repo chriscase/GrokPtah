@@ -263,6 +263,9 @@ pub enum ProbeAction {
     AttemptInvalidWorkInputResolution,
     ObserveNativeTicks,
     ClaimRetriedWork,
+    CreateAutonomousManagerPlan,
+    TickManagerPlan,
+    InspectManagerPlan,
 }
 
 impl ProbeAction {
@@ -368,6 +371,23 @@ impl ProbeAction {
             ],
             Self::ObserveNativeTicks => &["ptah_get_capacity"],
             Self::ClaimRetriedWork => &["ptah_claim_work"],
+            Self::CreateAutonomousManagerPlan => &[
+                "ptah_create_session",
+                "ptah_submit_task",
+                "ptah_cancel",
+                "ptah_get_run",
+                "ptah_list_persistent_agents",
+                FUTURE_SET_MANAGED_EXECUTION_TOOL,
+                "ptah_create_manager_plan",
+            ],
+            Self::TickManagerPlan => &["ptah_tick_manager_plan"],
+            Self::InspectManagerPlan => &[
+                "ptah_get_manager_plan",
+                "ptah_list_work",
+                "ptah_list_runs",
+                FUTURE_LIST_EXECUTION_INTENTS_TOOL,
+                "ptah_get_capacity",
+            ],
         }
     }
 
@@ -396,6 +416,7 @@ impl ProbeAction {
                 | Self::InspectManagedPolicy
                 | Self::ObserveNativeTicks
                 | Self::WaitForManagedAdmission
+                | Self::InspectManagerPlan
         )
     }
 }
@@ -518,6 +539,8 @@ pub enum OracleCode {
     ContinuationRunCreated,
     CheckpointUsedForContinuation,
     ResumeRequestReplayStable,
+    AlwaysOnPlanSucceeded,
+    UncertainAttemptNotResumed,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1156,6 +1179,7 @@ fn validate_action_sequence(probe: &ProbeDefinition, actions: &HashSet<ProbeActi
         ProbeAction::CreateTestAgents,
         ProbeAction::SubmitManagedWork,
         ProbeAction::SubmitIndependentPermissionCases,
+        ProbeAction::CreateAutonomousManagerPlan,
     ]
     .into_iter()
     .filter_map(position)
