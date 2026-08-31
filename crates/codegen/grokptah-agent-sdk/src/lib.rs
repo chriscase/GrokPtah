@@ -46,7 +46,6 @@ pub use grok_build::{
     GROK_BUILD_CONTRACT_VERSION, GrokBuildCleanupState, GrokBuildContractError,
     GrokBuildGitIdentity, GrokBuildIsolationReceipt, GrokBuildLaunchRequest, GrokBuildMutationMode,
     GrokBuildNonclaim, GrokBuildPolicyState, GrokBuildResult, GrokBuildRunState, GrokBuildVerdict,
-    INDEPENDENT_QUALIFICATION_EVIDENCE,
 };
 pub use ids::{RunId, SessionId, WorkspaceRef};
 pub use observe::{EventQuery, RunSelector, SessionScope};

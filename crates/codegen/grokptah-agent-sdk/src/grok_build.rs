@@ -15,9 +15,6 @@ use serde::{Deserialize, Serialize};
 /// Contract version stamped on isolation receipts.
 pub const GROK_BUILD_CONTRACT_VERSION: &str = "1.0";
 
-/// Evidence marker required by [`GrokBuildRunState::IndependentlyQualified`].
-pub const INDEPENDENT_QUALIFICATION_EVIDENCE: &str = "independent_qualification";
-
 /// Maximum JSON document size accepted by this contract.
 pub const MAX_DOCUMENT_BYTES: usize = 8_192;
 
@@ -45,6 +42,7 @@ pub const MAX_EVIDENCE_REFS: usize = 8;
 /// Maximum number of explicit nonclaims on a result.
 pub const MAX_NONCLAIMS: usize = 8;
 
+const GIT_SHA1_HEX_LEN: usize = 40;
 const GIT_SHA256_HEX_LEN: usize = 64;
 
 /// Fail-closed contract error. Messages are codes; they never echo input.
@@ -97,9 +95,7 @@ pub enum GrokBuildRunState {
     Running,
     NeedsSynthesis,
     CompleteAdvisory,
-    NotComplete,
     FailedClosed,
-    IndependentlyQualified,
 }
 
 /// Terminal verdict. Absent until a state that may carry one.
@@ -124,7 +120,8 @@ pub enum GrokBuildNonclaim {
     NotComputerUse,
 }
 
-/// Exact repository / ref / base / head identity. SHAs are SHA-256 hex.
+/// Exact repository / ref / base / head identity. Git object ids are lowercase
+/// SHA-1 or SHA-256 hex so both repository formats can be represented.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GrokBuildGitIdentity {
@@ -155,6 +152,9 @@ pub struct GrokBuildLaunchRequest {
 #[serde(deny_unknown_fields)]
 pub struct GrokBuildIsolationReceipt {
     pub contract_version: String,
+    pub request_id: String,
+    pub identity: GrokBuildGitIdentity,
+    pub credential_lease_id: String,
     pub isolated_home_alias: String,
     pub mcp_policy: GrokBuildPolicyState,
     pub hooks_policy: GrokBuildPolicyState,
@@ -241,6 +241,9 @@ impl GrokBuildIsolationReceipt {
         if self.contract_version != GROK_BUILD_CONTRACT_VERSION {
             return Err(GrokBuildContractError::InvalidRequest);
         }
+        validate_opaque_id(&self.request_id, MAX_OPAQUE_ID_BYTES)?;
+        self.identity.validate()?;
+        validate_opaque_id(&self.credential_lease_id, MAX_OPAQUE_ID_BYTES)?;
         validate_opaque_id(&self.isolated_home_alias, MAX_ALIAS_BYTES)?;
         if self.mcp_policy != GrokBuildPolicyState::Disabled
             || self.hooks_policy != GrokBuildPolicyState::Disabled
@@ -254,20 +257,36 @@ impl GrokBuildIsolationReceipt {
         Ok(())
     }
 
-    /// Receipt permission must not widen the launch mutation mode.
+    /// Receipt identity and permission must match the launch exactly, and its
+    /// pre-launch isolation posture must be live rather than failed closed.
     pub fn validate_for_launch(
         &self,
         launch: &GrokBuildLaunchRequest,
     ) -> Result<(), GrokBuildContractError> {
         launch.validate()?;
         self.validate()?;
+        if self.request_id != launch.request_id
+            || self.identity != launch.identity
+            || self.credential_lease_id != launch.credential_lease_id
+        {
+            return Err(GrokBuildContractError::IdentityMismatch);
+        }
         match (launch.mutation_mode, self.permission_policy) {
             (GrokBuildMutationMode::ReadOnly, GrokBuildMutationMode::IsolatedReview) => {
-                Err(GrokBuildContractError::ReadOnlyMutation)
+                return Err(GrokBuildContractError::ReadOnlyMutation);
             }
-            (left, right) if left != right => Err(GrokBuildContractError::InvalidRequest),
-            _ => Ok(()),
+            (left, right) if left != right => {
+                return Err(GrokBuildContractError::InvalidRequest);
+            }
+            _ => {}
         }
+        if !self.credential_present
+            || !self.permissions_ok
+            || self.cleanup_state != GrokBuildCleanupState::Pending
+        {
+            return Err(GrokBuildContractError::InvalidRequest);
+        }
+        Ok(())
     }
 }
 
@@ -311,10 +330,18 @@ impl GrokBuildResult {
             }
             seen_nonclaims.push(*nonclaim);
         }
-        if !self.nonclaims.contains(&GrokBuildNonclaim::AdvisoryOnly)
-            || !self
-                .nonclaims
-                .contains(&GrokBuildNonclaim::NotManagerImplementation)
+        let required_nonclaims = [
+            GrokBuildNonclaim::AdvisoryOnly,
+            GrokBuildNonclaim::NotManagerImplementation,
+            GrokBuildNonclaim::NotHostAuthority,
+            GrokBuildNonclaim::NotProviderAccount,
+            GrokBuildNonclaim::NotLiveQualified,
+            GrokBuildNonclaim::NotMergeAuthority,
+            GrokBuildNonclaim::NotComputerUse,
+        ];
+        if required_nonclaims
+            .iter()
+            .any(|required| !self.nonclaims.contains(required))
         {
             return Err(GrokBuildContractError::InvalidRequest);
         }
@@ -335,11 +362,51 @@ impl GrokBuildResult {
         Ok(())
     }
 
+    /// Validate the only supported launch/receipt/result lifecycle tuple. The
+    /// receipt must still originate from a trusted isolation host; this
+    /// advisory schema does not mint authority.
+    pub fn validate_for_launch_and_receipt(
+        &self,
+        launch: &GrokBuildLaunchRequest,
+        receipt: &GrokBuildIsolationReceipt,
+    ) -> Result<(), GrokBuildContractError> {
+        launch.validate()?;
+        receipt.validate()?;
+        self.validate_for_launch(launch)?;
+        if receipt.request_id != launch.request_id
+            || receipt.identity != launch.identity
+            || receipt.credential_lease_id != launch.credential_lease_id
+            || receipt.permission_policy != launch.mutation_mode
+        {
+            return Err(GrokBuildContractError::IdentityMismatch);
+        }
+        match self.state {
+            GrokBuildRunState::Running | GrokBuildRunState::NeedsSynthesis => {
+                if !receipt.credential_present
+                    || !receipt.permissions_ok
+                    || receipt.cleanup_state != GrokBuildCleanupState::Pending
+                {
+                    return Err(GrokBuildContractError::InvalidRequest);
+                }
+            }
+            GrokBuildRunState::CompleteAdvisory => {
+                if !receipt.credential_present
+                    || !receipt.permissions_ok
+                    || receipt.cleanup_state != GrokBuildCleanupState::Complete
+                {
+                    return Err(GrokBuildContractError::InvalidRequest);
+                }
+            }
+            GrokBuildRunState::FailedClosed => {
+                if receipt.cleanup_state != GrokBuildCleanupState::FailedClosed {
+                    return Err(GrokBuildContractError::InvalidRequest);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn validate_state_verdict(&self) -> Result<(), GrokBuildContractError> {
-        let has_marker = self
-            .evidence_refs
-            .iter()
-            .any(|marker| marker == INDEPENDENT_QUALIFICATION_EVIDENCE);
         match (self.state, self.terminal_verdict) {
             (
                 GrokBuildRunState::Running
@@ -353,8 +420,6 @@ impl GrokBuildResult {
                 | GrokBuildRunState::FailedClosed,
                 None,
             ) => Ok(()),
-            (GrokBuildRunState::NotComplete, Some(GrokBuildVerdict::NotComplete)) => Ok(()),
-            (GrokBuildRunState::NotComplete, _) => Err(GrokBuildContractError::VerdictInconsistent),
             (
                 GrokBuildRunState::CompleteAdvisory,
                 Some(
@@ -362,21 +427,11 @@ impl GrokBuildResult {
                     | GrokBuildVerdict::Findings
                     | GrokBuildVerdict::NotComplete,
                 ),
-            ) => Ok(()),
+            ) if !self.evidence_refs.is_empty() => Ok(()),
+            (GrokBuildRunState::CompleteAdvisory, Some(_)) => {
+                Err(GrokBuildContractError::MissingEvidenceMarker)
+            }
             (GrokBuildRunState::CompleteAdvisory, None) => {
-                Err(GrokBuildContractError::VerdictInconsistent)
-            }
-            (
-                GrokBuildRunState::IndependentlyQualified,
-                Some(GrokBuildVerdict::Clean | GrokBuildVerdict::Findings),
-            ) => {
-                if has_marker {
-                    Ok(())
-                } else {
-                    Err(GrokBuildContractError::MissingEvidenceMarker)
-                }
-            }
-            (GrokBuildRunState::IndependentlyQualified, _) => {
                 Err(GrokBuildContractError::VerdictInconsistent)
             }
         }
@@ -442,11 +497,16 @@ fn validate_git_ref(value: &str) -> Result<(), GrokBuildContractError> {
     if !chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/')) {
         return Err(GrokBuildContractError::InvalidRequest);
     }
+    if value.split('/').any(|component| {
+        component.is_empty() || component.starts_with('.') || component.ends_with(".lock")
+    }) {
+        return Err(GrokBuildContractError::InvalidRequest);
+    }
     reject_path_or_secret(value)
 }
 
 fn validate_git_sha256(value: &str) -> Result<(), GrokBuildContractError> {
-    if value.len() != GIT_SHA256_HEX_LEN {
+    if !matches!(value.len(), GIT_SHA1_HEX_LEN | GIT_SHA256_HEX_LEN) {
         return Err(GrokBuildContractError::InvalidRequest);
     }
     if !value
@@ -548,6 +608,9 @@ mod tests {
     fn receipt_json() -> Value {
         json!({
             "contract_version": GROK_BUILD_CONTRACT_VERSION,
+            "request_id": "req-1",
+            "identity": identity_json(),
+            "credential_lease_id": "lease-1",
             "isolated_home_alias": "iso-home-1",
             "mcp_policy": "disabled",
             "hooks_policy": "disabled",
@@ -556,7 +619,7 @@ mod tests {
             "permission_policy": "isolated_review",
             "credential_present": true,
             "permissions_ok": true,
-            "cleanup_state": "complete"
+            "cleanup_state": "pending"
         })
     }
 
@@ -574,7 +637,8 @@ mod tests {
                 "not_host_authority",
                 "not_provider_account",
                 "not_live_qualified",
-                "not_merge_authority"
+                "not_merge_authority",
+                "not_computer_use"
             ]
         })
     }
@@ -600,6 +664,12 @@ mod tests {
             .validate_for_launch(&launch)
             .expect("receipt matches");
         result.validate_for_launch(&launch).expect("result matches");
+        let mut completed_receipt_value = receipt_json();
+        completed_receipt_value["cleanup_state"] = json!("complete");
+        let completed_receipt = parse_receipt(completed_receipt_value).expect("completed receipt");
+        result
+            .validate_for_launch_and_receipt(&launch, &completed_receipt)
+            .expect("terminal lifecycle tuple matches");
 
         let launch_again = GrokBuildLaunchRequest::from_json_str(
             &serde_json::to_string(&launch).expect("launch json"),
@@ -628,6 +698,9 @@ mod tests {
         .expect("read-only launch");
         let read_only_receipt = parse_receipt(json!({
             "contract_version": GROK_BUILD_CONTRACT_VERSION,
+            "request_id": "req-1",
+            "identity": identity_json(),
+            "credential_lease_id": "lease-1",
             "isolated_home_alias": "iso-home-1",
             "mcp_policy": "disabled",
             "hooks_policy": "disabled",
@@ -789,10 +862,7 @@ mod tests {
 
         let mut sha1 = launch_json();
         sha1["identity"]["head_sha"] = json!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-        assert_eq!(
-            parse_launch(sha1),
-            Err(GrokBuildContractError::InvalidRequest)
-        );
+        parse_launch(sha1).expect("SHA-1 repositories remain representable");
 
         let mut upper_sha = launch_json();
         upper_sha["identity"]["base_sha"] = json!(BASE_SHA.to_ascii_uppercase());
@@ -890,19 +960,89 @@ mod tests {
     }
 
     #[test]
-    fn independently_qualified_requires_evidence_marker() {
-        let mut missing = result_json();
-        missing["state"] = json!("independently_qualified");
-        missing["terminal_verdict"] = json!("clean");
-        missing["evidence_refs"] = json!(["advisory-summary"]);
-        let parsed = parse_result(missing);
-        assert_eq!(parsed, Err(GrokBuildContractError::MissingEvidenceMarker));
+    fn lifecycle_tuple_binds_request_identity_lease_and_cleanup() {
+        let launch = parse_launch(launch_json()).expect("launch");
+        let result = parse_result(result_json()).expect("result");
 
-        let mut qualified = result_json();
-        qualified["state"] = json!("independently_qualified");
-        qualified["terminal_verdict"] = json!("findings");
-        qualified["evidence_refs"] = json!([INDEPENDENT_QUALIFICATION_EVIDENCE]);
-        parse_result(qualified).expect("marker present");
+        let mut complete_value = receipt_json();
+        complete_value["cleanup_state"] = json!("complete");
+        let complete = parse_receipt(complete_value).expect("complete receipt");
+        result
+            .validate_for_launch_and_receipt(&launch, &complete)
+            .expect("exact terminal tuple");
+
+        for field in ["request_id", "credential_lease_id"] {
+            let mut mismatch = receipt_json();
+            mismatch[field] = json!("other-1");
+            mismatch["cleanup_state"] = json!("complete");
+            let receipt = parse_receipt(mismatch).expect("well-formed mismatch");
+            assert_eq!(
+                result.validate_for_launch_and_receipt(&launch, &receipt),
+                Err(GrokBuildContractError::IdentityMismatch)
+            );
+        }
+
+        let mut wrong_identity = receipt_json();
+        wrong_identity["identity"]["head_sha"] =
+            json!("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
+        wrong_identity["cleanup_state"] = json!("complete");
+        let receipt = parse_receipt(wrong_identity).expect("well-formed identity mismatch");
+        assert_eq!(
+            result.validate_for_launch_and_receipt(&launch, &receipt),
+            Err(GrokBuildContractError::IdentityMismatch)
+        );
+
+        let pending = parse_receipt(receipt_json()).expect("pending receipt");
+        assert_eq!(
+            result.validate_for_launch_and_receipt(&launch, &pending),
+            Err(GrokBuildContractError::InvalidRequest)
+        );
+    }
+
+    #[test]
+    fn failed_isolation_cannot_admit_and_qualification_cannot_be_self_attested() {
+        let launch = parse_launch(launch_json()).expect("launch");
+        for (field, value) in [
+            ("credential_present", json!(false)),
+            ("permissions_ok", json!(false)),
+            ("cleanup_state", json!("failed_closed")),
+        ] {
+            let mut failed = receipt_json();
+            failed[field] = value;
+            let receipt = parse_receipt(failed).expect("failed posture is observable");
+            assert_eq!(
+                receipt.validate_for_launch(&launch),
+                Err(GrokBuildContractError::InvalidRequest)
+            );
+        }
+
+        let mut self_attested = result_json();
+        self_attested["state"] = json!("independently_qualified");
+        assert_eq!(
+            parse_result(self_attested),
+            Err(GrokBuildContractError::InvalidRequest)
+        );
+
+        let mut no_evidence = result_json();
+        no_evidence["evidence_refs"] = json!([]);
+        assert_eq!(
+            parse_result(no_evidence),
+            Err(GrokBuildContractError::MissingEvidenceMarker)
+        );
+
+        let mut missing_nonclaim = result_json();
+        missing_nonclaim["nonclaims"] = json!([
+            "advisory_only",
+            "not_manager_implementation",
+            "not_host_authority",
+            "not_provider_account",
+            "not_live_qualified",
+            "not_merge_authority"
+        ]);
+        assert_eq!(
+            parse_result(missing_nonclaim),
+            Err(GrokBuildContractError::InvalidRequest)
+        );
     }
 
     #[test]
