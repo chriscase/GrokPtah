@@ -242,8 +242,8 @@ impl WorkPolicy {
 ///
 /// Durable and typed, so reconciliation never has to infer provenance from the
 /// shape of a free-form string. A record written before this existed
-/// deserializes to `None`, which every reader treats as manual — see
-/// [`super::graph::evaluate_admission`] for why that direction is the safe one.
+/// deserializes to `None`. Readers treat that as a manual hold, except for the
+/// proven pre-upgrade derived wait in [`super::graph::is_legacy_derived_wait`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BlockProvenance {
@@ -427,9 +427,10 @@ pub struct WorkItem {
     pub blocked_reason: Option<String>,
     /// Who placed the current block. Absent on records written before this
     /// was typed, and on items that are not blocked. Adding it is a compatible
-    /// schema extension: existing items deserialize as `None`, and every
-    /// reader treats `None` on a blocked item as manual so an upgrade cannot
-    /// silently re-queue work a human stopped.
+    /// schema extension: existing items deserialize as `None`. `None` on a
+    /// blocked item is fail-closed as manual unless
+    /// [`super::graph::is_legacy_derived_wait`] recognizes the proven
+    /// pre-upgrade derived-wait shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub block_provenance: Option<BlockProvenance>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

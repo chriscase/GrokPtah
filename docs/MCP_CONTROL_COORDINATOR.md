@@ -226,6 +226,12 @@ authoritative.
 
 Source of truth: `orchestration::CONTROL_TOOLS` /
 `mcp_control::tool_input_schema`. Schemas use `additionalProperties: false`.
+The table below is a coordinator-facing excerpt, not a substitute for
+`CONTROL_TOOLS` or a release-qualification claim. Work-ledger tools
+advertised in `CONTROL_TOOLS` but omitted from the table include
+`ptah_create_work`, `ptah_list_work`, `ptah_get_work`, `ptah_assign_work`,
+the claim/progress/completion family, manager-plan tools, and the
+managed-execution tools.
 
 | Tool | Kind | Required arguments |
 |------|------|--------------------|
@@ -285,6 +291,36 @@ Source of truth: `orchestration::CONTROL_TOOLS` /
 | `ptah_ack_message` | mutate | `request_id`, `session_id`, `workspace`, `message_id` |
 | `ptah_list_inbox` | read | `session_id`, `workspace`, `agent_id`; optional `after_seq` |
 | `ptah_list_outbox` | read | `session_id`, `workspace`, `agent_id`; optional `after_seq` |
+
+### Work graph holds and recovery
+
+`ptah_unblock_work` is advertised and is the operator path that releases a
+manual hold. Blocked work carries typed `blockProvenance`:
+
+- `derived` — reconciliation's encoding of an unmet dependency. Lifted when
+  the dependency is satisfied. `ptah_unblock_work` refuses it.
+- `manual` — an explicit operator/coordinator hold. Reconciliation never
+  lifts it. `ptah_unblock_work` releases it under the same
+  session/workspace/revision fences as `ptah_block_work`.
+- absent (`None`) — fail-closed as manual, except for the proven pre-upgrade
+  derived-wait shape: `Blocked`, no provenance, no `blockedReason`, non-empty
+  dependencies, not a container. Opening the ledger reconciles once; that
+  shape is stamped `derived` (or lifted if its dependencies already
+  succeeded) so ordinary waits are not stranded across upgrade. A free-text
+  `blockedReason` is never parsed as derived.
+
+A lane may hold at most 4096 work items. A create that would pass that
+ceiling, including a dependency-free create, fails with
+`capacity_exhausted`, while an update of an existing item at the ceiling can
+still succeed. The current public list and graph tools are not paginated; at
+the legal ceiling their responses can exceed the MCP transport byte ceiling.
+Issue #520 tracks the bounded cursor contract. Do not interpret a transport
+refusal as an empty or complete lane.
+
+Assignment mutations write the decision receipt and then the item. A crash
+between those two atomic files can leave a receipt whose item did not
+change. There is no assignment-intent recovery; issue #521 tracks that open
+crash-consistency residual.
 
 ### Forbidden (never exposed)
 

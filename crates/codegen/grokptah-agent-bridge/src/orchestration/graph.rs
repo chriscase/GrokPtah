@@ -22,7 +22,10 @@
 //!   item whose dependencies were satisfied, and an item blocked by an
 //!   operator has no dependencies to satisfy — so the next reconciliation tick
 //!   silently re-queued, and then executed, work a human had stopped. A block
-//!   now carries typed provenance and only a derived one is lifted.
+//!   now carries typed provenance and only a derived one is lifted. Records
+//!   written before provenance existed deserialize to `None`. The only
+//!   auto-migrated exception is the proven pre-upgrade derived wait
+//!   ([`is_legacy_derived_wait`]); every other `None` stays fail-closed.
 //! * **The admission reason explains the canonical persisted state.** The
 //!   ledger reconciles a dependency wait to [`WorkState::Blocked`] and an
 //!   exceeded deadline to [`WorkState::Failed`], so a reason derived from "is
@@ -472,11 +475,15 @@ pub fn evaluate_admission(
     // container, and reconciliation must not re-queue it.
     //
     // Ambiguous provenance fails closed. A record written before provenance
-    // was typed carries none, and reading it as derived would let an upgrade
-    // silently re-queue -- and then execute -- work a human had stopped. Such
-    // a record is lifted by an explicit `unblock_work`, never by a tick.
+    // was typed carries none, and reading a free-text reason as derived would
+    // let an upgrade silently re-queue -- and then execute -- work a human had
+    // stopped. Those records are lifted by an explicit `unblock_work`, never
+    // by a tick. The one exception is [`is_legacy_derived_wait`]: old builds
+    // persisted ordinary dependency waits as `Blocked` with neither provenance
+    // nor reason, and that shape must refresh rather than strand.
     if item.state == WorkState::Blocked
         && item.block_provenance.is_none_or(BlockProvenance::is_manual)
+        && !is_legacy_derived_wait(item)
     {
         return AdmissionBlock::ManuallyBlocked;
     }
@@ -519,6 +526,21 @@ pub fn evaluate_admission(
     }
 
     AdmissionBlock::Admissible
+}
+
+/// Proven pre-upgrade shape of a reconciliation-derived dependency wait.
+///
+/// Builds before typed [`BlockProvenance`] persisted an unmet dependency as
+/// [`WorkState::Blocked`] with no `block_provenance` and no `blocked_reason`.
+/// Operator holds on those same builds always stored a non-empty reason, and
+/// containers were never auto-blocked. Only that exact shape is treated as
+/// derived; any other `None` provenance remains fail-closed.
+pub fn is_legacy_derived_wait(item: &WorkItem) -> bool {
+    item.state == WorkState::Blocked
+        && item.block_provenance.is_none()
+        && item.blocked_reason.is_none()
+        && !item.dependencies.is_empty()
+        && !item.is_container
 }
 
 // ---------------------------------------------------------------------------

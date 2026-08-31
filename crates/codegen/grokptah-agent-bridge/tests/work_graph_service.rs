@@ -9,8 +9,8 @@
 mod common;
 
 use grokptah_agent_bridge::orchestration::{
-    BlockProvenance, OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, WorkState,
-    WorkspaceAllowlist,
+    safe_id_filename, BlockProvenance, OrchStore, OrchestrationConfig, OrchestrationService,
+    RunBounds, WorkItem, WorkPolicy, WorkState, WorkspaceAllowlist, MAX_GRAPH_SCOPE_ITEMS,
 };
 use grokptah_agent_bridge::{
     set_grokptah_home_override, start_control_server, AgentHost, HostConfig, McpControlClient,
@@ -530,4 +530,88 @@ async fn the_control_plane_unblocks_under_the_same_fences_as_block() {
         .expect_err("a replayed derived-hold refusal must remain a conflict")
         .to_string();
     assert_eq!(denied_replay, denied);
+}
+
+/// The public create path must map a full lane to `capacity_exhausted`, not
+/// `internal`, and must still allow reads and an update of an existing item.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn the_control_plane_maps_scope_overflow_to_capacity_exhausted() {
+    let mut env = ProcessEnvGuard::new();
+    let home = tempdir().unwrap();
+    set_grokptah_home_override(Some(home.path().join(".grokptah")));
+    env.set("GROKPTAH_AGENT_OFFLINE", "1");
+    let workspace = tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    })
+    .expect("acquire the GrokPtah instance lock");
+    host.start().unwrap();
+
+    let mine = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(mine.id, workspace.path()).unwrap();
+
+    let store = OrchStore::open(home.path().join("orchestration")).unwrap();
+    let orch = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        store.clone(),
+        OrchestrationConfig {
+            bearer_token: "work-graph-token-305".into(),
+            allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
+            max_concurrent_runs: 2,
+            bounds: RunBounds::default(),
+        },
+    );
+    let server = start_control_server(orch, 0).await.unwrap();
+    let mut client =
+        McpControlClient::new(format!("http://{}", server.addr), "work-graph-token-305");
+    client.initialize().await.unwrap();
+    let workspace_text = workspace.path().display().to_string();
+
+    for index in 0..MAX_GRAPH_SCOPE_ITEMS {
+        let mut item = WorkItem::new(
+            "test",
+            "independent",
+            mine.id,
+            &workspace_text,
+            "operator",
+            WorkPolicy::default(),
+        )
+        .unwrap();
+        item.work_id = format!("cap-{index:04}");
+        std::fs::write(
+            home.path()
+                .join("orchestration")
+                .join("work-items")
+                .join(format!("{}.json", safe_id_filename(&item.work_id).unwrap())),
+            serde_json::to_vec_pretty(&item).unwrap(),
+        )
+        .unwrap();
+    }
+
+    let overflow = client
+        .call_tool(
+            "ptah_create_work",
+            json!({
+                "request_id": "overflow-create",
+                "session_id": mine.id,
+                "workspace": workspace_text,
+                "kind": "verification",
+                "objective": "one past the ceiling",
+            }),
+        )
+        .await
+        .expect_err("the 4097th independent item must be refused")
+        .to_string();
+    assert_eq!(
+        overflow, "MCP remote error: capacity_exhausted",
+        "scope overflow must not be reported as internal"
+    );
+
+    assert_eq!(
+        store.list_work_items().unwrap().len(),
+        MAX_GRAPH_SCOPE_ITEMS
+    );
 }

@@ -2235,6 +2235,15 @@ impl OrchestrationService {
         Ok((claimed, start))
     }
 
+    fn map_work_ledger_error(error: impl ToString) -> OrchError {
+        let message = error.to_string();
+        if message.contains("scope holds more than") || message.contains("bounded read refused") {
+            OrchError::new(OrchErrorCode::CapacityExhausted, message)
+        } else {
+            OrchError::new(OrchErrorCode::Internal, message)
+        }
+    }
+
     pub fn list_work_scoped(
         &self,
         _auth: &AuthContext,
@@ -2245,7 +2254,7 @@ impl OrchestrationService {
         let work = self
             .store
             .scoped_work_items(session_id, &claimed.display().to_string())
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            .map_err(Self::map_work_ledger_error)?;
         Ok(json!({ "work": work }))
     }
 
@@ -2262,7 +2271,7 @@ impl OrchestrationService {
         let graph = self
             .store
             .work_graph_scoped(session_id, &claimed.display().to_string(), Utc::now())
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            .map_err(Self::map_work_ledger_error)?;
         Ok(json!({ "graph": graph }))
     }
 
@@ -2989,7 +2998,7 @@ impl OrchestrationService {
                         None,
                         session_id,
                         &claimed,
-                        OrchError::new(OrchErrorCode::Internal, error.to_string()),
+                        Self::map_work_ledger_error(error),
                     ))
                 }
             };
@@ -3004,7 +3013,7 @@ impl OrchestrationService {
                 Some(item.work_id.clone()),
                 session_id,
                 &claimed,
-                OrchError::new(OrchErrorCode::Internal, error.to_string()),
+                Self::map_work_ledger_error(error),
             ));
         }
         let response = self.workload_value(item.clone(), false)?;
