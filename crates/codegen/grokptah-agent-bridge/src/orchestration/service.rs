@@ -2235,13 +2235,13 @@ impl OrchestrationService {
         Ok((claimed, start))
     }
 
-    fn map_work_ledger_error(error: impl ToString) -> OrchError {
-        let message = error.to_string();
-        if message.contains("scope holds more than") || message.contains("bounded read refused") {
-            OrchError::new(OrchErrorCode::CapacityExhausted, message)
-        } else {
-            OrchError::new(OrchErrorCode::Internal, message)
+    fn map_work_ledger_error(error: anyhow::Error) -> OrchError {
+        if let Some(ledger_error) = error.downcast_ref::<OrchError>() {
+            if ledger_error.code == OrchErrorCode::CapacityExhausted {
+                return ledger_error.clone();
+            }
         }
+        OrchError::new(OrchErrorCode::Internal, error.to_string())
     }
 
     pub fn list_work_scoped(

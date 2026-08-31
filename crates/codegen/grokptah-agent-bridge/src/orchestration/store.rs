@@ -927,10 +927,13 @@ impl OrchStore {
         if is_new {
             let lane = self.scoped_work_items_unlocked(super::graph::GraphScope::of(item))?;
             if lane.len() >= super::graph::MAX_GRAPH_SCOPE_ITEMS {
-                anyhow::bail!(
-                    "scope holds more than {} work items; a new item is refused rather than unbounded",
-                    super::graph::MAX_GRAPH_SCOPE_ITEMS
-                );
+                return Err(anyhow::Error::new(OrchError::new(
+                    OrchErrorCode::CapacityExhausted,
+                    format!(
+                        "scope holds more than {} work items; a new item is refused rather than unbounded",
+                        super::graph::MAX_GRAPH_SCOPE_ITEMS
+                    ),
+                )));
             }
         }
         if !item.dependencies.is_empty()
@@ -940,7 +943,7 @@ impl OrchStore {
             let mut lane = self.scoped_work_items_unlocked(super::graph::GraphScope::of(item))?;
             lane.retain(|existing| existing.work_id != item.work_id && scope.contains(existing));
             super::graph::validate_scoped_dependency_graph(&lane, item, scope)
-                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                .map_err(anyhow::Error::new)?;
         }
         let path = self
             .work_item_path(&item.work_id)
@@ -1079,10 +1082,13 @@ impl OrchStore {
             if scope.contains(&item) {
                 items.push(item);
                 if items.len() > super::graph::MAX_GRAPH_SCOPE_ITEMS {
-                    anyhow::bail!(
-                        "lane contains more than {} work items; bounded read refused",
-                        super::graph::MAX_GRAPH_SCOPE_ITEMS
-                    );
+                    return Err(anyhow::Error::new(OrchError::new(
+                        OrchErrorCode::CapacityExhausted,
+                        format!(
+                            "lane contains more than {} work items; bounded read refused",
+                            super::graph::MAX_GRAPH_SCOPE_ITEMS
+                        ),
+                    )));
                 }
             }
         }

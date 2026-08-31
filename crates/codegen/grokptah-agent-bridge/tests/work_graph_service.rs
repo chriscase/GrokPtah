@@ -533,7 +533,8 @@ async fn the_control_plane_unblocks_under_the_same_fences_as_block() {
 }
 
 /// The public create path must map a full lane to `capacity_exhausted`, not
-/// `internal`, and must still allow reads and an update of an existing item.
+/// `internal`. A pre-existing oversized lane must map list and graph reads to
+/// the same typed error.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::await_holding_lock)]
 async fn the_control_plane_maps_scope_overflow_to_capacity_exhausted() {
@@ -610,8 +611,41 @@ async fn the_control_plane_maps_scope_overflow_to_capacity_exhausted() {
         "scope overflow must not be reported as internal"
     );
 
+    let mut excess = WorkItem::new(
+        "test",
+        "oversized legacy lane",
+        mine.id,
+        &workspace_text,
+        "operator",
+        WorkPolicy::default(),
+    )
+    .unwrap();
+    excess.work_id = format!("cap-{MAX_GRAPH_SCOPE_ITEMS:04}");
+    std::fs::write(
+        home.path()
+            .join("orchestration")
+            .join("work-items")
+            .join(format!(
+                "{}.json",
+                safe_id_filename(&excess.work_id).unwrap()
+            )),
+        serde_json::to_vec_pretty(&excess).unwrap(),
+    )
+    .unwrap();
+    for tool in ["ptah_list_work", "ptah_get_work_graph"] {
+        let error = client
+            .call_tool(
+                tool,
+                json!({ "session_id": mine.id, "workspace": workspace_text }),
+            )
+            .await
+            .expect_err("an oversized lane must fail as typed capacity")
+            .to_string();
+        assert_eq!(error, "MCP remote error: capacity_exhausted", "{tool}");
+    }
+
     assert_eq!(
         store.list_work_items().unwrap().len(),
-        MAX_GRAPH_SCOPE_ITEMS
+        MAX_GRAPH_SCOPE_ITEMS + 1
     );
 }
