@@ -180,12 +180,12 @@ pub struct GrokBuildResult {
 }
 
 impl GrokBuildGitIdentity {
-    /// Fail closed unless repository, ref, and SHA-256 identities are exact.
+    /// Fail closed unless repository, ref, and SHA-1/SHA-256 object ids are exact.
     pub fn validate(&self) -> Result<(), GrokBuildContractError> {
         validate_opaque_id(&self.repository_id, MAX_OPAQUE_ID_BYTES)?;
         validate_git_ref(&self.git_ref)?;
-        validate_git_sha256(&self.base_sha)?;
-        validate_git_sha256(&self.head_sha)?;
+        validate_git_object_id(&self.base_sha)?;
+        validate_git_object_id(&self.head_sha)?;
         Ok(())
     }
 }
@@ -349,7 +349,8 @@ impl GrokBuildResult {
         Ok(())
     }
 
-    /// Result identity must match the launch exactly.
+    /// Result identity must match the launch exactly. Use
+    /// [`Self::validate_for_launch_and_receipt`] for lifecycle admission.
     pub fn validate_for_launch(
         &self,
         launch: &GrokBuildLaunchRequest,
@@ -373,6 +374,11 @@ impl GrokBuildResult {
         launch.validate()?;
         receipt.validate()?;
         self.validate_for_launch(launch)?;
+        if launch.mutation_mode == GrokBuildMutationMode::ReadOnly
+            && receipt.permission_policy == GrokBuildMutationMode::IsolatedReview
+        {
+            return Err(GrokBuildContractError::ReadOnlyMutation);
+        }
         if receipt.request_id != launch.request_id
             || receipt.identity != launch.identity
             || receipt.credential_lease_id != launch.credential_lease_id
@@ -505,7 +511,7 @@ fn validate_git_ref(value: &str) -> Result<(), GrokBuildContractError> {
     reject_path_or_secret(value)
 }
 
-fn validate_git_sha256(value: &str) -> Result<(), GrokBuildContractError> {
+fn validate_git_object_id(value: &str) -> Result<(), GrokBuildContractError> {
     if !matches!(value.len(), GIT_SHA1_HEX_LEN | GIT_SHA256_HEX_LEN) {
         return Err(GrokBuildContractError::InvalidRequest);
     }
@@ -941,6 +947,26 @@ mod tests {
             receipt.validate_for_launch(&launch),
             Err(GrokBuildContractError::ReadOnlyMutation)
         );
+
+        let mut terminal_receipt = receipt_json();
+        terminal_receipt["cleanup_state"] = json!("complete");
+        let terminal_receipt = parse_receipt(terminal_receipt).expect("terminal receipt");
+        let result = parse_result(result_json()).expect("result");
+        assert_eq!(
+            result.validate_for_launch_and_receipt(&launch, &terminal_receipt),
+            Err(GrokBuildContractError::ReadOnlyMutation)
+        );
+
+        let isolated_launch = parse_launch(launch_json()).expect("isolated launch");
+        for field in ["request_id", "credential_lease_id"] {
+            let mut mismatch = receipt_json();
+            mismatch[field] = json!("other-1");
+            let mismatch = parse_receipt(mismatch).expect("well-formed mismatch");
+            assert_eq!(
+                mismatch.validate_for_launch(&isolated_launch),
+                Err(GrokBuildContractError::IdentityMismatch)
+            );
+        }
     }
 
     #[test]
@@ -996,6 +1022,29 @@ mod tests {
         assert_eq!(
             result.validate_for_launch_and_receipt(&launch, &pending),
             Err(GrokBuildContractError::InvalidRequest)
+        );
+
+        let mut failed_result_value = result_json();
+        failed_result_value["state"] = json!("failed_closed");
+        failed_result_value["terminal_verdict"] = Value::Null;
+        let failed_result = parse_result(failed_result_value).expect("failed result");
+        let mut failed_receipt_value = receipt_json();
+        failed_receipt_value["credential_present"] = json!(false);
+        failed_receipt_value["permissions_ok"] = json!(false);
+        failed_receipt_value["cleanup_state"] = json!("failed_closed");
+        let failed_receipt = parse_receipt(failed_receipt_value).expect("failed receipt");
+        failed_result
+            .validate_for_launch_and_receipt(&launch, &failed_receipt)
+            .expect("failed-closed tuple remains representable without admission");
+
+        let mut mismatched_permission = receipt_json();
+        mismatched_permission["permission_policy"] = json!("read_only");
+        mismatched_permission["cleanup_state"] = json!("complete");
+        let mismatched_permission =
+            parse_receipt(mismatched_permission).expect("permission mismatch receipt");
+        assert_eq!(
+            result.validate_for_launch_and_receipt(&launch, &mismatched_permission),
+            Err(GrokBuildContractError::IdentityMismatch)
         );
     }
 
