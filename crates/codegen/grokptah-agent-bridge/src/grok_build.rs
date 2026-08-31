@@ -75,6 +75,8 @@ pub enum GrokBuildAdapterError {
     OutputOverflow,
     #[error("credential_lease")]
     CredentialLease,
+    #[error("credential_revocation")]
+    CredentialRevocation,
     #[error("isolation_failed")]
     IsolationFailed,
     #[error("termination_unproven")]
@@ -175,9 +177,17 @@ impl fmt::Debug for CredentialLeaseHandle {
     }
 }
 
-/// Injected credential lease resolution. Tests use fakes.
+/// Injected credential lease authority. Tests use fakes.
+///
+/// `revoke` must invalidate the upstream capability represented by `lease_id`,
+/// not merely remove a local credential file. It must be idempotent. The
+/// adapter invokes it whenever process-tree termination cannot be proved, so a
+/// surviving child cannot retain usable provider authority from an already
+/// loaded credential.
 pub trait CredentialLeaseResolver: Send + Sync {
     fn resolve(&self, lease_id: &str) -> Result<CredentialLeaseHandle, GrokBuildAdapterError>;
+
+    fn revoke(&self, lease_id: &str) -> Result<(), GrokBuildAdapterError>;
 }
 
 /// Bounded host-only evidence captured before the disposable Grok home is
@@ -297,7 +307,14 @@ pub async fn launch_grok_build(
     isolated.install_prompt(&host.prompt)?;
     isolated.install_lease(&lease)?;
 
-    verify_isolation(host, &isolated, cancel.clone()).await?;
+    verify_isolation(
+        host,
+        &isolated,
+        credentials,
+        &launch.credential_lease_id,
+        cancel.clone(),
+    )
+    .await?;
     // Close the inspect-to-launch window against an externally changed ref or
     // newly introduced project-local compatibility surface.
     gate_git_identity(launch, host, cancel.clone()).await?;
@@ -307,7 +324,7 @@ pub async fn launch_grok_build(
     }
 
     let session_id = Uuid::new_v4().to_string();
-    execute_allowlisted(launch, host, &isolated, &session_id, cancel).await
+    execute_allowlisted(launch, host, &isolated, credentials, &session_id, cancel).await
 }
 
 fn map_contract(err: GrokBuildContractError) -> GrokBuildAdapterError {
@@ -546,6 +563,8 @@ fn set_private_dir_permissions(path: &Path) -> Result<(), GrokBuildAdapterError>
 async fn verify_isolation(
     host: &GrokBuildHostLaunchConfig,
     isolated: &IsolatedHome,
+    credentials: &dyn CredentialLeaseResolver,
+    credential_lease_id: &str,
     cancel: CancellationToken,
 ) -> Result<(), GrokBuildAdapterError> {
     let env = allowlisted_env(&isolated.path)?;
@@ -572,9 +591,11 @@ async fn verify_isolation(
     )
     .await;
     if harvest.kind == HarvestKind::TerminationUnproven {
-        let _ = isolated.revoke_sensitive_material();
-        let _ = isolated.cleanup();
-        return Err(GrokBuildAdapterError::TerminationUnproven);
+        return Err(contain_uncertain_termination(
+            credentials,
+            credential_lease_id,
+            isolated,
+        ));
     }
     if harvest.kind != HarvestKind::Exited(0) {
         return Err(GrokBuildAdapterError::IsolationFailed);
@@ -981,6 +1002,7 @@ async fn execute_allowlisted(
     launch: &GrokBuildLaunchRequest,
     host: &GrokBuildHostLaunchConfig,
     isolated: &IsolatedHome,
+    credentials: &dyn CredentialLeaseResolver,
     session_id: &str,
     cancel: CancellationToken,
 ) -> Result<GrokBuildAdapterOutcome, GrokBuildAdapterError> {
@@ -1016,9 +1038,11 @@ async fn execute_allowlisted(
     )
     .await;
     if harvest.kind == HarvestKind::TerminationUnproven {
-        let _ = isolated.revoke_sensitive_material();
-        let _ = isolated.cleanup();
-        return Err(GrokBuildAdapterError::TerminationUnproven);
+        return Err(contain_uncertain_termination(
+            credentials,
+            &launch.credential_lease_id,
+            isolated,
+        ));
     }
 
     let readonly_violation = if launch.mutation_mode == GrokBuildMutationMode::ReadOnly {
@@ -1032,6 +1056,24 @@ async fn execute_allowlisted(
     let classified = classify_harvest(&harvest, readonly_violation, isolated, session_id);
     let cleaned = isolated.cleanup();
     finish_outcome(launch, session_id, classified, !readonly_violation, cleaned)
+}
+
+fn contain_uncertain_termination(
+    credentials: &dyn CredentialLeaseResolver,
+    credential_lease_id: &str,
+    isolated: &IsolatedHome,
+) -> GrokBuildAdapterError {
+    // Evaluate every containment action even when an earlier one fails. The
+    // stable error distinguishes an unproved process-tree stop with complete
+    // authority containment from a failure to revoke that authority.
+    let upstream_revoked = credentials.revoke(credential_lease_id).is_ok();
+    let local_revoked = isolated.revoke_sensitive_material();
+    let cleaned = isolated.cleanup();
+    if upstream_revoked && local_revoked && cleaned {
+        GrokBuildAdapterError::TerminationUnproven
+    } else {
+        GrokBuildAdapterError::CredentialRevocation
+    }
 }
 
 fn finish_outcome(
@@ -1236,7 +1278,7 @@ fn verified_advisory_evidence(
     if summary_lines == 0 {
         return None;
     }
-    let session_updates = retained_session_evidence(isolated, expected_session_id)?;
+    let session_updates = retained_session_evidence(isolated, expected_session_id, text)?;
     let summary_ref = sha256_evidence_ref("summary", text.as_bytes());
     let session_ref = sha256_evidence_ref("session", &session_updates);
     Some((
@@ -1251,7 +1293,11 @@ fn verified_advisory_evidence(
     ))
 }
 
-fn retained_session_evidence(isolated: &IsolatedHome, session_id: &str) -> Option<Vec<u8>> {
+fn retained_session_evidence(
+    isolated: &IsolatedHome,
+    session_id: &str,
+    expected_summary: &str,
+) -> Option<Vec<u8>> {
     let root = isolated.path.join("sessions");
     let mut matches = Vec::new();
     for workspace in std::fs::read_dir(root).ok()? {
@@ -1289,8 +1335,9 @@ fn retained_session_evidence(isolated: &IsolatedHome, session_id: &str) -> Optio
     if bytes.len() as u64 != metadata.len() || bytes.len() as u64 > SESSION_EVIDENCE_MAX {
         return None;
     }
-    let mut saw_agent_message = false;
+    let mut agent_message_bytes = Vec::new();
     let mut saw_terminal = false;
+    let mut last_update_was_agent_message = false;
     for line in bytes.split(|byte| *byte == b'\n') {
         if line.is_empty() {
             continue;
@@ -1310,19 +1357,38 @@ fn retained_session_evidence(isolated: &IsolatedHome, session_id: &str) -> Optio
         }
         let update = params.get("update")?.as_object()?;
         let update_type = update.get("sessionUpdate")?.as_str()?;
+        if saw_terminal {
+            return None;
+        }
         if update_type == "agent_message_chunk" {
-            saw_agent_message = true;
+            let content = update.get("content")?.as_object()?;
+            require_exact_keys(content, &["type", "text"]).ok()?;
+            if content.get("type")?.as_str()? != "text" {
+                return None;
+            }
+            let text = content.get("text")?.as_str()?;
+            if text.is_empty() {
+                return None;
+            }
+            agent_message_bytes.extend_from_slice(text.as_bytes());
+            last_update_was_agent_message = true;
+            continue;
         }
-        if update_type == "turn_completed"
-            && update
-                .get("stop_reason")
-                .and_then(serde_json::Value::as_str)
-                == Some("end_turn")
-        {
+        if update_type == "turn_completed" {
+            if !last_update_was_agent_message
+                || update
+                    .get("stop_reason")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("end_turn")
+            {
+                return None;
+            }
             saw_terminal = true;
+            continue;
         }
+        last_update_was_agent_message = false;
     }
-    (saw_agent_message && saw_terminal).then_some(bytes)
+    (saw_terminal && agent_message_bytes.ends_with(expected_summary.as_bytes())).then_some(bytes)
 }
 
 fn sha256_evidence_ref(kind: &str, bytes: &[u8]) -> String {
@@ -1755,6 +1821,54 @@ fn path_bytes_ok(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct RevocationProbe {
+        called: AtomicBool,
+        fail: bool,
+    }
+
+    impl CredentialLeaseResolver for RevocationProbe {
+        fn resolve(&self, _lease_id: &str) -> Result<CredentialLeaseHandle, GrokBuildAdapterError> {
+            Err(GrokBuildAdapterError::CredentialLease)
+        }
+
+        fn revoke(&self, lease_id: &str) -> Result<(), GrokBuildAdapterError> {
+            assert_eq!(lease_id, "lease-1");
+            self.called.store(true, Ordering::SeqCst);
+            if self.fail {
+                Err(GrokBuildAdapterError::CredentialRevocation)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn uncertain_termination_revokes_upstream_and_local_authority() {
+        let parent = tempfile::tempdir().expect("parent");
+        let isolated = IsolatedHome::create(parent.path()).expect("home");
+        isolated.install_prompt("bounded prompt").expect("prompt");
+        let resolver = RevocationProbe {
+            called: AtomicBool::new(false),
+            fail: false,
+        };
+        let error = contain_uncertain_termination(&resolver, "lease-1", &isolated);
+        assert_eq!(error, GrokBuildAdapterError::TerminationUnproven);
+        assert!(resolver.called.load(Ordering::SeqCst));
+        assert!(!isolated.path.exists());
+
+        let isolated = IsolatedHome::create(parent.path()).expect("second home");
+        isolated.install_prompt("bounded prompt").expect("prompt");
+        let resolver = RevocationProbe {
+            called: AtomicBool::new(false),
+            fail: true,
+        };
+        let error = contain_uncertain_termination(&resolver, "lease-1", &isolated);
+        assert_eq!(error, GrokBuildAdapterError::CredentialRevocation);
+        assert!(resolver.called.load(Ordering::SeqCst));
+        assert!(!isolated.path.exists());
+    }
 
     #[test]
     fn allowlisted_argv_is_exact() {

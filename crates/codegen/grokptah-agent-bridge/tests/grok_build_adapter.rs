@@ -7,6 +7,8 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use grokptah_agent_bridge::grok_build::{
@@ -26,12 +28,19 @@ const LEAK_ENV: &str = "GROKPTAH_TEST_LEAK";
 
 struct FakeResolver {
     path: PathBuf,
+    revoked: Arc<AtomicBool>,
 }
 
 impl CredentialLeaseResolver for FakeResolver {
     fn resolve(&self, lease_id: &str) -> Result<CredentialLeaseHandle, GrokBuildAdapterError> {
         let _ = lease_id;
         Ok(CredentialLeaseHandle::from_host_path(self.path.clone()))
+    }
+
+    fn revoke(&self, lease_id: &str) -> Result<(), GrokBuildAdapterError> {
+        assert_eq!(lease_id, "lease-1");
+        self.revoked.store(true, Ordering::SeqCst);
+        Ok(())
     }
 }
 
@@ -124,6 +133,7 @@ impl Fixture {
     fn resolver(&self) -> FakeResolver {
         FakeResolver {
             path: self.lease_file.clone(),
+            revoked: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -251,14 +261,33 @@ for arg in "$@"; do
 done
 if [ -n "$session_id" ] && [ "$behavior" != 'complete-no-session' ]; then
   mkdir -p "$GROK_HOME/sessions/workspace/$session_id"
-  printf '{"method":"session/update","params":{"_meta":{},"sessionId":"%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"bounded advisory summary"}}},"timestamp":"2026-08-31T00:00:00Z"}\n' "$session_id" > "$GROK_HOME/sessions/workspace/$session_id/updates.jsonl"
+  printf '{"method":"session/update","params":{"_meta":{},"sessionId":"%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"bounded advisory summary\\nGROK_BUILD_VERDICT=clean"}}},"timestamp":"2026-08-31T00:00:00Z"}\n' "$session_id" > "$GROK_HOME/sessions/workspace/$session_id/updates.jsonl"
   printf '{"method":"_x.ai/session/update","params":{"_meta":{},"sessionId":"%s","update":{"sessionUpdate":"turn_completed","stop_reason":"end_turn"}},"timestamp":"2026-08-31T00:00:01Z"}\n' "$session_id" >> "$GROK_HOME/sessions/workspace/$session_id/updates.jsonl"
   if [ "$behavior" = 'complete-bad-session' ]; then
     printf '%s\n' '{"event":"unbound"}' > "$GROK_HOME/sessions/workspace/$session_id/updates.jsonl"
   fi
+  if [ "$behavior" = 'complete-terminal-first' ]; then
+    printf '{"method":"_x.ai/session/update","params":{"_meta":{},"sessionId":"%s","update":{"sessionUpdate":"turn_completed","stop_reason":"end_turn"}},"timestamp":"2026-08-31T00:00:00Z"}\n' "$session_id" > "$GROK_HOME/sessions/workspace/$session_id/updates.jsonl"
+    printf '{"method":"session/update","params":{"_meta":{},"sessionId":"%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"bounded advisory summary"}}},"timestamp":"2026-08-31T00:00:01Z"}\n' "$session_id" >> "$GROK_HOME/sessions/workspace/$session_id/updates.jsonl"
+  fi
+  if [ "$behavior" = 'complete-empty-chunk' ]; then
+    printf '{"method":"session/update","params":{"_meta":{},"sessionId":"%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":""}}},"timestamp":"2026-08-31T00:00:00Z"}\n' "$session_id" > "$GROK_HOME/sessions/workspace/$session_id/updates.jsonl"
+    printf '{"method":"_x.ai/session/update","params":{"_meta":{},"sessionId":"%s","update":{"sessionUpdate":"turn_completed","stop_reason":"end_turn"}},"timestamp":"2026-08-31T00:00:01Z"}\n' "$session_id" >> "$GROK_HOME/sessions/workspace/$session_id/updates.jsonl"
+  fi
+  if [ "$behavior" = 'complete-mismatched-summary' ]; then
+    printf '{"method":"session/update","params":{"_meta":{},"sessionId":"%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"different summary\\nGROK_BUILD_VERDICT=clean"}}},"timestamp":"2026-08-31T00:00:00Z"}\n' "$session_id" > "$GROK_HOME/sessions/workspace/$session_id/updates.jsonl"
+    printf '{"method":"_x.ai/session/update","params":{"_meta":{},"sessionId":"%s","update":{"sessionUpdate":"turn_completed","stop_reason":"end_turn"}},"timestamp":"2026-08-31T00:00:01Z"}\n' "$session_id" >> "$GROK_HOME/sessions/workspace/$session_id/updates.jsonl"
+  fi
+  if [ "$behavior" = 'complete-duplicate-terminal' ]; then
+    printf '{"method":"_x.ai/session/update","params":{"_meta":{},"sessionId":"%s","update":{"sessionUpdate":"turn_completed","stop_reason":"end_turn"}},"timestamp":"2026-08-31T00:00:02Z"}\n' "$session_id" >> "$GROK_HOME/sessions/workspace/$session_id/updates.jsonl"
+  fi
+  if [ "$behavior" = 'leak-secret' ]; then
+    printf '{"method":"session/update","params":{"_meta":{},"sessionId":"%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"sk-live-secret-not-real\\nbounded advisory summary\\nGROK_BUILD_VERDICT=clean"}}},"timestamp":"2026-08-31T00:00:00Z"}\n' "$session_id" > "$GROK_HOME/sessions/workspace/$session_id/updates.jsonl"
+    printf '{"method":"_x.ai/session/update","params":{"_meta":{},"sessionId":"%s","update":{"sessionUpdate":"turn_completed","stop_reason":"end_turn"}},"timestamp":"2026-08-31T00:00:01Z"}\n' "$session_id" >> "$GROK_HOME/sessions/workspace/$session_id/updates.jsonl"
+  fi
 fi
 case "$behavior" in
-  complete|complete-bad-session)
+  complete|complete-bad-session|complete-terminal-first|complete-empty-chunk|complete-mismatched-summary|complete-duplicate-terminal)
     printf '{"text":"bounded advisory summary\\nGROK_BUILD_VERDICT=clean","stopReason":"end_turn","sessionId":"%s","requestId":"11111111-1111-4111-8111-111111111111","thought":"","usage":{},"num_turns":1,"total_cost_usd":0.0,"total_cost_usd_ticks":0,"modelUsage":{}}\n' "$session_id"
     exit 0
     ;;
@@ -551,9 +580,14 @@ async fn cancellation_kills_process_tree_and_cleans_home() {
     let launch = fx.launch(GrokBuildMutationMode::IsolatedReview, 60_000);
     let host = fx.host();
     let resolver = fx.resolver();
+    let launched = fx.fake_dir.path().join("captured-argv");
     let ((), outcome) = tokio::join!(
         async move {
-            tokio::time::sleep(Duration::from_millis(400)).await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while !launched.exists() && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            assert!(launched.exists(), "task process never launched");
             trigger.cancel();
         },
         launch_grok_build(&launch, &host, &resolver, cancel)
@@ -607,7 +641,10 @@ async fn permissive_or_symlinked_credential_sources_are_rejected() {
     fs::set_permissions(&target, target_perms).expect("target chmod");
     let link = fx.fake_dir.path().join("lease-link");
     std::os::unix::fs::symlink(&target, &link).expect("symlink");
-    let resolver = FakeResolver { path: link };
+    let resolver = FakeResolver {
+        path: link,
+        revoked: Arc::new(AtomicBool::new(false)),
+    };
     let err = launch_grok_build(
         &fx.launch(GrokBuildMutationMode::IsolatedReview, 60_000),
         &fx.host(),
@@ -721,7 +758,15 @@ async fn partial_and_max_turn_are_nonresumable_and_fail_closed() {
 
 #[tokio::test]
 async fn terminal_marker_requires_summary_and_retained_session() {
-    for behavior in ["marker-only", "complete-no-session", "complete-bad-session"] {
+    for behavior in [
+        "marker-only",
+        "complete-no-session",
+        "complete-bad-session",
+        "complete-terminal-first",
+        "complete-empty-chunk",
+        "complete-mismatched-summary",
+        "complete-duplicate-terminal",
+    ] {
         let fx = Fixture::new();
         fx.set_behavior(behavior);
         let outcome = launch_grok_build(
