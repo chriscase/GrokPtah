@@ -1,5 +1,6 @@
 //! Durable run records, idempotency receipts, audit log (#196).
 
+use std::collections::HashSet;
 use std::fs;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
@@ -2923,6 +2924,37 @@ impl OrchStore {
         Ok(out)
     }
 
+    /// Durable work and attempts visible to a public scoped worker projection.
+    /// Identity membership is fenced separately; this only bounds load counts
+    /// to the requested lane and workspace.
+    fn scoped_work_and_attempts_unlocked(
+        &self,
+        session_id: Uuid,
+        workspace: &str,
+    ) -> Result<(Vec<WorkItem>, Vec<WorkAttempt>), OrchError> {
+        let scope = super::graph::GraphScope {
+            session_id,
+            workspace,
+        };
+        let items = self
+            .list_work_items_unlocked()
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .into_iter()
+            .filter(|item| scope.contains(item))
+            .collect::<Vec<_>>();
+        let scoped_ids = items
+            .iter()
+            .map(|item| item.work_id.clone())
+            .collect::<HashSet<_>>();
+        let attempts = self
+            .list_work_attempts_unlocked(None)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .into_iter()
+            .filter(|attempt| scoped_ids.contains(&attempt.work_id))
+            .collect();
+        Ok((items, attempts))
+    }
+
     /// List only active workers attributable to the requested lane and
     /// workspace. This is the scoped read primitive used by public MCP
     /// observatory calls; the legacy workspace-only helper remains available
@@ -2937,12 +2969,7 @@ impl OrchStore {
         let agents = self
             .list_agents_unlocked()
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-        let items = self
-            .list_work_items_unlocked()
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-        let attempts = self
-            .list_work_attempts_unlocked(None)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let (items, attempts) = self.scoped_work_and_attempts_unlocked(session_id, workspace)?;
         let mut out = Vec::new();
         for agent in agents {
             if !agent.state.is_active_identity()
@@ -3019,12 +3046,7 @@ impl OrchStore {
         {
             return Ok(None);
         }
-        let items = self
-            .list_work_items_unlocked()
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-        let attempts = self
-            .list_work_attempts_unlocked(None)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let (items, attempts) = self.scoped_work_and_attempts_unlocked(session_id, workspace)?;
         let presence = self.load_worker_presence_unlocked(agent_id)?;
         Ok(Some(WorkerProjection::project(
             &agent,
