@@ -98,6 +98,54 @@ pub struct WorkerProjection {
     pub active_leases: Vec<LeaseOwnership>,
 }
 
+/// Public MCP observatory view of a worker. This is an allowlist: unknown
+/// fields are denied on decode, and internal `WorkerProjection` fields such as
+/// workspace paths, model routes, tool names, lease/attempt ids, and measured
+/// provider diagnostics are not serialized.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkerObservatoryProjection {
+    pub agent_id: String,
+    pub display_name: String,
+    pub host_kind: WorkerHostKind,
+    pub computer_use_allowed: bool,
+    pub declared_tool_count: usize,
+    pub load: WorkerLoad,
+    pub liveness: WorkerLivenessState,
+    pub last_heartbeat_at: Option<DateTime<Utc>>,
+    pub stale_after_ms: i64,
+}
+
+impl WorkerObservatoryProjection {
+    pub fn from_internal(worker: &WorkerProjection) -> Self {
+        Self {
+            agent_id: worker.agent_id.clone(),
+            display_name: worker.display_name.clone(),
+            host_kind: worker.host_kind,
+            computer_use_allowed: worker.computer_use_allowed,
+            declared_tool_count: worker.declared_tools.len(),
+            load: worker.load.clone(),
+            liveness: worker.liveness,
+            last_heartbeat_at: worker.last_heartbeat_at,
+            stale_after_ms: worker.stale_after_ms,
+        }
+    }
+
+    pub const fn allowlisted_json_keys() -> &'static [&'static str] {
+        &[
+            "agentId",
+            "displayName",
+            "hostKind",
+            "computerUseAllowed",
+            "declaredToolCount",
+            "load",
+            "liveness",
+            "lastHeartbeatAt",
+            "staleAfterMs",
+        ]
+    }
+}
+
 impl WorkerProjection {
     pub fn project(
         agent: &AgentRecord,
@@ -256,5 +304,101 @@ mod tests {
         };
         assert!(attempt.lease_active_at(now));
         assert_ne!(attempt.claimant_id, presence.agent_id);
+    }
+
+    fn sensitive_internal_projection(now: DateTime<Utc>) -> WorkerProjection {
+        WorkerProjection {
+            agent_id: "worker-z".into(),
+            display_name: "Worker Z".into(),
+            workspace: "/secret/workspace".into(),
+            host_kind: WorkerHostKind::Service,
+            model: Some(AgentModelSpec {
+                selection_key: "xai/grok-3".into(),
+                provider_id: "xai".into(),
+                model_id: "grok-3".into(),
+            }),
+            declared_tools: vec!["run_terminal_cmd".into(), "web_fetch".into()],
+            measured: Some(MeasuredCapability {
+                qualified_at: now,
+                qualified_tools: vec!["web_fetch".into()],
+                provider_route: "xai/grok-3".into(),
+            }),
+            policy_limits: RunBounds::default(),
+            computer_use_allowed: false,
+            load: WorkerLoad {
+                assigned_items: 2,
+                queued_items: 1,
+                active_leases: 1,
+            },
+            liveness: WorkerLivenessState::Live,
+            last_heartbeat_at: Some(now),
+            stale_after_ms: DEFAULT_WORKER_STALE_AFTER_MS,
+            active_leases: vec![LeaseOwnership {
+                work_id: "work-1".into(),
+                attempt_id: "attempt-secret".into(),
+                lease_expires_at: now,
+            }],
+        }
+    }
+
+    #[test]
+    fn observatory_projection_omits_sensitive_internal_fields() {
+        let internal = sensitive_internal_projection(Utc::now());
+        let public = WorkerObservatoryProjection::from_internal(&internal);
+        let value = serde_json::to_value(&public).expect("serialize public worker");
+        let object = value.as_object().expect("object");
+        let mut keys: Vec<_> = object.keys().cloned().collect();
+        keys.sort();
+        let mut allowed: Vec<_> = WorkerObservatoryProjection::allowlisted_json_keys()
+            .iter()
+            .map(|key| (*key).to_string())
+            .collect();
+        allowed.sort();
+        assert_eq!(keys, allowed);
+        assert_eq!(public.declared_tool_count, 2);
+        assert_eq!(public.load.active_leases, 1);
+        let encoded = value.to_string();
+        for forbidden in [
+            "workspace",
+            "/secret/workspace",
+            "declaredTools",
+            "run_terminal_cmd",
+            "web_fetch",
+            "measured",
+            "providerRoute",
+            "qualifiedTools",
+            "policyLimits",
+            "attempt-secret",
+            "attemptId",
+            "leaseExpiresAt",
+            "selectionKey",
+            "providerId",
+            "modelId",
+            "xai/grok-3",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "public worker JSON leaked {forbidden}: {encoded}"
+            );
+        }
+        // Nested load counts keep the existing WorkerLoad field name, which is
+        // a count rather than lease identity.
+        assert_eq!(object["load"]["activeLeases"], 1);
+        assert!(object["load"].get("attemptId").is_none());
+    }
+
+    #[test]
+    fn observatory_projection_denies_unknown_fields() {
+        let mut value = serde_json::to_value(WorkerObservatoryProjection::from_internal(
+            &sensitive_internal_projection(Utc::now()),
+        ))
+        .expect("serialize");
+        value["workspace"] = serde_json::json!("/secret/workspace");
+        let err = serde_json::from_value::<WorkerObservatoryProjection>(value)
+            .expect_err("unknown fields must be denied");
+        assert!(
+            err.to_string().contains("unknown field"),
+            "expected deny_unknown_fields, got {err}"
+        );
     }
 }

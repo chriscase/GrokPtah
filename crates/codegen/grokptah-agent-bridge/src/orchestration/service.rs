@@ -46,7 +46,7 @@ use super::supervisor::{
     MAX_MANAGER_OBSERVATIONS_PER_PASS, MAX_MANAGER_PLANS_PER_PASS,
 };
 use super::types::*;
-use super::worker::{reject_privilege_amplification, WorkerHostKind};
+use super::worker::{reject_privilege_amplification, WorkerHostKind, WorkerObservatoryProjection};
 use super::workload::{
     WorkAttempt, WorkAttemptView, WorkDecision, WorkDependency, WorkItem, WorkPolicy, WorkProgress,
     WorkResult, WorkState,
@@ -3545,7 +3545,10 @@ impl OrchestrationService {
         let claimed = self.authorize_work_read_scope(session_id, workspace)?;
         let workers = self
             .store
-            .list_workers(&claimed.display().to_string(), Utc::now())?;
+            .list_workers_scoped(session_id, &claimed.display().to_string(), Utc::now())?
+            .into_iter()
+            .map(|worker| WorkerObservatoryProjection::from_internal(&worker))
+            .collect::<Vec<_>>();
         Ok(json!({ "workers": workers }))
     }
 
@@ -3559,15 +3562,16 @@ impl OrchestrationService {
         let claimed = self.authorize_work_read_scope(session_id, workspace)?;
         let worker = self
             .store
-            .get_worker(agent_id, Utc::now())?
+            .get_worker_scoped(
+                agent_id,
+                session_id,
+                &claimed.display().to_string(),
+                Utc::now(),
+            )?
             .ok_or_else(|| OrchError::new(OrchErrorCode::InvalidRequest, "unknown worker"))?;
-        if !super::workspaces_match(&worker.workspace, &claimed.display().to_string()) {
-            return Err(OrchError::new(
-                OrchErrorCode::ForbiddenScope,
-                "worker is outside the requested workspace",
-            ));
-        }
-        Ok(json!({ "worker": worker }))
+        Ok(json!({
+            "worker": WorkerObservatoryProjection::from_internal(&worker)
+        }))
     }
 
     pub async fn heartbeat_worker(

@@ -3,7 +3,8 @@
 mod common;
 
 use grokptah_agent_bridge::orchestration::{
-    OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, WorkspaceAllowlist,
+    OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, WorkerObservatoryProjection,
+    WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
     set_grokptah_home_override, start_control_server, AgentHost, AgentState, AuthCredential,
@@ -774,4 +775,179 @@ async fn coordinator_identity_and_scope_are_enforced() {
     orch.stop_background_tasks().await;
     coordinator.close_session().await.unwrap();
     worker_client.close_session().await.unwrap();
+}
+
+fn assert_observatory_worker_json(worker: &serde_json::Value, workspace: &str) {
+    let object = worker
+        .as_object()
+        .unwrap_or_else(|| panic!("worker object: {worker}"));
+    let mut keys: Vec<_> = object.keys().cloned().collect();
+    keys.sort();
+    let mut allowed: Vec<_> = WorkerObservatoryProjection::allowlisted_json_keys()
+        .iter()
+        .map(|key| (*key).to_string())
+        .collect();
+    allowed.sort();
+    assert_eq!(keys, allowed, "public worker JSON changed shape: {worker}");
+    for key in [
+        "workspace",
+        "model",
+        "declaredTools",
+        "measured",
+        "policyLimits",
+        "activeLeases",
+    ] {
+        assert!(
+            object.get(key).is_none(),
+            "public worker JSON leaked top-level {key}: {worker}"
+        );
+    }
+    let load = object
+        .get("load")
+        .and_then(|value| value.as_object())
+        .unwrap_or_else(|| panic!("load object: {worker}"));
+    assert!(
+        load.get("activeLeases").is_some(),
+        "load.activeLeases count must remain on the public worker: {worker}"
+    );
+    assert!(load.get("attemptId").is_none());
+    assert!(load.get("workId").is_none());
+    let encoded = worker.to_string();
+    assert!(
+        !encoded.contains(workspace),
+        "public worker JSON leaked workspace path: {encoded}"
+    );
+    for token in [
+        "declaredTools",
+        "run_terminal_cmd",
+        "web_fetch",
+        "attemptId",
+        "leaseExpiresAt",
+        "providerId",
+        "modelId",
+        "selectionKey",
+        "providerRoute",
+        "qualifiedTools",
+        "policyLimits",
+    ] {
+        assert!(
+            !encoded.contains(token),
+            "public worker JSON leaked {token}: {encoded}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn observatory_reads_redact_and_hide_same_workspace_cross_lane_workers() {
+    let mut env = ProcessEnvGuard::new();
+    let home = tempdir().unwrap();
+    set_grokptah_home_override(Some(home.path().join(".grokptah")));
+    env.set("GROKPTAH_AGENT_OFFLINE", "1");
+    let workspace = tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    })
+    .expect("acquire the GrokPtah instance lock");
+    host.start().unwrap();
+    let lane_a = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(lane_a.id, workspace.path()).unwrap();
+    let lane_b = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(lane_b.id, workspace.path()).unwrap();
+    let local_template = host.ensure_session_agent(lane_a.id).unwrap();
+    let cross_template = host.ensure_session_agent(lane_b.id).unwrap();
+    let store = host.ensure_orchestration_store().unwrap();
+    let local = {
+        let mut local = local_template.clone();
+        local.agent_id = format!("obs-local-{}", lane_a.id);
+        if let Some(spec) = local.spec.as_mut() {
+            spec.display_name = "observatory-local".into();
+            spec.authority.allowed_tools = vec!["run_terminal_cmd".into(), "web_fetch".into()];
+        }
+        store.save_agent(&local).unwrap();
+        local
+    };
+    let cross = {
+        let mut cross = cross_template.clone();
+        cross.agent_id = format!("obs-cross-{}", lane_b.id);
+        if let Some(spec) = cross.spec.as_mut() {
+            spec.display_name = "observatory-cross".into();
+            spec.authority.allowed_tools = vec!["run_terminal_cmd".into()];
+        }
+        store.save_agent(&cross).unwrap();
+        cross
+    };
+    let orch = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        store,
+        OrchestrationConfig {
+            bearer_token: "coord-token-obs".into(),
+            allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
+            max_concurrent_runs: 2,
+            bounds: RunBounds::default(),
+        },
+    );
+    let auth = orch
+        .auth_header(Some("Bearer coord-token-obs"))
+        .expect("observatory bearer");
+    let workspace_text = workspace.path().display().to_string();
+    let model = local
+        .spec
+        .as_ref()
+        .map(|spec| spec.model.clone())
+        .expect("local worker model");
+
+    let listed = orch
+        .list_workers_scoped(&auth, lane_a.id, workspace.path())
+        .expect("list workers in lane A");
+    let workers = listed["workers"]
+        .as_array()
+        .cloned()
+        .expect("workers array");
+    let ids: Vec<&str> = workers
+        .iter()
+        .map(|worker| worker["agentId"].as_str().expect("agentId"))
+        .collect();
+    assert!(
+        ids.contains(&local.agent_id.as_str()),
+        "lane A list must include the local worker: {ids:?}"
+    );
+    assert!(
+        !ids.contains(&cross.agent_id.as_str()),
+        "same-workspace cross-lane worker must be omitted: {ids:?}"
+    );
+    let mut sorted = ids.clone();
+    sorted.sort();
+    assert_eq!(ids, sorted, "observatory list must be sorted by agentId");
+    for worker in &workers {
+        assert_observatory_worker_json(worker, &workspace_text);
+        let encoded = worker.to_string();
+        assert!(!encoded.contains(model.selection_key.as_str()));
+        assert!(!encoded.contains(model.provider_id.as_str()));
+        assert!(!encoded.contains(model.model_id.as_str()));
+    }
+
+    let detail = orch
+        .get_worker_scoped(&auth, lane_a.id, workspace.path(), &local.agent_id)
+        .expect("get local worker");
+    assert_observatory_worker_json(&detail["worker"], &workspace_text);
+
+    let unknown = orch
+        .get_worker_scoped(
+            &auth,
+            lane_a.id,
+            workspace.path(),
+            "missing-observatory-worker",
+        )
+        .expect_err("unknown worker");
+    let foreign = orch
+        .get_worker_scoped(&auth, lane_a.id, workspace.path(), &cross.agent_id)
+        .expect_err("cross-lane worker");
+    assert_eq!(unknown.code, foreign.code);
+    assert_eq!(unknown.message, foreign.message);
+    assert_eq!(unknown.data, foreign.data);
+
+    orch.stop_background_tasks().await;
 }

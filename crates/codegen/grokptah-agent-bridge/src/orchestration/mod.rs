@@ -92,7 +92,7 @@ pub use types::{
 };
 pub use worker::{
     reject_privilege_amplification, MeasuredCapability, WorkerHostKind, WorkerLivenessState,
-    WorkerPresence, WorkerProjection, DEFAULT_WORKER_STALE_AFTER_MS,
+    WorkerObservatoryProjection, WorkerPresence, WorkerProjection, DEFAULT_WORKER_STALE_AFTER_MS,
 };
 pub use workload::{
     lease_duration, AssignmentStatus, AttemptState, BlockProvenance, WorkApproval, WorkArtifactRef,

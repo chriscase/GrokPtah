@@ -136,13 +136,24 @@ struct LiveStreamState {
     start_seq: u64,
     end_seq: Option<u64>,
     receiver: EventReceiver,
+    /// Highest event queued for this stream. This is only a local duplicate
+    /// filter; it is not necessarily a safe durable-replay cursor because the
+    /// dual-lane receiver can reveal an earlier gap after a critical terminal
+    /// event has already been queued.
     last_seq: u64,
+    /// Highest sequence known to precede any observed subscriber gap.
+    /// Recovery instructions must use this cursor, never `last_seq`.
+    last_safe_seq: u64,
     replay_cursor: Option<u64>,
     pending: VecDeque<Bytes>,
     heartbeat: tokio::time::Interval,
     /// A terminal event has been queued but must remain open long enough to
     /// surface a subscriber gap that was observed on the other event lane.
     terminal_pending: bool,
+    /// Safe replay cursor captured before the queued terminal event. If the
+    /// other receiver lane reports a gap before close, replay must include the
+    /// terminal event rather than skipping an earlier missing event.
+    terminal_recovery_seq: Option<u64>,
     done: bool,
     shutdown: tokio_util::sync::CancellationToken,
     _permit: tokio::sync::OwnedSemaphorePermit,
@@ -174,6 +185,10 @@ impl LiveStreamState {
         }
         let event = PublicEventV1::from_update(seq, ts, &update);
         let terminal = event.kind == PublicEventKindV1::TurnComplete;
+        let safe_before_entry = self.last_safe_seq;
+        if !self.receiver_gap_pending() {
+            self.last_safe_seq = seq;
+        }
         self.last_seq = seq;
         self.pending.push_back(sse_message(
             Some(seq),
@@ -185,11 +200,16 @@ impl LiveStreamState {
         ));
         if terminal || self.end_seq == Some(seq) {
             self.terminal_pending = true;
+            self.terminal_recovery_seq = Some(safe_before_entry);
             self.replay_cursor = None;
         }
     }
 
     fn queue_recovery(&mut self, reason: &str) {
+        self.queue_recovery_after(reason, self.last_safe_seq);
+    }
+
+    fn queue_recovery_after(&mut self, reason: &str, after_seq: u64) {
         self.pending.push_back(sse_message(
             None,
             json!({
@@ -199,7 +219,7 @@ impl LiveStreamState {
                     "sessionId": self.session_id,
                     "workspace": self.workspace,
                     "runId": self.run_id,
-                    "afterSeq": self.last_seq,
+                    "afterSeq": after_seq,
                     "reason": reason,
                     "pollTool": "ptah_get_events",
                 }
@@ -221,10 +241,15 @@ impl LiveStreamState {
         if !self.terminal_pending || !self.pending.is_empty() {
             return false;
         }
+        let recovery_after_seq = self
+            .terminal_recovery_seq
+            .take()
+            .unwrap_or(self.last_safe_seq);
         self.terminal_pending = false;
         if self.receiver_gap_pending() {
-            self.queue_recovery(
+            self.queue_recovery_after(
                 "live event subscriber lagged before terminal delivery; resynchronize from the durable journal",
+                recovery_after_seq,
             );
         } else {
             self.done = true;
@@ -1106,10 +1131,12 @@ async fn streamable_get_handler(
         end_seq: scope.end_seq,
         receiver,
         last_seq,
+        last_safe_seq: last_seq,
         replay_cursor: None,
         pending: VecDeque::new(),
         heartbeat: tokio::time::interval(Duration::from_secs(10)),
         terminal_pending: false,
+        terminal_recovery_seq: None,
         done: false,
         shutdown: state.shutdown.clone(),
         _permit: permit,
@@ -4155,10 +4182,12 @@ mod tests {
             end_seq: None,
             receiver,
             last_seq: 0,
+            last_safe_seq: 0,
             replay_cursor: None,
             pending: VecDeque::new(),
             heartbeat: tokio::time::interval(Duration::from_secs(10)),
             terminal_pending: false,
+            terminal_recovery_seq: None,
             done: false,
             shutdown: tokio_util::sync::CancellationToken::new(),
             _permit: permit,
@@ -4192,6 +4221,10 @@ mod tests {
         let recovery = live.next_frame().await.expect("recovery frame");
         let recovery_text = String::from_utf8_lossy(&recovery);
         assert!(recovery_text.contains("notifications/ptah_recovery"));
+        assert!(
+            recovery_text.contains("\"afterSeq\":0"),
+            "recovery must replay from the last safe cursor before the terminal event: {recovery_text}"
+        );
         assert!(live.done);
         assert!(live.next_frame().await.is_none());
         set_grokptah_home_override(None);
@@ -4234,10 +4267,12 @@ mod tests {
             end_seq: None,
             receiver,
             last_seq: 0,
+            last_safe_seq: 0,
             replay_cursor: None,
             pending: VecDeque::new(),
             heartbeat,
             terminal_pending: false,
+            terminal_recovery_seq: None,
             done: false,
             shutdown: tokio_util::sync::CancellationToken::new(),
             _permit: permit,

@@ -2923,6 +2923,49 @@ impl OrchStore {
         Ok(out)
     }
 
+    /// List only active workers attributable to the requested lane and
+    /// workspace. This is the scoped read primitive used by public MCP
+    /// observatory calls; the legacy workspace-only helper remains available
+    /// to internal callers that already hold an equivalent scope.
+    pub fn list_workers_scoped(
+        &self,
+        session_id: Uuid,
+        workspace: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<Vec<WorkerProjection>, OrchError> {
+        let _guard = self.inner.lock.lock();
+        let agents = self
+            .list_agents_unlocked()
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let items = self
+            .list_work_items_unlocked()
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let attempts = self
+            .list_work_attempts_unlocked(None)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let mut out = Vec::new();
+        for agent in agents {
+            if !agent.state.is_active_identity()
+                || !agent.known_lane_ids().contains(&session_id)
+                || !workspaces_match(&agent.workspace, workspace)
+            {
+                continue;
+            }
+            let presence = self.load_worker_presence_unlocked(&agent.agent_id)?;
+            out.push(WorkerProjection::project(
+                &agent,
+                agent.spec.as_ref(),
+                presence.as_ref(),
+                &items,
+                &attempts,
+                now,
+                None,
+            ));
+        }
+        out.sort_by(|left, right| left.agent_id.cmp(&right.agent_id));
+        Ok(out)
+    }
+
     pub fn get_worker(
         &self,
         agent_id: &str,
@@ -2935,6 +2978,47 @@ impl OrchStore {
         else {
             return Ok(None);
         };
+        let items = self
+            .list_work_items_unlocked()
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let attempts = self
+            .list_work_attempts_unlocked(None)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let presence = self.load_worker_presence_unlocked(agent_id)?;
+        Ok(Some(WorkerProjection::project(
+            &agent,
+            agent.spec.as_ref(),
+            presence.as_ref(),
+            &items,
+            &attempts,
+            now,
+            None,
+        )))
+    }
+
+    /// Scoped detail read for public observatories. Out-of-scope, inactive,
+    /// and unknown identities intentionally collapse to `None` so the service
+    /// can expose one indistinguishable public error.
+    pub fn get_worker_scoped(
+        &self,
+        agent_id: &str,
+        session_id: Uuid,
+        workspace: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<Option<WorkerProjection>, OrchError> {
+        let _guard = self.inner.lock.lock();
+        let Some(agent) = self
+            .load_agent_unlocked(agent_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+        else {
+            return Ok(None);
+        };
+        if !agent.state.is_active_identity()
+            || !agent.known_lane_ids().contains(&session_id)
+            || !workspaces_match(&agent.workspace, workspace)
+        {
+            return Ok(None);
+        }
         let items = self
             .list_work_items_unlocked()
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
