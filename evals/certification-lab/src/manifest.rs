@@ -263,6 +263,9 @@ pub enum ProbeAction {
     AttemptInvalidWorkInputResolution,
     ObserveNativeTicks,
     ClaimRetriedWork,
+    CreateAutonomousManagerPlan,
+    TickManagerPlan,
+    InspectManagerPlan,
 }
 
 impl ProbeAction {
@@ -368,6 +371,23 @@ impl ProbeAction {
             ],
             Self::ObserveNativeTicks => &["ptah_get_capacity"],
             Self::ClaimRetriedWork => &["ptah_claim_work"],
+            Self::CreateAutonomousManagerPlan => &[
+                "ptah_create_session",
+                "ptah_submit_task",
+                "ptah_cancel",
+                "ptah_get_run",
+                "ptah_list_persistent_agents",
+                FUTURE_SET_MANAGED_EXECUTION_TOOL,
+                "ptah_create_manager_plan",
+            ],
+            Self::TickManagerPlan => &["ptah_tick_manager_plan"],
+            Self::InspectManagerPlan => &[
+                "ptah_get_manager_plan",
+                "ptah_list_work",
+                "ptah_list_runs",
+                FUTURE_LIST_EXECUTION_INTENTS_TOOL,
+                "ptah_get_capacity",
+            ],
         }
     }
 
@@ -396,6 +416,7 @@ impl ProbeAction {
                 | Self::InspectManagedPolicy
                 | Self::ObserveNativeTicks
                 | Self::WaitForManagedAdmission
+                | Self::InspectManagerPlan
         )
     }
 }
@@ -518,6 +539,9 @@ pub enum OracleCode {
     ContinuationRunCreated,
     CheckpointUsedForContinuation,
     ResumeRequestReplayStable,
+    AlwaysOnPlanSucceeded,
+    UncertainAttemptNotResumed,
+    InterruptedRunNotReadmittedWithinWindow,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1055,6 +1079,9 @@ impl ProbeDefinition {
                 }
             }
         }
+        if self.id == "always-on-grokbot-lifecycle-v1" {
+            validate_always_on_probe(self, &actions, &oracles)?;
+        }
         validate_action_sequence(self, &actions)?;
         Ok(())
     }
@@ -1146,6 +1173,79 @@ impl HardBounds {
     }
 }
 
+fn validate_always_on_probe(
+    probe: &ProbeDefinition,
+    actions: &HashSet<ProbeAction>,
+    oracles: &HashSet<OracleCode>,
+) -> Result<()> {
+    for action in [
+        ProbeAction::CreateAutonomousManagerPlan,
+        ProbeAction::InspectManagerPlan,
+        ProbeAction::InspectWorkSet,
+        ProbeAction::InspectWorkAttempts,
+        ProbeAction::InspectRunSet,
+        ProbeAction::InspectExecutionIntent,
+        ProbeAction::ReplayRequest,
+        ProbeAction::ReplayChangedPayload,
+        ProbeAction::TickManagerPlan,
+        ProbeAction::DisconnectClient,
+        ProbeAction::RestartService,
+        ProbeAction::ReconnectClient,
+    ] {
+        if !actions.contains(&action) {
+            bail!("always-on probe omitted required action {action:?}");
+        }
+    }
+    for oracle in [
+        OracleCode::AlwaysOnPlanSucceeded,
+        OracleCode::NoDuplicateNativeRun,
+        OracleCode::RequestReplaySameResource,
+        OracleCode::ChangedPayloadConflict,
+        OracleCode::InterruptedRunNotReadmittedWithinWindow,
+        OracleCode::DurableReadAfterRestart,
+        OracleCode::NoImplicitInvocationResume,
+        OracleCode::RestartReconnectObserved,
+    ] {
+        if !oracles.contains(&oracle) {
+            bail!("always-on probe omitted required oracle {oracle:?}");
+        }
+    }
+    let position = |needle: ProbeAction| probe.actions.iter().position(|action| *action == needle);
+    let inspect = position(ProbeAction::InspectManagerPlan)
+        .context("always-on probe lacks inspect_manager_plan")?;
+    let tick = position(ProbeAction::TickManagerPlan)
+        .context("always-on probe lacks tick_manager_plan")?;
+    let disconnect = position(ProbeAction::DisconnectClient)
+        .context("always-on probe lacks disconnect_client")?;
+    if inspect >= tick || tick >= disconnect {
+        bail!("always-on tick is not a post-inspect negative control before restart");
+    }
+    for (entity, from, to) in [
+        (
+            DurableEntity::Work,
+            DurableState::Queued,
+            DurableState::Succeeded,
+        ),
+        (
+            DurableEntity::Run,
+            DurableState::Running,
+            DurableState::Interrupted,
+        ),
+        (
+            DurableEntity::Work,
+            DurableState::Running,
+            DurableState::Failed,
+        ),
+    ] {
+        if !probe.expected_transitions.iter().any(|transition| {
+            transition.entity == entity && transition.from == from && transition.to == to
+        }) {
+            bail!("always-on probe omitted required observable transition");
+        }
+    }
+    Ok(())
+}
+
 fn validate_action_sequence(probe: &ProbeDefinition, actions: &HashSet<ProbeAction>) -> Result<()> {
     if probe.effect == ProbeEffect::ReadOnly && actions.iter().any(|action| action.mutates()) {
         bail!("read-only probe declares a mutating action");
@@ -1156,6 +1256,7 @@ fn validate_action_sequence(probe: &ProbeDefinition, actions: &HashSet<ProbeActi
         ProbeAction::CreateTestAgents,
         ProbeAction::SubmitManagedWork,
         ProbeAction::SubmitIndependentPermissionCases,
+        ProbeAction::CreateAutonomousManagerPlan,
     ]
     .into_iter()
     .filter_map(position)
@@ -2014,5 +2115,66 @@ mod tests {
         assert_eq!(path.components().next(), Some(Component::ParentDir));
         assert!(validate_relative_path(AUTHORITATIVE_CATALOG_RELATIVE_PATH).is_ok());
         assert!(validate_relative_path("/tmp/catalog.json").is_err());
+    }
+
+    fn always_on_probe_mut() -> (Value, usize) {
+        let value = bundled_value();
+        let index = value["probes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|probe| probe["id"] == "always-on-grokbot-lifecycle-v1")
+            .unwrap();
+        (value, index)
+    }
+
+    #[test]
+    fn always_on_manifest_rejects_deleting_each_required_action_oracle_or_transition() {
+        let (value, index) = always_on_probe_mut();
+        let actions = value["probes"][index]["actions"]
+            .as_array()
+            .unwrap()
+            .clone();
+        for (i, action) in actions.iter().enumerate() {
+            let mut mutated = value.clone();
+            mutated["probes"][index]["actions"]
+                .as_array_mut()
+                .unwrap()
+                .remove(i);
+            assert!(
+                validate_value(mutated).is_err(),
+                "deleting always-on action {action} must fail validation"
+            );
+        }
+        let oracles = value["probes"][index]["oracle_codes"]
+            .as_array()
+            .unwrap()
+            .clone();
+        for (i, oracle) in oracles.iter().enumerate() {
+            let mut mutated = value.clone();
+            mutated["probes"][index]["oracle_codes"]
+                .as_array_mut()
+                .unwrap()
+                .remove(i);
+            assert!(
+                validate_value(mutated).is_err(),
+                "deleting always-on oracle {oracle} must fail validation"
+            );
+        }
+        let transitions = value["probes"][index]["expected_transitions"]
+            .as_array()
+            .unwrap()
+            .clone();
+        for (i, _) in transitions.iter().enumerate() {
+            let mut mutated = value.clone();
+            mutated["probes"][index]["expected_transitions"]
+                .as_array_mut()
+                .unwrap()
+                .remove(i);
+            assert!(
+                validate_value(mutated).is_err(),
+                "deleting always-on transition {i} must fail validation"
+            );
+        }
     }
 }
