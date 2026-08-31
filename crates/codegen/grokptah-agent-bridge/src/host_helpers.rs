@@ -5051,9 +5051,18 @@ test result: FAILED. 0 passed; 3 failed; 0 ignored
             "{mixed_prefix}timestamp=2026-08-30T21:01:00Z;result=ok{}",
             "🙂".repeat(40)
         );
+        let mixed_changed = format!(
+            "{mixed_prefix}timestamp=2026-08-30T21:00:00Z;result=changed{}",
+            "🙂".repeat(40)
+        );
         assert_eq!(
             stationarity_digest(&mixed_one),
             stationarity_digest(&mixed_two)
+        );
+        assert_ne!(
+            stationarity_digest(&mixed_one),
+            stationarity_digest(&mixed_changed),
+            "mixed-width normalization must preserve substantive tail changes"
         );
         for chunk in [1, NORMALIZER_HOLD_BYTES, NORMALIZER_CHUNK_BYTES, 4_192] {
             assert_eq!(
@@ -5063,7 +5072,7 @@ test result: FAILED. 0 passed; 3 failed; 0 ignored
             );
         }
 
-        let fake_prefix = "q".repeat(NORMALIZER_CHUNK_BYTES - 4);
+        let fake_prefix = "q".repeat(NORMALIZER_CHUNK_BYTES - NORMALIZER_HOLD_BYTES - 2);
         let fake_one = format!("{fake_prefix}rapid=1{}", "z".repeat(128));
         let fake_two = format!("{fake_prefix}rapid=2{}", "z".repeat(128));
         assert_ne!(
