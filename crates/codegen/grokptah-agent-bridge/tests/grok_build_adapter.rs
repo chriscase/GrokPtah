@@ -109,6 +109,7 @@ impl Fixture {
             repository_id: "repo-acme".into(),
             base_ref: "base".into(),
             prompt: "review the isolated tree".into(),
+            allowed_files: vec!["README".into()],
             max_stdout_bytes: 8_192,
             max_stderr_bytes: 8_192,
             git_timeout: Duration::from_secs(5),
@@ -684,6 +685,63 @@ async fn secret_redaction_across_debug_and_public_result() {
         .iter()
         .any(|m| m.contains(SECRET)));
     assert_eq!(outcome.result().state, GrokBuildRunState::CompleteAdvisory);
+}
+
+#[tokio::test]
+async fn isolated_review_captures_only_allowlisted_mutation_evidence() {
+    let fx = Fixture::new();
+    fx.set_behavior("mutate");
+    let mut host = fx.host();
+    host.allowed_files = vec!["mutated-by-child.txt".into()];
+    let outcome = launch_grok_build(
+        &fx.launch(GrokBuildMutationMode::IsolatedReview, 60_000),
+        &host,
+        &fx.resolver(),
+        CancellationToken::new(),
+    )
+    .await
+    .expect("allowlisted isolated mutation");
+    let mutation = outcome
+        .mutation_evidence()
+        .expect("bounded mutation evidence");
+    assert_eq!(mutation.final_head_sha(), fx.identity.head_sha);
+    assert_eq!(mutation.final_ref(), fx.identity.git_ref);
+    assert_eq!(mutation.changed_paths(), &["mutated-by-child.txt"]);
+    assert!(mutation.diff_digest().starts_with("sha256:"));
+    assert_no_secret(&format!("{mutation:?}"));
+}
+
+#[tokio::test]
+async fn isolated_review_rejects_forbidden_mutation_and_publish_remote() {
+    let fx = Fixture::new();
+    fx.set_behavior("mutate");
+    let error = launch_grok_build(
+        &fx.launch(GrokBuildMutationMode::IsolatedReview, 60_000),
+        &fx.host(),
+        &fx.resolver(),
+        CancellationToken::new(),
+    )
+    .await
+    .expect_err("forbidden mutation");
+    assert_eq!(error, GrokBuildAdapterError::ReadOnlyMutation);
+
+    let remote = Fixture::new();
+    remote.set_behavior("complete");
+    git(
+        remote.repo.path(),
+        &["remote", "add", "origin", "https://example.invalid/repo"],
+    )
+    .expect("add remote");
+    let error = launch_grok_build(
+        &remote.launch(GrokBuildMutationMode::IsolatedReview, 60_000),
+        &remote.host(),
+        &remote.resolver(),
+        CancellationToken::new(),
+    )
+    .await
+    .expect_err("publish-capable remote");
+    assert_eq!(error, GrokBuildAdapterError::IsolationFailed);
+    assert!(!remote.fake_dir.path().join("captured-argv").exists());
 }
 
 #[tokio::test]

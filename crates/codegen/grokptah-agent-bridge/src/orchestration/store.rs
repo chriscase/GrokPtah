@@ -3824,6 +3824,12 @@ impl OrchStore {
         if intent.state == ManagedIntentState::Finalized {
             return Ok(Some(intent));
         }
+        // Dispatching means physical send may already have occurred. It can
+        // only converge through Review; abandoning it would release and
+        // requeue uncertain work, creating a duplicate-send path.
+        if intent.state == ManagedIntentState::Dispatching {
+            return Ok(Some(intent));
+        }
         if let Some(attempt_id) = &intent.attempt_id {
             if intent.run_id.is_none() {
                 if let Ok(Some(mut attempt)) = self.load_work_attempt_unlocked(attempt_id) {
@@ -4145,6 +4151,9 @@ impl OrchStore {
                     WorkState::AwaitingApproval,
                     result,
                 ),
+                ManagedFinalizationOutcome::Review => {
+                    (AttemptState::Review, WorkState::Review, result)
+                }
                 ManagedFinalizationOutcome::Failed => (
                     AttemptState::Failed,
                     WorkState::Failed,

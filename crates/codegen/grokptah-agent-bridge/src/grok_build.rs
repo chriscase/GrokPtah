@@ -10,13 +10,14 @@
 //! that file blindly into a private `GROK_HOME` and never retains, logs, or
 //! returns the contents.
 
-use std::cell::Cell;
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
@@ -99,6 +100,9 @@ pub struct GrokBuildHostLaunchConfig {
     pub base_ref: String,
     /// Prompt body written to the isolated home. Never inherited from argv/env.
     pub prompt: String,
+    /// Exact normalized workspace-relative files the isolated review may
+    /// change. Empty is never valid for IsolatedReview.
+    pub allowed_files: Vec<String>,
     pub max_stdout_bytes: usize,
     pub max_stderr_bytes: usize,
     pub git_timeout: Duration,
@@ -116,6 +120,7 @@ impl fmt::Debug for GrokBuildHostLaunchConfig {
             )
             .field("cwd_absolute", &self.cwd.is_absolute())
             .field("prompt_bytes", &self.prompt.len())
+            .field("allowed_file_count", &self.allowed_files.len())
             .field("max_stdout_bytes", &self.max_stdout_bytes)
             .field("max_stderr_bytes", &self.max_stderr_bytes)
             .finish_non_exhaustive()
@@ -143,6 +148,7 @@ impl GrokBuildHostLaunchConfig {
         if self.prompt.is_empty() || self.prompt.as_bytes().contains(&0) {
             return Err(GrokBuildAdapterError::InvalidRequest);
         }
+        validate_allowed_files(&self.allowed_files)?;
         if self.max_stdout_bytes == 0
             || self.max_stderr_bytes == 0
             || self.max_stdout_bytes > OUTPUT_BYTES_MAX
@@ -246,6 +252,7 @@ pub struct GrokBuildAdapterOutcome {
     receipt: GrokBuildIsolationReceipt,
     result: GrokBuildResult,
     advisory_evidence: Option<GrokBuildAdvisoryEvidence>,
+    mutation_evidence: Option<GrokBuildMutationEvidence>,
 }
 
 impl fmt::Debug for GrokBuildAdapterOutcome {
@@ -254,6 +261,7 @@ impl fmt::Debug for GrokBuildAdapterOutcome {
             .field("receipt", &self.receipt)
             .field("result", &self.result)
             .field("advisory_evidence", &self.advisory_evidence)
+            .field("mutation_evidence", &self.mutation_evidence)
             .finish()
     }
 }
@@ -269,6 +277,49 @@ impl GrokBuildAdapterOutcome {
 
     pub fn advisory_evidence(&self) -> Option<&GrokBuildAdvisoryEvidence> {
         self.advisory_evidence.as_ref()
+    }
+
+    pub fn mutation_evidence(&self) -> Option<&GrokBuildMutationEvidence> {
+        self.mutation_evidence.as_ref()
+    }
+}
+
+/// Bounded post-run proof that the disposable checkout remained on its exact
+/// launch identity and changed only the Work-authorized file set.
+#[derive(Clone, PartialEq, Eq)]
+pub struct GrokBuildMutationEvidence {
+    final_head_sha: String,
+    final_ref: String,
+    changed_paths: Vec<String>,
+    diff_digest: String,
+}
+
+impl fmt::Debug for GrokBuildMutationEvidence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GrokBuildMutationEvidence")
+            .field("final_head_sha", &self.final_head_sha)
+            .field("final_ref", &self.final_ref)
+            .field("changed_path_count", &self.changed_paths.len())
+            .field("diff_digest", &self.diff_digest)
+            .finish()
+    }
+}
+
+impl GrokBuildMutationEvidence {
+    pub fn final_head_sha(&self) -> &str {
+        &self.final_head_sha
+    }
+
+    pub fn final_ref(&self) -> &str {
+        &self.final_ref
+    }
+
+    pub fn changed_paths(&self) -> &[String] {
+        &self.changed_paths
+    }
+
+    pub fn diff_digest(&self) -> &str {
+        &self.diff_digest
     }
 }
 
@@ -289,6 +340,11 @@ pub async fn launch_grok_build(
     if launch.mutation_mode == GrokBuildMutationMode::ReadOnly {
         return Err(GrokBuildAdapterError::IsolationFailed);
     }
+    if launch.mutation_mode == GrokBuildMutationMode::IsolatedReview
+        && host.allowed_files.is_empty()
+    {
+        return Err(GrokBuildAdapterError::InvalidRequest);
+    }
     if host.repository_id != launch.identity.repository_id {
         return Err(GrokBuildAdapterError::IdentityMismatch);
     }
@@ -297,6 +353,7 @@ pub async fn launch_grok_build(
     }
 
     gate_git_identity(launch, host, cancel.clone()).await?;
+    gate_no_publish_remote(launch, host, cancel.clone()).await?;
     if cancel.is_cancelled() {
         return Err(GrokBuildAdapterError::Cancelled);
     }
@@ -386,7 +443,7 @@ fn allowlisted_env(grok_home: &Path) -> Result<Vec<(String, String)>, GrokBuildA
 
 struct IsolatedHome {
     path: PathBuf,
-    cleanup_on_drop: Cell<bool>,
+    cleanup_on_drop: AtomicBool,
 }
 
 impl IsolatedHome {
@@ -397,7 +454,7 @@ impl IsolatedHome {
         set_private_dir_permissions(&path)?;
         Ok(Self {
             path,
-            cleanup_on_drop: Cell::new(true),
+            cleanup_on_drop: AtomicBool::new(true),
         })
     }
 
@@ -445,7 +502,7 @@ impl IsolatedHome {
     fn cleanup(&self) -> bool {
         let cleaned = std::fs::remove_dir_all(&self.path).is_ok() && !self.path.exists();
         if cleaned {
-            self.cleanup_on_drop.set(false);
+            self.cleanup_on_drop.store(false, Ordering::Release);
         }
         cleaned
     }
@@ -483,7 +540,7 @@ impl IsolatedHome {
 
 impl Drop for IsolatedHome {
     fn drop(&mut self) {
-        if self.cleanup_on_drop.get() {
+        if self.cleanup_on_drop.load(Ordering::Acquire) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
     }
@@ -998,6 +1055,21 @@ async fn gate_git_identity(
     Ok(())
 }
 
+async fn gate_no_publish_remote(
+    launch: &GrokBuildLaunchRequest,
+    host: &GrokBuildHostLaunchConfig,
+    cancel: CancellationToken,
+) -> Result<(), GrokBuildAdapterError> {
+    if launch.mutation_mode != GrokBuildMutationMode::IsolatedReview {
+        return Ok(());
+    }
+    let remotes = git_stdout(host, &["remote"], cancel).await?;
+    if !bytes_to_trimmed_str(&remotes)?.is_empty() {
+        return Err(GrokBuildAdapterError::IsolationFailed);
+    }
+    Ok(())
+}
+
 async fn execute_allowlisted(
     launch: &GrokBuildLaunchRequest,
     host: &GrokBuildHostLaunchConfig,
@@ -1052,10 +1124,28 @@ async fn execute_allowlisted(
     } else {
         false
     };
+    let mutation_evidence = if launch.mutation_mode == GrokBuildMutationMode::IsolatedReview {
+        match capture_isolated_review_mutation(launch, host).await {
+            Ok(evidence) => Some(evidence),
+            Err(error) => {
+                let _ = isolated.cleanup();
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
 
     let classified = classify_harvest(&harvest, readonly_violation, isolated, session_id);
     let cleaned = isolated.cleanup();
-    finish_outcome(launch, session_id, classified, !readonly_violation, cleaned)
+    finish_outcome(
+        launch,
+        session_id,
+        classified,
+        !readonly_violation,
+        cleaned,
+        mutation_evidence,
+    )
 }
 
 fn contain_uncertain_termination(
@@ -1082,6 +1172,7 @@ fn finish_outcome(
     classified: ClassifiedRun,
     permissions_ok: bool,
     cleaned: bool,
+    mutation_evidence: Option<GrokBuildMutationEvidence>,
 ) -> Result<GrokBuildAdapterOutcome, GrokBuildAdapterError> {
     let mut state = classified.state;
     let mut verdict = classified.verdict;
@@ -1142,6 +1233,7 @@ fn finish_outcome(
         receipt,
         result,
         advisory_evidence,
+        mutation_evidence,
     })
 }
 
@@ -1651,6 +1743,133 @@ async fn git_stdout(
     Ok(output.stdout)
 }
 
+fn validate_allowed_files(files: &[String]) -> Result<(), GrokBuildAdapterError> {
+    if files.len() > 64 {
+        return Err(GrokBuildAdapterError::InvalidRequest);
+    }
+    let mut seen = HashSet::with_capacity(files.len());
+    for path in files {
+        if path.is_empty()
+            || path.len() > 512
+            || path.starts_with('/')
+            || path.ends_with('/')
+            || path.contains('\0')
+            || path.contains('\\')
+            || path.contains("//")
+            || path
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == "..")
+            || !seen.insert(path.as_str())
+        {
+            return Err(GrokBuildAdapterError::InvalidRequest);
+        }
+    }
+    Ok(())
+}
+
+async fn capture_isolated_review_mutation(
+    launch: &GrokBuildLaunchRequest,
+    host: &GrokBuildHostLaunchConfig,
+) -> Result<GrokBuildMutationEvidence, GrokBuildAdapterError> {
+    let cancel = CancellationToken::new();
+    let head = git_stdout(host, &["rev-parse", "--verify", "HEAD"], cancel.clone()).await?;
+    let head = bytes_to_trimmed_str(&head)?.to_string();
+    if head != launch.identity.head_sha {
+        return Err(GrokBuildAdapterError::IdentityMismatch);
+    }
+    let git_ref = git_stdout(host, &["symbolic-ref", "HEAD"], cancel.clone()).await?;
+    let git_ref = bytes_to_trimmed_str(&git_ref)?.to_string();
+    if git_ref != launch.identity.git_ref {
+        return Err(GrokBuildAdapterError::IdentityMismatch);
+    }
+    let status = git_stdout(
+        host,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignored=matching",
+        ],
+        cancel.clone(),
+    )
+    .await?;
+    let mut changed_paths = porcelain_paths(&status)?;
+    changed_paths.sort();
+    changed_paths.dedup();
+    if changed_paths
+        .iter()
+        .any(|path| !host.allowed_files.iter().any(|allowed| allowed == path))
+    {
+        return Err(GrokBuildAdapterError::ReadOnlyMutation);
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"grokptah-managed-grok-mutation-v1\0");
+    hasher.update((status.len() as u64).to_be_bytes());
+    hasher.update(&status);
+    let mut total_bytes = 0usize;
+    for path in &changed_paths {
+        hasher.update((path.len() as u64).to_be_bytes());
+        hasher.update(path.as_bytes());
+        let absolute = host.cwd.join(path);
+        match std::fs::symlink_metadata(&absolute) {
+            Ok(meta) if meta.file_type().is_file() => {
+                let file_len = usize::try_from(meta.len())
+                    .map_err(|_| GrokBuildAdapterError::OutputOverflow)?;
+                total_bytes = total_bytes
+                    .checked_add(file_len)
+                    .ok_or(GrokBuildAdapterError::OutputOverflow)?;
+                if total_bytes > OUTPUT_BYTES_MAX {
+                    return Err(GrokBuildAdapterError::OutputOverflow);
+                }
+                let contents =
+                    std::fs::read(&absolute).map_err(|_| GrokBuildAdapterError::DirtyTree)?;
+                if contents.len() != file_len {
+                    return Err(GrokBuildAdapterError::DirtyTree);
+                }
+                hasher.update(b"file\0");
+                hasher.update((contents.len() as u64).to_be_bytes());
+                hasher.update(contents);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                hasher.update(b"deleted\0");
+            }
+            _ => return Err(GrokBuildAdapterError::DirtyTree),
+        }
+    }
+
+    // Close the status/content capture window. A concurrent mutation or ref
+    // move makes the proof unusable rather than producing stale evidence.
+    let final_status = git_stdout(
+        host,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignored=matching",
+        ],
+        cancel.clone(),
+    )
+    .await?;
+    let final_head = git_stdout(host, &["rev-parse", "--verify", "HEAD"], cancel.clone()).await?;
+    let final_ref = git_stdout(host, &["symbolic-ref", "HEAD"], cancel).await?;
+    if final_status != status
+        || bytes_to_trimmed_str(&final_head)? != head
+        || bytes_to_trimmed_str(&final_ref)? != git_ref
+    {
+        return Err(GrokBuildAdapterError::DirtyTree);
+    }
+
+    Ok(GrokBuildMutationEvidence {
+        final_head_sha: head,
+        final_ref: git_ref,
+        changed_paths,
+        diff_digest: format!("sha256:{:x}", hasher.finalize()),
+    })
+}
+
 async fn git_status_ok(
     host: &GrokBuildHostLaunchConfig,
     args: &[&str],
@@ -1956,6 +2175,7 @@ mod tests {
             repository_id: "repo-acme".into(),
             base_ref: "base".into(),
             prompt: "review the private key sk-live-secret-not-real".into(),
+            allowed_files: vec!["README.md".into()],
             max_stdout_bytes: 32,
             max_stderr_bytes: 32,
             git_timeout: Duration::from_secs(1),
