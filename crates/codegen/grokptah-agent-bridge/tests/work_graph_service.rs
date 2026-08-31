@@ -352,6 +352,17 @@ async fn the_control_plane_unblocks_under_the_same_fences_as_block() {
     assert_eq!(released.structured["work"]["state"], "queued");
     assert!(released.structured["work"].get("blockProvenance").is_none());
     assert!(released.structured["work"].get("blockedReason").is_none());
+    assert_eq!(
+        released.structured["work"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        ["revision", "state", "workId"].into_iter().collect(),
+        "the public unblock response is an explicit allowlist"
+    );
+    assert!(released.structured.get("workspace").is_none());
 
     let sibling = client
         .call_tool(
@@ -420,6 +431,8 @@ async fn the_control_plane_unblocks_under_the_same_fences_as_block() {
         cross_unblock, cross_block,
         "unblock must not distinguish a sibling's work from block"
     );
+    assert_eq!(cross_block, unknown_block);
+    assert_eq!(cross_unblock, unknown_unblock);
 
     // A derived dependency hold is reconciliation's, not an operator's to
     // release. The control plane must not widen the store's provenance rule.

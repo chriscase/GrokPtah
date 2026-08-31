@@ -2179,8 +2179,8 @@ impl OrchestrationService {
             .ok_or_else(|| OrchError::new(OrchErrorCode::InvalidRequest, "unknown work_id"))?;
         if item.session_id != session_id || item.workspace != claimed.display().to_string() {
             return Err(OrchError::new(
-                OrchErrorCode::ForbiddenScope,
-                "work item is outside the requested session scope",
+                OrchErrorCode::InvalidRequest,
+                "unknown work_id",
             ));
         }
         Ok((item, claimed))
@@ -3912,26 +3912,59 @@ impl OrchestrationService {
         reason: String,
         expected_revision: Option<u64>,
     ) -> Result<serde_json::Value, OrchError> {
-        self.work_item_mutation(
-            "ptah_unblock_work",
-            request_id,
-            session_id,
-            workspace,
+        let tool = "ptah_unblock_work";
+        let payload = json!({
+            "sessionId": session_id,
+            "workspace": workspace.display().to_string(),
+            "workId": work_id,
+            "details": {"reason": reason, "expectedRevision": expected_revision},
+        });
+        let (claimed, start) = self
+            .begin_work_mutation(tool, request_id, session_id, workspace, &payload)
+            .await?;
+        let mut lease = match start {
+            IdempotencyStart::Replay(response) => return Ok(response),
+            IdempotencyStart::Perform(lease) => lease,
+        };
+        if let Err(error) = self.load_work_scoped(session_id, &claimed, work_id, false) {
+            return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+        }
+        let item = match self.store.unblock_work(
             work_id,
-            json!({"reason": reason, "expectedRevision": expected_revision}),
-            move |store| {
-                store
-                    .unblock_work(
-                        work_id,
-                        &auth.token_id,
-                        &reason,
-                        expected_revision,
-                        Utc::now(),
-                    )
-                    .map(|(item, _)| item)
-            },
-        )
-        .await
+            &auth.token_id,
+            &reason,
+            expected_revision,
+            Utc::now(),
+        ) {
+            Ok((item, _)) => item,
+            Err(error) => {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
+            }
+        };
+        let mut work = json!({
+            "workId": item.work_id,
+            "state": item.state,
+            "revision": item.revision,
+        });
+        if let Some(provenance) = item.block_provenance {
+            work["blockProvenance"] = json!(provenance);
+        }
+        let response = json!({
+            "work": work,
+            "sessionId": session_id,
+        });
+        lease
+            .complete(Some(work_id.to_string()), response.clone())
+            .map_err(|error| {
+                self.fail_claim(
+                    &mut lease,
+                    Some(work_id.to_string()),
+                    session_id,
+                    &claimed,
+                    error,
+                )
+            })?;
+        Ok(response)
     }
 
     #[allow(clippy::too_many_arguments)]
