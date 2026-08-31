@@ -1361,6 +1361,9 @@ fn retained_session_evidence(
             return None;
         }
         if update_type == "agent_message_chunk" {
+            if !last_update_was_agent_message {
+                agent_message_bytes.clear();
+            }
             let content = update.get("content")?.as_object()?;
             require_exact_keys(content, &["type", "text"]).ok()?;
             if content.get("type")?.as_str()? != "text" {
@@ -1386,9 +1389,10 @@ fn retained_session_evidence(
             saw_terminal = true;
             continue;
         }
+        agent_message_bytes.clear();
         last_update_was_agent_message = false;
     }
-    (saw_terminal && agent_message_bytes.ends_with(expected_summary.as_bytes())).then_some(bytes)
+    (saw_terminal && agent_message_bytes == expected_summary.as_bytes()).then_some(bytes)
 }
 
 fn sha256_evidence_ref(kind: &str, bytes: &[u8]) -> String {
