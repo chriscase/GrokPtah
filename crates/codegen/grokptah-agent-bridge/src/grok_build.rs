@@ -366,6 +366,11 @@ pub async fn launch_grok_build(
     if cancel.is_cancelled() {
         return Err(GrokBuildAdapterError::Cancelled);
     }
+    let source_fingerprint =
+        crate::run_promotion::fingerprint_at(&host.cwd, &launch.identity.head_sha)
+            .map_err(|_| GrokBuildAdapterError::IsolationFailed)?;
+    let checkout = IsolatedCheckout::create(launch, host, cancel.clone()).await?;
+    let execution_host = checkout.execution_host(host);
 
     let lease = credentials.resolve(&launch.credential_lease_id)?;
     let isolated = IsolatedHome::create(&host.isolate_parent)?;
@@ -374,7 +379,7 @@ pub async fn launch_grok_build(
     isolated.install_lease(&lease)?;
 
     verify_isolation(
-        host,
+        &execution_host,
         &isolated,
         credentials,
         &launch.credential_lease_id,
@@ -384,13 +389,24 @@ pub async fn launch_grok_build(
     // Close the inspect-to-launch window against an externally changed ref or
     // newly introduced project-local compatibility surface.
     gate_git_identity(launch, host, cancel.clone()).await?;
+    gate_detached_checkout_identity(launch, &execution_host, cancel.clone()).await?;
 
     if cancel.is_cancelled() {
+        let _ = checkout.cleanup(host).await;
         return Err(GrokBuildAdapterError::Cancelled);
     }
 
     let session_id = Uuid::new_v4().to_string();
-    execute_allowlisted(launch, host, &isolated, credentials, &session_id, cancel).await
+    let execution = AllowlistedExecution {
+        source_host: host,
+        execution_host: &execution_host,
+        checkout: &checkout,
+        source_fingerprint: &source_fingerprint,
+        isolated: &isolated,
+        credentials,
+        session_id: &session_id,
+    };
+    execute_allowlisted(launch, execution, cancel).await
 }
 
 fn map_contract(err: GrokBuildContractError) -> GrokBuildAdapterError {
@@ -458,6 +474,128 @@ fn allowlisted_env(grok_home: &Path) -> Result<Vec<(String, String)>, GrokBuildA
 struct IsolatedHome {
     path: PathBuf,
     cleanup_on_drop: AtomicBool,
+}
+
+/// A detached Git worktree that contains every byte the untrusted child may
+/// mutate. The authoritative Work checkout is not passed to the child and is
+/// changed only after a complete advisory has been verified and the child
+/// process tree is known to be gone.
+struct IsolatedCheckout {
+    source: PathBuf,
+    git_executable: PathBuf,
+    path: PathBuf,
+    registered: AtomicBool,
+}
+
+impl IsolatedCheckout {
+    async fn create(
+        launch: &GrokBuildLaunchRequest,
+        host: &GrokBuildHostLaunchConfig,
+        cancel: CancellationToken,
+    ) -> Result<Self, GrokBuildAdapterError> {
+        validate_isolate_parent(&host.isolate_parent)?;
+        let path = host
+            .isolate_parent
+            .join(format!("gw-{}", Uuid::new_v4().simple()));
+        let path_str = path
+            .to_str()
+            .ok_or(GrokBuildAdapterError::IsolationFailed)?;
+        git_status_ok(
+            host,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                "--no-guess-remote",
+                path_str,
+                &launch.identity.head_sha,
+            ],
+            cancel.clone(),
+        )
+        .await
+        .map_err(|_| GrokBuildAdapterError::IsolationFailed)?;
+        set_private_dir_permissions(&path)?;
+        let checkout = Self {
+            source: host.cwd.clone(),
+            git_executable: host.git_executable.clone(),
+            path,
+            registered: AtomicBool::new(true),
+        };
+        let execution_host = checkout.execution_host(host);
+        if gate_detached_checkout_identity(launch, &execution_host, cancel)
+            .await
+            .is_err()
+        {
+            let _ = checkout.cleanup(host).await;
+            return Err(GrokBuildAdapterError::IsolationFailed);
+        }
+        Ok(checkout)
+    }
+
+    fn execution_host(&self, source: &GrokBuildHostLaunchConfig) -> GrokBuildHostLaunchConfig {
+        let mut host = source.clone();
+        host.cwd = self.path.clone();
+        host
+    }
+
+    async fn cleanup(&self, source: &GrokBuildHostLaunchConfig) -> bool {
+        if !self.registered.load(Ordering::Acquire) {
+            return true;
+        }
+        let Some(path) = self.path.to_str() else {
+            return false;
+        };
+        let cleaned = git_status_ok(
+            source,
+            &["worktree", "remove", "--force", path],
+            CancellationToken::new(),
+        )
+        .await
+        .is_ok()
+            && !self.path.exists();
+        if cleaned {
+            self.registered.store(false, Ordering::Release);
+        }
+        cleaned
+    }
+
+    /// A possibly live child still owns this checkout. Keep it registered and
+    /// on disk for later owner-verified reclamation; most importantly, never
+    /// let Drop race the unproved process tree.
+    fn quarantine(&self) {
+        self.registered.store(false, Ordering::Release);
+    }
+}
+
+impl Drop for IsolatedCheckout {
+    fn drop(&mut self) {
+        if !self.registered.load(Ordering::Acquire) {
+            return;
+        }
+        let mut command = std::process::Command::new(&self.git_executable);
+        command
+            .current_dir(&self.source)
+            .env_clear()
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("PATH", BOUNDED_PATH)
+            .args([
+                "--no-replace-objects",
+                "--no-optional-locks",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "worktree",
+                "remove",
+                "--force",
+            ])
+            .arg(&self.path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let _ = command.status();
+    }
 }
 
 impl IsolatedHome {
@@ -1069,6 +1207,57 @@ async fn gate_git_identity(
     Ok(())
 }
 
+async fn gate_detached_checkout_identity(
+    launch: &GrokBuildLaunchRequest,
+    host: &GrokBuildHostLaunchConfig,
+    cancel: CancellationToken,
+) -> Result<(), GrokBuildAdapterError> {
+    let cwd =
+        dunce::canonicalize(&host.cwd).map_err(|_| GrokBuildAdapterError::IdentityMismatch)?;
+    let toplevel = git_stdout(host, &["rev-parse", "--show-toplevel"], cancel.clone()).await?;
+    let toplevel = dunce::canonicalize(bytes_to_trimmed_path(&toplevel)?)
+        .map_err(|_| GrokBuildAdapterError::IdentityMismatch)?;
+    if toplevel != cwd {
+        return Err(GrokBuildAdapterError::IdentityMismatch);
+    }
+    let head = git_stdout(host, &["rev-parse", "--verify", "HEAD"], cancel.clone()).await?;
+    if bytes_to_trimmed_str(&head)? != launch.identity.head_sha {
+        return Err(GrokBuildAdapterError::IdentityMismatch);
+    }
+    let symbolic = git_output(host, &["symbolic-ref", "-q", "HEAD"], cancel.clone()).await?;
+    if symbolic.status || !symbolic.stdout.is_empty() {
+        return Err(GrokBuildAdapterError::IdentityMismatch);
+    }
+    git_status_ok(
+        host,
+        &[
+            "merge-base",
+            "--is-ancestor",
+            "--end-of-options",
+            &launch.identity.base_sha,
+            "HEAD",
+        ],
+        cancel.clone(),
+    )
+    .await?;
+    let status = git_stdout(
+        host,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignored=matching",
+        ],
+        cancel,
+    )
+    .await?;
+    if !porcelain_paths(&status)?.is_empty() {
+        return Err(GrokBuildAdapterError::DirtyTree);
+    }
+    Ok(())
+}
+
 async fn gate_no_publish_remote(
     launch: &GrokBuildLaunchRequest,
     host: &GrokBuildHostLaunchConfig,
@@ -1084,14 +1273,30 @@ async fn gate_no_publish_remote(
     Ok(())
 }
 
+struct AllowlistedExecution<'a> {
+    source_host: &'a GrokBuildHostLaunchConfig,
+    execution_host: &'a GrokBuildHostLaunchConfig,
+    checkout: &'a IsolatedCheckout,
+    source_fingerprint: &'a str,
+    isolated: &'a IsolatedHome,
+    credentials: &'a dyn CredentialLeaseResolver,
+    session_id: &'a str,
+}
+
 async fn execute_allowlisted(
     launch: &GrokBuildLaunchRequest,
-    host: &GrokBuildHostLaunchConfig,
-    isolated: &IsolatedHome,
-    credentials: &dyn CredentialLeaseResolver,
-    session_id: &str,
+    execution: AllowlistedExecution<'_>,
     cancel: CancellationToken,
 ) -> Result<GrokBuildAdapterOutcome, GrokBuildAdapterError> {
+    let AllowlistedExecution {
+        source_host,
+        execution_host,
+        checkout,
+        source_fingerprint,
+        isolated,
+        credentials,
+        session_id,
+    } = execution;
     let args = allowlisted_args(
         &isolated.prompt_path(),
         launch.mutation_mode,
@@ -1099,9 +1304,9 @@ async fn execute_allowlisted(
         session_id,
     )?;
     let env = allowlisted_env(&isolated.path)?;
-    let mut cmd = Command::new(&host.executable);
+    let mut cmd = Command::new(&execution_host.executable);
     cmd.args(&args);
-    cmd.current_dir(&host.cwd);
+    cmd.current_dir(&execution_host.cwd);
     cmd.env_clear();
     cmd.envs(env);
     cmd.stdin(Stdio::null());
@@ -1117,13 +1322,17 @@ async fn execute_allowlisted(
 
     let harvest = harvest_child(
         &mut child,
-        host.max_stdout_bytes,
-        host.max_stderr_bytes,
+        execution_host.max_stdout_bytes,
+        execution_host.max_stderr_bytes,
         Duration::from_millis(launch.max_duration_ms),
         cancel,
     )
     .await;
     if harvest.kind == HarvestKind::TerminationUnproven {
+        // The original Work checkout was never exposed to this process. Keep
+        // the possibly-live disposable checkout quarantined rather than
+        // racing it with cleanup.
+        checkout.quarantine();
         return Err(contain_uncertain_termination(
             credentials,
             &launch.credential_lease_id,
@@ -1132,50 +1341,111 @@ async fn execute_allowlisted(
     }
 
     let readonly_violation = if launch.mutation_mode == GrokBuildMutationMode::ReadOnly {
-        gate_git_identity(launch, host, CancellationToken::new())
+        gate_detached_checkout_identity(launch, execution_host, CancellationToken::new())
             .await
             .is_err()
     } else {
         false
     };
-    let mut mutation_evidence = if launch.mutation_mode == GrokBuildMutationMode::IsolatedReview {
-        match capture_isolated_review_mutation(launch, host).await {
-            Ok(evidence) => Some(evidence),
-            Err(error) => {
-                let _ = isolated.cleanup();
-                if restore_failed_isolated_review_workspace(launch, host)
-                    .await
-                    .is_err()
-                {
-                    return Err(GrokBuildAdapterError::IsolationFailed);
-                }
-                return Err(error);
-            }
-        }
-    } else {
-        None
-    };
-
     let classified = classify_harvest(&harvest, readonly_violation, isolated, session_id);
     let cleaned = isolated.cleanup();
-    let mutation_may_remain = classified.state == GrokBuildRunState::CompleteAdvisory
+    let promote_mutation = classified.state == GrokBuildRunState::CompleteAdvisory
         && matches!(
             classified.verdict,
             Some(GrokBuildVerdict::Clean | GrokBuildVerdict::Findings)
         )
         && cleaned;
-    if launch.mutation_mode == GrokBuildMutationMode::IsolatedReview && !mutation_may_remain {
-        restore_failed_isolated_review_workspace(launch, host).await?;
-        mutation_evidence = None;
+    let mutation_evidence =
+        if launch.mutation_mode == GrokBuildMutationMode::IsolatedReview && promote_mutation {
+            match promote_verified_isolated_review_mutation(
+                launch,
+                source_host,
+                execution_host,
+                source_fingerprint,
+            )
+            .await
+            {
+                Ok(evidence) => Some(evidence),
+                Err(error) => {
+                    let _ = checkout.cleanup(source_host).await;
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+    let checkout_cleaned = checkout.cleanup(source_host).await;
+    if !checkout_cleaned {
+        if mutation_evidence.is_some() {
+            restore_failed_isolated_review_workspace(launch, source_host).await?;
+        }
+        return Err(GrokBuildAdapterError::IsolationFailed);
     }
     finish_outcome(
         launch,
         session_id,
         classified,
         !readonly_violation,
-        cleaned,
+        cleaned && checkout_cleaned,
         mutation_evidence,
     )
+}
+
+async fn promote_verified_isolated_review_mutation(
+    launch: &GrokBuildLaunchRequest,
+    source_host: &GrokBuildHostLaunchConfig,
+    execution_host: &GrokBuildHostLaunchConfig,
+    source_fingerprint: &str,
+) -> Result<GrokBuildMutationEvidence, GrokBuildAdapterError> {
+    let isolated_evidence = capture_isolated_review_mutation(launch, execution_host, true).await?;
+    gate_git_identity(launch, source_host, CancellationToken::new()).await?;
+    gate_no_publish_remote(launch, source_host, CancellationToken::new()).await?;
+
+    let snapshot = crate::run_promotion::snapshot(&execution_host.cwd, &launch.identity.head_sha)
+        .map_err(|_| GrokBuildAdapterError::IsolationFailed)?;
+    crate::run_promotion::promote(
+        &source_host.cwd,
+        &execution_host.cwd,
+        &launch.identity.head_sha,
+        source_fingerprint,
+        &snapshot.fingerprint,
+    )
+    .map_err(|_| GrokBuildAdapterError::IsolationFailed)?;
+
+    if let Err(error) = reset_index_for_paths(source_host, isolated_evidence.changed_paths()).await
+    {
+        let _ = restore_failed_isolated_review_workspace(launch, source_host).await;
+        return Err(error);
+    }
+    let promoted_evidence = match capture_isolated_review_mutation(launch, source_host, false).await
+    {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            let _ = restore_failed_isolated_review_workspace(launch, source_host).await;
+            return Err(error);
+        }
+    };
+    if promoted_evidence.changed_paths != isolated_evidence.changed_paths
+        || promoted_evidence.diff_digest != isolated_evidence.diff_digest
+    {
+        restore_failed_isolated_review_workspace(launch, source_host).await?;
+        return Err(GrokBuildAdapterError::IsolationFailed);
+    }
+    Ok(promoted_evidence)
+}
+
+async fn reset_index_for_paths(
+    host: &GrokBuildHostLaunchConfig,
+    paths: &[String],
+) -> Result<(), GrokBuildAdapterError> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let mut args = vec!["reset", "--quiet", "HEAD", "--"];
+    args.extend(paths.iter().map(String::as_str));
+    git_status_ok(host, &args, CancellationToken::new())
+        .await
+        .map_err(|_| GrokBuildAdapterError::IsolationFailed)
 }
 
 /// Restore the initially clean, exact-ref checkout after any untrusted child
@@ -1913,6 +2183,7 @@ fn validate_allowed_files(files: &[String]) -> Result<(), GrokBuildAdapterError>
 async fn capture_isolated_review_mutation(
     launch: &GrokBuildLaunchRequest,
     host: &GrokBuildHostLaunchConfig,
+    detached: bool,
 ) -> Result<GrokBuildMutationEvidence, GrokBuildAdapterError> {
     let cancel = CancellationToken::new();
     let head = git_stdout(host, &["rev-parse", "--verify", "HEAD"], cancel.clone()).await?;
@@ -1920,11 +2191,20 @@ async fn capture_isolated_review_mutation(
     if head != launch.identity.head_sha {
         return Err(GrokBuildAdapterError::IdentityMismatch);
     }
-    let git_ref = git_stdout(host, &["symbolic-ref", "HEAD"], cancel.clone()).await?;
-    let git_ref = bytes_to_trimmed_str(&git_ref)?.to_string();
-    if git_ref != launch.identity.git_ref {
-        return Err(GrokBuildAdapterError::IdentityMismatch);
-    }
+    let git_ref = if detached {
+        let symbolic = git_output(host, &["symbolic-ref", "-q", "HEAD"], cancel.clone()).await?;
+        if symbolic.status || !symbolic.stdout.is_empty() {
+            return Err(GrokBuildAdapterError::IdentityMismatch);
+        }
+        launch.identity.git_ref.clone()
+    } else {
+        let observed = git_stdout(host, &["symbolic-ref", "HEAD"], cancel.clone()).await?;
+        let observed = bytes_to_trimmed_str(&observed)?.to_string();
+        if observed != launch.identity.git_ref {
+            return Err(GrokBuildAdapterError::IdentityMismatch);
+        }
+        observed
+    };
     let status = git_stdout(
         host,
         &[
@@ -1997,11 +2277,14 @@ async fn capture_isolated_review_mutation(
     )
     .await?;
     let final_head = git_stdout(host, &["rev-parse", "--verify", "HEAD"], cancel.clone()).await?;
-    let final_ref = git_stdout(host, &["symbolic-ref", "HEAD"], cancel).await?;
-    if final_status != status
-        || bytes_to_trimmed_str(&final_head)? != head
-        || bytes_to_trimmed_str(&final_ref)? != git_ref
-    {
+    let final_ref_matches = if detached {
+        let symbolic = git_output(host, &["symbolic-ref", "-q", "HEAD"], cancel).await?;
+        !symbolic.status && symbolic.stdout.is_empty()
+    } else {
+        let final_ref = git_stdout(host, &["symbolic-ref", "HEAD"], cancel).await?;
+        bytes_to_trimmed_str(&final_ref)? == git_ref
+    };
+    if final_status != status || bytes_to_trimmed_str(&final_head)? != head || !final_ref_matches {
         return Err(GrokBuildAdapterError::DirtyTree);
     }
 

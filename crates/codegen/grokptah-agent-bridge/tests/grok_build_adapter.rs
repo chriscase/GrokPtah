@@ -165,6 +165,14 @@ impl Fixture {
         )
     }
 
+    fn captured_cwd(&self) -> PathBuf {
+        PathBuf::from(
+            fs::read_to_string(self.fake_dir.path().join("captured-cwd"))
+                .unwrap_or_default()
+                .trim(),
+        )
+    }
+
     fn isolate_children(&self) -> Vec<PathBuf> {
         fs::read_dir(self.isolate.path())
             .map(|entries| entries.filter_map(|e| e.ok().map(|e| e.path())).collect())
@@ -244,6 +252,7 @@ fi
 printf '%s\n' "$@" > "$dir/captured-argv"
 env | sort > "$dir/captured-env"
 printf '%s\n' "$GROK_HOME" > "$dir/captured-grok-home"
+printf '%s\n' "$PWD" > "$dir/captured-cwd"
 if [ -n "$GROK_HOME" ] && [ -f "$GROK_HOME/config.toml" ]; then
   cp "$GROK_HOME/config.toml" "$dir/captured-config.toml"
 fi
@@ -344,6 +353,14 @@ case "$behavior" in
     exit 0
     ;;
   sleep)
+    echo $$ > "$dir/pid"
+    /bin/sleep 30 &
+    descendant=$!
+    echo "$descendant" > "$dir/descendant-pid"
+    wait "$descendant"
+    ;;
+  mutate-sleep)
+    printf 'unqualified mutation\n' > mutated-by-child.txt
     echo $$ > "$dir/pid"
     /bin/sleep 30 &
     descendant=$!
@@ -475,6 +492,16 @@ async fn exact_command_argv_and_env() {
     );
     assert_eq!(outcome.result().state, GrokBuildRunState::CompleteAdvisory);
     assert_eq!(outcome.result().session_id, argv[11]);
+    assert_ne!(fx.captured_cwd(), fx.repo.path());
+    assert_eq!(
+        dunce::canonicalize(
+            fx.captured_cwd()
+                .parent()
+                .expect("captured checkout parent")
+        )
+        .expect("captured checkout parent exists"),
+        dunce::canonicalize(fx.isolate.path()).expect("isolate parent")
+    );
 }
 
 #[tokio::test]
@@ -619,6 +646,32 @@ async fn timeout_kills_process_tree_and_cleans_home() {
             .unwrap_or(false);
         assert!(!alive, "descendant still alive after timeout");
     }
+}
+
+#[tokio::test]
+async fn timed_out_mutation_never_reaches_the_work_checkout() {
+    let fx = Fixture::new();
+    fx.set_behavior("mutate-sleep");
+    let mut host = fx.host();
+    host.allowed_files = vec!["mutated-by-child.txt".into()];
+
+    let outcome = launch_grok_build(
+        &fx.launch(GrokBuildMutationMode::IsolatedReview, 400),
+        &host,
+        &fx.resolver(),
+        CancellationToken::new(),
+    )
+    .await
+    .expect("timeout outcome");
+
+    assert_eq!(outcome.result().state, GrokBuildRunState::FailedClosed);
+    assert!(!fx.repo.path().join("mutated-by-child.txt").exists());
+    assert!(git_stdout(
+        fx.repo.path(),
+        &["status", "--porcelain=v1", "--untracked-files=all"]
+    )
+    .is_empty());
+    assert!(fx.isolate_children().is_empty());
 }
 
 #[tokio::test]

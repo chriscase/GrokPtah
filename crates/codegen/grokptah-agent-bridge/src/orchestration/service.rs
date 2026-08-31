@@ -147,6 +147,7 @@ pub struct OrchestrationService {
     manager_supervisor_watcher: Mutex<Option<tokio::task::JoinHandle<()>>>,
     native_executor: Mutex<NativeExecutorStatus>,
     native_executor_watcher: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    native_executor_drive: tokio::sync::Mutex<()>,
     managed_grok_runtime: Mutex<Option<ManagedGrokRuntime>>,
     managed_grok_tasks: Mutex<HashMap<String, ManagedGrokTask>>,
     /// Join handles for in-flight runs (prevents forget + unbounded leaks).
@@ -334,6 +335,7 @@ impl OrchestrationService {
                 DEFAULT_NATIVE_EXECUTOR_INTERVAL_MS,
             )),
             native_executor_watcher: Mutex::new(None),
+            native_executor_drive: tokio::sync::Mutex::new(()),
             managed_grok_runtime: Mutex::new(None),
             managed_grok_tasks: Mutex::new(HashMap::new()),
             join_handles: Mutex::new(Vec::new()),
@@ -987,6 +989,13 @@ impl OrchestrationService {
     }
 
     pub async fn drive_native_executor_once(&self) {
+        // Timer ticks, explicit test/operator drives, and future wakeups may
+        // arrive concurrently. Keep one drive authoritative at a time so a
+        // second drive cannot mistake the durable `Dispatching` interval
+        // between claim persistence and supervised-task registration for a
+        // process restart. The child is still gated by the oneshot below and
+        // cannot physically launch before both operations are complete.
+        let _drive = self.native_executor_drive.lock().await;
         let now = Utc::now();
         self.native_executor.lock().last_tick_at = Some(now);
         if let Err(error) = self.harvest_completed_managed_grok_tasks().await {

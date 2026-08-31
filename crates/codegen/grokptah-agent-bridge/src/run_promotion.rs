@@ -328,7 +328,7 @@ fn diff_bytes(worktree: &Path, base_revision: &str) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
-fn fingerprint_at(root: &Path, base_revision: &str) -> Result<String> {
+pub(crate) fn fingerprint_at(root: &Path, base_revision: &str) -> Result<String> {
     let head = git_stdout(root, &["rev-parse", "HEAD"])?;
     let patch = diff_bytes(root, base_revision)?;
     let mut hasher = Sha256::new();
