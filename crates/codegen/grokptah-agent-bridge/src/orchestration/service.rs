@@ -22,9 +22,10 @@ use super::authz::{
 use super::graph::{validate_scoped_dependency_graph, GraphScope};
 use super::managed::{
     assemble_managed_run_input, managed_execution_eligible, select_relevant_managed_messages,
-    ManagedExecutionIntent, ManagedExecutionPolicy, ManagedFinalizationOutcome, ManagedIntentState,
-    ManagedRetryCause, NativeExecutorStatus, DEFAULT_NATIVE_EXECUTOR_INTERVAL_MS,
-    MANAGED_EXECUTION_SCHEMA_VERSION, MAX_MANAGED_MESSAGES,
+    ManagedAdmissionCapacity, ManagedExecutionIntent, ManagedExecutionPolicy,
+    ManagedFinalizationOutcome, ManagedIntentState, ManagedRetryCause, NativeExecutorStatus,
+    ProviderRoute, DEFAULT_NATIVE_EXECUTOR_INTERVAL_MS, MANAGED_EXECUTION_SCHEMA_VERSION,
+    MAX_CONCURRENT_PROVIDER_RUNS, MAX_MANAGED_MESSAGES, PROVIDER_CEILING_EXHAUSTED,
 };
 use super::manager::{
     parse_manager_directive, ManagerCoordinationMode, ManagerDecisionRecord, ManagerDecisionState,
@@ -74,6 +75,27 @@ struct PendingRun {
     session_id: Uuid,
     prompt: String,
     execution_mode: RunExecutionMode,
+}
+
+/// Re-derive the exact provider route for one captured AgentSpec revision.
+///
+/// The spec stores the opaque selection key alongside its parsed identity.
+/// Native admission re-parses the key and requires an exact match, so a
+/// record written by a different schema, hand-edited, or corrupted is never
+/// routed to a provider. Returning `None` fails the admission closed; it does
+/// not fall back to a default provider.
+fn resolve_agent_provider_route(spec: &super::types::AgentSpec) -> Option<ProviderRoute> {
+    let parsed =
+        super::types::AgentModelSpec::from_selection_key(&spec.model.selection_key).ok()?;
+    if parsed.provider_id != spec.model.provider_id || parsed.model_id != spec.model.model_id {
+        return None;
+    }
+    let route = ProviderRoute {
+        provider_id: parsed.provider_id,
+        model_id: parsed.model_id,
+    };
+    route.validate().ok()?;
+    Some(route)
 }
 
 #[derive(Clone)]
@@ -1263,19 +1285,36 @@ impl OrchestrationService {
                 self.native_executor.lock().skipped_ineligible += 1;
                 continue;
             }
+            // Fail closed: an admission never routes a provider identity the
+            // host cannot re-derive from the captured AgentSpec revision.
+            let Some(route) = resolve_agent_provider_route(&spec) else {
+                self.native_executor.lock().skipped_unroutable += 1;
+                continue;
+            };
             let decisions = self.store.list_work_decisions(&work.work_id)?;
-            let live = self.store.live_managed_intents_for_agent(&agent_id)?;
+            let capacity = ManagedAdmissionCapacity {
+                live_intents_for_agent: self.store.live_managed_intents_for_agent(&agent_id)?,
+                live_intents_for_provider: self
+                    .store
+                    .live_managed_intents_for_provider(&route.provider_id)?,
+                max_concurrent_provider_runs: MAX_CONCURRENT_PROVIDER_RUNS,
+            };
             let bounds = match managed_execution_eligible(
-                &work, &agent, &spec, &decisions, live, &ceiling,
+                &work, &agent, &spec, &decisions, capacity, &ceiling,
             ) {
                 Ok(bounds) => bounds,
-                Err(_) => {
-                    self.native_executor.lock().skipped_ineligible += 1;
+                Err(error) => {
+                    let mut status = self.native_executor.lock();
+                    if error.message == PROVIDER_CEILING_EXHAUSTED {
+                        status.skipped_provider_capacity += 1;
+                    } else {
+                        status.skipped_ineligible += 1;
+                    }
                     continue;
                 }
             };
             if let Err(error) = self
-                .admit_one_managed_work(&work, &agent, &spec, bounds, &owner, &secret)
+                .admit_one_managed_work(&work, &agent, &spec, route, bounds, &owner, &secret)
                 .await
             {
                 let mut status = self.native_executor.lock();
@@ -1288,11 +1327,13 @@ impl OrchestrationService {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn admit_one_managed_work(
         &self,
         work: &WorkItem,
         agent: &super::types::AgentRecord,
         spec: &super::types::AgentSpec,
+        route: ProviderRoute,
         bounds: super::types::RunBounds,
         owner_id: &str,
         secret: &str,
@@ -1343,6 +1384,7 @@ impl OrchestrationService {
             source_routine_id: work.source_routine_id.clone(),
             source_activation_id: work.source_activation_id.clone(),
             model_selection_key: spec.model.selection_key.clone(),
+            provider_route: Some(route),
             bounds: bounds.clone(),
             input_hash,
             state: ManagedIntentState::Claiming,
@@ -5079,7 +5121,27 @@ impl OrchestrationService {
                     && super::workspaces_match(&intent.workspace, &claimed.display().to_string())
             })
             .collect::<Vec<_>>();
-        Ok(json!({ "intents": intents, "executor": self.native_executor_status() }))
+        // The ceiling is home-wide, but the breakdown is deliberately limited
+        // to the intents this caller is already authorized to read. A Lane
+        // must not learn another Lane's provider identities or counts.
+        let mut live_in_scope: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for intent in &intents {
+            if !intent.state.is_live() {
+                continue;
+            }
+            if let Some(provider_id) = intent.effective_provider_id() {
+                *live_in_scope.entry(provider_id).or_default() += 1;
+            }
+        }
+        Ok(json!({
+            "intents": intents,
+            "executor": self.native_executor_status(),
+            "providerAdmission": {
+                "maxConcurrentRunsPerProvider": MAX_CONCURRENT_PROVIDER_RUNS,
+                "liveInScopeByProvider": live_in_scope,
+            },
+        }))
     }
 
     pub fn resolve_work_input(

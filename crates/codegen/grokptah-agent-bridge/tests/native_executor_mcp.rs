@@ -4,9 +4,9 @@ mod common;
 
 use grokptah_agent_bridge::orchestration::{
     AssignmentStatus, AuthContext, ManagedExecutionIntent, ManagedExecutionPolicy,
-    ManagedIntentState, OrchStore, OrchestrationConfig, OrchestrationService, RunBounds,
-    RunPurpose, RunRecord, RunState, WorkItem, WorkPolicy, WorkState, WorkspaceAllowlist,
-    MANAGED_EXECUTION_SCHEMA_VERSION,
+    ManagedIntentState, OrchStore, OrchestrationConfig, OrchestrationService, ProviderRoute,
+    RunBounds, RunPurpose, RunRecord, RunState, WorkItem, WorkPolicy, WorkState,
+    WorkspaceAllowlist, MANAGED_EXECUTION_SCHEMA_VERSION,
 };
 use grokptah_agent_bridge::{
     set_grokptah_home_override, start_control_server, AgentHost, HostConfig, McpControlClient,
@@ -224,14 +224,46 @@ async fn native_executor_runs_assigned_work_without_an_external_worker() {
         .filter(|intent| intent["workId"] == work_id)
         .count();
     assert!(work_intents <= 1);
+    for intent in listed {
+        let route = intent["providerRoute"]
+            .as_object()
+            .expect("every admitted intent carries an exact provider route");
+        assert!(route["providerId"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()));
+        assert!(route["modelId"].as_str().is_some_and(|id| !id.is_empty()));
+    }
+    let admission = &intents.structured["providerAdmission"];
+    assert!(admission["maxConcurrentRunsPerProvider"]
+        .as_u64()
+        .is_some_and(|ceiling| ceiling > 0));
+    assert!(admission["liveInScopeByProvider"].is_object());
+    // Every live intent this caller can read is accounted for, and nothing
+    // from another Lane leaks into the breakdown.
+    let in_scope: u64 = admission["liveInScopeByProvider"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|count| count.as_u64().unwrap())
+        .sum();
+    assert!(in_scope <= listed.len() as u64);
 
     let capacity = client
         .call_tool("ptah_get_capacity", json!({}))
         .await
         .unwrap();
-    assert!(capacity.structured["health"]["nativeExecutor"]["enabled"]
-        .as_bool()
-        .unwrap());
+    let executor = &capacity.structured["health"]["nativeExecutor"];
+    assert!(executor["enabled"].as_bool().unwrap());
+    for counter in [
+        "skippedProviderCapacity",
+        "skippedUnroutable",
+        "maxConcurrentProviderRuns",
+    ] {
+        assert!(
+            executor[counter].as_u64().is_some(),
+            "missing provider counter {counter}"
+        );
+    }
 
     orch.stop_background_tasks().await;
     client.close_session().await.unwrap();
@@ -467,6 +499,10 @@ fn seed_admitted_work(
         source_routine_id: None,
         source_activation_id: None,
         model_selection_key: "grok".into(),
+        provider_route: Some(ProviderRoute {
+            provider_id: "xai".into(),
+            model_id: "grok".into(),
+        }),
         bounds: RunBounds::default(),
         input_hash: "hash".into(),
         state: ManagedIntentState::Admitted,
@@ -595,6 +631,22 @@ async fn manager_decision_native_admission_has_durable_proposal_purpose() {
     assert_eq!(run.purpose, RunPurpose::ManagerProposal);
     assert_eq!(run.agent_id.as_deref(), Some(agent_id.as_str()));
     assert_eq!(run.agent_spec_revision, Some(intent.agent_spec_revision));
+
+    // The durable intent names the exact provider identity and model the host
+    // routed to, captured before the provider task was spawned.
+    let admitted_agent = orch.store().load_agent(&agent_id).unwrap().unwrap();
+    let admitted_spec = admitted_agent.current_spec().unwrap();
+    let route = intent
+        .provider_route
+        .as_ref()
+        .expect("native admission records an exact provider route");
+    assert_eq!(route.provider_id, admitted_spec.model.provider_id);
+    assert_eq!(route.model_id, admitted_spec.model.model_id);
+    assert!(!route.provider_id.is_empty() && !route.model_id.is_empty());
+    assert_eq!(
+        intent.effective_provider_id().as_deref(),
+        Some(admitted_spec.model.provider_id.as_str())
+    );
 
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
     while tokio::time::Instant::now() < deadline {
@@ -929,6 +981,10 @@ async fn resolve_work_input_requires_parked_scope() {
         source_routine_id: None,
         source_activation_id: None,
         model_selection_key: "grok".into(),
+        provider_route: Some(ProviderRoute {
+            provider_id: "xai".into(),
+            model_id: "grok".into(),
+        }),
         bounds: RunBounds::default(),
         input_hash: "hash".into(),
         state: ManagedIntentState::Parked,
