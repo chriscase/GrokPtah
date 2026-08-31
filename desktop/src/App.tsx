@@ -14,7 +14,6 @@ import {
   type SubagentInfo,
   type TranscriptItem,
   type DurableRun,
-  type DurableRunEvent,
   type DurableWorkItem,
   type DurableRoutine,
   type LaneSummary,
@@ -80,6 +79,15 @@ import {
   subscribeSessionUpdates,
 } from "./lib/sessionEvents";
 import { subscribeRemoteRunEvents } from "./lib/remoteRunEvents";
+import {
+  isRemotePublicRun,
+  loadPublicRemoteRunForRefresh,
+  loadPublicRemoteRunsForRefresh,
+  remoteNotificationInScope,
+  remotePublicRunScopeKey,
+  replaceScopedRemotePublicRun,
+  type RemotePublicRun,
+} from "./lib/publicRun";
 import {
   executionTargetValue,
   mergeLaneProjections,
@@ -351,7 +359,7 @@ export default function App() {
   const [skills, setSkills] = useState<any[]>([]);
   const [subagents, setSubagents] = useState<SubagentInfo[]>([]);
   const [bgTasks, setBgTasks] = useState<any[]>([]);
-  const [runs, setRuns] = useState<DurableRun[]>([]);
+  const [runs, setRuns] = useState<DurableRun[] | RemotePublicRun[]>([]);
   const [runsSessionId, setRunsSessionId] = useState<string | null>(null);
   const [runsError, setRunsError] = useState<string | null>(null);
   const [runsBusy, setRunsBusy] = useState(false);
@@ -376,7 +384,6 @@ export default function App() {
   const [remoteSessions, setRemoteSessions] = useState<RemoteSessionTarget[]>([]);
   const [remoteTargetSessionId, setRemoteTargetSessionId] = useState<string | null>(null);
   const [executionTarget, setExecutionTarget] = useState<"local" | "remote">("local");
-  const [remoteRunEvents, setRemoteRunEvents] = useState<Record<string, DurableRunEvent[]>>({});
   const [remoteRunRecoveryErrors, setRemoteRunRecoveryErrors] = useState<Record<string, string>>({});
   const [hooksPreview, setHooksPreview] = useState<string | null>(null);
   const [rules, setRules] = useState<string[]>([]);
@@ -444,10 +451,54 @@ export default function App() {
     [syncQueue],
   );
 
+  const refreshRemotePublicRun = useCallback(
+    async (runId: string) => {
+      if (!remoteServiceStatus.connected || !runId) return;
+      const target = remoteSessions.find((session) => session.sessionId === remoteTargetSessionId);
+      if (!target) return;
+      try {
+        const got = await loadPublicRemoteRunForRefresh({
+          sessionId: target.sessionId,
+          workspace: target.workspace,
+          runId,
+          get: api.remoteServicePublicRunGet,
+        });
+        setRuns((current) => {
+          if (current.length > 0 && !current.every(isRemotePublicRun)) return current;
+          return replaceScopedRemotePublicRun(
+            current as RemotePublicRun[],
+            got,
+            target.sessionId,
+            target.workspace,
+          );
+        });
+        setRemoteRunRecoveryErrors((current) => {
+          if (!(runId in current)) return current;
+          const next = { ...current };
+          delete next[runId];
+          return next;
+        });
+      } catch (error) {
+        setRemoteRunRecoveryErrors((current) => ({
+          ...current,
+          [runId]: String(error),
+        }));
+      }
+    },
+    [remoteServiceStatus.connected, remoteSessions, remoteTargetSessionId],
+  );
+
   const refreshRuns = useCallback(async () => {
     const remote = remoteServiceStatus.connected;
     const sessionId = activeSessionId;
-    const scopeKey = remote ? "__remote__" : sessionId;
+    const remoteTarget = remote
+      ? remoteSessions.find((session) => session.sessionId === remoteTargetSessionId) ?? null
+      : null;
+    const scopeKey = remote
+      ? remoteTarget
+        ? remotePublicRunScopeKey(remoteTarget.sessionId, remoteTarget.workspace)
+        : null
+      : sessionId;
     if (scopeKey && runsRefreshInFlight.current?.sessionId === scopeKey) return;
     const request = runsRefreshGuard.begin();
     if (!scopeKey) {
@@ -461,25 +512,23 @@ export default function App() {
     runsRefreshInFlight.current = { sessionId: scopeKey, request };
     setRunsBusy(true);
     try {
-      const nextRuns = remote
-        ? await api.remoteServiceRunList()
-        : await api.runList(sessionId!);
-      if (!runsRefreshGuard.isCurrent(request)) return;
-      setRuns(nextRuns);
-      setRunsSessionId(scopeKey);
-      setRunsError(null);
       if (remote) {
-        void api
-          .remoteServiceWatchRuns(
-            nextRuns
-              .filter((run) => run.startSeq != null && (run.state === "running" || run.state === "queued"))
-              .map((run) => ({
-                sessionId: run.sessionId,
-                workspace: run.workspace,
-                runId: run.runId,
-              })),
-          )
-          .catch((error) => console.warn("remote run watcher unavailable", error));
+        if (!remoteTarget) throw new Error("Remote public run list requires session and workspace scope");
+        const listed = await loadPublicRemoteRunsForRefresh({
+          sessionId: remoteTarget.sessionId,
+          workspace: remoteTarget.workspace,
+          list: api.remoteServicePublicRunList,
+        });
+        if (!runsRefreshGuard.isCurrent(request)) return;
+        setRuns(listed.runs);
+        setRunsSessionId(scopeKey);
+        setRunsError(null);
+      } else {
+        const nextRuns = await api.runList(sessionId!);
+        if (!runsRefreshGuard.isCurrent(request)) return;
+        setRuns(nextRuns);
+        setRunsSessionId(scopeKey);
+        setRunsError(null);
       }
     } catch (error) {
       if (!runsRefreshGuard.isCurrent(request)) return;
@@ -504,7 +553,13 @@ export default function App() {
       runsRefreshInFlight.current = null;
       if (runsRefreshGuard.isCurrent(request)) setRunsBusy(false);
     }
-  }, [activeSessionId, remoteServiceStatus.connected, runsRefreshGuard]);
+  }, [
+    activeSessionId,
+    remoteServiceStatus.connected,
+    remoteSessions,
+    remoteTargetSessionId,
+    runsRefreshGuard,
+  ]);
 
   const refreshPersistentAgents = useCallback(async () => {
     setPersistentAgentsBusy(true);
@@ -569,33 +624,32 @@ export default function App() {
 
   useEffect(() => {
     return subscribeRemoteRunEvents((notification) => {
-      if (notification.type === "event") {
-        const event = notification.payload;
-        setRemoteRunEvents((current) => {
-          const previous = current[event.runId] ?? [];
-          if (previous.some((entry) => entry.seq === event.seq)) return current;
-          return {
-            ...current,
-            [event.runId]: [...previous, event].sort((a, b) => a.seq - b.seq).slice(-500),
-          };
-        });
-        void refreshRuns();
-      } else {
+      const target = remoteSessions.find((session) => session.sessionId === remoteTargetSessionId);
+      if (!remoteServiceStatus.connected || !target) return;
+      const payload = notification.payload;
+      if (!remoteNotificationInScope(payload, target.sessionId, target.workspace)) return;
+      if (notification.type !== "event") {
         setRemoteRunRecoveryErrors((current) => ({
           ...current,
           [notification.payload.runId]: notification.payload.reason,
         }));
-        void refreshRuns();
       }
+      void refreshRemotePublicRun(payload.runId);
     });
-  }, [refreshRuns]);
+  }, [
+    refreshRemotePublicRun,
+    remoteServiceStatus.connected,
+    remoteSessions,
+    remoteTargetSessionId,
+  ]);
 
   const connectRemoteService = useCallback(
     async (baseUrl: string, token: string) => {
       try {
         const status = await api.remoteServiceConnect(baseUrl, token);
         setRemoteServiceStatus(status);
-        setRemoteRunEvents({});
+        setRuns([]);
+        setRunsSessionId(null);
         setRemoteRunRecoveryErrors({});
         const sessions = await api.remoteServiceSessionList();
         setRemoteSessions(sessions);
@@ -634,7 +688,8 @@ export default function App() {
       current.map((session) => ({ ...session, runtimeConnection: "disconnected" })),
     );
     setExecutionTarget("local");
-    setRemoteRunEvents({});
+    setRuns([]);
+    setRunsSessionId(null);
     setRemoteRunRecoveryErrors({});
     await refreshPersistentAgents();
   }, [refreshPersistentAgents]);
@@ -4526,23 +4581,32 @@ export default function App() {
                   : "Local desktop · Connected"
               }
               runs={
-                runsSessionId === "__remote__"
-                  ? runs
+                remoteServiceStatus.connected
+                  ? selectedRemoteLane
+                    ? runsSessionId ===
+                        remotePublicRunScopeKey(selectedRemoteLane.session_id, selectedRemoteLane.cwd)
+                      ? runs
+                      : []
+                    : []
                   : runsSessionId === activeSessionId
                     ? runs
                     : []
               }
               error={
-                runsSessionId === "__remote__"
-                  ? Object.values(remoteRunRecoveryErrors)[0] ?? runsError
+                remoteServiceStatus.connected
+                  ? runsSessionId ===
+                      (selectedRemoteLane
+                        ? remotePublicRunScopeKey(selectedRemoteLane.session_id, selectedRemoteLane.cwd)
+                        : null)
+                    ? Object.values(remoteRunRecoveryErrors)[0] ?? runsError
+                    : null
                   : runsSessionId === activeSessionId
                     ? runsError
                     : null
               }
               busy={runsBusy}
               watching={runsWatching}
-              remote={runsSessionId === "__remote__" || remoteServiceStatus.connected}
-              liveEvents={remoteServiceStatus.connected ? remoteRunEvents : undefined}
+              remote={remoteServiceStatus.connected}
               onWatchingChange={setRunsWatching}
               onRefresh={() => void refreshRuns()}
               onReview={(runId) => {
@@ -4573,35 +4637,41 @@ export default function App() {
                 await api.runRetry(activeSessionId, runId, prompt);
               }}
               onSteer={async (runId, text) => {
-                const run = runs.find((candidate) => candidate.runId === runId);
-                if (!run) throw new Error("Remote run is no longer visible");
                 if (remoteServiceStatus.connected) {
-                  await api.remoteServiceRunSteer(run.sessionId, run.workspace, text);
+                  const target = remoteSessions.find(
+                    (session) => session.sessionId === remoteTargetSessionId,
+                  );
+                  const run = runs.find((candidate) => candidate.runId === runId);
+                  if (!target || !run) throw new Error("Remote run is no longer visible");
+                  if (run.sessionId !== target.sessionId || run.workspace !== target.workspace) {
+                    throw new Error("Remote run is no longer visible");
+                  }
+                  await api.remoteServiceRunSteer(target.sessionId, target.workspace, text);
                   return;
                 }
                 if (!activeSessionId) throw new Error("No active session");
                 await api.runSteer(activeSessionId, runId, text);
               }}
               onCancel={async (runId) => {
-                const run = runs.find((candidate) => candidate.runId === runId);
-                if (!run) throw new Error("Remote run is no longer visible");
                 if (remoteServiceStatus.connected) {
-                  await api.remoteServiceRunCancel(run.sessionId, run.workspace, runId);
+                  const target = remoteSessions.find(
+                    (session) => session.sessionId === remoteTargetSessionId,
+                  );
+                  const run = runs.find((candidate) => candidate.runId === runId);
+                  if (!target || !run) throw new Error("Remote run is no longer visible");
+                  if (run.sessionId !== target.sessionId || run.workspace !== target.workspace) {
+                    throw new Error("Remote run is no longer visible");
+                  }
+                  await api.remoteServiceRunCancel(target.sessionId, target.workspace, runId);
                   return;
                 }
                 if (!activeSessionId) throw new Error("No active session");
                 await api.runCancel(activeSessionId, runId);
               }}
               onEvents={(runId, afterSeq = 0, limit = 80) => {
-                const run = runs.find((candidate) => candidate.runId === runId);
                 if (remoteServiceStatus.connected) {
-                  if (!run) return Promise.reject(new Error("Remote run is no longer visible"));
-                  return api.remoteServiceRunEvents(
-                    run.sessionId,
-                    run.workspace,
-                    runId,
-                    afterSeq,
-                    limit,
+                  return Promise.reject(
+                    new Error("Remote event replay is not available in the public run summary"),
                   );
                 }
                 if (!activeSessionId) return Promise.reject(new Error("No active session"));

@@ -7,6 +7,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use super::adaptive::{self, AdaptiveApproval, AdaptiveClaim, AdaptiveDecisionRecord};
 use super::policy::ComputerPolicy;
 use super::projection::{
     not_available, project_events, project_run_at, ComputerRunCapacity, ComputerRunEventPage,
@@ -322,6 +323,7 @@ impl ComputerUseService {
         result
     }
 
+    /// Dispatch one action. Unchanged: no adaptive review runs on this path.
     pub async fn act(
         &self,
         request_id: &str,
@@ -330,20 +332,99 @@ impl ComputerUseService {
         observation_id: &str,
         action: ComputerAction,
     ) -> ComputerResult<ActionOutcome> {
+        self.act_inner(
+            request_id,
+            run_id,
+            expected_version,
+            observation_id,
+            action,
+            None,
+        )
+        .await
+    }
+
+    /// Dispatch one action with a planner claim attached.
+    ///
+    /// Identical to [`Self::act`] in every authority respect -- same
+    /// idempotency receipt, same version fence, same staleness check, same
+    /// policy gate, same state machine, same dispatch site -- plus one
+    /// advisory review that runs after the policy gate has already admitted
+    /// the action and can only refuse it. See [`super::adaptive`] for why that
+    /// placement means a cheap model cannot buy its way past a kernel gate.
+    pub async fn act_with_plan(
+        &self,
+        request_id: &str,
+        run_id: &str,
+        expected_version: u64,
+        observation_id: &str,
+        action: ComputerAction,
+        claim: AdaptiveClaim,
+    ) -> ComputerResult<ActionOutcome> {
+        self.act_inner(
+            request_id,
+            run_id,
+            expected_version,
+            observation_id,
+            action,
+            Some(claim),
+        )
+        .await
+    }
+
+    /// Bind a host-supplied operator decision to the live stored run.
+    ///
+    /// This is the trusted-host integration seam for minting an
+    /// [`AdaptiveApproval`]. The host must already hold the yes/no; this
+    /// method does not prompt, persist a second send machine, or accept an
+    /// approval token from JSON. It loads the current run and binds the
+    /// boolean to that run's control epoch and current observation.
+    ///
+    /// Crate-private so planner, model, and wire types cannot call it. No
+    /// production caller in this crate currently collects the operator
+    /// decision; a host that does must call this and attach the token to the
+    /// claim. This is not wired to UI, MCP, or a provider.
+    #[allow(dead_code)]
+    pub(crate) fn mint_host_adaptive_approval(
+        &self,
+        run_id: &str,
+        approved: bool,
+    ) -> ComputerResult<AdaptiveApproval> {
+        validate_id("run_id", run_id)?;
+        let run = self.store.load_run(run_id)?.ok_or_else(unknown_run)?;
+        let observation = run.current_observation.as_ref().ok_or_else(|| {
+            ComputerError::new(
+                ComputerErrorCode::StaleObservation,
+                "computer run has no current observation to bind an approval to",
+            )
+        })?;
+        Ok(AdaptiveApproval::host_mint(&run, observation, approved))
+    }
+
+    async fn act_inner(
+        &self,
+        request_id: &str,
+        run_id: &str,
+        expected_version: u64,
+        observation_id: &str,
+        action: ComputerAction,
+        claim: Option<AdaptiveClaim>,
+    ) -> ComputerResult<ActionOutcome> {
         validate_id("run_id", run_id)?;
         validate_id("observation_id", observation_id)?;
         action.validate(&ComputerUseLimits::ceiling())?;
-        let payload = json!({
-            "runId": run_id,
-            "expectedVersion": expected_version,
-            "observationId": observation_id,
-            "action": action,
-        });
+        let payload = act_mutation_payload(
+            run_id,
+            expected_version,
+            observation_id,
+            &action,
+            claim.as_ref(),
+        )?;
         if let Some(replayed) = self.begin_mutation(request_id, "act", &payload)? {
             return replayed;
         }
 
         let mut budget_error = None;
+        let mut review_record: Option<AdaptiveDecisionRecord> = None;
         let prepared = self
             .store
             .update_run(run_id, |run| {
@@ -378,6 +459,29 @@ impl ComputerUseService {
                 }
                 self.policy
                     .authorize_action(run, &observation, &action, now)?;
+
+                // ---- adaptive seam ------------------------------------
+                // Reached only when the policy gate above already said yes,
+                // so this can narrow that answer and has no path that widens
+                // it. It mutates nothing but the decision record, drives no
+                // state transition, and never retries: a resolution that is
+                // not "commit" is returned as a refusal.
+                if let Some(claim) = claim.as_ref() {
+                    let outcome = adaptive::review(run, &observation, &action, claim, now);
+                    if let Some(error) = outcome.refusal() {
+                        // Carried out of the closure so the refused decision
+                        // still reaches the denial write path: returning `Err`
+                        // discards everything this closure wrote. Only a
+                        // refusal is carried, so a later denial for an
+                        // unrelated reason cannot be stamped with a record
+                        // that says the review admitted the action.
+                        review_record = Some(outcome.record().clone());
+                        return Err(error.clone());
+                    }
+                    run.adaptive = Some(outcome.record().clone());
+                }
+                // ---- end adaptive seam --------------------------------
+
                 if !backend_supports_action(&self.backend.capabilities(), action.class()) {
                     return Err(ComputerError::new(
                         ComputerErrorCode::ForbiddenAction,
@@ -417,7 +521,13 @@ impl ComputerUseService {
                 }
             }
             (Err(error), _) => {
-                self.record_denial(run_id, "act", Some(action.class()), &error);
+                self.record_denial_with_review(
+                    run_id,
+                    "act",
+                    Some(action.class()),
+                    &error,
+                    review_record.take(),
+                );
                 Err(error)
             }
         };
@@ -736,8 +846,29 @@ impl ComputerUseService {
         action_class: Option<super::types::ActionClass>,
         error: &ComputerError,
     ) {
+        self.record_denial_with_review(run_id, operation, action_class, error, None);
+    }
+
+    /// The same single denial write path, additionally stamping the adaptive
+    /// review that produced the refusal.
+    ///
+    /// Recording the refused decision here rather than through a new mutation
+    /// keeps the receipt truthful without adding a second write path: a
+    /// refusal discards the `act` closure's mutations by design, so the record
+    /// would otherwise be lost and the projection would show only admissions.
+    fn record_denial_with_review(
+        &self,
+        run_id: &str,
+        operation: &str,
+        action_class: Option<super::types::ActionClass>,
+        error: &ComputerError,
+        review: Option<AdaptiveDecisionRecord>,
+    ) {
         let _ = self.store.update_run(run_id, |run| {
             run.updated_at = Utc::now();
+            if let Some(review) = review.as_ref() {
+                run.adaptive = Some(review.clone());
+            }
             run.record_audit(operation, "denied", action_class, None, Some(error.code));
             Ok(())
         });
@@ -782,6 +913,51 @@ impl ComputerUseService {
         };
         self.store.complete_mutation(request_id, &encoded)
     }
+}
+
+/// Replay identity for one `act` / `act_with_plan` mutation.
+///
+/// The plain `act` object is exactly `runId`, `expectedVersion`,
+/// `observationId`, and `action`. Adaptive keys are added only when a plan
+/// (and, separately, a host-minted approval) is attached, so receipts written
+/// before this seam existed still hash byte-for-byte.
+fn act_mutation_payload(
+    run_id: &str,
+    expected_version: u64,
+    observation_id: &str,
+    action: &ComputerAction,
+    claim: Option<&AdaptiveClaim>,
+) -> ComputerResult<serde_json::Value> {
+    let mut payload = json!({
+        "runId": run_id,
+        "expectedVersion": expected_version,
+        "observationId": observation_id,
+        "action": action,
+    });
+    // The claim is part of the replay identity: reusing a request id with a
+    // different plan must fail closed rather than replay the first answer.
+    //
+    // The key is added only when a plan is attached, so the plain `act`
+    // payload -- and therefore every durable mutation receipt already
+    // written against it -- hashes exactly as it did before this seam
+    // existed. A `null` placeholder would have invalidated them all.
+    if let Some(claim) = claim {
+        let encoded = serde_json::to_value(claim).map_err(|_| {
+            ComputerError::new(
+                ComputerErrorCode::InvalidRequest,
+                "adaptive claim is not serializable",
+            )
+        })?;
+        payload["adaptiveClaim"] = encoded;
+        // The opaque approval never crosses the wire. The marker carries
+        // only the yes/no and a non-secret fingerprint of the hidden
+        // run/epoch/observation binding, so two approved tokens bound to
+        // different observations cannot collide.
+        if let Some(marker) = claim.approval_marker() {
+            payload["adaptiveApproval"] = marker;
+        }
+    }
+    Ok(payload)
 }
 
 /// Classify a failure the backend reported *after* it was handed an action.
@@ -1079,6 +1255,53 @@ mod tests {
             observation: &ComputerObservation,
             action: &ComputerAction,
         ) -> ComputerResult<ActionOutcome> {
+            self.inner.act(run_id, observation, action).await
+        }
+
+        async fn cancel(&self, run_id: &str) -> ComputerResult<()> {
+            self.inner.cancel(run_id).await
+        }
+    }
+
+    /// Counts backend `act` dispatches so a refused review can be distinguished
+    /// from an action that happened anyway.
+    #[derive(Debug, Default)]
+    struct CountingBackend {
+        inner: SimulatorBackend,
+        action_calls: AtomicUsize,
+    }
+
+    impl CountingBackend {
+        fn action_calls(&self) -> usize {
+            self.action_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ComputerBackend for CountingBackend {
+        fn capabilities(&self) -> ComputerCapabilities {
+            self.inner.capabilities()
+        }
+
+        async fn observe(
+            &self,
+            run_id: &str,
+            observation_id: &str,
+            target: &ComputerTarget,
+            limits: &ComputerUseLimits,
+        ) -> ComputerResult<ComputerObservation> {
+            self.inner
+                .observe(run_id, observation_id, target, limits)
+                .await
+        }
+
+        async fn act(
+            &self,
+            run_id: &str,
+            observation: &ComputerObservation,
+            action: &ComputerAction,
+        ) -> ComputerResult<ActionOutcome> {
+            self.action_calls.fetch_add(1, Ordering::SeqCst);
             self.inner.act(run_id, observation, action).await
         }
 
@@ -2276,5 +2499,346 @@ mod tests {
         assert!(tail.entries.is_empty());
         assert!(!tail.cursor_expired);
         assert_eq!(tail.next_cursor, None);
+    }
+
+    fn counting_service() -> (Arc<CountingBackend>, ComputerUseService) {
+        let dir = tempdir().unwrap().keep();
+        let backend = Arc::new(CountingBackend::default());
+        let service = ComputerUseService::new(
+            backend.clone(),
+            ComputerStore::open(dir.join("computer-use")).unwrap(),
+        );
+        (backend, service)
+    }
+
+    async fn authorized_observed_run(
+        service: &ComputerUseService,
+        request_prefix: &str,
+        classes: BTreeSet<ActionClass>,
+    ) -> (ComputerRun, ComputerObservation) {
+        let run = service
+            .create_run(
+                &format!("{request_prefix}-create"),
+                Uuid::new_v4(),
+                None,
+                SimulatorBackend::demo_target(),
+                Default::default(),
+            )
+            .unwrap();
+        let mut issued = grant(&run);
+        issued.action_classes = classes;
+        let run = service
+            .authorize(
+                &format!("{request_prefix}-grant"),
+                &run.run_id,
+                run.version,
+                issued,
+            )
+            .unwrap();
+        let observation = service
+            .observe(
+                &format!("{request_prefix}-observe"),
+                &run.run_id,
+                run.version,
+            )
+            .await
+            .unwrap();
+        let run = service.get_run(&run.run_id).unwrap().unwrap();
+        (run, observation)
+    }
+
+    fn below_floor_claim(run: &ComputerRun, sequence: u64) -> AdaptiveClaim {
+        AdaptiveClaim {
+            profile: crate::computer_use::AdaptiveProfile::Balanced,
+            planner: crate::computer_use::AdaptiveDisposition::Commit,
+            assessment: crate::computer_use::AmbiguityAssessment::unambiguous(6_500),
+            observed_control_epoch: run.control_epoch,
+            observed_sequence: sequence,
+            approval: None,
+        }
+    }
+
+    fn name_action(observation: &ComputerObservation) -> ComputerAction {
+        ComputerAction::SetValue {
+            element_id: format!("{}-name", observation.observation_id),
+            text: "Ada".into(),
+        }
+    }
+
+    #[test]
+    fn plain_act_mutation_payload_is_unchanged_when_no_plan_is_attached() {
+        let action = ComputerAction::SetValue {
+            element_id: "field".into(),
+            text: "Ada".into(),
+        };
+        let payload = act_mutation_payload("run-1", 3, "obs-1", &action, None).unwrap();
+        let expected = json!({
+            "runId": "run-1",
+            "expectedVersion": 3,
+            "observationId": "obs-1",
+            "action": action,
+        });
+        assert_eq!(payload, expected);
+        assert_eq!(
+            crate::orchestration::hash_payload(&payload),
+            crate::orchestration::hash_payload(&expected)
+        );
+        assert!(payload.get("adaptiveClaim").is_none());
+        assert!(payload.get("adaptiveApproval").is_none());
+    }
+
+    #[test]
+    fn approval_bindings_are_distinct_in_the_act_replay_identity() {
+        let now = Utc::now();
+        let mut run = ComputerRun::new(
+            Uuid::new_v4(),
+            None,
+            SimulatorBackend::demo_target(),
+            Default::default(),
+        )
+        .unwrap();
+        run.control_epoch = 4;
+        let observation = ComputerObservation {
+            observation_id: "obs-live".into(),
+            sequence: 1,
+            target: run.target.clone(),
+            captured_at: now,
+            geometry: crate::computer_use::ObservationGeometry {
+                x: 0.0,
+                y: 0.0,
+                width: 800.0,
+                height: 600.0,
+                scale_factor: 1.0,
+            },
+            screenshot: None,
+            elements: Vec::new(),
+            elements_truncated: false,
+            sensitivity: crate::computer_use::Sensitivity::None,
+        };
+        let action = ComputerAction::SetValue {
+            element_id: "field".into(),
+            text: "Ada".into(),
+        };
+        let mut first = below_floor_claim(&run, 1);
+        first.approval = Some(AdaptiveApproval::host_mint(&run, &observation, true));
+        let mut other_observation = observation.clone();
+        other_observation.observation_id = "obs-other".into();
+        let mut second = below_floor_claim(&run, 1);
+        second.approval = Some(AdaptiveApproval::host_mint(&run, &other_observation, true));
+
+        let first_payload = act_mutation_payload(
+            &run.run_id,
+            1,
+            &observation.observation_id,
+            &action,
+            Some(&first),
+        )
+        .unwrap();
+        let second_payload = act_mutation_payload(
+            &run.run_id,
+            1,
+            &observation.observation_id,
+            &action,
+            Some(&second),
+        )
+        .unwrap();
+        assert_ne!(
+            crate::orchestration::hash_payload(&first_payload),
+            crate::orchestration::hash_payload(&second_payload)
+        );
+        let first_marker = first_payload["adaptiveApproval"].clone();
+        let encoded = serde_json::to_string(&first_marker).unwrap();
+        assert!(!encoded.contains(&run.run_id));
+        assert!(!encoded.contains("obs-live"));
+        assert!(!encoded.contains("obs-other"));
+        assert_eq!(first_marker["approved"], json!(true));
+        assert_ne!(
+            first_marker["binding"],
+            second_payload["adaptiveApproval"]["binding"]
+        );
+    }
+
+    #[tokio::test]
+    async fn host_mint_binds_only_to_the_live_run_epoch_and_observation() {
+        let (backend, service) = counting_service();
+        let error = service
+            .mint_host_adaptive_approval("missing-run", true)
+            .unwrap_err();
+        assert_eq!(error.code, ComputerErrorCode::InvalidRequest);
+
+        let (run, observation) = authorized_observed_run(
+            &service,
+            "host-mint",
+            BTreeSet::from([ActionClass::Semantic, ActionClass::TextEntry]),
+        )
+        .await;
+        let minted = service
+            .mint_host_adaptive_approval(&run.run_id, true)
+            .unwrap();
+        let expected = AdaptiveApproval::host_mint(&run, &observation, true);
+        assert_eq!(minted, expected);
+
+        let next = service
+            .observe("host-mint-observe-2", &run.run_id, run.version)
+            .await
+            .unwrap();
+        assert_ne!(next.observation_id, observation.observation_id);
+        let live = service.get_run(&run.run_id).unwrap().unwrap();
+        let reminted = service
+            .mint_host_adaptive_approval(&run.run_id, true)
+            .unwrap();
+        assert_eq!(reminted, AdaptiveApproval::host_mint(&live, &next, true));
+        assert_ne!(minted.binding_fingerprint(), reminted.binding_fingerprint());
+        assert_eq!(backend.action_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn mismatched_host_approval_never_reaches_the_backend() {
+        let (backend, service) = counting_service();
+        let (run, _observation) = authorized_observed_run(
+            &service,
+            "mismatch",
+            BTreeSet::from([ActionClass::Semantic, ActionClass::TextEntry]),
+        )
+        .await;
+        let stale = service
+            .mint_host_adaptive_approval(&run.run_id, true)
+            .unwrap();
+        let next = service
+            .observe("mismatch-observe-2", &run.run_id, run.version)
+            .await
+            .unwrap();
+        let live = service.get_run(&run.run_id).unwrap().unwrap();
+        let mut claim = below_floor_claim(&live, next.sequence);
+        claim.approval = Some(stale);
+
+        let error = service
+            .act_with_plan(
+                "mismatch-act",
+                &live.run_id,
+                live.version,
+                &next.observation_id,
+                name_action(&next),
+                claim,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ComputerErrorCode::PermissionRequired);
+        assert_eq!(backend.action_calls(), 0);
+
+        let other = authorized_observed_run(
+            &service,
+            "mismatch-other",
+            BTreeSet::from([ActionClass::Semantic, ActionClass::TextEntry]),
+        )
+        .await
+        .0;
+        let foreign = service
+            .mint_host_adaptive_approval(&other.run_id, true)
+            .unwrap();
+        let matching = service
+            .mint_host_adaptive_approval(&live.run_id, true)
+            .unwrap();
+        let mut foreign_claim = below_floor_claim(&live, next.sequence);
+        foreign_claim.approval = Some(foreign);
+        let mut matching_claim = below_floor_claim(&live, next.sequence);
+        matching_claim.approval = Some(matching);
+
+        let first_payload = act_mutation_payload(
+            &live.run_id,
+            live.version,
+            &next.observation_id,
+            &name_action(&next),
+            Some(&foreign_claim),
+        )
+        .unwrap();
+        let second_payload = act_mutation_payload(
+            &live.run_id,
+            live.version,
+            &next.observation_id,
+            &name_action(&next),
+            Some(&matching_claim),
+        )
+        .unwrap();
+        assert_ne!(
+            crate::orchestration::hash_payload(&first_payload),
+            crate::orchestration::hash_payload(&second_payload)
+        );
+
+        let error = service
+            .act_with_plan(
+                "mismatch-replay",
+                &live.run_id,
+                live.version,
+                &next.observation_id,
+                name_action(&next),
+                foreign_claim,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ComputerErrorCode::PermissionRequired);
+        let error = service
+            .act_with_plan(
+                "mismatch-replay",
+                &live.run_id,
+                live.version,
+                &next.observation_id,
+                name_action(&next),
+                matching_claim,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ComputerErrorCode::Conflict);
+        assert_eq!(backend.action_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn matching_host_approval_still_admits_only_after_policy() {
+        let (backend, service) = counting_service();
+        let (run, observation) =
+            authorized_observed_run(&service, "policy", BTreeSet::from([ActionClass::Semantic]))
+                .await;
+        let approval = service
+            .mint_host_adaptive_approval(&run.run_id, true)
+            .unwrap();
+        let mut claim = below_floor_claim(&run, observation.sequence);
+        claim.approval = Some(approval);
+        let error = service
+            .act_with_plan(
+                "policy-ungranted",
+                &run.run_id,
+                run.version,
+                &observation.observation_id,
+                name_action(&observation),
+                claim,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ComputerErrorCode::ForbiddenAction);
+        assert_eq!(backend.action_calls(), 0);
+
+        let (run, observation) = authorized_observed_run(
+            &service,
+            "policy-ok",
+            BTreeSet::from([ActionClass::Semantic, ActionClass::TextEntry]),
+        )
+        .await;
+        let approval = service
+            .mint_host_adaptive_approval(&run.run_id, true)
+            .unwrap();
+        let mut claim = below_floor_claim(&run, observation.sequence);
+        claim.approval = Some(approval);
+        service
+            .act_with_plan(
+                "policy-granted",
+                &run.run_id,
+                run.version,
+                &observation.observation_id,
+                name_action(&observation),
+                claim,
+            )
+            .await
+            .unwrap();
+        assert_eq!(backend.action_calls(), 1);
     }
 }

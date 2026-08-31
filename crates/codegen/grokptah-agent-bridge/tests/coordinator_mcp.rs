@@ -3,7 +3,8 @@
 mod common;
 
 use grokptah_agent_bridge::orchestration::{
-    OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, WorkspaceAllowlist,
+    AssignmentStatus, OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, WorkItem,
+    WorkPolicy, WorkerObservatoryProjection, WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
     set_grokptah_home_override, start_control_server, AgentHost, AgentState, AuthCredential,
@@ -774,4 +775,499 @@ async fn coordinator_identity_and_scope_are_enforced() {
     orch.stop_background_tasks().await;
     coordinator.close_session().await.unwrap();
     worker_client.close_session().await.unwrap();
+}
+
+fn assert_observatory_worker_json(worker: &serde_json::Value, workspace: &str) {
+    let object = worker
+        .as_object()
+        .unwrap_or_else(|| panic!("worker object: {worker}"));
+    let mut keys: Vec<_> = object.keys().cloned().collect();
+    keys.sort();
+    let mut allowed: Vec<_> = WorkerObservatoryProjection::allowlisted_json_keys()
+        .iter()
+        .map(|key| (*key).to_string())
+        .collect();
+    allowed.sort();
+    assert_eq!(keys, allowed, "public worker JSON changed shape: {worker}");
+    for key in [
+        "workspace",
+        "model",
+        "declaredTools",
+        "measured",
+        "policyLimits",
+        "activeLeases",
+    ] {
+        assert!(
+            object.get(key).is_none(),
+            "public worker JSON leaked top-level {key}: {worker}"
+        );
+    }
+    let load = object
+        .get("load")
+        .and_then(|value| value.as_object())
+        .unwrap_or_else(|| panic!("load object: {worker}"));
+    assert!(
+        load.get("activeLeases").is_some(),
+        "load.activeLeases count must remain on the public worker: {worker}"
+    );
+    assert!(load.get("attemptId").is_none());
+    assert!(load.get("workId").is_none());
+    let encoded = worker.to_string();
+    assert!(
+        !encoded.contains(workspace),
+        "public worker JSON leaked workspace path: {encoded}"
+    );
+    for token in [
+        "declaredTools",
+        "run_terminal_cmd",
+        "web_fetch",
+        "attemptId",
+        "leaseExpiresAt",
+        "providerId",
+        "modelId",
+        "selectionKey",
+        "providerRoute",
+        "qualifiedTools",
+        "policyLimits",
+    ] {
+        assert!(
+            !encoded.contains(token),
+            "public worker JSON leaked {token}: {encoded}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn observatory_reads_redact_and_hide_same_workspace_cross_lane_workers() {
+    let mut env = ProcessEnvGuard::new();
+    let home = tempdir().unwrap();
+    set_grokptah_home_override(Some(home.path().join(".grokptah")));
+    env.set("GROKPTAH_AGENT_OFFLINE", "1");
+    let workspace = tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    })
+    .expect("acquire the GrokPtah instance lock");
+    host.start().unwrap();
+    let lane_a = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(lane_a.id, workspace.path()).unwrap();
+    let lane_b = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(lane_b.id, workspace.path()).unwrap();
+    let local_template = host.ensure_session_agent(lane_a.id).unwrap();
+    let cross_template = host.ensure_session_agent(lane_b.id).unwrap();
+    let store = host.ensure_orchestration_store().unwrap();
+    let local = {
+        let mut local = local_template.clone();
+        local.agent_id = format!("obs-local-{}", lane_a.id);
+        if let Some(spec) = local.spec.as_mut() {
+            spec.display_name = "observatory-local".into();
+            spec.authority.allowed_tools = vec!["run_terminal_cmd".into(), "web_fetch".into()];
+        }
+        store.save_agent(&local).unwrap();
+        local
+    };
+    let cross = {
+        let mut cross = cross_template.clone();
+        cross.agent_id = format!("obs-cross-{}", lane_b.id);
+        if let Some(spec) = cross.spec.as_mut() {
+            spec.display_name = "observatory-cross".into();
+            spec.authority.allowed_tools = vec!["run_terminal_cmd".into()];
+        }
+        store.save_agent(&cross).unwrap();
+        cross
+    };
+    let orch = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        store,
+        OrchestrationConfig {
+            bearer_token: "coord-token-obs".into(),
+            allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
+            max_concurrent_runs: 2,
+            bounds: RunBounds::default(),
+        },
+    );
+    let auth = orch
+        .auth_header(Some("Bearer coord-token-obs"))
+        .expect("observatory bearer");
+    let workspace_text = workspace.path().display().to_string();
+    let model = local
+        .spec
+        .as_ref()
+        .map(|spec| spec.model.clone())
+        .expect("local worker model");
+
+    let listed = orch
+        .list_workers_scoped(&auth, lane_a.id, workspace.path())
+        .expect("list workers in lane A");
+    let workers = listed["workers"]
+        .as_array()
+        .cloned()
+        .expect("workers array");
+    let ids: Vec<&str> = workers
+        .iter()
+        .map(|worker| worker["agentId"].as_str().expect("agentId"))
+        .collect();
+    assert!(
+        ids.contains(&local.agent_id.as_str()),
+        "lane A list must include the local worker: {ids:?}"
+    );
+    assert!(
+        !ids.contains(&cross.agent_id.as_str()),
+        "same-workspace cross-lane worker must be omitted: {ids:?}"
+    );
+    let mut sorted = ids.clone();
+    sorted.sort();
+    assert_eq!(ids, sorted, "observatory list must be sorted by agentId");
+    for worker in &workers {
+        assert_observatory_worker_json(worker, &workspace_text);
+        let encoded = worker.to_string();
+        assert!(!encoded.contains(model.selection_key.as_str()));
+        assert!(!encoded.contains(model.provider_id.as_str()));
+        assert!(!encoded.contains(model.model_id.as_str()));
+    }
+
+    let detail = orch
+        .get_worker_scoped(&auth, lane_a.id, workspace.path(), &local.agent_id)
+        .expect("get local worker");
+    assert_observatory_worker_json(&detail["worker"], &workspace_text);
+
+    let unknown = orch
+        .get_worker_scoped(
+            &auth,
+            lane_a.id,
+            workspace.path(),
+            "missing-observatory-worker",
+        )
+        .expect_err("unknown worker");
+    let foreign = orch
+        .get_worker_scoped(&auth, lane_a.id, workspace.path(), &cross.agent_id)
+        .expect_err("cross-lane worker");
+    assert_eq!(unknown.code, foreign.code);
+    assert_eq!(unknown.message, foreign.message);
+    assert_eq!(unknown.data, foreign.data);
+
+    orch.stop_background_tasks().await;
+}
+
+fn seed_assigned_work(
+    store: &OrchStore,
+    session_id: uuid::Uuid,
+    workspace: &str,
+    agent_id: &str,
+    objective: &str,
+    claim: bool,
+) {
+    let mut item = WorkItem::new(
+        "implementation",
+        objective,
+        session_id,
+        workspace,
+        "coordinator",
+        WorkPolicy::default(),
+    )
+    .expect("create assigned work");
+    item.assigned_agent_id = Some(agent_id.to_string());
+    item.assignment_status = AssignmentStatus::Accepted;
+    store.save_work_item(&item).expect("persist assigned work");
+    if claim {
+        store
+            .claim_work(&item.work_id, agent_id, None)
+            .expect("claim assigned work");
+    }
+}
+
+fn observatory_load(worker: &serde_json::Value) -> (u64, u64, u64) {
+    let load = worker
+        .get("load")
+        .unwrap_or_else(|| panic!("load object: {worker}"));
+    (
+        load["assignedItems"].as_u64().expect("assignedItems"),
+        load["queuedItems"].as_u64().expect("queuedItems"),
+        load["activeLeases"].as_u64().expect("activeLeases"),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn observatory_load_counts_stay_inside_the_requested_lane() {
+    let mut env = ProcessEnvGuard::new();
+    let home = tempdir().unwrap();
+    set_grokptah_home_override(Some(home.path().join(".grokptah")));
+    env.set("GROKPTAH_AGENT_OFFLINE", "1");
+    let workspace = tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    })
+    .expect("acquire the GrokPtah instance lock");
+    host.start().unwrap();
+    let lane_a = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(lane_a.id, workspace.path()).unwrap();
+    let lane_b = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(lane_b.id, workspace.path()).unwrap();
+    let shared = host.ensure_session_agent(lane_a.id).unwrap();
+    host.attach_session_to_agent(lane_b.id, &shared.agent_id)
+        .expect("attach shared worker to lane B");
+    let store = host.ensure_orchestration_store().unwrap();
+    let workspace_text = workspace.path().display().to_string();
+    seed_assigned_work(
+        &store,
+        lane_a.id,
+        &workspace_text,
+        &shared.agent_id,
+        "lane-a queued",
+        false,
+    );
+    seed_assigned_work(
+        &store,
+        lane_a.id,
+        &workspace_text,
+        &shared.agent_id,
+        "lane-a claimed",
+        true,
+    );
+    seed_assigned_work(
+        &store,
+        lane_b.id,
+        &workspace_text,
+        &shared.agent_id,
+        "lane-b queued-1",
+        false,
+    );
+    seed_assigned_work(
+        &store,
+        lane_b.id,
+        &workspace_text,
+        &shared.agent_id,
+        "lane-b queued-2",
+        false,
+    );
+    seed_assigned_work(
+        &store,
+        lane_b.id,
+        &workspace_text,
+        &shared.agent_id,
+        "lane-b claimed",
+        true,
+    );
+    let orch = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        store,
+        OrchestrationConfig {
+            bearer_token: "coord-token-obs-load".into(),
+            allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
+            max_concurrent_runs: 2,
+            bounds: RunBounds::default(),
+        },
+    );
+    let auth = orch
+        .auth_header(Some("Bearer coord-token-obs-load"))
+        .expect("observatory bearer");
+
+    let listed_a = orch
+        .list_workers_scoped(&auth, lane_a.id, workspace.path())
+        .expect("list workers in lane A");
+    let workers_a = listed_a["workers"]
+        .as_array()
+        .cloned()
+        .expect("lane A workers");
+    let shared_a = workers_a
+        .iter()
+        .find(|worker| worker["agentId"] == shared.agent_id)
+        .expect("shared worker in lane A");
+    assert_eq!(observatory_load(shared_a), (2, 1, 1));
+    let detail_a = orch
+        .get_worker_scoped(&auth, lane_a.id, workspace.path(), &shared.agent_id)
+        .expect("get shared worker in lane A");
+    assert_eq!(observatory_load(&detail_a["worker"]), (2, 1, 1));
+
+    let listed_b = orch
+        .list_workers_scoped(&auth, lane_b.id, workspace.path())
+        .expect("list workers in lane B");
+    let workers_b = listed_b["workers"]
+        .as_array()
+        .cloned()
+        .expect("lane B workers");
+    let shared_b = workers_b
+        .iter()
+        .find(|worker| worker["agentId"] == shared.agent_id)
+        .expect("shared worker in lane B");
+    assert_eq!(observatory_load(shared_b), (3, 2, 1));
+    let detail_b = orch
+        .get_worker_scoped(&auth, lane_b.id, workspace.path(), &shared.agent_id)
+        .expect("get shared worker in lane B");
+    assert_eq!(observatory_load(&detail_b["worker"]), (3, 2, 1));
+
+    orch.stop_background_tasks().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn mcp_worker_reads_redact_and_collapse_unknown_inactive_and_cross_lane() {
+    let mut env = ProcessEnvGuard::new();
+    let home = tempdir().unwrap();
+    set_grokptah_home_override(Some(home.path().join(".grokptah")));
+    env.set("GROKPTAH_AGENT_OFFLINE", "1");
+    let workspace = tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    })
+    .expect("acquire the GrokPtah instance lock");
+    host.start().unwrap();
+    let lane_a = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(lane_a.id, workspace.path()).unwrap();
+    let lane_b = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(lane_b.id, workspace.path()).unwrap();
+    let local_template = host.ensure_session_agent(lane_a.id).unwrap();
+    let cross_template = host.ensure_session_agent(lane_b.id).unwrap();
+    let store = host.ensure_orchestration_store().unwrap();
+    let local = {
+        let mut local = local_template.clone();
+        local.agent_id = format!("mcp-local-{}", lane_a.id);
+        if let Some(spec) = local.spec.as_mut() {
+            spec.display_name = "mcp-local".into();
+            spec.authority.allowed_tools = vec!["run_terminal_cmd".into(), "web_fetch".into()];
+        }
+        store.save_agent(&local).unwrap();
+        local
+    };
+    let cross = {
+        let mut cross = cross_template.clone();
+        cross.agent_id = format!("mcp-cross-{}", lane_b.id);
+        if let Some(spec) = cross.spec.as_mut() {
+            spec.display_name = "mcp-cross".into();
+            spec.authority.allowed_tools = vec!["run_terminal_cmd".into()];
+        }
+        store.save_agent(&cross).unwrap();
+        cross
+    };
+    let inactive = {
+        let mut inactive = local_template.clone();
+        inactive.agent_id = format!("mcp-inactive-{}", lane_a.id);
+        inactive.state = AgentState::Completed;
+        if let Some(spec) = inactive.spec.as_mut() {
+            spec.display_name = "mcp-inactive".into();
+        }
+        store.save_agent(&inactive).unwrap();
+        inactive
+    };
+    let orch = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        store,
+        OrchestrationConfig {
+            bearer_token: "coord-token-obs-mcp".into(),
+            allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
+            max_concurrent_runs: 2,
+            bounds: RunBounds::default(),
+        },
+    );
+    let auth = orch
+        .auth_header(Some("Bearer coord-token-obs-mcp"))
+        .expect("observatory bearer");
+    let workspace_text = workspace.path().display().to_string();
+    let server = start_control_server(orch.clone(), 0).await.unwrap();
+    let mut coordinator =
+        McpControlClient::new(format!("http://{}", server.addr), "coord-token-obs-mcp");
+    coordinator.initialize().await.unwrap();
+
+    let listed_mcp = coordinator
+        .call_tool(
+            "ptah_list_workers",
+            json!({"session_id": lane_a.id, "workspace": workspace_text}),
+        )
+        .await
+        .expect("mcp list workers");
+    let listed_svc = orch
+        .list_workers_scoped(&auth, lane_a.id, workspace.path())
+        .expect("service list workers");
+    assert_eq!(listed_mcp.structured, listed_svc);
+    let workers = listed_mcp.structured["workers"]
+        .as_array()
+        .cloned()
+        .expect("workers array");
+    let ids: Vec<&str> = workers
+        .iter()
+        .map(|worker| worker["agentId"].as_str().expect("agentId"))
+        .collect();
+    assert!(
+        ids.contains(&local.agent_id.as_str()),
+        "lane A MCP list must include the local worker: {ids:?}"
+    );
+    assert!(
+        !ids.contains(&cross.agent_id.as_str()),
+        "same-workspace cross-lane worker must be omitted from MCP list: {ids:?}"
+    );
+    assert!(
+        !ids.contains(&inactive.agent_id.as_str()),
+        "inactive worker must be omitted from MCP list: {ids:?}"
+    );
+    for worker in &workers {
+        assert_observatory_worker_json(worker, &workspace_text);
+    }
+
+    let detail_mcp = coordinator
+        .call_tool(
+            "ptah_get_worker",
+            json!({
+                "session_id": lane_a.id,
+                "workspace": workspace_text,
+                "agent_id": local.agent_id
+            }),
+        )
+        .await
+        .expect("mcp get local worker");
+    let detail_svc = orch
+        .get_worker_scoped(&auth, lane_a.id, workspace.path(), &local.agent_id)
+        .expect("service get local worker");
+    assert_eq!(detail_mcp.structured, detail_svc);
+    assert_observatory_worker_json(&detail_mcp.structured["worker"], &workspace_text);
+
+    let unknown = coordinator
+        .call_tool(
+            "ptah_get_worker",
+            json!({
+                "session_id": lane_a.id,
+                "workspace": workspace_text,
+                "agent_id": "missing-mcp-worker"
+            }),
+        )
+        .await
+        .expect_err("unknown worker");
+    let foreign = coordinator
+        .call_tool(
+            "ptah_get_worker",
+            json!({
+                "session_id": lane_a.id,
+                "workspace": workspace_text,
+                "agent_id": cross.agent_id
+            }),
+        )
+        .await
+        .expect_err("cross-lane worker");
+    let completed = coordinator
+        .call_tool(
+            "ptah_get_worker",
+            json!({
+                "session_id": lane_a.id,
+                "workspace": workspace_text,
+                "agent_id": inactive.agent_id
+            }),
+        )
+        .await
+        .expect_err("inactive worker");
+    assert_eq!(unknown.to_string(), foreign.to_string());
+    assert_eq!(unknown.to_string(), completed.to_string());
+    assert!(
+        unknown.to_string().contains("invalid_request"),
+        "collapsed MCP worker errors must stay invalid_request: {unknown}"
+    );
+
+    orch.stop_background_tasks().await;
+    coordinator.close_session().await.unwrap();
 }

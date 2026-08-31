@@ -7,7 +7,7 @@ use grokptah_agent_bridge::orchestration::{
 };
 use grokptah_agent_bridge::{
     home_override_serial, set_grokptah_home_override, AgentHostHandle, LiveNotification,
-    McpControlClient, RunScope, SessionUpdate,
+    McpControlClient, PublicEventKindV1, RunScope, SessionUpdate,
 };
 use grokptah_service::{start_service, ServiceConfig};
 use serde_json::json;
@@ -260,7 +260,19 @@ async fn service_mcp_contract_covers_scoped_live_reconnect_controls_and_restart(
         .await
         .unwrap();
     assert!(!run.is_error, "get run: {:?}", run.raw);
-    assert_eq!(run.structured["startSeq"], first_seq);
+    assert_eq!(run.structured["schemaVersion"], "grokptah.public-run.v1");
+    assert_eq!(run.structured["eventStartSeq"], first_seq);
+    for key in [
+        "parentRunId",
+        "checkpointId",
+        "continuationContextId",
+        "startSeq",
+    ] {
+        assert!(
+            run.structured.get(key).is_none(),
+            "public get_run leaked {key}"
+        );
+    }
 
     let events = client
         .call_tool(
@@ -276,8 +288,13 @@ async fn service_mcp_contract_covers_scoped_live_reconnect_controls_and_restart(
         .await
         .unwrap();
     assert!(!events.is_error, "get events: {:?}", events.raw);
-    assert_eq!(events.structured["entries"].as_array().unwrap().len(), 1);
-    assert_eq!(events.structured["entries"][0]["seq"], first_seq);
+    assert_eq!(
+        events.structured["schemaVersion"],
+        "grokptah.public-event.v1"
+    );
+    assert!(events.structured.get("entries").is_none());
+    assert_eq!(events.structured["events"].as_array().unwrap().len(), 1);
+    assert_eq!(events.structured["events"][0]["seq"], first_seq);
 
     let listed_runs = client
         .call_tool(
@@ -392,7 +409,8 @@ async fn service_mcp_contract_covers_scoped_live_reconnect_controls_and_restart(
     match frame.notification {
         LiveNotification::Event(event) => {
             assert_eq!(event.seq, first_seq);
-            assert_eq!(event.run_id, run_id);
+            assert_eq!(event.schema_version, "grokptah.public-event.v1");
+            assert_eq!(event.kind, PublicEventKindV1::AgentMessage);
         }
         other => panic!("expected replayed event, got {other:?}"),
     }
@@ -520,7 +538,12 @@ async fn service_mcp_contract_covers_scoped_live_reconnect_controls_and_restart(
         "restart events: {:?}",
         recovered_events.raw
     );
-    assert!(recovered_events.structured["entries"]
+    assert_eq!(
+        recovered_events.structured["schemaVersion"],
+        "grokptah.public-event.v1"
+    );
+    assert!(recovered_events.structured.get("entries").is_none());
+    assert!(recovered_events.structured["events"]
         .as_array()
         .unwrap()
         .iter()

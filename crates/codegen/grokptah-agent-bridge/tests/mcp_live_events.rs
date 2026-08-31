@@ -9,7 +9,7 @@ use grokptah_agent_bridge::orchestration::{
 };
 use grokptah_agent_bridge::{
     home_override_serial, set_grokptah_home_override, start_control_server, AgentHost, HostConfig,
-    LiveNotification, McpControlClient, RunScope, SessionKind, SessionUpdate,
+    LiveNotification, McpControlClient, PublicEventKindV1, RunScope, SessionKind,
 };
 use serde_json::{json, Value};
 use tempfile::tempdir;
@@ -114,6 +114,41 @@ fn event_id(frame: &str) -> u64 {
         .unwrap()
 }
 
+fn assert_public_run_projection(value: &Value) {
+    assert_eq!(value["schemaVersion"], "grokptah.public-run.v1");
+    for key in [
+        "promptPreview",
+        "finalResponse",
+        "workspace",
+        "sessionId",
+        "clientId",
+        "requestId",
+        "providerId",
+        "leaseId",
+        "attemptId",
+        "execution",
+        "approval",
+        "aggregates",
+        "progress",
+        "bounds",
+        "stopCause",
+        "terminalResult",
+        "parentRunId",
+        "checkpointId",
+        "continuationContextId",
+    ] {
+        assert!(value.get(key).is_none(), "public run leaked {key}");
+    }
+    let encoded = value.to_string();
+    for secret in [
+        "write live-events.txt: observed",
+        "/tmp/secret",
+        "credentials.env",
+    ] {
+        assert!(!encoded.contains(secret), "public run leaked {secret}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::await_holding_lock)]
 async fn live_get_replays_scoped_events_and_resumes_after_last_event() {
@@ -146,7 +181,51 @@ async fn live_get_replays_scoped_events_and_resumes_after_last_event() {
         .unwrap();
     let run_id = submitted.structured["runId"].as_str().unwrap().to_string();
     let terminal = wait_terminal(&mut client, owner.id, workspace.path(), &run_id).await;
-    assert!(terminal["startSeq"].as_u64().is_some());
+    assert!(terminal["eventStartSeq"].as_u64().is_some());
+    assert_public_run_projection(&terminal);
+
+    let listed = client
+        .call_tool(
+            "ptah_list_runs",
+            json!({
+                "session_id": owner.id,
+                "workspace": workspace.path().display().to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed.structured["schemaVersion"], "grokptah.public-run.v1");
+    let listed_run = listed.structured["runs"]
+        .as_array()
+        .and_then(|runs| runs.iter().find(|run| run["runId"] == run_id))
+        .expect("list includes submitted run");
+    assert_public_run_projection(listed_run);
+
+    let progress = client
+        .call_tool(
+            "ptah_get_progress",
+            json!({
+                "session_id": owner.id,
+                "workspace": workspace.path().display().to_string(),
+                "run_id": run_id,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_public_run_projection(&progress.structured);
+
+    let handoff = client
+        .call_tool(
+            "ptah_get_handoff",
+            json!({
+                "session_id": owner.id,
+                "workspace": workspace.path().display().to_string(),
+                "run_id": run_id,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_public_run_projection(&handoff.structured);
 
     // The existing unscoped GET remains a standards-compatible keep-alive.
     let keep_alive = http
@@ -174,7 +253,7 @@ async fn live_get_replays_scoped_events_and_resumes_after_last_event() {
     );
     let first = first_chunk(stream_response).await;
     assert!(first.contains("notifications/ptah_event"));
-    assert!(first.contains(&run_id));
+    assert!(first.contains("grokptah.public-event.v1"));
     let first_id = event_id(&first);
 
     // Reconnect with the last delivered event. The durable replay must not
@@ -191,11 +270,13 @@ async fn live_get_replays_scoped_events_and_resumes_after_last_event() {
     let next = first_chunk(resumed).await;
     assert!(next.contains("notifications/ptah_event"));
     assert!(event_id(&next) > first_id);
-    assert!(next.contains(&run_id));
+    assert!(next.contains("grokptah.public-event.v1"));
 
     // Reconnecting after the terminal sequence must close promptly instead
     // of leaving a completed run's stream open forever.
-    let terminal_id = terminal["endSeq"].as_u64().expect("terminal end sequence");
+    let terminal_id = terminal["eventEndSeq"]
+        .as_u64()
+        .expect("terminal end sequence");
     let completed = http
         .get(live_url(server.addr, owner.id, workspace.path(), &run_id))
         .header("Authorization", "Bearer live-event-token")
@@ -283,13 +364,13 @@ async fn reusable_client_reconnects_from_last_live_event() {
     let mut terminal_seen = matches!(
         next.notification,
         LiveNotification::Event(ref event)
-            if matches!(event.update, SessionUpdate::TurnComplete { .. })
+            if event.kind == PublicEventKindV1::TurnComplete
     );
     while let Some(frame) = resumed.next_notification().await.unwrap() {
         if matches!(
             frame.notification,
             LiveNotification::Event(ref event)
-                if matches!(event.update, SessionUpdate::TurnComplete { .. })
+                if event.kind == PublicEventKindV1::TurnComplete
         ) {
             terminal_seen = true;
         }
@@ -350,7 +431,7 @@ async fn live_get_delivers_events_while_a_run_is_still_active() {
             )
             .await
             .unwrap();
-        if progress.structured["startSeq"].as_u64().is_some()
+        if progress.structured["eventStartSeq"].as_u64().is_some()
             && progress.structured["state"].as_str() == Some("running")
         {
             break;

@@ -169,6 +169,34 @@ function structured(callJson) {
   return callJson?.result?.structuredContent ?? callJson?.result ?? null;
 }
 
+const PUBLIC_EVENT_SCHEMA = "grokptah.public-event.v1";
+const PUBLIC_RUN_SCHEMA = "grokptah.public-run.v1";
+
+function publicEventPage(callJson) {
+  const page = structured(callJson);
+  if (!page || page.schemaVersion !== PUBLIC_EVENT_SCHEMA) return null;
+  if (Object.prototype.hasOwnProperty.call(page, "entries")) return null;
+  if (Object.prototype.hasOwnProperty.call(page, "cursorExpired")) return null;
+  if (!Array.isArray(page.events)) return null;
+  if (
+    page.events.some(
+      (event) => !event || event.schemaVersion !== PUBLIC_EVENT_SCHEMA || typeof event.seq !== "number"
+    )
+  ) {
+    return null;
+  }
+  return page;
+}
+
+function publicHandoff(callJson) {
+  const handoff = structured(callJson);
+  if (!handoff || handoff.schemaVersion !== PUBLIC_RUN_SCHEMA) return null;
+  if (Object.prototype.hasOwnProperty.call(handoff, "finalResponse")) return null;
+  if (Object.prototype.hasOwnProperty.call(handoff, "changes")) return null;
+  if (typeof handoff.changeCount !== "number") return null;
+  return handoff;
+}
+
 function sampleResources(label) {
   const mu = process.memoryUsage();
   const sample = {
@@ -633,32 +661,36 @@ async function runFullMode() {
       { name: "ptah_get_events", arguments: { run_id: writeRunId, after_seq: 0, limit: 100 } },
       { id: 202, sessionId: primary }
     );
-    const entries = structured(events.json)?.entries ?? [];
+    const eventPage = publicEventPage(events.json);
     let ordered = true;
     let prev = 0;
     let maxSeq = 0;
-    for (const e of entries) {
-      if (typeof e.seq === "number") {
-        if (e.seq < prev) ordered = false;
-        prev = e.seq;
-        maxSeq = Math.max(maxSeq, e.seq);
-      }
+    for (const event of eventPage?.events ?? []) {
+      if (event.seq < prev) ordered = false;
+      prev = event.seq;
+      maxSeq = Math.max(maxSeq, event.seq);
     }
-    record("eventOrdering", events.status === 200 && ordered && entries.length > 0, {
-      count: entries.length,
+    record("eventOrdering", events.status === 200 && !!eventPage && ordered && eventPage.events.length > 0, {
+      count: eventPage?.events?.length ?? 0,
       maxSeq,
+      schemaVersion: eventPage?.schemaVersion ?? structured(events.json)?.schemaVersion,
     });
 
-    // Replay from 0 must succeed; high after_seq may expire or empty
+    // Replay from 0 must succeed as a versioned page; retired cursorExpired is fail-closed.
     const replay = await mcpFetch(
       "tools/call",
       { name: "ptah_get_events", arguments: { run_id: writeRunId, after_seq: 0, limit: 50 } },
       { id: 203, sessionId: primary }
     );
+    const replayPage = publicEventPage(replay.json);
     record(
       "eventReplayFromZero",
-      replay.status === 200 && structured(replay.json)?.cursorExpired !== true,
-      { status: replay.status, cursorExpired: structured(replay.json)?.cursorExpired }
+      replay.status === 200 && !!replayPage,
+      {
+        status: replay.status,
+        schemaVersion: replayPage?.schemaVersion ?? structured(replay.json)?.schemaVersion,
+        eventCount: replayPage?.events?.length ?? 0,
+      }
     );
     const far = await mcpFetch(
       "tools/call",
@@ -668,19 +700,17 @@ async function runFullMode() {
       },
       { id: 204, sessionId: primary }
     );
-    // Far cursor: either empty page or cursor_expired/gone — both fail-closed for replay
-    const farSc = structured(far.json);
+    // Far cursor: HTTP 410 / cursor_expired, or an empty versioned events page.
+    const farPage = publicEventPage(far.json);
     const farOk =
       far.status === 410 ||
       far.json?.error?.data?.code === "cursor_expired" ||
-      (far.status === 200 &&
-        (farSc?.cursorExpired === true ||
-          (Array.isArray(farSc?.entries) && farSc.entries.length === 0)));
+      (far.status === 200 && !!farPage && farPage.events.length === 0);
     record("eventCursorFarFailClosedOrEmpty", farOk, {
       status: far.status,
       code: far.json?.error?.data?.code,
-      cursorExpired: farSc?.cursorExpired,
-      entries: farSc?.entries?.length,
+      schemaVersion: farPage?.schemaVersion ?? structured(far.json)?.schemaVersion,
+      events: farPage?.events?.length,
     });
 
     const changes = await mcpFetch(
@@ -749,7 +779,6 @@ async function runFullMode() {
       // Tighten: require shape always; if not observed still pass shape but mark separately
       if (!shapeOk) checks.durableTestResults = false;
       else if (!observed) {
-        // Soft: re-check via handoff tests array after write run instead
         checks.durableTestResults = shapeOk;
       }
     } else {
@@ -761,24 +790,19 @@ async function runFullMode() {
       { name: "ptah_get_handoff", arguments: { run_id: writeRunId } },
       { id: 208, sessionId: primary }
     );
-    const h = structured(handoff.json);
+    const h = publicHandoff(handoff.json);
     record(
       "completedHandoff",
       handoff.status === 200 &&
         h?.runId === writeRunId &&
         h?.state === "completed" &&
-        (typeof h?.finalResponse === "string" || h?.finalResponse == null) &&
-        Array.isArray(h?.changes),
+        h.changeCount > 0,
       {
         state: h?.state,
-        hasFinal: typeof h?.finalResponse === "string",
-        changeN: h?.changes?.length,
+        schemaVersion: h?.schemaVersion ?? structured(handoff.json)?.schemaVersion,
+        changeCount: h?.changeCount,
       }
     );
-    // Require non-empty changes on completed handoff for write run
-    if (!(Array.isArray(h?.changes) && h.changes.length > 0)) {
-      checks.completedHandoff = false;
-    }
   } else {
     record("completedTerminal", false);
     record("progressVisibility", false);

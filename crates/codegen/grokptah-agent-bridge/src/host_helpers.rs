@@ -2,9 +2,11 @@
 //! Keep tool schemas, API wire, sandbox helpers, and transcript helpers here.
 
 use std::path::Path;
+use std::sync::OnceLock;
 
 use anyhow::{anyhow, bail, Result};
 use chrono::Utc;
+use regex::Regex;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -406,17 +408,19 @@ pub(crate) async fn tool_web_fetch(url: &str) -> Result<local_tools::ToolResult>
     let resp = client.get(url).send().await?;
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
-    let clipped: String = text.chars().take(24_000).collect();
+    let body = format!("HTTP {status}\n{text}");
+    let clipped = bounded_tool_output_with_integrity(&body, 24_000);
     Ok(local_tools::ToolResult::basic(
         format!("Fetch {url}"),
         ToolCallKind::Execute,
         serde_json::json!({ "url": url, "status": status.as_u16() }),
-        format!("HTTP {status}\n{clipped}"),
+        clipped,
         false,
         format!("web_fetch {url}"),
     ))
 }
 
+#[derive(Clone)]
 pub(crate) struct AgentToolCall {
     pub(crate) id: String,
     pub(crate) name: String,
@@ -437,7 +441,7 @@ const _: () = assert!(MAX_CONSECUTIVE_TRUE_NOOPS < NUDGE_AFTER_IDENTICAL_TOOL_CA
 /// retain their exact tool-and-arguments signature.
 #[derive(Default)]
 pub(crate) struct IdenticalToolCallRun {
-    last_signature_hash: Option<u64>,
+    last_progress_digest: Option<[u8; 32]>,
     tool_name: String,
     run_len: u32,
     is_true_noop_run: bool,
@@ -445,22 +449,22 @@ pub(crate) struct IdenticalToolCallRun {
 }
 
 impl IdenticalToolCallRun {
-    pub(crate) fn observe(&mut self, signature: &str, tool_name: &str, is_true_noop: bool) -> u32 {
-        use std::hash::{Hash, Hasher};
-
-        let signature = if is_true_noop {
-            "\0true_noop"
-        } else {
-            signature
-        };
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        signature.hash(&mut hasher);
-        let hash = hasher.finish();
-        if self.last_signature_hash == Some(hash) {
+    /// Observe a tool step using the complete, unclipped result. The result is
+    /// hashed in memory and is not retained by this ledger, so output changes
+    /// past the wire display cap still count as progress.
+    pub(crate) fn observe_with_outputs(
+        &mut self,
+        signature: &str,
+        tool_name: &str,
+        is_true_noop: bool,
+        raw_outputs: &[String],
+    ) -> u32 {
+        let digest = progress_digest(signature, raw_outputs, is_true_noop);
+        if self.last_progress_digest == Some(digest) {
             self.run_len += 1;
         } else {
             self.run_len = 1;
-            self.last_signature_hash = Some(hash);
+            self.last_progress_digest = Some(digest);
             self.is_true_noop_run = is_true_noop;
             self.nudged = false;
         }
@@ -492,6 +496,286 @@ impl IdenticalToolCallRun {
         (self.run_len >= threshold)
             .then(|| (self.run_len, self.tool_name.clone(), self.is_true_noop_run))
     }
+}
+
+fn progress_digest(signature: &str, raw_outputs: &[String], is_true_noop: bool) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    if is_true_noop {
+        // True no-ops remain broader than identical actions: changing their
+        // arguments or returned text must not evade the four-call stop.
+        hasher.update(b"grokptah-stationarity\0true-noop");
+    } else {
+        hasher.update(b"grokptah-stationarity\0action\0");
+        hasher.update((signature.len() as u64).to_be_bytes());
+        hasher.update(signature.as_bytes());
+        for output in raw_outputs {
+            hasher.update(b"\0output\0");
+            let stable = stationarity_output_projection(output);
+            hasher.update((stable.len() as u64).to_be_bytes());
+            hasher.update(stable.as_bytes());
+        }
+    }
+    hasher.finalize().into()
+}
+
+pub(crate) const TOOL_OUTPUT_WIRE_LIMIT_BYTES: usize = 24_000;
+
+const TOOL_OUTPUT_INTEGRITY_MARKER: &str = "[grokptah-output-integrity-v1";
+
+const NORMALIZER_HOLD_BYTES: usize = 96;
+const NORMALIZER_CHUNK_BYTES: usize = 4_096;
+
+const STATIONARITY_TIME_KEYS: &str = "timestamp|created_at|createdAt|updated_at|updatedAt|started_at|startedAt|finished_at|finishedAt|observed_at|observedAt|wall_clock|wallClock";
+const STATIONARITY_PID_KEYS: &str = "pid|process_id|processId|parent_pid|parentPid";
+const STATIONARITY_ID_KEYS: &str = "request_id|request-id|requestId|progress_id|progress-id|progressId|trace_id|trace-id|traceId|span_id|span-id|spanId|observation_id|observation-id|observationId|tool_call_id|tool-call-id|toolCallId|call_id|call-id|callId|event_id|event-id|eventId";
+const STATIONARITY_HTTP_DATE: &str = r#"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),\s+[0-9]{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+[0-9]{4}\s+[0-9]{2}:[0-9]{2}:[0-9]{2}\s+GMT"#;
+const STATIONARITY_TIME_TOKEN: &str = r#"[0-9A-Za-z:+._-]+"#;
+const STATIONARITY_BARE_UUID: &str = r#"[0-9a-f-]{16,}"#;
+
+fn labelled_key_pattern(keys: &str) -> String {
+    format!(r#"(?:\"(?:{keys})\"|\b(?:{keys})\b)"#)
+}
+
+fn timestamp_regex() -> &'static Regex {
+    static TIMESTAMP: OnceLock<Regex> = OnceLock::new();
+    TIMESTAMP.get_or_init(|| {
+        let keys = labelled_key_pattern(STATIONARITY_TIME_KEYS);
+        Regex::new(&format!(
+            r#"(?i)({keys}\s*[:=]\s*)(?:{http_date}|\"[^\"]*\"|'[^']*'|{time_token})"#,
+            http_date = STATIONARITY_HTTP_DATE,
+            time_token = STATIONARITY_TIME_TOKEN,
+        ))
+        .expect("timestamp normalizer regex is valid")
+    })
+}
+
+fn pid_regex() -> &'static Regex {
+    static PID: OnceLock<Regex> = OnceLock::new();
+    PID.get_or_init(|| {
+        let keys = labelled_key_pattern(STATIONARITY_PID_KEYS);
+        Regex::new(&format!(r#"(?i)({keys}\s*[:=]\s*)(?:\d+|"\d+"|'\d+')"#))
+            .expect("pid normalizer regex is valid")
+    })
+}
+
+fn identifier_regex() -> &'static Regex {
+    static IDENTIFIER: OnceLock<Regex> = OnceLock::new();
+    IDENTIFIER.get_or_init(|| {
+        let keys = labelled_key_pattern(STATIONARITY_ID_KEYS);
+        Regex::new(&format!(
+            r#"(?i)({keys}\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|{uuid})"#,
+            uuid = STATIONARITY_BARE_UUID,
+        ))
+        .expect("identifier normalizer regex is valid")
+    })
+}
+
+fn volatile_label_regex() -> &'static Regex {
+    static LABEL: OnceLock<Regex> = OnceLock::new();
+    LABEL.get_or_init(|| {
+        let keys = labelled_key_pattern(&format!(
+            "{STATIONARITY_TIME_KEYS}|{STATIONARITY_PID_KEYS}|{STATIONARITY_ID_KEYS}"
+        ));
+        Regex::new(&format!(r#"(?i){keys}\s*[:=]"#)).expect("volatile label regex is valid")
+    })
+}
+
+/// Replace only explicitly labelled runtime metadata.  Bare numbers, hashes,
+/// paths, and user content are intentionally left untouched.
+fn normalize_stationarity_text(input: &str) -> String {
+    let normalized = timestamp_regex().replace_all(input, "$1<volatile-time>");
+    let normalized = pid_regex().replace_all(&normalized, "$1<volatile-pid>");
+    identifier_regex()
+        .replace_all(&normalized, "$1<volatile-id>")
+        .into_owned()
+}
+
+fn stationarity_commit_split(pending: &str) -> usize {
+    let split = crate::textutil::truncate_at_char_boundary(pending, NORMALIZER_CHUNK_BYTES).len();
+    if split == 0 || split >= pending.len() {
+        return split;
+    }
+    let desired_start = split.saturating_sub(NORMALIZER_HOLD_BYTES);
+    let window_start = crate::textutil::truncate_at_char_boundary(pending, desired_start).len();
+    let context_start = pending[..window_start]
+        .char_indices()
+        .next_back()
+        .map(|(index, _)| index)
+        .unwrap_or(0);
+    let mut retracted = split;
+    for mat in volatile_label_regex().find_iter(&pending[context_start..]) {
+        let abs_start = context_start + mat.start();
+        if abs_start >= window_start && abs_start < split {
+            retracted = abs_start;
+            break;
+        }
+    }
+    if retracted == 0 {
+        split
+    } else {
+        retracted
+    }
+}
+
+/// Streaming normalizer used by the shell path so full output is hashed with
+/// bounded memory.  The small pending tail handles identifiers split across
+/// reader chunks.
+pub(crate) struct StationarityNormalizer {
+    pending: String,
+    hasher: Sha256,
+}
+
+impl Default for StationarityNormalizer {
+    fn default() -> Self {
+        Self {
+            pending: String::new(),
+            hasher: Sha256::new(),
+        }
+    }
+}
+
+impl StationarityNormalizer {
+    pub(crate) fn feed(&mut self, chunk: &str) {
+        self.pending.push_str(chunk);
+        while self.pending.len() > NORMALIZER_HOLD_BYTES + NORMALIZER_CHUNK_BYTES {
+            let split = stationarity_commit_split(&self.pending);
+            if split == 0 {
+                break;
+            }
+            let prefix = self.pending[..split].to_owned();
+            self.pending.drain(..split);
+            self.hasher
+                .update(normalize_stationarity_text(&prefix).as_bytes());
+        }
+    }
+
+    pub(crate) fn finish(mut self) -> [u8; 32] {
+        self.hasher
+            .update(normalize_stationarity_text(&self.pending).as_bytes());
+        self.hasher.finalize().into()
+    }
+}
+
+fn normalized_digest(content: &str) -> [u8; 32] {
+    let mut normalizer = StationarityNormalizer::default();
+    normalizer.feed(content);
+    normalizer.finish()
+}
+
+fn stationarity_output_projection(output: &str) -> String {
+    let Some(line_end) = output.find('\n') else {
+        return normalize_stationarity_text(output);
+    };
+    let marker = &output[..line_end];
+    let Some(rest) = marker.strip_prefix(TOOL_OUTPUT_INTEGRITY_MARKER) else {
+        return normalize_stationarity_text(output);
+    };
+    let Some(stable) = rest.strip_prefix(" bytes=") else {
+        return normalize_stationarity_text(output);
+    };
+    let Some((bytes, rest)) = stable.split_once(" sha256=") else {
+        return normalize_stationarity_text(output);
+    };
+    let Some((_, stable)) = rest.split_once(" stable_sha256=") else {
+        return normalize_stationarity_text(output);
+    };
+    let Some(stable) = stable.strip_suffix(']') else {
+        return normalize_stationarity_text(output);
+    };
+    if bytes.is_empty() || stable.len() != 64 || !stable.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return normalize_stationarity_text(output);
+    }
+    format!("integrity bytes=<volatile-bytes> stable_sha256={stable}")
+}
+
+/// Return a bounded tool projection that carries a stable identity for the
+/// complete payload when the display cap is exceeded.  Producers use this
+/// before clipping so stationarity can distinguish changes in an omitted
+/// suffix without retaining or exposing that suffix.
+pub(crate) fn bounded_tool_output_with_integrity(content: &str, limit: usize) -> String {
+    let digest = Sha256::digest(content.as_bytes());
+    let stable = normalized_digest(content);
+    bounded_tool_output_with_digests(
+        content,
+        content.len(),
+        digest.as_ref(),
+        stable.as_ref(),
+        limit,
+    )
+}
+
+pub(crate) fn bounded_tool_output_with_digests(
+    display_prefix: &str,
+    total_bytes: usize,
+    digest: &[u8],
+    stable_digest: &[u8],
+    limit: usize,
+) -> String {
+    if total_bytes <= limit {
+        return display_prefix.to_owned();
+    }
+    let digest_hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    let stable_hex: String = stable_digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let marker =
+        format!("{TOOL_OUTPUT_INTEGRITY_MARKER} bytes={total_bytes} sha256={digest_hex} stable_sha256={stable_hex}]\n");
+    let suffix = "\n… (truncated)";
+    let body_budget = limit.saturating_sub(marker.len() + suffix.len());
+    let body = crate::textutil::truncate_at_char_boundary(display_prefix, body_budget);
+    format!("{marker}{body}{suffix}")
+}
+
+/// Clip a tool result for the model wire. If a producer already attached an
+/// integrity marker, preserve that marker at the front so a second projection
+/// cannot discard the pre-clip identity used by stationarity.
+pub(crate) fn clip_tool_output_for_wire(content: String) -> String {
+    if content.len() > TOOL_OUTPUT_WIRE_LIMIT_BYTES {
+        if let Some(marker_end) = content
+            .strip_prefix(TOOL_OUTPUT_INTEGRITY_MARKER)
+            .and_then(|rest| rest.find('\n'))
+        {
+            let marker_len = TOOL_OUTPUT_INTEGRITY_MARKER.len() + marker_end + 1;
+            let marker = &content[..marker_len];
+            let body = &content[marker_len..];
+            let suffix = "\n(truncated wire projection)";
+            let body_budget =
+                TOOL_OUTPUT_WIRE_LIMIT_BYTES.saturating_sub(marker.len() + suffix.len());
+            let body = crate::textutil::truncate_at_char_boundary(body, body_budget);
+            return format!("{marker}{body}{suffix}");
+        }
+        bounded_tool_output_with_integrity(&content, TOOL_OUTPUT_WIRE_LIMIT_BYTES)
+    } else {
+        content
+    }
+}
+
+/// Observe stationarity from tools actually accepted this step.
+///
+/// Cancelled remainder is omitted. Skip substitutions and host
+/// auto-reverify are included because they are accepted outputs.
+pub(crate) fn observe_accepted_tool_progress(
+    run: &mut IdenticalToolCallRun,
+    accepted_calls: &[AgentToolCall],
+    raw_outputs: &[String],
+) -> u32 {
+    debug_assert_eq!(
+        accepted_calls.len(),
+        raw_outputs.len(),
+        "stationarity digest requires one raw output per accepted tool"
+    );
+    let signature = tool_step_signature(accepted_calls);
+    let tool_name = accepted_calls
+        .first()
+        .map(|tool_call| tool_call.name.as_str())
+        .unwrap_or("");
+    run.observe_with_outputs(
+        &signature,
+        tool_name,
+        is_true_noop_tool_step(accepted_calls),
+        raw_outputs,
+    )
 }
 
 fn command_is_true(command: &str) -> bool {
@@ -4259,9 +4543,9 @@ test result: FAILED. 0 passed; 3 failed; 0 ignored
     #[test]
     fn action_stationarity_resets_on_a_different_signature() {
         let mut run = IdenticalToolCallRun::default();
-        assert_eq!(run.observe("a", "read_file", false), 1);
-        assert_eq!(run.observe("a", "read_file", false), 2);
-        assert_eq!(run.observe("b", "read_file", false), 1);
+        assert_eq!(run.observe_with_outputs("a", "read_file", false, &[]), 1);
+        assert_eq!(run.observe_with_outputs("a", "read_file", false, &[]), 2);
+        assert_eq!(run.observe_with_outputs("b", "read_file", false, &[]), 1);
         assert!(run.stop_info().is_none());
     }
 
@@ -4269,10 +4553,16 @@ test result: FAILED. 0 passed; 3 failed; 0 ignored
     fn true_noops_chain_across_arguments_and_stop_at_four() {
         let mut run = IdenticalToolCallRun::default();
         for i in 1..=4 {
-            assert_eq!(run.observe(&format!("sig{i}"), "run_terminal_cmd", true), i);
+            assert_eq!(
+                run.observe_with_outputs(&format!("sig{i}"), "run_terminal_cmd", true, &[]),
+                i
+            );
         }
         assert_eq!(run.stop_info(), Some((4, "run_terminal_cmd".into(), true)));
-        assert_eq!(run.observe("different", "run_terminal_cmd", false), 1);
+        assert_eq!(
+            run.observe_with_outputs("different", "run_terminal_cmd", false, &[]),
+            1
+        );
         assert!(run.stop_info().is_none());
     }
 
@@ -4296,14 +4586,604 @@ test result: FAILED. 0 passed; 3 failed; 0 ignored
     fn identical_non_noop_run_nudges_once_at_eight() {
         let mut run = IdenticalToolCallRun::default();
         for i in 1..8 {
-            assert_eq!(run.observe("poll", "get_task_output", false), i);
+            assert_eq!(
+                run.observe_with_outputs("poll", "get_task_output", false, &[]),
+                i
+            );
             assert!(!run.take_nudge());
         }
-        assert_eq!(run.observe("poll", "get_task_output", false), 8);
+        assert_eq!(
+            run.observe_with_outputs("poll", "get_task_output", false, &[]),
+            8
+        );
         assert!(run.take_nudge());
         assert!(!run.take_nudge());
-        assert_eq!(run.observe("poll", "get_task_output", false), 9);
+        assert_eq!(
+            run.observe_with_outputs("poll", "get_task_output", false, &[]),
+            9
+        );
         assert!(!run.take_nudge());
+    }
+
+    #[test]
+    fn cancelled_partial_outputs_hash_only_accepted_tools() {
+        let first = tool_call("get_task_output", r#"{"task":"a"}"#);
+        let tail_a = tool_call("read_file", r#"{"path":"a"}"#);
+        let tail_b = tool_call("read_file", r#"{"path":"b"}"#);
+        let output = "task still running".to_string();
+        let accepted = [first.clone()];
+        let outputs = [output.clone()];
+
+        let mut run = IdenticalToolCallRun::default();
+        assert_eq!(
+            observe_accepted_tool_progress(&mut run, &accepted, &outputs),
+            1
+        );
+        // Cancel after the first tool leaves a partial vector. A different
+        // unexecuted tail must not reset the accepted digest.
+        assert_eq!(
+            observe_accepted_tool_progress(&mut run, &accepted, &outputs),
+            2
+        );
+        assert!(run.stop_info().is_none());
+
+        let mut mismatched = IdenticalToolCallRun::default();
+        mismatched.observe_with_outputs(
+            &tool_step_signature(&[first.clone(), tail_a]),
+            "get_task_output",
+            false,
+            &outputs,
+        );
+        assert_eq!(
+            mismatched.observe_with_outputs(
+                &tool_step_signature(&[first, tail_b]),
+                "get_task_output",
+                false,
+                &outputs,
+            ),
+            1,
+            "pairing a cancelled tail into the signature would evade stationarity"
+        );
+    }
+
+    #[test]
+    fn skip_and_auto_reverify_outputs_are_in_the_progress_digest() {
+        let write = tool_call("write_files", r#"{"files":[]}"#);
+        let explore = tool_call("list_dir", r#"{}"#);
+        let skip = post_cargo_failure_skip_message("list_dir");
+        let reverify = AgentToolCall {
+            id: "auto-reverify-test".into(),
+            name: "run_terminal_cmd".into(),
+            arguments: serde_json::json!({ "command": auto_cargo_reverify_command() }).to_string(),
+        };
+        let write_out = "wrote files".to_string();
+        let reverify_fail = "test result: FAILED. 3 failed".to_string();
+        let reverify_pass = "test result: ok. 3 passed".to_string();
+        let accepted = [write.clone(), explore.clone(), reverify.clone()];
+        let failed = [write_out.clone(), skip.clone(), reverify_fail.clone()];
+        let passed = [write_out.clone(), skip.clone(), reverify_pass];
+
+        let mut run = IdenticalToolCallRun::default();
+        assert_eq!(
+            observe_accepted_tool_progress(&mut run, &accepted, &failed),
+            1
+        );
+        assert_eq!(
+            observe_accepted_tool_progress(&mut run, &accepted, &failed),
+            2
+        );
+        assert_eq!(
+            observe_accepted_tool_progress(&mut run, &accepted, &passed),
+            1,
+            "auto-reverify output must participate in the progress digest"
+        );
+
+        let without_skip = [write, reverify];
+        let without_skip_out = [write_out, reverify_fail];
+        assert_eq!(
+            observe_accepted_tool_progress(&mut run, &without_skip, &without_skip_out),
+            1,
+            "post-cargo skip output must participate in the progress digest"
+        );
+        assert!(skip.starts_with("SKIPPED `list_dir`"));
+    }
+
+    #[test]
+    fn raw_output_suffix_beyond_wire_limit_resets_stationarity() {
+        let mut first = "same visible prefix".repeat(2_000);
+        first.push('a');
+        let mut second = "same visible prefix".repeat(2_000);
+        second.push('b');
+        assert!(first.len() > TOOL_OUTPUT_WIRE_LIMIT_BYTES);
+        let clipped_first = clip_tool_output_for_wire(first.clone());
+        let clipped_second = clip_tool_output_for_wire(second.clone());
+        assert_ne!(clipped_first, clipped_second);
+        assert!(clipped_first.starts_with(TOOL_OUTPUT_INTEGRITY_MARKER));
+        assert!(clipped_second.starts_with(TOOL_OUTPUT_INTEGRITY_MARKER));
+        assert!(clipped_first.len() <= TOOL_OUTPUT_WIRE_LIMIT_BYTES);
+        assert!(clipped_second.len() <= TOOL_OUTPUT_WIRE_LIMIT_BYTES);
+        assert_ne!(first, second);
+
+        let mut run = IdenticalToolCallRun::default();
+        assert_eq!(
+            run.observe_with_outputs("poll", "get_task_output", false, &[first]),
+            1
+        );
+        assert_eq!(
+            run.observe_with_outputs("poll", "get_task_output", false, &[second]),
+            1
+        );
+        assert!(run.stop_info().is_none());
+
+        let mut clipped_run = IdenticalToolCallRun::default();
+        assert_eq!(
+            clipped_run.observe_with_outputs("poll", "get_task_output", false, &[clipped_first]),
+            1
+        );
+        assert_eq!(
+            clipped_run.observe_with_outputs("poll", "get_task_output", false, &[clipped_second]),
+            1,
+            "the pre-clip integrity marker must distinguish suffix changes"
+        );
+    }
+
+    #[test]
+    fn volatile_runtime_metadata_does_not_reset_ordinary_stationarity() {
+        let first = "result=stable timestamp=2026-08-30T21:00:00Z pid=1201 request_id=11111111-1111-1111-1111-111111111111 progress_id=aaaa0000-0000-0000-0000-000000000000";
+        let second = "result=stable timestamp=2026-08-30T21:01:00Z pid=1202 request_id=22222222-2222-2222-2222-222222222222 progress_id=bbbb0000-0000-0000-0000-000000000000";
+        let mut run = IdenticalToolCallRun::default();
+        assert_eq!(
+            run.observe_with_outputs("poll", "get_task_output", false, &[first.into()]),
+            1
+        );
+        assert_eq!(
+            run.observe_with_outputs("poll", "get_task_output", false, &[second.into()]),
+            2,
+            "clearly labelled runtime metadata should not reset polling stationarity"
+        );
+    }
+
+    #[test]
+    fn substantive_output_still_resets_after_metadata_normalization() {
+        let first = "result=stable timestamp=2026-08-30T21:00:00Z pid=1201";
+        let second = "result=changed timestamp=2026-08-30T21:01:00Z pid=1202";
+        let mut run = IdenticalToolCallRun::default();
+        assert_eq!(
+            run.observe_with_outputs("poll", "get_task_output", false, &[first.into()]),
+            1
+        );
+        assert_eq!(
+            run.observe_with_outputs("poll", "get_task_output", false, &[second.into()]),
+            1
+        );
+    }
+
+    #[test]
+    fn normalized_integrity_marker_ignores_volatile_suffix_but_detects_real_suffix_change() {
+        let first = format!(
+            "timestamp=2026-08-30T21:00:00Z pid=1201 {}A",
+            "x".repeat(30_000)
+        );
+        let second = format!(
+            "timestamp=2026-08-30T21:01:00Z pid=1202 {}A",
+            "x".repeat(30_000)
+        );
+        let third = format!(
+            "timestamp=2026-08-30T21:02:00Z pid=1203 {}B",
+            "x".repeat(30_000)
+        );
+        let first = clip_tool_output_for_wire(bounded_tool_output_with_integrity(&first, 32_000));
+        let second = clip_tool_output_for_wire(bounded_tool_output_with_integrity(&second, 32_000));
+        let third = clip_tool_output_for_wire(bounded_tool_output_with_integrity(&third, 32_000));
+        let mut run = IdenticalToolCallRun::default();
+        assert_eq!(
+            run.observe_with_outputs("poll", "get_task_output", false, &[first]),
+            1
+        );
+        assert_eq!(
+            run.observe_with_outputs("poll", "get_task_output", false, &[second]),
+            2
+        );
+        assert_eq!(
+            run.observe_with_outputs("poll", "get_task_output", false, &[third]),
+            1
+        );
+    }
+
+    fn stationarity_digest(content: &str) -> [u8; 32] {
+        let mut normalizer = StationarityNormalizer::default();
+        normalizer.feed(content);
+        normalizer.finish()
+    }
+
+    fn stationarity_digest_chunked(content: &str, chunk_bytes: usize) -> [u8; 32] {
+        let mut normalizer = StationarityNormalizer::default();
+        let mut rest = content;
+        while !rest.is_empty() {
+            let bounded = crate::textutil::truncate_at_char_boundary(rest, chunk_bytes).len();
+            let n = if bounded == 0 {
+                rest.chars().next().unwrap().len_utf8()
+            } else {
+                bounded
+            };
+            normalizer.feed(&rest[..n]);
+            rest = &rest[n..];
+        }
+        normalizer.finish()
+    }
+
+    fn observe_poll(run: &mut IdenticalToolCallRun, output: &str) -> u32 {
+        run.observe_with_outputs("poll", "get_task_output", false, &[output.to_string()])
+    }
+
+    #[test]
+    fn unquoted_timestamp_does_not_consume_substantive_semicolon_or_ampersand_tails() {
+        assert_eq!(
+            normalize_stationarity_text("timestamp=2026-08-30T21:00:00Z;result=ok&path=/tmp/a"),
+            "timestamp=<volatile-time>;result=ok&path=/tmp/a"
+        );
+        assert_eq!(
+            normalize_stationarity_text("timestamp=2026-08-30T21:01:00Z;result=ok&path=/tmp/a"),
+            "timestamp=<volatile-time>;result=ok&path=/tmp/a"
+        );
+        assert_ne!(
+            normalize_stationarity_text("timestamp=2026-08-30T21:00:00Z;result=ok&path=/tmp/a"),
+            normalize_stationarity_text(
+                "timestamp=2026-08-30T21:00:00Z;result=changed&path=/tmp/a"
+            )
+        );
+        assert_ne!(
+            normalize_stationarity_text("timestamp=2026-08-30T21:00:00Z&status=idle"),
+            normalize_stationarity_text("timestamp=2026-08-30T21:00:00Z&status=busy")
+        );
+
+        let mut run = IdenticalToolCallRun::default();
+        assert_eq!(
+            observe_poll(
+                &mut run,
+                "timestamp=2026-08-30T21:00:00Z;result=ok&path=/tmp/a"
+            ),
+            1
+        );
+        assert_eq!(
+            observe_poll(
+                &mut run,
+                "timestamp=2026-08-30T21:01:00Z;result=ok&path=/tmp/a"
+            ),
+            2
+        );
+        assert_eq!(
+            observe_poll(
+                &mut run,
+                "timestamp=2026-08-30T21:02:00Z;result=changed&path=/tmp/a"
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn quoted_json_keys_normalize_only_recognized_fields() {
+        assert_eq!(
+            normalize_stationarity_text(
+                r#"{"timestamp":"2026-08-30T21:00:00Z","pid":"1201","request_id":"11111111-1111-1111-1111-111111111111","result":"stable"}"#
+            ),
+            r#"{"timestamp":<volatile-time>,"pid":<volatile-pid>,"request_id":<volatile-id>,"result":"stable"}"#
+        );
+        let mut run = IdenticalToolCallRun::default();
+        assert_eq!(
+            observe_poll(
+                &mut run,
+                r#"{"timestamp":"2026-08-30T21:00:00Z","pid":"1201","request_id":"11111111-1111-1111-1111-111111111111","result":"stable"}"#
+            ),
+            1
+        );
+        assert_eq!(
+            observe_poll(
+                &mut run,
+                r#"{"timestamp":"2026-08-30T21:01:00Z","pid":"1202","request_id":"22222222-2222-2222-2222-222222222222","result":"stable"}"#
+            ),
+            2
+        );
+        assert_eq!(
+            observe_poll(
+                &mut run,
+                r#"{"timestamp":"2026-08-30T21:02:00Z","pid":"1203","request_id":"33333333-3333-3333-3333-333333333333","result":"changed"}"#
+            ),
+            1
+        );
+        assert_ne!(
+            normalize_stationarity_text(r#"{"timestamp_extra":"2026-08-30T21:00:00Z"}"#),
+            normalize_stationarity_text(r#"{"timestamp_extra":"2026-08-30T21:01:00Z"}"#)
+        );
+    }
+
+    #[test]
+    fn camelcase_progress_http_date_and_bare_uuid_follow_existing_labels() {
+        assert_eq!(
+            normalize_stationarity_text(
+                "createdAt=2026-08-30T21:00:00Z requestId=11111111-1111-1111-1111-111111111111 progressId=aaaa0000-0000-0000-0000-000000000000 processId=1201"
+            ),
+            "createdAt=<volatile-time> requestId=<volatile-id> progressId=<volatile-id> processId=<volatile-pid>"
+        );
+        assert_eq!(
+            normalize_stationarity_text("timestamp: Wed, 21 Oct 2015 07:28:00 GMT result=stable"),
+            "timestamp: <volatile-time> result=stable"
+        );
+        assert_eq!(
+            normalize_stationarity_text(
+                r#"{"timestamp":"Thu, 22 Oct 2015 08:28:00 GMT","result":"stable"}"#
+            ),
+            r#"{"timestamp":<volatile-time>,"result":"stable"}"#
+        );
+
+        let mut run = IdenticalToolCallRun::default();
+        assert_eq!(
+            observe_poll(
+                &mut run,
+                "createdAt=2026-08-30T21:00:00Z requestId=11111111-1111-1111-1111-111111111111 progressId=aaaa0000-0000-0000-0000-000000000000 timestamp: Wed, 21 Oct 2015 07:28:00 GMT result=stable"
+            ),
+            1
+        );
+        assert_eq!(
+            observe_poll(
+                &mut run,
+                "createdAt=2026-08-30T21:01:00Z requestId=22222222-2222-2222-2222-222222222222 progressId=bbbb0000-0000-0000-0000-000000000000 timestamp: Thu, 22 Oct 2015 08:28:00 GMT result=stable"
+            ),
+            2
+        );
+    }
+
+    #[test]
+    fn integrity_projection_keeps_truthful_bytes_but_normalizes_them_in_the_digest() {
+        let first = format!(
+            "timestamp=2026-08-30T21:00:00Z pid=1201 {}A",
+            "x".repeat(30_000)
+        );
+        let second = format!(
+            "timestamp=2026-08-30T21:01:00.000Z pid=1202 {}A",
+            "x".repeat(30_000)
+        );
+        let third = format!(
+            "timestamp=2026-08-30T21:02:00Z pid=1203 {}B",
+            "x".repeat(30_000)
+        );
+        let first = clip_tool_output_for_wire(bounded_tool_output_with_integrity(&first, 32_000));
+        let second = clip_tool_output_for_wire(bounded_tool_output_with_integrity(&second, 32_000));
+        let third = clip_tool_output_for_wire(bounded_tool_output_with_integrity(&third, 32_000));
+        let first_marker = first.lines().next().unwrap();
+        let second_marker = second.lines().next().unwrap();
+        let first_bytes = first_marker
+            .split(" bytes=")
+            .nth(1)
+            .unwrap()
+            .split(' ')
+            .next()
+            .unwrap();
+        let second_bytes = second_marker
+            .split(" bytes=")
+            .nth(1)
+            .unwrap()
+            .split(' ')
+            .next()
+            .unwrap();
+        assert_ne!(first_bytes, second_bytes);
+        assert_ne!(first_marker, second_marker);
+        assert_eq!(
+            stationarity_output_projection(&first),
+            stationarity_output_projection(&second)
+        );
+        assert!(stationarity_output_projection(&first).contains("bytes=<volatile-bytes>"));
+        assert!(!stationarity_output_projection(&first).contains(&format!("bytes={first_bytes}")));
+
+        let mut run = IdenticalToolCallRun::default();
+        assert_eq!(observe_poll(&mut run, &first), 1);
+        assert_eq!(observe_poll(&mut run, &second), 2);
+        assert_eq!(observe_poll(&mut run, &third), 1);
+    }
+
+    #[test]
+    fn chunk_and_hold_boundaries_do_not_bisect_recognized_labels() {
+        let label_one = "timestamp=2026-08-30T21:00:00Z";
+        let label_two = "timestamp=2026-08-30T21:01:00Z";
+        let prefix = format!("{} ", "x".repeat(NORMALIZER_CHUNK_BYTES - 7));
+        let suffix = format!(";result=ok{}", "z".repeat(NORMALIZER_HOLD_BYTES + 8));
+        let first = format!("{prefix}{label_one}{suffix}");
+        let second = format!("{prefix}{label_two}{suffix}");
+        let changed = format!(
+            "{prefix}{label_two};result=changed{}",
+            "z".repeat(NORMALIZER_HOLD_BYTES + 8)
+        );
+        assert!(first.len() > NORMALIZER_CHUNK_BYTES + NORMALIZER_HOLD_BYTES);
+        assert_eq!(stationarity_digest(&first), stationarity_digest(&second));
+        assert_eq!(
+            stationarity_digest(&first),
+            stationarity_digest_chunked(&first, 1)
+        );
+        assert_eq!(
+            stationarity_digest(&first),
+            stationarity_digest_chunked(&first, NORMALIZER_HOLD_BYTES)
+        );
+        assert_eq!(
+            stationarity_digest(&first),
+            stationarity_digest_chunked(&first, 1_024)
+        );
+        assert_eq!(
+            stationarity_digest(&first),
+            stationarity_digest_chunked(&first, NORMALIZER_CHUNK_BYTES)
+        );
+        assert_eq!(
+            stationarity_digest_chunked(&first, NORMALIZER_CHUNK_BYTES),
+            stationarity_digest_chunked(&second, NORMALIZER_CHUNK_BYTES)
+        );
+        assert_ne!(stationarity_digest(&first), stationarity_digest(&changed));
+
+        let hold_prefix = format!(
+            "{} ",
+            "y".repeat(NORMALIZER_CHUNK_BYTES - NORMALIZER_HOLD_BYTES + 7)
+        );
+        let hold_first = format!("{hold_prefix}{label_one}{suffix}");
+        let hold_second = format!("{hold_prefix}{label_two}{suffix}");
+        assert_eq!(
+            stationarity_digest_chunked(&hold_first, NORMALIZER_CHUNK_BYTES),
+            stationarity_digest_chunked(&hold_second, NORMALIZER_CHUNK_BYTES)
+        );
+        assert_ne!(
+            stationarity_digest_chunked(&hold_first, NORMALIZER_CHUNK_BYTES),
+            stationarity_digest_chunked(
+                &format!("{hold_prefix}{label_two};result=changed{}", "z".repeat(104)),
+                NORMALIZER_CHUNK_BYTES
+            )
+        );
+    }
+
+    #[test]
+    fn mixed_width_and_false_slice_boundaries_remain_safe_and_substantive() {
+        let mixed_prefix = format!(
+            "{}é{} ",
+            "x".repeat(NORMALIZER_CHUNK_BYTES - NORMALIZER_HOLD_BYTES - 1),
+            "y".repeat(NORMALIZER_HOLD_BYTES - 2)
+        );
+        let mixed_one = format!(
+            "{mixed_prefix}timestamp=2026-08-30T21:00:00Z;result=ok{}",
+            "🙂".repeat(40)
+        );
+        let mixed_two = format!(
+            "{mixed_prefix}timestamp=2026-08-30T21:01:00Z;result=ok{}",
+            "🙂".repeat(40)
+        );
+        let mixed_changed = format!(
+            "{mixed_prefix}timestamp=2026-08-30T21:00:00Z;result=changed{}",
+            "🙂".repeat(40)
+        );
+        assert_eq!(
+            stationarity_digest(&mixed_one),
+            stationarity_digest(&mixed_two)
+        );
+        assert_ne!(
+            stationarity_digest(&mixed_one),
+            stationarity_digest(&mixed_changed),
+            "mixed-width normalization must preserve substantive tail changes"
+        );
+        for chunk in [1, NORMALIZER_HOLD_BYTES, NORMALIZER_CHUNK_BYTES, 4_192] {
+            assert_eq!(
+                stationarity_digest(&mixed_one),
+                stationarity_digest_chunked(&mixed_one, chunk),
+                "mixed-width digest must be chunk invariant at {chunk} bytes"
+            );
+        }
+
+        let fake_prefix = "q".repeat(NORMALIZER_CHUNK_BYTES - NORMALIZER_HOLD_BYTES - 2);
+        let fake_one = format!("{fake_prefix}rapid=1{}", "z".repeat(128));
+        let fake_two = format!("{fake_prefix}rapid=2{}", "z".repeat(128));
+        assert_ne!(
+            stationarity_digest_chunked(&fake_one, NORMALIZER_CHUNK_BYTES),
+            stationarity_digest_chunked(&fake_two, NORMALIZER_CHUNK_BYTES),
+            "a slice boundary must not fabricate a pid label inside rapid"
+        );
+    }
+
+    #[test]
+    fn unrecognized_fields_and_substantive_command_changes_remain_different() {
+        assert_ne!(
+            normalize_stationarity_text("result=stable nonce=11111111-1111-1111-1111-111111111111"),
+            normalize_stationarity_text("result=stable nonce=22222222-2222-2222-2222-222222222222")
+        );
+        assert_ne!(
+            normalize_stationarity_text("progress=1 timestamp=2026-08-30T21:00:00Z"),
+            normalize_stationarity_text("progress=2 timestamp=2026-08-30T21:01:00Z")
+        );
+        assert_ne!(
+            normalize_stationarity_text("Date: Wed, 21 Oct 2015 07:28:00 GMT result=stable"),
+            normalize_stationarity_text("Date: Thu, 22 Oct 2015 07:28:00 GMT result=stable")
+        );
+
+        let mut run = IdenticalToolCallRun::default();
+        assert_eq!(observe_poll(&mut run, "output=alpha"), 1);
+        assert_eq!(observe_poll(&mut run, "output=beta"), 1);
+        assert_eq!(
+            run.observe_with_outputs(
+                "poll-a",
+                "get_task_output",
+                false,
+                &["output=alpha".to_string()]
+            ),
+            1
+        );
+        assert_eq!(
+            run.observe_with_outputs(
+                "poll-b",
+                "get_task_output",
+                false,
+                &["output=alpha".to_string()]
+            ),
+            1,
+            "a real command/signature change must reset stationarity"
+        );
+    }
+
+    #[test]
+    fn frozen_raw_output_stops_at_the_existing_identical_threshold() {
+        let mut run = IdenticalToolCallRun::default();
+        let output = "unchanged output".to_string();
+        for i in 1..=MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS {
+            assert_eq!(
+                run.observe_with_outputs(
+                    "poll",
+                    "get_task_output",
+                    false,
+                    std::slice::from_ref(&output),
+                ),
+                i
+            );
+        }
+        assert_eq!(
+            run.stop_info(),
+            Some((
+                MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS,
+                "get_task_output".into(),
+                false,
+            ))
+        );
+    }
+
+    #[test]
+    fn true_noop_threshold_ignores_raw_output_changes() {
+        let mut run = IdenticalToolCallRun::default();
+        for i in 1..=MAX_CONSECUTIVE_TRUE_NOOPS {
+            let output = format!("different output {i}");
+            assert_eq!(
+                run.observe_with_outputs(
+                    &format!("different signature {i}"),
+                    "run_terminal_cmd",
+                    true,
+                    std::slice::from_ref(&output),
+                ),
+                i
+            );
+        }
+        assert_eq!(run.stop_info(), Some((4, "run_terminal_cmd".into(), true)));
+    }
+
+    #[test]
+    fn true_noop_threshold_unchanged_for_accepted_outputs() {
+        let mut run = IdenticalToolCallRun::default();
+        for i in 1..=MAX_CONSECUTIVE_TRUE_NOOPS {
+            let call = tool_call(
+                "run_terminal_cmd",
+                &format!(r#"{{"command":"true","n":{i}}}"#),
+            );
+            let output = format!("different output {i}");
+            assert_eq!(
+                observe_accepted_tool_progress(
+                    &mut run,
+                    std::slice::from_ref(&call),
+                    std::slice::from_ref(&output),
+                ),
+                i
+            );
+        }
+        assert_eq!(run.stop_info(), Some((4, "run_terminal_cmd".into(), true)));
+        assert_eq!(MAX_CONSECUTIVE_TRUE_NOOPS, 4);
     }
 
     #[test]

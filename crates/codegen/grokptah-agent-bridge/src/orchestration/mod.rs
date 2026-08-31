@@ -4,9 +4,12 @@
 
 mod authz;
 mod continuation;
+mod graph;
 pub(crate) mod managed;
 mod manager;
 mod message;
+mod public_event;
+mod public_run;
 mod routine;
 mod service;
 mod store;
@@ -26,6 +29,11 @@ pub use continuation::{
     ContinuationRunInput, ContinuationTestInput, ContinuationWorkloadRef,
     CONTINUATION_ASSEMBLER_VERSION, CONTINUATION_SCHEMA_VERSION,
 };
+pub use graph::{
+    compare_work_order, evaluate_admission, order_work, project_scoped_graph,
+    resolve_dependency_states, validate_scoped_dependency_graph, AdmissionBlock, DependencyStates,
+    GraphScope, WorkGraphNode, MAX_GRAPH_EDGES, MAX_GRAPH_SCOPE_ITEMS,
+};
 pub use managed::{
     assemble_managed_run_input, intersect_run_bounds, managed_execution_eligible,
     select_relevant_managed_messages, truncate_utf8_to_bytes, ManagedExecutionIntent,
@@ -44,6 +52,15 @@ pub use manager::{
 pub use message::{
     message_activation_unsupported, MessageKind, MessagePage, WorkMessage, MAX_MESSAGE_BODY_BYTES,
     MESSAGE_SCHEMA_VERSION,
+};
+pub use public_event::{
+    parse_public_event_page_v1, parse_public_event_v1, PublicEventDtoError, PublicEventKindV1,
+    PublicEventPageV1, PublicEventV1, PUBLIC_EVENT_SCHEMA_VERSION,
+};
+pub use public_run::{
+    parse_public_run_handoff_v1, parse_public_run_list_v1, parse_public_run_progress_v1,
+    parse_public_run_v1, PublicRunDtoError, PublicRunHandoffV1, PublicRunListV1,
+    PublicRunProgressV1, PublicRunV1, PUBLIC_RUN_SCHEMA_VERSION,
 };
 pub use routine::{
     occurrence_dedupe_key, ActivationCause, ActivationDisposition, ActivationRecord,
@@ -75,11 +92,11 @@ pub use types::{
 };
 pub use worker::{
     reject_privilege_amplification, MeasuredCapability, WorkerHostKind, WorkerLivenessState,
-    WorkerPresence, WorkerProjection, DEFAULT_WORKER_STALE_AFTER_MS,
+    WorkerObservatoryProjection, WorkerPresence, WorkerProjection, DEFAULT_WORKER_STALE_AFTER_MS,
 };
 pub use workload::{
-    lease_duration, AssignmentStatus, AttemptState, WorkApproval, WorkArtifactRef, WorkAttempt,
-    WorkAttemptView, WorkClaim, WorkDecision, WorkDecisionAction, WorkDependency, WorkItem,
-    WorkItemSnapshot, WorkPolicy, WorkProgress, WorkResult, WorkRetryPolicy, WorkState,
+    lease_duration, AssignmentStatus, AttemptState, BlockProvenance, WorkApproval, WorkArtifactRef,
+    WorkAttempt, WorkAttemptView, WorkClaim, WorkDecision, WorkDecisionAction, WorkDependency,
+    WorkItem, WorkItemSnapshot, WorkPolicy, WorkProgress, WorkResult, WorkRetryPolicy, WorkState,
     WorkloadReconciliationReport, WORKLOAD_SCHEMA_VERSION,
 };

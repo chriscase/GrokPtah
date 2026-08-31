@@ -492,7 +492,7 @@ try {
       { id: 22, sessionId: mcpSession }
     );
     const evSc = structured(events.json);
-    const entries = evSc?.entries ?? [];
+    const entries = evSc?.events ?? [];
     let ordered = true;
     let prev = 0;
     for (const e of entries) {
@@ -501,10 +501,19 @@ try {
         prev = e.seq;
       }
     }
-    record("eventsOrdered", events.status === 200 && ordered, {
+    record(
+      "eventsOrdered",
+      events.status === 200 &&
+        evSc?.schemaVersion === "grokptah.public-event.v1" &&
+        Array.isArray(evSc?.events) &&
+        entries.length > 0 &&
+        ordered,
+      {
       count: entries.length,
       ordered,
-    });
+      schemaVersion: evSc?.schemaVersion,
+      }
+    );
 
     // Replay same after_seq page is stable (cursor not expired for fresh run).
     const events2 = await mcpFetch(
@@ -515,9 +524,9 @@ try {
     record(
       "eventsReplay",
       events2.status === 200 &&
-        (structured(events2.json)?.cursorExpired === false ||
-          structured(events2.json)?.cursorExpired == null),
-      structured(events2.json)?.cursorExpired
+        structured(events2.json)?.schemaVersion === "grokptah.public-event.v1" &&
+        Array.isArray(structured(events2.json)?.events),
+      structured(events2.json)?.schemaVersion
     );
 
     const changes = await mcpFetch(

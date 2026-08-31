@@ -35,6 +35,12 @@ import type {
   RemoteRoutineSnapshot,
   DurableActivation,
 } from "./protocol";
+import {
+  parseRemotePublicRun,
+  parseRemotePublicRunList,
+  type RemotePublicRun,
+  type RemotePublicRunList,
+} from "./publicRun";
 import type {
   PromptQueueEntry,
   PromptQueueRunNextResult,
@@ -73,6 +79,26 @@ export const api = {
       executionMode,
       allowQueue,
     }),
+  /**
+   * Allowlisted `grokptah.public-run.v1` list for one remote session/workspace.
+   * Scope is taken from this request; the parser never copies it from the body.
+   * Poll-only: does not start `remote_service_watch_runs`.
+   */
+  remoteServicePublicRunList: async (
+    sessionId: string,
+    workspace: string,
+  ): Promise<RemotePublicRunList> => {
+    const raw = await invoke<unknown>("remote_service_public_run_list", {
+      sessionId,
+      workspace,
+    });
+    return parseRemotePublicRunList(raw, sessionId, workspace);
+  },
+  /**
+   * Compatibility: raw `remote_service_run_list` `RunRecord` list for the
+   * existing RunInspector. Isolated until that view can render public-run
+   * counts/status without prompt, path, lease, approval, or provider fields.
+   */
   remoteServiceRunList: () =>
     invoke<DurableRun[]>("remote_service_run_list"),
   remoteServiceWorkList: (sessionId: string, workspace: string) =>
@@ -275,6 +301,27 @@ export const api = {
       workspace,
       routineId,
     }),
+  /**
+   * Allowlisted `grokptah.public-run.v1` get for one remote run. Scope is
+   * stamped from this request, never from the remote body.
+   * Poll-only: does not start `remote_service_watch_runs`.
+   */
+  remoteServicePublicRunGet: async (
+    sessionId: string,
+    workspace: string,
+    runId: string,
+  ): Promise<RemotePublicRun> => {
+    const raw = await invoke<unknown>("remote_service_public_run_get", {
+      sessionId,
+      workspace,
+      runId,
+    });
+    return parseRemotePublicRun(raw, sessionId, workspace);
+  },
+  /**
+   * Compatibility: raw `remote_service_run_get` `RunRecord` for the existing
+   * inspector. Do not use for new remote reads.
+   */
   remoteServiceRunGet: (sessionId: string, workspace: string, runId: string) =>
     invoke<DurableRun>("remote_service_run_get", { sessionId, workspace, runId }),
   remoteServiceRunEvents: (

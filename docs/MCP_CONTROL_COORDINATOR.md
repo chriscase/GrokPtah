@@ -137,7 +137,11 @@ Accept: text/event-stream
 
 The server first replays the durable run journal, then follows live EventBus
 updates. Each event is an MCP `notifications/ptah_event` JSON-RPC notification
-with `sessionId`, `workspace`, `runId`, `seq`, `ts`, and typed `update` fields.
+with the versioned `grokptah.public-event.v1` allowlist: `schemaVersion`,
+`seq`, `ts`, `kind`, and bounded status/count flags. Session/workspace/run
+scope stays on the request and is never embedded in the event DTO; private
+`SessionUpdate` text, paths, commands, tool I/O, and queue bodies are not
+exposed.
 The SSE `id` is the durable sequence and can be sent back as `Last-Event-ID`
 on reconnect. The stream is authorized against the exact session/workspace/run
 triple and is independently bounded to 32 concurrent streams. The unscoped GET
@@ -226,6 +230,12 @@ authoritative.
 
 Source of truth: `orchestration::CONTROL_TOOLS` /
 `mcp_control::tool_input_schema`. Schemas use `additionalProperties: false`.
+The table below is a coordinator-facing excerpt, not a substitute for
+`CONTROL_TOOLS` or a release-qualification claim. Work-ledger tools
+advertised in `CONTROL_TOOLS` but omitted from the table include
+`ptah_create_work`, `ptah_list_work`, `ptah_get_work`, `ptah_assign_work`,
+the claim/progress/completion family, manager-plan tools, and the
+managed-execution tools.
 
 | Tool | Kind | Required arguments |
 |------|------|--------------------|
@@ -271,18 +281,50 @@ Source of truth: `orchestration::CONTROL_TOOLS` /
 | `ptah_list_workers` | read | `session_id`, `workspace` |
 | `ptah_get_worker` | read | `session_id`, `workspace`, `agent_id` |
 | `ptah_heartbeat_worker` | mutate | `request_id`, `session_id`, `workspace`, `agent_id` |
+| `ptah_get_work_graph` | read | `session_id`, `workspace` |
 | `ptah_offer_work` | mutate | `request_id`, `session_id`, `workspace`, `work_id`, `agent_id`, `reason` |
 | `ptah_accept_work` | mutate | `request_id`, `session_id`, `workspace`, `work_id`, `agent_id`, `reason` |
 | `ptah_decline_work` | mutate | `request_id`, `session_id`, `workspace`, `work_id`, `agent_id`, `reason` |
 | `ptah_reassign_work` | mutate | `request_id`, `session_id`, `workspace`, `work_id`, `agent_id`, `reason` |
 | `ptah_reprioritize_work` | mutate | `request_id`, `session_id`, `workspace`, `work_id`, `priority`, `reason` |
 | `ptah_block_work` | mutate | `request_id`, `session_id`, `workspace`, `work_id`, `reason` |
+| `ptah_unblock_work` | mutate | `request_id`, `session_id`, `workspace`, `work_id`, `reason` |
 | `ptah_request_review` | mutate | `request_id`, `session_id`, `workspace`, `work_id`, `reason` |
 | `ptah_list_work_decisions` | read | `session_id`, `workspace`, `work_id` |
 | `ptah_send_message` | mutate | `request_id`, `session_id`, `workspace`, `kind`, `body` |
 | `ptah_ack_message` | mutate | `request_id`, `session_id`, `workspace`, `message_id` |
 | `ptah_list_inbox` | read | `session_id`, `workspace`, `agent_id`; optional `after_seq` |
 | `ptah_list_outbox` | read | `session_id`, `workspace`, `agent_id`; optional `after_seq` |
+
+### Work graph holds and recovery
+
+`ptah_unblock_work` is advertised and is the operator path that releases a
+manual hold. Blocked work carries typed `blockProvenance`:
+
+- `derived` — reconciliation's encoding of an unmet dependency. Lifted when
+  the dependency is satisfied. `ptah_unblock_work` refuses it.
+- `manual` — an explicit operator/coordinator hold. Reconciliation never
+  lifts it. `ptah_unblock_work` releases it under the same
+  session/workspace/revision fences as `ptah_block_work`.
+- absent (`None`) — fail-closed as manual, except for the proven pre-upgrade
+  derived-wait shape: `Blocked`, no provenance, no `blockedReason`, non-empty
+  dependencies, not a container. Opening the ledger reconciles once; that
+  shape is stamped `derived` (or lifted if its dependencies already
+  succeeded) so ordinary waits are not stranded across upgrade. A free-text
+  `blockedReason` is never parsed as derived.
+
+A lane may hold at most 4096 work items. A create that would pass that
+ceiling, including a dependency-free create, fails with
+`capacity_exhausted`, while an update of an existing item at the ceiling can
+still succeed. The current public list and graph tools are not paginated; at
+the legal ceiling their responses can exceed the MCP transport byte ceiling.
+Issue #520 tracks the bounded cursor contract. Do not interpret a transport
+refusal as an empty or complete lane.
+
+Assignment mutations write the decision receipt and then the item. A crash
+between those two atomic files can leave a receipt whose item did not
+change. There is no assignment-intent recovery; issue #521 tracks that open
+crash-consistency residual.
 
 ### Forbidden (never exposed)
 
@@ -341,16 +383,19 @@ applied when the caller omits the field; an explicit caller value may only
 narrow it. Zero, values above the server ceiling, and unknown bounds fields are
 rejected.
 
-`ptah_get_run`, `ptah_list_runs`, and `ptah_get_handoff` expose the applied
-`bounds`, cumulative `usage`, `usageComplete`, `usagePendingRequests`, and typed
-`stopCause`. Accounting
-is persisted after each provider response rather than reconstructed from the
-process-local `/usage` counter, so a restart cannot turn consumed tokens back
-into zero. Enforcement happens at model-round boundaries: the response that
-reaches the ceiling and its already-returned tool batch finish, but no next
-parent or subagent model request begins. Missing or malformed usage stops a
-bounded run fail-closed with `token_accounting_unavailable`; unbounded runs
-continue and report `usageComplete: false`.
+`ptah_get_run`, `ptah_list_runs`, and `ptah_get_handoff` expose cumulative
+usage as flattened allowlisted counters (`usagePromptTokens`,
+`usageCompletionTokens`, `usageTotalTokens`, and `usageRequestCount`) plus
+`usageComplete` and `usagePendingRequestCount`. The public v1 documents
+deliberately omit the applied `bounds` and typed `stopCause`; callers must not
+infer either from state, usage, or event counts. Accounting is persisted after
+each provider response rather than reconstructed from the process-local
+`/usage` counter, so a restart cannot turn consumed tokens back into zero.
+Enforcement happens at model-round boundaries: the response that reaches the
+ceiling and its already-returned tool batch finish, but no next parent or
+subagent model request begins. Missing or malformed usage stops a bounded run
+fail-closed with `token_accounting_unavailable`; unbounded runs continue and
+report `usageComplete: false`.
 Bounded parent and child requests share one serialized admission gate, and an
 in-flight attempt is persisted before network transmission. Restart recovery
 turns any unresolved attempt into incomplete accounting rather than assuming
@@ -519,57 +564,29 @@ coordinator wants a bounded admission queue for capacity or session contention.
 ### Events
 
 - `ptah_get_events` requires the exact owning `session_id`, `workspace`, and
-  `run_id`; returns `{ entries, nextCursor, cursorExpired }`. The server
-  filters the bounded journal to the caller-owned run before applying `limit`,
-  so activity from other sessions cannot advance the run cursor past relevant
-  events.
+  `run_id`; returns `{ schemaVersion: "grokptah.public-event.v1", events,
+  nextCursor }`. The server filters the bounded journal to the caller-owned run
+  before applying `limit`, so activity from other sessions cannot advance the
+  run cursor past relevant events. Unknown fields or versions fail closed.
 - Sequences are monotonic for a run-scoped journal page; expired cursors return
   `cursor_expired` (HTTP 410).
 
 ### Evidence-backed handoff
 
-`ptah_get_handoff` includes the model's final response plus bounded evidence
-derived from typed bridge events. Coordinators must treat `verification.status`
-as the trust signal, not the model's prose alone:
+`ptah_get_handoff` exposes only allowlisted run metadata, event bounds, change
+and test counts, and flattened usage counters. The model's final response,
+applied bounds, stop cause, detailed change/test records, and nested
+`verification` object are intentionally absent. The versioned run, handoff,
+and event documents are derived from typed bridge records and reject unknown
+fields.
 
-```json
-{
-  "verification": {
-    "status": "verified | unverified | failed | incomplete",
-    "stopReason": "completed | failed | cancelled | interrupted | limit_reached",
-    "interrupted": false,
-    "claims": {
-      "present": true,
-      "mentionsChanges": true,
-      "mentionsTests": true,
-      "mentionsVerification": true
-    },
-    "observations": {
-      "changedFiles": 2,
-      "testsObserved": 1,
-      "testsPassed": 1,
-      "testsFailed": 0,
-      "testsIncomplete": 0,
-      "permissionsRequested": 0,
-      "permissionsGranted": 0,
-      "permissionsDenied": 0,
-      "permissionsUnresolved": 0
-    },
-    "usage": {
-      "promptTokens": 0,
-      "completionTokens": 0,
-      "totalTokens": 0,
-      "requests": 0
-    }
-  }
-}
-```
-
-`changedFiles`, test outcomes, permission outcomes, interruption, and usage
-are observations; claim booleans only indicate whether the final response
-addressed those topics. `unverified` is expected when no test command was
-observed or when the response omits claims required by the observed work.
-`failed` and `incomplete` must not be reported as successful completion.
+A terminal state or nonzero change/test count is not verification evidence.
+Use `ptah_get_changes` and `ptah_get_test_results` for the separately scoped
+observations, and apply the coordinator's verification policy to those
+results. `ptah_review_run` is a different operation: for a completed isolated
+worktree run it returns the bounded diff and exact source/final fingerprints
+needed by the approval/promotion flow. It does not restore the model response
+or the removed raw-run fields to `ptah_get_handoff`.
 
 ### Capacity
 

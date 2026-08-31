@@ -645,6 +645,11 @@ pub struct ComputerRun {
     pub last_outcome: Option<ActionOutcome>,
     pub audit: Vec<ComputerAuditEntry>,
     pub last_error: Option<ComputerError>,
+    /// Result of the most recent adaptive review, when the caller supplied a
+    /// planner claim. `None` on every run driven through the plain `act` path,
+    /// and on records written before the field existed.
+    #[serde(default)]
+    pub adaptive: Option<super::adaptive::AdaptiveDecisionRecord>,
 }
 
 impl ComputerRun {
@@ -681,6 +686,7 @@ impl ComputerRun {
             last_outcome: None,
             audit: Vec::new(),
             last_error: None,
+            adaptive: None,
         })
     }
 

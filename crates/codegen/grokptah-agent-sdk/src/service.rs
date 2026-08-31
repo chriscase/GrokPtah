@@ -10,13 +10,18 @@ use crate::capability::{
     TOOL_LIST_SESSIONS,
 };
 use crate::dto::{
-    EventPage, HostCapacity, RunView, SessionView, project_capacity, project_event_page,
-    project_run, project_runs, project_sessions,
+    EventPage, HostCapacity, PublicEventPageV1, PublicRunHandoffV1, PublicRunListV1,
+    PublicRunProgressV1, PublicRunV1, RunView, SessionView, parse_public_event_page_v1,
+    parse_public_run_handoff_v1, parse_public_run_list_v1, parse_public_run_progress_v1,
+    parse_public_run_v1, project_capacity, project_sessions,
 };
 use crate::error::SdkError;
 use crate::observe::{EventQuery, RunSelector, SessionScope};
 use crate::transport::McpTransport;
 use crate::version::{EVENT_PAGE_LIMIT_DEFAULT, EVENT_PAGE_LIMIT_MAX, EVENT_PAGE_LIMIT_MIN};
+
+const TOOL_GET_PROGRESS: &str = "ptah_get_progress";
+const TOOL_GET_HANDOFF: &str = "ptah_get_handoff";
 
 /// Versioned read-only facade. Mutation, computer-control, and credential tools
 /// are never invoked.
@@ -60,8 +65,30 @@ impl<T: McpTransport> ReadObservatory<T> {
         project_sessions(&body)
     }
 
-    /// Durable Build runs in one session/workspace. Missing tool → `unsupported`.
-    pub async fn list_runs(&self, scope: &SessionScope) -> Result<Vec<RunView>, SdkError> {
+    /// Legacy `RunRecord` list. Public MCP `ptah_list_runs` emits
+    /// `grokptah.public-run.v1` only; this method does not call that tool and
+    /// returns [`SdkError::Unsupported`]. Use [`Self::list_public_runs`].
+    pub async fn list_runs(&self, _scope: &SessionScope) -> Result<Vec<RunView>, SdkError> {
+        let _ = self;
+        Err(SdkError::Unsupported)
+    }
+
+    /// Legacy `RunRecord` get. Public MCP `ptah_get_run` emits
+    /// `grokptah.public-run.v1` only; this method does not call that tool and
+    /// returns [`SdkError::Unsupported`]. Use [`Self::observe_public_run`].
+    pub async fn observe_run(&self, _selector: &RunSelector) -> Result<RunView, SdkError> {
+        let _ = self;
+        Err(SdkError::Unsupported)
+    }
+
+    /// Allowlisted `grokptah.public-run.v1` list for one session/workspace.
+    ///
+    /// Session and workspace stay on `scope` and are never read from the body.
+    /// Unknown version/field and legacy `RunRecord` decode as [`SdkError::Internal`].
+    pub async fn list_public_runs(
+        &self,
+        scope: &SessionScope,
+    ) -> Result<PublicRunListV1, SdkError> {
         let body = self
             .call_required(
                 TOOL_LIST_RUNS,
@@ -71,24 +98,65 @@ impl<T: McpTransport> ReadObservatory<T> {
                 }),
             )
             .await?;
-        project_runs(&body)
+        parse_public_run_list_v1(&body)
     }
 
-    /// Project one run. Unknown and cross-scope denials are both `forbidden_scope`.
-    pub async fn observe_run(&self, selector: &RunSelector) -> Result<RunView, SdkError> {
+    /// Allowlisted `grokptah.public-run.v1` get. Unknown and cross-scope denials
+    /// are both `forbidden_scope`. Session/workspace stay on `selector`.
+    pub async fn observe_public_run(
+        &self,
+        selector: &RunSelector,
+    ) -> Result<PublicRunV1, SdkError> {
         let body = self
             .call_required(TOOL_GET_RUN, run_args(selector))
             .await
             .map_err(SdkError::collapse_run_scope)?;
-        project_run(&body)
+        parse_public_run_v1(&body)
     }
 
-    /// Page `ptah_get_events`. `limit` is 1..=500 (host default 50).
+    /// Allowlisted `ptah_get_progress` `grokptah.public-run.v1` document.
+    pub async fn observe_public_progress(
+        &self,
+        selector: &RunSelector,
+    ) -> Result<PublicRunProgressV1, SdkError> {
+        let body = self
+            .call_required(TOOL_GET_PROGRESS, run_args(selector))
+            .await
+            .map_err(SdkError::collapse_run_scope)?;
+        parse_public_run_progress_v1(&body)
+    }
+
+    /// Allowlisted `ptah_get_handoff` `grokptah.public-run.v1` document.
+    pub async fn observe_public_handoff(
+        &self,
+        selector: &RunSelector,
+    ) -> Result<PublicRunHandoffV1, SdkError> {
+        let body = self
+            .call_required(TOOL_GET_HANDOFF, run_args(selector))
+            .await
+            .map_err(SdkError::collapse_run_scope)?;
+        parse_public_run_handoff_v1(&body)
+    }
+
+    /// Legacy `JournalPage` reader. Public MCP `ptah_get_events` emits
+    /// `grokptah.public-event.v1` only; this method does not call that tool and
+    /// returns [`SdkError::Unsupported`]. Use [`Self::stream_public_events`].
     pub async fn stream_events(
+        &self,
+        _selector: &RunSelector,
+        _query: EventQuery,
+    ) -> Result<EventPage, SdkError> {
+        let _ = self;
+        Err(SdkError::Unsupported)
+    }
+
+    /// Allowlisted `ptah_get_events` `grokptah.public-event.v1` page.
+    /// `limit` is 1..=500 (host default 50).
+    pub async fn stream_public_events(
         &self,
         selector: &RunSelector,
         query: EventQuery,
-    ) -> Result<EventPage, SdkError> {
+    ) -> Result<PublicEventPageV1, SdkError> {
         let limit = query.limit.unwrap_or(EVENT_PAGE_LIMIT_DEFAULT);
         if !(EVENT_PAGE_LIMIT_MIN..=EVENT_PAGE_LIMIT_MAX).contains(&limit) {
             return Err(SdkError::InvalidRequest);
@@ -102,7 +170,7 @@ impl<T: McpTransport> ReadObservatory<T> {
             .call_required(TOOL_GET_EVENTS, arguments)
             .await
             .map_err(SdkError::collapse_run_scope)?;
-        project_event_page(&body)
+        parse_public_event_page_v1(&body)
     }
 
     /// Occupancy and health flags from `ptah_get_capacity`.

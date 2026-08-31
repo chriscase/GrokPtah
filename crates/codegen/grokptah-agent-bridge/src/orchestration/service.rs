@@ -19,6 +19,7 @@ use super::authz::{
     authenticate_bearer, canonical_workspace, require_workspace_match, AuthContext, AuthCredential,
     WorkspaceAllowlist,
 };
+use super::graph::{validate_scoped_dependency_graph, GraphScope};
 use super::managed::{
     assemble_managed_run_input, managed_execution_eligible, select_relevant_managed_messages,
     ManagedExecutionIntent, ManagedExecutionPolicy, ManagedFinalizationOutcome, ManagedIntentState,
@@ -30,6 +31,8 @@ use super::manager::{
     ManagerDirective, ManagerPlan, ManagerPlanState, ManagerStepSpec, MANAGER_SCHEMA_VERSION,
 };
 use super::message::{message_activation_unsupported, MessageKind, WorkMessage};
+use super::public_event::PublicEventPageV1;
+use super::public_run::{PublicRunHandoffV1, PublicRunListV1, PublicRunProgressV1, PublicRunV1};
 use super::routine::{
     manual_dedupe_key, ActivationCause, ActivationRequest, MissedRunPolicy,
     RoutineConcurrencyPolicy, RoutineLifecycle, RoutineRecord, RoutineRetryPolicy, RoutineTrigger,
@@ -43,7 +46,7 @@ use super::supervisor::{
     MAX_MANAGER_OBSERVATIONS_PER_PASS, MAX_MANAGER_PLANS_PER_PASS,
 };
 use super::types::*;
-use super::worker::{reject_privilege_amplification, WorkerHostKind};
+use super::worker::{reject_privilege_amplification, WorkerHostKind, WorkerObservatoryProjection};
 use super::workload::{
     WorkAttempt, WorkAttemptView, WorkDecision, WorkDependency, WorkItem, WorkPolicy, WorkProgress,
     WorkResult, WorkState,
@@ -2114,7 +2117,7 @@ impl OrchestrationService {
         workspace: &Path,
     ) -> Result<serde_json::Value, OrchError> {
         let claimed = self.authorize_queue_request(session_id, workspace)?;
-        let runs = self
+        let mut runs = self
             .store
             .list_runs()
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
@@ -2123,7 +2126,11 @@ impl OrchestrationService {
                 run.session_id == session_id && run.workspace == claimed.display().to_string()
             })
             .collect::<Vec<_>>();
-        Ok(json!({ "runs": runs }))
+        for run in &mut runs {
+            self.refresh_queue_position(run);
+        }
+        serde_json::to_value(PublicRunListV1::from_runs(&runs))
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
     }
 
     // ── durable workloads ----------------------------------------------
@@ -2178,8 +2185,8 @@ impl OrchestrationService {
             .ok_or_else(|| OrchError::new(OrchErrorCode::InvalidRequest, "unknown work_id"))?;
         if item.session_id != session_id || item.workspace != claimed.display().to_string() {
             return Err(OrchError::new(
-                OrchErrorCode::ForbiddenScope,
-                "work item is outside the requested session scope",
+                OrchErrorCode::InvalidRequest,
+                "unknown work_id",
             ));
         }
         Ok((item, claimed))
@@ -2234,6 +2241,15 @@ impl OrchestrationService {
         Ok((claimed, start))
     }
 
+    fn map_work_ledger_error(error: anyhow::Error) -> OrchError {
+        if let Some(ledger_error) = error.downcast_ref::<OrchError>() {
+            if ledger_error.code == OrchErrorCode::CapacityExhausted {
+                return ledger_error.clone();
+            }
+        }
+        OrchError::new(OrchErrorCode::Internal, error.to_string())
+    }
+
     pub fn list_work_scoped(
         &self,
         _auth: &AuthContext,
@@ -2243,14 +2259,26 @@ impl OrchestrationService {
         let claimed = self.authorize_work_read_scope(session_id, workspace)?;
         let work = self
             .store
-            .list_work_items()
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
-            .into_iter()
-            .filter(|item| {
-                item.session_id == session_id && item.workspace == claimed.display().to_string()
-            })
-            .collect::<Vec<_>>();
+            .scoped_work_items(session_id, &claimed.display().to_string())
+            .map_err(Self::map_work_ledger_error)?;
         Ok(json!({ "work": work }))
+    }
+
+    /// Return the lane-scoped redacted dependency graph. This is separate from
+    /// `ptah_list_work`, whose legacy payload intentionally contains the full
+    /// operator work item for trusted desktop callers.
+    pub fn get_work_graph_scoped(
+        &self,
+        _auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+    ) -> Result<serde_json::Value, OrchError> {
+        let claimed = self.authorize_work_read_scope(session_id, workspace)?;
+        let graph = self
+            .store
+            .work_graph_scoped(session_id, &claimed.display().to_string(), Utc::now())
+            .map_err(Self::map_work_ledger_error)?;
+        Ok(json!({ "graph": graph }))
     }
 
     pub fn get_work_scoped(
@@ -2960,13 +2988,38 @@ impl OrchestrationService {
         if let Err(error) = item.validate() {
             return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
         }
+        // The work-graph authority runs before the first durable write, so a
+        // rejected graph leaves no work record behind. The refusal is recorded
+        // under the idempotency key (`fail_claim`), so a replay is refused
+        // again rather than answering with a record that was never written.
+        // `WorkItem::validate` sees one item and can only reject a self-edge;
+        // a ring, a dangling id, and an id belonging to another lane are all
+        // graph-level facts.
+        if !item.dependencies.is_empty() {
+            let lane = match self.store.scoped_work_items(session_id, &item.workspace) {
+                Ok(lane) => lane,
+                Err(error) => {
+                    return Err(self.fail_claim(
+                        &mut lease,
+                        None,
+                        session_id,
+                        &claimed,
+                        Self::map_work_ledger_error(error),
+                    ))
+                }
+            };
+            let scope = GraphScope::of(&item);
+            if let Err(error) = validate_scoped_dependency_graph(&lane, &item, scope) {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+            }
+        }
         if let Err(error) = self.store.save_work_item(&item) {
             return Err(self.fail_claim(
                 &mut lease,
                 Some(item.work_id.clone()),
                 session_id,
                 &claimed,
-                OrchError::new(OrchErrorCode::Internal, error.to_string()),
+                Self::map_work_ledger_error(error),
             ));
         }
         let response = self.workload_value(item.clone(), false)?;
@@ -3492,7 +3545,10 @@ impl OrchestrationService {
         let claimed = self.authorize_work_read_scope(session_id, workspace)?;
         let workers = self
             .store
-            .list_workers(&claimed.display().to_string(), Utc::now())?;
+            .list_workers_scoped(session_id, &claimed.display().to_string(), Utc::now())?
+            .into_iter()
+            .map(|worker| WorkerObservatoryProjection::from_internal(&worker))
+            .collect::<Vec<_>>();
         Ok(json!({ "workers": workers }))
     }
 
@@ -3506,15 +3562,16 @@ impl OrchestrationService {
         let claimed = self.authorize_work_read_scope(session_id, workspace)?;
         let worker = self
             .store
-            .get_worker(agent_id, Utc::now())?
+            .get_worker_scoped(
+                agent_id,
+                session_id,
+                &claimed.display().to_string(),
+                Utc::now(),
+            )?
             .ok_or_else(|| OrchError::new(OrchErrorCode::InvalidRequest, "unknown worker"))?;
-        if !super::workspaces_match(&worker.workspace, &claimed.display().to_string()) {
-            return Err(OrchError::new(
-                OrchErrorCode::ForbiddenScope,
-                "worker is outside the requested workspace",
-            ));
-        }
-        Ok(json!({ "worker": worker }))
+        Ok(json!({
+            "worker": WorkerObservatoryProjection::from_internal(&worker)
+        }))
     }
 
     pub async fn heartbeat_worker(
@@ -3861,6 +3918,72 @@ impl OrchestrationService {
             },
         )
         .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn unblock_work(
+        &self,
+        auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        work_id: &str,
+        reason: String,
+        expected_revision: Option<u64>,
+    ) -> Result<serde_json::Value, OrchError> {
+        let tool = "ptah_unblock_work";
+        let payload = json!({
+            "sessionId": session_id,
+            "workspace": workspace.display().to_string(),
+            "workId": work_id,
+            "details": {"reason": reason, "expectedRevision": expected_revision},
+        });
+        let (claimed, start) = self
+            .begin_work_mutation(tool, request_id, session_id, workspace, &payload)
+            .await?;
+        let mut lease = match start {
+            IdempotencyStart::Replay(response) => return Ok(response),
+            IdempotencyStart::Perform(lease) => lease,
+        };
+        if let Err(error) = self.load_work_scoped(session_id, &claimed, work_id, false) {
+            return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+        }
+        let item = match self.store.unblock_work(
+            work_id,
+            &auth.token_id,
+            &reason,
+            expected_revision,
+            Utc::now(),
+        ) {
+            Ok((item, _)) => item,
+            Err(error) => {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
+            }
+        };
+        let mut work = json!({
+            "workId": item.work_id,
+            "state": item.state,
+            "revision": item.revision,
+        });
+        if let Some(provenance) = item.block_provenance {
+            work["blockProvenance"] = json!(provenance);
+        }
+        let response = json!({
+            "work": work,
+            "sessionId": session_id,
+        });
+        lease
+            .complete(Some(work_id.to_string()), response.clone())
+            .map_err(|error| {
+                self.fail_claim(
+                    &mut lease,
+                    Some(work_id.to_string()),
+                    session_id,
+                    &claimed,
+                    error,
+                )
+            })?;
+        Ok(response)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5103,7 +5226,7 @@ impl OrchestrationService {
         _auth: &AuthContext,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        self.run_value(self.load_authorized_run(run_id)?)
+        self.raw_run_value(self.load_authorized_run(run_id)?)
     }
 
     pub fn get_run_scoped(
@@ -5116,9 +5239,15 @@ impl OrchestrationService {
         self.run_value(self.authorize_run_request(session_id, workspace, run_id)?)
     }
 
-    fn run_value(&self, mut run: RunRecord) -> Result<serde_json::Value, OrchError> {
+    fn raw_run_value(&self, mut run: RunRecord) -> Result<serde_json::Value, OrchError> {
         self.refresh_queue_position(&mut run);
         serde_json::to_value(run)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+    }
+
+    fn run_value(&self, mut run: RunRecord) -> Result<serde_json::Value, OrchError> {
+        self.refresh_queue_position(&mut run);
+        serde_json::to_value(PublicRunV1::from_run(&run))
             .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))
     }
 
@@ -5127,7 +5256,7 @@ impl OrchestrationService {
         _auth: &AuthContext,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        self.progress_value(self.load_authorized_run(run_id)?)
+        self.raw_progress_value(self.load_authorized_run(run_id)?)
     }
 
     pub fn get_progress_scoped(
@@ -5140,7 +5269,7 @@ impl OrchestrationService {
         self.progress_value(self.authorize_run_request(session_id, workspace, run_id)?)
     }
 
-    fn progress_value(&self, mut run: RunRecord) -> Result<serde_json::Value, OrchError> {
+    fn raw_progress_value(&self, mut run: RunRecord) -> Result<serde_json::Value, OrchError> {
         self.refresh_queue_position(&mut run);
         let busy = self.host.session_busy(run.session_id);
         Ok(json!({
@@ -5160,6 +5289,13 @@ impl OrchestrationService {
             "bounds": run.bounds,
             "errorCode": run.error_code,
         }))
+    }
+
+    fn progress_value(&self, mut run: RunRecord) -> Result<serde_json::Value, OrchError> {
+        self.refresh_queue_position(&mut run);
+        let busy = self.host.session_busy(run.session_id);
+        serde_json::to_value(PublicRunProgressV1::from_run(&run, busy))
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
     }
 
     fn refresh_queue_position(&self, run: &mut RunRecord) {
@@ -5383,7 +5519,8 @@ impl OrchestrationService {
         after_seq: u64,
         limit: usize,
     ) -> Result<serde_json::Value, OrchError> {
-        serde_json::to_value(self.events_page_for_run(run, after_seq, limit)?)
+        let page = PublicEventPageV1::from_page(&self.events_page_for_run(run, after_seq, limit)?);
+        serde_json::to_value(page)
             .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))
     }
 
@@ -5547,7 +5684,7 @@ impl OrchestrationService {
         _auth: &AuthContext,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        self.handoff_for_run(self.load_authorized_run(run_id)?)
+        self.raw_handoff_for_run(self.load_authorized_run(run_id)?)
     }
 
     pub fn get_handoff_scoped(
@@ -5560,7 +5697,7 @@ impl OrchestrationService {
         self.handoff_for_run(self.authorize_run_request(session_id, workspace, run_id)?)
     }
 
-    fn handoff_for_run(&self, run: RunRecord) -> Result<serde_json::Value, OrchError> {
+    fn raw_handoff_for_run(&self, run: RunRecord) -> Result<serde_json::Value, OrchError> {
         Ok(json!({
             "runId": run.run_id,
             "sessionId": run.session_id,
@@ -5578,6 +5715,11 @@ impl OrchestrationService {
             "usageComplete": run.aggregates.usage_complete,
             "usagePendingRequests": run.aggregates.usage_pending_requests,
         }))
+    }
+
+    fn handoff_for_run(&self, run: RunRecord) -> Result<serde_json::Value, OrchError> {
+        serde_json::to_value(PublicRunHandoffV1::from_run(&run))
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
     }
 
     fn scoped_events_complete(

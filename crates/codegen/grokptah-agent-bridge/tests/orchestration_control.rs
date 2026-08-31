@@ -1479,6 +1479,40 @@ async fn submit_task_reaches_terminal_offline() {
     );
     let handoff = orch.get_handoff(&auth, &run_id).unwrap();
     assert!(handoff["finalResponse"].as_str().is_some());
+    let public_run = orch
+        .get_run_scoped(&auth, session.id, ws.path(), &run_id)
+        .unwrap();
+    let public_progress = orch
+        .get_progress_scoped(&auth, session.id, ws.path(), &run_id)
+        .unwrap();
+    let public_handoff = orch
+        .get_handoff_scoped(&auth, session.id, ws.path(), &run_id)
+        .unwrap();
+    for (label, value) in [
+        ("run", &public_run),
+        ("progress", &public_progress),
+        ("handoff", &public_handoff),
+    ] {
+        assert_eq!(
+            value["schemaVersion"], "grokptah.public-run.v1",
+            "public {label}"
+        );
+        for key in [
+            "parentRunId",
+            "checkpointId",
+            "continuationContextId",
+            "finalResponse",
+            "promptPreview",
+            "lastTool",
+            "agentId",
+            "bounds",
+        ] {
+            assert!(
+                value.get(key).is_none(),
+                "public {label} leaked retired field {key}"
+            );
+        }
+    }
 
     // Service-owned Build Runs must publish the same durable checkpoint that
     // the explicit public continuation API consumes. Checkpoint persistence
@@ -1535,16 +1569,40 @@ async fn submit_task_reaches_terminal_offline() {
         .unwrap();
     assert_eq!(replayed["response"], resumed["response"]);
     let runs = orch.list_runs_scoped(&auth, session.id, ws.path()).unwrap();
-    let resumed_runs = runs["runs"]
-        .as_array()
-        .unwrap()
+    assert_eq!(runs["schemaVersion"], "grokptah.public-run.v1");
+    let public_runs = runs["runs"].as_array().unwrap();
+    for row in public_runs {
+        for key in ["parentRunId", "checkpointId", "continuationContextId"] {
+            assert!(
+                row.get(key).is_none(),
+                "public list_runs leaked retired lineage field {key}"
+            );
+        }
+    }
+    let resumed_public: Vec<_> = public_runs
         .iter()
-        .filter(|candidate| candidate["parentRunId"] == run_id)
-        .collect::<Vec<_>>();
-    assert_eq!(resumed_runs.len(), 1);
-    assert_eq!(resumed_runs[0]["state"], "completed");
-    assert_eq!(resumed_runs[0]["checkpointId"], checkpoint_id);
-    assert!(resumed_runs[0]["continuationContextId"].as_str().is_some());
+        .filter(|candidate| candidate["runId"].as_str() != Some(run_id.as_str()))
+        .collect();
+    assert_eq!(resumed_public.len(), 1);
+    assert_eq!(resumed_public[0]["state"], "completed");
+    let resumed_run_id = resumed_public[0]["runId"].as_str().unwrap();
+    let private_child = orch
+        .store()
+        .load_run(resumed_run_id)
+        .unwrap()
+        .expect("private store retains continuation child");
+    assert_eq!(
+        private_child.parent_run_id.as_deref(),
+        Some(run_id.as_str())
+    );
+    assert_eq!(
+        private_child.checkpoint_id.as_deref(),
+        Some(checkpoint_id.as_str())
+    );
+    assert!(private_child
+        .continuation_context_id
+        .as_ref()
+        .is_some_and(|id| !id.is_empty()));
     // Idempotent retry
     let again = orch
         .submit_task(
@@ -1906,8 +1964,9 @@ fn run_event_pages_filter_before_limit_across_sessions() {
         .unwrap();
 
     let page = orch.get_events(&auth, Some(&run_id), 0, 1).unwrap();
-    assert_eq!(page["entries"].as_array().unwrap().len(), 1);
-    assert_eq!(page["entries"][0]["seq"], start_seq);
+    assert_eq!(page["schemaVersion"], "grokptah.public-event.v1");
+    assert_eq!(page["events"].as_array().unwrap().len(), 1);
+    assert_eq!(page["events"][0]["seq"], start_seq);
     assert_eq!(page["nextCursor"], start_seq);
     let next = orch
         .get_events(
@@ -1917,8 +1976,8 @@ fn run_event_pages_filter_before_limit_across_sessions() {
             1,
         )
         .unwrap();
-    assert_eq!(next["entries"].as_array().unwrap().len(), 1);
-    assert_eq!(next["entries"][0]["seq"], end_seq);
+    assert_eq!(next["events"].as_array().unwrap().len(), 1);
+    assert_eq!(next["events"][0]["seq"], end_seq);
     set_grokptah_home_override(None);
 }
 

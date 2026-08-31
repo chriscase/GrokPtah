@@ -1,12 +1,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use grokptah_agent_bridge::orchestration::WorkPolicy;
 use grokptah_agent_bridge::{
-    ActivationRecord, AgentRecord, AgentResumePlan, JournalPage, McpControlClient, RoutineRecord,
-    RoutineSnapshot, RunExecutionMode, RunRecord, RunScope, RunState, RuntimeConnectionState,
-    RuntimeTarget, SessionUpdate, WorkAttemptView, WorkItem,
+    ActivationRecord, AgentRecord, AgentResumePlan, JournalPage, McpControlClient, PublicEventKindV1,
+    RoutineRecord, RoutineSnapshot, RunExecutionMode, RunRecord, RunScope, RunState,
+    RuntimeConnectionState, RuntimeTarget, SessionUpdate, WorkAttemptView, WorkItem,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -14,6 +14,13 @@ use tauri::{AppHandle, Emitter};
 use tokio::sync::{watch, Mutex};
 use url::Url;
 use uuid::Uuid;
+
+use crate::remote_public_event::{
+    parse_remote_public_event_page, RemotePublicEventPage,
+};
+use crate::remote_public_run::{
+    parse_remote_public_run, parse_remote_public_run_list, RemotePublicRun, RemotePublicRunList,
+};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -83,6 +90,7 @@ impl From<RemoteSessionWire> for RemoteSessionTarget {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct RemoteRunEvent {
     pub run_id: String,
     pub session_id: Uuid,
@@ -296,12 +304,34 @@ impl RemoteServiceState {
         ))
     }
 
+    /// Retired compatibility list. Public MCP `ptah_list_runs` emits
+    /// `grokptah.public-run.v1` only; connected calls fail closed as a redacted
+    /// unsupported/legacy-wire error and do not invoke that tool. Use
+    /// [`Self::list_public_runs`]. Disconnected calls still return `None`.
     pub async fn list_runs(&self) -> Result<Option<Vec<RunRecord>>> {
         let mut client = self.client.lock().await;
         let Some(client) = client.as_mut() else {
             return Ok(None);
         };
         Ok(Some(client.list_runs().await?))
+    }
+
+    /// Additive allowlisted public-run list. The request supplies the scope;
+    /// no scope fields are accepted from the remote document.
+    ///
+    /// Poll-only: must not register [`Self::watch_runs`]. That path emits raw
+    /// `SessionUpdate` journal bodies on `remote://run-event`, which this DTO
+    /// redacts.
+    pub async fn list_public_runs(
+        &self,
+        session_id: Uuid,
+        workspace: String,
+    ) -> Result<Option<RemotePublicRunList>> {
+        let mut client = self.client.lock().await;
+        let Some(client) = client.as_mut() else {
+            return Ok(None);
+        };
+        Ok(Some(client.list_public_runs(session_id, workspace).await?))
     }
 
     pub async fn list_work(
@@ -564,6 +594,10 @@ impl RemoteServiceState {
         ))
     }
 
+    /// Retired compatibility get. Public MCP `ptah_get_run` emits
+    /// `grokptah.public-run.v1` only; connected calls fail closed as a redacted
+    /// unsupported/legacy-wire error and do not invoke that tool. Use
+    /// [`Self::get_public_run`]. Disconnected calls still return `None`.
     pub async fn get_run(
         &self,
         session_id: Uuid,
@@ -577,6 +611,31 @@ impl RemoteServiceState {
         Ok(Some(client.get_run(session_id, workspace, run_id).await?))
     }
 
+    /// Additive allowlisted public-run get. Legacy raw [`Self::get_run`] is
+    /// retired/unsupported; callers must use this method.
+    ///
+    /// Poll-only: must not register [`Self::watch_runs`]. That path emits raw
+    /// `SessionUpdate` journal bodies on `remote://run-event`, which this DTO
+    /// redacts.
+    pub async fn get_public_run(
+        &self,
+        session_id: Uuid,
+        workspace: String,
+        run_id: String,
+    ) -> Result<Option<RemotePublicRun>> {
+        let mut client = self.client.lock().await;
+        let Some(client) = client.as_mut() else {
+            return Ok(None);
+        };
+        Ok(Some(
+            client.get_public_run(session_id, workspace, run_id).await?,
+        ))
+    }
+
+    /// Retired compatibility events. Public MCP `ptah_get_events` emits
+    /// `grokptah.public-event.v1` only; connected calls fail closed as a redacted
+    /// unsupported/legacy-wire error and do not invoke that tool. Use
+    /// [`Self::get_public_events`]. Disconnected calls still return `None`.
     pub async fn get_events(
         &self,
         session_id: Uuid,
@@ -592,6 +651,30 @@ impl RemoteServiceState {
         Ok(Some(
             client
                 .get_events(session_id, workspace, run_id, after_seq, limit)
+                .await?,
+        ))
+    }
+
+    /// Additive allowlisted public-event page. Legacy raw [`Self::get_events`]
+    /// is retired/unsupported; callers must use this method.
+    ///
+    /// Poll-only: must not register [`Self::watch_runs`]. That path must not
+    /// reintroduce raw `SessionUpdate` journal delivery.
+    pub async fn get_public_events(
+        &self,
+        session_id: Uuid,
+        workspace: String,
+        run_id: String,
+        after_seq: u64,
+        limit: usize,
+    ) -> Result<Option<RemotePublicEventPage>> {
+        let mut client = self.client.lock().await;
+        let Some(client) = client.as_mut() else {
+            return Ok(None);
+        };
+        Ok(Some(
+            client
+                .get_public_events(session_id, workspace, run_id, after_seq, limit)
                 .await?,
         ))
     }
@@ -630,6 +713,8 @@ impl RemoteServiceState {
         Ok(Some(()))
     }
 
+    /// Legacy raw-event watcher. Emits `SessionUpdate` journal bodies on
+    /// `remote://run-event`. Public-run list/get refresh must not call this.
     pub async fn watch_runs(
         self: &Arc<Self>,
         scopes: Vec<RemoteRunScope>,
@@ -678,6 +763,10 @@ struct RemoteServiceClient {
     base_url: String,
     token: String,
     mcp: McpControlClient,
+    /// Test-only log of `tools/call` names. Legacy list/get/events must not
+    /// append `ptah_list_runs` / `ptah_get_run` / `ptah_get_events` when connected.
+    #[cfg(test)]
+    called_tools: Vec<String>,
 }
 
 impl RemoteServiceClient {
@@ -691,6 +780,8 @@ impl RemoteServiceClient {
             base_url: base_url.clone(),
             token: token.clone(),
             mcp: McpControlClient::new(base_url, token),
+            #[cfg(test)]
+            called_tools: Vec::new(),
         };
         client.reconnect().await?;
         let tools = client
@@ -743,6 +834,8 @@ impl RemoteServiceClient {
     }
 
     async fn call_tool(&mut self, name: &str, arguments: Value) -> Result<Value> {
+        #[cfg(test)]
+        self.called_tools.push(name.to_string());
         let first = self.mcp.call_tool(name, arguments.clone()).await;
         let result = match first {
             Ok(result) => result,
@@ -914,30 +1007,27 @@ impl RemoteServiceClient {
             .ok_or_else(|| anyhow::anyhow!("remote resume response omitted response"))
     }
 
+    /// Retired `RunRecord` list. Does not call `ptah_list_runs`.
     async fn list_runs(&mut self) -> Result<Vec<RunRecord>> {
-        let sessions = self.list_sessions().await?;
-        let mut runs = Vec::new();
-        for session in sessions {
-            let value = self
-                .call_tool(
-                    "ptah_list_runs",
-                    json!({
-                        "session_id": session.session_id,
-                        "workspace": session.workspace,
-                    }),
-                )
-                .await?;
-            let mut scoped: Vec<RunRecord> = serde_json::from_value(
-                value
-                    .get("runs")
-                    .cloned()
-                    .ok_or_else(|| anyhow::anyhow!("remote run list omitted runs"))?,
+        let _ = self;
+        Err(legacy_remote_run_wire_unsupported())
+    }
+
+    async fn list_public_runs(
+        &mut self,
+        session_id: Uuid,
+        workspace: String,
+    ) -> Result<RemotePublicRunList> {
+        let value = self
+            .call_tool(
+                "ptah_list_runs",
+                json!({
+                    "session_id": session_id,
+                    "workspace": workspace,
+                }),
             )
-            .context("decode remote durable run list")?;
-            runs.append(&mut scoped);
-        }
-        runs.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-        Ok(runs)
+            .await?;
+        parse_remote_public_run_list(&value, session_id, &workspace)
     }
 
     async fn list_work(&mut self, session_id: Uuid, workspace: String) -> Result<Vec<WorkItem>> {
@@ -975,6 +1065,7 @@ impl RemoteServiceClient {
         serde_json::from_value(value).context("decode remote durable work item")
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn create_work(
         &mut self,
         session_id: Uuid,
@@ -985,8 +1076,10 @@ impl RemoteServiceClient {
         requires_approval: bool,
         request_id: String,
     ) -> Result<WorkItem> {
-        let mut policy = WorkPolicy::default();
-        policy.requires_approval = requires_approval;
+        let policy = WorkPolicy {
+            requires_approval,
+            ..WorkPolicy::default()
+        };
         let value = self
             .call_tool(
                 "ptah_create_work",
@@ -1274,25 +1367,18 @@ impl RemoteServiceClient {
         .context("decode remote routine fire")
     }
 
+    /// Retired `RunRecord` get. Does not call `ptah_get_run`.
     async fn get_run(
         &mut self,
         session_id: Uuid,
         workspace: String,
         run_id: String,
     ) -> Result<RunRecord> {
-        let value = self
-            .call_tool(
-                "ptah_get_run",
-                json!({
-                    "session_id": session_id,
-                    "workspace": workspace,
-                    "run_id": run_id,
-                }),
-            )
-            .await?;
-        serde_json::from_value(value).context("decode remote durable run")
+        let _ = (self, session_id, workspace, run_id);
+        Err(legacy_remote_run_wire_unsupported())
     }
 
+    /// Retired `JournalPage` events. Does not call `ptah_get_events`.
     async fn get_events(
         &mut self,
         session_id: Uuid,
@@ -1301,6 +1387,18 @@ impl RemoteServiceClient {
         after_seq: u64,
         limit: usize,
     ) -> Result<JournalPage> {
+        let _ = (self, session_id, workspace, run_id, after_seq, limit);
+        Err(legacy_remote_run_wire_unsupported())
+    }
+
+    async fn get_public_events(
+        &mut self,
+        session_id: Uuid,
+        workspace: String,
+        run_id: String,
+        after_seq: u64,
+        limit: usize,
+    ) -> Result<RemotePublicEventPage> {
         let value = self
             .call_tool(
                 "ptah_get_events",
@@ -1313,7 +1411,26 @@ impl RemoteServiceClient {
                 }),
             )
             .await?;
-        serde_json::from_value(value).context("decode remote durable event page")
+        parse_remote_public_event_page(&value, session_id, &workspace)
+    }
+
+    async fn get_public_run(
+        &mut self,
+        session_id: Uuid,
+        workspace: String,
+        run_id: String,
+    ) -> Result<RemotePublicRun> {
+        let value = self
+            .call_tool(
+                "ptah_get_run",
+                json!({
+                    "session_id": session_id,
+                    "workspace": workspace,
+                    "run_id": run_id,
+                }),
+            )
+            .await?;
+        parse_remote_public_run(&value, session_id, &workspace)
     }
 
     async fn open_event_stream(
@@ -1389,18 +1506,7 @@ async fn run_watcher(
                     Ok(Some(frame)) => match frame.notification {
                         grokptah_agent_bridge::LiveNotification::Event(event) => {
                             cursor = cursor.max(event.seq);
-                            let update = RemoteRunEvent {
-                                run_id: event.run_id,
-                                session_id: event.session_id,
-                                workspace: event.workspace,
-                                seq: event.seq,
-                                ts: event.ts,
-                                update: event.update,
-                            };
-                            let terminal =
-                                matches!(update.update, SessionUpdate::TurnComplete { .. });
-                            let _ = app.emit("remote://run-event", update);
-                            if terminal {
+                            if event.kind == PublicEventKindV1::TurnComplete {
                                 return;
                             }
                         }
@@ -1611,6 +1717,10 @@ fn is_loopback_host(host: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
+fn legacy_remote_run_wire_unsupported() -> anyhow::Error {
+    anyhow!("unsupported: legacy-wire")
+}
+
 fn runtime_target_for_base_url(base_url: &str) -> RuntimeTarget {
     Url::parse(base_url)
         .ok()
@@ -1701,6 +1811,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disconnected_public_run_reads_do_not_register_run_watchers() {
+        let state = RemoteServiceState::new();
+        let session = uuid::Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        assert!(state
+            .list_public_runs(session, "/tmp/project".into())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(state
+            .get_public_run(session, "/tmp/project".into(), "run_public_dto_1".into())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(
+            state.watchers.lock().await.is_empty(),
+            "public-run list/get registered the raw run watcher while disconnected"
+        );
+    }
+
+    #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn remote_client_authenticates_and_reconnects_after_service_restart() {
         let _guard = home_override_serial();
@@ -1732,7 +1862,18 @@ mod tests {
                 .await
                 .unwrap();
         assert!(client.list_persistent_agents().await.unwrap().is_empty());
-        assert!(client.list_runs().await.unwrap().is_empty());
+        client.called_tools.clear();
+        assert!(client.list_runs().await.is_err());
+        assert!(client.called_tools.is_empty());
+        assert!(client
+            .get_run(
+                uuid::Uuid::nil(),
+                workspace.path().display().to_string(),
+                "run-legacy".into(),
+            )
+            .await
+            .is_err());
+        assert!(client.called_tools.is_empty());
         let session = client
             .create_session(
                 workspace.path().display().to_string(),
@@ -1753,11 +1894,12 @@ mod tests {
             .await
             .unwrap();
         assert!(client
-            .list_runs()
+            .list_public_runs(session.session_id, session.workspace.clone())
             .await
             .unwrap()
+            .runs
             .iter()
-            .any(|run| run.run_id == submission.run_id));
+            .any(|run| run.document.run_id == submission.run_id));
         assert!(RemoteServiceClient::connect(base_url, "wrong-token".into())
             .await
             .is_err());
@@ -1780,12 +1922,99 @@ mod tests {
         // its MCP session and transparently retries against the restarted service.
         assert!(!client.list_persistent_agents().await.unwrap().is_empty());
         assert!(client
-            .list_runs()
+            .list_public_runs(session.session_id, session.workspace)
             .await
             .unwrap()
+            .runs
             .iter()
-            .any(|run| run.run_id == submission.run_id));
+            .any(|run| run.document.run_id == submission.run_id));
         assert!(restarted_server.stop_and_wait().await.is_clean());
+        set_grokptah_home_override(None);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn public_run_list_and_get_do_not_register_raw_run_watchers() {
+        let _guard = home_override_serial();
+        let home = tempdir().unwrap();
+        set_grokptah_home_override(Some(home.path().join(".grokptah")));
+        let workspace = tempdir().unwrap();
+        let host = AgentHost::create(HostConfig {
+            always_approve: true,
+            ..HostConfig::default()
+        })
+        .expect("acquire the GrokPtah instance lock");
+        let orch = OrchestrationService::new(
+            host.clone(),
+            host.event_bus(),
+            OrchStore::open(home.path().join("orch")).unwrap(),
+            OrchestrationConfig {
+                bearer_token: "desktop-remote-token".into(),
+                allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
+                max_concurrent_runs: 2,
+                bounds: RunBounds::default(),
+            },
+        );
+
+        let server = start_control_server(orch, 0).await.unwrap();
+        let base_url = format!("http://{}", server.addr);
+        host.start().unwrap();
+        let state = RemoteServiceState::new();
+        state
+            .connect(base_url, "desktop-remote-token".into())
+            .await
+            .unwrap();
+
+        let session = state
+            .create_session(
+                workspace.path().display().to_string(),
+                Some("Public run watcher isolation".into()),
+            )
+            .await
+            .unwrap()
+            .expect("remote service connected");
+        let submission = state
+            .submit_task(
+                session.session_id,
+                session.workspace.clone(),
+                "return a short acknowledgement and stop".into(),
+                RunExecutionMode::Shared,
+                true,
+            )
+            .await
+            .unwrap()
+            .expect("remote service connected");
+
+        let listed = state
+            .list_public_runs(session.session_id, session.workspace.clone())
+            .await
+            .unwrap()
+            .expect("remote service connected");
+        assert!(listed
+            .runs
+            .iter()
+            .any(|run| run.document.run_id == submission.run_id));
+        assert!(
+            state.watchers.lock().await.is_empty(),
+            "public-run list registered the raw run watcher"
+        );
+
+        let got = state
+            .get_public_run(
+                session.session_id,
+                session.workspace.clone(),
+                submission.run_id.clone(),
+            )
+            .await
+            .unwrap()
+            .expect("remote service connected");
+        assert_eq!(got.document.run_id, submission.run_id);
+        assert!(
+            state.watchers.lock().await.is_empty(),
+            "public-run get registered the raw run watcher"
+        );
+
+        assert!(server.stop_and_wait().await.is_clean());
         set_grokptah_home_override(None);
     }
 }

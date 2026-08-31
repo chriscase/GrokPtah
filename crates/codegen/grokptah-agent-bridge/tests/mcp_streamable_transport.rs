@@ -18,7 +18,7 @@ use grokptah_agent_bridge::{
     ActionGrant, AgentHost, ComputerRun, ComputerUseService, ControlServerLimits, GrantIssuer,
     HostConfig, McpControlClient, SessionKind, SimulatorBackend, CONTROL_TOOLS,
 };
-use serde_json::json;
+use serde_json::{json, Value};
 use tempfile::tempdir;
 
 use common::ProcessEnvGuard;
@@ -55,6 +55,33 @@ fn setup() -> (
     );
     guard.set("GROKPTAH_AGENT_OFFLINE", "1");
     (home, guard, host, ws, orch)
+}
+
+fn assert_public_run_projection(value: &Value) {
+    assert_eq!(value["schemaVersion"], "grokptah.public-run.v1");
+    for key in [
+        "promptPreview",
+        "finalResponse",
+        "workspace",
+        "sessionId",
+        "clientId",
+        "requestId",
+        "providerId",
+        "leaseId",
+        "attemptId",
+        "execution",
+        "approval",
+        "aggregates",
+        "progress",
+        "bounds",
+        "stopCause",
+        "terminalResult",
+        "parentRunId",
+        "checkpointId",
+        "continuationContextId",
+    ] {
+        assert!(value.get(key).is_none(), "public run leaked {key}");
+    }
 }
 
 #[tokio::test]
@@ -1560,11 +1587,7 @@ async fn http_submit_durable_run_events_handoff_and_cancel() {
             .await
             .unwrap();
         assert!(!run.is_error);
-        assert_eq!(
-            run.structured.get("clientId").and_then(|v| v.as_str()),
-            Some("mcp"),
-            "MCP-submitted runs must retain their origin for desktop visibility"
-        );
+        assert_public_run_projection(&run.structured);
         state = run
             .structured
             .get("state")
@@ -1598,13 +1621,13 @@ async fn http_submit_durable_run_events_handoff_and_cancel() {
         .await
         .unwrap();
     assert!(!events.is_error);
+    assert_eq!(
+        events.structured["schemaVersion"],
+        "grokptah.public-event.v1"
+    );
+    assert!(events.structured.get("entries").is_none());
     // Event page is ordered; if present, sequences are non-decreasing.
-    if let Some(arr) = events
-        .structured
-        .get("events")
-        .or_else(|| events.structured.get("entries"))
-        .and_then(|v| v.as_array())
-    {
+    if let Some(arr) = events.structured.get("events").and_then(|v| v.as_array()) {
         let mut prev = 0u64;
         for e in arr {
             if let Some(seq) = e.get("seq").and_then(|s| s.as_u64()) {
@@ -1629,34 +1652,11 @@ async fn http_submit_durable_run_events_handoff_and_cancel() {
         !handoff.is_error,
         "handoff must be durable for terminal run"
     );
-    assert!(
-        handoff.structured["verification"].is_object(),
-        "handoff must expose evidence-backed verification"
-    );
-    assert!(
-        handoff.structured["verification"]["status"]
-            .as_str()
-            .is_some(),
-        "verification must expose a bounded trust status"
-    );
-    assert_eq!(
-        handoff.structured["stopCause"], "completed",
-        "handoff must expose the host-decided typed stop cause"
-    );
-    assert!(
-        handoff.structured["bounds"].is_object(),
-        "handoff must expose the applied run bounds"
-    );
-    assert!(
-        handoff.structured["bounds"]["maxRounds"].is_number(),
-        "handoff bounds must use the durable run projection"
-    );
-    assert!(
-        handoff.structured["usage"].is_object()
-            && handoff.structured["usageComplete"].is_boolean()
-            && handoff.structured["usagePendingRequests"].is_number(),
-        "handoff must project usage and its completeness together"
-    );
+    assert_public_run_projection(&handoff.structured);
+    assert!(handoff.structured["changeCount"].is_number());
+    assert!(handoff.structured["testCount"].is_number());
+    assert!(handoff.structured["usageComplete"].is_boolean());
+    assert!(handoff.structured["usagePendingRequestCount"].is_number());
 
     // Cancel of already-terminal run fails closed (no silent success).
     let cancel_term = client
@@ -1799,7 +1799,7 @@ async fn http_retry_interrupted_run_is_explicit_and_idempotent() {
             run.structured["state"].as_str(),
             Some("completed" | "failed" | "cancelled" | "interrupted" | "limit_reached")
         ) {
-            assert_eq!(run.structured["retryOf"], source_id);
+            assert_public_run_projection(&run.structured);
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1893,7 +1893,7 @@ async fn mcp_isolated_run_review_approval_and_restart_promotion() {
             .unwrap();
         state = run.structured["state"].as_str().unwrap_or_default().into();
         if state == "completed" || state == "failed" {
-            assert_eq!(run.structured["clientId"], "mcp");
+            assert_public_run_projection(&run.structured);
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1936,20 +1936,14 @@ async fn mcp_isolated_run_review_approval_and_restart_promotion() {
         .as_str()
         .unwrap()
         .to_string();
-    let run_before_tamper = client
-        .call_tool(
-            "ptah_get_run",
-            json!({
-                "session_id": session.id,
-                "workspace": ws.path().display().to_string(),
-                "run_id": run_id
-            }),
-        )
-        .await
-        .unwrap();
-    let isolated_workspace = run_before_tamper.structured["execution"]["executionWorkspace"]
-        .as_str()
-        .unwrap();
+    let isolated_workspace = orch
+        .store()
+        .load_run(&run_id)
+        .unwrap()
+        .expect("approved run remains in the private store")
+        .execution
+        .expect("isolated run records private execution metadata")
+        .execution_workspace;
     let isolated_file = PathBuf::from(isolated_workspace).join("mcp-approved.txt");
     std::fs::write(&isolated_file, "tampered after approval\n").unwrap();
     let stale = client

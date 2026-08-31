@@ -11,7 +11,14 @@
 //! disagree about run state, control disposition, epoch, or event range.
 //! Which runs each surface may list is a separate gate: the cockpit is
 //! session-scoped; coordinator reads take [`ComputerReadBinding`].
+//!
+//! [`adaptive`] adds one advisory tightening on the `act` admission path so a
+//! small local model and a strong one can drive the same run under an explicit
+//! efficiency profile. It has no authority of its own: it runs only after
+//! [`ComputerPolicy::authorize_action`] has already said yes, it can only
+//! refuse, and it owns no state machine. See that module for the argument.
 
+mod adaptive;
 mod macos_observation;
 mod platform;
 mod policy;
@@ -22,6 +29,10 @@ mod simulator;
 mod store;
 mod types;
 
+pub use adaptive::{
+    AdaptiveApproval, AdaptiveClaim, AdaptiveDecisionRecord, AdaptiveDisposition, AdaptiveOutcome,
+    AdaptiveProfile, AdaptiveReason, AdaptiveThresholds, AmbiguityAssessment,
+};
 pub use macos_observation::MacOsObservationPlatform;
 pub use platform::{
     ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
@@ -29,10 +40,10 @@ pub use platform::{
 };
 pub use policy::ComputerPolicy;
 pub use projection::{
-    project_run_at, ActionGrantSummary, ActionOutcomeSummary, ComputerErrorSummary,
-    ComputerRunCapacity, ComputerRunEventPage, ComputerRunEventRange, ComputerRunProgress,
-    ComputerRunProjection, ComputerScopeCapacity, ComputerTargetSummary, ObservationSummary,
-    DEFAULT_EVENT_PAGE, MAX_EVENT_PAGE,
+    project_run_at, ActionGrantSummary, ActionOutcomeSummary, AdaptiveDecisionSummary,
+    ComputerErrorSummary, ComputerRunCapacity, ComputerRunEventPage, ComputerRunEventRange,
+    ComputerRunProgress, ComputerRunProjection, ComputerScopeCapacity, ComputerTargetSummary,
+    ObservationSummary, DEFAULT_EVENT_PAGE, MAX_EVENT_PAGE,
 };
 pub use reads::{ComputerReadBinding, ComputerRunReads};
 

@@ -16,7 +16,7 @@ use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::events::SessionUpdate;
+use crate::orchestration::{parse_public_event_v1, PublicEventV1};
 
 /// Bound a coordinator-side SSE frame independently from the server body
 /// limit. A frame larger than this is rejected before it can grow buffers.
@@ -94,18 +94,6 @@ pub struct RunScope {
     pub run_id: String,
 }
 
-/// A typed event notification delivered by the coordinator event stream.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PtahEventNotification {
-    pub session_id: uuid::Uuid,
-    pub workspace: String,
-    pub run_id: String,
-    pub seq: u64,
-    pub ts: String,
-    pub update: SessionUpdate,
-}
-
 /// A typed recovery notification. The coordinator must poll the durable event
 /// tool before opening another live stream when this is received.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,7 +110,7 @@ pub struct PtahRecoveryNotification {
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
 pub enum LiveNotification {
-    Event(PtahEventNotification),
+    Event(PublicEventV1),
     Recovery(PtahRecoveryNotification),
     /// Preserve unknown notifications for forward-compatible coordinators.
     Unknown {
@@ -279,8 +267,8 @@ fn decode_sse_frame(frame: &[u8], scope: &RunScope) -> anyhow::Result<Option<Liv
         .ok_or_else(|| anyhow::anyhow!("live MCP notification has no params"))?;
     let notification = match method {
         "notifications/ptah_event" => {
-            let event: PtahEventNotification = serde_json::from_value(params)?;
-            validate_scope(scope, &event.session_id, &event.workspace, &event.run_id)?;
+            let event = parse_public_event_v1(&params)
+                .map_err(|_| anyhow::anyhow!("live public-event decode failed"))?;
             if sse_id != Some(event.seq) {
                 anyhow::bail!("SSE id does not match ptah_event seq");
             }
@@ -892,7 +880,7 @@ mod tests {
         const TEST_TIMEOUT: Duration = Duration::from_millis(100);
         const BODY_DELAY: Duration = Duration::from_millis(350);
 
-        async fn live_stream(State(scope): State<Arc<RunScope>>) -> Response {
+        async fn live_stream(State(_scope): State<Arc<RunScope>>) -> Response {
             let established = futures::stream::once(async {
                 Ok::<Bytes, Infallible>(Bytes::from_static(b": established\n\n"))
             });
@@ -900,16 +888,11 @@ mod tests {
                 "jsonrpc": "2.0",
                 "method": "notifications/ptah_event",
                 "params": {
-                    "sessionId": scope.session_id,
-                    "workspace": scope.workspace,
-                    "runId": scope.run_id,
+                    "schemaVersion": "grokptah.public-event.v1",
                     "seq": 1,
                     "ts": "2026-08-19T00:00:00Z",
-                    "update": {
-                        "type": "turn_complete",
-                        "session_id": scope.session_id,
-                        "cancelled": false
-                    }
+                    "kind": "turn_complete",
+                    "cancelled": false
                 }
             });
             let delayed = futures::stream::once(async move {
@@ -1082,16 +1065,11 @@ mod tests {
             "jsonrpc": "2.0",
             "method": "notifications/ptah_event",
             "params": {
-                "sessionId": scope.session_id,
-                "workspace": scope.workspace,
-                "runId": scope.run_id,
+                "schemaVersion": "grokptah.public-event.v1",
                 "seq": 7,
                 "ts": "2026-08-12T00:00:00Z",
-                "update": {
-                    "type": "turn_complete",
-                    "session_id": scope.session_id,
-                    "cancelled": false
-                }
+                "kind": "turn_complete",
+                "cancelled": false
             }
         });
         let encoded = format!(": keep-alive\n\nid: 7\nevent: message\ndata: {}\n\n", body);
@@ -1112,13 +1090,10 @@ mod tests {
         assert_eq!(frame.sse_id, Some(7));
         assert!(matches!(
             frame.notification,
-            LiveNotification::Event(PtahEventNotification {
-                update: SessionUpdate::TurnComplete {
-                    cancelled: false,
-                    ..
-                },
-                ..
-            })
+            LiveNotification::Event(ref event)
+                if event.seq == 7
+                    && event.kind == crate::orchestration::PublicEventKindV1::TurnComplete
+                    && event.cancelled == Some(false)
         ));
         assert_eq!(stream.last_event_id(), Some(7));
         assert!(stream.next_notification().await.unwrap().is_none());
@@ -1166,6 +1141,28 @@ mod tests {
         });
         let frame = format!("event: message\ndata: {}\n\n", body);
         assert!(decode_sse_frame(frame.as_bytes(), &scope).is_err());
+
+        let legacy = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/ptah_event",
+            "params": {
+                "sessionId": scope.session_id,
+                "workspace": scope.workspace,
+                "runId": scope.run_id,
+                "seq": 7,
+                "ts": "2026-08-12T00:00:00Z",
+                "update": {
+                    "type": "turn_complete",
+                    "session_id": scope.session_id,
+                    "cancelled": false
+                }
+            }
+        });
+        let legacy_frame = format!("id: 7\nevent: message\ndata: {}\n\n", legacy);
+        assert!(
+            decode_sse_frame(legacy_frame.as_bytes(), &scope).is_err(),
+            "legacy SessionUpdate live payload must fail closed"
+        );
 
         let chunks = vec![Ok::<Bytes, reqwest::Error>(Bytes::from("123456789"))];
         let mut stream = McpEventStream {

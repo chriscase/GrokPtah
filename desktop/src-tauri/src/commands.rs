@@ -151,6 +151,26 @@ pub async fn remote_service_run_list(
         .ok_or_else(|| "remote service is not connected".to_string())
 }
 
+/// Additive, allowlisted `grokptah.public-run.v1` list for one remote session.
+/// The legacy `remote_service_run_list` command is retained as a compatibility
+/// symbol but now fails closed because it cannot decode the public wire as a
+/// private `RunRecord`.
+/// Poll-only: does not start `remote_service_watch_runs`.
+#[tauri::command]
+pub async fn remote_service_public_run_list(
+    state: State<'_, AppState>,
+    session_id: String,
+    workspace: String,
+) -> Result<crate::remote_public_run::RemotePublicRunList, String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    state
+        .remote_service
+        .list_public_runs(session_id, workspace)
+        .await
+        .map_err(map_err)?
+        .ok_or_else(|| "remote service is not connected".to_string())
+}
+
 #[tauri::command]
 pub async fn remote_service_work_list(
     state: State<'_, AppState>,
@@ -601,6 +621,26 @@ pub async fn remote_service_run_get(
         .ok_or_else(|| "remote service is not connected".to_string())
 }
 
+/// Additive, allowlisted `grokptah.public-run.v1` get for one remote run. The
+/// legacy `remote_service_run_get` command is retained as a compatibility
+/// symbol but now fails closed for the same reason.
+/// Poll-only: does not start `remote_service_watch_runs`.
+#[tauri::command]
+pub async fn remote_service_public_run_get(
+    state: State<'_, AppState>,
+    session_id: String,
+    workspace: String,
+    run_id: String,
+) -> Result<crate::remote_public_run::RemotePublicRun, String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    state
+        .remote_service
+        .get_public_run(session_id, workspace, run_id)
+        .await
+        .map_err(map_err)?
+        .ok_or_else(|| "remote service is not connected".to_string())
+}
+
 #[tauri::command]
 pub async fn remote_service_run_events(
     state: State<'_, AppState>,
@@ -614,6 +654,35 @@ pub async fn remote_service_run_events(
     state
         .remote_service
         .get_events(
+            session_id,
+            workspace,
+            run_id,
+            after_seq.unwrap_or(0),
+            limit.unwrap_or(80),
+        )
+        .await
+        .map_err(map_err)?
+        .ok_or_else(|| "remote service is not connected".to_string())
+}
+
+/// Additive, allowlisted `grokptah.public-event.v1` page for one remote run.
+/// The legacy `remote_service_run_events` command is retained as a
+/// compatibility symbol but now fails closed because it cannot decode the
+/// public wire as a private `JournalPage`.
+/// Poll-only: does not start `remote_service_watch_runs`.
+#[tauri::command]
+pub async fn remote_service_public_run_events(
+    state: State<'_, AppState>,
+    session_id: String,
+    workspace: String,
+    run_id: String,
+    after_seq: Option<u64>,
+    limit: Option<usize>,
+) -> Result<crate::remote_public_event::RemotePublicEventPage, String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    state
+        .remote_service
+        .get_public_events(
             session_id,
             workspace,
             run_id,

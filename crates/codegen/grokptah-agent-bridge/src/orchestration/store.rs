@@ -1,5 +1,6 @@
 //! Durable run records, idempotency receipts, audit log (#196).
 
+use std::collections::HashSet;
 use std::fs;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
@@ -33,8 +34,8 @@ use super::types::{
 };
 use super::worker::{WorkerHostKind, WorkerPresence, WorkerProjection};
 use super::workload::{
-    lease_duration, AssignmentStatus, AttemptState, WorkApproval, WorkAttempt, WorkClaim,
-    WorkDecision, WorkDecisionAction, WorkItem, WorkProgress, WorkResult, WorkState,
+    lease_duration, AssignmentStatus, AttemptState, BlockProvenance, WorkApproval, WorkAttempt,
+    WorkClaim, WorkDecision, WorkDecisionAction, WorkItem, WorkProgress, WorkResult, WorkState,
     WorkloadReconciliationReport, WORKLOAD_SCHEMA_VERSION,
 };
 use super::{assemble_continuation_context, ContinuationContext, ContinuationInputSnapshot};
@@ -914,6 +915,46 @@ impl OrchStore {
     fn save_work_item_unlocked(&self, item: &WorkItem) -> anyhow::Result<()> {
         item.validate()
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        // Every durable writer must enforce the lane-local dependency graph,
+        // not only the public create endpoint. Manager adoption, supervisor
+        // reconciliation, and host recovery all converge here. Exclude the
+        // current record when updating it so validation sees one candidate.
+        let existing = self.load_work_item_unlocked(&item.work_id)?;
+        let is_new = existing.is_none();
+        let previous_dependencies = existing.map(|record| record.dependencies);
+        // Dependency-free creates used to skip the graph ceiling. New items
+        // count against it; an update of an item already at the ceiling must
+        // still land.
+        if is_new {
+            let lane = self.scoped_work_items_unlocked(super::graph::GraphScope::of(item))?;
+            if lane.len() >= super::graph::MAX_GRAPH_SCOPE_ITEMS {
+                return Err(anyhow::Error::new(OrchError::new(
+                    OrchErrorCode::CapacityExhausted,
+                    format!(
+                        "scope holds more than {} work items; a new item is refused rather than unbounded",
+                        super::graph::MAX_GRAPH_SCOPE_ITEMS
+                    ),
+                )));
+            }
+        }
+        if !item.dependencies.is_empty()
+            && previous_dependencies.as_ref() != Some(&item.dependencies)
+        {
+            let scope = super::graph::GraphScope::of(item);
+            let mut lane = self.scoped_work_items_unlocked(super::graph::GraphScope::of(item))?;
+            lane.retain(|existing| existing.work_id != item.work_id && scope.contains(existing));
+            super::graph::validate_scoped_dependency_graph(&lane, item, scope)
+                .map_err(anyhow::Error::new)?;
+        }
+        let path = self
+            .work_item_path(&item.work_id)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        atomic_write_json(&self.lease(), &path, item)
+    }
+
+    fn save_work_item_unchecked_unlocked(&self, item: &WorkItem) -> anyhow::Result<()> {
+        item.validate()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         let path = self
             .work_item_path(&item.work_id)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
@@ -961,11 +1002,10 @@ impl OrchStore {
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?;
             out.push(item);
         }
-        out.sort_by(|a, b| {
-            b.priority
-                .cmp(&a.priority)
-                .then_with(|| a.created_at.cmp(&b.created_at))
-        });
+        // Total order, not the previous partial one: two items created inside
+        // the same clock tick used to fall back to `read_dir` order, which is
+        // not reproducible across hosts or across restarts on one host.
+        super::graph::order_work(&mut out);
         Ok(out)
     }
 
@@ -1000,6 +1040,14 @@ impl OrchStore {
         self.save_work_item_unlocked(item)
     }
 
+    /// Import a pre-existing record for migration/fixture setup without
+    /// re-validating edges against the rest of the ledger. Runtime mutation
+    /// paths must use [`Self::save_work_item`].
+    pub fn save_work_item_unchecked(&self, item: &WorkItem) -> anyhow::Result<()> {
+        let _guard = self.inner.lock.lock();
+        self.save_work_item_unchecked_unlocked(item)
+    }
+
     pub fn load_work_item(&self, work_id: &str) -> anyhow::Result<Option<WorkItem>> {
         let _guard = self.inner.lock.lock();
         self.load_work_item_unlocked(work_id)
@@ -1008,6 +1056,76 @@ impl OrchStore {
     pub fn list_work_items(&self) -> anyhow::Result<Vec<WorkItem>> {
         let _guard = self.inner.lock.lock();
         self.list_work_items_unlocked()
+    }
+
+    /// The stored work of one lane, in the ledger's total order.
+    ///
+    /// This is what a writer validates a dependency graph against: it must see
+    /// its own lane and nothing else, so a dependency declaration cannot be
+    /// used to probe for work in another session or workspace.
+    fn scoped_work_items_unlocked(
+        &self,
+        scope: super::graph::GraphScope<'_>,
+    ) -> anyhow::Result<Vec<WorkItem>> {
+        let mut items = Vec::new();
+        let dir = self.inner.root.join("work-items");
+        if !dir.is_dir() {
+            return Ok(items);
+        }
+        for entry in fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let item: WorkItem = serde_json::from_str(&fs::read_to_string(path)?)?;
+            item.validate()
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            if scope.contains(&item) {
+                items.push(item);
+                if items.len() > super::graph::MAX_GRAPH_SCOPE_ITEMS {
+                    return Err(anyhow::Error::new(OrchError::new(
+                        OrchErrorCode::CapacityExhausted,
+                        format!(
+                            "lane contains more than {} work items; bounded read refused",
+                            super::graph::MAX_GRAPH_SCOPE_ITEMS
+                        ),
+                    )));
+                }
+            }
+        }
+        super::graph::order_work(&mut items);
+        Ok(items)
+    }
+
+    pub fn scoped_work_items(
+        &self,
+        session_id: Uuid,
+        workspace: &str,
+    ) -> anyhow::Result<Vec<WorkItem>> {
+        let _guard = self.inner.lock.lock();
+        self.scoped_work_items_unlocked(super::graph::GraphScope {
+            session_id,
+            workspace,
+        })
+    }
+
+    /// The lane-scoped, redacted operator view of the durable work graph.
+    ///
+    /// Every node carries the lane's own coordinates and typed enumerations
+    /// only; see [`super::graph::WorkGraphNode`] for what is withheld and why.
+    pub fn work_graph_scoped(
+        &self,
+        session_id: Uuid,
+        workspace: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> anyhow::Result<Vec<super::graph::WorkGraphNode>> {
+        let _guard = self.inner.lock.lock();
+        let scope = super::graph::GraphScope {
+            session_id,
+            workspace,
+        };
+        let items = self.scoped_work_items_unlocked(scope)?;
+        Ok(super::graph::project_scoped_graph(&items, scope, now))
     }
 
     pub fn list_work_attempts(&self, work_id: Option<&str>) -> anyhow::Result<Vec<WorkAttempt>> {
@@ -1995,31 +2113,94 @@ impl OrchStore {
         self.refresh_work_item_at_unlocked(item, Utc::now())
     }
 
+    /// Resolve one item's declared dependencies inside its own lane.
+    ///
+    /// The previous implementation looked each dependency up by id across the
+    /// whole ledger, so an item in one session could name work in another and
+    /// then read that work's progress out of its own `Blocked`/`Queued`
+    /// transitions. Resolution is scoped now, and an id outside the lane is
+    /// reported exactly as one that does not exist.
+    fn resolve_dependencies_unlocked(
+        &self,
+        item: &WorkItem,
+    ) -> anyhow::Result<super::graph::DependencyStates> {
+        if item.dependencies.is_empty() {
+            return Ok(super::graph::DependencyStates::new());
+        }
+        let scope = super::graph::GraphScope::of(item);
+        let mut states = super::graph::DependencyStates::new();
+        for dependency in &item.dependencies {
+            // Same per-id read the unscoped version did, plus the scope
+            // predicate -- so this costs what it always cost, and an
+            // unreadable record resolves to `None` rather than to a guess.
+            let resolved = self
+                .load_work_item_unlocked(&dependency.work_id)
+                .ok()
+                .flatten()
+                .filter(|candidate| scope.contains(candidate))
+                .map(|candidate| candidate.state);
+            states.insert(dependency.work_id.clone(), resolved);
+        }
+        Ok(states)
+    }
+
     fn refresh_work_item_at_unlocked(
         &self,
         item: &mut WorkItem,
         now: chrono::DateTime<Utc>,
     ) -> anyhow::Result<()> {
-        if item.state.is_terminal() || item.is_container {
+        if item.state.is_terminal() {
             return Ok(());
         }
-        let dependencies_ready = item.dependencies.iter().all(|dependency| {
-            self.load_work_item_unlocked(&dependency.work_id)
-                .ok()
-                .flatten()
-                .is_some_and(|dependency_item| dependency_item.state == dependency.required_state)
-        });
-        if !dependencies_ready && matches!(item.state, WorkState::Queued) {
+        let states = self.resolve_dependencies_unlocked(item)?;
+        let admission = super::graph::evaluate_admission(item, &states, now);
+        // Admission is consulted before the container skip: a manual hold on a
+        // container remains ManuallyBlocked, and the re-queue branch below
+        // must not treat Container as "not waiting". The previous ordering
+        // returned Container first, so a held container looked ready to lift.
+        // The deadline below is not suspended by an operator hold: it is a
+        // hard bound. Containers themselves are still not executed.
+        let manually_held = admission == super::graph::AdmissionBlock::ManuallyBlocked;
+        let waiting = !manually_held
+            && matches!(
+                admission,
+                super::graph::AdmissionBlock::DependenciesPending
+                    | super::graph::AdmissionBlock::DependencyUnsatisfiable
+                    | super::graph::AdmissionBlock::DependencyUnresolved
+            );
+        if waiting && matches!(item.state, WorkState::Queued) {
             item.state = WorkState::Blocked;
+            item.block_provenance = Some(BlockProvenance::Derived);
+            item.blocked_reason = Some(admission.as_str().to_string());
             item.bump();
             self.save_work_item_unlocked(item)?;
-        } else if dependencies_ready && matches!(item.state, WorkState::Blocked) {
+        } else if !waiting && !manually_held && matches!(item.state, WorkState::Blocked) {
             item.state = WorkState::Queued;
+            item.block_provenance = None;
+            item.blocked_reason = None;
             item.bump();
             self.save_work_item_unlocked(item)?;
+        } else if waiting && matches!(item.state, WorkState::Blocked) {
+            // The hold stands but its cause may have changed -- a dependency
+            // that was pending can become unsatisfiable. The same write stamps
+            // a proven pre-upgrade derived wait with typed provenance so the
+            // next tick does not have to recognize the legacy shape again.
+            let reason = Some(admission.as_str().to_string());
+            if item.blocked_reason != reason
+                || item.block_provenance != Some(BlockProvenance::Derived)
+            {
+                item.block_provenance = Some(BlockProvenance::Derived);
+                item.blocked_reason = reason;
+                item.bump();
+                self.save_work_item_unlocked(item)?;
+            }
+        }
+        if item.is_container || admission == super::graph::AdmissionBlock::Container {
+            return Ok(());
         }
         if item.deadline.is_some_and(|deadline| deadline <= now) && !item.state.is_terminal() {
             item.state = WorkState::Failed;
+            item.block_provenance = None;
             item.result = Some(Self::work_failure_result(
                 "work item deadline exceeded",
                 now,
@@ -2394,7 +2575,66 @@ impl OrchStore {
                     ));
                 }
                 item.state = WorkState::Blocked;
+                // Typed provenance, so reconciliation can tell an operator
+                // hold from its own dependency wait without parsing the
+                // free-text reason.
+                item.block_provenance = Some(BlockProvenance::Manual);
                 item.blocked_reason = Some(reason.to_string());
+                Ok(())
+            },
+        )
+    }
+
+    /// Release a block an operator placed, or an ambiguous legacy block whose
+    /// provenance was never recorded.
+    ///
+    /// `WorkDecisionAction::Unblock` has been part of the decision vocabulary
+    /// since the workload ledger landed but had no transition behind it, so a
+    /// manual block was releasable only by the reconciliation bug this seam
+    /// closes. Without this, making a manual hold durable would strand the
+    /// work it holds.
+    ///
+    /// A derived block is deliberately not releasable here: it is
+    /// reconciliation's own encoding of an unmet dependency, and clearing it
+    /// by hand would be re-derived on the next tick. The proven pre-upgrade
+    /// derived-wait shape is the same hold, just unstamped.
+    pub fn unblock_work(
+        &self,
+        work_id: &str,
+        actor_id: &str,
+        reason: &str,
+        expected_revision: Option<u64>,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<(WorkItem, WorkDecision), OrchError> {
+        self.mutate_assignment(
+            AssignmentMutation {
+                work_id,
+                action: WorkDecisionAction::Unblock,
+                actor_id,
+                actor_agent_id: None,
+                assigned_agent_id: None,
+                reason,
+                expected_revision,
+                now,
+            },
+            |item| {
+                if item.state != WorkState::Blocked {
+                    return Err(OrchError::new(
+                        OrchErrorCode::Conflict,
+                        "work item is not blocked",
+                    ));
+                }
+                if item.block_provenance == Some(BlockProvenance::Derived)
+                    || super::graph::is_legacy_derived_wait(item)
+                {
+                    return Err(OrchError::new(
+                        OrchErrorCode::Conflict,
+                        "a dependency block is released by reconciliation, not by an operator",
+                    ));
+                }
+                item.state = WorkState::Queued;
+                item.block_provenance = None;
+                item.blocked_reason = None;
                 Ok(())
             },
         )
@@ -2483,6 +2723,9 @@ impl OrchStore {
         item.last_decision_id = Some(decision.decision_id.clone());
         item.bump_at(request.now);
         item.validate()?;
+        // Two atomic files, not one sealed pair. A crash after the decision
+        // write and before the item write leaves a receipt whose item did not
+        // change. Issue #521 tracks the missing intent-recovery path.
         self.save_work_decision_unlocked(&decision)?;
         self.save_work_item_unlocked(&item)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
@@ -2681,6 +2924,75 @@ impl OrchStore {
         Ok(out)
     }
 
+    /// Durable work and attempts visible to a public scoped worker projection.
+    /// Identity membership is fenced separately; this only bounds load counts
+    /// to the requested lane and workspace.
+    fn scoped_work_and_attempts_unlocked(
+        &self,
+        session_id: Uuid,
+        workspace: &str,
+    ) -> Result<(Vec<WorkItem>, Vec<WorkAttempt>), OrchError> {
+        let scope = super::graph::GraphScope {
+            session_id,
+            workspace,
+        };
+        let items = self
+            .list_work_items_unlocked()
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .into_iter()
+            .filter(|item| scope.contains(item))
+            .collect::<Vec<_>>();
+        let scoped_ids = items
+            .iter()
+            .map(|item| item.work_id.clone())
+            .collect::<HashSet<_>>();
+        let attempts = self
+            .list_work_attempts_unlocked(None)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .into_iter()
+            .filter(|attempt| scoped_ids.contains(&attempt.work_id))
+            .collect();
+        Ok((items, attempts))
+    }
+
+    /// List only active workers attributable to the requested lane and
+    /// workspace. This is the scoped read primitive used by public MCP
+    /// observatory calls; the legacy workspace-only helper remains available
+    /// to internal callers that already hold an equivalent scope.
+    pub fn list_workers_scoped(
+        &self,
+        session_id: Uuid,
+        workspace: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<Vec<WorkerProjection>, OrchError> {
+        let _guard = self.inner.lock.lock();
+        let agents = self
+            .list_agents_unlocked()
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let (items, attempts) = self.scoped_work_and_attempts_unlocked(session_id, workspace)?;
+        let mut out = Vec::new();
+        for agent in agents {
+            if !agent.state.is_active_identity()
+                || !agent.known_lane_ids().contains(&session_id)
+                || !workspaces_match(&agent.workspace, workspace)
+            {
+                continue;
+            }
+            let presence = self.load_worker_presence_unlocked(&agent.agent_id)?;
+            out.push(WorkerProjection::project(
+                &agent,
+                agent.spec.as_ref(),
+                presence.as_ref(),
+                &items,
+                &attempts,
+                now,
+                None,
+            ));
+        }
+        out.sort_by(|left, right| left.agent_id.cmp(&right.agent_id));
+        Ok(out)
+    }
+
     pub fn get_worker(
         &self,
         agent_id: &str,
@@ -2699,6 +3011,42 @@ impl OrchStore {
         let attempts = self
             .list_work_attempts_unlocked(None)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let presence = self.load_worker_presence_unlocked(agent_id)?;
+        Ok(Some(WorkerProjection::project(
+            &agent,
+            agent.spec.as_ref(),
+            presence.as_ref(),
+            &items,
+            &attempts,
+            now,
+            None,
+        )))
+    }
+
+    /// Scoped detail read for public observatories. Out-of-scope, inactive,
+    /// and unknown identities intentionally collapse to `None` so the service
+    /// can expose one indistinguishable public error.
+    pub fn get_worker_scoped(
+        &self,
+        agent_id: &str,
+        session_id: Uuid,
+        workspace: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<Option<WorkerProjection>, OrchError> {
+        let _guard = self.inner.lock.lock();
+        let Some(agent) = self
+            .load_agent_unlocked(agent_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+        else {
+            return Ok(None);
+        };
+        if !agent.state.is_active_identity()
+            || !agent.known_lane_ids().contains(&session_id)
+            || !workspaces_match(&agent.workspace, workspace)
+        {
+            return Ok(None);
+        }
+        let (items, attempts) = self.scoped_work_and_attempts_unlocked(session_id, workspace)?;
         let presence = self.load_worker_presence_unlocked(agent_id)?;
         Ok(Some(WorkerProjection::project(
             &agent,
@@ -3967,13 +4315,17 @@ impl OrchStore {
         self.refresh_work_item_unlocked(&mut item)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         let now = Utc::now();
-        if let Some(active) = self
+        // The holder's identity is deliberately not echoed: a claim conflict is
+        // answered with the fact of the conflict, not with an attribution of
+        // the worker that won it.
+        if self
             .active_attempt_unlocked(work_id, now)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .is_some()
         {
             return Err(OrchError::new(
                 OrchErrorCode::Conflict,
-                format!("work item already leased by {}", active.claimant_id),
+                "work item is already leased by an active attempt",
             ));
         }
         for mut attempt in self
@@ -3991,14 +4343,25 @@ impl OrchStore {
                 format!("work item is not claimable in state {:?}", item.state),
             ));
         }
-        item.assignment_status
-            .is_claimable_by(item.assigned_agent_id.as_deref(), claimant_id)?;
-        if item.attempt_count >= item.policy.retry.max_attempts {
+        // The one admission evaluator, not a second opinion. `Queued` alone is
+        // not admission: reconciliation may not have run since a dependency
+        // was declared, and an unresolvable or cyclic edge leaves an item
+        // sitting in `Queued` that must never be handed to a worker.
+        let admission = super::graph::evaluate_admission(
+            &item,
+            &self
+                .resolve_dependencies_unlocked(&item)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+            now,
+        );
+        if !admission.is_admissible() {
             return Err(OrchError::new(
                 OrchErrorCode::Conflict,
-                "work item retry budget is exhausted",
+                format!("work item is not admissible: {}", admission.as_str()),
             ));
         }
+        item.assignment_status
+            .is_claimable_by(item.assigned_agent_id.as_deref(), claimant_id)?;
         let (mut attempt, lease_token) = match lease_secret {
             Some(secret) => {
                 let attempt = WorkAttempt::new_with_lease_secret(

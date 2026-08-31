@@ -33,10 +33,10 @@ use uuid::Uuid;
 use crate::host::AgentHostHandle;
 use crate::orchestration::{
     AuthContext, ChangeRecord, ManagerStepSpec, MessageKind, MissedRunPolicy, OrchError,
-    OrchErrorCode, OrchestrationConfig, OrchestrationService, RoutineConcurrencyPolicy,
-    RoutineLifecycle, RoutineRetryPolicy, RoutineTrigger, RunExecutionMode, WorkArtifactRef,
-    WorkDependency, WorkPolicy, WorkResult, WorkTemplate, WorkerHostKind, WorkspaceAllowlist,
-    CONTROL_TOOLS, FORBIDDEN_TOOLS,
+    OrchErrorCode, OrchestrationConfig, OrchestrationService, PublicEventKindV1, PublicEventV1,
+    RoutineConcurrencyPolicy, RoutineLifecycle, RoutineRetryPolicy, RoutineTrigger,
+    RunExecutionMode, WorkArtifactRef, WorkDependency, WorkPolicy, WorkResult, WorkTemplate,
+    WorkerHostKind, WorkspaceAllowlist, CONTROL_TOOLS, FORBIDDEN_TOOLS,
 };
 use crate::{EventReceiver, JournalPage, SessionUpdate};
 
@@ -136,10 +136,24 @@ struct LiveStreamState {
     start_seq: u64,
     end_seq: Option<u64>,
     receiver: EventReceiver,
+    /// Highest event queued for this stream. This is only a local duplicate
+    /// filter; it is not necessarily a safe durable-replay cursor because the
+    /// dual-lane receiver can reveal an earlier gap after a critical terminal
+    /// event has already been queued.
     last_seq: u64,
+    /// Highest sequence known to precede any observed subscriber gap.
+    /// Recovery instructions must use this cursor, never `last_seq`.
+    last_safe_seq: u64,
     replay_cursor: Option<u64>,
     pending: VecDeque<Bytes>,
     heartbeat: tokio::time::Interval,
+    /// A terminal event has been queued but must remain open long enough to
+    /// surface a subscriber gap that was observed on the other event lane.
+    terminal_pending: bool,
+    /// Safe replay cursor captured before the queued terminal event. If the
+    /// other receiver lane reports a gap before close, replay must include the
+    /// terminal event rather than skipping an earlier missing event.
+    terminal_recovery_seq: Option<u64>,
     done: bool,
     shutdown: tokio_util::sync::CancellationToken,
     _permit: tokio::sync::OwnedSemaphorePermit,
@@ -154,13 +168,13 @@ impl LiveStreamState {
             self.queue_entry(entry.seq, entry.ts, entry.update);
         }
         if self.end_seq.is_some_and(|end_seq| self.last_seq >= end_seq) {
-            self.done = true;
+            self.terminal_pending = true;
             self.replay_cursor = None;
         }
     }
 
     fn queue_entry(&mut self, seq: u64, ts: String, update: SessionUpdate) {
-        if seq <= self.last_seq || seq < self.start_seq {
+        if self.done || self.terminal_pending || seq <= self.last_seq || seq < self.start_seq {
             return;
         }
         if let Some(end_seq) = self.end_seq {
@@ -169,30 +183,33 @@ impl LiveStreamState {
                 return;
             }
         }
-        let terminal = matches!(&update, SessionUpdate::TurnComplete { .. });
+        let event = PublicEventV1::from_update(seq, ts, &update);
+        let terminal = event.kind == PublicEventKindV1::TurnComplete;
+        let safe_before_entry = self.last_safe_seq;
+        if !self.receiver_gap_pending() {
+            self.last_safe_seq = seq;
+        }
         self.last_seq = seq;
         self.pending.push_back(sse_message(
             Some(seq),
             json!({
                 "jsonrpc": "2.0",
                 "method": "notifications/ptah_event",
-                "params": {
-                    "sessionId": self.session_id,
-                    "workspace": self.workspace,
-                    "runId": self.run_id,
-                    "seq": seq,
-                    "ts": ts,
-                    "update": update,
-                }
+                "params": event,
             }),
         ));
         if terminal || self.end_seq == Some(seq) {
-            self.done = true;
+            self.terminal_pending = true;
+            self.terminal_recovery_seq = Some(safe_before_entry);
             self.replay_cursor = None;
         }
     }
 
     fn queue_recovery(&mut self, reason: &str) {
+        self.queue_recovery_after(reason, self.last_safe_seq);
+    }
+
+    fn queue_recovery_after(&mut self, reason: &str, after_seq: u64) {
         self.pending.push_back(sse_message(
             None,
             json!({
@@ -202,20 +219,52 @@ impl LiveStreamState {
                     "sessionId": self.session_id,
                     "workspace": self.workspace,
                     "runId": self.run_id,
-                    "afterSeq": self.last_seq,
+                    "afterSeq": after_seq,
                     "reason": reason,
                     "pollTool": "ptah_get_events",
                 }
             }),
         ));
+        self.terminal_pending = false;
         self.done = true;
         self.replay_cursor = None;
+    }
+
+    /// Detect a lag notice before closing after the terminal frame. Normal
+    /// events remain buffered in the receiver; only a gap changes the close
+    /// decision and queues an explicit durable-replay instruction.
+    fn receiver_gap_pending(&mut self) -> bool {
+        self.receiver.gap_pending()
+    }
+
+    fn finalize_terminal_if_ready(&mut self) -> bool {
+        if !self.terminal_pending || !self.pending.is_empty() {
+            return false;
+        }
+        let recovery_after_seq = self
+            .terminal_recovery_seq
+            .take()
+            .unwrap_or(self.last_safe_seq);
+        self.terminal_pending = false;
+        if self.receiver_gap_pending() {
+            self.queue_recovery_after(
+                "live event subscriber lagged before terminal delivery; resynchronize from the durable journal",
+                recovery_after_seq,
+            );
+        } else {
+            self.done = true;
+        }
+        true
     }
 
     async fn next_frame(&mut self) -> Option<Bytes> {
         loop {
             if let Some(frame) = self.pending.pop_front() {
+                self.finalize_terminal_if_ready();
                 return Some(frame);
+            }
+            if self.finalize_terminal_if_ready() {
+                continue;
             }
             if self.done {
                 return None;
@@ -247,7 +296,13 @@ impl LiveStreamState {
             tokio::select! {
                 event = self.receiver.recv_with_seq() => {
                     let Some((seq, update)) = event else {
-                        self.done = true;
+                        // A closed event receiver is an abnormal transport
+                        // condition for a still-running scoped stream. Do not
+                        // silently turn it into EOF: the client must be told
+                        // to reconcile from the durable journal.
+                        self.queue_recovery(
+                            "live event receiver closed; resynchronize from the durable journal",
+                        );
                         continue;
                     };
                     if seq == 0 {
@@ -1076,9 +1131,12 @@ async fn streamable_get_handler(
         end_seq: scope.end_seq,
         receiver,
         last_seq,
+        last_safe_seq: last_seq,
         replay_cursor: None,
         pending: VecDeque::new(),
         heartbeat: tokio::time::interval(Duration::from_secs(10)),
+        terminal_pending: false,
+        terminal_recovery_seq: None,
         done: false,
         shutdown: state.shutdown.clone(),
         _permit: permit,
@@ -2319,6 +2377,15 @@ fn tool_input_schema(name: &str) -> Value {
                 "workspace": workspace
             }
         }),
+        "ptah_get_work_graph" => json!({
+            "type": "object",
+            "required": ["session_id", "workspace"],
+            "additionalProperties": false,
+            "properties": {
+                "session_id": session,
+                "workspace": workspace
+            }
+        }),
         "ptah_get_work" => json!({
             "type": "object",
             "required": ["session_id", "workspace", "work_id"],
@@ -2663,7 +2730,7 @@ fn tool_input_schema(name: &str) -> Value {
                 "expected_revision": {"type": "integer", "minimum": 1}
             }
         }),
-        "ptah_block_work" | "ptah_request_review" => json!({
+        "ptah_block_work" | "ptah_unblock_work" | "ptah_request_review" => json!({
             "type": "object",
             "required": ["request_id", "session_id", "workspace", "work_id", "reason"],
             "additionalProperties": false,
@@ -3178,6 +3245,10 @@ async fn dispatch_tool(
             let args: WorkScopeArgs = parse_value(args)?;
             orch.list_work_scoped(auth, args.session_id, &args.workspace)
         }
+        "ptah_get_work_graph" => {
+            let args: WorkScopeArgs = parse_value(args)?;
+            orch.get_work_graph_scoped(auth, args.session_id, &args.workspace)
+        }
         "ptah_get_work" => {
             let args: WorkArgs = parse_value(args)?;
             require_nonempty(&args.work_id, "work_id")?;
@@ -3660,6 +3731,19 @@ async fn dispatch_tool(
             )
             .await
         }
+        "ptah_unblock_work" => {
+            let args: RetryWorkArgs = parse_value(args)?;
+            orch.unblock_work(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                &args.work_id,
+                args.reason,
+                args.expected_revision,
+            )
+            .await
+        }
         "ptah_request_review" => {
             let args: RetryWorkArgs = parse_value(args)?;
             orch.request_work_review(
@@ -4061,6 +4145,146 @@ mod tests {
                 "expected rejection: {raw}"
             );
         }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn terminal_frame_surfaces_pending_gap_before_stream_close() {
+        let _guard = home_override_serial();
+        let home = tempdir().unwrap();
+        set_grokptah_home_override(Some(home.path().join(".grokptah")));
+        let workspace = tempdir().unwrap();
+        let host = AgentHost::create(HostConfig {
+            always_approve: true,
+            event_bus_capacity: Some(2),
+            ..HostConfig::default()
+        })
+        .expect("acquire the GrokPtah instance lock");
+        host.start().unwrap();
+        let session = host.session_new_kind(crate::SessionKind::Build).unwrap();
+        host.session_set_cwd(session.id, workspace.path()).unwrap();
+        let bus = Arc::new(crate::event_bus::EventBus::new(2));
+        let receiver = bus.subscribe();
+        let orch = computer_orch(&host, home.path(), vec![workspace.path().to_path_buf()]);
+        let permit = Arc::new(Semaphore::new(1))
+            .try_acquire_owned()
+            .expect("test stream permit");
+        let mut live = LiveStreamState {
+            orch,
+            auth: AuthContext {
+                token_id: "test-token".into(),
+                owner_id: "test-owner".into(),
+            },
+            session_id: session.id,
+            workspace: workspace.path().to_path_buf(),
+            run_id: "continuity-terminal-gap".into(),
+            start_seq: 1,
+            end_seq: None,
+            receiver,
+            last_seq: 0,
+            last_safe_seq: 0,
+            replay_cursor: None,
+            pending: VecDeque::new(),
+            heartbeat: tokio::time::interval(Duration::from_secs(10)),
+            terminal_pending: false,
+            terminal_recovery_seq: None,
+            done: false,
+            shutdown: tokio_util::sync::CancellationToken::new(),
+            _permit: permit,
+        };
+
+        for index in 0..1024 {
+            bus.publish(SessionUpdate::AgentMessageChunk {
+                session_id: session.id,
+                text: format!("gap-{index}"),
+            });
+        }
+        let terminal_seq = bus.current_seq().saturating_add(1);
+        live.queue_entry(
+            terminal_seq,
+            chrono::Utc::now().to_rfc3339(),
+            SessionUpdate::TurnComplete {
+                session_id: session.id,
+                cancelled: false,
+            },
+        );
+
+        let terminal = live.next_frame().await.expect("terminal frame");
+        let terminal_text = String::from_utf8_lossy(&terminal);
+        assert!(terminal_text.contains("turn_complete"));
+        assert_eq!(
+            live.pending.len(),
+            1,
+            "the gap recovery frame must be queued"
+        );
+
+        let recovery = live.next_frame().await.expect("recovery frame");
+        let recovery_text = String::from_utf8_lossy(&recovery);
+        assert!(recovery_text.contains("notifications/ptah_recovery"));
+        assert!(
+            recovery_text.contains("\"afterSeq\":0"),
+            "recovery must replay from the last safe cursor before the terminal event: {recovery_text}"
+        );
+        assert!(live.done);
+        assert!(live.next_frame().await.is_none());
+        set_grokptah_home_override(None);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn closed_receiver_emits_recovery_before_stream_close() {
+        let _guard = home_override_serial();
+        let home = tempdir().unwrap();
+        set_grokptah_home_override(Some(home.path().join(".grokptah")));
+        let workspace = tempdir().unwrap();
+        let host = AgentHost::create(HostConfig {
+            always_approve: true,
+            ..HostConfig::default()
+        })
+        .expect("acquire the GrokPtah instance lock");
+        host.start().unwrap();
+        let session = host.session_new_kind(crate::SessionKind::Build).unwrap();
+        host.session_set_cwd(session.id, workspace.path()).unwrap();
+        let bus = Arc::new(crate::event_bus::EventBus::new(2));
+        let receiver = bus.subscribe();
+        drop(bus);
+        let orch = computer_orch(&host, home.path(), vec![workspace.path().to_path_buf()]);
+        let permit = Arc::new(Semaphore::new(1))
+            .try_acquire_owned()
+            .expect("test stream permit");
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
+        heartbeat.reset_after(Duration::from_secs(10));
+        let mut live = LiveStreamState {
+            orch,
+            auth: AuthContext {
+                token_id: "test-token".into(),
+                owner_id: "test-owner".into(),
+            },
+            session_id: session.id,
+            workspace: workspace.path().to_path_buf(),
+            run_id: "continuity-closed-receiver".into(),
+            start_seq: 1,
+            end_seq: None,
+            receiver,
+            last_seq: 0,
+            last_safe_seq: 0,
+            replay_cursor: None,
+            pending: VecDeque::new(),
+            heartbeat,
+            terminal_pending: false,
+            terminal_recovery_seq: None,
+            done: false,
+            shutdown: tokio_util::sync::CancellationToken::new(),
+            _permit: permit,
+        };
+
+        let recovery = live.next_frame().await.expect("recovery frame");
+        let recovery_text = String::from_utf8_lossy(&recovery);
+        assert!(recovery_text.contains("notifications/ptah_recovery"));
+        assert!(recovery_text.contains("live event receiver closed"));
+        assert!(live.done);
+        assert!(live.next_frame().await.is_none());
+        set_grokptah_home_override(None);
     }
 
     #[test]

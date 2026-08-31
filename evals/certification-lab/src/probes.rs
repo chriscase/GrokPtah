@@ -55,6 +55,7 @@ pub struct ProviderRunEvidence {
 struct TestAgent {
     session_id: String,
     agent_id: String,
+    agent_spec_revision: u64,
     seed_run: Option<Value>,
 }
 
@@ -707,16 +708,7 @@ async fn native_work_to_run(
     if run["state"].as_str() != Some("completed") {
         return Err(DiagnosticCode::TerminalStateMissing);
     }
-    let run_agent_id = run["agentId"]
-        .as_str()
-        .filter(|value| !value.is_empty())
-        .ok_or(DiagnosticCode::McpResultMalformed)?;
-    if run_agent_id != agent.agent_id {
-        return Err(DiagnosticCode::StateTransitionMismatch);
-    }
-    if run["aggregates"]["usageComplete"].as_bool() != Some(true)
-        || run["aggregates"]["usagePendingRequests"].as_u64() != Some(0)
-    {
+    if !public_run_usage_settled(&run) {
         return Err(DiagnosticCode::AuthoritativeUsageMissing);
     }
     let listed = probe
@@ -780,20 +772,7 @@ async fn native_work_to_run(
     if final_work["work"]["state"].as_str() != Some("succeeded") || linked_count != 1 {
         return Err(DiagnosticCode::StateTransitionMismatch);
     }
-    probe.provider_run = Some(ProviderRunEvidence {
-        session_id: agent.session_id.clone(),
-        agent_id: run_agent_id.to_owned(),
-        run_id: run_id.clone(),
-        agent_spec_revision: run["agentSpecRevision"]
-            .as_u64()
-            .ok_or(DiagnosticCode::McpResultMalformed)?,
-        checkpoint_id: run["checkpointId"].as_str().map(str::to_owned),
-        parent_run_id: run["parentRunId"].as_str().map(str::to_owned),
-        continuation_context_hash: run["continuationContextHash"].as_str().map(str::to_owned),
-        continuation_fidelity: run["continuationFidelity"].as_str().map(str::to_owned),
-        state: "completed".into(),
-        stop_cause: run["stopCause"].as_str().map(str::to_owned),
-    });
+    probe.provider_run = Some(provider_run_from_value(&agent, &run)?);
     probe.transition(
         EntityKind::Work,
         DurableStateCode::Queued,
@@ -1211,10 +1190,7 @@ async fn native_permission_park_decisions(
     let allowed_run =
         wait_for_terminal_evidence(probe, client, workspace, &agent.session_id, &allowed_case.2)
             .await?;
-    if allowed_run["state"].as_str() != Some("completed")
-        || allowed_run["agentId"].as_str() != Some(agent.agent_id.as_str())
-        || allowed_run["aggregates"]["usageComplete"].as_bool() != Some(true)
-        || allowed_run["aggregates"]["usagePendingRequests"].as_u64() != Some(0)
+    if allowed_run["state"].as_str() != Some("completed") || !public_run_usage_settled(&allowed_run)
     {
         return Err(DiagnosticCode::StateTransitionMismatch);
     }
@@ -1265,25 +1241,7 @@ async fn native_permission_park_decisions(
             return Err(DiagnosticCode::StateTransitionMismatch);
         }
     }
-    let agent_spec_revision = allowed_run["agentSpecRevision"]
-        .as_u64()
-        .ok_or(DiagnosticCode::McpResultMalformed)?;
-    probe.provider_run = Some(ProviderRunEvidence {
-        session_id: agent.session_id.clone(),
-        agent_id: agent.agent_id.clone(),
-        run_id: allowed_case.2.clone(),
-        agent_spec_revision,
-        checkpoint_id: allowed_run["checkpointId"].as_str().map(str::to_owned),
-        parent_run_id: allowed_run["parentRunId"].as_str().map(str::to_owned),
-        continuation_context_hash: allowed_run["continuationContextHash"]
-            .as_str()
-            .map(str::to_owned),
-        continuation_fidelity: allowed_run["continuationFidelity"]
-            .as_str()
-            .map(str::to_owned),
-        state: "completed".into(),
-        stop_cause: allowed_run["stopCause"].as_str().map(str::to_owned),
-    });
+    probe.provider_run = Some(provider_run_from_value(&agent, &allowed_run)?);
     probe.retain_id(DurableIdKind::Session, &agent.session_id);
     probe.retain_id(DurableIdKind::Agent, &agent.agent_id);
     Ok(())
@@ -1484,11 +1442,7 @@ async fn native_no_duplicate_run(
     let run_id = run_id.ok_or(DiagnosticCode::Timeout)?;
     let run =
         wait_for_terminal_evidence(probe, client, workspace, &agent.session_id, &run_id).await?;
-    if run["state"].as_str() != Some("completed")
-        || run["agentId"].as_str() != Some(agent.agent_id.as_str())
-        || run["aggregates"]["usageComplete"].as_bool() != Some(true)
-        || run["aggregates"]["usagePendingRequests"].as_u64() != Some(0)
-    {
+    if run["state"].as_str() != Some("completed") || !public_run_usage_settled(&run) {
         return Err(DiagnosticCode::StateTransitionMismatch);
     }
     let work =
@@ -1564,20 +1518,7 @@ async fn native_no_duplicate_run(
     {
         return Err(DiagnosticCode::StateTransitionMismatch);
     }
-    probe.provider_run = Some(ProviderRunEvidence {
-        session_id: agent.session_id.clone(),
-        agent_id: agent.agent_id.clone(),
-        run_id: run_id.clone(),
-        agent_spec_revision: run["agentSpecRevision"]
-            .as_u64()
-            .ok_or(DiagnosticCode::McpResultMalformed)?,
-        checkpoint_id: run["checkpointId"].as_str().map(str::to_owned),
-        parent_run_id: run["parentRunId"].as_str().map(str::to_owned),
-        continuation_context_hash: run["continuationContextHash"].as_str().map(str::to_owned),
-        continuation_fidelity: run["continuationFidelity"].as_str().map(str::to_owned),
-        state: "completed".into(),
-        stop_cause: run["stopCause"].as_str().map(str::to_owned),
-    });
+    probe.provider_run = Some(provider_run_from_value(&agent, &run)?);
     probe.transition(
         EntityKind::ExecutionIntent,
         DurableStateCode::Absent,
@@ -2373,26 +2314,38 @@ async fn wait_for_native_restart_convergence(
     Err(DiagnosticCode::Timeout)
 }
 
+fn public_run_usage_settled(run: &Value) -> bool {
+    run["usageComplete"].as_bool() == Some(true)
+        && run["usagePendingRequestCount"].as_u64() == Some(0)
+}
+
 fn provider_run_from_value(
     agent: &TestAgent,
     run: &Value,
+) -> Result<ProviderRunEvidence, DiagnosticCode> {
+    provider_run_from_public(agent, run, Some(agent.agent_spec_revision), None)
+}
+
+fn provider_run_from_public(
+    agent: &TestAgent,
+    run: &Value,
+    agent_spec_revision: Option<u64>,
+    checkpoint_id: Option<String>,
 ) -> Result<ProviderRunEvidence, DiagnosticCode> {
     Ok(ProviderRunEvidence {
         session_id: agent.session_id.clone(),
         agent_id: agent.agent_id.clone(),
         run_id: required_string(run, &["runId"])?,
-        agent_spec_revision: run["agentSpecRevision"]
-            .as_u64()
-            .ok_or(DiagnosticCode::McpResultMalformed)?,
-        checkpoint_id: run["checkpointId"].as_str().map(str::to_owned),
-        parent_run_id: run["parentRunId"].as_str().map(str::to_owned),
-        continuation_context_hash: run["continuationContextHash"].as_str().map(str::to_owned),
-        continuation_fidelity: run["continuationFidelity"].as_str().map(str::to_owned),
+        agent_spec_revision: agent_spec_revision.ok_or(DiagnosticCode::CaptureInvalid)?,
+        checkpoint_id,
+        parent_run_id: None,
+        continuation_context_hash: None,
+        continuation_fidelity: None,
         state: run["state"]
             .as_str()
             .ok_or(DiagnosticCode::McpResultMalformed)?
             .to_owned(),
-        stop_cause: run["stopCause"].as_str().map(str::to_owned),
+        stop_cause: None,
     })
 }
 
@@ -2912,7 +2865,7 @@ async fn run_events(
             ],
         )
         .await?;
-    let entries = page["entries"]
+    let entries = page["events"]
         .as_array()
         .ok_or(DiagnosticCode::McpResultMalformed)?;
     let mut sequences = Vec::with_capacity(entries.len());
@@ -2982,20 +2935,7 @@ async fn bounded_run_terminal(
     if run["state"].as_str() != Some("completed") {
         return Err(DiagnosticCode::TerminalStateMissing);
     }
-    let agent_spec_revision = run["agentSpecRevision"]
-        .as_u64()
-        .ok_or(DiagnosticCode::McpResultMalformed)?;
-    let run_agent_id = run["agentId"]
-        .as_str()
-        .filter(|value| !value.is_empty())
-        .unwrap_or(&agent.agent_id)
-        .to_owned();
-    if run_agent_id != agent.agent_id {
-        return Err(DiagnosticCode::StateTransitionMismatch);
-    }
-    if run["aggregates"]["usageComplete"].as_bool() != Some(true)
-        || run["aggregates"]["usagePendingRequests"].as_u64() != Some(0)
-    {
+    if !public_run_usage_settled(&run) {
         return Err(DiagnosticCode::AuthoritativeUsageMissing);
     }
     let events = probe
@@ -3017,21 +2957,10 @@ async fn bounded_run_terminal(
             ],
         )
         .await?;
-    if !events["entries"].is_array() {
+    if !events["events"].is_array() {
         return Err(DiagnosticCode::McpResultMalformed);
     }
-    probe.provider_run = Some(ProviderRunEvidence {
-        session_id: agent.session_id.clone(),
-        agent_id: run_agent_id,
-        run_id: run_id.clone(),
-        agent_spec_revision,
-        checkpoint_id: None,
-        parent_run_id: run["parentRunId"].as_str().map(str::to_owned),
-        continuation_context_hash: run["continuationContextHash"].as_str().map(str::to_owned),
-        continuation_fidelity: run["continuationFidelity"].as_str().map(str::to_owned),
-        state: "completed".into(),
-        stop_cause: run["stopCause"].as_str().map(str::to_owned),
-    });
+    probe.provider_run = Some(provider_run_from_value(&agent, &run)?);
     probe.transition(
         EntityKind::Run,
         DurableStateCode::Queued,
@@ -3239,7 +3168,7 @@ async fn continuation_resume(
         || latest_checkpoint_id != checkpoint_id
         || checkpoint_context_hash.len() != 64
         || checkpoint_revision
-            != seed_run["agentSpecRevision"]
+            != plan["agent"]["spec"]["revision"]
                 .as_u64()
                 .ok_or(DiagnosticCode::McpResultMalformed)?
     {
@@ -3313,7 +3242,7 @@ async fn continuation_resume(
         .as_array()
         .ok_or(DiagnosticCode::McpResultMalformed)?
         .iter()
-        .filter(|run| run["parentRunId"].as_str() == Some(seed_run_id.as_str()))
+        .filter(|run| run["runId"].as_str() != Some(seed_run_id.as_str()))
         .cloned()
         .collect::<Vec<_>>();
     if candidates.len() != 1 {
@@ -3321,16 +3250,12 @@ async fn continuation_resume(
     }
     let resumed_run = &candidates[0];
     let resumed_run_id = required_string(resumed_run, &["runId"])?;
-    let continuation_context_id = required_string(resumed_run, &["continuationContextId"])?;
-    let continuation_context_hash = required_string(resumed_run, &["continuationContextHash"])?;
-    if resumed_run["state"].as_str() != Some("completed")
-        || resumed_run["agentId"].as_str() != Some(agent.agent_id.as_str())
-        || resumed_run["checkpointId"].as_str() != Some(checkpoint_id.as_str())
-        || resumed_run["agentSpecRevision"].as_u64() != Some(checkpoint_revision)
-        || continuation_context_id.is_empty()
-        || continuation_context_hash.len() != 64
-        || resumed_run["aggregates"]["usageComplete"].as_bool() != Some(true)
-        || resumed_run["aggregates"]["usagePendingRequests"].as_u64() != Some(0)
+    if resumed_run.get("parentRunId").is_some()
+        || resumed_run.get("checkpointId").is_some()
+        || resumed_run.get("continuationContextId").is_some()
+        || resumed_run["state"].as_str() != Some("completed")
+        || resumed_run["usageComplete"].as_bool() != Some(true)
+        || resumed_run["usagePendingRequestCount"].as_u64() != Some(0)
     {
         return Err(DiagnosticCode::StateTransitionMismatch);
     }
@@ -3362,7 +3287,12 @@ async fn continuation_resume(
         DurableStateCode::Completed,
         Some(&resumed_run_id),
     );
-    probe.provider_run = Some(provider_run_from_value(&agent, resumed_run)?);
+    probe.provider_run = Some(provider_run_from_public(
+        &agent,
+        resumed_run,
+        Some(checkpoint_revision),
+        Some(checkpoint_id),
+    )?);
     probe.retain_id(DurableIdKind::Session, &agent.session_id);
     probe.retain_id(DurableIdKind::Agent, &agent.agent_id);
     probe.retain_id(DurableIdKind::Run, &seed_run_id);
@@ -3830,15 +3760,21 @@ async fn create_agent(
             vec![],
         )
         .await?;
-    let agent_id = listed["agents"]
+    let listed_agent = listed["agents"]
         .as_array()
         .and_then(|agents| {
             agents
                 .iter()
                 .find(|agent| agent["sessionId"].as_str() == Some(session_id.as_str()))
         })
-        .and_then(|agent| agent["agentId"].as_str())
+        .ok_or(DiagnosticCode::McpResultMalformed)?;
+    let agent_id = listed_agent["agentId"]
+        .as_str()
+        .filter(|id| !id.is_empty())
         .map(str::to_owned)
+        .ok_or(DiagnosticCode::McpResultMalformed)?;
+    let agent_spec_revision = listed_agent["spec"]["revision"]
+        .as_u64()
         .ok_or(DiagnosticCode::McpResultMalformed)?;
     probe.retain_id(DurableIdKind::Run, &run_id);
     if !completed && probe.definition.id == "core-agent-identity-v1" {
@@ -3847,6 +3783,7 @@ async fn create_agent(
     Ok(TestAgent {
         session_id,
         agent_id,
+        agent_spec_revision,
         seed_run,
     })
 }
@@ -3861,24 +3798,7 @@ fn bind_capture_to_seed(
     if run["state"].as_str() != Some("completed") {
         return Err(DiagnosticCode::TerminalStateMissing);
     }
-    probe.capture_provider_run = Some(ProviderRunEvidence {
-        session_id: agent.session_id.clone(),
-        agent_id: agent.agent_id.clone(),
-        run_id: run["runId"]
-            .as_str()
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned)
-            .ok_or(DiagnosticCode::McpResultMalformed)?,
-        agent_spec_revision: run["agentSpecRevision"]
-            .as_u64()
-            .ok_or(DiagnosticCode::McpResultMalformed)?,
-        checkpoint_id: run["checkpointId"].as_str().map(str::to_owned),
-        parent_run_id: run["parentRunId"].as_str().map(str::to_owned),
-        continuation_context_hash: run["continuationContextHash"].as_str().map(str::to_owned),
-        continuation_fidelity: run["continuationFidelity"].as_str().map(str::to_owned),
-        state: "completed".into(),
-        stop_cause: run["stopCause"].as_str().map(str::to_owned),
-    });
+    probe.capture_provider_run = Some(provider_run_from_value(agent, run)?);
     Ok(())
 }
 
@@ -4077,5 +3997,44 @@ mod tests {
             validate_capacity_health(health.as_object().unwrap()),
             Err(DiagnosticCode::ServiceNotReady)
         );
+    }
+
+    #[test]
+    fn public_run_evidence_keeps_known_agent_and_omits_retired_lineage() {
+        let agent = TestAgent {
+            session_id: "session-1".into(),
+            agent_id: "agent-1".into(),
+            agent_spec_revision: 2,
+            seed_run: None,
+        };
+        let run = json!({
+            "schemaVersion": "grokptah.public-run.v1",
+            "runId": "run-1",
+            "state": "completed",
+            "usageComplete": true,
+            "usagePendingRequestCount": 0,
+            "agentId": "retired-agent",
+            "agentSpecRevision": 9,
+            "checkpointId": "retired-checkpoint",
+            "parentRunId": "retired-parent",
+            "continuationContextHash": "aa".repeat(32),
+            "continuationFidelity": "exact",
+            "stopCause": "completed",
+            "aggregates": {
+                "usageComplete": false,
+                "usagePendingRequests": 3
+            }
+        });
+        assert!(public_run_usage_settled(&run));
+        let evidence = provider_run_from_value(&agent, &run).unwrap();
+        assert_eq!(evidence.agent_id, agent.agent_id);
+        assert_eq!(evidence.run_id, "run-1");
+        assert_eq!(evidence.state, "completed");
+        assert_eq!(evidence.agent_spec_revision, 2);
+        assert!(evidence.checkpoint_id.is_none());
+        assert!(evidence.parent_run_id.is_none());
+        assert!(evidence.continuation_context_hash.is_none());
+        assert!(evidence.continuation_fidelity.is_none());
+        assert!(evidence.stop_cause.is_none());
     }
 }

@@ -128,7 +128,11 @@ async fn named_device_credentials_share_agent_owner_and_attribute_runs() {
         )
         .await
         .unwrap();
-    assert_eq!(run.structured["clientId"], "laptop");
+    assert_eq!(run.structured["schemaVersion"], "grokptah.public-run.v1");
+    assert!(
+        run.structured.get("clientId").is_none(),
+        "public get_run must not expose device credential identity"
+    );
 
     let agents = laptop
         .call_tool("ptah_list_persistent_agents", json!({}))

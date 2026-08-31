@@ -182,7 +182,7 @@ pub use mcp_control::{
 };
 pub use mcp_control_client::{
     ListedTool, LiveEventFrame, LiveNotification, McpControlClient, McpEventStream, McpRemoteError,
-    PtahEventNotification, PtahRecoveryNotification, RunScope, MAX_LIVE_EVENT_FRAME_BYTES,
+    PtahRecoveryNotification, RunScope, MAX_LIVE_EVENT_FRAME_BYTES,
 };
 /// List MCP tools for the project (spawns stdio servers when allowed).
 pub use mcp_runtime::list_mcp_tools;
@@ -196,16 +196,16 @@ pub use orchestration::{
     ContinuationMemoryScope, ContinuationOmission, ContinuationReason, ContinuationReasonCode,
     ContinuationRunInput, ContinuationTestInput, ContinuationWorkloadRef, FakeClock,
     ManagedExecutionPolicy, MissedRunPolicy, NativeExecutorStatus, OrchStore, OrchestrationConfig,
-    OrchestrationService, PromotionState, RetentionPolicy, RetentionReport,
-    RoutineConcurrencyPolicy, RoutineLifecycle, RoutineRecord, RoutineRetryPolicy, RoutineSnapshot,
-    RoutineTrigger, RunApproval, RunBounds, RunExecution, RunExecutionMode, RunRecord, RunState,
-    RunStopCause, WorkAttemptView, WorkDecision, WorkItem, WorkItemSnapshot, WorkMessage,
-    WorkPolicy, WorkTemplate, WorkerProjection, WorkloadReconciliationReport, WorkloadSupervisor,
-    WorkloadSupervisorStatus, WorkspaceAllowlist, AGENT_SPEC_SCHEMA_VERSION,
-    CONTINUATION_ASSEMBLER_VERSION, CONTINUATION_SCHEMA_VERSION, CONTROL_TOOLS,
-    DEFAULT_AGENT_TOOL_IDS, DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS,
+    OrchestrationService, PromotionState, PublicEventKindV1, PublicEventPageV1, PublicEventV1,
+    RetentionPolicy, RetentionReport, RoutineConcurrencyPolicy, RoutineLifecycle, RoutineRecord,
+    RoutineRetryPolicy, RoutineSnapshot, RoutineTrigger, RunApproval, RunBounds, RunExecution,
+    RunExecutionMode, RunRecord, RunState, RunStopCause, WorkAttemptView, WorkDecision, WorkItem,
+    WorkItemSnapshot, WorkMessage, WorkPolicy, WorkTemplate, WorkerProjection,
+    WorkloadReconciliationReport, WorkloadSupervisor, WorkloadSupervisorStatus, WorkspaceAllowlist,
+    AGENT_SPEC_SCHEMA_VERSION, CONTINUATION_ASSEMBLER_VERSION, CONTINUATION_SCHEMA_VERSION,
+    CONTROL_TOOLS, DEFAULT_AGENT_TOOL_IDS, DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS,
     DEFAULT_WORKLOAD_RECONCILIATION_INTERVAL, FORBIDDEN_TOOLS, MAX_AGENT_CONTEXT_BYTES,
-    ROUTINE_SCHEMA_VERSION,
+    PUBLIC_EVENT_SCHEMA_VERSION, ROUTINE_SCHEMA_VERSION,
 };
 pub use permission::{PendingPermissionView, PermissionDecision, PermissionRequest};
 pub use run_promotion::RunReview;
