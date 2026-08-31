@@ -1206,9 +1206,12 @@ fn finish_outcome(
     let evidence = match state {
         GrokBuildRunState::CompleteAdvisory => classified.evidence_refs.clone(),
         GrokBuildRunState::NeedsSynthesis => vec!["nonresumable-run".to_string()],
-        GrokBuildRunState::FailedClosed | GrokBuildRunState::Running => {
-            vec!["closed-run".to_string()]
-        }
+        GrokBuildRunState::FailedClosed | GrokBuildRunState::Running => classified
+            .evidence_refs
+            .clone()
+            .into_iter()
+            .next()
+            .map_or_else(|| vec!["closed-run".to_string()], |value| vec![value]),
     };
 
     let receipt = GrokBuildIsolationReceipt {
@@ -1283,51 +1286,74 @@ fn classify_harvest(
         return ClassifiedRun {
             state: GrokBuildRunState::FailedClosed,
             verdict: None,
-            evidence_refs: Vec::new(),
+            evidence_refs: vec!["closed-run:read-only-mutation".into()],
             advisory_evidence: None,
         };
     }
     match harvest.kind {
-        HarvestKind::Overflow
-        | HarvestKind::Timeout
-        | HarvestKind::Cancelled
-        | HarvestKind::TerminationUnproven => ClassifiedRun {
+        HarvestKind::Overflow => ClassifiedRun {
             state: GrokBuildRunState::FailedClosed,
             verdict: None,
-            evidence_refs: Vec::new(),
+            evidence_refs: vec!["closed-run:output-overflow".into()],
             advisory_evidence: None,
         },
+        HarvestKind::Timeout => failed_closed_classification("timeout"),
+        HarvestKind::Cancelled => failed_closed_classification("cancelled"),
+        HarvestKind::TerminationUnproven => failed_closed_classification("termination-unproven"),
         HarvestKind::Exited(code) => {
             if has_max_turns(&harvest.stdout, &harvest.stderr) {
-                return ClassifiedRun {
-                    state: GrokBuildRunState::FailedClosed,
-                    verdict: None,
-                    evidence_refs: Vec::new(),
-                    advisory_evidence: None,
-                };
+                return failed_closed_classification("max-turns");
             }
             if code != 0 {
-                return ClassifiedRun {
-                    state: GrokBuildRunState::FailedClosed,
-                    verdict: None,
-                    evidence_refs: Vec::new(),
-                    advisory_evidence: None,
-                };
+                return failed_closed_classification("nonzero-exit");
             }
             match verified_advisory_evidence(&harvest.stdout, isolated, expected_session_id) {
-                Some((verdict, evidence)) => ClassifiedRun {
+                Ok((verdict, evidence)) => ClassifiedRun {
                     state: GrokBuildRunState::CompleteAdvisory,
                     verdict: Some(verdict),
                     evidence_refs: vec![evidence.summary_ref.clone(), evidence.session_ref.clone()],
                     advisory_evidence: Some(evidence),
                 },
-                None => ClassifiedRun {
-                    state: GrokBuildRunState::FailedClosed,
-                    verdict: None,
-                    evidence_refs: Vec::new(),
-                    advisory_evidence: None,
-                },
+                Err(error) => failed_closed_classification(error.code()),
             }
+        }
+    }
+}
+
+fn failed_closed_classification(reason: &str) -> ClassifiedRun {
+    ClassifiedRun {
+        state: GrokBuildRunState::FailedClosed,
+        verdict: None,
+        evidence_refs: vec![format!("closed-run:{reason}")],
+        advisory_evidence: None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdvisoryEvidenceError {
+    StdoutJson,
+    StdoutShape,
+    Summary,
+    StopReason,
+    SessionId,
+    RequestId,
+    Usage,
+    Verdict,
+    SessionEvidence,
+}
+
+impl AdvisoryEvidenceError {
+    const fn code(self) -> &'static str {
+        match self {
+            Self::StdoutJson => "stdout-json",
+            Self::StdoutShape => "stdout-shape",
+            Self::Summary => "summary",
+            Self::StopReason => "stop-reason",
+            Self::SessionId => "session-id",
+            Self::RequestId => "request-id",
+            Self::Usage => "usage-shape",
+            Self::Verdict => "verdict",
+            Self::SessionEvidence => "session-evidence",
         }
     }
 }
@@ -1336,9 +1362,12 @@ fn verified_advisory_evidence(
     stdout: &[u8],
     isolated: &IsolatedHome,
     expected_session_id: &str,
-) -> Option<(GrokBuildVerdict, GrokBuildAdvisoryEvidence)> {
-    let value: serde_json::Value = serde_json::from_slice(stdout).ok()?;
-    let object = value.as_object()?;
+) -> Result<(GrokBuildVerdict, GrokBuildAdvisoryEvidence), AdvisoryEvidenceError> {
+    let value: serde_json::Value =
+        serde_json::from_slice(stdout).map_err(|_| AdvisoryEvidenceError::StdoutJson)?;
+    let object = value
+        .as_object()
+        .ok_or(AdvisoryEvidenceError::StdoutShape)?;
     require_exact_keys(
         object,
         &[
@@ -1354,24 +1383,53 @@ fn verified_advisory_evidence(
             "modelUsage",
         ],
     )
-    .ok()?;
-    let text = object.get("text")?.as_str()?;
-    if text.trim().is_empty()
-        || text.len() > ADVISORY_SUMMARY_MAX
-        || object.get("stopReason")?.as_str()? != "end_turn"
-        || object.get("sessionId")?.as_str()? != expected_session_id
-    {
-        return None;
+    .map_err(|_| AdvisoryEvidenceError::StdoutShape)?;
+    let text = object
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(AdvisoryEvidenceError::Summary)?;
+    if text.trim().is_empty() || text.len() > ADVISORY_SUMMARY_MAX {
+        return Err(AdvisoryEvidenceError::Summary);
     }
-    let cli_request_id = object.get("requestId")?.as_str()?;
-    Uuid::parse_str(cli_request_id).ok()?;
-    object.get("thought")?.as_str()?;
-    object.get("usage")?.as_object()?;
-    object.get("num_turns")?.as_u64()?;
-    object.get("total_cost_usd")?.as_f64()?;
-    object.get("total_cost_usd_ticks")?.as_u64()?;
-    object.get("modelUsage")?.as_object()?;
-    let verdict = explicit_verdict(text.as_bytes(), &[])?;
+    if object.get("stopReason").and_then(serde_json::Value::as_str) != Some("end_turn") {
+        return Err(AdvisoryEvidenceError::StopReason);
+    }
+    if object.get("sessionId").and_then(serde_json::Value::as_str) != Some(expected_session_id) {
+        return Err(AdvisoryEvidenceError::SessionId);
+    }
+    let cli_request_id = object
+        .get("requestId")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(AdvisoryEvidenceError::RequestId)?;
+    Uuid::parse_str(cli_request_id).map_err(|_| AdvisoryEvidenceError::RequestId)?;
+    if object
+        .get("thought")
+        .and_then(serde_json::Value::as_str)
+        .is_none()
+        || object
+            .get("usage")
+            .and_then(serde_json::Value::as_object)
+            .is_none()
+        || object
+            .get("num_turns")
+            .and_then(serde_json::Value::as_u64)
+            .is_none()
+        || object
+            .get("total_cost_usd")
+            .and_then(serde_json::Value::as_f64)
+            .is_none()
+        || object
+            .get("total_cost_usd_ticks")
+            .and_then(serde_json::Value::as_u64)
+            .is_none()
+        || object
+            .get("modelUsage")
+            .and_then(serde_json::Value::as_object)
+            .is_none()
+    {
+        return Err(AdvisoryEvidenceError::Usage);
+    }
+    let verdict = explicit_verdict(text.as_bytes(), &[]).ok_or(AdvisoryEvidenceError::Verdict)?;
     let summary_lines = text
         .as_bytes()
         .split(|byte| *byte == b'\n')
@@ -1382,12 +1440,13 @@ fn verified_advisory_evidence(
         })
         .count();
     if summary_lines == 0 {
-        return None;
+        return Err(AdvisoryEvidenceError::Summary);
     }
-    let session_updates = retained_session_evidence(isolated, expected_session_id, text)?;
+    let session_updates = retained_session_evidence(isolated, expected_session_id, text)
+        .ok_or(AdvisoryEvidenceError::SessionEvidence)?;
     let summary_ref = sha256_evidence_ref("summary", text.as_bytes());
     let session_ref = sha256_evidence_ref("session", &session_updates);
-    Some((
+    Ok((
         verdict,
         GrokBuildAdvisoryEvidence {
             cli_request_id: cli_request_id.to_string(),
