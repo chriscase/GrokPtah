@@ -4976,7 +4976,7 @@ test result: FAILED. 0 passed; 3 failed; 0 ignored
     fn chunk_and_hold_boundaries_do_not_bisect_recognized_labels() {
         let label_one = "timestamp=2026-08-30T21:00:00Z";
         let label_two = "timestamp=2026-08-30T21:01:00Z";
-        let prefix = "x".repeat(NORMALIZER_CHUNK_BYTES - 6);
+        let prefix = format!("{} ", "x".repeat(NORMALIZER_CHUNK_BYTES - 7));
         let suffix = format!(";result=ok{}", "z".repeat(NORMALIZER_HOLD_BYTES + 8));
         let first = format!("{prefix}{label_one}{suffix}");
         let second = format!("{prefix}{label_two}{suffix}");
@@ -5000,7 +5000,10 @@ test result: FAILED. 0 passed; 3 failed; 0 ignored
         );
         assert_ne!(stationarity_digest(&first), stationarity_digest(&changed));
 
-        let hold_prefix = "y".repeat(NORMALIZER_CHUNK_BYTES - NORMALIZER_HOLD_BYTES + 8);
+        let hold_prefix = format!(
+            "{} ",
+            "y".repeat(NORMALIZER_CHUNK_BYTES - NORMALIZER_HOLD_BYTES + 7)
+        );
         let hold_first = format!("{hold_prefix}{label_one}{suffix}");
         let hold_second = format!("{hold_prefix}{label_two}{suffix}");
         assert_eq!(
