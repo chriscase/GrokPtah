@@ -9,8 +9,8 @@
 mod common;
 
 use grokptah_agent_bridge::orchestration::{
-    BlockProvenance, OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, WorkState,
-    WorkspaceAllowlist,
+    safe_id_filename, BlockProvenance, OrchStore, OrchestrationConfig, OrchestrationService,
+    RunBounds, WorkItem, WorkPolicy, WorkState, WorkspaceAllowlist, MAX_GRAPH_SCOPE_ITEMS,
 };
 use grokptah_agent_bridge::{
     set_grokptah_home_override, start_control_server, AgentHost, HostConfig, McpControlClient,
@@ -315,43 +315,72 @@ async fn the_control_plane_unblocks_under_the_same_fences_as_block() {
     assert_eq!(blocked.structured["work"]["blockProvenance"], "manual");
     let blocked_revision = blocked.structured["work"]["revision"].as_u64().unwrap();
 
+    let stale_args = json!({
+        "request_id": "unblock-stale",
+        "session_id": mine.id,
+        "workspace": workspace_text,
+        "work_id": work_id,
+        "reason": "stale fence",
+        "expected_revision": blocked_revision + 7,
+    });
     let stale = client
-        .call_tool(
-            "ptah_unblock_work",
-            json!({
-                "request_id": "unblock-stale",
-                "session_id": mine.id,
-                "workspace": workspace_text,
-                "work_id": work_id,
-                "reason": "stale fence",
-                "expected_revision": blocked_revision + 7,
-            }),
-        )
+        .call_tool("ptah_unblock_work", stale_args.clone())
         .await
         .expect_err("a stale revision fence must refuse the write")
         .to_string();
     assert_eq!(stale, "MCP remote error: stale_version");
+    let stale_replay = client
+        .call_tool("ptah_unblock_work", stale_args)
+        .await
+        .expect_err("a replayed stale fence must preserve the refusal")
+        .to_string();
+    assert_eq!(stale_replay, stale);
     let still_held = store.load_work_item(&work_id).unwrap().unwrap();
     assert_eq!(still_held.state, WorkState::Blocked);
     assert_eq!(still_held.revision, blocked_revision);
 
+    let release_args = json!({
+        "request_id": "unblock-release",
+        "session_id": mine.id,
+        "workspace": workspace_text,
+        "work_id": work_id,
+        "reason": "review complete",
+        "expected_revision": blocked_revision,
+    });
     let released = client
-        .call_tool(
-            "ptah_unblock_work",
-            json!({
-                "request_id": "unblock-release",
-                "session_id": mine.id,
-                "workspace": workspace_text,
-                "work_id": work_id,
-                "reason": "review complete",
-                "expected_revision": blocked_revision,
-            }),
-        )
+        .call_tool("ptah_unblock_work", release_args.clone())
         .await
         .unwrap();
     assert_eq!(released.structured["work"]["state"], "queued");
     assert!(released.structured["work"].get("blockProvenance").is_none());
     assert!(released.structured["work"].get("blockedReason").is_none());
+    assert_eq!(
+        released.structured["work"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        ["revision", "state", "workId"].into_iter().collect(),
+        "the public unblock response is an explicit allowlist"
+    );
+    assert!(released.structured.get("workspace").is_none());
+    assert_eq!(
+        released
+            .structured
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        ["sessionId", "work"].into_iter().collect(),
+        "the public unblock envelope is an explicit allowlist"
+    );
+    let released_replay = client
+        .call_tool("ptah_unblock_work", release_args)
+        .await
+        .expect("a successful replay must return the same redacted body");
+    assert_eq!(released_replay.structured, released.structured);
 
     let sibling = client
         .call_tool(
@@ -420,6 +449,44 @@ async fn the_control_plane_unblocks_under_the_same_fences_as_block() {
         cross_unblock, cross_block,
         "unblock must not distinguish a sibling's work from block"
     );
+    assert_eq!(cross_block, unknown_block);
+    assert_eq!(cross_unblock, unknown_unblock);
+
+    let unknown_session = client
+        .call_tool(
+            "ptah_unblock_work",
+            json!({
+                "request_id": "unblock-unknown-session",
+                "session_id": uuid::Uuid::new_v4(),
+                "workspace": workspace_text,
+                "work_id": work_id,
+                "reason": "probe",
+            }),
+        )
+        .await
+        .expect_err("an unknown session must fail before work-id collapse")
+        .to_string();
+    assert_eq!(
+        unknown_session, "MCP remote error: invalid_request",
+        "an unknown session remains fail-closed without becoming a work-id oracle"
+    );
+
+    let other_workspace = tempdir().unwrap();
+    let workspace_mismatch = client
+        .call_tool(
+            "ptah_unblock_work",
+            json!({
+                "request_id": "unblock-workspace-mismatch",
+                "session_id": mine.id,
+                "workspace": other_workspace.path().display().to_string(),
+                "work_id": work_id,
+                "reason": "probe",
+            }),
+        )
+        .await
+        .expect_err("workspace mismatch must fail before work-id collapse")
+        .to_string();
+    assert_eq!(workspace_mismatch, "MCP remote error: workspace_mismatch");
 
     // A derived dependency hold is reconciliation's, not an operator's to
     // release. The control plane must not widen the store's provenance rule.
@@ -444,19 +511,141 @@ async fn the_control_plane_unblocks_under_the_same_fences_as_block() {
     store.reconcile_workloads().unwrap();
     let derived = store.load_work_item(&waiting_id).unwrap().unwrap();
     assert_eq!(derived.block_provenance, Some(BlockProvenance::Derived));
+    let derived_args = json!({
+        "request_id": "unblock-derived",
+        "session_id": mine.id,
+        "workspace": workspace_text,
+        "work_id": waiting_id,
+        "reason": "impatience",
+    });
     let denied = client
-        .call_tool(
-            "ptah_unblock_work",
-            json!({
-                "request_id": "unblock-derived",
-                "session_id": mine.id,
-                "workspace": workspace_text,
-                "work_id": waiting_id,
-                "reason": "impatience",
-            }),
-        )
+        .call_tool("ptah_unblock_work", derived_args.clone())
         .await
         .expect_err("a dependency hold is not an operator's to release")
         .to_string();
     assert_eq!(denied, "MCP remote error: conflict");
+    let denied_replay = client
+        .call_tool("ptah_unblock_work", derived_args)
+        .await
+        .expect_err("a replayed derived-hold refusal must remain a conflict")
+        .to_string();
+    assert_eq!(denied_replay, denied);
+}
+
+/// The public create path must map a full lane to `capacity_exhausted`, not
+/// `internal`. A pre-existing oversized lane must map list and graph reads to
+/// the same typed error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn the_control_plane_maps_scope_overflow_to_capacity_exhausted() {
+    let mut env = ProcessEnvGuard::new();
+    let home = tempdir().unwrap();
+    set_grokptah_home_override(Some(home.path().join(".grokptah")));
+    env.set("GROKPTAH_AGENT_OFFLINE", "1");
+    let workspace = tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    })
+    .expect("acquire the GrokPtah instance lock");
+    host.start().unwrap();
+
+    let mine = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(mine.id, workspace.path()).unwrap();
+
+    let store = OrchStore::open(home.path().join("orchestration")).unwrap();
+    let orch = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        store.clone(),
+        OrchestrationConfig {
+            bearer_token: "work-graph-token-305".into(),
+            allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
+            max_concurrent_runs: 2,
+            bounds: RunBounds::default(),
+        },
+    );
+    let server = start_control_server(orch, 0).await.unwrap();
+    let mut client =
+        McpControlClient::new(format!("http://{}", server.addr), "work-graph-token-305");
+    client.initialize().await.unwrap();
+    let workspace_text = workspace.path().display().to_string();
+
+    for index in 0..MAX_GRAPH_SCOPE_ITEMS {
+        let mut item = WorkItem::new(
+            "test",
+            "independent",
+            mine.id,
+            &workspace_text,
+            "operator",
+            WorkPolicy::default(),
+        )
+        .unwrap();
+        item.work_id = format!("cap-{index:04}");
+        std::fs::write(
+            home.path()
+                .join("orchestration")
+                .join("work-items")
+                .join(format!("{}.json", safe_id_filename(&item.work_id).unwrap())),
+            serde_json::to_vec_pretty(&item).unwrap(),
+        )
+        .unwrap();
+    }
+
+    let overflow = client
+        .call_tool(
+            "ptah_create_work",
+            json!({
+                "request_id": "overflow-create",
+                "session_id": mine.id,
+                "workspace": workspace_text,
+                "kind": "verification",
+                "objective": "one past the ceiling",
+            }),
+        )
+        .await
+        .expect_err("the 4097th independent item must be refused")
+        .to_string();
+    assert_eq!(
+        overflow, "MCP remote error: capacity_exhausted",
+        "scope overflow must not be reported as internal"
+    );
+
+    let mut excess = WorkItem::new(
+        "test",
+        "oversized legacy lane",
+        mine.id,
+        &workspace_text,
+        "operator",
+        WorkPolicy::default(),
+    )
+    .unwrap();
+    excess.work_id = format!("cap-{MAX_GRAPH_SCOPE_ITEMS:04}");
+    std::fs::write(
+        home.path()
+            .join("orchestration")
+            .join("work-items")
+            .join(format!(
+                "{}.json",
+                safe_id_filename(&excess.work_id).unwrap()
+            )),
+        serde_json::to_vec_pretty(&excess).unwrap(),
+    )
+    .unwrap();
+    for tool in ["ptah_list_work", "ptah_get_work_graph"] {
+        let error = client
+            .call_tool(
+                tool,
+                json!({ "session_id": mine.id, "workspace": workspace_text }),
+            )
+            .await
+            .expect_err("an oversized lane must fail as typed capacity")
+            .to_string();
+        assert_eq!(error, "MCP remote error: capacity_exhausted", "{tool}");
+    }
+
+    assert_eq!(
+        store.list_work_items().unwrap().len(),
+        MAX_GRAPH_SCOPE_ITEMS + 1
+    );
 }

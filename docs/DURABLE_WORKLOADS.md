@@ -25,7 +25,11 @@ ownership model. See [DURABLE_ROUTINES.md](DURABLE_ROUTINES.md) and
 ## State and lease contract
 
 Work starts in `queued`. Missing or unsuccessful dependencies make it
-`blocked`; once all dependencies are `succeeded`, it becomes claimable again.
+`blocked` with typed `blockProvenance: derived`; once all dependencies are
+`succeeded`, reconciliation lifts the hold and the item becomes claimable
+again. An operator or coordinator hold is `blocked` with
+`blockProvenance: manual` and is released only by `ptah_unblock_work`, never
+by a tick.
 A successful claim creates an attempt and moves the item to `leased`.
 Progress moves both item and attempt to `running`. Completion moves to
 `succeeded`, unless `requiresApproval` is set, in which case the item and
@@ -46,6 +50,20 @@ recovery and serializes competing claims. It intentionally accepts only one
 concurrent attempt per WorkItem in this first slice; a multi-node scheduler,
 database backend, and approval-decision operation remain follow-on work.
 
+One lane may hold at most 4096 work items (`MAX_GRAPH_SCOPE_ITEMS`). New
+items — including dependency-free creates — are refused once the lane is at
+the ceiling; an update of an existing item at the ceiling still lands.
+Oversized lanes refuse bounded store reads. Public create maps the ceiling to
+`capacity_exhausted` rather than `internal`. Public list/graph pagination over
+the full legal range remains open in issue #520; callers must not interpret a
+transport-size refusal as an empty or complete lane.
+
+Assignment mutations (block, unblock, offer, and the other decision actions)
+write a `WorkDecision` file and then the `WorkItem` file. Each write is
+atomic, but the pair is not a sealed two-phase intent. A crash between them
+can leave a decision receipt whose item state did not change. There is no
+assignment-intent recovery path; issue #521 tracks that release residual.
+
 ## Service reconciliation
 
 Opening the ledger performs one recovery pass, and every live
@@ -58,8 +76,18 @@ second queue; it only reconciles durable state:
   disconnected;
 - returns retryable work to `queued`, or records terminal failure when its
   retry budget is exhausted;
-- applies dependency blocking/unblocking and deadline failure; and
+- applies dependency blocking/unblocking and deadline failure;
+- refreshes the proven pre-upgrade derived wait (`Blocked`, no
+  `blockProvenance`, no `blockedReason`, non-empty dependencies, not a
+  container) into a typed derived hold, or lifts it when its dependencies
+  are already satisfied; and
 - leaves Agent identities and archived Lanes untouched.
+
+Any other `Blocked` record with `blockProvenance: None` stays fail-closed as
+a manual hold, including a free-text `blockedReason` that happens to look
+like an admission string. Those records are released only by
+`ptah_unblock_work`. This is an upgrade-recovery rule, not a claim that the
+work-graph train is release-qualified.
 
 `ptah_get_capacity` exposes the last reconciliation timestamp, outcome counts,
 and any supervisor error under `health.workloadSupervisor`. `/ready` fails
@@ -73,6 +101,10 @@ process. See [NATIVE_AGENT_EXECUTION.md](NATIVE_AGENT_EXECUTION.md).
 
 ## MCP/service surface
 
+`orchestration::CONTROL_TOOLS` is the source of truth for the complete tool
+count and classification. The workload-specific subset advertised there
+includes:
+
 Read tools:
 
 - `ptah_list_work(session_id, workspace)`
@@ -80,6 +112,9 @@ Read tools:
 - `ptah_get_work_graph(session_id, workspace)` — lane-scoped redacted
   dependency graph (shape and admission/state only; no workspace path,
   principal, agent, objective, attempt, claimant, or lease identifier)
+- `ptah_list_work_decisions(session_id, workspace, work_id)`
+- `ptah_get_managed_execution(session_id, workspace, agent_id)`
+- `ptah_list_execution_intents(session_id, workspace)`
 
 Mutation tools:
 
@@ -95,8 +130,17 @@ Mutation tools:
 - `ptah_cancel_work`
 - `ptah_retry_work` (explicitly reopens a failed item only within its retry budget)
 - `ptah_approve_work` (human decision for an approval-gated completion)
-- `ptah_block_work` (explicit human hold with durable provenance)
-- `ptah_unblock_work` (explicit human release guarded by the current revision)
+- `ptah_offer_work` / `ptah_accept_work` / `ptah_decline_work` /
+  `ptah_reassign_work` / `ptah_reprioritize_work`
+- `ptah_block_work` / `ptah_unblock_work` / `ptah_request_review`
+- `ptah_set_managed_execution` / `ptah_authorize_work_execution` /
+  `ptah_resolve_work_input`
+
+`ptah_unblock_work` is the control-plane twin of `ptah_block_work`: same
+session/workspace fence, same revision fence, same payload shape. It releases
+a `manual` hold or an ambiguous pre-upgrade hold (`blockProvenance` absent,
+and not the proven derived-wait shape). It refuses a `derived` hold; those
+are lifted by reconciliation when dependencies are satisfied.
 
 Mutating calls use the existing durable request-id/idempotency mechanism. A
 replayed request returns the original response; the same request ID with a
@@ -106,17 +150,18 @@ auth token ID. Per-principal authorization is a separate security milestone.
 Human hold/release actions carry a revision fence; stale unblock attempts fail
 closed with `stale_version` and cannot silently overwrite a newer state.
 
-The desktop's remote-service adapter advertises and decodes the two read tools
-into typed `DurableWorkItem`, `DurableWorkAttempt`, and `RemoteWorkSnapshot`
-projections. It uses the same authenticated MCP boundary as other remote
-sessions and runs, so local and hosted deployments share the same wire
-contract. The desktop Work view adds a human-reviewed control surface for
-creating, assigning, retrying, approving, and cancelling Work Items. Local
-actions call the embedded ledger directly; hosted actions use fresh
-idempotent MCP request IDs. Neither path exposes lease tokens or worker-only
-claim/progress/completion controls to the UI. Every human mutation can carry a
-revision fence, and stale UI actions fail with `stale_version` rather than
-silently overwriting newer state.
+The desktop's remote-service adapter advertises and decodes the work read
+tools into typed `DurableWorkItem`, `DurableWorkAttempt`, and
+`RemoteWorkSnapshot` projections. It uses the same authenticated MCP boundary
+as other remote sessions and runs, so local and hosted deployments share the
+same wire contract. The desktop Work view adds a human-reviewed control
+surface for creating, assigning, retrying, approving, and cancelling Work
+Items. Local actions call the embedded ledger directly; hosted actions use
+fresh idempotent MCP request IDs. Neither path exposes lease tokens or
+worker-only claim/progress/completion controls to the UI. Every human
+mutation can carry a revision fence, and stale UI actions fail with
+`stale_version` rather than silently overwriting newer state. Desktop coverage
+of every work mutation listed above is not claimed here.
 
 Approval decisions are durable and attributable. An approval-gated worker
 completion remains `awaiting_approval` until an authenticated operator calls
@@ -139,4 +184,11 @@ The bridge integration tests cover:
 - progress and completion through the live loopback MCP server;
 - authorized reads surviving Lane archival and mutation rejection after archive.
 - deterministic lease/deadline reconciliation and supervisor status;
-- service restart shutdown/reopen without a lingering ledger lock.
+- service restart shutdown/reopen without a lingering ledger lock;
+- pre-upgrade derived-wait refresh (satisfied and pending) versus fail-closed
+  ambiguous/manual holds;
+- the 4096/4097 independent-item graph ceiling, including an update of an
+  existing item at the ceiling.
+
+These tests pin the ledger and control-plane fences above. They are not a
+release-qualification certificate for the rest of the product.

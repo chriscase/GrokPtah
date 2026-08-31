@@ -918,9 +918,24 @@ impl OrchStore {
         // not only the public create endpoint. Manager adoption, supervisor
         // reconciliation, and host recovery all converge here. Exclude the
         // current record when updating it so validation sees one candidate.
-        let previous_dependencies = self
-            .load_work_item_unlocked(&item.work_id)?
-            .map(|existing| existing.dependencies);
+        let existing = self.load_work_item_unlocked(&item.work_id)?;
+        let is_new = existing.is_none();
+        let previous_dependencies = existing.map(|record| record.dependencies);
+        // Dependency-free creates used to skip the graph ceiling. New items
+        // count against it; an update of an item already at the ceiling must
+        // still land.
+        if is_new {
+            let lane = self.scoped_work_items_unlocked(super::graph::GraphScope::of(item))?;
+            if lane.len() >= super::graph::MAX_GRAPH_SCOPE_ITEMS {
+                return Err(anyhow::Error::new(OrchError::new(
+                    OrchErrorCode::CapacityExhausted,
+                    format!(
+                        "scope holds more than {} work items; a new item is refused rather than unbounded",
+                        super::graph::MAX_GRAPH_SCOPE_ITEMS
+                    ),
+                )));
+            }
+        }
         if !item.dependencies.is_empty()
             && previous_dependencies.as_ref() != Some(&item.dependencies)
         {
@@ -928,7 +943,7 @@ impl OrchStore {
             let mut lane = self.scoped_work_items_unlocked(super::graph::GraphScope::of(item))?;
             lane.retain(|existing| existing.work_id != item.work_id && scope.contains(existing));
             super::graph::validate_scoped_dependency_graph(&lane, item, scope)
-                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                .map_err(anyhow::Error::new)?;
         }
         let path = self
             .work_item_path(&item.work_id)
@@ -1067,10 +1082,13 @@ impl OrchStore {
             if scope.contains(&item) {
                 items.push(item);
                 if items.len() > super::graph::MAX_GRAPH_SCOPE_ITEMS {
-                    anyhow::bail!(
-                        "lane contains more than {} work items; bounded read refused",
-                        super::graph::MAX_GRAPH_SCOPE_ITEMS
-                    );
+                    return Err(anyhow::Error::new(OrchError::new(
+                        OrchErrorCode::CapacityExhausted,
+                        format!(
+                            "lane contains more than {} work items; bounded read refused",
+                            super::graph::MAX_GRAPH_SCOPE_ITEMS
+                        ),
+                    )));
                 }
             }
         }
@@ -2163,9 +2181,9 @@ impl OrchStore {
             self.save_work_item_unlocked(item)?;
         } else if waiting && matches!(item.state, WorkState::Blocked) {
             // The hold stands but its cause may have changed -- a dependency
-            // that was pending can become unsatisfiable. Rewriting the reason
-            // in place keeps the operator-visible cause honest without
-            // consuming a revision when nothing moved.
+            // that was pending can become unsatisfiable. The same write stamps
+            // a proven pre-upgrade derived wait with typed provenance so the
+            // next tick does not have to recognize the legacy shape again.
             let reason = Some(admission.as_str().to_string());
             if item.blocked_reason != reason
                 || item.block_provenance != Some(BlockProvenance::Derived)
@@ -2566,8 +2584,8 @@ impl OrchStore {
         )
     }
 
-    /// Release a block an operator placed, or a legacy block whose provenance
-    /// was never recorded.
+    /// Release a block an operator placed, or an ambiguous legacy block whose
+    /// provenance was never recorded.
     ///
     /// `WorkDecisionAction::Unblock` has been part of the decision vocabulary
     /// since the workload ledger landed but had no transition behind it, so a
@@ -2577,7 +2595,8 @@ impl OrchStore {
     ///
     /// A derived block is deliberately not releasable here: it is
     /// reconciliation's own encoding of an unmet dependency, and clearing it
-    /// by hand would be re-derived on the next tick.
+    /// by hand would be re-derived on the next tick. The proven pre-upgrade
+    /// derived-wait shape is the same hold, just unstamped.
     pub fn unblock_work(
         &self,
         work_id: &str,
@@ -2604,7 +2623,9 @@ impl OrchStore {
                         "work item is not blocked",
                     ));
                 }
-                if item.block_provenance == Some(BlockProvenance::Derived) {
+                if item.block_provenance == Some(BlockProvenance::Derived)
+                    || super::graph::is_legacy_derived_wait(item)
+                {
                     return Err(OrchError::new(
                         OrchErrorCode::Conflict,
                         "a dependency block is released by reconciliation, not by an operator",
@@ -2701,6 +2722,9 @@ impl OrchStore {
         item.last_decision_id = Some(decision.decision_id.clone());
         item.bump_at(request.now);
         item.validate()?;
+        // Two atomic files, not one sealed pair. A crash after the decision
+        // write and before the item write leaves a receipt whose item did not
+        // change. Issue #521 tracks the missing intent-recovery path.
         self.save_work_decision_unlocked(&decision)?;
         self.save_work_item_unlocked(&item)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;

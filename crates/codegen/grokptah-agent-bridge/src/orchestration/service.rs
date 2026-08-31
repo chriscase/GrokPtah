@@ -2185,8 +2185,8 @@ impl OrchestrationService {
             .ok_or_else(|| OrchError::new(OrchErrorCode::InvalidRequest, "unknown work_id"))?;
         if item.session_id != session_id || item.workspace != claimed.display().to_string() {
             return Err(OrchError::new(
-                OrchErrorCode::ForbiddenScope,
-                "work item is outside the requested session scope",
+                OrchErrorCode::InvalidRequest,
+                "unknown work_id",
             ));
         }
         Ok((item, claimed))
@@ -2241,6 +2241,15 @@ impl OrchestrationService {
         Ok((claimed, start))
     }
 
+    fn map_work_ledger_error(error: anyhow::Error) -> OrchError {
+        if let Some(ledger_error) = error.downcast_ref::<OrchError>() {
+            if ledger_error.code == OrchErrorCode::CapacityExhausted {
+                return ledger_error.clone();
+            }
+        }
+        OrchError::new(OrchErrorCode::Internal, error.to_string())
+    }
+
     pub fn list_work_scoped(
         &self,
         _auth: &AuthContext,
@@ -2251,7 +2260,7 @@ impl OrchestrationService {
         let work = self
             .store
             .scoped_work_items(session_id, &claimed.display().to_string())
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            .map_err(Self::map_work_ledger_error)?;
         Ok(json!({ "work": work }))
     }
 
@@ -2268,7 +2277,7 @@ impl OrchestrationService {
         let graph = self
             .store
             .work_graph_scoped(session_id, &claimed.display().to_string(), Utc::now())
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            .map_err(Self::map_work_ledger_error)?;
         Ok(json!({ "graph": graph }))
     }
 
@@ -2995,7 +3004,7 @@ impl OrchestrationService {
                         None,
                         session_id,
                         &claimed,
-                        OrchError::new(OrchErrorCode::Internal, error.to_string()),
+                        Self::map_work_ledger_error(error),
                     ))
                 }
             };
@@ -3010,7 +3019,7 @@ impl OrchestrationService {
                 Some(item.work_id.clone()),
                 session_id,
                 &claimed,
-                OrchError::new(OrchErrorCode::Internal, error.to_string()),
+                Self::map_work_ledger_error(error),
             ));
         }
         let response = self.workload_value(item.clone(), false)?;
@@ -3918,26 +3927,59 @@ impl OrchestrationService {
         reason: String,
         expected_revision: Option<u64>,
     ) -> Result<serde_json::Value, OrchError> {
-        self.work_item_mutation(
-            "ptah_unblock_work",
-            request_id,
-            session_id,
-            workspace,
+        let tool = "ptah_unblock_work";
+        let payload = json!({
+            "sessionId": session_id,
+            "workspace": workspace.display().to_string(),
+            "workId": work_id,
+            "details": {"reason": reason, "expectedRevision": expected_revision},
+        });
+        let (claimed, start) = self
+            .begin_work_mutation(tool, request_id, session_id, workspace, &payload)
+            .await?;
+        let mut lease = match start {
+            IdempotencyStart::Replay(response) => return Ok(response),
+            IdempotencyStart::Perform(lease) => lease,
+        };
+        if let Err(error) = self.load_work_scoped(session_id, &claimed, work_id, false) {
+            return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+        }
+        let item = match self.store.unblock_work(
             work_id,
-            json!({"reason": reason, "expectedRevision": expected_revision}),
-            move |store| {
-                store
-                    .unblock_work(
-                        work_id,
-                        &auth.token_id,
-                        &reason,
-                        expected_revision,
-                        Utc::now(),
-                    )
-                    .map(|(item, _)| item)
-            },
-        )
-        .await
+            &auth.token_id,
+            &reason,
+            expected_revision,
+            Utc::now(),
+        ) {
+            Ok((item, _)) => item,
+            Err(error) => {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
+            }
+        };
+        let mut work = json!({
+            "workId": item.work_id,
+            "state": item.state,
+            "revision": item.revision,
+        });
+        if let Some(provenance) = item.block_provenance {
+            work["blockProvenance"] = json!(provenance);
+        }
+        let response = json!({
+            "work": work,
+            "sessionId": session_id,
+        });
+        lease
+            .complete(Some(work_id.to_string()), response.clone())
+            .map_err(|error| {
+                self.fail_claim(
+                    &mut lease,
+                    Some(work_id.to_string()),
+                    session_id,
+                    &claimed,
+                    error,
+                )
+            })?;
+        Ok(response)
     }
 
     #[allow(clippy::too_many_arguments)]
