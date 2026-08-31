@@ -51,7 +51,8 @@ impl Fixture {
         let fake_dir = tempfile::tempdir().expect("fake");
         git(repo.path(), &["init", "-b", "topic"]).expect("init");
         fs::write(repo.path().join("README"), "base\n").expect("readme");
-        git(repo.path(), &["add", "README"]).expect("add");
+        fs::write(repo.path().join(".gitignore"), "ignored/\n").expect("gitignore");
+        git(repo.path(), &["add", "README", ".gitignore"]).expect("add");
         git(repo.path(), &["commit", "-m", "base"]).expect("commit base");
         let base = git_stdout(repo.path(), &["rev-parse", "HEAD"]);
         fs::write(repo.path().join("README"), "head\n").expect("readme head");
@@ -216,11 +217,16 @@ fi
 if [ "$1" = "inspect" ] && [ "$2" = "--json" ]; then
   printf '%s\n' "$@" > "$dir/captured-inspect-argv"
   env | sort > "$dir/captured-inspect-env"
+  instructions='[]'
   if [ "$behavior" = "inspect-dirty" ]; then
-    printf '%s\n' '{"projectInstructions":[{"path":"CLAUDE.md"}],"hooks":[],"plugins":[],"mcpServers":[],"lspServers":[]}'
-    exit 0
+    instructions='[{"path":"CLAUDE.md"}]'
   fi
-  printf '%s\n' '{"projectInstructions":[],"hooks":[],"plugins":[],"mcpServers":[],"lspServers":[]}'
+  if [ "$behavior" = "inspect-unknown" ]; then
+    extra=',"futureCompatibilitySurface":[]'
+  else
+    extra=''
+  fi
+  printf '{"grokVersion":"1.0.5","channel":"stable","cwd":"%s","projectRoot":"%s","projectTrusted":true,"projectInstructions":%s,"permissions":{"loaded":0,"managedSettingsActive":false,"managedSettingsExists":false,"managedSettingsPath":"/managed/settings","marketplaceAllowlist":[],"mcpServerAllowlist":[],"skipped":[],"sources":[]},"loginPolicy":{"apiKeyAuthDisabled":false,"disableApiKeyAuth":null,"forceLoginTeamUuid":null},"hooks":[],"skills":[],"agents":[],"plugins":[],"marketplaces":[],"mcpServers":[],"lspServers":[],"configSources":{"layers":[{"path":"%s/config.toml","role":"user"}]},"externalCompat":{"cells":[{"enabled":false,"source":"config","surface":"skills","vendor":"cursor"},{"enabled":false,"source":"config","surface":"rules","vendor":"cursor"},{"enabled":false,"source":"config","surface":"agents","vendor":"cursor"},{"enabled":false,"source":"config","surface":"mcps","vendor":"cursor"},{"enabled":false,"source":"config","surface":"hooks","vendor":"cursor"},{"enabled":false,"source":"config","surface":"sessions","vendor":"cursor"},{"enabled":false,"source":"config","surface":"skills","vendor":"claude"},{"enabled":false,"source":"config","surface":"rules","vendor":"claude"},{"enabled":false,"source":"config","surface":"agents","vendor":"claude"},{"enabled":false,"source":"config","surface":"mcps","vendor":"claude"},{"enabled":false,"source":"config","surface":"hooks","vendor":"claude"},{"enabled":false,"source":"config","surface":"sessions","vendor":"claude"},{"enabled":false,"source":"config","surface":"sessions","vendor":"codex"}],"remoteSettingsLoaded":false}%s}\n' "$PWD" "$PWD" "$instructions" "$GROK_HOME" "$extra"
   exit 0
 fi
 printf '%s\n' "$@" > "$dir/captured-argv"
@@ -229,20 +235,43 @@ printf '%s\n' "$GROK_HOME" > "$dir/captured-grok-home"
 if [ -n "$GROK_HOME" ] && [ -f "$GROK_HOME/config.toml" ]; then
   cp "$GROK_HOME/config.toml" "$dir/captured-config.toml"
 fi
+if [ -n "$GROK_HOME" ] && [ -f "$GROK_HOME/sandbox.toml" ]; then
+  cp "$GROK_HOME/sandbox.toml" "$dir/captured-sandbox.toml"
+fi
 if [ -n "$GROK_HOME" ] && [ -f "$GROK_HOME/auth.json" ]; then
   printf 'present\n' > "$dir/auth-present"
 fi
+session_id=''
+previous=''
+for arg in "$@"; do
+  if [ "$previous" = '--session-id' ]; then
+    session_id="$arg"
+  fi
+  previous="$arg"
+done
+if [ -n "$session_id" ] && [ "$behavior" != 'complete-no-session' ]; then
+  mkdir -p "$GROK_HOME/sessions/workspace/$session_id"
+  printf '%s\n' '{"event":"retained"}' > "$GROK_HOME/sessions/workspace/$session_id/updates.jsonl"
+fi
 case "$behavior" in
   complete)
-    printf '%s\n' 'GROK_BUILD_VERDICT=clean'
+    printf '{"text":"bounded advisory summary\\nGROK_BUILD_VERDICT=clean","stopReason":"end_turn","sessionId":"%s","requestId":"request-1"}\n' "$session_id"
+    exit 0
+    ;;
+  complete-no-session)
+    printf '{"text":"bounded advisory summary\\nGROK_BUILD_VERDICT=clean","stopReason":"end_turn","sessionId":"%s","requestId":"request-1"}\n' "$session_id"
+    exit 0
+    ;;
+  marker-only)
+    printf '{"text":"GROK_BUILD_VERDICT=clean","stopReason":"end_turn","sessionId":"%s","requestId":"request-1"}\n' "$session_id"
     exit 0
     ;;
   max-turns)
-    printf '%s\n' 'max_turns_reached'
-    exit 1
+    printf '{"text":"partial output","stopReason":"max_turn_requests","sessionId":"%s","requestId":"request-1"}\n' "$session_id"
+    exit 0
     ;;
   partial)
-    printf '%s\n' 'partial output without verdict'
+    printf '{"text":"partial output without verdict","stopReason":"end_turn","sessionId":"%s","requestId":"request-1"}\n' "$session_id"
     exit 0
     ;;
   overflow)
@@ -251,20 +280,36 @@ case "$behavior" in
     ;;
   sleep)
     echo $$ > "$dir/pid"
-    /bin/sleep 30
+    /bin/sleep 30 &
+    descendant=$!
+    echo "$descendant" > "$dir/descendant-pid"
+    wait "$descendant"
+    ;;
+  mutate-commit)
+    printf 'committed mutation\n' > committed-by-child.txt
+    /usr/bin/git add committed-by-child.txt
+    /usr/bin/git -c user.name=test -c user.email=test@example.com commit -m mutation >/dev/null 2>&1
+    printf '{"text":"bounded advisory summary\\nGROK_BUILD_VERDICT=clean","stopReason":"end_turn","sessionId":"%s","requestId":"request-1"}\n' "$session_id"
+    exit 0
+    ;;
+  mutate-ref)
+    /usr/bin/git checkout --detach >/dev/null 2>&1
+    printf '{"text":"bounded advisory summary\\nGROK_BUILD_VERDICT=clean","stopReason":"end_turn","sessionId":"%s","requestId":"request-1"}\n' "$session_id"
+    exit 0
+    ;;
+  mutate-ignored)
+    mkdir -p ignored
+    printf 'hidden mutation\n' > ignored/result
+    printf '{"text":"bounded advisory summary\\nGROK_BUILD_VERDICT=clean","stopReason":"end_turn","sessionId":"%s","requestId":"request-1"}\n' "$session_id"
     exit 0
     ;;
   mutate)
     printf 'mutated\n' > mutated-by-child.txt
-    printf '%s\n' 'GROK_BUILD_VERDICT=clean'
+    printf '{"text":"bounded advisory summary\\nGROK_BUILD_VERDICT=clean","stopReason":"end_turn","sessionId":"%s","requestId":"request-1"}\n' "$session_id"
     exit 0
     ;;
   leak-secret)
-    if [ -f "$GROK_HOME/auth.json" ]; then
-      cat "$GROK_HOME/auth.json"
-      printf '\n'
-    fi
-    printf '%s\n' 'GROK_BUILD_VERDICT=clean'
+    printf '{"text":"sk-live-secret-not-real\\nbounded advisory summary\\nGROK_BUILD_VERDICT=clean","stopReason":"end_turn","sessionId":"%s","requestId":"request-1"}\n' "$session_id"
     exit 0
     ;;
 esac
@@ -305,19 +350,21 @@ async fn exact_command_argv_and_env() {
     assert_eq!(argv[0], "--prompt-file");
     assert!(argv[1].ends_with("/prompt"), "{argv:?}");
     assert_eq!(
-        &argv[2..8],
+        &argv[2..10],
         [
             "--permission-mode",
             "acceptEdits",
             "--disable-web-search",
             "--no-subagents",
+            "--sandbox",
+            "grokptah_workspace",
             "--max-turns",
             "8"
         ]
     );
-    assert_eq!(argv[8], "--session-id");
-    assert!(Uuid::parse_str(&argv[9]).is_ok(), "{argv:?}");
-    assert_eq!(&argv[10..], ["--output-format", "plain"]);
+    assert_eq!(argv[10], "--session-id");
+    assert!(Uuid::parse_str(&argv[11]).is_ok(), "{argv:?}");
+    assert_eq!(&argv[12..], ["--output-format", "json"]);
     assert!(!argv
         .iter()
         .any(|a| a.contains("yolo") || a.contains("--model")));
@@ -349,16 +396,20 @@ async fn exact_command_argv_and_env() {
 
     let config =
         fs::read_to_string(fx.fake_dir.path().join("captured-config.toml")).expect("config");
-    assert_eq!(
-        config,
-        "[compat.claude]\nskills = false\nrules = false\nagents = false\nmcps = false\nhooks = false\nsessions = false\n\n[compat.cursor]\nskills = false\nrules = false\nagents = false\nmcps = false\nhooks = false\nsessions = false\n"
-    );
+    assert!(config.contains("[compat.claude]"));
+    assert!(config.contains("[compat.cursor]"));
+    assert!(config.contains("[compat.codex]"));
+    assert!(config.contains("official_marketplace_auto_installed = false"));
+    let sandbox =
+        fs::read_to_string(fx.fake_dir.path().join("captured-sandbox.toml")).expect("sandbox");
+    assert!(sandbox.contains("[profiles.grokptah_read_only]"));
+    assert!(sandbox.contains("[profiles.grokptah_workspace]"));
     assert_eq!(
         fs::read_to_string(fx.fake_dir.path().join("auth-present")).expect("auth"),
         "present\n"
     );
     assert_eq!(outcome.result().state, GrokBuildRunState::CompleteAdvisory);
-    assert_eq!(outcome.result().session_id, argv[9]);
+    assert_eq!(outcome.result().session_id, argv[11]);
 }
 
 #[tokio::test]
@@ -393,6 +444,23 @@ async fn discovered_instruction_or_plugin_surface_fails_before_task_launch() {
     .expect_err("discovered surface");
     assert_eq!(err, GrokBuildAdapterError::IsolationFailed);
     assert!(fx.fake_dir.path().join("captured-inspect-argv").exists());
+    assert!(!fx.fake_dir.path().join("captured-argv").exists());
+    assert!(fx.isolate_children().is_empty());
+}
+
+#[tokio::test]
+async fn unknown_inspection_surface_fails_before_task_launch() {
+    let fx = Fixture::new();
+    fx.set_behavior("inspect-unknown");
+    let err = launch_grok_build(
+        &fx.launch(GrokBuildMutationMode::IsolatedReview, 60_000),
+        &fx.host(),
+        &fx.resolver(),
+        CancellationToken::new(),
+    )
+    .await
+    .expect_err("unknown inspection surface");
+    assert_eq!(err, GrokBuildAdapterError::IsolationFailed);
     assert!(!fx.fake_dir.path().join("captured-argv").exists());
     assert!(fx.isolate_children().is_empty());
 }
@@ -458,6 +526,15 @@ async fn timeout_kills_process_tree_and_cleans_home() {
             .map(|s| s.success())
             .unwrap_or(false);
         assert!(!alive, "child still alive after timeout");
+    }
+    if let Ok(pid) = fs::read_to_string(fx.fake_dir.path().join("descendant-pid")) {
+        let pid = pid.trim();
+        let alive = Command::new("/bin/kill")
+            .args(["-0", pid])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(!alive, "descendant still alive after timeout");
     }
 }
 
@@ -562,11 +639,34 @@ async fn read_only_mutation_is_refused() {
     );
     let argv = fx.captured_argv();
     assert!(argv.contains(&"plan".to_string()));
+    assert!(argv.contains(&"grokptah_read_only".to_string()));
     assert!(!argv.contains(&"acceptEdits".to_string()));
 }
 
 #[tokio::test]
-async fn partial_and_max_turn_need_synthesis_never_complete() {
+async fn read_only_clean_commit_ref_change_and_ignored_mutation_are_refused() {
+    for behavior in ["mutate-commit", "mutate-ref", "mutate-ignored"] {
+        let fx = Fixture::new();
+        fx.set_behavior(behavior);
+        let outcome = launch_grok_build(
+            &fx.launch(GrokBuildMutationMode::ReadOnly, 60_000),
+            &fx.host(),
+            &fx.resolver(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("readonly result");
+        assert_eq!(
+            outcome.result().state,
+            GrokBuildRunState::FailedClosed,
+            "behavior {behavior} escaped"
+        );
+        assert!(!outcome.receipt().permissions_ok);
+    }
+}
+
+#[tokio::test]
+async fn partial_and_max_turn_are_nonresumable_and_fail_closed() {
     let fx = Fixture::new();
     fx.set_behavior("partial");
     let partial = launch_grok_build(
@@ -577,11 +677,11 @@ async fn partial_and_max_turn_need_synthesis_never_complete() {
     )
     .await
     .expect("partial");
-    assert_eq!(partial.result().state, GrokBuildRunState::NeedsSynthesis);
+    assert_eq!(partial.result().state, GrokBuildRunState::FailedClosed);
     assert_eq!(partial.result().terminal_verdict, None);
     assert_eq!(
         partial.receipt().cleanup_state,
-        GrokBuildCleanupState::Pending
+        GrokBuildCleanupState::FailedClosed
     );
 
     fx.set_behavior("max-turns");
@@ -593,9 +693,27 @@ async fn partial_and_max_turn_need_synthesis_never_complete() {
     )
     .await
     .expect("max-turns");
-    assert_eq!(maxed.result().state, GrokBuildRunState::NeedsSynthesis);
+    assert_eq!(maxed.result().state, GrokBuildRunState::FailedClosed);
     assert_eq!(maxed.result().terminal_verdict, None);
     assert_ne!(maxed.result().state, GrokBuildRunState::CompleteAdvisory);
+}
+
+#[tokio::test]
+async fn terminal_marker_requires_summary_and_retained_session() {
+    for behavior in ["marker-only", "complete-no-session"] {
+        let fx = Fixture::new();
+        fx.set_behavior(behavior);
+        let outcome = launch_grok_build(
+            &fx.launch(GrokBuildMutationMode::IsolatedReview, 60_000),
+            &fx.host(),
+            &fx.resolver(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("closed result");
+        assert_eq!(outcome.result().state, GrokBuildRunState::FailedClosed);
+        assert!(outcome.result().terminal_verdict.is_none());
+    }
 }
 
 #[tokio::test]
@@ -615,7 +733,9 @@ async fn valid_complete_advisory_result() {
     let receipt = outcome.receipt();
     assert_eq!(result.state, GrokBuildRunState::CompleteAdvisory);
     assert_eq!(result.terminal_verdict, Some(GrokBuildVerdict::Clean));
-    assert_eq!(result.evidence_refs, ["advisory-summary"]);
+    assert_eq!(result.evidence_refs.len(), 2);
+    assert!(result.evidence_refs[0].starts_with("summary-sha256-"));
+    assert!(result.evidence_refs[1].starts_with("session-sha256-"));
     assert_eq!(result.request_id, "req-1");
     assert_eq!(result.identity, fx.identity);
     assert_eq!(receipt.mcp_policy, GrokBuildPolicyState::Disabled);

@@ -10,14 +10,16 @@
 //! that file blindly into a private `GROK_HOME` and never retains, logs, or
 //! returns the contents.
 
+use std::cell::Cell;
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs::OpenOptions;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
@@ -31,14 +33,18 @@ pub use grokptah_agent_sdk::{
 
 /// Allowlisted child `PATH`. Not inherited from the host process.
 const BOUNDED_PATH: &str = "/usr/bin:/bin:/usr/local/bin";
-const ISOLATED_CONFIG: &str = "[compat.claude]\nskills = false\nrules = false\nagents = false\nmcps = false\nhooks = false\nsessions = false\n\n[compat.cursor]\nskills = false\nrules = false\nagents = false\nmcps = false\nhooks = false\nsessions = false\n";
+const ISOLATED_CONFIG: &str = "[compat.claude]\nskills = false\nrules = false\nagents = false\nmcps = false\nhooks = false\nsessions = false\n\n[compat.cursor]\nskills = false\nrules = false\nagents = false\nmcps = false\nhooks = false\nsessions = false\n\n[compat.codex]\nskills = false\nrules = false\nagents = false\nmcps = false\nhooks = false\nsessions = false\n\n[marketplace]\nofficial_marketplace_auto_installed = false\ndefault_skills_installs_purged = true\n";
+const SANDBOX_CONFIG: &str = "[profiles.grokptah_read_only]\nextends = \"read-only\"\nrestrict_network = true\n\n[profiles.grokptah_workspace]\nextends = \"workspace\"\nrestrict_network = false\n";
 const INSPECT_OUTPUT_MAX: usize = 262_144;
 const GIT_OUTPUT_MAX: usize = 32_768;
 const LEASE_FILE_MAX: u64 = 1_048_576;
+const SESSION_EVIDENCE_MAX: u64 = 8_388_608;
+const OUTPUT_BYTES_MAX: usize = 4_194_304;
 const HOME_ALIAS_MAX: usize = 64;
 const AUTH_FILE_NAME: &str = "auth.json";
 const PROMPT_FILE_NAME: &str = "prompt";
 const CONFIG_FILE_NAME: &str = "config.toml";
+const SANDBOX_FILE_NAME: &str = "sandbox.toml";
 
 const VERDICT_CLEAN: &[u8] = b"GROK_BUILD_VERDICT=clean";
 const VERDICT_FINDINGS: &[u8] = b"GROK_BUILD_VERDICT=findings";
@@ -70,6 +76,8 @@ pub enum GrokBuildAdapterError {
     CredentialLease,
     #[error("isolation_failed")]
     IsolationFailed,
+    #[error("termination_unproven")]
+    TerminationUnproven,
 }
 
 /// Host-only launch configuration. Callers cannot supply extra CLI flags or
@@ -132,7 +140,11 @@ impl GrokBuildHostLaunchConfig {
         if self.prompt.is_empty() || self.prompt.as_bytes().contains(&0) {
             return Err(GrokBuildAdapterError::InvalidRequest);
         }
-        if self.max_stdout_bytes == 0 || self.max_stderr_bytes == 0 {
+        if self.max_stdout_bytes == 0
+            || self.max_stderr_bytes == 0
+            || self.max_stdout_bytes > OUTPUT_BYTES_MAX
+            || self.max_stderr_bytes > OUTPUT_BYTES_MAX
+        {
             return Err(GrokBuildAdapterError::InvalidRequest);
         }
         if self.git_timeout.is_zero() {
@@ -249,6 +261,10 @@ fn allowlisted_args(
     let prompt_file = prompt_file
         .to_str()
         .ok_or(GrokBuildAdapterError::IsolationFailed)?;
+    let sandbox = match mode {
+        GrokBuildMutationMode::ReadOnly => "grokptah_read_only",
+        GrokBuildMutationMode::IsolatedReview => "grokptah_workspace",
+    };
     Ok(vec![
         "--prompt-file".to_string(),
         prompt_file.to_string(),
@@ -256,12 +272,14 @@ fn allowlisted_args(
         permission_flag(mode).to_string(),
         "--disable-web-search".to_string(),
         "--no-subagents".to_string(),
+        "--sandbox".to_string(),
+        sandbox.to_string(),
         "--max-turns".to_string(),
         max_turns.to_string(),
         "--session-id".to_string(),
         session_id.to_string(),
         "--output-format".to_string(),
-        "plain".to_string(),
+        "json".to_string(),
     ])
 }
 
@@ -278,20 +296,29 @@ fn allowlisted_env(grok_home: &Path) -> Result<Vec<(String, String)>, GrokBuildA
 
 struct IsolatedHome {
     path: PathBuf,
+    cleanup_on_drop: Cell<bool>,
 }
 
 impl IsolatedHome {
     fn create(parent: &Path) -> Result<Self, GrokBuildAdapterError> {
+        validate_isolate_parent(parent)?;
         let path = parent.join(format!("gb-{}", Uuid::new_v4().simple()));
         std::fs::create_dir(&path).map_err(|_| GrokBuildAdapterError::IsolationFailed)?;
         set_private_dir_permissions(&path)?;
-        Ok(Self { path })
+        Ok(Self {
+            path,
+            cleanup_on_drop: Cell::new(true),
+        })
     }
 
     fn write_minimal_config(&self) -> Result<(), GrokBuildAdapterError> {
         write_private_file(
             &self.path.join(CONFIG_FILE_NAME),
             ISOLATED_CONFIG.as_bytes(),
+        )?;
+        write_private_file(
+            &self.path.join(SANDBOX_FILE_NAME),
+            SANDBOX_CONFIG.as_bytes(),
         )
     }
 
@@ -306,7 +333,7 @@ impl IsolatedHome {
     fn install_lease(&self, lease: &CredentialLeaseHandle) -> Result<(), GrokBuildAdapterError> {
         require_absolute_file_path(&lease.location)
             .map_err(|_| GrokBuildAdapterError::CredentialLease)?;
-        let mut source = open_credential_source(&lease.location)?;
+        let source = open_credential_source(&lease.location)?;
         let meta = source
             .metadata()
             .map_err(|_| GrokBuildAdapterError::CredentialLease)?;
@@ -314,7 +341,11 @@ impl IsolatedHome {
         let dest = self.path.join(AUTH_FILE_NAME);
         let mut target =
             create_private_file(&dest).map_err(|_| GrokBuildAdapterError::CredentialLease)?;
-        io::copy(&mut source, &mut target).map_err(|_| GrokBuildAdapterError::CredentialLease)?;
+        let copied = io::copy(&mut source.take(LEASE_FILE_MAX + 1), &mut target)
+            .map_err(|_| GrokBuildAdapterError::CredentialLease)?;
+        if copied == 0 || copied > LEASE_FILE_MAX || copied != meta.len() {
+            return Err(GrokBuildAdapterError::CredentialLease);
+        }
         target
             .sync_all()
             .map_err(|_| GrokBuildAdapterError::CredentialLease)?;
@@ -322,14 +353,40 @@ impl IsolatedHome {
     }
 
     fn cleanup(&self) -> bool {
-        std::fs::remove_dir_all(&self.path).is_ok() && !self.path.exists()
+        let cleaned = std::fs::remove_dir_all(&self.path).is_ok() && !self.path.exists();
+        if cleaned {
+            self.cleanup_on_drop.set(false);
+        }
+        cleaned
+    }
+
+    fn retain_for_termination_investigation(&self) {
+        self.cleanup_on_drop.set(false);
     }
 }
 
 impl Drop for IsolatedHome {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
+        if self.cleanup_on_drop.get() {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
     }
+}
+
+fn validate_isolate_parent(parent: &Path) -> Result<(), GrokBuildAdapterError> {
+    let meta =
+        std::fs::symlink_metadata(parent).map_err(|_| GrokBuildAdapterError::IsolationFailed)?;
+    if !meta.file_type().is_dir() || meta.file_type().is_symlink() {
+        return Err(GrokBuildAdapterError::IsolationFailed);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o022 != 0 {
+            return Err(GrokBuildAdapterError::IsolationFailed);
+        }
+    }
+    Ok(())
 }
 
 fn write_private_file(path: &Path, contents: &[u8]) -> Result<(), GrokBuildAdapterError> {
@@ -415,25 +472,341 @@ async fn verify_isolation(
         cancel,
     )
     .await;
+    if harvest.kind == HarvestKind::TerminationUnproven {
+        isolated.retain_for_termination_investigation();
+        return Err(GrokBuildAdapterError::TerminationUnproven);
+    }
     if harvest.kind != HarvestKind::Exited(0) {
         return Err(GrokBuildAdapterError::IsolationFailed);
     }
     let value: serde_json::Value = serde_json::from_slice(&harvest.stdout)
         .map_err(|_| GrokBuildAdapterError::IsolationFailed)?;
+    verify_inspect_report(host, isolated, &value)
+}
+
+fn verify_inspect_report(
+    host: &GrokBuildHostLaunchConfig,
+    isolated: &IsolatedHome,
+    value: &serde_json::Value,
+) -> Result<(), GrokBuildAdapterError> {
+    let report = value
+        .as_object()
+        .ok_or(GrokBuildAdapterError::IsolationFailed)?;
+    require_exact_keys(
+        report,
+        &[
+            "grokVersion",
+            "channel",
+            "cwd",
+            "projectRoot",
+            "projectTrusted",
+            "projectInstructions",
+            "permissions",
+            "loginPolicy",
+            "hooks",
+            "skills",
+            "agents",
+            "plugins",
+            "marketplaces",
+            "mcpServers",
+            "lspServers",
+            "configSources",
+            "externalCompat",
+        ],
+    )?;
     for field in [
         "projectInstructions",
         "hooks",
         "plugins",
+        "marketplaces",
         "mcpServers",
         "lspServers",
     ] {
-        let empty = value
+        require_empty_array(report.get(field))?;
+    }
+    for field in ["grokVersion", "channel"] {
+        if report
             .get(field)
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(Vec::is_empty);
-        if !empty {
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|value| value.is_empty())
+        {
             return Err(GrokBuildAdapterError::IsolationFailed);
         }
+    }
+    let expected_cwd =
+        dunce::canonicalize(&host.cwd).map_err(|_| GrokBuildAdapterError::IsolationFailed)?;
+    for field in ["cwd", "projectRoot"] {
+        let observed = report
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .ok_or(GrokBuildAdapterError::IsolationFailed)?;
+        if dunce::canonicalize(observed).ok().as_ref() != Some(&expected_cwd) {
+            return Err(GrokBuildAdapterError::IsolationFailed);
+        }
+    }
+    if !report
+        .get("projectTrusted")
+        .is_some_and(serde_json::Value::is_boolean)
+    {
+        return Err(GrokBuildAdapterError::IsolationFailed);
+    }
+    verify_permissions(report.get("permissions"))?;
+    verify_login_policy(report.get("loginPolicy"))?;
+    verify_builtin_skills(report.get("skills"), isolated)?;
+    verify_builtin_agents(report.get("agents"))?;
+    verify_config_sources(report.get("configSources"), isolated)?;
+    verify_external_compat(report.get("externalCompat"))
+}
+
+fn require_exact_keys(
+    object: &serde_json::Map<String, serde_json::Value>,
+    expected: &[&str],
+) -> Result<(), GrokBuildAdapterError> {
+    if object.len() != expected.len()
+        || object
+            .keys()
+            .any(|key| !expected.iter().any(|item| key == item))
+    {
+        return Err(GrokBuildAdapterError::IsolationFailed);
+    }
+    Ok(())
+}
+
+fn require_allowed_keys(
+    object: &serde_json::Map<String, serde_json::Value>,
+    required: &[&str],
+    allowed: &[&str],
+) -> Result<(), GrokBuildAdapterError> {
+    if required.iter().any(|key| !object.contains_key(*key))
+        || object
+            .keys()
+            .any(|key| !allowed.iter().any(|item| key == item))
+    {
+        return Err(GrokBuildAdapterError::IsolationFailed);
+    }
+    Ok(())
+}
+
+fn require_empty_array(value: Option<&serde_json::Value>) -> Result<(), GrokBuildAdapterError> {
+    if !value
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(Vec::is_empty)
+    {
+        return Err(GrokBuildAdapterError::IsolationFailed);
+    }
+    Ok(())
+}
+
+fn verify_permissions(value: Option<&serde_json::Value>) -> Result<(), GrokBuildAdapterError> {
+    let object = value
+        .and_then(serde_json::Value::as_object)
+        .ok_or(GrokBuildAdapterError::IsolationFailed)?;
+    require_exact_keys(
+        object,
+        &[
+            "loaded",
+            "managedSettingsActive",
+            "managedSettingsExists",
+            "managedSettingsPath",
+            "marketplaceAllowlist",
+            "mcpServerAllowlist",
+            "skipped",
+            "sources",
+        ],
+    )?;
+    if object.get("loaded").and_then(serde_json::Value::as_u64) != Some(0)
+        || object
+            .get("managedSettingsActive")
+            .and_then(serde_json::Value::as_bool)
+            != Some(false)
+        || object
+            .get("managedSettingsExists")
+            .and_then(serde_json::Value::as_bool)
+            != Some(false)
+        || !object
+            .get("managedSettingsPath")
+            .is_some_and(serde_json::Value::is_string)
+    {
+        return Err(GrokBuildAdapterError::IsolationFailed);
+    }
+    for field in [
+        "marketplaceAllowlist",
+        "mcpServerAllowlist",
+        "skipped",
+        "sources",
+    ] {
+        require_empty_array(object.get(field))?;
+    }
+    Ok(())
+}
+
+fn verify_login_policy(value: Option<&serde_json::Value>) -> Result<(), GrokBuildAdapterError> {
+    let object = value
+        .and_then(serde_json::Value::as_object)
+        .ok_or(GrokBuildAdapterError::IsolationFailed)?;
+    require_exact_keys(
+        object,
+        &[
+            "apiKeyAuthDisabled",
+            "disableApiKeyAuth",
+            "forceLoginTeamUuid",
+        ],
+    )?;
+    if !object
+        .get("apiKeyAuthDisabled")
+        .is_some_and(serde_json::Value::is_boolean)
+        || !object
+            .get("disableApiKeyAuth")
+            .is_some_and(|value| value.is_null() || value.is_boolean())
+        || !object
+            .get("forceLoginTeamUuid")
+            .is_some_and(|value| value.is_null() || value.is_string())
+    {
+        return Err(GrokBuildAdapterError::IsolationFailed);
+    }
+    Ok(())
+}
+
+fn verify_builtin_skills(
+    value: Option<&serde_json::Value>,
+    isolated: &IsolatedHome,
+) -> Result<(), GrokBuildAdapterError> {
+    let entries = value
+        .and_then(serde_json::Value::as_array)
+        .ok_or(GrokBuildAdapterError::IsolationFailed)?;
+    let bundled = isolated.path.join("bundled").join("skills");
+    for entry in entries {
+        let object = entry
+            .as_object()
+            .ok_or(GrokBuildAdapterError::IsolationFailed)?;
+        require_allowed_keys(
+            object,
+            &["name", "description", "source", "userInvocable"],
+            &[
+                "name",
+                "description",
+                "source",
+                "userInvocable",
+                "collidesWith",
+                "invocableAs",
+            ],
+        )?;
+        let source = object
+            .get("source")
+            .and_then(serde_json::Value::as_object)
+            .ok_or(GrokBuildAdapterError::IsolationFailed)?;
+        require_exact_keys(source, &["type", "path"])?;
+        if source.get("type").and_then(serde_json::Value::as_str) != Some("bundled") {
+            return Err(GrokBuildAdapterError::IsolationFailed);
+        }
+        let path = source
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .map(PathBuf::from)
+            .ok_or(GrokBuildAdapterError::IsolationFailed)?;
+        if !path.starts_with(&bundled) {
+            return Err(GrokBuildAdapterError::IsolationFailed);
+        }
+    }
+    Ok(())
+}
+
+fn verify_builtin_agents(value: Option<&serde_json::Value>) -> Result<(), GrokBuildAdapterError> {
+    let entries = value
+        .and_then(serde_json::Value::as_array)
+        .ok_or(GrokBuildAdapterError::IsolationFailed)?;
+    for entry in entries {
+        let object = entry
+            .as_object()
+            .ok_or(GrokBuildAdapterError::IsolationFailed)?;
+        require_exact_keys(object, &["name", "description", "source"])?;
+        let source = object
+            .get("source")
+            .and_then(serde_json::Value::as_object)
+            .ok_or(GrokBuildAdapterError::IsolationFailed)?;
+        require_exact_keys(source, &["type"])?;
+        if source.get("type").and_then(serde_json::Value::as_str) != Some("builtin") {
+            return Err(GrokBuildAdapterError::IsolationFailed);
+        }
+    }
+    Ok(())
+}
+
+fn verify_config_sources(
+    value: Option<&serde_json::Value>,
+    isolated: &IsolatedHome,
+) -> Result<(), GrokBuildAdapterError> {
+    let object = value
+        .and_then(serde_json::Value::as_object)
+        .ok_or(GrokBuildAdapterError::IsolationFailed)?;
+    require_exact_keys(object, &["layers"])?;
+    let layers = object
+        .get("layers")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(GrokBuildAdapterError::IsolationFailed)?;
+    if layers.len() != 1 {
+        return Err(GrokBuildAdapterError::IsolationFailed);
+    }
+    let layer = layers[0]
+        .as_object()
+        .ok_or(GrokBuildAdapterError::IsolationFailed)?;
+    require_exact_keys(layer, &["path", "role"])?;
+    if layer.get("role").and_then(serde_json::Value::as_str) != Some("user")
+        || layer.get("path").and_then(serde_json::Value::as_str)
+            != isolated.path.join(CONFIG_FILE_NAME).to_str()
+    {
+        return Err(GrokBuildAdapterError::IsolationFailed);
+    }
+    Ok(())
+}
+
+fn verify_external_compat(value: Option<&serde_json::Value>) -> Result<(), GrokBuildAdapterError> {
+    let object = value
+        .and_then(serde_json::Value::as_object)
+        .ok_or(GrokBuildAdapterError::IsolationFailed)?;
+    require_exact_keys(object, &["cells", "remoteSettingsLoaded"])?;
+    if object
+        .get("remoteSettingsLoaded")
+        .and_then(serde_json::Value::as_bool)
+        != Some(false)
+    {
+        return Err(GrokBuildAdapterError::IsolationFailed);
+    }
+    let cells = object
+        .get("cells")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(GrokBuildAdapterError::IsolationFailed)?;
+    let mut observed = Vec::new();
+    for cell in cells {
+        let cell = cell
+            .as_object()
+            .ok_or(GrokBuildAdapterError::IsolationFailed)?;
+        require_exact_keys(cell, &["enabled", "source", "surface", "vendor"])?;
+        if cell.get("enabled").and_then(serde_json::Value::as_bool) != Some(false)
+            || cell.get("source").and_then(serde_json::Value::as_str) != Some("config")
+        {
+            return Err(GrokBuildAdapterError::IsolationFailed);
+        }
+        observed.push((
+            cell.get("vendor")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(GrokBuildAdapterError::IsolationFailed)?,
+            cell.get("surface")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(GrokBuildAdapterError::IsolationFailed)?,
+        ));
+    }
+    observed.sort_unstable();
+    let mut expected = Vec::new();
+    for vendor in ["claude", "cursor"] {
+        for surface in ["agents", "hooks", "mcps", "rules", "sessions", "skills"] {
+            expected.push((vendor, surface));
+        }
+    }
+    expected.push(("codex", "sessions"));
+    expected.sort_unstable();
+    if observed != expected {
+        return Err(GrokBuildAdapterError::IsolationFailed);
     }
     Ok(())
 }
@@ -487,7 +860,13 @@ async fn gate_git_identity(
 
     let status = git_stdout(
         host,
-        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignored=matching",
+        ],
         cancel,
     )
     .await?;
@@ -536,14 +915,20 @@ async fn execute_allowlisted(
         cancel,
     )
     .await;
+    if harvest.kind == HarvestKind::TerminationUnproven {
+        isolated.retain_for_termination_investigation();
+        return Err(GrokBuildAdapterError::TerminationUnproven);
+    }
 
     let readonly_violation = if launch.mutation_mode == GrokBuildMutationMode::ReadOnly {
-        read_only_tree_mutated(host).await.unwrap_or(true)
+        gate_git_identity(launch, host, CancellationToken::new())
+            .await
+            .is_err()
     } else {
         false
     };
 
-    let classified = classify_harvest(&harvest, readonly_violation);
+    let classified = classify_harvest(&harvest, readonly_violation, isolated, session_id);
     let cleaned = isolated.cleanup();
     finish_outcome(launch, session_id, classified, !readonly_violation, cleaned)
 }
@@ -571,8 +956,8 @@ fn finish_outcome(
     }
 
     let evidence = match state {
-        GrokBuildRunState::CompleteAdvisory => vec!["advisory-summary".to_string()],
-        GrokBuildRunState::NeedsSynthesis => vec!["partial-run".to_string()],
+        GrokBuildRunState::CompleteAdvisory => classified.evidence_refs,
+        GrokBuildRunState::NeedsSynthesis => vec!["nonresumable-run".to_string()],
         GrokBuildRunState::FailedClosed | GrokBuildRunState::Running => {
             vec!["closed-run".to_string()]
         }
@@ -620,50 +1005,148 @@ enum HarvestKind {
     Timeout,
     Cancelled,
     Overflow,
+    TerminationUnproven,
 }
 
 struct ClassifiedRun {
     state: GrokBuildRunState,
     verdict: Option<GrokBuildVerdict>,
+    evidence_refs: Vec<String>,
 }
 
-fn classify_harvest(harvest: &Harvest, readonly_violation: bool) -> ClassifiedRun {
+fn classify_harvest(
+    harvest: &Harvest,
+    readonly_violation: bool,
+    isolated: &IsolatedHome,
+    expected_session_id: &str,
+) -> ClassifiedRun {
     if readonly_violation {
         return ClassifiedRun {
             state: GrokBuildRunState::FailedClosed,
             verdict: None,
+            evidence_refs: Vec::new(),
         };
     }
     match harvest.kind {
-        HarvestKind::Overflow | HarvestKind::Timeout | HarvestKind::Cancelled => ClassifiedRun {
+        HarvestKind::Overflow
+        | HarvestKind::Timeout
+        | HarvestKind::Cancelled
+        | HarvestKind::TerminationUnproven => ClassifiedRun {
             state: GrokBuildRunState::FailedClosed,
             verdict: None,
+            evidence_refs: Vec::new(),
         },
         HarvestKind::Exited(code) => {
             if has_max_turns(&harvest.stdout, &harvest.stderr) {
                 return ClassifiedRun {
-                    state: GrokBuildRunState::NeedsSynthesis,
+                    state: GrokBuildRunState::FailedClosed,
                     verdict: None,
+                    evidence_refs: Vec::new(),
                 };
             }
             if code != 0 {
                 return ClassifiedRun {
                     state: GrokBuildRunState::FailedClosed,
                     verdict: None,
+                    evidence_refs: Vec::new(),
                 };
             }
-            match explicit_verdict(&harvest.stdout, &harvest.stderr) {
-                Some(verdict) => ClassifiedRun {
+            match verified_advisory_evidence(&harvest.stdout, isolated, expected_session_id) {
+                Some((verdict, evidence_refs)) => ClassifiedRun {
                     state: GrokBuildRunState::CompleteAdvisory,
                     verdict: Some(verdict),
+                    evidence_refs,
                 },
                 None => ClassifiedRun {
-                    state: GrokBuildRunState::NeedsSynthesis,
+                    state: GrokBuildRunState::FailedClosed,
                     verdict: None,
+                    evidence_refs: Vec::new(),
                 },
             }
         }
     }
+}
+
+fn verified_advisory_evidence(
+    stdout: &[u8],
+    isolated: &IsolatedHome,
+    expected_session_id: &str,
+) -> Option<(GrokBuildVerdict, Vec<String>)> {
+    let value: serde_json::Value = serde_json::from_slice(stdout).ok()?;
+    let object = value.as_object()?;
+    let text = object.get("text")?.as_str()?;
+    if text.trim().is_empty()
+        || object.get("stopReason")?.as_str()? != "end_turn"
+        || object.get("sessionId")?.as_str()? != expected_session_id
+    {
+        return None;
+    }
+    let verdict = explicit_verdict(text.as_bytes(), &[])?;
+    let summary_lines = text
+        .as_bytes()
+        .split(|byte| *byte == b'\n')
+        .map(trim_ascii)
+        .filter(|line| !line.is_empty())
+        .filter(|line| {
+            *line != VERDICT_CLEAN && *line != VERDICT_FINDINGS && *line != VERDICT_NOT_COMPLETE
+        })
+        .count();
+    if summary_lines == 0 {
+        return None;
+    }
+    let session_digest = retained_session_digest(isolated, expected_session_id)?;
+    Some((
+        verdict,
+        vec![
+            sha256_evidence_ref("summary", text.as_bytes()),
+            session_digest,
+        ],
+    ))
+}
+
+fn retained_session_digest(isolated: &IsolatedHome, session_id: &str) -> Option<String> {
+    let root = isolated.path.join("sessions");
+    let mut matches = Vec::new();
+    for workspace in std::fs::read_dir(root).ok()? {
+        let workspace = workspace.ok()?;
+        if !workspace.file_type().ok()?.is_dir() {
+            return None;
+        }
+        let candidate = workspace.path().join(session_id);
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(meta) if meta.file_type().is_dir() && !meta.file_type().is_symlink() => {
+                matches.push(candidate)
+            }
+            Ok(_) => return None,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+    }
+    if matches.len() != 1 {
+        return None;
+    }
+    let updates = matches.pop()?.join("updates.jsonl");
+    let metadata = std::fs::symlink_metadata(&updates).ok()?;
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() == 0
+        || metadata.len() > SESSION_EVIDENCE_MAX
+    {
+        return None;
+    }
+    let file = open_credential_source(&updates).ok()?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(SESSION_EVIDENCE_MAX + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 != metadata.len() || bytes.len() as u64 > SESSION_EVIDENCE_MAX {
+        return None;
+    }
+    Some(sha256_evidence_ref("session", &bytes))
+}
+
+fn sha256_evidence_ref(kind: &str, bytes: &[u8]) -> String {
+    format!("{kind}-sha256-{digest:x}", digest = Sha256::digest(bytes))
 }
 
 fn explicit_verdict(stdout: &[u8], stderr: &[u8]) -> Option<GrokBuildVerdict> {
@@ -733,9 +1216,13 @@ async fn harvest_child(
     let mut stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {
-            crate::process_tree::terminate(child).await;
+            let kind = if terminate_and_confirm(child).await {
+                HarvestKind::Cancelled
+            } else {
+                HarvestKind::TerminationUnproven
+            };
             return Harvest {
-                kind: HarvestKind::Cancelled,
+                kind,
                 stdout: Vec::new(),
                 stderr: Vec::new(),
             };
@@ -744,9 +1231,13 @@ async fn harvest_child(
     let mut stderr = match child.stderr.take() {
         Some(stderr) => stderr,
         None => {
-            crate::process_tree::terminate(child).await;
+            let kind = if terminate_and_confirm(child).await {
+                HarvestKind::Cancelled
+            } else {
+                HarvestKind::TerminationUnproven
+            };
             return Harvest {
-                kind: HarvestKind::Cancelled,
+                kind,
                 stdout: Vec::new(),
                 stderr: Vec::new(),
             };
@@ -768,26 +1259,38 @@ async fn harvest_child(
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            crate::process_tree::terminate(child).await;
-            break HarvestKind::Timeout;
+            break if terminate_and_confirm(child).await {
+                HarvestKind::Timeout
+            } else {
+                HarvestKind::TerminationUnproven
+            };
         }
         tokio::select! {
             _ = cancel.cancelled() => {
-                crate::process_tree::terminate(child).await;
-                break HarvestKind::Cancelled;
+                break if terminate_and_confirm(child).await {
+                    HarvestKind::Cancelled
+                } else {
+                    HarvestKind::TerminationUnproven
+                };
             }
             _ = tokio::time::sleep(remaining) => {
-                crate::process_tree::terminate(child).await;
-                break HarvestKind::Timeout;
+                break if terminate_and_confirm(child).await {
+                    HarvestKind::Timeout
+                } else {
+                    HarvestKind::TerminationUnproven
+                };
             }
             n = stdout.read(&mut out_tmp), if !stdout_done => {
                 match n {
                     Ok(0) => stdout_done = true,
                     Ok(n) if out.len().saturating_add(n) > max_stdout => {
-                        crate::process_tree::terminate(child).await;
                         out.clear();
                         err.clear();
-                        break HarvestKind::Overflow;
+                        break if terminate_and_confirm(child).await {
+                            HarvestKind::Overflow
+                        } else {
+                            HarvestKind::TerminationUnproven
+                        };
                     }
                     Ok(n) => out.extend_from_slice(&out_tmp[..n]),
                     Err(_) => stdout_done = true,
@@ -797,10 +1300,13 @@ async fn harvest_child(
                 match n {
                     Ok(0) => stderr_done = true,
                     Ok(n) if err.len().saturating_add(n) > max_stderr => {
-                        crate::process_tree::terminate(child).await;
                         out.clear();
                         err.clear();
-                        break HarvestKind::Overflow;
+                        break if terminate_and_confirm(child).await {
+                            HarvestKind::Overflow
+                        } else {
+                            HarvestKind::TerminationUnproven
+                        };
                     }
                     Ok(n) => err.extend_from_slice(&err_tmp[..n]),
                     Err(_) => stderr_done = true,
@@ -813,7 +1319,6 @@ async fn harvest_child(
     };
 
     if !matches!(kind, HarvestKind::Exited(_)) {
-        let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
         out.clear();
         err.clear();
         return Harvest {
@@ -830,17 +1335,31 @@ async fn harvest_child(
     }
 }
 
-async fn read_only_tree_mutated(
-    host: &GrokBuildHostLaunchConfig,
-) -> Result<bool, GrokBuildAdapterError> {
-    let status = git_stdout(
-        host,
-        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
-        CancellationToken::new(),
-    )
-    .await?;
-    let dirty = porcelain_paths(&status)?;
-    Ok(!dirty.is_empty())
+async fn terminate_and_confirm(child: &mut tokio::process::Child) -> bool {
+    let process_group = child.id();
+    crate::process_tree::terminate_now(child);
+    let leader_reaped = matches!(
+        tokio::time::timeout(Duration::from_secs(3), child.wait()).await,
+        Ok(Ok(_))
+    ) || matches!(child.try_wait(), Ok(Some(_)));
+    if !leader_reaped {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        let Some(process_group) = process_group else {
+            return true;
+        };
+        let status = unsafe { libc::kill(-(process_group as i32), 0) };
+        if status == 0 {
+            return false;
+        }
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 async fn git_stdout(
@@ -1048,12 +1567,14 @@ mod tests {
                 "acceptEdits",
                 "--disable-web-search",
                 "--no-subagents",
+                "--sandbox",
+                "grokptah_workspace",
                 "--max-turns",
                 "8",
                 "--session-id",
                 "00000000-0000-4000-8000-000000000001",
                 "--output-format",
-                "plain",
+                "json",
             ]
         );
         assert!(!args.iter().any(|a| a.contains("yolo")
@@ -1068,6 +1589,7 @@ mod tests {
         )
         .expect("readonly args");
         assert_eq!(readonly[3], "plan");
+        assert_eq!(readonly[7], "grokptah_read_only");
         assert!(!readonly.iter().any(|a| a == "acceptEdits"));
     }
 
@@ -1123,25 +1645,29 @@ mod tests {
 
     #[test]
     fn max_turns_never_classifies_complete() {
+        let parent = tempfile::tempdir().expect("parent");
+        let isolated = IsolatedHome::create(parent.path()).expect("home");
         let harvest = Harvest {
             kind: HarvestKind::Exited(0),
             stdout: b"GROK_BUILD_VERDICT=clean\nmax_turns_reached\n".to_vec(),
             stderr: Vec::new(),
         };
-        let classified = classify_harvest(&harvest, false);
-        assert_eq!(classified.state, GrokBuildRunState::NeedsSynthesis);
+        let classified = classify_harvest(&harvest, false, &isolated, "session-1");
+        assert_eq!(classified.state, GrokBuildRunState::FailedClosed);
         assert_eq!(classified.verdict, None);
     }
 
     #[test]
-    fn missing_verdict_is_needs_synthesis() {
+    fn missing_verdict_fails_closed() {
+        let parent = tempfile::tempdir().expect("parent");
+        let isolated = IsolatedHome::create(parent.path()).expect("home");
         let harvest = Harvest {
             kind: HarvestKind::Exited(0),
             stdout: b"review complete without marker\n".to_vec(),
             stderr: Vec::new(),
         };
-        let classified = classify_harvest(&harvest, false);
-        assert_eq!(classified.state, GrokBuildRunState::NeedsSynthesis);
+        let classified = classify_harvest(&harvest, false, &isolated, "session-1");
+        assert_eq!(classified.state, GrokBuildRunState::FailedClosed);
     }
 
     #[test]
