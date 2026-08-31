@@ -49,6 +49,14 @@ pub struct CompletionEvidence {
     pub claims: CompletionClaims,
     pub observations: CompletionObservations,
     pub usage: CompletionUsage,
+    /// Optional binding to the Work this evidence claims to complete.
+    /// Absent on historical run records; required for success authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
 }
 
 pub(crate) fn claims_from_response(response: Option<&str>) -> CompletionClaims {
@@ -197,7 +205,37 @@ pub(crate) fn build_evidence(
         claims,
         observations,
         usage,
+        ..Default::default()
     }
+}
+
+/// Re-check the completion oracle/claims rules. Caller-supplied `status`
+/// is not trusted: failed tests, missing claims, or incomplete stops never
+/// authorize success even if the status string says `verified`.
+pub(crate) fn evidence_authorizes_success(evidence: &CompletionEvidence) -> bool {
+    if evidence.status != "verified" || evidence.stop_reason != "completed" || evidence.interrupted
+    {
+        return false;
+    }
+    let observations = &evidence.observations;
+    let claims = &evidence.claims;
+    if observations.tests_failed > 0 {
+        return false;
+    }
+    if !claims.present {
+        return false;
+    }
+    if observations.tests_observed == 0
+        || observations.tests_passed == 0
+        || observations.tests_incomplete > 0
+        || observations.permissions_unresolved > 0
+        || (observations.changed_files > 0 && !claims.mentions_changes)
+        || (observations.tests_observed > 0
+            && (!claims.mentions_tests || !claims.mentions_verification))
+    {
+        return false;
+    }
+    true
 }
 
 /// Append an evidence-backed trailer when the model final text omits observed
@@ -397,5 +435,39 @@ mod tests {
             false,
         );
         assert_eq!(incomplete_claims.status, "unverified");
+        assert!(!evidence_authorizes_success(&incomplete_claims));
+        assert!(evidence_authorizes_success(&evidence));
+    }
+
+    #[test]
+    fn failed_tests_never_authorize_success() {
+        let observations = CompletionObservations {
+            changed_files: 1,
+            tests_observed: 1,
+            tests_passed: 0,
+            tests_failed: 1,
+            ..CompletionObservations::default()
+        };
+        let evidence = build_evidence(
+            "completed",
+            Some("Changed src/lib.rs; cargo test passed; verification green."),
+            observations,
+            CompletionUsage::default(),
+            false,
+        );
+        assert_eq!(evidence.status, "failed");
+        let mut forged = evidence.clone();
+        forged.status = "verified".into();
+        assert!(!evidence_authorizes_success(&forged));
+
+        let mut no_passing_tests = evidence;
+        no_passing_tests.status = "verified".into();
+        no_passing_tests.observations.tests_failed = 0;
+        no_passing_tests.observations.tests_passed = 0;
+        assert!(!evidence_authorizes_success(&no_passing_tests));
+
+        no_passing_tests.observations.tests_passed = 1;
+        no_passing_tests.stop_reason = "unknown-success".into();
+        assert!(!evidence_authorizes_success(&no_passing_tests));
     }
 }

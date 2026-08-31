@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::types::{hash_payload, OrchError, OrchErrorCode, RunBounds};
+use crate::completion::CompletionEvidence;
 
 pub const WORKLOAD_SCHEMA_VERSION: u32 = 1;
 pub const MAX_WORK_KIND_BYTES: usize = 96;
@@ -409,6 +410,10 @@ pub struct WorkResult {
     pub failure: Option<String>,
     pub cancellation_reason: Option<String>,
     pub completed_at: DateTime<Utc>,
+    /// Existing completion-oracle evidence, optionally bound to this work.
+    /// Absent on historical records; never carries lease secrets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<CompletionEvidence>,
 }
 
 /// Durable attribution for the human decision that releases an approval-gated
@@ -460,6 +465,33 @@ impl WorkResult {
                 MAX_WORK_OBJECTIVE_BYTES,
                 "result.cancellation_reason",
             )?;
+        }
+        if let Some(verification) = &self.verification {
+            validate_text(
+                &verification.status,
+                MAX_WORK_ARTIFACT_BYTES,
+                "result.verification.status",
+            )?;
+            validate_text(
+                &verification.stop_reason,
+                MAX_WORK_ARTIFACT_BYTES,
+                "result.verification.stop_reason",
+            )?;
+            for (value, field) in [
+                (
+                    verification.work_id.as_deref(),
+                    "result.verification.work_id",
+                ),
+                (verification.run_id.as_deref(), "result.verification.run_id"),
+                (
+                    verification.attempt_id.as_deref(),
+                    "result.verification.attempt_id",
+                ),
+            ] {
+                if let Some(id) = value {
+                    validate_id(id, field)?;
+                }
+            }
         }
         Ok(())
     }

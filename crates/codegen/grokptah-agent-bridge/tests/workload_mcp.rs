@@ -188,7 +188,10 @@ async fn workload_protocol_is_idempotent_scoped_and_lane_archive_safe() {
         )
         .await
         .unwrap();
-    assert_eq!(final_read.structured["work"]["state"], "succeeded");
+    assert_eq!(
+        final_read.structured["work"]["state"], "review",
+        "an external worker summary without host-bound verification is review evidence, not success authority"
+    );
     assert!(final_read.structured["attempt"]
         .get("leaseTokenHash")
         .is_none());

@@ -385,6 +385,7 @@ mod tests {
                 claims: CompletionClaims::default(),
                 observations: CompletionObservations::default(),
                 usage: CompletionUsage::default(),
+                ..Default::default()
             },
         };
         let mut ledger = EventLedger::default();

@@ -1151,14 +1151,21 @@ impl OrchestrationService {
             .clone()
             .or(run.terminal_result.clone())
             .unwrap_or_else(|| format!("{:?}", run.state));
-        let result = WorkResult {
+        let mut result = WorkResult {
             summary,
             evidence: Vec::new(),
             artifacts: Vec::new(),
             failure: run.error_code.clone(),
             cancellation_reason: None,
             completed_at: Utc::now(),
+            verification: None,
         };
+        if let Some(mut evidence) = run.aggregates.verification.clone() {
+            evidence.work_id = Some(intent.work_id.clone());
+            evidence.run_id = Some(run.run_id.clone());
+            evidence.attempt_id = Some(attempt_id.clone());
+            result.verification = Some(evidence);
+        }
         let outcome = match run.state {
             RunState::Completed => {
                 let outcome = if self

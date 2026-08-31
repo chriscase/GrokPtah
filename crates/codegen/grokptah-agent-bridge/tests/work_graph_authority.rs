@@ -10,8 +10,11 @@ use chrono::{Duration as ChronoDuration, TimeZone, Utc};
 use grokptah_agent_bridge::orchestration::{
     evaluate_admission, order_work, resolve_dependency_states, safe_id_filename,
     validate_scoped_dependency_graph, AdmissionBlock, BlockProvenance, GraphScope, OrchErrorCode,
-    OrchStore, WorkDecisionAction, WorkDependency, WorkItem, WorkPolicy, WorkState,
-    MAX_GRAPH_SCOPE_ITEMS,
+    OrchStore, RunRecord, RunState, WorkClaim, WorkDecisionAction, WorkDependency, WorkItem,
+    WorkPolicy, WorkResult, WorkState, MAX_GRAPH_SCOPE_ITEMS,
+};
+use grokptah_agent_bridge::{
+    CompletionClaims, CompletionEvidence, CompletionObservations, CompletionUsage,
 };
 use tempfile::tempdir;
 use uuid::Uuid;
@@ -48,6 +51,100 @@ fn depends_on(item: &mut WorkItem, work_id: &str) {
         work_id: work_id.to_string(),
         required_state: WorkState::Succeeded,
     });
+}
+
+fn complete_with_verified_evidence(
+    store: &OrchStore,
+    item: &WorkItem,
+    claim: &WorkClaim,
+    completed_at: chrono::DateTime<Utc>,
+) {
+    let run_id = format!("run-{}", item.work_id);
+    store
+        .link_work_run(
+            &item.work_id,
+            &claim.attempt.attempt_id,
+            &claim.lease_token,
+            &run_id,
+        )
+        .unwrap();
+    let evidence = CompletionEvidence {
+        status: "verified".into(),
+        stop_reason: "completed".into(),
+        interrupted: false,
+        claims: CompletionClaims {
+            present: true,
+            mentions_changes: true,
+            mentions_tests: true,
+            mentions_verification: true,
+        },
+        observations: CompletionObservations {
+            changed_files: 1,
+            tests_observed: 1,
+            tests_passed: 1,
+            ..CompletionObservations::default()
+        },
+        usage: CompletionUsage::default(),
+        work_id: Some(item.work_id.clone()),
+        run_id: Some(run_id.clone()),
+        attempt_id: Some(claim.attempt.attempt_id.clone()),
+    };
+    let aggregates = grokptah_agent_bridge::orchestration::RunAggregates {
+        verification: Some(evidence.clone()),
+        ..Default::default()
+    };
+    store
+        .save_run(&RunRecord {
+            run_id: run_id.clone(),
+            session_id: item.session_id,
+            workspace: item.workspace.clone(),
+            request_id: format!("req-{}", item.work_id),
+            client_id: None,
+            state: RunState::Completed,
+            purpose: Default::default(),
+            agent_id: None,
+            retry_of: None,
+            parent_run_id: None,
+            agent_spec_revision: None,
+            checkpoint_id: None,
+            continuation_context_id: None,
+            continuation_context_hash: None,
+            continuation_fidelity: None,
+            queue_position: None,
+            bounds: Default::default(),
+            prompt_preview: "preview".into(),
+            start_seq: Some(1),
+            end_seq: Some(2),
+            created_at: completed_at,
+            updated_at: completed_at,
+            terminal_result: Some("completed".into()),
+            final_response: Some(
+                "Changed src/lib.rs; cargo test passed; verification green.".into(),
+            ),
+            error_code: None,
+            stop_cause: None,
+            aggregates,
+            progress: None,
+            execution: None,
+            approval: None,
+        })
+        .unwrap();
+    store
+        .complete_work(
+            &item.work_id,
+            &claim.attempt.attempt_id,
+            &claim.lease_token,
+            WorkResult {
+                summary: "done".into(),
+                evidence: vec!["deterministic evidence".into()],
+                artifacts: Vec::new(),
+                failure: None,
+                cancellation_reason: None,
+                completed_at,
+                verification: Some(evidence),
+            },
+        )
+        .unwrap();
 }
 
 /// The proven pre-upgrade derived wait: `Blocked`, no provenance, no reason,
@@ -897,21 +994,7 @@ fn reconciliation_is_idempotent_across_replay_and_restart() {
     let claim = reopened
         .claim_work(&dependency.work_id, "worker", None)
         .unwrap();
-    reopened
-        .complete_work(
-            &dependency.work_id,
-            &claim.attempt.attempt_id,
-            &claim.lease_token,
-            grokptah_agent_bridge::orchestration::WorkResult {
-                summary: "done".into(),
-                evidence: vec!["deterministic evidence".into()],
-                artifacts: Vec::new(),
-                failure: None,
-                cancellation_reason: None,
-                completed_at: now,
-            },
-        )
-        .unwrap();
+    complete_with_verified_evidence(&reopened, &dependency, &claim, now);
     let lifted = reopened
         .reconcile_workloads_at(now + ChronoDuration::seconds(1))
         .unwrap();

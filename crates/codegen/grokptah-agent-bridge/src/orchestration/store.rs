@@ -39,6 +39,7 @@ use super::workload::{
     WorkloadReconciliationReport, WORKLOAD_SCHEMA_VERSION,
 };
 use super::{assemble_continuation_context, ContinuationContext, ContinuationInputSnapshot};
+use crate::completion::{evidence_authorizes_success, CompletionEvidence};
 
 #[derive(Clone)]
 pub struct OrchStore {
@@ -2164,7 +2165,203 @@ impl OrchStore {
             failure: Some(summary.into()),
             cancellation_reason: None,
             completed_at: now,
+            verification: None,
         }
+    }
+
+    /// Classify completion-oracle evidence bound to this work/run/attempt.
+    /// Missing IDs are unbound (not success authority). Present IDs that do
+    /// not match this exact work, attempt, and an allowed run are refused.
+    fn bound_completion_evidence<'a>(
+        evidence: Option<&'a CompletionEvidence>,
+        work_id: &str,
+        attempt_id: &str,
+        linked_run_ids: &[String],
+        extra_run_id: Option<&str>,
+    ) -> Result<Option<&'a CompletionEvidence>, OrchError> {
+        let Some(evidence) = evidence else {
+            return Ok(None);
+        };
+        let has_any = evidence.work_id.is_some()
+            || evidence.run_id.is_some()
+            || evidence.attempt_id.is_some();
+        let has_all = evidence.work_id.is_some()
+            && evidence.run_id.is_some()
+            && evidence.attempt_id.is_some();
+        if has_any && !has_all {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "completion evidence must bind work, run, and attempt together",
+            ));
+        }
+        if !has_all {
+            return Ok(None);
+        }
+        let run_id = evidence.run_id.as_deref().unwrap_or_default();
+        let run_allowed = linked_run_ids.iter().any(|id| id == run_id)
+            || extra_run_id.is_some_and(|id| id == run_id);
+        if evidence.work_id.as_deref() != Some(work_id)
+            || evidence.attempt_id.as_deref() != Some(attempt_id)
+            || !run_allowed
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "completion evidence is not bound to this work/run/attempt",
+            ));
+        }
+        Ok(Some(evidence))
+    }
+
+    fn success_is_authorized_unlocked(
+        &self,
+        item: &WorkItem,
+        attempt: Option<&WorkAttempt>,
+        result: Option<&WorkResult>,
+        extra_run_id: Option<&str>,
+    ) -> Result<bool, OrchError> {
+        if item.approval.is_some() {
+            return Ok(true);
+        }
+        let Some(result) = result.or(item.result.as_ref()) else {
+            return Ok(false);
+        };
+        if result.failure.is_some() || result.cancellation_reason.is_some() {
+            return Ok(false);
+        }
+        let Some(attempt) = attempt else {
+            return Ok(false);
+        };
+        if attempt.work_id != item.work_id {
+            return Err(OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "completion attempt does not belong to this work item",
+            ));
+        }
+        let Some(evidence) = Self::bound_completion_evidence(
+            result.verification.as_ref(),
+            &item.work_id,
+            &attempt.attempt_id,
+            &attempt.linked_run_ids,
+            extra_run_id,
+        )?
+        else {
+            return Ok(false);
+        };
+        if !evidence_authorizes_success(evidence) {
+            return Ok(false);
+        }
+        let run_id = evidence.run_id.as_deref().unwrap_or_default();
+        match self.load_run_unlocked(run_id) {
+            Ok(Some(run)) => {
+                if run.session_id != item.session_id
+                    || !workspaces_match(&run.workspace, &item.workspace)
+                {
+                    return Err(OrchError::new(
+                        OrchErrorCode::ForbiddenScope,
+                        "completion evidence run is outside this work lane",
+                    ));
+                }
+                let Some(run_evidence) = run.aggregates.verification.as_ref() else {
+                    return Ok(false);
+                };
+                if !evidence_authorizes_success(run_evidence) {
+                    return Ok(false);
+                }
+                let same_observation = evidence.status == run_evidence.status
+                    && evidence.stop_reason == run_evidence.stop_reason
+                    && evidence.interrupted == run_evidence.interrupted
+                    && evidence.claims == run_evidence.claims
+                    && evidence.observations == run_evidence.observations
+                    && evidence.usage == run_evidence.usage;
+                if !same_observation {
+                    return Err(OrchError::new(
+                        OrchErrorCode::ForbiddenScope,
+                        "completion evidence does not match the durable Run observation",
+                    ));
+                }
+                Ok(true)
+            }
+            Ok(None) => Err(OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "completion evidence run does not exist",
+            )),
+            Err(error) => Err(OrchError::new(OrchErrorCode::Internal, error.to_string())),
+        }
+    }
+
+    fn ordinary_completion_states(item: &WorkItem) -> (AttemptState, WorkState) {
+        if item.policy.requires_approval {
+            (AttemptState::AwaitingApproval, WorkState::AwaitingApproval)
+        } else {
+            (AttemptState::Review, WorkState::Review)
+        }
+    }
+
+    fn bind_managed_completion_result_unlocked(
+        &self,
+        intent: &ManagedExecutionIntent,
+        result: Option<WorkResult>,
+        attempt: Option<&WorkAttempt>,
+    ) -> Result<Option<WorkResult>, OrchError> {
+        let Some(mut result) = result else {
+            return Ok(None);
+        };
+        if result.verification.is_some() {
+            return Ok(Some(result));
+        }
+        let Some(run_id) = intent.run_id.as_deref() else {
+            return Ok(Some(result));
+        };
+        let run = match self.load_run_unlocked(run_id) {
+            Ok(run) => run,
+            Err(error) => return Err(OrchError::new(OrchErrorCode::Internal, error.to_string())),
+        };
+        if let Some(mut evidence) = run.and_then(|run| run.aggregates.verification) {
+            if evidence_authorizes_success(&evidence) {
+                evidence.work_id = Some(intent.work_id.clone());
+                evidence.run_id = Some(run_id.to_string());
+                evidence.attempt_id = intent
+                    .attempt_id
+                    .clone()
+                    .or_else(|| attempt.map(|attempt| attempt.attempt_id.clone()));
+                result.verification = Some(evidence);
+            }
+        }
+        Ok(Some(result))
+    }
+
+    fn completion_result_replays(stored: &WorkResult, incoming: &WorkResult) -> bool {
+        stored.summary == incoming.summary
+            && stored.evidence == incoming.evidence
+            && stored.artifacts == incoming.artifacts
+            && stored.failure == incoming.failure
+            && stored.cancellation_reason == incoming.cancellation_reason
+            && stored.verification == incoming.verification
+    }
+
+    /// The only production writer of `WorkState::Succeeded`.
+    fn assign_work_succeeded_unlocked(
+        &self,
+        item: &mut WorkItem,
+        attempt: Option<&mut WorkAttempt>,
+        extra_run_id: Option<&str>,
+    ) -> Result<(), OrchError> {
+        if !self.success_is_authorized_unlocked(
+            item,
+            attempt.as_deref(),
+            item.result.as_ref(),
+            extra_run_id,
+        )? {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "work item cannot enter succeeded without verified completion evidence or durable approval",
+            ));
+        }
+        item.state = WorkState::Succeeded;
+        if let Some(attempt) = attempt {
+            attempt.state = AttemptState::Succeeded;
+        }
+        Ok(())
     }
 
     fn refresh_work_item_unlocked(&self, item: &mut WorkItem) -> anyhow::Result<()> {
@@ -3895,6 +4092,12 @@ impl OrchStore {
             .load_work_item_unlocked(&intent.work_id)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
             .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
+        let attempt = match intent.attempt_id.as_deref() {
+            Some(attempt_id) => self
+                .load_work_attempt_unlocked(attempt_id)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+            None => None,
+        };
         let (attempt_state, work_state, result) = if item.state == WorkState::Cancelled {
             (
                 AttemptState::Cancelled,
@@ -3912,7 +4115,29 @@ impl OrchStore {
         } else {
             match outcome {
                 ManagedFinalizationOutcome::Completed => {
-                    (AttemptState::Succeeded, WorkState::Succeeded, result)
+                    let result = self.bind_managed_completion_result_unlocked(
+                        &intent,
+                        result,
+                        attempt.as_ref(),
+                    )?;
+                    let mut candidate = item.clone();
+                    candidate.result = result.clone();
+                    if item.policy.requires_approval {
+                        (
+                            AttemptState::AwaitingApproval,
+                            WorkState::AwaitingApproval,
+                            result,
+                        )
+                    } else if self.success_is_authorized_unlocked(
+                        &candidate,
+                        attempt.as_ref(),
+                        result.as_ref(),
+                        intent.run_id.as_deref(),
+                    )? {
+                        (AttemptState::Succeeded, WorkState::Succeeded, result)
+                    } else {
+                        (AttemptState::Review, WorkState::Review, result)
+                    }
                 }
                 ManagedFinalizationOutcome::AwaitingApproval => (
                     AttemptState::AwaitingApproval,
@@ -4017,14 +4242,40 @@ impl OrchStore {
         if let Ok(Some(mut item)) = self.load_work_item_unlocked(&record.work_id) {
             let preserve_terminal = item.state == WorkState::Cancelled
                 || item.state == WorkState::Succeeded
-                || item.state == WorkState::AwaitingApproval;
+                || item.state == WorkState::AwaitingApproval
+                || item.state == WorkState::Review;
             if !preserve_terminal {
-                item.state = record.work_state;
-                if record.work_state == WorkState::Queued {
+                if record.result.is_some() && record.work_state != WorkState::Queued {
+                    item.result = record.result.clone();
+                }
+                if record.work_state == WorkState::Succeeded {
+                    let mut attempt = match record.attempt_id.as_deref() {
+                        Some(attempt_id) => {
+                            self.load_work_attempt_unlocked(attempt_id).ok().flatten()
+                        }
+                        None => None,
+                    };
+                    let extra_run_id = item
+                        .result
+                        .as_ref()
+                        .and_then(|result| result.verification.as_ref())
+                        .and_then(|evidence| evidence.run_id.clone());
+                    self.assign_work_succeeded_unlocked(
+                        &mut item,
+                        attempt.as_mut(),
+                        extra_run_id.as_deref(),
+                    )?;
+                    if let Some(attempt) = attempt.as_ref() {
+                        self.save_work_attempt_unlocked(attempt).map_err(|error| {
+                            OrchError::new(OrchErrorCode::Internal, error.to_string())
+                        })?;
+                    }
+                } else if record.work_state == WorkState::Queued {
+                    item.state = WorkState::Queued;
                     item.blocked_reason = None;
                     item.result = None;
-                } else if record.result.is_some() {
-                    item.result = record.result.clone();
+                } else {
+                    item.state = record.work_state;
                 }
                 item.bump_at(now);
                 self.save_work_item_unlocked(&item)
@@ -4287,6 +4538,40 @@ impl OrchStore {
             .load_work_item_unlocked(work_id)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
             .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
+        if item.state == WorkState::Succeeded
+            && item
+                .approval
+                .as_ref()
+                .is_some_and(|existing| existing.reviewer_id == reviewer_id)
+        {
+            let attempts = self
+                .list_work_attempts_unlocked(Some(work_id))
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            let attempt = attempts
+                .into_iter()
+                .rev()
+                .find(|attempt| {
+                    attempt.state == AttemptState::Succeeded
+                        || attempt.state == AttemptState::AwaitingApproval
+                })
+                .ok_or_else(|| {
+                    OrchError::new(
+                        OrchErrorCode::Conflict,
+                        "approved work item has no succeeded attempt",
+                    )
+                })?;
+            return Ok((item, attempt));
+        }
+        if item
+            .approval
+            .as_ref()
+            .is_some_and(|existing| existing.reviewer_id != reviewer_id)
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "work item is already approved by a different actor",
+            ));
+        }
         Self::require_work_revision(&item, expected_revision)?;
         if item.state != WorkState::AwaitingApproval {
             return Err(OrchError::new(
@@ -4307,11 +4592,12 @@ impl OrchStore {
                     "approval-gated work item has no awaiting attempt",
                 )
             })?;
-        attempt.state = AttemptState::Succeeded;
         attempt.terminal_reason = Some(format!("approved by {}", reviewer_id));
         attempt.updated_at = approval.approved_at;
-        item.state = WorkState::Succeeded;
         item.approval = Some(approval);
+        self.save_work_item_unlocked(&item)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        self.assign_work_succeeded_unlocked(&mut item, Some(attempt), None)?;
         item.bump();
         self.save_work_attempt_unlocked(attempt)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
@@ -4619,21 +4905,66 @@ impl OrchStore {
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
             .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
         let now = Utc::now();
-        let mut attempt =
-            self.load_active_attempt_for_token_unlocked(&item, attempt_id, lease_token, now)?;
+        let mut attempt = self
+            .load_work_attempt_unlocked(attempt_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work attempt not found"))?;
+        if attempt.work_id != item.work_id {
+            return Err(OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "work attempt does not belong to the work item",
+            ));
+        }
+        if !attempt.token_matches(lease_token) {
+            return Err(OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "invalid work lease token",
+            ));
+        }
+        let already_completed = matches!(
+            attempt.state,
+            AttemptState::Succeeded | AttemptState::Review | AttemptState::AwaitingApproval
+        ) && matches!(
+            item.state,
+            WorkState::Succeeded | WorkState::Review | WorkState::AwaitingApproval
+        );
+        if already_completed {
+            if !attempt
+                .result
+                .as_ref()
+                .is_some_and(|stored| Self::completion_result_replays(stored, &result))
+            {
+                return Err(OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "work attempt already completed",
+                ));
+            }
+            if item.state != WorkState::Succeeded && now >= attempt.lease_expires_at {
+                return Err(OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "work lease is no longer active",
+                ));
+            }
+            return Ok((item, attempt));
+        }
+        if !attempt.state.is_active() || now >= attempt.lease_expires_at {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "work lease is no longer active",
+            ));
+        }
         attempt.result = Some(result.clone());
-        attempt.state = if item.policy.requires_approval {
-            AttemptState::AwaitingApproval
-        } else {
-            AttemptState::Succeeded
-        };
         attempt.updated_at = now;
         item.result = Some(result);
-        item.state = if item.policy.requires_approval {
-            WorkState::AwaitingApproval
+        if self.success_is_authorized_unlocked(&item, Some(&attempt), item.result.as_ref(), None)?
+            && !item.policy.requires_approval
+        {
+            self.assign_work_succeeded_unlocked(&mut item, Some(&mut attempt), None)?;
         } else {
-            WorkState::Succeeded
-        };
+            let (attempt_state, work_state) = Self::ordinary_completion_states(&item);
+            attempt.state = attempt_state;
+            item.state = work_state;
+        }
         item.bump();
         self.save_work_attempt_unlocked(&attempt)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
@@ -4726,6 +5057,7 @@ impl OrchStore {
             failure: None,
             cancellation_reason: Some(reason.to_string()),
             completed_at: now,
+            verification: None,
         });
         item.bump();
         self.save_work_item_unlocked(&item)

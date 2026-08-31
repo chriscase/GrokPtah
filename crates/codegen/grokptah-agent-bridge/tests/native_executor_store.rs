@@ -255,6 +255,7 @@ fn expired_attempt_rejects_late_managed_completion() {
         failure: None,
         cancellation_reason: None,
         completed_at: Utc::now(),
+        verification: None,
     };
     assert!(store
         .complete_work(
@@ -1241,6 +1242,7 @@ fn completed_finalization_converges_after_partial_writes() {
             failure: None,
             cancellation_reason: None,
             completed_at: Utc::now(),
+            verification: None,
         };
         store
             .finalize_managed_intent_until(
@@ -1263,7 +1265,7 @@ fn completed_finalization_converges_after_partial_writes() {
     let store = OrchStore::open(&path).unwrap();
     assert_eq!(
         store.load_work_item(&work_id).unwrap().unwrap().state,
-        WorkState::Succeeded
+        WorkState::Review
     );
     assert_eq!(
         store
