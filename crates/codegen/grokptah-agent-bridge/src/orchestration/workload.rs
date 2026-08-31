@@ -23,6 +23,8 @@ pub const MAX_WORK_APPROVAL_NOTE_BYTES: usize = 4 * 1024;
 pub const DEFAULT_WORK_LEASE_MS: u64 = 5 * 60 * 1_000;
 pub const MAX_WORK_LEASE_MS: u64 = 60 * 60 * 1_000;
 pub const DEFAULT_WORK_MAX_ATTEMPTS: u32 = 3;
+pub const MAX_WORK_ALLOWED_FILES: usize = 256;
+pub const MAX_WORK_ALLOWED_FILE_PATH_BYTES: usize = 1024;
 
 /// Counts the durable changes made by one workload reconciliation pass.
 ///
@@ -211,6 +213,13 @@ pub struct WorkPolicy {
     /// Work-level override. Default inherit: Agent policy decides.
     #[serde(default)]
     pub managed_execution: super::managed::ManagedWorkMode,
+    /// Normalized relative workspace files this Work may mutate.
+    ///
+    /// Empty means unrestricted by Work policy (legacy behavior). A non-empty
+    /// list is fail-closed: only those destinations may be written, and shell
+    /// is denied rather than parsed.
+    #[serde(default)]
+    pub allowed_files: Vec<String>,
 }
 
 impl Default for WorkPolicy {
@@ -221,6 +230,7 @@ impl Default for WorkPolicy {
             requires_approval: false,
             max_concurrent_attempts: 1,
             managed_execution: super::managed::ManagedWorkMode::Inherit,
+            allowed_files: Vec::new(),
         }
     }
 }
@@ -234,8 +244,83 @@ impl WorkPolicy {
                 "policy.max_concurrent_attempts must be exactly one in the single-owner runtime",
             ));
         }
+        let normalized = normalize_allowed_files(&self.allowed_files)?;
+        if normalized != self.allowed_files {
+            return Err(invalid(
+                "allowed_files must be stored as normalized relative workspace paths",
+            ));
+        }
         Ok(())
     }
+
+    /// Empty allowlist preserves today's unrestricted-by-work-policy behavior.
+    pub fn restricts_local_mutations(&self) -> bool {
+        !self.allowed_files.is_empty()
+    }
+
+    /// Non-empty allowlists deny shell rather than attempting to parse argv.
+    pub fn denies_shell(&self) -> bool {
+        self.restricts_local_mutations()
+    }
+}
+
+/// Canonicalize one Work `allowed_files` entry.
+///
+/// Accepts only already-normalized relative paths inside the Work workspace:
+/// no absolute paths, `..`, empty/dot targets, or separator tricks.
+pub fn normalize_allowed_file_path(raw: &str) -> Result<String, OrchError> {
+    if raw.len() > MAX_WORK_ALLOWED_FILE_PATH_BYTES {
+        return Err(invalid("allowed_files path exceeds its bound"));
+    }
+    if raw.is_empty() || raw == "." || raw == ".." {
+        return Err(invalid(
+            "allowed_files entries must be relative workspace files",
+        ));
+    }
+    if raw.contains('\0') || raw.contains('\\') || raw.contains("//") || raw.ends_with('/') {
+        return Err(invalid(
+            "allowed_files path contains empty/dot targets or separator tricks",
+        ));
+    }
+    if raw.starts_with('/') {
+        return Err(invalid("allowed_files paths must be relative"));
+    }
+    let mut parts = Vec::new();
+    for part in raw.split('/') {
+        match part {
+            "" | "." => {
+                return Err(invalid(
+                    "allowed_files path contains empty or dot components",
+                ));
+            }
+            ".." => return Err(invalid("allowed_files paths must not contain ..")),
+            _ => parts.push(part),
+        }
+    }
+    if parts.is_empty() {
+        return Err(invalid(
+            "allowed_files entries must be relative workspace files",
+        ));
+    }
+    Ok(parts.join("/"))
+}
+
+/// Normalize and bound a Work `allowed_files` list. Duplicates after
+/// normalization are rejected.
+pub fn normalize_allowed_files(entries: &[String]) -> Result<Vec<String>, OrchError> {
+    if entries.len() > MAX_WORK_ALLOWED_FILES {
+        return Err(invalid("allowed_files exceeds the work policy bound"));
+    }
+    let mut out = Vec::with_capacity(entries.len());
+    let mut seen = HashSet::with_capacity(entries.len());
+    for raw in entries {
+        let normalized = normalize_allowed_file_path(raw)?;
+        if !seen.insert(normalized.clone()) {
+            return Err(invalid("allowed_files contains duplicate normalized paths"));
+        }
+        out.push(normalized);
+    }
+    Ok(out)
 }
 
 /// Why a work item is in the [`WorkState::Blocked`] state.
@@ -862,5 +947,75 @@ mod tests {
         assert!(WorkState::Succeeded.is_terminal());
         assert!(WorkState::Failed.is_terminal());
         assert!(!WorkState::Leased.is_claimable());
+    }
+
+    #[test]
+    fn allowed_files_legacy_empty_and_json_round_trip() {
+        let legacy: WorkPolicy = serde_json::from_value(serde_json::json!({
+            "bounds": { "maxPromptBytes": 1000, "maxRounds": 1, "maxDurationMs": 1000 },
+            "retry": {
+                "maxAttempts": 3,
+                "retryFailed": true,
+                "retryExpired": true,
+                "backoffMs": 0
+            },
+            "requiresApproval": false,
+            "maxConcurrentAttempts": 1,
+            "managedExecution": "inherit"
+        }))
+        .unwrap();
+        assert!(legacy.allowed_files.is_empty());
+        assert!(!legacy.restricts_local_mutations());
+        assert!(!legacy.denies_shell());
+        legacy.validate().unwrap();
+
+        let policy = WorkPolicy {
+            allowed_files: vec!["src/lib.rs".into(), "README.md".into()],
+            ..WorkPolicy::default()
+        };
+        policy.validate().unwrap();
+        assert!(policy.restricts_local_mutations());
+        assert!(policy.denies_shell());
+        let value = serde_json::to_value(&policy).unwrap();
+        assert_eq!(
+            value["allowedFiles"],
+            serde_json::json!(["src/lib.rs", "README.md"])
+        );
+        let back: WorkPolicy = serde_json::from_value(value).unwrap();
+        assert_eq!(back, policy);
+    }
+
+    #[test]
+    fn allowed_files_rejects_invalid_and_duplicate_paths() {
+        let mut policy = WorkPolicy::default();
+        for invalid_path in [
+            "",
+            ".",
+            "..",
+            "./foo.rs",
+            "src/./a.rs",
+            "src/../a.rs",
+            "/abs.rs",
+            "foo//bar.rs",
+            "foo\\bar.rs",
+            "dir/",
+            "a/../b.rs",
+        ] {
+            policy.allowed_files = vec![invalid_path.into()];
+            assert!(
+                policy.validate().is_err(),
+                "expected {invalid_path:?} to be rejected"
+            );
+        }
+        policy.allowed_files = vec!["src/a.rs".into(), "src/a.rs".into()];
+        assert!(policy.validate().is_err());
+        policy.allowed_files = vec!["x".repeat(MAX_WORK_ALLOWED_FILE_PATH_BYTES + 1)];
+        assert!(policy.validate().is_err());
+        policy.allowed_files = (0..=MAX_WORK_ALLOWED_FILES)
+            .map(|i| format!("f{i}.rs"))
+            .collect();
+        assert!(policy.validate().is_err());
+        policy.allowed_files = vec!["src/a.rs".into()];
+        policy.validate().unwrap();
     }
 }

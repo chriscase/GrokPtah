@@ -106,6 +106,100 @@ pub fn resolve_under_cwd(cwd: &Path, rel: &str) -> Result<PathBuf> {
     Ok(resolved)
 }
 
+fn relative_posix_under(canon_cwd: &Path, resolved: &Path) -> Result<String> {
+    let rel = resolved
+        .strip_prefix(canon_cwd)
+        .map_err(|_| anyhow::anyhow!("path escapes project root: {}", resolved.display()))?;
+    if rel.as_os_str().is_empty() {
+        anyhow::bail!("empty/dot destination is not allowed");
+    }
+    let mut out = String::new();
+    for component in rel.components() {
+        match component {
+            Component::Normal(part) => {
+                let part = part
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("non-utf8 path component"))?;
+                if !out.is_empty() {
+                    out.push('/');
+                }
+                out.push_str(part);
+            }
+            _ => anyhow::bail!("path is not a normalized relative workspace path"),
+        }
+    }
+    if out.is_empty() {
+        anyhow::bail!("empty/dot destination is not allowed");
+    }
+    Ok(out)
+}
+
+/// Fail-closed Work `allowed_files` preflight.
+///
+/// Empty `allowed_files` preserves unrestricted-by-work-policy behavior. A
+/// non-empty list requires every destination to resolve, via
+/// [`resolve_under_cwd`], to a canonical relative path in the list. The entire
+/// destination set is checked before the caller writes anything.
+pub fn preflight_allowed_destinations(
+    cwd: &Path,
+    allowed_files: &[String],
+    destinations: &[&str],
+) -> Result<()> {
+    if allowed_files.is_empty() {
+        return Ok(());
+    }
+    if destinations.is_empty() {
+        anyhow::bail!("Work allowed_files policy is non-empty but no destinations were provided");
+    }
+    let canon_cwd = dunce::canonicalize(cwd)
+        .with_context(|| format!("canonicalize project root {}", cwd.display()))?;
+    let allowed: std::collections::HashSet<&str> =
+        allowed_files.iter().map(String::as_str).collect();
+    for dest in destinations {
+        let resolved = resolve_under_cwd(cwd, dest)?;
+        let relative = relative_posix_under(&canon_cwd, &resolved)?;
+        if !allowed.contains(relative.as_str()) {
+            anyhow::bail!("destination `{dest}` is not in the Work allowed_files policy");
+        }
+    }
+    Ok(())
+}
+
+/// Extract mutation destinations from an `apply_patch` payload so a Work
+/// allowlist can be preflighted before any write.
+pub fn extract_patch_destinations(patch: &str) -> Result<Vec<String>> {
+    let mut paths = Vec::new();
+    let mut rest = patch.trim();
+    if rest.is_empty() {
+        anyhow::bail!("empty patch");
+    }
+    while let Some(idx) = rest.find("*** Update File:") {
+        rest = rest[idx + "*** Update File:".len()..].trim_start();
+        let path_line = rest
+            .split(['\n', '\r'])
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if path_line.is_empty() {
+            anyhow::bail!("missing path after *** Update File:");
+        }
+        paths.push(path_line.clone());
+        rest = rest.get(path_line.len()..).unwrap_or("");
+    }
+    if paths.is_empty() {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(patch) {
+            if let Some(path) = v.get("path").and_then(|x| x.as_str()) {
+                paths.push(path.to_string());
+            }
+        }
+    }
+    if paths.is_empty() {
+        anyhow::bail!("unrecognized patch format; cannot preflight Work allowed_files policy");
+    }
+    Ok(paths)
+}
+
 pub async fn tool_read_file(cwd: &Path, path: &str) -> Result<ToolResult> {
     let full = resolve_under_cwd(cwd, path)?;
     let text = tokio::fs::read_to_string(&full)
@@ -197,7 +291,13 @@ pub async fn tool_grep(cwd: &Path, pattern: &str, path: &str) -> Result<ToolResu
     ))
 }
 
-pub async fn tool_write_file(cwd: &Path, path: &str, content: &str) -> Result<ToolResult> {
+pub async fn tool_write_file(
+    cwd: &Path,
+    path: &str,
+    content: &str,
+    allowed_files: &[String],
+) -> Result<ToolResult> {
+    preflight_allowed_destinations(cwd, allowed_files, &[path])?;
     let full = resolve_under_cwd(cwd, path)?;
     if let Some(parent) = full.parent() {
         tokio::fs::create_dir_all(parent)
@@ -218,15 +318,21 @@ pub async fn tool_write_file(cwd: &Path, path: &str, content: &str) -> Result<To
 }
 
 /// Write many files in one tool call (turn-efficient multi-file edits for #187/#188).
-pub async fn tool_write_files(cwd: &Path, files: &[(String, String)]) -> Result<ToolResult> {
+pub async fn tool_write_files(
+    cwd: &Path,
+    files: &[(String, String)],
+    allowed_files: &[String],
+) -> Result<ToolResult> {
     if files.is_empty() {
         anyhow::bail!("write_files requires a non-empty files array");
     }
+    let policy_destinations: Vec<&str> = files.iter().map(|(path, _)| path.as_str()).collect();
+    preflight_allowed_destinations(cwd, allowed_files, &policy_destinations)?;
     let mut resolved = Vec::with_capacity(files.len());
-    let mut destinations = std::collections::HashSet::with_capacity(files.len());
+    let mut resolved_destinations = std::collections::HashSet::with_capacity(files.len());
     for (path, content) in files {
         let full = resolve_under_cwd(cwd, path)?;
-        if !destinations.insert(full.clone()) {
+        if !resolved_destinations.insert(full.clone()) {
             anyhow::bail!("write_files contains duplicate destination: {path}");
         }
         resolved.push((path, content, full));
@@ -531,7 +637,7 @@ mod tests {
             ("src/b.rs".into(), "pub fn b() {}\n".into()),
             ("src/c.rs".into(), "pub fn c() {}\n".into()),
         ];
-        let r = tool_write_files(dir.path(), &files).await.unwrap();
+        let r = tool_write_files(dir.path(), &files, &[]).await.unwrap();
         assert!(r.output.contains("3 file"));
         assert_eq!(
             std::fs::read_to_string(dir.path().join("src/a.rs")).unwrap(),
@@ -550,7 +656,7 @@ mod tests {
     #[tokio::test]
     async fn write_files_empty_is_error() {
         let dir = tempfile::tempdir().unwrap();
-        let res = tool_write_files(dir.path(), &[]).await;
+        let res = tool_write_files(dir.path(), &[], &[]).await;
         assert!(res.is_err());
         assert!(
             res.err().unwrap().to_string().contains("non-empty"),
@@ -564,7 +670,7 @@ mod tests {
         let project = parent.path().join("project");
         std::fs::create_dir(&project).unwrap();
 
-        let result = tool_write_file(&project, "../outside.txt", "nope").await;
+        let result = tool_write_file(&project, "../outside.txt", "nope", &[]).await;
 
         assert!(result.is_err());
         assert!(!parent.path().join("outside.txt").exists());
@@ -580,7 +686,7 @@ mod tests {
             ("../outside.txt".into(), "nope".into()),
         ];
 
-        let result = tool_write_files(&project, &files).await;
+        let result = tool_write_files(&project, &files, &[]).await;
 
         assert!(result.is_err());
         assert!(!project.join("inside.txt").exists());
@@ -595,6 +701,7 @@ mod tests {
             project.path(),
             "src/generated/../generated/value.rs",
             "pub const VALUE: u8 = 1;\n",
+            &[],
         )
         .await
         .unwrap();
@@ -611,8 +718,13 @@ mod tests {
         let outside = tempfile::NamedTempFile::new().unwrap();
         let original = std::fs::read(outside.path()).unwrap();
 
-        let result =
-            tool_write_file(project.path(), &outside.path().to_string_lossy(), "nope").await;
+        let result = tool_write_file(
+            project.path(),
+            &outside.path().to_string_lossy(),
+            "nope",
+            &[],
+        )
+        .await;
 
         assert!(result.is_err());
         assert_eq!(std::fs::read(outside.path()).unwrap(), original);
@@ -643,7 +755,7 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         symlink(outside.path(), project.path().join("linked")).unwrap();
 
-        let result = tool_write_file(project.path(), "linked/escaped.txt", "nope").await;
+        let result = tool_write_file(project.path(), "linked/escaped.txt", "nope", &[]).await;
 
         assert!(result.is_err());
         assert!(!outside.path().join("escaped.txt").exists());
@@ -666,6 +778,98 @@ mod tests {
         let result = resolve_under_cwd(&project, "dangling/escaped.txt");
 
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn allowed_files_empty_policy_still_writes() {
+        let project = tempfile::tempdir().unwrap();
+        tool_write_file(project.path(), "legacy.txt", "ok\n", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(project.path().join("legacy.txt")).unwrap(),
+            "ok\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn allowed_files_write_succeeds_for_listed_path() {
+        let project = tempfile::tempdir().unwrap();
+        let allowed = vec!["src/ok.rs".into()];
+        tool_write_file(project.path(), "src/ok.rs", "pub fn ok() {}\n", &allowed)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(project.path().join("src/ok.rs")).unwrap(),
+            "pub fn ok() {}\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn allowed_files_rejects_out_of_list_and_symlink_escape() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("ok.txt"), "listed\n").unwrap();
+        std::fs::write(project.path().join("secret.txt"), "hidden\n").unwrap();
+        let allowed = vec!["ok.txt".into()];
+
+        let out_of_list = tool_write_file(project.path(), "secret.txt", "nope\n", &allowed).await;
+        assert!(out_of_list.is_err());
+        assert_eq!(
+            std::fs::read_to_string(project.path().join("secret.txt")).unwrap(),
+            "hidden\n"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            symlink(
+                project.path().join("secret.txt"),
+                project.path().join("ok.txt"),
+            )
+            .ok();
+            std::fs::remove_file(project.path().join("ok.txt")).unwrap();
+            symlink(
+                project.path().join("secret.txt"),
+                project.path().join("ok.txt"),
+            )
+            .unwrap();
+            let escaped = tool_write_file(project.path(), "ok.txt", "pwned\n", &allowed).await;
+            assert!(escaped.is_err());
+            assert_eq!(
+                std::fs::read_to_string(project.path().join("secret.txt")).unwrap(),
+                "hidden\n"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn allowed_files_multi_write_is_atomic_on_policy_refusal() {
+        let project = tempfile::tempdir().unwrap();
+        let allowed = vec!["keep.txt".into()];
+        let files = vec![
+            ("keep.txt".into(), "would be partial".into()),
+            ("denied.txt".into(), "nope".into()),
+        ];
+        let result = tool_write_files(project.path(), &files, &allowed).await;
+        assert!(result.is_err());
+        assert!(!project.path().join("keep.txt").exists());
+        assert!(!project.path().join("denied.txt").exists());
+    }
+
+    #[test]
+    fn extract_patch_destinations_covers_marker_and_json_forms() {
+        let marker =
+            "*** Update File: src/lib.rs\n<<<<<<< SEARCH\nold\n=======\nnew\n>>>>>>> REPLACE\n";
+        assert_eq!(
+            extract_patch_destinations(marker).unwrap(),
+            vec!["src/lib.rs".to_string()]
+        );
+        let json = r#"{"path":"README.md","old_string":"a","new_string":"b"}"#;
+        assert_eq!(
+            extract_patch_destinations(json).unwrap(),
+            vec!["README.md".to_string()]
+        );
+        assert!(extract_patch_destinations("not a patch").is_err());
     }
 
     fn shell_map() -> LiveShellMap {

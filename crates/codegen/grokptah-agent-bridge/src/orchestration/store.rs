@@ -1138,6 +1138,64 @@ impl OrchStore {
         self.load_work_attempt_unlocked(attempt_id)
     }
 
+    /// Authoritative Work for a local executor Run, if this Run is Work-bound.
+    ///
+    /// Binding is the durable WorkAttempt `linked_run_ids` set and any
+    /// managed-execution intent that recorded this Run. Missing Work after a
+    /// binding is found fails closed rather than treating the Run as unbound.
+    pub fn work_item_for_run(&self, run_id: &str) -> Result<Option<WorkItem>, OrchError> {
+        let _guard = self.inner.lock.lock();
+        self.work_item_for_run_unlocked(run_id)
+    }
+
+    fn work_item_for_run_unlocked(&self, run_id: &str) -> Result<Option<WorkItem>, OrchError> {
+        let mut matched: Option<String> = None;
+        let attempts = self
+            .list_work_attempts_unlocked(None)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        for attempt in attempts {
+            if attempt.linked_run_ids.iter().any(|id| id == run_id) {
+                if let Some(existing) = matched.as_ref() {
+                    if existing != &attempt.work_id {
+                        return Err(OrchError::new(
+                            OrchErrorCode::Conflict,
+                            "run is linked to more than one Work item",
+                        ));
+                    }
+                } else {
+                    matched = Some(attempt.work_id.clone());
+                }
+            }
+        }
+        for intent in self.list_managed_intents_unlocked()? {
+            if intent.run_id.as_deref() == Some(run_id) {
+                if let Some(existing) = matched.as_ref() {
+                    if existing != &intent.work_id {
+                        return Err(OrchError::new(
+                            OrchErrorCode::Conflict,
+                            "run is linked to more than one Work item",
+                        ));
+                    }
+                } else {
+                    matched = Some(intent.work_id.clone());
+                }
+            }
+        }
+        let Some(work_id) = matched else {
+            return Ok(None);
+        };
+        match self
+            .load_work_item_unlocked(&work_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+        {
+            Some(item) => Ok(Some(item)),
+            None => Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                format!("Work-bound run {run_id} is missing its Work item"),
+            )),
+        }
+    }
+
     // --- Durable manager plans -------------------------------------------
 
     pub fn save_manager_plan_with_root(

@@ -484,3 +484,110 @@ async fn workload_supervisor_runs_and_reports_success() {
     assert!(status.last_success_at.is_some());
     assert!(status.last_error.is_none());
 }
+
+#[test]
+fn allowed_files_policy_survives_store_reload_and_binds_to_run() {
+    let home = tempdir().unwrap();
+    let policy = WorkPolicy {
+        allowed_files: vec!["src/only.rs".into()],
+        ..WorkPolicy::default()
+    };
+    let store = OrchStore::open(home.path()).unwrap();
+    let item = WorkItem::new(
+        "coding",
+        "scoped writes",
+        Uuid::new_v4(),
+        "/tmp/project",
+        "operator",
+        policy.clone(),
+    )
+    .unwrap();
+    store.save_work_item(&item).unwrap();
+    let claim = store.claim_work(&item.work_id, "worker", None).unwrap();
+    store
+        .link_work_run(
+            &item.work_id,
+            &claim.attempt.attempt_id,
+            &claim.lease_token,
+            "run-scoped-1",
+        )
+        .unwrap();
+    drop(store);
+
+    let reopened = OrchStore::open(home.path()).unwrap();
+    let loaded = reopened.load_work_item(&item.work_id).unwrap().unwrap();
+    assert_eq!(loaded.policy.allowed_files, vec!["src/only.rs".to_string()]);
+    assert!(loaded.policy.denies_shell());
+    let bound = reopened.work_item_for_run("run-scoped-1").unwrap().unwrap();
+    assert_eq!(bound.work_id, item.work_id);
+    assert_eq!(bound.policy.allowed_files, loaded.policy.allowed_files);
+    assert!(reopened
+        .work_item_for_run("run-unrelated")
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn work_file_policy_does_not_leak_across_works_and_fails_closed_if_missing() {
+    let home = tempdir().unwrap();
+    let store = OrchStore::open(home.path()).unwrap();
+    let policy_a = WorkPolicy {
+        allowed_files: vec!["shared.txt".into()],
+        ..WorkPolicy::default()
+    };
+    let policy_b = WorkPolicy {
+        allowed_files: vec!["other.txt".into()],
+        ..WorkPolicy::default()
+    };
+    let work_a = WorkItem::new(
+        "coding",
+        "a",
+        Uuid::new_v4(),
+        "/tmp/project",
+        "operator",
+        policy_a,
+    )
+    .unwrap();
+    let work_b = WorkItem::new(
+        "coding",
+        "b",
+        Uuid::new_v4(),
+        "/tmp/project",
+        "operator",
+        policy_b,
+    )
+    .unwrap();
+    store.save_work_item(&work_a).unwrap();
+    store.save_work_item(&work_b).unwrap();
+    let claim_a = store.claim_work(&work_a.work_id, "worker", None).unwrap();
+    let claim_b = store.claim_work(&work_b.work_id, "worker", None).unwrap();
+    store
+        .link_work_run(
+            &work_a.work_id,
+            &claim_a.attempt.attempt_id,
+            &claim_a.lease_token,
+            "run-a",
+        )
+        .unwrap();
+    store
+        .link_work_run(
+            &work_b.work_id,
+            &claim_b.attempt.attempt_id,
+            &claim_b.lease_token,
+            "run-b",
+        )
+        .unwrap();
+    let loaded_b = store.work_item_for_run("run-b").unwrap().unwrap();
+    assert_eq!(loaded_b.work_id, work_b.work_id);
+    assert_eq!(loaded_b.policy.allowed_files, vec!["other.txt".to_string()]);
+    assert!(!loaded_b.policy.allowed_files.contains(&"shared.txt".into()));
+
+    std::fs::remove_file(
+        home.path()
+            .join("work-items")
+            .join(format!("{}.json", work_a.work_id)),
+    )
+    .unwrap();
+    let missing = store.work_item_for_run("run-a").unwrap_err();
+    assert!(missing.to_string().contains("missing its Work item"));
+}

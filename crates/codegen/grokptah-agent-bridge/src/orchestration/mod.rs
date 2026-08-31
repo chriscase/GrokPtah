@@ -95,8 +95,9 @@ pub use worker::{
     WorkerObservatoryProjection, WorkerPresence, WorkerProjection, DEFAULT_WORKER_STALE_AFTER_MS,
 };
 pub use workload::{
-    lease_duration, AssignmentStatus, AttemptState, BlockProvenance, WorkApproval, WorkArtifactRef,
-    WorkAttempt, WorkAttemptView, WorkClaim, WorkDecision, WorkDecisionAction, WorkDependency,
-    WorkItem, WorkItemSnapshot, WorkPolicy, WorkProgress, WorkResult, WorkRetryPolicy, WorkState,
-    WorkloadReconciliationReport, WORKLOAD_SCHEMA_VERSION,
+    lease_duration, normalize_allowed_file_path, normalize_allowed_files, AssignmentStatus,
+    AttemptState, BlockProvenance, WorkApproval, WorkArtifactRef, WorkAttempt, WorkAttemptView,
+    WorkClaim, WorkDecision, WorkDecisionAction, WorkDependency, WorkItem, WorkItemSnapshot,
+    WorkPolicy, WorkProgress, WorkResult, WorkRetryPolicy, WorkState, WorkloadReconciliationReport,
+    MAX_WORK_ALLOWED_FILES, MAX_WORK_ALLOWED_FILE_PATH_BYTES, WORKLOAD_SCHEMA_VERSION,
 };

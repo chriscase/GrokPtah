@@ -315,6 +315,7 @@ fn validate_directive_json_shape(value: &Value) -> Result<(), OrchError> {
                     "requiresApproval",
                     "maxConcurrentAttempts",
                     "managedExecution",
+                    "allowedFiles",
                 ],
                 &format!("directive.steps[{index}].policy"),
             )?;
@@ -1443,7 +1444,7 @@ mod tests {
             }
         });
         parse_manager_directive(&valid.to_string()).unwrap();
-        let mut unknown = valid;
+        let mut unknown = valid.clone();
         unknown["unexpected"] = json!(true);
         assert!(parse_manager_directive(&unknown.to_string()).is_err());
         let mut nested_unknown = unknown;
@@ -1457,7 +1458,39 @@ mod tests {
             }
         });
         assert!(parse_manager_directive(&nested_unknown.to_string()).is_err());
+        let mut with_allowed_files = valid;
+        let mut policy = serde_json::to_value(WorkPolicy::default()).unwrap();
+        policy["allowedFiles"] = json!(["src/lib.rs"]);
+        with_allowed_files["directive"]["steps"][0]["policy"] = policy;
+        parse_manager_directive(&with_allowed_files.to_string()).unwrap();
         assert!(parse_manager_directive("{} trailing").is_err());
         assert!(parse_manager_directive(&"x".repeat(MAX_MANAGER_DIRECTIVE_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn materialized_child_inherits_exactly_its_step_policy() {
+        let now = Utc::now();
+        let mut step = spec("scoped", &[]);
+        step.policy.allowed_files = vec!["src/only.rs".into()];
+        let mut plan = ManagerPlan::new(
+            Uuid::new_v4(),
+            "/tmp/project",
+            "manager",
+            "objective",
+            "root",
+            vec![step],
+            1,
+            1,
+            now,
+        )
+        .unwrap();
+        let created = plan.advance(&[], "operator", now).unwrap();
+        assert_eq!(created.len(), 1);
+        assert_eq!(
+            created[0].policy.allowed_files,
+            vec!["src/only.rs".to_string()]
+        );
+        assert_eq!(created[0].policy, plan.steps[0].policy);
+        assert!(created[0].policy.denies_shell());
     }
 }
