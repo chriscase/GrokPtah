@@ -2499,7 +2499,7 @@ impl OrchStore {
             }
 
             for mut attempt in self.list_work_attempts_unlocked(Some(&item.work_id))? {
-                if !attempt.state.is_active() || now < attempt.lease_expires_at {
+                if !attempt.state.requires_lease_heartbeat() || now < attempt.lease_expires_at {
                     continue;
                 }
                 report.expired_attempts += 1;
@@ -2998,6 +2998,7 @@ impl OrchStore {
                 self.require_agent_in_scope_unlocked(agent_id, item.session_id, &item.workspace)
             })
             .transpose()?;
+        let assigned_agent_id = assigned_agent_id.or(item.assigned_agent_id.as_deref());
         let assigned = match assigned_agent_id {
             Some(agent_id)
                 if actor

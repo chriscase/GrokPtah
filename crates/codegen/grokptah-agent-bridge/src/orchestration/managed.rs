@@ -403,15 +403,28 @@ pub fn managed_execution_eligible(
             "managed execution cannot grant Computer Use or bypass permissions",
         ));
     }
-    if policy.requires_approval_before_execution
-        && !decisions
-            .iter()
-            .any(|decision| decision.action == WorkDecisionAction::AuthorizeExecution)
-    {
-        return Err(OrchError::new(
-            OrchErrorCode::Conflict,
-            "managed execution requires an explicit authorization decision",
-        ));
+    if policy.requires_approval_before_execution {
+        let current_authorization = work.last_decision_id.as_deref().and_then(|decision_id| {
+            decisions
+                .iter()
+                .find(|decision| decision.decision_id == decision_id)
+        });
+        let authorized = current_authorization.is_some_and(|decision| {
+            decision.action == WorkDecisionAction::AuthorizeExecution
+                && decision.work_id == work.work_id
+                && decision.assigned_agent_id.as_deref() == work.assigned_agent_id.as_deref()
+                && decision.policy_revision == Some(spec.revision)
+                && decision
+                    .work_revision
+                    .and_then(|revision| revision.checked_add(1))
+                    == Some(work.revision)
+        });
+        if !authorized {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "managed execution requires the current authorization decision",
+            ));
+        }
     }
     if live_intents_for_agent >= policy.max_concurrent_runs as usize {
         return Err(OrchError::new(

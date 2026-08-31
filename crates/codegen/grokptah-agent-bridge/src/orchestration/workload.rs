@@ -165,6 +165,15 @@ impl AttemptState {
                 | Self::Review
         )
     }
+
+    /// States whose lease expiry represents lost execution authority.
+    ///
+    /// Review and approval states remain active for claim exclusion, but no
+    /// worker is executing under their old lease. Expiring those states would
+    /// silently erase a durable human gate and requeue or fail finished work.
+    pub fn requires_lease_heartbeat(self) -> bool {
+        matches!(self, Self::Leased | Self::Running | Self::AwaitingInput)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

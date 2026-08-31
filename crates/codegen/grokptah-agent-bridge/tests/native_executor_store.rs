@@ -117,6 +117,103 @@ fn manual_only_and_foreign_agents_are_not_eligible() {
 }
 
 #[test]
+fn managed_execution_requires_the_current_bound_authorization() {
+    let home = tempdir().unwrap();
+    let store = OrchStore::open(home.path()).unwrap();
+    let session = Uuid::new_v4();
+    store
+        .save_agent(&agent("worker-a", "/tmp/ws", session))
+        .unwrap();
+    store
+        .revise_agent_spec("worker-a", "operator", |spec| {
+            spec.managed_execution.enabled = true;
+            spec.managed_execution.requires_approval_before_execution = true;
+            spec.managed_execution.bounds.max_total_tokens = Some(4_000);
+            Ok(())
+        })
+        .unwrap();
+    let item = accepted_work(session, "/tmp/ws", "worker-a");
+    store.save_work_item(&item).unwrap();
+    let (authorized, decision) = store
+        .authorize_work_execution(
+            &item.work_id,
+            "operator",
+            None,
+            "authorize one managed attempt",
+            Some(item.revision),
+            Utc::now(),
+        )
+        .unwrap();
+    let worker = store.load_agent("worker-a").unwrap().unwrap();
+    let spec = worker.current_spec().unwrap().clone();
+    let ceiling = RunBounds::default();
+    assert_eq!(
+        authorized.last_decision_id.as_deref(),
+        Some(decision.decision_id.as_str())
+    );
+    assert_eq!(
+        decision.work_revision.map(|revision| revision + 1),
+        Some(authorized.revision)
+    );
+    assert_eq!(
+        decision.assigned_agent_id.as_deref(),
+        authorized.assigned_agent_id.as_deref()
+    );
+    assert_eq!(decision.policy_revision, Some(spec.revision));
+    let eligible = managed_execution_eligible(
+        &authorized,
+        &worker,
+        &spec,
+        std::slice::from_ref(&decision),
+        0,
+        &ceiling,
+    );
+    assert!(eligible.is_ok(), "{eligible:?}");
+
+    let mut later_revision = authorized.clone();
+    later_revision.bump();
+    assert!(managed_execution_eligible(
+        &later_revision,
+        &worker,
+        &spec,
+        std::slice::from_ref(&decision),
+        0,
+        &ceiling,
+    )
+    .is_err());
+
+    let mut detached = authorized.clone();
+    detached.last_decision_id = None;
+    assert!(managed_execution_eligible(
+        &detached,
+        &worker,
+        &spec,
+        std::slice::from_ref(&decision),
+        0,
+        &ceiling,
+    )
+    .is_err());
+
+    let revised = store
+        .revise_agent_spec("worker-a", "operator", |spec| {
+            spec.default_run_bounds.max_prompt_bytes =
+                spec.default_run_bounds.max_prompt_bytes.saturating_sub(1);
+            Ok(())
+        })
+        .unwrap()
+        .unwrap();
+    assert!(managed_execution_eligible(
+        &authorized,
+        &revised,
+        revised.current_spec().unwrap(),
+        &[decision],
+        0,
+        &ceiling,
+    )
+    .is_err());
+}
+
+#[test]
 fn bounds_intersection_never_widens() {
     let server = RunBounds {
         max_prompt_bytes: 10_000,

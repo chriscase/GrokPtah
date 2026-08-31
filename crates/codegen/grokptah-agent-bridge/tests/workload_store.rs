@@ -336,6 +336,18 @@ fn approval_policy_stops_completion_at_awaiting_approval() {
         grokptah_agent_bridge::orchestration::AttemptState::AwaitingApproval
     );
     assert!(!completed.state.is_terminal());
+    let report = store
+        .reconcile_workloads_at(claim.attempt.lease_expires_at + ChronoDuration::days(365))
+        .unwrap();
+    assert_eq!(report.expired_attempts, 0);
+    assert_eq!(
+        store.load_work_item(&item.work_id).unwrap().unwrap().state,
+        WorkState::AwaitingApproval
+    );
+    assert_eq!(
+        store.list_work_attempts(Some(&item.work_id)).unwrap()[0].state,
+        AttemptState::AwaitingApproval
+    );
 
     let (approved, approved_attempt) = store
         .approve_work(
@@ -767,6 +779,18 @@ fn unverified_evidence_refuses_success_and_lands_in_review() {
     assert_eq!(completed.state, WorkState::Review);
     assert_eq!(attempt.state, AttemptState::Review);
     assert!(completed.approval.is_none());
+    let report = store
+        .reconcile_workloads_at(claim.attempt.lease_expires_at + ChronoDuration::days(365))
+        .unwrap();
+    assert_eq!(report.expired_attempts, 0);
+    assert_eq!(
+        store.load_work_item(&item.work_id).unwrap().unwrap().state,
+        WorkState::Review
+    );
+    assert_eq!(
+        store.list_work_attempts(Some(&item.work_id)).unwrap()[0].state,
+        AttemptState::Review
+    );
 }
 
 #[test]
