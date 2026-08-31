@@ -103,6 +103,11 @@ pub struct GrokBuildHostLaunchConfig {
     /// Exact normalized workspace-relative files the isolated review may
     /// change. Empty is never valid for IsolatedReview.
     pub allowed_files: Vec<String>,
+    /// Host-owned proof that the canonical work authority approved physical
+    /// tool execution for this exact launch. Headless Grok requires a
+    /// noninteractive permission mode, so the adapter refuses to construct
+    /// that argv unless this bit is present.
+    pub execution_approved: bool,
     pub max_stdout_bytes: usize,
     pub max_stderr_bytes: usize,
     pub git_timeout: Duration,
@@ -121,6 +126,7 @@ impl fmt::Debug for GrokBuildHostLaunchConfig {
             .field("cwd_absolute", &self.cwd.is_absolute())
             .field("prompt_bytes", &self.prompt.len())
             .field("allowed_file_count", &self.allowed_files.len())
+            .field("execution_approved", &self.execution_approved)
             .field("max_stdout_bytes", &self.max_stdout_bytes)
             .field("max_stderr_bytes", &self.max_stderr_bytes)
             .finish_non_exhaustive()
@@ -149,6 +155,9 @@ impl GrokBuildHostLaunchConfig {
             return Err(GrokBuildAdapterError::InvalidRequest);
         }
         validate_allowed_files(&self.allowed_files)?;
+        if !self.execution_approved {
+            return Err(GrokBuildAdapterError::InvalidRequest);
+        }
         if self.max_stdout_bytes == 0
             || self.max_stderr_bytes == 0
             || self.max_stdout_bytes > OUTPUT_BYTES_MAX
@@ -395,7 +404,12 @@ fn map_contract(err: GrokBuildContractError) -> GrokBuildAdapterError {
 fn permission_flag(mode: GrokBuildMutationMode) -> &'static str {
     match mode {
         GrokBuildMutationMode::ReadOnly => "plan",
-        GrokBuildMutationMode::IsolatedReview => "acceptEdits",
+        // `acceptEdits` still prompts for the write tool in Grok 1.0.13 and
+        // headless stdin is deliberately closed. The host maps an explicit,
+        // revision-bound Work approval into this noninteractive mode; the OS
+        // workspace sandbox, empty inherited environment, no-remote gate,
+        // sealed prompt, and exact post-run mutation allowlist remain active.
+        GrokBuildMutationMode::IsolatedReview => "bypassPermissions",
     }
 }
 
@@ -2189,6 +2203,7 @@ mod tests {
             base_ref: "base".into(),
             prompt: "review the private key sk-live-secret-not-real".into(),
             allowed_files: vec!["README.md".into()],
+            execution_approved: true,
             max_stdout_bytes: 32,
             max_stderr_bytes: 32,
             git_timeout: Duration::from_secs(1),

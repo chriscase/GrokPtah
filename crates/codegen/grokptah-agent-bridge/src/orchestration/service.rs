@@ -1856,6 +1856,11 @@ impl OrchestrationService {
             base_ref: runtime.config.base_ref.clone(),
             prompt,
             allowed_files,
+            // Reaching this point requires the exact current Work revision to
+            // carry an explicit pre-execution authorization and a claimed
+            // one-attempt lease. The adapter refuses headless tool execution
+            // without this host-owned proof bit.
+            execution_approved: true,
             max_stdout_bytes: limits.max_output_bytes,
             max_stderr_bytes: limits.max_output_bytes,
             git_timeout: Duration::from_secs(10),

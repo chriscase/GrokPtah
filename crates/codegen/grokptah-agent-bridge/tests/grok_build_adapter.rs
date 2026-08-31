@@ -110,6 +110,7 @@ impl Fixture {
             base_ref: "base".into(),
             prompt: "review the isolated tree".into(),
             allowed_files: vec!["README".into()],
+            execution_approved: true,
             max_stdout_bytes: 8_192,
             max_stderr_bytes: 8_192,
             git_timeout: Duration::from_secs(5),
@@ -399,7 +400,7 @@ async fn exact_command_argv_and_env() {
         &argv[2..10],
         [
             "--permission-mode",
-            "acceptEdits",
+            "bypassPermissions",
             "--disable-web-search",
             "--no-subagents",
             "--sandbox",
@@ -456,6 +457,24 @@ async fn exact_command_argv_and_env() {
     );
     assert_eq!(outcome.result().state, GrokBuildRunState::CompleteAdvisory);
     assert_eq!(outcome.result().session_id, argv[11]);
+}
+
+#[tokio::test]
+async fn noninteractive_tool_execution_requires_explicit_host_approval() {
+    let fx = Fixture::new();
+    fx.set_behavior("complete");
+    let mut host = fx.host();
+    host.execution_approved = false;
+    let error = launch_grok_build(
+        &fx.launch(GrokBuildMutationMode::IsolatedReview, 60_000),
+        &host,
+        &fx.resolver(),
+        CancellationToken::new(),
+    )
+    .await
+    .expect_err("unapproved host launch must fail before spawning Grok");
+    assert_eq!(error, GrokBuildAdapterError::InvalidRequest);
+    assert!(!fx.fake_dir.path().join("captured-argv").exists());
 }
 
 #[tokio::test]
