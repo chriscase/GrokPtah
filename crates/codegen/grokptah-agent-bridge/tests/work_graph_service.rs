@@ -315,38 +315,40 @@ async fn the_control_plane_unblocks_under_the_same_fences_as_block() {
     assert_eq!(blocked.structured["work"]["blockProvenance"], "manual");
     let blocked_revision = blocked.structured["work"]["revision"].as_u64().unwrap();
 
+    let stale_args = json!({
+        "request_id": "unblock-stale",
+        "session_id": mine.id,
+        "workspace": workspace_text,
+        "work_id": work_id,
+        "reason": "stale fence",
+        "expected_revision": blocked_revision + 7,
+    });
     let stale = client
-        .call_tool(
-            "ptah_unblock_work",
-            json!({
-                "request_id": "unblock-stale",
-                "session_id": mine.id,
-                "workspace": workspace_text,
-                "work_id": work_id,
-                "reason": "stale fence",
-                "expected_revision": blocked_revision + 7,
-            }),
-        )
+        .call_tool("ptah_unblock_work", stale_args.clone())
         .await
         .expect_err("a stale revision fence must refuse the write")
         .to_string();
     assert_eq!(stale, "MCP remote error: stale_version");
+    let stale_replay = client
+        .call_tool("ptah_unblock_work", stale_args)
+        .await
+        .expect_err("a replayed stale fence must preserve the refusal")
+        .to_string();
+    assert_eq!(stale_replay, stale);
     let still_held = store.load_work_item(&work_id).unwrap().unwrap();
     assert_eq!(still_held.state, WorkState::Blocked);
     assert_eq!(still_held.revision, blocked_revision);
 
+    let release_args = json!({
+        "request_id": "unblock-release",
+        "session_id": mine.id,
+        "workspace": workspace_text,
+        "work_id": work_id,
+        "reason": "review complete",
+        "expected_revision": blocked_revision,
+    });
     let released = client
-        .call_tool(
-            "ptah_unblock_work",
-            json!({
-                "request_id": "unblock-release",
-                "session_id": mine.id,
-                "workspace": workspace_text,
-                "work_id": work_id,
-                "reason": "review complete",
-                "expected_revision": blocked_revision,
-            }),
-        )
+        .call_tool("ptah_unblock_work", release_args.clone())
         .await
         .unwrap();
     assert_eq!(released.structured["work"]["state"], "queued");
@@ -363,6 +365,22 @@ async fn the_control_plane_unblocks_under_the_same_fences_as_block() {
         "the public unblock response is an explicit allowlist"
     );
     assert!(released.structured.get("workspace").is_none());
+    assert_eq!(
+        released
+            .structured
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        ["sessionId", "work"].into_iter().collect(),
+        "the public unblock envelope is an explicit allowlist"
+    );
+    let released_replay = client
+        .call_tool("ptah_unblock_work", release_args)
+        .await
+        .expect("a successful replay must return the same redacted body");
+    assert_eq!(released_replay.structured, released.structured);
 
     let sibling = client
         .call_tool(
@@ -434,6 +452,42 @@ async fn the_control_plane_unblocks_under_the_same_fences_as_block() {
     assert_eq!(cross_block, unknown_block);
     assert_eq!(cross_unblock, unknown_unblock);
 
+    let unknown_session = client
+        .call_tool(
+            "ptah_unblock_work",
+            json!({
+                "request_id": "unblock-unknown-session",
+                "session_id": uuid::Uuid::new_v4(),
+                "workspace": workspace_text,
+                "work_id": work_id,
+                "reason": "probe",
+            }),
+        )
+        .await
+        .expect_err("an unknown session must fail before work-id collapse")
+        .to_string();
+    assert_eq!(
+        unknown_session, "MCP remote error: invalid_request",
+        "an unknown session remains fail-closed without becoming a work-id oracle"
+    );
+
+    let other_workspace = tempdir().unwrap();
+    let workspace_mismatch = client
+        .call_tool(
+            "ptah_unblock_work",
+            json!({
+                "request_id": "unblock-workspace-mismatch",
+                "session_id": mine.id,
+                "workspace": other_workspace.path().display().to_string(),
+                "work_id": work_id,
+                "reason": "probe",
+            }),
+        )
+        .await
+        .expect_err("workspace mismatch must fail before work-id collapse")
+        .to_string();
+    assert_eq!(workspace_mismatch, "MCP remote error: workspace_mismatch");
+
     // A derived dependency hold is reconciliation's, not an operator's to
     // release. The control plane must not widen the store's provenance rule.
     let waiting = client
@@ -457,19 +511,23 @@ async fn the_control_plane_unblocks_under_the_same_fences_as_block() {
     store.reconcile_workloads().unwrap();
     let derived = store.load_work_item(&waiting_id).unwrap().unwrap();
     assert_eq!(derived.block_provenance, Some(BlockProvenance::Derived));
+    let derived_args = json!({
+        "request_id": "unblock-derived",
+        "session_id": mine.id,
+        "workspace": workspace_text,
+        "work_id": waiting_id,
+        "reason": "impatience",
+    });
     let denied = client
-        .call_tool(
-            "ptah_unblock_work",
-            json!({
-                "request_id": "unblock-derived",
-                "session_id": mine.id,
-                "workspace": workspace_text,
-                "work_id": waiting_id,
-                "reason": "impatience",
-            }),
-        )
+        .call_tool("ptah_unblock_work", derived_args.clone())
         .await
         .expect_err("a dependency hold is not an operator's to release")
         .to_string();
     assert_eq!(denied, "MCP remote error: conflict");
+    let denied_replay = client
+        .call_tool("ptah_unblock_work", derived_args)
+        .await
+        .expect_err("a replayed derived-hold refusal must remain a conflict")
+        .to_string();
+    assert_eq!(denied_replay, denied);
 }
