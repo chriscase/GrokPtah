@@ -284,6 +284,13 @@ if [ -n "$session_id" ] && [ "$behavior" != 'complete-no-session' ]; then
     printf '{"method":"session/update","params":{"_meta":{},"sessionId":"%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"bounded advisory summary\\nGROK_BUILD_VERDICT=clean"}}},"timestamp":1788214716}\n' "$session_id" > "$GROK_HOME/sessions/workspace/$session_id/updates.jsonl"
     printf '{"method":"_x.ai/session/update","params":{"_meta":{},"sessionId":"%s","update":{"sessionUpdate":"turn_completed","prompt_id":"11111111-1111-4111-8111-111111111111","stop_reason":"end_turn","usage":{},"numTurns":1,"elapsed_ms":10}},"timestamp":1788214717}\n' "$session_id" >> "$GROK_HOME/sessions/workspace/$session_id/updates.jsonl"
   fi
+  if [ "$behavior" = 'complete-tool-transcript' ]; then
+    printf '{"method":"session/update","params":{"_meta":{},"sessionId":"%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"bounded "}}},"timestamp":1788214716}\n' "$session_id" > "$GROK_HOME/sessions/workspace/$session_id/updates.jsonl"
+    printf '{"method":"session/update","params":{"_meta":{},"sessionId":"%s","update":{"sessionUpdate":"tool_call","toolCallId":"tool-1","title":"read_file","rawInput":{}}},"timestamp":1788214716}\n' "$session_id" >> "$GROK_HOME/sessions/workspace/$session_id/updates.jsonl"
+    printf '{"method":"session/update","params":{"_meta":{},"sessionId":"%s","update":{"sessionUpdate":"tool_call_update","toolCallId":"tool-1","status":"completed","rawOutput":{}}},"timestamp":1788214716}\n' "$session_id" >> "$GROK_HOME/sessions/workspace/$session_id/updates.jsonl"
+    printf '{"method":"session/update","params":{"_meta":{},"sessionId":"%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"advisory summary\\nGROK_BUILD_VERDICT=clean"}}},"timestamp":1788214717}\n' "$session_id" >> "$GROK_HOME/sessions/workspace/$session_id/updates.jsonl"
+    printf '{"method":"_x.ai/session/update","params":{"_meta":{},"sessionId":"%s","update":{"sessionUpdate":"turn_completed","stop_reason":"end_turn"}},"timestamp":1788214718}\n' "$session_id" >> "$GROK_HOME/sessions/workspace/$session_id/updates.jsonl"
+  fi
   if [ "$behavior" = 'complete-invalid-timestamp' ]; then
     printf '{"method":"session/update","params":{"_meta":{},"sessionId":"%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"bounded advisory summary\\nGROK_BUILD_VERDICT=clean"}}},"timestamp":{}}\n' "$session_id" > "$GROK_HOME/sessions/workspace/$session_id/updates.jsonl"
     printf '{"method":"_x.ai/session/update","params":{"_meta":{},"sessionId":"%s","update":{"sessionUpdate":"turn_completed","stop_reason":"end_turn"}},"timestamp":1788214717}\n' "$session_id" >> "$GROK_HOME/sessions/workspace/$session_id/updates.jsonl"
@@ -301,7 +308,7 @@ if [ -n "$session_id" ] && [ "$behavior" != 'complete-no-session' ]; then
   fi
 fi
 case "$behavior" in
-  complete|complete-bad-session|complete-terminal-first|complete-empty-chunk|complete-mismatched-summary|complete-prefixed-summary|complete-duplicate-terminal|complete-integer-timestamp|complete-invalid-timestamp)
+  complete|complete-bad-session|complete-terminal-first|complete-empty-chunk|complete-mismatched-summary|complete-prefixed-summary|complete-duplicate-terminal|complete-integer-timestamp|complete-invalid-timestamp|complete-tool-transcript)
     printf '{"text":"bounded advisory summary\\nGROK_BUILD_VERDICT=clean","stopReason":"end_turn","sessionId":"%s","requestId":"11111111-1111-4111-8111-111111111111","thought":"","usage":{},"num_turns":1,"total_cost_usd":0.0,"total_cost_usd_ticks":0,"modelUsage":{}}\n' "$session_id"
     exit 0
     ;;
@@ -948,4 +955,26 @@ async fn current_integer_session_timestamps_are_verified_without_weakening_shape
         Some(GrokBuildVerdict::Clean)
     );
     assert!(outcome.advisory_evidence().is_some());
+}
+
+#[tokio::test]
+async fn tool_using_transcript_binds_every_ordered_agent_chunk_to_stdout() {
+    let fx = Fixture::new();
+    fx.set_behavior("complete-tool-transcript");
+    let outcome = launch_grok_build(
+        &fx.launch(GrokBuildMutationMode::IsolatedReview, 60_000),
+        &fx.host(),
+        &fx.resolver(),
+        CancellationToken::new(),
+    )
+    .await
+    .expect("tool-using transcript");
+    assert_eq!(outcome.result().state, GrokBuildRunState::CompleteAdvisory);
+    assert_eq!(
+        outcome
+            .advisory_evidence()
+            .expect("bound advisory")
+            .summary(),
+        "bounded advisory summary\nGROK_BUILD_VERDICT=clean"
+    );
 }

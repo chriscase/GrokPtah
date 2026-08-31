@@ -1442,6 +1442,7 @@ fn retained_session_evidence(
         return None;
     }
     let mut agent_message_bytes = Vec::new();
+    let mut saw_agent_message = false;
     let mut saw_terminal = false;
     let mut last_update_was_agent_message = false;
     for line in bytes.split(|byte| *byte == b'\n') {
@@ -1469,9 +1470,6 @@ fn retained_session_evidence(
             return None;
         }
         if update_type == "agent_message_chunk" {
-            if !last_update_was_agent_message {
-                agent_message_bytes.clear();
-            }
             let content = update.get("content")?.as_object()?;
             require_exact_keys(content, &["type", "text"]).ok()?;
             if content.get("type")?.as_str()? != "text" {
@@ -1482,6 +1480,7 @@ fn retained_session_evidence(
                 return None;
             }
             agent_message_bytes.extend_from_slice(text.as_bytes());
+            saw_agent_message = true;
             last_update_was_agent_message = true;
             continue;
         }
@@ -1497,10 +1496,10 @@ fn retained_session_evidence(
             saw_terminal = true;
             continue;
         }
-        agent_message_bytes.clear();
         last_update_was_agent_message = false;
     }
-    (saw_terminal && agent_message_bytes == expected_summary.as_bytes()).then_some(bytes)
+    (saw_terminal && saw_agent_message && agent_message_bytes == expected_summary.as_bytes())
+        .then_some(bytes)
 }
 
 fn valid_session_timestamp(value: &serde_json::Value) -> bool {
