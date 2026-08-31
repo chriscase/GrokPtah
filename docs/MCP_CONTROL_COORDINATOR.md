@@ -383,16 +383,19 @@ applied when the caller omits the field; an explicit caller value may only
 narrow it. Zero, values above the server ceiling, and unknown bounds fields are
 rejected.
 
-`ptah_get_run`, `ptah_list_runs`, and `ptah_get_handoff` expose the applied
-`bounds`, cumulative `usage`, `usageComplete`, `usagePendingRequests`, and typed
-`stopCause`. Accounting
-is persisted after each provider response rather than reconstructed from the
-process-local `/usage` counter, so a restart cannot turn consumed tokens back
-into zero. Enforcement happens at model-round boundaries: the response that
-reaches the ceiling and its already-returned tool batch finish, but no next
-parent or subagent model request begins. Missing or malformed usage stops a
-bounded run fail-closed with `token_accounting_unavailable`; unbounded runs
-continue and report `usageComplete: false`.
+`ptah_get_run`, `ptah_list_runs`, and `ptah_get_handoff` expose cumulative
+usage as flattened allowlisted counters (`usagePromptTokens`,
+`usageCompletionTokens`, `usageTotalTokens`, and `usageRequestCount`) plus
+`usageComplete` and `usagePendingRequestCount`. The public v1 documents
+deliberately omit the applied `bounds` and typed `stopCause`; callers must not
+infer either from state, usage, or event counts. Accounting is persisted after
+each provider response rather than reconstructed from the process-local
+`/usage` counter, so a restart cannot turn consumed tokens back into zero.
+Enforcement happens at model-round boundaries: the response that reaches the
+ceiling and its already-returned tool batch finish, but no next parent or
+subagent model request begins. Missing or malformed usage stops a bounded run
+fail-closed with `token_accounting_unavailable`; unbounded runs continue and
+report `usageComplete: false`.
 Bounded parent and child requests share one serialized admission gate, and an
 in-flight attempt is persisted before network transmission. Restart recovery
 turns any unresolved attempt into incomplete accounting rather than assuming
@@ -570,50 +573,20 @@ coordinator wants a bounded admission queue for capacity or session contention.
 
 ### Evidence-backed handoff
 
-`ptah_get_handoff` exposes bounded run metadata and usage counters only; the
-model's final response is intentionally not part of this public DTO. The
-versioned run and event documents are allowlisted and derived from typed
-bridge records. Coordinators must treat `verification.status` as the trust
-signal, not the model's prose alone:
+`ptah_get_handoff` exposes only allowlisted run metadata, event bounds, change
+and test counts, and flattened usage counters. The model's final response,
+applied bounds, stop cause, detailed change/test records, and nested
+`verification` object are intentionally absent. The versioned run, handoff,
+and event documents are derived from typed bridge records and reject unknown
+fields.
 
-```json
-{
-  "verification": {
-    "status": "verified | unverified | failed | incomplete",
-    "stopReason": "completed | failed | cancelled | interrupted | limit_reached",
-    "interrupted": false,
-    "claims": {
-      "present": true,
-      "mentionsChanges": true,
-      "mentionsTests": true,
-      "mentionsVerification": true
-    },
-    "observations": {
-      "changedFiles": 2,
-      "testsObserved": 1,
-      "testsPassed": 1,
-      "testsFailed": 0,
-      "testsIncomplete": 0,
-      "permissionsRequested": 0,
-      "permissionsGranted": 0,
-      "permissionsDenied": 0,
-      "permissionsUnresolved": 0
-    },
-    "usage": {
-      "promptTokens": 0,
-      "completionTokens": 0,
-      "totalTokens": 0,
-      "requests": 0
-    }
-  }
-}
-```
-
-`changedFiles`, test outcomes, permission outcomes, interruption, and usage
-are observations; claim booleans only indicate whether the final response
-addressed those topics. `unverified` is expected when no test command was
-observed or when the response omits claims required by the observed work.
-`failed` and `incomplete` must not be reported as successful completion.
+A terminal state or nonzero change/test count is not verification evidence.
+Use `ptah_get_changes` and `ptah_get_test_results` for the separately scoped
+observations, and apply the coordinator's verification policy to those
+results. `ptah_review_run` is a different operation: for a completed isolated
+worktree run it returns the bounded diff and exact source/final fingerprints
+needed by the approval/promotion flow. It does not restore the model response
+or the removed raw-run fields to `ptah_get_handoff`.
 
 ### Capacity
 
