@@ -1138,11 +1138,17 @@ async fn execute_allowlisted(
     } else {
         false
     };
-    let mutation_evidence = if launch.mutation_mode == GrokBuildMutationMode::IsolatedReview {
+    let mut mutation_evidence = if launch.mutation_mode == GrokBuildMutationMode::IsolatedReview {
         match capture_isolated_review_mutation(launch, host).await {
             Ok(evidence) => Some(evidence),
             Err(error) => {
                 let _ = isolated.cleanup();
+                if restore_failed_isolated_review_workspace(launch, host)
+                    .await
+                    .is_err()
+                {
+                    return Err(GrokBuildAdapterError::IsolationFailed);
+                }
                 return Err(error);
             }
         }
@@ -1152,6 +1158,16 @@ async fn execute_allowlisted(
 
     let classified = classify_harvest(&harvest, readonly_violation, isolated, session_id);
     let cleaned = isolated.cleanup();
+    let mutation_may_remain = classified.state == GrokBuildRunState::CompleteAdvisory
+        && matches!(
+            classified.verdict,
+            Some(GrokBuildVerdict::Clean | GrokBuildVerdict::Findings)
+        )
+        && cleaned;
+    if launch.mutation_mode == GrokBuildMutationMode::IsolatedReview && !mutation_may_remain {
+        restore_failed_isolated_review_workspace(launch, host).await?;
+        mutation_evidence = None;
+    }
     finish_outcome(
         launch,
         session_id,
@@ -1160,6 +1176,37 @@ async fn execute_allowlisted(
         cleaned,
         mutation_evidence,
     )
+}
+
+/// Restore the initially clean, exact-ref checkout after any untrusted child
+/// run that cannot advance to bounded operator review. The adapter never uses
+/// this to make a successful mutation look clean: failure to prove the exact
+/// launch identity and an empty tree after restoration is itself fail closed.
+async fn restore_failed_isolated_review_workspace(
+    launch: &GrokBuildLaunchRequest,
+    host: &GrokBuildHostLaunchConfig,
+) -> Result<(), GrokBuildAdapterError> {
+    let cancel = CancellationToken::new();
+    git_status_ok(
+        host,
+        &["symbolic-ref", "HEAD", &launch.identity.git_ref],
+        cancel.clone(),
+    )
+    .await
+    .map_err(|_| GrokBuildAdapterError::IsolationFailed)?;
+    git_status_ok(
+        host,
+        &["reset", "--hard", &launch.identity.head_sha],
+        cancel.clone(),
+    )
+    .await
+    .map_err(|_| GrokBuildAdapterError::IsolationFailed)?;
+    git_status_ok(host, &["clean", "-ffdx", "--"], cancel.clone())
+        .await
+        .map_err(|_| GrokBuildAdapterError::IsolationFailed)?;
+    gate_git_identity(launch, host, cancel.clone()).await?;
+    gate_no_publish_remote(launch, host, cancel).await?;
+    Ok(())
 }
 
 fn contain_uncertain_termination(
@@ -2204,7 +2251,7 @@ mod tests {
                 "--prompt-file",
                 "/isolated/prompt",
                 "--permission-mode",
-                "acceptEdits",
+                "bypassPermissions",
                 "--disable-web-search",
                 "--no-subagents",
                 "--sandbox",
@@ -2230,7 +2277,9 @@ mod tests {
         .expect("readonly args");
         assert_eq!(readonly[3], "plan");
         assert_eq!(readonly[7], "grokptah_read_only");
-        assert!(!readonly.iter().any(|a| a == "acceptEdits"));
+        assert!(!readonly
+            .iter()
+            .any(|a| a == "acceptEdits" || a == "bypassPermissions"));
     }
 
     #[test]

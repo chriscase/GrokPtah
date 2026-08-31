@@ -26,7 +26,7 @@ pub const MAX_MANAGED_CONTEXT_BYTES: usize = 8 * 1024;
 pub const MAX_MANAGED_MESSAGES: usize = 16;
 pub const DEFAULT_NATIVE_EXECUTOR_INTERVAL_MS: u64 = 1_000;
 pub const MANAGED_TRUNCATION_MARKER: &str = "\n...[truncated]\n";
-pub const MANAGED_GROK_INVOCATION_SCHEMA_VERSION: u32 = 1;
+pub const MANAGED_GROK_INVOCATION_SCHEMA_VERSION: u32 = 2;
 pub const MAX_MANAGED_GROK_EVIDENCE_REFS: usize = 16;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -276,6 +276,23 @@ impl ManagedIntentState {
 /// owner persists this before physical spawn. Prompt text, raw output,
 /// transcripts, filesystem locations, provider identity, and credentials are
 /// deliberately not representable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedGrokCliPermissionMode {
+    /// Grok's headless write tool requires this CLI spelling. GrokPtah sets it
+    /// only after revision-bound Work authorization is revalidated and still
+    /// applies its own workspace/file authority before and after spawn.
+    HostMappedBypassPermissions,
+}
+
+impl ManagedGrokCliPermissionMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::HostMappedBypassPermissions => "host_mapped_bypass_permissions",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ManagedGrokInvocation {
@@ -286,6 +303,8 @@ pub struct ManagedGrokInvocation {
     pub dispatch_nonce: String,
     pub credential_alias_hash: String,
     pub prompt_hash: String,
+    pub cli_permission_mode: ManagedGrokCliPermissionMode,
+    pub host_execution_approved: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_head_sha: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -306,6 +325,11 @@ impl ManagedGrokInvocation {
     pub fn validate(&self) -> Result<(), OrchError> {
         if self.schema_version != MANAGED_GROK_INVOCATION_SCHEMA_VERSION {
             return Err(invalid("managed Grok invocation schema is invalid"));
+        }
+        if !self.host_execution_approved {
+            return Err(invalid(
+                "managed Grok invocation is missing host execution approval",
+            ));
         }
         self.identity
             .validate()

@@ -39,10 +39,11 @@ pub use managed::{
     select_relevant_managed_messages, truncate_utf8_to_bytes, ManagedExecutionBudgetProfile,
     ManagedExecutionIntent, ManagedExecutionPolicy, ManagedExecutorKind,
     ManagedFinalizationOutcome, ManagedFinalizationRecord, ManagedFinalizationStage,
-    ManagedGrokBudgetLimits, ManagedGrokInvocation, ManagedIntentState, ManagedRetryCause,
-    ManagedWorkMode, NativeExecutorStatus, DEFAULT_NATIVE_EXECUTOR_INTERVAL_MS,
-    MANAGED_EXECUTION_SCHEMA_VERSION, MANAGED_FINALIZATION_SCHEMA_VERSION,
-    MANAGED_GROK_INVOCATION_SCHEMA_VERSION, MANAGED_TRUNCATION_MARKER,
+    ManagedGrokBudgetLimits, ManagedGrokCliPermissionMode, ManagedGrokInvocation,
+    ManagedIntentState, ManagedRetryCause, ManagedWorkMode, NativeExecutorStatus,
+    DEFAULT_NATIVE_EXECUTOR_INTERVAL_MS, MANAGED_EXECUTION_SCHEMA_VERSION,
+    MANAGED_FINALIZATION_SCHEMA_VERSION, MANAGED_GROK_INVOCATION_SCHEMA_VERSION,
+    MANAGED_TRUNCATION_MARKER,
 };
 pub use manager::{
     parse_manager_directive, ManagerCoordinationMode, ManagerCoordinationPolicy,

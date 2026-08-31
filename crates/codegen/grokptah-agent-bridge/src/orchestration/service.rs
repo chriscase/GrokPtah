@@ -29,9 +29,9 @@ use super::graph::{validate_scoped_dependency_graph, GraphScope};
 use super::managed::{
     assemble_managed_run_input, managed_execution_eligible, seal_managed_grok_prompt,
     select_relevant_managed_messages, truncate_utf8_to_bytes, ManagedExecutionIntent,
-    ManagedExecutionPolicy, ManagedExecutorKind, ManagedFinalizationOutcome, ManagedGrokInvocation,
-    ManagedIntentState, ManagedRetryCause, NativeExecutorStatus,
-    DEFAULT_NATIVE_EXECUTOR_INTERVAL_MS, MANAGED_EXECUTION_SCHEMA_VERSION,
+    ManagedExecutionPolicy, ManagedExecutorKind, ManagedFinalizationOutcome,
+    ManagedGrokCliPermissionMode, ManagedGrokInvocation, ManagedIntentState, ManagedRetryCause,
+    NativeExecutorStatus, DEFAULT_NATIVE_EXECUTOR_INTERVAL_MS, MANAGED_EXECUTION_SCHEMA_VERSION,
     MANAGED_GROK_INVOCATION_SCHEMA_VERSION, MAX_MANAGED_MESSAGES,
 };
 use super::manager::{
@@ -46,7 +46,7 @@ use super::routine::{
     RoutineConcurrencyPolicy, RoutineLifecycle, RoutineRecord, RoutineRetryPolicy, RoutineTrigger,
     WorkTemplate,
 };
-use super::store::{IdempotencyClaim, OrchStore};
+use super::store::{IdempotencyClaim, ManagedGrokClaimFence, OrchStore};
 use super::supervisor::{
     ManagerSupervisorReport, ManagerSupervisorStatus, RoutineSupervisor, RoutineSupervisorStatus,
     WorkloadSupervisor, WorkloadSupervisorStatus, DEFAULT_MANAGER_TICK_INTERVAL,
@@ -1074,6 +1074,14 @@ impl OrchestrationService {
                     format!("executor:grok_build_isolated_review"),
                     format!("profile:{:?}", invocation.profile).to_ascii_lowercase(),
                     format!("state:{:?}", result.state).to_ascii_lowercase(),
+                    format!(
+                        "cli_permission_mode:{}",
+                        invocation.cli_permission_mode.as_str()
+                    ),
+                    format!(
+                        "host_execution_approved:{}",
+                        invocation.host_execution_approved
+                    ),
                 ];
                 evidence.extend(
                     result
@@ -1783,6 +1791,8 @@ impl OrchestrationService {
                 "credentialLeaseAlias": runtime.config.credential_lease_id,
             })),
             prompt_hash,
+            cli_permission_mode: ManagedGrokCliPermissionMode::HostMappedBypassPermissions,
+            host_execution_approved: true,
             final_head_sha: None,
             final_ref: None,
             final_state: None,
@@ -1814,11 +1824,24 @@ impl OrchestrationService {
             updated_at: now,
         };
         self.store.save_managed_intent(&intent)?;
-        let claim = match self.store.claim_work_with_lease_secret(
+        let decision_id = work.last_decision_id.as_deref().ok_or_else(|| {
+            OrchError::new(
+                OrchErrorCode::Conflict,
+                "managed Grok execution has no current authorization decision",
+            )
+        })?;
+        let claim_fence = ManagedGrokClaimFence {
+            expected_work_revision: work.revision,
+            expected_decision_id: decision_id,
+            expected_agent_spec_revision: spec.revision,
+            expected_allowed_files: &allowed_files,
+        };
+        let claim = match self.store.claim_managed_grok_work_with_lease_secret(
             &work.work_id,
             &agent.agent_id,
             None,
             secret,
+            &claim_fence,
         ) {
             Ok(claim) => claim,
             Err(error) => {

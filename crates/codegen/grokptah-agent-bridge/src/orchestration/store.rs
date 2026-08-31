@@ -46,6 +46,16 @@ pub struct OrchStore {
     inner: Arc<OrchStoreInner>,
 }
 
+/// Atomic pre-claim fence for the one-attempt managed Grok executor. Every
+/// field is derived from the already-eligible snapshot and is rechecked while
+/// the store lock is held, before an attempt or lease is created.
+pub(super) struct ManagedGrokClaimFence<'a> {
+    pub expected_work_revision: u64,
+    pub expected_decision_id: &'a str,
+    pub expected_agent_spec_revision: u64,
+    pub expected_allowed_files: &'a [String],
+}
+
 impl OrchStore {
     /// The authority every durable effect through this handle must pass.
     pub(crate) fn lease(&self) -> crate::host_runtime::WriteLease {
@@ -4616,13 +4626,73 @@ impl OrchStore {
         Ok((item, attempt.clone()))
     }
 
+    fn require_managed_grok_claim_fence_unlocked(
+        &self,
+        item: &WorkItem,
+        claimant_id: &str,
+        fence: &ManagedGrokClaimFence<'_>,
+    ) -> Result<(), OrchError> {
+        if item.revision != fence.expected_work_revision
+            || item.last_decision_id.as_deref() != Some(fence.expected_decision_id)
+            || item.assigned_agent_id.as_deref() != Some(claimant_id)
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "managed Grok Work authority changed before claim",
+            ));
+        }
+        let current_allowed = super::workload::normalize_allowed_files(&item.policy.allowed_files)?;
+        let expected_allowed =
+            super::workload::normalize_allowed_files(fence.expected_allowed_files)?;
+        if current_allowed != expected_allowed {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "managed Grok mutable-file authority changed before claim",
+            ));
+        }
+        let agent =
+            self.require_agent_in_scope_unlocked(claimant_id, item.session_id, &item.workspace)?;
+        let spec = agent
+            .current_spec()
+            .map_err(|error| OrchError::new(OrchErrorCode::Conflict, error.to_string()))?;
+        if spec.revision != fence.expected_agent_spec_revision {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "managed Grok Agent authority changed before claim",
+            ));
+        }
+        let decision_path = self.work_decision_path(&item.work_id, fence.expected_decision_id)?;
+        let decision: WorkDecision = serde_json::from_str(
+            &fs::read_to_string(decision_path)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+        )
+        .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let decision_is_current = decision.schema_version == WORKLOAD_SCHEMA_VERSION
+            && decision.decision_id == fence.expected_decision_id
+            && decision.work_id == item.work_id
+            && decision.action == WorkDecisionAction::AuthorizeExecution
+            && decision.assigned_agent_id.as_deref() == item.assigned_agent_id.as_deref()
+            && decision.policy_revision == Some(fence.expected_agent_spec_revision)
+            && decision
+                .work_revision
+                .and_then(|revision| revision.checked_add(1))
+                == Some(item.revision);
+        if !decision_is_current {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "managed Grok execution decision changed before claim",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn claim_work(
         &self,
         work_id: &str,
         claimant_id: &str,
         lease_ms: Option<u64>,
     ) -> Result<WorkClaim, OrchError> {
-        self.claim_work_inner(work_id, claimant_id, lease_ms, None)
+        self.claim_work_inner(work_id, claimant_id, lease_ms, None, None)
     }
 
     pub fn claim_work_with_lease_secret(
@@ -4638,7 +4708,30 @@ impl OrchStore {
                 "lease_secret is required",
             ));
         }
-        self.claim_work_inner(work_id, claimant_id, lease_ms, Some(lease_secret))
+        self.claim_work_inner(work_id, claimant_id, lease_ms, Some(lease_secret), None)
+    }
+
+    pub(super) fn claim_managed_grok_work_with_lease_secret(
+        &self,
+        work_id: &str,
+        claimant_id: &str,
+        lease_ms: Option<u64>,
+        lease_secret: &str,
+        fence: &ManagedGrokClaimFence<'_>,
+    ) -> Result<WorkClaim, OrchError> {
+        if lease_secret.is_empty() {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "lease_secret is required",
+            ));
+        }
+        self.claim_work_inner(
+            work_id,
+            claimant_id,
+            lease_ms,
+            Some(lease_secret),
+            Some(fence),
+        )
     }
 
     fn claim_work_inner(
@@ -4647,6 +4740,7 @@ impl OrchStore {
         claimant_id: &str,
         lease_ms: Option<u64>,
         lease_secret: Option<&str>,
+        managed_grok_fence: Option<&ManagedGrokClaimFence<'_>>,
     ) -> Result<WorkClaim, OrchError> {
         let lease = lease_duration(lease_ms)?;
         if claimant_id.trim().is_empty() || claimant_id.len() > 256 {
@@ -4668,6 +4762,9 @@ impl OrchStore {
         }
         self.refresh_work_item_unlocked(&mut item)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        if let Some(fence) = managed_grok_fence {
+            self.require_managed_grok_claim_fence_unlocked(&item, claimant_id, fence)?;
+        }
         let now = Utc::now();
         // The holder's identity is deliberately not echoed: a claim conflict is
         // answered with the fact of the conflict, not with an attribution of
@@ -7411,5 +7508,110 @@ mod tests {
         assert_eq!(agent.current_run_id, None);
         assert_eq!(agent.last_run_id.as_deref(), Some(run_id));
         assert!(!reopened.agent_activation_path(run_id).unwrap().exists());
+    }
+
+    #[test]
+    fn managed_grok_claim_fence_rejects_snapshot_to_claim_authority_changes() {
+        use crate::orchestration::workload::{WorkPolicy, WorkRetryPolicy};
+
+        let root = tempdir().unwrap();
+        let store = OrchStore::open(root.path()).unwrap();
+        let lane_id = Uuid::new_v4();
+        let now = Utc::now();
+        store
+            .save_agent(&AgentRecord {
+                agent_id: "grok-fenced-agent".into(),
+                owner_principal_id: None,
+                session_id: lane_id,
+                lane_ids: vec![lane_id],
+                lane_associations: Vec::new(),
+                workspace: "/tmp/grok-fenced-workspace".into(),
+                model: "grok".into(),
+                spec: None,
+                state: AgentState::Active,
+                current_run_id: None,
+                last_run_id: None,
+                last_lane_id: Some(lane_id),
+                latest_checkpoint_id: None,
+                continuation_ordinal: 0,
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+        let mut work = WorkItem::new(
+            "isolated-review",
+            "bounded claim fence",
+            lane_id,
+            "/tmp/grok-fenced-workspace",
+            "operator",
+            WorkPolicy {
+                retry: WorkRetryPolicy {
+                    max_attempts: 1,
+                    retry_failed: false,
+                    retry_expired: false,
+                    backoff_ms: 0,
+                },
+                allowed_files: vec!["allowed.txt".into()],
+                ..WorkPolicy::default()
+            },
+        )
+        .unwrap();
+        work.assigned_agent_id = Some("grok-fenced-agent".into());
+        work.assignment_status = AssignmentStatus::Accepted;
+        work.source_manager_plan_id = Some("plan-fence".into());
+        work.source_manager_step_id = Some("step-fence".into());
+        store.save_work_item(&work).unwrap();
+        let (authorized, decision) = store
+            .authorize_work_execution(
+                &work.work_id,
+                "operator",
+                None,
+                "authorize exact snapshot",
+                Some(work.revision),
+                now,
+            )
+            .unwrap();
+        let spec_revision = store
+            .load_agent("grok-fenced-agent")
+            .unwrap()
+            .unwrap()
+            .current_spec()
+            .unwrap()
+            .revision;
+        let expected_allowed = authorized.policy.allowed_files.clone();
+        let fence = ManagedGrokClaimFence {
+            expected_work_revision: authorized.revision,
+            expected_decision_id: &decision.decision_id,
+            expected_agent_spec_revision: spec_revision,
+            expected_allowed_files: &expected_allowed,
+        };
+
+        let mut narrowed = authorized.clone();
+        narrowed.policy.allowed_files = vec!["narrower.txt".into()];
+        narrowed.bump_at(now + Duration::milliseconds(1));
+        store.save_work_item(&narrowed).unwrap();
+
+        let error = store
+            .claim_managed_grok_work_with_lease_secret(
+                &narrowed.work_id,
+                "grok-fenced-agent",
+                None,
+                "claim-secret",
+                &fence,
+            )
+            .expect_err("stale authority snapshot must not claim");
+        assert_eq!(error.code, OrchErrorCode::Conflict);
+        assert!(store
+            .list_work_attempts(Some(&narrowed.work_id))
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store
+                .load_work_item(&narrowed.work_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            WorkState::Queued
+        );
     }
 }

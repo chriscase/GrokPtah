@@ -481,6 +481,8 @@ async fn run_live_profile(profile: ManagedExecutionBudgetProfile) {
         "invocation": {
             "requestId": invocation.request_id,
             "promptHash": invocation.prompt_hash,
+            "cliPermissionMode": invocation.cli_permission_mode.as_str(),
+            "hostExecutionApproved": invocation.host_execution_approved,
             "finalHeadSha": invocation.final_head_sha,
             "finalRef": invocation.final_ref,
             "finalState": invocation.final_state,

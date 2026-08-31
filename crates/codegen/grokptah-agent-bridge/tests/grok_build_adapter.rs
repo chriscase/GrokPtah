@@ -334,6 +334,11 @@ case "$behavior" in
     printf '{"text":"partial output without verdict","stopReason":"end_turn","sessionId":"%s","requestId":"11111111-1111-4111-8111-111111111111","thought":"","usage":{},"num_turns":1,"total_cost_usd":0.0,"total_cost_usd_ticks":0,"modelUsage":{}}\n' "$session_id"
     exit 0
     ;;
+  mutate-partial)
+    printf 'unqualified mutation\n' > mutated-by-child.txt
+    printf '{"text":"partial output without verdict","stopReason":"end_turn","sessionId":"%s","requestId":"11111111-1111-4111-8111-111111111111","thought":"","usage":{},"num_turns":1,"total_cost_usd":0.0,"total_cost_usd_ticks":0,"modelUsage":{}}\n' "$session_id"
+    exit 0
+    ;;
   overflow)
     dd if=/dev/zero bs=1024 count=64 2>/dev/null
     exit 0
@@ -764,6 +769,12 @@ async fn isolated_review_rejects_forbidden_mutation_and_publish_remote() {
     .await
     .expect_err("forbidden mutation");
     assert_eq!(error, GrokBuildAdapterError::ReadOnlyMutation);
+    assert!(!fx.repo.path().join("mutated-by-child.txt").exists());
+    assert!(git_stdout(
+        fx.repo.path(),
+        &["status", "--porcelain=v1", "--untracked-files=all"]
+    )
+    .is_empty());
 
     let remote = Fixture::new();
     remote.set_behavior("complete");
@@ -856,6 +867,32 @@ async fn partial_and_max_turn_are_nonresumable_and_fail_closed() {
     assert_eq!(maxed.result().state, GrokBuildRunState::FailedClosed);
     assert_eq!(maxed.result().terminal_verdict, None);
     assert_ne!(maxed.result().state, GrokBuildRunState::CompleteAdvisory);
+}
+
+#[tokio::test]
+async fn partial_isolated_review_restores_allowlisted_mutations() {
+    let fx = Fixture::new();
+    fx.set_behavior("mutate-partial");
+    let mut host = fx.host();
+    host.allowed_files = vec!["mutated-by-child.txt".into()];
+
+    let outcome = launch_grok_build(
+        &fx.launch(GrokBuildMutationMode::IsolatedReview, 60_000),
+        &host,
+        &fx.resolver(),
+        CancellationToken::new(),
+    )
+    .await
+    .expect("partial execution remains an observable failed-closed outcome");
+
+    assert_eq!(outcome.result().state, GrokBuildRunState::FailedClosed);
+    assert!(outcome.mutation_evidence().is_none());
+    assert!(!fx.repo.path().join("mutated-by-child.txt").exists());
+    assert!(git_stdout(
+        fx.repo.path(),
+        &["status", "--porcelain=v1", "--untracked-files=all"]
+    )
+    .is_empty());
 }
 
 #[tokio::test]
