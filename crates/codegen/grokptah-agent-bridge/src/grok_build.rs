@@ -1437,7 +1437,9 @@ fn retained_session_evidence(
         let value: serde_json::Value = serde_json::from_slice(line).ok()?;
         let object = value.as_object()?;
         require_exact_keys(object, &["method", "params", "timestamp"]).ok()?;
-        object.get("timestamp")?.as_str()?;
+        if !valid_session_timestamp(object.get("timestamp")?) {
+            return None;
+        }
         let method = object.get("method")?.as_str()?;
         if method != "session/update" && method != "_x.ai/session/update" {
             return None;
@@ -1485,6 +1487,17 @@ fn retained_session_evidence(
         last_update_was_agent_message = false;
     }
     (saw_terminal && agent_message_bytes == expected_summary.as_bytes()).then_some(bytes)
+}
+
+fn valid_session_timestamp(value: &serde_json::Value) -> bool {
+    match value {
+        // Grok 1.0.5 emitted RFC3339 strings. Grok 1.0.13 emits integer Unix
+        // seconds. Accept only those two bounded, nonempty representations;
+        // floats, negative values, null, arrays, and objects remain invalid.
+        serde_json::Value::String(value) => !value.is_empty() && value.len() <= 128,
+        serde_json::Value::Number(value) => value.as_u64().is_some(),
+        _ => false,
+    }
 }
 
 fn sha256_evidence_ref(kind: &str, bytes: &[u8]) -> String {

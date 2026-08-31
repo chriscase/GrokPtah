@@ -44,6 +44,15 @@ impl CredentialLeaseResolver for FileLeaseResolver {
         if lease_id != "dogfood-credential-lease" {
             return Err(GrokBuildAdapterError::CredentialRevocation);
         }
+        if self.path.exists() {
+            fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&self.path)
+                .and_then(|file| file.sync_all())
+                .map_err(|_| GrokBuildAdapterError::CredentialRevocation)?;
+            fs::remove_file(&self.path).map_err(|_| GrokBuildAdapterError::CredentialRevocation)?;
+        }
         Ok(())
     }
 }
@@ -283,6 +292,239 @@ async fn run_profile(profile: ManagedExecutionBudgetProfile) {
 async fn economy_and_high_assurance_share_authority_and_finish_truthfully() {
     run_profile(ManagedExecutionBudgetProfile::Economy).await;
     run_profile(ManagedExecutionBudgetProfile::HighAssurance).await;
+}
+
+/// Explicit live-provider dogfood. The ignored gate is intentional: callers
+/// must opt in with an authorized Grok executable and credential source. The
+/// credential is copied into a disposable host lease before the adapter sees
+/// it, and neither its path nor contents enter durable Work evidence.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires explicit live Grok Build authorization"]
+#[allow(clippy::await_holding_lock)]
+async fn live_grok_build_dogfood_runs_both_profiles_under_one_authority() {
+    run_live_profile(ManagedExecutionBudgetProfile::Economy).await;
+    run_live_profile(ManagedExecutionBudgetProfile::HighAssurance).await;
+}
+
+#[cfg(unix)]
+async fn run_live_profile(profile: ManagedExecutionBudgetProfile) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let executable = PathBuf::from(
+        std::env::var_os("GROKPTAH_LIVE_GROK")
+            .expect("GROKPTAH_LIVE_GROK must name the authorized Grok executable"),
+    );
+    let credential_source = PathBuf::from(
+        std::env::var_os("GROKPTAH_LIVE_GROK_AUTH")
+            .expect("GROKPTAH_LIVE_GROK_AUTH must name the authorized credential file"),
+    );
+    let candidate_head = std::env::var("GROKPTAH_LIVE_CANDIDATE_HEAD")
+        .expect("GROKPTAH_LIVE_CANDIDATE_HEAD must bind the qualification source");
+    let evidence_dir = PathBuf::from(
+        std::env::var_os("GROKPTAH_LIVE_EVIDENCE_DIR")
+            .expect("GROKPTAH_LIVE_EVIDENCE_DIR must name the secret-free evidence directory"),
+    );
+
+    let mut env = ProcessEnvGuard::new();
+    let home = tempdir().unwrap();
+    set_grokptah_home_override(Some(home.path().join(".grokptah")));
+    env.set("GROKPTAH_AGENT_OFFLINE", "1");
+
+    let workspace = tempdir().unwrap();
+    let identity = initialize_repo(workspace.path());
+    let isolate_parent = tempdir().unwrap();
+    let lease_parent = tempdir().unwrap();
+    let lease_path = lease_parent.path().join("lease.json");
+    fs::copy(&credential_source, &lease_path).expect("copy disposable Grok credential lease");
+    fs::set_permissions(&lease_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    })
+    .expect("acquire GrokPtah instance lock");
+    host.start().unwrap();
+    let lane = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(lane.id, workspace.path()).unwrap();
+    let agent = host.ensure_session_agent(lane.id).unwrap();
+    let orch = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        OrchStore::open(home.path().join("orchestration")).unwrap(),
+        OrchestrationConfig {
+            bearer_token: "managed-grok-live-dogfood-token".into(),
+            allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
+            max_concurrent_runs: 1,
+            bounds: RunBounds::default(),
+        },
+    );
+    orch.configure_managed_grok_executor(
+        ManagedGrokExecutorConfig {
+            executable,
+            git_executable: PathBuf::from("/usr/bin/git"),
+            cwd: workspace.path().to_path_buf(),
+            isolate_parent: isolate_parent.path().to_path_buf(),
+            repository_id: identity.repository_id.clone(),
+            base_ref: identity.git_ref.clone(),
+            identity,
+            credential_lease_id: "dogfood-credential-lease".into(),
+        },
+        Arc::new(FileLeaseResolver {
+            path: lease_path.clone(),
+        }),
+    )
+    .unwrap();
+    orch.store()
+        .revise_agent_spec(&agent.agent_id, "operator", |spec| {
+            spec.managed_execution = grok_policy(profile);
+            spec.authority.computer_use_allowed = false;
+            spec.authority.bypass_permissions = false;
+            Ok(())
+        })
+        .unwrap();
+
+    let policy = WorkPolicy {
+        retry: WorkRetryPolicy {
+            max_attempts: 1,
+            retry_failed: false,
+            retry_expired: false,
+            backoff_ms: 0,
+        },
+        allowed_files: vec!["DOGFOOD.txt".into()],
+        ..WorkPolicy::default()
+    };
+    let mut work = WorkItem::new(
+        "isolated-review",
+        "Open DOGFOOD.txt and replace its exact contents `before\\n` with `after\\n`. Edit no other file. Inspect the final diff and report truthfully.",
+        lane.id,
+        workspace.path().display().to_string(),
+        "operator",
+        policy,
+    )
+    .unwrap();
+    work.assigned_agent_id = Some(agent.agent_id.clone());
+    work.assignment_status = AssignmentStatus::Accepted;
+    work.source_manager_plan_id = Some("self-host-live-plan".into());
+    work.source_manager_step_id = Some(format!("{}-dogfood", profile.as_str()));
+    orch.store().save_work_item(&work).unwrap();
+    let (work, _) = orch
+        .store()
+        .authorize_work_execution(
+            &work.work_id,
+            "operator",
+            None,
+            "authorize one bounded live GrokPtah self-host attempt",
+            Some(work.revision),
+            Utc::now(),
+        )
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now()
+        + tokio::time::Duration::from_millis(profile.limits().max_duration_ms + 60_000);
+    let final_work = loop {
+        orch.drive_native_executor_once().await;
+        let current = orch.store().load_work_item(&work.work_id).unwrap().unwrap();
+        if matches!(
+            current.state,
+            WorkState::AwaitingApproval | WorkState::Review
+        ) {
+            break current;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "live managed Grok dogfood exceeded its bounded profile deadline"
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    };
+
+    assert_eq!(
+        final_work.state,
+        WorkState::AwaitingApproval,
+        "live managed executor did not return an advisory for approval: {:?}",
+        final_work.result
+    );
+    let result = final_work.result.as_ref().expect("live advisory result");
+    assert!(result.verification.is_none());
+    assert!(result.failure.is_none());
+    assert!(result
+        .evidence
+        .iter()
+        .any(|entry| entry == "changed_path:DOGFOOD.txt"));
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("DOGFOOD.txt")).unwrap(),
+        "after\n"
+    );
+    assert!(git(workspace.path(), &["remote"]).is_empty());
+
+    let intents = orch.store().list_managed_intents().unwrap();
+    let intent = intents
+        .iter()
+        .find(|candidate| candidate.work_id == work.work_id)
+        .unwrap();
+    assert_eq!(intent.state, ManagedIntentState::Finalized);
+    let invocation = intent.grok.as_ref().unwrap();
+    assert_eq!(invocation.profile, profile);
+    assert_eq!(invocation.changed_paths, ["DOGFOOD.txt"]);
+    assert!(invocation.diff_digest.is_some());
+    assert_ne!(invocation.prompt_hash, intent.input_hash);
+
+    fs::create_dir_all(&evidence_dir).unwrap();
+    let evidence = serde_json::json!({
+        "candidateHead": candidate_head,
+        "profile": profile.as_str(),
+        "workId": final_work.work_id,
+        "terminalState": format!("{:?}", final_work.state),
+        "verificationPresent": result.verification.is_some(),
+        "failurePresent": result.failure.is_some(),
+        "evidence": result.evidence,
+        "invocation": {
+            "requestId": invocation.request_id,
+            "promptHash": invocation.prompt_hash,
+            "finalHeadSha": invocation.final_head_sha,
+            "finalRef": invocation.final_ref,
+            "finalState": invocation.final_state,
+            "verdict": invocation.verdict,
+            "changedPaths": invocation.changed_paths,
+            "diffDigest": invocation.diff_digest,
+        },
+        "authority": {
+            "maxAttempts": 1,
+            "retryFailed": false,
+            "retryExpired": false,
+            "computerUseAllowed": false,
+            "bypassPermissions": false,
+        },
+    });
+    fs::write(
+        evidence_dir.join(format!("{}.json", profile.as_str())),
+        serde_json::to_vec_pretty(&evidence).unwrap(),
+    )
+    .unwrap();
+
+    if lease_path.exists() {
+        fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&lease_path)
+            .and_then(|file| file.sync_all())
+            .unwrap();
+        fs::remove_file(&lease_path).unwrap();
+    }
+    assert!(fs::read_dir(isolate_parent.path())
+        .unwrap()
+        .next()
+        .is_none());
+    orch.stop_background_tasks().await;
+    let shutdown = host.shutdown().await;
+    assert!(
+        shutdown.is_clean(),
+        "host shutdown: {}",
+        shutdown.operator_summary()
+    );
+    drop(orch);
+    drop(host);
+    set_grokptah_home_override(None);
 }
 
 #[cfg(unix)]
