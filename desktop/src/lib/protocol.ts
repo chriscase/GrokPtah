@@ -170,6 +170,8 @@ export interface PersistentAgent {
   laneAssociations?: PersistentAgentLaneAssociation[];
   displayName?: string | null;
   role?: string | null;
+  /** Public policy revision used for continuation fencing; policy contents remain redacted. */
+  agentSpecRevision?: number | null;
   workspace?: string;
   model?: string;
   spec?: PersistentAgentSpec;

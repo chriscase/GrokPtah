@@ -153,6 +153,11 @@ async fn named_device_credentials_share_agent_owner_and_attribute_runs() {
         agent["schemaVersion"], "grokptah.coordinator.agent.v1",
         "public persistent-agent projection must advertise the redacted coordinator schema"
     );
+    assert_eq!(
+        agent["agentSpecRevision"].as_u64(),
+        Some(1),
+        "public persistent-agent projection must expose only the non-sensitive policy revision"
+    );
 
     host.release_orchestration_turn("named-credentials-hold");
     primary.close_session().await.unwrap();

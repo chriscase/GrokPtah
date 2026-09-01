@@ -945,6 +945,11 @@ pub struct CoordinatorAgentView {
     pub session_id: Uuid,
     pub display_name: Option<String>,
     pub role: Option<String>,
+    /// Safe, non-sensitive revision of the immutable Agent policy used to
+    /// bind future work and continuation requests. The policy body remains
+    /// private; legacy records without a spec omit this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_spec_revision: Option<u64>,
     pub state: AgentState,
     pub lane_ids: Vec<Uuid>,
     pub current_run_id: Option<String>,
@@ -973,6 +978,12 @@ impl CoordinatorAgentView {
                 "coordinator agent Lane associations exceed their bound",
             ));
         }
+        if self.agent_spec_revision == Some(0) {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "coordinator agent specification revision is invalid",
+            ));
+        }
         Ok(())
     }
 }
@@ -996,6 +1007,7 @@ impl From<&AgentRecord> for CoordinatorAgentView {
             session_id,
             display_name,
             role,
+            agent_spec_revision: agent.spec.as_ref().map(|spec| spec.revision),
             state: agent.state,
             lane_ids,
             current_run_id: agent.current_run_id.clone(),
