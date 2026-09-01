@@ -3416,8 +3416,7 @@ async fn identity(
         agents.iter().any(|candidate| {
             candidate["agentId"].as_str() == Some(agent.agent_id.as_str())
                 && candidate["sessionId"].as_str() == Some(agent.session_id.as_str())
-                && candidate["schemaVersion"].as_str()
-                    == Some("grokptah.coordinator.agent.v1")
+                && candidate["schemaVersion"].as_str() == Some("grokptah.coordinator.agent.v1")
                 && candidate.get("workspace").is_none()
         })
     }) {
