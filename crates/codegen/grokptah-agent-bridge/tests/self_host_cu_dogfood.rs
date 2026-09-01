@@ -407,6 +407,15 @@ fn assert_redacted_cu_projection(service: &ComputerUseService, run_id: &str, wor
             raw.contains(&grant.target.display_name),
             "raw grant lost target detail the projection grant must not copy as payload"
         );
+        let grant_projection = serde_json::to_value(&project_run_at(&run, Utc::now()))
+            .expect("projection value")
+            .get("grant")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        assert!(
+            grant_projection.get("target").is_none(),
+            "projection copied the raw grant target payload: {grant_projection}"
+        );
     }
     if let Some(bound) = &run.workspace {
         assert!(
@@ -1286,6 +1295,21 @@ async fn run_profile(
         .collect();
     assert!(listed_ids.contains(original_run_id.as_str()));
     assert!(listed_ids.contains(successor_run_id.as_str()));
+    let listed_text = serde_json::to_string(listed_runs).expect("listed MCP projections");
+    for forbidden in [
+        workspace.path().to_str().unwrap(),
+        "currentObservation",
+        "leaseToken",
+        "opaque-test-credential",
+        "Not submitted",
+        "\"Name\"",
+        "-name",
+    ] {
+        assert!(
+            !listed_text.contains(forbidden),
+            "listed public MCP projections leaked {forbidden}: {listed_text}"
+        );
+    }
 
     let (status, interrupted_fetch) = public_mcp_tool(
         &public_client,
@@ -1344,6 +1368,9 @@ async fn run_profile(
         "currentObservation",
         "leaseToken",
         "opaque-test-credential",
+        "Not submitted",
+        "\"Name\"",
+        "-name",
     ] {
         assert!(
             !successor_text.contains(forbidden),
@@ -1412,6 +1439,39 @@ async fn run_profile(
     // error object so only the scoped failure vocabulary is required to match.
     assert_eq!(cross_lane["error"], unknown_run["error"]);
     assert_eq!(foreign_scope["error"]["data"]["code"], "workspace_mismatch");
+
+    let (status, cross_lane_list) = public_mcp_tool(
+        &public_client,
+        &public_url,
+        207,
+        "ptah_list_computer_runs",
+        serde_json::json!({
+            "session_id": other_lane.id,
+            "workspace": workspace.path(),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let cross_lane_runs = cross_lane_list["result"]["structuredContent"]["runs"]
+        .as_array()
+        .expect("cross-lane public MCP run list");
+    assert!(
+        cross_lane_runs.is_empty(),
+        "cross-lane list exposed runs owned by another lane: {cross_lane_list}"
+    );
+    let (status, foreign_list) = public_mcp_tool(
+        &public_client,
+        &public_url,
+        208,
+        "ptah_list_computer_runs",
+        serde_json::json!({
+            "session_id": lane.id,
+            "workspace": foreign.path(),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(foreign_list["error"]["data"]["code"], "workspace_mismatch");
 
     // Exercise both operator outcomes across the two profiles: Economy keeps
     // the bounded proposal via the approval gate, while High Assurance rejects
