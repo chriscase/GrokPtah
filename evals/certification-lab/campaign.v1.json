@@ -1711,7 +1711,7 @@
         "ptah_get_work",
         "ptah_list_runs",
         "ptah_list_execution_intents",
-        "ptah_list_inbox",
+        "ptah_list_outbox",
         "ptah_resolve_work_input",
         "ptah_review_run",
         "ptah_discard_run"
@@ -1794,7 +1794,7 @@
         "ptah_assign_work",
         "ptah_authorize_work_execution",
         "ptah_list_execution_intents",
-        "ptah_list_inbox",
+        "ptah_list_outbox",
         "ptah_resolve_work_input",
         "ptah_get_work",
         "ptah_list_runs"

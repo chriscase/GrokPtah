@@ -367,7 +367,7 @@ pub fn implementation_tools(probe_id: &str) -> Option<&'static [&'static str]> {
             "ptah_get_work",
             "ptah_list_runs",
             "ptah_list_execution_intents",
-            "ptah_list_inbox",
+            "ptah_list_outbox",
             "ptah_resolve_work_input",
             "ptah_review_run",
             "ptah_discard_run",
@@ -383,7 +383,7 @@ pub fn implementation_tools(probe_id: &str) -> Option<&'static [&'static str]> {
             "ptah_assign_work",
             "ptah_authorize_work_execution",
             "ptah_list_execution_intents",
-            "ptah_list_inbox",
+            "ptah_list_outbox",
             "ptah_resolve_work_input",
             "ptah_get_work",
             "ptah_list_runs",
@@ -736,8 +736,8 @@ async fn native_work_to_run(
             let page = probe
                 .call(
                     client,
-                    TraceOperationCode::ListInbox,
-                    "ptah_list_inbox",
+                    TraceOperationCode::ListOutbox,
+                    "ptah_list_outbox",
                     json!({
                         "session_id": agent.session_id,
                         "workspace": workspace,
@@ -1250,8 +1250,8 @@ async fn native_permission_park_decisions(
         let page = probe
             .call(
                 client,
-                TraceOperationCode::ListInbox,
-                "ptah_list_inbox",
+                TraceOperationCode::ListOutbox,
+                "ptah_list_outbox",
                 json!({
                     "session_id": agent.session_id,
                     "workspace": workspace,

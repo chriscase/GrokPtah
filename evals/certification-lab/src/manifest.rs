@@ -344,7 +344,7 @@ impl ProbeAction {
             ],
             Self::ObservePermissionPark => &[
                 FUTURE_LIST_EXECUTION_INTENTS_TOOL,
-                "ptah_list_inbox",
+                "ptah_list_outbox",
                 "ptah_get_work",
             ],
             Self::AllowPermission | Self::DenyPermission => &[FUTURE_RESOLVE_WORK_INPUT_TOOL],

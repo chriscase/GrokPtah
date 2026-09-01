@@ -870,6 +870,7 @@ pub enum TraceOperationCode {
     SendMessage,
     ListMessages,
     ListInbox,
+    ListOutbox,
     AckMessage,
     Disconnect,
     Reconnect,
