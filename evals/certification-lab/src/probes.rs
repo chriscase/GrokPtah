@@ -727,8 +727,15 @@ async fn native_work_to_run(
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     let run_id = run_id.ok_or(DiagnosticCode::Timeout)?;
-    let run =
-        wait_for_terminal_evidence(probe, client, workspace, &agent.session_id, &run_id).await?;
+    let run = wait_for_terminal_evidence_with_attempts(
+        probe,
+        client,
+        workspace,
+        &agent.session_id,
+        &run_id,
+        1_500,
+    )
+    .await?;
     if run["state"].as_str() != Some("completed") {
         return Err(DiagnosticCode::TerminalStateMissing);
     }
@@ -3986,7 +3993,19 @@ async fn wait_for_terminal_evidence(
     session_id: &str,
     run_id: &str,
 ) -> Result<Value, DiagnosticCode> {
-    for _ in 0..300 {
+    wait_for_terminal_evidence_with_attempts(probe, client, workspace, session_id, run_id, 300)
+        .await
+}
+
+async fn wait_for_terminal_evidence_with_attempts(
+    probe: &mut ProbeBuilder<'_>,
+    client: &mut McpControlClient,
+    workspace: &str,
+    session_id: &str,
+    run_id: &str,
+    attempts: usize,
+) -> Result<Value, DiagnosticCode> {
+    for _ in 0..attempts {
         let run = probe
             .call(
                 client,
