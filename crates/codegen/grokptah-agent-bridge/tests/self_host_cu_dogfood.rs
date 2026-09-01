@@ -36,13 +36,45 @@ use grokptah_agent_bridge::orchestration::{
     WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
-    set_grokptah_home_override, AgentHost, ComputerUseService, CredentialLeaseHandle,
-    CredentialLeaseResolver, GrokBuildAdapterError, HostConfig, SessionKind,
+    set_grokptah_home_override, start_control_server, AgentHost, ComputerUseService,
+    CredentialLeaseHandle, CredentialLeaseResolver, GrokBuildAdapterError, HostConfig, SessionKind,
 };
 use grokptah_agent_sdk::GrokBuildGitIdentity;
+use reqwest::StatusCode;
+use serde_json::Value;
 use uuid::Uuid;
 
 use common::ProcessEnvGuard;
+
+/// Exercise the public MCP projection path without conflating it with the
+/// intentionally local-only Computer Run mutation boundary. The public
+/// control plane owns scoped reads; the canonical ComputerUseService owns
+/// create/authorize/observe/act/complete.
+async fn public_mcp_tool(
+    client: &reqwest::Client,
+    url: &str,
+    id: u64,
+    name: &str,
+    arguments: Value,
+) -> (StatusCode, Value) {
+    let response = client
+        .post(url)
+        .header("Authorization", "Bearer managed-cu-dogfood-token")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments}
+        }))
+        .send()
+        .await
+        .expect("public MCP request");
+    let status = response.status();
+    (
+        status,
+        response.json().await.expect("public MCP JSON response"),
+    )
+}
 
 /// Simulator-backed backend that counts dispatches, matching the adaptive-seam fixture.
 #[derive(Debug)]
@@ -1221,6 +1253,88 @@ async fn run_profile(
     );
     assert!(!report_text.contains("DOGFOOD.txt"));
 
+    // The report above is assembled from the same projections used by the
+    // public MCP reads. Exercise that transport boundary as well: MCP may
+    // discover and read the scoped run/graph, while the canonical service
+    // remains the only owner of create/authorize/observe/act/complete.
+    let public_store = host.ensure_computer_store().expect("public CU store");
+    let public_service = ComputerUseService::new(Arc::new(SimulatorBackend::new()), public_store);
+    let public_run = public_service
+        .create_run(
+            "public-mcp-create",
+            lane.id,
+            Some(canonical_workspace_string(workspace.path()).expect("public workspace")),
+            SimulatorBackend::demo_target(),
+            ComputerUseLimits::default(),
+        )
+        .expect("public MCP projection run");
+    let public_server = start_control_server(orch.clone(), 0)
+        .await
+        .expect("public MCP control server");
+    let public_url = format!("http://{}/mcp", public_server.addr);
+    let public_client = reqwest::Client::new();
+    let (status, listed) = public_mcp_tool(
+        &public_client,
+        &public_url,
+        200,
+        "ptah_list_computer_runs",
+        serde_json::json!({
+            "session_id": lane.id,
+            "workspace": workspace.path(),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let listed_runs = listed["result"]["structuredContent"]["runs"]
+        .as_array()
+        .expect("public MCP run list");
+    assert_eq!(listed_runs.len(), 1);
+    assert_eq!(listed_runs[0]["runId"], public_run.run_id.as_str());
+
+    let (status, fetched) = public_mcp_tool(
+        &public_client,
+        &public_url,
+        201,
+        "ptah_get_computer_run",
+        serde_json::json!({
+            "session_id": lane.id,
+            "workspace": workspace.path(),
+            "run_id": public_run.run_id,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let fetched_projection = &fetched["result"]["structuredContent"];
+    assert_eq!(fetched_projection["runId"], public_run.run_id.as_str());
+    let fetched_text = serde_json::to_string(fetched_projection).expect("public MCP projection");
+    for forbidden in [
+        workspace.path().to_str().unwrap(),
+        "currentObservation",
+        "leaseToken",
+        "opaque-test-credential",
+    ] {
+        assert!(
+            !fetched_text.contains(forbidden),
+            "public MCP projection leaked {forbidden}: {fetched_text}"
+        );
+    }
+
+    let (status, graph_wire) = public_mcp_tool(
+        &public_client,
+        &public_url,
+        202,
+        "ptah_get_work_graph",
+        serde_json::json!({
+            "session_id": lane.id,
+            "workspace": workspace.path(),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let graph_text = serde_json::to_string(&graph_wire).expect("public MCP work graph");
+    assert!(graph_text.contains(&cu_work_id));
+    assert!(graph_text.contains(&grok_work_id));
+    assert!(!graph_text.contains(workspace.path().to_str().unwrap()));
     // Exercise both operator outcomes across the two profiles: Economy keeps
     // the bounded proposal via the approval gate, while High Assurance rejects
     // it through the durable Work failure path. Neither outcome can promote
@@ -1351,6 +1465,14 @@ async fn run_profile(
             .is_none(),
         "isolated checkout must be cleaned up after managed execution"
     );
+
+    let stop_report = public_server.stop_and_wait().await;
+    assert!(
+        stop_report.is_clean(),
+        "public MCP server shutdown: {:?}",
+        stop_report.errors
+    );
+    drop(public_service);
 
     orch.stop_background_tasks().await;
     let shutdown = host.shutdown().await;
