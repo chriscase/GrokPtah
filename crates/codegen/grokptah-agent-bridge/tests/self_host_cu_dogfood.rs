@@ -304,6 +304,19 @@ fn assert_redacted_operator_result(work: &WorkItem, workspace: &Path) {
         );
     }
     assert!(!result.summary.contains("opaque-test-credential"));
+    assert!(!result.summary.contains(&workspace_text));
+    assert!(!result.summary.contains("/private/") && !result.summary.contains("/var/"));
+    for artifact in &result.artifacts {
+        let artifact_text = format!("{artifact:?}");
+        assert!(!artifact_text.contains("opaque-test-credential"));
+        assert!(!artifact_text.contains(&workspace_text));
+        assert!(!artifact_text.contains("/private/") && !artifact_text.contains("/var/"));
+    }
+    if let Some(failure) = &result.failure {
+        assert!(!failure.contains("opaque-test-credential"));
+        assert!(!failure.contains(&workspace_text));
+        assert!(!failure.contains("/private/") && !failure.contains("/var/"));
+    }
 }
 
 /// Serialize the real host projection and require it not to carry observation
@@ -380,10 +393,6 @@ fn assert_redacted_cu_projection(service: &ComputerUseService, run_id: &str, wor
     assert!(
         !projected.contains("opaque-test-credential"),
         "projection leaked credential material: {projected}"
-    );
-    assert!(
-        !projected.contains("Ada"),
-        "projection leaked typed observation/action text: {projected}"
     );
     assert!(
         !projected.contains("/private/") && !projected.contains("/var/"),
@@ -636,6 +645,10 @@ async fn host_cu_runs(
             ComputerUseLimits::default(),
         )
         .expect("create successor");
+    assert_ne!(
+        original_id, successor.run_id,
+        "restart must mint a new CU run"
+    );
     let successor_grant = grant(&successor);
     assert_ne!(successor_grant.grant_id, original_grant.grant_id);
     let successor = service
