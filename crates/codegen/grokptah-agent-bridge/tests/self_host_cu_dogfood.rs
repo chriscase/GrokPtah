@@ -1310,9 +1310,13 @@ async fn run_profile(
                     !grant.contains_key("target"),
                     "listed public MCP projection copied a grant target payload: {listed_projection}"
                 );
+                assert!(listed_projection
+                    .as_object()
+                    .expect("listed projection object")
+                    .contains_key("observation"));
                 assert!(
-                    listed_projection["observation"].is_object(),
-                    "completed listed run lost its safe observation summary"
+                    listed_projection["observation"].is_null(),
+                    "completed listed run retained an inactive observation"
                 );
             }
             state => panic!("unexpected listed Computer Run state: {state:?}"),
@@ -1391,9 +1395,13 @@ async fn run_profile(
         !successor_grant.contains_key("target"),
         "successor public MCP projection copied a grant target payload: {successor_projection}"
     );
+    assert!(successor_projection
+        .as_object()
+        .expect("successor projection object")
+        .contains_key("observation"));
     assert!(
-        successor_projection["observation"].is_object(),
-        "successor MCP projection lost the observed fixture"
+        successor_projection["observation"].is_null(),
+        "completed successor retained an inactive observation"
     );
     let successor_text =
         serde_json::to_string(successor_projection).expect("successor MCP projection");
