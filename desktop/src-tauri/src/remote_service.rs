@@ -1763,10 +1763,12 @@ mod tests {
         normalize_base_url, runtime_target_for_base_url, should_reconnect_remote_error,
         RemoteServiceClient, RemoteServiceState,
     };
-    use grokptah_agent_bridge::orchestration::CoordinatorAgentView;
+    use grokptah_agent_bridge::orchestration::{
+        CoordinatorAgentView, CoordinatorResumePlanView,
+    };
 
     #[test]
-    fn coordinator_agent_wire_decodes_without_private_runtime_fields() {
+    fn coordinator_wire_decodes_and_reemits_redacted_views() {
         let session_id = uuid::Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
         let wire = serde_json::json!({
             "schemaVersion": "grokptah.coordinator.agent.v1",
@@ -1782,14 +1784,59 @@ mod tests {
             "latestCheckpointId": "checkpoint-safe",
             "continuationOrdinal": 2,
             "createdAt": "2026-01-01T00:00:00Z",
-            "updatedAt": "2026-01-01T00:01:00Z"
+            "updatedAt": "2026-01-01T00:01:00Z",
+            "workspace": "/private/customer-secret",
+            "model": "provider/secret-model",
+            "ownerPrincipalId": "tenant-secret",
+            "authority": {"allowedTools": ["run_terminal_cmd"]},
+            "memory": {"private": "do-not-forward"},
+            "laneAssociations": [{"laneId": session_id, "sourceWorkspace": "/private/customer-secret"}]
         });
         let view: CoordinatorAgentView = serde_json::from_value(wire.clone()).unwrap();
         assert_eq!(view.session_id, session_id);
         assert_eq!(view.lane_ids, vec![session_id]);
-        for forbidden in ["workspace", "model", "ownerPrincipalId", "authority", "memory"] {
-            assert!(!wire.as_object().unwrap().contains_key(forbidden));
+        let encoded = serde_json::to_value(&view).unwrap();
+        for forbidden in [
+            "workspace",
+            "model",
+            "ownerPrincipalId",
+            "authority",
+            "memory",
+            "laneAssociations",
+        ] {
+            assert!(
+                encoded.get(forbidden).is_none(),
+                "re-serialized coordinator agent leaked {forbidden}: {encoded}"
+            );
         }
+
+        let plan_wire = serde_json::json!({
+            "schemaVersion": "grokptah.coordinator.resume-plan.v1",
+            "agent": wire,
+            "checkpoint": {
+                "schemaVersion": "grokptah.coordinator.checkpoint.v1",
+                "checkpointId": "checkpoint-safe",
+                "agentId": "agent-safe",
+                "sessionId": session_id,
+                "runId": "run-safe",
+                "agentSpecRevision": 1,
+                "parentCheckpointId": null,
+                "ordinal": 2,
+                "contextSummary": "resume after an interrupted turn",
+                "eventSeq": 7,
+                "reason": "interrupted",
+                "createdAt": "2026-01-01T00:01:00Z",
+                "workspace": "/private/customer-secret",
+                "contextHash": "private-context-hash"
+            },
+            "parentRunId": "run-safe"
+        });
+        let plan: CoordinatorResumePlanView = serde_json::from_value(plan_wire).unwrap();
+        let encoded_plan = serde_json::to_value(plan).unwrap();
+        assert!(encoded_plan["agent"].get("workspace").is_none());
+        assert!(encoded_plan["agent"].get("ownerPrincipalId").is_none());
+        assert!(encoded_plan["checkpoint"].get("workspace").is_none());
+        assert!(encoded_plan["checkpoint"].get("contextHash").is_none());
     }
 
     #[test]
