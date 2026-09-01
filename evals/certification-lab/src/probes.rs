@@ -572,8 +572,8 @@ async fn native_work_to_run(
                     "maxConcurrentRuns": 1,
                     "bounds": {
                         "maxPromptBytes": 4096,
-                        "maxRounds": 2,
-                        "maxDurationMs": 30000,
+                        "maxRounds": 4,
+                        "maxDurationMs": 120000,
                         "maxTotalTokens": 20000
                     },
                     "retryEligible": false,
@@ -607,8 +607,8 @@ async fn native_work_to_run(
                 "policy": {
                     "bounds": {
                         "maxPromptBytes": 4096,
-                        "maxRounds": 2,
-                        "maxDurationMs": 30000,
+                        "maxRounds": 4,
+                        "maxDurationMs": 120000,
                         "maxTotalTokens": 20000
                     },
                     "retry": {
