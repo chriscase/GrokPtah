@@ -366,6 +366,9 @@ pub fn implementation_tools(probe_id: &str) -> Option<&'static [&'static str]> {
             "ptah_authorize_work_execution",
             "ptah_get_work",
             "ptah_list_runs",
+            "ptah_list_execution_intents",
+            "ptah_list_inbox",
+            "ptah_resolve_work_input",
             "ptah_review_run",
             "ptah_discard_run",
         ]),
@@ -727,6 +730,123 @@ async fn native_work_to_run(
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     let run_id = run_id.ok_or(DiagnosticCode::Timeout)?;
+    if live_provider {
+        let mut permission_case = None;
+        for _ in 0..900 {
+            let page = probe
+                .call(
+                    client,
+                    TraceOperationCode::ListInbox,
+                    "ptah_list_inbox",
+                    json!({
+                        "session_id": agent.session_id,
+                        "workspace": workspace,
+                        "agent_id": agent.agent_id,
+                        "after_seq": 0,
+                    }),
+                    vec![
+                        ArgumentFieldCode::SessionId,
+                        ArgumentFieldCode::Workspace,
+                        ArgumentFieldCode::AgentId,
+                        ArgumentFieldCode::AfterSequence,
+                    ],
+                )
+                .await?;
+            permission_case = page["messages"].as_array().and_then(|messages| {
+                messages.iter().find_map(|message| {
+                    let payload = message["payload"].as_object()?;
+                    (message["kind"].as_str() == Some("question")
+                        && message["workId"].as_str() == Some(work_id.as_str())
+                        && payload.get("runId").and_then(Value::as_str) == Some(run_id.as_str()))
+                    .then(|| {
+                        payload
+                            .get("permissionId")
+                            .and_then(Value::as_str)
+                            .map(|permission_id| {
+                                (work_id.clone(), permission_id.to_owned(), run_id.clone())
+                            })
+                    })
+                    .flatten()
+                })
+            });
+            if permission_case.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let permission_case = permission_case.ok_or(DiagnosticCode::PermissionCapabilityAbsent)?;
+        Uuid::parse_str(&permission_case.1).map_err(|_| DiagnosticCode::McpResultMalformed)?;
+        let intents = probe
+            .call(
+                client,
+                TraceOperationCode::ListExecutionIntents,
+                "ptah_list_execution_intents",
+                json!({
+                    "session_id": agent.session_id,
+                    "workspace": workspace,
+                }),
+                vec![ArgumentFieldCode::SessionId, ArgumentFieldCode::Workspace],
+            )
+            .await?;
+        let intent = intents["intents"]
+            .as_array()
+            .and_then(|items| {
+                items.iter().find(|intent| {
+                    intent["workId"].as_str() == Some(work_id.as_str())
+                        && intent["runId"].as_str() == Some(run_id.as_str())
+                })
+            })
+            .ok_or(DiagnosticCode::StateTransitionMismatch)?;
+        if intent["state"].as_str() != Some("parked")
+            || intent["permissionRequestId"].as_str() != Some(permission_case.1.as_str())
+        {
+            return Err(DiagnosticCode::StateTransitionMismatch);
+        }
+        let parked_work = probe
+            .call(
+                client,
+                TraceOperationCode::GetWork,
+                "ptah_get_work",
+                json!({
+                    "session_id": agent.session_id,
+                    "workspace": workspace,
+                    "work_id": work_id,
+                }),
+                vec![
+                    ArgumentFieldCode::SessionId,
+                    ArgumentFieldCode::Workspace,
+                    ArgumentFieldCode::WorkId,
+                ],
+            )
+            .await?;
+        if parked_work["work"]["state"].as_str() != Some("awaiting_input") {
+            return Err(DiagnosticCode::StateTransitionMismatch);
+        }
+        probe.counters.permission_requests = probe
+            .counters
+            .permission_requests
+            .checked_add(1)
+            .ok_or(DiagnosticCode::BoundExceeded)?;
+        probe.transition(
+            EntityKind::Permission,
+            DurableStateCode::Created,
+            DurableStateCode::Parked,
+            Some(&permission_case.1),
+        );
+        let allowed =
+            resolve_permission(probe, client, workspace, &agent, &permission_case, true).await?;
+        if allowed["allow"].as_bool() != Some(true)
+            || allowed["workId"].as_str() != Some(work_id.as_str())
+        {
+            return Err(DiagnosticCode::StateTransitionMismatch);
+        }
+        probe.transition(
+            EntityKind::Permission,
+            DurableStateCode::Parked,
+            DurableStateCode::Allowed,
+            Some(&permission_case.1),
+        );
+    }
     let run = wait_for_terminal_evidence_with_attempts(
         probe,
         client,

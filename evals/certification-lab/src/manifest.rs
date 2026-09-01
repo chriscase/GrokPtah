@@ -265,6 +265,7 @@ pub enum ProbeAction {
     ClaimRetriedWork,
     ReviewIsolatedNativeChange,
     DiscardIsolatedNativeChange,
+    ApproveIsolatedNativeChange,
 }
 
 impl ProbeAction {
@@ -372,6 +373,7 @@ impl ProbeAction {
             Self::ClaimRetriedWork => &["ptah_claim_work"],
             Self::ReviewIsolatedNativeChange => &["ptah_review_run"],
             Self::DiscardIsolatedNativeChange => &["ptah_discard_run"],
+            Self::ApproveIsolatedNativeChange => &[FUTURE_RESOLVE_WORK_INPUT_TOOL],
         }
     }
 

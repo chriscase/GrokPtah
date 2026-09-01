@@ -1710,6 +1710,9 @@
         "ptah_authorize_work_execution",
         "ptah_get_work",
         "ptah_list_runs",
+        "ptah_list_execution_intents",
+        "ptah_list_inbox",
+        "ptah_resolve_work_input",
         "ptah_review_run",
         "ptah_discard_run"
       ],
@@ -1745,6 +1748,8 @@
         "submit_managed_work",
         "authorize_work_execution",
         "wait_for_terminal_run",
+        "observe_permission_park",
+        "approve_isolated_native_change",
         "review_isolated_native_change",
         "discard_isolated_native_change"
       ],
