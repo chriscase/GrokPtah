@@ -321,7 +321,9 @@ fn approval_policy_stops_completion_at_awaiting_approval() {
     )
     .unwrap();
     store.save_work_item(&item).unwrap();
-    let claim = store.claim_work(&item.work_id, "worker", None).unwrap();
+    let claim = store
+        .claim_work(&item.work_id, "worker", Some(500))
+        .unwrap();
     let (completed, attempt) = store
         .complete_work(
             &item.work_id,
@@ -336,6 +338,9 @@ fn approval_policy_stops_completion_at_awaiting_approval() {
         grokptah_agent_bridge::orchestration::AttemptState::AwaitingApproval
     );
     assert!(!completed.state.is_terminal());
+    let mut expiring = completed.clone();
+    expiring.deadline = Some(Utc::now() - ChronoDuration::seconds(1));
+    store.save_work_item(&expiring).unwrap();
     let report = store
         .reconcile_workloads_at(claim.attempt.lease_expires_at + ChronoDuration::days(365))
         .unwrap();
@@ -347,6 +352,18 @@ fn approval_policy_stops_completion_at_awaiting_approval() {
     assert_eq!(
         store.list_work_attempts(Some(&item.work_id)).unwrap()[0].state,
         AttemptState::AwaitingApproval
+    );
+    std::thread::sleep(Duration::from_millis(600));
+    let claim_error = store
+        .claim_work(&item.work_id, "worker-2", None)
+        .unwrap_err();
+    assert!(
+        claim_error.to_string().contains("awaitingapproval")
+            || claim_error.to_string().contains("AwaitingApproval")
+    );
+    assert_eq!(
+        store.load_work_item(&item.work_id).unwrap().unwrap().state,
+        WorkState::AwaitingApproval
     );
 
     let (approved, approved_attempt) = store
@@ -764,7 +781,9 @@ fn unverified_evidence_refuses_success_and_lands_in_review() {
     let home = tempdir().unwrap();
     let (store, item) = new_work(home.path(), "needs review");
     store.save_work_item(&item).unwrap();
-    let claim = store.claim_work(&item.work_id, "worker", None).unwrap();
+    let claim = store
+        .claim_work(&item.work_id, "worker", Some(500))
+        .unwrap();
     let run_id = format!("run-{}", item.work_id);
     let evidence = unverified_evidence(&item.work_id, &run_id, &claim.attempt.attempt_id);
     bind_and_save_run(&store, &item, &claim, &evidence);
@@ -779,6 +798,9 @@ fn unverified_evidence_refuses_success_and_lands_in_review() {
     assert_eq!(completed.state, WorkState::Review);
     assert_eq!(attempt.state, AttemptState::Review);
     assert!(completed.approval.is_none());
+    let mut expiring = completed.clone();
+    expiring.deadline = Some(Utc::now() - ChronoDuration::seconds(1));
+    store.save_work_item(&expiring).unwrap();
     let report = store
         .reconcile_workloads_at(claim.attempt.lease_expires_at + ChronoDuration::days(365))
         .unwrap();
@@ -790,6 +812,17 @@ fn unverified_evidence_refuses_success_and_lands_in_review() {
     assert_eq!(
         store.list_work_attempts(Some(&item.work_id)).unwrap()[0].state,
         AttemptState::Review
+    );
+    std::thread::sleep(Duration::from_millis(600));
+    let claim_error = store
+        .claim_work(&item.work_id, "worker-2", None)
+        .unwrap_err();
+    assert!(
+        claim_error.to_string().contains("review") || claim_error.to_string().contains("Review")
+    );
+    assert_eq!(
+        store.load_work_item(&item.work_id).unwrap().unwrap().state,
+        WorkState::Review
     );
 }
 

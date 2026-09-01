@@ -1,11 +1,12 @@
 use chrono::Utc;
 use grokptah_agent_bridge::orchestration::{
     assemble_managed_run_input, intersect_run_bounds, managed_execution_eligible,
-    select_relevant_managed_messages, AssignmentStatus, ManagedExecutionBudgetProfile,
-    ManagedExecutionIntent, ManagedExecutionPolicy, ManagedExecutorKind, ManagedFinalizationStage,
-    ManagedIntentState, ManagedRetryCause, ManagedWorkMode, MessageKind, OrchErrorCode, OrchStore,
-    RunBounds, RunRecord, RunState, WorkItem, WorkMessage, WorkPolicy, WorkProgress, WorkResult,
-    WorkState, MANAGED_EXECUTION_SCHEMA_VERSION,
+    select_relevant_managed_messages, AssignmentStatus, AttemptState,
+    ManagedExecutionBudgetProfile, ManagedExecutionIntent, ManagedExecutionPolicy,
+    ManagedExecutorKind, ManagedFinalizationStage, ManagedIntentState, ManagedRetryCause,
+    ManagedWorkMode, MessageKind, OrchErrorCode, OrchStore, RunBounds, RunRecord, RunState,
+    WorkItem, WorkMessage, WorkPolicy, WorkProgress, WorkResult, WorkState,
+    MANAGED_EXECUTION_SCHEMA_VERSION,
 };
 use grokptah_agent_bridge::{AgentRecord, AgentState};
 use tempfile::tempdir;
@@ -848,6 +849,74 @@ fn interrupted_run_with_retry_allowed_requeues_without_resuming() {
         work.attempt_count + 1,
         ManagedRetryCause::Interrupted
     ));
+}
+
+#[test]
+fn managed_close_preserves_review_gate_even_when_retry_is_requested() {
+    let home = tempdir().unwrap();
+    let store = OrchStore::open(home.path()).unwrap();
+    let session = Uuid::new_v4();
+    store
+        .save_agent(&agent("worker-a", "/tmp/ws", session))
+        .unwrap();
+    enable_managed(&store, "worker-a", true);
+    let item = accepted_work(session, "/tmp/ws", "worker-a");
+    store.save_work_item(&item).unwrap();
+    let claim = store
+        .claim_work_with_lease_secret(&item.work_id, "worker-a", None, "secret")
+        .unwrap();
+    let (review, review_attempt) = store
+        .complete_work(
+            &item.work_id,
+            &claim.attempt.attempt_id,
+            &claim.lease_token,
+            WorkResult {
+                summary: "advisory requires review".into(),
+                evidence: Vec::new(),
+                artifacts: Vec::new(),
+                failure: None,
+                cancellation_reason: None,
+                completed_at: Utc::now(),
+                verification: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(review.state, WorkState::Review);
+    assert_eq!(review_attempt.state, AttemptState::Review);
+
+    let mut expiring = review.clone();
+    expiring.deadline = Some(Utc::now() - chrono::Duration::seconds(1));
+    store.save_work_item(&expiring).unwrap();
+    let mut intent = claiming_intent(
+        &item,
+        Some(claim.attempt.attempt_id.clone()),
+        Some("run-review".into()),
+        session,
+    );
+    intent.state = ManagedIntentState::Admitted;
+    store.save_managed_intent(&intent).unwrap();
+
+    store
+        .close_managed_attempt(
+            &intent.intent_id,
+            true,
+            ManagedRetryCause::Interrupted,
+            "child stopped after advisory result",
+            Utc::now(),
+        )
+        .unwrap();
+    assert_eq!(
+        store.load_work_item(&item.work_id).unwrap().unwrap().state,
+        WorkState::Review
+    );
+    assert_eq!(
+        store
+            .load_work_attempt(&claim.attempt.attempt_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        AttemptState::Review
+    );
 }
 
 #[test]

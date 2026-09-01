@@ -65,6 +65,13 @@ impl WorkState {
         matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled)
     }
 
+    /// Durable human gates remain claim-excluded until an explicit operator
+    /// action resolves them. Reconciliation must not turn them into a
+    /// deadline failure or retry.
+    pub fn is_review_gate(self) -> bool {
+        matches!(self, Self::AwaitingApproval | Self::Review)
+    }
+
     pub fn is_claimable(self) -> bool {
         matches!(self, Self::Queued)
     }

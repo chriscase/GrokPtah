@@ -2463,7 +2463,10 @@ impl OrchStore {
         if item.is_container || admission == super::graph::AdmissionBlock::Container {
             return Ok(());
         }
-        if item.deadline.is_some_and(|deadline| deadline <= now) && !item.state.is_terminal() {
+        if item.deadline.is_some_and(|deadline| deadline <= now)
+            && !item.state.is_terminal()
+            && !item.state.is_review_gate()
+        {
             item.state = WorkState::Failed;
             item.block_provenance = None;
             item.result = Some(Self::work_failure_result(
@@ -4020,7 +4023,7 @@ impl OrchStore {
             ..ManagedExecutionPolicy::default()
         };
         let retry = policy.allows_auto_retry(&item, attempt_number.saturating_add(1), cause);
-        let attempt_state = match cause {
+        let mut attempt_state = match cause {
             ManagedRetryCause::Expired | ManagedRetryCause::Interrupted => AttemptState::Expired,
             ManagedRetryCause::Failed => AttemptState::Failed,
         };
@@ -4030,16 +4033,23 @@ impl OrchStore {
                 WorkState::Cancelled,
                 item.result.clone(),
             )
-        } else if item.state == WorkState::Succeeded || item.state == WorkState::AwaitingApproval {
-            (
-                if item.state == WorkState::AwaitingApproval {
+        } else if item.state.is_review_gate() || item.state == WorkState::Succeeded {
+            let outcome = match item.state {
+                WorkState::AwaitingApproval => {
+                    attempt_state = AttemptState::AwaitingApproval;
                     ManagedFinalizationOutcome::AwaitingApproval
-                } else {
+                }
+                WorkState::Review => {
+                    attempt_state = AttemptState::Review;
+                    ManagedFinalizationOutcome::Review
+                }
+                WorkState::Succeeded => {
+                    attempt_state = AttemptState::Succeeded;
                     ManagedFinalizationOutcome::Completed
-                },
-                item.state,
-                item.result.clone(),
-            )
+                }
+                _ => unreachable!("review gate or succeeded state matched"),
+            };
+            (outcome, item.state, item.result.clone())
         } else if retry {
             (
                 ManagedFinalizationOutcome::RetryQueued,
@@ -4783,7 +4793,7 @@ impl OrchStore {
             .list_work_attempts_unlocked(Some(work_id))
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
         {
-            if attempt.state.is_active() && !attempt.lease_active_at(now) {
+            if attempt.state.requires_lease_heartbeat() && !attempt.lease_active_at(now) {
                 self.expire_attempt_unlocked(&mut item, &mut attempt, now)
                     .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
             }
