@@ -302,7 +302,7 @@ export function PersistentAgentPanel({
       {sortedAgents.map((agent) => {
         const plan = plans[agent.agentId];
         const isSelected = selectedAgentId === agent.agentId;
-        const laneIds = agent.laneIds?.length ? agent.laneIds : [agent.sessionId];
+        const laneIds = agent.laneIds?.length ? agent.laneIds : agent.sessionId ? [agent.sessionId] : [];
         const isCurrent = Boolean(activeLaneId && laneIds.includes(activeLaneId));
         const ownedLanes = lanes.filter((lane) => lane.agent_id === agent.agentId);
         const resumeAllowed = canResume(agent) && Boolean(agent.latestCheckpointId);
@@ -317,12 +317,11 @@ export function PersistentAgentPanel({
               <span className={`agent-state ${agent.state}`}>{stateLabel(agent.state)}</span>
             </div>
             <div style={{ color: "var(--muted)", fontSize: 11, marginTop: 4 }}>
-              {agent.model} · {laneIds.length} {laneIds.length === 1 ? "Lane" : "Lanes"} · continuation {agent.continuationOrdinal} · updated {timeLabel(agent.updatedAt)}
+              {agent.model ?? (remoteStatus.connected ? "Remote coordinator" : "Model unavailable")} · {laneIds.length} {laneIds.length === 1 ? "Lane" : "Lanes"} · continuation {agent.continuationOrdinal} · updated {timeLabel(agent.updatedAt)}
             </div>
-            <div style={{ color: "var(--muted)", fontSize: 11, marginTop: 3 }}>
-              Managed execution: {agent.spec?.managedExecution?.enabled ? "on" : "off"}
-              {!remoteStatus.connected && (
-                <>
+            {!remoteStatus.connected ? (
+              <div style={{ color: "var(--muted)", fontSize: 11, marginTop: 3 }}>
+                Managed execution: {agent.spec?.managedExecution?.enabled ? "on" : "off"}
                   {" "}
                   <button
                     type="button"
@@ -337,12 +336,17 @@ export function PersistentAgentPanel({
                   >
                     {agent.spec?.managedExecution?.enabled ? "Disable" : "Enable"}
                   </button>
-                </>
-              )}
-            </div>
-            <div style={{ color: "var(--muted)", fontSize: 11, marginTop: 3, wordBreak: "break-word" }}>
-              {agent.workspace}
-            </div>
+              </div>
+            ) : (
+              <div style={{ color: "var(--muted)", fontSize: 11, marginTop: 3 }}>
+                Coordinator view · runtime routing and workspace details hidden
+              </div>
+            )}
+            {agent.workspace && !remoteStatus.connected && (
+              <div style={{ color: "var(--muted)", fontSize: 11, marginTop: 3, wordBreak: "break-word" }}>
+                {agent.workspace}
+              </div>
+            )}
             {ownedLanes.length > 0 && (
               <div
                 aria-label={`Lanes owned by ${agent.agentId}`}

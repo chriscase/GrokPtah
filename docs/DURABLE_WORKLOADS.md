@@ -128,6 +128,13 @@ caller still must provide a fresh instruction to
 view is produced, and unknown/cross-scope identities use the same refusal
 vocabulary. Listing order is deterministic by opaque Agent ID.
 
+The desktop remote adapter consumes these versioned views directly. It uses
+the opaque primary/session and Lane references to resolve the authorized
+workspace only when issuing a scoped get or explicit resume request; it never
+expects or reconstructs a workspace, model, owner, authority, memory, lease,
+or managed-execution field from the coordinator response. The local embedded
+desktop path may still use its internal record for trusted operator controls.
+
 `orchestration::CONTROL_TOOLS` is the source of truth for the complete tool
 count and classification. The workload-specific subset advertised there
 includes:

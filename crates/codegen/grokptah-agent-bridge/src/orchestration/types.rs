@@ -933,11 +933,15 @@ pub struct AgentRecord {
 /// Those fields must never cross the authenticated coordinator boundary. This
 /// view keeps only opaque identity and lifecycle/checkpoint references needed
 /// to render a coordinator status surface and request an explicit resume.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CoordinatorAgentView {
-    pub schema_version: &'static str,
+    pub schema_version: String,
     pub agent_id: String,
+    /// Primary opaque Lane/session reference retained for desktop and
+    /// coordinator continuation targeting. It carries no workspace or
+    /// provider authority by itself.
+    pub session_id: Uuid,
     pub display_name: Option<String>,
     pub role: Option<String>,
     pub state: AgentState,
@@ -959,8 +963,9 @@ impl From<&AgentRecord> for CoordinatorAgentView {
             .map(|spec| (Some(spec.display_name.clone()), Some(spec.role.clone())))
             .unwrap_or((None, None));
         Self {
-            schema_version: "grokptah.coordinator.agent.v1",
+            schema_version: "grokptah.coordinator.agent.v1".into(),
             agent_id: agent.agent_id.clone(),
+            session_id: agent.session_id,
             display_name,
             role,
             state: agent.state,
@@ -1141,10 +1146,10 @@ pub struct ContinuationCheckpoint {
 /// Coordinator-safe checkpoint projection. The durable checkpoint's
 /// workspace path is deliberately omitted; its context is already bounded and
 /// redacted by the host before persistence.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CoordinatorCheckpointView {
-    pub schema_version: &'static str,
+    pub schema_version: String,
     pub checkpoint_id: String,
     pub agent_id: String,
     pub session_id: Uuid,
@@ -1161,7 +1166,7 @@ pub struct CoordinatorCheckpointView {
 impl From<&ContinuationCheckpoint> for CoordinatorCheckpointView {
     fn from(checkpoint: &ContinuationCheckpoint) -> Self {
         Self {
-            schema_version: "grokptah.coordinator.checkpoint.v1",
+            schema_version: "grokptah.coordinator.checkpoint.v1".into(),
             checkpoint_id: checkpoint.checkpoint_id.clone(),
             agent_id: checkpoint.agent_id.clone(),
             session_id: checkpoint.session_id,
@@ -1247,10 +1252,10 @@ pub struct AgentResumePlan {
 /// `AgentResumePlan` remains an internal host object used to validate the
 /// continuation; callers receive only what they need to confirm the opaque
 /// checkpoint and issue an explicit resume request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CoordinatorResumePlanView {
-    pub schema_version: &'static str,
+    pub schema_version: String,
     pub agent: CoordinatorAgentView,
     pub checkpoint: CoordinatorCheckpointView,
     pub parent_run_id: String,
@@ -1259,7 +1264,7 @@ pub struct CoordinatorResumePlanView {
 impl From<&AgentResumePlan> for CoordinatorResumePlanView {
     fn from(plan: &AgentResumePlan) -> Self {
         Self {
-            schema_version: "grokptah.coordinator.resume-plan.v1",
+            schema_version: "grokptah.coordinator.resume-plan.v1".into(),
             agent: CoordinatorAgentView::from(&plan.agent),
             checkpoint: CoordinatorCheckpointView::from(&plan.checkpoint),
             parent_run_id: plan.parent_run_id.clone(),
