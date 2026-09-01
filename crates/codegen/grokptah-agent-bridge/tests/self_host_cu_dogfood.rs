@@ -224,7 +224,7 @@ fn grok_step(agent_id: &str) -> ManagerStepSpec {
     ManagerStepSpec {
         step_id: "isolated-review".into(),
         kind: "isolated-review".into(),
-        objective: "Replace DOGFOOD.txt with the bounded managed-executor fixture.".into(),
+        objective: "Open DOGFOOD.txt and replace its exact contents `before\\n` with `after\\n`. Edit no other file. Inspect the final diff and report truthfully.".into(),
         priority: 0,
         dependencies: vec!["host-cu".into()],
         assigned_agent_id: Some(agent_id.into()),
@@ -440,8 +440,9 @@ async fn observe(
 async fn drive_until_review_gate(
     orch: &OrchestrationService,
     work_id: &str,
+    timeout_secs: u64,
 ) -> grokptah_agent_bridge::orchestration::WorkItem {
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(timeout_secs);
     loop {
         orch.drive_native_executor_once().await;
         let current = orch.store().load_work_item(work_id).unwrap().unwrap();
@@ -459,6 +460,47 @@ async fn drive_until_review_gate(
             "managed Grok dogfood did not reach a terminal operator state"
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// Explicit inputs for the opt-in live composition gate.  The normal test
+/// path never reads these variables and continues to use the deterministic
+/// fake CLI.
+#[derive(Debug)]
+struct LiveGate {
+    executable: PathBuf,
+    credential_source: PathBuf,
+    candidate_head: String,
+    evidence_dir: PathBuf,
+}
+
+impl LiveGate {
+    fn from_env() -> Self {
+        Self {
+            executable: PathBuf::from(
+                std::env::var_os("GROKPTAH_LIVE_GROK")
+                    .expect("GROKPTAH_LIVE_GROK must name the authorized Grok executable"),
+            ),
+            credential_source: PathBuf::from(
+                std::env::var_os("GROKPTAH_LIVE_GROK_AUTH")
+                    .expect("GROKPTAH_LIVE_GROK_AUTH must name the authorized credential file"),
+            ),
+            candidate_head: std::env::var("GROKPTAH_LIVE_CANDIDATE_HEAD")
+                .expect("GROKPTAH_LIVE_CANDIDATE_HEAD must bind the qualification source"),
+            evidence_dir: PathBuf::from(
+                std::env::var_os("GROKPTAH_LIVE_EVIDENCE_DIR").expect(
+                    "GROKPTAH_LIVE_EVIDENCE_DIR must name the secret-free evidence directory",
+                ),
+            ),
+        }
+    }
+}
+
+fn profile_name(profile: AdaptiveProfile) -> &'static str {
+    match profile {
+        AdaptiveProfile::Economy => "economy",
+        AdaptiveProfile::Balanced => "balanced",
+        AdaptiveProfile::HighAssurance => "high_assurance",
     }
 }
 
@@ -739,7 +781,11 @@ async fn host_cu_runs(
 }
 
 #[cfg(unix)]
-async fn run_profile(profile: AdaptiveProfile, retain_managed_result: bool) {
+async fn run_profile(
+    profile: AdaptiveProfile,
+    retain_managed_result: bool,
+    live: Option<&LiveGate>,
+) {
     let mut env = ProcessEnvGuard::new();
     let home = tempfile::tempdir().unwrap();
     set_grokptah_home_override(Some(home.path().join(".grokptah")));
@@ -752,9 +798,20 @@ async fn run_profile(profile: AdaptiveProfile, retain_managed_result: bool) {
     fs::set_permissions(isolate_parent.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let fake_dir = tempfile::tempdir().unwrap();
     let fake_grok = fake_dir.path().join("grok");
-    install_fake_grok(&fake_grok);
     let lease_path = fake_dir.path().join("lease.json");
-    fs::write(&lease_path, b"opaque-test-credential\n").unwrap();
+    let executable = if let Some(gate) = live {
+        fs::copy(&gate.credential_source, &lease_path)
+            .expect("copy disposable live Grok credential lease");
+        gate.executable.clone()
+    } else {
+        install_fake_grok(&fake_grok);
+        fs::write(&lease_path, b"opaque-test-credential\n").unwrap();
+        fake_grok.clone()
+    };
+    assert!(
+        executable.is_file(),
+        "managed Grok executable is unavailable"
+    );
     fs::set_permissions(&lease_path, fs::Permissions::from_mode(0o600)).unwrap();
 
     let host = AgentHost::create(HostConfig {
@@ -782,7 +839,7 @@ async fn run_profile(profile: AdaptiveProfile, retain_managed_result: bool) {
     );
     orch.configure_managed_grok_executor(
         ManagedGrokExecutorConfig {
-            executable: fake_grok.clone(),
+            executable,
             git_executable: PathBuf::from("/usr/bin/git"),
             cwd: workspace.path().to_path_buf(),
             isolate_parent: isolate_parent.path().to_path_buf(),
@@ -1083,7 +1140,8 @@ async fn run_profile(profile: AdaptiveProfile, retain_managed_result: bool) {
         .await
         .expect("authorize grok execution");
     let _ = authorized;
-    let reviewed = drive_until_review_gate(&orch, &grok_work_id).await;
+    let reviewed =
+        drive_until_review_gate(&orch, &grok_work_id, if live.is_some() { 180 } else { 10 }).await;
     assert_eq!(
         reviewed.state,
         WorkState::AwaitingApproval,
@@ -1104,7 +1162,9 @@ async fn run_profile(profile: AdaptiveProfile, retain_managed_result: bool) {
     assert!(!spec.authority.bypass_permissions);
     assert_eq!(
         fs::read_to_string(workspace.path().join("DOGFOOD.txt")).unwrap(),
-        "after\n"
+        "after\n",
+        "live managed result did not apply the bounded edit: {:?}",
+        reviewed.result
     );
 
     // The operator-facing handoff is assembled only from the redacted graph
@@ -1213,6 +1273,74 @@ async fn run_profile(profile: AdaptiveProfile, retain_managed_result: bool) {
         assert_eq!(rejected["work"]["state"], "failed");
     }
 
+    if let Some(gate) = live {
+        let final_grok = orch
+            .store()
+            .load_work_item(&grok_work_id)
+            .unwrap()
+            .expect("final managed Grok work");
+        let intent = orch
+            .store()
+            .list_managed_intents()
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.work_id == grok_work_id)
+            .expect("managed Grok intent");
+        let invocation = intent.grok.as_ref().expect("managed Grok invocation");
+        let safe_evidence = serde_json::json!({
+            "schemaVersion": 1,
+            "candidateHead": gate.candidate_head,
+            "profile": profile_name(profile),
+            "managerPlanId": plan_id,
+            "hostComputerUseWorkId": cu_work_id,
+            "managedGrokWorkId": grok_work_id,
+            "computerRuns": [original_run_id, successor_run_id],
+            "dependencyGate": "managed_grok_created_after_host_cu_succeeded",
+            "managed": {
+                "state": final_grok.state,
+                "attemptId": intent.attempt_id,
+                "runId": intent.run_id,
+                "requestId": invocation.request_id,
+                "cliPermissionMode": invocation.cli_permission_mode.as_str(),
+                "hostExecutionApproved": invocation.host_execution_approved,
+                "finalHeadSha": invocation.final_head_sha,
+                "finalRef": invocation.final_ref,
+                "finalState": invocation.final_state,
+                "verdict": invocation.verdict,
+                "changedPaths": invocation.changed_paths,
+                "diffDigest": invocation.diff_digest,
+                "evidenceRefs": invocation.evidence_refs,
+            },
+            "authority": {
+                "maxAttempts": 1,
+                "retryFailed": false,
+                "retryExpired": false,
+                "computerUseAllowed": false,
+                "bypassPermissions": false,
+            },
+        });
+        let evidence_text = serde_json::to_string_pretty(&safe_evidence).expect("live evidence");
+        for forbidden in [
+            workspace.path().to_str().unwrap(),
+            "credential",
+            "leaseToken",
+            "currentObservation",
+            "objective",
+        ] {
+            assert!(
+                !evidence_text.contains(forbidden),
+                "live composition evidence leaked {forbidden}: {evidence_text}"
+            );
+        }
+        fs::create_dir_all(&gate.evidence_dir).expect("live evidence directory");
+        fs::write(
+            gate.evidence_dir
+                .join(format!("composed-{}.json", profile_name(profile))),
+            evidence_text,
+        )
+        .expect("write live composition evidence");
+    }
+
     // A successful run does not revoke the caller-owned upstream lease; the
     // adapter only revokes it on unproved termination. The disposable
     // checkout, however, must always be gone before this lane returns.
@@ -1240,8 +1368,22 @@ async fn run_profile(profile: AdaptiveProfile, retain_managed_result: bool) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::await_holding_lock)]
 async fn economy_and_high_assurance_host_cu_then_dependent_grok() {
-    run_profile(AdaptiveProfile::Economy, true).await;
-    run_profile(AdaptiveProfile::HighAssurance, false).await;
+    run_profile(AdaptiveProfile::Economy, true, None).await;
+    run_profile(AdaptiveProfile::HighAssurance, false, None).await;
+}
+
+/// Explicit live-provider composition. The deterministic host Computer Use
+/// step still exercises the same adaptive/restart path; only the dependent
+/// isolated-review executor is switched to the authorized real Grok Build
+/// CLI. This remains ignored so no provider call can occur accidentally.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires explicit live Grok Build authorization"]
+#[allow(clippy::await_holding_lock)]
+async fn live_composed_host_cu_then_managed_grok_runs_both_profiles() {
+    let gate = LiveGate::from_env();
+    run_profile(AdaptiveProfile::Economy, true, Some(&gate)).await;
+    run_profile(AdaptiveProfile::HighAssurance, false, Some(&gate)).await;
 }
 
 #[cfg(unix)]
