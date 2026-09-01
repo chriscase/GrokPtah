@@ -542,7 +542,7 @@ async fn host_cu_runs(
     lane_id: Uuid,
     workspace: &Path,
     profile: AdaptiveProfile,
-) -> (String, String) {
+) -> (String, String, serde_json::Value, serde_json::Value) {
     let cu_dir = tempfile::tempdir().expect("cu store");
     let binding = canonical_workspace_string(workspace).expect("canonical workspace");
     let backend = Arc::new(DogfoodBackend::new());
@@ -713,7 +713,16 @@ async fn host_cu_runs(
         )
         .expect("complete successor");
     assert_eq!(completed.state, ComputerRunState::Completed);
-    (original_id, completed.run_id)
+    let original_projection = serde_json::to_value(project_run_at(&recovered_run, Utc::now()))
+        .expect("interrupted Computer Run projection");
+    let successor_projection =
+        serde_json::to_value(project_run_at(&completed, Utc::now())).expect("successor projection");
+    (
+        original_id,
+        completed.run_id,
+        original_projection,
+        successor_projection,
+    )
 }
 
 #[cfg(unix)]
@@ -933,7 +942,7 @@ async fn run_profile(profile: AdaptiveProfile) {
         .expect("lease token")
         .to_string();
 
-    let (original_run_id, successor_run_id) =
+    let (original_run_id, successor_run_id, original_projection, successor_projection) =
         host_cu_runs(lane.id, workspace.path(), profile).await;
     let completed = orch
         .complete_work(
@@ -1078,6 +1087,49 @@ async fn run_profile(profile: AdaptiveProfile) {
         fs::read_to_string(workspace.path().join("DOGFOOD.txt")).unwrap(),
         "after\n"
     );
+
+    // The operator-facing handoff is assembled only from the redacted graph
+    // and Computer Run projections. Keep this oracle next to the composed
+    // journey so a future report cannot accidentally switch to raw WorkItem
+    // or ComputerRun records that carry objectives, paths, grants, or
+    // observations. The graph method is the same public read seam used by
+    // ptah_get_work_graph; Computer Run projections are the corresponding
+    // ptah_get_computer_run payloads. Computer Run mutations intentionally
+    // remain local-only, per the control-plane contract.
+    let graph = orch
+        .get_work_graph_scoped(&auth(), lane.id, workspace.path())
+        .expect("redacted work graph");
+    let graph_nodes = graph["graph"].as_array().expect("graph nodes");
+    assert!(graph_nodes
+        .iter()
+        .any(|node| { node["workId"] == cu_work_id && node["state"] == "succeeded" }));
+    assert!(graph_nodes
+        .iter()
+        .any(|node| { node["workId"] == grok_work_id && node["state"] == "awaiting_approval" }));
+    let public_report = serde_json::json!({
+        "profile": profile,
+        "workGraph": graph["graph"].clone(),
+        "computerRuns": [original_projection, successor_projection],
+    });
+    let report_text = serde_json::to_string(&public_report).expect("public report json");
+    for secret in [
+        "opaque-test-credential",
+        workspace.path().to_str().unwrap(),
+        "observationId",
+        "currentObservation",
+        "objective",
+        "assignedAgentId",
+        "leaseToken",
+    ] {
+        assert!(
+            !report_text.contains(secret),
+            "public self-host report leaked {secret}: {report_text}"
+        );
+    }
+    assert!(report_text.contains(&original_run_id));
+    assert!(report_text.contains(&successor_run_id));
+    assert!(!report_text.contains("DOGFOOD.txt"));
+
     // A successful run does not revoke the caller-owned upstream lease; the
     // adapter only revokes it on unproved termination. The disposable
     // checkout, however, must always be gone before this lane returns.
