@@ -1518,7 +1518,7 @@ async fn run_profile(
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(foreign_list["error"]["data"]["code"], "workspace_mismatch");
 
     // Exercise both operator outcomes across the two profiles: Economy keeps
