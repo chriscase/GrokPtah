@@ -4,9 +4,9 @@ mod common;
 
 use grokptah_agent_bridge::orchestration::{
     AssignmentStatus, AuthContext, ManagedExecutionIntent, ManagedExecutionPolicy,
-    ManagedIntentState, OrchStore, OrchestrationConfig, OrchestrationService, RunBounds,
-    RunPurpose, RunRecord, RunState, WorkItem, WorkPolicy, WorkState, WorkspaceAllowlist,
-    MANAGED_EXECUTION_SCHEMA_VERSION,
+    ManagedIntentState, OrchStore, OrchestrationConfig, OrchestrationService, PromotionState,
+    RunBounds, RunExecution, RunExecutionMode, RunPurpose, RunRecord, RunState, WorkItem,
+    WorkPolicy, WorkState, WorkspaceAllowlist, MANAGED_EXECUTION_SCHEMA_VERSION,
 };
 use grokptah_agent_bridge::{
     set_grokptah_home_override, start_control_server, AgentHost, HostConfig, McpControlClient,
@@ -738,6 +738,78 @@ async fn boot_native(
         agent.agent_id,
         workspace_text,
     )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn isolated_terminal_runs_fail_when_durable_execution_evidence_is_missing_or_invalid() {
+    let (_env, _home, _workspace, _host, orch, session, agent_id, workspace_text) =
+        boot_native(false).await;
+    let invalid_executions = [
+        None,
+        Some(RunExecution {
+            mode: RunExecutionMode::Shared,
+            source_workspace: workspace_text.clone(),
+            execution_workspace: workspace_text.clone(),
+            base_revision: "base".into(),
+            source_fingerprint: "source".into(),
+            final_fingerprint: Some("final".into()),
+            promotion_state: PromotionState::Ready,
+            promoted_at: None,
+        }),
+        Some(RunExecution {
+            mode: RunExecutionMode::IsolatedWorktree,
+            source_workspace: workspace_text.clone(),
+            execution_workspace: "isolated".into(),
+            base_revision: "base".into(),
+            source_fingerprint: "source".into(),
+            final_fingerprint: None,
+            promotion_state: PromotionState::Ready,
+            promoted_at: None,
+        }),
+    ];
+    let mut fixtures = Vec::new();
+    for execution in invalid_executions {
+        let (item, mut intent, run) = seed_admitted_work(
+            orch.store(),
+            session,
+            &workspace_text,
+            &agent_id,
+            RunState::Completed,
+            "native-token-308",
+        );
+        intent.execution_mode = RunExecutionMode::IsolatedWorktree;
+        orch.store().save_managed_intent(&intent).unwrap();
+        orch.store()
+            .update_run(&run.run_id, |record| {
+                record.execution = execution.clone();
+                Ok(())
+            })
+            .unwrap();
+        fixtures.push((item, intent));
+    }
+
+    orch.drive_native_executor_once().await;
+
+    for (item, intent) in fixtures {
+        let work = orch.store().load_work_item(&item.work_id).unwrap().unwrap();
+        assert_eq!(work.state, WorkState::Failed);
+        assert_eq!(
+            work.result
+                .as_ref()
+                .and_then(|result| result.failure.as_deref()),
+            Some("managed run checkout mode did not match its durable admission intent")
+        );
+        assert_eq!(
+            orch.store()
+                .load_managed_intent(&intent.intent_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            ManagedIntentState::Finalized
+        );
+    }
+    orch.stop_background_tasks().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1405,13 +1405,25 @@ impl OrchestrationService {
         else {
             return Ok(());
         };
-        let execution_mode_mismatch = run
-            .execution
-            .as_ref()
-            .is_some_and(|execution| execution.mode != intent.execution_mode);
-        let isolated_execution_missing =
-            intent.execution_mode == RunExecutionMode::IsolatedWorktree && run.execution.is_none();
-        if run.state.is_terminal() && (execution_mode_mismatch || isolated_execution_missing) {
+        let execution_matches_intent = match (intent.execution_mode, run.execution.as_ref()) {
+            (RunExecutionMode::Shared, None) => true,
+            (RunExecutionMode::Shared, Some(execution)) => {
+                execution.mode == RunExecutionMode::Shared
+            }
+            (RunExecutionMode::IsolatedWorktree, Some(execution)) => {
+                execution.mode == RunExecutionMode::IsolatedWorktree
+                    && !execution.source_workspace.is_empty()
+                    && !execution.execution_workspace.is_empty()
+                    && !execution.base_revision.is_empty()
+                    && !execution.source_fingerprint.is_empty()
+                    && execution
+                        .final_fingerprint
+                        .as_deref()
+                        .is_some_and(|fingerprint| !fingerprint.is_empty())
+            }
+            (RunExecutionMode::IsolatedWorktree, None) => false,
+        };
+        if run.state.is_terminal() && !execution_matches_intent {
             let closed = self.store.close_managed_attempt(
                 &intent.intent_id,
                 false,
