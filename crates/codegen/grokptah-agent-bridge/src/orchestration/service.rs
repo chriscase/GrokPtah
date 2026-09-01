@@ -1405,6 +1405,25 @@ impl OrchestrationService {
         else {
             return Ok(());
         };
+        let execution_mode_mismatch = run
+            .execution
+            .as_ref()
+            .is_some_and(|execution| execution.mode != intent.execution_mode);
+        let isolated_execution_missing =
+            intent.execution_mode == RunExecutionMode::IsolatedWorktree && run.execution.is_none();
+        if run.state.is_terminal() && (execution_mode_mismatch || isolated_execution_missing) {
+            let closed = self.store.close_managed_attempt(
+                &intent.intent_id,
+                false,
+                ManagedRetryCause::Failed,
+                "managed run checkout mode did not match its durable admission intent",
+                Utc::now(),
+            )?;
+            if closed.is_some() {
+                self.native_executor.lock().finalized += 1;
+            }
+            return Ok(());
+        }
         if run.state == RunState::Interrupted {
             let retry_eligible = self.managed_retry_eligible(&intent.agent_id);
             let closed = self.store.close_managed_attempt(
@@ -1635,6 +1654,7 @@ impl OrchestrationService {
             source_activation_id: work.source_activation_id.clone(),
             model_selection_key: spec.model.selection_key.clone(),
             bounds: bounds.clone(),
+            execution_mode: spec.managed_execution.native_execution_mode,
             input_hash,
             grok: None,
             state: ManagedIntentState::Claiming,
@@ -1826,6 +1846,7 @@ impl OrchestrationService {
             source_activation_id: work.source_activation_id.clone(),
             model_selection_key: spec.model.selection_key.clone(),
             bounds: bounds.clone(),
+            execution_mode: RunExecutionMode::Shared,
             input_hash,
             grok: Some(invocation),
             state: ManagedIntentState::Claiming,
@@ -7268,8 +7289,15 @@ impl OrchestrationService {
                     ))
                 }
             };
-        let response = serde_json::to_value(promoted)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let response = json!({
+            "runId": promoted.run_id,
+            "sessionId": promoted.session_id,
+            "state": promoted.state,
+            "execution": promoted.execution.as_ref().map(|execution| json!({
+                "mode": execution.mode,
+                "promotionState": execution.promotion_state,
+            })),
+        });
         lease.complete(Some(run_id.to_string()), response.clone())?;
         Ok(response)
     }
@@ -7321,8 +7349,15 @@ impl OrchestrationService {
                 ))
             }
         };
-        let response = serde_json::to_value(discarded)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let response = json!({
+            "runId": discarded.run_id,
+            "sessionId": discarded.session_id,
+            "state": discarded.state,
+            "execution": discarded.execution.as_ref().map(|execution| json!({
+                "mode": execution.mode,
+                "promotionState": execution.promotion_state,
+            })),
+        });
         lease.complete(Some(run_id.to_string()), response.clone())?;
         Ok(response)
     }

@@ -314,14 +314,8 @@ async fn isolated_native_executor_uses_reviewable_checkout_and_discards_without_
         },
         ..ManagedExecutionPolicy::default()
     };
-    orch.set_managed_execution(
-        &auth(),
-        lane.id,
-        workspace.path(),
-        &agent.agent_id,
-        policy,
-    )
-    .unwrap();
+    orch.set_managed_execution(&auth(), lane.id, workspace.path(), &agent.agent_id, policy)
+        .unwrap();
     let work_policy = WorkPolicy {
         retry: grokptah_agent_bridge::orchestration::WorkRetryPolicy {
             max_attempts: 1,
@@ -399,7 +393,10 @@ async fn isolated_native_executor_uses_reviewable_checkout_and_discards_without_
         execution.mode,
         grokptah_agent_bridge::orchestration::RunExecutionMode::IsolatedWorktree
     );
-    assert_ne!(execution.execution_workspace, workspace.path().display().to_string());
+    assert_ne!(
+        execution.execution_workspace,
+        workspace.path().display().to_string()
+    );
     assert_eq!(
         fs::read_to_string(workspace.path().join("README.md")).unwrap(),
         "source baseline\n"
@@ -408,15 +405,32 @@ async fn isolated_native_executor_uses_reviewable_checkout_and_discards_without_
         .review_run(&auth(), lane.id, workspace.path(), &run.run_id)
         .unwrap();
     assert_eq!(review["promotionState"], "ready");
-    orch.discard_run(
-        &auth(),
-        "isolated-work-discard",
-        lane.id,
-        workspace.path(),
-        &run.run_id,
-    )
-    .await
-    .unwrap();
+    let review_wire = serde_json::to_string(&review).unwrap();
+    assert!(!review_wire.contains(&execution.execution_workspace));
+    let discarded = orch
+        .discard_run(
+            &auth(),
+            "isolated-work-discard",
+            lane.id,
+            workspace.path(),
+            &run.run_id,
+        )
+        .await
+        .unwrap();
+    assert_eq!(discarded["execution"]["promotionState"], "discarded");
+    let discarded_wire = serde_json::to_string(&discarded).unwrap();
+    assert!(!discarded_wire.contains(&workspace.path().display().to_string()));
+    for forbidden in [
+        "executionWorkspace",
+        "sourceWorkspace",
+        "sourceFingerprint",
+        "finalFingerprint",
+        "approvalId",
+        "lease",
+        "credential",
+    ] {
+        assert!(!discarded_wire.contains(forbidden), "leaked {forbidden}");
+    }
     assert_eq!(
         fs::read_to_string(workspace.path().join("README.md")).unwrap(),
         "source baseline\n"
@@ -656,6 +670,7 @@ fn seed_admitted_work(
         source_activation_id: None,
         model_selection_key: "grok".into(),
         bounds: RunBounds::default(),
+        execution_mode: Default::default(),
         input_hash: "hash".into(),
         grok: None,
         state: ManagedIntentState::Admitted,
@@ -1119,6 +1134,7 @@ async fn resolve_work_input_requires_parked_scope() {
         source_activation_id: None,
         model_selection_key: "grok".into(),
         bounds: RunBounds::default(),
+        execution_mode: Default::default(),
         input_hash: "hash".into(),
         grok: None,
         state: ManagedIntentState::Parked,

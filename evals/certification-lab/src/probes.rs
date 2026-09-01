@@ -3,7 +3,7 @@
 //! Every value extracted from MCP is used transiently and either discarded or
 //! converted to an opaque SHA-256 label before it can enter report evidence.
 
-use std::time::Instant;
+use std::{fs, path::Path, process::Command, time::Instant};
 
 use grokptah_agent_bridge::provider_observation::InMemoryObservationRecorder;
 use grokptah_agent_bridge::{McpControlClient, McpRemoteError};
@@ -366,6 +366,8 @@ pub fn implementation_tools(probe_id: &str) -> Option<&'static [&'static str]> {
             "ptah_authorize_work_execution",
             "ptah_get_work",
             "ptah_list_runs",
+            "ptah_review_run",
+            "ptah_discard_run",
         ]),
         "native-permission-park-decisions-v1" => Some(&[
             "ptah_create_session",
@@ -546,6 +548,8 @@ async fn native_work_to_run(
     workspace: &str,
     provider_recorder: Option<&InMemoryObservationRecorder>,
 ) -> Result<(), DiagnosticCode> {
+    prepare_native_isolated_workspace(workspace)?;
+    let live_provider = provider_recorder.is_some();
     let agent = create_agent(probe, client, workspace).await?;
     if let Some(recorder) = provider_recorder {
         probe.provider_attempt_start = recorder
@@ -573,7 +577,8 @@ async fn native_work_to_run(
                         "maxTotalTokens": 20000
                     },
                     "retryEligible": false,
-                    "requiresApprovalBeforeExecution": true
+                    "requiresApprovalBeforeExecution": true,
+                    "nativeExecutionMode": "isolated_worktree"
                 }
             }),
             vec![
@@ -598,7 +603,25 @@ async fn native_work_to_run(
                 "session_id": agent.session_id,
                 "workspace": workspace,
                 "kind": "native-certification",
-                "objective": "Return a short bounded acknowledgement and stop.",
+                "objective": "Use read_file on SELF_HOST_ALPHA.txt, then use write_file to replace it with exactly two lines: baseline and native-self-host-alpha. Do not use shell. After the write succeeds, return a short acknowledgement and stop.",
+                "policy": {
+                    "bounds": {
+                        "maxPromptBytes": 4096,
+                        "maxRounds": 2,
+                        "maxDurationMs": 30000,
+                        "maxTotalTokens": 20000
+                    },
+                    "retry": {
+                        "maxAttempts": 1,
+                        "retryFailed": false,
+                        "retryExpired": false,
+                        "backoffMs": 0
+                    },
+                    "requiresApproval": false,
+                    "maxConcurrentAttempts": 1,
+                    "managedExecution": "inherit",
+                    "allowedFiles": ["SELF_HOST_ALPHA.txt"]
+                }
             }),
             vec![
                 ArgumentFieldCode::RequestId,
@@ -606,6 +629,7 @@ async fn native_work_to_run(
                 ArgumentFieldCode::Workspace,
                 ArgumentFieldCode::Kind,
                 ArgumentFieldCode::Objective,
+                ArgumentFieldCode::Policy,
             ],
         )
         .await?;
@@ -780,6 +804,70 @@ async fn native_work_to_run(
     {
         return Err(DiagnosticCode::StateTransitionMismatch);
     }
+    let reviewed = probe
+        .call(
+            client,
+            TraceOperationCode::ReviewRun,
+            "ptah_review_run",
+            json!({
+                "session_id": agent.session_id,
+                "workspace": workspace,
+                "run_id": run_id,
+            }),
+            vec![
+                ArgumentFieldCode::SessionId,
+                ArgumentFieldCode::Workspace,
+                ArgumentFieldCode::RunId,
+            ],
+        )
+        .await?;
+    let changed_files = reviewed["changedFiles"]
+        .as_array()
+        .ok_or(DiagnosticCode::McpResultMalformed)?;
+    let expected_change = changed_files.len() == 1
+        && changed_files[0]["path"].as_str() == Some("SELF_HOST_ALPHA.txt")
+        && reviewed["diff"]
+            .as_str()
+            .is_some_and(|diff| diff.contains("native-self-host-alpha"));
+    if reviewed["promotionState"].as_str() != Some("ready")
+        || live_provider && !expected_change
+        || !live_provider && !changed_files.is_empty()
+    {
+        return Err(DiagnosticCode::StateTransitionMismatch);
+    }
+    if fs::read_to_string(Path::new(workspace).join("SELF_HOST_ALPHA.txt"))
+        .ok()
+        .as_deref()
+        != Some("baseline\n")
+    {
+        return Err(DiagnosticCode::StateTransitionMismatch);
+    }
+    probe
+        .call(
+            client,
+            TraceOperationCode::DiscardRun,
+            "ptah_discard_run",
+            json!({
+                "request_id": request_id("native-discard"),
+                "session_id": agent.session_id,
+                "workspace": workspace,
+                "run_id": run_id,
+            }),
+            vec![
+                ArgumentFieldCode::RequestId,
+                ArgumentFieldCode::SessionId,
+                ArgumentFieldCode::Workspace,
+                ArgumentFieldCode::RunId,
+            ],
+        )
+        .await?;
+    if fs::read_to_string(Path::new(workspace).join("SELF_HOST_ALPHA.txt"))
+        .ok()
+        .as_deref()
+        != Some("baseline\n")
+    {
+        return Err(DiagnosticCode::StateTransitionMismatch);
+    }
     probe.provider_run = Some(provider_run_from_value(&agent, &run)?);
     probe.transition(
         EntityKind::Work,
@@ -801,6 +889,38 @@ async fn native_work_to_run(
     probe.retain_id(DurableIdKind::Run, &run_id);
     probe.retain_id(DurableIdKind::Session, &agent.session_id);
     probe.retain_id(DurableIdKind::Agent, &agent.agent_id);
+    Ok(())
+}
+
+fn prepare_native_isolated_workspace(workspace: &str) -> Result<(), DiagnosticCode> {
+    let workspace = Path::new(workspace);
+    if workspace.join(".git").exists() {
+        return Err(DiagnosticCode::StateTransitionMismatch);
+    }
+    fs::write(workspace.join("SELF_HOST_ALPHA.txt"), "baseline\n")
+        .map_err(|_| DiagnosticCode::ServiceNotReady)?;
+    for args in [
+        vec!["init"],
+        vec!["add", "SELF_HOST_ALPHA.txt"],
+        vec![
+            "-c",
+            "user.name=GrokPtah Certification",
+            "-c",
+            "user.email=grokptah@example.invalid",
+            "commit",
+            "-m",
+            "native self-host alpha baseline",
+        ],
+    ] {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(workspace)
+            .status()
+            .map_err(|_| DiagnosticCode::ServiceNotReady)?;
+        if !status.success() {
+            return Err(DiagnosticCode::ServiceNotReady);
+        }
+    }
     Ok(())
 }
 

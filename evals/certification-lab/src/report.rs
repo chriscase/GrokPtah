@@ -879,6 +879,8 @@ pub enum TraceOperationCode {
     AuthorizeWorkExecution,
     ResolveWorkInput,
     ListExecutionIntents,
+    ReviewRun,
+    DiscardRun,
     Oracle,
 }
 

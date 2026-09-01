@@ -453,6 +453,10 @@ pub struct ManagedExecutionIntent {
     pub source_activation_id: Option<String>,
     pub model_selection_key: String,
     pub bounds: RunBounds,
+    /// Exact checkout boundary resolved from the captured AgentSpec revision
+    /// before admission. Legacy intents default to shared.
+    #[serde(default, skip_serializing_if = "is_shared_execution_mode")]
+    pub execution_mode: RunExecutionMode,
     pub input_hash: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grok: Option<ManagedGrokInvocation>,
@@ -483,6 +487,11 @@ impl ManagedExecutionIntent {
         self.bounds.validate()?;
         if let Some(grok) = &self.grok {
             grok.validate()?;
+            if self.execution_mode != RunExecutionMode::Shared {
+                return Err(invalid(
+                    "managed Grok execution intent cannot use the native checkout mode",
+                ));
+            }
         }
         Ok(())
     }
@@ -680,6 +689,12 @@ pub fn managed_execution_eligible(
     if policy.executor == ManagedExecutorKind::NativeRun
         && policy.native_execution_mode == RunExecutionMode::IsolatedWorktree
     {
+        if !policy.requires_approval_before_execution || policy.retry_eligible {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "isolated native managed execution requires current approval and forbids automatic retry",
+            ));
+        }
         if !work.policy.restricts_local_mutations() {
             return Err(OrchError::new(
                 OrchErrorCode::ForbiddenScope,

@@ -103,6 +103,7 @@ A `ManagedExecutionIntent` binds, under the store lock:
 - Run ID once admitted
 - source Routine/Activation when present
 - model route, intersected bounds, and input hash
+- resolved native execution mode (legacy intents default to `shared`)
 
 There is never more than one live Run for one Work item. Duplicate supervisor
 ticks and request-id replays return the committed relationship. The native

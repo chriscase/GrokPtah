@@ -389,6 +389,7 @@ fn abandoned_claiming_intent_returns_work_to_queued() {
         source_activation_id: None,
         model_selection_key: "grok".into(),
         bounds: RunBounds::default(),
+        execution_mode: RunExecutionMode::Shared,
         input_hash: "abc".into(),
         grok: None,
         state: ManagedIntentState::Claiming,
@@ -495,6 +496,11 @@ fn default_policy_is_disabled() {
 
 #[test]
 fn isolated_native_policy_is_explicit_approved_and_non_retrying() {
+    let legacy_json = serde_json::to_value(ManagedExecutionPolicy::default()).unwrap();
+    assert!(legacy_json.get("nativeExecutionMode").is_none());
+    let legacy: ManagedExecutionPolicy = serde_json::from_value(legacy_json).unwrap();
+    assert_eq!(legacy.native_execution_mode, RunExecutionMode::Shared);
+
     let mut policy = ManagedExecutionPolicy {
         enabled: true,
         requires_approval_before_execution: true,
@@ -504,13 +510,22 @@ fn isolated_native_policy_is_explicit_approved_and_non_retrying() {
     assert!(policy.validate().is_ok());
 
     policy.requires_approval_before_execution = false;
-    assert_eq!(policy.validate().unwrap_err().code, OrchErrorCode::InvalidRequest);
+    assert_eq!(
+        policy.validate().unwrap_err().code,
+        OrchErrorCode::InvalidRequest
+    );
     policy.requires_approval_before_execution = true;
     policy.retry_eligible = true;
-    assert_eq!(policy.validate().unwrap_err().code, OrchErrorCode::InvalidRequest);
+    assert_eq!(
+        policy.validate().unwrap_err().code,
+        OrchErrorCode::InvalidRequest
+    );
     policy.retry_eligible = false;
     policy.executor = ManagedExecutorKind::GrokBuildIsolatedReview;
-    assert_eq!(policy.validate().unwrap_err().code, OrchErrorCode::InvalidRequest);
+    assert_eq!(
+        policy.validate().unwrap_err().code,
+        OrchErrorCode::InvalidRequest
+    );
 }
 
 #[test]
@@ -518,7 +533,9 @@ fn isolated_native_work_requires_a_file_scope_and_current_authorization() {
     let home = tempdir().unwrap();
     let store = OrchStore::open(home.path()).unwrap();
     let session = Uuid::new_v4();
-    store.save_agent(&agent("worker-a", "/tmp/ws", session)).unwrap();
+    store
+        .save_agent(&agent("worker-a", "/tmp/ws", session))
+        .unwrap();
     store
         .revise_agent_spec("worker-a", "operator", |spec| {
             spec.managed_execution = ManagedExecutionPolicy {
@@ -584,6 +601,48 @@ fn isolated_native_work_requires_a_file_scope_and_current_authorization() {
         &ceiling,
     );
     assert!(eligible.is_ok(), "{eligible:?}");
+
+    let mut missing_approval = spec.clone();
+    missing_approval
+        .managed_execution
+        .requires_approval_before_execution = false;
+    assert_eq!(
+        managed_execution_eligible(
+            &authorized,
+            &worker,
+            &missing_approval,
+            std::slice::from_ref(&decision),
+            0,
+            &ceiling,
+        )
+        .unwrap_err()
+        .code,
+        OrchErrorCode::Conflict
+    );
+    let mut retrying_spec = spec.clone();
+    retrying_spec.managed_execution.retry_eligible = true;
+    assert_eq!(
+        managed_execution_eligible(
+            &authorized,
+            &worker,
+            &retrying_spec,
+            std::slice::from_ref(&decision),
+            0,
+            &ceiling,
+        )
+        .unwrap_err()
+        .code,
+        OrchErrorCode::Conflict
+    );
+    let mut retrying_work = authorized;
+    retrying_work.policy.retry.max_attempts = 2;
+    retrying_work.policy.retry.retry_failed = true;
+    assert_eq!(
+        managed_execution_eligible(&retrying_work, &worker, &spec, &[decision], 0, &ceiling,)
+            .unwrap_err()
+            .code,
+        OrchErrorCode::Conflict
+    );
 }
 
 fn enable_managed(store: &OrchStore, agent_id: &str, retry_eligible: bool) {
@@ -621,6 +680,7 @@ fn claiming_intent(
         source_activation_id: None,
         model_selection_key: "grok".into(),
         bounds: RunBounds::default(),
+        execution_mode: RunExecutionMode::Shared,
         input_hash: "hash".into(),
         grok: None,
         state: ManagedIntentState::Claiming,
