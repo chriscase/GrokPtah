@@ -1434,7 +1434,7 @@ async fn run_profile(
     // Scope errors must be indistinguishable on the actual wire, including
     // a same-workspace cross-lane read and an unknown run id. A foreign
     // workspace is rejected by the earlier workspace allowlist gate.
-    let (_, cross_lane) = public_mcp_tool(
+    let (cross_lane_status, cross_lane) = public_mcp_tool(
         &public_client,
         &public_url,
         204,
@@ -1458,7 +1458,7 @@ async fn run_profile(
         }),
     )
     .await;
-    let (_, unknown_run) = public_mcp_tool(
+    let (unknown_run_status, unknown_run) = public_mcp_tool(
         &public_client,
         &public_url,
         206,
@@ -1471,6 +1471,10 @@ async fn run_profile(
     )
     .await;
     assert_eq!(cross_lane["error"]["data"]["code"], "forbidden_scope");
+    assert_eq!(
+        cross_lane_status, unknown_run_status,
+        "cross-scope and unknown-run errors must share the HTTP status line"
+    );
     // JSON-RPC request ids are intentionally different; compare the complete
     // error object so only the scoped failure vocabulary is required to match.
     assert_eq!(cross_lane["error"], unknown_run["error"]);
