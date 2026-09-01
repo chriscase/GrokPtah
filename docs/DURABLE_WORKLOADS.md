@@ -58,11 +58,21 @@ Oversized lanes refuse bounded store reads. Public create maps the ceiling to
 the full legal range remains open in issue #520; callers must not interpret a
 transport-size refusal as an empty or complete lane.
 
-Assignment mutations (block, unblock, offer, and the other decision actions)
-write a `WorkDecision` file and then the `WorkItem` file. Each write is
-atomic, but the pair is not a sealed two-phase intent. A crash between them
-can leave a decision receipt whose item state did not change. There is no
-assignment-intent recovery path; issue #521 tracks that release residual.
+Assignment mutations that emit a `WorkDecision` (block, unblock, offer,
+accept, decline, reassign, reprioritize, request-review, and managed execution
+authorization) now use a durable `work-intents/` commit marker. The marker
+binds the decision ID, work ID, expected revision, prior and resulting item
+digests, and decision digest. Reopening the ledger replays a pair after either
+the decision or item write was interrupted, and refuses an unexpected prior
+revision or conflicting receipt rather than guessing. The marker is removed
+only after both validated records agree. Service request-id idempotency still
+guards the outer request, while this marker protects the paired store write.
+
+This closes the crash gap for the decision-producing assignment family only.
+The legacy `assign_work` convenience path and independent lifecycle mutations
+such as cancel/retry/approval remain separate durable transitions and are not
+claimed as covered by this marker; issue #521 stays open until every required
+mutation path has equivalent intent/recovery coverage.
 
 ## Service reconciliation
 
