@@ -192,6 +192,8 @@ The bridge integration tests cover:
 - create and claim idempotency, including conflicting replay rejection;
 - omission of `leaseTokenHash` from protocol responses;
 - progress and completion through the live loopback MCP server;
+- terminal runs retain typed completion evidence, and queued persistent-run
+  cancellation is terminal and request-id idempotent;
 - authorized reads surviving Lane archival and mutation rejection after archive.
 - deterministic lease/deadline reconciliation and supervisor status;
 - service restart shutdown/reopen without a lingering ledger lock;

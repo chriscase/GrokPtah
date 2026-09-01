@@ -226,6 +226,7 @@ impl WorkMutationIntent {
             || self.decision.work_id != self.work_id
             || self.intent_id != self.decision.decision_id
             || self.item.last_decision_id.as_deref() != Some(self.intent_id.as_str())
+            || self.decision.work_revision != Some(self.expected_revision)
             // Work decisions describe the revision being changed; the item
             // carries the incremented revision after the mutation lands.
             || self
@@ -6832,6 +6833,18 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("unexpected prior revision"));
+    }
+
+    #[test]
+    fn work_mutation_intent_binds_decision_to_expected_prior_revision() {
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+        let (_, _, _, mut intent) = work_mutation_fixture(&store);
+        intent.expected_revision += 1;
+        let error = intent
+            .validate()
+            .expect_err("a decision must authorize the exact prior revision");
+        assert!(error.to_string().contains("records do not agree"));
     }
 
     #[test]
