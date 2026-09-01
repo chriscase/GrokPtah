@@ -3,9 +3,9 @@ use grokptah_agent_bridge::orchestration::{
     assemble_managed_run_input, intersect_run_bounds, managed_execution_eligible,
     select_relevant_managed_messages, AssignmentStatus, AttemptState,
     ManagedExecutionBudgetProfile, ManagedExecutionIntent, ManagedExecutionPolicy,
-    ManagedExecutorKind, ManagedFinalizationStage, ManagedIntentState, ManagedRetryCause,
-    ManagedWorkMode, MessageKind, OrchErrorCode, OrchStore, RunBounds, RunRecord, RunState,
-    WorkItem, WorkMessage, WorkPolicy, WorkProgress, WorkResult, WorkState,
+    ManagedExecutorKind, ManagedFinalizationOutcome, ManagedFinalizationStage, ManagedIntentState,
+    ManagedRetryCause, ManagedWorkMode, MessageKind, OrchErrorCode, OrchStore, RunBounds,
+    RunRecord, RunState, WorkItem, WorkMessage, WorkPolicy, WorkProgress, WorkResult, WorkState,
     MANAGED_EXECUTION_SCHEMA_VERSION,
 };
 use grokptah_agent_bridge::{AgentRecord, AgentState};
@@ -896,9 +896,51 @@ fn managed_close_preserves_review_gate_even_when_retry_is_requested() {
     intent.state = ManagedIntentState::Admitted;
     store.save_managed_intent(&intent).unwrap();
 
+    let original_result = review_attempt.result.clone();
+    store
+        .finalize_managed_intent_until(
+            &intent.intent_id,
+            ManagedFinalizationOutcome::Failed,
+            "stale failure record",
+            Some(WorkResult {
+                summary: "stale replacement".into(),
+                evidence: Vec::new(),
+                artifacts: Vec::new(),
+                failure: Some("stale".into()),
+                cancellation_reason: None,
+                completed_at: Utc::now(),
+                verification: None,
+            }),
+            Utc::now(),
+            ManagedFinalizationStage::Complete,
+        )
+        .unwrap();
+    assert_eq!(
+        store.load_work_item(&item.work_id).unwrap().unwrap().state,
+        WorkState::Review
+    );
+    assert_eq!(
+        store
+            .load_work_attempt(&claim.attempt.attempt_id)
+            .unwrap()
+            .unwrap()
+            .result,
+        original_result
+    );
+
+    let mut close_intent = claiming_intent(
+        &item,
+        Some(claim.attempt.attempt_id.clone()),
+        Some("run-review-close".into()),
+        session,
+    );
+    close_intent.intent_id = "intent-review-close".into();
+    close_intent.state = ManagedIntentState::Admitted;
+    store.save_managed_intent(&close_intent).unwrap();
+
     store
         .close_managed_attempt(
-            &intent.intent_id,
+            &close_intent.intent_id,
             true,
             ManagedRetryCause::Interrupted,
             "child stopped after advisory result",

@@ -173,6 +173,12 @@ impl AttemptState {
         )
     }
 
+    /// Human-gated attempt states remain active for claim exclusion but must
+    /// not be overwritten by stale execution cleanup or retry records.
+    pub fn is_review_gate(self) -> bool {
+        matches!(self, Self::AwaitingApproval | Self::Review)
+    }
+
     /// States whose lease expiry represents lost execution authority.
     ///
     /// Review and approval states remain active for claim exclusion, but no

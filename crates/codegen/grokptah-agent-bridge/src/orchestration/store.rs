@@ -4253,7 +4253,7 @@ impl OrchStore {
         }
         if let Some(attempt_id) = record.attempt_id.as_deref() {
             if let Ok(Some(mut attempt)) = self.load_work_attempt_unlocked(attempt_id) {
-                if attempt.state.is_active() {
+                if attempt.state.is_active() && !attempt.state.is_review_gate() {
                     attempt.state = record.attempt_state;
                     attempt.terminal_reason = Some(record.reason.clone());
                     if record.result.is_some() {
