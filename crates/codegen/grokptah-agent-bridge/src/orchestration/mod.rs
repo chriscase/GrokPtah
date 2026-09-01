@@ -36,11 +36,14 @@ pub use graph::{
 };
 pub use managed::{
     assemble_managed_run_input, intersect_run_bounds, managed_execution_eligible,
-    select_relevant_managed_messages, truncate_utf8_to_bytes, ManagedExecutionIntent,
-    ManagedExecutionPolicy, ManagedFinalizationOutcome, ManagedFinalizationRecord,
-    ManagedFinalizationStage, ManagedIntentState, ManagedRetryCause, ManagedWorkMode,
-    NativeExecutorStatus, DEFAULT_NATIVE_EXECUTOR_INTERVAL_MS, MANAGED_EXECUTION_SCHEMA_VERSION,
-    MANAGED_FINALIZATION_SCHEMA_VERSION, MANAGED_TRUNCATION_MARKER,
+    select_relevant_managed_messages, truncate_utf8_to_bytes, ManagedExecutionBudgetProfile,
+    ManagedExecutionIntent, ManagedExecutionPolicy, ManagedExecutorKind,
+    ManagedFinalizationOutcome, ManagedFinalizationRecord, ManagedFinalizationStage,
+    ManagedGrokBudgetLimits, ManagedGrokCliPermissionMode, ManagedGrokInvocation,
+    ManagedIntentState, ManagedRetryCause, ManagedWorkMode, NativeExecutorStatus,
+    DEFAULT_NATIVE_EXECUTOR_INTERVAL_MS, MANAGED_EXECUTION_SCHEMA_VERSION,
+    MANAGED_FINALIZATION_SCHEMA_VERSION, MANAGED_GROK_INVOCATION_SCHEMA_VERSION,
+    MANAGED_TRUNCATION_MARKER,
 };
 pub use manager::{
     parse_manager_directive, ManagerCoordinationMode, ManagerCoordinationPolicy,
@@ -70,7 +73,7 @@ pub use routine::{
     ROUTINE_SCHEMA_VERSION,
 };
 pub(crate) use service::apply_run_aggregate;
-pub use service::{OrchestrationConfig, OrchestrationService};
+pub use service::{ManagedGrokExecutorConfig, OrchestrationConfig, OrchestrationService};
 pub(crate) use store::workspaces_match;
 pub(crate) use store::AuditWriterStopReport;
 pub use store::{IdempotencyClaim, OrchStore, RetentionPolicy, RetentionReport};
@@ -95,8 +98,9 @@ pub use worker::{
     WorkerObservatoryProjection, WorkerPresence, WorkerProjection, DEFAULT_WORKER_STALE_AFTER_MS,
 };
 pub use workload::{
-    lease_duration, AssignmentStatus, AttemptState, BlockProvenance, WorkApproval, WorkArtifactRef,
-    WorkAttempt, WorkAttemptView, WorkClaim, WorkDecision, WorkDecisionAction, WorkDependency,
-    WorkItem, WorkItemSnapshot, WorkPolicy, WorkProgress, WorkResult, WorkRetryPolicy, WorkState,
-    WorkloadReconciliationReport, WORKLOAD_SCHEMA_VERSION,
+    lease_duration, normalize_allowed_file_path, normalize_allowed_files, AssignmentStatus,
+    AttemptState, BlockProvenance, WorkApproval, WorkArtifactRef, WorkAttempt, WorkAttemptView,
+    WorkClaim, WorkDecision, WorkDecisionAction, WorkDependency, WorkItem, WorkItemSnapshot,
+    WorkPolicy, WorkProgress, WorkResult, WorkRetryPolicy, WorkState, WorkloadReconciliationReport,
+    MAX_WORK_ALLOWED_FILES, MAX_WORK_ALLOWED_FILE_PATH_BYTES, WORKLOAD_SCHEMA_VERSION,
 };

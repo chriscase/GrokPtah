@@ -4,17 +4,108 @@ mod common;
 
 use chrono::Utc;
 use grokptah_agent_bridge::orchestration::{
-    OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, WorkResult, WorkState,
-    WorkspaceAllowlist,
+    OrchStore, OrchestrationConfig, OrchestrationService, RunAggregates, RunBounds, RunRecord,
+    RunState, WorkItem, WorkResult, WorkState, WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
-    set_grokptah_home_override, start_control_server, AgentHost, HostConfig, McpControlClient,
+    set_grokptah_home_override, start_control_server, AgentHost, CompletionClaims,
+    CompletionEvidence, CompletionObservations, CompletionUsage, HostConfig, McpControlClient,
     SessionKind,
 };
 use serde_json::json;
 use tempfile::tempdir;
 
 use common::ProcessEnvGuard;
+
+fn complete_work_with_verified_evidence(
+    store: &OrchStore,
+    item: &WorkItem,
+    attempt_id: &str,
+    lease_token: &str,
+) {
+    let run_id = format!("run-{}", item.work_id);
+    store
+        .link_work_run(&item.work_id, attempt_id, lease_token, &run_id)
+        .unwrap();
+    let evidence = CompletionEvidence {
+        status: "verified".into(),
+        stop_reason: "completed".into(),
+        interrupted: false,
+        claims: CompletionClaims {
+            present: true,
+            mentions_changes: true,
+            mentions_tests: true,
+            mentions_verification: true,
+        },
+        observations: CompletionObservations {
+            changed_files: 1,
+            tests_observed: 1,
+            tests_passed: 1,
+            ..CompletionObservations::default()
+        },
+        usage: CompletionUsage::default(),
+        work_id: Some(item.work_id.clone()),
+        run_id: Some(run_id.clone()),
+        attempt_id: Some(attempt_id.into()),
+    };
+    let aggregates = RunAggregates {
+        verification: Some(evidence.clone()),
+        ..RunAggregates::default()
+    };
+    let now = Utc::now();
+    store
+        .save_run(&RunRecord {
+            run_id: run_id.clone(),
+            session_id: item.session_id,
+            workspace: item.workspace.clone(),
+            request_id: format!("req-{}", item.work_id),
+            client_id: None,
+            state: RunState::Completed,
+            purpose: Default::default(),
+            agent_id: None,
+            retry_of: None,
+            parent_run_id: None,
+            agent_spec_revision: None,
+            checkpoint_id: None,
+            continuation_context_id: None,
+            continuation_context_hash: None,
+            continuation_fidelity: None,
+            queue_position: None,
+            bounds: Default::default(),
+            prompt_preview: "preview".into(),
+            start_seq: Some(1),
+            end_seq: Some(2),
+            created_at: now,
+            updated_at: now,
+            terminal_result: Some("completed".into()),
+            final_response: Some(
+                "Changed src/lib.rs; cargo test passed; verification green.".into(),
+            ),
+            error_code: None,
+            stop_cause: None,
+            aggregates,
+            progress: None,
+            execution: None,
+            approval: None,
+        })
+        .unwrap();
+    store
+        .complete_work(
+            &item.work_id,
+            attempt_id,
+            lease_token,
+            WorkResult {
+                summary: "inspection complete".into(),
+                evidence: vec!["deterministic evidence".into()],
+                artifacts: Vec::new(),
+                failure: None,
+                cancellation_reason: None,
+                completed_at: now,
+                verification: Some(evidence),
+            },
+        )
+        .unwrap();
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::await_holding_lock)]
@@ -33,10 +124,11 @@ async fn hosted_manager_plan_replays_and_unlocks_dependency_graph() {
     let lane = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(lane.id, workspace.path()).unwrap();
     let manager = host.ensure_session_agent(lane.id).unwrap();
+    let requested_store = OrchStore::open(home.path().join("orchestration")).unwrap();
     let orch = OrchestrationService::new(
         host.clone(),
         host.event_bus(),
-        OrchStore::open(home.path().join("orchestration")).unwrap(),
+        requested_store,
         OrchestrationConfig {
             bearer_token: "manager-token-308".into(),
             allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
@@ -44,6 +136,10 @@ async fn hosted_manager_plan_replays_and_unlocks_dependency_graph() {
             bounds: RunBounds::default(),
         },
     );
+    // `ensure_session_agent` may have opened the process-wide host ledger
+    // before the service was constructed. Exercise the same canonical store
+    // the service selected instead of a discarded requested handle.
+    let store = host.ensure_orchestration_store().unwrap();
     let server = start_control_server(orch, 0).await.unwrap();
     let mut client = McpControlClient::new(format!("http://{}", server.addr), "manager-token-308");
     client.initialize().await.unwrap();
@@ -115,21 +211,26 @@ async fn hosted_manager_plan_replays_and_unlocks_dependency_graph() {
         )
         .await
         .unwrap();
-    client
-        .call_tool(
-            "ptah_complete_work",
-            json!({
-                "request_id": "manager-complete-308",
-                "session_id": lane.id,
-                "workspace": workspace_text,
-                "work_id": first_work,
-                "attempt_id": claimed.structured["attempt"]["attemptId"],
-                "lease_token": claimed.structured["leaseToken"],
-                "summary": "inspection complete"
-            }),
-        )
-        .await
-        .unwrap();
+    let item = store
+        .load_work_item(&first_work)
+        .unwrap()
+        .unwrap_or_else(|| {
+            panic!(
+                "manager-created work {first_work} missing from service store; present={:?}",
+                store
+                    .list_work_items()
+                    .unwrap()
+                    .into_iter()
+                    .map(|item| item.work_id)
+                    .collect::<Vec<_>>()
+            )
+        });
+    complete_work_with_verified_evidence(
+        &store,
+        &item,
+        claimed.structured["attempt"]["attemptId"].as_str().unwrap(),
+        claimed.structured["leaseToken"].as_str().unwrap(),
+    );
 
     let next = client
         .call_tool(
@@ -386,6 +487,7 @@ async fn hosted_manager_tick_routes_attention_and_terminal_outcomes() {
         failure: Some("fixture failure".into()),
         cancellation_reason: None,
         completed_at: now,
+        verification: None,
     });
     work.bump_at(now);
     store_for_fixture.save_work_item(&work).unwrap();

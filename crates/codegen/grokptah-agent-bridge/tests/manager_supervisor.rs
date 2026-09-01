@@ -119,6 +119,7 @@ async fn autonomous_manager_replans_once_and_reaches_success() {
         failure: Some("fixture failure".into()),
         cancellation_reason: None,
         completed_at: Utc::now(),
+        verification: None,
     });
     original.bump_at(Utc::now());
     fixture_store.save_work_item(&original).unwrap();
@@ -162,6 +163,7 @@ async fn autonomous_manager_replans_once_and_reaches_success() {
         failure: None,
         cancellation_reason: None,
         completed_at: Utc::now(),
+        verification: None,
     });
     decision_work.bump_at(Utc::now());
     fixture_store.save_work_item(&decision_work).unwrap();
@@ -192,6 +194,7 @@ async fn autonomous_manager_replans_once_and_reaches_success() {
         failure: None,
         cancellation_reason: None,
         completed_at: Utc::now(),
+        verification: None,
     });
     replacement.bump_at(Utc::now());
     fixture_store.save_work_item(&replacement).unwrap();

@@ -16,6 +16,7 @@ pub mod event_bus;
 mod events;
 mod exec_risk;
 mod gateway_config;
+pub mod grok_build;
 mod hooks;
 mod host;
 mod host_helpers;
@@ -168,6 +169,11 @@ pub use discover::{
 };
 pub use event_bus::{EventBus, EventReceiver, JournalEntry, JournalPage};
 pub use events::{SessionUpdate, ToolCallKind, ToolCallStatus};
+pub use grok_build::{
+    launch_grok_build, CredentialLeaseHandle, CredentialLeaseResolver, GrokBuildAdapterError,
+    GrokBuildAdapterOutcome, GrokBuildAdvisoryEvidence, GrokBuildHostLaunchConfig,
+    GrokBuildMutationEvidence,
+};
 pub use host::{AgentHost, AgentHostHandle, AgentStatus, HostConfig, WorkspaceUiState};
 pub use host_runtime::{
     quarantined_process_lock_count, ControlServerRejected, DurableWriteLease, HostPhase,
@@ -195,15 +201,17 @@ pub use orchestration::{
     ContinuationInputSnapshot, ContinuationMemoryFact, ContinuationMemoryInput,
     ContinuationMemoryScope, ContinuationOmission, ContinuationReason, ContinuationReasonCode,
     ContinuationRunInput, ContinuationTestInput, ContinuationWorkloadRef, FakeClock,
-    ManagedExecutionPolicy, MissedRunPolicy, NativeExecutorStatus, OrchStore, OrchestrationConfig,
-    OrchestrationService, PromotionState, PublicEventKindV1, PublicEventPageV1, PublicEventV1,
-    RetentionPolicy, RetentionReport, RoutineConcurrencyPolicy, RoutineLifecycle, RoutineRecord,
-    RoutineRetryPolicy, RoutineSnapshot, RoutineTrigger, RunApproval, RunBounds, RunExecution,
-    RunExecutionMode, RunRecord, RunState, RunStopCause, WorkAttemptView, WorkDecision, WorkItem,
-    WorkItemSnapshot, WorkMessage, WorkPolicy, WorkTemplate, WorkerProjection,
-    WorkloadReconciliationReport, WorkloadSupervisor, WorkloadSupervisorStatus, WorkspaceAllowlist,
-    AGENT_SPEC_SCHEMA_VERSION, CONTINUATION_ASSEMBLER_VERSION, CONTINUATION_SCHEMA_VERSION,
-    CONTROL_TOOLS, DEFAULT_AGENT_TOOL_IDS, DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS,
+    ManagedExecutionBudgetProfile, ManagedExecutionPolicy, ManagedExecutorKind,
+    ManagedGrokExecutorConfig, MissedRunPolicy, NativeExecutorStatus, OrchStore,
+    OrchestrationConfig, OrchestrationService, PromotionState, PublicEventKindV1,
+    PublicEventPageV1, PublicEventV1, RetentionPolicy, RetentionReport, RoutineConcurrencyPolicy,
+    RoutineLifecycle, RoutineRecord, RoutineRetryPolicy, RoutineSnapshot, RoutineTrigger,
+    RunApproval, RunBounds, RunExecution, RunExecutionMode, RunRecord, RunState, RunStopCause,
+    WorkAttemptView, WorkDecision, WorkItem, WorkItemSnapshot, WorkMessage, WorkPolicy,
+    WorkTemplate, WorkerProjection, WorkloadReconciliationReport, WorkloadSupervisor,
+    WorkloadSupervisorStatus, WorkspaceAllowlist, AGENT_SPEC_SCHEMA_VERSION,
+    CONTINUATION_ASSEMBLER_VERSION, CONTINUATION_SCHEMA_VERSION, CONTROL_TOOLS,
+    DEFAULT_AGENT_TOOL_IDS, DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS,
     DEFAULT_WORKLOAD_RECONCILIATION_INTERVAL, FORBIDDEN_TOOLS, MAX_AGENT_CONTEXT_BYTES,
     PUBLIC_EVENT_SCHEMA_VERSION, ROUTINE_SCHEMA_VERSION,
 };

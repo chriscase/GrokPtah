@@ -1,10 +1,11 @@
 use chrono::Utc;
 use grokptah_agent_bridge::orchestration::{
     assemble_managed_run_input, intersect_run_bounds, managed_execution_eligible,
-    select_relevant_managed_messages, AssignmentStatus, ManagedExecutionIntent,
-    ManagedExecutionPolicy, ManagedFinalizationStage, ManagedIntentState, ManagedRetryCause,
-    ManagedWorkMode, MessageKind, OrchErrorCode, OrchStore, RunBounds, RunRecord, RunState,
-    WorkItem, WorkMessage, WorkPolicy, WorkProgress, WorkResult, WorkState,
+    select_relevant_managed_messages, AssignmentStatus, AttemptState,
+    ManagedExecutionBudgetProfile, ManagedExecutionIntent, ManagedExecutionPolicy,
+    ManagedExecutorKind, ManagedFinalizationOutcome, ManagedFinalizationStage, ManagedIntentState,
+    ManagedRetryCause, ManagedWorkMode, MessageKind, OrchErrorCode, OrchStore, RunBounds,
+    RunRecord, RunState, WorkItem, WorkMessage, WorkPolicy, WorkProgress, WorkResult, WorkState,
     MANAGED_EXECUTION_SCHEMA_VERSION,
 };
 use grokptah_agent_bridge::{AgentRecord, AgentState};
@@ -117,6 +118,223 @@ fn manual_only_and_foreign_agents_are_not_eligible() {
 }
 
 #[test]
+fn managed_execution_requires_the_current_bound_authorization() {
+    let home = tempdir().unwrap();
+    let store = OrchStore::open(home.path()).unwrap();
+    let session = Uuid::new_v4();
+    store
+        .save_agent(&agent("worker-a", "/tmp/ws", session))
+        .unwrap();
+    store
+        .revise_agent_spec("worker-a", "operator", |spec| {
+            spec.managed_execution.enabled = true;
+            spec.managed_execution.requires_approval_before_execution = true;
+            spec.managed_execution.bounds.max_total_tokens = Some(4_000);
+            Ok(())
+        })
+        .unwrap();
+    let item = accepted_work(session, "/tmp/ws", "worker-a");
+    store.save_work_item(&item).unwrap();
+    let (authorized, decision) = store
+        .authorize_work_execution(
+            &item.work_id,
+            "operator",
+            None,
+            "authorize one managed attempt",
+            Some(item.revision),
+            Utc::now(),
+        )
+        .unwrap();
+    let worker = store.load_agent("worker-a").unwrap().unwrap();
+    let spec = worker.current_spec().unwrap().clone();
+    let ceiling = RunBounds::default();
+    assert_eq!(
+        authorized.last_decision_id.as_deref(),
+        Some(decision.decision_id.as_str())
+    );
+    assert_eq!(
+        decision.work_revision.map(|revision| revision + 1),
+        Some(authorized.revision)
+    );
+    assert_eq!(
+        decision.assigned_agent_id.as_deref(),
+        authorized.assigned_agent_id.as_deref()
+    );
+    assert_eq!(decision.policy_revision, Some(spec.revision));
+    let eligible = managed_execution_eligible(
+        &authorized,
+        &worker,
+        &spec,
+        std::slice::from_ref(&decision),
+        0,
+        &ceiling,
+    );
+    assert!(eligible.is_ok(), "{eligible:?}");
+
+    let mut later_revision = authorized.clone();
+    later_revision.bump();
+    assert!(managed_execution_eligible(
+        &later_revision,
+        &worker,
+        &spec,
+        std::slice::from_ref(&decision),
+        0,
+        &ceiling,
+    )
+    .is_err());
+
+    let mut detached = authorized.clone();
+    detached.last_decision_id = None;
+    assert!(managed_execution_eligible(
+        &detached,
+        &worker,
+        &spec,
+        std::slice::from_ref(&decision),
+        0,
+        &ceiling,
+    )
+    .is_err());
+
+    let revised = store
+        .revise_agent_spec("worker-a", "operator", |spec| {
+            spec.default_run_bounds.max_prompt_bytes =
+                spec.default_run_bounds.max_prompt_bytes.saturating_sub(1);
+            Ok(())
+        })
+        .unwrap()
+        .unwrap();
+    assert!(managed_execution_eligible(
+        &authorized,
+        &revised,
+        revised.current_spec().unwrap(),
+        &[decision],
+        0,
+        &ceiling,
+    )
+    .is_err());
+}
+
+#[test]
+fn grok_managed_execution_requires_the_strict_self_host_authority_envelope() {
+    let home = tempdir().unwrap();
+    let store = OrchStore::open(home.path()).unwrap();
+    let session = Uuid::new_v4();
+    store
+        .save_agent(&agent("worker-a", "/tmp/ws", session))
+        .unwrap();
+    store
+        .revise_agent_spec("worker-a", "operator", |spec| {
+            spec.managed_execution.enabled = true;
+            spec.managed_execution.executor = ManagedExecutorKind::GrokBuildIsolatedReview;
+            spec.managed_execution.budget_profile = Some(ManagedExecutionBudgetProfile::Economy);
+            spec.managed_execution.requires_approval_before_execution = true;
+            spec.managed_execution.retry_eligible = false;
+            spec.managed_execution.bounds.max_total_tokens = Some(4_000);
+            Ok(())
+        })
+        .unwrap();
+    let mut item = accepted_work(session, "/tmp/ws", "worker-a");
+    item.policy.allowed_files = vec!["src/lib.rs".into()];
+    item.policy.retry.max_attempts = 1;
+    item.policy.retry.retry_failed = false;
+    item.policy.retry.retry_expired = false;
+    item.source_manager_plan_id = Some("plan-1".into());
+    item.source_manager_step_id = Some("step-1".into());
+    store.save_work_item(&item).unwrap();
+    let (authorized, decision) = store
+        .authorize_work_execution(
+            &item.work_id,
+            "operator",
+            None,
+            "authorize one isolated Grok review",
+            Some(item.revision),
+            Utc::now(),
+        )
+        .unwrap();
+    let worker = store.load_agent("worker-a").unwrap().unwrap();
+    let spec = worker.current_spec().unwrap().clone();
+    let ceiling = RunBounds::default();
+    assert!(managed_execution_eligible(
+        &authorized,
+        &worker,
+        &spec,
+        std::slice::from_ref(&decision),
+        0,
+        &ceiling,
+    )
+    .is_ok());
+
+    let mut missing_scope = authorized.clone();
+    missing_scope.policy.allowed_files.clear();
+    assert!(managed_execution_eligible(
+        &missing_scope,
+        &worker,
+        &spec,
+        std::slice::from_ref(&decision),
+        0,
+        &ceiling,
+    )
+    .is_err());
+
+    let mut missing_plan = authorized.clone();
+    missing_plan.source_manager_plan_id = None;
+    missing_plan.source_manager_step_id = None;
+    assert!(managed_execution_eligible(
+        &missing_plan,
+        &worker,
+        &spec,
+        std::slice::from_ref(&decision),
+        0,
+        &ceiling,
+    )
+    .is_err());
+
+    let mut retryable = authorized.clone();
+    retryable.policy.retry.max_attempts = 2;
+    retryable.policy.retry.retry_failed = true;
+    assert!(managed_execution_eligible(
+        &retryable,
+        &worker,
+        &spec,
+        std::slice::from_ref(&decision),
+        0,
+        &ceiling,
+    )
+    .is_err());
+
+    let mut no_profile = spec.clone();
+    no_profile.managed_execution.budget_profile = None;
+    assert!(managed_execution_eligible(
+        &authorized,
+        &worker,
+        &no_profile,
+        std::slice::from_ref(&decision),
+        0,
+        &ceiling,
+    )
+    .is_err());
+}
+
+#[test]
+fn grok_budget_profiles_change_cost_bounds_not_authority() {
+    let economy = ManagedExecutionBudgetProfile::Economy.limits();
+    let high = ManagedExecutionBudgetProfile::HighAssurance.limits();
+    assert!(economy.max_prompt_bytes < high.max_prompt_bytes);
+    assert!(economy.max_turns < high.max_turns);
+    assert!(economy.max_duration_ms < high.max_duration_ms);
+    assert!(economy.max_output_bytes < high.max_output_bytes);
+
+    let legacy = ManagedExecutionPolicy::default();
+    assert_eq!(legacy.executor, ManagedExecutorKind::NativeRun);
+    assert_eq!(legacy.budget_profile, None);
+    assert!(legacy.validate().is_ok());
+
+    let mut invalid_native = legacy;
+    invalid_native.budget_profile = Some(ManagedExecutionBudgetProfile::Economy);
+    assert!(invalid_native.validate().is_err());
+}
+
+#[test]
 fn bounds_intersection_never_widens() {
     let server = RunBounds {
         max_prompt_bytes: 10_000,
@@ -172,6 +390,7 @@ fn abandoned_claiming_intent_returns_work_to_queued() {
         model_selection_key: "grok".into(),
         bounds: RunBounds::default(),
         input_hash: "abc".into(),
+        grok: None,
         state: ManagedIntentState::Claiming,
         permission_request_id: None,
         created_at: Utc::now(),
@@ -255,6 +474,7 @@ fn expired_attempt_rejects_late_managed_completion() {
         failure: None,
         cancellation_reason: None,
         completed_at: Utc::now(),
+        verification: None,
     };
     assert!(store
         .complete_work(
@@ -307,6 +527,7 @@ fn claiming_intent(
         model_selection_key: "grok".into(),
         bounds: RunBounds::default(),
         input_hash: "hash".into(),
+        grok: None,
         state: ManagedIntentState::Claiming,
         permission_request_id: None,
         created_at: now,
@@ -402,6 +623,62 @@ fn claiming_intent_after_claim_without_run_releases_attempt() {
     let attempts = store.list_work_attempts(Some(&item.work_id)).unwrap();
     assert_eq!(attempts.len(), 1);
     assert!(!attempts[0].state.is_active());
+}
+
+#[test]
+fn dispatching_intent_cannot_be_abandoned_or_requeued_after_possible_send() {
+    let home = tempdir().unwrap();
+    let store = OrchStore::open(home.path()).unwrap();
+    let session = Uuid::new_v4();
+    store
+        .save_agent(&agent("worker-a", "/tmp/ws", session))
+        .unwrap();
+    let work = accepted_work(session, "/tmp/ws", "worker-a");
+    store.save_work_item(&work).unwrap();
+    let claim = store
+        .claim_work_with_lease_secret(&work.work_id, "worker-a", None, "secret")
+        .unwrap();
+    let mut intent = claiming_intent(
+        &claim.work,
+        Some(claim.attempt.attempt_id.clone()),
+        None,
+        session,
+    );
+    intent.state = ManagedIntentState::Dispatching;
+    store.save_managed_intent(&intent).unwrap();
+
+    let unchanged = store
+        .abandon_managed_intent(&intent.intent_id, Utc::now())
+        .unwrap()
+        .unwrap();
+    assert_eq!(unchanged.state, ManagedIntentState::Dispatching);
+    assert_ne!(
+        store.load_work_item(&work.work_id).unwrap().unwrap().state,
+        WorkState::Queued
+    );
+
+    let reviewed = store
+        .finalize_managed_intent(
+            &intent.intent_id,
+            grokptah_agent_bridge::orchestration::ManagedFinalizationOutcome::Review,
+            "dispatch outcome is uncertain after restart",
+            Some(WorkResult {
+                summary: "dispatch outcome is uncertain after restart".into(),
+                evidence: vec!["executor:grok_build_isolated_review".into()],
+                artifacts: Vec::new(),
+                failure: Some("grok_dispatch_uncertain_after_restart".into()),
+                cancellation_reason: None,
+                completed_at: Utc::now(),
+                verification: None,
+            }),
+            Utc::now(),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(reviewed.state, ManagedIntentState::Finalized);
+    let work = store.load_work_item(&work.work_id).unwrap().unwrap();
+    assert_eq!(work.state, WorkState::Review);
+    assert!(work.result.unwrap().verification.is_none());
 }
 
 #[test]
@@ -572,6 +849,116 @@ fn interrupted_run_with_retry_allowed_requeues_without_resuming() {
         work.attempt_count + 1,
         ManagedRetryCause::Interrupted
     ));
+}
+
+#[test]
+fn managed_close_preserves_review_gate_even_when_retry_is_requested() {
+    let home = tempdir().unwrap();
+    let store = OrchStore::open(home.path()).unwrap();
+    let session = Uuid::new_v4();
+    store
+        .save_agent(&agent("worker-a", "/tmp/ws", session))
+        .unwrap();
+    enable_managed(&store, "worker-a", true);
+    let item = accepted_work(session, "/tmp/ws", "worker-a");
+    store.save_work_item(&item).unwrap();
+    let claim = store
+        .claim_work_with_lease_secret(&item.work_id, "worker-a", None, "secret")
+        .unwrap();
+    let (review, review_attempt) = store
+        .complete_work(
+            &item.work_id,
+            &claim.attempt.attempt_id,
+            &claim.lease_token,
+            WorkResult {
+                summary: "advisory requires review".into(),
+                evidence: Vec::new(),
+                artifacts: Vec::new(),
+                failure: None,
+                cancellation_reason: None,
+                completed_at: Utc::now(),
+                verification: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(review.state, WorkState::Review);
+    assert_eq!(review_attempt.state, AttemptState::Review);
+
+    let mut expiring = review.clone();
+    expiring.deadline = Some(Utc::now() - chrono::Duration::seconds(1));
+    store.save_work_item(&expiring).unwrap();
+    let mut intent = claiming_intent(
+        &item,
+        Some(claim.attempt.attempt_id.clone()),
+        Some("run-review".into()),
+        session,
+    );
+    intent.state = ManagedIntentState::Admitted;
+    store.save_managed_intent(&intent).unwrap();
+
+    let original_result = review_attempt.result.clone();
+    store
+        .finalize_managed_intent_until(
+            &intent.intent_id,
+            ManagedFinalizationOutcome::Failed,
+            "stale failure record",
+            Some(WorkResult {
+                summary: "stale replacement".into(),
+                evidence: Vec::new(),
+                artifacts: Vec::new(),
+                failure: Some("stale".into()),
+                cancellation_reason: None,
+                completed_at: Utc::now(),
+                verification: None,
+            }),
+            Utc::now(),
+            ManagedFinalizationStage::Complete,
+        )
+        .unwrap();
+    assert_eq!(
+        store.load_work_item(&item.work_id).unwrap().unwrap().state,
+        WorkState::Review
+    );
+    assert_eq!(
+        store
+            .load_work_attempt(&claim.attempt.attempt_id)
+            .unwrap()
+            .unwrap()
+            .result,
+        original_result
+    );
+
+    let mut close_intent = claiming_intent(
+        &item,
+        Some(claim.attempt.attempt_id.clone()),
+        Some("run-review-close".into()),
+        session,
+    );
+    close_intent.intent_id = "intent-review-close".into();
+    close_intent.state = ManagedIntentState::Admitted;
+    store.save_managed_intent(&close_intent).unwrap();
+
+    store
+        .close_managed_attempt(
+            &close_intent.intent_id,
+            true,
+            ManagedRetryCause::Interrupted,
+            "child stopped after advisory result",
+            Utc::now(),
+        )
+        .unwrap();
+    assert_eq!(
+        store.load_work_item(&item.work_id).unwrap().unwrap().state,
+        WorkState::Review
+    );
+    assert_eq!(
+        store
+            .load_work_attempt(&claim.attempt.attempt_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        AttemptState::Review
+    );
 }
 
 #[test]
@@ -1241,6 +1628,7 @@ fn completed_finalization_converges_after_partial_writes() {
             failure: None,
             cancellation_reason: None,
             completed_at: Utc::now(),
+            verification: None,
         };
         store
             .finalize_managed_intent_until(
@@ -1263,7 +1651,7 @@ fn completed_finalization_converges_after_partial_writes() {
     let store = OrchStore::open(&path).unwrap();
     assert_eq!(
         store.load_work_item(&work_id).unwrap().unwrap().state,
-        WorkState::Succeeded
+        WorkState::Review
     );
     assert_eq!(
         store

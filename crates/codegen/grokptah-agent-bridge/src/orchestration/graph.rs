@@ -492,15 +492,20 @@ pub fn evaluate_admission(
     if item.is_container {
         return AdmissionBlock::Container;
     }
-    if item.deadline.is_some_and(|deadline| deadline <= now) {
-        return AdmissionBlock::DeadlineExceeded;
-    }
     match item.state {
         WorkState::Leased | WorkState::Running => return AdmissionBlock::AttemptActive,
         WorkState::AwaitingInput => return AdmissionBlock::AwaitingInput,
-        WorkState::AwaitingApproval => return AdmissionBlock::AwaitingApproval,
-        WorkState::Review => return AdmissionBlock::UnderReview,
+        state if state.is_review_gate() => {
+            return if state == WorkState::AwaitingApproval {
+                AdmissionBlock::AwaitingApproval
+            } else {
+                AdmissionBlock::UnderReview
+            };
+        }
         _ => {}
+    }
+    if item.deadline.is_some_and(|deadline| deadline <= now) {
+        return AdmissionBlock::DeadlineExceeded;
     }
 
     // Dependencies are evaluated for Queued and derived-Blocked alike:

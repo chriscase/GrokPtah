@@ -18,10 +18,14 @@
 //! document from `ptah_get_events`. Legacy `list_runs` / `observe_run` /
 //! `stream_events` are unsupported shims: they do not call those public tools
 //! and do not deserialize the DTO as `RunRecord` / `JournalPage`.
+//!
+//! [`grok_build`] is an advisory, provider-neutral manager contract. It does
+//! not launch runs, call providers, or confer authority.
 
 mod capability;
 mod dto;
 mod error;
+mod grok_build;
 mod ids;
 mod observe;
 mod page;
@@ -38,6 +42,11 @@ pub use dto::{
     parse_public_run_list_v1, parse_public_run_progress_v1, parse_public_run_v1,
 };
 pub use error::SdkError;
+pub use grok_build::{
+    GROK_BUILD_CONTRACT_VERSION, GrokBuildCleanupState, GrokBuildContractError,
+    GrokBuildGitIdentity, GrokBuildIsolationReceipt, GrokBuildLaunchRequest, GrokBuildMutationMode,
+    GrokBuildNonclaim, GrokBuildPolicyState, GrokBuildResult, GrokBuildRunState, GrokBuildVerdict,
+};
 pub use ids::{RunId, SessionId, WorkspaceRef};
 pub use observe::{EventQuery, RunSelector, SessionScope};
 pub use page::{Cursor, RetainedRange};

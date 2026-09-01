@@ -4774,6 +4774,71 @@ impl AgentHostHandle {
         Ok(run.purpose == RunPurpose::ManagerProposal)
     }
 
+    /// Load the Work policy bound to the current local executor Run, if any.
+    ///
+    /// Ordinary desktop/orchestration Runs with no WorkAttempt or managed
+    /// intent stay unrestricted by Work policy. A Run that is Work-bound but
+    /// cannot load its Work item fails closed.
+    fn session_work_policy(&self, session_id: Uuid) -> Result<Option<WorkPolicy>> {
+        // The usage tracker is the normal in-turn identity, but it is not an
+        // authority source: it is installed for accounting and may not exist
+        // at every admission boundary. Recover the currently activated
+        // durable Run from the persistent Agent rather than silently treating
+        // a Work-bound turn as an unrestricted desktop turn.
+        let run_id = if let Some(run_id) = self.current_turn_run_id(session_id) {
+            run_id
+        } else {
+            let agent_id = self
+                .inner
+                .lock()
+                .sessions
+                .get(&session_id)
+                .and_then(|session| session.agent_id.clone());
+            let Some(agent_id) = agent_id else {
+                return Ok(None);
+            };
+            let store = self
+                .orchestration_store
+                .lock()
+                .clone()
+                .ok_or_else(|| anyhow!("persistent Run store is unavailable"))?;
+            let Some(agent) = store.load_agent(&agent_id)? else {
+                bail!("active session Agent record is missing");
+            };
+            let Some(run_id) = agent.current_run_id else {
+                return Ok(None);
+            };
+            run_id
+        };
+        let Some(store) = self.orchestration_store.lock().clone() else {
+            bail!("persistent Run store is unavailable");
+        };
+        match store.work_item_for_run(&run_id) {
+            Ok(None) => Ok(None),
+            Ok(Some(work)) => Ok(Some(work.policy)),
+            Err(error) => Err(anyhow!(
+                "Work-bound run {run_id} could not load its Work policy: {error}"
+            )),
+        }
+    }
+
+    fn session_work_allowed_files(&self, session_id: Uuid) -> Result<Vec<String>> {
+        Ok(self
+            .session_work_policy(session_id)?
+            .map(|policy| policy.allowed_files)
+            .unwrap_or_default())
+    }
+
+    fn work_shell_policy_error(&self, session_id: Uuid) -> Option<String> {
+        match self.session_work_policy(session_id) {
+            Ok(Some(policy)) if policy.denies_shell() => {
+                Some("ERROR: Work allowed_files policy forbids run_terminal_cmd".into())
+            }
+            Err(error) => Some(format!("ERROR: {error}")),
+            _ => None,
+        }
+    }
+
     /// Intersect mutable host policy with the Agent's captured ceiling. Either
     /// side may deny or require approval; auto-approval requires both.
     fn tool_gate(&self, session_id: Uuid, tool_name: &str) -> ToolGate {
@@ -8711,31 +8776,45 @@ impl AgentHostHandle {
                     emit_message(event_tx, session_id, msg);
                     // still finish turn below
                 } else {
-                    let out = self
-                        .run_tool_for_output(
-                            session_id,
-                            "write_file",
-                            &serde_json::json!({ "path": path, "content": content }),
-                            || {
-                                let cwd = cwd.to_path_buf();
-                                let path = path.clone();
-                                let content = content.clone();
-                                async move {
-                                    local_tools::tool_write_file(&cwd, &path, &content).await
-                                }
-                            },
-                            cancel,
-                            event_tx,
-                        )
-                        .await;
-                    if out.as_ref().is_ok_and(|s| !s.starts_with("DENIED")) {
-                        self.emit_file_edit(
-                            session_id,
-                            cwd,
-                            &path_rec,
-                            &format!("Wrote {path_rec}"),
-                            event_tx,
-                        );
+                    match self.session_work_allowed_files(session_id) {
+                        Err(error) => {
+                            emit_message(event_tx, session_id, &format!("ERROR: {error}"));
+                        }
+                        Ok(allowed) => {
+                            let out = self
+                                .run_tool_for_output(
+                                    session_id,
+                                    "write_file",
+                                    &serde_json::json!({ "path": path, "content": content }),
+                                    || {
+                                        let cwd = cwd.to_path_buf();
+                                        let path = path.clone();
+                                        let content = content.clone();
+                                        let allowed = allowed.clone();
+                                        async move {
+                                            local_tools::tool_write_file(
+                                                &cwd, &path, &content, &allowed,
+                                            )
+                                            .await
+                                        }
+                                    },
+                                    cancel,
+                                    event_tx,
+                                )
+                                .await;
+                            if out
+                                .as_ref()
+                                .is_ok_and(|s| !s.starts_with("DENIED") && !s.starts_with("ERROR:"))
+                            {
+                                self.emit_file_edit(
+                                    session_id,
+                                    cwd,
+                                    &path_rec,
+                                    &format!("Wrote {path_rec}"),
+                                    event_tx,
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -9675,6 +9754,10 @@ impl AgentHostHandle {
                 if self.session_sandbox_is_readonly(session_id) {
                     return Ok("ERROR: tool safety profile is read-only; write_file denied".into());
                 }
+                let allowed = match self.session_work_allowed_files(session_id) {
+                    Ok(files) => files,
+                    Err(error) => return Ok(format!("ERROR: {error}")),
+                };
                 let path = args
                     .get("path")
                     .and_then(|v| v.as_str())
@@ -9697,7 +9780,10 @@ impl AgentHostHandle {
                             let cwd = cwd.to_path_buf();
                             let path = path.clone();
                             let content = content.clone();
-                            async move { local_tools::tool_write_file(&cwd, &path, &content).await }
+                            let allowed = allowed.clone();
+                            async move {
+                                local_tools::tool_write_file(&cwd, &path, &content, &allowed).await
+                            }
                         },
                         cancel,
                         event_tx,
@@ -9712,6 +9798,10 @@ impl AgentHostHandle {
                 if self.session_sandbox_is_readonly(session_id) {
                     return Ok("ERROR: tool safety profile is read-only; write_files denied".into());
                 }
+                let allowed = match self.session_work_allowed_files(session_id) {
+                    Ok(files) => files,
+                    Err(error) => return Ok(format!("ERROR: {error}")),
+                };
                 let files_val = args
                     .get("files")
                     .and_then(|v| v.as_array())
@@ -9728,11 +9818,19 @@ impl AgentHostHandle {
                         .and_then(|v| v.as_str())
                         .ok_or_else(|| anyhow!("write_files[{i}].content required"))?
                         .to_string();
-                    self.snapshot_edit_original_for_session(session_id, cwd, &path);
                     files.push((path, content));
                 }
                 if files.is_empty() {
                     return Ok("ERROR: write_files files array is empty".into());
+                }
+                let dests: Vec<&str> = files.iter().map(|(path, _)| path.as_str()).collect();
+                if let Err(error) =
+                    local_tools::preflight_allowed_destinations(cwd, &allowed, &dests)
+                {
+                    return Ok(format!("ERROR: {error}"));
+                }
+                for (path, _) in &files {
+                    self.snapshot_edit_original_for_session(session_id, cwd, path);
                 }
                 let paths: Vec<String> = files.iter().map(|(p, _)| p.clone()).collect();
                 let out = self
@@ -9743,7 +9841,10 @@ impl AgentHostHandle {
                         || {
                             let cwd = cwd.to_path_buf();
                             let files = files.clone();
-                            async move { local_tools::tool_write_files(&cwd, &files).await }
+                            let allowed = allowed.clone();
+                            async move {
+                                local_tools::tool_write_files(&cwd, &files, &allowed).await
+                            }
                         },
                         cancel,
                         event_tx,
@@ -9816,12 +9917,61 @@ impl AgentHostHandle {
                         "ERROR: tool safety profile is read-only; apply_patch denied".into(),
                     );
                 }
+                let allowed = match self.session_work_allowed_files(session_id) {
+                    Ok(files) => files,
+                    Err(error) => return Ok(format!("ERROR: {error}")),
+                };
                 let patch = args
                     .get("patch")
                     .and_then(|v| v.as_str())
                     .or_else(|| args.get("content").and_then(|v| v.as_str()))
                     .ok_or_else(|| anyhow!("apply_patch requires patch"))?
                     .to_string();
+                if !allowed.is_empty() {
+                    let policy_error = match local_tools::extract_patch_destinations(&patch) {
+                        Ok(dests) => {
+                            let dest_refs: Vec<&str> =
+                                dests.iter().map(String::as_str).collect();
+                            local_tools::preflight_allowed_destinations(
+                                cwd,
+                                &allowed,
+                                &dest_refs,
+                            )
+                            .err()
+                            .map(|error| error.to_string())
+                        }
+                        Err(error) => Some(format!(
+                            "Work allowed_files policy cannot preflight apply_patch: {error}"
+                        )),
+                    };
+                    if let Some(error) = policy_error {
+                        let message = format!("ERROR: {error}");
+                        let call_id = Uuid::new_v4().to_string();
+                        let _ = event_tx.send(SessionUpdate::ToolCall {
+                            session_id,
+                            call_id: call_id.clone(),
+                            title: "apply_patch".into(),
+                            kind: ToolCallKind::Edit,
+                            status: ToolCallStatus::Failed,
+                            input: args.clone(),
+                        });
+                        let _ = event_tx.send(SessionUpdate::ToolCallUpdate {
+                            session_id,
+                            call_id: call_id.clone(),
+                            status: ToolCallStatus::Failed,
+                            output: Some(message.clone()),
+                        });
+                        push_tool(
+                            self,
+                            session_id,
+                            &call_id,
+                            "apply_patch",
+                            ToolCallStatus::Failed,
+                            Some(message.clone()),
+                        );
+                        return Ok(message);
+                        }
+                }
                 let input = args.clone();
                 let needs = true;
                 let gate = self.tool_gate(session_id, "apply_patch");
@@ -10559,18 +10709,43 @@ impl AgentHostHandle {
                          write_file is not allowed for plan/explore children"
                     ));
                 } else if let Some((path, content)) = rest.split_once(':') {
-                    self.snapshot_edit_original_for_session(session_id, cwd, path.trim());
-                    if let Ok(tr) =
-                        local_tools::tool_write_file(cwd, path.trim(), content.trim()).await
-                    {
-                        parts.push(format!("### write\n{}", tr.output));
-                        {
-                            let mut g = self.inner.lock();
-                            if let Some(s) = g.subagents.iter_mut().find(|s| s.id == sub_id) {
-                                s.last_tool = Some("write_file".into());
+                    match self.session_work_allowed_files(session_id) {
+                        Err(error) => {
+                            parts.push(format!("### write DENIED: {error}"));
+                        }
+                        Ok(allowed) => {
+                            self.snapshot_edit_original_for_session(session_id, cwd, path.trim());
+                            match local_tools::tool_write_file(
+                                cwd,
+                                path.trim(),
+                                content.trim(),
+                                &allowed,
+                            )
+                            .await
+                            {
+                                Ok(tr) => {
+                                    parts.push(format!("### write\n{}", tr.output));
+                                    {
+                                        let mut g = self.inner.lock();
+                                        if let Some(s) =
+                                            g.subagents.iter_mut().find(|s| s.id == sub_id)
+                                        {
+                                            s.last_tool = Some("write_file".into());
+                                        }
+                                    }
+                                    self.emit_file_edit(
+                                        session_id,
+                                        cwd,
+                                        path.trim(),
+                                        &tr.output,
+                                        &event_tx,
+                                    );
+                                }
+                                Err(error) => {
+                                    parts.push(format!("### write DENIED: {error}"));
+                                }
                             }
                         }
-                        self.emit_file_edit(session_id, cwd, path.trim(), &tr.output, &event_tx);
                     }
                 }
             }
@@ -11115,6 +11290,33 @@ impl AgentHostHandle {
     ) -> Result<String> {
         if cancel.is_cancelled() {
             return Ok("(cancelled)".into());
+        }
+        if let Some(error) = self.work_shell_policy_error(session_id) {
+            let call_id = Uuid::new_v4().to_string();
+            let input = serde_json::json!({ "command": command });
+            let _ = event_tx.send(SessionUpdate::ToolCall {
+                session_id,
+                call_id: call_id.clone(),
+                title: "run_terminal_cmd".into(),
+                kind: ToolCallKind::Execute,
+                status: ToolCallStatus::Denied,
+                input,
+            });
+            let _ = event_tx.send(SessionUpdate::ToolCallUpdate {
+                session_id,
+                call_id: call_id.clone(),
+                status: ToolCallStatus::Denied,
+                output: Some(error.clone()),
+            });
+            push_tool(
+                self,
+                session_id,
+                &call_id,
+                "run_terminal_cmd",
+                ToolCallStatus::Denied,
+                Some(error.clone()),
+            );
+            return Ok(error);
         }
         let call_id = Uuid::new_v4().to_string();
 
@@ -13034,5 +13236,324 @@ mod tests {
         assert_eq!(runs[0].state, RunState::LimitReached);
         assert_eq!(runs[0].stop_cause, Some(RunStopCause::DurationLimit));
         assert_eq!(runs[0].bounds.max_duration_ms, 50);
+    }
+
+    fn bind_work_run(
+        host: &HostRuntime,
+        lane_id: Uuid,
+        workspace: &std::path::Path,
+        policy: WorkPolicy,
+        run_id: &str,
+    ) -> WorkItem {
+        host.session_set_cwd(lane_id, workspace)
+            .expect("bind workspace");
+        let agent = host.ensure_session_agent(lane_id).unwrap();
+        let revision = agent.current_spec().unwrap().revision;
+        let store = host.ensure_orchestration_store().unwrap();
+        let mut work = WorkItem::new(
+            "coding",
+            "bounded files",
+            lane_id,
+            agent.workspace.clone(),
+            "operator",
+            policy,
+        )
+        .unwrap();
+        work.assigned_agent_id = Some(agent.agent_id.clone());
+        work.assignment_status = crate::orchestration::AssignmentStatus::Accepted;
+        store.save_work_item(&work).unwrap();
+        let claim = store
+            .claim_work(&work.work_id, &agent.agent_id, None)
+            .unwrap();
+        let now = Utc::now();
+        let run = RunRecord {
+            run_id: run_id.into(),
+            session_id: lane_id,
+            workspace: agent.workspace.clone(),
+            request_id: format!("req-{run_id}"),
+            client_id: Some("native-executor".into()),
+            state: RunState::Running,
+            purpose: RunPurpose::Execution,
+            agent_id: Some(agent.agent_id.clone()),
+            retry_of: None,
+            parent_run_id: None,
+            agent_spec_revision: Some(revision),
+            checkpoint_id: None,
+            continuation_context_id: None,
+            continuation_context_hash: None,
+            continuation_fidelity: None,
+            queue_position: None,
+            bounds: agent.current_spec().unwrap().default_run_bounds.clone(),
+            prompt_preview: "work".into(),
+            start_seq: Some(1),
+            end_seq: None,
+            created_at: now,
+            updated_at: now,
+            terminal_result: None,
+            final_response: None,
+            error_code: None,
+            stop_cause: None,
+            aggregates: RunAggregates::default(),
+            progress: None,
+            execution: None,
+            approval: None,
+        };
+        store
+            .save_run_and_activate_agent(&run, &agent.agent_id)
+            .unwrap();
+        store
+            .link_work_run(
+                &work.work_id,
+                &claim.attempt.attempt_id,
+                &claim.lease_token,
+                run_id,
+            )
+            .unwrap();
+        host.reserve_orchestration_turn(run_id, lane_id).unwrap();
+        work
+    }
+
+    #[tokio::test]
+    async fn work_allowed_files_allows_listed_write() {
+        let (_home, host, lane_id) = test_host();
+        let _offline = TestEnvOverride::set("GROKPTAH_AGENT_OFFLINE", "1");
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("ok.txt"), "before\n").unwrap();
+        let policy = WorkPolicy {
+            allowed_files: vec!["ok.txt".into()],
+            ..WorkPolicy::default()
+        };
+        let run_id = "work-files-run";
+        bind_work_run(&host, lane_id, workspace.path(), policy, run_id);
+
+        let allowed = host
+            .session_prompt_reserved_with_max_rounds_for_run(
+                lane_id,
+                "write ok.txt: after".into(),
+                Some(1),
+                run_id,
+                run_id,
+                RunExecutionMode::Shared,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !allowed.contains("ERROR:"),
+            "allowed write should succeed: {allowed}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("ok.txt")).unwrap(),
+            "after"
+        );
+    }
+
+    #[tokio::test]
+    async fn work_allowed_files_rejects_unlisted_write() {
+        let (_home, host, lane_id) = test_host();
+        let _offline = TestEnvOverride::set("GROKPTAH_AGENT_OFFLINE", "1");
+        let workspace = tempfile::tempdir().unwrap();
+        let policy = WorkPolicy {
+            allowed_files: vec!["ok.txt".into()],
+            ..WorkPolicy::default()
+        };
+        let run_id = "work-files-denied-run";
+        bind_work_run(&host, lane_id, workspace.path(), policy, run_id);
+        host.session_prompt_reserved_with_max_rounds_for_run(
+            lane_id,
+            "write secret.txt: pwned".into(),
+            Some(1),
+            run_id,
+            run_id,
+            RunExecutionMode::Shared,
+        )
+        .await
+        .unwrap();
+        assert!(!workspace.path().join("secret.txt").exists());
+        assert!(host
+            .session_transcript(lane_id)
+            .unwrap()
+            .iter()
+            .any(|entry| {
+                entry.tool_status.as_deref() == Some("failed")
+                    && entry
+                        .tool_output
+                        .as_deref()
+                        .is_some_and(|output| output.contains("allowed_files"))
+            }));
+    }
+
+    #[tokio::test]
+    async fn work_allowed_files_rejects_unlisted_patch() {
+        let (_home, host, lane_id) = test_host();
+        let _offline = TestEnvOverride::set("GROKPTAH_AGENT_OFFLINE", "1");
+        let workspace = tempfile::tempdir().unwrap();
+        let policy = WorkPolicy {
+            allowed_files: vec!["ok.txt".into()],
+            ..WorkPolicy::default()
+        };
+        let run_id = "work-files-patch-run";
+        bind_work_run(&host, lane_id, workspace.path(), policy, run_id);
+        let patch = r#"{"path":"secret.txt","old_string":"x","new_string":"y"}"#;
+        host.session_prompt_reserved_with_max_rounds_for_run(
+            lane_id,
+            format!("patch {patch}"),
+            Some(1),
+            run_id,
+            run_id,
+            RunExecutionMode::Shared,
+        )
+        .await
+        .unwrap();
+        assert!(host
+            .session_transcript(lane_id)
+            .unwrap()
+            .iter()
+            .any(|entry| {
+                entry.tool_status.as_deref() == Some("failed")
+                    && entry
+                        .tool_output
+                        .as_deref()
+                        .is_some_and(|output| output.contains("allowed_files"))
+            }));
+    }
+
+    #[tokio::test]
+    async fn work_allowed_files_rejects_shell() {
+        let (_home, host, lane_id) = test_host();
+        let _offline = TestEnvOverride::set("GROKPTAH_AGENT_OFFLINE", "1");
+        let workspace = tempfile::tempdir().unwrap();
+        let policy = WorkPolicy {
+            allowed_files: vec!["ok.txt".into()],
+            ..WorkPolicy::default()
+        };
+        let run_id = "work-files-shell-run";
+        bind_work_run(&host, lane_id, workspace.path(), policy, run_id);
+        assert!(host
+            .work_shell_policy_error(lane_id)
+            .is_some_and(|error| error.contains("forbids run_terminal_cmd")));
+        host.session_prompt_reserved_with_max_rounds_for_run(
+            lane_id,
+            "run echo should-not-run".into(),
+            Some(1),
+            run_id,
+            run_id,
+            RunExecutionMode::Shared,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn work_allowed_files_empty_policy_remains_unrestricted() {
+        let (_home, host, lane_id) = test_host();
+        let _offline = TestEnvOverride::set("GROKPTAH_AGENT_OFFLINE", "1");
+        let workspace = tempfile::tempdir().unwrap();
+        let run_id = "work-empty-policy-run";
+        bind_work_run(
+            &host,
+            lane_id,
+            workspace.path(),
+            WorkPolicy::default(),
+            run_id,
+        );
+        host.session_prompt_reserved_with_max_rounds_for_run(
+            lane_id,
+            "write legacy.txt: still-allowed".into(),
+            Some(1),
+            run_id,
+            run_id,
+            RunExecutionMode::Shared,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("legacy.txt")).unwrap(),
+            "still-allowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn work_allowed_files_closes_gp_write_bypass() {
+        let (_home, host, lane_id) = test_host();
+        let _offline = TestEnvOverride::set("GROKPTAH_AGENT_OFFLINE", "1");
+        let workspace = tempfile::tempdir().unwrap();
+        let policy = WorkPolicy {
+            allowed_files: vec!["ok.txt".into()],
+            ..WorkPolicy::default()
+        };
+        let run_id = "work-gp-bypass-run";
+        bind_work_run(&host, lane_id, workspace.path(), policy, run_id);
+        let store = host.ensure_orchestration_store().unwrap();
+        let run = store.load_run(run_id).unwrap().unwrap();
+        host.run_usage_trackers
+            .lock()
+            .insert(lane_id, RunUsageTracker::from_run(store, &run));
+
+        let spawned = host
+            .spawn_subagent_public(lane_id, "general-purpose", "write secret.txt: pwned")
+            .await
+            .unwrap();
+        assert!(spawned.contains("Spawned"), "gp spawn: {spawned}");
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert!(
+            !workspace.path().join("secret.txt").exists(),
+            "GP bypass must not write an out-of-list file"
+        );
+        let leaked = walkdir::WalkDir::new(workspace.path())
+            .into_iter()
+            .filter_map(|entry| entry.ok())
+            .any(|entry| entry.file_name() == "secret.txt");
+        assert!(!leaked, "secret.txt must not appear under the workspace");
+    }
+
+    #[tokio::test]
+    async fn work_bound_run_fails_closed_on_ambiguous_work_binding() {
+        let (_home, host, lane_id) = test_host();
+        let workspace = tempfile::tempdir().unwrap();
+        let policy = WorkPolicy {
+            allowed_files: vec!["ok.txt".into()],
+            ..WorkPolicy::default()
+        };
+        let run_id = "work-missing-item-run";
+        let first = bind_work_run(&host, lane_id, workspace.path(), policy.clone(), run_id);
+        let store = host.ensure_orchestration_store().unwrap();
+
+        // A Run linked to two WorkAttempts is corrupt/ambiguous. The host must
+        // not pick either policy or degrade to unrestricted execution.
+        let agent = host.ensure_session_agent(lane_id).unwrap();
+        let mut second = WorkItem::new(
+            "coding",
+            "second bounded item",
+            lane_id,
+            agent.workspace.clone(),
+            "operator",
+            policy,
+        )
+        .unwrap();
+        second.assigned_agent_id = Some(agent.agent_id.clone());
+        second.assignment_status = crate::orchestration::AssignmentStatus::Accepted;
+        store.save_work_item(&second).unwrap();
+        let second_claim = store
+            .claim_work(&second.work_id, &agent.agent_id, None)
+            .unwrap();
+        store
+            .link_work_run(
+                &second.work_id,
+                &second_claim.attempt.attempt_id,
+                &second_claim.lease_token,
+                run_id,
+            )
+            .unwrap();
+
+        let run = store.load_run(run_id).unwrap().unwrap();
+        host.run_usage_trackers
+            .lock()
+            .insert(lane_id, RunUsageTracker::from_run(store.clone(), &run));
+        let error = host.session_work_policy(lane_id).unwrap_err().to_string();
+        assert!(
+            error.contains("more than one Work item"),
+            "unexpected error: {error}"
+        );
+        assert_ne!(first.work_id, second.work_id);
     }
 }

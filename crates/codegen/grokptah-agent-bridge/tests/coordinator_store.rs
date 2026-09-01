@@ -273,6 +273,7 @@ fn expired_lease_rejects_late_completion() {
         failure: None,
         cancellation_reason: None,
         completed_at: Utc::now(),
+        verification: None,
     };
     assert!(store
         .complete_work(

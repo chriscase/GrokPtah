@@ -143,7 +143,7 @@ async fn native_executor_runs_assigned_work_without_an_external_worker() {
     orch.drive_native_executor_once().await;
     orch.drive_native_executor_once().await;
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(8);
-    loop {
+    let terminal_state = loop {
         orch.drive_native_executor_once().await;
         let snapshot = client
             .call_tool(
@@ -158,6 +158,7 @@ async fn native_executor_runs_assigned_work_without_an_external_worker() {
             .unwrap();
         let state = snapshot.structured["work"]["state"].as_str().unwrap();
         if state == "succeeded"
+            || state == "review"
             || state == "awaiting_approval"
             || tokio::time::Instant::now() >= deadline
         {
@@ -165,6 +166,7 @@ async fn native_executor_runs_assigned_work_without_an_external_worker() {
                 state == "succeeded"
                     || state == "leased"
                     || state == "running"
+                    || state == "review"
                     || state == "awaiting_approval",
                 "native work ended in {state}"
             );
@@ -172,10 +174,14 @@ async fn native_executor_runs_assigned_work_without_an_external_worker() {
             if !attempts.is_empty() {
                 assert!(attempts[0]["linkedRunIds"].as_array().unwrap().len() <= 1);
             }
-            break;
+            break state.to_string();
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-    }
+    };
+    assert_eq!(
+        terminal_state, "review",
+        "an offline native run without bound passing-test evidence must not self-certify success"
+    );
 
     let replay_assign = client
         .call_tool(
@@ -469,6 +475,7 @@ fn seed_admitted_work(
         model_selection_key: "grok".into(),
         bounds: RunBounds::default(),
         input_hash: "hash".into(),
+        grok: None,
         state: ManagedIntentState::Admitted,
         permission_request_id: None,
         created_at: now,
@@ -931,6 +938,7 @@ async fn resolve_work_input_requires_parked_scope() {
         model_selection_key: "grok".into(),
         bounds: RunBounds::default(),
         input_hash: "hash".into(),
+        grok: None,
         state: ManagedIntentState::Parked,
         permission_request_id: Some(permission_id.to_string()),
         created_at: now,

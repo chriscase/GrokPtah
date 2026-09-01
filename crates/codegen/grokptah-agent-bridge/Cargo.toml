@@ -31,6 +31,7 @@ url = "2"
 bytes = "1"
 sha2 = "0.10"
 xai-host-authority = { path = "../../common/xai-host-authority" }
+grokptah-agent-sdk = { path = "../grokptah-agent-sdk" }
 
 keyring = { version = "3", features = ["apple-native", "sync-secret-service", "windows-native"] }
 open = "5"
@@ -50,4 +51,5 @@ cc = "1"
 [dev-dependencies]
 grokptah-test-gateway = { path = "test-support/grokptah-test-gateway" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "process", "test-util"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 tempfile = "3"

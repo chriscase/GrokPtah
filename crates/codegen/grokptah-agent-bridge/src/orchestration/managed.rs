@@ -26,6 +26,71 @@ pub const MAX_MANAGED_CONTEXT_BYTES: usize = 8 * 1024;
 pub const MAX_MANAGED_MESSAGES: usize = 16;
 pub const DEFAULT_NATIVE_EXECUTOR_INTERVAL_MS: u64 = 1_000;
 pub const MANAGED_TRUNCATION_MARKER: &str = "\n...[truncated]\n";
+pub const MANAGED_GROK_INVOCATION_SCHEMA_VERSION: u32 = 2;
+pub const MAX_MANAGED_GROK_EVIDENCE_REFS: usize = 16;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedExecutorKind {
+    #[default]
+    NativeRun,
+    GrokBuildIsolatedReview,
+}
+
+impl ManagedExecutorKind {
+    fn is_native(value: &Self) -> bool {
+        *value == Self::NativeRun
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedExecutionBudgetProfile {
+    Economy,
+    Balanced,
+    HighAssurance,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ManagedGrokBudgetLimits {
+    pub max_prompt_bytes: usize,
+    pub max_turns: u32,
+    pub max_duration_ms: u64,
+    pub max_output_bytes: usize,
+}
+
+impl ManagedExecutionBudgetProfile {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Economy => "economy",
+            Self::Balanced => "balanced",
+            Self::HighAssurance => "high_assurance",
+        }
+    }
+
+    pub fn limits(self) -> ManagedGrokBudgetLimits {
+        match self {
+            Self::Economy => ManagedGrokBudgetLimits {
+                max_prompt_bytes: 16 * 1024,
+                max_turns: 8,
+                max_duration_ms: 5 * 60 * 1_000,
+                max_output_bytes: 512 * 1024,
+            },
+            Self::Balanced => ManagedGrokBudgetLimits {
+                max_prompt_bytes: 32 * 1024,
+                max_turns: 16,
+                max_duration_ms: 15 * 60 * 1_000,
+                max_output_bytes: 2 * 1024 * 1024,
+            },
+            Self::HighAssurance => ManagedGrokBudgetLimits {
+                max_prompt_bytes: 64 * 1024,
+                max_turns: 32,
+                max_duration_ms: 30 * 60 * 1_000,
+                max_output_bytes: 4 * 1024 * 1024,
+            },
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -47,6 +112,14 @@ pub struct ManagedExecutionPolicy {
     pub retry_eligible: bool,
     #[serde(default)]
     pub requires_approval_before_execution: bool,
+    /// Selects an executor inside the existing durable managed-work state
+    /// machine. Legacy policies omit this field and remain native-only.
+    #[serde(default, skip_serializing_if = "ManagedExecutorKind::is_native")]
+    pub executor: ManagedExecutorKind,
+    /// Required for Grok Build. Profiles vary resource consumption only; they
+    /// never widen authority, mutation scope, retry, or evidence policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_profile: Option<ManagedExecutionBudgetProfile>,
 }
 
 fn default_managed_max_concurrent_runs() -> u32 {
@@ -72,6 +145,8 @@ impl Default for ManagedExecutionPolicy {
             bounds: default_managed_bounds(),
             retry_eligible: false,
             requires_approval_before_execution: false,
+            executor: ManagedExecutorKind::NativeRun,
+            budget_profile: None,
         }
     }
 }
@@ -105,6 +180,12 @@ impl ManagedExecutionPolicy {
             ));
         }
         self.bounds.validate()?;
+        if self.executor == ManagedExecutorKind::NativeRun && self.budget_profile.is_some() {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "managedExecution.budgetProfile requires the Grok Build executor",
+            ));
+        }
         Ok(())
     }
 
@@ -170,6 +251,9 @@ pub enum ManagedWorkMode {
 #[serde(rename_all = "snake_case")]
 pub enum ManagedIntentState {
     Claiming,
+    /// Exact launch authority is durably recorded, but process admission has
+    /// not yet been proven. Recovery never redispatches this state.
+    Dispatching,
     Admitted,
     Parked,
     /// Durable commit of a permission resolution is in flight. Counts as live
@@ -183,8 +267,98 @@ impl ManagedIntentState {
     pub fn is_live(self) -> bool {
         matches!(
             self,
-            Self::Claiming | Self::Admitted | Self::Parked | Self::Resolving
+            Self::Claiming | Self::Dispatching | Self::Admitted | Self::Parked | Self::Resolving
         )
+    }
+}
+
+/// Secret-free durable record for one Grok Build dispatch. The orchestration
+/// owner persists this before physical spawn. Prompt text, raw output,
+/// transcripts, filesystem locations, provider identity, and credentials are
+/// deliberately not representable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedGrokCliPermissionMode {
+    /// Grok's headless write tool requires this CLI spelling. GrokPtah sets it
+    /// only after revision-bound Work authorization is revalidated and still
+    /// applies its own workspace/file authority before and after spawn.
+    HostMappedBypassPermissions,
+}
+
+impl ManagedGrokCliPermissionMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::HostMappedBypassPermissions => "host_mapped_bypass_permissions",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ManagedGrokInvocation {
+    pub schema_version: u32,
+    pub profile: ManagedExecutionBudgetProfile,
+    pub identity: grokptah_agent_sdk::GrokBuildGitIdentity,
+    pub request_id: String,
+    pub dispatch_nonce: String,
+    pub credential_alias_hash: String,
+    pub prompt_hash: String,
+    pub cli_permission_mode: ManagedGrokCliPermissionMode,
+    pub host_execution_approved: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_head_sha: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_state: Option<grokptah_agent_sdk::GrokBuildRunState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<grokptah_agent_sdk::GrokBuildVerdict>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_digest: Option<String>,
+}
+
+impl ManagedGrokInvocation {
+    pub fn validate(&self) -> Result<(), OrchError> {
+        if self.schema_version != MANAGED_GROK_INVOCATION_SCHEMA_VERSION {
+            return Err(invalid("managed Grok invocation schema is invalid"));
+        }
+        if !self.host_execution_approved {
+            return Err(invalid(
+                "managed Grok invocation is missing host execution approval",
+            ));
+        }
+        self.identity
+            .validate()
+            .map_err(|_| invalid("managed Grok invocation identity is invalid"))?;
+        for (value, field) in [
+            (self.request_id.as_str(), "request_id"),
+            (self.dispatch_nonce.as_str(), "dispatch_nonce"),
+            (self.credential_alias_hash.as_str(), "credential_alias_hash"),
+            (self.prompt_hash.as_str(), "prompt_hash"),
+        ] {
+            if value.is_empty() || value.len() > 512 || value.contains('\0') {
+                return Err(invalid(format!(
+                    "managed Grok invocation {field} is empty or exceeds its bound"
+                )));
+            }
+        }
+        if self.evidence_refs.len() > MAX_MANAGED_GROK_EVIDENCE_REFS {
+            return Err(invalid("managed Grok evidence refs exceed their bound"));
+        }
+        for evidence_ref in &self.evidence_refs {
+            if evidence_ref.is_empty() || evidence_ref.len() > 512 || evidence_ref.contains('\0') {
+                return Err(invalid("managed Grok evidence ref is invalid"));
+            }
+        }
+        let normalized = super::workload::normalize_allowed_files(&self.changed_paths)?;
+        if normalized != self.changed_paths {
+            return Err(invalid("managed Grok changed paths are not normalized"));
+        }
+        Ok(())
     }
 }
 
@@ -195,6 +369,9 @@ pub const MANAGED_FINALIZATION_SCHEMA_VERSION: u32 = 1;
 pub enum ManagedFinalizationOutcome {
     Completed,
     AwaitingApproval,
+    /// Execution ended without trustworthy completion evidence. Review is
+    /// terminal for this attempt and is never eligible for automatic retry.
+    Review,
     Failed,
     RetryQueued,
     Cancelled,
@@ -244,6 +421,8 @@ pub struct ManagedExecutionIntent {
     pub model_selection_key: String,
     pub bounds: RunBounds,
     pub input_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grok: Option<ManagedGrokInvocation>,
     pub state: ManagedIntentState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_request_id: Option<String>,
@@ -269,6 +448,9 @@ impl ManagedExecutionIntent {
             }
         }
         self.bounds.validate()?;
+        if let Some(grok) = &self.grok {
+            grok.validate()?;
+        }
         Ok(())
     }
 }
@@ -403,15 +585,64 @@ pub fn managed_execution_eligible(
             "managed execution cannot grant Computer Use or bypass permissions",
         ));
     }
-    if policy.requires_approval_before_execution
-        && !decisions
-            .iter()
-            .any(|decision| decision.action == WorkDecisionAction::AuthorizeExecution)
-    {
-        return Err(OrchError::new(
-            OrchErrorCode::Conflict,
-            "managed execution requires an explicit authorization decision",
-        ));
+    if policy.requires_approval_before_execution {
+        let current_authorization = work.last_decision_id.as_deref().and_then(|decision_id| {
+            decisions
+                .iter()
+                .find(|decision| decision.decision_id == decision_id)
+        });
+        let authorized = current_authorization.is_some_and(|decision| {
+            decision.action == WorkDecisionAction::AuthorizeExecution
+                && decision.work_id == work.work_id
+                && decision.assigned_agent_id.as_deref() == work.assigned_agent_id.as_deref()
+                && decision.policy_revision == Some(spec.revision)
+                && decision
+                    .work_revision
+                    .and_then(|revision| revision.checked_add(1))
+                    == Some(work.revision)
+        });
+        if !authorized {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "managed execution requires the current authorization decision",
+            ));
+        }
+    }
+    if policy.executor == ManagedExecutorKind::GrokBuildIsolatedReview {
+        if !policy.requires_approval_before_execution {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "Grok Build managed execution requires approval before execution",
+            ));
+        }
+        if policy.budget_profile.is_none() {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "Grok Build managed execution requires an explicit budget profile",
+            ));
+        }
+        if policy.retry_eligible
+            || work.policy.retry.max_attempts != 1
+            || work.policy.retry.retry_failed
+            || work.policy.retry.retry_expired
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "Grok Build managed execution forbids automatic retry",
+            ));
+        }
+        if work.source_manager_plan_id.is_none() || work.source_manager_step_id.is_none() {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "Grok Build managed execution requires a linked manager plan and step",
+            ));
+        }
+        if !work.policy.restricts_local_mutations() {
+            return Err(OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "Grok Build managed execution requires a non-empty allowedFiles scope",
+            ));
+        }
     }
     if live_intents_for_agent >= policy.max_concurrent_runs as usize {
         return Err(OrchError::new(
@@ -419,12 +650,18 @@ pub fn managed_execution_eligible(
             "managed execution concurrent run ceiling is exhausted",
         ));
     }
-    let bounds = intersect_run_bounds(&[
+    let mut bounds = intersect_run_bounds(&[
         server_ceiling,
         &spec.default_run_bounds,
         &policy.bounds,
         &work.policy.bounds,
     ]);
+    if let Some(profile) = policy.budget_profile {
+        let limits = profile.limits();
+        bounds.max_prompt_bytes = bounds.max_prompt_bytes.min(limits.max_prompt_bytes);
+        bounds.max_rounds = bounds.max_rounds.min(limits.max_turns);
+        bounds.max_duration_ms = bounds.max_duration_ms.min(limits.max_duration_ms);
+    }
     bounds.validate()?;
     Ok(bounds)
 }
@@ -456,6 +693,64 @@ pub fn truncate_utf8_to_bytes(input: &str, max_bytes: usize) -> String {
     debug_assert!(out.len() <= max_bytes);
     debug_assert!(out.is_char_boundary(out.len()));
     out
+}
+
+/// Bind a managed Grok invocation to the exact host authority that will be
+/// enforced after the child exits. The footer is host-authored, always kept in
+/// full, and included in the durable prompt hash. Only the untrusted managed
+/// context may be truncated to fit the selected profile.
+pub fn seal_managed_grok_prompt(
+    managed_context: &str,
+    request_id: &str,
+    identity: &grokptah_agent_sdk::GrokBuildGitIdentity,
+    profile: ManagedExecutionBudgetProfile,
+    allowed_files: &[String],
+    max_bytes: usize,
+) -> Result<(String, String), OrchError> {
+    identity
+        .validate()
+        .map_err(|_| invalid("managed Grok prompt identity is invalid"))?;
+    if request_id.is_empty() || request_id.len() > 512 || request_id.contains('\0') {
+        return Err(invalid("managed Grok prompt request id is invalid"));
+    }
+    let allowed_files = super::workload::normalize_allowed_files(allowed_files)?;
+    if allowed_files.is_empty() {
+        return Err(invalid("managed Grok prompt requires an allowlist"));
+    }
+
+    let mut footer = String::from("\n--- GrokPtah sealed execution contract ---\n");
+    footer.push_str(&format!("Request ID: {request_id}\n"));
+    footer.push_str(&format!("Repository ID: {}\n", identity.repository_id));
+    footer.push_str(&format!("Base SHA: {}\n", identity.base_sha));
+    footer.push_str(&format!("Head SHA: {}\n", identity.head_sha));
+    footer.push_str(&format!("Git ref: {}\n", identity.git_ref));
+    footer.push_str(&format!("Budget profile: {}\n", profile.as_str()));
+    footer.push_str("Exact mutable-file allowlist:\n");
+    for path in &allowed_files {
+        footer.push_str("- ");
+        footer.push_str(path);
+        footer.push('\n');
+    }
+    footer.push_str(
+        "Authority: edit only the allowlisted files. Do not commit, push, merge, fetch, add or change a remote, use browser authentication, resume another session, or launch a second invocation. Do not claim tests or verification you did not run. Stop rather than widening scope.\nFinal response: provide a concise truthful summary, then end with exactly one of these lines:\nGROK_BUILD_VERDICT=clean\nGROK_BUILD_VERDICT=findings\nGROK_BUILD_VERDICT=not_complete\n",
+    );
+    if footer.len() >= max_bytes {
+        return Err(invalid(
+            "managed Grok sealed contract exceeds the selected prompt bound",
+        ));
+    }
+    let context_budget = max_bytes - footer.len();
+    let context = truncate_utf8_to_bytes(managed_context, context_budget);
+    let mut sealed = String::with_capacity(context.len() + footer.len());
+    sealed.push_str(&context);
+    sealed.push_str(&footer);
+    if sealed.len() > max_bytes {
+        return Err(invalid("managed Grok sealed prompt exceeds its bound"));
+    }
+    let prompt_hash = hash_payload(&serde_json::json!({
+        "managedGrokPrompt": sealed,
+    }));
+    Ok((sealed, prompt_hash))
 }
 
 pub fn select_relevant_managed_messages(
@@ -662,6 +957,56 @@ mod tests {
         let (body, _) =
             assemble_managed_run_input(&work, &spec, &tiny, 1, None, &[], None).unwrap();
         assert!(body.len() <= 8);
+    }
+
+    #[test]
+    fn sealed_grok_prompt_preserves_authority_footer_and_hashes_exact_bytes() {
+        let identity = grokptah_agent_sdk::GrokBuildGitIdentity {
+            repository_id: "repo-grokptah".into(),
+            base_sha: "a".repeat(40),
+            head_sha: "b".repeat(40),
+            git_ref: "refs/heads/codex/self-host".into(),
+        };
+        let (sealed, hash) = seal_managed_grok_prompt(
+            &"context ".repeat(1_000),
+            "11111111-1111-4111-8111-111111111111",
+            &identity,
+            ManagedExecutionBudgetProfile::Economy,
+            &["src/lib.rs".into(), "tests/self_host.rs".into()],
+            1_024,
+        )
+        .unwrap();
+        assert!(sealed.len() <= 1_024);
+        assert!(sealed.contains(MANAGED_TRUNCATION_MARKER));
+        assert!(sealed.contains("Budget profile: economy"));
+        assert!(sealed.contains("- src/lib.rs"));
+        assert!(sealed.contains("- tests/self_host.rs"));
+        assert!(sealed.contains("Do not commit, push, merge, fetch"));
+        assert!(sealed.ends_with("GROK_BUILD_VERDICT=not_complete\n"));
+        assert_eq!(
+            hash,
+            hash_payload(&serde_json::json!({ "managedGrokPrompt": sealed }))
+        );
+    }
+
+    #[test]
+    fn sealed_grok_prompt_refuses_to_truncate_its_authority_contract() {
+        let identity = grokptah_agent_sdk::GrokBuildGitIdentity {
+            repository_id: "repo-grokptah".into(),
+            base_sha: "a".repeat(40),
+            head_sha: "b".repeat(40),
+            git_ref: "refs/heads/codex/self-host".into(),
+        };
+        let error = seal_managed_grok_prompt(
+            "context",
+            "request",
+            &identity,
+            ManagedExecutionBudgetProfile::Economy,
+            &["src/lib.rs".into()],
+            64,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, OrchErrorCode::InvalidRequest);
     }
 
     #[test]

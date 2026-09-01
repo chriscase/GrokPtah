@@ -443,6 +443,7 @@ pub enum DurableState {
     Active,
     Running,
     Blocked,
+    Review,
     AwaitingApproval,
     Enabled,
     Paused,

@@ -1,6 +1,6 @@
 //! Orchestration service: reads + bounded mutations over AgentHostHandle (#196).
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -8,9 +8,15 @@ use std::time::Duration;
 use chrono::Utc;
 use parking_lot::Mutex;
 use serde_json::json;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::event_bus::{CursorExpiredError, EventBus, EventReceiver, JournalPage};
+use crate::grok_build::{
+    launch_grok_build, CredentialLeaseResolver, GrokBuildAdapterError, GrokBuildAdapterOutcome,
+    GrokBuildGitIdentity, GrokBuildHostLaunchConfig, GrokBuildLaunchRequest, GrokBuildMutationMode,
+    GrokBuildRunState, GrokBuildVerdict,
+};
 use crate::host::AgentHostHandle;
 use crate::prompt_queue::{PromptQueueEntry, SteeringDisposition};
 use crate::session::{SessionKind, WorkspaceStatus};
@@ -21,10 +27,12 @@ use super::authz::{
 };
 use super::graph::{validate_scoped_dependency_graph, GraphScope};
 use super::managed::{
-    assemble_managed_run_input, managed_execution_eligible, select_relevant_managed_messages,
-    ManagedExecutionIntent, ManagedExecutionPolicy, ManagedFinalizationOutcome, ManagedIntentState,
-    ManagedRetryCause, NativeExecutorStatus, DEFAULT_NATIVE_EXECUTOR_INTERVAL_MS,
-    MANAGED_EXECUTION_SCHEMA_VERSION, MAX_MANAGED_MESSAGES,
+    assemble_managed_run_input, managed_execution_eligible, seal_managed_grok_prompt,
+    select_relevant_managed_messages, truncate_utf8_to_bytes, ManagedExecutionIntent,
+    ManagedExecutionPolicy, ManagedExecutorKind, ManagedFinalizationOutcome,
+    ManagedGrokCliPermissionMode, ManagedGrokInvocation, ManagedIntentState, ManagedRetryCause,
+    NativeExecutorStatus, DEFAULT_NATIVE_EXECUTOR_INTERVAL_MS, MANAGED_EXECUTION_SCHEMA_VERSION,
+    MANAGED_GROK_INVOCATION_SCHEMA_VERSION, MAX_MANAGED_MESSAGES,
 };
 use super::manager::{
     parse_manager_directive, ManagerCoordinationMode, ManagerDecisionRecord, ManagerDecisionState,
@@ -38,7 +46,7 @@ use super::routine::{
     RoutineConcurrencyPolicy, RoutineLifecycle, RoutineRecord, RoutineRetryPolicy, RoutineTrigger,
     WorkTemplate,
 };
-use super::store::{IdempotencyClaim, OrchStore};
+use super::store::{IdempotencyClaim, ManagedGrokClaimFence, OrchStore};
 use super::supervisor::{
     ManagerSupervisorReport, ManagerSupervisorStatus, RoutineSupervisor, RoutineSupervisorStatus,
     WorkloadSupervisor, WorkloadSupervisorStatus, DEFAULT_MANAGER_TICK_INTERVAL,
@@ -84,6 +92,32 @@ pub struct OrchestrationConfig {
     pub bounds: RunBounds,
 }
 
+/// Host-owned, in-memory authority needed to dispatch an exact Grok Build
+/// checkout. Credential material is never accepted here; only an opaque lease
+/// alias understood by the injected resolver is retained.
+#[derive(Clone)]
+pub struct ManagedGrokExecutorConfig {
+    pub executable: PathBuf,
+    pub git_executable: PathBuf,
+    pub cwd: PathBuf,
+    pub isolate_parent: PathBuf,
+    pub repository_id: String,
+    pub base_ref: String,
+    pub identity: GrokBuildGitIdentity,
+    pub credential_lease_id: String,
+}
+
+#[derive(Clone)]
+struct ManagedGrokRuntime {
+    config: ManagedGrokExecutorConfig,
+    credentials: Arc<dyn CredentialLeaseResolver>,
+}
+
+struct ManagedGrokTask {
+    cancel: CancellationToken,
+    join: tokio::task::JoinHandle<Result<GrokBuildAdapterOutcome, GrokBuildAdapterError>>,
+}
+
 impl Default for OrchestrationConfig {
     fn default() -> Self {
         Self {
@@ -113,6 +147,9 @@ pub struct OrchestrationService {
     manager_supervisor_watcher: Mutex<Option<tokio::task::JoinHandle<()>>>,
     native_executor: Mutex<NativeExecutorStatus>,
     native_executor_watcher: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    native_executor_drive: tokio::sync::Mutex<()>,
+    managed_grok_runtime: Mutex<Option<ManagedGrokRuntime>>,
+    managed_grok_tasks: Mutex<HashMap<String, ManagedGrokTask>>,
     /// Join handles for in-flight runs (prevents forget + unbounded leaks).
     join_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
@@ -298,6 +335,9 @@ impl OrchestrationService {
                 DEFAULT_NATIVE_EXECUTOR_INTERVAL_MS,
             )),
             native_executor_watcher: Mutex::new(None),
+            native_executor_drive: tokio::sync::Mutex::new(()),
+            managed_grok_runtime: Mutex::new(None),
+            managed_grok_tasks: Mutex::new(HashMap::new()),
             join_handles: Mutex::new(Vec::new()),
         });
         service.start_scheduler_watcher();
@@ -949,8 +989,19 @@ impl OrchestrationService {
     }
 
     pub async fn drive_native_executor_once(&self) {
+        // Timer ticks, explicit test/operator drives, and future wakeups may
+        // arrive concurrently. Keep one drive authoritative at a time so a
+        // second drive cannot mistake the durable `Dispatching` interval
+        // between claim persistence and supervised-task registration for a
+        // process restart. The child is still gated by the oneshot below and
+        // cannot physically launch before both operations are complete.
+        let _drive = self.native_executor_drive.lock().await;
         let now = Utc::now();
         self.native_executor.lock().last_tick_at = Some(now);
+        if let Err(error) = self.harvest_completed_managed_grok_tasks().await {
+            self.native_executor.lock().last_error = Some(error.to_string());
+            return;
+        }
         if let Err(error) = self.recover_and_finalize_managed_intents().await {
             self.native_executor.lock().last_error = Some(error.to_string());
             return;
@@ -965,6 +1016,178 @@ impl OrchestrationService {
                 self.native_executor.lock().last_error = Some(error.to_string());
             }
         }
+    }
+
+    async fn harvest_completed_managed_grok_tasks(&self) -> Result<(), OrchError> {
+        let finished = self
+            .managed_grok_tasks
+            .lock()
+            .iter()
+            .filter(|(_, task)| task.join.is_finished())
+            .map(|(intent_id, _)| intent_id.clone())
+            .collect::<Vec<_>>();
+        for intent_id in finished {
+            let Some(task) = self.managed_grok_tasks.lock().remove(&intent_id) else {
+                continue;
+            };
+            let outcome = task.join.await.map_err(|_| {
+                OrchError::new(
+                    OrchErrorCode::Internal,
+                    "managed Grok supervisor task did not join cleanly",
+                )
+            })?;
+            self.finalize_managed_grok_task(&intent_id, outcome)?;
+        }
+        Ok(())
+    }
+
+    fn finalize_managed_grok_task(
+        &self,
+        intent_id: &str,
+        outcome: Result<GrokBuildAdapterOutcome, GrokBuildAdapterError>,
+    ) -> Result<(), OrchError> {
+        let Some(mut intent) = self.store.load_managed_intent(intent_id)? else {
+            return Ok(());
+        };
+        if intent.state != ManagedIntentState::Dispatching {
+            return Ok(());
+        }
+        let Some(mut invocation) = intent.grok.clone() else {
+            return self.finalize_managed_grok_review(
+                &intent,
+                "managed Grok dispatch completed without a durable invocation",
+                "grok_dispatch_missing_invocation",
+            );
+        };
+        let (summary, evidence, failure, reason, finalization) = match outcome {
+            Ok(adapter) => {
+                let result = adapter.result();
+                invocation.final_state = Some(result.state);
+                invocation.verdict = result.terminal_verdict;
+                invocation.evidence_refs = result.evidence_refs.clone();
+                let mutation_proved = adapter.mutation_evidence().is_some();
+                if let Some(mutation) = adapter.mutation_evidence() {
+                    invocation.final_head_sha = Some(mutation.final_head_sha().into());
+                    invocation.final_ref = Some(mutation.final_ref().into());
+                    invocation.changed_paths = mutation.changed_paths().to_vec();
+                    invocation.diff_digest = Some(mutation.diff_digest().into());
+                }
+                let summary = adapter
+                    .advisory_evidence()
+                    .map(|value| truncate_utf8_to_bytes(value.summary(), 16 * 1024))
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| {
+                        "Grok Build returned no persistable advisory summary".into()
+                    });
+                let mut evidence = vec![
+                    format!("executor:grok_build_isolated_review"),
+                    format!("profile:{:?}", invocation.profile).to_ascii_lowercase(),
+                    format!("state:{:?}", result.state).to_ascii_lowercase(),
+                    format!(
+                        "cli_permission_mode:{}",
+                        invocation.cli_permission_mode.as_str()
+                    ),
+                    format!(
+                        "host_execution_approved:{}",
+                        invocation.host_execution_approved
+                    ),
+                ];
+                evidence.extend(
+                    result
+                        .evidence_refs
+                        .iter()
+                        .map(|value| format!("evidence_ref:{value}")),
+                );
+                if let Some(mutation) = adapter.mutation_evidence() {
+                    evidence.push(format!("final_head:{}", mutation.final_head_sha()));
+                    evidence.push(format!("final_ref:{}", mutation.final_ref()));
+                    evidence.push(format!("diff_digest:{}", mutation.diff_digest()));
+                    evidence.extend(
+                        mutation
+                            .changed_paths()
+                            .iter()
+                            .map(|path| format!("changed_path:{path}")),
+                    );
+                }
+                let terminal = result.state == GrokBuildRunState::CompleteAdvisory
+                    && matches!(
+                        result.terminal_verdict,
+                        Some(GrokBuildVerdict::Clean | GrokBuildVerdict::Findings)
+                    );
+                let (reason, finalization) = if terminal && mutation_proved {
+                    (
+                        "managed Grok advisory completed with bounded mutation evidence",
+                        ManagedFinalizationOutcome::AwaitingApproval,
+                    )
+                } else if terminal {
+                    (
+                        "managed Grok advisory requires mutation-scope review",
+                        ManagedFinalizationOutcome::Review,
+                    )
+                } else {
+                    (
+                        "managed Grok execution did not produce a complete advisory",
+                        ManagedFinalizationOutcome::Review,
+                    )
+                };
+                (summary, evidence, None, reason, finalization)
+            }
+            Err(error) => (
+                "Grok Build execution ended without trustworthy completion evidence".into(),
+                vec!["executor:grok_build_isolated_review".into()],
+                Some(error.to_string()),
+                "managed Grok execution failed closed",
+                ManagedFinalizationOutcome::Review,
+            ),
+        };
+        intent.grok = Some(invocation);
+        intent.updated_at = Utc::now();
+        self.store.save_managed_intent(&intent)?;
+        let result = WorkResult {
+            summary,
+            evidence,
+            artifacts: Vec::new(),
+            failure,
+            cancellation_reason: None,
+            completed_at: Utc::now(),
+            verification: None,
+        };
+        self.store
+            .finalize_managed_intent(intent_id, finalization, reason, Some(result), Utc::now())?
+            .ok_or_else(|| {
+                OrchError::new(
+                    OrchErrorCode::Internal,
+                    "managed Grok intent disappeared during finalization",
+                )
+            })?;
+        self.native_executor.lock().finalized += 1;
+        Ok(())
+    }
+
+    fn finalize_managed_grok_review(
+        &self,
+        intent: &ManagedExecutionIntent,
+        summary: &str,
+        failure: &str,
+    ) -> Result<(), OrchError> {
+        let result = WorkResult {
+            summary: summary.into(),
+            evidence: vec!["executor:grok_build_isolated_review".into()],
+            artifacts: Vec::new(),
+            failure: Some(failure.into()),
+            cancellation_reason: None,
+            completed_at: Utc::now(),
+            verification: None,
+        };
+        self.store.finalize_managed_intent(
+            &intent.intent_id,
+            ManagedFinalizationOutcome::Review,
+            summary,
+            Some(result),
+            Utc::now(),
+        )?;
+        self.native_executor.lock().finalized += 1;
+        Ok(())
     }
 
     pub async fn notify_native_executor(&self, update: &crate::events::SessionUpdate) {
@@ -1073,10 +1296,66 @@ impl OrchestrationService {
                         }
                     }
                 }
+                ManagedIntentState::Dispatching => {
+                    self.recover_or_heartbeat_managed_grok(&intent, &secret)?;
+                }
                 ManagedIntentState::Admitted | ManagedIntentState::Parked => {
                     self.finalize_or_heartbeat_intent(&intent, &secret).await?;
                 }
                 _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn recover_or_heartbeat_managed_grok(
+        &self,
+        intent: &ManagedExecutionIntent,
+        secret: &str,
+    ) -> Result<(), OrchError> {
+        let running = self
+            .managed_grok_tasks
+            .lock()
+            .contains_key(&intent.intent_id);
+        if !running {
+            return self.finalize_managed_grok_review(
+                intent,
+                "Grok Build dispatch state survived without a live supervised task",
+                "grok_dispatch_uncertain_after_restart",
+            );
+        }
+        let Some(attempt_id) = intent.attempt_id.as_deref() else {
+            if let Some(task) = self.managed_grok_tasks.lock().get(&intent.intent_id) {
+                task.cancel.cancel();
+            }
+            return self.finalize_managed_grok_review(
+                intent,
+                "Grok Build dispatch is missing its durable Work attempt",
+                "grok_dispatch_missing_attempt",
+            );
+        };
+        let Some(attempt) = self
+            .store
+            .load_work_attempt(attempt_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+        else {
+            if let Some(task) = self.managed_grok_tasks.lock().get(&intent.intent_id) {
+                task.cancel.cancel();
+            }
+            return self.finalize_managed_grok_review(
+                intent,
+                "Grok Build dispatch lost its durable Work attempt",
+                "grok_dispatch_lost_attempt",
+            );
+        };
+        let token = attempt.lease_token_for_secret(secret);
+        if self
+            .store
+            .renew_work_lease(&intent.work_id, attempt_id, &token, None)
+            .is_err()
+        {
+            if let Some(task) = self.managed_grok_tasks.lock().get(&intent.intent_id) {
+                task.cancel.cancel();
             }
         }
         Ok(())
@@ -1151,14 +1430,21 @@ impl OrchestrationService {
             .clone()
             .or(run.terminal_result.clone())
             .unwrap_or_else(|| format!("{:?}", run.state));
-        let result = WorkResult {
+        let mut result = WorkResult {
             summary,
             evidence: Vec::new(),
             artifacts: Vec::new(),
             failure: run.error_code.clone(),
             cancellation_reason: None,
             completed_at: Utc::now(),
+            verification: None,
         };
+        if let Some(mut evidence) = run.aggregates.verification.clone() {
+            evidence.work_id = Some(intent.work_id.clone());
+            evidence.run_id = Some(run.run_id.clone());
+            evidence.attempt_id = Some(attempt_id.clone());
+            result.verification = Some(evidence);
+        }
         let outcome = match run.state {
             RunState::Completed => {
                 let outcome = if self
@@ -1329,6 +1615,11 @@ impl OrchestrationService {
             &messages,
             None,
         )?;
+        if spec.managed_execution.executor == ManagedExecutorKind::GrokBuildIsolatedReview {
+            return self
+                .admit_one_managed_grok_work(work, agent, spec, bounds, prompt, input_hash, secret)
+                .await;
+        }
         let mut intent = ManagedExecutionIntent {
             schema_version: MANAGED_EXECUTION_SCHEMA_VERSION,
             intent_id: Uuid::new_v4().to_string(),
@@ -1345,6 +1636,7 @@ impl OrchestrationService {
             model_selection_key: spec.model.selection_key.clone(),
             bounds: bounds.clone(),
             input_hash,
+            grok: None,
             state: ManagedIntentState::Claiming,
             permission_request_id: None,
             created_at: now,
@@ -1443,6 +1735,214 @@ impl OrchestrationService {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn admit_one_managed_grok_work(
+        &self,
+        work: &WorkItem,
+        agent: &super::types::AgentRecord,
+        spec: &super::types::AgentSpec,
+        bounds: RunBounds,
+        prompt: String,
+        input_hash: String,
+        secret: &str,
+    ) -> Result<(), OrchError> {
+        let runtime = self.managed_grok_runtime.lock().clone().ok_or_else(|| {
+            OrchError::new(
+                OrchErrorCode::Conflict,
+                "managed Grok executor authority is not installed",
+            )
+        })?;
+        let configured_workspace = dunce::canonicalize(&runtime.config.cwd).map_err(|_| {
+            OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "managed Grok checkout identity is unavailable",
+            )
+        })?;
+        let work_workspace = dunce::canonicalize(Path::new(&work.workspace)).map_err(|_| {
+            OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "managed Work checkout identity is unavailable",
+            )
+        })?;
+        if configured_workspace != work_workspace {
+            return Err(OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "managed Grok executor is bound to a different checkout",
+            ));
+        }
+        let profile = spec.managed_execution.budget_profile.ok_or_else(|| {
+            OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "managed Grok executor requires an explicit budget profile",
+            )
+        })?;
+        let limits = profile.limits();
+        let now = Utc::now();
+        let intent_id = Uuid::new_v4().to_string();
+        let request_id = intent_id.clone();
+        let prompt_bound = limits.max_prompt_bytes.min(bounds.max_prompt_bytes);
+        let allowed_files = super::workload::normalize_allowed_files(&work.policy.allowed_files)?;
+        let (prompt, prompt_hash) = seal_managed_grok_prompt(
+            &prompt,
+            &request_id,
+            &runtime.config.identity,
+            profile,
+            &allowed_files,
+            prompt_bound,
+        )?;
+        let invocation = ManagedGrokInvocation {
+            schema_version: MANAGED_GROK_INVOCATION_SCHEMA_VERSION,
+            profile,
+            identity: runtime.config.identity.clone(),
+            request_id: request_id.clone(),
+            dispatch_nonce: Uuid::new_v4().to_string(),
+            credential_alias_hash: hash_payload(&json!({
+                "credentialLeaseAlias": runtime.config.credential_lease_id,
+            })),
+            prompt_hash,
+            cli_permission_mode: ManagedGrokCliPermissionMode::HostMappedBypassPermissions,
+            host_execution_approved: true,
+            final_head_sha: None,
+            final_ref: None,
+            final_state: None,
+            verdict: None,
+            evidence_refs: Vec::new(),
+            changed_paths: Vec::new(),
+            diff_digest: None,
+        };
+        let mut intent = ManagedExecutionIntent {
+            schema_version: MANAGED_EXECUTION_SCHEMA_VERSION,
+            intent_id,
+            agent_id: agent.agent_id.clone(),
+            agent_spec_revision: spec.revision,
+            work_id: work.work_id.clone(),
+            work_revision: work.revision,
+            attempt_id: None,
+            run_id: None,
+            session_id: work.session_id,
+            workspace: work.workspace.clone(),
+            source_routine_id: work.source_routine_id.clone(),
+            source_activation_id: work.source_activation_id.clone(),
+            model_selection_key: spec.model.selection_key.clone(),
+            bounds: bounds.clone(),
+            input_hash,
+            grok: Some(invocation),
+            state: ManagedIntentState::Claiming,
+            permission_request_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        self.store.save_managed_intent(&intent)?;
+        let decision_id = work.last_decision_id.as_deref().ok_or_else(|| {
+            OrchError::new(
+                OrchErrorCode::Conflict,
+                "managed Grok execution has no current authorization decision",
+            )
+        })?;
+        let claim_fence = ManagedGrokClaimFence {
+            expected_work_revision: work.revision,
+            expected_decision_id: decision_id,
+            expected_agent_spec_revision: spec.revision,
+            expected_allowed_files: &allowed_files,
+        };
+        let claim = match self.store.claim_managed_grok_work_with_lease_secret(
+            &work.work_id,
+            &agent.agent_id,
+            None,
+            secret,
+            &claim_fence,
+        ) {
+            Ok(claim) => claim,
+            Err(error) => {
+                let _ = self
+                    .store
+                    .abandon_managed_intent(&intent.intent_id, Utc::now());
+                return Err(error);
+            }
+        };
+        intent.attempt_id = Some(claim.attempt.attempt_id.clone());
+        intent.state = ManagedIntentState::Dispatching;
+        intent.updated_at = Utc::now();
+        self.store.save_managed_intent(&intent)?;
+
+        let launch = GrokBuildLaunchRequest {
+            request_id,
+            identity: runtime.config.identity.clone(),
+            mutation_mode: GrokBuildMutationMode::IsolatedReview,
+            max_prompt_bytes: prompt_bound as u64,
+            max_turns: limits.max_turns.min(bounds.max_rounds),
+            max_duration_ms: limits.max_duration_ms.min(bounds.max_duration_ms),
+            credential_lease_id: runtime.config.credential_lease_id.clone(),
+        };
+        launch.validate().map_err(|_| {
+            OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "managed Grok launch contract is invalid",
+            )
+        })?;
+        let host = GrokBuildHostLaunchConfig {
+            executable: runtime.config.executable.clone(),
+            git_executable: runtime.config.git_executable.clone(),
+            cwd: runtime.config.cwd.clone(),
+            repository_id: runtime.config.repository_id.clone(),
+            base_ref: runtime.config.base_ref.clone(),
+            prompt,
+            allowed_files,
+            // Reaching this point requires the exact current Work revision to
+            // carry an explicit pre-execution authorization and a claimed
+            // one-attempt lease. The adapter refuses headless tool execution
+            // without this host-owned proof bit.
+            execution_approved: true,
+            max_stdout_bytes: limits.max_output_bytes,
+            max_stderr_bytes: limits.max_output_bytes,
+            git_timeout: Duration::from_secs(10),
+            isolate_parent: runtime.config.isolate_parent.clone(),
+        };
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let credentials = runtime.credentials.clone();
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel::<()>();
+        let join = tokio::spawn(async move {
+            start_rx
+                .await
+                .map_err(|_| GrokBuildAdapterError::Cancelled)?;
+            launch_grok_build(&launch, &host, credentials.as_ref(), task_cancel).await
+        });
+        if self
+            .managed_grok_tasks
+            .lock()
+            .insert(intent.intent_id.clone(), ManagedGrokTask { cancel, join })
+            .is_some()
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "managed Grok intent already has a supervised task",
+            ));
+        }
+        if start_tx.send(()).is_err() {
+            if let Some(task) = self.managed_grok_tasks.lock().remove(&intent.intent_id) {
+                task.cancel.cancel();
+            }
+            self.finalize_managed_grok_review(
+                &intent,
+                "Grok Build dispatch could not start under supervision",
+                "grok_dispatch_supervision_failed",
+            )?;
+            return Ok(());
+        }
+        let _ = self.store.report_work_progress(
+            &work.work_id,
+            &claim.attempt.attempt_id,
+            &claim.lease_token,
+            WorkProgress {
+                summary: "Grok Build dispatch recorded and supervised".into(),
+                percent: Some(1),
+                updated_at: Utc::now(),
+            },
+        );
+        Ok(())
+    }
+
     pub fn bus(&self) -> &EventBus {
         &self.bus
     }
@@ -1528,6 +2028,30 @@ impl OrchestrationService {
                 }
             }
         }
+        let managed_grok_tasks = self
+            .managed_grok_tasks
+            .lock()
+            .drain()
+            .map(|(_, task)| task)
+            .collect::<Vec<_>>();
+        for task in &managed_grok_tasks {
+            task.cancel.cancel();
+        }
+        for task in managed_grok_tasks {
+            match tokio::time::timeout_at(deadline, task.join).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) if error.is_cancelled() => {}
+                Ok(Err(error)) => report
+                    .errors
+                    .push(format!("managed Grok task failed to join: {error}")),
+                Err(_) => {
+                    report.fully_stopped = false;
+                    report
+                        .errors
+                        .push(format!("managed Grok task did not stop within {timeout:?}"));
+                }
+            }
+        }
         self.native_executor.lock().enabled = false;
         self.manager_supervisor.lock().enabled = false;
         report
@@ -1535,6 +2059,39 @@ impl OrchestrationService {
 
     pub fn store(&self) -> &OrchStore {
         &self.store
+    }
+
+    /// Install the host-owned Grok Build dispatch capability. The durable
+    /// policy still defaults to native execution and must opt in explicitly;
+    /// installing this runtime alone cannot make queued Work eligible.
+    pub fn configure_managed_grok_executor(
+        &self,
+        config: ManagedGrokExecutorConfig,
+        credentials: Arc<dyn CredentialLeaseResolver>,
+    ) -> Result<(), OrchError> {
+        config
+            .identity
+            .validate()
+            .map_err(|_| OrchError::new(OrchErrorCode::InvalidRequest, "invalid Grok identity"))?;
+        if config.repository_id != config.identity.repository_id
+            || config.credential_lease_id.is_empty()
+            || config.credential_lease_id.len() > 512
+            || config.credential_lease_id.contains('\0')
+            || !config.executable.is_absolute()
+            || !config.git_executable.is_absolute()
+            || !config.cwd.is_absolute()
+            || !config.isolate_parent.is_absolute()
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "managed Grok executor configuration is invalid",
+            ));
+        }
+        *self.managed_grok_runtime.lock() = Some(ManagedGrokRuntime {
+            config,
+            credentials,
+        });
+        Ok(())
     }
 
     pub fn set_token(&self, token: String) {
