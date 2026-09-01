@@ -1242,6 +1242,7 @@ async fn run_profile(
     let report_text = serde_json::to_string(&public_report).expect("public report json");
     for secret in [
         "opaque-test-credential",
+        lease_token.as_str(),
         workspace.path().to_str().unwrap(),
         "currentObservation",
         "objective",
@@ -1295,12 +1296,19 @@ async fn run_profile(
         .collect();
     assert!(listed_ids.contains(original_run_id.as_str()));
     assert!(listed_ids.contains(successor_run_id.as_str()));
+    for listed_projection in listed_runs {
+        assert!(
+            listed_projection["grant"].get("target").is_none(),
+            "listed public MCP projection copied a grant target payload: {listed_projection}"
+        );
+    }
     let listed_text = serde_json::to_string(listed_runs).expect("listed MCP projections");
     for forbidden in [
         workspace.path().to_str().unwrap(),
         "currentObservation",
         "leaseToken",
         "opaque-test-credential",
+        lease_token.as_str(),
         "Not submitted",
         "\"Name\"",
         "-name",
@@ -1327,6 +1335,8 @@ async fn run_profile(
     let interrupted_projection = &interrupted_fetch["result"]["structuredContent"];
     assert_eq!(interrupted_projection["runId"], original_run_id);
     assert_eq!(interrupted_projection["state"], "interrupted");
+    assert!(interrupted_projection["grant"].is_null());
+    assert!(interrupted_projection["observation"].is_null());
     let interrupted_text =
         serde_json::to_string(interrupted_projection).expect("interrupted MCP projection");
     for forbidden in [
@@ -1334,6 +1344,7 @@ async fn run_profile(
         "currentObservation",
         "leaseToken",
         "opaque-test-credential",
+        lease_token.as_str(),
     ] {
         assert!(
             !interrupted_text.contains(forbidden),
@@ -1358,6 +1369,10 @@ async fn run_profile(
     assert_eq!(successor_projection["runId"], successor_run_id);
     assert_eq!(successor_projection["state"], "completed");
     assert!(
+        successor_projection["grant"].get("target").is_none(),
+        "successor public MCP projection copied a grant target payload: {successor_projection}"
+    );
+    assert!(
         successor_projection["observation"].is_object(),
         "successor MCP projection lost the observed fixture"
     );
@@ -1368,6 +1383,7 @@ async fn run_profile(
         "currentObservation",
         "leaseToken",
         "opaque-test-credential",
+        lease_token.as_str(),
         "Not submitted",
         "\"Name\"",
         "-name",
@@ -1394,6 +1410,7 @@ async fn run_profile(
     assert!(graph_text.contains(&cu_work_id));
     assert!(graph_text.contains(&grok_work_id));
     assert!(!graph_text.contains(workspace.path().to_str().unwrap()));
+    assert!(!graph_text.contains(lease_token.as_str()));
 
     // Scope errors must be indistinguishable on the actual wire, including
     // a same-workspace cross-lane read and an unknown run id. A foreign
