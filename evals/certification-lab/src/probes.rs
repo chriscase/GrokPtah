@@ -606,7 +606,7 @@ async fn native_work_to_run(
                 "session_id": agent.session_id,
                 "workspace": workspace,
                 "kind": "native-certification",
-                "objective": "Use read_file on SELF_HOST_ALPHA.txt, then use write_file to replace it with exactly two lines: baseline and native-self-host-alpha. Do not use shell. After the write succeeds, return a short acknowledgement and stop.",
+                "objective": "Use the write_file tool now to replace SELF_HOST_ALPHA.txt with exactly these two lines: baseline and native-self-host-alpha. This action is intentionally permission-gated; do not merely explain it. Do not read the file and do not use shell. After the write succeeds, return a short acknowledgement and stop.",
                 "policy": {
                     "bounds": {
                         "maxPromptBytes": 4096,
@@ -732,7 +732,7 @@ async fn native_work_to_run(
     let run_id = run_id.ok_or(DiagnosticCode::Timeout)?;
     if live_provider {
         let mut permission_case = None;
-        for _ in 0..900 {
+        for poll in 0..600 {
             let page = probe
                 .call(
                     client,
@@ -771,6 +771,61 @@ async fn native_work_to_run(
             });
             if permission_case.is_some() {
                 break;
+            }
+            if poll % 10 == 0 {
+                let run = probe
+                    .call(
+                        client,
+                        TraceOperationCode::GetRun,
+                        "ptah_get_run",
+                        json!({
+                            "session_id": agent.session_id,
+                            "workspace": workspace,
+                            "run_id": run_id,
+                        }),
+                        vec![
+                            ArgumentFieldCode::SessionId,
+                            ArgumentFieldCode::Workspace,
+                            ArgumentFieldCode::RunId,
+                        ],
+                    )
+                    .await?;
+                if matches!(
+                    run["state"].as_str(),
+                    Some("completed" | "failed" | "cancelled" | "expired")
+                ) {
+                    return Err(DiagnosticCode::PermissionCapabilityAbsent);
+                }
+                let work = probe
+                    .call(
+                        client,
+                        TraceOperationCode::GetWork,
+                        "ptah_get_work",
+                        json!({
+                            "session_id": agent.session_id,
+                            "workspace": workspace,
+                            "work_id": work_id,
+                        }),
+                        vec![
+                            ArgumentFieldCode::SessionId,
+                            ArgumentFieldCode::Workspace,
+                            ArgumentFieldCode::WorkId,
+                        ],
+                    )
+                    .await?;
+                match work["work"]["state"].as_str() {
+                    Some("awaiting_input") => {
+                        return Err(DiagnosticCode::StateTransitionMismatch);
+                    }
+                    Some("failed" | "cancelled") => {
+                        return Err(DiagnosticCode::TerminalStateMissing);
+                    }
+                    Some(
+                        "queued" | "leased" | "running" | "awaiting_approval" | "review"
+                        | "succeeded",
+                    ) => {}
+                    _ => return Err(DiagnosticCode::McpResultMalformed),
+                }
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
