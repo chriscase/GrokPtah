@@ -401,6 +401,28 @@ async fn isolated_native_executor_uses_reviewable_checkout_and_discards_without_
         fs::read_to_string(workspace.path().join("README.md")).unwrap(),
         "source baseline\n"
     );
+    let finalization_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(3);
+    loop {
+        orch.drive_native_executor_once().await;
+        let work = orch.store().load_work_item(&work_id).unwrap().unwrap();
+        if work.state == WorkState::Review {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < finalization_deadline,
+            "valid isolated execution evidence did not reach the Work review gate: {work:?}"
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+    }
+    let intent = orch
+        .store()
+        .list_managed_intents()
+        .unwrap()
+        .into_iter()
+        .find(|intent| intent.work_id == work_id)
+        .unwrap();
+    assert_eq!(intent.execution_mode, RunExecutionMode::IsolatedWorktree);
+    assert_eq!(intent.state, ManagedIntentState::Finalized);
     let review = orch
         .review_run(&auth(), lane.id, workspace.path(), &run.run_id)
         .unwrap();
