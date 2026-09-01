@@ -469,21 +469,19 @@ async fn exact_command_argv_and_env() {
     assert_eq!(argv[0], "--prompt-file");
     assert!(argv[1].ends_with("/prompt"), "{argv:?}");
     assert_eq!(
-        &argv[2..10],
+        &argv[2..8],
         [
             "--permission-mode",
             "bypassPermissions",
             "--disable-web-search",
             "--no-subagents",
-            "--sandbox",
-            "grokptah_workspace",
             "--max-turns",
             "8"
         ]
     );
-    assert_eq!(argv[10], "--session-id");
-    assert!(Uuid::parse_str(&argv[11]).is_ok(), "{argv:?}");
-    assert_eq!(&argv[12..], ["--output-format", "json"]);
+    assert_eq!(argv[8], "--session-id");
+    assert!(Uuid::parse_str(&argv[9]).is_ok(), "{argv:?}");
+    assert_eq!(&argv[10..], ["--output-format", "json"]);
     assert!(!argv
         .iter()
         .any(|a| a.contains("yolo") || a.contains("--model")));
@@ -527,13 +525,13 @@ async fn exact_command_argv_and_env() {
     let sandbox =
         fs::read_to_string(fx.capture_dir.join("captured-sandbox.toml")).expect("sandbox");
     assert!(sandbox.contains("[profiles.grokptah_read_only]"));
-    assert!(sandbox.contains("[profiles.grokptah_workspace]"));
+    assert!(!sandbox.contains("grokptah_workspace"));
     assert_eq!(
         fs::read_to_string(fx.capture_dir.join("auth-present")).expect("auth"),
         "present\n"
     );
     assert_eq!(outcome.result().state, GrokBuildRunState::CompleteAdvisory);
-    assert_eq!(outcome.result().session_id, argv[11]);
+    assert_eq!(outcome.result().session_id, argv[9]);
     assert_ne!(fx.captured_cwd(), fx.repo.path());
     let captured_git_dir = PathBuf::from(
         fs::read_to_string(fx.capture_dir.join("captured-git-dir"))

@@ -35,7 +35,8 @@ pub use grokptah_agent_sdk::{
 /// Allowlisted child `PATH`. Not inherited from the host process.
 const BOUNDED_PATH: &str = "/usr/bin:/bin:/usr/local/bin";
 const ISOLATED_CONFIG: &str = "[compat.claude]\nskills = false\nrules = false\nagents = false\nmcps = false\nhooks = false\nsessions = false\n\n[compat.cursor]\nskills = false\nrules = false\nagents = false\nmcps = false\nhooks = false\nsessions = false\n\n[compat.codex]\nskills = false\nrules = false\nagents = false\nmcps = false\nhooks = false\nsessions = false\n\n[marketplace]\nofficial_marketplace_auto_installed = false\ndefault_skills_installs_purged = true\n";
-const SANDBOX_CONFIG: &str = "[profiles.grokptah_read_only]\nextends = \"read-only\"\nrestrict_network = true\n\n[profiles.grokptah_workspace]\nextends = \"workspace\"\nrestrict_network = false\n";
+const SANDBOX_CONFIG: &str =
+    "[profiles.grokptah_read_only]\nextends = \"read-only\"\nrestrict_network = true\n";
 const INSPECT_OUTPUT_MAX: usize = 262_144;
 const GIT_OUTPUT_MAX: usize = 32_768;
 const LEASE_FILE_MAX: u64 = 1_048_576;
@@ -462,26 +463,26 @@ fn allowlisted_args(
     let prompt_file = prompt_file
         .to_str()
         .ok_or(GrokBuildAdapterError::IsolationFailed)?;
-    let sandbox = match mode {
-        GrokBuildMutationMode::ReadOnly => "grokptah_read_only",
-        GrokBuildMutationMode::IsolatedReview => "grokptah_workspace",
-    };
-    Ok(vec![
+    let mut args = vec![
         "--prompt-file".to_string(),
         prompt_file.to_string(),
         "--permission-mode".to_string(),
         permission_flag(mode).to_string(),
         "--disable-web-search".to_string(),
         "--no-subagents".to_string(),
-        "--sandbox".to_string(),
-        sandbox.to_string(),
+    ];
+    if mode == GrokBuildMutationMode::ReadOnly {
+        args.extend(["--sandbox".to_string(), "grokptah_read_only".to_string()]);
+    }
+    args.extend([
         "--max-turns".to_string(),
         max_turns.to_string(),
         "--session-id".to_string(),
         session_id.to_string(),
         "--output-format".to_string(),
         "json".to_string(),
-    ])
+    ]);
+    Ok(args)
 }
 
 fn allowlisted_env(grok_home: &Path) -> Result<Vec<(String, String)>, GrokBuildAdapterError> {
@@ -2846,8 +2847,6 @@ mod tests {
                 "bypassPermissions",
                 "--disable-web-search",
                 "--no-subagents",
-                "--sandbox",
-                "grokptah_workspace",
                 "--max-turns",
                 "8",
                 "--session-id",
