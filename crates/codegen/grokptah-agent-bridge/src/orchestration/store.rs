@@ -1425,13 +1425,11 @@ impl OrchStore {
         let current = self
             .load_work_item_unlocked(&intent.work_id)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-        let current_digest = current
-            .as_ref()
-            .map(|item| {
-                serde_json::to_value(item)
-                    .map(|value| super::hash_payload(&value))
-                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
-            });
+        let current_digest = current.as_ref().map(|item| {
+            serde_json::to_value(item)
+                .map(|value| super::hash_payload(&value))
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+        });
         let current_digest = current_digest.transpose()?;
         if current_digest.as_deref() != Some(intent.prior_item_digest.as_str())
             && current_digest.as_deref() != Some(intent.next_item_digest.as_str())
@@ -6778,7 +6776,9 @@ mod tests {
             let (_, next, decision, intent) = work_mutation_fixture(&store);
             expected = next;
             intent_path = store.work_mutation_intent_path(&intent.intent_id).unwrap();
-            store.persist_work_mutation_intent_unlocked(&intent).unwrap();
+            store
+                .persist_work_mutation_intent_unlocked(&intent)
+                .unwrap();
             store.save_work_decision_unlocked(&decision).unwrap();
         }
 
@@ -6787,7 +6787,13 @@ mod tests {
             reopened.load_work_item(&expected.work_id).unwrap(),
             Some(expected.clone())
         );
-        assert_eq!(reopened.list_work_decisions(&expected.work_id).unwrap().len(), 1);
+        assert_eq!(
+            reopened
+                .list_work_decisions(&expected.work_id)
+                .unwrap()
+                .len(),
+            1
+        );
         assert!(!intent_path.exists());
     }
 
@@ -6801,7 +6807,9 @@ mod tests {
             let (_, next, _, intent) = work_mutation_fixture(&store);
             expected = next.clone();
             intent_path = store.work_mutation_intent_path(&intent.intent_id).unwrap();
-            store.persist_work_mutation_intent_unlocked(&intent).unwrap();
+            store
+                .persist_work_mutation_intent_unlocked(&intent)
+                .unwrap();
             store.save_work_item_unlocked(&next).unwrap();
         }
 
@@ -6810,7 +6818,13 @@ mod tests {
             reopened.load_work_item(&expected.work_id).unwrap(),
             Some(expected.clone())
         );
-        assert_eq!(reopened.list_work_decisions(&expected.work_id).unwrap().len(), 1);
+        assert_eq!(
+            reopened
+                .list_work_decisions(&expected.work_id)
+                .unwrap()
+                .len(),
+            1
+        );
         assert!(!intent_path.exists());
     }
 
@@ -6820,11 +6834,15 @@ mod tests {
         {
             let store = OrchStore::open(d.path()).unwrap();
             let (prior, _, _, intent) = work_mutation_fixture(&store);
-            store.persist_work_mutation_intent_unlocked(&intent).unwrap();
+            store
+                .persist_work_mutation_intent_unlocked(&intent)
+                .unwrap();
             let mut conflicting = prior;
             conflicting.priority = 7;
             conflicting.bump();
-            store.save_work_item_unchecked_unlocked(&conflicting).unwrap();
+            store
+                .save_work_item_unchecked_unlocked(&conflicting)
+                .unwrap();
         }
 
         let result = OrchStore::open(d.path());
