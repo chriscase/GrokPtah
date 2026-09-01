@@ -6,6 +6,8 @@
 //! opens an application, requests a macOS permission, launches a VM, or calls
 //! a provider.
 
+#![cfg(unix)]
+
 mod common;
 
 use std::collections::BTreeSet;
@@ -30,7 +32,7 @@ use grokptah_agent_bridge::computer_use::{
 use grokptah_agent_bridge::orchestration::{
     AuthContext, ManagedExecutionBudgetProfile, ManagedExecutionPolicy, ManagedExecutorKind,
     ManagedGrokExecutorConfig, ManagerStepSpec, OrchErrorCode, OrchStore, OrchestrationConfig,
-    OrchestrationService, RunBounds, WorkPolicy, WorkResult, WorkRetryPolicy, WorkState,
+    OrchestrationService, RunBounds, WorkItem, WorkPolicy, WorkResult, WorkRetryPolicy, WorkState,
     WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
@@ -156,7 +158,6 @@ fn initialize_repo(repo: &Path) -> GrokBuildGitIdentity {
     }
 }
 
-#[cfg(unix)]
 fn install_fake_grok(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
     fs::write(path, FAKE_GROK).unwrap();
@@ -284,35 +285,129 @@ fn adaptive_of(
     project_run_at(&run, Utc::now()).adaptive
 }
 
-fn assert_redacted_cu_evidence(
-    work_result: &WorkResult,
-    workspace: &Path,
-    original: &str,
-    successor: &str,
-) {
-    let rendered = format!("{work_result:?}");
+fn assert_redacted_operator_result(work: &WorkItem, workspace: &Path) {
+    let result = work.result.as_ref().expect("operator result");
+    assert!(result.verification.is_none());
+    let rendered = format!("{result:?}");
+    assert!(
+        !rendered.contains("opaque-test-credential"),
+        "operator result leaked credential material: {rendered}"
+    );
     let workspace_text = workspace.display().to_string();
-    assert!(!rendered.contains("opaque-test-credential"));
-    assert!(!rendered.contains(&workspace_text));
-    assert!(!work_result.summary.contains("opaque-test-credential"));
-    assert_eq!(work_result.evidence.len(), 2);
-    assert!(work_result
-        .evidence
-        .iter()
-        .any(|entry| entry == &format!("computer_run:{original}")));
-    assert!(work_result
-        .evidence
-        .iter()
-        .any(|entry| entry == &format!("computer_run:{successor}")));
-    for entry in &work_result.evidence {
+    for entry in &result.evidence {
         assert!(
             !entry.contains("opaque-test-credential")
                 && !entry.contains(&workspace_text)
                 && !entry.contains("/private/")
-                && !entry.contains("/var/")
-                && !entry.contains("Ada")
-                && !entry.contains("grant-"),
-            "CU evidence is not bounded/redacted: {entry}"
+                && !entry.contains("/var/"),
+            "operator evidence is not bounded/redacted: {entry}"
+        );
+    }
+    assert!(!result.summary.contains("opaque-test-credential"));
+}
+
+/// Serialize the real host projection and require it not to carry observation
+/// values, credentials, workspace paths, or grant payloads. The raw run is
+/// checked first so a missing fixture value cannot make the projection check
+/// vacuously pass.
+fn assert_redacted_cu_projection(service: &ComputerUseService, run_id: &str, workspace: &Path) {
+    let run = service
+        .get_run(run_id)
+        .expect("run readable")
+        .expect("run exists");
+    let raw = serde_json::to_string(&run).expect("raw run json");
+    let projected =
+        serde_json::to_string(&project_run_at(&run, Utc::now())).expect("projection json");
+    let workspace_text = workspace.display().to_string();
+
+    if let Some(observation) = &run.current_observation {
+        let name_id = format!("{}-name", observation.observation_id);
+        assert!(
+            raw.contains(&name_id),
+            "raw run lost the fixture element id the projection must hide"
+        );
+        assert!(
+            raw.contains("Not submitted") || raw.contains("\"Name\""),
+            "raw run lost fixture observation labels the projection must hide"
+        );
+        assert!(
+            !projected.contains(&name_id),
+            "projection leaked observation element id: {projected}"
+        );
+        assert!(
+            !projected.contains("Not submitted"),
+            "projection leaked observation value: {projected}"
+        );
+        assert!(
+            !projected.contains("\"Name\""),
+            "projection leaked observation label: {projected}"
+        );
+    }
+    if let Some(outcome) = &run.last_outcome {
+        assert!(
+            raw.contains(&outcome.summary),
+            "raw run lost the action summary the projection must hide"
+        );
+        assert!(
+            !projected.contains(&outcome.summary),
+            "projection leaked action summary: {projected}"
+        );
+    }
+    if let Some(grant) = &run.grant {
+        assert!(
+            raw.contains(&grant.grant_id),
+            "raw run lost the grant id used as a leak oracle"
+        );
+        assert!(
+            raw.contains(&grant.target.display_name),
+            "raw grant lost target detail the projection grant must not copy as payload"
+        );
+    }
+    if let Some(bound) = &run.workspace {
+        assert!(
+            raw.contains(bound),
+            "raw run lost the workspace binding the projection must hide"
+        );
+        assert!(
+            !projected.contains(bound),
+            "projection leaked workspace binding: {projected}"
+        );
+    }
+    assert!(
+        !projected.contains(&workspace_text),
+        "projection leaked workspace path: {projected}"
+    );
+    assert!(
+        !projected.contains("opaque-test-credential"),
+        "projection leaked credential material: {projected}"
+    );
+    assert!(
+        !projected.contains("Ada"),
+        "projection leaked typed observation/action text: {projected}"
+    );
+    assert!(
+        !projected.contains("/private/") && !projected.contains("/var/"),
+        "projection leaked an absolute path: {projected}"
+    );
+}
+
+fn assert_opaque_cu_run_evidence(result: &WorkResult, original: &str, successor: &str) {
+    assert_eq!(
+        result.evidence,
+        [
+            format!("computer_run:{original}"),
+            format!("computer_run:{successor}"),
+        ]
+    );
+    let rendered = format!("{result:?}");
+    assert!(!rendered.contains("opaque-test-credential"));
+    assert!(!result.summary.contains("opaque-test-credential"));
+    for entry in &result.evidence {
+        assert!(
+            entry.starts_with("computer_run:")
+                && !entry.contains("grant-")
+                && !entry.contains("Ada"),
+            "CU work evidence is not an opaque run id: {entry}"
         );
     }
 }
@@ -467,6 +562,7 @@ async fn host_cu_runs(
     let (original, observation) = observe(&service, &original, "cu-observe-original").await;
     assert!(original.grant.is_some());
     assert!(original.current_observation.is_some());
+    assert_redacted_cu_projection(&service, &original.run_id, workspace);
 
     let now = Utc::now();
     let owner = ComputerReadBinding::new(lane_id, &binding);
@@ -526,6 +622,10 @@ async fn host_cu_runs(
         .expect("recovered exists");
     assert!(recovered_run.grant.is_none());
     assert!(recovered_run.current_observation.is_none());
+    let recovered_projection = serde_json::to_string(&project_run_at(&recovered_run, Utc::now()))
+        .expect("recovered projection json");
+    assert!(!recovered_projection.contains("opaque-test-credential"));
+    assert!(!recovered_projection.contains(&workspace.display().to_string()));
 
     let successor = service
         .create_run(
@@ -547,6 +647,7 @@ async fn host_cu_runs(
         )
         .expect("authorize successor");
     let (successor, observation) = observe(&service, &successor, "cu-observe-successor").await;
+    assert_redacted_cu_projection(&service, &successor.run_id, workspace);
     let observation_id = observation.observation_id.clone();
     service
         .act_with_plan(
@@ -560,6 +661,7 @@ async fn host_cu_runs(
         .await
         .unwrap_or_else(|error| panic!("{profile:?} refused a clean successor action: {error}"));
     assert_eq!(backend.action_calls(), 1);
+    assert_redacted_cu_projection(&service, &successor.run_id, workspace);
     let summary = adaptive_of(&service, &successor.run_id).expect("admitted review");
     assert!(summary.admitted);
     assert_eq!(summary.profile, profile);
@@ -846,9 +948,8 @@ async fn run_profile(profile: AdaptiveProfile) {
         .expect("complete host CU work");
     assert_eq!(completed["work"]["state"], "awaiting_approval");
     let cu_work = orch.store().load_work_item(&cu_work_id).unwrap().unwrap();
-    assert_redacted_cu_evidence(
+    assert_opaque_cu_run_evidence(
         cu_work.result.as_ref().expect("cu result"),
-        workspace.path(),
         &original_run_id,
         &successor_run_id,
     );
@@ -885,9 +986,8 @@ async fn run_profile(profile: AdaptiveProfile) {
     assert_eq!(approved["work"]["state"], "succeeded");
     let cu_work = orch.store().load_work_item(&cu_work_id).unwrap().unwrap();
     assert_eq!(cu_work.state, WorkState::Succeeded);
-    assert_redacted_cu_evidence(
+    assert_opaque_cu_run_evidence(
         cu_work.result.as_ref().expect("cu result"),
-        workspace.path(),
         &original_run_id,
         &successor_run_id,
     );
@@ -950,6 +1050,7 @@ async fn run_profile(profile: AdaptiveProfile) {
         reviewed.result
     );
     assert_ne!(reviewed.state, WorkState::Succeeded);
+    assert_redacted_operator_result(&reviewed, workspace.path());
     let spec = orch
         .store()
         .load_agent(&agent.agent_id)
@@ -963,6 +1064,16 @@ async fn run_profile(profile: AdaptiveProfile) {
     assert_eq!(
         fs::read_to_string(workspace.path().join("DOGFOOD.txt")).unwrap(),
         "after\n"
+    );
+    // A successful run does not revoke the caller-owned upstream lease; the
+    // adapter only revokes it on unproved termination. The disposable
+    // checkout, however, must always be gone before this lane returns.
+    assert!(
+        fs::read_dir(isolate_parent.path())
+            .unwrap()
+            .next()
+            .is_none(),
+        "isolated checkout must be cleaned up after managed execution"
     );
 
     orch.stop_background_tasks().await;
