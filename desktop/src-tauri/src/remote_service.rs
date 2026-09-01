@@ -1716,10 +1716,10 @@ async fn replay_remote_events(
 
 fn preferred_agent_session_ids(agent: &CoordinatorAgentView) -> Vec<Uuid> {
     let mut candidates = Vec::with_capacity(agent.lane_ids.len() + 2);
-    if let Some(last_lane_id) = agent.last_lane_id
-        && agent.lane_ids.contains(&last_lane_id)
-    {
-        candidates.push(last_lane_id);
+    if let Some(last_lane_id) = agent.last_lane_id {
+        if agent.lane_ids.contains(&last_lane_id) {
+            candidates.push(last_lane_id);
+        }
     }
     candidates.extend(agent.lane_ids.iter().copied());
     if !candidates.contains(&agent.session_id) {
@@ -1803,8 +1803,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        normalize_base_url, runtime_target_for_base_url, should_reconnect_remote_error,
-        RemoteServiceClient, RemoteServiceState,
+        normalize_base_url, preferred_agent_session_ids, runtime_target_for_base_url,
+        should_reconnect_remote_error, RemoteServiceClient, RemoteServiceState,
     };
     use grokptah_agent_bridge::orchestration::{
         CoordinatorAgentView, CoordinatorResumePlanView,
