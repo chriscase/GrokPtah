@@ -1319,6 +1319,7 @@ dependencies = [
  "dunce",
  "fs2",
  "futures",
+ "grokptah-agent-sdk",
  "http-body-util",
  "keyring",
  "libc",
