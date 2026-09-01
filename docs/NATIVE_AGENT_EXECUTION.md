@@ -22,6 +22,7 @@ Defaults:
 - finite prompt, round, duration, and token ceilings
 - `retryEligible`: false
 - `requiresApprovalBeforeExecution`: false
+- `nativeExecutionMode`: `shared`
 
 `WorkPolicy.managed_execution` may be `inherit` (default) or `forbid`. Forbid
 keeps the item manual-only even when the Agent is enabled.
@@ -29,6 +30,26 @@ keeps the item manual-only even when the Agent is enabled.
 Authority may only narrow. Computer Use and `bypassPermissions` Agents are
 rejected. Enabling managed execution clears `bypassPermissions` on the spec.
 The supervisor never sets global auto-approve and never grants Computer Use.
+
+### Native isolated-worktree execution
+
+`nativeExecutionMode: isolated_worktree` reuses the existing Build Run
+checkout, review, approval, promotion, and discard boundary. It is accepted
+only for the native executor and requires all of the following:
+
+- `requiresApprovalBeforeExecution: true`
+- `retryEligible: false`
+- Work retry fixed to one attempt with failed/expired retry disabled
+- a non-empty normalized `WorkPolicy.allowedFiles` scope
+
+The operator authorization is bound to the current Work and Agent policy
+revisions before admission. The resulting Run records its execution mode and
+isolated checkout through the normal Run state. Completion snapshots the
+candidate for review but never promotes it. `ptah_approve_run` only records a
+short-lived, exact-diff approval; `ptah_promote_run` remains a separate
+explicit mutation, and `ptah_discard_run` removes the isolated checkout
+without changing the source workspace. Legacy and omitted policies remain
+shared, so this does not silently isolate existing managed Agents.
 
 Manager-decision Work is a stricter native-execution subtype. Before spawning
 the provider task, the native executor installs a host-owned proposal-only
@@ -82,6 +103,7 @@ A `ManagedExecutionIntent` binds, under the store lock:
 - Run ID once admitted
 - source Routine/Activation when present
 - model route, intersected bounds, and input hash
+- resolved native execution mode (legacy intents default to `shared`)
 
 There is never more than one live Run for one Work item. Duplicate supervisor
 ticks and request-id replays return the committed relationship. The native

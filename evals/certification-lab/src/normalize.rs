@@ -53,6 +53,7 @@ pub enum ReplayFixtureKind {
 #[serde(rename_all = "snake_case")]
 pub enum ReplayAttemptDisposition {
     Completed,
+    Continued,
     Retried,
     Downgraded,
     RateLimited,
@@ -413,7 +414,9 @@ fn replay_case(kind: ReplayFixtureKind, case: &ReplayCase) -> Result<ReplayCaseR
                     counters.usage_complete = false;
                 }
                 match disposition {
-                    ReplayAttemptDisposition::Completed | ReplayAttemptDisposition::Downgraded => {
+                    ReplayAttemptDisposition::Completed
+                    | ReplayAttemptDisposition::Continued
+                    | ReplayAttemptDisposition::Downgraded => {
                         successful_attempt = true;
                     }
                     ReplayAttemptDisposition::Retried => {}
@@ -849,6 +852,9 @@ fn capture_terminal(capture: &PersistentAgentCapture) -> Result<TerminalCategory
         Some(CaptureAttemptDisposition::Success | CaptureAttemptDisposition::Downgraded) => {
             Ok(TerminalCategory::Completed)
         }
+        Some(CaptureAttemptDisposition::Continued) => {
+            bail!("capture ends with a nonterminal provider continuation")
+        }
         Some(CaptureAttemptDisposition::RateLimited) => Ok(TerminalCategory::RateLimitExhausted),
         Some(CaptureAttemptDisposition::TimedOut) => Ok(TerminalCategory::Timeout),
         Some(CaptureAttemptDisposition::Cancelled) => Ok(TerminalCategory::Interrupted),
@@ -864,6 +870,7 @@ fn capture_terminal(capture: &PersistentAgentCapture) -> Result<TerminalCategory
 fn map_disposition(value: &CaptureAttemptDisposition) -> ReplayAttemptDisposition {
     match value {
         CaptureAttemptDisposition::Success => ReplayAttemptDisposition::Completed,
+        CaptureAttemptDisposition::Continued => ReplayAttemptDisposition::Continued,
         CaptureAttemptDisposition::Retried => ReplayAttemptDisposition::Retried,
         CaptureAttemptDisposition::Downgraded => ReplayAttemptDisposition::Downgraded,
         CaptureAttemptDisposition::RateLimited => ReplayAttemptDisposition::RateLimited,
@@ -1151,6 +1158,14 @@ mod tests {
         let mut mismatched = candidate;
         mismatched.promotion_manifest.source_run_ids[0] = format!("opaque-{}", "8".repeat(64));
         assert!(validate_candidate(&mismatched).is_err());
+    }
+
+    #[test]
+    fn provider_continuation_cannot_stand_in_for_terminal_evidence() {
+        let mut capture = normalizable_capture();
+        capture.durable_states.clear();
+        capture.attempts[0].disposition = CaptureAttemptDisposition::Continued;
+        assert!(capture_terminal(&capture).is_err());
     }
 
     #[test]

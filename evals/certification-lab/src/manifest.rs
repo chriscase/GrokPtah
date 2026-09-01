@@ -263,6 +263,9 @@ pub enum ProbeAction {
     AttemptInvalidWorkInputResolution,
     ObserveNativeTicks,
     ClaimRetriedWork,
+    ReviewIsolatedNativeChange,
+    DiscardIsolatedNativeChange,
+    ApproveIsolatedNativeChange,
 }
 
 impl ProbeAction {
@@ -341,7 +344,7 @@ impl ProbeAction {
             ],
             Self::ObservePermissionPark => &[
                 FUTURE_LIST_EXECUTION_INTENTS_TOOL,
-                "ptah_list_inbox",
+                "ptah_list_outbox",
                 "ptah_get_work",
             ],
             Self::AllowPermission | Self::DenyPermission => &[FUTURE_RESOLVE_WORK_INPUT_TOOL],
@@ -368,6 +371,9 @@ impl ProbeAction {
             ],
             Self::ObserveNativeTicks => &["ptah_get_capacity"],
             Self::ClaimRetriedWork => &["ptah_claim_work"],
+            Self::ReviewIsolatedNativeChange => &["ptah_review_run"],
+            Self::DiscardIsolatedNativeChange => &["ptah_discard_run"],
+            Self::ApproveIsolatedNativeChange => &[FUTURE_RESOLVE_WORK_INPUT_TOOL],
         }
     }
 
@@ -396,6 +402,7 @@ impl ProbeAction {
                 | Self::InspectManagedPolicy
                 | Self::ObserveNativeTicks
                 | Self::WaitForManagedAdmission
+                | Self::ReviewIsolatedNativeChange
         )
     }
 }
@@ -500,6 +507,8 @@ pub enum OracleCode {
     CrossWorkspaceRejected,
     ManagedPolicyDefaultOff,
     NativeRunLinkedToWork,
+    IsolatedChangeReviewed,
+    SourceUnchangedAfterDiscard,
     PermissionDecisionExplicit,
     NoDuplicateNativeRun,
     PermissionBoundToExactRun,

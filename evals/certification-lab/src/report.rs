@@ -870,6 +870,7 @@ pub enum TraceOperationCode {
     SendMessage,
     ListMessages,
     ListInbox,
+    ListOutbox,
     AckMessage,
     Disconnect,
     Reconnect,
@@ -879,6 +880,8 @@ pub enum TraceOperationCode {
     AuthorizeWorkExecution,
     ResolveWorkInput,
     ListExecutionIntents,
+    ReviewRun,
+    DiscardRun,
     Oracle,
 }
 

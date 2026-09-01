@@ -1238,39 +1238,43 @@ impl OrchestrationService {
             intent.permission_request_id = Some(request.id.to_string());
             intent.updated_at = Utc::now();
             let _ = self.store.save_managed_intent(&intent);
-            let _ = self.store.send_message(
+            let question = super::message::WorkMessage::new(
+                MessageKind::Question,
+                "native-executor",
+                Some(intent.agent_id.clone()),
+                None,
+                intent.session_id,
+                intent.workspace.clone(),
+                Some(intent.work_id.clone()),
+                reason,
+                Some(json!({
+                    "permissionId": request.id,
+                    "toolName": request.tool_name,
+                    "runId": run_id,
+                })),
+                Utc::now(),
+            )
+            .map(|mut message| {
+                message.attempt_id = Some(attempt_id.clone());
+                message.run_id = Some(run_id.clone());
+                message
+            })
+            .unwrap_or_else(|_| {
                 super::message::WorkMessage::new(
-                    MessageKind::Question,
+                    MessageKind::Informational,
                     "native-executor",
-                    Some(intent.agent_id.clone()),
+                    None,
                     None,
                     intent.session_id,
                     intent.workspace.clone(),
                     Some(intent.work_id.clone()),
-                    reason,
-                    Some(json!({
-                        "permissionId": request.id,
-                        "toolName": request.tool_name,
-                        "runId": run_id,
-                    })),
+                    "permission required",
+                    None,
                     Utc::now(),
                 )
-                .unwrap_or_else(|_| {
-                    super::message::WorkMessage::new(
-                        MessageKind::Informational,
-                        "native-executor",
-                        None,
-                        None,
-                        intent.session_id,
-                        intent.workspace.clone(),
-                        Some(intent.work_id.clone()),
-                        "permission required",
-                        None,
-                        Utc::now(),
-                    )
-                    .expect("informational fallback")
-                }),
-            );
+                .expect("informational fallback")
+            });
+            let _ = self.store.send_message(question);
         }
     }
 
@@ -1405,6 +1409,37 @@ impl OrchestrationService {
         else {
             return Ok(());
         };
+        let execution_matches_intent = match (intent.execution_mode, run.execution.as_ref()) {
+            (RunExecutionMode::Shared, None) => true,
+            (RunExecutionMode::Shared, Some(execution)) => {
+                execution.mode == RunExecutionMode::Shared
+            }
+            (RunExecutionMode::IsolatedWorktree, Some(execution)) => {
+                execution.mode == RunExecutionMode::IsolatedWorktree
+                    && !execution.source_workspace.is_empty()
+                    && !execution.execution_workspace.is_empty()
+                    && !execution.base_revision.is_empty()
+                    && !execution.source_fingerprint.is_empty()
+                    && execution
+                        .final_fingerprint
+                        .as_deref()
+                        .is_some_and(|fingerprint| !fingerprint.is_empty())
+            }
+            (RunExecutionMode::IsolatedWorktree, None) => false,
+        };
+        if run.state.is_terminal() && !execution_matches_intent {
+            let closed = self.store.close_managed_attempt(
+                &intent.intent_id,
+                false,
+                ManagedRetryCause::Failed,
+                "managed run checkout mode did not match its durable admission intent",
+                Utc::now(),
+            )?;
+            if closed.is_some() {
+                self.native_executor.lock().finalized += 1;
+            }
+            return Ok(());
+        }
         if run.state == RunState::Interrupted {
             let retry_eligible = self.managed_retry_eligible(&intent.agent_id);
             let closed = self.store.close_managed_attempt(
@@ -1635,6 +1670,7 @@ impl OrchestrationService {
             source_activation_id: work.source_activation_id.clone(),
             model_selection_key: spec.model.selection_key.clone(),
             bounds: bounds.clone(),
+            execution_mode: spec.managed_execution.native_execution_mode,
             input_hash,
             grok: None,
             state: ManagedIntentState::Claiming,
@@ -1666,6 +1702,7 @@ impl OrchestrationService {
         };
         let bounds_json = serde_json::to_value(&bounds)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let execution_mode = spec.managed_execution.native_execution_mode;
         let submitted = match self
             .submit_task_with_execution_mode_and_queue_parent(
                 &auth,
@@ -1674,7 +1711,7 @@ impl OrchestrationService {
                 Path::new(&work.workspace),
                 prompt,
                 Some(bounds_json),
-                RunExecutionMode::Shared,
+                execution_mode,
                 false,
                 None,
                 "ptah_native_execute",
@@ -1825,6 +1862,7 @@ impl OrchestrationService {
             source_activation_id: work.source_activation_id.clone(),
             model_selection_key: spec.model.selection_key.clone(),
             bounds: bounds.clone(),
+            execution_mode: RunExecutionMode::Shared,
             input_hash,
             grok: Some(invocation),
             state: ManagedIntentState::Claiming,
@@ -7267,8 +7305,15 @@ impl OrchestrationService {
                     ))
                 }
             };
-        let response = serde_json::to_value(promoted)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let response = json!({
+            "runId": promoted.run_id,
+            "sessionId": promoted.session_id,
+            "state": promoted.state,
+            "execution": promoted.execution.as_ref().map(|execution| json!({
+                "mode": execution.mode,
+                "promotionState": execution.promotion_state,
+            })),
+        });
         lease.complete(Some(run_id.to_string()), response.clone())?;
         Ok(response)
     }
@@ -7320,8 +7365,15 @@ impl OrchestrationService {
                 ))
             }
         };
-        let response = serde_json::to_value(discarded)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let response = json!({
+            "runId": discarded.run_id,
+            "sessionId": discarded.session_id,
+            "state": discarded.state,
+            "execution": discarded.execution.as_ref().map(|execution| json!({
+                "mode": execution.mode,
+                "promotionState": execution.promotion_state,
+            })),
+        });
         lease.complete(Some(run_id.to_string()), response.clone())?;
         Ok(response)
     }

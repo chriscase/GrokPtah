@@ -4,16 +4,16 @@ mod common;
 
 use grokptah_agent_bridge::orchestration::{
     AssignmentStatus, AuthContext, ManagedExecutionIntent, ManagedExecutionPolicy,
-    ManagedIntentState, OrchStore, OrchestrationConfig, OrchestrationService, RunBounds,
-    RunPurpose, RunRecord, RunState, WorkItem, WorkPolicy, WorkState, WorkspaceAllowlist,
-    MANAGED_EXECUTION_SCHEMA_VERSION,
+    ManagedIntentState, OrchStore, OrchestrationConfig, OrchestrationService, PromotionState,
+    RunBounds, RunExecution, RunExecutionMode, RunPurpose, RunRecord, RunState, WorkItem,
+    WorkPolicy, WorkState, WorkspaceAllowlist, MANAGED_EXECUTION_SCHEMA_VERSION,
 };
 use grokptah_agent_bridge::{
     set_grokptah_home_override, start_control_server, AgentHost, HostConfig, McpControlClient,
     McpRemoteError, SessionKind, SessionUpdate,
 };
 use serde_json::json;
-use std::path::Path;
+use std::{fs, path::Path, process::Command};
 use tempfile::tempdir;
 use uuid::Uuid;
 
@@ -43,6 +43,19 @@ fn enabled_policy() -> ManagedExecutionPolicy {
         retry_eligible: true,
         ..ManagedExecutionPolicy::default()
     }
+}
+
+fn git(workspace: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(workspace)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -241,6 +254,211 @@ async fn native_executor_runs_assigned_work_without_an_external_worker() {
 
     orch.stop_background_tasks().await;
     client.close_session().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn isolated_native_executor_uses_reviewable_checkout_and_discards_without_source_changes() {
+    let mut env = ProcessEnvGuard::new();
+    let home = tempdir().unwrap();
+    set_grokptah_home_override(Some(home.path().join(".grokptah")));
+    env.set("GROKPTAH_AGENT_OFFLINE", "1");
+    let workspace = tempdir().unwrap();
+    fs::write(workspace.path().join("README.md"), "source baseline\n").unwrap();
+    git(workspace.path(), &["init"]);
+    git(workspace.path(), &["add", "README.md"]);
+    git(
+        workspace.path(),
+        &[
+            "-c",
+            "user.name=GrokPtah Test",
+            "-c",
+            "user.email=grokptah@example.invalid",
+            "commit",
+            "-m",
+            "baseline",
+        ],
+    );
+
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    })
+    .expect("acquire the GrokPtah instance lock");
+    host.start().unwrap();
+    let lane = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(lane.id, workspace.path()).unwrap();
+    let agent = host.ensure_session_agent(lane.id).unwrap();
+    let orch = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        OrchStore::open(home.path().join("orchestration")).unwrap(),
+        OrchestrationConfig {
+            bearer_token: "native-token-isolated".into(),
+            allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
+            max_concurrent_runs: 1,
+            bounds: RunBounds::default(),
+        },
+    );
+    let policy = ManagedExecutionPolicy {
+        enabled: true,
+        allowed_work_kinds: vec!["native-isolated".into()],
+        requires_approval_before_execution: true,
+        native_execution_mode:
+            grokptah_agent_bridge::orchestration::RunExecutionMode::IsolatedWorktree,
+        bounds: RunBounds {
+            max_prompt_bytes: 16 * 1024,
+            max_rounds: 4,
+            max_duration_ms: 30_000,
+            max_total_tokens: Some(8_000),
+        },
+        ..ManagedExecutionPolicy::default()
+    };
+    orch.set_managed_execution(&auth(), lane.id, workspace.path(), &agent.agent_id, policy)
+        .unwrap();
+    let work_policy = WorkPolicy {
+        retry: grokptah_agent_bridge::orchestration::WorkRetryPolicy {
+            max_attempts: 1,
+            retry_failed: false,
+            retry_expired: false,
+            backoff_ms: 0,
+        },
+        allowed_files: vec!["README.md".into()],
+        ..WorkPolicy::default()
+    };
+    let created = orch
+        .create_work(
+            &auth(),
+            "isolated-work-create",
+            lane.id,
+            workspace.path(),
+            "native-isolated".into(),
+            "Inspect the scoped file without changing the source checkout".into(),
+            0,
+            None,
+            None,
+            Vec::new(),
+            work_policy,
+        )
+        .await
+        .unwrap();
+    let work_id = created["work"]["workId"].as_str().unwrap().to_string();
+    let assigned = orch
+        .assign_work(
+            &auth(),
+            "isolated-work-assign",
+            lane.id,
+            workspace.path(),
+            &work_id,
+            Some(agent.agent_id.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+    let assigned_revision = assigned["work"]["revision"].as_u64().unwrap();
+    orch.authorize_work_execution(
+        &auth(),
+        "isolated-work-authorize",
+        lane.id,
+        workspace.path(),
+        &work_id,
+        "authorize exactly one isolated native attempt".into(),
+        Some(assigned_revision),
+    )
+    .await
+    .unwrap();
+
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(8);
+    let run = loop {
+        orch.drive_native_executor_once().await;
+        let run = orch
+            .store()
+            .list_managed_intents()
+            .unwrap()
+            .into_iter()
+            .find(|intent| intent.work_id == work_id)
+            .and_then(|intent| intent.run_id)
+            .and_then(|run_id| orch.store().load_run(&run_id).unwrap());
+        if let Some(run) = run.filter(|run| run.state.is_terminal()) {
+            break run;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "isolated native Run did not become terminal"
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    };
+    let execution = run.execution.as_ref().expect("isolated execution attached");
+    assert_eq!(
+        execution.mode,
+        grokptah_agent_bridge::orchestration::RunExecutionMode::IsolatedWorktree
+    );
+    assert_ne!(
+        execution.execution_workspace,
+        workspace.path().display().to_string()
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("README.md")).unwrap(),
+        "source baseline\n"
+    );
+    let finalization_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(3);
+    loop {
+        orch.drive_native_executor_once().await;
+        let work = orch.store().load_work_item(&work_id).unwrap().unwrap();
+        if work.state == WorkState::Review {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < finalization_deadline,
+            "valid isolated execution evidence did not reach the Work review gate: {work:?}"
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+    }
+    let intent = orch
+        .store()
+        .list_managed_intents()
+        .unwrap()
+        .into_iter()
+        .find(|intent| intent.work_id == work_id)
+        .unwrap();
+    assert_eq!(intent.execution_mode, RunExecutionMode::IsolatedWorktree);
+    assert_eq!(intent.state, ManagedIntentState::Finalized);
+    let review = orch
+        .review_run(&auth(), lane.id, workspace.path(), &run.run_id)
+        .unwrap();
+    assert_eq!(review["promotionState"], "ready");
+    let review_wire = serde_json::to_string(&review).unwrap();
+    assert!(!review_wire.contains(&execution.execution_workspace));
+    let discarded = orch
+        .discard_run(
+            &auth(),
+            "isolated-work-discard",
+            lane.id,
+            workspace.path(),
+            &run.run_id,
+        )
+        .await
+        .unwrap();
+    assert_eq!(discarded["execution"]["promotionState"], "discarded");
+    let discarded_wire = serde_json::to_string(&discarded).unwrap();
+    assert!(!discarded_wire.contains(&workspace.path().display().to_string()));
+    for forbidden in [
+        "executionWorkspace",
+        "sourceWorkspace",
+        "sourceFingerprint",
+        "finalFingerprint",
+        "approvalId",
+        "lease",
+        "credential",
+    ] {
+        assert!(!discarded_wire.contains(forbidden), "leaked {forbidden}");
+    }
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("README.md")).unwrap(),
+        "source baseline\n"
+    );
+
+    orch.stop_background_tasks().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -474,6 +692,7 @@ fn seed_admitted_work(
         source_activation_id: None,
         model_selection_key: "grok".into(),
         bounds: RunBounds::default(),
+        execution_mode: Default::default(),
         input_hash: "hash".into(),
         grok: None,
         state: ManagedIntentState::Admitted,
@@ -541,6 +760,78 @@ async fn boot_native(
         agent.agent_id,
         workspace_text,
     )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn isolated_terminal_runs_fail_when_durable_execution_evidence_is_missing_or_invalid() {
+    let (_env, _home, _workspace, _host, orch, session, agent_id, workspace_text) =
+        boot_native(false).await;
+    let invalid_executions = [
+        None,
+        Some(RunExecution {
+            mode: RunExecutionMode::Shared,
+            source_workspace: workspace_text.clone(),
+            execution_workspace: workspace_text.clone(),
+            base_revision: "base".into(),
+            source_fingerprint: "source".into(),
+            final_fingerprint: Some("final".into()),
+            promotion_state: PromotionState::Ready,
+            promoted_at: None,
+        }),
+        Some(RunExecution {
+            mode: RunExecutionMode::IsolatedWorktree,
+            source_workspace: workspace_text.clone(),
+            execution_workspace: "isolated".into(),
+            base_revision: "base".into(),
+            source_fingerprint: "source".into(),
+            final_fingerprint: None,
+            promotion_state: PromotionState::Ready,
+            promoted_at: None,
+        }),
+    ];
+    let mut fixtures = Vec::new();
+    for execution in invalid_executions {
+        let (item, mut intent, run) = seed_admitted_work(
+            orch.store(),
+            session,
+            &workspace_text,
+            &agent_id,
+            RunState::Completed,
+            "native-token-308",
+        );
+        intent.execution_mode = RunExecutionMode::IsolatedWorktree;
+        orch.store().save_managed_intent(&intent).unwrap();
+        orch.store()
+            .update_run(&run.run_id, |record| {
+                record.execution = execution.clone();
+                Ok(())
+            })
+            .unwrap();
+        fixtures.push((item, intent));
+    }
+
+    orch.drive_native_executor_once().await;
+
+    for (item, intent) in fixtures {
+        let work = orch.store().load_work_item(&item.work_id).unwrap().unwrap();
+        assert_eq!(work.state, WorkState::Failed);
+        assert_eq!(
+            work.result
+                .as_ref()
+                .and_then(|result| result.failure.as_deref()),
+            Some("managed run checkout mode did not match its durable admission intent")
+        );
+        assert_eq!(
+            orch.store()
+                .load_managed_intent(&intent.intent_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            ManagedIntentState::Finalized
+        );
+    }
+    orch.stop_background_tasks().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -937,6 +1228,7 @@ async fn resolve_work_input_requires_parked_scope() {
         source_activation_id: None,
         model_selection_key: "grok".into(),
         bounds: RunBounds::default(),
+        execution_mode: Default::default(),
         input_hash: "hash".into(),
         grok: None,
         state: ManagedIntentState::Parked,
@@ -1159,7 +1451,6 @@ async fn resolve_work_input_uses_real_host_pending() {
         RunState::Running,
         "native-token-308",
     );
-    let _ = intent;
     let (req, rx) = host
         .begin_pending_permission(
             lane.id,
@@ -1173,6 +1464,31 @@ async fn resolve_work_input_uses_real_host_pending() {
         request: req.clone(),
     })
     .await;
+    let outbox = client
+        .call_tool(
+            "ptah_list_outbox",
+            json!({
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "agent_id": agent.agent_id,
+                "after_seq": 0
+            }),
+        )
+        .await
+        .unwrap();
+    let question = outbox.structured["messages"]
+        .as_array()
+        .and_then(|messages| {
+            messages.iter().find(|message| {
+                message["payload"]["permissionId"].as_str() == Some(req.id.to_string().as_str())
+            })
+        })
+        .expect("permission question is visible on the bound Agent outbox");
+    assert_eq!(question["kind"], "question");
+    assert_eq!(question["fromAgentId"], agent.agent_id);
+    assert_eq!(question["workId"], item.work_id);
+    assert_eq!(question["attemptId"], intent.attempt_id.unwrap());
+    assert_eq!(question["runId"], run.run_id);
     let allowed = client
         .call_tool(
             "ptah_resolve_work_input",

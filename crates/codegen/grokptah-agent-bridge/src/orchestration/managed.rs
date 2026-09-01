@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use super::message::{MessageKind, WorkMessage};
 use super::types::{
-    hash_payload, AgentRecord, AgentSpec, OrchError, OrchErrorCode, RunBounds,
+    hash_payload, AgentRecord, AgentSpec, OrchError, OrchErrorCode, RunBounds, RunExecutionMode,
     DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS,
 };
 use super::workload::{
@@ -116,10 +116,20 @@ pub struct ManagedExecutionPolicy {
     /// machine. Legacy policies omit this field and remain native-only.
     #[serde(default, skip_serializing_if = "ManagedExecutorKind::is_native")]
     pub executor: ManagedExecutorKind,
+    /// Selects the existing checkout boundary used by native managed Runs.
+    /// Legacy policies omit this field and retain shared-checkout behavior.
+    /// Isolated execution is deliberately unavailable to the child CLI
+    /// adapter, which owns a separate isolation contract.
+    #[serde(default, skip_serializing_if = "is_shared_execution_mode")]
+    pub native_execution_mode: RunExecutionMode,
     /// Required for Grok Build. Profiles vary resource consumption only; they
     /// never widen authority, mutation scope, retry, or evidence policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget_profile: Option<ManagedExecutionBudgetProfile>,
+}
+
+fn is_shared_execution_mode(value: &RunExecutionMode) -> bool {
+    *value == RunExecutionMode::Shared
 }
 
 fn default_managed_max_concurrent_runs() -> u32 {
@@ -146,6 +156,7 @@ impl Default for ManagedExecutionPolicy {
             retry_eligible: false,
             requires_approval_before_execution: false,
             executor: ManagedExecutorKind::NativeRun,
+            native_execution_mode: RunExecutionMode::Shared,
             budget_profile: None,
         }
     }
@@ -185,6 +196,28 @@ impl ManagedExecutionPolicy {
                 OrchErrorCode::InvalidRequest,
                 "managedExecution.budgetProfile requires the Grok Build executor",
             ));
+        }
+        if self.executor != ManagedExecutorKind::NativeRun
+            && self.native_execution_mode != RunExecutionMode::Shared
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "managedExecution.nativeExecutionMode is available only to the native executor",
+            ));
+        }
+        if self.native_execution_mode == RunExecutionMode::IsolatedWorktree {
+            if !self.requires_approval_before_execution {
+                return Err(OrchError::new(
+                    OrchErrorCode::InvalidRequest,
+                    "isolated native managed execution requires approval before execution",
+                ));
+            }
+            if self.retry_eligible {
+                return Err(OrchError::new(
+                    OrchErrorCode::InvalidRequest,
+                    "isolated native managed execution forbids automatic retry",
+                ));
+            }
         }
         Ok(())
     }
@@ -420,6 +453,10 @@ pub struct ManagedExecutionIntent {
     pub source_activation_id: Option<String>,
     pub model_selection_key: String,
     pub bounds: RunBounds,
+    /// Exact checkout boundary resolved from the captured AgentSpec revision
+    /// before admission. Legacy intents default to shared.
+    #[serde(default, skip_serializing_if = "is_shared_execution_mode")]
+    pub execution_mode: RunExecutionMode,
     pub input_hash: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grok: Option<ManagedGrokInvocation>,
@@ -450,6 +487,11 @@ impl ManagedExecutionIntent {
         self.bounds.validate()?;
         if let Some(grok) = &self.grok {
             grok.validate()?;
+            if self.execution_mode != RunExecutionMode::Shared {
+                return Err(invalid(
+                    "managed Grok execution intent cannot use the native checkout mode",
+                ));
+            }
         }
         Ok(())
     }
@@ -641,6 +683,31 @@ pub fn managed_execution_eligible(
             return Err(OrchError::new(
                 OrchErrorCode::ForbiddenScope,
                 "Grok Build managed execution requires a non-empty allowedFiles scope",
+            ));
+        }
+    }
+    if policy.executor == ManagedExecutorKind::NativeRun
+        && policy.native_execution_mode == RunExecutionMode::IsolatedWorktree
+    {
+        if !policy.requires_approval_before_execution || policy.retry_eligible {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "isolated native managed execution requires current approval and forbids automatic retry",
+            ));
+        }
+        if !work.policy.restricts_local_mutations() {
+            return Err(OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "isolated native managed execution requires a non-empty allowedFiles scope",
+            ));
+        }
+        if work.policy.retry.max_attempts != 1
+            || work.policy.retry.retry_failed
+            || work.policy.retry.retry_expired
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "isolated native managed execution forbids automatic retry",
             ));
         }
     }

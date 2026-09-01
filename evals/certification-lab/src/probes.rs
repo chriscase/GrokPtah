@@ -3,7 +3,7 @@
 //! Every value extracted from MCP is used transiently and either discarded or
 //! converted to an opaque SHA-256 label before it can enter report evidence.
 
-use std::time::Instant;
+use std::{fs, path::Path, process::Command, time::Instant};
 
 use grokptah_agent_bridge::provider_observation::InMemoryObservationRecorder;
 use grokptah_agent_bridge::{McpControlClient, McpRemoteError};
@@ -366,6 +366,11 @@ pub fn implementation_tools(probe_id: &str) -> Option<&'static [&'static str]> {
             "ptah_authorize_work_execution",
             "ptah_get_work",
             "ptah_list_runs",
+            "ptah_list_execution_intents",
+            "ptah_list_outbox",
+            "ptah_resolve_work_input",
+            "ptah_review_run",
+            "ptah_discard_run",
         ]),
         "native-permission-park-decisions-v1" => Some(&[
             "ptah_create_session",
@@ -378,7 +383,7 @@ pub fn implementation_tools(probe_id: &str) -> Option<&'static [&'static str]> {
             "ptah_assign_work",
             "ptah_authorize_work_execution",
             "ptah_list_execution_intents",
-            "ptah_list_inbox",
+            "ptah_list_outbox",
             "ptah_resolve_work_input",
             "ptah_get_work",
             "ptah_list_runs",
@@ -546,6 +551,8 @@ async fn native_work_to_run(
     workspace: &str,
     provider_recorder: Option<&InMemoryObservationRecorder>,
 ) -> Result<(), DiagnosticCode> {
+    prepare_native_isolated_workspace(workspace)?;
+    let live_provider = provider_recorder.is_some();
     let agent = create_agent(probe, client, workspace).await?;
     if let Some(recorder) = provider_recorder {
         probe.provider_attempt_start = recorder
@@ -568,12 +575,13 @@ async fn native_work_to_run(
                     "maxConcurrentRuns": 1,
                     "bounds": {
                         "maxPromptBytes": 4096,
-                        "maxRounds": 2,
-                        "maxDurationMs": 30000,
+                        "maxRounds": 4,
+                        "maxDurationMs": 120000,
                         "maxTotalTokens": 20000
                     },
                     "retryEligible": false,
-                    "requiresApprovalBeforeExecution": true
+                    "requiresApprovalBeforeExecution": true,
+                    "nativeExecutionMode": "isolated_worktree"
                 }
             }),
             vec![
@@ -598,7 +606,25 @@ async fn native_work_to_run(
                 "session_id": agent.session_id,
                 "workspace": workspace,
                 "kind": "native-certification",
-                "objective": "Return a short bounded acknowledgement and stop.",
+                "objective": "Use the write_file tool now to replace SELF_HOST_ALPHA.txt with exactly these two lines: baseline and native-self-host-alpha. This action is intentionally permission-gated; do not merely explain it. Do not read the file and do not use shell. After the write succeeds, return a short acknowledgement and stop.",
+                "policy": {
+                    "bounds": {
+                        "maxPromptBytes": 4096,
+                        "maxRounds": 4,
+                        "maxDurationMs": 120000,
+                        "maxTotalTokens": 20000
+                    },
+                    "retry": {
+                        "maxAttempts": 1,
+                        "retryFailed": false,
+                        "retryExpired": false,
+                        "backoffMs": 0
+                    },
+                    "requiresApproval": false,
+                    "maxConcurrentAttempts": 1,
+                    "managedExecution": "inherit",
+                    "allowedFiles": ["SELF_HOST_ALPHA.txt"]
+                }
             }),
             vec![
                 ArgumentFieldCode::RequestId,
@@ -606,6 +632,7 @@ async fn native_work_to_run(
                 ArgumentFieldCode::Workspace,
                 ArgumentFieldCode::Kind,
                 ArgumentFieldCode::Objective,
+                ArgumentFieldCode::Policy,
             ],
         )
         .await?;
@@ -703,8 +730,187 @@ async fn native_work_to_run(
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     let run_id = run_id.ok_or(DiagnosticCode::Timeout)?;
-    let run =
-        wait_for_terminal_evidence(probe, client, workspace, &agent.session_id, &run_id).await?;
+    if live_provider {
+        let mut permission_case = None;
+        for poll in 0..600 {
+            let page = probe
+                .call(
+                    client,
+                    TraceOperationCode::ListOutbox,
+                    "ptah_list_outbox",
+                    json!({
+                        "session_id": agent.session_id,
+                        "workspace": workspace,
+                        "agent_id": agent.agent_id,
+                        "after_seq": 0,
+                    }),
+                    vec![
+                        ArgumentFieldCode::SessionId,
+                        ArgumentFieldCode::Workspace,
+                        ArgumentFieldCode::AgentId,
+                        ArgumentFieldCode::AfterSequence,
+                    ],
+                )
+                .await?;
+            permission_case = page["messages"].as_array().and_then(|messages| {
+                messages.iter().find_map(|message| {
+                    let payload = message["payload"].as_object()?;
+                    (message["kind"].as_str() == Some("question")
+                        && message["workId"].as_str() == Some(work_id.as_str())
+                        && payload.get("runId").and_then(Value::as_str) == Some(run_id.as_str()))
+                    .then(|| {
+                        payload
+                            .get("permissionId")
+                            .and_then(Value::as_str)
+                            .map(|permission_id| {
+                                (work_id.clone(), permission_id.to_owned(), run_id.clone())
+                            })
+                    })
+                    .flatten()
+                })
+            });
+            if permission_case.is_some() {
+                break;
+            }
+            if poll % 10 == 0 {
+                let run = probe
+                    .call(
+                        client,
+                        TraceOperationCode::GetRun,
+                        "ptah_get_run",
+                        json!({
+                            "session_id": agent.session_id,
+                            "workspace": workspace,
+                            "run_id": run_id,
+                        }),
+                        vec![
+                            ArgumentFieldCode::SessionId,
+                            ArgumentFieldCode::Workspace,
+                            ArgumentFieldCode::RunId,
+                        ],
+                    )
+                    .await?;
+                if matches!(
+                    run["state"].as_str(),
+                    Some("completed" | "failed" | "cancelled" | "expired")
+                ) {
+                    return Err(DiagnosticCode::PermissionCapabilityAbsent);
+                }
+                let work = probe
+                    .call(
+                        client,
+                        TraceOperationCode::GetWork,
+                        "ptah_get_work",
+                        json!({
+                            "session_id": agent.session_id,
+                            "workspace": workspace,
+                            "work_id": work_id,
+                        }),
+                        vec![
+                            ArgumentFieldCode::SessionId,
+                            ArgumentFieldCode::Workspace,
+                            ArgumentFieldCode::WorkId,
+                        ],
+                    )
+                    .await?;
+                match work["work"]["state"].as_str() {
+                    Some("awaiting_input") => {
+                        return Err(DiagnosticCode::StateTransitionMismatch);
+                    }
+                    Some("failed" | "cancelled") => {
+                        return Err(DiagnosticCode::TerminalStateMissing);
+                    }
+                    Some(
+                        "queued" | "leased" | "running" | "awaiting_approval" | "review"
+                        | "succeeded",
+                    ) => {}
+                    _ => return Err(DiagnosticCode::McpResultMalformed),
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let permission_case = permission_case.ok_or(DiagnosticCode::PermissionCapabilityAbsent)?;
+        Uuid::parse_str(&permission_case.1).map_err(|_| DiagnosticCode::McpResultMalformed)?;
+        let intents = probe
+            .call(
+                client,
+                TraceOperationCode::ListExecutionIntents,
+                "ptah_list_execution_intents",
+                json!({
+                    "session_id": agent.session_id,
+                    "workspace": workspace,
+                }),
+                vec![ArgumentFieldCode::SessionId, ArgumentFieldCode::Workspace],
+            )
+            .await?;
+        let intent = intents["intents"]
+            .as_array()
+            .and_then(|items| {
+                items.iter().find(|intent| {
+                    intent["workId"].as_str() == Some(work_id.as_str())
+                        && intent["runId"].as_str() == Some(run_id.as_str())
+                })
+            })
+            .ok_or(DiagnosticCode::StateTransitionMismatch)?;
+        if intent["state"].as_str() != Some("parked")
+            || intent["permissionRequestId"].as_str() != Some(permission_case.1.as_str())
+        {
+            return Err(DiagnosticCode::StateTransitionMismatch);
+        }
+        let parked_work = probe
+            .call(
+                client,
+                TraceOperationCode::GetWork,
+                "ptah_get_work",
+                json!({
+                    "session_id": agent.session_id,
+                    "workspace": workspace,
+                    "work_id": work_id,
+                }),
+                vec![
+                    ArgumentFieldCode::SessionId,
+                    ArgumentFieldCode::Workspace,
+                    ArgumentFieldCode::WorkId,
+                ],
+            )
+            .await?;
+        if parked_work["work"]["state"].as_str() != Some("awaiting_input") {
+            return Err(DiagnosticCode::StateTransitionMismatch);
+        }
+        probe.counters.permission_requests = probe
+            .counters
+            .permission_requests
+            .checked_add(1)
+            .ok_or(DiagnosticCode::BoundExceeded)?;
+        probe.transition(
+            EntityKind::Permission,
+            DurableStateCode::Created,
+            DurableStateCode::Parked,
+            Some(&permission_case.1),
+        );
+        let allowed =
+            resolve_permission(probe, client, workspace, &agent, &permission_case, true).await?;
+        if allowed["allow"].as_bool() != Some(true)
+            || allowed["workId"].as_str() != Some(work_id.as_str())
+        {
+            return Err(DiagnosticCode::StateTransitionMismatch);
+        }
+        probe.transition(
+            EntityKind::Permission,
+            DurableStateCode::Parked,
+            DurableStateCode::Allowed,
+            Some(&permission_case.1),
+        );
+    }
+    let run = wait_for_terminal_evidence_with_attempts(
+        probe,
+        client,
+        workspace,
+        &agent.session_id,
+        &run_id,
+        1_500,
+    )
+    .await?;
     if run["state"].as_str() != Some("completed") {
         return Err(DiagnosticCode::TerminalStateMissing);
     }
@@ -780,6 +986,70 @@ async fn native_work_to_run(
     {
         return Err(DiagnosticCode::StateTransitionMismatch);
     }
+    let reviewed = probe
+        .call(
+            client,
+            TraceOperationCode::ReviewRun,
+            "ptah_review_run",
+            json!({
+                "session_id": agent.session_id,
+                "workspace": workspace,
+                "run_id": run_id,
+            }),
+            vec![
+                ArgumentFieldCode::SessionId,
+                ArgumentFieldCode::Workspace,
+                ArgumentFieldCode::RunId,
+            ],
+        )
+        .await?;
+    let changed_files = reviewed["changedFiles"]
+        .as_array()
+        .ok_or(DiagnosticCode::McpResultMalformed)?;
+    let expected_change = changed_files.len() == 1
+        && changed_files[0]["path"].as_str() == Some("SELF_HOST_ALPHA.txt")
+        && reviewed["diff"]
+            .as_str()
+            .is_some_and(|diff| diff.contains("native-self-host-alpha"));
+    if reviewed["promotionState"].as_str() != Some("ready")
+        || live_provider && !expected_change
+        || !live_provider && !changed_files.is_empty()
+    {
+        return Err(DiagnosticCode::StateTransitionMismatch);
+    }
+    if fs::read_to_string(Path::new(workspace).join("SELF_HOST_ALPHA.txt"))
+        .ok()
+        .as_deref()
+        != Some("baseline\n")
+    {
+        return Err(DiagnosticCode::StateTransitionMismatch);
+    }
+    probe
+        .call(
+            client,
+            TraceOperationCode::DiscardRun,
+            "ptah_discard_run",
+            json!({
+                "request_id": request_id("native-discard"),
+                "session_id": agent.session_id,
+                "workspace": workspace,
+                "run_id": run_id,
+            }),
+            vec![
+                ArgumentFieldCode::RequestId,
+                ArgumentFieldCode::SessionId,
+                ArgumentFieldCode::Workspace,
+                ArgumentFieldCode::RunId,
+            ],
+        )
+        .await?;
+    if fs::read_to_string(Path::new(workspace).join("SELF_HOST_ALPHA.txt"))
+        .ok()
+        .as_deref()
+        != Some("baseline\n")
+    {
+        return Err(DiagnosticCode::StateTransitionMismatch);
+    }
     probe.provider_run = Some(provider_run_from_value(&agent, &run)?);
     probe.transition(
         EntityKind::Work,
@@ -801,6 +1071,38 @@ async fn native_work_to_run(
     probe.retain_id(DurableIdKind::Run, &run_id);
     probe.retain_id(DurableIdKind::Session, &agent.session_id);
     probe.retain_id(DurableIdKind::Agent, &agent.agent_id);
+    Ok(())
+}
+
+fn prepare_native_isolated_workspace(workspace: &str) -> Result<(), DiagnosticCode> {
+    let workspace = Path::new(workspace);
+    if workspace.join(".git").exists() {
+        return Err(DiagnosticCode::StateTransitionMismatch);
+    }
+    fs::write(workspace.join("SELF_HOST_ALPHA.txt"), "baseline\n")
+        .map_err(|_| DiagnosticCode::ServiceNotReady)?;
+    for args in [
+        vec!["init"],
+        vec!["add", "SELF_HOST_ALPHA.txt"],
+        vec![
+            "-c",
+            "user.name=GrokPtah Certification",
+            "-c",
+            "user.email=grokptah@example.invalid",
+            "commit",
+            "-m",
+            "native self-host alpha baseline",
+        ],
+    ] {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(workspace)
+            .status()
+            .map_err(|_| DiagnosticCode::ServiceNotReady)?;
+        if !status.success() {
+            return Err(DiagnosticCode::ServiceNotReady);
+        }
+    }
     Ok(())
 }
 
@@ -948,8 +1250,8 @@ async fn native_permission_park_decisions(
         let page = probe
             .call(
                 client,
-                TraceOperationCode::ListInbox,
-                "ptah_list_inbox",
+                TraceOperationCode::ListOutbox,
+                "ptah_list_outbox",
                 json!({
                     "session_id": agent.session_id,
                     "workspace": workspace,
@@ -3866,7 +4168,19 @@ async fn wait_for_terminal_evidence(
     session_id: &str,
     run_id: &str,
 ) -> Result<Value, DiagnosticCode> {
-    for _ in 0..300 {
+    wait_for_terminal_evidence_with_attempts(probe, client, workspace, session_id, run_id, 300)
+        .await
+}
+
+async fn wait_for_terminal_evidence_with_attempts(
+    probe: &mut ProbeBuilder<'_>,
+    client: &mut McpControlClient,
+    workspace: &str,
+    session_id: &str,
+    run_id: &str,
+    attempts: usize,
+) -> Result<Value, DiagnosticCode> {
+    for _ in 0..attempts {
         let run = probe
             .call(
                 client,

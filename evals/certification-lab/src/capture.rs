@@ -54,7 +54,7 @@ pub fn build_capture(
     let attempts = values
         .iter()
         .enumerate()
-        .map(|(index, value)| attempt(value, index + 1))
+        .map(|(index, value)| attempt(value, index + 1, index + 1 == values.len()))
         .collect::<Result<Vec<_>>>()?;
     let scope_bound = observations.iter().all(|observation| {
         let Ok(value) = serde_json::to_value(observation) else {
@@ -245,7 +245,11 @@ fn provider_identity(value: &Value) -> Result<ProviderIdentity> {
     })
 }
 
-fn attempt(value: &Value, attempt_number: usize) -> Result<ProviderAttemptEvidence> {
+fn attempt(
+    value: &Value,
+    attempt_number: usize,
+    final_attempt: bool,
+) -> Result<ProviderAttemptEvidence> {
     let method = value["method"]
         .as_str()
         .map(str::to_ascii_uppercase)
@@ -259,7 +263,8 @@ fn attempt(value: &Value, attempt_number: usize) -> Result<ProviderAttemptEviden
     let response = &value["response"];
     let status = response["status_code"].as_u64().map(|value| value as u16);
     let disposition = match response["disposition"].as_str() {
-        Some("completed") => CaptureAttemptDisposition::Success,
+        Some("completed") if final_attempt => CaptureAttemptDisposition::Success,
+        Some("completed") => CaptureAttemptDisposition::Continued,
         Some("http_error") if status == Some(429) => CaptureAttemptDisposition::RateLimited,
         Some("http_error")
             if status.is_some_and(|value| value == 408 || value == 425 || value >= 500) =>
