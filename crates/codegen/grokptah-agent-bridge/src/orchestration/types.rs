@@ -938,9 +938,10 @@ pub struct AgentRecord {
 pub struct CoordinatorAgentView {
     pub schema_version: String,
     pub agent_id: String,
-    /// Primary opaque Lane/session reference retained for desktop and
-    /// coordinator continuation targeting. It carries no workspace or
-    /// provider authority by itself.
+    /// Preferred opaque Lane/session reference retained for desktop and
+    /// coordinator continuation targeting. When the legacy primary Lane is
+    /// archived, this points at the first currently attached Lane instead.
+    /// It carries no workspace or provider authority by itself.
     pub session_id: Uuid,
     pub display_name: Option<String>,
     pub role: Option<String>,
@@ -962,14 +963,20 @@ impl From<&AgentRecord> for CoordinatorAgentView {
             .as_ref()
             .map(|spec| (Some(spec.display_name.clone()), Some(spec.role.clone())))
             .unwrap_or((None, None));
+        let lane_ids = agent.known_lane_ids();
+        let session_id = agent
+            .last_lane_id
+            .filter(|lane_id| lane_ids.contains(lane_id))
+            .or_else(|| lane_ids.first().copied())
+            .unwrap_or(agent.session_id);
         Self {
             schema_version: "grokptah.coordinator.agent.v1".into(),
             agent_id: agent.agent_id.clone(),
-            session_id: agent.session_id,
+            session_id,
             display_name,
             role,
             state: agent.state,
-            lane_ids: agent.known_lane_ids(),
+            lane_ids,
             current_run_id: agent.current_run_id.clone(),
             last_run_id: agent.last_run_id.clone(),
             last_lane_id: agent.last_lane_id,
@@ -1831,6 +1838,52 @@ mod tests {
         let agent: AgentRecord = serde_json::from_value(legacy).unwrap();
         assert!(agent.lane_ids.is_empty());
         assert_eq!(agent.known_lane_ids(), vec![session_id]);
+    }
+
+    #[test]
+    fn coordinator_view_prefers_a_live_lane_when_legacy_primary_is_detached() {
+        let primary = Uuid::new_v4();
+        let live = Uuid::new_v4();
+        let now = Utc::now();
+        let agent = AgentRecord {
+            agent_id: "agent-multi-lane".into(),
+            owner_principal_id: None,
+            session_id: primary,
+            lane_ids: vec![primary, live],
+            lane_associations: vec![
+                AgentLaneAssociation {
+                    lane_id: primary,
+                    source_workspace: "/tmp/project".into(),
+                    attached_at: now,
+                    attached_by: "test".into(),
+                    detached_at: Some(now),
+                    detached_by: Some("test".into()),
+                },
+                AgentLaneAssociation {
+                    lane_id: live,
+                    source_workspace: "/tmp/project".into(),
+                    attached_at: now,
+                    attached_by: "test".into(),
+                    detached_at: None,
+                    detached_by: None,
+                },
+            ],
+            workspace: "/tmp/project".into(),
+            model: "grok".into(),
+            spec: None,
+            state: AgentState::Waiting,
+            current_run_id: None,
+            last_run_id: None,
+            last_lane_id: Some(primary),
+            latest_checkpoint_id: None,
+            continuation_ordinal: 0,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let view = CoordinatorAgentView::from(&agent);
+        assert_eq!(view.session_id, live);
+        assert_eq!(view.lane_ids, vec![live]);
     }
 
     #[test]

@@ -941,12 +941,12 @@ impl RemoteServiceClient {
             .into_iter()
             .find(|agent| agent.agent_id == agent_id)
             .ok_or_else(|| anyhow::anyhow!("remote agent is outside the service scope"))?;
-        let workspace = self.workspace_for_session(agent.session_id).await?;
+        let (session_id, workspace) = self.workspace_for_agent(&agent).await?;
         let plan = self
             .call_tool(
                 "ptah_get_persistent_agent",
                 json!({
-                    "session_id": agent.session_id,
+                    "session_id": session_id,
                     "workspace": workspace,
                     "agent_id": agent.agent_id,
                 }),
@@ -984,6 +984,30 @@ impl RemoteServiceClient {
             .find(|session| session.session_id == session_id)
             .map(|session| session.workspace)
             .ok_or_else(|| anyhow::anyhow!("remote session is outside the service scope"))
+    }
+
+    async fn workspace_for_agent(
+        &mut self,
+        agent: &CoordinatorAgentView,
+    ) -> Result<(Uuid, String)> {
+        let sessions = self.list_sessions().await?;
+        let mut candidates = Vec::with_capacity(agent.lane_ids.len() + 2);
+        if let Some(last_lane_id) = agent.last_lane_id {
+            candidates.push(last_lane_id);
+        }
+        candidates.extend(agent.lane_ids.iter().copied());
+        if !candidates.contains(&agent.session_id) {
+            candidates.push(agent.session_id);
+        }
+        candidates
+            .into_iter()
+            .find_map(|candidate| {
+                sessions
+                    .iter()
+                    .find(|session| session.session_id == candidate)
+                    .map(|session| (candidate, session.workspace.clone()))
+            })
+            .ok_or_else(|| anyhow::anyhow!("remote agent has no accessible session"))
     }
 
     async fn resume(
