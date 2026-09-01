@@ -1254,11 +1254,12 @@ async fn run_profile(
     assert!(!report_text.contains("DOGFOOD.txt"));
 
     // The report above is assembled from the same projections used by the
-    // public MCP reads. Exercise that transport boundary as well: MCP may
-    // discover and read the scoped run/graph, while the canonical service
-    // remains the only owner of create/authorize/observe/act/complete.
+    // public MCP reads. Exercise that transport boundary against a complete
+    // canonical service lifecycle in the host-owned ledger: MCP must read
+    // the same authorized/observed/acted run, not a sidecar fixture store.
     let public_store = host.ensure_computer_store().expect("public CU store");
-    let public_service = ComputerUseService::new(Arc::new(SimulatorBackend::new()), public_store);
+    let public_backend = Arc::new(DogfoodBackend::new());
+    let public_service = ComputerUseService::new(public_backend.clone(), public_store);
     let public_run = public_service
         .create_run(
             "public-mcp-create",
@@ -1268,6 +1269,29 @@ async fn run_profile(
             ComputerUseLimits::default(),
         )
         .expect("public MCP projection run");
+    let public_run = public_service
+        .authorize(
+            "public-mcp-authorize",
+            &public_run.run_id,
+            public_run.version,
+            grant(&public_run),
+        )
+        .expect("public MCP authorize");
+    let (public_run, public_observation) =
+        observe(&public_service, &public_run, "public-mcp-observe").await;
+    public_service
+        .act_with_plan(
+            "public-mcp-act",
+            &public_run.run_id,
+            public_run.version,
+            &public_observation.observation_id,
+            set_name(&public_observation),
+            claim(profile, &public_run, public_observation.sequence),
+        )
+        .await
+        .expect("public MCP canonical action");
+    assert_eq!(public_backend.action_calls(), 1);
+    assert_redacted_cu_projection(&public_service, &public_run.run_id, workspace);
     let public_server = start_control_server(orch.clone(), 0)
         .await
         .expect("public MCP control server");
@@ -1335,6 +1359,92 @@ async fn run_profile(
     assert!(graph_text.contains(&cu_work_id));
     assert!(graph_text.contains(&grok_work_id));
     assert!(!graph_text.contains(workspace.path().to_str().unwrap()));
+
+    // Scope errors must be indistinguishable on the actual wire, including
+    // a same-workspace cross-lane read, a foreign workspace, and an unknown
+    // run id. These calls remain read-only and must not expose existence.
+    let (_, cross_lane) = public_mcp_tool(
+        &public_client,
+        &public_url,
+        203,
+        "ptah_get_computer_run",
+        serde_json::json!({
+            "session_id": other_lane.id,
+            "workspace": workspace.path(),
+            "run_id": public_run.run_id,
+        }),
+    )
+    .await;
+    let (_, foreign_scope) = public_mcp_tool(
+        &public_client,
+        &public_url,
+        204,
+        "ptah_get_computer_run",
+        serde_json::json!({
+            "session_id": lane.id,
+            "workspace": foreign.path(),
+            "run_id": public_run.run_id,
+        }),
+    )
+    .await;
+    let (_, unknown_run) = public_mcp_tool(
+        &public_client,
+        &public_url,
+        205,
+        "ptah_get_computer_run",
+        serde_json::json!({
+            "session_id": lane.id,
+            "workspace": workspace.path(),
+            "run_id": "no-such-public-run",
+        }),
+    )
+    .await;
+    assert_eq!(cross_lane["error"]["data"]["code"], "forbidden_scope");
+    assert_eq!(cross_lane, foreign_scope);
+    assert_eq!(cross_lane, unknown_run);
+
+    // Complete the same service-owned run and read it again through MCP so
+    // the transport proof covers the terminal projection too.
+    let public_run = public_service
+        .get_run(&public_run.run_id)
+        .expect("public MCP completion load")
+        .expect("public MCP run exists");
+    let completed = public_service
+        .complete(
+            "public-mcp-complete",
+            &public_run.run_id,
+            public_run.version,
+        )
+        .expect("public MCP canonical completion");
+    assert_eq!(completed.state, ComputerRunState::Completed);
+    let (status, completed_fetch) = public_mcp_tool(
+        &public_client,
+        &public_url,
+        206,
+        "ptah_get_computer_run",
+        serde_json::json!({
+            "session_id": lane.id,
+            "workspace": workspace.path(),
+            "run_id": completed.run_id,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let completed_projection = &completed_fetch["result"]["structuredContent"];
+    assert_eq!(completed_projection["runId"], completed.run_id);
+    assert_eq!(completed_projection["state"], "completed");
+    let completed_text = serde_json::to_string(&completed_fetch).expect("completed MCP projection");
+    for forbidden in [
+        workspace.path().to_str().unwrap(),
+        "currentObservation",
+        "leaseToken",
+        "opaque-test-credential",
+    ] {
+        assert!(
+            !completed_text.contains(forbidden),
+            "completed public MCP projection leaked {forbidden}: {completed_text}"
+        );
+    }
     // Exercise both operator outcomes across the two profiles: Economy keeps
     // the bounded proposal via the approval gate, while High Assurance rejects
     // it through the durable Work failure path. Neither outcome can promote
