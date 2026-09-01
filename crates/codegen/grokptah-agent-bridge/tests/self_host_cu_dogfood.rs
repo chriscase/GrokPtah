@@ -542,7 +542,14 @@ async fn host_cu_runs(
     lane_id: Uuid,
     workspace: &Path,
     profile: AdaptiveProfile,
-) -> (String, String) {
+) -> (
+    String,
+    String,
+    serde_json::Value,
+    serde_json::Value,
+    serde_json::Value,
+    serde_json::Value,
+) {
     let cu_dir = tempfile::tempdir().expect("cu store");
     let binding = canonical_workspace_string(workspace).expect("canonical workspace");
     let backend = Arc::new(DogfoodBackend::new());
@@ -572,6 +579,8 @@ async fn host_cu_runs(
     assert!(original.grant.is_some());
     assert!(original.current_observation.is_some());
     assert_redacted_cu_projection(&service, &original.run_id, workspace);
+    let original_live_projection =
+        serde_json::to_value(project_run_at(&original, Utc::now())).expect("live projection");
 
     let now = Utc::now();
     let owner = ComputerReadBinding::new(lane_id, &binding);
@@ -661,6 +670,8 @@ async fn host_cu_runs(
         .expect("authorize successor");
     let (successor, observation) = observe(&service, &successor, "cu-observe-successor").await;
     assert_redacted_cu_projection(&service, &successor.run_id, workspace);
+    let successor_live_projection =
+        serde_json::to_value(project_run_at(&successor, Utc::now())).expect("live projection");
     let observation_id = observation.observation_id.clone();
     service
         .act_with_plan(
@@ -713,11 +724,22 @@ async fn host_cu_runs(
         )
         .expect("complete successor");
     assert_eq!(completed.state, ComputerRunState::Completed);
-    (original_id, completed.run_id)
+    let original_projection = serde_json::to_value(project_run_at(&recovered_run, Utc::now()))
+        .expect("interrupted Computer Run projection");
+    let successor_projection =
+        serde_json::to_value(project_run_at(&completed, Utc::now())).expect("successor projection");
+    (
+        original_id,
+        completed.run_id,
+        original_live_projection,
+        successor_live_projection,
+        original_projection,
+        successor_projection,
+    )
 }
 
 #[cfg(unix)]
-async fn run_profile(profile: AdaptiveProfile) {
+async fn run_profile(profile: AdaptiveProfile, retain_managed_result: bool) {
     let mut env = ProcessEnvGuard::new();
     let home = tempfile::tempdir().unwrap();
     set_grokptah_home_override(Some(home.path().join(".grokptah")));
@@ -933,8 +955,14 @@ async fn run_profile(profile: AdaptiveProfile) {
         .expect("lease token")
         .to_string();
 
-    let (original_run_id, successor_run_id) =
-        host_cu_runs(lane.id, workspace.path(), profile).await;
+    let (
+        original_run_id,
+        successor_run_id,
+        original_live_projection,
+        successor_live_projection,
+        original_projection,
+        successor_projection,
+    ) = host_cu_runs(lane.id, workspace.path(), profile).await;
     let completed = orch
         .complete_work(
             &auth(),
@@ -1078,6 +1106,113 @@ async fn run_profile(profile: AdaptiveProfile) {
         fs::read_to_string(workspace.path().join("DOGFOOD.txt")).unwrap(),
         "after\n"
     );
+
+    // The operator-facing handoff is assembled only from the redacted graph
+    // and Computer Run projections. Keep this oracle next to the composed
+    // journey so a future report cannot accidentally switch to raw WorkItem
+    // or ComputerRun records that carry objectives, paths, grants, or
+    // observations. The graph method is the same public read seam used by
+    // ptah_get_work_graph, and the run values use the same projection helper
+    // used by the ptah_get_computer_run path. Computer Run mutations
+    // intentionally remain local-only, per the control-plane contract; this
+    // test proves the shared public projection shape, not HTTP dispatch.
+    let graph = orch
+        .get_work_graph_scoped(&auth(), lane.id, workspace.path())
+        .expect("redacted work graph");
+    let graph_nodes = graph["graph"].as_array().expect("graph nodes");
+    assert!(graph_nodes
+        .iter()
+        .any(|node| { node["workId"] == cu_work_id && node["state"] == "succeeded" }));
+    assert!(graph_nodes
+        .iter()
+        .any(|node| { node["workId"] == grok_work_id && node["state"] == "awaiting_approval" }));
+    let public_report = serde_json::json!({
+        "profile": profile,
+        "workGraph": graph["graph"].clone(),
+        "computerRuns": [
+            original_live_projection,
+            successor_live_projection,
+            original_projection,
+            successor_projection
+        ],
+    });
+    let report_text = serde_json::to_string(&public_report).expect("public report json");
+    for secret in [
+        "opaque-test-credential",
+        workspace.path().to_str().unwrap(),
+        "currentObservation",
+        "objective",
+        "assignedAgentId",
+        "leaseToken",
+        "Not submitted",
+        "\"Name\"",
+        "-name",
+    ] {
+        assert!(
+            !report_text.contains(secret),
+            "public self-host report leaked {secret}: {report_text}"
+        );
+    }
+    assert!(report_text.contains(&original_run_id));
+    assert!(report_text.contains(&successor_run_id));
+    assert!(
+        report_text.contains("observation-ref-"),
+        "live report omitted the safe observation surrogate: {report_text}"
+    );
+    assert!(!report_text.contains("DOGFOOD.txt"));
+
+    // Exercise both operator outcomes across the two profiles: Economy keeps
+    // the bounded proposal via the approval gate, while High Assurance rejects
+    // it through the durable Work failure path. Neither outcome can promote
+    // code automatically, and the managed executor has already cleaned its
+    // disposable checkout before either decision is recorded.
+    if retain_managed_result {
+        let kept = orch
+            .approve_work(
+                &auth(),
+                "cu-dogfood-approve-grok",
+                lane.id,
+                workspace.path(),
+                &grok_work_id,
+                Some("operator retained the reviewed bounded change".into()),
+                Some(reviewed.revision),
+            )
+            .await
+            .expect("approve managed Grok result");
+        assert_eq!(kept["work"]["state"], "succeeded");
+    } else {
+        let attempt = orch
+            .store()
+            .list_work_attempts(Some(&grok_work_id))
+            .expect("list managed Grok attempts")
+            .into_iter()
+            .last()
+            .expect("managed Grok attempt");
+        let token = attempt.lease_token_for_secret("managed-cu-dogfood-token");
+        let rejected = orch
+            .fail_work(
+                &auth(),
+                "cu-dogfood-reject-grok",
+                lane.id,
+                workspace.path(),
+                &grok_work_id,
+                &attempt.attempt_id,
+                &token,
+                WorkResult {
+                    summary: "operator rejected the reviewed bounded change".into(),
+                    evidence: vec!["operator:rejected".into()],
+                    artifacts: Vec::new(),
+                    failure: Some("operator rejected proposed change".into()),
+                    cancellation_reason: None,
+                    completed_at: Utc::now(),
+                    verification: None,
+                },
+            )
+            .await
+            .expect("reject managed Grok result");
+        assert_eq!(rejected["work"]["state"], "failed");
+    }
+
     // A successful run does not revoke the caller-owned upstream lease; the
     // adapter only revokes it on unproved termination. The disposable
     // checkout, however, must always be gone before this lane returns.
@@ -1105,8 +1240,8 @@ async fn run_profile(profile: AdaptiveProfile) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::await_holding_lock)]
 async fn economy_and_high_assurance_host_cu_then_dependent_grok() {
-    run_profile(AdaptiveProfile::Economy).await;
-    run_profile(AdaptiveProfile::HighAssurance).await;
+    run_profile(AdaptiveProfile::Economy, true).await;
+    run_profile(AdaptiveProfile::HighAssurance, false).await;
 }
 
 #[cfg(unix)]
