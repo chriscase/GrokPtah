@@ -1329,7 +1329,9 @@ impl CoordinatorResumePlanView {
                 "coordinator resume-plan agent binding is invalid",
             ));
         }
-        if self.agent.latest_checkpoint_id.as_deref() != Some(self.checkpoint.checkpoint_id.as_str()) {
+        if self.agent.latest_checkpoint_id.as_deref()
+            != Some(self.checkpoint.checkpoint_id.as_str())
+        {
             return Err(OrchError::new(
                 OrchErrorCode::InvalidRequest,
                 "coordinator resume-plan checkpoint binding is invalid",
