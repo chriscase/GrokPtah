@@ -5,8 +5,8 @@ use grokptah_agent_bridge::orchestration::{
     ManagedExecutionBudgetProfile, ManagedExecutionIntent, ManagedExecutionPolicy,
     ManagedExecutorKind, ManagedFinalizationOutcome, ManagedFinalizationStage, ManagedIntentState,
     ManagedRetryCause, ManagedWorkMode, MessageKind, OrchErrorCode, OrchStore, RunBounds,
-    RunRecord, RunState, WorkItem, WorkMessage, WorkPolicy, WorkProgress, WorkResult, WorkState,
-    MANAGED_EXECUTION_SCHEMA_VERSION,
+    RunExecutionMode, RunRecord, RunState, WorkItem, WorkMessage, WorkPolicy, WorkProgress,
+    WorkResult, WorkState, MANAGED_EXECUTION_SCHEMA_VERSION,
 };
 use grokptah_agent_bridge::{AgentRecord, AgentState};
 use tempfile::tempdir;
@@ -488,7 +488,102 @@ fn expired_attempt_rejects_late_managed_completion() {
 
 #[test]
 fn default_policy_is_disabled() {
-    assert!(!ManagedExecutionPolicy::default().enabled);
+    let policy = ManagedExecutionPolicy::default();
+    assert!(!policy.enabled);
+    assert_eq!(policy.native_execution_mode, RunExecutionMode::Shared);
+}
+
+#[test]
+fn isolated_native_policy_is_explicit_approved_and_non_retrying() {
+    let mut policy = ManagedExecutionPolicy {
+        enabled: true,
+        requires_approval_before_execution: true,
+        native_execution_mode: RunExecutionMode::IsolatedWorktree,
+        ..ManagedExecutionPolicy::default()
+    };
+    assert!(policy.validate().is_ok());
+
+    policy.requires_approval_before_execution = false;
+    assert_eq!(policy.validate().unwrap_err().code, OrchErrorCode::InvalidRequest);
+    policy.requires_approval_before_execution = true;
+    policy.retry_eligible = true;
+    assert_eq!(policy.validate().unwrap_err().code, OrchErrorCode::InvalidRequest);
+    policy.retry_eligible = false;
+    policy.executor = ManagedExecutorKind::GrokBuildIsolatedReview;
+    assert_eq!(policy.validate().unwrap_err().code, OrchErrorCode::InvalidRequest);
+}
+
+#[test]
+fn isolated_native_work_requires_a_file_scope_and_current_authorization() {
+    let home = tempdir().unwrap();
+    let store = OrchStore::open(home.path()).unwrap();
+    let session = Uuid::new_v4();
+    store.save_agent(&agent("worker-a", "/tmp/ws", session)).unwrap();
+    store
+        .revise_agent_spec("worker-a", "operator", |spec| {
+            spec.managed_execution = ManagedExecutionPolicy {
+                enabled: true,
+                requires_approval_before_execution: true,
+                native_execution_mode: RunExecutionMode::IsolatedWorktree,
+                ..ManagedExecutionPolicy::default()
+            };
+            Ok(())
+        })
+        .unwrap();
+    let worker = store.load_agent("worker-a").unwrap().unwrap();
+    let spec = worker.current_spec().unwrap().clone();
+    let ceiling = RunBounds::default();
+    let unscoped = accepted_work(session, "/tmp/ws", "worker-a");
+    store.save_work_item(&unscoped).unwrap();
+    let (authorized_unscoped, unscoped_decision) = store
+        .authorize_work_execution(
+            &unscoped.work_id,
+            "operator",
+            None,
+            "authorize one unscoped native attempt",
+            Some(unscoped.revision),
+            Utc::now(),
+        )
+        .unwrap();
+    assert_eq!(
+        managed_execution_eligible(
+            &authorized_unscoped,
+            &worker,
+            &spec,
+            &[unscoped_decision],
+            0,
+            &ceiling,
+        )
+        .unwrap_err()
+        .code,
+        OrchErrorCode::ForbiddenScope
+    );
+
+    let mut scoped = accepted_work(session, "/tmp/ws", "worker-a");
+    scoped.policy.allowed_files = vec!["README.md".into()];
+    scoped.policy.retry.max_attempts = 1;
+    scoped.policy.retry.retry_failed = false;
+    scoped.policy.retry.retry_expired = false;
+    store.save_work_item(&scoped).unwrap();
+    let (authorized, decision) = store
+        .authorize_work_execution(
+            &scoped.work_id,
+            "operator",
+            None,
+            "authorize one isolated native attempt",
+            Some(scoped.revision),
+            Utc::now(),
+        )
+        .unwrap();
+    let eligible = managed_execution_eligible(
+        &authorized,
+        &worker,
+        &spec,
+        std::slice::from_ref(&decision),
+        0,
+        &ceiling,
+    );
+    assert!(eligible.is_ok(), "{eligible:?}");
 }
 
 fn enable_managed(store: &OrchStore, agent_id: &str, retry_eligible: bool) {

@@ -1666,6 +1666,7 @@ impl OrchestrationService {
         };
         let bounds_json = serde_json::to_value(&bounds)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let execution_mode = spec.managed_execution.native_execution_mode;
         let submitted = match self
             .submit_task_with_execution_mode_and_queue_parent(
                 &auth,
@@ -1674,7 +1675,7 @@ impl OrchestrationService {
                 Path::new(&work.workspace),
                 prompt,
                 Some(bounds_json),
-                RunExecutionMode::Shared,
+                execution_mode,
                 false,
                 None,
                 "ptah_native_execute",
