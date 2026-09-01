@@ -1438,6 +1438,19 @@ async fn run_profile(
     assert!(graph_text.contains(&grok_work_id));
     assert!(!graph_text.contains(workspace.path().to_str().unwrap()));
     assert!(!graph_text.contains(lease_token.as_str()));
+    for forbidden in [
+        "currentObservation",
+        "opaque-test-credential",
+        "Not submitted",
+        "\"Name\"",
+        "-name",
+        "leaseToken",
+    ] {
+        assert!(
+            !graph_text.contains(forbidden),
+            "public MCP work graph leaked {forbidden}: {graph_text}"
+        );
+    }
 
     // Scope errors must be indistinguishable on the actual wire, including
     // a same-workspace cross-lane read and an unknown run id. A foreign
@@ -1454,7 +1467,7 @@ async fn run_profile(
         }),
     )
     .await;
-    let (_, foreign_scope) = public_mcp_tool(
+    let (foreign_get_status, foreign_scope) = public_mcp_tool(
         &public_client,
         &public_url,
         205,
@@ -1487,6 +1500,7 @@ async fn run_profile(
     // error object so only the scoped failure vocabulary is required to match.
     assert_eq!(cross_lane["error"], unknown_run["error"]);
     assert_eq!(foreign_scope["error"]["data"]["code"], "workspace_mismatch");
+    assert_eq!(foreign_get_status, StatusCode::FORBIDDEN);
 
     let (status, cross_lane_list) = public_mcp_tool(
         &public_client,
