@@ -559,7 +559,8 @@ pub async fn run_campaign(options: &CampaignOptions) -> Result<CampaignCompletio
                                 report.provider = Some(provider);
                                 report.provider_actuals = Some(capture.actuals.clone());
                             }
-                            Err(_) => {
+                            Err(error) => {
+                                eprintln!("provider capture rejected: {error:#}");
                                 execution.result = ProbeResult::indeterminate(
                                     definition.id.clone(),
                                     definition.catalog_scenario_ids.clone(),
