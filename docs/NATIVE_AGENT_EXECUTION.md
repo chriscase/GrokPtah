@@ -94,6 +94,7 @@ runs for that request ID.
 | State | Meaning |
 | --- | --- |
 | `claiming` | Durable intent exists; claim and/or Run admission may still be in flight |
+| `dispatching` | The host has claimed Work and is starting the bounded managed executor |
 | `admitted` | A finite Run is linked; the executor heartbeats the lease |
 | `parked` | Run asked for permission; Work and attempt are `awaiting_input` |
 | `resolving` | Operator resolve is in flight; host oneshot not yet committed |
@@ -110,6 +111,12 @@ Live concurrency counts `claiming`, `admitted`, `parked`, and `resolving`.
 4. `submit_task` with `request_id = intent_id`
 5. `link_work_run`
 6. Persist `runId` and `admitted`
+
+For the `GrokBuildIsolatedReview` executor, dispatching is a host-owned,
+one-attempt proposal lane. It keeps `computerUseAllowed` and
+`bypassPermissions` false, requires finite bounds and a non-empty allowed-file
+set, and runs with the captured model route. It cannot turn managed Work into
+a Computer Use grant or silently retry it.
 
 ### Claiming recovery (atomic admission)
 
@@ -187,7 +194,7 @@ the 500 retained records) and then `select_relevant_managed_messages`:
 | --- | --- |
 | queued / running | leased / running |
 | progress event | Work progress |
-| completed | succeeded, or awaiting approval |
+| completed | succeeded only with bound verification, `review` when evidence is unverified, or awaiting approval when an explicit approval gate is configured |
 | failed / limit | failed, or queued for a new attempt when both retry policies allow |
 | permission/input | awaiting input + durable question |
 | cancelled | Work cancelled; late writes fail |

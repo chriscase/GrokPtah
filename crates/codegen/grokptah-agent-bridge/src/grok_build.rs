@@ -3,7 +3,9 @@
 //! This module executes a validated [`GrokBuildLaunchRequest`] against an
 //! allowlisted local CLI. It is not a manager, not host authority, not a
 //! provider account, not live qualification, not merge authority, and not
-//! Computer Use. It does not wire into orchestration or Work.
+//! Computer Use authority. The orchestration service may invoke it as a
+//! bounded, proposal-only managed Work executor after host-owned policy and
+//! Work/lane fences admit the invocation.
 //!
 //! Credential material is never accepted as a raw token. A host-injected
 //! lease resolver may return only a path/lease handle; this adapter copies
