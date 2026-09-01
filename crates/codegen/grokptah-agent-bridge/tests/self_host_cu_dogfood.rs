@@ -1297,10 +1297,26 @@ async fn run_profile(
     assert!(listed_ids.contains(original_run_id.as_str()));
     assert!(listed_ids.contains(successor_run_id.as_str()));
     for listed_projection in listed_runs {
-        assert!(
-            listed_projection["grant"].get("target").is_none(),
-            "listed public MCP projection copied a grant target payload: {listed_projection}"
-        );
+        match listed_projection["state"].as_str() {
+            Some("interrupted") => {
+                assert!(listed_projection["grant"].is_null());
+                assert!(listed_projection["observation"].is_null());
+            }
+            Some("completed") => {
+                let grant = listed_projection["grant"]
+                    .as_object()
+                    .expect("completed listed run keeps its safe grant summary");
+                assert!(
+                    !grant.contains_key("target"),
+                    "listed public MCP projection copied a grant target payload: {listed_projection}"
+                );
+                assert!(
+                    listed_projection["observation"].is_object(),
+                    "completed listed run lost its safe observation summary"
+                );
+            }
+            state => panic!("unexpected listed Computer Run state: {state:?}"),
+        }
     }
     let listed_text = serde_json::to_string(listed_runs).expect("listed MCP projections");
     for forbidden in [
@@ -1368,8 +1384,11 @@ async fn run_profile(
     let successor_projection = &successor_fetch["result"]["structuredContent"];
     assert_eq!(successor_projection["runId"], successor_run_id);
     assert_eq!(successor_projection["state"], "completed");
+    let successor_grant = successor_projection["grant"]
+        .as_object()
+        .expect("completed successor keeps its safe grant summary");
     assert!(
-        successor_projection["grant"].get("target").is_none(),
+        !successor_grant.contains_key("target"),
         "successor public MCP projection copied a grant target payload: {successor_projection}"
     );
     assert!(
