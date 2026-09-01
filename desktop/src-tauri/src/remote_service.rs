@@ -1894,6 +1894,7 @@ mod tests {
             session_id: primary,
             display_name: None,
             role: None,
+            agent_spec_revision: None,
             state: grokptah_agent_bridge::orchestration::AgentState::Waiting,
             lane_ids: vec![live],
             current_run_id: None,
