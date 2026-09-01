@@ -2684,7 +2684,7 @@ impl OrchestrationService {
         auth: &AuthContext,
     ) -> Result<serde_json::Value, OrchError> {
         let allowlist = self.config.lock().allowlist.clone();
-        let agents = self
+        let mut agents = self
             .host
             .list_persistent_agents()
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
@@ -2696,7 +2696,9 @@ impl OrchestrationService {
                         .as_deref()
                         .is_none_or(|owner| owner == auth.owner_id)
             })
+            .map(|agent| CoordinatorAgentView::from(&agent))
             .collect::<Vec<_>>();
+        agents.sort_by(|left, right| left.agent_id.cmp(&right.agent_id));
         Ok(json!({ "agents": agents }))
     }
 
@@ -5413,7 +5415,7 @@ impl OrchestrationService {
                 "persistent agent is not available in the requested scope",
             ));
         }
-        serde_json::to_value(plan)
+        serde_json::to_value(CoordinatorResumePlanView::from(&plan))
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
     }
 
@@ -5524,9 +5526,8 @@ impl OrchestrationService {
             "persistent agent resumed",
         );
         Ok(json!({
-            "agent": updated,
+            "agent": CoordinatorAgentView::from(&updated),
             "sessionId": session_id,
-            "workspace": claimed.display().to_string(),
             "response": response,
         }))
     }

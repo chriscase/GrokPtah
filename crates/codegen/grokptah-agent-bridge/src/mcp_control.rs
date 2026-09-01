@@ -4093,8 +4093,8 @@ mod tests {
     use super::*;
     use crate::host::{AgentHost, HostConfig};
     use crate::orchestration::{
-        ContinuationCheckpoint, ContinuationReason, OrchErrorCode, OrchStore, OrchestrationConfig,
-        RunBounds, WorkspaceAllowlist,
+        ContinuationCheckpoint, ContinuationReason, CoordinatorAgentView, OrchErrorCode, OrchStore,
+        OrchestrationConfig, RunBounds, WorkspaceAllowlist,
     };
     use crate::{home_override_serial, set_grokptah_home_override};
     use chrono::Utc;
@@ -5418,23 +5418,41 @@ mod tests {
             .into_iter()
             .find(|candidate| candidate.agent_id == agent.agent_id)
             .unwrap();
+        let public_agent = &listed["agents"][0];
         assert_eq!(
-            listed["agents"][0],
-            serde_json::to_value(&desktop_agent).unwrap(),
-            "service/MCP Agent projection must match the desktop runtime record"
+            public_agent,
+            &serde_json::to_value(CoordinatorAgentView::from(&desktop_agent)).unwrap(),
+            "service/MCP Agent projection must use the coordinator-safe view"
         );
+        for forbidden in [
+            "workspace",
+            "model",
+            "ownerPrincipalId",
+            "spec",
+            "authority",
+            "memory",
+            "managedExecution",
+        ] {
+            assert!(
+                public_agent.get(forbidden).is_none(),
+                "coordinator Agent projection leaked {forbidden}"
+            );
+        }
         let plan = orch
             .get_persistent_agent_scoped(&auth, session.id, &workspace_path, &agent.agent_id)
             .unwrap();
         assert_eq!(
             plan["agent"],
-            serde_json::to_value(&desktop_agent).unwrap(),
-            "scoped service Agent reads must not rewrite transport-neutral state"
+            serde_json::to_value(CoordinatorAgentView::from(&desktop_agent)).unwrap(),
+            "scoped service Agent reads must use the coordinator-safe view"
         );
         assert_eq!(
             plan["checkpoint"]["checkpointId"],
             "checkpoint-agent-scope-1"
         );
+        assert!(plan["checkpoint"].get("workspace").is_none());
+        assert!(plan["checkpoint"].get("contextSummary").is_some());
+        assert_eq!(plan["schemaVersion"], "grokptah.coordinator.resume-plan.v1");
 
         let error = orch
             .get_persistent_agent_scoped(&auth, session.id, &workspace_path, "agent-not-visible")

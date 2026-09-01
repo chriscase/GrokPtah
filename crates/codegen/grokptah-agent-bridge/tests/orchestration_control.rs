@@ -1581,6 +1581,10 @@ async fn submit_task_reaches_terminal_offline() {
         .await
         .unwrap();
     assert_eq!(replayed["response"], resumed["response"]);
+    assert!(resumed.get("workspace").is_none());
+    assert!(resumed["agent"].get("workspace").is_none());
+    assert!(resumed["agent"].get("model").is_none());
+    assert!(resumed["agent"].get("spec").is_none());
     let runs = orch.list_runs_scoped(&auth, session.id, ws.path()).unwrap();
     assert_eq!(runs["schemaVersion"], "grokptah.public-run.v1");
     let public_runs = runs["runs"].as_array().unwrap();

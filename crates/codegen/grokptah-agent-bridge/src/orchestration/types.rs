@@ -926,6 +926,56 @@ pub struct AgentRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Stable, coordinator-facing projection of a durable Agent identity.
+///
+/// `AgentRecord` is an internal/desktop record and intentionally contains
+/// workspace paths, provider/model routing, ownership, and authority policy.
+/// Those fields must never cross the authenticated coordinator boundary. This
+/// view keeps only opaque identity and lifecycle/checkpoint references needed
+/// to render a coordinator status surface and request an explicit resume.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoordinatorAgentView {
+    pub schema_version: &'static str,
+    pub agent_id: String,
+    pub display_name: Option<String>,
+    pub role: Option<String>,
+    pub state: AgentState,
+    pub lane_ids: Vec<Uuid>,
+    pub current_run_id: Option<String>,
+    pub last_run_id: Option<String>,
+    pub last_lane_id: Option<Uuid>,
+    pub latest_checkpoint_id: Option<String>,
+    pub continuation_ordinal: u64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl From<&AgentRecord> for CoordinatorAgentView {
+    fn from(agent: &AgentRecord) -> Self {
+        let (display_name, role) = agent
+            .spec
+            .as_ref()
+            .map(|spec| (Some(spec.display_name.clone()), Some(spec.role.clone())))
+            .unwrap_or((None, None));
+        Self {
+            schema_version: "grokptah.coordinator.agent.v1",
+            agent_id: agent.agent_id.clone(),
+            display_name,
+            role,
+            state: agent.state,
+            lane_ids: agent.known_lane_ids(),
+            current_run_id: agent.current_run_id.clone(),
+            last_run_id: agent.last_run_id.clone(),
+            last_lane_id: agent.last_lane_id,
+            latest_checkpoint_id: agent.latest_checkpoint_id.clone(),
+            continuation_ordinal: agent.continuation_ordinal,
+            created_at: agent.created_at,
+            updated_at: agent.updated_at,
+        }
+    }
+}
+
 impl AgentRecord {
     pub fn migrate_legacy_spec(&mut self) -> Result<bool, OrchError> {
         let mut changed = false;
@@ -1088,6 +1138,45 @@ pub struct ContinuationCheckpoint {
     pub created_at: DateTime<Utc>,
 }
 
+/// Coordinator-safe checkpoint projection. The durable checkpoint's
+/// workspace path is deliberately omitted; its context is already bounded and
+/// redacted by the host before persistence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoordinatorCheckpointView {
+    pub schema_version: &'static str,
+    pub checkpoint_id: String,
+    pub agent_id: String,
+    pub session_id: Uuid,
+    pub run_id: String,
+    pub agent_spec_revision: Option<u64>,
+    pub parent_checkpoint_id: Option<String>,
+    pub ordinal: u64,
+    pub context_summary: String,
+    pub event_seq: u64,
+    pub reason: ContinuationReason,
+    pub created_at: DateTime<Utc>,
+}
+
+impl From<&ContinuationCheckpoint> for CoordinatorCheckpointView {
+    fn from(checkpoint: &ContinuationCheckpoint) -> Self {
+        Self {
+            schema_version: "grokptah.coordinator.checkpoint.v1",
+            checkpoint_id: checkpoint.checkpoint_id.clone(),
+            agent_id: checkpoint.agent_id.clone(),
+            session_id: checkpoint.session_id,
+            run_id: checkpoint.run_id.clone(),
+            agent_spec_revision: checkpoint.agent_spec_revision,
+            parent_checkpoint_id: checkpoint.parent_checkpoint_id.clone(),
+            ordinal: checkpoint.ordinal,
+            context_summary: checkpoint.context_summary.clone(),
+            event_seq: checkpoint.event_seq,
+            reason: checkpoint.reason,
+            created_at: checkpoint.created_at,
+        }
+    }
+}
+
 impl ContinuationCheckpoint {
     pub fn context_hash_for(&self) -> String {
         match self.agent_spec_revision {
@@ -1152,6 +1241,30 @@ pub struct AgentResumePlan {
     pub agent: AgentRecord,
     pub checkpoint: ContinuationCheckpoint,
     pub parent_run_id: String,
+}
+
+/// Redacted plan returned by the coordinator read contract. The full
+/// `AgentResumePlan` remains an internal host object used to validate the
+/// continuation; callers receive only what they need to confirm the opaque
+/// checkpoint and issue an explicit resume request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoordinatorResumePlanView {
+    pub schema_version: &'static str,
+    pub agent: CoordinatorAgentView,
+    pub checkpoint: CoordinatorCheckpointView,
+    pub parent_run_id: String,
+}
+
+impl From<&AgentResumePlan> for CoordinatorResumePlanView {
+    fn from(plan: &AgentResumePlan) -> Self {
+        Self {
+            schema_version: "grokptah.coordinator.resume-plan.v1",
+            agent: CoordinatorAgentView::from(&plan.agent),
+            checkpoint: CoordinatorCheckpointView::from(&plan.checkpoint),
+            parent_run_id: plan.parent_run_id.clone(),
+        }
+    }
 }
 
 impl AgentResumePlan {

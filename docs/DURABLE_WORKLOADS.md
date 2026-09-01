@@ -111,6 +111,23 @@ process. See [NATIVE_AGENT_EXECUTION.md](NATIVE_AGENT_EXECUTION.md).
 
 ## MCP/service surface
 
+### Persistent-agent coordinator projection
+
+The authenticated coordinator surface deliberately does not serialize the
+desktop `AgentRecord` or `AgentResumePlan` directly. `ptah_list_persistent_agents`
+returns `grokptah.coordinator.agent.v1` views containing opaque identity,
+current/last Run and Lane references, lifecycle state, and checkpoint lineage.
+`ptah_get_persistent_agent` returns a
+`grokptah.coordinator.resume-plan.v1` containing that same Agent view plus a
+`grokptah.coordinator.checkpoint.v1` view. Workspace paths, provider/model
+routing, owner principals, authority policy, memory policy, and managed
+execution settings are internal-only and are absent from these responses.
+The checkpoint context is the host-produced bounded redacted summary; the
+caller still must provide a fresh instruction to
+`ptah_resume_persistent_agent`. Scope and ownership are checked before either
+view is produced, and unknown/cross-scope identities use the same refusal
+vocabulary. Listing order is deterministic by opaque Agent ID.
+
 `orchestration::CONTROL_TOOLS` is the source of truth for the complete tool
 count and classification. The workload-specific subset advertised there
 includes:
