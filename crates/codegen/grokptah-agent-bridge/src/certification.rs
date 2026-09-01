@@ -152,6 +152,9 @@ pub enum StreamFraming {
 #[serde(rename_all = "snake_case")]
 pub enum AttemptDisposition {
     Success,
+    /// One successful physical model step in a multi-step Agent Run. The
+    /// durable Run remained active and issued a later provider request.
+    Continued,
     Retried,
     Downgraded,
     RateLimited,
@@ -796,7 +799,9 @@ fn validate_attempt(
     }
     let status = attempt.response_status;
     let response_shape_valid = match attempt.disposition {
-        AttemptDisposition::Success | AttemptDisposition::Downgraded => {
+        AttemptDisposition::Success
+        | AttemptDisposition::Continued
+        | AttemptDisposition::Downgraded => {
             status.is_some_and(|value| (200..300).contains(&value))
                 && matches!(attempt.framing, StreamFraming::Sse | StreamFraming::Json)
         }
@@ -884,6 +889,7 @@ fn validate_promotion_completeness(
             matches!(
                 attempt.disposition,
                 AttemptDisposition::Retried
+                    | AttemptDisposition::Continued
                     | AttemptDisposition::RateLimited
                     | AttemptDisposition::TimedOut
                     | AttemptDisposition::TransportFailed
@@ -1884,6 +1890,26 @@ mod tests {
         capture.attempts[0].response_content_type = Some("application/json".into());
         capture.attempts[0].framing = StreamFraming::Json;
         capture.durable_states[0].terminal_state = "failed".into();
+        assert!(matches!(
+            capture.validate_for_xai_fixture_promotion_at(directory.path()),
+            Err(CertificationError::NotPromotable(_))
+        ));
+
+        let mut capture = fixture();
+        let mut final_attempt = capture.attempts[0].clone();
+        final_attempt.attempt = 2;
+        final_attempt.request_body = None;
+        final_attempt.response_body = None;
+        capture.attempts[0].disposition = AttemptDisposition::Continued;
+        capture.attempts.push(final_attempt);
+        capture.actuals.provider_requests = 2;
+        capture.actuals.total_tokens = 30;
+        let directory = materialize_fixture(&mut capture);
+        capture
+            .validate_for_xai_fixture_promotion_at(directory.path())
+            .unwrap();
+
+        capture.attempts[1].disposition = AttemptDisposition::Continued;
         assert!(matches!(
             capture.validate_for_xai_fixture_promotion_at(directory.path()),
             Err(CertificationError::NotPromotable(_))

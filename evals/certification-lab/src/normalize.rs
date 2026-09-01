@@ -53,6 +53,7 @@ pub enum ReplayFixtureKind {
 #[serde(rename_all = "snake_case")]
 pub enum ReplayAttemptDisposition {
     Completed,
+    Continued,
     Retried,
     Downgraded,
     RateLimited,
@@ -413,7 +414,9 @@ fn replay_case(kind: ReplayFixtureKind, case: &ReplayCase) -> Result<ReplayCaseR
                     counters.usage_complete = false;
                 }
                 match disposition {
-                    ReplayAttemptDisposition::Completed | ReplayAttemptDisposition::Downgraded => {
+                    ReplayAttemptDisposition::Completed
+                    | ReplayAttemptDisposition::Continued
+                    | ReplayAttemptDisposition::Downgraded => {
                         successful_attempt = true;
                     }
                     ReplayAttemptDisposition::Retried => {}
@@ -846,9 +849,11 @@ fn capture_terminal(capture: &PersistentAgentCapture) -> Result<TerminalCategory
         };
     }
     match capture.attempts.last().map(|attempt| &attempt.disposition) {
-        Some(CaptureAttemptDisposition::Success | CaptureAttemptDisposition::Downgraded) => {
-            Ok(TerminalCategory::Completed)
-        }
+        Some(
+            CaptureAttemptDisposition::Success
+            | CaptureAttemptDisposition::Continued
+            | CaptureAttemptDisposition::Downgraded,
+        ) => Ok(TerminalCategory::Completed),
         Some(CaptureAttemptDisposition::RateLimited) => Ok(TerminalCategory::RateLimitExhausted),
         Some(CaptureAttemptDisposition::TimedOut) => Ok(TerminalCategory::Timeout),
         Some(CaptureAttemptDisposition::Cancelled) => Ok(TerminalCategory::Interrupted),
@@ -864,6 +869,7 @@ fn capture_terminal(capture: &PersistentAgentCapture) -> Result<TerminalCategory
 fn map_disposition(value: &CaptureAttemptDisposition) -> ReplayAttemptDisposition {
     match value {
         CaptureAttemptDisposition::Success => ReplayAttemptDisposition::Completed,
+        CaptureAttemptDisposition::Continued => ReplayAttemptDisposition::Continued,
         CaptureAttemptDisposition::Retried => ReplayAttemptDisposition::Retried,
         CaptureAttemptDisposition::Downgraded => ReplayAttemptDisposition::Downgraded,
         CaptureAttemptDisposition::RateLimited => ReplayAttemptDisposition::RateLimited,
