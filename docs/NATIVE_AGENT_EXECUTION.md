@@ -101,7 +101,8 @@ runs for that request ID.
 | `finalized` | Terminal for this intent; does not consume concurrency |
 | `abandoned` | Admission did not commit a Run; any claim was released |
 
-Live concurrency counts `claiming`, `admitted`, `parked`, and `resolving`.
+Live concurrency counts `claiming`, `dispatching`, `admitted`, `parked`, and
+`resolving`.
 
 ### Admission sequence
 
