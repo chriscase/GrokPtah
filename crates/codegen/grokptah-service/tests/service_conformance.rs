@@ -150,8 +150,7 @@ async fn named_device_credentials_share_agent_owner_and_attribute_runs() {
         "public persistent-agent projection must not expose ownerPrincipalId: {agent}"
     );
     assert_eq!(
-        agent["schemaVersion"],
-        "grokptah.coordinator.agent.v1",
+        agent["schemaVersion"], "grokptah.coordinator.agent.v1",
         "public persistent-agent projection must advertise the redacted coordinator schema"
     );
 
