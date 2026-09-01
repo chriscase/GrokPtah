@@ -407,7 +407,7 @@ fn assert_redacted_cu_projection(service: &ComputerUseService, run_id: &str, wor
             raw.contains(&grant.target.display_name),
             "raw grant lost target detail the projection grant must not copy as payload"
         );
-        let grant_projection = serde_json::to_value(&project_run_at(&run, Utc::now()))
+        let grant_projection = serde_json::to_value(project_run_at(&run, Utc::now()))
             .expect("projection value")
             .get("grant")
             .cloned()
