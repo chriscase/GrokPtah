@@ -863,13 +863,19 @@ impl RemoteServiceClient {
         let value = self
             .call_tool("ptah_list_persistent_agents", json!({}))
             .await?;
-        serde_json::from_value(
+        let agents: Vec<CoordinatorAgentView> = serde_json::from_value(
             value
                 .get("agents")
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("remote agent list omitted agents"))?,
         )
-        .context("decode remote persistent agents")
+        .context("decode remote persistent agents")?;
+        for agent in &agents {
+            agent
+                .validate()
+                .map_err(|error| anyhow::anyhow!("invalid remote coordinator agent: {error}"))?;
+        }
+        Ok(agents)
     }
 
     async fn list_sessions(&mut self) -> Result<Vec<RemoteSessionTarget>> {
@@ -954,6 +960,8 @@ impl RemoteServiceClient {
             .await?;
         let plan: CoordinatorResumePlanView = serde_json::from_value(plan)
             .context("decode remote persistent-agent checkpoint plan")?;
+        plan.validate()
+            .map_err(|error| anyhow::anyhow!("invalid remote coordinator resume plan: {error}"))?;
         Ok(plan.agent)
     }
 
@@ -974,7 +982,11 @@ impl RemoteServiceClient {
                 }),
             )
             .await?;
-        serde_json::from_value(value).context("decode remote resume plan")
+        let plan: CoordinatorResumePlanView =
+            serde_json::from_value(value).context("decode remote resume plan")?;
+        plan.validate()
+            .map_err(|error| anyhow::anyhow!("invalid remote coordinator resume plan: {error}"))?;
+        Ok(plan)
     }
 
     async fn workspace_for_session(&mut self, session_id: Uuid) -> Result<String> {
@@ -991,15 +1003,7 @@ impl RemoteServiceClient {
         agent: &CoordinatorAgentView,
     ) -> Result<(Uuid, String)> {
         let sessions = self.list_sessions().await?;
-        let mut candidates = Vec::with_capacity(agent.lane_ids.len() + 2);
-        if let Some(last_lane_id) = agent.last_lane_id {
-            candidates.push(last_lane_id);
-        }
-        candidates.extend(agent.lane_ids.iter().copied());
-        if !candidates.contains(&agent.session_id) {
-            candidates.push(agent.session_id);
-        }
-        candidates
+        preferred_agent_session_ids(agent)
             .into_iter()
             .find_map(|candidate| {
                 sessions
@@ -1710,6 +1714,20 @@ async fn replay_remote_events(
     }
 }
 
+fn preferred_agent_session_ids(agent: &CoordinatorAgentView) -> Vec<Uuid> {
+    let mut candidates = Vec::with_capacity(agent.lane_ids.len() + 2);
+    if let Some(last_lane_id) = agent.last_lane_id
+        && agent.lane_ids.contains(&last_lane_id)
+    {
+        candidates.push(last_lane_id);
+    }
+    candidates.extend(agent.lane_ids.iter().copied());
+    if !candidates.contains(&agent.session_id) {
+        candidates.push(agent.session_id);
+    }
+    candidates
+}
+
 fn normalize_base_url(value: &str) -> Result<String> {
     let parsed = Url::parse(value.trim()).context("remote service URL is invalid")?;
     match parsed.scheme() {
@@ -1775,6 +1793,7 @@ fn runtime_target_for_base_url(base_url: &str) -> RuntimeTarget {
 mod tests {
     use std::time::Duration;
 
+    use chrono::Utc;
     use grokptah_agent_bridge::{
         home_override_serial, set_grokptah_home_override, start_control_server,
         start_control_server_with_bind, AgentHost, ControlServerLimits, HostConfig, OrchStore,
@@ -1861,6 +1880,31 @@ mod tests {
         assert!(encoded_plan["agent"].get("ownerPrincipalId").is_none());
         assert!(encoded_plan["checkpoint"].get("workspace").is_none());
         assert!(encoded_plan["checkpoint"].get("contextHash").is_none());
+    }
+
+    #[test]
+    fn remote_agent_session_candidates_skip_detached_last_lane() {
+        let primary = uuid::Uuid::new_v4();
+        let detached = uuid::Uuid::new_v4();
+        let live = uuid::Uuid::new_v4();
+        let now = Utc::now();
+        let agent = CoordinatorAgentView {
+            schema_version: CoordinatorAgentView::SCHEMA_VERSION.into(),
+            agent_id: "agent-multi-lane".into(),
+            session_id: primary,
+            display_name: None,
+            role: None,
+            state: grokptah_agent_bridge::orchestration::AgentState::Waiting,
+            lane_ids: vec![live],
+            current_run_id: None,
+            last_run_id: None,
+            last_lane_id: Some(detached),
+            latest_checkpoint_id: None,
+            continuation_ordinal: 0,
+            created_at: now,
+            updated_at: now,
+        };
+        assert_eq!(preferred_agent_session_ids(&agent), vec![live, primary]);
     }
 
     #[test]

@@ -956,6 +956,27 @@ pub struct CoordinatorAgentView {
     pub updated_at: DateTime<Utc>,
 }
 
+impl CoordinatorAgentView {
+    pub const SCHEMA_VERSION: &'static str = "grokptah.coordinator.agent.v1";
+
+    pub fn validate(&self) -> Result<(), OrchError> {
+        if self.schema_version != Self::SCHEMA_VERSION {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "unsupported coordinator agent schema",
+            ));
+        }
+        validate_id(&self.agent_id, "agent_id")?;
+        if self.lane_ids.len() > 256 {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "coordinator agent Lane associations exceed their bound",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl From<&AgentRecord> for CoordinatorAgentView {
     fn from(agent: &AgentRecord) -> Self {
         let (display_name, role) = agent
@@ -970,7 +991,7 @@ impl From<&AgentRecord> for CoordinatorAgentView {
             .or_else(|| lane_ids.first().copied())
             .unwrap_or(agent.session_id);
         Self {
-            schema_version: "grokptah.coordinator.agent.v1".into(),
+            schema_version: Self::SCHEMA_VERSION.into(),
             agent_id: agent.agent_id.clone(),
             session_id,
             display_name,
@@ -1170,10 +1191,32 @@ pub struct CoordinatorCheckpointView {
     pub created_at: DateTime<Utc>,
 }
 
+impl CoordinatorCheckpointView {
+    pub const SCHEMA_VERSION: &'static str = "grokptah.coordinator.checkpoint.v1";
+
+    pub fn validate(&self) -> Result<(), OrchError> {
+        if self.schema_version != Self::SCHEMA_VERSION {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "unsupported coordinator checkpoint schema",
+            ));
+        }
+        validate_id(&self.checkpoint_id, "checkpoint_id")?;
+        validate_id(&self.agent_id, "agent_id")?;
+        validate_id(&self.run_id, "run_id")?;
+        validate_bounded_string(
+            &self.context_summary,
+            MAX_AGENT_CONTEXT_BYTES,
+            "context_summary",
+        )?;
+        Ok(())
+    }
+}
+
 impl From<&ContinuationCheckpoint> for CoordinatorCheckpointView {
     fn from(checkpoint: &ContinuationCheckpoint) -> Self {
         Self {
-            schema_version: "grokptah.coordinator.checkpoint.v1".into(),
+            schema_version: Self::SCHEMA_VERSION.into(),
             checkpoint_id: checkpoint.checkpoint_id.clone(),
             agent_id: checkpoint.agent_id.clone(),
             session_id: checkpoint.session_id,
@@ -1268,10 +1311,44 @@ pub struct CoordinatorResumePlanView {
     pub parent_run_id: String,
 }
 
+impl CoordinatorResumePlanView {
+    pub const SCHEMA_VERSION: &'static str = "grokptah.coordinator.resume-plan.v1";
+
+    pub fn validate(&self) -> Result<(), OrchError> {
+        if self.schema_version != Self::SCHEMA_VERSION {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "unsupported coordinator resume-plan schema",
+            ));
+        }
+        self.agent.validate()?;
+        self.checkpoint.validate()?;
+        if self.agent.agent_id != self.checkpoint.agent_id {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "coordinator resume-plan agent binding is invalid",
+            ));
+        }
+        if self.agent.latest_checkpoint_id.as_deref() != Some(self.checkpoint.checkpoint_id.as_str()) {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "coordinator resume-plan checkpoint binding is invalid",
+            ));
+        }
+        if self.parent_run_id != self.checkpoint.run_id {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "coordinator resume-plan run binding is invalid",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl From<&AgentResumePlan> for CoordinatorResumePlanView {
     fn from(plan: &AgentResumePlan) -> Self {
         Self {
-            schema_version: "grokptah.coordinator.resume-plan.v1".into(),
+            schema_version: Self::SCHEMA_VERSION.into(),
             agent: CoordinatorAgentView::from(&plan.agent),
             checkpoint: CoordinatorCheckpointView::from(&plan.checkpoint),
             parent_run_id: plan.parent_run_id.clone(),

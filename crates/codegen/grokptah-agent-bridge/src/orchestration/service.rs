@@ -6429,16 +6429,16 @@ impl OrchestrationService {
         {
             return Err(OrchError::new(
                 OrchErrorCode::ForbiddenScope,
-                "persistent agent is not owned by this service account",
+                "persistent agent is not available in the requested scope",
             ));
         }
         let agent = if claim_owner {
             self.store
                 .claim_agent_owner(&agent.agent_id, &auth.owner_id)
-                .map_err(|error| {
+                .map_err(|_error| {
                     OrchError::new(
                         OrchErrorCode::ForbiddenScope,
-                        format!("persistent agent is not owned by this service account: {error}"),
+                        "persistent agent is not available in the requested scope",
                     )
                 })?
                 .ok_or_else(|| {
