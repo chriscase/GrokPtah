@@ -613,6 +613,7 @@ async fn prove_adaptive_invariants(
 }
 
 async fn host_cu_runs(
+    computer_root: &Path,
     lane_id: Uuid,
     workspace: &Path,
     profile: AdaptiveProfile,
@@ -624,10 +625,9 @@ async fn host_cu_runs(
     serde_json::Value,
     serde_json::Value,
 ) {
-    let cu_dir = tempfile::tempdir().expect("cu store");
     let binding = canonical_workspace_string(workspace).expect("canonical workspace");
     let backend = Arc::new(DogfoodBackend::new());
-    let store = ComputerStore::open(cu_dir.path()).expect("open cu store");
+    let store = ComputerStore::open(computer_root).expect("open cu store");
     let reads = ComputerRunReads::new(store.clone());
     let service = ComputerUseService::new(backend.clone(), store);
 
@@ -696,7 +696,7 @@ async fn host_cu_runs(
     drop(backend);
 
     let backend = Arc::new(DogfoodBackend::new());
-    let store = ComputerStore::open(cu_dir.path()).expect("reopen cu store");
+    let store = ComputerStore::open(computer_root).expect("reopen cu store");
     let service = ComputerUseService::new(backend.clone(), store);
     let recovered = service
         .project_session_run(lane_id, &original_id, Utc::now())
@@ -1044,6 +1044,8 @@ async fn run_profile(
         .expect("lease token")
         .to_string();
 
+    let computer_root = host.runtime_home().computer_root();
+
     let (
         original_run_id,
         successor_run_id,
@@ -1051,7 +1053,7 @@ async fn run_profile(
         successor_live_projection,
         original_projection,
         successor_projection,
-    ) = host_cu_runs(lane.id, workspace.path(), profile).await;
+    ) = host_cu_runs(&computer_root, lane.id, workspace.path(), profile).await;
     let completed = orch
         .complete_work(
             &auth(),
@@ -1254,44 +1256,9 @@ async fn run_profile(
     assert!(!report_text.contains("DOGFOOD.txt"));
 
     // The report above is assembled from the same projections used by the
-    // public MCP reads. Exercise that transport boundary against a complete
-    // canonical service lifecycle in the host-owned ledger: MCP must read
-    // the same authorized/observed/acted run, not a sidecar fixture store.
-    let public_store = host.ensure_computer_store().expect("public CU store");
-    let public_backend = Arc::new(DogfoodBackend::new());
-    let public_service = ComputerUseService::new(public_backend.clone(), public_store);
-    let public_run = public_service
-        .create_run(
-            "public-mcp-create",
-            lane.id,
-            Some(canonical_workspace_string(workspace.path()).expect("public workspace")),
-            SimulatorBackend::demo_target(),
-            ComputerUseLimits::default(),
-        )
-        .expect("public MCP projection run");
-    let public_run = public_service
-        .authorize(
-            "public-mcp-authorize",
-            &public_run.run_id,
-            public_run.version,
-            grant(&public_run),
-        )
-        .expect("public MCP authorize");
-    let (public_run, public_observation) =
-        observe(&public_service, &public_run, "public-mcp-observe").await;
-    public_service
-        .act_with_plan(
-            "public-mcp-act",
-            &public_run.run_id,
-            public_run.version,
-            &public_observation.observation_id,
-            set_name(&public_observation),
-            claim(profile, &public_run, public_observation.sequence),
-        )
-        .await
-        .expect("public MCP canonical action");
-    assert_eq!(public_backend.action_calls(), 1);
-    assert_redacted_cu_projection(&public_service, &public_run.run_id, workspace);
+    // public MCP reads. The canonical CU runs live in the host-owned ledger,
+    // so the control plane below reads the original interrupted run and the
+    // successor that was explicitly reauthorized and completed.
     let public_server = start_control_server(orch.clone(), 0)
         .await
         .expect("public MCP control server");
@@ -1312,10 +1279,15 @@ async fn run_profile(
     let listed_runs = listed["result"]["structuredContent"]["runs"]
         .as_array()
         .expect("public MCP run list");
-    assert_eq!(listed_runs.len(), 1);
-    assert_eq!(listed_runs[0]["runId"], public_run.run_id.as_str());
+    assert_eq!(listed_runs.len(), 2);
+    let listed_ids: BTreeSet<&str> = listed_runs
+        .iter()
+        .filter_map(|run| run["runId"].as_str())
+        .collect();
+    assert!(listed_ids.contains(original_run_id.as_str()));
+    assert!(listed_ids.contains(successor_run_id.as_str()));
 
-    let (status, fetched) = public_mcp_tool(
+    let (status, interrupted_fetch) = public_mcp_tool(
         &public_client,
         &public_url,
         201,
@@ -1323,14 +1295,16 @@ async fn run_profile(
         serde_json::json!({
             "session_id": lane.id,
             "workspace": workspace.path(),
-            "run_id": public_run.run_id,
+            "run_id": original_run_id,
         }),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let fetched_projection = &fetched["result"]["structuredContent"];
-    assert_eq!(fetched_projection["runId"], public_run.run_id.as_str());
-    let fetched_text = serde_json::to_string(fetched_projection).expect("public MCP projection");
+    let interrupted_projection = &interrupted_fetch["result"]["structuredContent"];
+    assert_eq!(interrupted_projection["runId"], original_run_id);
+    assert_eq!(interrupted_projection["state"], "interrupted");
+    let interrupted_text =
+        serde_json::to_string(interrupted_projection).expect("interrupted MCP projection");
     for forbidden in [
         workspace.path().to_str().unwrap(),
         "currentObservation",
@@ -1338,15 +1312,49 @@ async fn run_profile(
         "opaque-test-credential",
     ] {
         assert!(
-            !fetched_text.contains(forbidden),
-            "public MCP projection leaked {forbidden}: {fetched_text}"
+            !interrupted_text.contains(forbidden),
+            "interrupted public MCP projection leaked {forbidden}: {interrupted_text}"
+        );
+    }
+
+    let (status, successor_fetch) = public_mcp_tool(
+        &public_client,
+        &public_url,
+        202,
+        "ptah_get_computer_run",
+        serde_json::json!({
+            "session_id": lane.id,
+            "workspace": workspace.path(),
+            "run_id": successor_run_id,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let successor_projection = &successor_fetch["result"]["structuredContent"];
+    assert_eq!(successor_projection["runId"], successor_run_id);
+    assert_eq!(successor_projection["state"], "completed");
+    assert!(
+        successor_projection["observation"].is_object(),
+        "successor MCP projection lost the observed fixture"
+    );
+    let successor_text =
+        serde_json::to_string(successor_projection).expect("successor MCP projection");
+    for forbidden in [
+        workspace.path().to_str().unwrap(),
+        "currentObservation",
+        "leaseToken",
+        "opaque-test-credential",
+    ] {
+        assert!(
+            !successor_text.contains(forbidden),
+            "successor public MCP projection leaked {forbidden}: {successor_text}"
         );
     }
 
     let (status, graph_wire) = public_mcp_tool(
         &public_client,
         &public_url,
-        202,
+        203,
         "ptah_get_work_graph",
         serde_json::json!({
             "session_id": lane.id,
@@ -1361,36 +1369,36 @@ async fn run_profile(
     assert!(!graph_text.contains(workspace.path().to_str().unwrap()));
 
     // Scope errors must be indistinguishable on the actual wire, including
-    // a same-workspace cross-lane read, a foreign workspace, and an unknown
-    // run id. These calls remain read-only and must not expose existence.
+    // a same-workspace cross-lane read and an unknown run id. A foreign
+    // workspace is rejected by the earlier workspace allowlist gate.
     let (_, cross_lane) = public_mcp_tool(
         &public_client,
         &public_url,
-        203,
+        204,
         "ptah_get_computer_run",
         serde_json::json!({
             "session_id": other_lane.id,
             "workspace": workspace.path(),
-            "run_id": public_run.run_id,
+            "run_id": successor_run_id,
         }),
     )
     .await;
     let (_, foreign_scope) = public_mcp_tool(
         &public_client,
         &public_url,
-        204,
+        205,
         "ptah_get_computer_run",
         serde_json::json!({
             "session_id": lane.id,
             "workspace": foreign.path(),
-            "run_id": public_run.run_id,
+            "run_id": successor_run_id,
         }),
     )
     .await;
     let (_, unknown_run) = public_mcp_tool(
         &public_client,
         &public_url,
-        205,
+        206,
         "ptah_get_computer_run",
         serde_json::json!({
             "session_id": lane.id,
@@ -1400,51 +1408,11 @@ async fn run_profile(
     )
     .await;
     assert_eq!(cross_lane["error"]["data"]["code"], "forbidden_scope");
-    assert_eq!(cross_lane, foreign_scope);
-    assert_eq!(cross_lane, unknown_run);
+    // JSON-RPC request ids are intentionally different; compare the complete
+    // error object so only the scoped failure vocabulary is required to match.
+    assert_eq!(cross_lane["error"], unknown_run["error"]);
+    assert_eq!(foreign_scope["error"]["data"]["code"], "workspace_mismatch");
 
-    // Complete the same service-owned run and read it again through MCP so
-    // the transport proof covers the terminal projection too.
-    let public_run = public_service
-        .get_run(&public_run.run_id)
-        .expect("public MCP completion load")
-        .expect("public MCP run exists");
-    let completed = public_service
-        .complete(
-            "public-mcp-complete",
-            &public_run.run_id,
-            public_run.version,
-        )
-        .expect("public MCP canonical completion");
-    assert_eq!(completed.state, ComputerRunState::Completed);
-    let (status, completed_fetch) = public_mcp_tool(
-        &public_client,
-        &public_url,
-        206,
-        "ptah_get_computer_run",
-        serde_json::json!({
-            "session_id": lane.id,
-            "workspace": workspace.path(),
-            "run_id": completed.run_id,
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let completed_projection = &completed_fetch["result"]["structuredContent"];
-    assert_eq!(completed_projection["runId"], completed.run_id);
-    assert_eq!(completed_projection["state"], "completed");
-    let completed_text = serde_json::to_string(&completed_fetch).expect("completed MCP projection");
-    for forbidden in [
-        workspace.path().to_str().unwrap(),
-        "currentObservation",
-        "leaseToken",
-        "opaque-test-credential",
-    ] {
-        assert!(
-            !completed_text.contains(forbidden),
-            "completed public MCP projection leaked {forbidden}: {completed_text}"
-        );
-    }
     // Exercise both operator outcomes across the two profiles: Economy keeps
     // the bounded proposal via the approval gate, while High Assurance rejects
     // it through the durable Work failure path. Neither outcome can promote
@@ -1582,7 +1550,6 @@ async fn run_profile(
         "public MCP server shutdown: {:?}",
         stop_report.errors
     );
-    drop(public_service);
 
     orch.stop_background_tasks().await;
     let shutdown = host.shutdown().await;
