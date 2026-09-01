@@ -1748,7 +1748,7 @@
         {
           "entity": "work",
           "from": "queued",
-          "to": "succeeded"
+          "to": "review"
         },
         {
           "entity": "run",

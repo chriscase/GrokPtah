@@ -749,7 +749,7 @@ async fn native_work_to_run(
             )
             .await?;
         match snapshot["work"]["state"].as_str() {
-            Some("succeeded") => {
+            Some("succeeded" | "review") => {
                 final_work = Some(snapshot);
                 break;
             }
@@ -769,14 +769,26 @@ async fn native_work_to_run(
             .filter(|value| value.as_str() == Some(run_id.as_str()))
             .count()
     });
-    if final_work["work"]["state"].as_str() != Some("succeeded") || linked_count != 1 {
+    let final_state = final_work["work"]["state"]
+        .as_str()
+        .ok_or(DiagnosticCode::McpResultMalformed)?;
+    if !matches!(final_state, "succeeded" | "review") || linked_count != 1 {
+        return Err(DiagnosticCode::StateTransitionMismatch);
+    }
+    if final_state == "review"
+        && final_work["work"]["result"]["verification"]["status"].as_str() != Some("unverified")
+    {
         return Err(DiagnosticCode::StateTransitionMismatch);
     }
     probe.provider_run = Some(provider_run_from_value(&agent, &run)?);
     probe.transition(
         EntityKind::Work,
         DurableStateCode::Queued,
-        DurableStateCode::Succeeded,
+        if final_state == "review" {
+            DurableStateCode::Review
+        } else {
+            DurableStateCode::Succeeded
+        },
         Some(&work_id),
     );
     probe.transition(
@@ -1455,7 +1467,15 @@ async fn native_no_duplicate_run(
             .filter(|value| value.as_str() == Some(run_id.as_str()))
             .count()
     });
-    if work["work"]["state"].as_str() != Some("succeeded") || linked_count != 1 {
+    let work_state = work["work"]["state"]
+        .as_str()
+        .ok_or(DiagnosticCode::McpResultMalformed)?;
+    if !matches!(work_state, "succeeded" | "review") || linked_count != 1 {
+        return Err(DiagnosticCode::StateTransitionMismatch);
+    }
+    if work_state == "review"
+        && work["work"]["result"]["verification"]["status"].as_str() != Some("unverified")
+    {
         return Err(DiagnosticCode::StateTransitionMismatch);
     }
     let work_set = probe
@@ -3903,7 +3923,9 @@ async fn wait_for_work_terminal(
             )
             .await?;
         match work["work"]["state"].as_str() {
-            Some("succeeded" | "failed" | "cancelled" | "awaiting_approval") => return Ok(work),
+            Some("succeeded" | "failed" | "cancelled" | "awaiting_approval" | "review") => {
+                return Ok(work)
+            }
             Some("queued" | "leased" | "running" | "awaiting_input") => {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
