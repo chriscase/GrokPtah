@@ -1451,7 +1451,6 @@ async fn resolve_work_input_uses_real_host_pending() {
         RunState::Running,
         "native-token-308",
     );
-    let _ = intent;
     let (req, rx) = host
         .begin_pending_permission(
             lane.id,
@@ -1465,6 +1464,31 @@ async fn resolve_work_input_uses_real_host_pending() {
         request: req.clone(),
     })
     .await;
+    let outbox = client
+        .call_tool(
+            "ptah_list_outbox",
+            json!({
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "agent_id": agent.agent_id,
+                "after_seq": 0
+            }),
+        )
+        .await
+        .unwrap();
+    let question = outbox.structured["messages"]
+        .as_array()
+        .and_then(|messages| {
+            messages.iter().find(|message| {
+                message["payload"]["permissionId"].as_str() == Some(req.id.to_string().as_str())
+            })
+        })
+        .expect("permission question is visible on the bound Agent outbox");
+    assert_eq!(question["kind"], "question");
+    assert_eq!(question["fromAgentId"], agent.agent_id);
+    assert_eq!(question["workId"], item.work_id);
+    assert_eq!(question["attemptId"], intent.attempt_id.unwrap());
+    assert_eq!(question["runId"], run.run_id);
     let allowed = client
         .call_tool(
             "ptah_resolve_work_input",

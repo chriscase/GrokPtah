@@ -1238,39 +1238,43 @@ impl OrchestrationService {
             intent.permission_request_id = Some(request.id.to_string());
             intent.updated_at = Utc::now();
             let _ = self.store.save_managed_intent(&intent);
-            let _ = self.store.send_message(
+            let question = super::message::WorkMessage::new(
+                MessageKind::Question,
+                "native-executor",
+                Some(intent.agent_id.clone()),
+                None,
+                intent.session_id,
+                intent.workspace.clone(),
+                Some(intent.work_id.clone()),
+                reason,
+                Some(json!({
+                    "permissionId": request.id,
+                    "toolName": request.tool_name,
+                    "runId": run_id,
+                })),
+                Utc::now(),
+            )
+            .map(|mut message| {
+                message.attempt_id = Some(attempt_id.clone());
+                message.run_id = Some(run_id.clone());
+                message
+            })
+            .unwrap_or_else(|_| {
                 super::message::WorkMessage::new(
-                    MessageKind::Question,
+                    MessageKind::Informational,
                     "native-executor",
-                    Some(intent.agent_id.clone()),
+                    None,
                     None,
                     intent.session_id,
                     intent.workspace.clone(),
                     Some(intent.work_id.clone()),
-                    reason,
-                    Some(json!({
-                        "permissionId": request.id,
-                        "toolName": request.tool_name,
-                        "runId": run_id,
-                    })),
+                    "permission required",
+                    None,
                     Utc::now(),
                 )
-                .unwrap_or_else(|_| {
-                    super::message::WorkMessage::new(
-                        MessageKind::Informational,
-                        "native-executor",
-                        None,
-                        None,
-                        intent.session_id,
-                        intent.workspace.clone(),
-                        Some(intent.work_id.clone()),
-                        "permission required",
-                        None,
-                        Utc::now(),
-                    )
-                    .expect("informational fallback")
-                }),
-            );
+                .expect("informational fallback")
+            });
+            let _ = self.store.send_message(question);
         }
     }
 
