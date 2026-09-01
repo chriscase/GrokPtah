@@ -228,13 +228,21 @@ pub(crate) fn discard(source: &Path, worktree: &Path) -> Result<()> {
 
 pub(crate) fn validate_worktree_path(worktree: &Path) -> Result<()> {
     let worktree = dunce::canonicalize(worktree).context("canonicalize run worktree")?;
-    if !worktree.join(".git").is_file() {
+    let dot_git = worktree.join(".git");
+    let metadata = fs::symlink_metadata(&dot_git).context("read isolated Git metadata")?;
+    if metadata.file_type().is_file() {
+        let git_dir = fs::read_to_string(&dot_git).context("read isolated worktree metadata")?;
+        if !git_dir.contains("worktrees") {
+            bail!("isolated run path is not a Git worktree");
+        }
+    } else if metadata.file_type().is_dir() {
+        let private_git =
+            dunce::canonicalize(&dot_git).context("canonicalize private isolated Git directory")?;
+        if !private_git.starts_with(&worktree) || private_git.join("commondir").exists() {
+            bail!("private isolated Git directory is not self-contained");
+        }
+    } else {
         bail!("isolated run worktree is unavailable");
-    }
-    let git_dir =
-        fs::read_to_string(worktree.join(".git")).context("read isolated worktree metadata")?;
-    if !git_dir.contains("worktrees") {
-        bail!("isolated run path is not a Git worktree");
     }
     Ok(())
 }

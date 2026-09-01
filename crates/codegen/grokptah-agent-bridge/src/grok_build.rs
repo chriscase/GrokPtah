@@ -47,6 +47,14 @@ const AUTH_FILE_NAME: &str = "auth.json";
 const PROMPT_FILE_NAME: &str = "prompt";
 const CONFIG_FILE_NAME: &str = "config.toml";
 const SANDBOX_FILE_NAME: &str = "sandbox.toml";
+#[cfg(target_os = "macos")]
+const MACOS_MUTATION_SANDBOX: &str = r#"(version 1)
+(allow default)
+(deny file-write*)
+(allow file-write*
+  (subpath (param "ISOLATE_ROOT"))
+  (literal "/dev/null"))
+"#;
 
 const VERDICT_CLEAN: &[u8] = b"GROK_BUILD_VERDICT=clean";
 const VERDICT_FINDINGS: &[u8] = b"GROK_BUILD_VERDICT=findings";
@@ -139,6 +147,7 @@ impl GrokBuildHostLaunchConfig {
         require_absolute_file_path(&self.git_executable)?;
         require_absolute_dir(&self.cwd)?;
         require_absolute_dir(&self.isolate_parent)?;
+        validate_isolation_boundary(&self.cwd, &self.isolate_parent)?;
         if self.repository_id.is_empty() || self.base_ref.is_empty() {
             return Err(GrokBuildAdapterError::InvalidRequest);
         }
@@ -366,13 +375,16 @@ pub async fn launch_grok_build(
     if cancel.is_cancelled() {
         return Err(GrokBuildAdapterError::Cancelled);
     }
+    let isolation_scope = IsolatedScope::acquire(&host.isolate_parent)?;
     let source_fingerprint =
         crate::run_promotion::fingerprint_at(&host.cwd, &launch.identity.head_sha)
             .map_err(|_| GrokBuildAdapterError::IsolationFailed)?;
+    let source_control_fingerprint = repository_control_fingerprint(host).await?;
     let checkout = IsolatedCheckout::create(launch, host, cancel.clone()).await?;
     let execution_host = checkout.execution_host(host);
 
     let lease = credentials.resolve(&launch.credential_lease_id)?;
+    validate_credential_boundary(&lease.location, &host.isolate_parent)?;
     let isolated = IsolatedHome::create(&host.isolate_parent)?;
     isolated.write_minimal_config()?;
     isolated.install_prompt(&host.prompt)?;
@@ -389,10 +401,18 @@ pub async fn launch_grok_build(
     // Close the inspect-to-launch window against an externally changed ref or
     // newly introduced project-local compatibility surface.
     gate_git_identity(launch, host, cancel.clone()).await?;
+    verify_source_repository_unchanged(
+        host,
+        &launch.identity.head_sha,
+        &source_fingerprint,
+        &source_control_fingerprint,
+    )
+    .await?;
     gate_detached_checkout_identity(launch, &execution_host, cancel.clone()).await?;
+    checkout.verify_control_state(&execution_host).await?;
 
     if cancel.is_cancelled() {
-        let _ = checkout.cleanup(host).await;
+        let _ = checkout.cleanup().await;
         return Err(GrokBuildAdapterError::Cancelled);
     }
 
@@ -402,11 +422,14 @@ pub async fn launch_grok_build(
         execution_host: &execution_host,
         checkout: &checkout,
         source_fingerprint: &source_fingerprint,
+        source_control_fingerprint: &source_control_fingerprint,
         isolated: &isolated,
         credentials,
         session_id: &session_id,
     };
-    execute_allowlisted(launch, execution, cancel).await
+    let outcome = execute_allowlisted(launch, execution, cancel).await;
+    drop(isolation_scope);
+    outcome
 }
 
 fn map_contract(err: GrokBuildContractError) -> GrokBuildAdapterError {
@@ -422,9 +445,10 @@ fn permission_flag(mode: GrokBuildMutationMode) -> &'static str {
         GrokBuildMutationMode::ReadOnly => "plan",
         // `acceptEdits` still prompts for the write tool in Grok 1.0.13 and
         // headless stdin is deliberately closed. The host maps an explicit,
-        // revision-bound Work approval into this noninteractive mode; the OS
-        // workspace sandbox, empty inherited environment, no-remote gate,
-        // sealed prompt, and exact post-run mutation allowlist remain active.
+        // revision-bound Work approval into this noninteractive mode. This CLI
+        // flag is not isolation authority: the host separately enforces an OS
+        // write sandbox, a private Git directory, an empty inherited
+        // environment, a no-remote gate, and an exact post-run allowlist.
         GrokBuildMutationMode::IsolatedReview => "bypassPermissions",
     }
 }
@@ -467,8 +491,40 @@ fn allowlisted_env(grok_home: &Path) -> Result<Vec<(String, String)>, GrokBuildA
     Ok(vec![
         ("GROK_HOME".to_string(), home.to_string()),
         ("HOME".to_string(), home.to_string()),
+        ("TMPDIR".to_string(), home.to_string()),
         ("PATH".to_string(), BOUNDED_PATH.to_string()),
     ])
+}
+
+#[cfg(target_os = "macos")]
+fn mutation_sandbox_command(
+    host: &GrokBuildHostLaunchConfig,
+    args: &[String],
+) -> Result<Command, GrokBuildAdapterError> {
+    let sandbox = Path::new("/usr/bin/sandbox-exec");
+    require_absolute_file_path(sandbox)?;
+    let isolate_root = dunce::canonicalize(&host.isolate_parent)
+        .map_err(|_| GrokBuildAdapterError::IsolationFailed)?;
+    let isolate_root = isolate_root
+        .to_str()
+        .ok_or(GrokBuildAdapterError::IsolationFailed)?;
+    let mut command = Command::new(sandbox);
+    command
+        .arg("-p")
+        .arg(MACOS_MUTATION_SANDBOX)
+        .arg("-D")
+        .arg(format!("ISOLATE_ROOT={isolate_root}"))
+        .arg(&host.executable)
+        .args(args);
+    Ok(command)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn mutation_sandbox_command(
+    _host: &GrokBuildHostLaunchConfig,
+    _args: &[String],
+) -> Result<Command, GrokBuildAdapterError> {
+    Err(GrokBuildAdapterError::IsolationFailed)
 }
 
 struct IsolatedHome {
@@ -476,15 +532,47 @@ struct IsolatedHome {
     cleanup_on_drop: AtomicBool,
 }
 
-/// A detached Git worktree that contains every byte the untrusted child may
-/// mutate. The authoritative Work checkout is not passed to the child and is
-/// changed only after a complete advisory has been verified and the child
-/// process tree is known to be gone.
+struct IsolatedScope {
+    lock_path: PathBuf,
+}
+
+impl IsolatedScope {
+    fn acquire(parent: &Path) -> Result<Self, GrokBuildAdapterError> {
+        validate_isolate_parent(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = std::fs::symlink_metadata(parent)
+                .map_err(|_| GrokBuildAdapterError::IsolationFailed)?;
+            if metadata.mode() & 0o077 != 0 {
+                return Err(GrokBuildAdapterError::IsolationFailed);
+            }
+        }
+        let mut entries =
+            std::fs::read_dir(parent).map_err(|_| GrokBuildAdapterError::IsolationFailed)?;
+        if entries.next().is_some() {
+            return Err(GrokBuildAdapterError::IsolationFailed);
+        }
+        let lock_path = parent.join(".grokptah-isolation-scope");
+        write_private_file(&lock_path, b"grokptah-isolation-scope-v1\n")?;
+        Ok(Self { lock_path })
+    }
+}
+
+impl Drop for IsolatedScope {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.lock_path);
+    }
+}
+
+/// A self-contained private clone with no shared Git directory or remote.
+/// The untrusted child is additionally confined by a host-observed OS write
+/// sandbox. The authoritative Work checkout is changed only after a complete
+/// advisory has been verified and the child process tree is known to be gone.
 struct IsolatedCheckout {
-    source: PathBuf,
-    git_executable: PathBuf,
     path: PathBuf,
-    registered: AtomicBool,
+    control_fingerprint: String,
+    cleanup_on_drop: AtomicBool,
 }
 
 impl IsolatedCheckout {
@@ -494,41 +582,71 @@ impl IsolatedCheckout {
         cancel: CancellationToken,
     ) -> Result<Self, GrokBuildAdapterError> {
         validate_isolate_parent(&host.isolate_parent)?;
+        validate_isolation_boundary(&host.cwd, &host.isolate_parent)?;
         let path = host
             .isolate_parent
             .join(format!("gw-{}", Uuid::new_v4().simple()));
+        let source =
+            dunce::canonicalize(&host.cwd).map_err(|_| GrokBuildAdapterError::IsolationFailed)?;
+        let source_str = source
+            .to_str()
+            .ok_or(GrokBuildAdapterError::IsolationFailed)?;
         let path_str = path
             .to_str()
             .ok_or(GrokBuildAdapterError::IsolationFailed)?;
         git_status_ok(
             host,
             &[
-                "worktree",
-                "add",
-                "--detach",
-                "--no-guess-remote",
+                "clone",
+                "--no-local",
+                "--no-hardlinks",
+                "--no-checkout",
+                "--no-tags",
+                "--",
+                source_str,
                 path_str,
-                &launch.identity.head_sha,
             ],
             cancel.clone(),
         )
         .await
         .map_err(|_| GrokBuildAdapterError::IsolationFailed)?;
         set_private_dir_permissions(&path)?;
-        let checkout = Self {
-            source: host.cwd.clone(),
-            git_executable: host.git_executable.clone(),
+        let mut checkout = Self {
             path,
-            registered: AtomicBool::new(true),
+            control_fingerprint: String::new(),
+            cleanup_on_drop: AtomicBool::new(true),
         };
         let execution_host = checkout.execution_host(host);
-        if gate_detached_checkout_identity(launch, &execution_host, cancel)
-            .await
-            .is_err()
-        {
-            let _ = checkout.cleanup(host).await;
-            return Err(GrokBuildAdapterError::IsolationFailed);
+        let prepared = async {
+            git_status_ok(
+                &execution_host,
+                &["config", "--local", "core.hooksPath", "/dev/null"],
+                cancel.clone(),
+            )
+            .await?;
+            git_status_ok(
+                &execution_host,
+                &["remote", "remove", "origin"],
+                cancel.clone(),
+            )
+            .await?;
+            git_status_ok(
+                &execution_host,
+                &["checkout", "--detach", "--force", &launch.identity.head_sha],
+                cancel.clone(),
+            )
+            .await?;
+            gate_private_repository(&execution_host, cancel.clone()).await?;
+            gate_no_publish_remote(launch, &execution_host, cancel.clone()).await?;
+            gate_detached_checkout_identity(launch, &execution_host, cancel.clone()).await?;
+            repository_control_fingerprint(&execution_host).await
         }
+        .await;
+        let Ok(control_fingerprint) = prepared else {
+            let _ = checkout.cleanup().await;
+            return Err(GrokBuildAdapterError::IsolationFailed);
+        };
+        checkout.control_fingerprint = control_fingerprint;
         Ok(checkout)
     }
 
@@ -538,63 +656,41 @@ impl IsolatedCheckout {
         host
     }
 
-    async fn cleanup(&self, source: &GrokBuildHostLaunchConfig) -> bool {
-        if !self.registered.load(Ordering::Acquire) {
+    async fn verify_control_state(
+        &self,
+        host: &GrokBuildHostLaunchConfig,
+    ) -> Result<(), GrokBuildAdapterError> {
+        gate_private_repository(host, CancellationToken::new()).await?;
+        if repository_control_fingerprint(host).await? != self.control_fingerprint {
+            return Err(GrokBuildAdapterError::IsolationFailed);
+        }
+        Ok(())
+    }
+
+    async fn cleanup(&self) -> bool {
+        if !self.cleanup_on_drop.load(Ordering::Acquire) {
             return true;
         }
-        let Some(path) = self.path.to_str() else {
-            return false;
-        };
-        let cleaned = git_status_ok(
-            source,
-            &["worktree", "remove", "--force", path],
-            CancellationToken::new(),
-        )
-        .await
-        .is_ok()
-            && !self.path.exists();
+        let cleaned = std::fs::remove_dir_all(&self.path).is_ok() && !self.path.exists();
         if cleaned {
-            self.registered.store(false, Ordering::Release);
+            self.cleanup_on_drop.store(false, Ordering::Release);
         }
         cleaned
     }
 
-    /// A possibly live child still owns this checkout. Keep it registered and
+    /// A possibly live child still owns this checkout. Keep it quarantined and
     /// on disk for later owner-verified reclamation; most importantly, never
     /// let Drop race the unproved process tree.
     fn quarantine(&self) {
-        self.registered.store(false, Ordering::Release);
+        self.cleanup_on_drop.store(false, Ordering::Release);
     }
 }
 
 impl Drop for IsolatedCheckout {
     fn drop(&mut self) {
-        if !self.registered.load(Ordering::Acquire) {
-            return;
+        if self.cleanup_on_drop.load(Ordering::Acquire) {
+            let _ = std::fs::remove_dir_all(&self.path);
         }
-        let mut command = std::process::Command::new(&self.git_executable);
-        command
-            .current_dir(&self.source)
-            .env_clear()
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("PATH", BOUNDED_PATH)
-            .args([
-                "--no-replace-objects",
-                "--no-optional-locks",
-                "-c",
-                "core.hooksPath=/dev/null",
-                "worktree",
-                "remove",
-                "--force",
-            ])
-            .arg(&self.path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let _ = command.status();
     }
 }
 
@@ -714,6 +810,33 @@ fn validate_isolate_parent(parent: &Path) -> Result<(), GrokBuildAdapterError> {
     Ok(())
 }
 
+fn validate_credential_boundary(
+    credential: &Path,
+    isolate_parent: &Path,
+) -> Result<(), GrokBuildAdapterError> {
+    let credential =
+        dunce::canonicalize(credential).map_err(|_| GrokBuildAdapterError::CredentialLease)?;
+    let isolate_parent =
+        dunce::canonicalize(isolate_parent).map_err(|_| GrokBuildAdapterError::IsolationFailed)?;
+    if credential.starts_with(isolate_parent) {
+        return Err(GrokBuildAdapterError::CredentialLease);
+    }
+    Ok(())
+}
+
+fn validate_isolation_boundary(
+    source: &Path,
+    isolate_parent: &Path,
+) -> Result<(), GrokBuildAdapterError> {
+    let source = dunce::canonicalize(source).map_err(|_| GrokBuildAdapterError::IsolationFailed)?;
+    let isolate_parent =
+        dunce::canonicalize(isolate_parent).map_err(|_| GrokBuildAdapterError::IsolationFailed)?;
+    if source.starts_with(&isolate_parent) || isolate_parent.starts_with(&source) {
+        return Err(GrokBuildAdapterError::IsolationFailed);
+    }
+    Ok(())
+}
+
 fn write_private_file(path: &Path, contents: &[u8]) -> Result<(), GrokBuildAdapterError> {
     let mut file = create_private_file(path).map_err(|_| GrokBuildAdapterError::IsolationFailed)?;
     file.write_all(contents)
@@ -727,7 +850,9 @@ fn create_private_file(path: &Path) -> io::Result<std::fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600).custom_flags(libc::O_CLOEXEC);
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
     }
     options.open(path)
 }
@@ -1273,11 +1398,180 @@ async fn gate_no_publish_remote(
     Ok(())
 }
 
+async fn gate_private_repository(
+    host: &GrokBuildHostLaunchConfig,
+    cancel: CancellationToken,
+) -> Result<(), GrokBuildAdapterError> {
+    let root =
+        dunce::canonicalize(&host.cwd).map_err(|_| GrokBuildAdapterError::IsolationFailed)?;
+    let git_dir = git_stdout(
+        host,
+        &["rev-parse", "--path-format=absolute", "--git-dir"],
+        cancel.clone(),
+    )
+    .await?;
+    let common_dir = git_stdout(
+        host,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        cancel.clone(),
+    )
+    .await?;
+    let git_dir = dunce::canonicalize(bytes_to_trimmed_path(&git_dir)?)
+        .map_err(|_| GrokBuildAdapterError::IsolationFailed)?;
+    let common_dir = dunce::canonicalize(bytes_to_trimmed_path(&common_dir)?)
+        .map_err(|_| GrokBuildAdapterError::IsolationFailed)?;
+    if git_dir != common_dir
+        || !git_dir.starts_with(&root)
+        || git_dir.join("commondir").exists()
+        || !git_dir.is_dir()
+    {
+        return Err(GrokBuildAdapterError::IsolationFailed);
+    }
+    let hooks = git_stdout(
+        host,
+        &["config", "--local", "--get", "core.hooksPath"],
+        cancel.clone(),
+    )
+    .await?;
+    if bytes_to_trimmed_str(&hooks)? != "/dev/null" {
+        return Err(GrokBuildAdapterError::IsolationFailed);
+    }
+    let remotes = git_stdout(host, &["remote"], cancel).await?;
+    if !bytes_to_trimmed_str(&remotes)?.is_empty() {
+        return Err(GrokBuildAdapterError::IsolationFailed);
+    }
+    Ok(())
+}
+
+async fn repository_control_fingerprint(
+    host: &GrokBuildHostLaunchConfig,
+) -> Result<String, GrokBuildAdapterError> {
+    let cancel = CancellationToken::new();
+    let refs = git_stdout(
+        host,
+        &[
+            "for-each-ref",
+            "--sort=refname",
+            "--format=%(refname)%00%(objectname)%00%(symref)%00",
+        ],
+        cancel.clone(),
+    )
+    .await?;
+    let config = git_stdout(
+        host,
+        &["config", "--local", "--null", "--list"],
+        cancel.clone(),
+    )
+    .await?;
+    let head = git_stdout(host, &["rev-parse", "--verify", "HEAD"], cancel.clone()).await?;
+    let symbolic = git_output(host, &["symbolic-ref", "-q", "HEAD"], cancel.clone()).await?;
+    let common_dir = git_stdout(
+        host,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        cancel,
+    )
+    .await?;
+    let common_dir = dunce::canonicalize(bytes_to_trimmed_path(&common_dir)?)
+        .map_err(|_| GrokBuildAdapterError::IsolationFailed)?;
+    let hooks = common_dir.join("hooks");
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"grokptah-repository-control-v1\0");
+    for bytes in [&refs, &config, &head, &symbolic.stdout] {
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+    let mut entries = 0usize;
+    let mut bytes = 0usize;
+    hash_bounded_control_path(&hooks, &mut hasher, &mut entries, &mut bytes)?;
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn hash_bounded_control_path(
+    path: &Path,
+    hasher: &mut Sha256,
+    entries: &mut usize,
+    bytes: &mut usize,
+) -> Result<(), GrokBuildAdapterError> {
+    const MAX_CONTROL_ENTRIES: usize = 256;
+    const MAX_CONTROL_BYTES: usize = 1_048_576;
+    *entries = entries
+        .checked_add(1)
+        .ok_or(GrokBuildAdapterError::IsolationFailed)?;
+    if *entries > MAX_CONTROL_ENTRIES {
+        return Err(GrokBuildAdapterError::IsolationFailed);
+    }
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            hasher.update(b"missing\0");
+            return Ok(());
+        }
+        Err(_) => return Err(GrokBuildAdapterError::IsolationFailed),
+    };
+    if metadata.file_type().is_symlink() {
+        let target =
+            std::fs::read_link(path).map_err(|_| GrokBuildAdapterError::IsolationFailed)?;
+        let target = target.as_os_str().as_encoded_bytes();
+        hasher.update(b"symlink\0");
+        hasher.update((target.len() as u64).to_be_bytes());
+        hasher.update(target);
+        return Ok(());
+    }
+    if metadata.file_type().is_file() {
+        let contents = std::fs::read(path).map_err(|_| GrokBuildAdapterError::IsolationFailed)?;
+        *bytes = bytes
+            .checked_add(contents.len())
+            .ok_or(GrokBuildAdapterError::IsolationFailed)?;
+        if *bytes > MAX_CONTROL_BYTES {
+            return Err(GrokBuildAdapterError::IsolationFailed);
+        }
+        hasher.update(b"file\0");
+        hasher.update((contents.len() as u64).to_be_bytes());
+        hasher.update(contents);
+        return Ok(());
+    }
+    if !metadata.file_type().is_dir() {
+        return Err(GrokBuildAdapterError::IsolationFailed);
+    }
+    hasher.update(b"dir\0");
+    let mut children = std::fs::read_dir(path)
+        .map_err(|_| GrokBuildAdapterError::IsolationFailed)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| GrokBuildAdapterError::IsolationFailed)?;
+    children.sort_by_key(std::fs::DirEntry::file_name);
+    for child in children {
+        let name = child.file_name();
+        let name = name.as_encoded_bytes();
+        hasher.update((name.len() as u64).to_be_bytes());
+        hasher.update(name);
+        hash_bounded_control_path(&child.path(), hasher, entries, bytes)?;
+    }
+    Ok(())
+}
+
+async fn verify_source_repository_unchanged(
+    host: &GrokBuildHostLaunchConfig,
+    head_sha: &str,
+    worktree_fingerprint: &str,
+    control_fingerprint: &str,
+) -> Result<(), GrokBuildAdapterError> {
+    let current = crate::run_promotion::fingerprint_at(&host.cwd, head_sha)
+        .map_err(|_| GrokBuildAdapterError::IsolationFailed)?;
+    if current != worktree_fingerprint
+        || repository_control_fingerprint(host).await? != control_fingerprint
+    {
+        return Err(GrokBuildAdapterError::IsolationFailed);
+    }
+    Ok(())
+}
+
 struct AllowlistedExecution<'a> {
     source_host: &'a GrokBuildHostLaunchConfig,
     execution_host: &'a GrokBuildHostLaunchConfig,
     checkout: &'a IsolatedCheckout,
     source_fingerprint: &'a str,
+    source_control_fingerprint: &'a str,
     isolated: &'a IsolatedHome,
     credentials: &'a dyn CredentialLeaseResolver,
     session_id: &'a str,
@@ -1293,6 +1587,7 @@ async fn execute_allowlisted(
         execution_host,
         checkout,
         source_fingerprint,
+        source_control_fingerprint,
         isolated,
         credentials,
         session_id,
@@ -1304,8 +1599,7 @@ async fn execute_allowlisted(
         session_id,
     )?;
     let env = allowlisted_env(&isolated.path)?;
-    let mut cmd = Command::new(&execution_host.executable);
-    cmd.args(&args);
+    let mut cmd = mutation_sandbox_command(execution_host, &args)?;
     cmd.current_dir(&execution_host.cwd);
     cmd.env_clear();
     cmd.envs(env);
@@ -1340,6 +1634,21 @@ async fn execute_allowlisted(
         ));
     }
 
+    if checkout.verify_control_state(execution_host).await.is_err()
+        || verify_source_repository_unchanged(
+            source_host,
+            &launch.identity.head_sha,
+            source_fingerprint,
+            source_control_fingerprint,
+        )
+        .await
+        .is_err()
+    {
+        let _ = isolated.cleanup();
+        let _ = checkout.cleanup().await;
+        return Err(GrokBuildAdapterError::IsolationFailed);
+    }
+
     let readonly_violation = if launch.mutation_mode == GrokBuildMutationMode::ReadOnly {
         gate_detached_checkout_identity(launch, execution_host, CancellationToken::new())
             .await
@@ -1367,14 +1676,14 @@ async fn execute_allowlisted(
             {
                 Ok(evidence) => Some(evidence),
                 Err(error) => {
-                    let _ = checkout.cleanup(source_host).await;
+                    let _ = checkout.cleanup().await;
                     return Err(error);
                 }
             }
         } else {
             None
         };
-    let checkout_cleaned = checkout.cleanup(source_host).await;
+    let checkout_cleaned = checkout.cleanup().await;
     if !checkout_cleaned {
         if mutation_evidence.is_some() {
             restore_failed_isolated_review_workspace(launch, source_host).await?;
@@ -2573,6 +2882,7 @@ mod tests {
             [
                 ("GROK_HOME".to_string(), "/isolated/home".to_string()),
                 ("HOME".to_string(), "/isolated/home".to_string()),
+                ("TMPDIR".to_string(), "/isolated/home".to_string()),
                 ("PATH".to_string(), BOUNDED_PATH.to_string()),
             ]
         );

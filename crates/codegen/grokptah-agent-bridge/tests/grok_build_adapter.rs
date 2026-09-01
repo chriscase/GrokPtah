@@ -1,7 +1,7 @@
 //! Focused process-adapter tests. All child processes are fakes; no live
 //! Grok/provider call is made.
 
-#![cfg(unix)]
+#![cfg(target_os = "macos")]
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -48,6 +48,7 @@ struct Fixture {
     repo: tempfile::TempDir,
     isolate: tempfile::TempDir,
     fake_dir: tempfile::TempDir,
+    capture_dir: PathBuf,
     identity: GrokBuildGitIdentity,
     lease_file: PathBuf,
     fake_bin: PathBuf,
@@ -57,6 +58,8 @@ impl Fixture {
     fn new() -> Self {
         let repo = tempfile::tempdir().expect("repo");
         let isolate = tempfile::tempdir().expect("isolate");
+        fs::set_permissions(isolate.path(), fs::Permissions::from_mode(0o700))
+            .expect("private isolate root");
         let fake_dir = tempfile::tempdir().expect("fake");
         git(repo.path(), &["init", "-b", "topic"]).expect("init");
         fs::write(repo.path().join("README"), "base\n").expect("readme");
@@ -81,11 +84,18 @@ impl Fixture {
         let mut lease_perms = fs::metadata(&lease_file).expect("lease meta").permissions();
         lease_perms.set_mode(0o600);
         fs::set_permissions(&lease_file, lease_perms).expect("lease chmod");
+        fs::write(
+            fake_dir.path().join("source-path"),
+            repo.path().as_os_str().as_encoded_bytes(),
+        )
+        .expect("source path fixture");
+        let capture_dir = isolate.path().join("capture");
 
         Self {
             repo,
             isolate,
             fake_dir,
+            capture_dir,
             identity: GrokBuildGitIdentity {
                 repository_id: "repo-acme".into(),
                 git_ref: "refs/heads/topic".into(),
@@ -98,6 +108,9 @@ impl Fixture {
     }
 
     fn set_behavior(&self, behavior: &str) {
+        if self.capture_dir.exists() {
+            fs::remove_dir_all(&self.capture_dir).expect("reset capture directory");
+        }
         fs::write(self.fake_dir.path().join("behavior"), behavior).expect("behavior");
     }
 
@@ -140,7 +153,7 @@ impl Fixture {
     }
 
     fn captured_argv(&self) -> Vec<String> {
-        fs::read_to_string(self.fake_dir.path().join("captured-argv"))
+        fs::read_to_string(self.capture_dir.join("captured-argv"))
             .unwrap_or_default()
             .lines()
             .map(str::to_string)
@@ -149,7 +162,7 @@ impl Fixture {
     }
 
     fn captured_env(&self) -> Vec<(String, String)> {
-        fs::read_to_string(self.fake_dir.path().join("captured-env"))
+        fs::read_to_string(self.capture_dir.join("captured-env"))
             .unwrap_or_default()
             .lines()
             .filter_map(|line| line.split_once('='))
@@ -159,7 +172,7 @@ impl Fixture {
 
     fn captured_grok_home(&self) -> PathBuf {
         PathBuf::from(
-            fs::read_to_string(self.fake_dir.path().join("captured-grok-home"))
+            fs::read_to_string(self.capture_dir.join("captured-grok-home"))
                 .unwrap_or_default()
                 .trim(),
         )
@@ -167,7 +180,7 @@ impl Fixture {
 
     fn captured_cwd(&self) -> PathBuf {
         PathBuf::from(
-            fs::read_to_string(self.fake_dir.path().join("captured-cwd"))
+            fs::read_to_string(self.capture_dir.join("captured-cwd"))
                 .unwrap_or_default()
                 .trim(),
         )
@@ -175,7 +188,12 @@ impl Fixture {
 
     fn isolate_children(&self) -> Vec<PathBuf> {
         fs::read_dir(self.isolate.path())
-            .map(|entries| entries.filter_map(|e| e.ok().map(|e| e.path())).collect())
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                    .filter(|path| path != &self.capture_dir)
+                    .collect()
+            })
             .unwrap_or_default()
     }
 }
@@ -230,13 +248,15 @@ fn assert_no_secret(rendered: &str) {
 
 const FAKE_SCRIPT: &str = r#"#!/bin/sh
 dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+capture="${GROK_HOME%/*}/capture"
+mkdir -p "$capture"
 behavior=complete
 if [ -f "$dir/behavior" ]; then
   behavior=$(cat "$dir/behavior")
 fi
 if [ "$1" = "inspect" ] && [ "$2" = "--json" ]; then
-  printf '%s\n' "$@" > "$dir/captured-inspect-argv"
-  env | sort > "$dir/captured-inspect-env"
+  printf '%s\n' "$@" > "$capture/captured-inspect-argv"
+  env | sort > "$capture/captured-inspect-env"
   instructions='[]'
   if [ "$behavior" = "inspect-dirty" ]; then
     instructions='[{"path":"CLAUDE.md"}]'
@@ -249,18 +269,21 @@ if [ "$1" = "inspect" ] && [ "$2" = "--json" ]; then
   printf '{"grokVersion":"1.0.5","channel":"stable","cwd":"%s","projectRoot":"%s","projectTrusted":true,"projectInstructions":%s,"permissions":{"loaded":0,"managedSettingsActive":false,"managedSettingsExists":false,"managedSettingsPath":"/managed/settings","marketplaceAllowlist":[],"mcpServerAllowlist":[],"skipped":[],"sources":[]},"loginPolicy":{"apiKeyAuthDisabled":false,"disableApiKeyAuth":null,"forceLoginTeamUuid":null},"hooks":[],"skills":[],"agents":[],"plugins":[],"marketplaces":[],"mcpServers":[],"lspServers":[],"configSources":{"layers":[{"path":"%s/config.toml","role":"user"}]},"externalCompat":{"cells":[{"enabled":false,"source":"config","surface":"skills","vendor":"cursor"},{"enabled":false,"source":"config","surface":"rules","vendor":"cursor"},{"enabled":false,"source":"config","surface":"agents","vendor":"cursor"},{"enabled":false,"source":"config","surface":"mcps","vendor":"cursor"},{"enabled":false,"source":"config","surface":"hooks","vendor":"cursor"},{"enabled":false,"source":"config","surface":"sessions","vendor":"cursor"},{"enabled":false,"source":"config","surface":"skills","vendor":"claude"},{"enabled":false,"source":"config","surface":"rules","vendor":"claude"},{"enabled":false,"source":"config","surface":"agents","vendor":"claude"},{"enabled":false,"source":"config","surface":"mcps","vendor":"claude"},{"enabled":false,"source":"config","surface":"hooks","vendor":"claude"},{"enabled":false,"source":"config","surface":"sessions","vendor":"claude"},{"enabled":false,"source":"config","surface":"sessions","vendor":"codex"}],"remoteSettingsLoaded":false}%s}\n' "$PWD" "$PWD" "$instructions" "$GROK_HOME" "$extra"
   exit 0
 fi
-printf '%s\n' "$@" > "$dir/captured-argv"
-env | sort > "$dir/captured-env"
-printf '%s\n' "$GROK_HOME" > "$dir/captured-grok-home"
-printf '%s\n' "$PWD" > "$dir/captured-cwd"
+printf '%s\n' "$@" > "$capture/captured-argv"
+env | sort > "$capture/captured-env"
+printf '%s\n' "$GROK_HOME" > "$capture/captured-grok-home"
+printf '%s\n' "$PWD" > "$capture/captured-cwd"
+/usr/bin/git rev-parse --path-format=absolute --git-dir > "$capture/captured-git-dir"
+/usr/bin/git rev-parse --path-format=absolute --git-common-dir > "$capture/captured-common-dir"
+/usr/bin/git remote > "$capture/captured-remotes"
 if [ -n "$GROK_HOME" ] && [ -f "$GROK_HOME/config.toml" ]; then
-  cp "$GROK_HOME/config.toml" "$dir/captured-config.toml"
+  cp "$GROK_HOME/config.toml" "$capture/captured-config.toml"
 fi
 if [ -n "$GROK_HOME" ] && [ -f "$GROK_HOME/sandbox.toml" ]; then
-  cp "$GROK_HOME/sandbox.toml" "$dir/captured-sandbox.toml"
+  cp "$GROK_HOME/sandbox.toml" "$capture/captured-sandbox.toml"
 fi
 if [ -n "$GROK_HOME" ] && [ -f "$GROK_HOME/auth.json" ]; then
-  printf 'present\n' > "$dir/auth-present"
+  printf 'present\n' > "$capture/auth-present"
 fi
 session_id=''
 previous=''
@@ -353,18 +376,18 @@ case "$behavior" in
     exit 0
     ;;
   sleep)
-    echo $$ > "$dir/pid"
+    echo $$ > "$capture/pid"
     /bin/sleep 30 &
     descendant=$!
-    echo "$descendant" > "$dir/descendant-pid"
+    echo "$descendant" > "$capture/descendant-pid"
     wait "$descendant"
     ;;
   mutate-sleep)
     printf 'unqualified mutation\n' > mutated-by-child.txt
-    echo $$ > "$dir/pid"
+    echo $$ > "$capture/pid"
     /bin/sleep 30 &
     descendant=$!
-    echo "$descendant" > "$dir/descendant-pid"
+    echo "$descendant" > "$capture/descendant-pid"
     wait "$descendant"
     ;;
   mutate-commit)
@@ -375,7 +398,21 @@ case "$behavior" in
     exit 0
     ;;
   mutate-ref)
-    /usr/bin/git checkout --detach >/dev/null 2>&1
+    /usr/bin/git update-ref refs/heads/child-ref HEAD >/dev/null 2>&1
+    printf '{"text":"bounded advisory summary\\nGROK_BUILD_VERDICT=clean","stopReason":"end_turn","sessionId":"%s","requestId":"11111111-1111-4111-8111-111111111111","thought":"","usage":{},"num_turns":1,"total_cost_usd":0.0,"total_cost_usd_ticks":0,"modelUsage":{}}\n' "$session_id"
+    exit 0
+    ;;
+  mutate-common-git)
+    common=$(/usr/bin/git rev-parse --git-common-dir)
+    /usr/bin/git config --local grokptah.malicious true
+    mkdir -p "$common/hooks"
+    printf '#!/bin/sh\nexit 1\n' > "$common/hooks/pre-commit"
+    printf '{"text":"bounded advisory summary\\nGROK_BUILD_VERDICT=clean","stopReason":"end_turn","sessionId":"%s","requestId":"11111111-1111-4111-8111-111111111111","thought":"","usage":{},"num_turns":1,"total_cost_usd":0.0,"total_cost_usd_ticks":0,"modelUsage":{}}\n' "$session_id"
+    exit 0
+    ;;
+  mutate-source-absolute)
+    source=$(cat "$dir/source-path")
+    printf 'source escape\n' > "$source/README" 2>/dev/null || true
     printf '{"text":"bounded advisory summary\\nGROK_BUILD_VERDICT=clean","stopReason":"end_turn","sessionId":"%s","requestId":"11111111-1111-4111-8111-111111111111","thought":"","usage":{},"num_turns":1,"total_cost_usd":0.0,"total_cost_usd_ticks":0,"modelUsage":{}}\n' "$session_id"
     exit 0
     ;;
@@ -465,6 +502,12 @@ async fn exact_command_argv_and_env() {
     assert_eq!(grok_home, home);
     assert_eq!(
         env.iter()
+            .find(|(k, _)| k == "TMPDIR")
+            .map(|(_, v)| v.as_str()),
+        Some(home)
+    );
+    assert_eq!(
+        env.iter()
             .find(|(k, _)| k == "PATH")
             .map(|(_, v)| v.as_str()),
         Some("/usr/bin:/bin:/usr/local/bin")
@@ -476,23 +519,38 @@ async fn exact_command_argv_and_env() {
         || k.contains("CLAUDE")
         || v.contains(SECRET)));
 
-    let config =
-        fs::read_to_string(fx.fake_dir.path().join("captured-config.toml")).expect("config");
+    let config = fs::read_to_string(fx.capture_dir.join("captured-config.toml")).expect("config");
     assert!(config.contains("[compat.claude]"));
     assert!(config.contains("[compat.cursor]"));
     assert!(config.contains("[compat.codex]"));
     assert!(config.contains("official_marketplace_auto_installed = false"));
     let sandbox =
-        fs::read_to_string(fx.fake_dir.path().join("captured-sandbox.toml")).expect("sandbox");
+        fs::read_to_string(fx.capture_dir.join("captured-sandbox.toml")).expect("sandbox");
     assert!(sandbox.contains("[profiles.grokptah_read_only]"));
     assert!(sandbox.contains("[profiles.grokptah_workspace]"));
     assert_eq!(
-        fs::read_to_string(fx.fake_dir.path().join("auth-present")).expect("auth"),
+        fs::read_to_string(fx.capture_dir.join("auth-present")).expect("auth"),
         "present\n"
     );
     assert_eq!(outcome.result().state, GrokBuildRunState::CompleteAdvisory);
     assert_eq!(outcome.result().session_id, argv[11]);
     assert_ne!(fx.captured_cwd(), fx.repo.path());
+    let captured_git_dir = PathBuf::from(
+        fs::read_to_string(fx.capture_dir.join("captured-git-dir"))
+            .expect("private git directory")
+            .trim(),
+    );
+    let captured_common_dir = PathBuf::from(
+        fs::read_to_string(fx.capture_dir.join("captured-common-dir"))
+            .expect("private common directory")
+            .trim(),
+    );
+    assert_eq!(captured_git_dir, captured_common_dir);
+    assert!(captured_git_dir.starts_with(fx.captured_cwd()));
+    assert_eq!(
+        fs::read_to_string(fx.capture_dir.join("captured-remotes")).expect("remote capture"),
+        ""
+    );
     assert_eq!(
         dunce::canonicalize(
             fx.captured_cwd()
@@ -502,6 +560,75 @@ async fn exact_command_argv_and_env() {
         .expect("captured checkout parent exists"),
         dunce::canonicalize(fx.isolate.path()).expect("isolate parent")
     );
+}
+
+#[tokio::test]
+async fn isolation_parent_must_not_overlap_the_authoritative_checkout() {
+    let fx = Fixture::new();
+    fx.set_behavior("complete");
+    let mut host = fx.host();
+    host.isolate_parent = fx.repo.path().to_path_buf();
+    let error = launch_grok_build(
+        &fx.launch(GrokBuildMutationMode::IsolatedReview, 60_000),
+        &host,
+        &fx.resolver(),
+        CancellationToken::new(),
+    )
+    .await
+    .expect_err("source and writable isolation root must be disjoint");
+    assert_eq!(error, GrokBuildAdapterError::IsolationFailed);
+    assert!(!fx.capture_dir.join("captured-argv").exists());
+}
+
+#[tokio::test]
+async fn os_sandbox_denies_absolute_source_checkout_writes() {
+    let fx = Fixture::new();
+    fx.set_behavior("mutate-source-absolute");
+    let before = fs::read(fx.repo.path().join("README")).expect("source before");
+    let outcome = launch_grok_build(
+        &fx.launch(GrokBuildMutationMode::IsolatedReview, 60_000),
+        &fx.host(),
+        &fx.resolver(),
+        CancellationToken::new(),
+    )
+    .await
+    .expect("denied source escape leaves a complete no-change advisory");
+    assert_eq!(outcome.result().state, GrokBuildRunState::CompleteAdvisory);
+    assert_eq!(
+        fs::read(fx.repo.path().join("README")).expect("source after"),
+        before
+    );
+    assert!(git_stdout(
+        fx.repo.path(),
+        &["status", "--porcelain=v1", "--untracked-files=all"]
+    )
+    .is_empty());
+}
+
+#[tokio::test]
+async fn private_clone_rejects_commit_ref_and_git_control_mutations() {
+    for behavior in ["mutate-commit", "mutate-ref", "mutate-common-git"] {
+        let fx = Fixture::new();
+        fx.set_behavior(behavior);
+        let mut host = fx.host();
+        host.allowed_files = vec!["committed-by-child.txt".into()];
+        let error = launch_grok_build(
+            &fx.launch(GrokBuildMutationMode::IsolatedReview, 60_000),
+            &host,
+            &fx.resolver(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("private Git control mutation must fail closed");
+        assert_eq!(error, GrokBuildAdapterError::IsolationFailed, "{behavior}");
+        assert!(git_stdout(
+            fx.repo.path(),
+            &["status", "--porcelain=v1", "--untracked-files=all"]
+        )
+        .is_empty());
+        assert!(!fx.repo.path().join("committed-by-child.txt").exists());
+        assert!(fx.isolate_children().is_empty());
+    }
 }
 
 #[tokio::test]
@@ -519,7 +646,7 @@ async fn noninteractive_tool_execution_requires_explicit_host_approval() {
     .await
     .expect_err("unapproved host launch must fail before spawning Grok");
     assert_eq!(error, GrokBuildAdapterError::InvalidRequest);
-    assert!(!fx.fake_dir.path().join("captured-argv").exists());
+    assert!(!fx.capture_dir.join("captured-argv").exists());
 }
 
 #[tokio::test]
@@ -537,7 +664,7 @@ async fn identity_mismatch_is_rejected() {
     .expect_err("mismatch");
     assert_eq!(err, GrokBuildAdapterError::IdentityMismatch);
     assert!(fx.isolate_children().is_empty());
-    assert!(!fx.fake_dir.path().join("captured-argv").exists());
+    assert!(!fx.capture_dir.join("captured-argv").exists());
 }
 
 #[tokio::test]
@@ -553,8 +680,8 @@ async fn discovered_instruction_or_plugin_surface_fails_before_task_launch() {
     .await
     .expect_err("discovered surface");
     assert_eq!(err, GrokBuildAdapterError::IsolationFailed);
-    assert!(fx.fake_dir.path().join("captured-inspect-argv").exists());
-    assert!(!fx.fake_dir.path().join("captured-argv").exists());
+    assert!(fx.capture_dir.join("captured-inspect-argv").exists());
+    assert!(!fx.capture_dir.join("captured-argv").exists());
     assert!(fx.isolate_children().is_empty());
 }
 
@@ -571,7 +698,7 @@ async fn unknown_inspection_surface_fails_before_task_launch() {
     .await
     .expect_err("unknown inspection surface");
     assert_eq!(err, GrokBuildAdapterError::IsolationFailed);
-    assert!(!fx.fake_dir.path().join("captured-argv").exists());
+    assert!(!fx.capture_dir.join("captured-argv").exists());
     assert!(fx.isolate_children().is_empty());
 }
 
@@ -628,7 +755,7 @@ async fn timeout_kills_process_tree_and_cleans_home() {
     .expect("timeout outcome");
     assert_eq!(outcome.result().state, GrokBuildRunState::FailedClosed);
     assert!(fx.isolate_children().is_empty());
-    if let Ok(pid) = fs::read_to_string(fx.fake_dir.path().join("pid")) {
+    if let Ok(pid) = fs::read_to_string(fx.capture_dir.join("pid")) {
         let pid = pid.trim();
         let alive = Command::new("/bin/kill")
             .args(["-0", pid])
@@ -637,7 +764,7 @@ async fn timeout_kills_process_tree_and_cleans_home() {
             .unwrap_or(false);
         assert!(!alive, "child still alive after timeout");
     }
-    if let Ok(pid) = fs::read_to_string(fx.fake_dir.path().join("descendant-pid")) {
+    if let Ok(pid) = fs::read_to_string(fx.capture_dir.join("descendant-pid")) {
         let pid = pid.trim();
         let alive = Command::new("/bin/kill")
             .args(["-0", pid])
@@ -683,7 +810,7 @@ async fn cancellation_kills_process_tree_and_cleans_home() {
     let launch = fx.launch(GrokBuildMutationMode::IsolatedReview, 60_000);
     let host = fx.host();
     let resolver = fx.resolver();
-    let launched = fx.fake_dir.path().join("captured-argv");
+    let launched = fx.capture_dir.join("captured-argv");
     let ((), outcome) = tokio::join!(
         async move {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -845,7 +972,7 @@ async fn isolated_review_rejects_forbidden_mutation_and_publish_remote() {
     .await
     .expect_err("publish-capable remote");
     assert_eq!(error, GrokBuildAdapterError::IsolationFailed);
-    assert!(!remote.fake_dir.path().join("captured-argv").exists());
+    assert!(!remote.capture_dir.join("captured-argv").exists());
 }
 
 #[tokio::test]
@@ -861,8 +988,8 @@ async fn read_only_mode_is_refused_without_observed_sandbox_authority() {
     .await
     .expect_err("read-only lacks an observable sandbox receipt");
     assert_eq!(error, GrokBuildAdapterError::IsolationFailed);
-    assert!(!fx.fake_dir.path().join("captured-inspect-argv").exists());
-    assert!(!fx.fake_dir.path().join("captured-argv").exists());
+    assert!(!fx.capture_dir.join("captured-inspect-argv").exists());
+    assert!(!fx.capture_dir.join("captured-argv").exists());
     assert!(fx.isolate_children().is_empty());
 }
 
@@ -884,7 +1011,7 @@ async fn read_only_never_reaches_a_mutating_child() {
             GrokBuildAdapterError::IsolationFailed,
             "behavior {behavior} reached the child"
         );
-        assert!(!fx.fake_dir.path().join("captured-argv").exists());
+        assert!(!fx.capture_dir.join("captured-argv").exists());
         assert!(fx.isolate_children().is_empty());
     }
 }

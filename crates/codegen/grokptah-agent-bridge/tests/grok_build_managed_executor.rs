@@ -125,12 +125,13 @@ async fn run_profile(profile: ManagedExecutionBudgetProfile) {
     let workspace = tempdir().unwrap();
     let identity = initialize_repo(workspace.path());
     let isolate_parent = tempdir().unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(isolate_parent.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let fake_dir = tempdir().unwrap();
     let fake_grok = fake_dir.path().join("grok");
     install_fake_grok(&fake_grok);
     let lease_path = fake_dir.path().join("lease.json");
     fs::write(&lease_path, b"opaque-test-credential\n").unwrap();
-    use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(&lease_path, fs::Permissions::from_mode(0o600)).unwrap();
 
     let host = AgentHost::create(HostConfig {
@@ -264,12 +265,6 @@ async fn run_profile(profile: ManagedExecutionBudgetProfile) {
     assert_eq!(invocation.changed_paths, ["DOGFOOD.txt"]);
     assert!(invocation.diff_digest.is_some());
 
-    let prompt = fs::read_to_string(fake_dir.path().join("captured-prompt")).unwrap();
-    assert!(prompt.contains(&format!("Budget profile: {}", profile.as_str())));
-    assert!(prompt.contains("Exact mutable-file allowlist:\n- DOGFOOD.txt\n"));
-    assert!(prompt.contains("Do not commit, push, merge, fetch"));
-    assert!(prompt.ends_with("GROK_BUILD_VERDICT=not_complete\n"));
-    assert!(!prompt.contains("opaque-test-credential"));
     assert!(fs::read_dir(isolate_parent.path())
         .unwrap()
         .next()
@@ -334,6 +329,7 @@ async fn run_live_profile(profile: ManagedExecutionBudgetProfile) {
     let workspace = tempdir().unwrap();
     let identity = initialize_repo(workspace.path());
     let isolate_parent = tempdir().unwrap();
+    fs::set_permissions(isolate_parent.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let lease_parent = tempdir().unwrap();
     let lease_path = lease_parent.path().join("lease.json");
     fs::copy(&credential_source, &lease_path).expect("copy disposable Grok credential lease");
@@ -531,7 +527,6 @@ async fn run_live_profile(profile: ManagedExecutionBudgetProfile) {
 
 #[cfg(unix)]
 const FAKE_GROK: &str = r#"#!/bin/sh
-dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 if [ "$1" = "inspect" ] && [ "$2" = "--json" ]; then
   printf '{"grokVersion":"1.0.5","channel":"stable","cwd":"%s","projectRoot":"%s","projectTrusted":true,"projectInstructions":[],"permissions":{"loaded":0,"managedSettingsActive":false,"managedSettingsExists":false,"managedSettingsPath":"/managed/settings","marketplaceAllowlist":[],"mcpServerAllowlist":[],"skipped":[],"sources":[]},"loginPolicy":{"apiKeyAuthDisabled":false,"disableApiKeyAuth":null,"forceLoginTeamUuid":null},"hooks":[],"skills":[],"agents":[],"plugins":[],"marketplaces":[],"mcpServers":[],"lspServers":[],"configSources":{"layers":[{"path":"%s/config.toml","role":"user"}]},"externalCompat":{"cells":[{"enabled":false,"source":"config","surface":"skills","vendor":"cursor"},{"enabled":false,"source":"config","surface":"rules","vendor":"cursor"},{"enabled":false,"source":"config","surface":"agents","vendor":"cursor"},{"enabled":false,"source":"config","surface":"mcps","vendor":"cursor"},{"enabled":false,"source":"config","surface":"hooks","vendor":"cursor"},{"enabled":false,"source":"config","surface":"sessions","vendor":"cursor"},{"enabled":false,"source":"config","surface":"skills","vendor":"claude"},{"enabled":false,"source":"config","surface":"rules","vendor":"claude"},{"enabled":false,"source":"config","surface":"agents","vendor":"claude"},{"enabled":false,"source":"config","surface":"mcps","vendor":"claude"},{"enabled":false,"source":"config","surface":"hooks","vendor":"claude"},{"enabled":false,"source":"config","surface":"sessions","vendor":"claude"},{"enabled":false,"source":"config","surface":"sessions","vendor":"codex"}],"remoteSettingsLoaded":false}}\n' "$PWD" "$PWD" "$GROK_HOME"
   exit 0
@@ -545,10 +540,12 @@ for arg in "$@"; do
   previous="$arg"
 done
 [ "$HOME" = "$GROK_HOME" ] || exit 71
-cp "$prompt_file" "$dir/captured-prompt"
 grep -q -- 'Exact mutable-file allowlist:' "$prompt_file" || exit 72
 grep -q -- '- DOGFOOD.txt' "$prompt_file" || exit 73
 grep -q -- 'GROK_BUILD_VERDICT=not_complete' "$prompt_file" || exit 74
+grep -Eq -- 'Budget profile: (economy|high_assurance)' "$prompt_file" || exit 75
+grep -q -- 'Do not commit, push, merge, fetch' "$prompt_file" || exit 76
+if grep -q -- 'opaque-test-credential' "$prompt_file"; then exit 77; fi
 printf 'after\n' > DOGFOOD.txt
 mkdir -p "$GROK_HOME/sessions/workspace/$session_id"
 printf '{"method":"session/update","params":{"_meta":{},"sessionId":"%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"bounded managed dogfood\\nGROK_BUILD_VERDICT=clean"}}},"timestamp":"2026-08-31T00:00:00Z"}\n' "$session_id" > "$GROK_HOME/sessions/workspace/$session_id/updates.jsonl"
