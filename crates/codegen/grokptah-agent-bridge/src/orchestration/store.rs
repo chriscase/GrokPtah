@@ -628,10 +628,10 @@ impl OrchStore {
         store.recover_agent_activation_intents()?;
         store.recover_finalization_intents()?;
         store.recover_routine_intents()?;
-        store.recover_managed_finalization_intents()?;
         store.recover_manager_creation_intents()?;
         store.recover_work_mutation_intents()?;
         store.recover_work_lifecycle_intents()?;
+        store.recover_managed_finalization_intents()?;
         store.mark_unfinished_interrupted()?;
         store.fail_orphaned_idempotency_claims()?;
         store.reconcile_workloads()?;
@@ -1814,48 +1814,6 @@ impl OrchStore {
 
     fn managed_finalization_lifecycle_intent_id(intent_id: &str) -> String {
         format!("managed-finalization:{intent_id}")
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn commit_work_lifecycle_snapshots_until_unlocked(
-        &self,
-        operation: &str,
-        prior_item: WorkItem,
-        item: WorkItem,
-        prior_attempts: Vec<WorkAttempt>,
-        attempts: Vec<WorkAttempt>,
-        stage: ManagedFinalizationStage,
-        lifecycle_intent_id: Option<&str>,
-    ) -> Result<(), OrchError> {
-        if matches!(
-            stage,
-            ManagedFinalizationStage::BeforeJournal | ManagedFinalizationStage::AfterJournal
-        ) {
-            return Ok(());
-        }
-        let intent_id = lifecycle_intent_id
-            .map(str::to_string)
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
-        let intent = WorkLifecycleIntent::new_with_id(
-            intent_id,
-            operation,
-            prior_item,
-            item,
-            prior_attempts,
-            attempts,
-        )?;
-        if stage == ManagedFinalizationStage::Complete {
-            return self.commit_work_lifecycle_intent_unlocked(&intent);
-        }
-        let (current_item_digest, current_attempts) =
-            self.preflight_work_lifecycle_intent_unlocked(&intent)?;
-        self.persist_work_lifecycle_intent_unlocked(&intent)?;
-        self.write_work_lifecycle_attempt_updates_unlocked(&intent, &current_attempts)?;
-        if stage == ManagedFinalizationStage::AfterAttempt {
-            return Ok(());
-        }
-        self.write_work_lifecycle_item_update_unlocked(&intent, &current_item_digest)?;
-        Ok(())
     }
 
     fn replace_attempt_snapshot(
@@ -4520,33 +4478,42 @@ impl OrchStore {
         }
         if let Some(attempt_id) = &intent.attempt_id {
             if intent.run_id.is_none() {
-                if let Ok(Some(mut attempt)) = self.load_work_attempt_unlocked(attempt_id) {
-                    if attempt.state.is_active() {
-                        if let Ok(Some(mut item)) = self.load_work_item_unlocked(&intent.work_id) {
-                            let prior_item = item.clone();
-                            let prior_attempts = self
-                                .list_work_attempts_unlocked(Some(&intent.work_id))
-                                .map_err(|error| {
-                                    OrchError::new(OrchErrorCode::Internal, error.to_string())
-                                })?;
-                            attempt.state = AttemptState::Released;
-                            attempt.terminal_reason = Some(
-                                "managed admission abandoned before a Run was committed".into(),
-                            );
-                            attempt.updated_at = now;
-                            item.state = WorkState::Queued;
-                            item.bump_at(now);
-                            let mut attempts = prior_attempts.clone();
-                            Self::replace_attempt_snapshot(&mut attempts, attempt)?;
-                            self.commit_work_lifecycle_snapshots_unlocked(
-                                "abandon_managed",
-                                prior_item,
-                                item,
-                                prior_attempts,
-                                attempts,
-                            )?;
-                        }
-                    }
+                let mut attempt = self
+                    .load_work_attempt_unlocked(attempt_id)
+                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+                    .ok_or_else(|| {
+                        OrchError::new(OrchErrorCode::Conflict, "work attempt not found")
+                    })?;
+                if attempt.state.is_active() {
+                    let mut item = self
+                        .load_work_item_unlocked(&intent.work_id)
+                        .map_err(|error| {
+                            OrchError::new(OrchErrorCode::Internal, error.to_string())
+                        })?
+                        .ok_or_else(|| {
+                            OrchError::new(OrchErrorCode::Conflict, "work item not found")
+                        })?;
+                    let prior_item = item.clone();
+                    let prior_attempts = self
+                        .list_work_attempts_unlocked(Some(&intent.work_id))
+                        .map_err(|error| {
+                            OrchError::new(OrchErrorCode::Internal, error.to_string())
+                        })?;
+                    attempt.state = AttemptState::Released;
+                    attempt.terminal_reason =
+                        Some("managed admission abandoned before a Run was committed".into());
+                    attempt.updated_at = now;
+                    item.state = WorkState::Queued;
+                    item.bump_at(now);
+                    let mut attempts = prior_attempts.clone();
+                    Self::replace_attempt_snapshot(&mut attempts, attempt)?;
+                    self.commit_work_lifecycle_snapshots_unlocked(
+                        "abandon_managed",
+                        prior_item,
+                        item,
+                        prior_attempts,
+                        attempts,
+                    )?;
                 }
             }
         }
@@ -4626,40 +4593,44 @@ impl OrchStore {
         if let Some(run) = run {
             intent.run_id = Some(run.run_id.clone());
             if let Some(attempt_id) = intent.attempt_id.clone() {
-                if let Ok(Some(attempt)) = self.load_work_attempt_unlocked(&attempt_id) {
-                    let token = attempt.lease_token_for_secret(lease_secret);
-                    if attempt.token_matches(&token) && attempt.lease_active_at(now) {
-                        let prior_attempts = self
-                            .list_work_attempts_unlocked(Some(&intent.work_id))
-                            .map_err(|error| {
-                                OrchError::new(OrchErrorCode::Internal, error.to_string())
-                            })?;
-                        let mut linked = attempt;
-                        if !linked.linked_run_ids.iter().any(|id| id == &run.run_id) {
-                            linked.linked_run_ids.push(run.run_id.clone());
-                        }
-                        if linked.state == AttemptState::Leased {
-                            linked.state = AttemptState::Running;
-                        }
-                        linked.updated_at = now;
-                        let prior_item = self
-                            .load_work_item_unlocked(&intent.work_id)
-                            .map_err(|error| {
-                                OrchError::new(OrchErrorCode::Internal, error.to_string())
-                            })?
-                            .ok_or_else(|| {
-                                OrchError::new(OrchErrorCode::Conflict, "work item not found")
-                            })?;
-                        let mut attempts = prior_attempts.clone();
-                        Self::replace_attempt_snapshot(&mut attempts, linked)?;
-                        self.commit_work_lifecycle_snapshots_unlocked(
-                            "reconcile_claiming",
-                            prior_item.clone(),
-                            prior_item,
-                            prior_attempts,
-                            attempts,
-                        )?;
+                let attempt = self
+                    .load_work_attempt_unlocked(&attempt_id)
+                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+                    .ok_or_else(|| {
+                        OrchError::new(OrchErrorCode::Conflict, "work attempt not found")
+                    })?;
+                let token = attempt.lease_token_for_secret(lease_secret);
+                if attempt.token_matches(&token) && attempt.lease_active_at(now) {
+                    let prior_attempts = self
+                        .list_work_attempts_unlocked(Some(&intent.work_id))
+                        .map_err(|error| {
+                            OrchError::new(OrchErrorCode::Internal, error.to_string())
+                        })?;
+                    let mut linked = attempt;
+                    if !linked.linked_run_ids.iter().any(|id| id == &run.run_id) {
+                        linked.linked_run_ids.push(run.run_id.clone());
                     }
+                    if linked.state == AttemptState::Leased {
+                        linked.state = AttemptState::Running;
+                    }
+                    linked.updated_at = now;
+                    let prior_item = self
+                        .load_work_item_unlocked(&intent.work_id)
+                        .map_err(|error| {
+                            OrchError::new(OrchErrorCode::Internal, error.to_string())
+                        })?
+                        .ok_or_else(|| {
+                            OrchError::new(OrchErrorCode::Conflict, "work item not found")
+                        })?;
+                    let mut attempts = prior_attempts.clone();
+                    Self::replace_attempt_snapshot(&mut attempts, linked)?;
+                    self.commit_work_lifecycle_snapshots_unlocked(
+                        "reconcile_claiming",
+                        prior_item.clone(),
+                        prior_item,
+                        prior_attempts,
+                        attempts,
+                    )?;
                 }
             }
             intent.state = ManagedIntentState::Admitted;
@@ -5030,41 +5001,39 @@ impl OrchStore {
         }
         let lifecycle_intent_id = Self::managed_finalization_lifecycle_intent_id(&record.intent_id);
         let lifecycle_path = self.work_lifecycle_intent_path(&lifecycle_intent_id)?;
-        if lifecycle_path.is_file() {
+        let intent = if lifecycle_path.is_file() {
             let intent: WorkLifecycleIntent = serde_json::from_str(
                 &fs::read_to_string(&lifecycle_path)
                     .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
             )
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-            if stage == ManagedFinalizationStage::Complete {
-                self.commit_work_lifecycle_intent_unlocked(&intent)?;
-            } else {
-                let (current_item_digest, current_attempts) =
-                    self.preflight_work_lifecycle_intent_unlocked(&intent)?;
-                if stage == ManagedFinalizationStage::AfterAttempt {
-                    self.write_work_lifecycle_attempt_updates_unlocked(&intent, &current_attempts)?;
-                } else if stage == ManagedFinalizationStage::AfterWork {
-                    self.write_work_lifecycle_attempt_updates_unlocked(&intent, &current_attempts)?;
-                    self.write_work_lifecycle_item_update_unlocked(&intent, &current_item_digest)?;
-                }
-            }
+            intent
         } else {
             let (prior_item, next_item, prior_attempts, next_attempts) =
                 self.prepare_managed_finalization_snapshots_unlocked(record, now)?;
-            self.commit_work_lifecycle_snapshots_until_unlocked(
+            WorkLifecycleIntent::new_with_id(
+                lifecycle_intent_id,
                 "managed_finalization",
                 prior_item,
                 next_item,
                 prior_attempts,
                 next_attempts,
-                stage,
-                Some(&lifecycle_intent_id),
-            )?;
-        }
-        if stage == ManagedFinalizationStage::AfterAttempt
-            || stage == ManagedFinalizationStage::AfterWork
-        {
-            return Ok(());
+            )?
+        };
+        self.persist_work_lifecycle_intent_unlocked(&intent)?;
+        if stage == ManagedFinalizationStage::Complete {
+            self.commit_work_lifecycle_intent_unlocked(&intent)?;
+        } else {
+            let (current_item_digest, current_attempts) =
+                self.preflight_work_lifecycle_intent_unlocked(&intent)?;
+            self.write_work_lifecycle_attempt_updates_unlocked(&intent, &current_attempts)?;
+            if stage == ManagedFinalizationStage::AfterAttempt {
+                return Ok(());
+            }
+            self.write_work_lifecycle_item_update_unlocked(&intent, &current_item_digest)?;
+            if stage == ManagedFinalizationStage::AfterWork {
+                return Ok(());
+            }
         }
         if let Some(mut intent) = self.load_managed_intent_unlocked(&record.intent_id)? {
             if intent.state != ManagedIntentState::Finalized
@@ -7295,6 +7264,7 @@ fn write_json_exclusive<T: serde::Serialize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::orchestration::managed::MANAGED_EXECUTION_SCHEMA_VERSION;
     use crate::orchestration::types::RunPurpose;
     use crate::orchestration::types::{
         AgentRecord, ContinuationCheckpoint, ContinuationReason, RunBounds,
@@ -9084,15 +9054,16 @@ mod tests {
     #[test]
     fn managed_finalization_recovery_refuses_a_foreign_work_writer() {
         let d = tempdir().unwrap();
+        let path = d.path().to_path_buf();
+        let session = Uuid::new_v4();
         let work_id;
-        let managed_intent_id = "intent-managed-foreign".to_string();
         {
-            let store = OrchStore::open(d.path()).unwrap();
+            let store = OrchStore::open(&path).unwrap();
             let now = Utc::now();
             let item = WorkItem::new_at(
                 "managed",
                 "foreign writer fence",
-                Uuid::new_v4(),
+                session,
                 "/tmp/coordinator-workspace",
                 "operator",
                 Default::default(),
@@ -9102,36 +9073,307 @@ mod tests {
             work_id = item.work_id.clone();
             store.save_work_item(&item).unwrap();
             let claim = store.claim_work(&work_id, "worker-a", None).unwrap();
-            let record = ManagedFinalizationRecord {
-                schema_version: MANAGED_FINALIZATION_SCHEMA_VERSION,
-                intent_id: managed_intent_id.clone(),
+            let managed = ManagedExecutionIntent {
+                schema_version: MANAGED_EXECUTION_SCHEMA_VERSION,
+                intent_id: "intent-managed-foreign".into(),
+                agent_id: "worker-a".into(),
+                agent_spec_revision: 1,
                 work_id: work_id.clone(),
+                work_revision: claim.work.revision,
                 attempt_id: Some(claim.attempt.attempt_id.clone()),
-                outcome: ManagedFinalizationOutcome::Failed,
-                attempt_state: AttemptState::Failed,
-                work_state: WorkState::Failed,
-                reason: "interrupted".into(),
-                result: None,
+                run_id: Some("run-foreign".into()),
+                session_id: session,
+                workspace: item.workspace.clone(),
+                source_routine_id: None,
+                source_activation_id: None,
+                model_selection_key: "grok".into(),
+                bounds: Default::default(),
+                execution_mode: Default::default(),
+                input_hash: "hash".into(),
+                grok: None,
+                state: ManagedIntentState::Admitted,
+                permission_request_id: None,
                 created_at: now,
+                updated_at: now,
             };
+            store.save_managed_intent(&managed).unwrap();
             store
-                .apply_managed_finalization_unlocked(
-                    &record,
-                    ManagedFinalizationStage::AfterAttempt,
+                .close_managed_attempt_until(
+                    &managed.intent_id,
+                    false,
+                    ManagedRetryCause::Interrupted,
+                    "interrupted",
                     now,
+                    ManagedFinalizationStage::AfterWork,
                 )
                 .unwrap();
+            let lifecycle_path = store
+                .work_lifecycle_intent_path(&OrchStore::managed_finalization_lifecycle_intent_id(
+                    &managed.intent_id,
+                ))
+                .unwrap();
+            assert!(
+                lifecycle_path.is_file(),
+                "production AfterWork must persist the lifecycle intent before item writes"
+            );
             let mut foreign = store.load_work_item(&work_id).unwrap().unwrap();
             foreign.blocked_reason = Some("foreign writer".into());
             foreign.bump_at(now + chrono::Duration::seconds(2));
             store.save_work_item(&foreign).unwrap();
         }
-        let error = match OrchStore::open(d.path()) {
+        let error = match OrchStore::open(&path) {
             Ok(_) => panic!("managed finalization recovery must refuse a foreign work writer"),
             Err(error) => error,
         };
         assert!(error
             .to_string()
             .contains("unexpected prior revision for managed_finalization"));
+    }
+
+    #[test]
+    fn managed_finalization_recovery_runs_after_work_lifecycle_intents() {
+        let d = tempdir().unwrap();
+        let now = Utc::now();
+        let item = WorkItem::new_at(
+            "managed",
+            "recovery order",
+            Uuid::new_v4(),
+            "/tmp/coordinator-workspace",
+            "operator",
+            Default::default(),
+            now,
+        )
+        .unwrap();
+        let work_id = item.work_id.clone();
+        {
+            let store = OrchStore::open(d.path()).unwrap();
+            store.save_work_item(&item).unwrap();
+            let claim = store.claim_work(&work_id, "worker-a", None).unwrap();
+            let running = store.load_work_item(&work_id).unwrap().unwrap();
+            let attempts = store.list_work_attempts(Some(&work_id)).unwrap();
+            let mut requeued = running.clone();
+            requeued.state = WorkState::Queued;
+            requeued.result = None;
+            requeued.bump_at(now + chrono::Duration::seconds(1));
+            let lifecycle_intent = WorkLifecycleIntent::new(
+                "requeue",
+                running.clone(),
+                requeued,
+                attempts.clone(),
+                attempts.clone(),
+            )
+            .unwrap();
+            store
+                .persist_work_lifecycle_intent_unlocked(&lifecycle_intent)
+                .unwrap();
+            let mut failed = running.clone();
+            failed.state = WorkState::Failed;
+            failed.result = Some(WorkResult {
+                summary: "managed second".into(),
+                evidence: Vec::new(),
+                artifacts: Vec::new(),
+                failure: Some("managed second".into()),
+                cancellation_reason: None,
+                completed_at: now,
+                verification: None,
+            });
+            failed.bump_at(now + chrono::Duration::seconds(2));
+            let record = ManagedFinalizationRecord {
+                schema_version: MANAGED_FINALIZATION_SCHEMA_VERSION,
+                intent_id: "intent-order".into(),
+                work_id: work_id.clone(),
+                attempt_id: Some(claim.attempt.attempt_id.clone()),
+                outcome: ManagedFinalizationOutcome::Failed,
+                attempt_state: AttemptState::Failed,
+                work_state: WorkState::Failed,
+                reason: "managed second".into(),
+                result: None,
+                created_at: now,
+            };
+            store
+                .apply_managed_finalization_unlocked(
+                    &record,
+                    ManagedFinalizationStage::AfterJournal,
+                    now,
+                )
+                .unwrap();
+            let lifecycle_intent_id =
+                OrchStore::managed_finalization_lifecycle_intent_id(&record.intent_id);
+            let managed_lifecycle = WorkLifecycleIntent::new_with_id(
+                lifecycle_intent_id,
+                "managed_finalization",
+                running,
+                failed,
+                attempts.clone(),
+                attempts,
+            )
+            .unwrap();
+            store
+                .persist_work_lifecycle_intent_unlocked(&managed_lifecycle)
+                .unwrap();
+        }
+        let error = match OrchStore::open(d.path()) {
+            Ok(_) => panic!("managed finalization must refuse after lifecycle intents converge"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("unexpected prior revision for managed_finalization"),
+            "managed finalization must refuse after lifecycle intents converge: {message}"
+        );
+        let item_path = d
+            .path()
+            .join("work-items")
+            .join(format!("{}.json", safe_id_filename(&work_id).unwrap()));
+        let recovered: WorkItem =
+            serde_json::from_str(&fs::read_to_string(item_path).unwrap()).unwrap();
+        assert_eq!(
+            recovered.state,
+            WorkState::Queued,
+            "work-lifecycle recovery must commit before managed finalization is attempted"
+        );
+    }
+
+    #[test]
+    fn abandon_managed_intent_fails_closed_when_attempt_load_breaks() {
+        let d = tempdir().unwrap();
+        let now = Utc::now();
+        let session = Uuid::new_v4();
+        let item = WorkItem::new_at(
+            "managed",
+            "abandon load failure",
+            session,
+            "/tmp/coordinator-workspace",
+            "operator",
+            Default::default(),
+            now,
+        )
+        .unwrap();
+        let attempt_id = "attempt-missing".to_string();
+        let intent_id = "intent-abandon-load".to_string();
+        {
+            let store = OrchStore::open(d.path()).unwrap();
+            store.save_work_item(&item).unwrap();
+            let managed = ManagedExecutionIntent {
+                schema_version: MANAGED_EXECUTION_SCHEMA_VERSION,
+                intent_id: intent_id.clone(),
+                agent_id: "worker-a".into(),
+                agent_spec_revision: 1,
+                work_id: item.work_id.clone(),
+                work_revision: item.revision,
+                attempt_id: Some(attempt_id.clone()),
+                run_id: None,
+                session_id: session,
+                workspace: item.workspace.clone(),
+                source_routine_id: None,
+                source_activation_id: None,
+                model_selection_key: "grok".into(),
+                bounds: Default::default(),
+                execution_mode: Default::default(),
+                input_hash: "hash".into(),
+                grok: None,
+                state: ManagedIntentState::Claiming,
+                permission_request_id: None,
+                created_at: now,
+                updated_at: now,
+            };
+            store.save_managed_intent(&managed).unwrap();
+        }
+        let store = OrchStore::open(d.path()).unwrap();
+        let error = store
+            .abandon_managed_intent(&intent_id, now)
+            .expect_err("missing attempt must not abandon the managed intent");
+        assert_eq!(error.code, OrchErrorCode::Conflict);
+        let intent = store.load_managed_intent(&intent_id).unwrap().unwrap();
+        assert_eq!(intent.state, ManagedIntentState::Claiming);
+    }
+
+    #[test]
+    fn reconcile_claiming_intent_fails_closed_when_attempt_load_breaks() {
+        let d = tempdir().unwrap();
+        let now = Utc::now();
+        let session = Uuid::new_v4();
+        let item = WorkItem::new_at(
+            "managed",
+            "reconcile load failure",
+            session,
+            "/tmp/coordinator-workspace",
+            "operator",
+            Default::default(),
+            now,
+        )
+        .unwrap();
+        let attempt_id = "attempt-missing".to_string();
+        let intent_id = "intent-reconcile-load".to_string();
+        let run_id = "run-reconcile-load".to_string();
+        {
+            let store = OrchStore::open(d.path()).unwrap();
+            store.save_work_item(&item).unwrap();
+            store
+                .save_run(&RunRecord {
+                    run_id: run_id.clone(),
+                    request_id: intent_id.clone(),
+                    session_id: session,
+                    workspace: item.workspace.clone(),
+                    client_id: None,
+                    state: RunState::Running,
+                    purpose: Default::default(),
+                    agent_id: Some("worker-a".into()),
+                    retry_of: None,
+                    parent_run_id: None,
+                    agent_spec_revision: Some(1),
+                    checkpoint_id: None,
+                    continuation_context_id: None,
+                    continuation_context_hash: None,
+                    continuation_fidelity: None,
+                    queue_position: None,
+                    bounds: RunBounds::default(),
+                    prompt_preview: "preview".into(),
+                    start_seq: Some(1),
+                    end_seq: None,
+                    created_at: now,
+                    updated_at: now,
+                    terminal_result: None,
+                    final_response: None,
+                    error_code: None,
+                    stop_cause: None,
+                    aggregates: Default::default(),
+                    progress: None,
+                    execution: None,
+                    approval: None,
+                })
+                .unwrap();
+            let managed = ManagedExecutionIntent {
+                schema_version: MANAGED_EXECUTION_SCHEMA_VERSION,
+                intent_id: intent_id.clone(),
+                agent_id: "worker-a".into(),
+                agent_spec_revision: 1,
+                work_id: item.work_id.clone(),
+                work_revision: item.revision,
+                attempt_id: Some(attempt_id.clone()),
+                run_id: Some(run_id.clone()),
+                session_id: session,
+                workspace: item.workspace.clone(),
+                source_routine_id: None,
+                source_activation_id: None,
+                model_selection_key: "grok".into(),
+                bounds: Default::default(),
+                execution_mode: Default::default(),
+                input_hash: "hash".into(),
+                grok: None,
+                state: ManagedIntentState::Claiming,
+                permission_request_id: None,
+                created_at: now,
+                updated_at: now,
+            };
+            store.save_managed_intent(&managed).unwrap();
+        }
+        let store = OrchStore::open(d.path()).unwrap();
+        let error = store
+            .reconcile_claiming_intent(&intent_id, "secret", now)
+            .expect_err("missing attempt must not admit the managed intent");
+        assert_eq!(error.code, OrchErrorCode::Conflict);
+        let intent = store.load_managed_intent(&intent_id).unwrap().unwrap();
+        assert_eq!(intent.state, ManagedIntentState::Claiming);
     }
 }
