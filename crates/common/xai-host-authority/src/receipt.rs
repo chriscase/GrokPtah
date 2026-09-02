@@ -13,8 +13,8 @@
 use crate::digest::ContentDigest;
 use crate::ids::{
     AttemptId, AuthGeneration, CapabilityGeneration, CapabilityId, ControlEpoch,
-    CredentialIncarnation, EffectLeaseId, ObservationRevision, PrincipalId, ResourceIncarnation,
-    SessionId, WorkspaceId,
+    CredentialIncarnation, EffectLeaseId, ObservationRevision, PolicyRevision, PrincipalId,
+    ResourceIncarnation, SessionId, WorkspaceId,
 };
 
 /// The complete authority binding tuple.
@@ -77,6 +77,7 @@ pub struct AuthContext {
     pub(crate) incarnation: CredentialIncarnation,
     pub(crate) auth_generation: AuthGeneration,
     pub(crate) capability_generation: CapabilityGeneration,
+    pub(crate) policy_revision: PolicyRevision,
     pub(crate) control_epoch: ControlEpoch,
     pub(crate) credential_id: String,
     pub(crate) owner_id: String,
@@ -89,8 +90,20 @@ impl AuthContext {
     pub fn auth_generation(&self) -> AuthGeneration {
         self.auth_generation
     }
+    pub fn capability_generation(&self) -> CapabilityGeneration {
+        self.capability_generation
+    }
     pub fn control_epoch(&self) -> ControlEpoch {
         self.control_epoch
+    }
+    pub fn policy_revision(&self) -> PolicyRevision {
+        self.policy_revision
+    }
+    pub fn credential_id(&self) -> &str {
+        &self.credential_id
+    }
+    pub fn owner_id(&self) -> &str {
+        &self.owner_id
     }
     /// Public, secret-free projection of who this is.
     pub fn public_handle(&self) -> String {

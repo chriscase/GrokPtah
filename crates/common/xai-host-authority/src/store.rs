@@ -487,6 +487,7 @@ impl HostAuthority {
                 incarnation: decode_id(&record.incarnation, "incarnation")?,
                 auth_generation: AuthGeneration::from_raw(record.auth_generation),
                 capability_generation: CapabilityGeneration::from_raw(state.capability_generation),
+                policy_revision: PolicyRevision::from_raw(state.policy_revision),
                 control_epoch: ControlEpoch::from_raw(state.control_epoch),
                 credential_id: record.credential_id.clone(),
                 owner_id: record.owner_id.clone(),
@@ -506,6 +507,17 @@ impl HostAuthority {
     /// Confirm a previously minted context is still current.
     pub fn require_current(&self, auth: &AuthContext) -> Result<(), AuthorityError> {
         self.read(|state| require_current_state(state, auth))
+    }
+
+    /// Project the authenticated principal into a public read DTO.
+    ///
+    /// Fails closed when any checked generation has advanced.
+    pub fn principal_projection(
+        &self,
+        auth: &AuthContext,
+    ) -> Result<crate::projection::PrincipalProjection, AuthorityError> {
+        self.require_current(auth)?;
+        Ok(crate::projection::PrincipalProjection::from_context(auth))
     }
 
     /// Issue a host-owned session for an authenticated principal.
@@ -666,6 +678,29 @@ impl HostAuthority {
         })
     }
 
+    /// Rotate the policy revision, invalidating every context minted under the
+    /// previous revision.
+    ///
+    /// Workspace allowlist changes, queue ownership policy changes, and similar
+    /// host policy mutations advance this counter separately from credential
+    /// rotation ([`AuthGeneration`]) and capability withdrawal
+    /// ([`CapabilityGeneration`]).
+    pub fn rotate_policy_revision(
+        &self,
+        admin: &HostAdminAuthority,
+    ) -> Result<PolicyRevision, AuthorityError> {
+        self.require_admin(admin)?;
+        self.with_state(|state| {
+            state.policy_revision = state
+                .policy_revision
+                .checked_add(1)
+                .ok_or_else(|| AuthorityError::Durability("policy revision exhausted".into()))?;
+            state.capabilities.clear();
+            state.leases.clear();
+            Ok(PolicyRevision::from_raw(state.policy_revision))
+        })
+    }
+
     /// The owner account this root serves. An operator read.
     pub fn owner_id(&self, admin: &HostAdminAuthority) -> Result<String, AuthorityError> {
         self.require_admin(admin)?;
@@ -728,6 +763,9 @@ pub(crate) fn require_current_state(
     }
     if state.capability_generation != auth.capability_generation.raw() {
         return Err(AuthorityError::StaleCapability);
+    }
+    if state.policy_revision != auth.policy_revision.raw() {
+        return Err(AuthorityError::StalePolicy);
     }
     if state.control_epoch != auth.control_epoch.raw() {
         return Err(AuthorityError::StaleControlEpoch);

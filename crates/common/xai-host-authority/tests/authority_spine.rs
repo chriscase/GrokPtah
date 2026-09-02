@@ -843,7 +843,7 @@ fn a_corrupt_authority_root_refuses_service_rather_than_inventing_authority() {
     // A record written by some other build that lacks a required field.
     std::fs::write(
         f.root.join("authority.json"),
-        r#"{"schema_version":1,"owner_id":"account-1"}"#,
+        r#"{"schema_version":2,"owner_id":"account-1"}"#,
     )
     .unwrap();
     let root = f.root.clone();

@@ -19,6 +19,8 @@ pub enum AuthorityError {
     StalePrincipal,
     /// The capability generation has advanced since this grant was sealed.
     StaleCapability,
+    /// The host policy revision has advanced since this context was minted.
+    StalePolicy,
     /// The control plane epoch has advanced: a previous host incarnation
     /// admitted this work and the current one will not complete it.
     StaleControlEpoch,
@@ -63,6 +65,7 @@ impl fmt::Display for AuthorityError {
             Self::Unauthenticated => f.write_str("bearer did not match a live credential"),
             Self::StalePrincipal => f.write_str("principal authority has been superseded"),
             Self::StaleCapability => f.write_str("capability generation has advanced"),
+            Self::StalePolicy => f.write_str("policy revision has advanced"),
             Self::StaleControlEpoch => f.write_str("control epoch has advanced"),
             Self::StaleObservation => f.write_str("observed surface has moved"),
             Self::UnknownResource => f.write_str("resource was not issued by this host"),
