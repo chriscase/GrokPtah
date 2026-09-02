@@ -180,6 +180,86 @@ struct WorkMutationIntent {
     decision: WorkDecision,
 }
 
+/// Crash-recovery envelope for WorkItem and WorkAttempt lifecycle changes.
+///
+/// Work decisions have their own envelope above because they are an
+/// attributable audit record.  Lease/terminal lifecycle changes do not create
+/// a decision, but they can still touch several independently durable files.
+/// This envelope records both sides of every file so reopen can finish an
+/// interrupted transition without guessing, and refuses an unexpected writer
+/// rather than overwriting it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkLifecycleIntent {
+    schema_version: u32,
+    intent_id: String,
+    operation: String,
+    work_id: String,
+    prior_item: WorkItem,
+    item: WorkItem,
+    prior_attempts: Vec<WorkAttempt>,
+    attempts: Vec<WorkAttempt>,
+}
+
+const WORK_LIFECYCLE_INTENT_SCHEMA_VERSION: u32 = 1;
+
+impl WorkLifecycleIntent {
+    fn new(
+        operation: &str,
+        prior_item: WorkItem,
+        item: WorkItem,
+        prior_attempts: Vec<WorkAttempt>,
+        attempts: Vec<WorkAttempt>,
+    ) -> Result<Self, OrchError> {
+        let intent = Self {
+            schema_version: WORK_LIFECYCLE_INTENT_SCHEMA_VERSION,
+            intent_id: Uuid::new_v4().to_string(),
+            operation: operation.to_string(),
+            work_id: item.work_id.clone(),
+            prior_item,
+            item,
+            prior_attempts,
+            attempts,
+        };
+        intent.validate()?;
+        Ok(intent)
+    }
+
+    fn validate(&self) -> Result<(), OrchError> {
+        if self.schema_version != WORK_LIFECYCLE_INTENT_SCHEMA_VERSION
+            || self.intent_id.is_empty()
+            || self.operation.trim().is_empty()
+            || self.work_id.is_empty()
+            || self.prior_item.work_id != self.work_id
+            || self.item.work_id != self.work_id
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "work lifecycle intent schema or identity is invalid",
+            ));
+        }
+        self.prior_item.validate()?;
+        self.item.validate()?;
+        validate_work_attempt_set(&self.work_id, &self.prior_attempts)?;
+        validate_work_attempt_set(&self.work_id, &self.attempts)?;
+        Ok(())
+    }
+}
+
+fn validate_work_attempt_set(work_id: &str, attempts: &[WorkAttempt]) -> Result<(), OrchError> {
+    let mut ids = HashSet::new();
+    for attempt in attempts {
+        attempt.validate()?;
+        if attempt.work_id != work_id || !ids.insert(attempt.attempt_id.clone()) {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "work lifecycle intent has a duplicate or foreign attempt",
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl WorkMutationIntent {
     fn new(prior: &WorkItem, item: WorkItem, decision: WorkDecision) -> Result<Self, OrchError> {
         let prior_item_digest = super::hash_payload(
@@ -465,6 +545,7 @@ impl OrchStore {
         fs::create_dir_all(root.join("manager-decisions"))?;
         fs::create_dir_all(root.join("manager-intents"))?;
         fs::create_dir_all(root.join("work-intents"))?;
+        fs::create_dir_all(root.join("work-lifecycle-intents"))?;
         let root = dunce::canonicalize(root)?;
         let lock_path = root.join(".store.lock");
         let store_lock = OpenOptions::new()
@@ -529,6 +610,7 @@ impl OrchStore {
         store.recover_managed_finalization_intents()?;
         store.recover_manager_creation_intents()?;
         store.recover_work_mutation_intents()?;
+        store.recover_work_lifecycle_intents()?;
         store.mark_unfinished_interrupted()?;
         store.fail_orphaned_idempotency_claims()?;
         store.reconcile_workloads()?;
@@ -638,6 +720,14 @@ impl OrchStore {
             .root
             .join("work-attempts")
             .join(format!("{safe}.json")))
+    }
+
+    fn work_lifecycle_intent_path(&self, intent_id: &str) -> Result<PathBuf, OrchError> {
+        Ok(self
+            .inner
+            .root
+            .join("work-lifecycle-intents")
+            .join(format!("{}.json", safe_id_filename(intent_id)?)))
     }
 
     fn routine_path(&self, routine_id: &str) -> Result<PathBuf, OrchError> {
@@ -1491,6 +1581,178 @@ impl OrchStore {
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
             self.commit_work_mutation_intent_unlocked(&intent)?;
         }
+        Ok(())
+    }
+
+    fn persist_work_lifecycle_intent_unlocked(
+        &self,
+        intent: &WorkLifecycleIntent,
+    ) -> Result<(), OrchError> {
+        intent.validate()?;
+        let path = self.work_lifecycle_intent_path(&intent.intent_id)?;
+        atomic_write_json(&self.lease(), &path, intent)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+    }
+
+    fn clear_work_lifecycle_intent_unlocked(&self, intent_id: &str) -> Result<(), OrchError> {
+        let path = self.work_lifecycle_intent_path(intent_id)?;
+        remove_file_durable(&self.lease(), &path)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+    }
+
+    fn work_digest(item: &WorkItem) -> Result<String, OrchError> {
+        serde_json::to_value(item)
+            .map(|value| super::hash_payload(&value))
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+    }
+
+    fn attempt_digest(attempt: &WorkAttempt) -> Result<String, OrchError> {
+        serde_json::to_value(attempt)
+            .map(|value| super::hash_payload(&value))
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+    }
+
+    fn commit_work_lifecycle_intent_unlocked(
+        &self,
+        intent: &WorkLifecycleIntent,
+    ) -> Result<(), OrchError> {
+        intent.validate()?;
+        let current_item = self
+            .load_work_item_unlocked(&intent.work_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .ok_or_else(|| {
+                OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "work item disappeared during lifecycle recovery",
+                )
+            })?;
+        let prior_item_digest = Self::work_digest(&intent.prior_item)?;
+        let next_item_digest = Self::work_digest(&intent.item)?;
+        let current_item_digest = Self::work_digest(&current_item)?;
+        if current_item_digest != prior_item_digest && current_item_digest != next_item_digest {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                format!(
+                    "work lifecycle recovery found an unexpected prior revision for {}",
+                    intent.operation
+                ),
+            ));
+        }
+
+        let next_by_id = intent
+            .attempts
+            .iter()
+            .map(|attempt| (attempt.attempt_id.as_str(), attempt))
+            .collect::<std::collections::HashMap<_, _>>();
+        let current_attempts = self
+            .list_work_attempts_unlocked(Some(&intent.work_id))
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let mut current_by_id = current_attempts
+            .iter()
+            .map(|attempt| (attempt.attempt_id.as_str(), attempt))
+            .collect::<std::collections::HashMap<_, _>>();
+        for attempt in &intent.prior_attempts {
+            let Some(current) = current_by_id.remove(attempt.attempt_id.as_str()) else {
+                return Err(OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "work lifecycle recovery found a missing attempt",
+                ));
+            };
+            let current_digest = Self::attempt_digest(current)?;
+            let prior_digest = Self::attempt_digest(attempt)?;
+            let next = next_by_id.get(attempt.attempt_id.as_str()).ok_or_else(|| {
+                OrchError::new(
+                    OrchErrorCode::InvalidRequest,
+                    "work lifecycle intent removed an existing attempt",
+                )
+            })?;
+            let next_digest = Self::attempt_digest(next)?;
+            if current_digest != prior_digest && current_digest != next_digest {
+                return Err(OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "work lifecycle recovery found an unexpected attempt revision",
+                ));
+            }
+        }
+        // An intent may add a new attempt (claim) but must never overwrite an
+        // unrelated attempt created by another writer while it was pending.
+        if current_by_id
+            .keys()
+            .any(|attempt_id| !next_by_id.contains_key(attempt_id))
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "work lifecycle recovery found an unexpected attempt",
+            ));
+        }
+        for attempt in &intent.attempts {
+            let current_digest = current_attempts
+                .iter()
+                .find(|current| current.attempt_id == attempt.attempt_id)
+                .map(Self::attempt_digest)
+                .transpose()?;
+            if current_digest.as_deref() != Some(Self::attempt_digest(attempt)?.as_str()) {
+                self.save_work_attempt_unlocked(attempt)
+                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            }
+        }
+        if current_item_digest != next_item_digest {
+            self.save_work_item_unlocked(&intent.item)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        }
+        self.clear_work_lifecycle_intent_unlocked(&intent.intent_id)
+    }
+
+    fn recover_work_lifecycle_intents(&self) -> Result<(), OrchError> {
+        let _guard = self.inner.lock.lock();
+        let dir = self.inner.root.join("work-lifecycle-intents");
+        for entry in fs::read_dir(&dir)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+        {
+            let path = entry
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+                .path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let intent: WorkLifecycleIntent = serde_json::from_str(
+                &fs::read_to_string(&path)
+                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+            )
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            self.commit_work_lifecycle_intent_unlocked(&intent)?;
+        }
+        Ok(())
+    }
+
+    fn commit_work_lifecycle_snapshots_unlocked(
+        &self,
+        operation: &str,
+        prior_item: WorkItem,
+        item: WorkItem,
+        prior_attempts: Vec<WorkAttempt>,
+        attempts: Vec<WorkAttempt>,
+    ) -> Result<(), OrchError> {
+        let intent =
+            WorkLifecycleIntent::new(operation, prior_item, item, prior_attempts, attempts)?;
+        self.persist_work_lifecycle_intent_unlocked(&intent)?;
+        self.commit_work_lifecycle_intent_unlocked(&intent)
+    }
+
+    fn replace_attempt_snapshot(
+        attempts: &mut [WorkAttempt],
+        updated: WorkAttempt,
+    ) -> Result<(), OrchError> {
+        let Some(slot) = attempts
+            .iter_mut()
+            .find(|attempt| attempt.attempt_id == updated.attempt_id)
+        else {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "work attempt disappeared during lifecycle mutation",
+            ));
+        };
+        *slot = updated;
         Ok(())
     }
 
@@ -2825,6 +3087,10 @@ impl OrchStore {
             .load_work_item_unlocked(work_id)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
             .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
+        let prior_item = item.clone();
+        let prior_attempts = self
+            .list_work_attempts_unlocked(Some(work_id))
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         Self::require_work_revision(&item, expected_revision)?;
         if item.state.is_terminal() {
             return Err(OrchError::new(
@@ -2840,8 +3106,13 @@ impl OrchStore {
         };
         item.validate()?;
         item.bump();
-        self.save_work_item_unlocked(&item)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        self.commit_work_lifecycle_snapshots_unlocked(
+            "assign",
+            prior_item,
+            item.clone(),
+            prior_attempts.clone(),
+            prior_attempts,
+        )?;
         Ok(item)
     }
 
@@ -4030,6 +4301,11 @@ impl OrchStore {
             .load_work_item_unlocked(work_id)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
             .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
+        let prior_item = item.clone();
+        let prior_attempts = self
+            .list_work_attempts_unlocked(Some(work_id))
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let mut attempts = prior_attempts.clone();
         let now = Utc::now();
         let mut attempt =
             self.load_active_attempt_for_token_unlocked(&item, attempt_id, lease_token, now)?;
@@ -4039,10 +4315,14 @@ impl OrchStore {
         attempt.state = AttemptState::AwaitingInput;
         attempt.last_heartbeat_at = now;
         attempt.updated_at = now;
-        self.save_work_attempt_unlocked(&attempt)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-        self.save_work_item_unlocked(&item)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        Self::replace_attempt_snapshot(&mut attempts, attempt.clone())?;
+        self.commit_work_lifecycle_snapshots_unlocked(
+            "park_input",
+            prior_item,
+            item.clone(),
+            prior_attempts,
+            attempts,
+        )?;
         Ok((item, attempt))
     }
 
@@ -4740,6 +5020,10 @@ impl OrchStore {
             .load_work_item_unlocked(work_id)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
             .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
+        let prior_item = item.clone();
+        let prior_attempts = self
+            .list_work_attempts_unlocked(Some(work_id))
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         Self::require_work_revision(&item, expected_revision)?;
         if item.state != WorkState::Failed {
             return Err(OrchError::new(
@@ -4763,8 +5047,13 @@ impl OrchStore {
         item.result = None;
         item.approval = None;
         item.bump();
-        self.save_work_item_unlocked(&item)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        self.commit_work_lifecycle_snapshots_unlocked(
+            "retry",
+            prior_item,
+            item.clone(),
+            prior_attempts.clone(),
+            prior_attempts,
+        )?;
         Ok(item)
     }
 
@@ -4789,6 +5078,7 @@ impl OrchStore {
             .load_work_item_unlocked(work_id)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
             .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
+        let prior_item = item.clone();
         if item.state == WorkState::Succeeded
             && item
                 .approval
@@ -4833,6 +5123,7 @@ impl OrchStore {
         let mut attempts = self
             .list_work_attempts_unlocked(Some(work_id))
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let prior_attempts = attempts.clone();
         let attempt = attempts
             .iter_mut()
             .rev()
@@ -4846,15 +5137,17 @@ impl OrchStore {
         attempt.terminal_reason = Some(format!("approved by {}", reviewer_id));
         attempt.updated_at = approval.approved_at;
         item.approval = Some(approval);
-        self.save_work_item_unlocked(&item)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         self.assign_work_succeeded_unlocked(&mut item, Some(attempt), None)?;
+        let approved_attempt = attempt.clone();
         item.bump();
-        self.save_work_attempt_unlocked(attempt)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-        self.save_work_item_unlocked(&item)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-        Ok((item, attempt.clone()))
+        self.commit_work_lifecycle_snapshots_unlocked(
+            "approve",
+            prior_item,
+            item.clone(),
+            prior_attempts,
+            attempts.clone(),
+        )?;
+        Ok((item, approved_attempt))
     }
 
     fn require_managed_grok_claim_fence_unlocked(
@@ -5129,14 +5422,25 @@ impl OrchStore {
             .load_work_item_unlocked(work_id)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
             .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
+        let prior_item = item.clone();
+        let prior_attempts = self
+            .list_work_attempts_unlocked(Some(work_id))
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let mut attempts = prior_attempts.clone();
         let now = Utc::now();
         let mut attempt =
             self.load_active_attempt_for_token_unlocked(&item, attempt_id, lease_token, now)?;
         attempt.last_heartbeat_at = now;
         attempt.lease_expires_at = now + lease;
         attempt.updated_at = now;
-        self.save_work_attempt_unlocked(&attempt)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        Self::replace_attempt_snapshot(&mut attempts, attempt.clone())?;
+        self.commit_work_lifecycle_snapshots_unlocked(
+            "renew_lease",
+            prior_item,
+            item,
+            prior_attempts,
+            attempts,
+        )?;
         Ok(attempt)
     }
 
@@ -5152,6 +5456,11 @@ impl OrchStore {
             .load_work_item_unlocked(work_id)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
             .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
+        let prior_item = item.clone();
+        let prior_attempts = self
+            .list_work_attempts_unlocked(Some(work_id))
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let mut attempts = prior_attempts.clone();
         let now = Utc::now();
         let mut attempt =
             self.load_active_attempt_for_token_unlocked(&item, attempt_id, lease_token, now)?;
@@ -5168,8 +5477,14 @@ impl OrchStore {
             attempt.state = AttemptState::Running;
         }
         attempt.updated_at = now;
-        self.save_work_attempt_unlocked(&attempt)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        Self::replace_attempt_snapshot(&mut attempts, attempt.clone())?;
+        self.commit_work_lifecycle_snapshots_unlocked(
+            "link_run",
+            prior_item,
+            item,
+            prior_attempts,
+            attempts,
+        )?;
         Ok(attempt)
     }
 
@@ -5185,6 +5500,11 @@ impl OrchStore {
             .load_work_item_unlocked(work_id)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
             .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
+        let prior_item = item.clone();
+        let prior_attempts = self
+            .list_work_attempts_unlocked(Some(work_id))
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let mut attempts = prior_attempts.clone();
         let now = Utc::now();
         let mut attempt =
             self.load_active_attempt_for_token_unlocked(&item, attempt_id, lease_token, now)?;
@@ -5195,10 +5515,14 @@ impl OrchStore {
         attempt.state = AttemptState::Running;
         attempt.last_heartbeat_at = now;
         attempt.updated_at = now;
-        self.save_work_attempt_unlocked(&attempt)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-        self.save_work_item_unlocked(&item)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        Self::replace_attempt_snapshot(&mut attempts, attempt.clone())?;
+        self.commit_work_lifecycle_snapshots_unlocked(
+            "progress",
+            prior_item,
+            item.clone(),
+            prior_attempts,
+            attempts,
+        )?;
         Ok((item, attempt))
     }
 
@@ -5214,6 +5538,11 @@ impl OrchStore {
             .load_work_item_unlocked(work_id)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
             .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
+        let prior_item = item.clone();
+        let prior_attempts = self
+            .list_work_attempts_unlocked(Some(work_id))
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let mut attempts = prior_attempts.clone();
         let now = Utc::now();
         let mut attempt =
             self.load_active_attempt_for_token_unlocked(&item, attempt_id, lease_token, now)?;
@@ -5222,10 +5551,14 @@ impl OrchStore {
         attempt.updated_at = now;
         item.state = WorkState::Queued;
         item.bump();
-        self.save_work_attempt_unlocked(&attempt)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-        self.save_work_item_unlocked(&item)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        Self::replace_attempt_snapshot(&mut attempts, attempt.clone())?;
+        self.commit_work_lifecycle_snapshots_unlocked(
+            "release",
+            prior_item,
+            item.clone(),
+            prior_attempts,
+            attempts,
+        )?;
         Ok((item, attempt))
     }
 
@@ -5242,6 +5575,11 @@ impl OrchStore {
             .load_work_item_unlocked(work_id)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
             .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
+        let prior_item = item.clone();
+        let prior_attempts = self
+            .list_work_attempts_unlocked(Some(work_id))
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let mut attempts = prior_attempts.clone();
         let now = Utc::now();
         let mut attempt = self
             .load_work_attempt_unlocked(attempt_id)
@@ -5304,10 +5642,14 @@ impl OrchStore {
             item.state = work_state;
         }
         item.bump();
-        self.save_work_attempt_unlocked(&attempt)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-        self.save_work_item_unlocked(&item)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        Self::replace_attempt_snapshot(&mut attempts, attempt.clone())?;
+        self.commit_work_lifecycle_snapshots_unlocked(
+            "complete",
+            prior_item,
+            item.clone(),
+            prior_attempts,
+            attempts,
+        )?;
         Ok((item, attempt))
     }
 
@@ -5324,6 +5666,11 @@ impl OrchStore {
             .load_work_item_unlocked(work_id)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
             .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
+        let prior_item = item.clone();
+        let prior_attempts = self
+            .list_work_attempts_unlocked(Some(work_id))
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let mut attempts = prior_attempts.clone();
         let now = Utc::now();
         let mut attempt =
             self.load_active_attempt_for_token_unlocked(&item, attempt_id, lease_token, now)?;
@@ -5340,10 +5687,14 @@ impl OrchStore {
             WorkState::Failed
         };
         item.bump();
-        self.save_work_attempt_unlocked(&attempt)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-        self.save_work_item_unlocked(&item)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        Self::replace_attempt_snapshot(&mut attempts, attempt.clone())?;
+        self.commit_work_lifecycle_snapshots_unlocked(
+            "fail",
+            prior_item,
+            item.clone(),
+            prior_attempts,
+            attempts,
+        )?;
         Ok((item, attempt))
     }
 
@@ -5375,16 +5726,16 @@ impl OrchStore {
             ));
         }
         let now = Utc::now();
-        let mut attempts = self
+        let prior_item = item.clone();
+        let prior_attempts = self
             .list_work_attempts_unlocked(Some(work_id))
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let mut attempts = prior_attempts.clone();
         for attempt in &mut attempts {
             if attempt.state.is_active() {
                 attempt.state = AttemptState::Cancelled;
                 attempt.terminal_reason = Some(reason.to_string());
                 attempt.updated_at = now;
-                self.save_work_attempt_unlocked(attempt)
-                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
             }
         }
         item.state = WorkState::Cancelled;
@@ -5398,8 +5749,13 @@ impl OrchStore {
             verification: None,
         });
         item.bump();
-        self.save_work_item_unlocked(&item)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        self.commit_work_lifecycle_snapshots_unlocked(
+            "cancel",
+            prior_item,
+            item.clone(),
+            prior_attempts,
+            attempts.clone(),
+        )?;
         Ok((item, attempts))
     }
 
@@ -6828,6 +7184,88 @@ mod tests {
         assert!(!intent_path.exists());
     }
 
+    #[derive(Clone, Copy)]
+    enum WorkMutationCrashCut {
+        BeforeIntent,
+        AfterIntent,
+        AfterDecision,
+        AfterItem,
+        AfterCommit,
+    }
+
+    #[test]
+    fn work_mutation_reopen_is_deterministic_at_each_crash_cut() {
+        for cut in [
+            WorkMutationCrashCut::BeforeIntent,
+            WorkMutationCrashCut::AfterIntent,
+            WorkMutationCrashCut::AfterDecision,
+            WorkMutationCrashCut::AfterItem,
+            WorkMutationCrashCut::AfterCommit,
+        ] {
+            let d = tempdir().unwrap();
+            let expected_item;
+            let expected_decision;
+            let intent_path;
+            {
+                let store = OrchStore::open(d.path()).unwrap();
+                let (prior, next, decision, intent) = work_mutation_fixture(&store);
+                expected_item = if matches!(cut, WorkMutationCrashCut::BeforeIntent) {
+                    prior
+                } else {
+                    next.clone()
+                };
+                expected_decision = decision.clone();
+                intent_path = store.work_mutation_intent_path(&intent.intent_id).unwrap();
+                match cut {
+                    WorkMutationCrashCut::BeforeIntent => {}
+                    WorkMutationCrashCut::AfterIntent => {
+                        store
+                            .persist_work_mutation_intent_unlocked(&intent)
+                            .unwrap();
+                    }
+                    WorkMutationCrashCut::AfterDecision => {
+                        store
+                            .persist_work_mutation_intent_unlocked(&intent)
+                            .unwrap();
+                        store.save_work_decision_unlocked(&decision).unwrap();
+                    }
+                    WorkMutationCrashCut::AfterItem => {
+                        store
+                            .persist_work_mutation_intent_unlocked(&intent)
+                            .unwrap();
+                        store.save_work_item_unlocked(&next).unwrap();
+                    }
+                    WorkMutationCrashCut::AfterCommit => {
+                        store
+                            .persist_work_mutation_intent_unlocked(&intent)
+                            .unwrap();
+                        store.save_work_decision_unlocked(&decision).unwrap();
+                        store.save_work_item_unlocked(&next).unwrap();
+                        store
+                            .clear_work_mutation_intent_unlocked(&intent.intent_id)
+                            .unwrap();
+                    }
+                }
+            }
+            let reopened = OrchStore::open(d.path()).unwrap();
+            assert_eq!(
+                reopened.load_work_item(&expected_item.work_id).unwrap(),
+                Some(expected_item)
+            );
+            assert_eq!(
+                reopened
+                    .list_work_decisions(&expected_decision.work_id)
+                    .unwrap(),
+                if matches!(cut, WorkMutationCrashCut::BeforeIntent) {
+                    Vec::new()
+                } else {
+                    vec![expected_decision]
+                }
+            );
+            assert!(!intent_path.exists());
+        }
+    }
+
     #[test]
     fn work_mutation_intent_refuses_an_unexpected_prior_revision() {
         let d = tempdir().unwrap();
@@ -6863,6 +7301,193 @@ mod tests {
             .validate()
             .expect_err("a decision must authorize the exact prior revision");
         assert!(error.to_string().contains("records do not agree"));
+    }
+
+    fn work_lifecycle_fixture(
+        store: &OrchStore,
+    ) -> (
+        WorkItem,
+        WorkItem,
+        WorkAttempt,
+        WorkAttempt,
+        WorkLifecycleIntent,
+    ) {
+        let now = Utc::now();
+        let prior = WorkItem::new_at(
+            "triage",
+            "resume the synthetic incident",
+            Uuid::new_v4(),
+            "/tmp/coordinator-workspace",
+            "operator",
+            Default::default(),
+            now,
+        )
+        .unwrap();
+        let mut prior_item = prior.clone();
+        prior_item.attempt_count = 1;
+        prior_item.state = WorkState::Running;
+        prior_item.bump_at(now + chrono::Duration::seconds(1));
+        let mut prior_attempt = WorkAttempt::new(&prior_item.work_id, 1, "worker", "secret");
+        prior_attempt.state = AttemptState::Running;
+        prior_attempt.updated_at = now + chrono::Duration::seconds(1);
+        store.save_work_item(&prior_item).unwrap();
+        store.save_work_attempt_unlocked(&prior_attempt).unwrap();
+
+        let mut next_item = prior_item.clone();
+        next_item.state = WorkState::Queued;
+        next_item.bump_at(now + chrono::Duration::seconds(2));
+        let mut next_attempt = prior_attempt.clone();
+        next_attempt.state = AttemptState::Released;
+        next_attempt.terminal_reason = Some("operator paused the run".into());
+        next_attempt.updated_at = now + chrono::Duration::seconds(2);
+        let intent = WorkLifecycleIntent::new(
+            "release",
+            prior_item.clone(),
+            next_item.clone(),
+            vec![prior_attempt.clone()],
+            vec![next_attempt.clone()],
+        )
+        .unwrap();
+        (prior_item, next_item, prior_attempt, next_attempt, intent)
+    }
+
+    #[test]
+    fn work_lifecycle_intent_recovers_after_attempt_only_crash() {
+        let d = tempdir().unwrap();
+        let intent_path;
+        let expected_item;
+        let expected_attempt;
+        {
+            let store = OrchStore::open(d.path()).unwrap();
+            let (_, next_item, _, next_attempt, intent) = work_lifecycle_fixture(&store);
+            expected_item = next_item;
+            expected_attempt = next_attempt.clone();
+            intent_path = store.work_lifecycle_intent_path(&intent.intent_id).unwrap();
+            store
+                .persist_work_lifecycle_intent_unlocked(&intent)
+                .unwrap();
+            store.save_work_attempt_unlocked(&next_attempt).unwrap();
+        }
+        let reopened = OrchStore::open(d.path()).unwrap();
+        assert_eq!(
+            reopened.load_work_item(&expected_item.work_id).unwrap(),
+            Some(expected_item)
+        );
+        assert_eq!(
+            reopened
+                .load_work_attempt(&expected_attempt.attempt_id)
+                .unwrap(),
+            Some(expected_attempt)
+        );
+        assert!(!intent_path.exists());
+    }
+
+    #[derive(Clone, Copy)]
+    enum LifecycleCrashCut {
+        BeforeIntent,
+        AfterIntent,
+        AfterAttempt,
+        AfterItem,
+        AfterCommit,
+    }
+
+    #[test]
+    fn work_lifecycle_reopen_is_deterministic_at_each_crash_cut() {
+        for cut in [
+            LifecycleCrashCut::BeforeIntent,
+            LifecycleCrashCut::AfterIntent,
+            LifecycleCrashCut::AfterAttempt,
+            LifecycleCrashCut::AfterItem,
+            LifecycleCrashCut::AfterCommit,
+        ] {
+            let d = tempdir().unwrap();
+            let expected_item;
+            let expected_attempt;
+            let intent_path;
+            {
+                let store = OrchStore::open(d.path()).unwrap();
+                let (prior_item, next_item, prior_attempt, next_attempt, intent) =
+                    work_lifecycle_fixture(&store);
+                expected_item = if matches!(cut, LifecycleCrashCut::BeforeIntent) {
+                    prior_item
+                } else {
+                    next_item.clone()
+                };
+                expected_attempt = if matches!(cut, LifecycleCrashCut::BeforeIntent) {
+                    prior_attempt
+                } else {
+                    next_attempt.clone()
+                };
+                intent_path = store.work_lifecycle_intent_path(&intent.intent_id).unwrap();
+                match cut {
+                    LifecycleCrashCut::BeforeIntent => {}
+                    LifecycleCrashCut::AfterIntent => {
+                        store
+                            .persist_work_lifecycle_intent_unlocked(&intent)
+                            .unwrap();
+                    }
+                    LifecycleCrashCut::AfterAttempt => {
+                        store
+                            .persist_work_lifecycle_intent_unlocked(&intent)
+                            .unwrap();
+                        store.save_work_attempt_unlocked(&next_attempt).unwrap();
+                    }
+                    LifecycleCrashCut::AfterItem => {
+                        store
+                            .persist_work_lifecycle_intent_unlocked(&intent)
+                            .unwrap();
+                        store.save_work_attempt_unlocked(&next_attempt).unwrap();
+                        store.save_work_item_unlocked(&next_item).unwrap();
+                    }
+                    LifecycleCrashCut::AfterCommit => {
+                        store
+                            .persist_work_lifecycle_intent_unlocked(&intent)
+                            .unwrap();
+                        store.save_work_attempt_unlocked(&next_attempt).unwrap();
+                        store.save_work_item_unlocked(&next_item).unwrap();
+                        store
+                            .clear_work_lifecycle_intent_unlocked(&intent.intent_id)
+                            .unwrap();
+                    }
+                }
+            }
+            let reopened = OrchStore::open(d.path()).unwrap();
+            assert_eq!(
+                reopened.load_work_item(&expected_item.work_id).unwrap(),
+                Some(expected_item)
+            );
+            assert_eq!(
+                reopened
+                    .load_work_attempt(&expected_attempt.attempt_id)
+                    .unwrap(),
+                Some(expected_attempt)
+            );
+            assert!(!intent_path.exists());
+        }
+    }
+
+    #[test]
+    fn work_lifecycle_intent_refuses_an_unexpected_attempt_writer() {
+        let d = tempdir().unwrap();
+        {
+            let store = OrchStore::open(d.path()).unwrap();
+            let (prior_item, _, prior_attempt, _, intent) = work_lifecycle_fixture(&store);
+            store
+                .persist_work_lifecycle_intent_unlocked(&intent)
+                .unwrap();
+            let mut conflicting = prior_attempt;
+            conflicting.terminal_reason = Some("unexpected writer".into());
+            store.save_work_attempt_unlocked(&conflicting).unwrap();
+            let mut conflicting_item = prior_item;
+            conflicting_item.priority = 9;
+            conflicting_item.bump();
+            store.save_work_item_unchecked(&conflicting_item).unwrap();
+        }
+        let error = match OrchStore::open(d.path()) {
+            Ok(_) => panic!("recovery must fail closed"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("unexpected"));
     }
 
     #[test]
