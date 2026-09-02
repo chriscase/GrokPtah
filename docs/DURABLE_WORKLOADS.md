@@ -58,11 +58,21 @@ Oversized lanes refuse bounded store reads. Public create maps the ceiling to
 the full legal range remains open in issue #520; callers must not interpret a
 transport-size refusal as an empty or complete lane.
 
-Assignment mutations (block, unblock, offer, and the other decision actions)
-write a `WorkDecision` file and then the `WorkItem` file. Each write is
-atomic, but the pair is not a sealed two-phase intent. A crash between them
-can leave a decision receipt whose item state did not change. There is no
-assignment-intent recovery path; issue #521 tracks that release residual.
+Assignment mutations that emit a `WorkDecision` (block, unblock, offer,
+accept, decline, reassign, reprioritize, request-review, and managed execution
+authorization) now use a durable `work-intents/` commit marker. The marker
+binds the decision ID, work ID, expected revision, prior and resulting item
+digests, and decision digest. Reopening the ledger replays a pair after either
+the decision or item write was interrupted, and refuses an unexpected prior
+revision or conflicting receipt rather than guessing. The marker is removed
+only after both validated records agree. Service request-id idempotency still
+guards the outer request, while this marker protects the paired store write.
+
+This closes the crash gap for the decision-producing assignment family only.
+The legacy `assign_work` convenience path and independent lifecycle mutations
+such as cancel/retry/approval remain separate durable transitions and are not
+claimed as covered by this marker; issue #521 stays open until every required
+mutation path has equivalent intent/recovery coverage.
 
 ## Service reconciliation
 
@@ -100,6 +110,30 @@ Native persistent-Agent execution is a separate, opt-in dispatcher in the same
 process. See [NATIVE_AGENT_EXECUTION.md](NATIVE_AGENT_EXECUTION.md).
 
 ## MCP/service surface
+
+### Persistent-agent coordinator projection
+
+The authenticated coordinator surface deliberately does not serialize the
+desktop `AgentRecord` or `AgentResumePlan` directly. `ptah_list_persistent_agents`
+returns `grokptah.coordinator.agent.v1` views containing opaque identity,
+current/last Run and Lane references, lifecycle state, and checkpoint lineage.
+`ptah_get_persistent_agent` returns a
+`grokptah.coordinator.resume-plan.v1` containing that same Agent view plus a
+`grokptah.coordinator.checkpoint.v1` view. Workspace paths, provider/model
+routing, owner principals, authority policy, memory policy, and managed
+execution settings are internal-only and are absent from these responses.
+The checkpoint context is the host-produced bounded redacted summary; the
+caller still must provide a fresh instruction to
+`ptah_resume_persistent_agent`. Scope and ownership are checked before either
+view is produced, and unknown/cross-scope identities use the same refusal
+vocabulary. Listing order is deterministic by opaque Agent ID.
+
+The desktop remote adapter consumes these versioned views directly. It uses
+the opaque primary/session and Lane references to resolve the authorized
+workspace only when issuing a scoped get or explicit resume request; it never
+expects or reconstructs a workspace, model, owner, authority, memory, lease,
+or managed-execution field from the coordinator response. The local embedded
+desktop path may still use its internal record for trusted operator controls.
 
 `orchestration::CONTROL_TOOLS` is the source of truth for the complete tool
 count and classification. The workload-specific subset advertised there
@@ -182,6 +216,8 @@ The bridge integration tests cover:
 - create and claim idempotency, including conflicting replay rejection;
 - omission of `leaseTokenHash` from protocol responses;
 - progress and completion through the live loopback MCP server;
+- terminal runs retain typed completion evidence, and queued persistent-run
+  cancellation is terminal and request-id idempotent;
 - authorized reads surviving Lane archival and mutation rejection after archive.
 - deterministic lease/deadline reconciliation and supervisor status;
 - service restart shutdown/reopen without a lingering ledger lock;

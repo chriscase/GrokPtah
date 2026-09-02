@@ -926,6 +926,101 @@ pub struct AgentRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Stable, coordinator-facing projection of a durable Agent identity.
+///
+/// `AgentRecord` is an internal/desktop record and intentionally contains
+/// workspace paths, provider/model routing, ownership, and authority policy.
+/// Those fields must never cross the authenticated coordinator boundary. This
+/// view keeps only opaque identity and lifecycle/checkpoint references needed
+/// to render a coordinator status surface and request an explicit resume.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoordinatorAgentView {
+    pub schema_version: String,
+    pub agent_id: String,
+    /// Preferred opaque Lane/session reference retained for desktop and
+    /// coordinator continuation targeting. When the legacy primary Lane is
+    /// archived, this points at the first currently attached Lane instead.
+    /// It carries no workspace or provider authority by itself.
+    pub session_id: Uuid,
+    pub display_name: Option<String>,
+    pub role: Option<String>,
+    /// Safe, non-sensitive revision of the immutable Agent policy used to
+    /// bind future work and continuation requests. The policy body remains
+    /// private; legacy records without a spec omit this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_spec_revision: Option<u64>,
+    pub state: AgentState,
+    pub lane_ids: Vec<Uuid>,
+    pub current_run_id: Option<String>,
+    pub last_run_id: Option<String>,
+    pub last_lane_id: Option<Uuid>,
+    pub latest_checkpoint_id: Option<String>,
+    pub continuation_ordinal: u64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl CoordinatorAgentView {
+    pub const SCHEMA_VERSION: &'static str = "grokptah.coordinator.agent.v1";
+
+    pub fn validate(&self) -> Result<(), OrchError> {
+        if self.schema_version != Self::SCHEMA_VERSION {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "unsupported coordinator agent schema",
+            ));
+        }
+        validate_id(&self.agent_id, "agent_id")?;
+        if self.lane_ids.len() > 256 {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "coordinator agent Lane associations exceed their bound",
+            ));
+        }
+        if self.agent_spec_revision == Some(0) {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "coordinator agent specification revision is invalid",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl From<&AgentRecord> for CoordinatorAgentView {
+    fn from(agent: &AgentRecord) -> Self {
+        let (display_name, role) = agent
+            .spec
+            .as_ref()
+            .map(|spec| (Some(spec.display_name.clone()), Some(spec.role.clone())))
+            .unwrap_or((None, None));
+        let lane_ids = agent.known_lane_ids();
+        let session_id = agent
+            .last_lane_id
+            .filter(|lane_id| lane_ids.contains(lane_id))
+            .or_else(|| lane_ids.first().copied())
+            .unwrap_or(agent.session_id);
+        Self {
+            schema_version: Self::SCHEMA_VERSION.into(),
+            agent_id: agent.agent_id.clone(),
+            session_id,
+            display_name,
+            role,
+            agent_spec_revision: agent.spec.as_ref().map(|spec| spec.revision),
+            state: agent.state,
+            lane_ids,
+            current_run_id: agent.current_run_id.clone(),
+            last_run_id: agent.last_run_id.clone(),
+            last_lane_id: agent.last_lane_id,
+            latest_checkpoint_id: agent.latest_checkpoint_id.clone(),
+            continuation_ordinal: agent.continuation_ordinal,
+            created_at: agent.created_at,
+            updated_at: agent.updated_at,
+        }
+    }
+}
+
 impl AgentRecord {
     pub fn migrate_legacy_spec(&mut self) -> Result<bool, OrchError> {
         let mut changed = false;
@@ -1088,6 +1183,67 @@ pub struct ContinuationCheckpoint {
     pub created_at: DateTime<Utc>,
 }
 
+/// Coordinator-safe checkpoint projection. The durable checkpoint's
+/// workspace path is deliberately omitted; its context is already bounded and
+/// redacted by the host before persistence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoordinatorCheckpointView {
+    pub schema_version: String,
+    pub checkpoint_id: String,
+    pub agent_id: String,
+    pub session_id: Uuid,
+    pub run_id: String,
+    pub agent_spec_revision: Option<u64>,
+    pub parent_checkpoint_id: Option<String>,
+    pub ordinal: u64,
+    pub context_summary: String,
+    pub event_seq: u64,
+    pub reason: ContinuationReason,
+    pub created_at: DateTime<Utc>,
+}
+
+impl CoordinatorCheckpointView {
+    pub const SCHEMA_VERSION: &'static str = "grokptah.coordinator.checkpoint.v1";
+
+    pub fn validate(&self) -> Result<(), OrchError> {
+        if self.schema_version != Self::SCHEMA_VERSION {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "unsupported coordinator checkpoint schema",
+            ));
+        }
+        validate_id(&self.checkpoint_id, "checkpoint_id")?;
+        validate_id(&self.agent_id, "agent_id")?;
+        validate_id(&self.run_id, "run_id")?;
+        validate_bounded_string(
+            &self.context_summary,
+            MAX_AGENT_CONTEXT_BYTES,
+            "context_summary",
+        )?;
+        Ok(())
+    }
+}
+
+impl From<&ContinuationCheckpoint> for CoordinatorCheckpointView {
+    fn from(checkpoint: &ContinuationCheckpoint) -> Self {
+        Self {
+            schema_version: Self::SCHEMA_VERSION.into(),
+            checkpoint_id: checkpoint.checkpoint_id.clone(),
+            agent_id: checkpoint.agent_id.clone(),
+            session_id: checkpoint.session_id,
+            run_id: checkpoint.run_id.clone(),
+            agent_spec_revision: checkpoint.agent_spec_revision,
+            parent_checkpoint_id: checkpoint.parent_checkpoint_id.clone(),
+            ordinal: checkpoint.ordinal,
+            context_summary: checkpoint.context_summary.clone(),
+            event_seq: checkpoint.event_seq,
+            reason: checkpoint.reason,
+            created_at: checkpoint.created_at,
+        }
+    }
+}
+
 impl ContinuationCheckpoint {
     pub fn context_hash_for(&self) -> String {
         match self.agent_spec_revision {
@@ -1152,6 +1308,66 @@ pub struct AgentResumePlan {
     pub agent: AgentRecord,
     pub checkpoint: ContinuationCheckpoint,
     pub parent_run_id: String,
+}
+
+/// Redacted plan returned by the coordinator read contract. The full
+/// `AgentResumePlan` remains an internal host object used to validate the
+/// continuation; callers receive only what they need to confirm the opaque
+/// checkpoint and issue an explicit resume request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoordinatorResumePlanView {
+    pub schema_version: String,
+    pub agent: CoordinatorAgentView,
+    pub checkpoint: CoordinatorCheckpointView,
+    pub parent_run_id: String,
+}
+
+impl CoordinatorResumePlanView {
+    pub const SCHEMA_VERSION: &'static str = "grokptah.coordinator.resume-plan.v1";
+
+    pub fn validate(&self) -> Result<(), OrchError> {
+        if self.schema_version != Self::SCHEMA_VERSION {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "unsupported coordinator resume-plan schema",
+            ));
+        }
+        self.agent.validate()?;
+        self.checkpoint.validate()?;
+        if self.agent.agent_id != self.checkpoint.agent_id {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "coordinator resume-plan agent binding is invalid",
+            ));
+        }
+        if self.agent.latest_checkpoint_id.as_deref()
+            != Some(self.checkpoint.checkpoint_id.as_str())
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "coordinator resume-plan checkpoint binding is invalid",
+            ));
+        }
+        if self.parent_run_id != self.checkpoint.run_id {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "coordinator resume-plan run binding is invalid",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl From<&AgentResumePlan> for CoordinatorResumePlanView {
+    fn from(plan: &AgentResumePlan) -> Self {
+        Self {
+            schema_version: Self::SCHEMA_VERSION.into(),
+            agent: CoordinatorAgentView::from(&plan.agent),
+            checkpoint: CoordinatorCheckpointView::from(&plan.checkpoint),
+            parent_run_id: plan.parent_run_id.clone(),
+        }
+    }
 }
 
 impl AgentResumePlan {
@@ -1713,6 +1929,52 @@ mod tests {
         let agent: AgentRecord = serde_json::from_value(legacy).unwrap();
         assert!(agent.lane_ids.is_empty());
         assert_eq!(agent.known_lane_ids(), vec![session_id]);
+    }
+
+    #[test]
+    fn coordinator_view_prefers_a_live_lane_when_legacy_primary_is_detached() {
+        let primary = Uuid::new_v4();
+        let live = Uuid::new_v4();
+        let now = Utc::now();
+        let agent = AgentRecord {
+            agent_id: "agent-multi-lane".into(),
+            owner_principal_id: None,
+            session_id: primary,
+            lane_ids: vec![primary, live],
+            lane_associations: vec![
+                AgentLaneAssociation {
+                    lane_id: primary,
+                    source_workspace: "/tmp/project".into(),
+                    attached_at: now,
+                    attached_by: "test".into(),
+                    detached_at: Some(now),
+                    detached_by: Some("test".into()),
+                },
+                AgentLaneAssociation {
+                    lane_id: live,
+                    source_workspace: "/tmp/project".into(),
+                    attached_at: now,
+                    attached_by: "test".into(),
+                    detached_at: None,
+                    detached_by: None,
+                },
+            ],
+            workspace: "/tmp/project".into(),
+            model: "grok".into(),
+            spec: None,
+            state: AgentState::Waiting,
+            current_run_id: None,
+            last_run_id: None,
+            last_lane_id: Some(primary),
+            latest_checkpoint_id: None,
+            continuation_ordinal: 0,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let view = CoordinatorAgentView::from(&agent);
+        assert_eq!(view.session_id, live);
+        assert_eq!(view.lane_ids, vec![live]);
     }
 
     #[test]

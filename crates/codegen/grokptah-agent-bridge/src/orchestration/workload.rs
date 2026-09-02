@@ -146,6 +146,31 @@ pub struct WorkDecision {
     pub created_at: DateTime<Utc>,
 }
 
+impl WorkDecision {
+    pub fn validate(&self) -> Result<(), OrchError> {
+        if self.schema_version != WORKLOAD_SCHEMA_VERSION {
+            return Err(invalid("work decision schema version is invalid"));
+        }
+        validate_id(&self.decision_id, "decision_id")?;
+        validate_id(&self.work_id, "work_id")?;
+        validate_text(&self.actor_id, MAX_WORK_ACTOR_BYTES, "actor_id")?;
+        if let Some(actor_agent_id) = &self.actor_agent_id {
+            validate_id(actor_agent_id, "actor_agent_id")?;
+        }
+        if let Some(assigned_agent_id) = &self.assigned_agent_id {
+            validate_id(assigned_agent_id, "assigned_agent_id")?;
+        }
+        if self.work_revision == Some(0) {
+            return Err(invalid("work_revision must be greater than zero"));
+        }
+        if self.policy_revision == Some(0) {
+            return Err(invalid("policy_revision must be greater than zero"));
+        }
+        validate_text(&self.reason, MAX_WORK_OBJECTIVE_BYTES, "reason")?;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttemptState {
@@ -967,6 +992,24 @@ mod tests {
         assert_eq!(item.state, WorkState::Queued);
         assert!(item.validate().is_ok());
         assert!(lease_duration(Some(MAX_WORK_LEASE_MS + 1)).is_err());
+    }
+
+    #[test]
+    fn work_decision_rejects_zero_policy_revision() {
+        let decision = WorkDecision {
+            schema_version: WORKLOAD_SCHEMA_VERSION,
+            decision_id: "decision-1".into(),
+            work_id: "work-1".into(),
+            action: WorkDecisionAction::Assign,
+            actor_id: "operator".into(),
+            actor_agent_id: None,
+            assigned_agent_id: None,
+            policy_revision: Some(0),
+            work_revision: Some(1),
+            reason: "assign".into(),
+            created_at: Utc::now(),
+        };
+        assert!(decision.validate().is_err());
     }
 
     #[test]

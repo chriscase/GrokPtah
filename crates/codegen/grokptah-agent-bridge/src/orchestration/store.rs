@@ -161,6 +161,103 @@ struct ManagerCreationIntent {
     root_work: WorkItem,
 }
 
+/// Crash-recovery envelope for the paired WorkDecision + WorkItem mutation.
+///
+/// Each record is still an independently atomic JSON file, but the intent is
+/// the durable commit marker: reopening the ledger can finish an interrupted
+/// pair, or refuse a pair whose prior state was changed by an unknown writer.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkMutationIntent {
+    schema_version: u32,
+    intent_id: String,
+    work_id: String,
+    expected_revision: u64,
+    prior_item_digest: String,
+    next_item_digest: String,
+    decision_digest: String,
+    item: WorkItem,
+    decision: WorkDecision,
+}
+
+impl WorkMutationIntent {
+    fn new(prior: &WorkItem, item: WorkItem, decision: WorkDecision) -> Result<Self, OrchError> {
+        let prior_item_digest = super::hash_payload(
+            &serde_json::to_value(prior)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+        );
+        let next_item_digest = super::hash_payload(
+            &serde_json::to_value(&item)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+        );
+        let decision_digest = super::hash_payload(
+            &serde_json::to_value(&decision)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+        );
+        let intent = Self {
+            schema_version: WORKLOAD_SCHEMA_VERSION,
+            intent_id: decision.decision_id.clone(),
+            work_id: item.work_id.clone(),
+            expected_revision: prior.revision,
+            prior_item_digest,
+            next_item_digest,
+            decision_digest,
+            item,
+            decision,
+        };
+        intent.validate()?;
+        Ok(intent)
+    }
+
+    fn validate(&self) -> Result<(), OrchError> {
+        if self.schema_version != WORKLOAD_SCHEMA_VERSION
+            || self.intent_id.is_empty()
+            || self.work_id.is_empty()
+            || self.expected_revision == 0
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "work mutation intent schema or identity is invalid",
+            ));
+        }
+        self.item.validate()?;
+        self.decision.validate()?;
+        if self.item.work_id != self.work_id
+            || self.decision.work_id != self.work_id
+            || self.intent_id != self.decision.decision_id
+            || self.item.last_decision_id.as_deref() != Some(self.intent_id.as_str())
+            || self.decision.work_revision != Some(self.expected_revision)
+            // Work decisions describe the revision being changed; the item
+            // carries the incremented revision after the mutation lands.
+            || self
+                .decision
+                .work_revision
+                .and_then(|revision| revision.checked_add(1))
+                != Some(self.item.revision)
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "work mutation intent records do not agree",
+            ));
+        }
+        let item_digest = super::hash_payload(
+            &serde_json::to_value(&self.item)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+        );
+        let decision_digest = super::hash_payload(
+            &serde_json::to_value(&self.decision)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+        );
+        if item_digest != self.next_item_digest || decision_digest != self.decision_digest {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "work mutation intent digest is invalid",
+            ));
+        }
+        Ok(())
+    }
+}
+
 const MAX_AUDIT_BYTES: u64 = 4 * 1024 * 1024;
 
 struct AssignmentMutation<'a> {
@@ -367,6 +464,7 @@ impl OrchStore {
         fs::create_dir_all(root.join("manager-plans"))?;
         fs::create_dir_all(root.join("manager-decisions"))?;
         fs::create_dir_all(root.join("manager-intents"))?;
+        fs::create_dir_all(root.join("work-intents"))?;
         let root = dunce::canonicalize(root)?;
         let lock_path = root.join(".store.lock");
         let store_lock = OpenOptions::new()
@@ -430,6 +528,7 @@ impl OrchStore {
         store.recover_routine_intents()?;
         store.recover_managed_finalization_intents()?;
         store.recover_manager_creation_intents()?;
+        store.recover_work_mutation_intents()?;
         store.mark_unfinished_interrupted()?;
         store.fail_orphaned_idempotency_claims()?;
         store.reconcile_workloads()?;
@@ -612,6 +711,14 @@ impl OrchStore {
             .root
             .join("manager-intents")
             .join(format!("{}.json", safe_id_filename(plan_id)?)))
+    }
+
+    fn work_mutation_intent_path(&self, intent_id: &str) -> Result<PathBuf, OrchError> {
+        Ok(self
+            .inner
+            .root
+            .join("work-intents")
+            .join(format!("{}.json", safe_id_filename(intent_id)?)))
     }
 
     pub fn save_run(&self, run: &RunRecord) -> anyhow::Result<()> {
@@ -1272,6 +1379,117 @@ impl OrchStore {
             self.commit_manager_creation_intent_unlocked(&intent)?;
             remove_file_durable(&self.lease(), &path)
                 .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn persist_work_mutation_intent_unlocked(
+        &self,
+        intent: &WorkMutationIntent,
+    ) -> Result<(), OrchError> {
+        intent.validate()?;
+        let path = self.work_mutation_intent_path(&intent.intent_id)?;
+        atomic_write_json(&self.lease(), &path, intent)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+    }
+
+    fn clear_work_mutation_intent_unlocked(&self, intent_id: &str) -> Result<(), OrchError> {
+        let path = self.work_mutation_intent_path(intent_id)?;
+        remove_file_durable(&self.lease(), &path)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+    }
+
+    fn load_work_decision_unlocked(
+        &self,
+        work_id: &str,
+        decision_id: &str,
+    ) -> Result<Option<WorkDecision>, OrchError> {
+        let path = self.work_decision_path(work_id, decision_id)?;
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let decision: WorkDecision = serde_json::from_str(
+            &fs::read_to_string(path)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+        )
+        .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        decision.validate()?;
+        Ok(Some(decision))
+    }
+
+    fn commit_work_mutation_intent_unlocked(
+        &self,
+        intent: &WorkMutationIntent,
+    ) -> Result<(), OrchError> {
+        intent.validate()?;
+        let current = self
+            .load_work_item_unlocked(&intent.work_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let current_digest = current.as_ref().map(|item| {
+            serde_json::to_value(item)
+                .map(|value| super::hash_payload(&value))
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+        });
+        let current_digest = current_digest.transpose()?;
+        if current_digest.as_deref() != Some(intent.prior_item_digest.as_str())
+            && current_digest.as_deref() != Some(intent.next_item_digest.as_str())
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "work mutation recovery found an unexpected prior revision",
+            ));
+        }
+        if current_digest.as_deref() == Some(intent.prior_item_digest.as_str())
+            && current
+                .as_ref()
+                .is_none_or(|item| item.revision != intent.expected_revision)
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "work mutation recovery found an unexpected expected_revision",
+            ));
+        }
+        if let Some(decision) =
+            self.load_work_decision_unlocked(&intent.work_id, &intent.decision.decision_id)?
+        {
+            let digest = super::hash_payload(
+                &serde_json::to_value(&decision)
+                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+            );
+            if digest != intent.decision_digest || decision != intent.decision {
+                return Err(OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "work mutation recovery found a conflicting decision receipt",
+                ));
+            }
+        } else {
+            self.save_work_decision_unlocked(&intent.decision)?;
+        }
+        if current_digest.as_deref() != Some(intent.next_item_digest.as_str()) {
+            self.save_work_item_unlocked(&intent.item)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        }
+        self.clear_work_mutation_intent_unlocked(&intent.intent_id)
+    }
+
+    fn recover_work_mutation_intents(&self) -> Result<(), OrchError> {
+        let _guard = self.inner.lock.lock();
+        let dir = self.inner.root.join("work-intents");
+        for entry in fs::read_dir(&dir)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+        {
+            let path = entry
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+                .path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let intent: WorkMutationIntent = serde_json::from_str(
+                &fs::read_to_string(&path)
+                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+            )
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            self.commit_work_mutation_intent_unlocked(&intent)?;
         }
         Ok(())
     }
@@ -2965,6 +3183,7 @@ impl OrchStore {
             .load_work_item_unlocked(request.work_id)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
             .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
+        let prior_item = item.clone();
         Self::require_work_revision(&item, request.expected_revision)?;
         let (actor_agent_id, policy_revision) = self.resolve_assignment_agents_unlocked(
             &item,
@@ -2991,12 +3210,12 @@ impl OrchStore {
         item.last_decision_id = Some(decision.decision_id.clone());
         item.bump_at(request.now);
         item.validate()?;
-        // Two atomic files, not one sealed pair. A crash after the decision
-        // write and before the item write leaves a receipt whose item did not
-        // change. Issue #521 tracks the missing intent-recovery path.
-        self.save_work_decision_unlocked(&decision)?;
-        self.save_work_item_unlocked(&item)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        // The intent is the durable commit marker for this pair. Either file
+        // may be missing after a crash; reopening the store replays the exact
+        // decision and item only when the observed prior/next digests agree.
+        let intent = WorkMutationIntent::new(&prior_item, item.clone(), decision.clone())?;
+        self.persist_work_mutation_intent_unlocked(&intent)?;
+        self.commit_work_mutation_intent_unlocked(&intent)?;
         Ok((item, decision))
     }
 
@@ -3076,6 +3295,7 @@ impl OrchStore {
     }
 
     fn save_work_decision_unlocked(&self, decision: &WorkDecision) -> Result<(), OrchError> {
+        decision.validate()?;
         let path = self.work_decision_path(&decision.work_id, &decision.decision_id)?;
         atomic_write_json(&self.lease(), &path, decision)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
@@ -3114,6 +3334,7 @@ impl OrchStore {
                     .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
             )
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            decision.validate()?;
             out.push(decision);
         }
         out.sort_by(|left, right| left.created_at.cmp(&right.created_at));
@@ -6501,6 +6722,147 @@ mod tests {
         };
         checkpoint.context_hash = checkpoint.context_hash_for();
         checkpoint
+    }
+
+    fn work_mutation_fixture(
+        store: &OrchStore,
+    ) -> (WorkItem, WorkItem, WorkDecision, WorkMutationIntent) {
+        let now = Utc::now();
+        let prior = WorkItem::new_at(
+            "triage",
+            "inspect the synthetic incident",
+            Uuid::new_v4(),
+            "/tmp/coordinator-workspace",
+            "operator",
+            Default::default(),
+            now,
+        )
+        .unwrap();
+        store.save_work_item(&prior).unwrap();
+
+        let mut next = prior.clone();
+        next.state = WorkState::Blocked;
+        next.block_provenance = Some(BlockProvenance::Manual);
+        next.blocked_reason = Some("waiting for human evidence approval".into());
+        next.bump_at(now + chrono::Duration::seconds(1));
+        let decision = WorkDecision {
+            schema_version: WORKLOAD_SCHEMA_VERSION,
+            decision_id: Uuid::new_v4().to_string(),
+            work_id: prior.work_id.clone(),
+            action: WorkDecisionAction::Block,
+            actor_id: "operator".into(),
+            actor_agent_id: None,
+            assigned_agent_id: None,
+            policy_revision: None,
+            // A decision records the revision it authorizes; the item carries
+            // the following revision after the mutation is applied.
+            work_revision: Some(prior.revision),
+            reason: "waiting for human evidence approval".into(),
+            created_at: now,
+        };
+        next.last_decision_id = Some(decision.decision_id.clone());
+        next.validate().unwrap();
+        let intent = WorkMutationIntent::new(&prior, next.clone(), decision.clone()).unwrap();
+        (prior, next, decision, intent)
+    }
+
+    #[test]
+    fn work_mutation_intent_recovers_after_decision_only_crash() {
+        let d = tempdir().unwrap();
+        let intent_path;
+        let expected;
+        {
+            let store = OrchStore::open(d.path()).unwrap();
+            let (_, next, decision, intent) = work_mutation_fixture(&store);
+            expected = next;
+            intent_path = store.work_mutation_intent_path(&intent.intent_id).unwrap();
+            store
+                .persist_work_mutation_intent_unlocked(&intent)
+                .unwrap();
+            store.save_work_decision_unlocked(&decision).unwrap();
+        }
+
+        let reopened = OrchStore::open(d.path()).unwrap();
+        assert_eq!(
+            reopened.load_work_item(&expected.work_id).unwrap(),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            reopened
+                .list_work_decisions(&expected.work_id)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(!intent_path.exists());
+    }
+
+    #[test]
+    fn work_mutation_intent_recovers_after_item_only_crash() {
+        let d = tempdir().unwrap();
+        let intent_path;
+        let expected;
+        {
+            let store = OrchStore::open(d.path()).unwrap();
+            let (_, next, _, intent) = work_mutation_fixture(&store);
+            expected = next.clone();
+            intent_path = store.work_mutation_intent_path(&intent.intent_id).unwrap();
+            store
+                .persist_work_mutation_intent_unlocked(&intent)
+                .unwrap();
+            store.save_work_item_unlocked(&next).unwrap();
+        }
+
+        let reopened = OrchStore::open(d.path()).unwrap();
+        assert_eq!(
+            reopened.load_work_item(&expected.work_id).unwrap(),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            reopened
+                .list_work_decisions(&expected.work_id)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(!intent_path.exists());
+    }
+
+    #[test]
+    fn work_mutation_intent_refuses_an_unexpected_prior_revision() {
+        let d = tempdir().unwrap();
+        {
+            let store = OrchStore::open(d.path()).unwrap();
+            let (prior, _, _, intent) = work_mutation_fixture(&store);
+            store
+                .persist_work_mutation_intent_unlocked(&intent)
+                .unwrap();
+            let mut conflicting = prior;
+            conflicting.priority = 7;
+            conflicting.bump();
+            store
+                .save_work_item_unchecked_unlocked(&conflicting)
+                .unwrap();
+        }
+
+        let result = OrchStore::open(d.path());
+        let error = match result {
+            Ok(_) => panic!("recovery must refuse an unexpected prior revision"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("unexpected prior revision"));
+    }
+
+    #[test]
+    fn work_mutation_intent_binds_decision_to_expected_prior_revision() {
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+        let (_, _, _, mut intent) = work_mutation_fixture(&store);
+        intent.expected_revision += 1;
+        let error = intent
+            .validate()
+            .expect_err("a decision must authorize the exact prior revision");
+        assert!(error.to_string().contains("records do not agree"));
     }
 
     #[test]

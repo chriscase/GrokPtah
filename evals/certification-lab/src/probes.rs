@@ -3416,7 +3416,8 @@ async fn identity(
         agents.iter().any(|candidate| {
             candidate["agentId"].as_str() == Some(agent.agent_id.as_str())
                 && candidate["sessionId"].as_str() == Some(agent.session_id.as_str())
-                && candidate["workspace"].as_str() == Some(workspace)
+                && candidate["schemaVersion"].as_str() == Some("grokptah.coordinator.agent.v1")
+                && candidate.get("workspace").is_none()
         })
     }) {
         return Err(DiagnosticCode::McpResultMalformed);
@@ -3482,17 +3483,18 @@ async fn continuation_resume(
     let checkpoint_id = required_string(&plan, &["checkpoint", "checkpointId"])?;
     let checkpoint_run_id = required_string(&plan, &["checkpoint", "runId"])?;
     let latest_checkpoint_id = required_string(&plan, &["agent", "latestCheckpointId"])?;
-    let checkpoint_context_hash = required_string(&plan, &["checkpoint", "contextHash"])?;
     let checkpoint_revision = plan["checkpoint"]["agentSpecRevision"]
         .as_u64()
         .ok_or(DiagnosticCode::McpResultMalformed)?;
     if checkpoint_run_id != seed_run_id
         || latest_checkpoint_id != checkpoint_id
-        || checkpoint_context_hash.len() != 64
-        || checkpoint_revision
-            != plan["agent"]["spec"]["revision"]
-                .as_u64()
-                .ok_or(DiagnosticCode::McpResultMalformed)?
+        || plan["schemaVersion"].as_str() != Some("grokptah.coordinator.resume-plan.v1")
+        || plan["agent"].get("workspace").is_some()
+        || plan["agent"].get("spec").is_some()
+        || plan["agent"].get("model").is_some()
+        || plan["agent"].get("authority").is_some()
+        || plan["checkpoint"].get("workspace").is_some()
+        || plan["checkpoint"].get("contextHash").is_some()
     {
         return Err(DiagnosticCode::StateTransitionMismatch);
     }
@@ -4095,7 +4097,7 @@ async fn create_agent(
         .filter(|id| !id.is_empty())
         .map(str::to_owned)
         .ok_or(DiagnosticCode::McpResultMalformed)?;
-    let agent_spec_revision = listed_agent["spec"]["revision"]
+    let agent_spec_revision = listed_agent["agentSpecRevision"]
         .as_u64()
         .ok_or(DiagnosticCode::McpResultMalformed)?;
     probe.retain_id(DurableIdKind::Run, &run_id);

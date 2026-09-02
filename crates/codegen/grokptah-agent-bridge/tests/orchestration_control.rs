@@ -1473,6 +1473,19 @@ async fn submit_task_reaches_terminal_offline() {
     let run = orch.get_run(&auth, &run_id).unwrap();
     let agent_id = run["agentId"].as_str().unwrap().to_string();
     assert!(!agent_id.is_empty());
+    let stored_run = orch
+        .store()
+        .load_run(&run_id)
+        .unwrap()
+        .expect("completed run remains durable");
+    let evidence = stored_run
+        .aggregates
+        .verification
+        .as_ref()
+        .expect("terminal run publishes completion evidence");
+    assert!(!evidence.status.is_empty());
+    assert!(!evidence.stop_reason.is_empty());
+    assert!(!evidence.interrupted);
     assert_eq!(
         run["bounds"]["maxTotalTokens"],
         grokptah_agent_bridge::DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS
@@ -1568,6 +1581,10 @@ async fn submit_task_reaches_terminal_offline() {
         .await
         .unwrap();
     assert_eq!(replayed["response"], resumed["response"]);
+    assert!(resumed.get("workspace").is_none());
+    assert!(resumed["agent"].get("workspace").is_none());
+    assert!(resumed["agent"].get("model").is_none());
+    assert!(resumed["agent"].get("spec").is_none());
     let runs = orch.list_runs_scoped(&auth, session.id, ws.path()).unwrap();
     assert_eq!(runs["schemaVersion"], "grokptah.public-run.v1");
     let public_runs = runs["runs"].as_array().unwrap();
@@ -1616,6 +1633,76 @@ async fn submit_task_reaches_terminal_offline() {
         .await
         .unwrap();
     assert_eq!(again["runId"], run_id);
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn queued_persistent_run_cancel_is_terminal_and_idempotent() {
+    let (home, _lock) = setup_home();
+    let host = started_host();
+    let ws = tempdir().unwrap();
+    host.set_project_cwd(ws.path()).unwrap();
+    let first_session = host.session_new_kind(SessionKind::Build).unwrap();
+    let queued_session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(first_session.id, ws.path()).unwrap();
+    host.session_set_cwd(queued_session.id, ws.path()).unwrap();
+    let orch = orch_for(&host, &home, &ws, 1);
+    let auth = orch.auth_header(Some("Bearer t")).unwrap();
+    let _first = orch
+        .submit_task(
+            &auth,
+            "queue-cancel-first",
+            first_session.id,
+            ws.path(),
+            "run sleep 8".into(),
+            Some(json!({"maxPromptBytes": 10000, "maxRounds": 24, "maxDurationMs": 60000})),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let queued = orch
+        .submit_task_with_execution_mode_and_queue(
+            &auth,
+            "queue-cancel-second",
+            queued_session.id,
+            ws.path(),
+            "bounded queued triage follow-up".into(),
+            None,
+            RunExecutionMode::Shared,
+            true,
+        )
+        .await
+        .unwrap();
+    let queued_run_id = queued["runId"].as_str().unwrap().to_string();
+    let cancelled = orch
+        .cancel(
+            &auth,
+            "queue-cancel-request",
+            queued_session.id,
+            ws.path(),
+            Some(&queued_run_id),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cancelled["cancelled"], true);
+    assert_eq!(cancelled["wasQueued"], true);
+    assert_eq!(cancelled["state"], "cancelled");
+    assert_eq!(
+        orch.get_run(&auth, &queued_run_id).unwrap()["state"],
+        "cancelled"
+    );
+    let replay = orch
+        .cancel(
+            &auth,
+            "queue-cancel-request",
+            queued_session.id,
+            ws.path(),
+            Some(&queued_run_id),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay, cancelled);
     set_grokptah_home_override(None);
 }
 

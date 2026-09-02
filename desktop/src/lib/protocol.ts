@@ -162,13 +162,18 @@ export interface LaneSummary {
 }
 
 export interface PersistentAgent {
+  schemaVersion?: string;
   agentId: string;
   sessionId: string;
   /** All durable Lanes attached to this Agent; old records expose the primary Lane. */
   laneIds?: string[];
   laneAssociations?: PersistentAgentLaneAssociation[];
-  workspace: string;
-  model: string;
+  displayName?: string | null;
+  role?: string | null;
+  /** Public policy revision used for continuation fencing; policy contents remain redacted. */
+  agentSpecRevision?: number | null;
+  workspace?: string;
+  model?: string;
   spec?: PersistentAgentSpec;
   state: PersistentAgentState;
   currentRunId?: string | null;
@@ -188,9 +193,9 @@ export interface PersistentAgentCheckpoint {
   agentSpecRevision?: number | null;
   parentCheckpointId?: string | null;
   ordinal: number;
-  workspace: string;
+  workspace?: string;
   contextSummary: string;
-  contextHash: string;
+  contextHash?: string;
   eventSeq: number;
   reason: string;
   createdAt: string;

@@ -2,9 +2,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use grokptah_agent_bridge::orchestration::WorkPolicy;
+use grokptah_agent_bridge::orchestration::{CoordinatorAgentView, CoordinatorResumePlanView, WorkPolicy};
 use grokptah_agent_bridge::{
-    ActivationRecord, AgentRecord, AgentResumePlan, JournalPage, McpControlClient, PublicEventKindV1,
+    ActivationRecord, JournalPage, McpControlClient, PublicEventKindV1,
     RoutineRecord, RoutineSnapshot, RunExecutionMode, RunRecord, RunScope, RunState,
     RuntimeConnectionState, RuntimeTarget, SessionUpdate, WorkAttemptView, WorkItem,
 };
@@ -201,7 +201,7 @@ impl RemoteServiceState {
         status.last_error = None;
     }
 
-    pub async fn list_persistent_agents(&self) -> Result<Option<Vec<AgentRecord>>> {
+    pub async fn list_persistent_agents(&self) -> Result<Option<Vec<CoordinatorAgentView>>> {
         let mut client = self.client.lock().await;
         let result = {
             let Some(client) = client.as_mut() else {
@@ -270,7 +270,7 @@ impl RemoteServiceState {
         ))
     }
 
-    pub async fn get_persistent_agent(&self, agent_id: &str) -> Result<Option<AgentRecord>> {
+    pub async fn get_persistent_agent(&self, agent_id: &str) -> Result<Option<CoordinatorAgentView>> {
         let mut client = self.client.lock().await;
         let Some(client) = client.as_mut() else {
             return Ok(None);
@@ -278,7 +278,7 @@ impl RemoteServiceState {
         Ok(Some(client.get_persistent_agent(agent_id).await?))
     }
 
-    pub async fn resume_plan(&self, session_id: Uuid) -> Result<Option<AgentResumePlan>> {
+    pub async fn resume_plan(&self, session_id: Uuid) -> Result<Option<CoordinatorResumePlanView>> {
         let mut client = self.client.lock().await;
         let Some(client) = client.as_mut() else {
             return Ok(None);
@@ -859,17 +859,23 @@ impl RemoteServiceClient {
         Ok(result.structured)
     }
 
-    async fn list_persistent_agents(&mut self) -> Result<Vec<AgentRecord>> {
+    async fn list_persistent_agents(&mut self) -> Result<Vec<CoordinatorAgentView>> {
         let value = self
             .call_tool("ptah_list_persistent_agents", json!({}))
             .await?;
-        serde_json::from_value(
+        let agents: Vec<CoordinatorAgentView> = serde_json::from_value(
             value
                 .get("agents")
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("remote agent list omitted agents"))?,
         )
-        .context("decode remote persistent agents")
+        .context("decode remote persistent agents")?;
+        for agent in &agents {
+            agent
+                .validate()
+                .map_err(|error| anyhow::anyhow!("invalid remote coordinator agent: {error}"))?;
+        }
+        Ok(agents)
     }
 
     async fn list_sessions(&mut self) -> Result<Vec<RemoteSessionTarget>> {
@@ -935,44 +941,77 @@ impl RemoteServiceClient {
         serde_json::from_value(value).context("decode remote task submission")
     }
 
-    async fn get_persistent_agent(&mut self, agent_id: &str) -> Result<AgentRecord> {
+    async fn get_persistent_agent(&mut self, agent_id: &str) -> Result<CoordinatorAgentView> {
         let agents = self.list_persistent_agents().await?;
         let agent = agents
             .into_iter()
             .find(|agent| agent.agent_id == agent_id)
             .ok_or_else(|| anyhow::anyhow!("remote agent is outside the service scope"))?;
+        let (session_id, workspace) = self.workspace_for_agent(&agent).await?;
         let plan = self
             .call_tool(
                 "ptah_get_persistent_agent",
                 json!({
-                    "session_id": agent.session_id,
-                    "workspace": agent.workspace,
+                    "session_id": session_id,
+                    "workspace": workspace,
                     "agent_id": agent.agent_id,
                 }),
             )
             .await?;
-        let plan: AgentResumePlan = serde_json::from_value(plan)
+        let plan: CoordinatorResumePlanView = serde_json::from_value(plan)
             .context("decode remote persistent-agent checkpoint plan")?;
+        plan.validate()
+            .map_err(|error| anyhow::anyhow!("invalid remote coordinator resume plan: {error}"))?;
         Ok(plan.agent)
     }
 
-    async fn resume_plan(&mut self, session_id: Uuid) -> Result<AgentResumePlan> {
+    async fn resume_plan(&mut self, session_id: Uuid) -> Result<CoordinatorResumePlanView> {
         let agents = self.list_persistent_agents().await?;
         let agent = agents
             .into_iter()
-            .find(|agent| agent.known_lane_ids().contains(&session_id))
+            .find(|agent| agent.lane_ids.iter().any(|lane_id| *lane_id == session_id))
             .ok_or_else(|| anyhow::anyhow!("remote session has no persistent agent"))?;
+        let workspace = self.workspace_for_session(session_id).await?;
         let value = self
             .call_tool(
                 "ptah_get_persistent_agent",
                 json!({
                     "session_id": session_id,
-                    "workspace": agent.workspace,
+                    "workspace": workspace,
                     "agent_id": agent.agent_id,
                 }),
             )
             .await?;
-        serde_json::from_value(value).context("decode remote resume plan")
+        let plan: CoordinatorResumePlanView =
+            serde_json::from_value(value).context("decode remote resume plan")?;
+        plan.validate()
+            .map_err(|error| anyhow::anyhow!("invalid remote coordinator resume plan: {error}"))?;
+        Ok(plan)
+    }
+
+    async fn workspace_for_session(&mut self, session_id: Uuid) -> Result<String> {
+        self.list_sessions()
+            .await?
+            .into_iter()
+            .find(|session| session.session_id == session_id)
+            .map(|session| session.workspace)
+            .ok_or_else(|| anyhow::anyhow!("remote session is outside the service scope"))
+    }
+
+    async fn workspace_for_agent(
+        &mut self,
+        agent: &CoordinatorAgentView,
+    ) -> Result<(Uuid, String)> {
+        let sessions = self.list_sessions().await?;
+        preferred_agent_session_ids(agent)
+            .into_iter()
+            .find_map(|candidate| {
+                sessions
+                    .iter()
+                    .find(|session| session.session_id == candidate)
+                    .map(|session| (candidate, session.workspace.clone()))
+            })
+            .ok_or_else(|| anyhow::anyhow!("remote agent has no accessible session"))
     }
 
     async fn resume(
@@ -985,15 +1024,16 @@ impl RemoteServiceClient {
         let agents = self.list_persistent_agents().await?;
         let agent = agents
             .into_iter()
-            .find(|agent| agent.known_lane_ids().contains(&session_id))
+            .find(|agent| agent.lane_ids.iter().any(|lane_id| *lane_id == session_id))
             .ok_or_else(|| anyhow::anyhow!("remote session has no persistent agent"))?;
+        let workspace = self.workspace_for_session(session_id).await?;
         let value = self
             .call_tool(
                 "ptah_resume_persistent_agent",
                 json!({
                     "request_id": request_id,
                     "session_id": session_id,
-                    "workspace": agent.workspace,
+                    "workspace": workspace,
                     "agent_id": agent.agent_id,
                     "prompt": prompt,
                     "max_rounds": max_rounds,
@@ -1674,6 +1714,20 @@ async fn replay_remote_events(
     }
 }
 
+fn preferred_agent_session_ids(agent: &CoordinatorAgentView) -> Vec<Uuid> {
+    let mut candidates = Vec::with_capacity(agent.lane_ids.len() + 2);
+    if let Some(last_lane_id) = agent.last_lane_id {
+        if agent.lane_ids.contains(&last_lane_id) {
+            candidates.push(last_lane_id);
+        }
+    }
+    candidates.extend(agent.lane_ids.iter().copied());
+    if !candidates.contains(&agent.session_id) {
+        candidates.push(agent.session_id);
+    }
+    candidates
+}
+
 fn normalize_base_url(value: &str) -> Result<String> {
     let parsed = Url::parse(value.trim()).context("remote service URL is invalid")?;
     match parsed.scheme() {
@@ -1739,6 +1793,7 @@ fn runtime_target_for_base_url(base_url: &str) -> RuntimeTarget {
 mod tests {
     use std::time::Duration;
 
+    use chrono::Utc;
     use grokptah_agent_bridge::{
         home_override_serial, set_grokptah_home_override, start_control_server,
         start_control_server_with_bind, AgentHost, ControlServerLimits, HostConfig, OrchStore,
@@ -1748,9 +1803,110 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        normalize_base_url, runtime_target_for_base_url, should_reconnect_remote_error,
-        RemoteServiceClient, RemoteServiceState,
+        normalize_base_url, preferred_agent_session_ids, runtime_target_for_base_url,
+        should_reconnect_remote_error, RemoteServiceClient, RemoteServiceState,
     };
+    use grokptah_agent_bridge::orchestration::{
+        CoordinatorAgentView, CoordinatorResumePlanView,
+    };
+
+    #[test]
+    fn coordinator_wire_decodes_and_reemits_redacted_views() {
+        let session_id = uuid::Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        let wire = serde_json::json!({
+            "schemaVersion": "grokptah.coordinator.agent.v1",
+            "agentId": "agent-safe",
+            "sessionId": session_id,
+            "displayName": "Triage coordinator",
+            "role": "triage",
+            "state": "waiting",
+            "laneIds": [session_id],
+            "currentRunId": null,
+            "lastRunId": "run-safe",
+            "lastLaneId": session_id,
+            "latestCheckpointId": "checkpoint-safe",
+            "continuationOrdinal": 2,
+            "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-01T00:01:00Z",
+            "workspace": "/private/customer-secret",
+            "model": "provider/secret-model",
+            "ownerPrincipalId": "tenant-secret",
+            "authority": {"allowedTools": ["run_terminal_cmd"]},
+            "memory": {"private": "do-not-forward"},
+            "laneAssociations": [{"laneId": session_id, "sourceWorkspace": "/private/customer-secret"}]
+        });
+        let view: CoordinatorAgentView = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(view.session_id, session_id);
+        assert_eq!(view.lane_ids, vec![session_id]);
+        let encoded = serde_json::to_value(&view).unwrap();
+        for forbidden in [
+            "workspace",
+            "model",
+            "ownerPrincipalId",
+            "authority",
+            "memory",
+            "laneAssociations",
+        ] {
+            assert!(
+                encoded.get(forbidden).is_none(),
+                "re-serialized coordinator agent leaked {forbidden}: {encoded}"
+            );
+        }
+
+        let plan_wire = serde_json::json!({
+            "schemaVersion": "grokptah.coordinator.resume-plan.v1",
+            "agent": wire,
+            "checkpoint": {
+                "schemaVersion": "grokptah.coordinator.checkpoint.v1",
+                "checkpointId": "checkpoint-safe",
+                "agentId": "agent-safe",
+                "sessionId": session_id,
+                "runId": "run-safe",
+                "agentSpecRevision": 1,
+                "parentCheckpointId": null,
+                "ordinal": 2,
+                "contextSummary": "resume after an interrupted turn",
+                "eventSeq": 7,
+                "reason": "interrupted",
+                "createdAt": "2026-01-01T00:01:00Z",
+                "workspace": "/private/customer-secret",
+                "contextHash": "private-context-hash"
+            },
+            "parentRunId": "run-safe"
+        });
+        let plan: CoordinatorResumePlanView = serde_json::from_value(plan_wire).unwrap();
+        let encoded_plan = serde_json::to_value(plan).unwrap();
+        assert!(encoded_plan["agent"].get("workspace").is_none());
+        assert!(encoded_plan["agent"].get("ownerPrincipalId").is_none());
+        assert!(encoded_plan["checkpoint"].get("workspace").is_none());
+        assert!(encoded_plan["checkpoint"].get("contextHash").is_none());
+    }
+
+    #[test]
+    fn remote_agent_session_candidates_skip_detached_last_lane() {
+        let primary = uuid::Uuid::new_v4();
+        let detached = uuid::Uuid::new_v4();
+        let live = uuid::Uuid::new_v4();
+        let now = Utc::now();
+        let agent = CoordinatorAgentView {
+            schema_version: CoordinatorAgentView::SCHEMA_VERSION.into(),
+            agent_id: "agent-multi-lane".into(),
+            session_id: primary,
+            display_name: None,
+            role: None,
+            agent_spec_revision: None,
+            state: grokptah_agent_bridge::orchestration::AgentState::Waiting,
+            lane_ids: vec![live],
+            current_run_id: None,
+            last_run_id: None,
+            last_lane_id: Some(detached),
+            latest_checkpoint_id: None,
+            continuation_ordinal: 0,
+            created_at: now,
+            updated_at: now,
+        };
+        assert_eq!(preferred_agent_session_ids(&agent), vec![live, primary]);
+    }
 
     #[test]
     fn local_http_is_allowed_but_remote_http_and_embedded_credentials_are_not() {

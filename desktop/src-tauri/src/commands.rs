@@ -742,34 +742,39 @@ pub async fn remote_service_watch_runs(
 #[tauri::command]
 pub async fn persistent_agent_list(
     state: State<'_, AppState>,
-) -> Result<Vec<grokptah_agent_bridge::AgentRecord>, String> {
+) -> Result<serde_json::Value, String> {
     if let Some(agents) = state
         .remote_service
         .list_persistent_agents()
         .await
         .map_err(map_err)?
     {
-        return Ok(agents);
+        return serde_json::to_value(agents).map_err(map_err);
     }
     let host = state.host.clone();
-    run_blocking(move || host.list_persistent_agents().map_err(map_err)).await
+    let agents = run_blocking(move || host.list_persistent_agents().map_err(map_err)).await?;
+    serde_json::to_value(agents).map_err(map_err)
 }
 
 #[tauri::command]
 pub async fn persistent_agent_get(
     state: State<'_, AppState>,
     agent_id: String,
-) -> Result<Option<grokptah_agent_bridge::AgentRecord>, String> {
+) -> Result<Option<serde_json::Value>, String> {
     if let Some(agent) = state
         .remote_service
         .get_persistent_agent(&agent_id)
         .await
         .map_err(map_err)?
     {
-        return Ok(Some(agent));
+        return serde_json::to_value(agent).map(Some).map_err(map_err);
     }
     let host = state.host.clone();
-    run_blocking(move || host.get_persistent_agent(&agent_id).map_err(map_err)).await
+    let agent = run_blocking(move || host.get_persistent_agent(&agent_id).map_err(map_err)).await?;
+    agent
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(map_err)
 }
 
 #[tauri::command]
@@ -813,7 +818,7 @@ pub fn lane_list(
 pub async fn persistent_agent_resume_plan(
     state: State<'_, AppState>,
     session_id: String,
-) -> Result<grokptah_agent_bridge::AgentResumePlan, String> {
+) -> Result<serde_json::Value, String> {
     let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
     if let Some(plan) = state
         .remote_service
@@ -821,10 +826,11 @@ pub async fn persistent_agent_resume_plan(
         .await
         .map_err(map_err)?
     {
-        return Ok(plan);
+        return serde_json::to_value(plan).map_err(map_err);
     }
     let host = state.host.clone();
-    run_blocking(move || host.prepare_agent_resume(session_id).map_err(map_err)).await
+    let plan = run_blocking(move || host.prepare_agent_resume(session_id).map_err(map_err)).await?;
+    serde_json::to_value(plan).map_err(map_err)
 }
 
 /// Manual continuation only: the caller supplies a fresh instruction and the
