@@ -1141,7 +1141,7 @@ impl OrchStore {
         Ok(Some(item))
     }
 
-    fn save_work_item_unlocked(&self, item: &WorkItem) -> anyhow::Result<()> {
+    fn validate_work_item_for_save_unlocked(&self, item: &WorkItem) -> anyhow::Result<()> {
         item.validate()
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         // Every durable writer must enforce the lane-local dependency graph,
@@ -1175,10 +1175,93 @@ impl OrchStore {
             super::graph::validate_scoped_dependency_graph(&lane, item, scope)
                 .map_err(anyhow::Error::new)?;
         }
+        Ok(())
+    }
+
+    fn write_work_item_unlocked(&self, item: &WorkItem) -> anyhow::Result<()> {
         let path = self
             .work_item_path(&item.work_id)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         atomic_write_json(&self.lease(), &path, item)
+    }
+
+    fn save_work_item_unlocked(&self, item: &WorkItem) -> anyhow::Result<()> {
+        self.validate_work_item_for_save_unlocked(item)?;
+        self.write_work_item_unlocked(item)
+    }
+
+    fn validate_work_items_for_save_unlocked(&self, items: &[WorkItem]) -> anyhow::Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let mut batch_new_per_scope: std::collections::HashMap<(Uuid, String), usize> =
+            std::collections::HashMap::new();
+        for item in items {
+            if self.load_work_item_unlocked(&item.work_id)?.is_none() {
+                *batch_new_per_scope
+                    .entry((item.session_id, item.workspace.clone()))
+                    .or_default() += 1;
+            }
+        }
+        let mut batch_in_scope: std::collections::HashMap<(Uuid, String), Vec<&WorkItem>> =
+            std::collections::HashMap::new();
+        for item in items {
+            batch_in_scope
+                .entry((item.session_id, item.workspace.clone()))
+                .or_default()
+                .push(item);
+        }
+        for item in items {
+            item.validate()
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            let existing = self.load_work_item_unlocked(&item.work_id)?;
+            let is_new = existing.is_none();
+            let previous_dependencies = existing.map(|record| record.dependencies);
+            if is_new {
+                let scope = super::graph::GraphScope::of(item);
+                let lane = self.scoped_work_items_unlocked(scope)?;
+                let batch_new = batch_new_per_scope
+                    .get(&(item.session_id, item.workspace.clone()))
+                    .copied()
+                    .unwrap_or(0);
+                if lane.len().saturating_add(batch_new) > super::graph::MAX_GRAPH_SCOPE_ITEMS {
+                    return Err(anyhow::Error::new(OrchError::new(
+                        OrchErrorCode::CapacityExhausted,
+                        format!(
+                            "scope holds more than {} work items; a new item is refused rather than unbounded",
+                            super::graph::MAX_GRAPH_SCOPE_ITEMS
+                        ),
+                    )));
+                }
+            }
+            if !item.dependencies.is_empty()
+                && previous_dependencies.as_ref() != Some(&item.dependencies)
+            {
+                let scope = super::graph::GraphScope::of(item);
+                let mut lane = self.scoped_work_items_unlocked(scope)?;
+                lane.retain(|existing| {
+                    existing.work_id != item.work_id && scope.contains(existing)
+                });
+                if let Some(batch_mates) =
+                    batch_in_scope.get(&(item.session_id, item.workspace.clone()))
+                {
+                    for mate in batch_mates {
+                        if mate.work_id != item.work_id {
+                            lane.push((*mate).clone());
+                        }
+                    }
+                }
+                super::graph::validate_scoped_dependency_graph(&lane, item, scope)
+                    .map_err(anyhow::Error::new)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn orch_error_from_anyhow(error: anyhow::Error) -> OrchError {
+        error
+            .downcast::<OrchError>()
+            .unwrap_or_else(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
     }
 
     fn save_work_item_unchecked_unlocked(&self, item: &WorkItem) -> anyhow::Result<()> {
@@ -1858,9 +1941,11 @@ impl OrchStore {
         work_items: &[WorkItem],
     ) -> Result<(), OrchError> {
         let _guard = self.inner.lock.lock();
+        self.validate_work_items_for_save_unlocked(work_items)
+            .map_err(Self::orch_error_from_anyhow)?;
         for item in work_items {
-            self.save_work_item_unlocked(item)
-                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            self.write_work_item_unlocked(item)
+                .map_err(Self::orch_error_from_anyhow)?;
         }
         self.save_manager_plan_unlocked(plan)
     }
@@ -1885,9 +1970,13 @@ impl OrchStore {
                 "manager plan changed before the mutation could be committed",
             ));
         }
+        // Validate the full materialization batch before the first durable
+        // write so a refused graph cannot leave a partial manager adoption.
+        self.validate_work_items_for_save_unlocked(work_items)
+            .map_err(Self::orch_error_from_anyhow)?;
         for item in work_items {
-            self.save_work_item_unlocked(item)
-                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            self.write_work_item_unlocked(item)
+                .map_err(Self::orch_error_from_anyhow)?;
         }
         self.save_manager_plan_unlocked(plan)
     }
