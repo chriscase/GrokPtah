@@ -428,6 +428,7 @@ pub struct ManagedFinalizationRecord {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManagedFinalizationStage {
+    BeforeJournal,
     AfterJournal,
     AfterAttempt,
     AfterWork,
