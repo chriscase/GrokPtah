@@ -1647,6 +1647,7 @@ impl OrchStore {
     fn recover_work_lifecycle_intents(&self) -> Result<(), OrchError> {
         let _guard = self.inner.lock.lock();
         let dir = self.inner.root.join("work-lifecycle-intents");
+        let mut intents = Vec::new();
         for entry in fs::read_dir(&dir)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
         {
@@ -1661,6 +1662,19 @@ impl OrchStore {
                     .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
             )
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            intents.push(intent);
+        }
+        // read_dir order is filesystem-dependent; managed-finalization envelopes
+        // must converge only after every other queued lifecycle intent for the
+        // same work item has been replayed.
+        intents.sort_by(|left, right| {
+            let left_managed = left.operation == "managed_finalization";
+            let right_managed = right.operation == "managed_finalization";
+            left_managed
+                .cmp(&right_managed)
+                .then_with(|| left.intent_id.cmp(&right.intent_id))
+        });
+        for intent in intents {
             self.commit_work_lifecycle_intent_unlocked(&intent)?;
         }
         Ok(())
