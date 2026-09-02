@@ -1639,6 +1639,24 @@ fn crash_close_stage(stage: ManagedFinalizationStage) {
             .unwrap()
             .unwrap();
         match stage {
+            ManagedFinalizationStage::BeforeJournal => {
+                assert_eq!(loaded.state, ManagedIntentState::Admitted);
+                assert!(store
+                    .load_work_attempt(&claim.attempt.attempt_id)
+                    .unwrap()
+                    .unwrap()
+                    .state
+                    .is_active());
+                assert!(
+                    !store
+                        .load_work_item(&item.work_id)
+                        .unwrap()
+                        .unwrap()
+                        .state
+                        .is_terminal(),
+                    "work must remain non-terminal before the journal lands"
+                );
+            }
             ManagedFinalizationStage::AfterJournal => {
                 assert_eq!(loaded.state, ManagedIntentState::Admitted);
                 assert!(store
@@ -1671,6 +1689,34 @@ fn crash_close_stage(stage: ManagedFinalizationStage) {
         (item.work_id, intent.intent_id, claim.attempt.attempt_id)
     };
     let store = OrchStore::open(&path).unwrap();
+    if stage == ManagedFinalizationStage::BeforeJournal {
+        let intent = store.load_managed_intent(&intent_id).unwrap().unwrap();
+        assert_eq!(intent.state, ManagedIntentState::Admitted);
+        assert!(
+            !store
+                .load_work_item(&work_id)
+                .unwrap()
+                .unwrap()
+                .state
+                .is_terminal(),
+            "work must remain non-terminal when the journal never landed"
+        );
+        assert!(store
+            .load_work_attempt(&attempt_id)
+            .unwrap()
+            .unwrap()
+            .state
+            .is_active());
+        store
+            .close_managed_attempt(
+                &intent_id,
+                false,
+                ManagedRetryCause::Interrupted,
+                "interrupted",
+                Utc::now(),
+            )
+            .unwrap();
+    }
     let intent = store.load_managed_intent(&intent_id).unwrap().unwrap();
     assert_eq!(intent.state, ManagedIntentState::Finalized);
     assert_eq!(
@@ -1684,6 +1730,11 @@ fn crash_close_stage(stage: ManagedFinalizationStage) {
         .state
         .is_active());
     assert_eq!(store.live_managed_intents_for_agent("worker-a").unwrap(), 0);
+}
+
+#[test]
+fn managed_finalization_converges_before_journal_crash() {
+    crash_close_stage(ManagedFinalizationStage::BeforeJournal);
 }
 
 #[test]
@@ -1815,5 +1866,30 @@ fn completed_finalization_converges_after_partial_writes() {
             .unwrap()
             .state,
         ManagedIntentState::Finalized
+    );
+}
+
+#[test]
+fn seal_queued_managed_work_converges_after_store_reload() {
+    let home = tempdir().unwrap();
+    let work_id;
+    {
+        let store = OrchStore::open(home.path()).unwrap();
+        let session = Uuid::new_v4();
+        let item = accepted_work(session, "/tmp/ws", "worker-a");
+        store.save_work_item(&item).unwrap();
+        work_id = item.work_id.clone();
+        store
+            .seal_queued_managed_work(&work_id, "lane sealed", Utc::now())
+            .unwrap();
+        assert_eq!(
+            store.load_work_item(&work_id).unwrap().unwrap().state,
+            WorkState::Failed
+        );
+    }
+    let store = OrchStore::open(home.path()).unwrap();
+    assert_eq!(
+        store.load_work_item(&work_id).unwrap().unwrap().state,
+        WorkState::Failed
     );
 }
