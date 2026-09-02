@@ -232,10 +232,13 @@ impl WorkLifecycleIntent {
             || self.work_id.is_empty()
             || self.prior_item.work_id != self.work_id
             || self.item.work_id != self.work_id
+            || self.prior_item.session_id != self.item.session_id
+            || self.prior_item.workspace != self.item.workspace
+            || self.prior_item.created_by != self.item.created_by
         {
             return Err(OrchError::new(
                 OrchErrorCode::InvalidRequest,
-                "work lifecycle intent schema or identity is invalid",
+                "work lifecycle intent schema or lane identity is invalid",
             ));
         }
         self.prior_item.validate()?;
@@ -1691,7 +1694,24 @@ impl OrchStore {
                 .find(|current| current.attempt_id == attempt.attempt_id)
                 .map(Self::attempt_digest)
                 .transpose()?;
-            if current_digest.as_deref() != Some(Self::attempt_digest(attempt)?.as_str()) {
+            let next_digest = Self::attempt_digest(attempt)?;
+            if let Some(current_digest) = current_digest {
+                let was_present_in_prior = intent
+                    .prior_attempts
+                    .iter()
+                    .any(|prior| prior.attempt_id == attempt.attempt_id);
+                if current_digest != next_digest {
+                    if !was_present_in_prior {
+                        return Err(OrchError::new(
+                            OrchErrorCode::Conflict,
+                            "work lifecycle recovery found an unexpected next-only attempt revision",
+                        ));
+                    }
+                    self.save_work_attempt_unlocked(attempt).map_err(|error| {
+                        OrchError::new(OrchErrorCode::Internal, error.to_string())
+                    })?;
+                }
+            } else {
                 self.save_work_attempt_unlocked(attempt)
                     .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
             }
@@ -7444,6 +7464,57 @@ mod tests {
             Some(expected_attempt)
         );
         assert!(!intent_path.exists());
+    }
+
+    #[test]
+    fn work_lifecycle_intent_rejects_lane_identity_changes() {
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+        let (prior_item, mut next_item, _, next_attempt, _) = work_lifecycle_fixture(&store);
+        next_item.session_id = Uuid::new_v4();
+        let error = WorkLifecycleIntent::new(
+            "lane-change",
+            prior_item,
+            next_item,
+            vec![],
+            vec![next_attempt],
+        )
+        .expect_err("lifecycle intent must pin session identity");
+        assert!(error.to_string().contains("lane identity"));
+    }
+
+    #[test]
+    fn work_lifecycle_intent_rejects_an_unexpected_next_only_attempt_writer() {
+        let d = tempdir().unwrap();
+        {
+            let store = OrchStore::open(d.path()).unwrap();
+            let (prior_item, next_item, prior_attempt, next_attempt, _) =
+                work_lifecycle_fixture(&store);
+            let mut next_only = WorkAttempt::new(&prior_item.work_id, 2, "worker-b", "secret-b");
+            next_only.state = AttemptState::Running;
+            store.save_work_attempt_unlocked(&next_only).unwrap();
+            let intent = WorkLifecycleIntent::new(
+                "claim",
+                prior_item.clone(),
+                next_item,
+                vec![prior_attempt],
+                vec![next_attempt, next_only.clone()],
+            )
+            .unwrap();
+            store
+                .persist_work_lifecycle_intent_unlocked(&intent)
+                .unwrap();
+            let mut conflicting = next_only;
+            conflicting.claimant_id = "worker-c".into();
+            store.save_work_attempt_unlocked(&conflicting).unwrap();
+        }
+        let error = match OrchStore::open(d.path()) {
+            Ok(_) => panic!("recovery must refuse an unexpected next-only attempt writer"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("unexpected next-only attempt revision"));
     }
 
     #[derive(Clone, Copy)]
