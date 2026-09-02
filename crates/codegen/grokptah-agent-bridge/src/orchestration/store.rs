@@ -1688,6 +1688,7 @@ impl OrchStore {
                 "work lifecycle recovery found an unexpected attempt",
             ));
         }
+        let mut attempts_to_write = Vec::new();
         for attempt in &intent.attempts {
             let current_digest = current_attempts
                 .iter()
@@ -1707,14 +1708,15 @@ impl OrchStore {
                             "work lifecycle recovery found an unexpected next-only attempt revision",
                         ));
                     }
-                    self.save_work_attempt_unlocked(attempt).map_err(|error| {
-                        OrchError::new(OrchErrorCode::Internal, error.to_string())
-                    })?;
+                    attempts_to_write.push(attempt);
                 }
             } else {
-                self.save_work_attempt_unlocked(attempt)
-                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+                attempts_to_write.push(attempt);
             }
+        }
+        for attempt in attempts_to_write {
+            self.save_work_attempt_unlocked(attempt)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         }
         if current_item_digest != next_item_digest {
             self.save_work_item_unlocked(&intent.item)
@@ -7470,26 +7472,46 @@ mod tests {
     fn work_lifecycle_intent_rejects_lane_identity_changes() {
         let d = tempdir().unwrap();
         let store = OrchStore::open(d.path()).unwrap();
-        let (prior_item, mut next_item, _, next_attempt, _) = work_lifecycle_fixture(&store);
-        next_item.session_id = Uuid::new_v4();
-        let error = WorkLifecycleIntent::new(
-            "lane-change",
-            prior_item,
-            next_item,
-            vec![],
-            vec![next_attempt],
-        )
-        .expect_err("lifecycle intent must pin session identity");
-        assert!(error.to_string().contains("lane identity"));
+        let (prior_item, next_item, _, next_attempt, _) = work_lifecycle_fixture(&store);
+        fn assert_rejected(
+            prior_item: &WorkItem,
+            next_item: &WorkItem,
+            next_attempt: &WorkAttempt,
+            mutate: fn(&mut WorkItem),
+        ) {
+            let mut changed = next_item.clone();
+            mutate(&mut changed);
+            let error = WorkLifecycleIntent::new(
+                "lane-change",
+                prior_item.clone(),
+                changed,
+                vec![],
+                vec![next_attempt.clone()],
+            )
+            .expect_err("lifecycle intent must pin lane identity");
+            assert!(error.to_string().contains("lane identity"));
+        }
+        assert_rejected(&prior_item, &next_item, &next_attempt, |item| {
+            item.session_id = Uuid::new_v4()
+        });
+        assert_rejected(&prior_item, &next_item, &next_attempt, |item| {
+            item.workspace = "/tmp/other-workspace".into()
+        });
+        assert_rejected(&prior_item, &next_item, &next_attempt, |item| {
+            item.created_by = "other-operator".into()
+        });
     }
 
     #[test]
     fn work_lifecycle_intent_rejects_an_unexpected_next_only_attempt_writer() {
         let d = tempdir().unwrap();
+        let original_prior_attempt;
+        let conflicting_next_only;
         {
             let store = OrchStore::open(d.path()).unwrap();
             let (prior_item, next_item, prior_attempt, next_attempt, _) =
                 work_lifecycle_fixture(&store);
+            original_prior_attempt = prior_attempt.clone();
             let mut next_only = WorkAttempt::new(&prior_item.work_id, 2, "worker-b", "secret-b");
             next_only.state = AttemptState::Running;
             store.save_work_attempt_unlocked(&next_only).unwrap();
@@ -7507,6 +7529,7 @@ mod tests {
             let mut conflicting = next_only;
             conflicting.claimant_id = "worker-c".into();
             store.save_work_attempt_unlocked(&conflicting).unwrap();
+            conflicting_next_only = conflicting;
         }
         let error = match OrchStore::open(d.path()) {
             Ok(_) => panic!("recovery must refuse an unexpected next-only attempt writer"),
@@ -7515,6 +7538,126 @@ mod tests {
         assert!(error
             .to_string()
             .contains("unexpected next-only attempt revision"));
+        let prior_path = d.path().join("work-attempts").join(format!(
+            "{}.json",
+            safe_id_filename(&original_prior_attempt.attempt_id).unwrap()
+        ));
+        let next_only_path = d.path().join("work-attempts").join(format!(
+            "{}.json",
+            safe_id_filename(&conflicting_next_only.attempt_id).unwrap()
+        ));
+        assert_eq!(
+            serde_json::from_str::<WorkAttempt>(&fs::read_to_string(prior_path).unwrap()).unwrap(),
+            original_prior_attempt
+        );
+        assert_eq!(
+            serde_json::from_str::<WorkAttempt>(&fs::read_to_string(next_only_path).unwrap())
+                .unwrap(),
+            conflicting_next_only
+        );
+    }
+
+    #[test]
+    fn work_lifecycle_claim_reopen_is_deterministic_for_a_new_attempt() {
+        for cut in [
+            LifecycleCrashCut::BeforeIntent,
+            LifecycleCrashCut::AfterIntent,
+            LifecycleCrashCut::AfterAttempt,
+            LifecycleCrashCut::AfterItem,
+            LifecycleCrashCut::AfterCommit,
+        ] {
+            let d = tempdir().unwrap();
+            let expected_item;
+            let expected_attempt;
+            let intent_path;
+            {
+                let store = OrchStore::open(d.path()).unwrap();
+                let now = Utc::now();
+                let prior_item = WorkItem::new_at(
+                    "triage",
+                    "claim the synthetic incident",
+                    Uuid::new_v4(),
+                    "/tmp/coordinator-workspace",
+                    "operator",
+                    Default::default(),
+                    now,
+                )
+                .unwrap();
+                store.save_work_item(&prior_item).unwrap();
+                let mut next_item = prior_item.clone();
+                next_item.state = WorkState::Running;
+                next_item.attempt_count = 1;
+                next_item.bump_at(now + chrono::Duration::seconds(1));
+                let mut next_attempt =
+                    WorkAttempt::new(&prior_item.work_id, 1, "worker-claim", "claim-secret");
+                next_attempt.state = AttemptState::Running;
+                next_attempt.updated_at = now + chrono::Duration::seconds(1);
+                let intent = WorkLifecycleIntent::new(
+                    "claim",
+                    prior_item.clone(),
+                    next_item.clone(),
+                    vec![],
+                    vec![next_attempt.clone()],
+                )
+                .unwrap();
+                expected_item = if matches!(cut, LifecycleCrashCut::BeforeIntent) {
+                    prior_item
+                } else {
+                    next_item.clone()
+                };
+                expected_attempt = if matches!(cut, LifecycleCrashCut::BeforeIntent) {
+                    None
+                } else {
+                    Some(next_attempt.clone())
+                };
+                intent_path = store.work_lifecycle_intent_path(&intent.intent_id).unwrap();
+                match cut {
+                    LifecycleCrashCut::BeforeIntent => {}
+                    LifecycleCrashCut::AfterIntent => {
+                        store
+                            .persist_work_lifecycle_intent_unlocked(&intent)
+                            .unwrap();
+                    }
+                    LifecycleCrashCut::AfterAttempt => {
+                        store
+                            .persist_work_lifecycle_intent_unlocked(&intent)
+                            .unwrap();
+                        store.save_work_attempt_unlocked(&next_attempt).unwrap();
+                    }
+                    LifecycleCrashCut::AfterItem => {
+                        store
+                            .persist_work_lifecycle_intent_unlocked(&intent)
+                            .unwrap();
+                        store.save_work_attempt_unlocked(&next_attempt).unwrap();
+                        store.save_work_item_unlocked(&next_item).unwrap();
+                    }
+                    LifecycleCrashCut::AfterCommit => {
+                        store
+                            .persist_work_lifecycle_intent_unlocked(&intent)
+                            .unwrap();
+                        store.save_work_attempt_unlocked(&next_attempt).unwrap();
+                        store.save_work_item_unlocked(&next_item).unwrap();
+                        store
+                            .clear_work_lifecycle_intent_unlocked(&intent.intent_id)
+                            .unwrap();
+                    }
+                }
+            }
+            let reopened = OrchStore::open(d.path()).unwrap();
+            assert_eq!(
+                reopened.load_work_item(&expected_item.work_id).unwrap(),
+                Some(expected_item)
+            );
+            let attempt_id = expected_attempt
+                .as_ref()
+                .map(|attempt| attempt.attempt_id.as_str())
+                .unwrap_or("missing-claim-attempt");
+            assert_eq!(
+                reopened.load_work_attempt(attempt_id).unwrap(),
+                expected_attempt
+            );
+            assert!(!intent_path.exists());
+        }
     }
 
     #[derive(Clone, Copy)]
