@@ -2914,17 +2914,19 @@ impl OrchStore {
                     | super::graph::AdmissionBlock::DependencyUnresolved
             );
         if waiting && matches!(item.state, WorkState::Queued) {
+            let prior_item = item.clone();
             item.state = WorkState::Blocked;
             item.block_provenance = Some(BlockProvenance::Derived);
             item.blocked_reason = Some(admission.as_str().to_string());
             item.bump();
-            self.save_work_item_unlocked(item)?;
+            self.commit_refreshed_work_item_unlocked(prior_item, item)?;
         } else if !waiting && !manually_held && matches!(item.state, WorkState::Blocked) {
+            let prior_item = item.clone();
             item.state = WorkState::Queued;
             item.block_provenance = None;
             item.blocked_reason = None;
             item.bump();
-            self.save_work_item_unlocked(item)?;
+            self.commit_refreshed_work_item_unlocked(prior_item, item)?;
         } else if waiting && matches!(item.state, WorkState::Blocked) {
             // The hold stands but its cause may have changed -- a dependency
             // that was pending can become unsatisfiable. The same write stamps
@@ -2934,10 +2936,11 @@ impl OrchStore {
             if item.blocked_reason != reason
                 || item.block_provenance != Some(BlockProvenance::Derived)
             {
+                let prior_item = item.clone();
                 item.block_provenance = Some(BlockProvenance::Derived);
                 item.blocked_reason = reason;
                 item.bump();
-                self.save_work_item_unlocked(item)?;
+                self.commit_refreshed_work_item_unlocked(prior_item, item)?;
             }
         }
         if item.is_container || admission == super::graph::AdmissionBlock::Container {
@@ -2947,6 +2950,7 @@ impl OrchStore {
             && !item.state.is_terminal()
             && !item.state.is_review_gate()
         {
+            let prior_item = item.clone();
             item.state = WorkState::Failed;
             item.block_provenance = None;
             item.result = Some(Self::work_failure_result(
@@ -2954,9 +2958,25 @@ impl OrchStore {
                 now,
             ));
             item.bump();
-            self.save_work_item_unlocked(item)?;
+            self.commit_refreshed_work_item_unlocked(prior_item, item)?;
         }
         Ok(())
+    }
+
+    fn commit_refreshed_work_item_unlocked(
+        &self,
+        prior_item: WorkItem,
+        item: &WorkItem,
+    ) -> anyhow::Result<()> {
+        let attempts = self.list_work_attempts_unlocked(Some(&item.work_id))?;
+        self.commit_work_lifecycle_snapshots_unlocked(
+            "refresh",
+            prior_item,
+            item.clone(),
+            attempts.clone(),
+            attempts,
+        )
+        .map_err(|error| anyhow::anyhow!(error.to_string()))
     }
 
     /// Reconcile every durable workload at a caller-supplied instant.
@@ -3001,10 +3021,7 @@ impl OrchStore {
                     // happened before the supervisor saw the stale attempt.
                     // Preserve that terminal WorkItem state while closing the
                     // attempt so no active lease survives reconciliation.
-                    attempt.state = AttemptState::Expired;
-                    attempt.terminal_reason = Some("lease expired".into());
-                    attempt.updated_at = now;
-                    self.save_work_attempt_unlocked(&attempt)?;
+                    self.expire_terminal_attempt_unlocked(&item, &mut attempt, now)?;
                     continue;
                 }
                 let previous_state = item.state;
@@ -3026,10 +3043,10 @@ impl OrchStore {
         attempt: &mut WorkAttempt,
         now: chrono::DateTime<Utc>,
     ) -> anyhow::Result<()> {
+        let prior_item = item.clone();
         attempt.state = AttemptState::Expired;
         attempt.terminal_reason = Some("lease expired".into());
         attempt.updated_at = now;
-        self.save_work_attempt_unlocked(attempt)?;
         if item.policy.retry.retry_expired
             && attempt.attempt_number < item.policy.retry.max_attempts
         {
@@ -3042,7 +3059,45 @@ impl OrchStore {
             ));
         }
         item.bump();
-        self.save_work_item_unlocked(item)
+        self.commit_expired_attempt_lifecycle_unlocked("expire", prior_item, item, attempt)
+    }
+
+    fn expire_terminal_attempt_unlocked(
+        &self,
+        item: &WorkItem,
+        attempt: &mut WorkAttempt,
+        now: chrono::DateTime<Utc>,
+    ) -> anyhow::Result<()> {
+        attempt.state = AttemptState::Expired;
+        attempt.terminal_reason = Some("lease expired".into());
+        attempt.updated_at = now;
+        self.commit_expired_attempt_lifecycle_unlocked(
+            "expire_terminal",
+            item.clone(),
+            item,
+            attempt,
+        )
+    }
+
+    fn commit_expired_attempt_lifecycle_unlocked(
+        &self,
+        operation: &str,
+        prior_item: WorkItem,
+        item: &WorkItem,
+        attempt: &WorkAttempt,
+    ) -> anyhow::Result<()> {
+        let prior_attempts = self.list_work_attempts_unlocked(Some(&item.work_id))?;
+        let mut attempts = prior_attempts.clone();
+        Self::replace_attempt_snapshot(&mut attempts, attempt.clone())
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        self.commit_work_lifecycle_snapshots_unlocked(
+            operation,
+            prior_item,
+            item.clone(),
+            prior_attempts,
+            attempts,
+        )
+        .map_err(|error| anyhow::anyhow!(error.to_string()))
     }
 
     fn active_attempt_unlocked(
@@ -5363,13 +5418,22 @@ impl OrchStore {
         attempt.last_heartbeat_at = now;
         attempt.lease_expires_at = now + lease;
         attempt.updated_at = now;
+        let prior_item = item.clone();
+        let prior_attempts = self
+            .list_work_attempts_unlocked(Some(work_id))
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let mut attempts = prior_attempts.clone();
         item.attempt_count = attempt.attempt_number;
         item.state = WorkState::Leased;
         item.bump();
-        self.save_work_attempt_unlocked(&attempt)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-        self.save_work_item_unlocked(&item)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        attempts.push(attempt.clone());
+        self.commit_work_lifecycle_snapshots_unlocked(
+            "claim",
+            prior_item,
+            item.clone(),
+            prior_attempts,
+            attempts,
+        )?;
         Ok(WorkClaim {
             work: item,
             attempt,
