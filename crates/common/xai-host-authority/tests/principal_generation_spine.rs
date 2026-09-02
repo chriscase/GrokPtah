@@ -81,7 +81,7 @@ fn a_second_principal_cannot_project_or_bind_the_first_principals_workspace() {
     assert!(host.authority.principal_projection(&b).is_ok());
     assert!(matches!(
         host.authority.resource_binding(&b, resource),
-        Err(AuthorityError::ResourceOwnershipMismatch)
+        Err(AuthorityError::UnknownResource)
     ));
 }
 
@@ -122,7 +122,7 @@ fn restart_reopens_durable_generations_and_rejects_stale_contexts() {
     // Resources issued under the previous control epoch are not resurrected.
     assert!(matches!(
         reopened.resource_binding(&after, resource),
-        Err(AuthorityError::UnknownResource) | Err(AuthorityError::StaleControlEpoch)
+        Err(AuthorityError::UnknownResource)
     ));
 
     let probe = InternalServiceAuthority::open_probe(&root).unwrap();
@@ -202,6 +202,44 @@ fn policy_revision_rotation_invalidates_prior_contexts_without_touching_auth_gen
 }
 
 #[test]
+fn policy_revision_rotation_invalidates_resources_after_reauth() {
+    let host = open_host();
+    host.authority
+        .set_credentials(
+            &host.admin,
+            &[HostCredential::new("primary", SECRET_A).unwrap()],
+        )
+        .unwrap();
+    let auth = host.authority.authenticate(SECRET_A).unwrap();
+    let session = host.authority.issue_session(&auth).unwrap();
+    let workspace = host
+        .authority
+        .issue_workspace(&auth, host.root.as_path())
+        .unwrap();
+    let resource = host
+        .authority
+        .issue_resource(&auth, session, workspace, ContentDigest::of_bytes(b"frame"))
+        .unwrap();
+
+    host.authority.rotate_policy_revision(&host.admin).unwrap();
+    let fresh = host.authority.authenticate(SECRET_A).unwrap();
+    assert!(matches!(
+        host.authority.resource_binding(&fresh, resource),
+        Err(AuthorityError::UnknownResource)
+    ));
+    assert!(matches!(
+        host.authority.seal_capability(
+            &fresh,
+            resource,
+            ActorClass::VerifiedOperator,
+            EffectClass::ProviderSend,
+            60_000
+        ),
+        Err(AuthorityError::UnknownResource)
+    ));
+}
+
+#[test]
 fn foreign_resource_handles_fail_closed_without_becoming_existence_oracles() {
     let first = open_host();
     install_two_credentials(&first);
@@ -222,14 +260,60 @@ fn foreign_resource_handles_fail_closed_without_becoming_existence_oracles() {
 
     assert!(first.authority.resource_binding(&a, resource).is_ok());
     let b_on_first = first.authority.authenticate(SECRET_B).unwrap();
-    assert!(matches!(
-        first.authority.resource_binding(&b_on_first, resource),
-        Err(AuthorityError::ResourceOwnershipMismatch)
-    ));
-    assert!(matches!(
-        second.authority.resource_binding(&other_host, resource),
-        Err(AuthorityError::UnknownResource)
-    ));
+
+    let cross_principal = first
+        .authority
+        .resource_binding(&b_on_first, resource)
+        .unwrap_err();
+    let foreign_host = second
+        .authority
+        .resource_binding(&other_host, resource)
+        .unwrap_err();
+    let never_issued = first
+        .authority
+        .seal_capability(
+            &a,
+            second_resource_from_unrelated_host(),
+            ActorClass::VerifiedOperator,
+            EffectClass::ProviderSend,
+            60_000,
+        )
+        .unwrap_err();
+
+    for denial in [&cross_principal, &foreign_host, &never_issued] {
+        assert!(matches!(denial, AuthorityError::UnknownResource));
+    }
+    assert_eq!(cross_principal, foreign_host);
+    assert_eq!(cross_principal, never_issued);
+    assert_eq!(
+        cross_principal.to_string(),
+        foreign_host.to_string(),
+        "denial text must not distinguish foreign from cross-principal"
+    );
+}
+
+/// A resource incarnation issued by another host root, never present in `first`.
+fn second_resource_from_unrelated_host() -> ResourceIncarnation {
+    let other = open_host();
+    other
+        .authority
+        .set_credentials(&other.admin, &[HostCredential::new("a", SECRET_A).unwrap()])
+        .unwrap();
+    let auth = other.authority.authenticate(SECRET_A).unwrap();
+    let session = other.authority.issue_session(&auth).unwrap();
+    let workspace = other
+        .authority
+        .issue_workspace(&auth, other.root.as_path())
+        .unwrap();
+    other
+        .authority
+        .issue_resource(
+            &auth,
+            session,
+            workspace,
+            ContentDigest::of_bytes(b"foreign"),
+        )
+        .unwrap()
 }
 
 #[test]
@@ -289,6 +373,31 @@ fn schema_v1_roots_are_rejected_fail_closed() {
     ));
     assert!(matches!(
         HostAuthority::open(&root, &admin_credential()),
-        Err(AuthorityError::CorruptState(_)) | Err(AuthorityError::Durability(_))
+        Err(AuthorityError::CorruptState(_))
+    ));
+}
+
+#[test]
+fn schema_v1_with_policy_revision_field_is_still_rejected() {
+    let host = open_host();
+    std::fs::write(
+        host.root.join("authority.json"),
+        r#"{"schema_version":1,"owner_id":"account-1","admin_credential_fingerprint":"abc","control_epoch":1,"capability_generation":1,"policy_revision":1,"next_auth_generation":1,"credentials":[],"resources":{},"capabilities":{},"leases":{},"attempts":{}}"#,
+    )
+    .unwrap();
+    let root = host.root.clone();
+    drop(host.authority);
+
+    let probe = InternalServiceAuthority::open_probe(&root).unwrap();
+    let error = probe
+        .liveness_projection()
+        .expect_err("v1 must not be accepted even with policy_revision present");
+    assert!(
+        matches!(error, AuthorityError::CorruptState(ref msg) if msg.contains("unsupported authority schema version 1")),
+        "got {error:?}"
+    );
+    assert!(matches!(
+        HostAuthority::open(&root, &admin_credential()),
+        Err(AuthorityError::CorruptState(_))
     ));
 }

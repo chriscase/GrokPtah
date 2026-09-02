@@ -242,7 +242,7 @@ fn a_second_principal_cannot_use_the_first_principals_resource() {
     // b holds a live context, but not this resource.
     assert!(matches!(
         authority.resource_binding(&b, resource),
-        Err(AuthorityError::ResourceOwnershipMismatch)
+        Err(AuthorityError::UnknownResource)
     ));
     assert!(matches!(
         authority.seal_capability(
@@ -252,11 +252,11 @@ fn a_second_principal_cannot_use_the_first_principals_resource() {
             EffectClass::ProviderSend,
             60_000
         ),
-        Err(AuthorityError::ResourceOwnershipMismatch)
+        Err(AuthorityError::UnknownResource)
     ));
     assert!(matches!(
         authority.record_observation(&b, resource, observation("frame-2")),
-        Err(AuthorityError::ResourceOwnershipMismatch)
+        Err(AuthorityError::UnknownResource)
     ));
 }
 

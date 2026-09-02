@@ -28,6 +28,7 @@ pub struct AuthorityBinding {
     pub(crate) incarnation: CredentialIncarnation,
     pub(crate) auth_generation: AuthGeneration,
     pub(crate) capability_generation: CapabilityGeneration,
+    pub(crate) policy_revision: PolicyRevision,
     pub(crate) session: SessionId,
     pub(crate) workspace: WorkspaceId,
     pub(crate) resource: ResourceIncarnation,
@@ -52,6 +53,9 @@ impl AuthorityBinding {
     }
     pub fn capability_generation(&self) -> CapabilityGeneration {
         self.capability_generation
+    }
+    pub fn policy_revision(&self) -> PolicyRevision {
+        self.policy_revision
     }
 }
 
@@ -93,11 +97,11 @@ impl AuthContext {
     pub fn capability_generation(&self) -> CapabilityGeneration {
         self.capability_generation
     }
-    pub fn control_epoch(&self) -> ControlEpoch {
-        self.control_epoch
-    }
     pub fn policy_revision(&self) -> PolicyRevision {
         self.policy_revision
+    }
+    pub fn control_epoch(&self) -> ControlEpoch {
+        self.control_epoch
     }
     pub fn credential_id(&self) -> &str {
         &self.credential_id

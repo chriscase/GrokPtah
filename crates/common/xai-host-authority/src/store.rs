@@ -572,6 +572,7 @@ impl HostAuthority {
                 principal: auth.principal.to_hex(),
                 credential_incarnation: auth.incarnation.to_hex(),
                 auth_generation: auth.auth_generation.raw(),
+                policy_revision: auth.policy_revision.raw(),
                 session: session.to_hex(),
                 workspace: workspace.to_hex(),
                 control_epoch: state.control_epoch,
@@ -605,7 +606,7 @@ impl HostAuthority {
             let record = state
                 .resources
                 .get(&resource.to_hex())
-                .ok_or(AuthorityError::UnknownResource)?;
+                .ok_or_else(deny_resource_access)?;
             binding_from_resource(state, auth, record)
         })
     }
@@ -626,14 +627,16 @@ impl HostAuthority {
             let record = state
                 .resources
                 .get_mut(&resource.to_hex())
-                .ok_or(AuthorityError::UnknownResource)?;
+                .ok_or_else(deny_resource_access)?;
             if record.principal != auth.principal.to_hex()
                 || record.credential_incarnation != auth.incarnation.to_hex()
+                || record.auth_generation != auth.auth_generation.raw()
+                || record.policy_revision != state.policy_revision
             {
-                return Err(AuthorityError::ResourceOwnershipMismatch);
+                return Err(deny_resource_access());
             }
             if record.control_epoch != control_epoch {
-                return Err(AuthorityError::StaleControlEpoch);
+                return Err(deny_resource_access());
             }
             record.observation_revision =
                 record.observation_revision.checked_add(1).ok_or_else(|| {
@@ -695,6 +698,7 @@ impl HostAuthority {
                 .policy_revision
                 .checked_add(1)
                 .ok_or_else(|| AuthorityError::Durability("policy revision exhausted".into()))?;
+            state.resources.clear();
             state.capabilities.clear();
             state.leases.clear();
             Ok(PolicyRevision::from_raw(state.policy_revision))
@@ -773,6 +777,10 @@ pub(crate) fn require_current_state(
     Ok(())
 }
 
+pub(crate) fn deny_resource_access() -> AuthorityError {
+    AuthorityError::UnknownResource
+}
+
 pub(crate) fn binding_from_resource(
     state: &StoredAuthority,
     auth: &AuthContext,
@@ -781,17 +789,19 @@ pub(crate) fn binding_from_resource(
     if record.principal != auth.principal.to_hex()
         || record.credential_incarnation != auth.incarnation.to_hex()
         || record.auth_generation != auth.auth_generation.raw()
+        || record.policy_revision != state.policy_revision
     {
-        return Err(AuthorityError::ResourceOwnershipMismatch);
+        return Err(deny_resource_access());
     }
     if record.control_epoch != state.control_epoch {
-        return Err(AuthorityError::StaleControlEpoch);
+        return Err(deny_resource_access());
     }
     Ok(AuthorityBinding {
         principal: auth.principal,
         incarnation: auth.incarnation,
         auth_generation: auth.auth_generation,
         capability_generation: CapabilityGeneration::from_raw(state.capability_generation),
+        policy_revision: PolicyRevision::from_raw(state.policy_revision),
         session: decode_id(&record.session, "session")?,
         workspace: decode_id(&record.workspace, "workspace")?,
         resource: decode_id(&record.incarnation, "resource")?,

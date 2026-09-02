@@ -67,6 +67,7 @@ pub enum AuditEvent {
         principal: String,
         auth_generation: u64,
         capability_generation: u64,
+        policy_revision: u64,
         session: String,
         workspace: String,
         resource: String,
