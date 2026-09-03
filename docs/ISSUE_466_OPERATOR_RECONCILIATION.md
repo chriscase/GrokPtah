@@ -22,6 +22,15 @@ Restart recovery replays the typed reconciliation audit event before classifying
 open attempts. A failed audit append or snapshot write leaves the attempt
 ambiguous rather than silently changing its truth.
 
+## Residuals (this repair)
+
+- Settlement evidence digests are validated at apply time but are not yet
+  persisted in the typed audit WAL; replay cannot independently re-identify the
+  provider receipt or operator observation from audit records alone.
+- Downstream callers still on `reconcile_attempt` must migrate to
+  `mint_reconciliation_grant` / `apply_reconciliation`; the legacy entry point now
+  fails closed with an explicit migration seam.
+
 ## Evidence
 
 `cargo test -p xai-host-authority --locked --offline -- --test-threads=1`,

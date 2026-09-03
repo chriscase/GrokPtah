@@ -780,3 +780,231 @@ fn sending_stays_uncertain_until_explicit_reconciliation() {
     assert_eq!(after.state, "uncertain");
     assert!(after.ambiguous);
 }
+
+#[test]
+fn legacy_reconcile_attempt_fails_closed_with_migration_seam() {
+    let host = open_host(&[("a", SECRET_A)]);
+    let auth = host.authority.authenticate(SECRET_A).unwrap();
+    let (session, workspace, permit) = prepared(
+        &host.authority,
+        &auth,
+        ROUTE,
+        b"legacy",
+        Path::new("/tmp/gp-ws"),
+    );
+    let attempt = permit.attempt();
+    let _ = host.authority.settle_uncertain(
+        host.authority.admit_sending(&auth, permit).unwrap(),
+        UncertainReason::TransportAfterPossibleWrite,
+    );
+    let before = host
+        .authority
+        .scoped_attempt_projection(&auth, session, workspace, &attempt.public_handle())
+        .unwrap()
+        .unwrap();
+    let audit_before = std::fs::read(host._dir.path().join("audit.log")).unwrap();
+
+    #[allow(deprecated)]
+    let err = host
+        .authority
+        .reconcile_attempt(&host.admin, attempt, true)
+        .unwrap_err();
+    assert_eq!(
+        err,
+        AuthorityError::Invalid(
+            "legacy reconcile_attempt is retired; use mint_reconciliation_grant and apply_reconciliation"
+        )
+    );
+
+    let after = host
+        .authority
+        .scoped_attempt_projection(&auth, session, workspace, &attempt.public_handle())
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.state, before.state);
+    assert_eq!(
+        std::fs::read(host._dir.path().join("audit.log")).unwrap(),
+        audit_before
+    );
+}
+
+#[test]
+fn stale_auth_generation_rejects_before_audit_or_lease() {
+    let host = open_host(&[("a", SECRET_A)]);
+    host.authority
+        .set_credentials(&host.admin, &[HostCredential::new("a", SECRET_A).unwrap()])
+        .unwrap();
+    let old = host.authority.authenticate(SECRET_A).unwrap();
+    let (session, workspace, permit) = prepared(
+        &host.authority,
+        &old,
+        ROUTE,
+        b"rotate",
+        Path::new("/tmp/gp-ws"),
+    );
+    let handle = permit.attempt().public_handle();
+    let _ = host.authority.settle_uncertain(
+        host.authority.admit_sending(&old, permit).unwrap(),
+        UncertainReason::TransportAfterPossibleWrite,
+    );
+    let grant = host
+        .authority
+        .mint_reconciliation_grant(
+            &old,
+            session,
+            workspace,
+            &handle,
+            ReconciliationDisposition::MarkSettled,
+            60_000,
+        )
+        .unwrap();
+
+    host.authority
+        .set_credentials(
+            &host.admin,
+            &[HostCredential::new("a", "rotated-secret-value-32b!!").unwrap()],
+        )
+        .unwrap();
+
+    assert!(matches!(
+        host.authority.apply_reconciliation(
+            &old,
+            grant,
+            ReconciliationEvidence::provider_receipt(ContentDigest::of_bytes(b"rcpt")),
+        ),
+        Err(AuthorityError::StalePrincipal)
+    ));
+
+    let fresh = host
+        .authority
+        .authenticate("rotated-secret-value-32b!!")
+        .unwrap();
+    assert!(matches!(
+        host.authority.mint_reconciliation_grant(
+            &fresh,
+            session,
+            workspace,
+            &handle,
+            ReconciliationDisposition::MarkSettled,
+            60_000,
+        ),
+        Err(AuthorityError::StalePrincipal)
+    ));
+
+    let projection = host
+        .authority
+        .scoped_attempt_projection(&fresh, session, workspace, &handle)
+        .unwrap()
+        .unwrap();
+    assert_eq!(projection.state, "uncertain");
+    let records = host.authority.audit_records(&host.admin).unwrap();
+    assert!(
+        !records.iter().any(|record| {
+            matches!(
+                record.event,
+                AuditEvent::AttemptReconciled { .. } | AuditEvent::AttemptReviewed { .. }
+            )
+        }),
+        "stale grants must not append reconciliation audit events"
+    );
+}
+
+#[test]
+fn conflicting_concurrency_and_restart_regression() {
+    let host = open_host(&[("a", SECRET_A)]);
+    let auth = host.authority.authenticate(SECRET_A).unwrap();
+    let (session, workspace, permit) = prepared(
+        &host.authority,
+        &auth,
+        ROUTE,
+        b"conflict",
+        Path::new("/tmp/gp-ws"),
+    );
+    let handle = permit.attempt().public_handle();
+    let _ = host.authority.settle_uncertain(
+        host.authority.admit_sending(&auth, permit).unwrap(),
+        UncertainReason::TransportAfterPossibleWrite,
+    );
+
+    let discard = host
+        .authority
+        .mint_reconciliation_grant(
+            &auth,
+            session,
+            workspace,
+            &handle,
+            ReconciliationDisposition::Discard,
+            60_000,
+        )
+        .unwrap();
+    let settled = host
+        .authority
+        .mint_reconciliation_grant(
+            &auth,
+            session,
+            workspace,
+            &handle,
+            ReconciliationDisposition::MarkSettled,
+            60_000,
+        )
+        .unwrap();
+
+    std::thread::scope(|scope| {
+        let authority = &host.authority;
+        let (tx, rx) = mpsc::channel();
+        scope.spawn({
+            let tx = tx.clone();
+            let auth = auth.clone();
+            move || {
+                tx.send(authority.apply_reconciliation(
+                    &auth,
+                    discard,
+                    ReconciliationEvidence::default(),
+                ))
+                .unwrap();
+            }
+        });
+        scope.spawn({
+            let auth = auth.clone();
+            move || {
+                tx.send(authority.apply_reconciliation(
+                    &auth,
+                    settled,
+                    ReconciliationEvidence::provider_receipt(ContentDigest::of_bytes(b"rcpt")),
+                ))
+                .unwrap();
+            }
+        });
+        let first = rx.recv().unwrap();
+        let second = rx.recv().unwrap();
+        assert_eq!(first.is_ok(), second.is_err() || second.is_ok());
+        let outcomes = [first, second];
+        let successes = outcomes.iter().filter(|result| result.is_ok()).count();
+        let failures = outcomes.iter().filter(|result| result.is_err()).count();
+        assert_eq!(successes, 1, "exactly one conflicting disposition may win");
+        assert_eq!(failures, 1, "the loser must fail closed");
+    });
+
+    let projection = host
+        .authority
+        .scoped_attempt_projection(&auth, session, workspace, &handle)
+        .unwrap()
+        .unwrap();
+    assert!(
+        projection.state == "discarded" || projection.state == "settled",
+        "state must reflect the winning disposition only"
+    );
+
+    let root = host._dir.path().to_path_buf();
+    drop(host.authority);
+    drop(host.admin);
+    let (authority, admin) = reopen_root(&root);
+    let auth = authority.authenticate(SECRET_A).unwrap();
+    authority.recover_incomplete(&admin).unwrap();
+    let after_restart = authority
+        .scoped_attempt_projection(&auth, session, workspace, &handle)
+        .unwrap()
+        .unwrap();
+    assert_eq!(after_restart.state, projection.state);
+    assert!(authority.audit_chain_intact(&admin).unwrap());
+}

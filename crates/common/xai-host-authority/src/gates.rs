@@ -54,6 +54,7 @@ impl HostAuthority {
         };
 
         let mut outcomes = std::collections::BTreeMap::<String, (String, String)>::new();
+        let mut reconciliation_truths = std::collections::BTreeMap::<String, String>::new();
         for record in records {
             match record.event {
                 AuditEvent::SendOutcome {
@@ -84,6 +85,15 @@ impl HostAuthority {
                             )));
                         }
                     };
+                    if let Some(existing) = reconciliation_truths.get(&attempt) {
+                        if existing != &truth {
+                            return Err(AuthorityError::CorruptState(
+                                "conflicting reconciliation audit records for one attempt".into(),
+                            ));
+                        }
+                    } else {
+                        reconciliation_truths.insert(attempt.clone(), truth.clone());
+                    }
                     outcomes.insert(attempt, (state.to_string(), "reconciled".into()));
                 }
                 _ => {}
@@ -684,7 +694,8 @@ impl HostAuthority {
     ///
     /// There is no retry here and no path back to a fresh permit: an
     /// [`SendOutcome::Uncertain`] attempt is resolved by
-    /// [`Self::reconcile_attempt`] after the host establishes provider truth.
+    /// [`Self::mint_reconciliation_grant`] and [`Self::apply_reconciliation`]
+    /// after the host establishes provider truth.
     pub fn settle_uncertain(
         &self,
         permit: PhysicalSendPermit,
@@ -910,63 +921,23 @@ impl HostAuthority {
 
     /// Resolve an ambiguous attempt with established provider truth.
     ///
-    /// This is the only exit from [`SendOutcome::Uncertain`], and it takes a
-    /// decision the host made by observing the provider, not a retry.
-    ///
-    /// Requires admin authority precisely because it is that decision:
-    /// declaring that an ambiguous effect did or did not happen is an operator
-    /// assertion about the outside world, and nothing that merely holds a
-    /// `&HostAuthority` is entitled to make it.
+    /// **Migration seam:** this legacy admin-only path is retired. Callers must
+    /// use [`Self::mint_reconciliation_grant`] and [`Self::apply_reconciliation`]
+    /// with the current evidence/grant contract instead.
+    #[deprecated(
+        since = "0.0.0",
+        note = "use mint_reconciliation_grant and apply_reconciliation"
+    )]
     pub fn reconcile_attempt(
         &self,
         admin: &HostAdminAuthority,
         attempt: AttemptId,
         took_effect: bool,
     ) -> Result<(), AuthorityError> {
-        self.require_admin(admin)?;
-        let _lifecycle = self.lock_attempt_lifecycle()?;
-        let epoch = self.read(|state| {
-            let record = state
-                .attempts
-                .get(&attempt.to_hex())
-                .ok_or(AuthorityError::UnknownResource)?;
-            // `sending` is accepted as well as `uncertain`: a settlement whose
-            // write failed leaves the record in flight while the caller was
-            // told Uncertain, and that caller must still be able to reconcile.
-            if record.state != STATE_UNCERTAIN && record.state != STATE_SENDING {
-                return Err(AuthorityError::Invalid("attempt is already settled"));
-            }
-            Ok(state.control_epoch)
-        })?;
-        // WAL first. If this append fails, state remains ambiguous. If the
-        // following snapshot write fails, open-time replay applies this exact
-        // operator truth before recovery is allowed to classify anything.
-        self.append_audit(
-            epoch,
-            AuditEvent::AttemptReconciled {
-                attempt: attempt.public_handle(),
-                truth: if took_effect {
-                    "took_effect"
-                } else {
-                    "no_effect"
-                }
-                .to_string(),
-            },
-        )?;
-        self.with_state(|state| {
-            let record = state
-                .attempts
-                .get_mut(&attempt.to_hex())
-                .ok_or(AuthorityError::UnknownResource)?;
-            record.state = if took_effect {
-                STATE_SETTLED
-            } else {
-                STATE_FAILED
-            }
-            .to_string();
-            record.settlement = Some("reconciled".to_string());
-            Ok(())
-        })
+        let _ = (admin, attempt, took_effect);
+        Err(AuthorityError::Invalid(
+            crate::reconciliation::LEGACY_RECONCILE_ATTEMPT_RETIRED,
+        ))
     }
 
     /// A secret-, content-, and path-free view of an attempt.
@@ -1379,16 +1350,31 @@ mod concurrency_tests {
         });
 
         // Reconciliation is serialized with the same transaction boundary.
+        let handle = recovering.public_handle();
+        let grant = authority
+            .mint_reconciliation_grant(
+                &auth,
+                session,
+                workspace,
+                &handle,
+                ReconciliationDisposition::MarkSettled,
+                60_000,
+            )
+            .unwrap();
+        let auth_for_thread = auth.clone();
         let lifecycle = authority.attempt_lifecycle.lock().unwrap();
         std::thread::scope(|scope| {
             let (started_tx, started_rx) = mpsc::channel();
             let (done_tx, done_rx) = mpsc::channel();
             let authority = &authority;
-            let admin = &admin;
             scope.spawn(move || {
                 started_tx.send(()).unwrap();
                 done_tx
-                    .send(authority.reconcile_attempt(admin, recovering, true))
+                    .send(authority.apply_reconciliation(
+                        &auth_for_thread,
+                        grant,
+                        ReconciliationEvidence::provider_receipt(ContentDigest::of_bytes(b"rcpt")),
+                    ))
                     .unwrap();
             });
             started_rx.recv().unwrap();

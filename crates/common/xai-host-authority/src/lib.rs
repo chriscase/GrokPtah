@@ -30,7 +30,8 @@
 //!   both durable.
 //! * **Post-dispatch ambiguity settles `Uncertain` and never auto-retries.**
 //!   There is no retry API; the only exit is
-//!   [`HostAuthority::reconcile_attempt`] with established provider truth.
+//!   [`HostAuthority::mint_reconciliation_grant`] and
+//!   [`HostAuthority::apply_reconciliation`] with established provider truth.
 //! * **Public projections are secret-, content-, and path-free.** Identifiers
 //!   render as truncated, domain-separated digests; bodies, URLs, credentials
 //!   and filesystem paths are digested on the way in and never stored.

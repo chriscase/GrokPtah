@@ -20,6 +20,8 @@ use crate::store::{decode_digest, decode_id, require_current_state, unix_time_mi
 
 const RECONCILE_ACTION: &str = "operator-reconcile-v1";
 const DEFAULT_GRANT_TTL_MS: u64 = 15_000;
+const LEGACY_RECONCILE_MIGRATION: &str =
+    "legacy reconcile_attempt is retired; use mint_reconciliation_grant and apply_reconciliation";
 
 impl HostAuthority {
     /// Mint a short-lived grant bound to one attempt at its current revision.
@@ -47,7 +49,10 @@ impl HostAuthority {
         };
         let (attempt, record) = self.read(|state| {
             require_current_state(state, auth)?;
-            lookup_scoped_attempt(state, auth, session, workspace, attempt_handle)
+            let (attempt, record) =
+                lookup_scoped_attempt(state, auth, session, workspace, attempt_handle)?;
+            validate_reconciliation_binding(auth, &record)?;
+            Ok((attempt, record))
         })?;
         match disposition {
             ReconciliationDisposition::Review => {}
@@ -123,7 +128,7 @@ impl HostAuthority {
             return Err(AuthorityError::NotPermitted);
         }
 
-        let (current, epoch) = self.read(|state| {
+        let current = self.read(|state| {
             require_current_state(state, auth)?;
             let record = state
                 .attempts
@@ -133,13 +138,16 @@ impl HostAuthority {
             if record.principal != auth.principal.to_hex() {
                 return Err(AuthorityError::UnknownResource);
             }
-            Ok((record, state.control_epoch))
+            validate_reconciliation_binding(auth, &record)?;
+            Ok(record)
         })?;
 
         let current_revision = attempt_revision(grant.attempt, &current);
         let already_applied = already_matches_disposition(&current, grant.disposition);
         if current_revision != grant.revision {
             if already_applied {
+                validate_reconciliation_binding(auth, &current)?;
+                self.consume_reconciliation_lease(auth, &grant, now)?;
                 return project_from_current(grant.attempt, &current);
             }
             return Err(AuthorityError::Invalid("stale revision"));
@@ -149,20 +157,6 @@ impl HostAuthority {
             || grant.route_digest.to_hex() != current.route_digest
         {
             return Err(AuthorityError::Invalid("grant binding mismatch"));
-        }
-        if current.auth_generation != auth.auth_generation.raw()
-            || current.capability_generation != auth.capability_generation.raw()
-            || current.policy_revision != auth.policy_revision.raw()
-        {
-            // Attempt was recorded under a different generation than the live
-            // principal. The grant still binds the current generations via the
-            // sealed capability; refuse rather than silently widen.
-            if current.capability_generation != auth.capability_generation.raw() {
-                return Err(AuthorityError::StaleCapability);
-            }
-            if current.policy_revision != auth.policy_revision.raw() {
-                return Err(AuthorityError::StalePolicy);
-            }
         }
 
         match grant.disposition {
@@ -210,9 +204,32 @@ impl HostAuthority {
         }
 
         if already_applied && grant.disposition != ReconciliationDisposition::Review {
+            validate_reconciliation_binding(auth, &current)?;
             self.consume_reconciliation_lease(auth, &grant, now)?;
             return project_from_current(grant.attempt, &current);
         }
+
+        if let Some(truth) = grant.disposition.truth()
+            && let Some(existing) = audited_reconciliation_truth(self, &grant.attempt)?
+            && existing != truth
+        {
+            return Err(AuthorityError::Invalid("conflicting reconciliation"));
+        }
+
+        let (current, epoch) = self.read(|state| {
+            require_current_state(state, auth)?;
+            let record = state
+                .attempts
+                .get(&grant.attempt.to_hex())
+                .ok_or(AuthorityError::UnknownResource)?
+                .clone();
+            validate_reconciliation_binding(auth, &record)?;
+            let current_revision = attempt_revision(grant.attempt, &record);
+            if current_revision != grant.revision {
+                return Err(AuthorityError::Invalid("stale revision"));
+            }
+            Ok((record, state.control_epoch))
+        })?;
 
         let event = match grant.disposition.truth() {
             Some(truth) => AuditEvent::AttemptReconciled {
@@ -244,7 +261,7 @@ impl HostAuthority {
                 .attempts
                 .get_mut(&grant.attempt.to_hex())
                 .ok_or(AuthorityError::UnknownResource)?;
-            if record.state != current.state {
+            if attempt_revision(grant.attempt, record) != grant.revision {
                 return Err(AuthorityError::Invalid("stale revision"));
             }
             record.state = next_state.clone();
@@ -259,6 +276,79 @@ impl HostAuthority {
                 .ok_or(AuthorityError::UnknownResource)?;
             project_stored_attempt(grant.attempt, record)
         })
+    }
+}
+
+pub(crate) const LEGACY_RECONCILE_ATTEMPT_RETIRED: &str = LEGACY_RECONCILE_MIGRATION;
+
+fn validate_reconciliation_binding(
+    auth: &AuthContext,
+    record: &StoredAttempt,
+) -> Result<(), AuthorityError> {
+    if record.credential_incarnation != auth.incarnation.to_hex() {
+        return Err(AuthorityError::StalePrincipal);
+    }
+    if record.auth_generation != auth.auth_generation.raw() {
+        return Err(AuthorityError::StalePrincipal);
+    }
+    if record.capability_generation != auth.capability_generation.raw() {
+        return Err(AuthorityError::StaleCapability);
+    }
+    if record.policy_revision != auth.policy_revision.raw() {
+        return Err(AuthorityError::StalePolicy);
+    }
+    Ok(())
+}
+
+fn audited_reconciliation_truth(
+    authority: &HostAuthority,
+    attempt: &AttemptId,
+) -> Result<Option<&'static str>, AuthorityError> {
+    let handle = attempt.public_handle();
+    let log = authority
+        .audit
+        .lock()
+        .map_err(|_| AuthorityError::Durability("audit log lock poisoned".into()))?;
+    if !log.verify_chain()? {
+        return Err(AuthorityError::CorruptState(
+            "audit chain is damaged".into(),
+        ));
+    }
+    let mut truth = None;
+    for record in log.records()? {
+        if let AuditEvent::AttemptReconciled {
+            attempt: audited,
+            truth: audited_truth,
+        } = record.event
+        {
+            if audited != handle {
+                continue;
+            }
+            let Some(normalized) = normalize_reconciliation_truth(&audited_truth) else {
+                return Err(AuthorityError::CorruptState(format!(
+                    "unknown audited reconciliation truth {audited_truth}"
+                )));
+            };
+            if let Some(existing) = truth {
+                if existing != normalized {
+                    return Err(AuthorityError::CorruptState(
+                        "conflicting reconciliation audit records for one attempt".into(),
+                    ));
+                }
+            } else {
+                truth = Some(normalized);
+            }
+        }
+    }
+    Ok(truth)
+}
+
+fn normalize_reconciliation_truth(truth: &str) -> Option<&'static str> {
+    match truth {
+        "took_effect" => Some("took_effect"),
+        "no_effect" => Some("no_effect"),
+        "discarded" => Some("discarded"),
+        _ => None,
     }
 }
 

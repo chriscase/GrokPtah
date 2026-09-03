@@ -93,6 +93,28 @@ fn lease_for(f: &Fixture, req: &RequestIdentity) -> EffectLease {
         .unwrap()
 }
 
+fn reconcile_settled(f: &Fixture, attempt: AttemptId) {
+    let handle = attempt.public_handle();
+    let grant = f
+        .authority
+        .mint_reconciliation_grant(
+            &f.auth,
+            f.session,
+            f.workspace,
+            &handle,
+            ReconciliationDisposition::MarkSettled,
+            60_000,
+        )
+        .unwrap();
+    f.authority
+        .apply_reconciliation(
+            &f.auth,
+            grant,
+            ReconciliationEvidence::provider_receipt(ContentDigest::of_bytes(b"rcpt")),
+        )
+        .unwrap();
+}
+
 // ───────────────────────────── Gate 1: principal root ─────────────────────────────
 
 #[test]
@@ -559,9 +581,7 @@ fn ambiguity_after_dispatch_is_uncertain_and_offers_no_retry() {
     assert!(projection.ambiguous);
 
     // The only exit is an explicit reconciliation against provider truth.
-    f.authority
-        .reconcile_attempt(&f.admin, attempt, true)
-        .unwrap();
+    reconcile_settled(&f, attempt);
     let projection = f
         .authority
         .attempt_projection(&f.auth, attempt)
@@ -569,9 +589,17 @@ fn ambiguity_after_dispatch_is_uncertain_and_offers_no_retry() {
         .unwrap();
     assert!(!projection.ambiguous);
     // Reconciling twice is refused: the attempt is no longer uncertain.
+    let handle = attempt.public_handle();
     assert!(
         f.authority
-            .reconcile_attempt(&f.admin, attempt, true)
+            .mint_reconciliation_grant(
+                &f.auth,
+                f.session,
+                f.workspace,
+                &handle,
+                ReconciliationDisposition::Discard,
+                60_000,
+            )
             .is_err()
     );
 }
@@ -1452,9 +1480,7 @@ fn an_uncertain_outcome_is_always_reconcilable() {
 
     // Repair the log and reconcile the attempt the caller was handed.
     std::fs::remove_dir(&log).unwrap();
-    f.authority
-        .reconcile_attempt(&f.admin, attempt, true)
-        .expect("the attempt the caller was told to reconcile must be reconcilable");
+    reconcile_settled(&f, attempt);
 }
 
 #[test]
@@ -1747,9 +1773,25 @@ fn reconciliation_audit_replays_when_the_state_snapshot_write_fails() {
     ));
 
     let state_tmp = f.root.join("authority.json.tmp");
+    let handle = attempt.public_handle();
+    let grant = f
+        .authority
+        .mint_reconciliation_grant(
+            &f.auth,
+            f.session,
+            f.workspace,
+            &handle,
+            ReconciliationDisposition::MarkSettled,
+            60_000,
+        )
+        .unwrap();
     std::fs::create_dir(&state_tmp).unwrap();
     assert!(matches!(
-        f.authority.reconcile_attempt(&f.admin, attempt, true),
+        f.authority.apply_reconciliation(
+            &f.auth,
+            grant,
+            ReconciliationEvidence::provider_receipt(ContentDigest::of_bytes(b"rcpt")),
+        ),
         Err(AuthorityError::Durability(_))
     ));
     std::fs::remove_dir(&state_tmp).unwrap();
@@ -1784,10 +1826,26 @@ fn reconciliation_audit_failure_leaves_state_ambiguous() {
         .settle_uncertain(permit, UncertainReason::TransportAfterPossibleWrite);
 
     let log = f.root.join("audit.log");
+    let handle = attempt.public_handle();
+    let grant = f
+        .authority
+        .mint_reconciliation_grant(
+            &f.auth,
+            f.session,
+            f.workspace,
+            &handle,
+            ReconciliationDisposition::MarkSettled,
+            60_000,
+        )
+        .unwrap();
     std::fs::remove_file(&log).unwrap();
     std::fs::create_dir(&log).unwrap();
     assert!(matches!(
-        f.authority.reconcile_attempt(&f.admin, attempt, true),
+        f.authority.apply_reconciliation(
+            &f.auth,
+            grant,
+            ReconciliationEvidence::provider_receipt(ContentDigest::of_bytes(b"rcpt")),
+        ),
         Err(AuthorityError::Durability(_))
     ));
     let projection = f
