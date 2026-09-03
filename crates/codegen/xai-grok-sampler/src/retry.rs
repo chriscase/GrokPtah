@@ -204,9 +204,13 @@ pub fn classify_error(
         };
     }
 
-    // Rate-limited (429): cap retries at the rate-limit threshold to
-    // avoid burning long waits.
+    // Rate-limited (429): only retry when the failure proves the request never
+    // reached the provider. A 429 response body means the server saw the
+    // request, so automatic retry would risk a duplicate spend.
     if err.is_rate_limited() {
+        if !err.is_proven_not_sent() {
+            return RetryDecision::Fatal(clone_error(err));
+        }
         let next_attempt = retry_count + 1;
         let effective_cap = max_retries.min(rate_limit_threshold);
         if next_attempt >= effective_cap {
@@ -597,17 +601,14 @@ mod tests {
     }
 
     #[test]
-    fn classify_rate_limited_uses_retry_after() {
+    fn classify_rate_limited_without_not_sent_proof_is_fatal() {
         let err = api_err_with_retry_after(StatusCode::TOO_MANY_REQUESTS, 7);
+        assert!(!err.is_proven_not_sent());
         match classify_error(&err, 0, 5, RATE_LIMIT_RETRY_THRESHOLD) {
-            RetryDecision::RetryWithBackoff {
-                backoff,
-                is_rate_limited,
-            } => {
-                assert!(is_rate_limited);
-                assert_eq!(backoff, Duration::from_secs(7));
+            RetryDecision::Fatal(SamplingError::Api { status, .. }) => {
+                assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
             }
-            other => panic!("expected RetryWithBackoff, got {other:?}"),
+            other => panic!("expected Fatal for possible-write 429, got {other:?}"),
         }
     }
 

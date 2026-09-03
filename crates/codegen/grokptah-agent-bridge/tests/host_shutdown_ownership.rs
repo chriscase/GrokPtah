@@ -1536,6 +1536,10 @@ fn a_refused_host_creates_nothing_and_preserves_the_owner_stamp() {
         );
         std::thread::sleep(Duration::from_millis(25));
     }
+    // The owning child finishes `AgentHost::create` after the lock is visible.
+    // Lazy-init files such as `plugin-catalog.json` must exist before the
+    // baseline snapshot, or a refused contender is blamed for owner-side work.
+    wait_for_owner_home_stable(&home, deadline);
 
     // The owner's stamp, and the exact set of entries the owner's home has.
     let owner_stamp = std::fs::read(&lock_path).expect("the owner stamped its lock");
@@ -1576,6 +1580,21 @@ fn home_entries(home: &Path) -> Vec<String> {
         .unwrap_or_default();
     names.sort();
     names
+}
+
+/// Wait until the lock-holding child has finished lazy home initialization.
+fn wait_for_owner_home_stable(home: &Path, deadline: std::time::Instant) {
+    let catalog = home.join("plugin-catalog.json");
+    while std::time::Instant::now() < deadline {
+        if catalog.is_file() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!(
+        "owner never wrote lazy home init at {}",
+        catalog.display()
+    );
 }
 
 /// P0 — bypass inventory. Each of these public entry points reaches a durable

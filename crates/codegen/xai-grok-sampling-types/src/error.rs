@@ -613,6 +613,7 @@ mod tests {
         };
         assert!(err.is_rate_limited());
         assert!(err.is_retryable(), "429 should be retryable");
+        assert!(!err.is_proven_not_sent(), "429 response is a possible write");
         assert!(!err.is_auth_error());
         assert!(!err.is_payload_too_large());
     }
