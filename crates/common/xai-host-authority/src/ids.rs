@@ -163,6 +163,15 @@ generation!(
 );
 
 generation!(
+    /// Advances whenever workspace allowlists, queue ownership policy, or other
+    /// host policy that is distinct from credential rotation changes.
+    ///
+    /// This is not a second authentication epoch: credential rotation advances
+    /// [`AuthGeneration`], while policy rotation advances this counter.
+    PolicyRevision
+);
+
+generation!(
     /// Advances whenever the host's control plane restarts or re-arms.
     ///
     /// Binding effects to the control epoch means work admitted by a previous

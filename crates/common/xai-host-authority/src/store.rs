@@ -487,6 +487,7 @@ impl HostAuthority {
                 incarnation: decode_id(&record.incarnation, "incarnation")?,
                 auth_generation: AuthGeneration::from_raw(record.auth_generation),
                 capability_generation: CapabilityGeneration::from_raw(state.capability_generation),
+                policy_revision: PolicyRevision::from_raw(state.policy_revision),
                 control_epoch: ControlEpoch::from_raw(state.control_epoch),
                 credential_id: record.credential_id.clone(),
                 owner_id: record.owner_id.clone(),
@@ -506,6 +507,17 @@ impl HostAuthority {
     /// Confirm a previously minted context is still current.
     pub fn require_current(&self, auth: &AuthContext) -> Result<(), AuthorityError> {
         self.read(|state| require_current_state(state, auth))
+    }
+
+    /// Project the authenticated principal into a public read DTO.
+    ///
+    /// Fails closed when any checked generation has advanced.
+    pub fn principal_projection(
+        &self,
+        auth: &AuthContext,
+    ) -> Result<crate::projection::PrincipalProjection, AuthorityError> {
+        self.require_current(auth)?;
+        Ok(crate::projection::PrincipalProjection::from_context(auth))
     }
 
     /// Issue a host-owned session for an authenticated principal.
@@ -560,6 +572,7 @@ impl HostAuthority {
                 principal: auth.principal.to_hex(),
                 credential_incarnation: auth.incarnation.to_hex(),
                 auth_generation: auth.auth_generation.raw(),
+                policy_revision: auth.policy_revision.raw(),
                 session: session.to_hex(),
                 workspace: workspace.to_hex(),
                 control_epoch: state.control_epoch,
@@ -593,7 +606,7 @@ impl HostAuthority {
             let record = state
                 .resources
                 .get(&resource.to_hex())
-                .ok_or(AuthorityError::UnknownResource)?;
+                .ok_or_else(deny_resource_access)?;
             binding_from_resource(state, auth, record)
         })
     }
@@ -614,14 +627,16 @@ impl HostAuthority {
             let record = state
                 .resources
                 .get_mut(&resource.to_hex())
-                .ok_or(AuthorityError::UnknownResource)?;
+                .ok_or_else(deny_resource_access)?;
             if record.principal != auth.principal.to_hex()
                 || record.credential_incarnation != auth.incarnation.to_hex()
+                || record.auth_generation != auth.auth_generation.raw()
+                || record.policy_revision != state.policy_revision
             {
-                return Err(AuthorityError::ResourceOwnershipMismatch);
+                return Err(deny_resource_access());
             }
             if record.control_epoch != control_epoch {
-                return Err(AuthorityError::StaleControlEpoch);
+                return Err(deny_resource_access());
             }
             record.observation_revision =
                 record.observation_revision.checked_add(1).ok_or_else(|| {
@@ -663,6 +678,30 @@ impl HostAuthority {
             state.capabilities.clear();
             state.leases.clear();
             Ok(CapabilityGeneration::from_raw(state.capability_generation))
+        })
+    }
+
+    /// Rotate the policy revision, invalidating every context minted under the
+    /// previous revision.
+    ///
+    /// Workspace allowlist changes, queue ownership policy changes, and similar
+    /// host policy mutations advance this counter separately from credential
+    /// rotation ([`AuthGeneration`]) and capability withdrawal
+    /// ([`CapabilityGeneration`]).
+    pub fn rotate_policy_revision(
+        &self,
+        admin: &HostAdminAuthority,
+    ) -> Result<PolicyRevision, AuthorityError> {
+        self.require_admin(admin)?;
+        self.with_state(|state| {
+            state.policy_revision = state
+                .policy_revision
+                .checked_add(1)
+                .ok_or_else(|| AuthorityError::Durability("policy revision exhausted".into()))?;
+            state.resources.clear();
+            state.capabilities.clear();
+            state.leases.clear();
+            Ok(PolicyRevision::from_raw(state.policy_revision))
         })
     }
 
@@ -729,10 +768,17 @@ pub(crate) fn require_current_state(
     if state.capability_generation != auth.capability_generation.raw() {
         return Err(AuthorityError::StaleCapability);
     }
+    if state.policy_revision != auth.policy_revision.raw() {
+        return Err(AuthorityError::StalePolicy);
+    }
     if state.control_epoch != auth.control_epoch.raw() {
         return Err(AuthorityError::StaleControlEpoch);
     }
     Ok(())
+}
+
+pub(crate) fn deny_resource_access() -> AuthorityError {
+    AuthorityError::UnknownResource
 }
 
 pub(crate) fn binding_from_resource(
@@ -743,17 +789,19 @@ pub(crate) fn binding_from_resource(
     if record.principal != auth.principal.to_hex()
         || record.credential_incarnation != auth.incarnation.to_hex()
         || record.auth_generation != auth.auth_generation.raw()
+        || record.policy_revision != state.policy_revision
     {
-        return Err(AuthorityError::ResourceOwnershipMismatch);
+        return Err(deny_resource_access());
     }
     if record.control_epoch != state.control_epoch {
-        return Err(AuthorityError::StaleControlEpoch);
+        return Err(deny_resource_access());
     }
     Ok(AuthorityBinding {
         principal: auth.principal,
         incarnation: auth.incarnation,
         auth_generation: auth.auth_generation,
         capability_generation: CapabilityGeneration::from_raw(state.capability_generation),
+        policy_revision: PolicyRevision::from_raw(state.policy_revision),
         session: decode_id(&record.session, "session")?,
         workspace: decode_id(&record.workspace, "workspace")?,
         resource: decode_id(&record.incarnation, "resource")?,

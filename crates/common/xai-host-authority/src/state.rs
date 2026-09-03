@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-pub(crate) const SCHEMA_VERSION: u32 = 1;
+pub(crate) const SCHEMA_VERSION: u32 = 2;
 
 /// One credential belonging to one principal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,6 +47,7 @@ pub(crate) struct StoredResource {
     pub(crate) principal: String,
     pub(crate) credential_incarnation: String,
     pub(crate) auth_generation: u64,
+    pub(crate) policy_revision: u64,
     pub(crate) session: String,
     pub(crate) workspace: String,
     pub(crate) control_epoch: u64,
@@ -65,6 +66,7 @@ pub(crate) struct StoredCapability {
     pub(crate) credential_incarnation: String,
     pub(crate) auth_generation: u64,
     pub(crate) capability_generation: u64,
+    pub(crate) policy_revision: u64,
     pub(crate) session: String,
     pub(crate) workspace: String,
     pub(crate) resource: String,
@@ -90,6 +92,7 @@ pub(crate) struct StoredLease {
     pub(crate) credential_incarnation: String,
     pub(crate) auth_generation: u64,
     pub(crate) capability_generation: u64,
+    pub(crate) policy_revision: u64,
     pub(crate) session: String,
     pub(crate) workspace: String,
     pub(crate) resource: String,
@@ -114,6 +117,7 @@ pub(crate) struct StoredAttempt {
     pub(crate) credential_incarnation: String,
     pub(crate) auth_generation: u64,
     pub(crate) capability_generation: u64,
+    pub(crate) policy_revision: u64,
     pub(crate) session: String,
     pub(crate) workspace: String,
     pub(crate) resource: String,
@@ -145,6 +149,8 @@ pub(crate) struct StoredAuthority {
     pub(crate) control_epoch: u64,
     /// Advances on capability policy rotation or revocation.
     pub(crate) capability_generation: u64,
+    /// Advances on workspace allowlist or queue-ownership policy changes.
+    pub(crate) policy_revision: u64,
     /// Next authentication generation to hand out.
     pub(crate) next_auth_generation: u64,
     pub(crate) credentials: Vec<StoredCredential>,
@@ -162,6 +168,7 @@ impl StoredAuthority {
             admin_credential_fingerprint,
             control_epoch: 1,
             capability_generation: 1,
+            policy_revision: 1,
             next_auth_generation: 1,
             credentials: Vec::new(),
             resources: BTreeMap::new(),

@@ -186,7 +186,7 @@ impl HostAuthority {
             let record = state
                 .resources
                 .get(&resource.to_hex())
-                .ok_or(AuthorityError::UnknownResource)?
+                .ok_or_else(deny_resource_access)?
                 .clone();
             let binding = binding_from_resource(state, auth, &record)?;
             let id = CapabilityId::mint();
@@ -198,6 +198,7 @@ impl HostAuthority {
                     credential_incarnation: binding.incarnation.to_hex(),
                     auth_generation: binding.auth_generation.raw(),
                     capability_generation: binding.capability_generation.raw(),
+                    policy_revision: binding.policy_revision.raw(),
                     session: binding.session.to_hex(),
                     workspace: binding.workspace.to_hex(),
                     resource: binding.resource.to_hex(),
@@ -269,12 +270,16 @@ impl HostAuthority {
             if stored.capability_generation != state.capability_generation {
                 return Err(AuthorityError::StaleCapability);
             }
+            if stored.policy_revision != state.policy_revision {
+                return Err(AuthorityError::StalePolicy);
+            }
             if stored.control_epoch != state.control_epoch {
                 return Err(AuthorityError::StaleControlEpoch);
             }
             // The presented capability must match the durable one in full.
             if stored.principal != capability.binding.principal.to_hex()
                 || stored.credential_incarnation != capability.binding.incarnation.to_hex()
+                || stored.policy_revision != capability.binding.policy_revision.raw()
                 || stored.session != capability.binding.session.to_hex()
                 || stored.workspace != capability.binding.workspace.to_hex()
                 || stored.resource != capability.binding.resource.to_hex()
@@ -292,7 +297,7 @@ impl HostAuthority {
             let resource = state
                 .resources
                 .get(&stored.resource)
-                .ok_or(AuthorityError::UnknownResource)?
+                .ok_or_else(deny_resource_access)?
                 .clone();
 
             // A lease is a narrower grant than its capability, never a longer
@@ -309,6 +314,7 @@ impl HostAuthority {
                     credential_incarnation: stored.credential_incarnation.clone(),
                     auth_generation: stored.auth_generation,
                     capability_generation: stored.capability_generation,
+                    policy_revision: stored.policy_revision,
                     session: stored.session.clone(),
                     workspace: stored.workspace.clone(),
                     resource: stored.resource.clone(),
@@ -408,6 +414,9 @@ impl HostAuthority {
             if stored.capability_generation != state.capability_generation {
                 return Err(AuthorityError::StaleCapability);
             }
+            if stored.policy_revision != state.policy_revision {
+                return Err(AuthorityError::StalePolicy);
+            }
             if stored.principal != auth.principal.to_hex()
                 || stored.credential_incarnation != auth.incarnation.to_hex()
                 || stored.auth_generation != auth.auth_generation.raw()
@@ -454,7 +463,7 @@ impl HostAuthority {
             let resource = state
                 .resources
                 .get(&stored.resource)
-                .ok_or(AuthorityError::UnknownResource)?;
+                .ok_or_else(deny_resource_access)?;
             if resource.observation_revision != stored.observation_revision
                 || resource.observation_digest != stored.observation_digest
             {
@@ -476,6 +485,7 @@ impl HostAuthority {
                 return Err(AuthorityError::Expired);
             }
             if capability.capability_generation != capability_generation
+                || capability.policy_revision != state.policy_revision
                 || capability.control_epoch != control_epoch
             {
                 return Err(AuthorityError::StaleCapability);
@@ -495,6 +505,7 @@ impl HostAuthority {
                     credential_incarnation: stored.credential_incarnation.clone(),
                     auth_generation: stored.auth_generation,
                     capability_generation: stored.capability_generation,
+                    policy_revision: stored.policy_revision,
                     session: stored.session.clone(),
                     workspace: stored.workspace.clone(),
                     resource: stored.resource.clone(),
@@ -536,6 +547,7 @@ impl HostAuthority {
                 principal: binding.principal.public_handle(),
                 auth_generation: binding.auth_generation.raw(),
                 capability_generation: binding.capability_generation.raw(),
+                policy_revision: binding.policy_revision.raw(),
                 session: binding.session.public_handle(),
                 workspace: binding.workspace.public_handle(),
                 resource: binding.resource.public_handle(),

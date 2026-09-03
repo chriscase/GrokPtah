@@ -49,6 +49,7 @@
 //!     incarnation: todo!(),
 //!     auth_generation: todo!(),
 //!     capability_generation: todo!(),
+//!     policy_revision: todo!(),
 //!     control_epoch: todo!(),
 //!     credential_id: String::new(),
 //!     owner_id: String::new(),
@@ -122,6 +123,11 @@
 //! ```compile_fail
 //! # use xai_host_authority::*;
 //! let _ = ControlEpoch(9_999);
+//! ```
+//!
+//! ```compile_fail
+//! # use xai_host_authority::*;
+//! let _ = PolicyRevision(9_999);
 //! ```
 //!
 //! Resolving an ambiguous effect is an operator assertion about the outside
@@ -215,6 +221,8 @@ mod digest;
 mod error;
 mod gates;
 mod ids;
+mod internal;
+mod projection;
 mod receipt;
 mod state;
 mod store;
@@ -225,9 +233,11 @@ pub use error::AuthorityError;
 pub use gates::AttemptProjection;
 pub use ids::{
     AttemptId, AuthGeneration, CapabilityGeneration, CapabilityId, ControlEpoch,
-    CredentialIncarnation, EffectLeaseId, ObservationRevision, PrincipalId, ResourceIncarnation,
-    SessionId, WorkspaceId,
+    CredentialIncarnation, EffectLeaseId, ObservationRevision, PolicyRevision, PrincipalId,
+    ResourceIncarnation, SessionId, WorkspaceId,
 };
+pub use internal::InternalServiceAuthority;
+pub use projection::{PrincipalProjection, ServiceLivenessProjection};
 pub use receipt::{
     ActorClass, AuthContext, AuthorityBinding, EffectClass, EffectLease, FailedReason,
     PhysicalSendPermit, SealedCapability, SendOutcome, UncertainReason,
