@@ -167,6 +167,9 @@ jobs:
           cargo fmt --check
           cargo clippy --locked --all-targets -- -D warnings
           cargo test --locked -- --test-threads=1
+      - name: Shell provider helper compile
+        working-directory: .
+        run: cargo check --locked --manifest-path crates/codegen/xai-grok-shell/Cargo.toml
       - name: Pager fmt + production composition checks
         working-directory: .
         run: |
