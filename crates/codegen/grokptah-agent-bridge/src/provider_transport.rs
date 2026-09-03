@@ -341,12 +341,18 @@ async fn send_provider_request_with(
     let permit = runtime
         .permit(&identity, scope.target_scope)
         .map_err(ProviderTransportError::before_dispatch)?;
-    if let Err(error) = bind_idempotency_key(&mut request, &identity, &permit) {
-        let outcome = runtime
-            .authority
-            .settle_failed_before_write(permit, FailedReason::DeniedBeforeDispatch);
-        return Err(ProviderTransportError::settled(error.to_string(), outcome));
+    if dialect_supports_wire_idempotency(permit.dialect()) {
+        if let Err(error) = bind_idempotency_key(&mut request, &identity, &permit) {
+            let outcome = runtime
+                .authority
+                .settle_failed_before_write(permit, FailedReason::DeniedBeforeDispatch);
+            return Err(ProviderTransportError::settled(error.to_string(), outcome));
+        }
     }
+    let permit = runtime
+        .authority
+        .admit_sending(permit)
+        .map_err(|error| ProviderTransportError::before_dispatch(error))?;
 
     let result = if let Some(cancel) = cancel {
         tokio::select! {
@@ -525,11 +531,22 @@ fn validate_oauth_refresh_credential(
     Ok(())
 }
 
+/// Whether the wire dialect explicitly supports a host-bound idempotency key.
+pub(crate) fn dialect_supports_wire_idempotency(dialect: &str) -> bool {
+    matches!(
+        dialect,
+        "xai_chat_completions" | "openai_chat_completions" | "provider_qualification"
+    )
+}
+
 fn bind_idempotency_key(
     request: &mut reqwest::Request,
     identity: &RequestIdentity,
     permit: &PhysicalSendPermit,
 ) -> anyhow::Result<()> {
+    if !dialect_supports_wire_idempotency(permit.dialect()) {
+        return Ok(());
+    }
     if permit.request_digest() != identity.digest() {
         return Err(anyhow!(
             "provider permit does not match the admitted request identity"
@@ -579,7 +596,9 @@ impl ProviderAuthority {
         let lease =
             self.authority
                 .mint_lease(&auth, &capability, request.digest(), LEASE_TTL_MS)?;
-        Ok(self.authority.begin_send(&auth, lease, request)?)
+        Ok(self
+            .authority
+            .begin_send(&auth, lease, request, target_scope)?)
     }
 }
 
@@ -1306,11 +1325,38 @@ mod tests {
         assert_eq!(dispatch.calls.load(Ordering::SeqCst), 0);
     }
 
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn oauth_refresh_does_not_bind_a_wire_idempotency_key() {
+        let home = tempfile::tempdir().unwrap();
+        let _serial = crate::discover::home_override_serial();
+        let _home = HomeOverride::install(home.path().to_path_buf());
+        let dispatch = HeaderCaptureDispatch {
+            idempotency_key: Mutex::new(None),
+        };
+        let client = reqwest::Client::new();
+        let oauth_scope = ProviderRequestScope {
+            credential_secret: b"synthetic-refresh-token",
+            dialect: "oauth2_refresh",
+            model: "oidc-token-refresh",
+            target_scope: "oidc-token-refresh",
+        };
+        let valid = client.post("http://127.0.0.1/token").form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", "synthetic-refresh-token"),
+        ]);
+        let _ = send_provider_request_with(&client, valid, oauth_scope, None, &dispatch)
+            .await
+            .unwrap_err();
+        assert!(dispatch.idempotency_key.lock().unwrap().is_none());
+        assert!(!dialect_supports_wire_idempotency("oauth2_refresh"));
+    }
+
     #[test]
     fn credential_bearing_model_calls_have_no_raw_send_escape_hatch() {
         let raw_send = [".", "send()"].concat();
         let source_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        for entry in walkdir::WalkDir::new(source_root) {
+        for entry in walkdir::WalkDir::new(&source_root) {
             let entry = entry.unwrap();
             if !entry.file_type().is_file()
                 || entry.path().extension().and_then(|value| value.to_str()) != Some("rs")
@@ -1345,6 +1391,7 @@ mod tests {
         let this_module = include_str!("provider_transport.rs");
         let execute_needle = ["client.execute", "(request)"].concat();
         assert_eq!(this_module.matches(&execute_needle).count(), 1);
+        assert!(this_module.contains("admit_sending"));
 
         let public_surface = include_str!("lib.rs");
         assert!(public_surface.contains(

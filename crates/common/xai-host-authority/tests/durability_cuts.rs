@@ -21,6 +21,10 @@ fn admin_credential() -> HostAdminCredential {
 }
 const SECRET: &str = "s3cret-bearer-value";
 
+fn admit_wire(authority: &HostAuthority, permit: PhysicalSendPermit) -> PhysicalSendPermit {
+    authority.admit_sending(permit).unwrap()
+}
+
 fn request(body: &[u8]) -> RequestIdentity {
     RequestIdentity::new(
         "https://api.example.invalid/v1/chat",
@@ -96,7 +100,7 @@ fn a_pre_effect_persistence_failure_prevents_dispatch() {
     break_audit_log(&r.root);
 
     let req = request(b"body");
-    let outcome = r.authority.begin_send(&r.auth, r.lease, &req);
+    let outcome = r.authority.begin_send(&r.auth, r.lease, &req, "test-route");
 
     // No permit exists, so the physical send that it would have authorised
     // cannot happen. The whole point: the effect is prevented, not recorded.
@@ -115,8 +119,14 @@ fn audit_trouble_after_dispatch_never_reports_an_ordinary_failure() {
     let r = ready();
     let req = request(b"body");
 
-    // Admission succeeds and the permit exists: a physical send is now possible.
-    let permit = r.authority.begin_send(&r.auth, r.lease, &req).unwrap();
+    // Admission succeeds and the permit exists: wire admission makes a
+    // physical send possible.
+    let permit = admit_wire(
+        &r.authority,
+        r.authority
+            .begin_send(&r.auth, r.lease, &req, "test-route")
+            .unwrap(),
+    );
     let attempt = permit.attempt();
 
     // The audit log breaks while the request is in flight.
@@ -154,7 +164,12 @@ fn audit_trouble_after_dispatch_never_reports_an_ordinary_failure() {
 fn a_successful_send_with_a_broken_audit_log_is_also_ambiguous() {
     let r = ready();
     let req = request(b"body");
-    let permit = r.authority.begin_send(&r.auth, r.lease, &req).unwrap();
+    let permit = admit_wire(
+        &r.authority,
+        r.authority
+            .begin_send(&r.auth, r.lease, &req, "test-route")
+            .unwrap(),
+    );
     break_audit_log(&r.root);
 
     let outcome = r.authority.settle_settled(permit);

@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-pub(crate) const SCHEMA_VERSION: u32 = 2;
+pub(crate) const SCHEMA_VERSION: u32 = 3;
 
 /// One credential belonging to one principal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,6 +55,8 @@ pub(crate) struct StoredResource {
     pub(crate) observation_revision: u64,
     /// Digest of the latest accepted observation.
     pub(crate) observation_digest: String,
+    /// Next ordinal to assign for a physical-send attempt on this resource.
+    pub(crate) next_attempt_ordinal: u64,
 }
 
 /// A sealed capability grant.
@@ -127,8 +129,16 @@ pub(crate) struct StoredAttempt {
     /// Body digest alone, for audit correlation.
     pub(crate) body_digest: String,
     pub(crate) actor: String,
+    /// Monotonic ordinal for this resource's physical-send attempts.
+    pub(crate) ordinal: u64,
+    /// Wire dialect class for this attempt (for example `openai_chat_completions`).
+    pub(crate) dialect: String,
+    /// Digest of the secret-free logical route (for example `agent-step`).
+    pub(crate) route_digest: String,
     /// Idempotency key offered to the provider, when it supports one.
     pub(crate) idempotency_key: String,
+    /// Digest of the versioned wire idempotency identity.
+    pub(crate) wire_idempotency_digest: String,
     pub(crate) state: String,
     /// Set once the attempt reaches a terminal or ambiguous state.
     pub(crate) settlement: Option<String>,

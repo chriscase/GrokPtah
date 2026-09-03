@@ -578,6 +578,7 @@ impl HostAuthority {
                 control_epoch: state.control_epoch,
                 observation_revision: 1,
                 observation_digest: initial_observation.to_hex(),
+                next_attempt_ordinal: 1,
             };
             state.resources.insert(incarnation.to_hex(), record);
             Ok((incarnation, session, workspace))

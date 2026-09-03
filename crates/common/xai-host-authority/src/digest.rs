@@ -139,6 +139,11 @@ impl RequestIdentity {
     pub fn body_digest(&self) -> ContentDigest {
         self.body
     }
+
+    /// Wire dialect class bound into this identity.
+    pub fn dialect(&self) -> &str {
+        &self.dialect
+    }
 }
 
 impl std::fmt::Debug for RequestIdentity {

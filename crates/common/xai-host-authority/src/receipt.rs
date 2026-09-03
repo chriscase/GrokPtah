@@ -280,6 +280,8 @@ pub struct PhysicalSendPermit {
     pub(crate) request_digest: ContentDigest,
     pub(crate) body_digest: ContentDigest,
     pub(crate) idempotency_key: String,
+    pub(crate) dialect: String,
+    pub(crate) wire_admitted: bool,
 }
 
 impl PhysicalSendPermit {
@@ -299,6 +301,17 @@ impl PhysicalSendPermit {
     /// is deduplicated provider-side.
     pub fn idempotency_key(&self) -> &str {
         &self.idempotency_key
+    }
+
+    /// Wire dialect class for this attempt.
+    pub fn dialect(&self) -> &str {
+        &self.dialect
+    }
+
+    /// Whether wire admission has durably transitioned this attempt to
+    /// `sending` immediately before bytes may move.
+    pub fn wire_admitted(&self) -> bool {
+        self.wire_admitted
     }
 }
 
@@ -359,6 +372,9 @@ pub enum FailedReason {
     DeniedBeforeDispatch,
     /// The connection was refused before any request byte was written.
     ConnectRefusedBeforeWrite,
+    /// The attempt never reached the wire: preparing was durable but wire
+    /// admission did not occur before abandonment or recovery.
+    AbandonedBeforeWireAdmission,
 }
 
 /// Why an attempt is ambiguous.

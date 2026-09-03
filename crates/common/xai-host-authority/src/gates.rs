@@ -16,6 +16,7 @@ use crate::state::*;
 use crate::store::*;
 
 /// Attempt lifecycle as persisted.
+pub(crate) const STATE_PREPARING: &str = "preparing";
 pub(crate) const STATE_SENDING: &str = "sending";
 pub(crate) const STATE_SETTLED: &str = "settled";
 pub(crate) const STATE_FAILED: &str = "failed";
@@ -364,16 +365,20 @@ impl HostAuthority {
     /// Ordering, in this exact sequence:
     ///
     /// 1. Validate the lease against durable state and **consume it**, and
-    ///    record the attempt as `sending`, in one atomic, fsynced transaction.
+    ///    record the attempt as `preparing`, in one atomic, fsynced transaction.
     /// 2. Append the `SendIntent` audit record and fsync it.
     /// 3. Only then construct the permit.
     ///
-    /// Any failure in steps 1 or 2 returns [`AuthorityError::Durability`] and
-    /// no permit, so a pre-effect persistence failure prevents dispatch. A
-    /// crash after step 1 leaves the attempt `sending`, which
-    /// [`Self::recover_incomplete`] settles as
-    /// [`UncertainReason::CrashBetweenDispatchAndSettlement`] rather than
-    /// silently retrying.
+    /// Wire admission — transitioning to `sending` immediately before bytes
+    /// may move — is [`Self::admit_sending`], which is the only path to
+    /// dispatch. Any failure in steps 1 or 2 returns
+    /// [`AuthorityError::Durability`] and no permit, so a pre-effect
+    /// persistence failure prevents dispatch. A crash after step 1 leaves the
+    /// attempt `preparing`, which [`Self::recover_incomplete`] settles as
+    /// [`FailedReason::AbandonedBeforeWireAdmission`] rather than silently
+    /// retrying. A crash after wire admission leaves the attempt `sending`,
+    /// which recovery settles as
+    /// [`UncertainReason::CrashBetweenDispatchAndSettlement`].
     ///
     /// The permit is bound to `request`'s full identity — URL, method,
     /// dialect, credential, model, and body — so it cannot be carried to a
@@ -383,6 +388,7 @@ impl HostAuthority {
         auth: &AuthContext,
         lease: EffectLease,
         request: &RequestIdentity,
+        route: &str,
     ) -> Result<PhysicalSendPermit, AuthorityError> {
         let _lifecycle = self.lock_attempt_lifecycle()?;
         if lease.effect != EffectClass::ProviderSend {
@@ -391,6 +397,8 @@ impl HostAuthority {
         let now = unix_time_millis();
         let request_digest = request.digest();
         let body_digest = request.body_digest();
+        let dialect = request.dialect().to_string();
+        let route_digest = route_digest_for(route);
 
         // Step 1: consume the lease and record the attempt, atomically.
         let admitted = self.with_state(|state| {
@@ -460,9 +468,10 @@ impl HostAuthority {
                 return Err(AuthorityError::ResourceOwnershipMismatch);
             }
             // The surface must not have moved since the lease was minted.
+            let resource_key = stored.resource.clone();
             let resource = state
                 .resources
-                .get(&stored.resource)
+                .get_mut(&resource_key)
                 .ok_or_else(deny_resource_access)?;
             if resource.observation_revision != stored.observation_revision
                 || resource.observation_digest != stored.observation_digest
@@ -496,6 +505,12 @@ impl HostAuthority {
             state.leases.remove(&lease.id.to_hex());
 
             let attempt = AttemptId::mint();
+            let ordinal = resource.next_attempt_ordinal;
+            resource.next_attempt_ordinal = ordinal
+                .checked_add(1)
+                .ok_or_else(|| AuthorityError::Durability("attempt ordinal exhausted".into()))?;
+            let idempotency_key = idempotency_key_for(attempt);
+            let wire_idempotency_digest = wire_idempotency_digest_for(&idempotency_key);
             state.attempts.insert(
                 attempt.to_hex(),
                 StoredAttempt {
@@ -511,20 +526,24 @@ impl HostAuthority {
                     resource: stored.resource.clone(),
                     control_epoch: stored.control_epoch,
                     actor: stored.actor.clone(),
+                    ordinal,
+                    dialect: dialect.clone(),
+                    route_digest: route_digest.to_hex(),
                     request_digest: request_digest.to_hex(),
                     body_digest: body_digest.to_hex(),
-                    idempotency_key: idempotency_key_for(attempt),
-                    state: STATE_SENDING.to_string(),
+                    idempotency_key: idempotency_key.clone(),
+                    wire_idempotency_digest: wire_idempotency_digest.to_hex(),
+                    state: STATE_PREPARING.to_string(),
                     settlement: None,
                 },
             );
-            Ok((attempt, lease.binding))
+            Ok((attempt, lease.binding, idempotency_key, dialect, ordinal))
         });
 
         // A refusal is recorded against the authenticated principal that asked.
         // Failing to record a *denial* cannot change the denial: no effect
         // occurred and none is being permitted, so the refusal still stands.
-        let (attempt, binding) = match admitted {
+        let (attempt, binding, idempotency_key, dialect, ordinal) = match admitted {
             Ok(admitted) => admitted,
             Err(error) => {
                 let _ = self.append_audit(
@@ -552,8 +571,13 @@ impl HostAuthority {
                 workspace: binding.workspace.public_handle(),
                 resource: binding.resource.public_handle(),
                 actor: lease.actor.as_str().to_string(),
+                ordinal,
+                dialect: dialect.clone(),
+                route_digest: route_digest.public_handle(),
                 request_digest: request_digest.public_handle(),
                 body_digest: body_digest.public_handle(),
+                wire_idempotency_digest: wire_idempotency_digest_for(&idempotency_key)
+                    .public_handle(),
             },
         )?;
 
@@ -564,7 +588,44 @@ impl HostAuthority {
             binding,
             request_digest,
             body_digest,
-            idempotency_key: idempotency_key_for(attempt),
+            idempotency_key,
+            dialect,
+            wire_admitted: false,
+        })
+    }
+
+    /// Durably admit one prepared attempt to the wire immediately before bytes
+    /// may move. This is the only path from `preparing` to `sending`.
+    pub fn admit_sending(
+        &self,
+        permit: PhysicalSendPermit,
+    ) -> Result<PhysicalSendPermit, AuthorityError> {
+        if permit.wire_admitted {
+            return Err(AuthorityError::Invalid("attempt already wire-admitted"));
+        }
+        let _lifecycle = self.lock_attempt_lifecycle()?;
+        let attempt = permit.attempt;
+        let epoch = permit.binding.control_epoch.raw();
+        self.with_state(|state| {
+            let record = state
+                .attempts
+                .get_mut(&attempt.to_hex())
+                .ok_or_else(|| AuthorityError::CorruptState("attempt record vanished".into()))?;
+            if record.state != STATE_PREPARING {
+                return Err(AuthorityError::Invalid("attempt is not preparing"));
+            }
+            record.state = STATE_SENDING.to_string();
+            Ok(())
+        })?;
+        self.append_audit(
+            epoch,
+            AuditEvent::SendWireAdmission {
+                attempt: attempt.public_handle(),
+            },
+        )?;
+        Ok(PhysicalSendPermit {
+            wire_admitted: true,
+            ..permit
         })
     }
 
@@ -626,6 +687,36 @@ impl HostAuthority {
                 };
             }
         };
+        let current_state = match self.read(|state| {
+            state
+                .attempts
+                .get(&attempt.to_hex())
+                .map(|record| record.state.clone())
+                .ok_or_else(|| AuthorityError::CorruptState("attempt record vanished".into()))
+        }) {
+            Ok(state) => state,
+            Err(_) => {
+                return SendOutcome::Uncertain {
+                    attempt,
+                    reason: UncertainReason::StateNotDurableAfterDispatch,
+                };
+            }
+        };
+        if durable_state == STATE_SETTLED && !permit.wire_admitted {
+            return SendOutcome::Uncertain {
+                attempt,
+                reason: UncertainReason::ProtocolAfterPossibleEffect,
+            };
+        }
+        if durable_state == STATE_UNCERTAIN
+            && !permit.wire_admitted
+            && current_state != STATE_SENDING
+        {
+            return SendOutcome::Failed {
+                attempt,
+                reason: FailedReason::AbandonedBeforeWireAdmission,
+            };
+        }
         let epoch = permit.binding.control_epoch.raw();
         let detail_text = match detail {
             None => "response observed".to_string(),
@@ -681,7 +772,9 @@ impl HostAuthority {
     ///
     /// Called at open time after a crash. It never re-sends: an attempt that
     /// was `sending` when the process stopped may have reached the provider,
-    /// so it becomes ambiguous and waits for reconciliation.
+    /// so it becomes ambiguous and waits for reconciliation. An attempt left
+    /// in `preparing` never reached the wire and is settled as
+    /// [`FailedReason::AbandonedBeforeWireAdmission`].
     ///
     /// Requires admin authority. Forcing every in-flight attempt into the
     /// ambiguous state is a host decision, not something a component serving
@@ -692,30 +785,32 @@ impl HostAuthority {
     ) -> Result<Vec<AttemptId>, AuthorityError> {
         self.require_admin(admin)?;
         let _lifecycle = self.lock_attempt_lifecycle()?;
-        // A prior terminal audit append may already describe a snapshot that
-        // failed to persist. Converge that WAL evidence before treating any
-        // remaining Sending record as a crash cut; otherwise a same-host retry
-        // could duplicate uncertainty or overwrite recorded settled truth.
         self.replay_attempt_settlements_locked()?;
-        // Write the recovery evidence before changing the snapshot. A crash
-        // after the snapshot rename but before the audit append would leave an
-        // ambiguous attempt with no durable explanation and nothing for the
-        // next open to replay. The authority root is held exclusively for this
-        // HostAuthority, so the two phases cannot race another live holder.
-        let recovered = self.read(|state| {
-            Ok(state
-                .attempts
-                .iter()
-                .filter(|(_, record)| record.state == STATE_SENDING)
-                .map(|(key, _)| key.clone())
-                .collect::<Vec<_>>())
+        let (preparing, sending) = self.read(|state| {
+            let mut preparing = Vec::new();
+            let mut sending = Vec::new();
+            for (key, record) in &state.attempts {
+                match record.state.as_str() {
+                    STATE_PREPARING => preparing.push(key.clone()),
+                    STATE_SENDING => sending.push(key.clone()),
+                    _ => {}
+                }
+            }
+            Ok((preparing, sending))
         })?;
-        if recovered.is_empty() {
-            return Ok(Vec::new());
-        }
         let epoch = self.read(|state| Ok(state.control_epoch))?;
-        let mut ids = Vec::with_capacity(recovered.len());
-        for key in &recovered {
+        for key in &preparing {
+            let id: AttemptId = decode_id(key, "attempt")?;
+            self.append_audit(
+                epoch,
+                AuditEvent::SendOutcome {
+                    attempt: id.public_handle(),
+                    outcome: "failed".to_string(),
+                    detail: format!("{:?}", FailedReason::AbandonedBeforeWireAdmission),
+                },
+            )?;
+        }
+        for key in &sending {
             let id: AttemptId = decode_id(key, "attempt")?;
             self.append_audit(
                 epoch,
@@ -725,10 +820,26 @@ impl HostAuthority {
                     detail: format!("{:?}", UncertainReason::CrashBetweenDispatchAndSettlement),
                 },
             )?;
-            ids.push(id);
         }
+        if preparing.is_empty() && sending.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut ids = Vec::with_capacity(preparing.len() + sending.len());
         self.with_state(|state| {
-            for key in &recovered {
+            for key in &preparing {
+                let id: AttemptId = decode_id(key, "attempt")?;
+                let record = state.attempts.get_mut(key).ok_or_else(|| {
+                    AuthorityError::CorruptState("attempt record vanished during recovery".into())
+                })?;
+                if record.state == STATE_PREPARING {
+                    record.state = STATE_FAILED.to_string();
+                    record.settlement =
+                        Some(format!("{:?}", FailedReason::AbandonedBeforeWireAdmission));
+                    ids.push(id);
+                }
+            }
+            for key in &sending {
+                let id: AttemptId = decode_id(key, "attempt")?;
                 let record = state.attempts.get_mut(key).ok_or_else(|| {
                     AuthorityError::CorruptState("attempt record vanished during recovery".into())
                 })?;
@@ -738,6 +849,7 @@ impl HostAuthority {
                         "{:?}",
                         UncertainReason::CrashBetweenDispatchAndSettlement
                     ));
+                    ids.push(id);
                 }
             }
             Ok(())
@@ -849,9 +961,10 @@ impl HostAuthority {
             Ok(Some(AttemptProjection {
                 attempt: attempt.public_handle(),
                 state: record.state.clone(),
+                ordinal: record.ordinal,
                 request_digest: decode_digest(&record.request_digest, "request")?.public_handle(),
                 body_digest: decode_digest(&record.body_digest, "body")?.public_handle(),
-                settled: record.state != STATE_SENDING,
+                settled: record.state != STATE_PREPARING && record.state != STATE_SENDING,
                 ambiguous: record.state == STATE_UNCERTAIN,
             }))
         })
@@ -911,6 +1024,7 @@ impl HostAuthority {
 pub struct AttemptProjection {
     pub attempt: String,
     pub state: String,
+    pub ordinal: u64,
     pub request_digest: String,
     pub body_digest: String,
     pub settled: bool,
@@ -921,6 +1035,14 @@ pub struct AttemptProjection {
 /// one deduplicates a repeat of the *same* attempt rather than acting twice.
 fn idempotency_key_for(attempt: AttemptId) -> String {
     format!("grokptah-{}", attempt.public_handle())
+}
+
+fn route_digest_for(route: &str) -> ContentDigest {
+    ContentDigest::of_fields(&[("provider-route-v1", route.as_bytes())])
+}
+
+fn wire_idempotency_digest_for(idempotency_key: &str) -> ContentDigest {
+    ContentDigest::of_fields(&[("wire-idempotency-v1", idempotency_key.as_bytes())])
 }
 
 #[cfg(test)]
@@ -958,7 +1080,13 @@ mod concurrency_tests {
         let lease = authority
             .mint_lease(auth, &capability, request.digest(), 60_000)
             .unwrap();
-        authority.begin_send(auth, lease, &request).unwrap()
+        authority
+            .begin_send(auth, lease, &request, "test-route")
+            .unwrap()
+    }
+
+    fn admit(permit: PhysicalSendPermit, authority: &HostAuthority) -> PhysicalSendPermit {
+        authority.admit_sending(permit).unwrap()
     }
 
     #[test]
@@ -980,7 +1108,10 @@ mod concurrency_tests {
 
         // Settlement cannot interleave its WAL append and snapshot update with
         // replay or recovery on another thread.
-        let permit = permit_for(&authority, &auth, resource, b"settle");
+        let permit = admit(
+            permit_for(&authority, &auth, resource, b"settle"),
+            &authority,
+        );
         let lifecycle = authority.attempt_lifecycle.lock().unwrap();
         std::thread::scope(|scope| {
             let (started_tx, started_rx) = mpsc::channel();
@@ -1000,8 +1131,38 @@ mod concurrency_tests {
         });
 
         // Recovery uses the same lock, including its replay, scan, WAL, and
-        // snapshot phases.
-        let permit = permit_for(&authority, &auth, resource, b"recover");
+        // snapshot phases. A preparing attempt is settled NotSent.
+        let permit = permit_for(&authority, &auth, resource, b"recover-preparing");
+        let preparing = permit.attempt();
+        std::mem::forget(permit);
+        let lifecycle = authority.attempt_lifecycle.lock().unwrap();
+        std::thread::scope(|scope| {
+            let (started_tx, started_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let authority = &authority;
+            let admin = &admin;
+            scope.spawn(move || {
+                started_tx.send(()).unwrap();
+                done_tx.send(authority.recover_incomplete(admin)).unwrap();
+            });
+            started_rx.recv().unwrap();
+            assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+            drop(lifecycle);
+            assert_eq!(done_rx.recv().unwrap().unwrap(), vec![preparing]);
+        });
+        let projection = authority
+            .attempt_projection(&auth, preparing)
+            .unwrap()
+            .unwrap();
+        assert_eq!(projection.state, STATE_FAILED);
+        assert!(!projection.ambiguous);
+
+        // A wire-admitted attempt left in flight becomes uncertain and may be
+        // reconciled.
+        let permit = admit(
+            permit_for(&authority, &auth, resource, b"recover-sending"),
+            &authority,
+        );
         let recovering = permit.attempt();
         std::mem::forget(permit);
         let lifecycle = authority.attempt_lifecycle.lock().unwrap();
