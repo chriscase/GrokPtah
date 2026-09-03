@@ -1591,10 +1591,7 @@ fn wait_for_owner_home_stable(home: &Path, deadline: std::time::Instant) {
         }
         std::thread::sleep(Duration::from_millis(25));
     }
-    panic!(
-        "owner never wrote lazy home init at {}",
-        catalog.display()
-    );
+    panic!("owner never wrote lazy home init at {}", catalog.display());
 }
 
 /// P0 — bypass inventory. Each of these public entry points reaches a durable
