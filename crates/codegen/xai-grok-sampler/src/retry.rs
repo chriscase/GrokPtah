@@ -5,17 +5,19 @@
 //!
 //! # Retry behavior summary
 //!
-//! **Retried** (up to [`DEFAULT_MAX_RETRIES`] = 15, ~6 min with 30s backoff cap):
-//! - 500, 502, 503, 504, 520 (server errors)
-//! - Connection errors (timeout, refused, reset)
-//! - `EventStreamError` / `StreamError` (mid-stream failures)
-//! - `EmptyResponse` (model returned no content/tool calls)
+//! **Retried only when delivery is proven `NotSent`** (up to
+//! [`DEFAULT_MAX_RETRIES`] = 15, ~6 min with 30s backoff cap):
+//! - connection refusal and other pre-write transport failures
+//! - any future retryable class whose transport evidence proves no bytes moved
 //!
-//! **Retried with lower cap** ([`RATE_LIMIT_RETRY_THRESHOLD`] = 2):
-//! - 429 (rate limited) — avoids burning long waits
+//! **Never automatically retried after a possible write:**
+//! - 429/5xx responses, stream/EOF/timeout-after-write failures, and empty
+//!   responses
+//! - 413 or image-processing responses; stripping images is left to an
+//!   explicit caller retry because the response itself is possible-write
 //!
-//! **Special handling** (not counted against retry budget):
-//! - 413 / image processing errors → strip images and retry once
+//! Doom-loop resampling is a separate explicit recovery path and is not a
+//! transport retry.
 //!
 //! **Not retried** (Fatal immediately):
 //! - 400, 401, 403, 404, 408, 422 (client errors)
@@ -28,10 +30,9 @@
 //! - `false` → Fatal immediately, regardless of status code
 //! - `true` / absent → falls through to status-code logic above
 //!
-//! Today CCP's header mirrors the client's `is_retryable()` logic
-//! (4xx except 429 = false, 5xx + 429 = true), so no behavior changes
-//! on merge. The header enables future CCP-side refinements (e.g.
-//! marking content-caused 500s as non-retryable) without client updates.
+//! `SamplingError::is_retryable()` remains a class label for telemetry and
+//! compatibility. It is never sufficient for an automatic resend: the
+//! classifier also requires `is_proven_not_sent()`.
 
 use std::time::Duration;
 
@@ -157,17 +158,14 @@ pub fn classify_error(
         return RetryDecision::EmitToSession(clone_error(err));
     }
 
-    // 413 Payload Too Large: strip inline images and try once. The
-    // caller checks if there are images left after the strip; if not,
-    // upgrade to Fatal.
-    if err.is_payload_too_large() {
-        return RetryDecision::RetryWithImageStrip;
-    }
-
-    // Image processing errors (direct 400 or proxy-wrapped 500): strip
-    // images and retry, same recovery as 413.
-    if err.is_image_processing_error() {
-        return RetryDecision::RetryWithImageStrip;
+    // Image/payload responses are possible writes. Keep the image-strip arm
+    // available for a future pre-send error type, but never turn an observed
+    // provider response into an automatic second request.
+    if err.is_payload_too_large() || err.is_image_processing_error() {
+        if err.is_proven_not_sent() {
+            return RetryDecision::RetryWithImageStrip;
+        }
+        return RetryDecision::Fatal(clone_error(err));
     }
 
     // Server explicitly said don't retry (x-should-retry: false).
@@ -553,39 +551,39 @@ mod tests {
     }
 
     #[test]
-    fn classify_payload_too_large_strips_images() {
+    fn classify_payload_too_large_response_is_fatal() {
         let err = api_err(StatusCode::PAYLOAD_TOO_LARGE, "too big");
         assert!(matches!(
             classify_error(&err, 0, 5, RATE_LIMIT_RETRY_THRESHOLD),
-            RetryDecision::RetryWithImageStrip
+            RetryDecision::Fatal(_)
         ));
     }
 
     #[test]
-    fn classify_image_processing_error_400_strips_images() {
+    fn classify_image_processing_error_400_response_is_fatal() {
         let err = api_err(StatusCode::BAD_REQUEST, "Could not process image");
         assert!(matches!(
             classify_error(&err, 0, 5, RATE_LIMIT_RETRY_THRESHOLD),
-            RetryDecision::RetryWithImageStrip
+            RetryDecision::Fatal(_)
         ));
     }
 
     #[test]
-    fn classify_image_processing_error_500_wrapped_strips_images() {
+    fn classify_image_processing_error_500_response_is_fatal() {
         let err = api_err(
             StatusCode::INTERNAL_SERVER_ERROR,
             "upstream: 400 Bad Request: Could not process image",
         );
         assert!(matches!(
             classify_error(&err, 0, 5, RATE_LIMIT_RETRY_THRESHOLD),
-            RetryDecision::RetryWithImageStrip
+            RetryDecision::Fatal(_)
         ));
     }
 
     #[test]
-    fn classify_image_processing_error_takes_priority_over_5xx_retry() {
-        // A 500 wrapping "Could not process image" is retryable by status
-        // code alone — verify the image-processing guard intercepts first.
+    fn classify_image_processing_error_does_not_bypass_not_sent_gate() {
+        // A 500 wrapping "Could not process image" remains a possible write;
+        // the image-specific path must not bypass the NotSent gate.
         let err = api_err(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Could not process image: bad format",
@@ -596,7 +594,7 @@ mod tests {
         );
         assert!(matches!(
             classify_error(&err, 0, 5, RATE_LIMIT_RETRY_THRESHOLD),
-            RetryDecision::RetryWithImageStrip
+            RetryDecision::Fatal(_)
         ));
     }
 

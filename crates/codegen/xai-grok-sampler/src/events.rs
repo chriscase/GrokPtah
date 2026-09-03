@@ -122,6 +122,9 @@ pub struct SamplingErrorInfo {
     pub kind: SamplingErrorKind,
     pub status_code: Option<u16>,
     pub message: String,
+    /// Whether the error class has a retry policy. This is not an automatic
+    /// resend authorization: callers must separately prove `NotSent` before
+    /// issuing another provider request.
     pub is_retryable: bool,
     pub retry_after_secs: Option<u64>,
     pub model_metadata: Option<ResponseModelMetadata>,
@@ -286,7 +289,7 @@ mod tests {
     }
 
     #[test]
-    fn api_500_classified_as_api_and_retryable() {
+    fn api_500_classified_as_api_and_retryable_class() {
         let err = SamplingError::Api {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: "boom".into(),
@@ -297,7 +300,10 @@ mod tests {
         let info = SamplingErrorInfo::from(&err);
         assert_eq!(info.kind, SamplingErrorKind::Api);
         assert_eq!(info.status_code, Some(500));
-        assert!(info.is_retryable, "5xx should be retryable");
+        assert!(
+            info.is_retryable,
+            "5xx remains a retryable class, but not auto-retry authorization"
+        );
     }
 
     #[test]
@@ -313,7 +319,10 @@ mod tests {
         assert_eq!(info.kind, SamplingErrorKind::RateLimited);
         assert_eq!(info.status_code, Some(429));
         assert_eq!(info.retry_after_secs, Some(15));
-        assert!(info.is_retryable, "429 should be retryable");
+        assert!(
+            info.is_retryable,
+            "429 remains a retryable class, but not auto-retry authorization"
+        );
     }
 
     #[test]
@@ -337,15 +346,18 @@ mod tests {
     }
 
     #[test]
-    fn event_stream_error_classified_as_http_and_retryable() {
+    fn event_stream_error_classified_as_http_and_retryable_class() {
         let err = SamplingError::EventStreamError("conn reset".into());
         let info = SamplingErrorInfo::from(&err);
         assert_eq!(info.kind, SamplingErrorKind::Http);
-        assert!(info.is_retryable);
+        assert!(
+            info.is_retryable,
+            "stream errors remain a retryable class, but not auto-retry authorization"
+        );
     }
 
     #[test]
-    fn stream_error_classified_as_api_and_retryable() {
+    fn stream_error_classified_as_api_and_retryable_class() {
         let err = SamplingError::StreamError {
             error_type: "server_error".into(),
             message: "transient".into(),
@@ -353,7 +365,10 @@ mod tests {
         let info = SamplingErrorInfo::from(&err);
         assert_eq!(info.kind, SamplingErrorKind::Api);
         assert_eq!(info.status_code, None);
-        assert!(info.is_retryable, "stream errors should be retryable");
+        assert!(
+            info.is_retryable,
+            "stream errors remain a retryable class, but not auto-retry authorization"
+        );
     }
 
     #[test]

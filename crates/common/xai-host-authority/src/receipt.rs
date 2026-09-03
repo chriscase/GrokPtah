@@ -268,9 +268,11 @@ impl EffectLease {
 
 /// Gate 3 receipt: the only thing that permits a physical provider send.
 ///
-/// A permit is issued only after the attempt has been durably recorded in the
-/// `Sending` state. It is consumed by value at settlement, so the type system
-/// enforces one-use: a spent permit no longer exists to be presented again.
+/// A permit is issued after the attempt and `SendIntent` are durable in
+/// `Preparing`; [`HostAuthority::admit_sending`](crate::HostAuthority::admit_sending)
+/// transitions it to `Sending` immediately before bytes may move. It is
+/// consumed by value at settlement, so the type system enforces one-use: a
+/// spent permit no longer exists to be presented again.
 #[must_use = "holding a permit without settling it leaves the attempt Uncertain"]
 #[derive(PartialEq, Eq)]
 pub struct PhysicalSendPermit {

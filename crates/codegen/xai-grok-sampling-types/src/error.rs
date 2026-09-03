@@ -237,6 +237,12 @@ impl SamplingError {
         )
     }
 
+    /// Whether this error belongs to a class with a retry policy.
+    ///
+    /// This is classification metadata, not permission to issue another
+    /// provider request. Automatic retry callers must also require
+    /// [`Self::is_proven_not_sent`]; response, stream, and post-write
+    /// transport failures remain possible writes even when this returns true.
     pub fn is_retryable(&self) -> bool {
         match self {
             SamplingError::Auth(_) => false,
@@ -503,8 +509,9 @@ mod tests {
     }
 
     #[test]
-    fn event_stream_error_is_retryable() {
-        // Verify the existing contract hasn't changed — EventStreamError is retryable.
+    fn event_stream_error_is_retryable_class() {
+        // This class remains eligible for policy evaluation, but a stream
+        // failure is not automatic-resend authorization without NotSent proof.
         let err = SamplingError::EventStreamError("connection reset".into());
         assert!(err.is_retryable());
     }
@@ -612,7 +619,10 @@ mod tests {
             should_retry: None,
         };
         assert!(err.is_rate_limited());
-        assert!(err.is_retryable(), "429 should be retryable");
+        assert!(
+            err.is_retryable(),
+            "429 remains a retryable class, not auto-retry authorization"
+        );
         assert!(
             !err.is_proven_not_sent(),
             "429 response is a possible write"
