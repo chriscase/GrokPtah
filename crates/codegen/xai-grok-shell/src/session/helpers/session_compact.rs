@@ -41,11 +41,15 @@ your response.
 pub(crate) enum CompactFailure {
     /// Retrying the same payload will hit the same failure. The retry loop
     /// in `run_compact_inner` should bail without sleeping or re-issuing.
-    /// Possible-write 5xx/429/stream/idle-timeout failures are this variant:
-    /// the request may already have reached the provider.
+    /// Possible-write HTTP/stream/idle-timeout failures (5xx/429/stream/idle)
+    /// are this variant: the request may already have reached the provider
+    /// and is never automatically resent.
     Deterministic(acp::Error),
-    /// Proven NotSent (connect refused before write). The caller may issue a
-    /// new admitted physical attempt. Never used for 5xx/429/stream.
+    /// Proven NotSent (connect refused before write), or bounded empty-content
+    /// recovery after a completed stream. The caller may issue a distinct
+    /// fresh admitted request (new request id). Never used for possible-write
+    /// 5xx/429/stream/idle failures. Empty-content recovery is not a
+    /// same-attempt transport retry.
     Transient(acp::Error),
 }
 pub(crate) use xai_grok_sampling_types::is_context_length_error;
@@ -306,8 +310,11 @@ where
 /// enum has no `none`, so that path relies on the prompt instruction alone.
 ///
 /// Errors carry a [`CompactFailure`] classification so the caller can
-/// short-circuit retries on possible-write failures (4xx, 429, 5xx, stream,
-/// idle timeout) while still retrying proven NotSent connect failures.
+/// refuse auto-resend on possible-write failures (4xx, 429, 5xx, stream,
+/// idle timeout). Proven NotSent connect failures remain Transient so a
+/// distinct fresh admitted request may be issued. An empty-content
+/// completion is also Transient: that recovery is a new request/id, not a
+/// same-attempt transport retry.
 pub(crate) async fn generate_session_compact(
     chat_history: Vec<ConversationItem>,
     tools: Vec<ToolSpec>,
@@ -689,7 +696,7 @@ pub(crate) async fn generate_session_compact(
 /// Pin the deterministic-vs-transient mapping for every `SamplingError`
 /// variant and for the meaningful branches of the response-event classifier
 /// (numeric code, `invalid_request_error` marker in code or message, and
-/// the default-to-transient fallback for unknown / missing codes).
+/// unknown / missing codes, which are possible-write and deterministic).
 /// Also covers `StreamTiming` boundaries and `CompactionOutcome::as_str`.
 #[cfg(test)]
 mod classify_tests {
@@ -799,7 +806,7 @@ mod classify_tests {
         })));
     }
     #[test]
-    fn sampling_http_is_transient() {
+    fn sampling_connect_refused_http_is_transient() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1730,7 +1737,7 @@ mod reasoning_compaction_regression_tests {
         let _ = shutdown_tx.send(());
     }
     #[tokio::test]
-    async fn stalled_compaction_stream_times_out_as_transient() {
+    async fn stalled_compaction_stream_times_out_as_deterministic() {
         let app = Router::new().route(
             "/v1/chat/completions",
             post(|| async {
