@@ -80,19 +80,17 @@ async fn build_embedding_provider(
         return None;
     }
 
-    // Prefer the refresh-capable credential provider — the middleware gives
-    // 401 retry for free without any per-call key resolution.
+    // Prefer the refresh-capable credential provider. 401 recovery is a new
+    // admitted send after refresh, not a middleware resend of the same attempt.
     if let Some(creds) = auth_credentials {
-        let client = super::embedding::build_middleware_client(creds.clone());
         return super::embedding::ApiEmbeddingProvider::from_config(
             config,
             base_url.to_owned(),
-            client,
+            creds.clone(),
         );
     }
 
-    // Fallback: resolve API key per-call, wrap in a static middleware client
-    // (no 401 refresh, but auth header is still stamped by middleware).
+    // Fallback: resolve API key per-call into a static credential provider.
     let api_key = match api_key_provider {
         Some(p) => p.current_api_key_async().await,
         None => None,
@@ -131,7 +129,7 @@ pub struct MemoryBackendImpl {
     pub search_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Dynamic API key provider for embedding requests.
     api_key_provider: Option<xai_grok_tools::types::SharedApiKeyProvider>,
-    /// Refresh-capable credential provider for embedding HTTP middleware.
+    /// Refresh-capable credential provider for admitted embedding sends.
     auth_credentials: Option<Arc<dyn xai_grok_auth::AuthCredentialProvider>>,
 }
 

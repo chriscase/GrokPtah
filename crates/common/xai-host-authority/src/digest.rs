@@ -87,9 +87,9 @@ impl std::fmt::Debug for ContentDigest {
 /// The full identity of one physical provider request.
 ///
 /// A permit is bound to this whole tuple, not just the body. Changing the URL,
-/// the HTTP method, the wire dialect, the credential, or the model after
-/// admission invalidates the permit, so a request admitted for one endpoint or
-/// one credential can never be replayed against another.
+/// the HTTP method, the wire dialect, the credential, model, or provider
+/// request ID after admission invalidates the permit, so a request admitted
+/// for one physical attempt cannot be silently reused for another.
 #[derive(Clone, PartialEq, Eq)]
 pub struct RequestIdentity {
     url: String,
@@ -97,6 +97,10 @@ pub struct RequestIdentity {
     dialect: String,
     credential_fingerprint: ContentDigest,
     model: String,
+    /// Provider request identifier, when the caller supplies one. This is a
+    /// physical-attempt discriminator: an explicit recovery request must not
+    /// silently collide with the original request body.
+    provider_request_id: String,
     body: ContentDigest,
 }
 
@@ -113,12 +117,28 @@ impl RequestIdentity {
         model: &str,
         body: &[u8],
     ) -> Self {
+        Self::new_with_provider_request_id(url, method, dialect, credential_secret, model, "", body)
+    }
+
+    /// Build the identity of a physical send with the provider request ID
+    /// included in the binding. The ID is treated as opaque and retained only
+    /// inside the identity so it is never exposed by [`Debug`].
+    pub fn new_with_provider_request_id(
+        url: &str,
+        method: &str,
+        dialect: &str,
+        credential_secret: &[u8],
+        model: &str,
+        provider_request_id: &str,
+        body: &[u8],
+    ) -> Self {
         Self {
             url: url.to_string(),
             method: method.to_ascii_uppercase(),
             dialect: dialect.to_string(),
             credential_fingerprint: ContentDigest::of_fields(&[("credential", credential_secret)]),
             model: model.to_string(),
+            provider_request_id: provider_request_id.to_string(),
             body: ContentDigest::of_bytes(body),
         }
     }
@@ -131,6 +151,7 @@ impl RequestIdentity {
             ("dialect", self.dialect.as_bytes()),
             ("credential", self.credential_fingerprint.as_bytes()),
             ("model", self.model.as_bytes()),
+            ("provider-request-id", self.provider_request_id.as_bytes()),
             ("body", self.body.as_bytes()),
         ])
     }

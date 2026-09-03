@@ -13253,6 +13253,7 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "async-trait",
+ "axum",
  "blake3",
  "chrono",
  "dunce",
@@ -13262,7 +13263,6 @@ dependencies = [
  "nix 0.30.1",
  "notify",
  "reqwest 0.12.24",
- "reqwest-middleware 0.4.2",
  "rusqlite",
  "serde_json",
  "sqlite-vec",
@@ -13277,6 +13277,7 @@ dependencies = [
  "xai-grok-telemetry",
  "xai-grok-tools",
  "xai-grok-version",
+ "xai-host-authority",
  "xai-sqlite-journal",
 ]
 
@@ -13562,6 +13563,7 @@ dependencies = [
  "async-openai",
  "async-stream",
  "axum",
+ "bytes",
  "chrono",
  "eventsource-stream",
  "futures-util",
@@ -13569,6 +13571,7 @@ dependencies = [
  "reqwest 0.12.24",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tracing",
@@ -13576,6 +13579,7 @@ dependencies = [
  "xai-grok-sampling-types",
  "xai-grok-test-support",
  "xai-grok-version",
+ "xai-host-authority",
 ]
 
 [[package]]

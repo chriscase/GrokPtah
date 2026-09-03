@@ -114,6 +114,15 @@ pub(crate) async fn run_request_task(
     }
 
     let mut request = request;
+    // The actor request ID is the stable logical correlation key. A doom-loop
+    // resample is a new physical provider attempt, however, so give it a
+    // distinct provider request ID instead of presenting the same physical
+    // identity to the authority ledger. This is an explicit recovery path,
+    // not an automatic retry of a possibly-written request.
+    let provider_request_id = request
+        .x_grok_req_id
+        .clone()
+        .unwrap_or_else(|| request_id.to_string());
     let mut retry_count: u32 = 0;
     // Doom-loop recovery keeps its own resample budget, independent of the
     // transport/empty budget above.
@@ -225,6 +234,9 @@ pub(crate) async fn run_request_task(
                         outcome = "resampled",
                         "doom-loop recovery: discarding the poisoned attempt and resampling"
                     );
+                    request.x_grok_req_id = Some(format!(
+                        "{provider_request_id}:doom-resample-{doom_retry_count}"
+                    ));
                     emit_retrying(
                         &event_tx,
                         &request_id,

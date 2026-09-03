@@ -25,6 +25,7 @@ pub mod doom_loop;
 pub mod events;
 pub mod handle;
 pub mod metrics;
+mod provider_admission;
 pub mod retry;
 pub mod sampling_log;
 mod shared_http;

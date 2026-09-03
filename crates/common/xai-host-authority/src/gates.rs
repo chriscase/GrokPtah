@@ -381,8 +381,9 @@ impl HostAuthority {
     /// [`UncertainReason::CrashBetweenDispatchAndSettlement`].
     ///
     /// The permit is bound to `request`'s full identity — URL, method,
-    /// dialect, credential, model, and body — so it cannot be carried to a
-    /// different endpoint, credential, model, or body.
+    /// dialect, credential, model, provider request ID, and body — so it
+    /// cannot be carried to a different endpoint, credential, model, physical
+    /// attempt, or body.
     pub fn begin_send(
         &self,
         auth: &AuthContext,
@@ -1044,6 +1045,35 @@ impl HostAuthority {
             .lock()
             .map_err(|_| AuthorityError::Durability("audit log lock poisoned".into()))?;
         log.verify_chain()
+    }
+
+    /// Seal, lease, begin, and durably admit one operator-backed provider send.
+    ///
+    /// This is the smallest shared caller seam on the existing lattice: it
+    /// does not open a root, mint a second ledger, or perform HTTP. The
+    /// returned permit has already passed [`Self::admit_sending`]; the
+    /// caller must physically send immediately afterwards and consume the
+    /// permit by settlement. Actor class is [`ActorClass::VerifiedOperator`].
+    pub fn admit_operator_send(
+        &self,
+        auth: &AuthContext,
+        request: &RequestIdentity,
+        target_scope: &str,
+    ) -> Result<PhysicalSendPermit, AuthorityError> {
+        let cwd = std::env::current_dir()
+            .map_err(|error| AuthorityError::Durability(error.to_string()))?;
+        let workspace = self.issue_workspace(auth, &cwd)?;
+        let resource = self.obtain_provider_send_surface(auth, workspace, target_scope)?;
+        let capability = self.seal_capability(
+            auth,
+            resource,
+            ActorClass::VerifiedOperator,
+            EffectClass::ProviderSend,
+            60_000,
+        )?;
+        let lease = self.mint_lease(auth, &capability, request.digest(), 30_000)?;
+        let permit = self.begin_send(auth, lease, request, target_scope)?;
+        self.admit_sending(auth, permit)
     }
 }
 
