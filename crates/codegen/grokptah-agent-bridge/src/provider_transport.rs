@@ -651,12 +651,20 @@ pub(crate) fn reconcile_provider_attempt(
     let runtime = authority_runtime()?;
     runtime.require_reconciliation_authority(operator)?;
     let auth = runtime.authority.authenticate(&runtime.service_bearer)?;
-    let disposition = if took_effect {
-        ReconciliationDisposition::MarkSettled
+    let (disposition, evidence) = if took_effect {
+        (
+            ReconciliationDisposition::MarkSettled,
+            operator_reconciliation_evidence(attempt),
+        )
     } else {
-        ReconciliationDisposition::MarkNotSent
+        // Post-wire uncertain attempts cannot be declared NotSent: that path is
+        // host-proven pre-wire only. Operator "no effect" after possible write
+        // is an explicit discard, not a retry-eligible failed outcome.
+        (
+            ReconciliationDisposition::Discard,
+            ReconciliationEvidence::default(),
+        )
     };
-    let evidence = operator_reconciliation_evidence(attempt, took_effect);
     let grant = runtime.authority.mint_reconciliation_grant_for_attempt(
         &auth,
         attempt,
@@ -669,17 +677,12 @@ pub(crate) fn reconcile_provider_attempt(
     Ok(())
 }
 
-fn operator_reconciliation_evidence(attempt: AttemptId, took_effect: bool) -> ReconciliationEvidence {
-    let digest = ContentDigest::of_fields(&[
+fn operator_reconciliation_evidence(attempt: AttemptId) -> ReconciliationEvidence {
+    ReconciliationEvidence::provider_receipt(ContentDigest::of_fields(&[
         ("provider-reconcile-bridge-v1", b""),
         ("attempt", attempt.public_handle().as_bytes()),
-        ("took_effect", &[u8::from(took_effect)]),
-    ]);
-    if took_effect {
-        ReconciliationEvidence::provider_receipt(digest)
-    } else {
-        ReconciliationEvidence::operator_observation(digest)
-    }
+        ("took_effect", &[1_u8]),
+    ]))
 }
 
 pub(crate) fn provider_attempts_requiring_reconciliation(

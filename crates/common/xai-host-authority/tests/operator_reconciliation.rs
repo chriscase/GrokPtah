@@ -257,6 +257,36 @@ fn mark_not_sent_requires_pre_wire_evidence() {
 }
 
 #[test]
+fn post_wire_mark_not_sent_refused_even_with_operator_observation() {
+    let host = open_host(&[("a", SECRET_A)]);
+    let auth = host.authority.authenticate(SECRET_A).unwrap();
+    let (session, workspace, permit) = prepared(
+        &host.authority,
+        &auth,
+        ROUTE,
+        b"post-wire",
+        Path::new("/tmp/gp-ws"),
+    );
+    let handle = permit.attempt().public_handle();
+    let _ = host.authority.settle_uncertain(
+        host.authority.admit_sending(&auth, permit).unwrap(),
+        UncertainReason::TransportAfterPossibleWrite,
+    );
+    let denied = host.authority.mint_reconciliation_grant(
+        &auth,
+        session,
+        workspace,
+        &handle,
+        ReconciliationDisposition::MarkNotSent,
+        60_000,
+    );
+    assert_eq!(
+        denied.unwrap_err(),
+        AuthorityError::Invalid("mark-not-sent requires host-proven pre-wire evidence")
+    );
+}
+
+#[test]
 fn mark_settled_rejects_timestamp_only_evidence() {
     let host = open_host(&[("a", SECRET_A)]);
     let auth = host.authority.authenticate(SECRET_A).unwrap();

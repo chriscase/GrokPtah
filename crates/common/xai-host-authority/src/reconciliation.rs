@@ -62,9 +62,7 @@ impl HostAuthority {
                         "attempt is still in flight; wait for settlement before reconciling",
                     ));
                 }
-                if record.state != STATE_UNCERTAIN
-                    && !host_has_pre_wire_evidence(self, &attempt, &record)?
-                {
+                if !host_has_pre_wire_evidence(self, &attempt, &record)? {
                     return Err(AuthorityError::Invalid(
                         "mark-not-sent requires host-proven pre-wire evidence",
                     ));
@@ -203,9 +201,9 @@ impl HostAuthority {
         match grant.disposition {
             ReconciliationDisposition::Review => {}
             ReconciliationDisposition::MarkNotSent => {
-                if !can_mark_not_sent(self, &grant.attempt, &current, &evidence)? {
+                if !host_has_pre_wire_evidence(self, &grant.attempt, &current)? {
                     return Err(AuthorityError::Invalid(
-                        "mark-not-sent requires host-proven pre-wire evidence or operator observation",
+                        "mark-not-sent requires host-proven pre-wire evidence",
                     ));
                 }
             }
@@ -429,24 +427,6 @@ fn already_matches_disposition(
         ReconciliationDisposition::MarkSettled => record.state == STATE_SETTLED,
         ReconciliationDisposition::Discard => record.state == STATE_DISCARDED,
     }
-}
-
-fn can_mark_not_sent(
-    authority: &HostAuthority,
-    attempt: &AttemptId,
-    record: &StoredAttempt,
-    evidence: &ReconciliationEvidence,
-) -> Result<bool, AuthorityError> {
-    if host_has_pre_wire_evidence(authority, attempt, record)? {
-        return Ok(true);
-    }
-    if record.state == STATE_UNCERTAIN
-        && evidence.has_identity_proof()
-        && wire_admission_recorded(authority, attempt)?
-    {
-        return Ok(true);
-    }
-    Ok(false)
 }
 
 fn is_operator_reconciled(record: &StoredAttempt) -> bool {
