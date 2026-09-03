@@ -159,9 +159,11 @@ impl CompactionSampler for ShellCompactionSampler {
 /// - `Deterministic` → [`CompactionSampleError::Build`] (whose
 ///   `is_deterministic()` is `true`); a context-length overflow keeps its
 ///   message text so the engine's `is_context_length_error` check fires and
-///   sets `context_overflow`.
+///   sets `context_overflow`. Possible-write 5xx/429/stream failures are
+///   this arm and are never auto-resent.
 /// - `Transient` → [`CompactionSampleError::Other`] (`is_deterministic()` is
-///   `false`), so the engine retries it.
+///   `false`), so the engine retries it. Only proven NotSent connect
+///   failures take this arm.
 fn compact_failure_to_sample_error(failure: CompactFailure) -> CompactionSampleError {
     let (deterministic, err) = match failure {
         CompactFailure::Deterministic(err) => (true, err),
