@@ -11,3 +11,6 @@ pub mod session_summary;
 pub mod tool_input_parsing;
 
 pub use compaction_context::CompactionStateContext;
+
+#[cfg(test)]
+mod provider_send_admission;

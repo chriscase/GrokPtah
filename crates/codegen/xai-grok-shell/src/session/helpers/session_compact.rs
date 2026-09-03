@@ -41,78 +41,40 @@ your response.
 pub(crate) enum CompactFailure {
     /// Retrying the same payload will hit the same failure. The retry loop
     /// in `run_compact_inner` should bail without sleeping or re-issuing.
+    /// Possible-write 5xx/429/stream/idle-timeout failures are this variant:
+    /// the request may already have reached the provider.
     Deterministic(acp::Error),
-    /// Failure may resolve on retry. The caller follows its existing
-    /// N-attempt + backoff loop.
+    /// Proven NotSent (connect refused before write). The caller may issue a
+    /// new admitted physical attempt. Never used for 5xx/429/stream.
     Transient(acp::Error),
 }
 pub(crate) use xai_grok_sampling_types::is_context_length_error;
 /// Classify an upstream `SamplingError` for the compaction retry loop.
 ///
-/// `Auth`, `InvalidConfiguration`, `Serialization` and
-/// `IdleTimeout` are all deterministic by construction (re-issuing the same
-/// request cannot change the outcome — auth state, config, payload shape,
-/// and stuck-model conditions all persist). 4xx API responses other than
-/// 408 (timeout) and 429 (rate limit) are likewise deterministic. Network
-/// transport errors, stream-level blips, and 5xx responses are transient.
+/// Auto-retry is permitted only for a proven pre-write connection failure
+/// ([`SamplingError::is_proven_not_sent`]). HTTP responses, stream errors,
+/// idle timeouts, 429, and 5xx are possible-write: they become
+/// [`CompactFailure::Deterministic`] and are never auto-resent.
 fn classify_sampling_error(err: SamplingError) -> CompactFailure {
     let acp_err = acp::Error::internal_error().data(format!("compact failed: {err}"));
-    let deterministic = match &err {
-        SamplingError::Auth(_)
-        | SamplingError::InvalidConfiguration(_)
-        | SamplingError::Serialization(_)
-        | SamplingError::IdleTimeout { .. } => true,
-        SamplingError::Api {
-            status, message, ..
-        } => {
-            is_context_length_error(message)
-                || (status.is_client_error()
-                    && *status != StatusCode::REQUEST_TIMEOUT
-                    && *status != StatusCode::TOO_MANY_REQUESTS)
-        }
-        SamplingError::MaxTokensTruncation => true,
-        SamplingError::Http(_)
-        | SamplingError::EventStreamError(_)
-        | SamplingError::StreamError { .. }
-        | SamplingError::EmptyResponse { .. }
-        | SamplingError::DoomLoopDetected { .. } => false,
-    };
-    if deterministic {
-        CompactFailure::Deterministic(acp_err)
-    } else {
+    if matches!(&err, SamplingError::Http(_)) && err.is_proven_not_sent() {
         CompactFailure::Transient(acp_err)
+    } else {
+        CompactFailure::Deterministic(acp_err)
     }
 }
 /// Classify a Anthropic-style stream error event (`ResponseError` /
 /// `ResponseFailed.error`) for the compaction retry loop.
 ///
-/// `code` is the structured `code` field on the event (typically a numeric
-/// HTTP status as a string, but Anthropic also uses error-type strings like
-/// `"invalid_request_error"`). `message` is the human-readable detail.
-///
-/// Numeric codes are classified by HTTP-status range. The Anthropic
-/// `invalid_request_error` marker, which can appear in either field, always
-/// maps to `Deterministic` (schema violations cannot be fixed by re-sending
-/// the same payload).
+/// Stream events arrive after request bytes have moved, so every branch is
+/// [`CompactFailure::Deterministic`]. Context-length overflows stay
+/// deterministic so the input ladder can still step down.
 fn classify_response_event_error(code: Option<&str>, message: &str) -> CompactFailure {
     let acp_err = acp::Error::internal_error().data(match code {
         Some(c) => format!("compact failed: {c}: {message}"),
         None => format!("compact failed: {message}"),
     });
-    if matches!(code, Some("invalid_request_error")) || message.contains("invalid_request_error") {
-        return CompactFailure::Deterministic(acp_err);
-    }
-    if let Some(status_code) = code.and_then(|c| c.parse::<u16>().ok())
-        && (400..500).contains(&status_code)
-        && status_code != 408
-        && status_code != 429
-    {
-        return CompactFailure::Deterministic(acp_err);
-    }
-    if is_context_length_error(message) {
-        return CompactFailure::Deterministic(acp_err);
-    }
-    CompactFailure::Transient(acp_err)
+    CompactFailure::Deterministic(acp_err)
 }
 /// Build the chat history that will be sent to the compaction model.
 ///
@@ -344,9 +306,8 @@ where
 /// enum has no `none`, so that path relies on the prompt instruction alone.
 ///
 /// Errors carry a [`CompactFailure`] classification so the caller can
-/// short-circuit retries on deterministic failures (4xx schema violations,
-/// auth errors) while still retrying transient ones (5xx,
-/// network blips, rate limits).
+/// short-circuit retries on possible-write failures (4xx, 429, 5xx, stream,
+/// idle timeout) while still retrying proven NotSent connect failures.
 pub(crate) async fn generate_session_compact(
     chat_history: Vec<ConversationItem>,
     tools: Vec<ToolSpec>,
@@ -401,7 +362,7 @@ pub(crate) async fn generate_session_compact(
                     StreamStep::Ended => break,
                     StreamStep::IdleTimeout => {
                         return Err(
-                            CompactFailure::Transient(
+                            CompactFailure::Deterministic(
                                 acp::Error::internal_error()
                                     .data(
                                         format!(
@@ -415,7 +376,7 @@ pub(crate) async fn generate_session_compact(
                 };
                 if wall_clock_budget_secs > 0 && timing.elapsed_secs() >= wall_clock_budget_secs {
                     return Err(
-                        CompactFailure::Transient(
+                        CompactFailure::Deterministic(
                             acp::Error::internal_error()
                                 .data(
                                     format!(
@@ -495,7 +456,7 @@ pub(crate) async fn generate_session_compact(
                     StreamStep::Ended => break,
                     StreamStep::IdleTimeout => {
                         return Err(
-                            CompactFailure::Transient(
+                            CompactFailure::Deterministic(
                                 acp::Error::internal_error()
                                     .data(
                                         format!(
@@ -509,7 +470,7 @@ pub(crate) async fn generate_session_compact(
                 };
                 if wall_clock_budget_secs > 0 && timing.elapsed_secs() >= wall_clock_budget_secs {
                     return Err(
-                        CompactFailure::Transient(
+                        CompactFailure::Deterministic(
                             acp::Error::internal_error()
                                 .data(
                                     format!(
@@ -617,7 +578,7 @@ pub(crate) async fn generate_session_compact(
                     StreamStep::Ended => break,
                     StreamStep::IdleTimeout => {
                         return Err(
-                            CompactFailure::Transient(
+                            CompactFailure::Deterministic(
                                 acp::Error::internal_error()
                                     .data(
                                         format!(
@@ -631,7 +592,7 @@ pub(crate) async fn generate_session_compact(
                 };
                 if wall_clock_budget_secs > 0 && timing.elapsed_secs() >= wall_clock_budget_secs {
                     return Err(
-                        CompactFailure::Transient(
+                        CompactFailure::Deterministic(
                             acp::Error::internal_error()
                                 .data(
                                     format!(
@@ -737,7 +698,7 @@ mod classify_tests {
         matches!(failure, CompactFailure::Deterministic(_))
     }
     #[test]
-    fn sampling_api_4xx_is_deterministic_except_408_and_429() {
+    fn sampling_api_responses_are_deterministic_including_408_429_and_5xx() {
         let det = |s: StatusCode| {
             is_det(&classify_sampling_error(SamplingError::Api {
                 status: s,
@@ -752,11 +713,11 @@ mod classify_tests {
         assert!(det(StatusCode::FORBIDDEN));
         assert!(det(StatusCode::NOT_FOUND));
         assert!(det(StatusCode::PAYLOAD_TOO_LARGE));
-        assert!(!det(StatusCode::REQUEST_TIMEOUT));
-        assert!(!det(StatusCode::TOO_MANY_REQUESTS));
-        assert!(!det(StatusCode::INTERNAL_SERVER_ERROR));
-        assert!(!det(StatusCode::BAD_GATEWAY));
-        assert!(!det(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(det(StatusCode::REQUEST_TIMEOUT));
+        assert!(det(StatusCode::TOO_MANY_REQUESTS));
+        assert!(det(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(det(StatusCode::BAD_GATEWAY));
+        assert!(det(StatusCode::SERVICE_UNAVAILABLE));
     }
     #[test]
     fn sampling_non_api_variants_classify_correctly() {
@@ -769,10 +730,10 @@ mod classify_tests {
         assert!(is_det(&classify_sampling_error(
             SamplingError::IdleTimeout { elapsed_secs: 60 }
         )));
-        assert!(!is_det(&classify_sampling_error(
+        assert!(is_det(&classify_sampling_error(
             SamplingError::EventStreamError("conn reset".into())
         )));
-        assert!(!is_det(&classify_sampling_error(
+        assert!(is_det(&classify_sampling_error(
             SamplingError::StreamError {
                 error_type: "overloaded_error".into(),
                 message: "try again".into(),
@@ -791,25 +752,22 @@ mod classify_tests {
         )));
     }
     #[test]
-    fn response_event_numeric_codes_match_http_classification() {
+    fn response_event_numeric_codes_are_deterministic_after_possible_write() {
         let det = |c: &str| is_det(&classify_response_event_error(Some(c), "msg"));
         assert!(det("400"));
         assert!(det("401"));
         assert!(det("403"));
         assert!(det("404"));
-        assert!(!det("408"));
-        assert!(!det("429"));
-        assert!(!det("500"));
-        assert!(!det("503"));
+        assert!(det("408"));
+        assert!(det("429"));
+        assert!(det("500"));
+        assert!(det("503"));
     }
     #[test]
-    fn response_event_unknown_code_defaults_to_transient() {
-        assert!(!is_det(&classify_response_event_error(None, "msg")));
-        assert!(!is_det(&classify_response_event_error(
-            Some("error"),
-            "msg"
-        )));
-        assert!(!is_det(&classify_response_event_error(
+    fn response_event_unknown_code_is_deterministic() {
+        assert!(is_det(&classify_response_event_error(None, "msg")));
+        assert!(is_det(&classify_response_event_error(Some("error"), "msg")));
+        assert!(is_det(&classify_response_event_error(
             Some("overloaded_error"),
             "msg"
         )));
@@ -874,14 +832,14 @@ mod classify_tests {
         let data = err.data.as_ref().and_then(|d| d.as_str()).unwrap();
         assert!(data.contains("compact failed"));
         assert!(data.contains("bad payload"));
-        let CompactFailure::Transient(err) = classify_sampling_error(SamplingError::Api {
+        let CompactFailure::Deterministic(err) = classify_sampling_error(SamplingError::Api {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: "upstream blip".into(),
             model_metadata: None,
             retry_after_secs: None,
             should_retry: None,
         }) else {
-            panic!("expected Transient for 500");
+            panic!("expected Deterministic for possible-write 500");
         };
         let data = err.data.as_ref().and_then(|d| d.as_str()).unwrap();
         assert!(data.contains("upstream blip"));
@@ -1810,7 +1768,7 @@ mod reasoning_compaction_regression_tests {
         )
         .await;
         match result {
-            Err(CompactFailure::Transient(err)) => {
+            Err(CompactFailure::Deterministic(err)) => {
                 let data = err
                     .data
                     .as_ref()
@@ -1818,11 +1776,11 @@ mod reasoning_compaction_regression_tests {
                     .unwrap_or_default();
                 assert!(
                     data.contains("idle timeout"),
-                    "expected an idle-timeout transient failure, got: {data}"
+                    "expected an idle-timeout possible-write failure, got: {data}"
                 );
             }
-            Err(CompactFailure::Deterministic(_)) => {
-                panic!("a stalled stream must be retryable (Transient), not Deterministic")
+            Err(CompactFailure::Transient(_)) => {
+                panic!("a stalled stream is possible-write and must not auto-retry")
             }
             Ok(_) => panic!("a stalled stream must not produce a summary"),
         }
@@ -1877,7 +1835,7 @@ mod reasoning_compaction_regression_tests {
         )
         .await;
         match result {
-            Err(CompactFailure::Transient(err)) => {
+            Err(CompactFailure::Deterministic(err)) => {
                 let data = err
                     .data
                     .as_ref()
@@ -1885,11 +1843,11 @@ mod reasoning_compaction_regression_tests {
                     .unwrap_or_default();
                 assert!(
                     data.contains("idle timeout"),
-                    "expected an idle-timeout transient failure, got: {data}"
+                    "expected an idle-timeout possible-write failure, got: {data}"
                 );
             }
-            Err(CompactFailure::Deterministic(_)) => {
-                panic!("a stalled stream must be retryable (Transient), not Deterministic")
+            Err(CompactFailure::Transient(_)) => {
+                panic!("a stalled stream is possible-write and must not auto-retry")
             }
             Ok(_) => {
                 panic!(
@@ -1948,7 +1906,7 @@ mod reasoning_compaction_regression_tests {
         )
         .await;
         match result {
-            Err(CompactFailure::Transient(err)) => {
+            Err(CompactFailure::Deterministic(err)) => {
                 let data = err
                     .data
                     .as_ref()
@@ -1956,11 +1914,11 @@ mod reasoning_compaction_regression_tests {
                     .unwrap_or_default();
                 assert!(
                     data.contains("idle timeout"),
-                    "expected an idle-timeout transient failure, got: {data}"
+                    "expected an idle-timeout possible-write failure, got: {data}"
                 );
             }
-            Err(CompactFailure::Deterministic(_)) => {
-                panic!("a stalled stream must be retryable (Transient), not Deterministic")
+            Err(CompactFailure::Transient(_)) => {
+                panic!("a stalled stream is possible-write and must not auto-retry")
             }
             Ok(_) => {
                 panic!("salvage removed: a substantial partial must error, not be returned")
@@ -1969,7 +1927,7 @@ mod reasoning_compaction_regression_tests {
         let _ = shutdown_tx.send(());
     }
     #[tokio::test]
-    async fn thin_partial_retries_on_stall() {
+    async fn thin_partial_stall_is_possible_write() {
         let app = Router::new().route(
             "/v1/chat/completions",
             post(|| async {
@@ -2016,8 +1974,8 @@ mod reasoning_compaction_regression_tests {
         )
         .await;
         match result {
-            Err(CompactFailure::Transient(_)) => {}
-            _ => panic!("a thin stalled body must retry (Transient), not salvage"),
+            Err(CompactFailure::Deterministic(_)) => {}
+            _ => panic!("a thin stalled body is possible-write and must not auto-retry or salvage"),
         }
         let _ = shutdown_tx.send(());
     }
