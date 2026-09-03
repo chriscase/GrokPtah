@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::AuthorityError;
 
 /// What an audit record describes.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AuditEvent {
@@ -72,9 +73,16 @@ pub enum AuditEvent {
         workspace: String,
         resource: String,
         actor: String,
+        ordinal: u64,
+        dialect: String,
+        route_digest: String,
         request_digest: String,
         body_digest: String,
+        wire_idempotency_digest: String,
     },
+    /// Wire admission: the attempt durably entered `sending` immediately
+    /// before bytes may move. Only transport evidence may follow.
+    SendWireAdmission { attempt: String },
     /// How a physical send ended. Written *after* dispatch was possible.
     SendOutcome {
         attempt: String,

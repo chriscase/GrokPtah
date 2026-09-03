@@ -39,6 +39,16 @@ fn request(body: &[u8]) -> RequestIdentity {
     )
 }
 
+const TEST_ROUTE: &str = "test-route";
+
+fn admit_wire(
+    authority: &HostAuthority,
+    auth: &AuthContext,
+    permit: PhysicalSendPermit,
+) -> PhysicalSendPermit {
+    authority.admit_sending(auth, permit).unwrap()
+}
+
 fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_path_buf();
@@ -304,10 +314,13 @@ fn a_lease_is_one_use() {
     let req = request(b"{\"m\":1}");
     let lease = lease_for(&f, &req);
 
-    let permit = f
-        .authority
-        .begin_send(&f.auth, lease.clone(), &req)
-        .unwrap();
+    let permit = admit_wire(
+        &f.authority,
+        &f.auth,
+        f.authority
+            .begin_send(&f.auth, lease.clone(), &req, TEST_ROUTE)
+            .unwrap(),
+    );
     assert!(matches!(
         f.authority.settle_settled(permit),
         SendOutcome::Settled { .. }
@@ -315,7 +328,7 @@ fn a_lease_is_one_use() {
 
     // Presenting the same lease again is a replay and must be refused.
     assert!(matches!(
-        f.authority.begin_send(&f.auth, lease, &req),
+        f.authority.begin_send(&f.auth, lease, &req, "test-route"),
         Err(AuthorityError::AlreadyConsumed)
     ));
 }
@@ -388,7 +401,7 @@ fn a_capability_for_one_effect_class_does_not_authorise_another() {
         .mint_lease(&f.auth, &cap, req.digest(), 60_000)
         .unwrap();
     assert!(matches!(
-        f.authority.begin_send(&f.auth, lease, &req),
+        f.authority.begin_send(&f.auth, lease, &req, "test-route"),
         Err(AuthorityError::NotPermitted)
     ));
 }
@@ -474,7 +487,8 @@ fn a_permit_is_bound_to_the_whole_request_identity() {
         let lease = lease_for(&f, &base);
         assert!(
             matches!(
-                f.authority.begin_send(&f.auth, lease, &altered),
+                f.authority
+                    .begin_send(&f.auth, lease, &altered, "test-route"),
                 Err(AuthorityError::DigestMismatch)
             ),
             "changing the {what} after admission must invalidate the permit"
@@ -494,7 +508,7 @@ fn an_action_cannot_be_applied_after_the_surface_moves() {
         .unwrap();
 
     assert!(matches!(
-        f.authority.begin_send(&f.auth, lease, &req),
+        f.authority.begin_send(&f.auth, lease, &req, "test-route"),
         Err(AuthorityError::StaleObservation)
     ));
 }
@@ -508,7 +522,7 @@ fn rotating_the_control_epoch_retires_in_flight_admissions() {
 
     let fresh = f.authority.authenticate(SECRET).unwrap();
     assert!(matches!(
-        f.authority.begin_send(&fresh, lease, &req),
+        f.authority.begin_send(&fresh, lease, &req, "test-route"),
         Err(AuthorityError::AlreadyConsumed) | Err(AuthorityError::StaleControlEpoch)
     ));
 }
@@ -518,7 +532,13 @@ fn ambiguity_after_dispatch_is_uncertain_and_offers_no_retry() {
     let f = fixture();
     let req = request(b"body");
     let lease = lease_for(&f, &req);
-    let permit = f.authority.begin_send(&f.auth, lease, &req).unwrap();
+    let permit = admit_wire(
+        &f.authority,
+        &f.auth,
+        f.authority
+            .begin_send(&f.auth, lease, &req, TEST_ROUTE)
+            .unwrap(),
+    );
     let attempt = permit.attempt();
 
     let outcome = f
@@ -561,7 +581,10 @@ fn only_a_proven_unwritten_request_is_reported_as_failed() {
     let f = fixture();
     let req = request(b"body");
     let lease = lease_for(&f, &req);
-    let permit = f.authority.begin_send(&f.auth, lease, &req).unwrap();
+    let permit = f
+        .authority
+        .begin_send(&f.auth, lease, &req, "test-route")
+        .unwrap();
 
     let outcome = f
         .authority
@@ -600,7 +623,13 @@ fn a_crash_between_dispatch_and_settlement_settles_uncertain() {
         let lease = authority
             .mint_lease(&auth, &cap, req.digest(), 60_000)
             .unwrap();
-        let permit = authority.begin_send(&auth, lease, &req).unwrap();
+        let permit = admit_wire(
+            &authority,
+            &auth,
+            authority
+                .begin_send(&auth, lease, &req, TEST_ROUTE)
+                .unwrap(),
+        );
         let id = permit.attempt();
         // Drop the permit without settling: the process "crashes" here.
         std::mem::forget(permit);
@@ -668,7 +697,8 @@ fn concurrent_spends_of_one_lease_admit_exactly_one() {
         let lease = lease.clone();
         handles.push(std::thread::spawn(move || {
             let req = request(b"body");
-            if let Ok(permit) = authority.begin_send(&auth, lease, &req) {
+            if let Ok(permit) = authority.begin_send(&auth, lease, &req, "test-route") {
+                let permit = authority.admit_sending(&auth, permit).unwrap();
                 admitted.fetch_add(1, Ordering::SeqCst);
                 let _ = authority.settle_settled(permit);
             }
@@ -691,7 +721,13 @@ fn intent_is_recorded_before_the_outcome_and_the_chain_verifies() {
     let f = fixture();
     let req = request(b"body");
     let lease = lease_for(&f, &req);
-    let permit = f.authority.begin_send(&f.auth, lease, &req).unwrap();
+    let permit = admit_wire(
+        &f.authority,
+        &f.auth,
+        f.authority
+            .begin_send(&f.auth, lease, &req, TEST_ROUTE)
+            .unwrap(),
+    );
     let _ = f.authority.settle_settled(permit);
 
     let records = f.authority.audit_records(&f.admin).unwrap();
@@ -720,7 +756,13 @@ fn a_truncated_audit_log_is_detected() {
     let f = fixture();
     let req = request(b"body");
     let lease = lease_for(&f, &req);
-    let permit = f.authority.begin_send(&f.auth, lease, &req).unwrap();
+    let permit = admit_wire(
+        &f.authority,
+        &f.auth,
+        f.authority
+            .begin_send(&f.auth, lease, &req, TEST_ROUTE)
+            .unwrap(),
+    );
     let _ = f.authority.settle_settled(permit);
 
     let path = f.root.join("audit.log");
@@ -744,7 +786,13 @@ fn audit_export_rejects_same_length_tampering() {
     let f = fixture();
     let req = request(b"body");
     let lease = lease_for(&f, &req);
-    let permit = f.authority.begin_send(&f.auth, lease, &req).unwrap();
+    let permit = admit_wire(
+        &f.authority,
+        &f.auth,
+        f.authority
+            .begin_send(&f.auth, lease, &req, TEST_ROUTE)
+            .unwrap(),
+    );
     let _ = f.authority.settle_settled(permit);
 
     let path = f.root.join("audit.log");
@@ -785,7 +833,13 @@ fn public_projections_are_secret_content_and_path_free() {
     let f = fixture();
     let req = request(b"super-secret-user-content");
     let lease = lease_for(&f, &req);
-    let permit = f.authority.begin_send(&f.auth, lease, &req).unwrap();
+    let permit = admit_wire(
+        &f.authority,
+        &f.auth,
+        f.authority
+            .begin_send(&f.auth, lease, &req, TEST_ROUTE)
+            .unwrap(),
+    );
     let attempt = permit.attempt();
 
     let rendered = format!(
@@ -870,7 +924,13 @@ fn a_send_intent_always_names_its_producing_principal_and_generations() {
     let f = fixture();
     let req = request(b"body");
     let lease = lease_for(&f, &req);
-    let permit = f.authority.begin_send(&f.auth, lease, &req).unwrap();
+    let permit = admit_wire(
+        &f.authority,
+        &f.auth,
+        f.authority
+            .begin_send(&f.auth, lease, &req, TEST_ROUTE)
+            .unwrap(),
+    );
     let _ = f.authority.settle_settled(permit);
 
     let records = f.authority.audit_records(&f.admin).unwrap();
@@ -925,12 +985,19 @@ fn a_refused_send_is_recorded_against_the_principal_that_asked() {
     let req = request(b"body");
     let lease = lease_for(&f, &req);
     // Spend the lease, then replay it.
-    let permit = f
-        .authority
-        .begin_send(&f.auth, lease.clone(), &req)
-        .unwrap();
+    let permit = admit_wire(
+        &f.authority,
+        &f.auth,
+        f.authority
+            .begin_send(&f.auth, lease.clone(), &req, TEST_ROUTE)
+            .unwrap(),
+    );
     let _ = f.authority.settle_settled(permit);
-    assert!(f.authority.begin_send(&f.auth, lease, &req).is_err());
+    assert!(
+        f.authority
+            .begin_send(&f.auth, lease, &req, "test-route")
+            .is_err()
+    );
 
     let denied = f
         .authority
@@ -1021,7 +1088,13 @@ fn a_missing_authority_root_with_prior_evidence_refuses_service() {
     let f = fixture();
     let req = request(b"body");
     let lease = lease_for(&f, &req);
-    let permit = f.authority.begin_send(&f.auth, lease, &req).unwrap();
+    let permit = admit_wire(
+        &f.authority,
+        &f.auth,
+        f.authority
+            .begin_send(&f.auth, lease, &req, TEST_ROUTE)
+            .unwrap(),
+    );
     let _ = f.authority.settle_settled(permit);
     drop(f.authority);
 
@@ -1069,7 +1142,11 @@ fn one_principal_cannot_read_another_principals_attempt() {
     let lease = authority
         .mint_lease(&a, &cap, req.digest(), 60_000)
         .unwrap();
-    let permit = authority.begin_send(&a, lease, &req).unwrap();
+    let permit = admit_wire(
+        &authority,
+        &a,
+        authority.begin_send(&a, lease, &req, TEST_ROUTE).unwrap(),
+    );
     let attempt = permit.attempt();
     let _ = authority.settle_settled(permit);
 
@@ -1121,7 +1198,13 @@ fn a_model_sealed_capability_is_never_operator_authority() {
         .collect();
     assert!(sealed_actors.contains(&"verified_model".to_string()));
 
-    let permit = f.authority.begin_send(&f.auth, lease, &req).unwrap();
+    let permit = admit_wire(
+        &f.authority,
+        &f.auth,
+        f.authority
+            .begin_send(&f.auth, lease, &req, TEST_ROUTE)
+            .unwrap(),
+    );
     let _ = f.authority.settle_settled(permit);
     let intent_actors: Vec<String> = f
         .authority
@@ -1166,7 +1249,7 @@ fn an_unrecognised_durable_actor_is_corrupt_state_not_an_implicit_operator() {
 
     let error = f
         .authority
-        .begin_send(&f.auth, lease, &req)
+        .begin_send(&f.auth, lease, &req, "test-route")
         .expect_err("an unknown actor must not authorise a send");
     assert!(
         matches!(error, AuthorityError::CorruptState(_)),
@@ -1293,12 +1376,19 @@ fn one_capability_cannot_authorise_two_sends() {
         .mint_lease(&f.auth, &capability, second.digest(), 60_000)
         .unwrap();
 
-    let permit = f.authority.begin_send(&f.auth, lease_a, &first).unwrap();
+    let permit = admit_wire(
+        &f.authority,
+        &f.auth,
+        f.authority
+            .begin_send(&f.auth, lease_a, &first, TEST_ROUTE)
+            .unwrap(),
+    );
     let _ = f.authority.settle_settled(permit);
 
     assert!(
         matches!(
-            f.authority.begin_send(&f.auth, lease_b, &second),
+            f.authority
+                .begin_send(&f.auth, lease_b, &second, "test-route"),
             Err(AuthorityError::AlreadyConsumed)
         ),
         "the capability was spent by the first send"
@@ -1328,7 +1418,7 @@ fn a_lease_cannot_outlive_its_capability() {
 
     assert!(
         matches!(
-            f.authority.begin_send(&f.auth, lease, &req),
+            f.authority.begin_send(&f.auth, lease, &req, "test-route"),
             Err(AuthorityError::Expired)
         ),
         "a lease must expire with its capability, not outlast it"
@@ -1343,7 +1433,13 @@ fn an_uncertain_outcome_is_always_reconcilable() {
     let f = fixture();
     let req = request(b"body");
     let lease = lease_for(&f, &req);
-    let permit = f.authority.begin_send(&f.auth, lease, &req).unwrap();
+    let permit = admit_wire(
+        &f.authority,
+        &f.auth,
+        f.authority
+            .begin_send(&f.auth, lease, &req, TEST_ROUTE)
+            .unwrap(),
+    );
     let attempt = permit.attempt();
 
     // Break the audit log after admission, then settle.
@@ -1366,7 +1462,13 @@ fn settlement_audit_replays_when_the_state_snapshot_write_fails() {
     let f = fixture();
     let req = request(b"body");
     let lease = lease_for(&f, &req);
-    let permit = f.authority.begin_send(&f.auth, lease, &req).unwrap();
+    let permit = admit_wire(
+        &f.authority,
+        &f.auth,
+        f.authority
+            .begin_send(&f.auth, lease, &req, TEST_ROUTE)
+            .unwrap(),
+    );
     let attempt = permit.attempt();
 
     // The WAL append remains writable, but the subsequent state snapshot
@@ -1401,7 +1503,13 @@ fn same_host_recovery_does_not_downgrade_an_audited_settlement() {
     let f = fixture();
     let req = request(b"body");
     let lease = lease_for(&f, &req);
-    let permit = f.authority.begin_send(&f.auth, lease, &req).unwrap();
+    let permit = admit_wire(
+        &f.authority,
+        &f.auth,
+        f.authority
+            .begin_send(&f.auth, lease, &req, TEST_ROUTE)
+            .unwrap(),
+    );
     let attempt = permit.attempt();
 
     let state_tmp = f.root.join("authority.json.tmp");
@@ -1449,7 +1557,10 @@ fn same_host_recovery_does_not_downgrade_an_audited_prewrite_failure() {
     let f = fixture();
     let req = request(b"body");
     let lease = lease_for(&f, &req);
-    let permit = f.authority.begin_send(&f.auth, lease, &req).unwrap();
+    let permit = f
+        .authority
+        .begin_send(&f.auth, lease, &req, "test-route")
+        .unwrap();
     let attempt = permit.attempt();
 
     let state_tmp = f.root.join("authority.json.tmp");
@@ -1498,7 +1609,13 @@ fn crash_recovery_audit_replays_when_the_state_snapshot_write_fails() {
     let f = fixture();
     let req = request(b"body");
     let lease = lease_for(&f, &req);
-    let permit = f.authority.begin_send(&f.auth, lease, &req).unwrap();
+    let permit = admit_wire(
+        &f.authority,
+        &f.auth,
+        f.authority
+            .begin_send(&f.auth, lease, &req, TEST_ROUTE)
+            .unwrap(),
+    );
     let attempt = permit.attempt();
     // Model the prior host dying after dispatch but before settlement.
     std::mem::forget(permit);
@@ -1552,7 +1669,13 @@ fn crash_recovery_retry_on_the_same_authority_reuses_the_audited_outcome() {
     let f = fixture();
     let req = request(b"body");
     let lease = lease_for(&f, &req);
-    let permit = f.authority.begin_send(&f.auth, lease, &req).unwrap();
+    let permit = admit_wire(
+        &f.authority,
+        &f.auth,
+        f.authority
+            .begin_send(&f.auth, lease, &req, TEST_ROUTE)
+            .unwrap(),
+    );
     let attempt = permit.attempt();
     std::mem::forget(permit);
 
@@ -1609,7 +1732,13 @@ fn reconciliation_audit_replays_when_the_state_snapshot_write_fails() {
     let f = fixture();
     let req = request(b"body");
     let lease = lease_for(&f, &req);
-    let permit = f.authority.begin_send(&f.auth, lease, &req).unwrap();
+    let permit = admit_wire(
+        &f.authority,
+        &f.auth,
+        f.authority
+            .begin_send(&f.auth, lease, &req, TEST_ROUTE)
+            .unwrap(),
+    );
     let attempt = permit.attempt();
     assert!(matches!(
         f.authority
@@ -1642,7 +1771,13 @@ fn reconciliation_audit_failure_leaves_state_ambiguous() {
     let f = fixture();
     let req = request(b"body");
     let lease = lease_for(&f, &req);
-    let permit = f.authority.begin_send(&f.auth, lease, &req).unwrap();
+    let permit = admit_wire(
+        &f.authority,
+        &f.auth,
+        f.authority
+            .begin_send(&f.auth, lease, &req, TEST_ROUTE)
+            .unwrap(),
+    );
     let attempt = permit.attempt();
     let _ = f
         .authority
@@ -1671,7 +1806,13 @@ fn a_damaged_audit_log_is_never_resealed() {
     let f = fixture();
     let req = request(b"body");
     let lease = lease_for(&f, &req);
-    let permit = f.authority.begin_send(&f.auth, lease, &req).unwrap();
+    let permit = admit_wire(
+        &f.authority,
+        &f.auth,
+        f.authority
+            .begin_send(&f.auth, lease, &req, TEST_ROUTE)
+            .unwrap(),
+    );
     let _ = f.authority.settle_settled(permit);
 
     let path = f.root.join("audit.log");

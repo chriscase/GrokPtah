@@ -1,9 +1,10 @@
 //! A real crash cut across two processes.
 //!
-//! The child opens the authority, takes a physical-send permit, and then dies
-//! by `abort()` between dispatch and settlement — no unwinding, no destructors,
-//! no cooperative cleanup. The parent then opens the same root and must find
-//! exactly one ambiguous attempt, never a retried or silently-failed one.
+//! The child opens the authority, wire-admits a physical-send permit, and then
+//! dies by `abort()` between dispatch and settlement — no unwinding, no
+//! destructors, no cooperative cleanup. The parent then opens the same root
+//! and must find exactly one ambiguous attempt, never a retried or silently-
+//! failed one.
 
 use std::path::Path;
 use std::process::Command;
@@ -64,8 +65,11 @@ fn child_take_permit_then_die(root: &Path) -> ! {
 
     // The permit exists only after the attempt and its intent are durable.
     let permit = authority
-        .begin_send(&auth, lease, &req)
+        .begin_send(&auth, lease, &req, "test-route")
         .expect("child permit");
+    let permit = authority
+        .admit_sending(&auth, permit)
+        .expect("child wire admission");
     // Signal that we got this far, then die where a physical send would be
     // in flight: after admission, before settlement.
     std::fs::write(

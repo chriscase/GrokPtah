@@ -128,7 +128,7 @@ fn restart_reopens_durable_generations_and_rejects_stale_contexts() {
     let probe = InternalServiceAuthority::open_probe(&root).unwrap();
     let liveness = probe.liveness_projection().unwrap();
     assert!(liveness.credentials_configured);
-    assert_eq!(liveness.schema_version, 2);
+    assert_eq!(liveness.schema_version, 3);
     assert!(liveness.policy_revision >= 1);
 }
 

@@ -44,6 +44,9 @@ pub enum AuthorityError {
     AlreadyConsumed,
     /// The action or body digest does not match what was authorised.
     DigestMismatch,
+    /// A prior attempt for the same request identity is still ambiguous or in
+    /// flight, so a fresh send must not be admitted.
+    AmbiguousPriorAttempt,
     /// The capability does not cover the requested effect.
     NotPermitted,
     /// An identifier or field failed validation before anything was recorded.
@@ -77,6 +80,9 @@ impl fmt::Display for AuthorityError {
             Self::Expired => f.write_str("authority has expired"),
             Self::AlreadyConsumed => f.write_str("one-use authority was already consumed"),
             Self::DigestMismatch => f.write_str("action digest does not match the authorised one"),
+            Self::AmbiguousPriorAttempt => {
+                f.write_str("a prior attempt for this request identity is ambiguous or in flight")
+            }
             Self::NotPermitted => f.write_str("capability does not cover this effect"),
             Self::Invalid(what) => write!(f, "invalid {what}"),
             Self::Durability(e) => write!(f, "authority could not be durably recorded: {e}"),

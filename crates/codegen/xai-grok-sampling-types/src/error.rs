@@ -237,6 +237,12 @@ impl SamplingError {
         )
     }
 
+    /// Whether this error belongs to a class with a retry policy.
+    ///
+    /// This is classification metadata, not permission to issue another
+    /// provider request. Automatic retry callers must also require
+    /// [`Self::is_proven_not_sent`]; response, stream, and post-write
+    /// transport failures remain possible writes even when this returns true.
     pub fn is_retryable(&self) -> bool {
         match self {
             SamplingError::Auth(_) => false,
@@ -252,6 +258,25 @@ impl SamplingError {
             SamplingError::EmptyResponse { .. } => true,
             SamplingError::MaxTokensTruncation => false,
             SamplingError::DoomLoopDetected { .. } => true,
+        }
+    }
+
+    /// Whether the failure proves no provider-side effect could have occurred.
+    ///
+    /// Auto-retry is permitted only when this returns true. Timeouts after a
+    /// request may have been written, stream failures, and HTTP responses that
+    /// arrived all remain ambiguous and must not be retried automatically.
+    pub fn is_proven_not_sent(&self) -> bool {
+        match self {
+            SamplingError::Auth(_) | SamplingError::InvalidConfiguration(_) => true,
+            SamplingError::Http(err) => is_proven_not_sent_reqwest(err),
+            SamplingError::Serialization(_) => true,
+            SamplingError::Api { .. } => false,
+            SamplingError::EventStreamError(_) | SamplingError::StreamError { .. } => false,
+            SamplingError::IdleTimeout { .. } => false,
+            SamplingError::EmptyResponse { .. } => false,
+            SamplingError::MaxTokensTruncation => false,
+            SamplingError::DoomLoopDetected { .. } => false,
         }
     }
 
@@ -395,6 +420,17 @@ pub fn is_retryable_reqwest(err: &reqwest::Error) -> bool {
     false
 }
 
+/// True when a transport error proves the request never reached the provider.
+pub fn is_proven_not_sent_reqwest(err: &reqwest::Error) -> bool {
+    if err.is_connect() {
+        return true;
+    }
+    if err.is_timeout() && !err.is_request() {
+        return true;
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -473,8 +509,9 @@ mod tests {
     }
 
     #[test]
-    fn event_stream_error_is_retryable() {
-        // Verify the existing contract hasn't changed — EventStreamError is retryable.
+    fn event_stream_error_is_retryable_class() {
+        // This class remains eligible for policy evaluation, but a stream
+        // failure is not automatic-resend authorization without NotSent proof.
         let err = SamplingError::EventStreamError("connection reset".into());
         assert!(err.is_retryable());
     }
@@ -582,7 +619,14 @@ mod tests {
             should_retry: None,
         };
         assert!(err.is_rate_limited());
-        assert!(err.is_retryable(), "429 should be retryable");
+        assert!(
+            err.is_retryable(),
+            "429 remains a retryable class, not auto-retry authorization"
+        );
+        assert!(
+            !err.is_proven_not_sent(),
+            "429 response is a possible write"
+        );
         assert!(!err.is_auth_error());
         assert!(!err.is_payload_too_large());
     }
