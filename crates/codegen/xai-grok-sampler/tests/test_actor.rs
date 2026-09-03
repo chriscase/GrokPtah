@@ -372,11 +372,11 @@ async fn two_concurrent_requests_complete_with_correct_request_ids() {
 }
 
 // ---------------------------------------------------------------------------
-// Retry on transient transport error
+// Possible-write server failure must not retry
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn retries_on_500_then_succeeds() {
+async fn does_not_retry_after_500_response() {
     let counter = Arc::new(AtomicU32::new(0));
     let counter_handler = Arc::clone(&counter);
     let app = Router::new().route(
@@ -384,27 +384,23 @@ async fn retries_on_500_then_succeeds() {
         post(move || {
             let counter = Arc::clone(&counter_handler);
             async move {
-                let n = counter.fetch_add(1, Ordering::SeqCst);
-                if n == 0 {
-                    // First attempt: server error.
-                    Err::<Sse<_>, (StatusCode, String)>((
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        json!({ "error": { "message": "transient" } }).to_string(),
-                    ))
-                } else {
-                    // Subsequent attempts: success.
-                    let events = sse::chat_completion_events("ok", "test-model");
-                    Ok(Sse::new(stream::iter(
-                        events.into_iter().map(Ok::<_, std::convert::Infallible>),
-                    )))
-                }
+                counter.fetch_add(1, Ordering::SeqCst);
+                Err::<
+                    Sse<
+                        futures_util::stream::Iter<
+                            std::vec::IntoIter<Result<Event, std::convert::Infallible>>,
+                        >,
+                    >,
+                    (StatusCode, String),
+                >((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({ "error": { "message": "transient" } }).to_string(),
+                ))
             }
         }),
     );
     let server = MockServer::spawn(app).await;
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-    // Lots of retries available; backoff is jittered around 2s on first
-    // retry, so this test takes a bit to run.
     let cfg = test_config(server.base_url(), "test-model");
     let handle = SamplerActor::spawn(cfg, RetryPolicy::default(), event_tx);
 
@@ -414,23 +410,23 @@ async fn retries_on_500_then_succeeds() {
     let events = drain_until_terminal(&mut event_rx, Duration::from_secs(15)).await;
     server.shutdown();
 
-    let saw_retrying = events
-        .iter()
-        .any(|e| matches!(e, SamplingEvent::Retrying { .. }));
-    assert!(saw_retrying, "expected at least one Retrying event");
-
     match events.last().unwrap() {
-        SamplingEvent::Completed { response, .. } => {
-            if let Some(a) = response.assistant() {
-                assert_eq!(a.content.as_ref(), "ok");
-            }
+        SamplingEvent::Failed { error, .. } => {
+            assert_eq!(error.status_code, Some(500));
         }
-        other => panic!("expected Completed after retry, got {other:?}"),
+        other => panic!("expected Failed after possible-write 500, got {other:?}"),
     }
 
     assert!(
-        counter.load(Ordering::SeqCst) >= 2,
-        "server hit at least twice"
+        !events
+            .iter()
+            .any(|e| matches!(e, SamplingEvent::Retrying { .. })),
+        "possible-write 500 must not emit Retrying"
+    );
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "no retry after 500 response"
     );
 }
 
