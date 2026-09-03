@@ -1,7 +1,7 @@
 use chrono::Utc;
 use grokptah_agent_bridge::orchestration::{
-    ManagerDecisionRecord, ManagerDecisionState, ManagerPlan, ManagerStepSpec, OrchStore, WorkItem,
-    WorkPolicy, WorkState, MANAGER_SCHEMA_VERSION,
+    ManagerDecisionRecord, ManagerDecisionState, ManagerPlan, ManagerStepSpec, OrchErrorCode,
+    OrchStore, WorkDependency, WorkItem, WorkPolicy, WorkState, MANAGER_SCHEMA_VERSION,
 };
 use grokptah_agent_bridge::{AgentRecord, AgentState};
 use tempfile::tempdir;
@@ -142,6 +142,76 @@ fn concurrent_same_revision_advances_commit_one_child() {
         .collect::<Vec<_>>();
     assert_eq!(manager_children.len(), 1);
     assert_eq!(manager_children[0].work_id, left_work[0].work_id);
+}
+
+/// Manager materialization must run the canonical graph authority over the full
+/// proposed batch before the first durable write. A refusal must not leave a
+/// partial adoption behind.
+#[test]
+fn manager_materialization_validates_the_full_batch_before_writing() {
+    let home = tempdir().unwrap();
+    let session_id = Uuid::new_v4();
+    let workspace = "/tmp/manager-batch-validation";
+    let store = OrchStore::open(home.path()).unwrap();
+    let now = Utc::now();
+    let root = WorkItem::new(
+        "manager-plan",
+        "batch objective",
+        session_id,
+        workspace,
+        "operator",
+        WorkPolicy::default(),
+    )
+    .unwrap();
+    let plan = ManagerPlan::new(
+        session_id,
+        workspace,
+        "manager",
+        "batch objective",
+        root.work_id.clone(),
+        vec![step("a"), step("b")],
+        2,
+        2,
+        now,
+    )
+    .unwrap();
+    store.save_manager_plan(&plan).unwrap();
+
+    let mut valid = WorkItem::new(
+        "coding",
+        "first materialized step",
+        session_id,
+        workspace,
+        "manager",
+        WorkPolicy::default(),
+    )
+    .unwrap();
+    valid.work_id = "manager-valid".into();
+    let mut invalid = WorkItem::new(
+        "coding",
+        "second materialized step",
+        session_id,
+        workspace,
+        "manager",
+        WorkPolicy::default(),
+    )
+    .unwrap();
+    invalid.work_id = "manager-invalid".into();
+    invalid.dependencies.push(WorkDependency {
+        work_id: "no-such-work".into(),
+        required_state: WorkState::Succeeded,
+    });
+    invalid.source_manager_plan_id = Some(plan.plan_id.clone());
+    invalid.source_manager_step_id = Some("b".into());
+
+    let error = store
+        .save_manager_plan_with_work_cas(&plan, plan.revision, &[valid, invalid])
+        .expect_err("an invalid graph in the batch must refuse the whole CAS");
+    assert_eq!(error.code, OrchErrorCode::InvalidRequest);
+    assert!(
+        store.load_work_item("manager-valid").unwrap().is_none(),
+        "a refused manager batch must not leave the first item behind"
+    );
 }
 
 #[test]
