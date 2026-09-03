@@ -27,9 +27,9 @@ ambiguous rather than silently changing its truth.
 - Settlement evidence digests are validated at apply time but are not yet
   persisted in the typed audit WAL; replay cannot independently re-identify the
   provider receipt or operator observation from audit records alone.
-- Downstream callers still on `reconcile_attempt` must migrate to
-  `mint_reconciliation_grant` / `apply_reconciliation`; the legacy entry point now
-  fails closed with an explicit migration seam.
+- `reconcile_attempt` remains a fail-closed migration seam for any caller that
+  has not yet adopted `mint_reconciliation_grant` / `apply_reconciliation`.
+  `grokptah-agent-bridge` now routes through the operator grant path.
 
 ## Evidence
 

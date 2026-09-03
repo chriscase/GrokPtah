@@ -72,6 +72,11 @@ impl HostAuthority {
                             )));
                         }
                     };
+                    if let Some((_, existing_detail)) = outcomes.get(&attempt)
+                        && existing_detail.starts_with("reconciled")
+                    {
+                        continue;
+                    }
                     outcomes.insert(attempt, (state.to_string(), detail));
                 }
                 AuditEvent::AttemptReconciled { attempt, truth } => {
@@ -733,7 +738,7 @@ impl HostAuthority {
             state
                 .attempts
                 .get(&attempt.to_hex())
-                .map(|record| record.state.clone())
+                .cloned()
                 .ok_or_else(|| AuthorityError::CorruptState("attempt record vanished".into()))
         }) {
             Ok(state) => state,
@@ -744,6 +749,11 @@ impl HostAuthority {
                 };
             }
         };
+        if let Some(outcome) =
+            crate::reconciliation::absorb_settlement_for_reconciled_attempt(attempt, &current_state)
+        {
+            return outcome;
+        }
         if durable_state == STATE_SETTLED && !permit.wire_admitted {
             return SendOutcome::Uncertain {
                 attempt,
@@ -752,7 +762,7 @@ impl HostAuthority {
         }
         if durable_state == STATE_UNCERTAIN
             && !permit.wire_admitted
-            && current_state != STATE_SENDING
+            && current_state.state != STATE_SENDING
         {
             return SendOutcome::Failed {
                 attempt,
@@ -924,10 +934,6 @@ impl HostAuthority {
     /// **Migration seam:** this legacy admin-only path is retired. Callers must
     /// use [`Self::mint_reconciliation_grant`] and [`Self::apply_reconciliation`]
     /// with the current evidence/grant contract instead.
-    #[deprecated(
-        since = "0.0.0",
-        note = "use mint_reconciliation_grant and apply_reconciliation"
-    )]
     pub fn reconcile_attempt(
         &self,
         admin: &HostAdminAuthority,

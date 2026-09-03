@@ -57,14 +57,26 @@ impl HostAuthority {
         match disposition {
             ReconciliationDisposition::Review => {}
             ReconciliationDisposition::MarkNotSent => {
-                if !host_has_pre_wire_evidence(self, &attempt, &record)? {
+                if record.state == STATE_SENDING {
+                    return Err(AuthorityError::Invalid(
+                        "attempt is still in flight; wait for settlement before reconciling",
+                    ));
+                }
+                if record.state != STATE_UNCERTAIN
+                    && !host_has_pre_wire_evidence(self, &attempt, &record)?
+                {
                     return Err(AuthorityError::Invalid(
                         "mark-not-sent requires host-proven pre-wire evidence",
                     ));
                 }
             }
             ReconciliationDisposition::MarkSettled | ReconciliationDisposition::Discard => {
-                if record.state != STATE_UNCERTAIN && record.state != STATE_SENDING {
+                if record.state == STATE_SENDING {
+                    return Err(AuthorityError::Invalid(
+                        "attempt is still in flight; wait for settlement before reconciling",
+                    ));
+                }
+                if record.state != STATE_UNCERTAIN {
                     if already_matches_disposition(&record, disposition) {
                         // Idempotent remint against a completed decision is
                         // allowed so a retry can present the same grant path.
@@ -104,6 +116,35 @@ impl HostAuthority {
             route_digest,
             disposition,
         })
+    }
+
+    /// Mint a reconciliation grant from an attempt id alone.
+    ///
+    /// Scope is taken from the durable attempt record. Foreign or unknown
+    /// attempts still fail as [`AuthorityError::UnknownResource`].
+    pub fn mint_reconciliation_grant_for_attempt(
+        &self,
+        auth: &AuthContext,
+        attempt: AttemptId,
+        disposition: ReconciliationDisposition,
+        ttl_ms: u64,
+    ) -> Result<ReconciliationGrant, AuthorityError> {
+        let (session, workspace, handle) = self.read(|state| {
+            require_current_state(state, auth)?;
+            let record = state
+                .attempts
+                .get(&attempt.to_hex())
+                .ok_or(AuthorityError::UnknownResource)?
+                .clone();
+            if record.principal != auth.principal.to_hex() {
+                return Err(AuthorityError::UnknownResource);
+            }
+            validate_reconciliation_binding(auth, &record)?;
+            let session: SessionId = decode_id(&record.session, "session")?;
+            let workspace: WorkspaceId = decode_id(&record.workspace, "workspace")?;
+            Ok((session, workspace, attempt.public_handle()))
+        })?;
+        self.mint_reconciliation_grant(auth, session, workspace, &handle, disposition, ttl_ms)
     }
 
     /// Spend a reconciliation grant. No provider I/O and no resend.
@@ -162,9 +203,9 @@ impl HostAuthority {
         match grant.disposition {
             ReconciliationDisposition::Review => {}
             ReconciliationDisposition::MarkNotSent => {
-                if !host_has_pre_wire_evidence(self, &grant.attempt, &current)? {
+                if !can_mark_not_sent(self, &grant.attempt, &current, &evidence)? {
                     return Err(AuthorityError::Invalid(
-                        "mark-not-sent requires host-proven pre-wire evidence",
+                        "mark-not-sent requires host-proven pre-wire evidence or operator observation",
                     ));
                 }
             }
@@ -174,21 +215,24 @@ impl HostAuthority {
                         "mark-settled requires provider receipt or operator observation",
                     ));
                 }
-                if current.state != STATE_UNCERTAIN
-                    && current.state != STATE_SENDING
-                    && !already_applied
-                {
+                if current.state != STATE_UNCERTAIN && !already_applied {
                     return Err(AuthorityError::Invalid("attempt is already settled"));
                 }
             }
             ReconciliationDisposition::Discard => {
-                if current.state != STATE_UNCERTAIN
-                    && current.state != STATE_SENDING
-                    && !already_applied
-                {
+                if current.state != STATE_UNCERTAIN && !already_applied {
                     return Err(AuthorityError::Invalid("attempt is already settled"));
                 }
             }
+        }
+
+        if current.state == STATE_SENDING
+            && grant.disposition != ReconciliationDisposition::Review
+            && !already_applied
+        {
+            return Err(AuthorityError::Invalid(
+                "attempt is still in flight; wait for settlement before reconciling",
+            ));
         }
 
         let expected_action = reconcile_action_digest(
@@ -387,6 +431,56 @@ fn already_matches_disposition(
     }
 }
 
+fn can_mark_not_sent(
+    authority: &HostAuthority,
+    attempt: &AttemptId,
+    record: &StoredAttempt,
+    evidence: &ReconciliationEvidence,
+) -> Result<bool, AuthorityError> {
+    if host_has_pre_wire_evidence(authority, attempt, record)? {
+        return Ok(true);
+    }
+    if record.state == STATE_UNCERTAIN
+        && evidence.has_identity_proof()
+        && wire_admission_recorded(authority, attempt)?
+    {
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn is_operator_reconciled(record: &StoredAttempt) -> bool {
+    record
+        .settlement
+        .as_deref()
+        .is_some_and(|detail| detail.starts_with("reconciled"))
+}
+
+pub(crate) fn absorb_settlement_for_reconciled_attempt(
+    attempt: AttemptId,
+    record: &StoredAttempt,
+) -> Option<SendOutcome> {
+    if !is_operator_reconciled(record) {
+        return None;
+    }
+    Some(match record.state.as_str() {
+        STATE_SETTLED => SendOutcome::Settled { attempt },
+        STATE_FAILED => SendOutcome::Failed {
+            attempt,
+            reason: FailedReason::AbandonedBeforeWireAdmission,
+        },
+        STATE_DISCARDED => SendOutcome::Uncertain {
+            attempt,
+            reason: UncertainReason::TransportAfterPossibleWrite,
+        },
+        STATE_UNCERTAIN => SendOutcome::Uncertain {
+            attempt,
+            reason: UncertainReason::TransportAfterPossibleWrite,
+        },
+        _ => return None,
+    })
+}
+
 fn host_has_pre_wire_evidence(
     authority: &HostAuthority,
     attempt: &AttemptId,
@@ -581,5 +675,167 @@ mod tests {
             .begin_send(&auth, grant.lease.clone(), &request, "agent-step")
             .unwrap_err();
         assert_eq!(err, AuthorityError::NotPermitted);
+    }
+
+    #[test]
+    fn replay_preserves_operator_reconciliation_over_later_send_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let (authority, admin) = HostAuthority::open(
+            dir.path(),
+            &HostAdminCredential::new("host-admin-custody-secret-32-bytes-minimum-v1").unwrap(),
+        )
+        .unwrap();
+        authority
+            .set_credentials(
+                &admin,
+                &[HostCredential::new("a", "secret-a-value-32-bytes-minimum!!").unwrap()],
+            )
+            .unwrap();
+        let auth = authority
+            .authenticate("secret-a-value-32-bytes-minimum!!")
+            .unwrap();
+        let workspace = authority.issue_workspace(&auth, dir.path()).unwrap();
+        let resource = authority
+            .obtain_provider_send_surface(&auth, workspace, "agent-step")
+            .unwrap();
+        let binding = authority.resource_binding(&auth, resource).unwrap();
+        let session = binding.session();
+        let capability = authority
+            .seal_capability(
+                &auth,
+                resource,
+                ActorClass::VerifiedOperator,
+                EffectClass::ProviderSend,
+                60_000,
+            )
+            .unwrap();
+        let request = crate::RequestIdentity::new(
+            "https://api.example.invalid/v1/chat",
+            "POST",
+            "openai-chat",
+            b"provider-key",
+            "grok-4",
+            b"replay",
+        );
+        let lease = authority
+            .mint_lease(&auth, &capability, request.digest(), 60_000)
+            .unwrap();
+        let permit = authority
+            .begin_send(&auth, lease, &request, "agent-step")
+            .unwrap();
+        let attempt = permit.attempt();
+        let handle = attempt.public_handle();
+        let _ = authority.settle_uncertain(
+            authority.admit_sending(&auth, permit).unwrap(),
+            UncertainReason::TransportAfterPossibleWrite,
+        );
+        let grant = authority
+            .mint_reconciliation_grant(
+                &auth,
+                session,
+                workspace,
+                &handle,
+                ReconciliationDisposition::Discard,
+                60_000,
+            )
+            .unwrap();
+        authority
+            .apply_reconciliation(&auth, grant, ReconciliationEvidence::default())
+            .unwrap();
+        let epoch = authority.read(|state| Ok(state.control_epoch)).unwrap();
+        authority
+            .append_audit(
+                epoch,
+                AuditEvent::SendOutcome {
+                    attempt: handle.clone(),
+                    outcome: "uncertain".to_string(),
+                    detail: "synthetic late settlement".to_string(),
+                },
+            )
+            .unwrap();
+        drop(authority);
+        let (authority, _admin) = HostAuthority::open(
+            dir.path(),
+            &HostAdminCredential::new("host-admin-custody-secret-32-bytes-minimum-v1").unwrap(),
+        )
+        .unwrap();
+        let auth = authority
+            .authenticate("secret-a-value-32-bytes-minimum!!")
+            .unwrap();
+        authority.replay_attempt_settlements().unwrap();
+        let projection = authority
+            .attempt_projection(&auth, attempt)
+            .unwrap()
+            .unwrap();
+        assert_eq!(projection.state, "discarded");
+    }
+
+    #[test]
+    fn settle_absorbs_reconciled_attempt_without_competing_audit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (authority, admin) = HostAuthority::open(
+            dir.path(),
+            &HostAdminCredential::new("host-admin-custody-secret-32-bytes-minimum-v1").unwrap(),
+        )
+        .unwrap();
+        authority
+            .set_credentials(
+                &admin,
+                &[HostCredential::new("a", "secret-a-value-32-bytes-minimum!!").unwrap()],
+            )
+            .unwrap();
+        let auth = authority
+            .authenticate("secret-a-value-32-bytes-minimum!!")
+            .unwrap();
+        let workspace = authority.issue_workspace(&auth, dir.path()).unwrap();
+        let resource = authority
+            .obtain_provider_send_surface(&auth, workspace, "agent-step")
+            .unwrap();
+        let capability = authority
+            .seal_capability(
+                &auth,
+                resource,
+                ActorClass::VerifiedOperator,
+                EffectClass::ProviderSend,
+                60_000,
+            )
+            .unwrap();
+        let request = crate::RequestIdentity::new(
+            "https://api.example.invalid/v1/chat",
+            "POST",
+            "openai-chat",
+            b"provider-key",
+            "grok-4",
+            b"absorb",
+        );
+        let lease = authority
+            .mint_lease(&auth, &capability, request.digest(), 60_000)
+            .unwrap();
+        let permit = authority
+            .begin_send(&auth, lease, &request, "agent-step")
+            .unwrap();
+        let attempt = permit.attempt();
+        let admitted = authority.admit_sending(&auth, permit).unwrap();
+        let audit_before = authority.audit_records(&admin).unwrap().len();
+        authority
+            .with_state(|state| {
+                let record = state
+                    .attempts
+                    .get_mut(&attempt.to_hex())
+                    .ok_or(AuthorityError::UnknownResource)?;
+                record.state = STATE_DISCARDED.to_string();
+                record.settlement = Some("reconciled:discard".to_string());
+                Ok(())
+            })
+            .unwrap();
+        let outcome =
+            authority.settle_uncertain(admitted, UncertainReason::TransportAfterPossibleWrite);
+        assert!(matches!(outcome, SendOutcome::Uncertain { .. }));
+        assert_eq!(authority.audit_records(&admin).unwrap().len(), audit_before);
+        let projection = authority
+            .attempt_projection(&auth, attempt)
+            .unwrap()
+            .unwrap();
+        assert_eq!(projection.state, "discarded");
     }
 }

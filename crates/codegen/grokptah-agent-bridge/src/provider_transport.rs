@@ -18,9 +18,9 @@ use reqwest::header::{HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use xai_host_authority::{
-    ActorClass, AttemptId, AuthContext, EffectClass, FailedReason, HostAdminAuthority,
-    HostAdminCredential, HostAuthority, HostCredential, PhysicalSendPermit, RequestIdentity,
-    SendOutcome, UncertainReason,
+    ActorClass, AttemptId, AuthContext, ContentDigest, EffectClass, FailedReason,
+    HostAdminAuthority, HostAdminCredential, HostAuthority, HostCredential, PhysicalSendPermit,
+    ReconciliationDisposition, ReconciliationEvidence, RequestIdentity, SendOutcome, UncertainReason,
 };
 
 const AUTHORITY_DIR: &str = "authority/provider-send-v1";
@@ -28,6 +28,7 @@ const CUSTODY_FILE: &str = "authority/provider-send-v1.key";
 const SERVICE_CREDENTIAL_ID: &str = "provider-transport";
 const CAPABILITY_TTL_MS: u64 = 60_000;
 const LEASE_TTL_MS: u64 = 30_000;
+const RECONCILE_GRANT_TTL_MS: u64 = 60_000;
 const IDEMPOTENCY_KEY_HEADER: HeaderName = HeaderName::from_static("idempotency-key");
 
 static AUTHORITIES: OnceLock<Mutex<HashMap<PathBuf, Arc<ProviderAuthority>>>> = OnceLock::new();
@@ -649,10 +650,36 @@ pub(crate) fn reconcile_provider_attempt(
 ) -> anyhow::Result<()> {
     let runtime = authority_runtime()?;
     runtime.require_reconciliation_authority(operator)?;
+    let auth = runtime.authority.authenticate(&runtime.service_bearer)?;
+    let disposition = if took_effect {
+        ReconciliationDisposition::MarkSettled
+    } else {
+        ReconciliationDisposition::MarkNotSent
+    };
+    let evidence = operator_reconciliation_evidence(attempt, took_effect);
+    let grant = runtime.authority.mint_reconciliation_grant_for_attempt(
+        &auth,
+        attempt,
+        disposition,
+        RECONCILE_GRANT_TTL_MS,
+    )?;
     runtime
         .authority
-        .reconcile_attempt(&runtime.admin, attempt, took_effect)?;
+        .apply_reconciliation(&auth, grant, evidence)?;
     Ok(())
+}
+
+fn operator_reconciliation_evidence(attempt: AttemptId, took_effect: bool) -> ReconciliationEvidence {
+    let digest = ContentDigest::of_fields(&[
+        ("provider-reconcile-bridge-v1", b""),
+        ("attempt", attempt.public_handle().as_bytes()),
+        ("took_effect", &[u8::from(took_effect)]),
+    ]);
+    if took_effect {
+        ReconciliationEvidence::provider_receipt(digest)
+    } else {
+        ReconciliationEvidence::operator_observation(digest)
+    }
 }
 
 pub(crate) fn provider_attempts_requiring_reconciliation(

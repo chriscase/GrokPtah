@@ -1478,8 +1478,9 @@ fn an_uncertain_outcome_is_always_reconcilable() {
     let outcome = f.authority.settle_settled(permit);
     assert!(matches!(outcome, SendOutcome::Uncertain { .. }));
 
-    // Repair the log and reconcile the attempt the caller was handed.
+    // Repair the log, classify the in-flight attempt as uncertain, then reconcile.
     std::fs::remove_dir(&log).unwrap();
+    f.authority.recover_incomplete(&f.admin).unwrap();
     reconcile_settled(&f, attempt);
 }
 

@@ -804,7 +804,6 @@ fn legacy_reconcile_attempt_fails_closed_with_migration_seam() {
         .unwrap();
     let audit_before = std::fs::read(host._dir.path().join("audit.log")).unwrap();
 
-    #[allow(deprecated)]
     let err = host
         .authority
         .reconcile_attempt(&host.admin, attempt, true)
@@ -1007,4 +1006,40 @@ fn conflicting_concurrency_and_restart_regression() {
         .unwrap();
     assert_eq!(after_restart.state, projection.state);
     assert!(authority.audit_chain_intact(&admin).unwrap());
+}
+
+#[test]
+fn reconcile_on_live_sending_fails_closed() {
+    let host = open_host(&[("a", SECRET_A)]);
+    let auth = host.authority.authenticate(SECRET_A).unwrap();
+    let (session, workspace, permit) = prepared(
+        &host.authority,
+        &auth,
+        ROUTE,
+        b"sending",
+        Path::new("/tmp/gp-ws"),
+    );
+    let handle = permit.attempt().public_handle();
+    let admitted = host.authority.admit_sending(&auth, permit).unwrap();
+    std::mem::forget(admitted);
+    let denied = host.authority.mint_reconciliation_grant(
+        &auth,
+        session,
+        workspace,
+        &handle,
+        ReconciliationDisposition::Discard,
+        60_000,
+    );
+    assert_eq!(
+        denied.unwrap_err(),
+        AuthorityError::Invalid(
+            "attempt is still in flight; wait for settlement before reconciling"
+        )
+    );
+    let projection = host
+        .authority
+        .scoped_attempt_projection(&auth, session, workspace, &handle)
+        .unwrap()
+        .unwrap();
+    assert_eq!(projection.state, "sending");
 }
