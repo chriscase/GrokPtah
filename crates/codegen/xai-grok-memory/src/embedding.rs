@@ -388,11 +388,65 @@ mod tests {
     }
 
     #[test]
-    fn embedding_source_has_no_raw_middleware_execute_or_possible_write_retry() {
-        let source = include_str!("embedding.rs");
+    fn embedding_admits_before_single_execute_and_does_not_retry_possible_write() {
+        let production = include_str!("embedding.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production embedding source");
         assert!(
-            source.contains("OperatorSendHost::process") && source.contains("host.admit("),
+            production.contains("OperatorSendHost::process") && production.contains("host.admit("),
             "embeddings must admit through OperatorSendHost before bytes"
+        );
+        let admit = production
+            .find("host.admit(")
+            .expect("embedding path must call host.admit");
+        let execute = production
+            .find("shared_client().execute(request)")
+            .expect("embedding path must perform one shared_client execute");
+        assert!(
+            admit < execute,
+            "OperatorSendHost admission must precede the single shared_client execute"
+        );
+        assert_eq!(
+            production
+                .matches("shared_client().execute(request)")
+                .count(),
+            1,
+            "embedding path must have exactly one shared_client execute"
+        );
+        assert!(
+            !production.contains(".send().await") && !production.contains("self.http.execute"),
+            "embedding path must not raw-send outside the admitted execute"
+        );
+        let rate_limited = production
+            .split(
+                "if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()",
+            )
+            .nth(1)
+            .expect("embedding path must classify 429/5xx")
+            .split("live.complete()")
+            .next()
+            .expect("429/5xx arm");
+        assert!(
+            rate_limited.contains("fail_uncertain")
+                && rate_limited.contains("return Err")
+                && !rate_limited.contains("continue"),
+            "429/5xx must settle Uncertain and return; they must not retry"
+        );
+        assert!(
+            production.contains("UncertainReason::TransportAfterPossibleWrite")
+                && production.contains("retrying embedding connect after proven NotSent"),
+            "non-connect transport errors are possible-write; only proven NotSent connect retries"
+        );
+        assert_eq!(
+            production.matches("continue;").count(),
+            1,
+            "the only loop continue is 401 refresh as a new admitted attempt"
+        );
+        let cont = production.find("continue;").expect("401 refresh continue");
+        assert!(
+            production[..cont].contains("UNAUTHORIZED"),
+            "the only continue must belong to the 401 refresh path"
         );
     }
 

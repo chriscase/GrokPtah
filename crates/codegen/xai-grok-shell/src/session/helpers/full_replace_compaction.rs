@@ -1,7 +1,7 @@
 //! grok-build's L5 wiring onto the shared full-replace engine
 //! (`xai_grok_compaction::code_compaction`).
 //!
-//! The shared engine drives the sample → retry → degenerate/failure
+//! The shared engine drives the sample → recovery → degenerate/failure
 //! classification loop via [`sample_full_replace_summary`](xai_grok_compaction::sample_full_replace_summary);
 //! this module adapts grok-build's transport and telemetry to its two seams:
 //!
@@ -153,17 +153,19 @@ impl CompactionSampler for ShellCompactionSampler {
 }
 
 /// Map grok-build's [`CompactFailure`] onto the shared engine's
-/// [`CompactionSampleError`] so the shared retry loop classifies it the same
+/// [`CompactionSampleError`] so the shared sample loop classifies it the same
 /// way the in-shell loop did:
 ///
 /// - `Deterministic` → [`CompactionSampleError::Build`] (whose
 ///   `is_deterministic()` is `true`); a context-length overflow keeps its
 ///   message text so the engine's `is_context_length_error` check fires and
-///   sets `context_overflow`. Possible-write 5xx/429/stream failures are
-///   this arm and are never auto-resent.
+///   sets `context_overflow`. Possible-write HTTP/stream/idle failures
+///   (5xx/429/stream/idle-timeout) are this arm and are never auto-resent.
 /// - `Transient` → [`CompactionSampleError::Other`] (`is_deterministic()` is
-///   `false`), so the engine retries it. Only proven NotSent connect
-///   failures take this arm.
+///   `false`). The engine may issue a distinct fresh admitted request (new
+///   request id). Proven NotSent connect failures take this arm; bounded
+///   empty-content compaction recovery also does. That recovery is not a
+///   same-attempt transport retry.
 fn compact_failure_to_sample_error(failure: CompactFailure) -> CompactionSampleError {
     let (deterministic, err) = match failure {
         CompactFailure::Deterministic(err) => (true, err),
@@ -345,9 +347,10 @@ impl FullReplaceObserver for ShellFullReplaceObserver {
                 }
             }
             FullReplaceAttemptOutcome::EmptyResponse { .. } => {
-                // The shell surfaces an empty response as a transient error
-                // (`generate_session_compact` returns `Transient`), so it never
-                // reaches the shared `Ok("")` branch; handle defensively.
+                // Empty content is classified Transient so a later sample is a
+                // distinct fresh admitted request/id, not a same-attempt
+                // transport retry. `generate_session_compact` returns Transient
+                // for empty content, so this Ok("") branch is defensive.
                 s.transient_rejections += 1;
                 let msg = "compact failed: model returned empty response".to_string();
                 s.attempt_details.push(CompactionAttempt {
