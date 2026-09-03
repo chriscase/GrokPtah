@@ -19,14 +19,13 @@ git2 = { version = "0.20", default-features = false, features = [
 ] }
 notify = { workspace = true }
 reqwest = { workspace = true }
-reqwest-middleware = { workspace = true }
 # rusqlite 0.37 + bundled = self-contained SQLite (>= 3.50.2) with FTS5.
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde_json = { workspace = true }
 # sqlite-vec: vec0 virtual table for KNN vector search.
 sqlite-vec = "=0.1.7-alpha.2"
 tar = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "net"] }
 tracing = { workspace = true }
 xai-grok-auth = { workspace = true }
 xai-grok-config-types = { workspace = true }
@@ -34,6 +33,7 @@ xai-grok-http = { workspace = true }
 xai-grok-telemetry = { workspace = true }
 xai-grok-tools = { workspace = true }
 xai-grok-version = { workspace = true }
+xai-host-authority = { workspace = true }
 xai-sqlite-journal = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
@@ -43,6 +43,7 @@ nix = { workspace = true }
 windows = { workspace = true }
 
 [dev-dependencies]
+axum = { workspace = true }
 filetime = { workspace = true }
 tempfile = { workspace = true }
 

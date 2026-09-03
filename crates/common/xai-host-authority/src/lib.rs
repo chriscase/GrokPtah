@@ -222,6 +222,7 @@ mod error;
 mod gates;
 mod ids;
 mod internal;
+mod operator_send;
 mod projection;
 mod receipt;
 mod state;
@@ -237,6 +238,7 @@ pub use ids::{
     ResourceIncarnation, SessionId, WorkspaceId,
 };
 pub use internal::InternalServiceAuthority;
+pub use operator_send::{OperatorSendHost, install_operator_send_root};
 pub use projection::{PrincipalProjection, ServiceLivenessProjection};
 pub use receipt::{
     ActorClass, AuthContext, AuthorityBinding, EffectClass, EffectLease, FailedReason,

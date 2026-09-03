@@ -6,11 +6,18 @@
 //! Embeddings are cached in the sqlite-vec `chunks_vec` table — the vec0
 //! virtual table IS the cache. No separate cache needed.
 
-use async_trait::async_trait;
+use std::sync::Arc;
 
-/// Maximum retry attempts for transient API errors (429, 5xx).
-const MAX_RETRIES: usize = 3;
-/// Initial backoff delay in milliseconds (doubles on each retry: 1s, 2s, 4s).
+use async_trait::async_trait;
+use reqwest::header::AUTHORIZATION;
+use xai_grok_auth::AuthCredentialProvider;
+use xai_host_authority::{
+    FailedReason, OperatorSendHost, PhysicalSendPermit, RequestIdentity, UncertainReason,
+};
+
+/// Proven-NotSent connect retries only. Possible-write 429/5xx responses are
+/// not resent; a 401 may start a new admitted attempt after an explicit refresh.
+const MAX_CONNECT_RETRIES: usize = 3;
 const INITIAL_BACKOFF_MS: u64 = 1000;
 
 /// Trait for generating text embeddings.
@@ -38,7 +45,7 @@ pub struct ApiEmbeddingProvider {
     api_base: String,
     model: String,
     dimensions: usize,
-    client: reqwest_middleware::ClientWithMiddleware,
+    credentials: Arc<dyn AuthCredentialProvider>,
     max_batch_size: usize,
 }
 
@@ -47,13 +54,13 @@ impl ApiEmbeddingProvider {
         api_base: String,
         model: String,
         dimensions: usize,
-        client: reqwest_middleware::ClientWithMiddleware,
+        credentials: Arc<dyn AuthCredentialProvider>,
     ) -> Self {
         Self {
             api_base,
             model,
             dimensions,
-            client,
+            credentials,
             max_batch_size: 32,
         }
     }
@@ -61,10 +68,10 @@ impl ApiEmbeddingProvider {
     pub fn from_config(
         config: &xai_grok_config_types::MemoryEmbeddingConfig,
         api_base: String,
-        client: reqwest_middleware::ClientWithMiddleware,
+        credentials: Arc<dyn AuthCredentialProvider>,
     ) -> Option<Self> {
         let model = config.model.clone().filter(|m| !m.is_empty())?;
-        Some(Self::new(api_base, model, config.dimensions, client))
+        Some(Self::new(api_base, model, config.dimensions, credentials))
     }
 
     pub fn from_session(
@@ -72,24 +79,199 @@ impl ApiEmbeddingProvider {
         proxy_base_url: String,
         auth_key: String,
     ) -> Option<Self> {
-        let client = build_static_middleware_client(Some(auth_key));
-        Self::from_config(config, proxy_base_url, client)
+        let credentials: Arc<dyn AuthCredentialProvider> =
+            Arc::new(xai_grok_auth::StaticAuthCredentialProvider::new(
+                Box::new(NoopHttpAuth),
+                Some(auth_key),
+            ));
+        Self::from_config(config, proxy_base_url, credentials)
+    }
+
+    async fn embed_one_batch(
+        &self,
+        body_json: &serde_json::Value,
+    ) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error>> {
+        let url = format!("{}/embeddings", self.api_base);
+        let mut auth_retried = false;
+        let mut connect_attempt = 0usize;
+
+        loop {
+            let mut builder = xai_grok_http::shared_client()
+                .post(&url)
+                .json(body_json)
+                .header("X-XAI-Token-Auth", "xai-grok-cli")
+                .header("x-grok-client-version", xai_grok_version::VERSION)
+                // A refresh is an explicit new physical attempt. Connect
+                // retries keep the same ID because they are proven NotSent.
+                .header(
+                    "x-grok-req-id",
+                    if auth_retried {
+                        "embedding-auth-refresh-1"
+                    } else {
+                        "embedding-attempt-1"
+                    },
+                );
+            builder = self.credentials.apply(builder, &self.api_base);
+            if let Some(token) = self.credentials.snapshot().token {
+                builder = builder.bearer_auth(token);
+            }
+            let request = builder
+                .build()
+                .map_err(|error| format!("failed to build embedding request: {error}"))?;
+            let body = match request.body() {
+                None => &[][..],
+                Some(body) => body
+                    .as_bytes()
+                    .ok_or("embedding request body is not immutable bytes")?,
+            };
+            let credential = request
+                .headers()
+                .get(AUTHORIZATION)
+                .map(|value| value.as_bytes().to_vec())
+                .unwrap_or_default();
+            let identity = RequestIdentity::new_with_provider_request_id(
+                request.url().as_str(),
+                request.method().as_str(),
+                "openai_embeddings",
+                &credential,
+                &self.model,
+                request
+                    .headers()
+                    .get("x-grok-req-id")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default(),
+                body,
+            );
+            let host = OperatorSendHost::process()?;
+            let (_auth, permit) = host.admit(&identity, "embeddings")?;
+            let mut live = LivePermit {
+                host: Arc::clone(&host),
+                permit: Some(permit),
+            };
+
+            match xai_grok_http::shared_client().execute(request).await {
+                Ok(response) => {
+                    let status = response.status();
+                    let bytes = match response.bytes().await {
+                        Ok(bytes) => bytes,
+                        Err(error) => {
+                            live.fail_uncertain(UncertainReason::ResponseBodyAfterPossibleEffect);
+                            return Err(format!("embedding response body failed: {error}").into());
+                        }
+                    };
+                    if status.is_success() {
+                        live.complete();
+                        return parse_embedding_payload(&bytes);
+                    }
+                    if status == reqwest::StatusCode::UNAUTHORIZED && !auth_retried {
+                        live.fail_uncertain(UncertainReason::ProtocolAfterPossibleEffect);
+                        if self.credentials.refresh_after_unauthorized().await {
+                            auth_retried = true;
+                            continue;
+                        }
+                        return Err(format!(
+                            "embedding API error {status}: {}",
+                            String::from_utf8_lossy(&bytes)
+                        )
+                        .into());
+                    }
+                    if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+                    {
+                        live.fail_uncertain(UncertainReason::ProtocolAfterPossibleEffect);
+                        return Err(format!(
+                            "embedding API error {status}: {}",
+                            String::from_utf8_lossy(&bytes)
+                        )
+                        .into());
+                    }
+                    live.complete();
+                    return Err(format!(
+                        "embedding API error {status}: {}",
+                        String::from_utf8_lossy(&bytes)
+                    )
+                    .into());
+                }
+                Err(error) if error.is_connect() => {
+                    live.fail_before_write(FailedReason::ConnectRefusedBeforeWrite);
+                    connect_attempt += 1;
+                    let error_message = format!("request failed: {error}");
+                    if connect_attempt >= MAX_CONNECT_RETRIES {
+                        return Err(format!(
+                            "embedding API failed after {MAX_CONNECT_RETRIES} connect attempts: {}",
+                            error_message
+                        )
+                        .into());
+                    }
+                    let delay = INITIAL_BACKOFF_MS * 2u64.pow(connect_attempt as u32 - 1);
+                    tracing::warn!(
+                        attempt = connect_attempt,
+                        delay_ms = delay,
+                        "retrying embedding connect after proven NotSent"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                }
+                Err(error) => {
+                    live.fail_uncertain(UncertainReason::TransportAfterPossibleWrite);
+                    return Err(format!("request failed: {error}").into());
+                }
+            }
+        }
     }
 }
 
-pub(super) fn build_middleware_client(
-    credentials: std::sync::Arc<dyn xai_grok_auth::AuthCredentialProvider>,
-) -> reqwest_middleware::ClientWithMiddleware {
-    xai_grok_http::with_auth_retry(xai_grok_http::shared_client(), credentials)
+struct LivePermit {
+    host: Arc<OperatorSendHost>,
+    permit: Option<PhysicalSendPermit>,
 }
 
-fn build_static_middleware_client(
-    api_key: Option<String>,
-) -> reqwest_middleware::ClientWithMiddleware {
-    let provider: std::sync::Arc<dyn xai_grok_auth::AuthCredentialProvider> = std::sync::Arc::new(
-        xai_grok_auth::StaticAuthCredentialProvider::new(Box::new(NoopHttpAuth), api_key),
-    );
-    build_middleware_client(provider)
+impl LivePermit {
+    fn complete(&mut self) {
+        if let Some(permit) = self.permit.take() {
+            let _ = self.host.settle_settled(permit);
+        }
+    }
+
+    fn fail_before_write(&mut self, reason: FailedReason) {
+        if let Some(permit) = self.permit.take() {
+            let _ = self.host.settle_failed_before_write(permit, reason);
+        }
+    }
+
+    fn fail_uncertain(&mut self, reason: UncertainReason) {
+        if let Some(permit) = self.permit.take() {
+            let _ = self.host.settle_uncertain(permit, reason);
+        }
+    }
+}
+
+impl Drop for LivePermit {
+    fn drop(&mut self) {
+        if let Some(permit) = self.permit.take() {
+            let _ = self
+                .host
+                .settle_uncertain(permit, UncertainReason::TransportAfterPossibleWrite);
+        }
+    }
+}
+
+fn parse_embedding_payload(bytes: &[u8]) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error>> {
+    let body: serde_json::Value = serde_json::from_slice(bytes)?;
+    let data = body
+        .get("data")
+        .and_then(|value| value.as_array())
+        .ok_or("embedding response missing 'data' array")?;
+    let mut embeddings = Vec::with_capacity(data.len());
+    for item in data {
+        let embedding: Vec<f32> = item
+            .get("embedding")
+            .and_then(|value| value.as_array())
+            .ok_or("embedding item missing 'embedding' array")?
+            .iter()
+            .filter_map(|value| value.as_f64().map(|float| float as f32))
+            .collect();
+        embeddings.push(embedding);
+    }
+    Ok(embeddings)
 }
 
 struct NoopHttpAuth;
@@ -113,7 +295,6 @@ impl EmbeddingProvider for ApiEmbeddingProvider {
 
         let mut all_embeddings = Vec::with_capacity(texts.len());
 
-        // Process in batches to respect API payload limits
         for batch in texts.chunks(self.max_batch_size) {
             let input: Vec<&str> = batch.to_vec();
             let body_json = serde_json::json!({
@@ -121,83 +302,8 @@ impl EmbeddingProvider for ApiEmbeddingProvider {
                 "input": input,
                 "dimensions": self.dimensions,
             });
-
-            // Retry with exponential backoff on transient errors (429, 5xx)
-            let mut last_err = String::new();
-            let mut success = false;
-            for attempt in 0..MAX_RETRIES {
-                if attempt > 0 {
-                    let delay = INITIAL_BACKOFF_MS * 2u64.pow(attempt as u32 - 1);
-                    tracing::warn!(
-                        attempt,
-                        delay_ms = delay,
-                        "retrying embedding API call after transient error"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-                }
-
-                let request = xai_grok_http::shared_client()
-                    .post(format!("{}/embeddings", self.api_base))
-                    .json(&body_json)
-                    .header("X-XAI-Token-Auth", "xai-grok-cli")
-                    .header("x-grok-client-version", xai_grok_version::VERSION);
-
-                let req = match request.build() {
-                    Ok(r) => r,
-                    Err(e) => {
-                        return Err(format!("failed to build embedding request: {e}").into());
-                    }
-                };
-                let response = match self.client.execute(req).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        last_err = format!("request failed: {e}");
-                        continue;
-                    }
-                };
-
-                let status = response.status();
-                if status.is_success() {
-                    let body: serde_json::Value = response.json().await?;
-                    let data = body
-                        .get("data")
-                        .and_then(|d| d.as_array())
-                        .ok_or("embedding response missing 'data' array")?;
-
-                    for item in data {
-                        let embedding: Vec<f32> = item
-                            .get("embedding")
-                            .and_then(|e| e.as_array())
-                            .ok_or("embedding item missing 'embedding' array")?
-                            .iter()
-                            .filter_map(|v| v.as_f64().map(|f| f as f32))
-                            .collect();
-                        all_embeddings.push(embedding);
-                    }
-                    success = true;
-                    break;
-                }
-
-                // Retry on 429 (rate limit) or 5xx (server error)
-                if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
-                    last_err = format!(
-                        "HTTP {status}: {}",
-                        response.text().await.unwrap_or_default()
-                    );
-                    continue;
-                }
-
-                // Non-retryable error (4xx other than 429)
-                let body = response.text().await.unwrap_or_default();
-                return Err(format!("embedding API error {status}: {body}").into());
-            }
-
-            if !success {
-                return Err(format!(
-                    "embedding API failed after {MAX_RETRIES} attempts: {last_err}"
-                )
-                .into());
-            }
+            let embeddings = self.embed_one_batch(&body_json).await?;
+            all_embeddings.extend(embeddings);
         }
 
         Ok(all_embeddings)
@@ -279,5 +385,181 @@ mod tests {
         let provider = MockEmbeddingProvider { dimensions: 128 };
         let results = provider.embed_batch(&["test"]).await.unwrap();
         assert_eq!(results[0].len(), 128);
+    }
+
+    #[test]
+    fn embedding_source_has_no_raw_middleware_execute_or_possible_write_retry() {
+        let source = include_str!("embedding.rs");
+        assert!(
+            source.contains("OperatorSendHost::process") && source.contains("host.admit("),
+            "embeddings must admit through OperatorSendHost before bytes"
+        );
+    }
+
+    fn embedding_config() -> xai_grok_config_types::MemoryEmbeddingConfig {
+        xai_grok_config_types::MemoryEmbeddingConfig {
+            provider: "api".into(),
+            model: Some("test-embed".into()),
+            dimensions: 2,
+        }
+    }
+
+    async fn spawn_embeddings_server(
+        handler: impl Fn(usize, axum::http::HeaderMap, axum::body::Bytes) -> axum::response::Response
+        + Send
+        + Sync
+        + Clone
+        + 'static,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use axum::Router;
+        use axum::extract::State;
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let state = hits.clone();
+        let app = Router::new()
+            .route(
+                "/embeddings",
+                post(
+                    move |State(hits): State<Arc<std::sync::atomic::AtomicUsize>>,
+                          headers: axum::http::HeaderMap,
+                          body: axum::body::Bytes| {
+                        let handler = handler.clone();
+                        async move {
+                            let prior = hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            handler(prior, headers, body)
+                        }
+                    },
+                ),
+            )
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    #[tokio::test]
+    async fn admitted_embedding_batch_hits_fake_transport_once() {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use std::sync::atomic::Ordering;
+
+        let (base, hits) = spawn_embeddings_server(|_, _, _| {
+            (
+                StatusCode::OK,
+                r#"{"data":[{"embedding":[0.1,0.2]},{"embedding":[0.3,0.4]}]}"#,
+            )
+                .into_response()
+        })
+        .await;
+        let provider =
+            ApiEmbeddingProvider::from_session(&embedding_config(), base, "test-key".into())
+                .unwrap();
+        let results = provider.embed_batch(&["a", "b"]).await.unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].len(), 2);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn possible_write_5xx_is_not_resent() {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use std::sync::atomic::Ordering;
+
+        let (base, hits) =
+            spawn_embeddings_server(|_, _, _| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+                .await;
+        let provider =
+            ApiEmbeddingProvider::from_session(&embedding_config(), base, "test-key".into())
+                .unwrap();
+        let first = provider.embed_batch(&["same"]).await;
+        assert!(first.is_err(), "{first:?}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let second = provider.embed_batch(&["same"]).await;
+        assert!(second.is_err(), "{second:?}");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "possible-write 5xx must not admit a second send of the same body"
+        );
+    }
+
+    #[tokio::test]
+    async fn possible_write_429_is_not_resent() {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use std::sync::atomic::Ordering;
+
+        let (base, hits) =
+            spawn_embeddings_server(|_, _, _| StatusCode::TOO_MANY_REQUESTS.into_response()).await;
+        let provider =
+            ApiEmbeddingProvider::from_session(&embedding_config(), base, "test-key".into())
+                .unwrap();
+        assert!(provider.embed_batch(&["rate"]).await.is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert!(provider.embed_batch(&["rate"]).await.is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    struct RefreshOnceProvider {
+        token: std::sync::Mutex<String>,
+    }
+
+    impl xai_grok_auth::HttpAuth for RefreshOnceProvider {
+        fn apply(
+            &self,
+            builder: reqwest::RequestBuilder,
+            _base_url: &str,
+        ) -> reqwest::RequestBuilder {
+            builder
+        }
+    }
+
+    #[async_trait]
+    impl AuthCredentialProvider for RefreshOnceProvider {
+        fn snapshot(&self) -> xai_grok_auth::CredentialSnapshot {
+            xai_grok_auth::CredentialSnapshot {
+                token: Some(self.token.lock().unwrap().clone()),
+                ..Default::default()
+            }
+        }
+
+        async fn refresh_after_unauthorized(&self) -> bool {
+            *self.token.lock().unwrap() = "fresh-token".into();
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn unauthorized_refresh_is_a_new_admitted_send() {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use std::sync::atomic::Ordering;
+
+        let (base, hits) = spawn_embeddings_server(|_, headers, _| {
+            let auth = headers
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+            if auth == "Bearer stale-token" {
+                StatusCode::UNAUTHORIZED.into_response()
+            } else {
+                (StatusCode::OK, r#"{"data":[{"embedding":[1.0,2.0]}]}"#).into_response()
+            }
+        })
+        .await;
+        let credentials: Arc<dyn AuthCredentialProvider> = Arc::new(RefreshOnceProvider {
+            token: std::sync::Mutex::new("stale-token".into()),
+        });
+        let provider =
+            ApiEmbeddingProvider::from_config(&embedding_config(), base, credentials).unwrap();
+        let results = provider.embed_batch(&["hello"]).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 }

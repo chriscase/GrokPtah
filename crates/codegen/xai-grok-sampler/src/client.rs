@@ -714,29 +714,11 @@ impl SamplingClient {
     }
 
     /// Build response headers string for error messages.
-    fn format_response_headers(response: &reqwest::Response) -> Vec<String> {
-        response
-            .headers()
+    fn format_response_headers(headers: &HeaderMap) -> Vec<String> {
+        headers
             .iter()
             .map(|(name, value)| Self::format_header(name.as_str(), &format!("{:?}", value)))
             .collect()
-    }
-
-    /// Log all headers from a request at debug level (redacting sensitive values).
-    fn log_request_headers(request: &reqwest::Request, endpoint_name: &str) {
-        for (name, value) in request.headers().iter() {
-            let value_str = if Self::is_sensitive_header(name.as_str()) {
-                "[REDACTED]"
-            } else {
-                value.to_str().unwrap_or("[non-utf8]")
-            };
-            tracing::debug!(
-                header_name = %name,
-                header_value = %value_str,
-                "Request header ({})",
-                endpoint_name
-            );
-        }
     }
 
     /// Build error context message based on error type and status code.
@@ -775,6 +757,17 @@ impl SamplingClient {
         format!("{base}/{path}")
     }
 
+    async fn dispatch_admitted(
+        &self,
+        builder: reqwest::RequestBuilder,
+        dialect: &'static str,
+        model: &str,
+        target_scope: &'static str,
+    ) -> Result<crate::provider_admission::AdmittedResponse> {
+        crate::provider_admission::send_admitted(&self.http, builder, dialect, model, target_scope)
+            .await
+    }
+
     fn apply_defaults(&self, mut request: ChatCompletionRequest) -> Result<ChatCompletionRequest> {
         if request.model.is_none() {
             request.model = Some(self.defaults.model.clone());
@@ -795,7 +788,10 @@ impl SamplingClient {
         Ok(request)
     }
 
-    async fn handle_response(&self, response: reqwest::Response) -> Result<ChatCompletionResponse> {
+    async fn handle_response(
+        &self,
+        response: crate::provider_admission::AdmittedResponse,
+    ) -> Result<ChatCompletionResponse> {
         let status = response.status();
         let model_metadata = extract_model_metadata(response.headers());
         let retry_after_secs = extract_retry_after(response.headers());
@@ -865,11 +861,14 @@ impl SamplingClient {
             .apply(self.post(self.endpoint("chat/completions")))
             .json(&payload);
 
-        let response = http_request.send().await.map_err(|e| {
-            // Log at debug level; errors are surfaced to the caller.
-            tracing::debug!("HTTP request failed: {}", e);
-            e
-        })?;
+        let response = self
+            .dispatch_admitted(
+                http_request,
+                "sampler_chat_completions",
+                &model_id,
+                "sampler-chat-completions",
+            )
+            .await?;
 
         self.handle_response(response).await
     }
@@ -924,23 +923,24 @@ impl SamplingClient {
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"))
             .json(&streaming_request);
 
-        let built_request = http_request.build().map_err(|e| {
-            tracing::error!("Failed to build HTTP request: {}", e);
-            SamplingError::Http(e)
-        })?;
-
         tracing::debug!(
-            url = %built_request.url(),
-            method = %built_request.method(),
+            url = %self.endpoint("chat/completions"),
             "Sending chat/completions request"
         );
-        Self::log_request_headers(&built_request, "chat/completions");
 
-        let response = self.http.execute(built_request).await.map_err(|e| {
-            tracing::debug!("HTTP request failed: {}", e);
-            record_stream_request_failure(&e);
-            e
-        })?;
+        let response = self
+            .dispatch_admitted(
+                http_request,
+                "sampler_chat_completions",
+                &model_id,
+                "sampler-chat-completions",
+            )
+            .await
+            .inspect_err(|e| {
+                if let SamplingError::Http(err) = &e {
+                    record_stream_request_failure(err);
+                }
+            })?;
 
         let status = response.status();
         let span = tracing::Span::current();
@@ -964,7 +964,7 @@ impl SamplingClient {
 
             let req_headers =
                 self.format_request_headers(x_grok_conv_id, x_grok_req_id, &model_id, true);
-            let resp_headers = Self::format_response_headers(&response);
+            let resp_headers = Self::format_response_headers(response.headers());
             let bytes = response.bytes().await?;
             let server_message = parse_error_bytes(bytes.as_ref());
 
@@ -995,7 +995,8 @@ impl SamplingClient {
         // Strip UTF-8 BOM if present: eventsource-stream 0.2.3 incorrectly slices BOM at byte 1 instead of 3.
         const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
         let mut is_first = true;
-        let byte_stream = response.bytes_stream().map(move |result| {
+        let (byte_stream, settlement) = response.into_byte_stream();
+        let byte_stream = byte_stream.map(move |result| {
             result.map(|bytes| {
                 if is_first {
                     is_first = false;
@@ -1016,7 +1017,7 @@ impl SamplingClient {
         // then subsequent polls return `None` -- preventing an infinite busy-loop
         // when the HTTP/2 connection drops and h2 keeps producing errors.
         let chunks = event_stream
-            .scan(false, |had_transport_error, event_res| {
+            .scan(false, move |had_transport_error, event_res| {
                 if *had_transport_error {
                     return std::future::ready(None);
                 }
@@ -1024,6 +1025,7 @@ impl SamplingClient {
                     Ok(event) => {
                         let data = &event.data;
                         if data == "[DONE]" {
+                            settlement.complete();
                             return std::future::ready(None);
                         }
 
@@ -1051,6 +1053,7 @@ impl SamplingClient {
                     }
                     Err(e) => {
                         *had_transport_error = true;
+                        settlement.fail();
                         Some(Err(SamplingError::EventStreamError(e.to_string())))
                     }
                 };
@@ -1146,10 +1149,14 @@ impl SamplingClient {
             .apply(self.post(self.endpoint("responses")))
             .json(&request_body);
 
-        let response = http_request.send().await.map_err(|e| {
-            tracing::debug!("HTTP request failed: {}", e);
-            e
-        })?;
+        let response = self
+            .dispatch_admitted(
+                http_request,
+                "sampler_responses",
+                &model_id,
+                "sampler-responses",
+            )
+            .await?;
 
         let status = response.status();
         let model_metadata = extract_model_metadata(response.headers());
@@ -1302,23 +1309,24 @@ impl SamplingClient {
         }
         let http_request = http_request.json(&request_body);
 
-        let built_request = http_request.build().map_err(|e| {
-            tracing::error!("Failed to build HTTP request: {}", e);
-            SamplingError::Http(e)
-        })?;
-
         tracing::debug!(
-            url = %built_request.url(),
-            method = %built_request.method(),
+            url = %self.endpoint("responses"),
             "Sending responses API stream request"
         );
-        Self::log_request_headers(&built_request, "responses");
 
-        let response = self.http.execute(built_request).await.map_err(|e| {
-            tracing::debug!("HTTP request failed: {}", e);
-            record_stream_request_failure(&e);
-            e
-        })?;
+        let response = self
+            .dispatch_admitted(
+                http_request,
+                "sampler_responses",
+                &model_id,
+                "sampler-responses",
+            )
+            .await
+            .inspect_err(|e| {
+                if let SamplingError::Http(err) = &e {
+                    record_stream_request_failure(err);
+                }
+            })?;
 
         let status = response.status();
         let span = tracing::Span::current();
@@ -1339,7 +1347,7 @@ impl SamplingClient {
             let should_retry = extract_should_retry(response.headers());
             let req_headers =
                 self.format_request_headers(x_grok_conv_id, x_grok_req_id, &model_id, true);
-            let resp_headers = Self::format_response_headers(&response);
+            let resp_headers = Self::format_response_headers(response.headers());
             let bytes = response.bytes().await?;
             let server_message = parse_error_bytes(bytes.as_ref());
 
@@ -1372,7 +1380,8 @@ impl SamplingClient {
         // Strip UTF-8 BOM if present
         const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
         let mut is_first = true;
-        let byte_stream = response.bytes_stream().map(move |result| {
+        let (byte_stream, settlement) = response.into_byte_stream();
+        let byte_stream = byte_stream.map(move |result| {
             result.map(|bytes| {
                 if is_first {
                     is_first = false;
@@ -1401,6 +1410,7 @@ impl SamplingClient {
                     Ok(event) => {
                         let data = &event.data;
                         if data == "[DONE]" {
+                            settlement.complete();
                             return std::future::ready(None);
                         }
 
@@ -1431,6 +1441,7 @@ impl SamplingClient {
                     }
                     Err(e) => {
                         *had_transport_error = true;
+                        settlement.fail();
                         Some(Some(Err(SamplingError::EventStreamError(e.to_string()))))
                     }
                 };
@@ -1504,10 +1515,14 @@ impl SamplingClient {
             .apply(self.post(self.endpoint("messages")))
             .json(&request.inner);
 
-        let response = http_request.send().await.map_err(|e| {
-            tracing::debug!("HTTP request failed: {}", e);
-            e
-        })?;
+        let response = self
+            .dispatch_admitted(
+                http_request,
+                "sampler_messages",
+                &model_id,
+                "sampler-messages",
+            )
+            .await?;
 
         let status = response.status();
         let model_metadata = extract_model_metadata(response.headers());
@@ -1621,23 +1636,24 @@ impl SamplingClient {
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"))
             .json(&request.inner);
 
-        let built_request = http_request.build().map_err(|e| {
-            tracing::error!("Failed to build HTTP request: {}", e);
-            SamplingError::Http(e)
-        })?;
-
         tracing::debug!(
-            url = %built_request.url(),
-            method = %built_request.method(),
+            url = %self.endpoint("messages"),
             "Sending messages API stream request"
         );
-        Self::log_request_headers(&built_request, "messages");
 
-        let response = self.http.execute(built_request).await.map_err(|e| {
-            tracing::debug!("HTTP request failed: {}", e);
-            record_stream_request_failure(&e);
-            e
-        })?;
+        let response = self
+            .dispatch_admitted(
+                http_request,
+                "sampler_messages",
+                &model_id,
+                "sampler-messages",
+            )
+            .await
+            .inspect_err(|e| {
+                if let SamplingError::Http(err) = &e {
+                    record_stream_request_failure(err);
+                }
+            })?;
 
         let status = response.status();
         let span = tracing::Span::current();
@@ -1658,7 +1674,7 @@ impl SamplingClient {
             let should_retry = extract_should_retry(response.headers());
             let req_headers =
                 self.format_request_headers(x_grok_conv_id, x_grok_req_id, &model_id, true);
-            let resp_headers = Self::format_response_headers(&response);
+            let resp_headers = Self::format_response_headers(response.headers());
             let bytes = response.bytes().await?;
             let server_message = parse_error_bytes(bytes.as_ref());
 
@@ -1691,7 +1707,8 @@ impl SamplingClient {
         // Strip UTF-8 BOM if present
         const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
         let mut is_first = true;
-        let byte_stream = response.bytes_stream().map(move |result| {
+        let (byte_stream, settlement) = response.into_byte_stream();
+        let byte_stream = byte_stream.map(move |result| {
             result.map(|bytes| {
                 if is_first {
                     is_first = false;
@@ -1710,7 +1727,7 @@ impl SamplingClient {
         // Uses `scan` so transport errors terminate the stream after the first
         // error (same pattern as `chat_completion_stream`).
         let events = event_stream
-            .scan(false, |had_transport_error, event_res| {
+            .scan(false, move |had_transport_error, event_res| {
                 if *had_transport_error {
                     return std::future::ready(None);
                 }
@@ -1718,6 +1735,7 @@ impl SamplingClient {
                     Ok(event) => {
                         let data = &event.data;
                         if data == "[DONE]" {
+                            settlement.complete();
                             return std::future::ready(None);
                         }
 
@@ -1747,6 +1765,7 @@ impl SamplingClient {
                     }
                     Err(e) => {
                         *had_transport_error = true;
+                        settlement.fail();
                         Some(Err(SamplingError::EventStreamError(e.to_string())))
                     }
                 };
