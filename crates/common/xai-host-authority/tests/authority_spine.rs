@@ -41,8 +41,12 @@ fn request(body: &[u8]) -> RequestIdentity {
 
 const TEST_ROUTE: &str = "test-route";
 
-fn admit_wire(authority: &HostAuthority, permit: PhysicalSendPermit) -> PhysicalSendPermit {
-    authority.admit_sending(permit).unwrap()
+fn admit_wire(
+    authority: &HostAuthority,
+    auth: &AuthContext,
+    permit: PhysicalSendPermit,
+) -> PhysicalSendPermit {
+    authority.admit_sending(auth, permit).unwrap()
 }
 
 fn fixture() -> Fixture {
@@ -312,6 +316,7 @@ fn a_lease_is_one_use() {
 
     let permit = admit_wire(
         &f.authority,
+        &f.auth,
         f.authority
             .begin_send(&f.auth, lease.clone(), &req, TEST_ROUTE)
             .unwrap(),
@@ -529,6 +534,7 @@ fn ambiguity_after_dispatch_is_uncertain_and_offers_no_retry() {
     let lease = lease_for(&f, &req);
     let permit = admit_wire(
         &f.authority,
+        &f.auth,
         f.authority
             .begin_send(&f.auth, lease, &req, TEST_ROUTE)
             .unwrap(),
@@ -619,6 +625,7 @@ fn a_crash_between_dispatch_and_settlement_settles_uncertain() {
             .unwrap();
         let permit = admit_wire(
             &authority,
+            &auth,
             authority
                 .begin_send(&auth, lease, &req, TEST_ROUTE)
                 .unwrap(),
@@ -691,7 +698,7 @@ fn concurrent_spends_of_one_lease_admit_exactly_one() {
         handles.push(std::thread::spawn(move || {
             let req = request(b"body");
             if let Ok(permit) = authority.begin_send(&auth, lease, &req, "test-route") {
-                let permit = authority.admit_sending(permit).unwrap();
+                let permit = authority.admit_sending(&auth, permit).unwrap();
                 admitted.fetch_add(1, Ordering::SeqCst);
                 let _ = authority.settle_settled(permit);
             }
@@ -716,6 +723,7 @@ fn intent_is_recorded_before_the_outcome_and_the_chain_verifies() {
     let lease = lease_for(&f, &req);
     let permit = admit_wire(
         &f.authority,
+        &f.auth,
         f.authority
             .begin_send(&f.auth, lease, &req, TEST_ROUTE)
             .unwrap(),
@@ -750,6 +758,7 @@ fn a_truncated_audit_log_is_detected() {
     let lease = lease_for(&f, &req);
     let permit = admit_wire(
         &f.authority,
+        &f.auth,
         f.authority
             .begin_send(&f.auth, lease, &req, TEST_ROUTE)
             .unwrap(),
@@ -779,6 +788,7 @@ fn audit_export_rejects_same_length_tampering() {
     let lease = lease_for(&f, &req);
     let permit = admit_wire(
         &f.authority,
+        &f.auth,
         f.authority
             .begin_send(&f.auth, lease, &req, TEST_ROUTE)
             .unwrap(),
@@ -825,6 +835,7 @@ fn public_projections_are_secret_content_and_path_free() {
     let lease = lease_for(&f, &req);
     let permit = admit_wire(
         &f.authority,
+        &f.auth,
         f.authority
             .begin_send(&f.auth, lease, &req, TEST_ROUTE)
             .unwrap(),
@@ -915,6 +926,7 @@ fn a_send_intent_always_names_its_producing_principal_and_generations() {
     let lease = lease_for(&f, &req);
     let permit = admit_wire(
         &f.authority,
+        &f.auth,
         f.authority
             .begin_send(&f.auth, lease, &req, TEST_ROUTE)
             .unwrap(),
@@ -975,6 +987,7 @@ fn a_refused_send_is_recorded_against_the_principal_that_asked() {
     // Spend the lease, then replay it.
     let permit = admit_wire(
         &f.authority,
+        &f.auth,
         f.authority
             .begin_send(&f.auth, lease.clone(), &req, TEST_ROUTE)
             .unwrap(),
@@ -1077,6 +1090,7 @@ fn a_missing_authority_root_with_prior_evidence_refuses_service() {
     let lease = lease_for(&f, &req);
     let permit = admit_wire(
         &f.authority,
+        &f.auth,
         f.authority
             .begin_send(&f.auth, lease, &req, TEST_ROUTE)
             .unwrap(),
@@ -1130,6 +1144,7 @@ fn one_principal_cannot_read_another_principals_attempt() {
         .unwrap();
     let permit = admit_wire(
         &authority,
+        &a,
         authority.begin_send(&a, lease, &req, TEST_ROUTE).unwrap(),
     );
     let attempt = permit.attempt();
@@ -1185,6 +1200,7 @@ fn a_model_sealed_capability_is_never_operator_authority() {
 
     let permit = admit_wire(
         &f.authority,
+        &f.auth,
         f.authority
             .begin_send(&f.auth, lease, &req, TEST_ROUTE)
             .unwrap(),
@@ -1362,6 +1378,7 @@ fn one_capability_cannot_authorise_two_sends() {
 
     let permit = admit_wire(
         &f.authority,
+        &f.auth,
         f.authority
             .begin_send(&f.auth, lease_a, &first, TEST_ROUTE)
             .unwrap(),
@@ -1418,6 +1435,7 @@ fn an_uncertain_outcome_is_always_reconcilable() {
     let lease = lease_for(&f, &req);
     let permit = admit_wire(
         &f.authority,
+        &f.auth,
         f.authority
             .begin_send(&f.auth, lease, &req, TEST_ROUTE)
             .unwrap(),
@@ -1446,6 +1464,7 @@ fn settlement_audit_replays_when_the_state_snapshot_write_fails() {
     let lease = lease_for(&f, &req);
     let permit = admit_wire(
         &f.authority,
+        &f.auth,
         f.authority
             .begin_send(&f.auth, lease, &req, TEST_ROUTE)
             .unwrap(),
@@ -1486,6 +1505,7 @@ fn same_host_recovery_does_not_downgrade_an_audited_settlement() {
     let lease = lease_for(&f, &req);
     let permit = admit_wire(
         &f.authority,
+        &f.auth,
         f.authority
             .begin_send(&f.auth, lease, &req, TEST_ROUTE)
             .unwrap(),
@@ -1591,6 +1611,7 @@ fn crash_recovery_audit_replays_when_the_state_snapshot_write_fails() {
     let lease = lease_for(&f, &req);
     let permit = admit_wire(
         &f.authority,
+        &f.auth,
         f.authority
             .begin_send(&f.auth, lease, &req, TEST_ROUTE)
             .unwrap(),
@@ -1650,6 +1671,7 @@ fn crash_recovery_retry_on_the_same_authority_reuses_the_audited_outcome() {
     let lease = lease_for(&f, &req);
     let permit = admit_wire(
         &f.authority,
+        &f.auth,
         f.authority
             .begin_send(&f.auth, lease, &req, TEST_ROUTE)
             .unwrap(),
@@ -1712,6 +1734,7 @@ fn reconciliation_audit_replays_when_the_state_snapshot_write_fails() {
     let lease = lease_for(&f, &req);
     let permit = admit_wire(
         &f.authority,
+        &f.auth,
         f.authority
             .begin_send(&f.auth, lease, &req, TEST_ROUTE)
             .unwrap(),
@@ -1750,6 +1773,7 @@ fn reconciliation_audit_failure_leaves_state_ambiguous() {
     let lease = lease_for(&f, &req);
     let permit = admit_wire(
         &f.authority,
+        &f.auth,
         f.authority
             .begin_send(&f.auth, lease, &req, TEST_ROUTE)
             .unwrap(),
@@ -1784,6 +1808,7 @@ fn a_damaged_audit_log_is_never_resealed() {
     let lease = lease_for(&f, &req);
     let permit = admit_wire(
         &f.authority,
+        &f.auth,
         f.authority
             .begin_send(&f.auth, lease, &req, TEST_ROUTE)
             .unwrap(),

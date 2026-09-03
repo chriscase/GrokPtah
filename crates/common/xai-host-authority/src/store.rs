@@ -596,6 +596,71 @@ impl HostAuthority {
         Ok(incarnation)
     }
 
+    /// Return the durable provider-send surface for one logical route, reusing
+    /// an existing resource when the same principal already owns one for this
+    /// workspace and target scope so attempt ordinals advance monotonically.
+    pub fn obtain_provider_send_surface(
+        &self,
+        auth: &AuthContext,
+        workspace: WorkspaceId,
+        target_scope: &str,
+    ) -> Result<ResourceIncarnation, AuthorityError> {
+        let observation =
+            ContentDigest::of_fields(&[("provider-send-target-v1", target_scope.as_bytes())]);
+        let observation_hex = observation.to_hex();
+        let workspace_hex = workspace.to_hex();
+        if let Some(incarnation) = self.read(|state| {
+            require_current_state(state, auth)?;
+            for (key, record) in &state.resources {
+                if record.principal == auth.principal.to_hex()
+                    && record.credential_incarnation == auth.incarnation.to_hex()
+                    && record.auth_generation == auth.auth_generation.raw()
+                    && record.policy_revision == state.policy_revision
+                    && record.control_epoch == state.control_epoch
+                    && record.workspace == workspace_hex
+                    && record.observation_digest == observation_hex
+                    && record.observation_revision == 1
+                {
+                    return Ok(Some(decode_id(key, "resource")?));
+                }
+            }
+            Ok(None)
+        })? {
+            return Ok(incarnation);
+        }
+
+        let session = SessionId::mint();
+        let issued = self.with_state(|state| {
+            require_current_state(state, auth)?;
+            let incarnation = ResourceIncarnation::mint();
+            let record = StoredResource {
+                incarnation: incarnation.to_hex(),
+                principal: auth.principal.to_hex(),
+                credential_incarnation: auth.incarnation.to_hex(),
+                auth_generation: auth.auth_generation.raw(),
+                policy_revision: auth.policy_revision.raw(),
+                session: session.to_hex(),
+                workspace: workspace_hex,
+                control_epoch: state.control_epoch,
+                observation_revision: 1,
+                observation_digest: observation_hex,
+                next_attempt_ordinal: 1,
+            };
+            state.resources.insert(incarnation.to_hex(), record);
+            Ok(incarnation)
+        })?;
+        self.append_audit(
+            auth.control_epoch.raw(),
+            crate::audit::AuditEvent::ResourceIssued {
+                resource: issued.public_handle(),
+                principal: auth.principal.public_handle(),
+                session: session.public_handle(),
+                workspace: workspace.public_handle(),
+            },
+        )?;
+        Ok(issued)
+    }
+
     /// The binding a host-issued resource carries.
     pub fn resource_binding(
         &self,

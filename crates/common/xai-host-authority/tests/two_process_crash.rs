@@ -68,7 +68,7 @@ fn child_take_permit_then_die(root: &Path) -> ! {
         .begin_send(&auth, lease, &req, "test-route")
         .expect("child permit");
     let permit = authority
-        .admit_sending(permit)
+        .admit_sending(&auth, permit)
         .expect("child wire admission");
     // Signal that we got this far, then die where a physical send would be
     // in flight: after admission, before settlement.

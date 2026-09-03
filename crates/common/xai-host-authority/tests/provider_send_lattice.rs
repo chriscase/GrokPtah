@@ -40,6 +40,34 @@ fn host_with_credentials(
     (dir, authority, admin)
 }
 
+fn prepared_send_on_surface(
+    authority: &HostAuthority,
+    auth: &AuthContext,
+    route: &str,
+    body: &[u8],
+) -> PhysicalSendPermit {
+    let workspace = authority
+        .issue_workspace(auth, std::path::Path::new("/tmp"))
+        .unwrap();
+    let resource = authority
+        .obtain_provider_send_surface(auth, workspace, route)
+        .unwrap();
+    let capability = authority
+        .seal_capability(
+            auth,
+            resource,
+            ActorClass::VerifiedOperator,
+            EffectClass::ProviderSend,
+            60_000,
+        )
+        .unwrap();
+    let req = request(body);
+    let lease = authority
+        .mint_lease(auth, &capability, req.digest(), 60_000)
+        .unwrap();
+    authority.begin_send(auth, lease, &req, route).unwrap()
+}
+
 fn prepared_send(
     authority: &HostAuthority,
     auth: &AuthContext,
@@ -79,8 +107,8 @@ fn two_credentials_assign_distinct_ordinals_on_the_same_route() {
     let permit_b = prepared_send(&authority, &b, ROUTE, b"second");
     let attempt_a = permit_a.attempt();
     let attempt_b = permit_b.attempt();
-    let _ = authority.settle_settled(authority.admit_sending(permit_a).unwrap());
-    let _ = authority.settle_settled(authority.admit_sending(permit_b).unwrap());
+    let _ = authority.settle_settled(authority.admit_sending(&a, permit_a).unwrap());
+    let _ = authority.settle_settled(authority.admit_sending(&b, permit_b).unwrap());
 
     let projection_a = authority
         .attempt_projection(&a, attempt_a)
@@ -123,7 +151,7 @@ fn crash_after_preparing_before_wire_is_not_sent_and_may_retry() {
     assert!(!projection.ambiguous);
 
     let retry = prepared_send(&authority, &auth, ROUTE, b"body");
-    let outcome = authority.settle_settled(authority.admit_sending(retry).unwrap());
+    let outcome = authority.settle_settled(authority.admit_sending(&auth, retry).unwrap());
     assert!(matches!(outcome, SendOutcome::Settled { .. }));
 }
 
@@ -138,7 +166,7 @@ fn crash_after_sending_is_uncertain_and_retry_is_not_safe() {
             .unwrap();
         let auth = authority.authenticate(SECRET_A).unwrap();
         let permit = authority
-            .admit_sending(prepared_send(&authority, &auth, ROUTE, b"body"))
+            .admit_sending(&auth, prepared_send(&authority, &auth, ROUTE, b"body"))
             .unwrap();
         let id = permit.attempt();
         std::mem::forget(permit);
@@ -155,12 +183,84 @@ fn crash_after_sending_is_uncertain_and_retry_is_not_safe() {
     assert!(projection.ambiguous);
     assert!(!projection.settled || projection.state == "uncertain");
 
-    let retry = prepared_send(&authority, &auth, ROUTE, b"body");
-    let uncertain = authority.settle_uncertain(
-        authority.admit_sending(retry).unwrap(),
-        UncertainReason::TransportAfterPossibleWrite,
-    );
-    assert!(!uncertain.is_safe_to_resend());
+    assert!(matches!(
+        prepared_send_result(&authority, &auth, ROUTE, b"body"),
+        Err(AuthorityError::AmbiguousPriorAttempt)
+    ));
+}
+
+fn prepared_send_result(
+    authority: &HostAuthority,
+    auth: &AuthContext,
+    route: &str,
+    body: &[u8],
+) -> Result<PhysicalSendPermit, AuthorityError> {
+    let workspace = authority
+        .issue_workspace(auth, std::path::Path::new("/tmp"))
+        .unwrap();
+    let resource = authority.obtain_provider_send_surface(auth, workspace, route)?;
+    let capability = authority.seal_capability(
+        auth,
+        resource,
+        ActorClass::VerifiedOperator,
+        EffectClass::ProviderSend,
+        60_000,
+    )?;
+    let req = request(body);
+    let lease = authority.mint_lease(auth, &capability, req.digest(), 60_000)?;
+    authority.begin_send(auth, lease, &req, route)
+}
+
+#[test]
+fn same_route_ordinals_advance_on_reused_send_surface() {
+    let (_dir, authority, _admin) = host_with_credentials(&[("a", SECRET_A)]);
+    let auth = authority.authenticate(SECRET_A).unwrap();
+
+    let first = prepared_send_on_surface(&authority, &auth, ROUTE, b"first");
+    let second = prepared_send_on_surface(&authority, &auth, ROUTE, b"second");
+    let attempt_first = first.attempt();
+    let attempt_second = second.attempt();
+    let _ = authority.settle_settled(authority.admit_sending(&auth, first).unwrap());
+    let _ = authority.settle_settled(authority.admit_sending(&auth, second).unwrap());
+
+    let projection_first = authority
+        .attempt_projection(&auth, attempt_first)
+        .unwrap()
+        .unwrap();
+    let projection_second = authority
+        .attempt_projection(&auth, attempt_second)
+        .unwrap()
+        .unwrap();
+    assert_eq!(projection_first.ordinal, 1);
+    assert_eq!(projection_second.ordinal, 2);
+}
+
+#[test]
+fn admit_sending_revalidates_generations() {
+    let (_dir, authority, admin) = host_with_credentials(&[("a", SECRET_A)]);
+    let auth = authority.authenticate(SECRET_A).unwrap();
+    let permit = prepared_send_on_surface(&authority, &auth, ROUTE, b"body");
+    authority.rotate_capability_generation(&admin).unwrap();
+    let auth = authority.authenticate(SECRET_A).unwrap();
+    assert!(matches!(
+        authority.admit_sending(&auth, permit),
+        Err(AuthorityError::StaleCapability)
+    ));
+}
+
+#[test]
+fn schema_v2_provider_send_root_refuses_service() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    std::fs::write(
+        root.join("authority.json"),
+        r#"{"schema_version":2,"owner_id":"account-1","admin_credential_fingerprint":"abc","control_epoch":1,"capability_generation":1,"policy_revision":1,"next_auth_generation":1,"credentials":[],"resources":{},"capabilities":{},"leases":{},"attempts":{}}"#,
+    )
+    .unwrap();
+    match HostAuthority::open(&root, &admin_credential()) {
+        Err(AuthorityError::CorruptState(_)) => {}
+        other => panic!("expected corrupt state for schema v2 root, got {other:?}"),
+    }
 }
 
 #[test]

@@ -224,8 +224,12 @@ pub fn classify_error(
 
     // Generic retryable transport / 5xx errors. First retry rebuilds
     // the HTTP client with HTTP/1.1 to escape poisoned HTTP/2 pools;
-    // later retries just back off.
+    // later retries just back off. Possible-write failures must stand
+    // down unless the error proves the request was never sent.
     if err.is_retryable() {
+        if !err.is_proven_not_sent() {
+            return RetryDecision::Fatal(clone_error(err));
+        }
         let next_attempt = retry_count + 1;
         if next_attempt >= max_retries {
             return RetryDecision::Fatal(clone_error(err));
@@ -620,19 +624,60 @@ mod tests {
     }
 
     #[test]
-    fn classify_5xx_first_retry_rebuilds_client() {
+    fn classify_5xx_without_not_sent_proof_is_fatal() {
         let err = api_err(StatusCode::INTERNAL_SERVER_ERROR, "boom");
+        match classify_error(&err, 0, 5, RATE_LIMIT_RETRY_THRESHOLD) {
+            RetryDecision::Fatal(SamplingError::Api { status, .. }) => {
+                assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            }
+            other => panic!("expected Fatal for possible-write 5xx, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_event_stream_error_is_fatal_without_not_sent_proof() {
+        let err = SamplingError::EventStreamError("connection reset".into());
+        assert!(matches!(
+            classify_error(&err, 0, 5, RATE_LIMIT_RETRY_THRESHOLD),
+            RetryDecision::Fatal(_)
+        ));
+    }
+
+    #[test]
+    fn classify_stream_error_is_fatal_without_not_sent_proof() {
+        let err = SamplingError::StreamError {
+            error_type: "transient".into(),
+            message: "x".into(),
+        };
+        assert!(matches!(
+            classify_error(&err, 0, 5, RATE_LIMIT_RETRY_THRESHOLD),
+            RetryDecision::Fatal(_)
+        ));
+    }
+
+    #[test]
+    fn classify_5xx_first_retry_rebuilds_client() {
+        let err = SamplingError::Http({
+            let client = reqwest::Client::new();
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async { client.get("http://127.0.0.1:1").send().await.unwrap_err() })
+        });
+        assert!(err.is_proven_not_sent());
         match classify_error(&err, 0, 5, RATE_LIMIT_RETRY_THRESHOLD) {
             RetryDecision::RetryWithClientRebuild { backoff } => {
                 assert!(backoff >= Duration::from_millis(1600));
             }
-            other => panic!("expected RetryWithClientRebuild, got {other:?}"),
+            other => panic!("expected RetryWithClientRebuild for connect refusal, got {other:?}"),
         }
     }
 
     #[test]
     fn classify_5xx_subsequent_retry_uses_plain_retry() {
-        let err = api_err(StatusCode::BAD_GATEWAY, "boom");
+        let err = SamplingError::Http({
+            let client = reqwest::Client::new();
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async { client.get("http://127.0.0.1:1").send().await.unwrap_err() })
+        });
         match classify_error(&err, 1, 5, RATE_LIMIT_RETRY_THRESHOLD) {
             RetryDecision::Retry { backoff } => {
                 assert!(backoff >= Duration::from_millis(3200));
@@ -647,27 +692,6 @@ mod tests {
         match classify_error(&err, 4, 5, RATE_LIMIT_RETRY_THRESHOLD) {
             RetryDecision::Fatal(SamplingError::Api { .. }) => {}
             other => panic!("expected Fatal, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn classify_event_stream_error_is_retryable() {
-        let err = SamplingError::EventStreamError("connection reset".into());
-        match classify_error(&err, 0, 5, RATE_LIMIT_RETRY_THRESHOLD) {
-            RetryDecision::RetryWithClientRebuild { .. } => {}
-            other => panic!("expected RetryWithClientRebuild, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn classify_stream_error_is_retryable() {
-        let err = SamplingError::StreamError {
-            error_type: "transient".into(),
-            message: "x".into(),
-        };
-        match classify_error(&err, 0, 5, RATE_LIMIT_RETRY_THRESHOLD) {
-            RetryDecision::RetryWithClientRebuild { .. } => {}
-            other => panic!("expected RetryWithClientRebuild for StreamError, got {other:?}"),
         }
     }
 
@@ -791,13 +815,11 @@ mod tests {
 
     #[test]
     fn should_retry_true_falls_through_to_existing_logic() {
-        let err = SamplingError::Api {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: "boom".into(),
-            model_metadata: None,
-            retry_after_secs: None,
-            should_retry: Some(true),
-        };
+        let err = SamplingError::Http({
+            let client = reqwest::Client::new();
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async { client.get("http://127.0.0.1:1").send().await.unwrap_err() })
+        });
         assert!(matches!(
             classify_error(&err, 0, 15, RATE_LIMIT_RETRY_THRESHOLD),
             RetryDecision::RetryWithClientRebuild { .. }
@@ -806,13 +828,11 @@ mod tests {
 
     #[test]
     fn should_retry_absent_falls_through() {
-        let err = SamplingError::Api {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: "boom".into(),
-            model_metadata: None,
-            retry_after_secs: None,
-            should_retry: None,
-        };
+        let err = SamplingError::Http({
+            let client = reqwest::Client::new();
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async { client.get("http://127.0.0.1:1").send().await.unwrap_err() })
+        });
         assert!(matches!(
             classify_error(&err, 0, 15, RATE_LIMIT_RETRY_THRESHOLD),
             RetryDecision::RetryWithClientRebuild { .. }

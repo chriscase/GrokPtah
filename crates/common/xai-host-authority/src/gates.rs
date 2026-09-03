@@ -399,10 +399,24 @@ impl HostAuthority {
         let body_digest = request.body_digest();
         let dialect = request.dialect().to_string();
         let route_digest = route_digest_for(route);
+        let request_digest_hex = request_digest.to_hex();
 
         // Step 1: consume the lease and record the attempt, atomically.
         let admitted = self.with_state(|state| {
             require_current_state(state, auth)?;
+            for record in state.attempts.values() {
+                if record.principal != auth.principal.to_hex()
+                    || record.request_digest != request_digest_hex
+                {
+                    continue;
+                }
+                if matches!(
+                    record.state.as_str(),
+                    STATE_PREPARING | STATE_SENDING | STATE_UNCERTAIN
+                ) {
+                    return Err(AuthorityError::AmbiguousPriorAttempt);
+                }
+            }
             let capability_generation = state.capability_generation;
             let control_epoch = state.control_epoch;
             let stored = state
@@ -598,6 +612,7 @@ impl HostAuthority {
     /// may move. This is the only path from `preparing` to `sending`.
     pub fn admit_sending(
         &self,
+        auth: &AuthContext,
         permit: PhysicalSendPermit,
     ) -> Result<PhysicalSendPermit, AuthorityError> {
         if permit.wire_admitted {
@@ -607,10 +622,23 @@ impl HostAuthority {
         let attempt = permit.attempt;
         let epoch = permit.binding.control_epoch.raw();
         self.with_state(|state| {
+            require_current_state(state, auth)?;
             let record = state
                 .attempts
                 .get_mut(&attempt.to_hex())
                 .ok_or_else(|| AuthorityError::CorruptState("attempt record vanished".into()))?;
+            if record.principal != auth.principal.to_hex()
+                || record.credential_incarnation != auth.incarnation.to_hex()
+                || record.auth_generation != auth.auth_generation.raw()
+            {
+                return Err(AuthorityError::ResourceOwnershipMismatch);
+            }
+            if record.capability_generation != state.capability_generation
+                || record.policy_revision != state.policy_revision
+                || record.control_epoch != state.control_epoch
+            {
+                return Err(AuthorityError::StaleCapability);
+            }
             if record.state != STATE_PREPARING {
                 return Err(AuthorityError::Invalid("attempt is not preparing"));
             }
@@ -1085,8 +1113,12 @@ mod concurrency_tests {
             .unwrap()
     }
 
-    fn admit(permit: PhysicalSendPermit, authority: &HostAuthority) -> PhysicalSendPermit {
-        authority.admit_sending(permit).unwrap()
+    fn admit(
+        auth: &AuthContext,
+        permit: PhysicalSendPermit,
+        authority: &HostAuthority,
+    ) -> PhysicalSendPermit {
+        authority.admit_sending(auth, permit).unwrap()
     }
 
     #[test]
@@ -1109,6 +1141,7 @@ mod concurrency_tests {
         // Settlement cannot interleave its WAL append and snapshot update with
         // replay or recovery on another thread.
         let permit = admit(
+            &auth,
             permit_for(&authority, &auth, resource, b"settle"),
             &authority,
         );
@@ -1160,6 +1193,7 @@ mod concurrency_tests {
         // A wire-admitted attempt left in flight becomes uncertain and may be
         // reconciled.
         let permit = admit(
+            &auth,
             permit_for(&authority, &auth, resource, b"recover-sending"),
             &authority,
         );

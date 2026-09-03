@@ -255,6 +255,25 @@ impl SamplingError {
         }
     }
 
+    /// Whether the failure proves no provider-side effect could have occurred.
+    ///
+    /// Auto-retry is permitted only when this returns true. Timeouts after a
+    /// request may have been written, stream failures, and HTTP responses that
+    /// arrived all remain ambiguous and must not be retried automatically.
+    pub fn is_proven_not_sent(&self) -> bool {
+        match self {
+            SamplingError::Auth(_) | SamplingError::InvalidConfiguration(_) => true,
+            SamplingError::Http(err) => is_proven_not_sent_reqwest(err),
+            SamplingError::Serialization(_) => true,
+            SamplingError::Api { .. } => false,
+            SamplingError::EventStreamError(_) | SamplingError::StreamError { .. } => false,
+            SamplingError::IdleTimeout { .. } => false,
+            SamplingError::EmptyResponse { .. } => false,
+            SamplingError::MaxTokensTruncation => false,
+            SamplingError::DoomLoopDetected { .. } => false,
+        }
+    }
+
     pub fn model_metadata(&self) -> Option<&ResponseModelMetadata> {
         match self {
             SamplingError::Api { model_metadata, .. } => model_metadata.as_ref(),
@@ -392,6 +411,17 @@ pub fn is_retryable_reqwest(err: &reqwest::Error) -> bool {
         return true;
     }
 
+    false
+}
+
+/// True when a transport error proves the request never reached the provider.
+pub fn is_proven_not_sent_reqwest(err: &reqwest::Error) -> bool {
+    if err.is_connect() {
+        return true;
+    }
+    if err.is_timeout() && !err.is_request() {
+        return true;
+    }
     false
 }
 

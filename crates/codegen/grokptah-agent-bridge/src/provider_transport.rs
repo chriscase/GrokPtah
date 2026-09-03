@@ -18,7 +18,7 @@ use reqwest::header::{HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use xai_host_authority::{
-    ActorClass, AttemptId, ContentDigest, EffectClass, FailedReason, HostAdminAuthority,
+    ActorClass, AttemptId, AuthContext, EffectClass, FailedReason, HostAdminAuthority,
     HostAdminCredential, HostAuthority, HostCredential, PhysicalSendPermit, RequestIdentity,
     SendOutcome, UncertainReason,
 };
@@ -338,7 +338,7 @@ async fn send_provider_request_with(
         body,
     );
     let runtime = authority_runtime().map_err(ProviderTransportError::before_dispatch)?;
-    let permit = runtime
+    let (auth, permit) = runtime
         .permit(&identity, scope.target_scope)
         .map_err(ProviderTransportError::before_dispatch)?;
     if dialect_supports_wire_idempotency(permit.dialect()) {
@@ -351,8 +351,8 @@ async fn send_provider_request_with(
     }
     let permit = runtime
         .authority
-        .admit_sending(permit)
-        .map_err(|error| ProviderTransportError::before_dispatch(error))?;
+        .admit_sending(&auth, permit)
+        .map_err(ProviderTransportError::before_dispatch)?;
 
     let result = if let Some(cancel) = cancel {
         tokio::select! {
@@ -576,16 +576,13 @@ impl ProviderAuthority {
         &self,
         request: &RequestIdentity,
         target_scope: &str,
-    ) -> anyhow::Result<PhysicalSendPermit> {
+    ) -> anyhow::Result<(AuthContext, PhysicalSendPermit)> {
         let auth = self.authority.authenticate(&self.service_bearer)?;
-        let session = self.authority.issue_session(&auth)?;
         let cwd = std::env::current_dir().context("resolve provider-send workspace")?;
         let workspace = self.authority.issue_workspace(&auth, &cwd)?;
-        let observation =
-            ContentDigest::of_fields(&[("provider-send-target-v1", target_scope.as_bytes())]);
-        let resource = self
-            .authority
-            .issue_resource(&auth, session, workspace, observation)?;
+        let resource =
+            self.authority
+                .obtain_provider_send_surface(&auth, workspace, target_scope)?;
         let capability = self.authority.seal_capability(
             &auth,
             resource,
@@ -596,9 +593,10 @@ impl ProviderAuthority {
         let lease =
             self.authority
                 .mint_lease(&auth, &capability, request.digest(), LEASE_TTL_MS)?;
-        Ok(self
+        let permit = self
             .authority
-            .begin_send(&auth, lease, request, target_scope)?)
+            .begin_send(&auth, lease, request, target_scope)?;
+        Ok((auth, permit))
     }
 }
 

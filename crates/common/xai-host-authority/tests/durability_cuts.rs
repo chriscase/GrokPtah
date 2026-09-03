@@ -21,8 +21,12 @@ fn admin_credential() -> HostAdminCredential {
 }
 const SECRET: &str = "s3cret-bearer-value";
 
-fn admit_wire(authority: &HostAuthority, permit: PhysicalSendPermit) -> PhysicalSendPermit {
-    authority.admit_sending(permit).unwrap()
+fn admit_wire(
+    authority: &HostAuthority,
+    auth: &AuthContext,
+    permit: PhysicalSendPermit,
+) -> PhysicalSendPermit {
+    authority.admit_sending(auth, permit).unwrap()
 }
 
 fn request(body: &[u8]) -> RequestIdentity {
@@ -123,6 +127,7 @@ fn audit_trouble_after_dispatch_never_reports_an_ordinary_failure() {
     // physical send possible.
     let permit = admit_wire(
         &r.authority,
+        &r.auth,
         r.authority
             .begin_send(&r.auth, r.lease, &req, "test-route")
             .unwrap(),
@@ -166,6 +171,7 @@ fn a_successful_send_with_a_broken_audit_log_is_also_ambiguous() {
     let req = request(b"body");
     let permit = admit_wire(
         &r.authority,
+        &r.auth,
         r.authority
             .begin_send(&r.auth, r.lease, &req, "test-route")
             .unwrap(),
