@@ -21,6 +21,7 @@ pub(crate) const STATE_SENDING: &str = "sending";
 pub(crate) const STATE_SETTLED: &str = "settled";
 pub(crate) const STATE_FAILED: &str = "failed";
 pub(crate) const STATE_UNCERTAIN: &str = "uncertain";
+pub(crate) const STATE_DISCARDED: &str = "discarded";
 
 impl HostAuthority {
     /// Replay terminal attempt records from the verified audit WAL into the
@@ -76,6 +77,7 @@ impl HostAuthority {
                     let state = match truth.as_str() {
                         "took_effect" => STATE_SETTLED,
                         "no_effect" => STATE_FAILED,
+                        "discarded" => STATE_DISCARDED,
                         _ => {
                             return Err(AuthorityError::CorruptState(format!(
                                 "unknown audited reconciliation truth {truth}"
@@ -987,15 +989,55 @@ impl HostAuthority {
             {
                 return Ok(None);
             }
-            Ok(Some(AttemptProjection {
-                attempt: attempt.public_handle(),
-                state: record.state.clone(),
-                ordinal: record.ordinal,
-                request_digest: decode_digest(&record.request_digest, "request")?.public_handle(),
-                body_digest: decode_digest(&record.body_digest, "body")?.public_handle(),
-                settled: record.state != STATE_PREPARING && record.state != STATE_SENDING,
-                ambiguous: record.state == STATE_UNCERTAIN,
-            }))
+            Ok(Some(project_stored_attempt(attempt, record)?))
+        })
+    }
+
+    /// Secret-free list of attempts owned by this principal in this session and
+    /// workspace. Foreign work is omitted, never distinguished.
+    pub fn list_scoped_attempt_projections(
+        &self,
+        auth: &AuthContext,
+        session: SessionId,
+        workspace: WorkspaceId,
+    ) -> Result<Vec<AttemptProjection>, AuthorityError> {
+        self.read(|state| {
+            require_current_state(state, auth)?;
+            let mut out = Vec::new();
+            for (key, record) in &state.attempts {
+                if !attempt_in_scope(record, auth, session, workspace) {
+                    continue;
+                }
+                let attempt: AttemptId = decode_id(key, "attempt")?;
+                out.push(project_stored_attempt(attempt, record)?);
+            }
+            out.sort_by(|left, right| {
+                left.ordinal
+                    .cmp(&right.ordinal)
+                    .then_with(|| left.attempt.cmp(&right.attempt))
+            });
+            Ok(out)
+        })
+    }
+
+    /// Secret-free get by public attempt handle, scoped to principal, session,
+    /// and workspace. Unknown and foreign handles return `None` identically.
+    pub fn scoped_attempt_projection(
+        &self,
+        auth: &AuthContext,
+        session: SessionId,
+        workspace: WorkspaceId,
+        attempt_handle: &str,
+    ) -> Result<Option<AttemptProjection>, AuthorityError> {
+        self.read(|state| {
+            require_current_state(state, auth)?;
+            let Some((attempt, record)) = find_attempt_by_handle(state, attempt_handle)? else {
+                return Ok(None);
+            };
+            if !attempt_in_scope(&record, auth, session, workspace) {
+                return Ok(None);
+            }
+            Ok(Some(project_stored_attempt(attempt, &record)?))
         })
     }
 
@@ -1015,7 +1057,9 @@ impl HostAuthority {
         Ok(())
     }
 
-    fn lock_attempt_lifecycle(&self) -> Result<std::sync::MutexGuard<'_, ()>, AuthorityError> {
+    pub(crate) fn lock_attempt_lifecycle(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, ()>, AuthorityError> {
         self.attempt_lifecycle
             .lock()
             .map_err(|_| AuthorityError::Durability("attempt lifecycle lock poisoned".into()))
@@ -1087,6 +1131,95 @@ pub struct AttemptProjection {
     pub body_digest: String,
     pub settled: bool,
     pub ambiguous: bool,
+    /// Public session handle. Not a filesystem path.
+    pub session: String,
+    /// Public workspace handle. Not a filesystem path.
+    pub workspace: String,
+    /// Wire dialect class (for example `openai-chat`). Never a URL or raw route.
+    pub dialect: String,
+    /// Public handle of the logical route digest. Never the raw route string.
+    pub route: String,
+    /// CAS token for this durable attempt record.
+    pub revision: String,
+    pub auth_generation: u64,
+    pub capability_generation: u64,
+    pub policy_revision: u64,
+}
+
+pub(crate) fn project_stored_attempt(
+    attempt: AttemptId,
+    record: &StoredAttempt,
+) -> Result<AttemptProjection, AuthorityError> {
+    let session: SessionId = decode_id(&record.session, "session")?;
+    let workspace: WorkspaceId = decode_id(&record.workspace, "workspace")?;
+    let route = decode_digest(&record.route_digest, "route")?;
+    Ok(AttemptProjection {
+        attempt: attempt.public_handle(),
+        state: record.state.clone(),
+        ordinal: record.ordinal,
+        request_digest: decode_digest(&record.request_digest, "request")?.public_handle(),
+        body_digest: decode_digest(&record.body_digest, "body")?.public_handle(),
+        settled: record.state != STATE_PREPARING && record.state != STATE_SENDING,
+        ambiguous: record.state == STATE_UNCERTAIN,
+        session: session.public_handle(),
+        workspace: workspace.public_handle(),
+        dialect: record.dialect.clone(),
+        route: route.public_handle(),
+        revision: attempt_revision(attempt, record).public_handle(),
+        auth_generation: record.auth_generation,
+        capability_generation: record.capability_generation,
+        policy_revision: record.policy_revision,
+    })
+}
+
+pub(crate) fn attempt_revision(attempt: AttemptId, record: &StoredAttempt) -> ContentDigest {
+    ContentDigest::of_fields(&[
+        ("attempt-revision-v1", attempt.to_hex().as_bytes()),
+        ("state", record.state.as_bytes()),
+        (
+            "settlement",
+            record.settlement.as_deref().unwrap_or("").as_bytes(),
+        ),
+        ("ordinal", &record.ordinal.to_le_bytes()),
+        ("dialect", record.dialect.as_bytes()),
+        ("route", record.route_digest.as_bytes()),
+        ("auth_generation", &record.auth_generation.to_le_bytes()),
+        (
+            "capability_generation",
+            &record.capability_generation.to_le_bytes(),
+        ),
+        ("policy_revision", &record.policy_revision.to_le_bytes()),
+    ])
+}
+
+pub(crate) fn attempt_in_scope(
+    record: &StoredAttempt,
+    auth: &AuthContext,
+    session: SessionId,
+    workspace: WorkspaceId,
+) -> bool {
+    record.principal == auth.principal.to_hex()
+        && record.session == session.to_hex()
+        && record.workspace == workspace.to_hex()
+}
+
+pub(crate) fn find_attempt_by_handle(
+    state: &StoredAuthority,
+    attempt_handle: &str,
+) -> Result<Option<(AttemptId, StoredAttempt)>, AuthorityError> {
+    let mut found = None;
+    for (key, record) in &state.attempts {
+        let attempt: AttemptId = decode_id(key, "attempt")?;
+        if attempt.public_handle() == attempt_handle {
+            if found.is_some() {
+                return Err(AuthorityError::CorruptState(
+                    "attempt public-handle collision".into(),
+                ));
+            }
+            found = Some((attempt, record.clone()));
+        }
+    }
+    Ok(found)
 }
 
 /// Deterministic idempotency key for an attempt, so a provider that supports

@@ -91,6 +91,12 @@ pub enum AuditEvent {
     },
     /// An ambiguous attempt was reconciled by an explicit host decision.
     AttemptReconciled { attempt: String, truth: String },
+    /// An operator reviewed an attempt under an exact-state grant. No mutation.
+    AttemptReviewed {
+        attempt: String,
+        principal: String,
+        disposition: String,
+    },
     /// Authority was refused.
     Denied { principal: String, reason: String },
 }

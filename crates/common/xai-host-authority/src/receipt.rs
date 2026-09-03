@@ -204,6 +204,10 @@ pub enum EffectClass {
     ComputerUseAct,
     /// Work handed to an external worker process.
     ExternalWorkerDispatch,
+    /// An operator disposition of one already-recorded provider attempt.
+    ///
+    /// This never authorises a physical send. `begin_send` rejects it.
+    OperatorReconcile,
 }
 
 impl EffectClass {
@@ -212,6 +216,7 @@ impl EffectClass {
             Self::ProviderSend => "provider_send",
             Self::ComputerUseAct => "computer_use_act",
             Self::ExternalWorkerDispatch => "external_worker_dispatch",
+            Self::OperatorReconcile => "operator_reconcile",
         }
     }
 
@@ -220,8 +225,135 @@ impl EffectClass {
             "provider_send" => Some(Self::ProviderSend),
             "computer_use_act" => Some(Self::ComputerUseAct),
             "external_worker_dispatch" => Some(Self::ExternalWorkerDispatch),
+            "operator_reconcile" => Some(Self::OperatorReconcile),
             _ => None,
         }
+    }
+}
+
+/// Explicit operator disposition of an uncertain (or still in-flight) attempt.
+///
+/// None of these variants performs provider I/O or resends work.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum ReconciliationDisposition {
+    /// Inspect the bound attempt at this revision. No state change.
+    Review,
+    /// Assert the attempt never reached the wire. Requires host pre-wire evidence.
+    MarkNotSent,
+    /// Assert the attempt took effect. Requires a provider receipt or independent
+    /// operator observation digest; `observed_at` alone is not identity proof.
+    MarkSettled,
+    /// Explicitly discard the attempt without asserting provider effect.
+    Discard,
+}
+
+impl ReconciliationDisposition {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Review => "review",
+            Self::MarkNotSent => "mark_not_sent",
+            Self::MarkSettled => "mark_settled",
+            Self::Discard => "discard",
+        }
+    }
+
+    pub(crate) fn truth(self) -> Option<&'static str> {
+        match self {
+            Self::Review => None,
+            Self::MarkNotSent => Some("no_effect"),
+            Self::MarkSettled => Some("took_effect"),
+            Self::Discard => Some("discarded"),
+        }
+    }
+}
+
+/// Evidence the operator presents when settling or discarding an attempt.
+///
+/// Identity is a provider-receipt digest or an independent operator observation
+/// digest. A wall-clock `observed_at_ms` is never sufficient on its own.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct ReconciliationEvidence {
+    pub(crate) provider_receipt: Option<ContentDigest>,
+    pub(crate) operator_observation: Option<ContentDigest>,
+    pub(crate) observed_at_ms: Option<u64>,
+}
+
+impl ReconciliationEvidence {
+    /// Evidence that identifies a provider-issued receipt.
+    pub fn provider_receipt(digest: ContentDigest) -> Self {
+        Self {
+            provider_receipt: Some(digest),
+            operator_observation: None,
+            observed_at_ms: None,
+        }
+    }
+
+    /// Independent operator observation of provider truth. Not a timestamp.
+    pub fn operator_observation(digest: ContentDigest) -> Self {
+        Self {
+            provider_receipt: None,
+            operator_observation: Some(digest),
+            observed_at_ms: None,
+        }
+    }
+
+    /// Timestamp-only claim. This is never identity proof.
+    pub fn observed_at_only(observed_at_ms: u64) -> Self {
+        Self {
+            provider_receipt: None,
+            operator_observation: None,
+            observed_at_ms: Some(observed_at_ms),
+        }
+    }
+
+    /// Whether this evidence identifies a provider receipt or operator observation.
+    pub fn has_identity_proof(&self) -> bool {
+        self.provider_receipt.is_some() || self.operator_observation.is_some()
+    }
+}
+
+/// Short-lived, one-use operator grant bound to one attempt at one revision.
+///
+/// Fields are private and there is no public constructor. The only producer is
+/// [`crate::HostAuthority::mint_reconciliation_grant`].
+#[must_use = "a reconciliation grant authorises nothing until it is spent"]
+pub struct ReconciliationGrant {
+    pub(crate) lease: EffectLease,
+    pub(crate) attempt: AttemptId,
+    pub(crate) revision: ContentDigest,
+    pub(crate) state: String,
+    pub(crate) dialect: String,
+    pub(crate) route_digest: ContentDigest,
+    pub(crate) disposition: ReconciliationDisposition,
+    pub(crate) expires_at_ms: u64,
+}
+
+impl ReconciliationGrant {
+    pub fn attempt(&self) -> AttemptId {
+        self.attempt
+    }
+    pub fn revision(&self) -> ContentDigest {
+        self.revision
+    }
+    pub fn disposition(&self) -> ReconciliationDisposition {
+        self.disposition
+    }
+    pub fn expires_at_ms(&self) -> u64 {
+        self.expires_at_ms
+    }
+    /// Effect class this grant authorises. Always operator reconcile, never send.
+    pub fn effect(&self) -> EffectClass {
+        self.lease.effect()
+    }
+}
+
+impl std::fmt::Debug for ReconciliationGrant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReconciliationGrant")
+            .field("attempt", &self.attempt.public_handle())
+            .field("revision", &self.revision.public_handle())
+            .field("disposition", &self.disposition)
+            .finish_non_exhaustive()
     }
 }
 

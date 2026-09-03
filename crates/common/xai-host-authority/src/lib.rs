@@ -215,6 +215,22 @@
 //!     let _ = authority.settle_settled(permit);
 //! }
 //! ```
+//!
+//! An operator reconciliation grant cannot be forged:
+//!
+//! ```compile_fail
+//! # use xai_host_authority::*;
+//! let _ = ReconciliationGrant {
+//!     lease: todo!(),
+//!     attempt: todo!(),
+//!     revision: todo!(),
+//!     state: String::new(),
+//!     dialect: String::new(),
+//!     route_digest: todo!(),
+//!     disposition: ReconciliationDisposition::Discard,
+//!     expires_at_ms: 0,
+//! };
+//! ```
 
 mod audit;
 mod digest;
@@ -225,6 +241,7 @@ mod internal;
 mod operator_send;
 mod projection;
 mod receipt;
+mod reconciliation;
 mod state;
 mod store;
 
@@ -242,7 +259,8 @@ pub use operator_send::{OperatorSendHost, install_operator_send_root};
 pub use projection::{PrincipalProjection, ServiceLivenessProjection};
 pub use receipt::{
     ActorClass, AuthContext, AuthorityBinding, EffectClass, EffectLease, FailedReason,
-    PhysicalSendPermit, SealedCapability, SendOutcome, UncertainReason,
+    PhysicalSendPermit, ReconciliationDisposition, ReconciliationEvidence, ReconciliationGrant,
+    SealedCapability, SendOutcome, UncertainReason,
 };
 pub use store::{HostAdminAuthority, HostAdminCredential, HostAuthority, HostCredential};
 
