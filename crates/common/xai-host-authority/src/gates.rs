@@ -21,6 +21,7 @@ pub(crate) const STATE_SENDING: &str = "sending";
 pub(crate) const STATE_SETTLED: &str = "settled";
 pub(crate) const STATE_FAILED: &str = "failed";
 pub(crate) const STATE_UNCERTAIN: &str = "uncertain";
+pub(crate) const STATE_DISCARDED: &str = "discarded";
 
 impl HostAuthority {
     /// Replay terminal attempt records from the verified audit WAL into the
@@ -53,6 +54,7 @@ impl HostAuthority {
         };
 
         let mut outcomes = std::collections::BTreeMap::<String, (String, String)>::new();
+        let mut reconciliation_truths = std::collections::BTreeMap::<String, String>::new();
         for record in records {
             match record.event {
                 AuditEvent::SendOutcome {
@@ -70,18 +72,33 @@ impl HostAuthority {
                             )));
                         }
                     };
+                    if let Some((_, existing_detail)) = outcomes.get(&attempt)
+                        && existing_detail.starts_with("reconciled")
+                    {
+                        continue;
+                    }
                     outcomes.insert(attempt, (state.to_string(), detail));
                 }
                 AuditEvent::AttemptReconciled { attempt, truth } => {
                     let state = match truth.as_str() {
                         "took_effect" => STATE_SETTLED,
                         "no_effect" => STATE_FAILED,
+                        "discarded" => STATE_DISCARDED,
                         _ => {
                             return Err(AuthorityError::CorruptState(format!(
                                 "unknown audited reconciliation truth {truth}"
                             )));
                         }
                     };
+                    if let Some(existing) = reconciliation_truths.get(&attempt) {
+                        if existing != &truth {
+                            return Err(AuthorityError::CorruptState(
+                                "conflicting reconciliation audit records for one attempt".into(),
+                            ));
+                        }
+                    } else {
+                        reconciliation_truths.insert(attempt.clone(), truth.clone());
+                    }
                     outcomes.insert(attempt, (state.to_string(), "reconciled".into()));
                 }
                 _ => {}
@@ -682,7 +699,8 @@ impl HostAuthority {
     ///
     /// There is no retry here and no path back to a fresh permit: an
     /// [`SendOutcome::Uncertain`] attempt is resolved by
-    /// [`Self::reconcile_attempt`] after the host establishes provider truth.
+    /// [`Self::mint_reconciliation_grant`] and [`Self::apply_reconciliation`]
+    /// after the host establishes provider truth.
     pub fn settle_uncertain(
         &self,
         permit: PhysicalSendPermit,
@@ -720,7 +738,7 @@ impl HostAuthority {
             state
                 .attempts
                 .get(&attempt.to_hex())
-                .map(|record| record.state.clone())
+                .cloned()
                 .ok_or_else(|| AuthorityError::CorruptState("attempt record vanished".into()))
         }) {
             Ok(state) => state,
@@ -731,6 +749,11 @@ impl HostAuthority {
                 };
             }
         };
+        if let Some(outcome) =
+            crate::reconciliation::absorb_settlement_for_reconciled_attempt(attempt, &current_state)
+        {
+            return outcome;
+        }
         if durable_state == STATE_SETTLED && !permit.wire_admitted {
             return SendOutcome::Uncertain {
                 attempt,
@@ -739,7 +762,7 @@ impl HostAuthority {
         }
         if durable_state == STATE_UNCERTAIN
             && !permit.wire_admitted
-            && current_state != STATE_SENDING
+            && current_state.state != STATE_SENDING
         {
             return SendOutcome::Failed {
                 attempt,
@@ -908,63 +931,19 @@ impl HostAuthority {
 
     /// Resolve an ambiguous attempt with established provider truth.
     ///
-    /// This is the only exit from [`SendOutcome::Uncertain`], and it takes a
-    /// decision the host made by observing the provider, not a retry.
-    ///
-    /// Requires admin authority precisely because it is that decision:
-    /// declaring that an ambiguous effect did or did not happen is an operator
-    /// assertion about the outside world, and nothing that merely holds a
-    /// `&HostAuthority` is entitled to make it.
+    /// **Migration seam:** this legacy admin-only path is retired. Callers must
+    /// use [`Self::mint_reconciliation_grant`] and [`Self::apply_reconciliation`]
+    /// with the current evidence/grant contract instead.
     pub fn reconcile_attempt(
         &self,
         admin: &HostAdminAuthority,
         attempt: AttemptId,
         took_effect: bool,
     ) -> Result<(), AuthorityError> {
-        self.require_admin(admin)?;
-        let _lifecycle = self.lock_attempt_lifecycle()?;
-        let epoch = self.read(|state| {
-            let record = state
-                .attempts
-                .get(&attempt.to_hex())
-                .ok_or(AuthorityError::UnknownResource)?;
-            // `sending` is accepted as well as `uncertain`: a settlement whose
-            // write failed leaves the record in flight while the caller was
-            // told Uncertain, and that caller must still be able to reconcile.
-            if record.state != STATE_UNCERTAIN && record.state != STATE_SENDING {
-                return Err(AuthorityError::Invalid("attempt is already settled"));
-            }
-            Ok(state.control_epoch)
-        })?;
-        // WAL first. If this append fails, state remains ambiguous. If the
-        // following snapshot write fails, open-time replay applies this exact
-        // operator truth before recovery is allowed to classify anything.
-        self.append_audit(
-            epoch,
-            AuditEvent::AttemptReconciled {
-                attempt: attempt.public_handle(),
-                truth: if took_effect {
-                    "took_effect"
-                } else {
-                    "no_effect"
-                }
-                .to_string(),
-            },
-        )?;
-        self.with_state(|state| {
-            let record = state
-                .attempts
-                .get_mut(&attempt.to_hex())
-                .ok_or(AuthorityError::UnknownResource)?;
-            record.state = if took_effect {
-                STATE_SETTLED
-            } else {
-                STATE_FAILED
-            }
-            .to_string();
-            record.settlement = Some("reconciled".to_string());
-            Ok(())
-        })
+        let _ = (admin, attempt, took_effect);
+        Err(AuthorityError::Invalid(
+            crate::reconciliation::LEGACY_RECONCILE_ATTEMPT_RETIRED,
+        ))
     }
 
     /// A secret-, content-, and path-free view of an attempt.
@@ -987,15 +966,55 @@ impl HostAuthority {
             {
                 return Ok(None);
             }
-            Ok(Some(AttemptProjection {
-                attempt: attempt.public_handle(),
-                state: record.state.clone(),
-                ordinal: record.ordinal,
-                request_digest: decode_digest(&record.request_digest, "request")?.public_handle(),
-                body_digest: decode_digest(&record.body_digest, "body")?.public_handle(),
-                settled: record.state != STATE_PREPARING && record.state != STATE_SENDING,
-                ambiguous: record.state == STATE_UNCERTAIN,
-            }))
+            Ok(Some(project_stored_attempt(attempt, record)?))
+        })
+    }
+
+    /// Secret-free list of attempts owned by this principal in this session and
+    /// workspace. Foreign work is omitted, never distinguished.
+    pub fn list_scoped_attempt_projections(
+        &self,
+        auth: &AuthContext,
+        session: SessionId,
+        workspace: WorkspaceId,
+    ) -> Result<Vec<AttemptProjection>, AuthorityError> {
+        self.read(|state| {
+            require_current_state(state, auth)?;
+            let mut out = Vec::new();
+            for (key, record) in &state.attempts {
+                if !attempt_in_scope(record, auth, session, workspace) {
+                    continue;
+                }
+                let attempt: AttemptId = decode_id(key, "attempt")?;
+                out.push(project_stored_attempt(attempt, record)?);
+            }
+            out.sort_by(|left, right| {
+                left.ordinal
+                    .cmp(&right.ordinal)
+                    .then_with(|| left.attempt.cmp(&right.attempt))
+            });
+            Ok(out)
+        })
+    }
+
+    /// Secret-free get by public attempt handle, scoped to principal, session,
+    /// and workspace. Unknown and foreign handles return `None` identically.
+    pub fn scoped_attempt_projection(
+        &self,
+        auth: &AuthContext,
+        session: SessionId,
+        workspace: WorkspaceId,
+        attempt_handle: &str,
+    ) -> Result<Option<AttemptProjection>, AuthorityError> {
+        self.read(|state| {
+            require_current_state(state, auth)?;
+            let Some((attempt, record)) = find_attempt_by_handle(state, attempt_handle)? else {
+                return Ok(None);
+            };
+            if !attempt_in_scope(&record, auth, session, workspace) {
+                return Ok(None);
+            }
+            Ok(Some(project_stored_attempt(attempt, &record)?))
         })
     }
 
@@ -1015,7 +1034,9 @@ impl HostAuthority {
         Ok(())
     }
 
-    fn lock_attempt_lifecycle(&self) -> Result<std::sync::MutexGuard<'_, ()>, AuthorityError> {
+    pub(crate) fn lock_attempt_lifecycle(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, ()>, AuthorityError> {
         self.attempt_lifecycle
             .lock()
             .map_err(|_| AuthorityError::Durability("attempt lifecycle lock poisoned".into()))
@@ -1087,6 +1108,95 @@ pub struct AttemptProjection {
     pub body_digest: String,
     pub settled: bool,
     pub ambiguous: bool,
+    /// Public session handle. Not a filesystem path.
+    pub session: String,
+    /// Public workspace handle. Not a filesystem path.
+    pub workspace: String,
+    /// Wire dialect class (for example `openai-chat`). Never a URL or raw route.
+    pub dialect: String,
+    /// Public handle of the logical route digest. Never the raw route string.
+    pub route: String,
+    /// CAS token for this durable attempt record.
+    pub revision: String,
+    pub auth_generation: u64,
+    pub capability_generation: u64,
+    pub policy_revision: u64,
+}
+
+pub(crate) fn project_stored_attempt(
+    attempt: AttemptId,
+    record: &StoredAttempt,
+) -> Result<AttemptProjection, AuthorityError> {
+    let session: SessionId = decode_id(&record.session, "session")?;
+    let workspace: WorkspaceId = decode_id(&record.workspace, "workspace")?;
+    let route = decode_digest(&record.route_digest, "route")?;
+    Ok(AttemptProjection {
+        attempt: attempt.public_handle(),
+        state: record.state.clone(),
+        ordinal: record.ordinal,
+        request_digest: decode_digest(&record.request_digest, "request")?.public_handle(),
+        body_digest: decode_digest(&record.body_digest, "body")?.public_handle(),
+        settled: record.state != STATE_PREPARING && record.state != STATE_SENDING,
+        ambiguous: record.state == STATE_UNCERTAIN,
+        session: session.public_handle(),
+        workspace: workspace.public_handle(),
+        dialect: record.dialect.clone(),
+        route: route.public_handle(),
+        revision: attempt_revision(attempt, record).public_handle(),
+        auth_generation: record.auth_generation,
+        capability_generation: record.capability_generation,
+        policy_revision: record.policy_revision,
+    })
+}
+
+pub(crate) fn attempt_revision(attempt: AttemptId, record: &StoredAttempt) -> ContentDigest {
+    ContentDigest::of_fields(&[
+        ("attempt-revision-v1", attempt.to_hex().as_bytes()),
+        ("state", record.state.as_bytes()),
+        (
+            "settlement",
+            record.settlement.as_deref().unwrap_or("").as_bytes(),
+        ),
+        ("ordinal", &record.ordinal.to_le_bytes()),
+        ("dialect", record.dialect.as_bytes()),
+        ("route", record.route_digest.as_bytes()),
+        ("auth_generation", &record.auth_generation.to_le_bytes()),
+        (
+            "capability_generation",
+            &record.capability_generation.to_le_bytes(),
+        ),
+        ("policy_revision", &record.policy_revision.to_le_bytes()),
+    ])
+}
+
+pub(crate) fn attempt_in_scope(
+    record: &StoredAttempt,
+    auth: &AuthContext,
+    session: SessionId,
+    workspace: WorkspaceId,
+) -> bool {
+    record.principal == auth.principal.to_hex()
+        && record.session == session.to_hex()
+        && record.workspace == workspace.to_hex()
+}
+
+pub(crate) fn find_attempt_by_handle(
+    state: &StoredAuthority,
+    attempt_handle: &str,
+) -> Result<Option<(AttemptId, StoredAttempt)>, AuthorityError> {
+    let mut found = None;
+    for (key, record) in &state.attempts {
+        let attempt: AttemptId = decode_id(key, "attempt")?;
+        if attempt.public_handle() == attempt_handle {
+            if found.is_some() {
+                return Err(AuthorityError::CorruptState(
+                    "attempt public-handle collision".into(),
+                ));
+            }
+            found = Some((attempt, record.clone()));
+        }
+    }
+    Ok(found)
 }
 
 /// Deterministic idempotency key for an attempt, so a provider that supports
@@ -1246,16 +1356,31 @@ mod concurrency_tests {
         });
 
         // Reconciliation is serialized with the same transaction boundary.
+        let handle = recovering.public_handle();
+        let grant = authority
+            .mint_reconciliation_grant(
+                &auth,
+                session,
+                workspace,
+                &handle,
+                ReconciliationDisposition::MarkSettled,
+                60_000,
+            )
+            .unwrap();
+        let auth_for_thread = auth.clone();
         let lifecycle = authority.attempt_lifecycle.lock().unwrap();
         std::thread::scope(|scope| {
             let (started_tx, started_rx) = mpsc::channel();
             let (done_tx, done_rx) = mpsc::channel();
             let authority = &authority;
-            let admin = &admin;
             scope.spawn(move || {
                 started_tx.send(()).unwrap();
                 done_tx
-                    .send(authority.reconcile_attempt(admin, recovering, true))
+                    .send(authority.apply_reconciliation(
+                        &auth_for_thread,
+                        grant,
+                        ReconciliationEvidence::provider_receipt(ContentDigest::of_bytes(b"rcpt")),
+                    ))
                     .unwrap();
             });
             started_rx.recv().unwrap();
