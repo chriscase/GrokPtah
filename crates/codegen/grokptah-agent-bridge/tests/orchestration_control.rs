@@ -12,8 +12,8 @@ use axum::routing::post;
 use axum::{Json, Router};
 use chrono::Utc;
 use grokptah_agent_bridge::orchestration::{
-    hash_payload, AgentModelSpec, OrchStore, OrchestrationConfig, OrchestrationService, RunBounds,
-    RunExecutionMode, RunRecord, RunState, WorkspaceAllowlist,
+    hash_payload, AgentModelSpec, AuthContext, OrchStore, OrchestrationConfig,
+    OrchestrationService, RunBounds, RunExecutionMode, RunRecord, RunState, WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
     discovered_tool_names, model_selection_key, set_grokptah_home_override, start_control_server,
@@ -296,6 +296,59 @@ async fn idempotency_conflict_and_replay() {
         .await
         .unwrap();
     assert_eq!(r1, r2);
+    let rotated = AuthContext {
+        token_id: "rotated-credential".into(),
+        owner_id: auth.owner_id.clone(),
+    };
+    let rotated_replay = orch
+        .queue_prompt(
+            &rotated,
+            "req-1",
+            session.id,
+            ws.path(),
+            "hello world".into(),
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        r1, rotated_replay,
+        "credential rotation must preserve replay"
+    );
+
+    let foreign = AuthContext {
+        token_id: "foreign-token".into(),
+        owner_id: "foreign-owner".into(),
+    };
+    let foreign_result = orch
+        .queue_prompt(
+            &foreign,
+            "req-1",
+            session.id,
+            ws.path(),
+            "hello world".into(),
+            false,
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        r1, foreign_result,
+        "another principal must perform independently rather than replay"
+    );
+
+    let other_session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(other_session.id, ws.path()).unwrap();
+    assert!(orch
+        .queue_prompt(
+            &auth,
+            "req-1",
+            other_session.id,
+            ws.path(),
+            "hello world".into(),
+            false,
+        )
+        .await
+        .is_err());
     let conflict = orch.queue_prompt(
         &auth,
         "req-1",

@@ -10,6 +10,7 @@ mod manager;
 mod message;
 mod public_event;
 mod public_run;
+mod receipt;
 mod routine;
 mod service;
 mod store;
@@ -65,6 +66,10 @@ pub use public_run::{
     parse_public_run_v1, PublicRunDtoError, PublicRunHandoffV1, PublicRunListV1,
     PublicRunProgressV1, PublicRunV1, PUBLIC_RUN_SCHEMA_VERSION,
 };
+pub use receipt::{
+    OperationReceiptPageV1, OperationReceiptV1, MAX_OPERATION_RECEIPT_PAGE_SIZE,
+    OPERATION_RECEIPT_SCHEMA_VERSION,
+};
 pub use routine::{
     occurrence_dedupe_key, ActivationCause, ActivationDisposition, ActivationRecord,
     ActivationRequest, CapturedActivationPolicy, Clock, ExternalAdapterKind, FakeClock,
@@ -83,16 +88,17 @@ pub use supervisor::{
     DEFAULT_ROUTINE_TICK_INTERVAL, DEFAULT_WORKLOAD_RECONCILIATION_INTERVAL,
     MAX_MANAGER_OBSERVATIONS_PER_PASS, MAX_MANAGER_PLANS_PER_PASS,
 };
+pub use types::IdempotencyScope;
 pub use types::{
     hash_payload, is_recognized_test_command, merge_bounds, prompt_preview, reject_control_prompt,
     safe_id_filename, AgentAuthorityPolicy, AgentLaneAssociation, AgentMemoryPolicy,
     AgentModelSpec, AgentRecord, AgentResumePlan, AgentRuntimeState, AgentSpec, AgentState,
     AuditEntry, ChangeRecord, ContinuationCheckpoint, ContinuationReason, CoordinatorAgentView,
-    CoordinatorCheckpointView, CoordinatorResumePlanView, IdempotencyReceipt, OrchError,
-    OrchErrorCode, PromotionState, RunAggregates, RunApproval, RunBounds, RunExecution,
-    RunExecutionMode, RunProgress, RunPurpose, RunRecord, RunState, RunStopCause, TestObservation,
-    AGENT_SPEC_SCHEMA_VERSION, CONTROL_TOOLS, DEFAULT_AGENT_TOOL_IDS,
-    DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS, FORBIDDEN_TOOLS, MAX_AGENT_CONTEXT_BYTES,
+    CoordinatorCheckpointView, CoordinatorResumePlanView, OrchError, OrchErrorCode, PromotionState,
+    RunAggregates, RunApproval, RunBounds, RunExecution, RunExecutionMode, RunProgress, RunPurpose,
+    RunRecord, RunState, RunStopCause, TestObservation, AGENT_SPEC_SCHEMA_VERSION, CONTROL_TOOLS,
+    DEFAULT_AGENT_TOOL_IDS, DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS, FORBIDDEN_TOOLS,
+    MAX_AGENT_CONTEXT_BYTES,
 };
 pub use worker::{
     reject_privilege_amplification, MeasuredCapability, WorkerHostKind, WorkerLivenessState,

@@ -739,7 +739,7 @@ fn claiming_intent_without_claim_is_abandoned() {
         .save_managed_intent(&claiming_intent(&item, None, None, session))
         .unwrap();
     let recovered = store
-        .reconcile_claiming_intent("intent-admit-1", "secret", Utc::now())
+        .reconcile_claiming_intent("test-owner", "intent-admit-1", "secret", Utc::now())
         .unwrap()
         .unwrap();
     assert_eq!(recovered.state, ManagedIntentState::Abandoned);
@@ -771,7 +771,7 @@ fn claiming_intent_after_claim_without_run_releases_attempt() {
         ))
         .unwrap();
     store
-        .reconcile_claiming_intent("intent-admit-1", "secret", Utc::now())
+        .reconcile_claiming_intent("test-owner", "intent-admit-1", "secret", Utc::now())
         .unwrap();
     let restored = store.load_work_item(&item.work_id).unwrap().unwrap();
     assert_eq!(restored.state, WorkState::Queued);
@@ -860,7 +860,7 @@ fn claiming_intent_adopts_already_committed_run() {
         ))
         .unwrap();
     let recovered = store
-        .reconcile_claiming_intent("intent-admit-1", "secret", Utc::now())
+        .reconcile_claiming_intent("test-owner", "intent-admit-1", "secret", Utc::now())
         .unwrap()
         .unwrap();
     assert_eq!(recovered.state, ManagedIntentState::Admitted);
@@ -905,7 +905,7 @@ fn linked_attempt_before_intent_commit_recovers_one_run() {
         ))
         .unwrap();
     let recovered = store
-        .reconcile_claiming_intent("intent-admit-1", "secret", Utc::now())
+        .reconcile_claiming_intent("test-owner", "intent-admit-1", "secret", Utc::now())
         .unwrap()
         .unwrap();
     assert_eq!(recovered.state, ManagedIntentState::Admitted);

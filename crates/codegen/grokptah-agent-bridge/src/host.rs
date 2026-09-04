@@ -2442,7 +2442,20 @@ impl AgentHostHandle {
         prompt: String,
         max_rounds: Option<u32>,
     ) -> Result<String> {
-        self.resume_agent_with_request_id(session_id, prompt, max_rounds, None)
+        self.resume_agent_scoped("grokptah-embedded-local-v1", session_id, prompt, max_rounds)
+            .await
+    }
+
+    /// Resume under an explicit stable principal identity supplied by an
+    /// embedding host. Credential rotation must retain the same owner id.
+    pub async fn resume_agent_scoped(
+        &self,
+        owner_id: &str,
+        session_id: Uuid,
+        prompt: String,
+        max_rounds: Option<u32>,
+    ) -> Result<String> {
+        self.resume_agent_with_request_id_scoped(owner_id, session_id, prompt, max_rounds, None)
             .await
     }
 
@@ -2456,7 +2469,38 @@ impl AgentHostHandle {
         max_rounds: Option<u32>,
         request_id: Option<String>,
     ) -> Result<String> {
+        self.resume_agent_with_request_id_scoped(
+            "grokptah-embedded-local-v1",
+            session_id,
+            prompt,
+            max_rounds,
+            request_id,
+        )
+        .await
+    }
+
+    /// Explicit-principal variant of [`Self::resume_agent_with_request_id`].
+    pub async fn resume_agent_with_request_id_scoped(
+        &self,
+        owner_id: &str,
+        session_id: Uuid,
+        prompt: String,
+        max_rounds: Option<u32>,
+        request_id: Option<String>,
+    ) -> Result<String> {
         let store = self.ensure_orchestration_store()?;
+        let session_workspace = self
+            .session_inspect(session_id)
+            .map_err(|_| anyhow!("unknown session"))?
+            .cwd;
+        if session_workspace.trim().is_empty() {
+            bail!("persistent agent session has no workspace");
+        }
+        let canonical_workspace = dunce::canonicalize(&session_workspace)
+            .with_context(|| format!("canonicalize session workspace {session_workspace}"))?;
+        let scope =
+            crate::orchestration::IdempotencyScope::new(owner_id, session_id, &canonical_workspace)
+                .map_err(|error| anyhow!(error.to_string()))?;
         let request_id = request_id.unwrap_or_else(|| format!("resume-{}", Uuid::new_v4()));
         let bound_agent_id = self
             .inner
@@ -2471,7 +2515,12 @@ impl AgentHostHandle {
             "instructionByteLength": prompt.len(),
             "maxRounds": max_rounds,
         }));
-        match store.claim_idempotency("persistent_agent_resume", &request_id, &payload_hash)? {
+        match store.claim_idempotency(
+            &scope,
+            "persistent_agent_resume",
+            &request_id,
+            &payload_hash,
+        )? {
             crate::orchestration::IdempotencyClaim::Replay(Ok(value)) => value
                 .as_str()
                 .map(ToOwned::to_owned)
@@ -2487,6 +2536,7 @@ impl AgentHostHandle {
                     Ok(plan) => plan,
                     Err(error) => {
                         let _ = store.fail_idempotency(
+                            &scope,
                             "persistent_agent_resume",
                             &request_id,
                             &payload_hash,
@@ -2517,6 +2567,7 @@ impl AgentHostHandle {
                 match result {
                     Ok(response) => {
                         store.complete_idempotency(
+                            &scope,
                             "persistent_agent_resume",
                             &request_id,
                             &payload_hash,
@@ -2527,6 +2578,7 @@ impl AgentHostHandle {
                     }
                     Err(error) => {
                         let _ = store.fail_idempotency(
+                            &scope,
                             "persistent_agent_resume",
                             &request_id,
                             &payload_hash,
@@ -12499,7 +12551,8 @@ mod tests {
         host.ensure_session_agent(session_id).unwrap();
 
         let first = host
-            .resume_agent_with_request_id(
+            .resume_agent_with_request_id_scoped(
+                "test-owner",
                 session_id,
                 "continue from the checkpoint".into(),
                 Some(1),
@@ -12509,7 +12562,8 @@ mod tests {
             .unwrap_err()
             .to_string();
         let replay = host
-            .resume_agent_with_request_id(
+            .resume_agent_with_request_id_scoped(
+                "test-owner",
                 session_id,
                 "continue from the checkpoint".into(),
                 Some(1),
@@ -12522,7 +12576,8 @@ mod tests {
         assert!(replay.contains("persistent agent has no verified checkpoint"));
 
         let changed = host
-            .resume_agent_with_request_id(
+            .resume_agent_with_request_id_scoped(
+                "test-owner",
                 session_id,
                 "different payload".into(),
                 Some(1),
@@ -12645,7 +12700,8 @@ mod tests {
 
         let offline = TestEnvOverride::set("GROKPTAH_AGENT_OFFLINE", "1");
         let response = host
-            .resume_agent_with_request_id(
+            .resume_agent_with_request_id_scoped(
+                "test-owner",
                 session_id,
                 "continue".into(),
                 Some(3),
@@ -12655,7 +12711,8 @@ mod tests {
             .unwrap();
         let run_count = host.list_session_runs(session_id).unwrap().len();
         let replay = host
-            .resume_agent_with_request_id(
+            .resume_agent_with_request_id_scoped(
+                "test-owner",
                 session_id,
                 "continue".into(),
                 Some(3),
@@ -12666,8 +12723,14 @@ mod tests {
         drop(offline);
         assert_eq!(replay, response);
         assert_eq!(host.list_session_runs(session_id).unwrap().len(), run_count);
+        let receipt_scope = crate::orchestration::IdempotencyScope::new(
+            "test-owner",
+            session_id,
+            &dunce::canonicalize(&agent.workspace).unwrap(),
+        )
+        .unwrap();
         let receipt = store
-            .load_idempotency("deterministic-continuation-replay")
+            .load_idempotency(&receipt_scope, "deterministic-continuation-replay")
             .unwrap()
             .unwrap();
         let run_id = receipt.run_id.expect("receipt records the finite Run ID");

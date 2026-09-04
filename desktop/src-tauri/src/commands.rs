@@ -861,7 +861,15 @@ pub async fn persistent_agent_resume(
     }
     state
         .host
-        .resume_agent_with_request_id(session_id, prompt, max_rounds, request_id)
+        // The local desktop is a single installation-scoped principal. Remote
+        // resumes use the authenticated service owner instead of this fallback.
+        .resume_agent_with_request_id_scoped(
+            "grokptah-desktop-local-v1",
+            session_id,
+            prompt,
+            max_rounds,
+            request_id,
+        )
         .await
         .map_err(map_err)
 }

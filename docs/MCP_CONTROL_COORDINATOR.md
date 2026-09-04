@@ -82,7 +82,14 @@ against the same disposable GrokPtah home, recovers the owning Build session,
 and reads the prior run's state, events, and handoff through a new MCP session.
 It replays a completed submission's exact `request_id` after restart and
 requires the original run ID, proving the durable idempotency receipt prevents
-a duplicate run.
+a duplicate run. Version 2 receipts are partitioned by stable authenticated
+principal and bound to the exact session plus canonical workspace. Credential
+rotation for the same principal preserves replay, while another principal may
+independently use the same request ID. A changed tool, payload, session, or
+workspace conflicts instead of crossing an authority boundary. Unscoped
+version 1 receipts are quarantined on open and are never used to recover a run.
+Their request IDs leave durable tombstones, so an upgrade cannot reinterpret an
+already-applied unscoped request as new work; callers must choose a new ID.
 
 ### Durable retention
 
@@ -97,6 +104,10 @@ Retention never removes queued/running records, a run referenced by a
 exists, or an unrecognized/corrupt record. Pending and unknown idempotency
 statuses are preserved. Coordinators that need long-term history should copy
 the bounded read-tool results or handoff into their own durable store.
+
+Each principal shard also has a hard 4,096-receipt ceiling, including pending
+records. Admission fails with `capacity_exhausted` at that ceiling rather than
+allowing an unbounded operator-list scan.
 
 
 ### Optional transport knobs (tests / soak only)
@@ -280,6 +291,8 @@ managed-execution tools.
 | `ptah_disable_routine` | mutate | `request_id`, `session_id`, `workspace`, `routine_id`; optional `expected_revision` |
 | `ptah_list_workers` | read | `session_id`, `workspace` |
 | `ptah_get_worker` | read | `session_id`, `workspace`, `agent_id` |
+| `ptah_list_operation_receipts` | read | `session_id`, `workspace`; optional `after_request_id`, `limit` (1–100, default 50) |
+| `ptah_get_operation_receipt` | read | `session_id`, `workspace`, `request_id` |
 | `ptah_heartbeat_worker` | mutate | `request_id`, `session_id`, `workspace`, `agent_id` |
 | `ptah_get_work_graph` | read | `session_id`, `workspace` |
 | `ptah_offer_work` | mutate | `request_id`, `session_id`, `workspace`, `work_id`, `agent_id`, `reason` |
@@ -295,6 +308,14 @@ managed-execution tools.
 | `ptah_ack_message` | mutate | `request_id`, `session_id`, `workspace`, `message_id` |
 | `ptah_list_inbox` | read | `session_id`, `workspace`, `agent_id`; optional `after_seq` |
 | `ptah_list_outbox` | read | `session_id`, `workspace`, `agent_id`; optional `after_seq` |
+
+Operation-receipt reads expose only `schemaVersion`, `requestId`, `sessionId`,
+`tool`, `runId`, `status`, `createdAt`, and `errorCode`. They never expose the
+principal, workspace digest/path, payload hash, replay response, or detailed
+error. Pages are ordered by request ID; pass `nextAfterRequestId` back as
+`after_request_id` to continue. The cursor is traversal state, not a snapshot:
+concurrent receipt changes may affect later pages. Unknown and out-of-scope
+receipt IDs return the same public error.
 
 ### Work graph holds and recovery
 
