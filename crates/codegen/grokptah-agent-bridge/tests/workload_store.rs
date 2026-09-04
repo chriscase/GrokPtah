@@ -1236,7 +1236,10 @@ fn production_succeeded_assignment_is_confined_to_the_store_helper() {
     ];
     let mut assignments = Vec::new();
     for src in files {
-        let production = src.split("#[cfg(test)]").next().unwrap_or(src);
+        // Method-level test helpers can appear before production methods. Exclude
+        // only the file's test module so the complete production implementation
+        // remains covered by this confinement check.
+        let production = src.split("\n#[cfg(test)]\nmod tests").next().unwrap_or(src);
         for (idx, line) in production.lines().enumerate() {
             let trimmed = line.trim();
             if trimmed.starts_with("//") || trimmed.starts_with("///") {
