@@ -691,16 +691,84 @@ impl OrchStore {
         Ok(fs::read_dir(owner_dir)?.take(stop_at).count())
     }
 
+    #[cfg(test)]
     fn prune_if_owner_at_capacity(
         &self,
         scope: &IdempotencyScope,
         capacity: usize,
     ) -> Result<(), OrchError> {
-        let count = self
+        // Admission pressure in one principal's shard must not run the
+        // store-wide retention policy: doing so could remove unrelated Runs
+        // or another principal's receipts. Remove only the oldest terminal,
+        // valid, inactive receipt in this exact owner shard to make room for
+        // the pending claim. Invalid, pending, and active-linked evidence is
+        // deliberately retained and therefore continues to fail closed at
+        // the hard capacity bound.
+        let _guard = self.inner.lock.lock();
+        if self
             .owner_idempotency_entry_count(scope, capacity)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-        if count >= capacity {
-            self.prune_retention(RetentionPolicy::default())
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            < capacity
+        {
+            return Ok(());
+        }
+        self.prune_one_owner_receipt_unlocked(scope)
+    }
+
+    fn prune_one_owner_receipt_unlocked(&self, scope: &IdempotencyScope) -> Result<(), OrchError> {
+        let owner_dir = self
+            .inner
+            .root
+            .join("idempotency")
+            .join("v2")
+            .join(scope.owner_path_digest());
+        let mut eligible = Vec::new();
+        for entry in fs::read_dir(&owner_dir)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+        {
+            let entry = entry
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            let path = entry.path();
+            if !entry
+                .file_type()
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+                .is_file()
+                || path.extension().and_then(|value| value.to_str()) != Some("json")
+            {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(receipt) = serde_json::from_str::<IdempotencyReceipt>(&text) else {
+                continue;
+            };
+            let Ok(receipt_scope) = receipt.scope() else {
+                continue;
+            };
+            if receipt.owner_id != scope.owner_id
+                || receipt_scope.owner_path_digest() != scope.owner_path_digest()
+                || path.file_stem().and_then(|value| value.to_str())
+                    != safe_id_filename(&receipt.request_id).ok().as_deref()
+                || !matches!(receipt.status.as_str(), "complete" | "failed")
+            {
+                continue;
+            }
+            let linked_active = match receipt.run_id.as_deref() {
+                Some(run_id) => match self.load_run_unlocked(run_id) {
+                    Ok(Some(run)) => !run.state.is_terminal(),
+                    Ok(None) => false,
+                    Err(_) => true,
+                },
+                None => false,
+            };
+            if !linked_active {
+                eligible.push((path, receipt.created_at));
+            }
+        }
+        eligible.sort_by_key(|(_, created_at)| *created_at);
+        if let Some((path, _)) = eligible.first() {
+            remove_file_durable(&self.lease(), path)
                 .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         }
         Ok(())
@@ -4772,8 +4840,9 @@ impl OrchStore {
             self.load_run_unlocked(run_id)
                 .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
         } else {
-            let scope =
-                IdempotencyScope::new(owner_id, intent.session_id, Path::new(&intent.workspace))?;
+            let canonical_workspace =
+                super::authz::canonical_workspace(Path::new(&intent.workspace))?;
+            let scope = IdempotencyScope::new(owner_id, intent.session_id, &canonical_workspace)?;
             let receipt = self
                 .load_idempotency(&scope, &intent.intent_id)
                 .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
@@ -7082,12 +7151,18 @@ impl OrchStore {
         payload_hash: &str,
     ) -> Result<IdempotencyClaim, OrchError> {
         let path = self.idemp_path(scope, request_id)?;
-        // Keep a long-lived manager healthy without requiring a restart to
-        // run the normal terminal-receipt retention pass.
-        if !path.is_file() {
-            self.prune_if_owner_at_capacity(scope, MAX_IDEMPOTENCY_RECEIPTS_PER_OWNER)?;
-        }
         let _g = self.inner.lock.lock();
+        // Count, compact, and claim under one critical section so concurrent
+        // callers cannot discard more terminal evidence than the one slot
+        // needed for the winning claim.
+        if !path.is_file()
+            && self
+                .owner_idempotency_entry_count(scope, MAX_IDEMPOTENCY_RECEIPTS_PER_OWNER)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+                >= MAX_IDEMPOTENCY_RECEIPTS_PER_OWNER
+        {
+            self.prune_one_owner_receipt_unlocked(scope)?;
+        }
         if self
             .legacy_idempotency_tombstone_path(request_id)?
             .is_file()
@@ -9001,26 +9076,46 @@ mod tests {
         let d = tempdir().unwrap();
         let store = OrchStore::open(d.path()).unwrap();
         let scope = receipt_scope(d.path());
-        for request_id in ["old-a", "old-b", "old-c"] {
+        let older_session_scope =
+            IdempotencyScope::new("owner-a", Uuid::new_v4(), d.path()).unwrap();
+        let mut unrelated_run = terminal_run("unrelated-old-run");
+        unrelated_run.updated_at = Utc::now() - Duration::days(10);
+        store.save_run(&unrelated_run).unwrap();
+        for (receipt_scope, request_id, age_days) in [
+            (&older_session_scope, "old-other-session", 11),
+            (&scope, "old-b", 10),
+            (&scope, "old-c", 10),
+        ] {
             store
                 .save_idempotency(&IdempotencyReceipt {
                     schema_version: IDEMPOTENCY_RECEIPT_SCHEMA_VERSION,
-                    owner_id: scope.owner_id.clone(),
-                    session_id: scope.session_id,
-                    workspace_digest: scope.workspace_digest.clone(),
+                    owner_id: receipt_scope.owner_id.clone(),
+                    session_id: receipt_scope.session_id,
+                    workspace_digest: receipt_scope.workspace_digest.clone(),
                     request_id: request_id.into(),
                     payload_hash: "hash".into(),
                     run_id: None,
                     tool: "tool".into(),
                     response: serde_json::Value::Null,
                     error: None,
-                    created_at: Utc::now() - Duration::days(10),
+                    created_at: Utc::now() - Duration::days(age_days),
                     status: "complete".into(),
                 })
                 .unwrap();
         }
         store.prune_if_owner_at_capacity(&scope, 3).unwrap();
-        assert_eq!(store.list_idempotency(&scope, None, 10).unwrap().len(), 0);
+        assert_eq!(store.list_idempotency(&scope, None, 10).unwrap().len(), 2);
+        assert!(
+            store
+                .load_idempotency(&older_session_scope, "old-other-session")
+                .unwrap()
+                .is_none(),
+            "owner capacity must be recoverable from eligible receipts in older sessions"
+        );
+        assert!(
+            store.load_run(&unrelated_run.run_id).unwrap().is_some(),
+            "owner-shard compaction must not invoke global Run retention"
+        );
         assert!(matches!(
             store
                 .claim_idempotency(&scope, "tool", "fresh", "hash")
@@ -10226,7 +10321,8 @@ mod tests {
         let session = Uuid::new_v4();
         let intent_id = "intent-corrupt-receipt".to_string();
         let owner_id = "owner-a";
-        let workspace = "/tmp/coordinator-workspace";
+        let workspace = d.path().join("coordinator-workspace");
+        fs::create_dir_all(&workspace).unwrap();
         let store = OrchStore::open(d.path()).unwrap();
         store
             .save_managed_intent(&ManagedExecutionIntent {
@@ -10239,7 +10335,7 @@ mod tests {
                 attempt_id: None,
                 run_id: None,
                 session_id: session,
-                workspace: workspace.into(),
+                workspace: workspace.display().to_string(),
                 source_routine_id: None,
                 source_activation_id: None,
                 model_selection_key: "grok".into(),
@@ -10253,7 +10349,8 @@ mod tests {
                 updated_at: now,
             })
             .unwrap();
-        let scope = IdempotencyScope::new(owner_id, session, Path::new(workspace)).unwrap();
+        let canonical_workspace = super::super::authz::canonical_workspace(&workspace).unwrap();
+        let scope = IdempotencyScope::new(owner_id, session, &canonical_workspace).unwrap();
         let receipt_path = store.idemp_path(&scope, &intent_id).unwrap();
         fs::create_dir_all(receipt_path.parent().unwrap()).unwrap();
         assert!(matches!(
@@ -10288,5 +10385,80 @@ mod tests {
                 .state,
             ManagedIntentState::Claiming
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconcile_claiming_intent_canonicalizes_workspace_alias_for_receipt_lookup() {
+        use std::os::unix::fs::symlink;
+
+        let d = tempdir().unwrap();
+        let real_workspace = d.path().join("real-workspace");
+        let alias_workspace = d.path().join("workspace-alias");
+        fs::create_dir_all(&real_workspace).unwrap();
+        symlink(&real_workspace, &alias_workspace).unwrap();
+
+        let store = OrchStore::open(d.path()).unwrap();
+        let now = Utc::now();
+        let session_id = Uuid::new_v4();
+        let intent_id = "intent-canonical-workspace";
+        let run_id = "run-canonical-workspace";
+        let owner_id = "owner-a";
+        store
+            .save_managed_intent(&ManagedExecutionIntent {
+                schema_version: MANAGED_EXECUTION_SCHEMA_VERSION,
+                intent_id: intent_id.into(),
+                agent_id: "worker-a".into(),
+                agent_spec_revision: 1,
+                work_id: "work-a".into(),
+                work_revision: 1,
+                attempt_id: None,
+                run_id: None,
+                session_id,
+                workspace: alias_workspace.display().to_string(),
+                source_routine_id: None,
+                source_activation_id: None,
+                model_selection_key: "grok".into(),
+                bounds: Default::default(),
+                execution_mode: Default::default(),
+                input_hash: "hash".into(),
+                grok: None,
+                state: ManagedIntentState::Claiming,
+                permission_request_id: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+        let mut run = terminal_run(run_id);
+        run.request_id = intent_id.into();
+        run.session_id = session_id;
+        run.workspace = real_workspace.display().to_string();
+        run.agent_id = Some("worker-a".into());
+        store.save_run(&run).unwrap();
+        let canonical = super::super::authz::canonical_workspace(&real_workspace).unwrap();
+        let scope = IdempotencyScope::new(owner_id, session_id, &canonical).unwrap();
+        store
+            .save_idempotency(&IdempotencyReceipt {
+                schema_version: IDEMPOTENCY_RECEIPT_SCHEMA_VERSION,
+                owner_id: owner_id.into(),
+                session_id,
+                workspace_digest: scope.workspace_digest.clone(),
+                request_id: intent_id.into(),
+                payload_hash: "hash".into(),
+                run_id: Some(run_id.into()),
+                tool: "ptah_native_execute".into(),
+                response: serde_json::json!({"runId": run_id}),
+                error: None,
+                created_at: now,
+                status: "complete".into(),
+            })
+            .unwrap();
+
+        let recovered = store
+            .reconcile_claiming_intent(owner_id, intent_id, "secret", now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.state, ManagedIntentState::Admitted);
+        assert_eq!(recovered.run_id.as_deref(), Some(run_id));
     }
 }

@@ -1735,7 +1735,7 @@ impl OrchestrationService {
             Ok(value) => value,
             Err(error) => {
                 let recovered = self.store.reconcile_claiming_intent(
-                    &self.agent_owner_id(),
+                    owner_id,
                     &intent.intent_id,
                     secret,
                     Utc::now(),
