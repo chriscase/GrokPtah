@@ -20,7 +20,8 @@ use tokio_util::sync::CancellationToken;
 use xai_host_authority::{
     ActorClass, AttemptId, AuthContext, ContentDigest, EffectClass, FailedReason,
     HostAdminAuthority, HostAdminCredential, HostAuthority, HostCredential, PhysicalSendPermit,
-    ReconciliationDisposition, ReconciliationEvidence, RequestIdentity, SendOutcome, UncertainReason,
+    ReconciliationDisposition, ReconciliationEvidence, RequestIdentity, SendOutcome,
+    UncertainReason,
 };
 
 const AUTHORITY_DIR: &str = "authority/provider-send-v1";
