@@ -15,6 +15,16 @@ use tempfile::tempdir;
 
 use common::ProcessEnvGuard;
 
+fn read_owner_sharded_receipt(root: &std::path::Path, receipt_name: &str) -> Option<String> {
+    std::fs::read_dir(root).ok()?.find_map(|owner| {
+        let owner = owner.ok()?;
+        if !owner.file_type().ok()?.is_dir() {
+            return None;
+        }
+        std::fs::read_to_string(owner.path().join(receipt_name)).ok()
+    })
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::await_holding_lock)]
 async fn workload_protocol_is_idempotent_scoped_and_lane_archive_safe() {
@@ -129,16 +139,16 @@ async fn workload_protocol_is_idempotent_scoped_and_lane_archive_safe() {
         home.path()
             .join("orchestration")
             .join("idempotency")
-            .join(&receipt_name),
+            .join("v2"),
         home.path()
             .join(".grokptah")
             .join("orchestration")
             .join("idempotency")
-            .join(&receipt_name),
+            .join("v2"),
     ];
     let claim_receipt = receipt_paths
         .iter()
-        .find_map(|path| std::fs::read_to_string(path).ok())
+        .find_map(|path| read_owner_sharded_receipt(path, &receipt_name))
         .expect("durable claim receipt");
     assert!(!claim_receipt.contains("leaseToken"));
 

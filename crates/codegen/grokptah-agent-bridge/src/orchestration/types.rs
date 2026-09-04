@@ -1444,9 +1444,64 @@ fn validate_bounded_string(value: &str, max_bytes: usize, field: &str) -> Result
     Ok(())
 }
 
+pub const IDEMPOTENCY_RECEIPT_SCHEMA_VERSION: u32 = 2;
+
+/// Stable authority scope for an idempotent mutation.
+///
+/// The account/agent owner is deliberately used instead of a credential id so
+/// credential rotation does not destroy replay. Workspaces are represented by
+/// a domain-separated digest: durable receipt paths and records never disclose
+/// the host filesystem path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdempotencyScope {
+    pub(crate) owner_id: String,
+    pub(crate) session_id: Uuid,
+    pub(crate) workspace_digest: String,
+}
+
+impl IdempotencyScope {
+    pub fn new(
+        owner_id: &str,
+        session_id: Uuid,
+        canonical_workspace: &Path,
+    ) -> Result<Self, OrchError> {
+        validate_bounded_string(owner_id, 256, "owner_id")?;
+        let workspace = canonical_workspace.to_str().ok_or_else(|| {
+            OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "workspace must be valid UTF-8",
+            )
+        })?;
+        validate_workspace(workspace)?;
+        Ok(Self {
+            owner_id: owner_id.to_string(),
+            session_id,
+            workspace_digest: domain_digest("grokptah-idempotency-workspace-v2", workspace),
+        })
+    }
+
+    pub(crate) fn owner_path_digest(&self) -> String {
+        domain_digest("grokptah-idempotency-owner-v2", &self.owner_id)
+    }
+}
+
+fn domain_digest(domain: &str, value: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(domain.as_bytes());
+    hasher.update([0]);
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value.as_bytes());
+    hex_sha256(&hasher.finalize())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct IdempotencyReceipt {
+    pub schema_version: u32,
+    pub owner_id: String,
+    pub session_id: Uuid,
+    pub workspace_digest: String,
     pub request_id: String,
     pub payload_hash: String,
     pub run_id: Option<String>,
@@ -1459,6 +1514,41 @@ pub struct IdempotencyReceipt {
     /// pending | complete | failed
     #[serde(default = "default_receipt_status")]
     pub status: String,
+}
+
+impl IdempotencyReceipt {
+    pub(crate) fn scope(&self) -> Result<IdempotencyScope, OrchError> {
+        if self.schema_version != IDEMPOTENCY_RECEIPT_SCHEMA_VERSION {
+            return Err(OrchError::new(
+                OrchErrorCode::Internal,
+                "unsupported idempotency receipt schema",
+            ));
+        }
+        validate_bounded_string(&self.owner_id, 256, "owner_id")?;
+        if self.workspace_digest.len() != 64
+            || !self
+                .workspace_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::Internal,
+                "idempotency receipt workspace scope is invalid",
+            ));
+        }
+        Ok(IdempotencyScope {
+            owner_id: self.owner_id.clone(),
+            session_id: self.session_id,
+            workspace_digest: self.workspace_digest.clone(),
+        })
+    }
+
+    pub(crate) fn is_in_scope(&self, scope: &IdempotencyScope) -> bool {
+        self.schema_version == IDEMPOTENCY_RECEIPT_SCHEMA_VERSION
+            && self.owner_id == scope.owner_id
+            && self.session_id == scope.session_id
+            && self.workspace_digest == scope.workspace_digest
+    }
 }
 
 fn default_receipt_status() -> String {
@@ -1704,6 +1794,8 @@ pub const CONTROL_TOOLS: &[&str] = &[
     "ptah_list_activations",
     "ptah_list_workers",
     "ptah_get_worker",
+    "ptah_list_operation_receipts",
+    "ptah_get_operation_receipt",
     "ptah_heartbeat_worker",
     "ptah_offer_work",
     "ptah_accept_work",

@@ -128,13 +128,19 @@ new automatic tools, and records `legacy_migration` attribution.
   resume target. The legacy primary `session_id` is not an authorization
   boundary.
 - An optional request id is protected by the existing durable idempotency
-  ledger. Its request identity includes Agent, target Lane, instruction
+  ledger. The receipt is owned by the stable authenticated principal and bound
+  to the target Lane plus canonical workspace; rotating that principal's
+  credential preserves replay, but another principal receives an independent
+  request namespace. Its request identity includes Agent, target Lane, instruction
   hash/length, and requested round narrowing, so an exact retry still replays
   after the first Run advances the Agent checkpoint. The sealed continuation
   input separately binds source workspace, checkpoint/hash, execution-spec
   revision, effective bounds, assembler version, and input hash. The receipt
   records the actual finite Run ID. Changed request payloads cannot create a
   second Run.
+- Direct local embedders retain the compatibility resume methods, which use an
+  explicit installation-local owner. Multi-user/service embedders must use the
+  scoped variants and supply a stable owner identity across credential rotation.
 
 ## Explicit non-goals
 

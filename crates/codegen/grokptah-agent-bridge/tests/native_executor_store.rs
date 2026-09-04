@@ -1,12 +1,12 @@
 use chrono::Utc;
 use grokptah_agent_bridge::orchestration::{
     assemble_managed_run_input, intersect_run_bounds, managed_execution_eligible,
-    select_relevant_managed_messages, AssignmentStatus, AttemptState,
-    ManagedExecutionBudgetProfile, ManagedExecutionIntent, ManagedExecutionPolicy,
-    ManagedExecutorKind, ManagedFinalizationOutcome, ManagedFinalizationStage, ManagedIntentState,
-    ManagedRetryCause, ManagedWorkMode, MessageKind, OrchErrorCode, OrchStore, RunBounds,
-    RunExecutionMode, RunRecord, RunState, WorkItem, WorkMessage, WorkPolicy, WorkProgress,
-    WorkResult, WorkState, MANAGED_EXECUTION_SCHEMA_VERSION,
+    select_relevant_managed_messages, AssignmentStatus, AttemptState, IdempotencyClaim,
+    IdempotencyScope, ManagedExecutionBudgetProfile, ManagedExecutionIntent,
+    ManagedExecutionPolicy, ManagedExecutorKind, ManagedFinalizationOutcome,
+    ManagedFinalizationStage, ManagedIntentState, ManagedRetryCause, ManagedWorkMode, MessageKind,
+    OrchErrorCode, OrchStore, RunBounds, RunExecutionMode, RunRecord, RunState, WorkItem,
+    WorkMessage, WorkPolicy, WorkProgress, WorkResult, WorkState, MANAGED_EXECUTION_SCHEMA_VERSION,
 };
 use grokptah_agent_bridge::{AgentRecord, AgentState};
 use tempfile::tempdir;
@@ -730,16 +730,19 @@ fn claiming_intent_without_claim_is_abandoned() {
     let home = tempdir().unwrap();
     let store = OrchStore::open(home.path()).unwrap();
     let session = Uuid::new_v4();
+    let workspace = home.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let workspace = workspace.to_str().unwrap();
     store
-        .save_agent(&agent("worker-a", "/tmp/ws", session))
+        .save_agent(&agent("worker-a", workspace, session))
         .unwrap();
-    let item = accepted_work(session, "/tmp/ws", "worker-a");
+    let item = accepted_work(session, workspace, "worker-a");
     store.save_work_item(&item).unwrap();
     store
         .save_managed_intent(&claiming_intent(&item, None, None, session))
         .unwrap();
     let recovered = store
-        .reconcile_claiming_intent("intent-admit-1", "secret", Utc::now())
+        .reconcile_claiming_intent("test-owner", "intent-admit-1", "secret", Utc::now())
         .unwrap()
         .unwrap();
     assert_eq!(recovered.state, ManagedIntentState::Abandoned);
@@ -754,10 +757,13 @@ fn claiming_intent_after_claim_without_run_releases_attempt() {
     let home = tempdir().unwrap();
     let store = OrchStore::open(home.path()).unwrap();
     let session = Uuid::new_v4();
+    let workspace = home.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let workspace = workspace.to_str().unwrap();
     store
-        .save_agent(&agent("worker-a", "/tmp/ws", session))
+        .save_agent(&agent("worker-a", workspace, session))
         .unwrap();
-    let item = accepted_work(session, "/tmp/ws", "worker-a");
+    let item = accepted_work(session, workspace, "worker-a");
     store.save_work_item(&item).unwrap();
     let claim = store
         .claim_work_with_lease_secret(&item.work_id, "worker-a", None, "secret")
@@ -771,7 +777,7 @@ fn claiming_intent_after_claim_without_run_releases_attempt() {
         ))
         .unwrap();
     store
-        .reconcile_claiming_intent("intent-admit-1", "secret", Utc::now())
+        .reconcile_claiming_intent("test-owner", "intent-admit-1", "secret", Utc::now())
         .unwrap();
     let restored = store.load_work_item(&item.work_id).unwrap().unwrap();
     assert_eq!(restored.state, WorkState::Queued);
@@ -841,16 +847,31 @@ fn claiming_intent_adopts_already_committed_run() {
     let home = tempdir().unwrap();
     let store = OrchStore::open(home.path()).unwrap();
     let session = Uuid::new_v4();
+    let workspace = home.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let workspace = workspace.to_str().unwrap();
     store
-        .save_agent(&agent("worker-a", "/tmp/ws", session))
+        .save_agent(&agent("worker-a", workspace, session))
         .unwrap();
-    let item = accepted_work(session, "/tmp/ws", "worker-a");
+    let item = accepted_work(session, workspace, "worker-a");
     store.save_work_item(&item).unwrap();
     let claim = store
         .claim_work_with_lease_secret(&item.work_id, "worker-a", None, "secret")
         .unwrap();
-    let run = run_for_intent("intent-admit-1", session, "/tmp/ws", RunState::Running);
+    let run = run_for_intent("intent-admit-1", session, workspace, RunState::Running);
     store.save_run(&run).unwrap();
+    let scope = IdempotencyScope::new(
+        "test-owner",
+        session,
+        &dunce::canonicalize(workspace).unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        store
+            .claim_idempotency(&scope, "ptah_native_execute", "intent-admit-1", "hash")
+            .unwrap(),
+        IdempotencyClaim::Perform
+    ));
     store
         .save_managed_intent(&claiming_intent(
             &item,
@@ -860,7 +881,7 @@ fn claiming_intent_adopts_already_committed_run() {
         ))
         .unwrap();
     let recovered = store
-        .reconcile_claiming_intent("intent-admit-1", "secret", Utc::now())
+        .reconcile_claiming_intent("test-owner", "intent-admit-1", "secret", Utc::now())
         .unwrap()
         .unwrap();
     assert_eq!(recovered.state, ManagedIntentState::Admitted);
@@ -878,16 +899,31 @@ fn linked_attempt_before_intent_commit_recovers_one_run() {
     let home = tempdir().unwrap();
     let store = OrchStore::open(home.path()).unwrap();
     let session = Uuid::new_v4();
+    let workspace = home.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let workspace = workspace.to_str().unwrap();
     store
-        .save_agent(&agent("worker-a", "/tmp/ws", session))
+        .save_agent(&agent("worker-a", workspace, session))
         .unwrap();
-    let item = accepted_work(session, "/tmp/ws", "worker-a");
+    let item = accepted_work(session, workspace, "worker-a");
     store.save_work_item(&item).unwrap();
     let claim = store
         .claim_work_with_lease_secret(&item.work_id, "worker-a", None, "secret")
         .unwrap();
-    let run = run_for_intent("intent-admit-1", session, "/tmp/ws", RunState::Running);
+    let run = run_for_intent("intent-admit-1", session, workspace, RunState::Running);
     store.save_run(&run).unwrap();
+    let scope = IdempotencyScope::new(
+        "test-owner",
+        session,
+        &dunce::canonicalize(workspace).unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        store
+            .claim_idempotency(&scope, "ptah_native_execute", "intent-admit-1", "hash")
+            .unwrap(),
+        IdempotencyClaim::Perform
+    ));
     store
         .link_work_run(
             &item.work_id,
@@ -905,7 +941,7 @@ fn linked_attempt_before_intent_commit_recovers_one_run() {
         ))
         .unwrap();
     let recovered = store
-        .reconcile_claiming_intent("intent-admit-1", "secret", Utc::now())
+        .reconcile_claiming_intent("test-owner", "intent-admit-1", "secret", Utc::now())
         .unwrap()
         .unwrap();
     assert_eq!(recovered.state, ManagedIntentState::Admitted);

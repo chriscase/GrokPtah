@@ -1712,6 +1712,25 @@ struct WorkerArgs {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ListOperationReceiptsArgs {
+    session_id: Uuid,
+    workspace: PathBuf,
+    #[serde(default)]
+    after_request_id: Option<String>,
+    #[serde(default = "default_operation_receipt_limit")]
+    limit: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GetOperationReceiptArgs {
+    session_id: Uuid,
+    workspace: PathBuf,
+    request_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct HeartbeatWorkerArgs {
     request_id: String,
     session_id: Uuid,
@@ -1853,6 +1872,10 @@ fn default_event_limit() -> usize {
 
 fn default_computer_event_limit() -> usize {
     crate::computer_use::DEFAULT_EVENT_PAGE
+}
+
+fn default_operation_receipt_limit() -> usize {
+    50
 }
 
 #[derive(Debug, Serialize)]
@@ -2673,6 +2696,27 @@ fn tool_input_schema(name: &str) -> Value {
                 "session_id": session,
                 "workspace": workspace,
                 "agent_id": {"type": "string", "minLength": 1, "maxLength": 256}
+            }
+        }),
+        "ptah_list_operation_receipts" => json!({
+            "type": "object",
+            "required": ["session_id", "workspace"],
+            "additionalProperties": false,
+            "properties": {
+                "session_id": session,
+                "workspace": workspace,
+                "after_request_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50}
+            }
+        }),
+        "ptah_get_operation_receipt" => json!({
+            "type": "object",
+            "required": ["session_id", "workspace", "request_id"],
+            "additionalProperties": false,
+            "properties": {
+                "session_id": session,
+                "workspace": workspace,
+                "request_id": req_id
             }
         }),
         "ptah_heartbeat_worker" => json!({
@@ -3632,6 +3676,35 @@ async fn dispatch_tool(
             require_nonempty(&args.agent_id, "agent_id")?;
             orch.get_worker_scoped(auth, args.session_id, &args.workspace, &args.agent_id)
         }
+        "ptah_list_operation_receipts" => {
+            let args: ListOperationReceiptsArgs = parse_value(args)?;
+            if let Some(after_request_id) = args.after_request_id.as_deref() {
+                require_nonempty(after_request_id, "after_request_id")?;
+            }
+            if !(1..=100).contains(&args.limit) {
+                return Err(OrchError::new(
+                    OrchErrorCode::InvalidRequest,
+                    "limit must be between 1 and 100",
+                ));
+            }
+            orch.list_operation_receipts_scoped(
+                auth,
+                args.session_id,
+                &args.workspace,
+                args.after_request_id.as_deref(),
+                args.limit,
+            )
+        }
+        "ptah_get_operation_receipt" => {
+            let args: GetOperationReceiptArgs = parse_value(args)?;
+            require_nonempty(&args.request_id, "request_id")?;
+            orch.get_operation_receipt_scoped(
+                auth,
+                args.session_id,
+                &args.workspace,
+                &args.request_id,
+            )
+        }
         "ptah_heartbeat_worker" => {
             let args: HeartbeatWorkerArgs = parse_value(args)?;
             require_nonempty(&args.request_id, "request_id")?;
@@ -4093,8 +4166,8 @@ mod tests {
     use super::*;
     use crate::host::{AgentHost, HostConfig};
     use crate::orchestration::{
-        ContinuationCheckpoint, ContinuationReason, CoordinatorAgentView, OrchErrorCode, OrchStore,
-        OrchestrationConfig, RunBounds, WorkspaceAllowlist,
+        ContinuationCheckpoint, ContinuationReason, CoordinatorAgentView, IdempotencyScope,
+        OrchErrorCode, OrchStore, OrchestrationConfig, RunBounds, WorkspaceAllowlist,
     };
     use crate::{home_override_serial, set_grokptah_home_override};
     use chrono::Utc;
@@ -4602,6 +4675,216 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn operation_receipt_tools_have_strict_bounded_schemas_and_arguments() {
+        for name in ["ptah_list_operation_receipts", "ptah_get_operation_receipt"] {
+            assert!(CONTROL_TOOLS.contains(&name));
+            assert_eq!(
+                tool_input_schema(name)["additionalProperties"],
+                json!(false)
+            );
+        }
+
+        let list_schema = tool_input_schema("ptah_list_operation_receipts");
+        assert_eq!(list_schema["required"], json!(["session_id", "workspace"]));
+        assert_eq!(list_schema["properties"]["limit"]["minimum"], json!(1));
+        assert_eq!(list_schema["properties"]["limit"]["maximum"], json!(100));
+        assert_eq!(list_schema["properties"]["limit"]["default"], json!(50));
+
+        let session_id = Uuid::new_v4();
+        let parsed: ListOperationReceiptsArgs = parse_value(&json!({
+            "session_id": session_id,
+            "workspace": "/tmp/receipt-scope"
+        }))
+        .unwrap();
+        assert_eq!(parsed.limit, 50);
+        assert!(parsed.after_request_id.is_none());
+        assert!(parse_value::<ListOperationReceiptsArgs>(&json!({
+            "session_id": session_id,
+            "workspace": "/tmp/receipt-scope",
+            "unexpected": true
+        }))
+        .is_err());
+
+        let get_schema = tool_input_schema("ptah_get_operation_receipt");
+        assert_eq!(
+            get_schema["required"],
+            json!(["session_id", "workspace", "request_id"])
+        );
+        assert!(parse_value::<GetOperationReceiptArgs>(&json!({
+            "session_id": session_id,
+            "workspace": "/tmp/receipt-scope",
+            "request_id": "receipt-1",
+            "unexpected": true
+        }))
+        .is_err());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn operation_receipt_reads_are_bounded_redacted_and_scope_indistinguishable() {
+        let _guard = home_override_serial();
+        let home = tempdir().unwrap();
+        set_grokptah_home_override(Some(home.path().join(".grokptah")));
+        let workspace = tempdir().unwrap();
+        let host = AgentHost::create(HostConfig {
+            always_approve: true,
+            ..HostConfig::default()
+        })
+        .expect("acquire host lock");
+        host.start().unwrap();
+        host.set_project_cwd(workspace.path()).unwrap();
+        let session = host.session_new_kind(crate::SessionKind::Build).unwrap();
+        host.session_set_cwd(session.id, workspace.path()).unwrap();
+        let other_session = host.session_new_kind(crate::SessionKind::Build).unwrap();
+        host.session_set_cwd(other_session.id, workspace.path())
+            .unwrap();
+
+        let orch = computer_orch(&host, home.path(), vec![workspace.path().to_path_buf()]);
+        let canonical = dunce::canonicalize(workspace.path()).unwrap();
+        let scope = IdempotencyScope::new("primary", session.id, &canonical).unwrap();
+        for request_id in ["receipt-a", "receipt-b"] {
+            assert!(matches!(
+                orch.store()
+                    .claim_idempotency(&scope, "ptah_probe", request_id, "payload-secret")
+                    .unwrap(),
+                crate::orchestration::IdempotencyClaim::Perform
+            ));
+            orch.store()
+                .complete_idempotency(
+                    &scope,
+                    "ptah_probe",
+                    request_id,
+                    "payload-secret",
+                    Some("run-visible".into()),
+                    json!({"credential": "response-secret"}),
+                )
+                .unwrap();
+        }
+        let other_scope = IdempotencyScope::new("primary", other_session.id, &canonical).unwrap();
+        orch.store()
+            .claim_idempotency(
+                &other_scope,
+                "ptah_probe",
+                "other-session-receipt",
+                "other-secret",
+            )
+            .unwrap();
+
+        let srv = start_control_server(orch, 0).await.unwrap();
+        let fixture = ComputerFixture {
+            url: format!("http://{}/mcp", srv.addr),
+            srv,
+            client: reqwest::Client::new(),
+        };
+        let (status, body) = call_tool(
+            &fixture,
+            1,
+            "ptah_list_operation_receipts",
+            json!({"session_id": session.id, "workspace": workspace.path(), "limit": 1}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let page = &body["result"]["structuredContent"];
+        assert_eq!(page["receipts"].as_array().unwrap().len(), 1);
+        assert_eq!(page["receipts"][0]["requestId"], "receipt-a");
+        assert_eq!(page["nextAfterRequestId"], "receipt-a");
+        let rendered = page.to_string();
+        for hidden in [
+            "payload-secret",
+            "response-secret",
+            "other-session-receipt",
+            "workspaceDigest",
+            "ownerId",
+        ] {
+            assert!(!rendered.contains(hidden), "receipt list leaked {hidden}");
+        }
+
+        let (status, body) = call_tool(
+            &fixture,
+            2,
+            "ptah_list_operation_receipts",
+            json!({
+                "session_id": session.id,
+                "workspace": workspace.path(),
+                "limit": 1,
+                "after_request_id": "receipt-a"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let second_page = &body["result"]["structuredContent"];
+        assert_eq!(second_page["receipts"].as_array().unwrap().len(), 1);
+        assert_eq!(second_page["receipts"][0]["requestId"], "receipt-b");
+        assert!(second_page["nextAfterRequestId"].is_null());
+
+        for (id, arguments) in [
+            (
+                3,
+                json!({"session_id": session.id, "workspace": workspace.path(), "limit": 0}),
+            ),
+            (
+                4,
+                json!({
+                    "session_id": session.id,
+                    "workspace": workspace.path(),
+                    "after_request_id": "../invalid"
+                }),
+            ),
+        ] {
+            let (_, rejected) =
+                call_tool(&fixture, id, "ptah_list_operation_receipts", arguments).await;
+            assert!(rejected.get("error").is_some());
+        }
+
+        let (status, body) = call_tool(
+            &fixture,
+            5,
+            "ptah_get_operation_receipt",
+            json!({
+                "session_id": session.id,
+                "workspace": workspace.path(),
+                "request_id": "receipt-b"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["result"]["structuredContent"]["receipt"]["requestId"],
+            "receipt-b"
+        );
+        assert!(!body.to_string().contains("response-secret"));
+
+        let (_, unknown) = call_tool(
+            &fixture,
+            6,
+            "ptah_get_operation_receipt",
+            json!({
+                "session_id": session.id,
+                "workspace": workspace.path(),
+                "request_id": "does-not-exist"
+            }),
+        )
+        .await;
+        let (_, cross_scope) = call_tool(
+            &fixture,
+            7,
+            "ptah_get_operation_receipt",
+            json!({
+                "session_id": session.id,
+                "workspace": workspace.path(),
+                "request_id": "other-session-receipt"
+            }),
+        )
+        .await;
+        assert_eq!(unknown["error"]["code"], cross_scope["error"]["code"]);
+        assert_eq!(unknown["error"]["message"], cross_scope["error"]["message"]);
+        assert_eq!(unknown["error"]["data"], cross_scope["error"]["data"]);
+
+        fixture.srv.stop();
+        set_grokptah_home_override(None);
     }
 
     use crate::computer_use::{

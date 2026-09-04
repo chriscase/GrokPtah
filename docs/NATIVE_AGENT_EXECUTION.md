@@ -144,9 +144,10 @@ a Computer Use grant or silently retry it.
 ### Claiming recovery (atomic admission)
 
 Recovery of a `claiming` intent **first** discovers any Run already created
-for that intent/request ID (`intent.runId`, then the idempotency receipt, then
-`find_run_by_request_id`). It never blindly releases a Work claim when a Run
-already exists.
+for that intent/request ID (`intent.runId`, then the principal/session/workspace
+scoped idempotency receipt). A receipt-discovered Run must also match the
+intent's Agent and scope. There is no unscoped request-ID scan or adoption. It
+never blindly releases a Work claim when an authoritative Run already exists.
 
 | Crash window | Recovery |
 | --- | --- |

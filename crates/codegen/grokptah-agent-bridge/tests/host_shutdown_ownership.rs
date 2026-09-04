@@ -16,8 +16,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use grokptah_agent_bridge::orchestration::{
-    AuditEntry, AuthContext, OrchStore, OrchestrationConfig, OrchestrationService, RunBounds,
-    WorkspaceAllowlist,
+    AuditEntry, AuthContext, IdempotencyScope, OrchStore, OrchestrationConfig,
+    OrchestrationService, RunBounds, WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
     set_grokptah_home_override, start_control_server, AgentHost, HostConfig, HostPhase,
@@ -1608,11 +1608,13 @@ async fn every_durable_primitive_refuses_a_stale_clone() {
     let computer = runtime.ensure_computer_store().unwrap();
     let stale_orch = orch.clone();
     let stale_computer = computer.clone();
+    let receipt_scope = IdempotencyScope::new("shutdown-test-owner", session_id, lane.ws())
+        .expect("valid test receipt scope");
 
     // Live: each primitive works.
     assert!(probe_store_write(&orch, session_id).is_ok(), "audit append");
     assert!(
-        orch.claim_idempotency("probe", "req-live", "hash-live")
+        orch.claim_idempotency(&receipt_scope, "probe", "req-live", "hash-live")
             .is_ok(),
         "exclusive create"
     );
@@ -1628,7 +1630,9 @@ async fn every_durable_primitive_refuses_a_stale_clone() {
     if let Err(error) = probe_store_write(&stale_orch, session_id) {
         refusals.push(("audit append", format!("{error:#}")));
     }
-    if let Err(error) = stale_orch.claim_idempotency("probe", "req-stale", "hash-stale") {
+    if let Err(error) =
+        stale_orch.claim_idempotency(&receipt_scope, "probe", "req-stale", "hash-stale")
+    {
         refusals.push(("exclusive create", format!("{error:?}")));
     }
     if let Err(error) = stale_orch.prune_retention(Default::default()) {
