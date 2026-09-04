@@ -9125,6 +9125,143 @@ mod tests {
     }
 
     #[test]
+    fn live_principal_capacity_compaction_preserves_authority_evidence_and_serializes_replay() {
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+        let scope = receipt_scope(d.path());
+        let owner_dir = store.idemp_path(&scope, "new-request").unwrap();
+        let owner_dir = owner_dir.parent().unwrap();
+        fs::create_dir_all(owner_dir).unwrap();
+
+        let receipt = |request_id: &str,
+                       created_at: chrono::DateTime<Utc>,
+                       status: &str,
+                       run_id: Option<String>| IdempotencyReceipt {
+            schema_version: IDEMPOTENCY_RECEIPT_SCHEMA_VERSION,
+            owner_id: scope.owner_id.clone(),
+            session_id: scope.session_id,
+            workspace_digest: scope.workspace_digest.clone(),
+            request_id: request_id.into(),
+            payload_hash: "hash".into(),
+            run_id,
+            tool: "tool".into(),
+            response: serde_json::Value::Null,
+            error: None,
+            created_at,
+            status: status.into(),
+        };
+        store
+            .save_idempotency(&receipt(
+                "eligible-oldest",
+                Utc::now() - Duration::days(20),
+                "complete",
+                None,
+            ))
+            .unwrap();
+        store
+            .save_idempotency(&receipt(
+                "eligible-newer",
+                Utc::now() - Duration::days(10),
+                "failed",
+                None,
+            ))
+            .unwrap();
+        store
+            .save_idempotency(&receipt(
+                "pending-protected",
+                Utc::now() - Duration::days(30),
+                "pending",
+                None,
+            ))
+            .unwrap();
+        fs::write(owner_dir.join("corrupt-protected.json"), b"not-json").unwrap();
+        let wrong_path = receipt(
+            "different-request-id",
+            Utc::now() - Duration::days(30),
+            "complete",
+            None,
+        );
+        fs::write(
+            owner_dir.join("wrong-path-protected.json"),
+            serde_json::to_vec(&wrong_path).unwrap(),
+        )
+        .unwrap();
+        let mut active_run = terminal_run("active-linked-run");
+        active_run.state = RunState::Running;
+        active_run.end_seq = None;
+        active_run.terminal_result = None;
+        active_run.final_response = None;
+        store.save_run(&active_run).unwrap();
+        store
+            .save_idempotency(&receipt(
+                "active-linked-protected",
+                Utc::now() - Duration::days(30),
+                "complete",
+                Some(active_run.run_id.clone()),
+            ))
+            .unwrap();
+        for index in 0..(MAX_IDEMPOTENCY_RECEIPTS_PER_OWNER - 6) {
+            fs::write(owner_dir.join(format!("invalid-{index}.json")), b"{}").unwrap();
+        }
+
+        std::thread::scope(|threads| {
+            let left_store = store.clone();
+            let left_scope = scope.clone();
+            let left = threads.spawn(move || {
+                left_store.claim_idempotency(&left_scope, "tool", "concurrent-request", "hash")
+            });
+            let right_store = store.clone();
+            let right_scope = scope.clone();
+            let right = threads.spawn(move || {
+                right_store.claim_idempotency(&right_scope, "tool", "concurrent-request", "hash")
+            });
+            let outcomes = [
+                left.join().unwrap().unwrap(),
+                right.join().unwrap().unwrap(),
+            ];
+            assert_eq!(
+                outcomes
+                    .iter()
+                    .filter(|outcome| matches!(outcome, IdempotencyClaim::Perform))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                outcomes
+                    .iter()
+                    .filter(|outcome| matches!(outcome, IdempotencyClaim::Pending))
+                    .count(),
+                1
+            );
+        });
+
+        assert!(store
+            .load_idempotency(&scope, "eligible-oldest")
+            .unwrap()
+            .is_none());
+        assert!(store
+            .load_idempotency(&scope, "eligible-newer")
+            .unwrap()
+            .is_some());
+        assert!(store
+            .load_idempotency(&scope, "pending-protected")
+            .unwrap()
+            .is_some());
+        assert!(owner_dir.join("corrupt-protected.json").is_file());
+        assert!(owner_dir.join("wrong-path-protected.json").is_file());
+        assert!(store
+            .load_idempotency(&scope, "active-linked-protected")
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            store
+                .owner_idempotency_entry_count(&scope, MAX_IDEMPOTENCY_RECEIPTS_PER_OWNER + 1,)
+                .unwrap(),
+            MAX_IDEMPOTENCY_RECEIPTS_PER_OWNER
+        );
+    }
+
+    #[test]
     fn terminal_receipt_preserves_claim_creation_time() {
         let d = tempdir().unwrap();
         let store = OrchStore::open(d.path()).unwrap();
