@@ -19,7 +19,10 @@ pub use lifecycle::{
     GuestLifecycle, GuestLifecycleDisposition, GuestLifecyclePhase, ProofEvidenceClass,
     LIFECYCLE_SCHEMA_VERSION,
 };
-pub use sentinel::{HostSentinelDiff, HostSentinelRegistry, HostSentinelSnapshot};
+pub use sentinel::{
+    HostSentinelDiff, HostSentinelProbe, HostSentinelRegistry, HostSentinelSnapshot,
+    SyntheticHostProbe,
+};
 pub use simulator::{FrameDelta, GuestFrame, SyntheticGuest, SyntheticGuestAction};
 pub use store::{snapshot_root, HarnessSnapshot, SNAPSHOT_FILE, SNAPSHOT_SCHEMA_VERSION};
 

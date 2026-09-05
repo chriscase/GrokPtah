@@ -79,14 +79,53 @@ impl GuestLifecycle {
     pub fn is_live(&self) -> bool {
         !matches!(
             self.phase,
-            GuestLifecyclePhase::NotStarted
-                | GuestLifecyclePhase::Stopping
-                | GuestLifecyclePhase::Destroyed
+            GuestLifecyclePhase::NotStarted | GuestLifecyclePhase::Destroyed
         )
     }
 
     pub fn allows_inject(&self) -> bool {
-        self.phase == GuestLifecyclePhase::Ready && !self.inject_fenced
+        if self.inject_fenced {
+            return false;
+        }
+        if self.disposition == Some(GuestLifecycleDisposition::Uncertain) {
+            return false;
+        }
+        self.phase == GuestLifecyclePhase::Ready
+    }
+
+    /// Reconcile public/restored fields so Uncertain cannot silently re-enable inject.
+    pub fn reconcile_invariants(&mut self) -> HarnessResult<()> {
+        if self.disposition == Some(GuestLifecycleDisposition::Uncertain) {
+            self.inject_fenced = true;
+            if self.phase == GuestLifecyclePhase::Ready {
+                return Err(HarnessError::invalid_state(
+                    "restored Uncertain lifecycle cannot be Ready",
+                ));
+            }
+        }
+        if self.inject_fenced
+            && self.phase == GuestLifecyclePhase::Ready
+            && self.disposition.is_some()
+        {
+            return Err(HarnessError::invalid_state(
+                "fenced Ready lifecycle cannot carry a terminal disposition",
+            ));
+        }
+        Ok(())
+    }
+
+    fn enforce_fail_closed(&self, op: &str) -> HarnessResult<()> {
+        if self.inject_fenced {
+            return Err(HarnessError::inject_fenced(format!(
+                "{op} is fenced after Stop or Uncertain disposition"
+            )));
+        }
+        if self.disposition == Some(GuestLifecycleDisposition::Uncertain) {
+            return Err(HarnessError::uncertain_outcome(format!(
+                "{op} is forbidden while disposition is Uncertain"
+            )));
+        }
+        Ok(())
     }
 
     pub fn begin_boot(&mut self, now: DateTime<Utc>) -> HarnessResult<()> {
@@ -102,11 +141,7 @@ impl GuestLifecycle {
     }
 
     pub fn begin_act(&mut self, now: DateTime<Utc>) -> HarnessResult<()> {
-        if self.inject_fenced {
-            return Err(HarnessError::inject_fenced(
-                "inject is fenced after Stop or Uncertain disposition",
-            ));
-        }
+        self.enforce_fail_closed("begin_act")?;
         self.require_phase(GuestLifecyclePhase::Ready, "begin_act")?;
         self.guest_input_possible = true;
         self.advance(GuestLifecyclePhase::Acting, now);
@@ -114,6 +149,7 @@ impl GuestLifecycle {
     }
 
     pub fn complete_act(&mut self, now: DateTime<Utc>) -> HarnessResult<()> {
+        self.enforce_fail_closed("complete_act")?;
         self.require_phase(GuestLifecyclePhase::Acting, "complete_act")?;
         self.guest_input_possible = false;
         self.actions_completed = self.actions_completed.saturating_add(1);
@@ -131,7 +167,7 @@ impl GuestLifecycle {
         }
         self.disposition = Some(GuestLifecycleDisposition::Uncertain);
         self.inject_fenced = true;
-        self.advance(self.phase, now);
+        self.advance(GuestLifecyclePhase::Acting, now);
         Ok(())
     }
 
@@ -166,20 +202,19 @@ impl GuestLifecycle {
         Ok(())
     }
 
-    /// Restart recovery: if guest input was possible and outcome unknown, land in Uncertain.
+    /// Restart recovery: uncertain or interrupted surfaces are destroyed fail-closed.
     pub fn recover_after_restart(&mut self, now: DateTime<Utc>) -> HarnessResult<()> {
         if self.phase == GuestLifecyclePhase::Destroyed {
             return Ok(());
         }
         if self.guest_input_possible {
             self.disposition = Some(GuestLifecycleDisposition::Uncertain);
-            self.inject_fenced = true;
-            self.advance(GuestLifecyclePhase::Stopping, now);
-        } else if self.is_live() {
-            self.inject_fenced = true;
+        } else if self.disposition.is_none() {
             self.disposition = Some(GuestLifecycleDisposition::Stopped);
-            self.advance(GuestLifecyclePhase::Stopping, now);
         }
+        self.inject_fenced = true;
+        self.guest_input_possible = false;
+        self.advance(GuestLifecyclePhase::Destroyed, now);
         Ok(())
     }
 
@@ -230,7 +265,7 @@ mod tests {
     }
 
     #[test]
-    fn uncertain_fences_inject() {
+    fn complete_act_blocked_after_uncertain() {
         let mut lifecycle = GuestLifecycle::new("surface-1", now());
         let t0 = lifecycle.updated_at;
         lifecycle.begin_boot(t0).unwrap();
@@ -243,13 +278,35 @@ mod tests {
         lifecycle
             .mark_uncertain(t0 + chrono::Duration::milliseconds(3))
             .unwrap();
-        assert!(lifecycle.inject_fenced);
-        assert_eq!(
-            lifecycle.disposition,
-            Some(GuestLifecycleDisposition::Uncertain)
-        );
+        assert!(!lifecycle.allows_inject());
+        lifecycle
+            .complete_act(t0 + chrono::Duration::milliseconds(4))
+            .expect_err("complete_act after uncertain");
+    }
+
+    #[test]
+    fn restored_uncertain_fields_cannot_reenable_inject() {
+        let mut lifecycle = GuestLifecycle::new("surface-1", now());
+        let t0 = lifecycle.updated_at;
+        lifecycle.begin_boot(t0).unwrap();
+        lifecycle
+            .complete_boot(t0 + chrono::Duration::milliseconds(1))
+            .unwrap();
+        lifecycle
+            .begin_act(t0 + chrono::Duration::milliseconds(2))
+            .unwrap();
+        lifecycle
+            .mark_uncertain(t0 + chrono::Duration::milliseconds(3))
+            .unwrap();
+
+        // Simulate hostile snapshot restore of public fields.
+        lifecycle.phase = GuestLifecyclePhase::Ready;
+        lifecycle.inject_fenced = false;
+
+        assert!(lifecycle.reconcile_invariants().is_err());
+        assert!(!lifecycle.allows_inject());
         lifecycle
             .begin_act(t0 + chrono::Duration::milliseconds(4))
-            .unwrap_err();
+            .expect_err("begin_act after hostile restore");
     }
 }

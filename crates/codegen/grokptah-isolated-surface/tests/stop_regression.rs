@@ -1,8 +1,8 @@
 //! Crash/restart/Stop regression suite for the Isolated Surface Proof Harness.
 
 use grokptah_isolated_surface::{
-    GuestLifecycleDisposition, GuestLifecyclePhase, HarnessErrorCode, HostSentinelSnapshot,
-    IsolatedSurfaceHarness, ProofEvidenceClass, SyntheticGuestAction,
+    GuestLifecycleDisposition, GuestLifecyclePhase, HarnessErrorCode, HostSentinelRegistry,
+    HostSentinelSnapshot, IsolatedSurfaceHarness, ProofEvidenceClass, SyntheticGuestAction,
 };
 use tempfile::TempDir;
 
@@ -23,9 +23,28 @@ fn canonical_proof_sequence_succeeds_with_unchanged_host_sentinels() {
 
     let evidence = harness.run_canonical_proof().expect("canonical proof");
     assert!(evidence.host_sentinels_unchanged);
+    assert!(harness.sentinels().verified_via_probe());
     assert_eq!(evidence.channels_destroyed, 2);
     assert_eq!(harness.lifecycle().phase, GuestLifecyclePhase::Destroyed);
     harness.sentinels().assert_unchanged().expect("sentinels");
+}
+
+#[test]
+fn stop_evidence_rejects_skipped_host_probe() {
+    let registry = HostSentinelRegistry::capture(HostSentinelSnapshot::synthetic_baseline());
+    assert!(!registry.verified_via_probe());
+    registry.assert_unchanged().expect_err("probe required");
+}
+
+#[test]
+fn host_mutation_detected_before_stop_claims_unchanged() {
+    let mut harness = IsolatedSurfaceHarness::new(HostSentinelSnapshot::synthetic_baseline());
+    harness.boot().expect("boot");
+    harness.host_probe_mut().simulate_host_mutation("pointer");
+    let err = harness
+        .stop()
+        .expect_err("stop must fail when host mutated");
+    assert_eq!(err.code, HarnessErrorCode::HostSentinelViolation);
 }
 
 #[test]
@@ -67,22 +86,28 @@ fn crash_during_inject_marks_uncertain_without_auto_retry() {
 }
 
 #[test]
-fn restart_after_uncertain_inject_does_not_auto_retry() {
-    let (mut harness, _dir) = harness_with_snapshot();
+fn restart_after_uncertain_lands_destroyed_with_closed_channels() {
+    let (mut harness, dir) = harness_with_snapshot();
     harness.boot().expect("boot");
     harness.schedule_uncertain_on_next_inject();
     harness
         .inject_guest_action(SyntheticGuestAction::ClickGuestButton)
         .expect_err("uncertain inject");
 
-    // Simulated restart: reload snapshot and recover.
     let mut restarted = IsolatedSurfaceHarness::new(HostSentinelSnapshot::synthetic_baseline())
-        .with_snapshot_root(_dir.path());
+        .with_snapshot_root(dir.path());
     restarted.recover_after_restart().expect("recover");
+
+    assert_eq!(restarted.lifecycle().phase, GuestLifecyclePhase::Destroyed);
     assert_eq!(
         restarted.lifecycle().disposition,
         Some(GuestLifecycleDisposition::Uncertain)
     );
+    assert!(!restarted.guest_is_booted());
+    restarted
+        .channels()
+        .assert_all_destroyed()
+        .expect("channels");
     assert!(restarted.lifecycle().inject_fenced);
 
     let retry_err = restarted

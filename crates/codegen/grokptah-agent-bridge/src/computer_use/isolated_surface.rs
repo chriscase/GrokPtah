@@ -7,8 +7,9 @@
 pub use grokptah_isolated_surface::{
     isolated_surface_admission_available, ChannelRegistry, FrameDelta, GuestFrame, GuestLifecycle,
     GuestLifecycleDisposition, GuestLifecyclePhase, HarnessError, HarnessErrorCode, HarnessResult,
-    HostSentinelDiff, HostSentinelRegistry, HostSentinelSnapshot, IsolatedSurfaceHarness,
-    ProofEvidenceClass, StopEvidence, SyntheticGuestAction, SYNTHETIC_HARNESS_NONCLAIM,
+    HostSentinelDiff, HostSentinelProbe, HostSentinelRegistry, HostSentinelSnapshot,
+    IsolatedSurfaceHarness, ProofEvidenceClass, StopEvidence, SyntheticGuestAction,
+    SyntheticHostProbe, SYNTHETIC_HARNESS_NONCLAIM,
 };
 
 /// Bridge-level admission check. Remains unavailable until physical Mac proof.

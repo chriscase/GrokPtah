@@ -1320,6 +1320,7 @@ dependencies = [
  "fs2",
  "futures",
  "grokptah-agent-sdk",
+ "grokptah-isolated-surface",
  "http-body-util",
  "keyring",
  "libc",
@@ -1402,6 +1403,17 @@ dependencies = [
  "grokptah-help-contract",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "grokptah-isolated-surface"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "uuid",
 ]
 
 [[package]]

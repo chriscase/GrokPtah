@@ -7,7 +7,6 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::{HarnessError, HarnessResult};
-use crate::sentinel::HostSentinelRegistry;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -54,6 +53,10 @@ impl SyntheticGuest {
         }
     }
 
+    pub fn is_booted(&self) -> bool {
+        self.booted
+    }
+
     pub fn schedule_crash_on_inject(&mut self) {
         self.crash_on_next_inject = true;
     }
@@ -62,11 +65,10 @@ impl SyntheticGuest {
         self.uncertain_on_next_inject = true;
     }
 
-    pub fn boot(&mut self, sentinels: &mut HostSentinelRegistry) -> HarnessResult<GuestFrame> {
+    pub fn boot(&mut self) -> HarnessResult<GuestFrame> {
         if self.booted {
             return Err(HarnessError::invalid_state("guest already booted"));
         }
-        sentinels.assert_unchanged()?;
         self.booted = true;
         self.frame_epoch = 1;
         Ok(self.current_frame())
@@ -80,15 +82,10 @@ impl SyntheticGuest {
         }
     }
 
-    pub fn inject(
-        &mut self,
-        action: SyntheticGuestAction,
-        sentinels: &mut HostSentinelRegistry,
-    ) -> HarnessResult<InjectOutcome> {
+    pub fn inject(&mut self, action: SyntheticGuestAction) -> HarnessResult<InjectOutcome> {
         if !self.booted {
             return Err(HarnessError::invalid_state("guest is not booted"));
         }
-        sentinels.assert_unchanged()?;
 
         if self.crash_on_next_inject {
             self.crash_on_next_inject = false;
@@ -110,7 +107,6 @@ impl SyntheticGuest {
         }
         self.frame_epoch = self.frame_epoch.saturating_add(1);
         let after = self.current_frame();
-        sentinels.assert_unchanged()?;
         let guest_local_change = before.digest != after.digest;
         Ok(InjectOutcome::Changed(FrameDelta {
             before_epoch: before.epoch,
@@ -121,8 +117,7 @@ impl SyntheticGuest {
         }))
     }
 
-    pub fn shutdown(&mut self, sentinels: &mut HostSentinelRegistry) -> HarnessResult<()> {
-        sentinels.assert_unchanged()?;
+    pub fn shutdown(&mut self) -> HarnessResult<()> {
         self.booted = false;
         Ok(())
     }

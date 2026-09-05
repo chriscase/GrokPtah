@@ -40,9 +40,9 @@ pub use isolated_surface::{
     GuestFrame as IsolatedGuestFrame, GuestLifecycle, GuestLifecycleDisposition,
     GuestLifecyclePhase, HarnessError as IsolatedHarnessError,
     HarnessErrorCode as IsolatedHarnessErrorCode, HarnessResult as IsolatedHarnessResult,
-    HostSentinelDiff, HostSentinelRegistry, HostSentinelSnapshot, IsolatedSurfaceHarness,
-    ProofEvidenceClass, StopEvidence as IsolatedStopEvidence, SyntheticGuestAction,
-    SYNTHETIC_HARNESS_NONCLAIM,
+    HostSentinelDiff, HostSentinelProbe, HostSentinelRegistry, HostSentinelSnapshot,
+    IsolatedSurfaceHarness, ProofEvidenceClass, StopEvidence as IsolatedStopEvidence,
+    SyntheticGuestAction, SyntheticHostProbe, SYNTHETIC_HARNESS_NONCLAIM,
 };
 pub use macos_observation::MacOsObservationPlatform;
 pub use platform::{
