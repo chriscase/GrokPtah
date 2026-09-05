@@ -9,6 +9,7 @@ build = "build.rs"
 
 # Own workspace root (excluded from monorepo root Cargo.toml).
 [workspace]
+resolver = "2"
 
 [dependencies]
 anyhow = "1"
@@ -32,6 +33,7 @@ bytes = "1"
 sha2 = "0.10"
 xai-host-authority = { path = "../../common/xai-host-authority" }
 grokptah-agent-sdk = { path = "../grokptah-agent-sdk" }
+grokptah-isolated-surface = { path = "../grokptah-isolated-surface" }
 
 keyring = { version = "3", features = ["apple-native", "sync-secret-service", "windows-native"] }
 open = "5"

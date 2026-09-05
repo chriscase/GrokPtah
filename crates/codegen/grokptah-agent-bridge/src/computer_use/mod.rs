@@ -19,6 +19,7 @@
 //! refuse, and it owns no state machine. See that module for the argument.
 
 mod adaptive;
+mod isolated_surface;
 mod macos_observation;
 mod platform;
 mod policy;
@@ -32,6 +33,16 @@ mod types;
 pub use adaptive::{
     AdaptiveApproval, AdaptiveClaim, AdaptiveDecisionRecord, AdaptiveDisposition, AdaptiveOutcome,
     AdaptiveProfile, AdaptiveReason, AdaptiveThresholds, AmbiguityAssessment,
+};
+pub use isolated_surface::{
+    computer_use_isolated_surface_admission, isolated_surface_admission_available,
+    ChannelRegistry as IsolatedChannelRegistry, FrameDelta as IsolatedFrameDelta,
+    GuestFrame as IsolatedGuestFrame, GuestLifecycle, GuestLifecycleDisposition,
+    GuestLifecyclePhase, HarnessError as IsolatedHarnessError,
+    HarnessErrorCode as IsolatedHarnessErrorCode, HarnessResult as IsolatedHarnessResult,
+    HostSentinelDiff, HostSentinelProbe, HostSentinelRegistry, HostSentinelSnapshot,
+    IsolatedSurfaceHarness, ProofEvidenceClass, StopEvidence as IsolatedStopEvidence,
+    SyntheticGuestAction, SyntheticHostProbe, SYNTHETIC_HARNESS_NONCLAIM,
 };
 pub use macos_observation::MacOsObservationPlatform;
 pub use platform::{
