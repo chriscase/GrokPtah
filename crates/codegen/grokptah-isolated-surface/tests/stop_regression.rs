@@ -1,0 +1,122 @@
+//! Crash/restart/Stop regression suite for the Isolated Surface Proof Harness.
+
+use grokptah_isolated_surface::{
+    GuestLifecycleDisposition, GuestLifecyclePhase, HarnessErrorCode, HostSentinelSnapshot,
+    IsolatedSurfaceHarness, ProofEvidenceClass, SyntheticGuestAction,
+};
+use tempfile::TempDir;
+
+fn harness_with_snapshot() -> (IsolatedSurfaceHarness, TempDir) {
+    let dir = TempDir::new().expect("tempdir");
+    let harness = IsolatedSurfaceHarness::new(HostSentinelSnapshot::synthetic_baseline())
+        .with_snapshot_root(dir.path());
+    (harness, dir)
+}
+
+#[test]
+fn canonical_proof_sequence_succeeds_with_unchanged_host_sentinels() {
+    let mut harness = IsolatedSurfaceHarness::new(HostSentinelSnapshot::synthetic_baseline());
+    assert_eq!(
+        harness.evidence_class(),
+        ProofEvidenceClass::SyntheticHarnessIneligible
+    );
+
+    let evidence = harness.run_canonical_proof().expect("canonical proof");
+    assert!(evidence.host_sentinels_unchanged);
+    assert_eq!(evidence.channels_destroyed, 2);
+    assert_eq!(harness.lifecycle().phase, GuestLifecyclePhase::Destroyed);
+    harness.sentinels().assert_unchanged().expect("sentinels");
+}
+
+#[test]
+fn stop_is_authoritative_and_fences_inject() {
+    let mut harness = IsolatedSurfaceHarness::new(HostSentinelSnapshot::synthetic_baseline());
+    harness.boot().expect("boot");
+    harness
+        .inject_guest_action(SyntheticGuestAction::ClickGuestButton)
+        .expect("inject");
+
+    let evidence = harness.stop().expect("stop");
+    assert_eq!(
+        evidence.disposition,
+        Some(GuestLifecycleDisposition::Stopped)
+    );
+    let inject_err = harness
+        .inject_guest_action(SyntheticGuestAction::ClickGuestButton)
+        .expect_err("inject after stop");
+    assert_eq!(inject_err.code, HarnessErrorCode::InjectFenced);
+}
+
+#[test]
+fn crash_during_inject_marks_uncertain_without_auto_retry() {
+    let (mut harness, _dir) = harness_with_snapshot();
+    harness.boot().expect("boot");
+    harness.schedule_crash_on_next_inject();
+
+    let err = harness
+        .inject_guest_action(SyntheticGuestAction::ClickGuestButton)
+        .expect_err("crash inject");
+    assert_eq!(err.code, HarnessErrorCode::UncertainOutcome);
+    assert!(harness.lifecycle().inject_fenced);
+
+    let retry_err = harness
+        .retry_inject_after_uncertain(SyntheticGuestAction::ClickGuestButton)
+        .expect_err("retry forbidden");
+    assert_eq!(retry_err.code, HarnessErrorCode::AutoRetryForbidden);
+    assert_eq!(harness.auto_retry_attempts(), 1);
+}
+
+#[test]
+fn restart_after_uncertain_inject_does_not_auto_retry() {
+    let (mut harness, _dir) = harness_with_snapshot();
+    harness.boot().expect("boot");
+    harness.schedule_uncertain_on_next_inject();
+    harness
+        .inject_guest_action(SyntheticGuestAction::ClickGuestButton)
+        .expect_err("uncertain inject");
+
+    // Simulated restart: reload snapshot and recover.
+    let mut restarted = IsolatedSurfaceHarness::new(HostSentinelSnapshot::synthetic_baseline())
+        .with_snapshot_root(_dir.path());
+    restarted.recover_after_restart().expect("recover");
+    assert_eq!(
+        restarted.lifecycle().disposition,
+        Some(GuestLifecycleDisposition::Uncertain)
+    );
+    assert!(restarted.lifecycle().inject_fenced);
+
+    let retry_err = restarted
+        .retry_inject_after_uncertain(SyntheticGuestAction::ClickGuestButton)
+        .expect_err("no auto retry");
+    assert_eq!(retry_err.code, HarnessErrorCode::AutoRetryForbidden);
+}
+
+#[test]
+fn destroy_cleans_channels_and_preserves_host_sentinels() {
+    let mut harness = IsolatedSurfaceHarness::new(HostSentinelSnapshot::synthetic_baseline());
+    harness.boot().expect("boot");
+    assert_eq!(harness.channels().open_count(), 2);
+
+    let evidence = harness.stop().expect("stop");
+    assert_eq!(evidence.channels_destroyed, 2);
+    harness.channels().assert_all_destroyed().expect("no leak");
+    harness.sentinels().assert_unchanged().expect("sentinels");
+}
+
+#[test]
+fn stop_after_uncertain_still_tears_down_cleanly() {
+    let (mut harness, _dir) = harness_with_snapshot();
+    harness.boot().expect("boot");
+    harness.schedule_uncertain_on_next_inject();
+    harness
+        .inject_guest_action(SyntheticGuestAction::ClickGuestButton)
+        .expect_err("uncertain");
+
+    let evidence = harness.stop().expect("stop after uncertain");
+    assert_eq!(
+        evidence.disposition,
+        Some(GuestLifecycleDisposition::Uncertain)
+    );
+    harness.channels().assert_all_destroyed().expect("channels");
+    harness.sentinels().assert_unchanged().expect("sentinels");
+}

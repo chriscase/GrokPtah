@@ -500,6 +500,7 @@ dependencies = [
  "fs2",
  "futures",
  "grokptah-agent-sdk",
+ "grokptah-isolated-surface",
  "grokptah-test-gateway",
  "http-body-util",
  "keyring",
@@ -529,6 +530,17 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "grokptah-isolated-surface"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "uuid",
 ]
 
 [[package]]
