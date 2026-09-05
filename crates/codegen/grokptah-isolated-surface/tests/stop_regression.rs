@@ -23,6 +23,7 @@ fn canonical_proof_sequence_succeeds_with_unchanged_host_sentinels() {
 
     let evidence = harness.run_canonical_proof().expect("canonical proof");
     assert!(evidence.host_sentinels_unchanged);
+    assert!(evidence.host_sentinel_probe_error.is_none());
     assert!(harness.sentinels().verified_via_probe());
     assert_eq!(evidence.channels_destroyed, 2);
     assert_eq!(harness.lifecycle().phase, GuestLifecyclePhase::Destroyed);
@@ -37,14 +38,31 @@ fn stop_evidence_rejects_skipped_host_probe() {
 }
 
 #[test]
-fn host_mutation_detected_before_stop_claims_unchanged() {
+fn host_mutation_still_fences_and_tears_down_before_probe_error() {
     let mut harness = IsolatedSurfaceHarness::new(HostSentinelSnapshot::synthetic_baseline());
     harness.boot().expect("boot");
+    assert_eq!(harness.channels().open_count(), 2);
     harness.host_probe_mut().simulate_host_mutation("pointer");
-    let err = harness
+
+    let evidence = harness
         .stop()
-        .expect_err("stop must fail when host mutated");
-    assert_eq!(err.code, HarnessErrorCode::HostSentinelViolation);
+        .expect("stop completes despite probe failure");
+    assert!(!evidence.host_sentinels_unchanged);
+    let probe_err = evidence
+        .host_sentinel_probe_error
+        .expect("probe error reported separately");
+    assert_eq!(probe_err.code, HarnessErrorCode::HostSentinelViolation);
+
+    assert!(harness.lifecycle().inject_fenced);
+    assert_eq!(harness.lifecycle().phase, GuestLifecyclePhase::Destroyed);
+    assert!(!harness.guest_is_booted());
+    assert_eq!(evidence.channels_destroyed, 2);
+    harness.channels().assert_all_destroyed().expect("channels");
+
+    let inject_err = harness
+        .inject_guest_action(SyntheticGuestAction::ClickGuestButton)
+        .expect_err("inject fenced after stop");
+    assert_eq!(inject_err.code, HarnessErrorCode::InjectFenced);
 }
 
 #[test]
@@ -60,6 +78,7 @@ fn stop_is_authoritative_and_fences_inject() {
         evidence.disposition,
         Some(GuestLifecycleDisposition::Stopped)
     );
+    assert!(evidence.host_sentinel_probe_error.is_none());
     let inject_err = harness
         .inject_guest_action(SyntheticGuestAction::ClickGuestButton)
         .expect_err("inject after stop");

@@ -60,9 +60,15 @@ NotStarted → Booting → Ready → Acting → Stopping → Destroyed
 ```
 
 - **Uncertain** is a disposition, not a resumable phase. It is recorded after possible
-  guest input when outcome cannot be established (crash mid-inject, scheduled uncertainty,
-  restart while `guest_input_possible`).
-- **Stop** sets `inject_fenced` and is authoritative; further inject is rejected.
+  guest input when outcome cannot be established (crash mid-inject, Stop during an
+  in-flight action with `guest_input_possible`, restart while `guest_input_possible`).
+- **Stop is fence-first:** `begin_stop` runs before host sentinel probe or teardown.
+  Inject is fenced immediately; channels and guest are always destroyed; probe errors
+  are reported separately in `StopEvidence.host_sentinel_probe_error` and do not skip
+  cleanup.
+- **Uncertain-on-possible-input:** stopping while `guest_input_possible` preserves
+  `GuestLifecycleDisposition::Uncertain` — never downgrades to ordinary `Stopped`.
+  `Destroyed` + `Uncertain` is a valid terminal pair.
 - **No auto-retry** after uncertain inject — explicit retry increments a counter and fails
   with `AutoRetryForbidden`.
 
@@ -89,9 +95,9 @@ Bridge admission `isolated_surface_admission_available()` remains **false**.
 | Capture frame | `observe_frame()` | ScreenCaptureKit / guest framebuffer channel |
 | Inject ONE guest-local action | `inject_guest_action(ClickGuestButton)` | Guest input channel only |
 | Changed frame | `FrameDelta.guest_local_change == true` | Frame digest / epoch increment |
-| Stop | `stop()` → `GuestLifecycleDisposition::Stopped` | Operator Stop + helper teardown |
-| Destroy channels | `ChannelRegistry::destroy_all` + `assert_all_destroyed` | Close VF/frame/input IPC |
-| Host sentinels unchanged | `HostSentinelRegistry::assert_unchanged` | AX/CGEvent/clipboard/window probes |
+| Stop | `stop()` fences first → teardown → probe; `Uncertain` preserved when input possible | Operator Stop + helper teardown |
+| Destroy channels | `ChannelRegistry::destroy_all` (always, even if probe fails) | Close VF/frame/input IPC |
+| Host sentinels unchanged | `StopEvidence.host_sentinel_probe_error` separate from teardown | AX/CGEvent/clipboard/window probes |
 | Crash mid-inject → uncertain, no retry | `stop_regression` tests | Same policy on native adapter |
 | Process restart recovery | `recover_after_restart` + snapshot | Durable guest ledger on disk |
 

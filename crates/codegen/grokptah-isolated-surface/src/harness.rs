@@ -21,6 +21,7 @@ pub struct StopEvidence {
     pub surface_id: String,
     pub channels_destroyed: usize,
     pub host_sentinels_unchanged: bool,
+    pub host_sentinel_probe_error: Option<HarnessError>,
     pub disposition: Option<GuestLifecycleDisposition>,
 }
 
@@ -158,14 +159,26 @@ impl IsolatedSurfaceHarness {
         }
     }
 
-    /// Authoritative Stop: fences inject and begins teardown.
+    /// Authoritative Stop: fence inject first, always teardown, probe separately.
     pub fn stop(&mut self) -> HarnessResult<StopEvidence> {
         let now = Utc::now();
-        self.probe_host_sentinels()?;
         self.lifecycle.begin_stop(now)?;
         self.persist_snapshot()?;
+
         self.teardown(now + chrono::Duration::milliseconds(1))?;
-        self.finish_stop()
+
+        let probe_error = self.probe_host_sentinels().err();
+        let host_sentinels_unchanged = probe_error.is_none() && self.sentinels.verified_via_probe();
+
+        self.channels.assert_all_destroyed()?;
+
+        Ok(StopEvidence {
+            surface_id: self.lifecycle.surface_id.clone(),
+            channels_destroyed: self.last_channels_destroyed,
+            host_sentinels_unchanged,
+            host_sentinel_probe_error: probe_error,
+            disposition: self.lifecycle.disposition,
+        })
     }
 
     fn teardown(&mut self, now: DateTime<Utc>) -> HarnessResult<()> {
@@ -179,20 +192,8 @@ impl IsolatedSurfaceHarness {
         if self.lifecycle.phase != GuestLifecyclePhase::Destroyed {
             self.lifecycle.complete_destroy(now)?;
         }
-        self.probe_host_sentinels()?;
         self.persist_snapshot()?;
         Ok(())
-    }
-
-    fn finish_stop(&self) -> HarnessResult<StopEvidence> {
-        self.sentinels.assert_unchanged()?;
-        self.channels.assert_all_destroyed()?;
-        Ok(StopEvidence {
-            surface_id: self.lifecycle.surface_id.clone(),
-            channels_destroyed: self.last_channels_destroyed,
-            host_sentinels_unchanged: self.sentinels.verified_via_probe(),
-            disposition: self.lifecycle.disposition,
-        })
     }
 
     pub fn schedule_crash_on_next_inject(&mut self) {

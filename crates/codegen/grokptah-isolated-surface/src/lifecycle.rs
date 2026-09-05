@@ -179,7 +179,11 @@ impl GuestLifecycle {
             return Ok(());
         }
         self.inject_fenced = true;
-        if self.disposition != Some(GuestLifecycleDisposition::Uncertain) {
+        if self.guest_input_possible
+            || self.disposition == Some(GuestLifecycleDisposition::Uncertain)
+        {
+            self.disposition = Some(GuestLifecycleDisposition::Uncertain);
+        } else if self.disposition.is_none() {
             self.disposition = Some(GuestLifecycleDisposition::Stopped);
         }
         self.advance(GuestLifecyclePhase::Stopping, now);
@@ -262,6 +266,37 @@ mod tests {
         assert_eq!(lifecycle.phase, GuestLifecyclePhase::Ready);
         assert_eq!(lifecycle.actions_completed, 1);
         assert!(!lifecycle.inject_fenced);
+    }
+
+    #[test]
+    fn stop_during_inflight_action_preserves_uncertain() {
+        let mut lifecycle = GuestLifecycle::new("surface-1", now());
+        let t0 = lifecycle.updated_at;
+        lifecycle.begin_boot(t0).unwrap();
+        lifecycle
+            .complete_boot(t0 + chrono::Duration::milliseconds(1))
+            .unwrap();
+        lifecycle
+            .begin_act(t0 + chrono::Duration::milliseconds(2))
+            .unwrap();
+        assert!(lifecycle.guest_input_possible);
+
+        lifecycle
+            .begin_stop(t0 + chrono::Duration::milliseconds(3))
+            .unwrap();
+        assert_eq!(
+            lifecycle.disposition,
+            Some(GuestLifecycleDisposition::Uncertain)
+        );
+        assert!(lifecycle.inject_fenced);
+        lifecycle
+            .complete_destroy(t0 + chrono::Duration::milliseconds(4))
+            .unwrap();
+        assert_eq!(lifecycle.phase, GuestLifecyclePhase::Destroyed);
+        assert_eq!(
+            lifecycle.disposition,
+            Some(GuestLifecycleDisposition::Uncertain)
+        );
     }
 
     #[test]
