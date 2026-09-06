@@ -13,6 +13,7 @@ mod git;
 mod identity;
 mod lifecycle;
 mod patch;
+mod paths;
 mod session;
 mod store;
 

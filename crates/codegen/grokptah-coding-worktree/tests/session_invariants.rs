@@ -43,6 +43,18 @@ fn session_with_snapshot(dir: &TempDir, base_sha: &str) -> CodingWorktreeSession
         .with_snapshot_root(dir.path().join("snapshots"))
 }
 
+fn clone_apply_target(source_repo: &std::path::Path) -> TempDir {
+    let apply_root = TempDir::new().expect("apply tempdir");
+    let output = std::process::Command::new("git")
+        .args(["clone", "-q"])
+        .arg(source_repo)
+        .arg(apply_root.path())
+        .output()
+        .expect("clone apply target");
+    assert!(output.status.success(), "{}", stderr(&output));
+    apply_root
+}
+
 #[test]
 fn accept_applies_exact_patch_to_explicit_target_not_main() {
     let dir = TempDir::new().expect("tempdir");
@@ -54,19 +66,13 @@ fn accept_applies_exact_patch_to_explicit_target_not_main() {
         .expect("write");
     let patch = session.stage_patch().expect("stage");
 
-    let apply_target = dir.path().join("apply-target");
-    let output = std::process::Command::new("git")
-        .args(["clone", "-q"])
-        .arg(dir.path())
-        .arg(&apply_target)
-        .output()
-        .expect("clone apply target");
-    assert!(output.status.success());
+    let apply_root = clone_apply_target(dir.path());
+    let apply_target = apply_root.path();
 
     let main_before = std::fs::read_to_string(dir.path().join("README.md")).expect("main read");
     let now = Utc::now();
     let evidence = session
-        .accept(&apply_target, &patch.digest, now)
+        .accept(apply_target, &patch.digest, now)
         .expect("accept");
     assert_eq!(evidence.patch_digest, patch.digest);
     assert_eq!(
@@ -112,12 +118,11 @@ fn accept_requires_exact_patch_digest_match() {
         .write_worktree_file("README.md", "x\n")
         .expect("write");
     let patch = session.stage_patch().expect("stage");
-    let apply_target = dir.path().join("apply-target");
-    std::fs::create_dir_all(&apply_target).expect("target");
-    std::fs::write(apply_target.join("README.md"), "baseline\n").expect("seed");
+    let apply_root = clone_apply_target(dir.path());
+    let apply_target = apply_root.path();
 
     let err = session
-        .accept(&apply_target, "sha256:wrong", Utc::now())
+        .accept(apply_target, "sha256:wrong", Utc::now())
         .expect_err("digest mismatch");
     assert_eq!(err.code, SessionErrorCode::PatchDigestMismatch);
     assert_eq!(
@@ -205,12 +210,135 @@ fn restart_with_apply_in_flight_becomes_uncertain_no_auto_accept() {
         restored.lifecycle().disposition,
         Some(SessionDisposition::Uncertain)
     );
-    let apply_target = dir.path().join("apply-target");
-    std::fs::create_dir_all(&apply_target).expect("target");
+    let apply_root = clone_apply_target(dir.path());
     let retry_err = restored
-        .accept(&apply_target, "sha256:any", Utc::now())
+        .accept(apply_root.path(), "sha256:any", Utc::now())
         .expect_err("no auto-retry accept");
     assert_eq!(retry_err.code, SessionErrorCode::UncertainOutcome);
+}
+
+#[test]
+fn write_worktree_file_rejects_absolute_main_path() {
+    let dir = TempDir::new().expect("tempdir");
+    init_fixture_repo(dir.path());
+    let main_readme = dir.path().join("README.md");
+    let session = session_with_snapshot(&dir, "HEAD");
+
+    let err = session
+        .write_worktree_file(main_readme.to_str().expect("utf8"), "hostile\n")
+        .expect_err("absolute main path");
+    assert_eq!(err.code, SessionErrorCode::MainCheckoutProtected);
+    assert_eq!(
+        std::fs::read_to_string(main_readme).expect("main unchanged"),
+        "baseline\n"
+    );
+}
+
+#[test]
+fn write_worktree_file_rejects_parent_dir_escape_to_main() {
+    let dir = TempDir::new().expect("tempdir");
+    init_fixture_repo(dir.path());
+    let main_readme = dir.path().join("README.md");
+    let session = session_with_snapshot(&dir, "HEAD");
+
+    let err = session
+        .write_worktree_file("../../../README.md", "hostile\n")
+        .expect_err("parent escape");
+    assert_eq!(err.code, SessionErrorCode::MainCheckoutProtected);
+    assert_eq!(
+        std::fs::read_to_string(main_readme).expect("main unchanged"),
+        "baseline\n"
+    );
+}
+
+#[test]
+fn accept_rejects_apply_target_under_main_checkout() {
+    let dir = TempDir::new().expect("tempdir");
+    init_fixture_repo(dir.path());
+    let mut session = session_with_snapshot(&dir, "HEAD");
+    session
+        .write_worktree_file("README.md", "agent edit\n")
+        .expect("write");
+    let patch = session.stage_patch().expect("stage");
+
+    let nested = dir.path().join(".grokptah").join("nested-target");
+    std::fs::create_dir_all(&nested).expect("nested");
+
+    let err = session
+        .accept(&nested, &patch.digest, Utc::now())
+        .expect_err("nested under main");
+    assert_eq!(err.code, SessionErrorCode::MainCheckoutProtected);
+}
+
+#[test]
+fn accept_rejects_tampered_patch_bytes_even_with_stored_digest() {
+    let dir = TempDir::new().expect("tempdir");
+    init_fixture_repo(dir.path());
+    let mut session = session_with_snapshot(&dir, "HEAD");
+    session
+        .write_worktree_file("README.md", "agent edit\n")
+        .expect("write");
+    let patch = session.stage_patch().expect("stage");
+    let apply_root = clone_apply_target(dir.path());
+    let apply_target = apply_root.path();
+
+    let snapshot = session.to_snapshot();
+    let mut tampered = snapshot.patch.expect("patch");
+    tampered.bytes.push(b'\n');
+    let restored = SessionSnapshot::new(
+        snapshot.identity,
+        snapshot.lifecycle,
+        Some(tampered),
+        snapshot.main_checkout_digest,
+        snapshot.worktree_path,
+        snapshot.repo_root,
+    );
+    let mut session = CodingWorktreeSession::restore_from_snapshot(restored).expect("restore");
+
+    let err = session
+        .accept(apply_target, &patch.digest, Utc::now())
+        .expect_err("tampered bytes");
+    assert_eq!(err.code, SessionErrorCode::PatchDigestMismatch);
+}
+
+#[test]
+fn stage_patch_includes_untracked_files() {
+    let dir = TempDir::new().expect("tempdir");
+    init_fixture_repo(dir.path());
+    let mut session = session_with_snapshot(&dir, "HEAD");
+    session
+        .write_worktree_file("new-file.txt", "brand new\n")
+        .expect("write new file");
+
+    let patch = session.stage_patch().expect("stage");
+    assert!(patch.paths.iter().any(|path| path == "new-file.txt"));
+    assert!(patch.bytes.windows(9).any(|window| window == b"brand new"));
+}
+
+#[test]
+fn discard_clears_git_worktree_registration() {
+    let dir = TempDir::new().expect("tempdir");
+    init_fixture_repo(dir.path());
+    let mut session = session_with_snapshot(&dir, "HEAD");
+    let worktree = session.worktree_path().to_path_buf();
+
+    session.discard(Utc::now()).expect("discard");
+    assert!(!worktree.exists());
+
+    let list = std::process::Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(dir.path())
+        .output()
+        .expect("list");
+    assert!(list.status.success());
+    let listed = String::from_utf8_lossy(&list.stdout);
+    assert!(
+        !listed.lines().any(|line| {
+            line.strip_prefix("worktree ")
+                .is_some_and(|path| path.contains("run-test-session"))
+        }),
+        "discard left worktree registered: {listed}"
+    );
 }
 
 #[test]

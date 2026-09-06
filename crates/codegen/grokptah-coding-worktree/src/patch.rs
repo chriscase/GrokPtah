@@ -41,12 +41,19 @@ impl PatchArtifact {
         })
     }
 
+    /// Verify `expected` matches the SHA-256 of the bytes that would be applied.
+    /// Never trusts the stored digest label without hashing `bytes`.
     pub fn verify_digest(&self, expected: &str) -> SessionResult<()> {
-        if self.digest != expected {
+        let actual = digest_bytes(&self.bytes);
+        if actual != expected {
             return Err(SessionError::patch_digest_mismatch(format!(
-                "expected digest {expected}, found {digest}",
-                digest = self.digest
+                "expected digest {expected}, found {actual} from patch bytes"
             )));
+        }
+        if self.digest != actual {
+            return Err(SessionError::patch_digest_mismatch(
+                "stored patch digest does not match patch bytes",
+            ));
         }
         Ok(())
     }

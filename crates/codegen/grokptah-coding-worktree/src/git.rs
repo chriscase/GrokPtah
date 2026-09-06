@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use crate::error::{SessionError, SessionErrorCode, SessionResult};
-use crate::patch::PatchArtifact;
+use crate::patch::{digest_bytes, PatchArtifact};
 
 pub fn resolve_sha(repo_root: &Path, base_sha: &str) -> SessionResult<String> {
     let output = git_in(repo_root, &["rev-parse", "--verify", base_sha])?;
@@ -55,6 +55,8 @@ pub fn create_worktree(
 }
 
 pub fn capture_patch(worktree_path: &Path, base_sha: &str) -> SessionResult<PatchArtifact> {
+    let untracked_before = list_untracked_paths(worktree_path)?;
+    mark_untracked_intent_to_add(worktree_path)?;
     let diff = git_in(
         worktree_path,
         &[
@@ -73,7 +75,75 @@ pub fn capture_patch(worktree_path: &Path, base_sha: &str) -> SessionResult<Patc
         ));
     }
     let paths = list_changed_paths(worktree_path, base_sha)?;
-    PatchArtifact::from_diff(diff.stdout, paths)
+    let had_untracked = !untracked_before.is_empty();
+    let mut all_paths = paths;
+    for path in untracked_before {
+        if !all_paths.iter().any(|existing| existing == &path) {
+            all_paths.push(path);
+        }
+    }
+    if had_untracked && diff.stdout.is_empty() {
+        return Err(SessionError::invalid_state(
+            "untracked worktree files present but patch capture produced empty diff",
+        ));
+    }
+    PatchArtifact::from_diff(diff.stdout, all_paths)
+}
+
+fn mark_untracked_intent_to_add(worktree_path: &Path) -> SessionResult<()> {
+    let output = git_in(
+        worktree_path,
+        &["ls-files", "-o", "--exclude-standard", "-z"],
+    )?;
+    if !output.status.success() {
+        return Err(SessionError::new(
+            SessionErrorCode::Internal,
+            format!(
+                "git ls-files for untracked failed: {}",
+                command_error(&output)
+            ),
+        ));
+    }
+    for file in parse_null_separated(&output.stdout) {
+        let add = git_in(worktree_path, &["add", "-N", &file])?;
+        if !add.status.success() {
+            return Err(SessionError::new(
+                SessionErrorCode::Internal,
+                format!(
+                    "git add -N for untracked file failed: {}",
+                    command_error(&add)
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn list_untracked_paths(worktree_path: &Path) -> SessionResult<Vec<String>> {
+    let output = git_in(worktree_path, &["ls-files", "-o", "--exclude-standard"])?;
+    if !output.status.success() {
+        return Err(SessionError::new(
+            SessionErrorCode::Internal,
+            format!("git ls-files --others failed: {}", command_error(&output)),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+fn parse_null_separated(bytes: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    for part in bytes.split(|byte| *byte == 0) {
+        if part.is_empty() {
+            continue;
+        }
+        out.push(String::from_utf8_lossy(part).to_string());
+    }
+    out
 }
 
 fn list_changed_paths(worktree_path: &Path, base_sha: &str) -> SessionResult<Vec<String>> {
@@ -93,8 +163,18 @@ fn list_changed_paths(worktree_path: &Path, base_sha: &str) -> SessionResult<Vec
     Ok(paths)
 }
 
-pub fn apply_patch(target_root: &Path, patch: &PatchArtifact) -> SessionResult<()> {
+pub fn apply_patch(
+    target_root: &Path,
+    patch: &PatchArtifact,
+    expected_digest: &str,
+) -> SessionResult<()> {
     assert_target_not_empty(target_root)?;
+    let actual = digest_bytes(&patch.bytes);
+    if actual != expected_digest {
+        return Err(SessionError::patch_digest_mismatch(
+            "apply refused: digest of patch bytes does not match operator digest",
+        ));
+    }
     let mut child = Command::new("git")
         .args(["apply", "--binary", "--whitespace=nowarn", "-"])
         .current_dir(target_root)
@@ -120,39 +200,41 @@ pub fn apply_patch(target_root: &Path, patch: &PatchArtifact) -> SessionResult<(
 }
 
 pub fn remove_worktree(repo_root: &Path, worktree_path: &Path) -> SessionResult<()> {
-    if !worktree_path.exists() {
-        return Ok(());
-    }
-    let output = Command::new("git")
-        .args(["worktree", "remove", "--force", "--"])
-        .arg(worktree_path)
-        .current_dir(repo_root)
-        .output()
-        .map_err(|error| {
-            SessionError::new(
+    if worktree_path.exists() {
+        let output = Command::new("git")
+            .args(["worktree", "remove", "--force", "--"])
+            .arg(worktree_path)
+            .current_dir(repo_root)
+            .output()
+            .map_err(|error| {
+                SessionError::new(
+                    SessionErrorCode::Internal,
+                    format!("git worktree remove unavailable: {error}"),
+                )
+            })?;
+        if !output.status.success() {
+            return Err(SessionError::new(
                 SessionErrorCode::Internal,
-                format!("git worktree remove unavailable: {error}"),
-            )
-        })?;
+                format!("git worktree remove failed: {}", command_error(&output)),
+            ));
+        }
+    }
+    prune_worktrees(repo_root)?;
+    Ok(())
+}
+
+pub fn prune_worktrees(repo_root: &Path) -> SessionResult<()> {
+    let output = git_in(repo_root, &["worktree", "prune", "--expire", "now"])?;
     if !output.status.success() {
         return Err(SessionError::new(
             SessionErrorCode::Internal,
-            format!("git worktree remove failed: {}", command_error(&output)),
+            format!("git worktree prune failed: {}", command_error(&output)),
         ));
     }
     Ok(())
 }
 
-pub fn worktree_is_registered(repo_root: &Path, worktree_path: &Path) -> SessionResult<bool> {
-    if !worktree_path.exists() {
-        return Ok(false);
-    }
-    let canonical = dunce::canonicalize(worktree_path).map_err(|error| {
-        SessionError::new(
-            SessionErrorCode::Internal,
-            format!("canonicalize worktree: {error}"),
-        )
-    })?;
+pub fn listed_worktree_paths(repo_root: &Path) -> SessionResult<Vec<PathBuf>> {
     let output = git_in(repo_root, &["worktree", "list", "--porcelain"])?;
     if !output.status.success() {
         return Err(SessionError::new(
@@ -160,30 +242,45 @@ pub fn worktree_is_registered(repo_root: &Path, worktree_path: &Path) -> Session
             format!("git worktree list failed: {}", command_error(&output)),
         ));
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    for line in text.lines() {
-        if line.starts_with("worktree ") {
-            let path = line.trim_start_matches("worktree ").trim();
-            if let Ok(path) = dunce::canonicalize(path) {
-                if path == canonical {
-                    return Ok(true);
-                }
-            }
+    let mut paths = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            paths.push(PathBuf::from(path.trim()));
+        }
+    }
+    Ok(paths)
+}
+
+pub fn worktree_is_listed(repo_root: &Path, worktree_path: &Path) -> SessionResult<bool> {
+    for listed in listed_worktree_paths(repo_root)? {
+        if paths_refer_to_same_worktree(&listed, worktree_path)? {
+            return Ok(true);
         }
     }
     Ok(false)
 }
 
+fn paths_refer_to_same_worktree(left: &Path, right: &Path) -> SessionResult<bool> {
+    if left == right {
+        return Ok(true);
+    }
+    match (dunce::canonicalize(left), dunce::canonicalize(right)) {
+        (Ok(a), Ok(b)) => Ok(a == b),
+        _ => Ok(left.to_string_lossy() == right.to_string_lossy()),
+    }
+}
+
 pub fn assert_worktree_removed(repo_root: &Path, worktree_path: &Path) -> SessionResult<()> {
+    prune_worktrees(repo_root)?;
     if worktree_path.exists() {
         return Err(SessionError::worktree_still_active(format!(
             "worktree path still exists: {}",
             worktree_path.display()
         )));
     }
-    if worktree_is_registered(repo_root, worktree_path)? {
+    if worktree_is_listed(repo_root, worktree_path)? {
         return Err(SessionError::worktree_still_active(
-            "worktree still registered with git",
+            "worktree still registered in git worktree list",
         ));
     }
     Ok(())
@@ -194,25 +291,6 @@ pub fn managed_worktree_path(repo_root: &Path, session_id: &str) -> PathBuf {
         .join(".grokptah")
         .join("worktrees")
         .join(format!("run-{session_id}"))
-}
-
-pub fn assert_path_not_main_checkout(
-    main_checkout: &Path,
-    target: &Path,
-    op: &str,
-) -> SessionResult<()> {
-    let main = canonical_or_same(main_checkout)?;
-    let candidate = canonical_or_same(target)?;
-    if main == candidate {
-        return Err(SessionError::main_checkout_protected(format!(
-            "{op} cannot target the protected main checkout"
-        )));
-    }
-    Ok(())
-}
-
-fn canonical_or_same(path: &Path) -> SessionResult<PathBuf> {
-    Ok(dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
 }
 
 fn assert_target_not_empty(target_root: &Path) -> SessionResult<()> {

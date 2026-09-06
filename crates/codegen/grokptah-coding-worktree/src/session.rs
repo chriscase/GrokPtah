@@ -10,12 +10,14 @@ use chrono::{DateTime, Utc};
 
 use crate::error::{SessionError, SessionErrorCode, SessionResult};
 use crate::git::{
-    apply_patch, assert_path_not_main_checkout, assert_worktree_removed, capture_patch,
-    create_worktree, managed_worktree_path, remove_worktree, resolve_sha,
+    apply_patch, assert_worktree_removed, capture_patch, create_worktree, managed_worktree_path,
+    remove_worktree, resolve_sha,
 };
 use crate::identity::CodingWorktreeIdentity;
 use crate::lifecycle::{SessionDisposition, SessionLifecycle, SessionPhase};
-use crate::patch::{digest_path, PatchArtifact};
+use crate::patch::{digest_bytes, digest_path, PatchArtifact};
+use crate::paths::assert_apply_target_allowed;
+use crate::paths::resolve_worktree_write_path;
 use crate::store::{snapshot_root, SessionSnapshot};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,8 +131,7 @@ impl CodingWorktreeSession {
                 "staging is fenced after settlement begins",
             ));
         }
-        let path = self.worktree_path.join(relative);
-        assert_path_not_main_checkout(&self.main_checkout, &path, "write_worktree_file")?;
+        let path = resolve_worktree_write_path(&self.worktree_path, relative)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|error| {
                 SessionError::new(
@@ -172,7 +173,7 @@ impl CodingWorktreeSession {
         now: DateTime<Utc>,
     ) -> SessionResult<AcceptEvidence> {
         self.enforce_no_auto_retry("accept")?;
-        assert_path_not_main_checkout(&self.main_checkout, apply_target, "accept")?;
+        assert_apply_target_allowed(&self.main_checkout, apply_target, "accept")?;
         let patch = self
             .patch
             .as_ref()
@@ -184,7 +185,7 @@ impl CodingWorktreeSession {
         self.lifecycle.mark_apply_in_flight(now)?;
         self.persist_snapshot()?;
 
-        if let Err(error) = apply_patch(apply_target, &patch) {
+        if let Err(error) = apply_patch(apply_target, &patch, expected_patch_digest) {
             self.lifecycle.mark_apply_uncertain(now)?;
             self.remove_worktree_best_effort()?;
             self.persist_snapshot()?;
@@ -196,7 +197,7 @@ impl CodingWorktreeSession {
         self.remove_worktree_best_effort()?;
         self.persist_snapshot()?;
         Ok(AcceptEvidence {
-            patch_digest: patch.digest,
+            patch_digest: digest_bytes(&patch.bytes),
             target_root: apply_target.to_path_buf(),
         })
     }
@@ -281,9 +282,14 @@ impl CodingWorktreeSession {
     }
 
     fn remove_worktree_best_effort(&mut self) -> SessionResult<()> {
-        let _ = remove_worktree(&self.repo_root, &self.worktree_path);
+        remove_worktree(&self.repo_root, &self.worktree_path)?;
         if self.worktree_path.exists() {
-            let _ = std::fs::remove_dir_all(&self.worktree_path);
+            std::fs::remove_dir_all(&self.worktree_path).map_err(|error| {
+                SessionError::new(
+                    SessionErrorCode::Internal,
+                    format!("remove worktree directory: {error}"),
+                )
+            })?;
         }
         Ok(())
     }
