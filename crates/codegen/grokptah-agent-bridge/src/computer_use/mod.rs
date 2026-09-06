@@ -45,8 +45,8 @@ pub use isolated_surface::{
     HostSentinelDiff, HostSentinelProbe, HostSentinelRegistry, HostSentinelSnapshot,
     IsolatedSurfaceBackend, IsolatedSurfaceHarness, MainCheckoutFence, ProofEvidenceClass,
     SealedProofEvidence, Sep18NoModelProofSequencer, StopEvidence as IsolatedStopEvidence,
-    SyntheticGuest, SyntheticGuestAction, SyntheticHostProbe, VfLaunchReceipt,
-    SYNTHETIC_HARNESS_NONCLAIM,
+    SyntheticGuest, SyntheticGuestAction, SyntheticHostProbe, VfDryRunEvidence, VfDryRunOutcome,
+    VfDryRunPlatform, VfLaunchReceipt, SYNTHETIC_HARNESS_NONCLAIM, VF_DRY_RUN_NONCLAIM,
 };
 pub use macos_observation::MacOsObservationPlatform;
 pub use platform::{

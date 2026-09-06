@@ -67,6 +67,47 @@ pub trait HostSentinelProbe {
     fn probe_host(&self) -> HarnessResult<HostSentinelSnapshot>;
 }
 
+/// Mac physical proof hook for live host sentinel collection.
+///
+/// On Sep 18, a Mac worker collects pointer, foreground app/window, clipboard digest,
+/// unrelated host window, and `MainCheckoutFence`, then passes the snapshot to
+/// [`HostSentinelRegistry::refresh_from_host`] (or [`IsolatedSurfaceHarness::refresh_host_sentinels`])
+/// at boot, inject, and Stop probe points. This dry-run stub fails closed until the
+/// physical checklist wires real AX/clipboard/main-checkout reads.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone)]
+pub struct MacHostSentinelCollector {
+    checkout_path: String,
+}
+
+#[cfg(target_os = "macos")]
+impl MacHostSentinelCollector {
+    pub fn new(checkout_path: impl Into<String>) -> Self {
+        Self {
+            checkout_path: checkout_path.into(),
+        }
+    }
+
+    pub fn checkout_path(&self) -> &str {
+        &self.checkout_path
+    }
+
+    /// Collect live host sentinel state for [`HostSentinelRegistry::refresh_from_host`].
+    pub fn collect(&self) -> HarnessResult<HostSentinelSnapshot> {
+        let _ = &self.checkout_path;
+        Err(HarnessError::backend_unavailable(
+            "Mac host sentinel collection is not wired in dry-run; use physical Sep 18 checklist",
+        ))
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl HostSentinelProbe for MacHostSentinelCollector {
+    fn probe_host(&self) -> HarnessResult<HostSentinelSnapshot> {
+        self.collect()
+    }
+}
+
 /// Synthetic host-side state for harness tests. Starts at the baseline and may
 /// only diverge when a test simulates host mutation.
 #[derive(Debug, Clone)]

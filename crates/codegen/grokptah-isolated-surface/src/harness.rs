@@ -119,6 +119,12 @@ impl<B: IsolatedSurfaceBackend> IsolatedSurfaceHarness<B> {
         &self.sentinels
     }
 
+    /// Mac physical proof hook: compare an externally collected host snapshot to the
+    /// harness baseline via [`HostSentinelRegistry::refresh_from_host`].
+    pub fn refresh_host_sentinels(&mut self, snapshot: HostSentinelSnapshot) -> HarnessResult<()> {
+        self.sentinels.refresh_from_host(snapshot)
+    }
+
     pub fn host_probe_mut(&mut self) -> &mut SyntheticHostProbe {
         &mut self.host_probe
     }

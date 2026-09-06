@@ -56,3 +56,7 @@ grokptah-test-gateway = { path = "test-support/grokptah-test-gateway" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "process", "test-util"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tempfile = "3"
+
+[features]
+default = []
+vf-backend = ["grokptah-isolated-surface/vf-backend"]

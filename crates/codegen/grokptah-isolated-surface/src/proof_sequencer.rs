@@ -7,12 +7,13 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::backend::assert_evidence_class_unchanged;
+use crate::backend::{assert_evidence_class_unchanged, VfLaunchReceipt};
 use crate::error::{HarnessError, HarnessErrorCode, HarnessResult};
 use crate::harness::{IsolatedSurfaceHarness, StopEvidence};
 use crate::lifecycle::{GuestLifecycleDisposition, GuestLifecyclePhase, ProofEvidenceClass};
 use crate::sentinel::HostSentinelSnapshot;
 use crate::simulator::{GuestLocalAction, SyntheticGuest};
+use crate::vf_dry_run::{run_vf_dry_run, VfDryRunEvidence};
 use crate::SYNTHETIC_HARNESS_NONCLAIM;
 
 /// Bounded fault-matrix cases exercised against the synthetic backend.
@@ -76,6 +77,13 @@ impl Sep18NoModelProofSequencer {
     pub fn run_happy_path(&self) -> HarnessResult<SealedProofEvidence> {
         let mut harness = self.harness();
         self.run_checklist(&mut harness, None)
+    }
+
+    /// VF dry-run path for Sep 18 gate rehearsal. On non-macOS returns
+    /// `UnsupportedPlatform`; on macOS without `vf-backend` returns `FeatureDisabled`.
+    /// Never claims a physical PASS — admission stays false.
+    pub fn run_vf_dry_run(&self, receipt: VfLaunchReceipt) -> HarnessResult<VfDryRunEvidence> {
+        run_vf_dry_run(receipt, self.baseline.clone())
     }
 
     /// Run one bounded fault-matrix case.

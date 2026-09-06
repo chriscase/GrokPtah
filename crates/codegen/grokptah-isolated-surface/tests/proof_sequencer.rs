@@ -3,7 +3,8 @@
 use grokptah_isolated_surface::{
     ChecklistStep, ContainedBrowserBackend, FaultMatrixCase, HarnessErrorCode,
     HostSentinelSnapshot, IsolatedSurfaceBackend, IsolatedSurfaceHarness, ProofEvidenceClass,
-    Sep18NoModelProofSequencer,
+    Sep18NoModelProofSequencer, VfDryRunOutcome, VfDryRunPlatform, VfLaunchReceipt,
+    VF_DRY_RUN_NONCLAIM,
 };
 use tempfile::TempDir;
 
@@ -247,4 +248,40 @@ fn evidence_class_never_upgrades_at_seal() {
     let sequencer = Sep18NoModelProofSequencer::new(HostSentinelSnapshot::synthetic_baseline());
     let sealed = sequencer.run_happy_path().expect("seal");
     assert!(!sealed.evidence_class.is_vf_qualification_eligible());
+}
+
+#[test]
+fn sep18_vf_dry_run_unsupported_on_linux_ci() {
+    let sequencer = Sep18NoModelProofSequencer::new(HostSentinelSnapshot::synthetic_baseline());
+    let receipt = VfLaunchReceipt {
+        physical_mac_proof_id: "dry-run-linux-ci".into(),
+    };
+    let evidence = sequencer.run_vf_dry_run(receipt).expect("dry-run artifact");
+    assert_eq!(evidence.platform, VfDryRunPlatform::NonMacOs);
+    assert_eq!(evidence.outcome, VfDryRunOutcome::UnsupportedPlatform);
+    assert!(!evidence.physical_pass_claimed);
+    assert!(!evidence.boot_attempted);
+    assert!(evidence.nonclaim.contains("never claim Sep 18 PASS"));
+    assert_eq!(evidence.nonclaim, VF_DRY_RUN_NONCLAIM);
+}
+
+#[test]
+fn vf_dry_run_rejects_empty_receipt() {
+    let sequencer = Sep18NoModelProofSequencer::new(HostSentinelSnapshot::synthetic_baseline());
+    let err = sequencer
+        .run_vf_dry_run(VfLaunchReceipt {
+            physical_mac_proof_id: "  ".into(),
+        })
+        .expect_err("empty receipt");
+    assert_eq!(err.code, HarnessErrorCode::InvalidState);
+}
+
+#[test]
+fn harness_refresh_host_sentinels_uses_probe_path() {
+    let mut harness = IsolatedSurfaceHarness::new(HostSentinelSnapshot::synthetic_baseline());
+    harness.boot().expect("boot");
+    harness
+        .refresh_host_sentinels(HostSentinelSnapshot::synthetic_baseline())
+        .expect("refresh matches baseline");
+    assert!(harness.sentinels().verified_via_probe());
 }

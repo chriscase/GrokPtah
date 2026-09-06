@@ -6,6 +6,11 @@ license = "Apache-2.0"
 description = "Synthetic Isolated Surface Proof Harness for Windowed Coding Run v0 (#288/#286)"
 authors = ["GrokPtah"]
 
+[features]
+default = []
+# Mac-only Virtualization.framework backend stub; off by default on Linux CI.
+vf-backend = []
+
 # Own workspace root (excluded from monorepo root and agent-bridge workspace).
 [workspace]
 resolver = "2"
