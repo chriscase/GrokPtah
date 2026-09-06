@@ -41,9 +41,11 @@ Active → stage patch → Accept | Discard | KeepForReview → Settled
 
 | Invariant | Enforcement |
 |---|---|
-| Main checkout never written by session helpers | `assert_path_not_main_checkout` on write/accept |
-| Accept requires exact patch digest | `PatchArtifact::verify_digest` |
-| Discard cannot leave active worktree | `assert_worktree_removed` after `git worktree remove` |
+| Main checkout never written by session helpers | `resolve_worktree_write_path` canonicalizes and confines writes to disposable worktree root; rejects absolute paths and `..` escapes |
+| Accept targets outside main checkout prefix | `assert_apply_target_allowed` rejects any path equal to or under protected checkout |
+| Accept requires exact patch digest of bytes applied | `PatchArtifact::verify_digest` hashes `bytes`; `apply_patch` re-hashes before `git apply` |
+| Discard cannot leave active worktree | `git worktree remove` + `prune` + `git worktree list` must not list session path |
+| Staging includes untracked files | `git add -N` intent-to-add before diff capture; fail-closed if untracked present but diff empty |
 | Restart/reload cannot auto-Accept | `recover_after_restart` → `Uncertain` when `apply_in_flight` |
 | Uncertain apply → no auto-retry | `enforce_no_auto_retry` on all settlement ops |
 
