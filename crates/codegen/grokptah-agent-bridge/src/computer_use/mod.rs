@@ -38,6 +38,7 @@ pub use isolated_surface::{
     assert_evidence_class_unchanged, computer_use_isolated_surface_admission,
     honest_harness_evidence_class, isolated_surface_admission_available,
     ChannelRegistry as IsolatedChannelRegistry, ChecklistStep, ContainedBrowserBackend,
+    ContainedBrowserDryRunEvidence, ContainedBrowserDryRunOutcome, ContainedBrowserDryRunPlatform,
     FaultInjectingBackend, FaultMatrixCase, FrameDelta as IsolatedFrameDelta,
     GuestFrame as IsolatedGuestFrame, GuestLifecycle, GuestLifecycleDisposition,
     GuestLifecyclePhase, GuestLocalAction, HarnessError as IsolatedHarnessError,
@@ -46,7 +47,8 @@ pub use isolated_surface::{
     IsolatedSurfaceBackend, IsolatedSurfaceHarness, MainCheckoutFence, ProofEvidenceClass,
     SealedProofEvidence, Sep18NoModelProofSequencer, StopEvidence as IsolatedStopEvidence,
     SyntheticGuest, SyntheticGuestAction, SyntheticHostProbe, VfDryRunEvidence, VfDryRunOutcome,
-    VfDryRunPlatform, VfLaunchReceipt, SYNTHETIC_HARNESS_NONCLAIM, VF_DRY_RUN_NONCLAIM,
+    VfDryRunPlatform, VfLaunchReceipt, CONTAINED_BROWSER_DRY_RUN_NONCLAIM,
+    SYNTHETIC_HARNESS_NONCLAIM, VF_DRY_RUN_NONCLAIM,
 };
 pub use macos_observation::MacOsObservationPlatform;
 pub use platform::{

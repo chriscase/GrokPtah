@@ -5,10 +5,12 @@
 //! Virtualization.framework qualification.
 
 use grokptah_agent_bridge::computer_use::{
-    computer_use_isolated_surface_admission, ContainedBrowserBackend, GuestLifecyclePhase,
+    computer_use_isolated_surface_admission, ContainedBrowserBackend,
+    ContainedBrowserDryRunOutcome, ContainedBrowserDryRunPlatform, GuestLifecyclePhase,
     HostSentinelSnapshot, IsolatedSurfaceBackend, IsolatedSurfaceHarness, ProofEvidenceClass,
     Sep18NoModelProofSequencer, SyntheticGuestAction, VfDryRunOutcome, VfDryRunPlatform,
-    VfLaunchReceipt, SYNTHETIC_HARNESS_NONCLAIM, VF_DRY_RUN_NONCLAIM,
+    VfLaunchReceipt, CONTAINED_BROWSER_DRY_RUN_NONCLAIM, SYNTHETIC_HARNESS_NONCLAIM,
+    VF_DRY_RUN_NONCLAIM,
 };
 
 #[test]
@@ -46,12 +48,34 @@ fn bridge_sep18_sequencer_reachable() {
 }
 
 #[test]
-fn bridge_contained_browser_stub_honest_label() {
+fn bridge_contained_browser_substrate_honest_label() {
     let backend = ContainedBrowserBackend::new();
     assert_eq!(
         backend.evidence_class(),
         ProofEvidenceClass::ContainedBrowser
     );
+    assert!(!backend.isolation_proof_available());
+    assert!(!computer_use_isolated_surface_admission());
+}
+
+#[test]
+fn bridge_contained_browser_dry_run_honest_nonclaim() {
+    let sequencer = Sep18NoModelProofSequencer::new(HostSentinelSnapshot::synthetic_baseline());
+    let evidence = sequencer
+        .run_contained_browser_dry_run()
+        .expect("contained browser dry-run");
+    assert_eq!(
+        evidence.platform,
+        ContainedBrowserDryRunPlatform::SimulatorSubstrate
+    );
+    assert_eq!(
+        evidence.outcome,
+        ContainedBrowserDryRunOutcome::SubstrateRehearsal
+    );
+    assert!(!evidence.isolation_pass_claimed);
+    assert!(!evidence.vf_pass_claimed);
+    assert_eq!(evidence.nonclaim, CONTAINED_BROWSER_DRY_RUN_NONCLAIM);
+    assert!(!computer_use_isolated_surface_admission());
 }
 
 #[test]
