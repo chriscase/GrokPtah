@@ -6,6 +6,7 @@
 mod agents_personas;
 mod auth_store;
 pub mod certification;
+mod coding_worktree;
 mod completion;
 mod computer_agent;
 pub mod computer_use;
@@ -145,6 +146,13 @@ pub use host_helpers::{replay_xai_provider_contract_on_loopback, ProviderContrac
 
 pub use memory::{MemoryFact, MemoryScope};
 
+pub use coding_worktree::{
+    digest_bytes, digest_path, snapshot_root, AcceptEvidence, CodingWorktreeIdentity,
+    CodingWorktreeSession, DiscardEvidence, KeepForReviewEvidence, PatchArtifact,
+    SessionDisposition, SessionError, SessionErrorCode, SessionLifecycle, SessionPhase,
+    SessionResult, SessionSnapshot, LIFECYCLE_SCHEMA_VERSION, MAX_PATCH_BYTES, MAX_PATCH_PATHS,
+    SNAPSHOT_FILE, SNAPSHOT_SCHEMA_VERSION, SYNTHETIC_SESSION_NONCLAIM,
+};
 pub use completion::{
     enrich_terminal_handoff, CompletionClaims, CompletionEvidence, CompletionObservations,
     CompletionUsage,
