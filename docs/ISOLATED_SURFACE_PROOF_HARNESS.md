@@ -17,10 +17,11 @@ surface), [#267](https://github.com/chriscase/GrokPtah/issues/267) (epic).
 | Sep 5 | Packet 1 — Harness v0 (#542) | **Landed** — lifecycle, sentinels, synthetic guest, fence-first Stop |
 | Sep 6–12 | Packet 2 — Backend SPI + sequencer + Contained Browser stub (#543) | **Landed** — `IsolatedSurfaceBackend`, `Sep18NoModelProofSequencer`, main-checkout sentinel |
 | Sep 6–12 | Packet 3 — Mac VF backend behind SPI, feature-gated (#545) | **Landed** — `VirtualizationFrameworkBackend`, VF dry-run path, Mac sentinel hooks |
-| Sep 6–12 | Packet 4 — Contained Browser substrate v0 (#546) | **This slice** — real browser lifecycle on simulator substrate, CB dry-run path, admission false |
+| Sep 6–12 | Packet 4 — Contained Browser substrate v0 (#546) | **Landed** — real browser lifecycle on simulator substrate, CB dry-run path, admission false |
+| Sep 6–12 | Packet 5 — Sep 18 checklist runner + evidence-pack verifier (#547) | **This slice** — `grokptah-sep18-checklist` CLI, sealed pack + independent verifier |
 | Sep 18 | Physical Mac gate | VF PASS or honest Contained Browser pivot |
 
-## Exact-main inventory (base `bea0ac60a8a92ea303e2a3da3aa1812660efeb35` + packet 4)
+## Exact-main inventory (base `e33ff26c2e0e23af00c64b9e1bb0847c3c25e2e6` + packet 5)
 
 ### Already satisfies Windowed Coding Run noninterference (semantic macOS path)
 
@@ -57,6 +58,10 @@ surface), [#267](https://github.com/chriscase/GrokPtah/issues/267) (epic).
 | Sequencer + SPI regression | `tests/proof_sequencer.rs` |
 | Bridge fail-closed seam | `grokptah-agent-bridge/src/computer_use/isolated_surface.rs` |
 | Bridge integration tests | `grokptah-agent-bridge/tests/isolated_surface_proof_harness.rs` |
+| Sep 18 checklist runner | `checklist_runner.rs` — default CB dry-run, optional VF dry-run / fault matrix |
+| Sealed evidence pack + verifier | `evidence_pack.rs` — independent accept/reject with explicit codes |
+| Checklist CLI | `src/bin/grokptah-sep18-checklist.rs` — `run` + `verify` subcommands |
+| Evidence-pack verifier tests | `tests/evidence_pack_verifier.rs` — happy path + tamper rejection |
 
 ### Lifecycle phases
 
@@ -143,6 +148,64 @@ Rehearses the Sep 18 pivot substrate without claiming isolation or VF PASS:
 
 Bounded fault cuts via `run_contained_browser_fault_matrix`: `BootStop`, `PreDispatchStop`, `LostAckUncertain`, `RestartNoReplay`. Fence-first Stop + Uncertain invariants match the synthetic harness (#543).
 
+## Sep 18 checklist runner + evidence-pack verifier (Packet 5)
+
+The **One-Mac / CI checklist runner** seals a JSON evidence pack without enabling
+admission or claiming physical PASS. The **independent verifier** reads only the
+pack file — no live backend, no runner aggregates.
+
+### Day-30 Surface Alpha evidence ladder
+
+| Rung | Artifact | Verifier accepts physical PASS? |
+|---|---|---|
+| Linux CI / default | CB dry-run pack (`ContainedBrowser`, `physical_pass_claimed: false`) | No |
+| VF rehearsal | VF dry-run pack (`physical_pass_claimed: false`) | No |
+| Synthetic fault matrix | Subset sealed packs with explicit fault case | No |
+| Sep 18 Mac worker (future) | VF physical pack with `PhysicalProofMarkers` + live sentinel collection | Only when markers qualify |
+
+### CLI
+
+```sh
+# Default: Contained Browser dry-run checklist → sealed pack
+cargo run --locked --manifest-path crates/codegen/grokptah-isolated-surface/Cargo.toml \
+  --bin grokptah-sep18-checklist -- run --output sep18-evidence-pack.json
+
+# Independent verification (no backend)
+cargo run --locked --manifest-path crates/codegen/grokptah-isolated-surface/Cargo.toml \
+  --bin grokptah-sep18-checklist -- verify sep18-evidence-pack.json
+
+# Optional VF dry-run when features allow
+cargo run --locked --manifest-path crates/codegen/grokptah-isolated-surface/Cargo.toml \
+  --bin grokptah-sep18-checklist -- run --vf-dry-run --output vf-dry-run-pack.json
+
+# Bounded fault-matrix subset on CB substrate
+cargo run --locked --manifest-path crates/codegen/grokptah-isolated-surface/Cargo.toml \
+  --bin grokptah-sep18-checklist -- run --fault-matrix lost_ack_uncertain -o fault-pack.json
+```
+
+### Sealed pack fields (honest defaults)
+
+- `evidence_class`: fixed at backend creation (`ContainedBrowser` default on Linux CI)
+- `physical_pass_claimed`: **false** unless a future physical gate flips it with Mac markers
+- `admission_available`: **false** (verifier rejects `true`)
+- `host_sentinel_probes`: probe counts + channel teardown summary from Stop evidence
+- `sealed_evidence`: checklist steps + Stop/Uncertain disposition when checklist completes
+
+### Verifier reject codes (subset)
+
+| Code | Trigger |
+|---|---|
+| `admission_must_stay_false` | `admission_available == true` |
+| `physical_pass_without_mac_markers` | PASS claimed without Mac worker + live sentinel collection |
+| `stop_channels_still_open` | `channels_open_after_stop > 0` |
+| `uncertain_downgraded_after_possible_inject` | LostAckUncertain / RestartNoReplay with `Stopped` disposition |
+| `evidence_class_tampered` | Pack label ≠ sealed label |
+| `vf_dry_run_cannot_qualify_physical_pass` | VF dry-run artifact with PASS claim |
+
+Maps to Astra Sep 18 one-Mac checklist steps 1–11: runner exercises steps 2–10 on
+simulator substrate; verifier is the independent gate for sealed artifacts before
+any admission enablement discussion.
+
 ## Sep 18 2026 physical proof checklist (Mac worker)
 
 Run once a physical Mac worker is available. Admission stays **false** until a
@@ -209,6 +272,13 @@ cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Car
 cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Cargo.toml \
   --test proof_sequencer sep18_contained_browser -- --test-threads=1
 
+cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Cargo.toml \
+  --test evidence_pack_verifier -- --test-threads=1
+
+# Checklist runner CLI smoke (CB default)
+cargo run --locked --manifest-path crates/codegen/grokptah-isolated-surface/Cargo.toml \
+  --bin grokptah-sep18-checklist -- run -o /tmp/sep18-evidence-pack.json
+
 # Optional browser-engine feature (default-off; must compile fail-closed)
 cargo check --locked --manifest-path crates/codegen/grokptah-isolated-surface/Cargo.toml \
   --features browser-engine
@@ -221,9 +291,10 @@ cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Car
   --features vf-backend --test proof_sequencer sep18_vf_dry_run -- --test-threads=1
 ```
 
-## Residuals (honest, post-packet-4)
+## Residuals (honest, post-packet-5)
 
-- VF backend is dry-run stub only — no signed guest image, live VF IPC, or packaged helper.
+- Checklist runner seals dry-run packs only — no live Mac VF IPC or packaged helper.
+- Independent verifier is pack-only; physical Mac worker still required for VF PASS rung.
 - Contained Browser substrate v0 uses an in-process simulator — not a real isolated browser engine.
 - Optional `browser-engine` feature fails closed until native engine wiring lands.
 - No TCC entitlement or notarization claims.

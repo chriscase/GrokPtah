@@ -6,9 +6,11 @@
 
 mod backend;
 mod channels;
+mod checklist_runner;
 mod contained_browser;
 mod contained_browser_dry_run;
 mod error;
+mod evidence_pack;
 mod harness;
 mod lifecycle;
 mod proof_sequencer;
@@ -24,12 +26,21 @@ pub use backend::{
     VfLaunchReceipt,
 };
 pub use channels::ChannelRegistry;
+pub use checklist_runner::{
+    run_sep18_checklist, Sep18ChecklistRunOutcome, Sep18ChecklistRunnerConfig,
+};
 pub use contained_browser::ContainedBrowserBackend;
 pub use contained_browser_dry_run::{
     run_contained_browser_fault_matrix, run_contained_browser_stop_fence_regression,
     ContainedBrowserDryRunEvidence, ContainedBrowserDryRunOutcome, ContainedBrowserDryRunPlatform,
 };
 pub use error::{HarnessError, HarnessErrorCode, HarnessResult};
+pub use evidence_pack::{
+    parse_evidence_pack, seal_contained_browser_dry_run_pack, seal_synthetic_harness_pack,
+    seal_vf_dry_run_pack, serialize_evidence_pack, verifier_exit_code, verify_evidence_pack,
+    EvidenceVerifierCode, EvidenceVerifierDecision, HostSentinelProbeSummary, PhysicalProofMarkers,
+    Sep18ChecklistSubstrate, Sep18EvidencePack, EVIDENCE_PACK_SCHEMA_VERSION,
+};
 pub use harness::{IsolatedSurfaceHarness, StopEvidence};
 pub use lifecycle::{
     GuestLifecycle, GuestLifecycleDisposition, GuestLifecyclePhase, ProofEvidenceClass,
