@@ -8,6 +8,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::backend::{assert_evidence_class_unchanged, VfLaunchReceipt};
+use crate::contained_browser_dry_run::{
+    run_contained_browser_dry_run, run_contained_browser_fault_matrix,
+    ContainedBrowserDryRunEvidence,
+};
 use crate::error::{HarnessError, HarnessErrorCode, HarnessResult};
 use crate::harness::{IsolatedSurfaceHarness, StopEvidence};
 use crate::lifecycle::{GuestLifecycleDisposition, GuestLifecyclePhase, ProofEvidenceClass};
@@ -84,6 +88,25 @@ impl Sep18NoModelProofSequencer {
     /// Never claims a physical PASS — admission stays false.
     pub fn run_vf_dry_run(&self, receipt: VfLaunchReceipt) -> HarnessResult<VfDryRunEvidence> {
         run_vf_dry_run(receipt, self.baseline.clone())
+    }
+
+    /// Contained Browser dry-run path for Sep 18 pivot rehearsal. Exercises the
+    /// browser substrate checklist on the default simulator (Linux CI). Never
+    /// claims VF PASS, isolation PASS, or enables admission.
+    pub fn run_contained_browser_dry_run(&self) -> HarnessResult<ContainedBrowserDryRunEvidence> {
+        run_contained_browser_dry_run(self.baseline.clone(), self.snapshot_root.as_deref())
+    }
+
+    /// Bounded fault-matrix case against the Contained Browser substrate.
+    pub fn run_contained_browser_fault_matrix(
+        &self,
+        case: FaultMatrixCase,
+    ) -> HarnessResult<SealedProofEvidence> {
+        run_contained_browser_fault_matrix(
+            self.baseline.clone(),
+            self.snapshot_root.as_deref(),
+            case,
+        )
     }
 
     /// Run one bounded fault-matrix case.

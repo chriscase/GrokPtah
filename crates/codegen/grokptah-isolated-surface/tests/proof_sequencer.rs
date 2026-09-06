@@ -6,6 +6,11 @@ use grokptah_isolated_surface::{
     Sep18NoModelProofSequencer, VfDryRunOutcome, VfDryRunPlatform, VfLaunchReceipt,
     VF_DRY_RUN_NONCLAIM,
 };
+#[cfg(not(feature = "browser-engine"))]
+use grokptah_isolated_surface::{
+    ContainedBrowserDryRunOutcome, ContainedBrowserDryRunPlatform,
+    CONTAINED_BROWSER_DRY_RUN_NONCLAIM,
+};
 use tempfile::TempDir;
 
 #[test]
@@ -21,19 +26,28 @@ fn synthetic_backend_implements_spi() {
 }
 
 #[test]
-fn contained_browser_stub_fails_closed() {
-    let mut backend = ContainedBrowserBackend::new();
+fn contained_browser_substrate_honest_label() {
+    let backend = ContainedBrowserBackend::new();
     assert_eq!(
         backend.evidence_class(),
         ProofEvidenceClass::ContainedBrowser
     );
-    let err = backend.boot().expect_err("unsupported");
-    assert_eq!(err.code, HarnessErrorCode::BackendUnavailable);
-    assert!(!backend.is_booted());
+    assert!(!backend.isolation_proof_available());
+    assert!(!backend.evidence_class().is_vf_qualification_eligible());
 }
 
+#[cfg(not(feature = "browser-engine"))]
 #[test]
-fn harness_with_contained_browser_backend_fails_on_boot() {
+fn contained_browser_simulator_boot_succeeds() {
+    let mut backend = ContainedBrowserBackend::new();
+    let frame = backend.boot().expect("simulator boot");
+    assert_eq!(frame.epoch, 1);
+    assert!(backend.is_booted());
+}
+
+#[cfg(not(feature = "browser-engine"))]
+#[test]
+fn harness_with_contained_browser_backend_runs_checklist() {
     let mut harness = IsolatedSurfaceHarness::with_backend(
         HostSentinelSnapshot::synthetic_baseline(),
         ContainedBrowserBackend::new(),
@@ -43,28 +57,27 @@ fn harness_with_contained_browser_backend_fails_on_boot() {
         harness.evidence_class(),
         ProofEvidenceClass::ContainedBrowser
     );
-    let err = harness.boot().expect_err("boot must fail closed");
-    assert_eq!(err.code, HarnessErrorCode::BackendUnavailable);
+
+    harness.boot().expect("boot");
+    let before = harness.observe_frame().expect("frame");
+    assert!(before.epoch > 0);
+    let delta = harness
+        .inject_guest_action(grokptah_isolated_surface::GuestLocalAction::ClickGuestButton)
+        .expect("inject");
+    assert!(delta.guest_local_change);
+    let evidence = harness.stop().expect("stop");
+    assert_eq!(
+        evidence.disposition,
+        Some(grokptah_isolated_surface::GuestLifecycleDisposition::Stopped)
+    );
 }
 
 #[test]
 fn contained_browser_stop_tears_down_after_fence_error() {
-    let mut harness = IsolatedSurfaceHarness::with_backend(
+    grokptah_isolated_surface::run_contained_browser_stop_fence_regression(
         HostSentinelSnapshot::synthetic_baseline(),
-        ContainedBrowserBackend::new(),
     )
-    .expect("contained browser is permitted");
-    harness.boot().expect_err("boot fails closed");
-    assert_eq!(harness.channels().open_count(), 2);
-
-    let evidence = harness.stop().expect("stop must always teardown");
-    assert!(evidence.backend_fence_error.is_some());
-    assert_eq!(evidence.channels_destroyed, 2);
-    assert_eq!(
-        harness.lifecycle().phase,
-        grokptah_isolated_surface::GuestLifecyclePhase::Destroyed
-    );
-    harness.channels().assert_all_destroyed().expect("no leak");
+    .expect("fence regression");
 }
 
 #[test]
@@ -284,4 +297,81 @@ fn harness_refresh_host_sentinels_uses_probe_path() {
         .refresh_host_sentinels(HostSentinelSnapshot::synthetic_baseline())
         .expect("refresh matches baseline");
     assert!(harness.sentinels().verified_via_probe());
+}
+
+#[cfg(not(feature = "browser-engine"))]
+#[test]
+fn sep18_contained_browser_dry_run_simulator_on_linux_ci() {
+    let sequencer = Sep18NoModelProofSequencer::new(HostSentinelSnapshot::synthetic_baseline());
+    let evidence = sequencer
+        .run_contained_browser_dry_run()
+        .expect("contained browser dry-run");
+    assert_eq!(
+        evidence.platform,
+        ContainedBrowserDryRunPlatform::SimulatorSubstrate
+    );
+    assert_eq!(
+        evidence.outcome,
+        ContainedBrowserDryRunOutcome::SubstrateRehearsal
+    );
+    assert_eq!(
+        evidence.evidence_class,
+        ProofEvidenceClass::ContainedBrowser
+    );
+    assert!(evidence.checklist_completed);
+    assert!(!evidence.isolation_pass_claimed);
+    assert!(!evidence.vf_pass_claimed);
+    assert_eq!(evidence.nonclaim, CONTAINED_BROWSER_DRY_RUN_NONCLAIM);
+    assert!(evidence.nonclaim.contains("not isolation PASS"));
+    assert!(!grokptah_isolated_surface::isolated_surface_admission_available());
+
+    let sealed = evidence.sealed_evidence.expect("sealed checklist");
+    assert_eq!(sealed.evidence_class, ProofEvidenceClass::ContainedBrowser);
+    assert!(!sealed.evidence_class.is_vf_qualification_eligible());
+    assert!(sealed
+        .checklist_steps
+        .contains(&ChecklistStep::EvidenceSealed));
+}
+
+#[cfg(not(feature = "browser-engine"))]
+#[test]
+fn sep18_contained_browser_fault_matrix_boot_stop() {
+    let sequencer = Sep18NoModelProofSequencer::new(HostSentinelSnapshot::synthetic_baseline());
+    let sealed = sequencer
+        .run_contained_browser_fault_matrix(FaultMatrixCase::BootStop)
+        .expect("boot stop");
+    assert_eq!(sealed.fault_matrix_case, Some(FaultMatrixCase::BootStop));
+    assert_eq!(sealed.evidence_class, ProofEvidenceClass::ContainedBrowser);
+    assert!(!sealed.evidence_class.is_vf_qualification_eligible());
+}
+
+#[cfg(not(feature = "browser-engine"))]
+#[test]
+fn sep18_contained_browser_fault_matrix_lost_ack_uncertain() {
+    let sequencer = Sep18NoModelProofSequencer::new(HostSentinelSnapshot::synthetic_baseline());
+    let sealed = sequencer
+        .run_contained_browser_fault_matrix(FaultMatrixCase::LostAckUncertain)
+        .expect("lost ack");
+    assert_eq!(
+        sealed.fault_matrix_case,
+        Some(FaultMatrixCase::LostAckUncertain)
+    );
+    assert_eq!(
+        sealed.stop_evidence.disposition,
+        Some(grokptah_isolated_surface::GuestLifecycleDisposition::Uncertain)
+    );
+}
+
+#[cfg(not(feature = "browser-engine"))]
+#[test]
+fn contained_browser_no_pass_laundering_at_seal() {
+    let sequencer = Sep18NoModelProofSequencer::new(HostSentinelSnapshot::synthetic_baseline());
+    let evidence = sequencer.run_contained_browser_dry_run().expect("dry-run");
+    let sealed = evidence.sealed_evidence.expect("sealed");
+    assert_ne!(
+        sealed.evidence_class,
+        ProofEvidenceClass::VirtualizationFramework
+    );
+    assert_ne!(sealed.evidence_class, ProofEvidenceClass::Synthetic);
+    assert!(!sealed.evidence_class.is_vf_qualification_eligible());
 }

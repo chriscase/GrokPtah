@@ -2,7 +2,7 @@
 
 This document inventories the current `main` Computer Use / isolated-guest code,
 defines the synthetic proof harness, and maps it to the Sep 5–18 2026 calendar
-(Phase-1 packet 3: Mac VF backend behind SPI, feature-gated). It does **not**
+(Phase-1 packet 4: Contained Browser substrate v0 behind SPI). It does **not**
 claim packaged Virtualization.framework qualification from Linux CI or dry-run
 artifacts.
 
@@ -16,10 +16,11 @@ surface), [#267](https://github.com/chriscase/GrokPtah/issues/267) (epic).
 |---|---|---|
 | Sep 5 | Packet 1 — Harness v0 (#542) | **Landed** — lifecycle, sentinels, synthetic guest, fence-first Stop |
 | Sep 6–12 | Packet 2 — Backend SPI + sequencer + Contained Browser stub (#543) | **Landed** — `IsolatedSurfaceBackend`, `Sep18NoModelProofSequencer`, main-checkout sentinel |
-| Sep 6–12 | Packet 3 — Mac VF backend behind SPI, feature-gated | **This slice** — `VirtualizationFrameworkBackend`, VF dry-run path, Mac sentinel hooks |
+| Sep 6–12 | Packet 3 — Mac VF backend behind SPI, feature-gated (#545) | **Landed** — `VirtualizationFrameworkBackend`, VF dry-run path, Mac sentinel hooks |
+| Sep 6–12 | Packet 4 — Contained Browser substrate v0 (#546) | **This slice** — real browser lifecycle on simulator substrate, CB dry-run path, admission false |
 | Sep 18 | Physical Mac gate | VF PASS or honest Contained Browser pivot |
 
-## Exact-main inventory (base `5b1b425fc8fb0d3c6f03495620019ed6b7287b05` + packet 3)
+## Exact-main inventory (base `bea0ac60a8a92ea303e2a3da3aa1812660efeb35` + packet 4)
 
 ### Already satisfies Windowed Coding Run noninterference (semantic macOS path)
 
@@ -33,7 +34,7 @@ surface), [#267](https://github.com/chriscase/GrokPtah/issues/267) (epic).
 | Visible activity (#286 UI) | `desktop/src/lib/computerActivity.ts` | Disposition-first activity mapping |
 | Threat model honesty | `docs/COMPUTER_USE_THREAT_MODEL.md` | #288 disabled until separate input surface |
 
-### Packet 1 (#542) + Packet 2 + Packet 3 deliverables
+### Packet 1 (#542) + Packet 2 + Packet 3 + Packet 4 deliverables
 
 | Deliverable | Location |
 |---|---|
@@ -42,7 +43,10 @@ surface), [#267](https://github.com/chriscase/GrokPtah/issues/267) (epic).
 | Mac host sentinel collector hook | `sentinel.rs` — `MacHostSentinelCollector` + `refresh_from_host` |
 | `IsolatedSurfaceBackend` SPI | `backend.rs` — boot / observe_frame / inject_guest_local / stop_fence_first / destroy |
 | Synthetic backend (SPI impl) | `simulator.rs` — `SyntheticGuest` |
-| Contained Browser stub (fail-closed) | `contained_browser.rs` — honest `ContainedBrowser` label, not PASS |
+| Contained Browser substrate v0 (simulator) | `contained_browser.rs` — honest `ContainedBrowser` label, browser-only lifecycle, not isolation PASS |
+| Contained Browser dry-run sequencer path | `contained_browser_dry_run.rs` + `Sep18NoModelProofSequencer::run_contained_browser_dry_run` |
+| Contained Browser fault matrix | `run_contained_browser_fault_matrix` — bounded fault cuts on CB substrate |
+| Contained Browser regression | `tests/contained_browser_regression.rs` |
 | VF backend stub (Mac + `vf-backend` feature) | `vf_backend.rs` — honest `VirtualizationFramework` label, dry-run only |
 | VF dry-run sequencer path | `vf_dry_run.rs` + `Sep18NoModelProofSequencer::run_vf_dry_run` |
 | Sep 18 no-model proof sequencer | `proof_sequencer.rs` — checklist + bounded fault matrix |
@@ -84,11 +88,13 @@ case in `proof_sequencer` tests.
 |---|---|
 | `Synthetic` | Harness/simulator output — ineligible for VF qualification |
 | `VirtualizationFramework` | Reserved for real Mac VF physical proof PASS only |
-| `ContainedBrowser` | Honest Sep 18 pivot label — stub fails closed, not current PASS |
+| `ContainedBrowser` | Honest Sep 18 pivot label — substrate v0 on simulator; not isolation PASS, not VF PASS |
 
 Labels are fixed at backend creation and must **never** be upgraded at seal time.
 Linux CI never produces `VirtualizationFramework` PASS. VF dry-run artifacts carry
-`VF_DRY_RUN_NONCLAIM` and set `physical_pass_claimed: false`.
+`VF_DRY_RUN_NONCLAIM` and set `physical_pass_claimed: false`. Contained Browser
+dry-run artifacts carry `CONTAINED_BROWSER_DRY_RUN_NONCLAIM` and set
+`isolation_pass_claimed: false`.
 
 Bridge admission `isolated_surface_admission_available()` remains **false**.
 
@@ -126,6 +132,17 @@ Rehearses the Sep 18 VF gate without claiming physical PASS:
 
 Requires `VfLaunchReceipt` with non-empty `physical_mac_proof_id`. Wire the backend only via `IsolatedSurfaceHarness::with_vf_backend(receipt)` — `with_backend` rejects VF without receipt.
 
+### Contained Browser dry-run path (`run_contained_browser_dry_run`)
+
+Rehearses the Sep 18 pivot substrate without claiming isolation or VF PASS:
+
+| Platform | Outcome | Checklist completed |
+|---|---|---|
+| Linux CI / default (simulator substrate) | `SubstrateRehearsal` | Yes — full checklist on in-process browser simulator |
+| Any, `browser-engine` feature | `BackendUnavailable` | No — boot fails closed until engine wired |
+
+Bounded fault cuts via `run_contained_browser_fault_matrix`: `BootStop`, `PreDispatchStop`, `LostAckUncertain`, `RestartNoReplay`. Fence-first Stop + Uncertain invariants match the synthetic harness (#543).
+
 ## Sep 18 2026 physical proof checklist (Mac worker)
 
 Run once a physical Mac worker is available. Admission stays **false** until a
@@ -159,14 +176,14 @@ separate gate enables it after honest PASS.
 | 11 | Seal evidence | `ProofEvidenceClass::VirtualizationFramework`, `physical_pass_claimed: true` (physical runner only — not dry-run) |
 
 **MISS → Contained Browser:** if step 3–7 cannot complete by Sep 18, pivot to
-`ContainedBrowserBackend` (stub fails closed today).
+`ContainedBrowserBackend` substrate v0 (simulator rehearsal today; isolation PASS still open).
 
 ### Gate verdict
 
 - **PASS (Sep 18):** real Mac completes the checklist with `ProofEvidenceClass::VirtualizationFramework`
   and unchanged host sentinels.
 - **DRY-RUN (this slice):** `run_vf_dry_run` — honest nonclaim, `physical_pass_claimed: false`.
-- **MISS → Contained Browser:** `ContainedBrowserBackend` stub documents the pivot path.
+- **MISS → Contained Browser:** `run_contained_browser_dry_run` — honest nonclaim, `isolation_pass_claimed: false`.
 
 ## Verification commands
 
@@ -184,26 +201,41 @@ cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Car
   --test stop_regression -- --test-threads=1
 
 cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Cargo.toml \
+  --test contained_browser_regression -- --test-threads=1
+
+cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Cargo.toml \
   --test proof_sequencer -- --test-threads=1
+
+cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Cargo.toml \
+  --test proof_sequencer sep18_contained_browser -- --test-threads=1
+
+# Optional browser-engine feature (default-off; must compile fail-closed)
+cargo check --locked --manifest-path crates/codegen/grokptah-isolated-surface/Cargo.toml \
+  --features browser-engine
+
+cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Cargo.toml \
+  --features browser-engine --test browser_engine_feature -- --test-threads=1
 
 # Mac VF dry-run rehearsal (physical worker only)
 cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Cargo.toml \
   --features vf-backend --test proof_sequencer sep18_vf_dry_run -- --test-threads=1
 ```
 
-## Residuals (honest, post-packet-3)
+## Residuals (honest, post-packet-4)
 
 - VF backend is dry-run stub only — no signed guest image, live VF IPC, or packaged helper.
+- Contained Browser substrate v0 uses an in-process simulator — not a real isolated browser engine.
+- Optional `browser-engine` feature fails closed until native engine wiring lands.
 - No TCC entitlement or notarization claims.
 - No Windows/Linux isolated surface.
 - No agent-owned cursor / surface-event stream (#286 UI layer still disposition-only).
 - No bridge admission enablement — `isolated_surface_admission_available()` stays false.
-- Contained Browser stub is fail-closed — not a PASS path.
-- Linux CI proves contract + VF dry-run unsupported; physical Mac proof is a separate exact-head gate.
+- Linux CI proves contract + substrate rehearsal; physical isolation PASS is a separate exact-head gate.
+- #288 packaged-VM acceptance stays open.
 
 ## Non-claims
 
 - Simulator / Linux CI does **not** qualify a packaged VM.
 - VF dry-run does **not** claim Sep 18 physical PASS.
 - Synthetic harness success does **not** enable isolated visual Computer Use in production.
-- `ContainedBrowser` stub does **not** implement browser isolation — only documents the Sep 18 pivot.
+- `ContainedBrowser` substrate v0 does **not** prove browser isolation — only exercises the SPI lifecycle on a simulator.

@@ -351,3 +351,13 @@ impl IsolatedSurfaceHarness<SyntheticGuest> {
         self.backend.schedule_uncertain_on_inject();
     }
 }
+
+impl IsolatedSurfaceHarness<crate::contained_browser::ContainedBrowserBackend> {
+    pub fn schedule_crash_on_next_inject(&mut self) {
+        self.backend.schedule_crash_on_next_inject();
+    }
+
+    pub fn schedule_uncertain_on_next_inject(&mut self) {
+        self.backend.schedule_uncertain_on_next_inject();
+    }
+}

@@ -7,6 +7,7 @@
 mod backend;
 mod channels;
 mod contained_browser;
+mod contained_browser_dry_run;
 mod error;
 mod harness;
 mod lifecycle;
@@ -24,6 +25,10 @@ pub use backend::{
 };
 pub use channels::ChannelRegistry;
 pub use contained_browser::ContainedBrowserBackend;
+pub use contained_browser_dry_run::{
+    run_contained_browser_fault_matrix, run_contained_browser_stop_fence_regression,
+    ContainedBrowserDryRunEvidence, ContainedBrowserDryRunOutcome, ContainedBrowserDryRunPlatform,
+};
 pub use error::{HarnessError, HarnessErrorCode, HarnessResult};
 pub use harness::{IsolatedSurfaceHarness, StopEvidence};
 pub use lifecycle::{
@@ -61,3 +66,7 @@ pub const SYNTHETIC_HARNESS_NONCLAIM: &str =
 /// Non-claim for VF dry-run artifacts. Does not assert physical Sep 18 PASS.
 pub const VF_DRY_RUN_NONCLAIM: &str =
     "VF dry-run is not physical Mac proof; Linux CI and dry-run artifacts never claim Sep 18 PASS.";
+
+/// Non-claim for Contained Browser dry-run artifacts. Substrate rehearsal only.
+pub const CONTAINED_BROWSER_DRY_RUN_NONCLAIM: &str =
+    "Contained Browser substrate v0 is not isolation PASS; never claim Virtualization.framework PASS or enable admission.";
