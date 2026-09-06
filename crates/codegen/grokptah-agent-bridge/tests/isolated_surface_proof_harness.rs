@@ -62,9 +62,19 @@ fn bridge_vf_dry_run_honest_nonclaim() {
             physical_mac_proof_id: "bridge-dry-run".into(),
         })
         .expect("dry-run");
-    assert_eq!(evidence.platform, VfDryRunPlatform::NonMacOs);
-    assert_eq!(evidence.outcome, VfDryRunOutcome::UnsupportedPlatform);
+    match evidence.platform {
+        VfDryRunPlatform::NonMacOs => {
+            assert_eq!(evidence.outcome, VfDryRunOutcome::UnsupportedPlatform);
+        }
+        VfDryRunPlatform::MacOsFeatureDisabled => {
+            assert_eq!(evidence.outcome, VfDryRunOutcome::FeatureDisabled);
+        }
+        VfDryRunPlatform::MacOsDryRun => {
+            panic!("vf-backend dry-run is not exercised by this bridge integration test");
+        }
+    }
     assert!(!evidence.physical_pass_claimed);
     assert_eq!(evidence.nonclaim, VF_DRY_RUN_NONCLAIM);
+    assert!(evidence.nonclaim.contains("never claim Sep 18 PASS"));
     assert!(!computer_use_isolated_surface_admission());
 }
