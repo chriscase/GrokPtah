@@ -4,6 +4,8 @@
 //! the synthetic harness and an admission gate that stays false until a native
 //! Virtualization.framework adapter passes the Sep 18 physical proof checklist.
 
+#[cfg(all(target_os = "macos", feature = "vf-backend"))]
+pub use grokptah_isolated_surface::VirtualizationFrameworkBackend;
 pub use grokptah_isolated_surface::{
     assert_evidence_class_unchanged, honest_harness_evidence_class,
     isolated_surface_admission_available, ChannelRegistry, ChecklistStep, ContainedBrowserBackend,
@@ -12,8 +14,8 @@ pub use grokptah_isolated_surface::{
     HarnessErrorCode, HarnessResult, HostSentinelDiff, HostSentinelProbe, HostSentinelRegistry,
     HostSentinelSnapshot, IsolatedSurfaceBackend, IsolatedSurfaceHarness, MainCheckoutFence,
     ProofEvidenceClass, SealedProofEvidence, Sep18NoModelProofSequencer, StopEvidence,
-    SyntheticGuest, SyntheticGuestAction, SyntheticHostProbe, VfLaunchReceipt,
-    SYNTHETIC_HARNESS_NONCLAIM,
+    SyntheticGuest, SyntheticGuestAction, SyntheticHostProbe, VfDryRunEvidence, VfDryRunOutcome,
+    VfDryRunPlatform, VfLaunchReceipt, SYNTHETIC_HARNESS_NONCLAIM, VF_DRY_RUN_NONCLAIM,
 };
 
 /// Bridge-level admission check. Remains unavailable until physical Mac proof.

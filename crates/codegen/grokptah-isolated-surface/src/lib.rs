@@ -14,6 +14,9 @@ mod proof_sequencer;
 mod sentinel;
 mod simulator;
 mod store;
+#[cfg(all(target_os = "macos", feature = "vf-backend"))]
+mod vf_backend;
+mod vf_dry_run;
 
 pub use backend::{
     assert_evidence_class_unchanged, honest_harness_evidence_class, IsolatedSurfaceBackend,
@@ -30,6 +33,8 @@ pub use lifecycle::{
 pub use proof_sequencer::{
     ChecklistStep, FaultMatrixCase, SealedProofEvidence, Sep18NoModelProofSequencer,
 };
+#[cfg(target_os = "macos")]
+pub use sentinel::MacHostSentinelCollector;
 pub use sentinel::{
     HostSentinelDiff, HostSentinelProbe, HostSentinelRegistry, HostSentinelSnapshot,
     MainCheckoutFence, SyntheticHostProbe,
@@ -39,6 +44,9 @@ pub use simulator::{
     SyntheticGuestAction,
 };
 pub use store::{snapshot_root, HarnessSnapshot, SNAPSHOT_FILE, SNAPSHOT_SCHEMA_VERSION};
+#[cfg(all(target_os = "macos", feature = "vf-backend"))]
+pub use vf_backend::VirtualizationFrameworkBackend;
+pub use vf_dry_run::{VfDryRunEvidence, VfDryRunOutcome, VfDryRunPlatform};
 
 /// Fail-closed admission gate for bridge integration. Remains false until a
 /// native adapter passes the physical Mac proof checklist.
@@ -49,3 +57,7 @@ pub fn isolated_surface_admission_available() -> bool {
 /// Human-readable non-claim for proof artifacts.
 pub const SYNTHETIC_HARNESS_NONCLAIM: &str =
     "Synthetic harness evidence is ineligible for Virtualization.framework qualification.";
+
+/// Non-claim for VF dry-run artifacts. Does not assert physical Sep 18 PASS.
+pub const VF_DRY_RUN_NONCLAIM: &str =
+    "VF dry-run is not physical Mac proof; Linux CI and dry-run artifacts never claim Sep 18 PASS.";

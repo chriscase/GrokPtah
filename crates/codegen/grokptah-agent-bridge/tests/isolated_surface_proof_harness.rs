@@ -7,7 +7,8 @@
 use grokptah_agent_bridge::computer_use::{
     computer_use_isolated_surface_admission, ContainedBrowserBackend, GuestLifecyclePhase,
     HostSentinelSnapshot, IsolatedSurfaceBackend, IsolatedSurfaceHarness, ProofEvidenceClass,
-    Sep18NoModelProofSequencer, SyntheticGuestAction, SYNTHETIC_HARNESS_NONCLAIM,
+    Sep18NoModelProofSequencer, SyntheticGuestAction, VfDryRunOutcome, VfDryRunPlatform,
+    VfLaunchReceipt, SYNTHETIC_HARNESS_NONCLAIM, VF_DRY_RUN_NONCLAIM,
 };
 
 #[test]
@@ -51,4 +52,29 @@ fn bridge_contained_browser_stub_honest_label() {
         backend.evidence_class(),
         ProofEvidenceClass::ContainedBrowser
     );
+}
+
+#[test]
+fn bridge_vf_dry_run_honest_nonclaim() {
+    let sequencer = Sep18NoModelProofSequencer::new(HostSentinelSnapshot::synthetic_baseline());
+    let evidence = sequencer
+        .run_vf_dry_run(VfLaunchReceipt {
+            physical_mac_proof_id: "bridge-dry-run".into(),
+        })
+        .expect("dry-run");
+    match evidence.platform {
+        VfDryRunPlatform::NonMacOs => {
+            assert_eq!(evidence.outcome, VfDryRunOutcome::UnsupportedPlatform);
+        }
+        VfDryRunPlatform::MacOsFeatureDisabled => {
+            assert_eq!(evidence.outcome, VfDryRunOutcome::FeatureDisabled);
+        }
+        VfDryRunPlatform::MacOsDryRun => {
+            panic!("vf-backend dry-run is not exercised by this bridge integration test");
+        }
+    }
+    assert!(!evidence.physical_pass_claimed);
+    assert_eq!(evidence.nonclaim, VF_DRY_RUN_NONCLAIM);
+    assert!(evidence.nonclaim.contains("never claim Sep 18 PASS"));
+    assert!(!computer_use_isolated_surface_admission());
 }
