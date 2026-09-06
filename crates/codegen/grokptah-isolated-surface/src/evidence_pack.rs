@@ -165,6 +165,14 @@ pub fn verify_evidence_pack(pack: &Sep18EvidencePack) -> EvidenceVerifierDecisio
         );
     }
 
+    if let Some(decision) = verify_substrate_pass_claims(pack) {
+        return decision;
+    }
+
+    if let Some(decision) = verify_substrate_evidence_class(pack) {
+        return decision;
+    }
+
     if pack.physical_pass_claimed && !pack.physical_proof_markers.qualifies_vf_physical_pass() {
         return EvidenceVerifierDecision::reject(
             EvidenceVerifierCode::PhysicalPassWithoutMacMarkers,
@@ -303,14 +311,26 @@ fn verify_sealed_evidence(
         ));
     }
 
-    if pack.checklist_completed
+    if sealed.checklist_steps.contains(&ChecklistStep::Booted)
         && !sealed
             .checklist_steps
             .contains(&ChecklistStep::StopDestroyed)
     {
         return Some(EvidenceVerifierDecision::reject(
             EvidenceVerifierCode::ChecklistIncomplete,
-            "completed checklist must include StopDestroyed",
+            "booted checklist must include StopDestroyed teardown",
+        ));
+    }
+
+    if sealed
+        .checklist_steps
+        .contains(&ChecklistStep::StopDestroyed)
+        && stop.channels_destroyed == 0
+        && pack.host_sentinel_probes.channels_open_after_stop > 0
+    {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::StopChannelsStillOpen,
+            "StopDestroyed requires channels to be torn down",
         ));
     }
 
@@ -325,10 +345,23 @@ fn verify_sealed_evidence(
 }
 
 fn verify_uncertain_invariants(sealed: &SealedProofEvidence) -> Option<EvidenceVerifierDecision> {
-    let possible_inject = sealed
+    let guest_action_marked = sealed
         .checklist_steps
         .contains(&ChecklistStep::GuestLocalActionMarkedPossible);
+    let postcondition_verified = sealed
+        .checklist_steps
+        .contains(&ChecklistStep::PostconditionVerified);
     let disposition = sealed.stop_evidence.disposition;
+
+    if guest_action_marked
+        && !postcondition_verified
+        && disposition != Some(GuestLifecycleDisposition::Uncertain)
+    {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::UncertainDowngradedAfterPossibleInject,
+            "guest inject without postcondition requires Uncertain disposition at Stop",
+        ));
+    }
 
     if sealed.fault_matrix_case == Some(FaultMatrixCase::LostAckUncertain)
         && disposition != Some(GuestLifecycleDisposition::Uncertain)
@@ -336,16 +369,6 @@ fn verify_uncertain_invariants(sealed: &SealedProofEvidence) -> Option<EvidenceV
         return Some(EvidenceVerifierDecision::reject(
             EvidenceVerifierCode::UncertainDowngradedAfterPossibleInject,
             "LostAckUncertain fault matrix requires Uncertain disposition at Stop",
-        ));
-    }
-
-    if possible_inject
-        && sealed.fault_matrix_case == Some(FaultMatrixCase::LostAckUncertain)
-        && disposition == Some(GuestLifecycleDisposition::Stopped)
-    {
-        return Some(EvidenceVerifierDecision::reject(
-            EvidenceVerifierCode::UncertainDowngradedAfterPossibleInject,
-            "Uncertain cannot be downgraded to Stopped after possible guest inject",
         ));
     }
 
@@ -374,6 +397,81 @@ fn verify_fault_matrix_disposition(
         }
         _ => {}
     }
+    None
+}
+
+fn verify_substrate_pass_claims(pack: &Sep18EvidencePack) -> Option<EvidenceVerifierDecision> {
+    if !matches!(
+        pack.substrate,
+        Sep18ChecklistSubstrate::ContainedBrowserDryRun
+    ) {
+        return None;
+    }
+
+    if pack.physical_pass_claimed {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::PhysicalPassWithoutMacMarkers,
+            "Contained Browser dry-run cannot claim physical PASS",
+        ));
+    }
+
+    if pack.vf_pass_claimed {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::VfPassClaimOnDryRun,
+            "Contained Browser dry-run cannot claim VF PASS",
+        ));
+    }
+
+    if let Some(cb) = &pack.contained_browser {
+        if cb.vf_pass_claimed {
+            return Some(EvidenceVerifierDecision::reject(
+                EvidenceVerifierCode::VfPassClaimOnDryRun,
+                "contained_browser evidence cannot claim VF PASS on dry-run",
+            ));
+        }
+        if cb.isolation_pass_claimed {
+            return Some(EvidenceVerifierDecision::reject(
+                EvidenceVerifierCode::IsolationPassClaimOnDryRun,
+                "contained_browser evidence cannot claim isolation PASS on dry-run",
+            ));
+        }
+    }
+
+    None
+}
+
+fn verify_substrate_evidence_class(pack: &Sep18EvidencePack) -> Option<EvidenceVerifierDecision> {
+    let expected = match pack.substrate {
+        Sep18ChecklistSubstrate::ContainedBrowserDryRun => ProofEvidenceClass::ContainedBrowser,
+        Sep18ChecklistSubstrate::VfDryRun => ProofEvidenceClass::VirtualizationFramework,
+        Sep18ChecklistSubstrate::SyntheticHarness => ProofEvidenceClass::Synthetic,
+    };
+
+    if pack.evidence_class != expected {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::EvidenceClassTampered,
+            "pack evidence_class is inconsistent with substrate",
+        ));
+    }
+
+    if let Some(cb) = &pack.contained_browser {
+        if cb.evidence_class != expected {
+            return Some(EvidenceVerifierDecision::reject(
+                EvidenceVerifierCode::EvidenceClassTampered,
+                "contained_browser evidence_class is inconsistent with substrate",
+            ));
+        }
+    }
+
+    if let Some(sealed) = &pack.sealed_evidence {
+        if sealed.evidence_class != expected {
+            return Some(EvidenceVerifierDecision::reject(
+                EvidenceVerifierCode::EvidenceClassTampered,
+                "sealed_evidence evidence_class is inconsistent with substrate",
+            ));
+        }
+    }
+
     None
 }
 
