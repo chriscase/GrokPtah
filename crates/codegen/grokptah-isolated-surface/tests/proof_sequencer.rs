@@ -8,7 +8,8 @@ use grokptah_isolated_surface::{
 };
 #[cfg(not(feature = "browser-engine"))]
 use grokptah_isolated_surface::{
-    ContainedBrowserDryRunOutcome, ContainedBrowserDryRunPlatform, CONTAINED_BROWSER_DRY_RUN_NONCLAIM,
+    ContainedBrowserDryRunOutcome, ContainedBrowserDryRunPlatform,
+    CONTAINED_BROWSER_DRY_RUN_NONCLAIM,
 };
 use tempfile::TempDir;
 
