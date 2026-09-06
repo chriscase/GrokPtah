@@ -34,6 +34,7 @@ sha2 = "0.10"
 xai-host-authority = { path = "../../common/xai-host-authority" }
 grokptah-agent-sdk = { path = "../grokptah-agent-sdk" }
 grokptah-isolated-surface = { path = "../grokptah-isolated-surface" }
+grokptah-coding-worktree = { path = "../grokptah-coding-worktree" }
 
 keyring = { version = "3", features = ["apple-native", "sync-secret-service", "windows-native"] }
 open = "5"
