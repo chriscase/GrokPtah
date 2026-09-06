@@ -118,6 +118,9 @@ pub enum EvidenceVerifierCode {
     NonclaimMismatch,
     VfDryRunCannotQualifyPhysicalPass,
     FaultMatrixDispositionMismatch,
+    HostSentinelProbeSummaryMismatch,
+    PackSealedEvidenceMismatch,
+    SubstrateNestedEvidenceMissing,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -173,6 +176,10 @@ pub fn verify_evidence_pack(pack: &Sep18EvidencePack) -> EvidenceVerifierDecisio
         return decision;
     }
 
+    if let Some(decision) = verify_substrate_nested_evidence(pack) {
+        return decision;
+    }
+
     if pack.physical_pass_claimed && !pack.physical_proof_markers.qualifies_vf_physical_pass() {
         return EvidenceVerifierDecision::reject(
             EvidenceVerifierCode::PhysicalPassWithoutMacMarkers,
@@ -184,18 +191,6 @@ pub fn verify_evidence_pack(pack: &Sep18EvidencePack) -> EvidenceVerifierDecisio
         return EvidenceVerifierDecision::reject(
             EvidenceVerifierCode::VfPassClaimOnDryRun,
             "vf_pass_claimed requires Mac physical proof markers",
-        );
-    }
-
-    if pack.isolation_pass_claimed
-        && matches!(
-            pack.substrate,
-            Sep18ChecklistSubstrate::ContainedBrowserDryRun
-        )
-    {
-        return EvidenceVerifierDecision::reject(
-            EvidenceVerifierCode::IsolationPassClaimOnDryRun,
-            "Contained Browser dry-run cannot claim isolation PASS",
         );
     }
 
@@ -236,6 +231,9 @@ pub fn verify_evidence_pack(pack: &Sep18EvidencePack) -> EvidenceVerifierDecisio
                 EvidenceVerifierCode::EvidenceClassTampered,
                 "pack evidence_class does not match sealed_evidence label",
             );
+        }
+        if let Some(decision) = verify_pack_sealed_consistency(pack, sealed) {
+            return decision;
         }
         if let Some(decision) = verify_sealed_evidence(pack, sealed) {
             return decision;
@@ -279,6 +277,17 @@ pub fn verify_evidence_pack(pack: &Sep18EvidencePack) -> EvidenceVerifierDecisio
         }
     }
 
+    if let Some(cb) = &pack.contained_browser {
+        if let Some(cb_sealed) = &cb.sealed_evidence {
+            if let Some(decision) = verify_uncertain_invariants(cb_sealed) {
+                return decision;
+            }
+            if let Some(decision) = verify_fault_matrix_disposition(cb_sealed) {
+                return decision;
+            }
+        }
+    }
+
     EvidenceVerifierDecision::accept()
 }
 
@@ -296,8 +305,15 @@ fn verify_sealed_evidence(
 
     if pack.host_sentinel_probes.probes_performed != stop.host_sentinel_probes_performed {
         return Some(EvidenceVerifierDecision::reject(
-            EvidenceVerifierCode::EvidenceClassTampered,
+            EvidenceVerifierCode::HostSentinelProbeSummaryMismatch,
             "host_sentinel_probes_performed mismatch between pack and sealed stop_evidence",
+        ));
+    }
+
+    if pack.host_sentinel_probes.channels_destroyed != stop.channels_destroyed {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::HostSentinelProbeSummaryMismatch,
+            "channels_destroyed mismatch between pack summary and sealed stop_evidence",
         ));
     }
 
@@ -311,22 +327,24 @@ fn verify_sealed_evidence(
         ));
     }
 
-    if sealed.checklist_steps.contains(&ChecklistStep::Booted)
-        && !sealed
-            .checklist_steps
-            .contains(&ChecklistStep::StopDestroyed)
+    if !sealed
+        .checklist_steps
+        .contains(&ChecklistStep::StopDestroyed)
     {
         return Some(EvidenceVerifierDecision::reject(
             EvidenceVerifierCode::ChecklistIncomplete,
-            "booted checklist must include StopDestroyed teardown",
+            "sealed checklist must include StopDestroyed teardown",
         ));
+    }
+
+    if let Some(decision) = verify_checklist_shape(sealed) {
+        return Some(decision);
     }
 
     if sealed
         .checklist_steps
         .contains(&ChecklistStep::StopDestroyed)
         && stop.channels_destroyed == 0
-        && pack.host_sentinel_probes.channels_open_after_stop > 0
     {
         return Some(EvidenceVerifierDecision::reject(
             EvidenceVerifierCode::StopChannelsStillOpen,
@@ -338,6 +356,38 @@ fn verify_sealed_evidence(
         return Some(EvidenceVerifierDecision::reject(
             EvidenceVerifierCode::StopSentinelProbeMissing,
             "stop_evidence cannot claim unchanged sentinels with probe error",
+        ));
+    }
+
+    None
+}
+
+fn verify_checklist_shape(sealed: &SealedProofEvidence) -> Option<EvidenceVerifierDecision> {
+    let steps = &sealed.checklist_steps;
+    if !steps.contains(&ChecklistStep::Booted) || !steps.contains(&ChecklistStep::StopDestroyed) {
+        return None;
+    }
+
+    match sealed.fault_matrix_case {
+        Some(FaultMatrixCase::BootStop) | Some(FaultMatrixCase::PreDispatchStop) => return None,
+        _ => {}
+    }
+
+    if steps.contains(&ChecklistStep::FrameChallenge)
+        && !steps.contains(&ChecklistStep::GuestLocalActionMarkedPossible)
+    {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::ChecklistIncomplete,
+            "FrameChallenge checklist must record guest-local action possibility before Stop",
+        ));
+    }
+
+    if !steps.contains(&ChecklistStep::FrameChallenge)
+        && !steps.contains(&ChecklistStep::GuestLocalActionMarkedPossible)
+    {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::ChecklistIncomplete,
+            "Booted checklist must record guest-local action possibility before Stop",
         ));
     }
 
@@ -401,24 +451,26 @@ fn verify_fault_matrix_disposition(
 }
 
 fn verify_substrate_pass_claims(pack: &Sep18EvidencePack) -> Option<EvidenceVerifierDecision> {
-    if !matches!(
-        pack.substrate,
-        Sep18ChecklistSubstrate::ContainedBrowserDryRun
-    ) {
-        return None;
-    }
-
+    // No physical VF substrate exists today — every current substrate is dry-run /
+    // synthetic rehearsal. Unsigned JSON markers must never qualify PASS.
     if pack.physical_pass_claimed {
         return Some(EvidenceVerifierDecision::reject(
-            EvidenceVerifierCode::PhysicalPassWithoutMacMarkers,
-            "Contained Browser dry-run cannot claim physical PASS",
+            EvidenceVerifierCode::VfDryRunCannotQualifyPhysicalPass,
+            "no current substrate can claim physical PASS",
         ));
     }
 
     if pack.vf_pass_claimed {
         return Some(EvidenceVerifierDecision::reject(
             EvidenceVerifierCode::VfPassClaimOnDryRun,
-            "Contained Browser dry-run cannot claim VF PASS",
+            "no current substrate can claim VF PASS",
+        ));
+    }
+
+    if pack.isolation_pass_claimed {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::IsolationPassClaimOnDryRun,
+            "no current substrate can claim isolation PASS",
         ));
     }
 
@@ -434,6 +486,63 @@ fn verify_substrate_pass_claims(pack: &Sep18EvidencePack) -> Option<EvidenceVeri
                 EvidenceVerifierCode::IsolationPassClaimOnDryRun,
                 "contained_browser evidence cannot claim isolation PASS on dry-run",
             ));
+        }
+    }
+
+    if let Some(vf) = &pack.vf_dry_run {
+        if vf.physical_pass_claimed {
+            return Some(EvidenceVerifierDecision::reject(
+                EvidenceVerifierCode::VfDryRunCannotQualifyPhysicalPass,
+                "VF dry-run artifacts never qualify as physical PASS",
+            ));
+        }
+    }
+
+    None
+}
+
+fn verify_substrate_nested_evidence(pack: &Sep18EvidencePack) -> Option<EvidenceVerifierDecision> {
+    match pack.substrate {
+        Sep18ChecklistSubstrate::ContainedBrowserDryRun => {
+            if pack.contained_browser.is_none() {
+                return Some(EvidenceVerifierDecision::reject(
+                    EvidenceVerifierCode::SubstrateNestedEvidenceMissing,
+                    "ContainedBrowserDryRun requires contained_browser nested evidence",
+                ));
+            }
+        }
+        Sep18ChecklistSubstrate::VfDryRun => {
+            if pack.vf_dry_run.is_none() {
+                return Some(EvidenceVerifierDecision::reject(
+                    EvidenceVerifierCode::SubstrateNestedEvidenceMissing,
+                    "VfDryRun requires vf_dry_run nested evidence",
+                ));
+            }
+        }
+        Sep18ChecklistSubstrate::SyntheticHarness => {}
+    }
+    None
+}
+
+fn verify_pack_sealed_consistency(
+    pack: &Sep18EvidencePack,
+    sealed: &SealedProofEvidence,
+) -> Option<EvidenceVerifierDecision> {
+    if pack.fault_matrix_case != sealed.fault_matrix_case {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::PackSealedEvidenceMismatch,
+            "pack fault_matrix_case does not match sealed_evidence",
+        ));
+    }
+
+    if let Some(cb) = &pack.contained_browser {
+        if let Some(cb_sealed) = &cb.sealed_evidence {
+            if cb_sealed != sealed {
+                return Some(EvidenceVerifierDecision::reject(
+                    EvidenceVerifierCode::PackSealedEvidenceMismatch,
+                    "contained_browser.sealed_evidence does not match pack.sealed_evidence",
+                ));
+            }
         }
     }
 
@@ -606,6 +715,9 @@ pub fn verifier_exit_code(decision: &EvidenceVerifierDecision) -> i32 {
             EvidenceVerifierCode::NonclaimMismatch => 20,
             EvidenceVerifierCode::VfDryRunCannotQualifyPhysicalPass => 21,
             EvidenceVerifierCode::FaultMatrixDispositionMismatch => 22,
+            EvidenceVerifierCode::HostSentinelProbeSummaryMismatch => 23,
+            EvidenceVerifierCode::PackSealedEvidenceMismatch => 24,
+            EvidenceVerifierCode::SubstrateNestedEvidenceMissing => 25,
         }
     }
 }
@@ -643,7 +755,7 @@ mod tests {
         assert!(!decision.accepted);
         assert_eq!(
             decision.code,
-            EvidenceVerifierCode::PhysicalPassWithoutMacMarkers
+            EvidenceVerifierCode::VfDryRunCannotQualifyPhysicalPass
         );
     }
 }
