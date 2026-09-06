@@ -4,26 +4,36 @@
 //! Virtualization.framework proof. This crate does **not** claim packaged VM
 //! qualification from Linux CI or simulator evidence alone.
 
+mod backend;
 mod channels;
+mod contained_browser;
 mod error;
 mod harness;
 mod lifecycle;
+mod proof_sequencer;
 mod sentinel;
 mod simulator;
 mod store;
 
+pub use backend::{assert_evidence_class_unchanged, IsolatedSurfaceBackend};
 pub use channels::ChannelRegistry;
+pub use contained_browser::ContainedBrowserBackend;
 pub use error::{HarnessError, HarnessErrorCode, HarnessResult};
 pub use harness::{IsolatedSurfaceHarness, StopEvidence};
 pub use lifecycle::{
     GuestLifecycle, GuestLifecycleDisposition, GuestLifecyclePhase, ProofEvidenceClass,
     LIFECYCLE_SCHEMA_VERSION,
 };
+pub use proof_sequencer::{
+    ChecklistStep, FaultMatrixCase, SealedProofEvidence, Sep18NoModelProofSequencer,
+};
 pub use sentinel::{
     HostSentinelDiff, HostSentinelProbe, HostSentinelRegistry, HostSentinelSnapshot,
-    SyntheticHostProbe,
+    MainCheckoutFence, SyntheticHostProbe,
 };
-pub use simulator::{FrameDelta, GuestFrame, SyntheticGuest, SyntheticGuestAction};
+pub use simulator::{
+    FrameDelta, GuestFrame, GuestLocalAction, InjectOutcome, SyntheticGuest, SyntheticGuestAction,
+};
 pub use store::{snapshot_root, HarnessSnapshot, SNAPSHOT_FILE, SNAPSHOT_SCHEMA_VERSION};
 
 /// Fail-closed admission gate for bridge integration. Remains false until a

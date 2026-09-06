@@ -31,14 +31,26 @@ pub enum GuestLifecycleDisposition {
     Stopped,
 }
 
-/// Evidence class for proof artifacts. Simulator output never qualifies as a
-/// packaged Virtualization.framework proof.
+/// Evidence class for proof artifacts. Labels are fixed at backend creation and
+/// must never be upgraded at seal time. Linux CI never produces
+/// `VirtualizationFramework` PASS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProofEvidenceClass {
-    SyntheticHarnessIneligible,
+    /// Synthetic harness / simulator — ineligible for VF qualification.
+    #[serde(alias = "synthetic_harness_ineligible")]
+    Synthetic,
+    /// Real Mac Virtualization.framework physical proof only.
     VirtualizationFramework,
+    /// Contained Browser pivot path — honest miss label, not current PASS.
     ContainedBrowser,
+}
+
+impl ProofEvidenceClass {
+    /// True only for physical Mac VF proof artifacts.
+    pub fn is_vf_qualification_eligible(self) -> bool {
+        matches!(self, ProofEvidenceClass::VirtualizationFramework)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,7 +80,7 @@ impl GuestLifecycle {
             disposition: None,
             inject_fenced: false,
             guest_input_possible: false,
-            evidence_class: ProofEvidenceClass::SyntheticHarnessIneligible,
+            evidence_class: ProofEvidenceClass::Synthetic,
             frame_epoch: 0,
             actions_completed: 0,
             created_at: now,

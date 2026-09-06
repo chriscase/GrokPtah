@@ -1,15 +1,25 @@
 # Isolated Surface Proof Harness v0
 
 This document inventories the current `main` Computer Use / isolated-guest code,
-defines the synthetic proof harness added in this slice, and maps it to the Sep 18
-2026 physical Mac gate and Contained Browser fallback. It does **not** claim
-packaged Virtualization.framework qualification from Linux CI or simulator evidence.
+defines the synthetic proof harness, and maps it to the Sep 5–18 2026 calendar
+(Phase-1 packet 2: Backend SPI + no-model sequencer + Contained Browser stub).
+It does **not** claim packaged Virtualization.framework qualification from Linux CI
+or simulator evidence.
 
 Related issues: [#288](https://github.com/chriscase/GrokPtah/issues/288) (isolated
 visual), [#286](https://github.com/chriscase/GrokPtah/issues/286) (agent-owned
 surface), [#267](https://github.com/chriscase/GrokPtah/issues/267) (epic).
 
-## Exact-main inventory (base `f11318828ba9720f7f018f037aa23293cd3b3e47`)
+## Calendar (Sep 5–18 2026)
+
+| Date window | Packet | Status on main |
+|---|---|---|
+| Sep 5 | Packet 1 — Harness v0 (#542) | **Landed** — lifecycle, sentinels, synthetic guest, fence-first Stop |
+| Sep 6–12 | Packet 2 — Backend SPI + sequencer + Contained Browser stub | **This slice** — `IsolatedSurfaceBackend`, `Sep18NoModelProofSequencer`, main-checkout sentinel |
+| Sep 13–17 | Packet 3 (next) — Mac VF backend behind SPI, feature-gated | Planned — still `admission false` |
+| Sep 18 | Physical Mac gate | VF PASS or honest Contained Browser pivot |
+
+## Exact-main inventory (base `6a55faf9711addca01c1eec795850f11ba42bcec` + packet 2)
 
 ### Already satisfies Windowed Coding Run noninterference (semantic macOS path)
 
@@ -23,32 +33,21 @@ surface), [#267](https://github.com/chriscase/GrokPtah/issues/267) (epic).
 | Visible activity (#286 UI) | `desktop/src/lib/computerActivity.ts` | Disposition-first activity mapping |
 | Threat model honesty | `docs/COMPUTER_USE_THREAT_MODEL.md` | #288 disabled until separate input surface |
 
-### Fails or is absent for Windowed Coding Run (#288 / physical isolation)
-
-| Gap | Status on main before this slice |
-|---|---|
-| Guest lifecycle `NotStarted → Booting → Ready → Acting → Stopping → Destroyed` | **Absent** — no isolated guest crate |
-| Host sentinel noninterference hooks (pointer/foreground/clipboard/unrelated window) | **Absent** — no testable sentinel registry |
-| Synthetic proof harness for launch → boot → frame → inject → changed frame → Stop → destroy | **Absent** |
-| Channel destroy / leak assertions after Stop | **Absent** |
-| Crash/restart with no auto-retry after uncertain guest inject | Partial on Computer Run ledger only; **not** on guest surface |
-| Virtualization.framework adapter | **Absent** — explicitly disabled in threat model |
-| Agent-owned in-GrokPtah cursor / surface events (#286) | **Absent** — UI activity only |
-| Packaged VM / notarized helper proof | **Absent** |
-
-Draft PR archaeology (#447 `grokptah-isolated-visual`) is **not** merged wholesale. This slice
-reconstructs only the contract and synthetic machinery current-main tests prove is missing.
-
-## What this slice adds
+### Packet 1 (#542) + Packet 2 deliverables
 
 | Deliverable | Location |
 |---|---|
 | `GuestLifecycle` state machine | `crates/codegen/grokptah-isolated-surface/src/lifecycle.rs` |
-| Host sentinel registry + assertions | `crates/codegen/grokptah-isolated-surface/src/sentinel.rs` |
-| Channel destroy registry | `crates/codegen/grokptah-isolated-surface/src/channels.rs` |
-| Synthetic guest + harness orchestrator | `simulator.rs`, `harness.rs` |
+| Host sentinel registry + main-checkout fence | `sentinel.rs` — `MainCheckoutFence` digest/mtime hook |
+| `IsolatedSurfaceBackend` SPI | `backend.rs` — boot / observe_frame / inject_guest_local / stop_fence_first / destroy |
+| Synthetic backend (SPI impl) | `simulator.rs` — `SyntheticGuest` |
+| Contained Browser stub (fail-closed) | `contained_browser.rs` — honest `ContainedBrowser` label, not PASS |
+| Sep 18 no-model proof sequencer | `proof_sequencer.rs` — checklist + bounded fault matrix |
+| Harness orchestrator | `harness.rs` — backend-generic, fence-first Stop preserved |
+| Channel destroy registry | `channels.rs` |
 | Restart snapshot for recovery tests | `store.rs` |
-| Crash/Stop regression suite | `grokptah-isolated-surface/tests/stop_regression.rs` |
+| Crash/Stop regression suite | `tests/stop_regression.rs` |
+| Sequencer + SPI regression | `tests/proof_sequencer.rs` |
 | Bridge fail-closed seam | `grokptah-agent-bridge/src/computer_use/isolated_surface.rs` |
 | Bridge integration tests | `grokptah-agent-bridge/tests/isolated_surface_proof_harness.rs` |
 
@@ -59,53 +58,73 @@ NotStarted → Booting → Ready → Acting → Stopping → Destroyed
                               ↘ Uncertain disposition (fail-closed, inject fenced)
 ```
 
-- **Uncertain** is a disposition, not a resumable phase. It is recorded after possible
-  guest input when outcome cannot be established (crash mid-inject, Stop during an
-  in-flight action with `guest_input_possible`, restart while `guest_input_possible`).
-- **Stop is fence-first:** `begin_stop` runs before host sentinel probe or teardown.
-  Inject is fenced immediately; channels and guest are always destroyed; probe errors
-  are reported separately in `StopEvidence.host_sentinel_probe_error` and do not skip
-  cleanup.
-- **Uncertain-on-possible-input:** stopping while `guest_input_possible` preserves
-  `GuestLifecycleDisposition::Uncertain` — never downgrades to ordinary `Stopped`.
-  `Destroyed` + `Uncertain` is a valid terminal pair.
-- **No auto-retry** after uncertain inject — explicit retry increments a counter and fails
-  with `AutoRetryForbidden`.
+- **Uncertain** is a disposition, not a resumable phase.
+- **Stop is fence-first:** `begin_stop` + `backend.stop_fence_first()` before teardown.
+- **No auto-retry** after uncertain inject.
 
-### Host sentinels
+### Host sentinels + main-checkout fence
 
 `HostSentinelSnapshot` captures baseline pointer, foreground app/window, clipboard digest,
-and an unrelated host window. The synthetic harness asserts these are unchanged across boot,
-frame observe, inject, Stop, and destroy. `HostSentinelRegistry::refresh_from_host` is the
-extension point for native Mac evidence collection on physical proof day.
+unrelated host window, and `MainCheckoutFence` (digest or mtime fence for the main checkout,
+not the disposable worktree). Synthetic mutation of main-checkout fence is a regression
+case in `proof_sequencer` tests.
 
-### Evidence class
+### Evidence class (`ProofEvidenceClass`)
 
-All harness output is `ProofEvidenceClass::SyntheticHarnessIneligible`. This is explicitly
-**not** `VirtualizationFramework` and must not be cited as VM qualification.
+| Variant | Meaning |
+|---|---|
+| `Synthetic` | Harness/simulator output — ineligible for VF qualification |
+| `VirtualizationFramework` | Reserved for real Mac VF physical proof PASS only |
+| `ContainedBrowser` | Honest Sep 18 pivot label — stub fails closed, not current PASS |
+
+Labels are fixed at backend creation and must **never** be upgraded at seal time.
+Linux CI never produces `VirtualizationFramework` PASS.
 
 Bridge admission `isolated_surface_admission_available()` remains **false**.
+
+## Sep 18 no-model proof sequencer
+
+`Sep18NoModelProofSequencer` runs the checklist against the synthetic backend:
+
+1. **Arm** — verify `ProofEvidenceClass::Synthetic`
+2. **Boot** — `IsolatedSurfaceHarness::boot()`
+3. **Frame+challenge** — `observe_frame()`, epoch > 0
+4. **One guest-local action** — `inject_guest_action` (marks possible before boundary)
+5. **Postcondition** — guest-local frame change verified
+6. **Stop/destroy** — fence-first Stop, channels destroyed
+7. **Reject stale tokens** — post-Stop inject must return `InjectFenced`
+8. **Seal evidence** — `SealedProofEvidence` with nonclaim string
+
+### Bounded fault matrix
+
+| Case | Scenario |
+|---|---|
+| `BootStop` | Boot then Stop before inject |
+| `PreDispatchStop` | Boot, frame, Stop before guest-local dispatch |
+| `LostAckUncertain` | Uncertain inject → Stop preserves Uncertain |
+| `RestartNoReplay` | Restart after uncertain → destroyed, no inject replay |
 
 ## Sep 18 2026 physical proof checklist mapping
 
 | Physical Mac step | Synthetic harness equivalent | Native extension point |
 |---|---|---|
 | Launch isolated surface | `IsolatedSurfaceHarness::boot()` | VF helper spawn + window attach |
-| Boot guest | `SyntheticGuest::boot` → `GuestLifecyclePhase::Ready` | Guest image boot + first frame |
+| Boot guest | `IsolatedSurfaceBackend::boot` → `Ready` | Guest image boot + first frame |
 | Capture frame | `observe_frame()` | ScreenCaptureKit / guest framebuffer channel |
-| Inject ONE guest-local action | `inject_guest_action(ClickGuestButton)` | Guest input channel only |
+| Inject ONE guest-local action | `inject_guest_local(ClickGuestButton)` | Guest input channel only |
 | Changed frame | `FrameDelta.guest_local_change == true` | Frame digest / epoch increment |
-| Stop | `stop()` fences first → teardown → probe; `Uncertain` preserved when input possible | Operator Stop + helper teardown |
-| Destroy channels | `ChannelRegistry::destroy_all` (always, even if probe fails) | Close VF/frame/input IPC |
-| Host sentinels unchanged | `StopEvidence.host_sentinel_probe_error` separate from teardown | AX/CGEvent/clipboard/window probes |
-| Crash mid-inject → uncertain, no retry | `stop_regression` tests | Same policy on native adapter |
-| Process restart recovery | `recover_after_restart` + snapshot | Durable guest ledger on disk |
+| Stop | `stop()` fences first → teardown → probe | Operator Stop + helper teardown |
+| Destroy channels | `ChannelRegistry::destroy_all` | Close VF/frame/input IPC |
+| Host sentinels unchanged | `StopEvidence.host_sentinel_probe_error` separate | AX/CGEvent/clipboard/window + main-checkout probes |
+| Crash mid-inject → uncertain, no retry | fault matrix + `stop_regression` | Same policy on native adapter |
+| Process restart recovery | `RestartNoReplay` fault case | Durable guest ledger on disk |
 
 ### Gate verdict
 
 - **PASS (Sep 18):** real Mac completes the checklist with `ProofEvidenceClass::VirtualizationFramework`
   and unchanged host sentinels.
-- **MISS → Contained Browser:** honest label; never call foreground `CGEvent` injection "isolated".
+- **MISS → Contained Browser:** `ContainedBrowserBackend` stub documents the pivot path; stub
+  fails closed until real browser isolation lands — never call foreground `CGEvent` injection "isolated".
 
 ## Verification commands
 
@@ -121,19 +140,23 @@ cargo test --locked --manifest-path crates/codegen/grokptah-agent-bridge/Cargo.t
 
 cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Cargo.toml \
   --test stop_regression -- --test-threads=1
+
+cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Cargo.toml \
+  --test proof_sequencer -- --test-threads=1
 ```
 
-## Residuals (honest, post-slice)
+## Residuals (honest, post-packet-2)
 
 - No Virtualization.framework adapter, signed guest image, or packaged helper.
 - No TCC entitlement or notarization claims.
 - No Windows/Linux isolated surface.
 - No agent-owned cursor / surface-event stream (#286 UI layer still disposition-only).
 - No bridge admission enablement — `isolated_surface_admission_available()` stays false.
+- Contained Browser stub is fail-closed — not a PASS path.
 - Linux CI proves contract only; physical Mac proof is a separate exact-head gate.
 
 ## Non-claims
 
 - Simulator / Linux CI does **not** qualify a packaged VM.
 - Synthetic harness success does **not** enable isolated visual Computer Use in production.
-- Contained Browser fallback is not implemented in this slice; only documented as the honest miss path.
+- `ContainedBrowser` stub does **not** implement browser isolation — only documents the Sep 18 pivot.

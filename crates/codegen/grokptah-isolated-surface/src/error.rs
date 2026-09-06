@@ -51,6 +51,10 @@ impl HarnessError {
     pub fn auto_retry_forbidden(message: impl Into<String>) -> Self {
         Self::new(HarnessErrorCode::AutoRetryForbidden, message)
     }
+
+    pub fn backend_unavailable(message: impl Into<String>) -> Self {
+        Self::new(HarnessErrorCode::BackendUnavailable, message)
+    }
 }
 
 pub type HarnessResult<T> = Result<T, HarnessError>;
