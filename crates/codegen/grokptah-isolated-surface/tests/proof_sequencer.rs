@@ -1,11 +1,14 @@
 //! Sep 18 no-model proof sequencer + backend SPI regression tests.
 
 use grokptah_isolated_surface::{
-    ChecklistStep, ContainedBrowserBackend, ContainedBrowserDryRunOutcome,
-    ContainedBrowserDryRunPlatform, FaultMatrixCase, HarnessErrorCode, HostSentinelSnapshot,
-    IsolatedSurfaceBackend, IsolatedSurfaceHarness, ProofEvidenceClass, Sep18NoModelProofSequencer,
-    VfDryRunOutcome, VfDryRunPlatform, VfLaunchReceipt, CONTAINED_BROWSER_DRY_RUN_NONCLAIM,
+    ChecklistStep, ContainedBrowserBackend, FaultMatrixCase, HarnessErrorCode,
+    HostSentinelSnapshot, IsolatedSurfaceBackend, IsolatedSurfaceHarness, ProofEvidenceClass,
+    Sep18NoModelProofSequencer, VfDryRunOutcome, VfDryRunPlatform, VfLaunchReceipt,
     VF_DRY_RUN_NONCLAIM,
+};
+#[cfg(not(feature = "browser-engine"))]
+use grokptah_isolated_surface::{
+    ContainedBrowserDryRunOutcome, ContainedBrowserDryRunPlatform, CONTAINED_BROWSER_DRY_RUN_NONCLAIM,
 };
 use tempfile::TempDir;
 
@@ -22,20 +25,26 @@ fn synthetic_backend_implements_spi() {
 }
 
 #[test]
-fn contained_browser_substrate_honest_label_no_isolation_pass() {
-    let mut backend = ContainedBrowserBackend::new();
+fn contained_browser_substrate_honest_label() {
+    let backend = ContainedBrowserBackend::new();
     assert_eq!(
         backend.evidence_class(),
         ProofEvidenceClass::ContainedBrowser
     );
     assert!(!backend.isolation_proof_available());
     assert!(!backend.evidence_class().is_vf_qualification_eligible());
+}
 
+#[cfg(not(feature = "browser-engine"))]
+#[test]
+fn contained_browser_simulator_boot_succeeds() {
+    let mut backend = ContainedBrowserBackend::new();
     let frame = backend.boot().expect("simulator boot");
     assert_eq!(frame.epoch, 1);
     assert!(backend.is_booted());
 }
 
+#[cfg(not(feature = "browser-engine"))]
 #[test]
 fn harness_with_contained_browser_backend_runs_checklist() {
     let mut harness = IsolatedSurfaceHarness::with_backend(
@@ -289,6 +298,7 @@ fn harness_refresh_host_sentinels_uses_probe_path() {
     assert!(harness.sentinels().verified_via_probe());
 }
 
+#[cfg(not(feature = "browser-engine"))]
 #[test]
 fn sep18_contained_browser_dry_run_simulator_on_linux_ci() {
     let sequencer = Sep18NoModelProofSequencer::new(HostSentinelSnapshot::synthetic_baseline());
@@ -322,6 +332,7 @@ fn sep18_contained_browser_dry_run_simulator_on_linux_ci() {
         .contains(&ChecklistStep::EvidenceSealed));
 }
 
+#[cfg(not(feature = "browser-engine"))]
 #[test]
 fn sep18_contained_browser_fault_matrix_boot_stop() {
     let sequencer = Sep18NoModelProofSequencer::new(HostSentinelSnapshot::synthetic_baseline());
@@ -333,6 +344,7 @@ fn sep18_contained_browser_fault_matrix_boot_stop() {
     assert!(!sealed.evidence_class.is_vf_qualification_eligible());
 }
 
+#[cfg(not(feature = "browser-engine"))]
 #[test]
 fn sep18_contained_browser_fault_matrix_lost_ack_uncertain() {
     let sequencer = Sep18NoModelProofSequencer::new(HostSentinelSnapshot::synthetic_baseline());
@@ -349,6 +361,7 @@ fn sep18_contained_browser_fault_matrix_lost_ack_uncertain() {
     );
 }
 
+#[cfg(not(feature = "browser-engine"))]
 #[test]
 fn contained_browser_no_pass_laundering_at_seal() {
     let sequencer = Sep18NoModelProofSequencer::new(HostSentinelSnapshot::synthetic_baseline());

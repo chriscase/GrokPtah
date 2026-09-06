@@ -21,6 +21,7 @@ const ENGINE_UNAVAILABLE: &str =
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SubstrateMode {
     /// In-process browser frame simulator — exercises SPI contract, not isolation PASS.
+    #[cfg_attr(feature = "browser-engine", allow(dead_code))]
     Simulator,
     #[cfg(feature = "browser-engine")]
     /// Reserved for native browser engine wiring; always fails closed in v0.
@@ -218,6 +219,7 @@ impl IsolatedSurfaceBackend for ContainedBrowserBackend {
 mod tests {
     use super::*;
 
+    #[cfg(not(feature = "browser-engine"))]
     #[test]
     fn contained_browser_simulator_lifecycle() {
         let mut backend = ContainedBrowserBackend::new();

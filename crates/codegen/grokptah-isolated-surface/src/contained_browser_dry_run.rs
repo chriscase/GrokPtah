@@ -6,15 +6,22 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::backend::assert_evidence_class_unchanged;
 use crate::contained_browser::ContainedBrowserBackend;
 use crate::error::{HarnessError, HarnessErrorCode, HarnessResult};
 use crate::harness::IsolatedSurfaceHarness;
-use crate::lifecycle::{GuestLifecycleDisposition, ProofEvidenceClass};
-use crate::proof_sequencer::{ChecklistStep, FaultMatrixCase, SealedProofEvidence};
+use crate::lifecycle::ProofEvidenceClass;
+use crate::proof_sequencer::{FaultMatrixCase, SealedProofEvidence};
 use crate::sentinel::HostSentinelSnapshot;
-use crate::simulator::{FaultInjectingBackend, GuestLocalAction};
 use crate::CONTAINED_BROWSER_DRY_RUN_NONCLAIM;
+
+#[cfg(not(feature = "browser-engine"))]
+use crate::backend::assert_evidence_class_unchanged;
+#[cfg(not(feature = "browser-engine"))]
+use crate::lifecycle::GuestLifecycleDisposition;
+#[cfg(not(feature = "browser-engine"))]
+use crate::proof_sequencer::ChecklistStep;
+#[cfg(not(feature = "browser-engine"))]
+use crate::simulator::{FaultInjectingBackend, GuestLocalAction};
 
 /// Where the Contained Browser dry-run ran.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,7 +65,8 @@ pub fn run_contained_browser_dry_run(
 ) -> HarnessResult<ContainedBrowserDryRunEvidence> {
     #[cfg(feature = "browser-engine")]
     {
-        return run_contained_browser_engine_unavailable(baseline);
+        let _ = snapshot_root;
+        run_contained_browser_engine_unavailable(baseline)
     }
 
     #[cfg(not(feature = "browser-engine"))]
@@ -76,9 +84,9 @@ pub fn run_contained_browser_fault_matrix(
     #[cfg(feature = "browser-engine")]
     {
         let _ = (baseline, snapshot_root, case);
-        return Err(HarnessError::backend_unavailable(
+        Err(HarnessError::backend_unavailable(
             "Contained Browser fault matrix requires simulator substrate; browser-engine fails closed",
-        ));
+        ))
     }
 
     #[cfg(not(feature = "browser-engine"))]
@@ -385,7 +393,7 @@ fn run_contained_browser_restart_no_replay(
 }
 
 #[cfg(not(feature = "browser-engine"))]
-pub fn run_contained_browser_stop_fence_regression(
+fn run_contained_browser_stop_fence_regression_simulator(
     baseline: HostSentinelSnapshot,
 ) -> HarnessResult<()> {
     let mut wrapped = FaultInjectingBackend::new(ContainedBrowserBackend::new());
@@ -404,4 +412,48 @@ pub fn run_contained_browser_stop_fence_regression(
     );
     harness.channels().assert_all_destroyed()?;
     Ok(())
+}
+
+#[cfg(feature = "browser-engine")]
+fn run_contained_browser_stop_fence_regression_engine(
+    baseline: HostSentinelSnapshot,
+) -> HarnessResult<()> {
+    let mut harness =
+        IsolatedSurfaceHarness::with_backend(baseline, ContainedBrowserBackend::new())?;
+    let boot_err = harness
+        .boot()
+        .expect_err("browser-engine boot must fail closed");
+    if boot_err.code != HarnessErrorCode::BackendUnavailable {
+        return Err(HarnessError::invalid_state(format!(
+            "browser-engine boot must return BackendUnavailable, got {:?}",
+            boot_err.code
+        )));
+    }
+    assert_eq!(harness.channels().open_count(), 2);
+
+    let evidence = harness.stop()?;
+    assert_eq!(evidence.channels_destroyed, 2);
+    assert_eq!(
+        harness.lifecycle().phase,
+        crate::lifecycle::GuestLifecyclePhase::Destroyed
+    );
+    harness.channels().assert_all_destroyed()?;
+    Ok(())
+}
+
+/// Fence-first Stop regression for the Contained Browser substrate.
+///
+/// Simulator (default): injected fence error still tears down channels.
+/// `browser-engine`: boot fails closed; Stop still tears down opened channels.
+pub fn run_contained_browser_stop_fence_regression(
+    baseline: HostSentinelSnapshot,
+) -> HarnessResult<()> {
+    #[cfg(not(feature = "browser-engine"))]
+    {
+        run_contained_browser_stop_fence_regression_simulator(baseline)
+    }
+    #[cfg(feature = "browser-engine")]
+    {
+        run_contained_browser_stop_fence_regression_engine(baseline)
+    }
 }

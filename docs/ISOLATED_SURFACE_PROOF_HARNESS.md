@@ -209,6 +209,13 @@ cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Car
 cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Cargo.toml \
   --test proof_sequencer sep18_contained_browser -- --test-threads=1
 
+# Optional browser-engine feature (default-off; must compile fail-closed)
+cargo check --locked --manifest-path crates/codegen/grokptah-isolated-surface/Cargo.toml \
+  --features browser-engine
+
+cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Cargo.toml \
+  --features browser-engine --test browser_engine_feature -- --test-threads=1
+
 # Mac VF dry-run rehearsal (physical worker only)
 cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Cargo.toml \
   --features vf-backend --test proof_sequencer sep18_vf_dry_run -- --test-threads=1

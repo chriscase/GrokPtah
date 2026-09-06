@@ -1,11 +1,14 @@
 //! Contained Browser substrate regression — fence-first Stop + Uncertain invariants.
 
+#[cfg(not(feature = "browser-engine"))]
 use grokptah_isolated_surface::{
     ContainedBrowserBackend, GuestLifecycleDisposition, GuestLifecyclePhase, HarnessErrorCode,
     HostSentinelSnapshot, IsolatedSurfaceHarness, ProofEvidenceClass, SyntheticGuestAction,
 };
+#[cfg(not(feature = "browser-engine"))]
 use tempfile::TempDir;
 
+#[cfg(not(feature = "browser-engine"))]
 #[test]
 fn contained_browser_canonical_proof_with_unchanged_host_sentinels() {
     let mut harness = IsolatedSurfaceHarness::with_backend(
@@ -26,6 +29,7 @@ fn contained_browser_canonical_proof_with_unchanged_host_sentinels() {
     harness.sentinels().assert_unchanged().expect("sentinels");
 }
 
+#[cfg(not(feature = "browser-engine"))]
 #[test]
 fn contained_browser_stop_after_uncertain_preserves_disposition() {
     let dir = TempDir::new().expect("tempdir");
@@ -54,6 +58,7 @@ fn contained_browser_admission_stays_false() {
     assert!(!grokptah_isolated_surface::isolated_surface_admission_available());
 }
 
+#[cfg(not(feature = "browser-engine"))]
 #[test]
 fn contained_browser_post_stop_inject_fenced() {
     let mut harness = IsolatedSurfaceHarness::with_backend(
