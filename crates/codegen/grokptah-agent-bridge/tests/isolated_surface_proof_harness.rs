@@ -5,8 +5,9 @@
 //! Virtualization.framework qualification.
 
 use grokptah_agent_bridge::computer_use::{
-    computer_use_isolated_surface_admission, GuestLifecyclePhase, HostSentinelSnapshot,
-    IsolatedSurfaceHarness, ProofEvidenceClass, SyntheticGuestAction, SYNTHETIC_HARNESS_NONCLAIM,
+    computer_use_isolated_surface_admission, ContainedBrowserBackend, GuestLifecyclePhase,
+    HostSentinelSnapshot, IsolatedSurfaceBackend, IsolatedSurfaceHarness, ProofEvidenceClass,
+    Sep18NoModelProofSequencer, SyntheticGuestAction, SYNTHETIC_HARNESS_NONCLAIM,
 };
 
 #[test]
@@ -17,10 +18,7 @@ fn admission_is_fail_closed_from_bridge() {
 #[test]
 fn bridge_can_run_synthetic_canonical_proof() {
     let mut harness = IsolatedSurfaceHarness::new(HostSentinelSnapshot::synthetic_baseline());
-    assert_eq!(
-        harness.evidence_class(),
-        ProofEvidenceClass::SyntheticHarnessIneligible
-    );
+    assert_eq!(harness.evidence_class(), ProofEvidenceClass::Synthetic);
     assert!(SYNTHETIC_HARNESS_NONCLAIM.contains("ineligible"));
 
     let evidence = harness.run_canonical_proof().expect("canonical proof");
@@ -37,4 +35,20 @@ fn bridge_harness_stop_regression_smoke() {
         .expect("inject");
     harness.stop().expect("stop");
     harness.sentinels().assert_unchanged().expect("sentinels");
+}
+
+#[test]
+fn bridge_sep18_sequencer_reachable() {
+    let sequencer = Sep18NoModelProofSequencer::new(HostSentinelSnapshot::synthetic_baseline());
+    let sealed = sequencer.run_happy_path().expect("sequencer");
+    assert_eq!(sealed.evidence_class, ProofEvidenceClass::Synthetic);
+}
+
+#[test]
+fn bridge_contained_browser_stub_honest_label() {
+    let backend = ContainedBrowserBackend::new();
+    assert_eq!(
+        backend.evidence_class(),
+        ProofEvidenceClass::ContainedBrowser
+    );
 }

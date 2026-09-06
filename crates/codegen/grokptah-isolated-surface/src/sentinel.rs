@@ -9,6 +9,26 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{HarnessError, HarnessResult};
 
+/// Digest or mtime fence for the main checkout (not the disposable worktree).
+/// Detects synthetic mutation of the host main checkout during harness runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MainCheckoutFence {
+    pub checkout_path: String,
+    pub content_digest: String,
+    pub mtime_fence_ns: Option<u64>,
+}
+
+impl MainCheckoutFence {
+    pub fn synthetic() -> Self {
+        Self {
+            checkout_path: "/workspace".into(),
+            content_digest: "sha256:main-checkout-baseline".into(),
+            mtime_fence_ns: Some(1_700_000_000_000_000_000),
+        }
+    }
+}
+
 /// Immutable host-side sentinel values captured before guest boot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -21,6 +41,7 @@ pub struct HostSentinelSnapshot {
     pub unrelated_window_app_id: String,
     pub unrelated_window_id: String,
     pub unrelated_window_title_hash: String,
+    pub main_checkout_fence: MainCheckoutFence,
 }
 
 impl HostSentinelSnapshot {
@@ -34,12 +55,14 @@ impl HostSentinelSnapshot {
             unrelated_window_app_id: "com.apple.finder".into(),
             unrelated_window_id: "finder-desktop-1".into(),
             unrelated_window_title_hash: "sha256:finder-desktop".into(),
+            main_checkout_fence: MainCheckoutFence::synthetic(),
         }
     }
 }
 
 /// Reads live host sentinel state. Native Mac adapters implement this with real
-/// AX/CGEvent/clipboard evidence; the synthetic harness uses [`SyntheticHostProbe`].
+/// AX/CGEvent/clipboard evidence and main-checkout digest/mtime fence; the
+/// synthetic harness uses [`SyntheticHostProbe`].
 pub trait HostSentinelProbe {
     fn probe_host(&self) -> HarnessResult<HostSentinelSnapshot>;
 }
@@ -70,6 +93,14 @@ impl SyntheticHostProbe {
             }
             "unrelated_window" => {
                 self.state.unrelated_window_title_hash = "sha256:mutated".into();
+            }
+            "main_checkout" | "main_checkout_digest" => {
+                self.state.main_checkout_fence.content_digest =
+                    "sha256:main-checkout-mutated".into();
+            }
+            "main_checkout_mtime" => {
+                self.state.main_checkout_fence.mtime_fence_ns =
+                    Some(self.state.main_checkout_fence.mtime_fence_ns.unwrap_or(0) + 1);
             }
             _ => {
                 self.state.pointer_y += 1;
@@ -119,10 +150,13 @@ impl HostSentinelRegistry {
         self.probes_performed = self.probes_performed.saturating_add(1);
         if observed != self.baseline {
             self.last_probe_matches_baseline = false;
-            self.violation = Some("host sentinel drift detected by probe".into());
-            return Err(HarnessError::host_sentinel_violation(
-                "host sentinel probe differs from baseline",
-            ));
+            let detail = if observed.main_checkout_fence != self.baseline.main_checkout_fence {
+                "main checkout fence drift detected by probe"
+            } else {
+                "host sentinel drift detected by probe"
+            };
+            self.violation = Some(detail.into());
+            return Err(HarnessError::host_sentinel_violation(detail));
         }
         self.last_probe_matches_baseline = true;
         Ok(())
@@ -176,6 +210,8 @@ impl HostSentinelRegistry {
                 || self.baseline.unrelated_window_id != observed.unrelated_window_id
                 || self.baseline.unrelated_window_title_hash
                     != observed.unrelated_window_title_hash,
+            main_checkout_changed: self.baseline.main_checkout_fence
+                != observed.main_checkout_fence,
         })
     }
 }
@@ -187,6 +223,7 @@ pub struct HostSentinelDiff {
     pub foreground_changed: bool,
     pub clipboard_changed: bool,
     pub unrelated_window_changed: bool,
+    pub main_checkout_changed: bool,
 }
 
 #[cfg(test)]
@@ -214,5 +251,21 @@ mod tests {
             crate::error::HarnessErrorCode::HostSentinelViolation
         );
         assert!(!registry.verified_via_probe());
+    }
+
+    #[test]
+    fn main_checkout_mutation_detected_by_probe() {
+        let baseline = HostSentinelSnapshot::synthetic_baseline();
+        let mut probe = SyntheticHostProbe::new(baseline.clone());
+        let mut registry = HostSentinelRegistry::capture(baseline);
+        registry.probe_and_verify(&probe).expect("initial probe");
+
+        probe.simulate_host_mutation("main_checkout");
+        let err = registry.probe_and_verify(&probe).expect_err("mutation");
+        assert_eq!(
+            err.code,
+            crate::error::HarnessErrorCode::HostSentinelViolation
+        );
+        assert!(err.message.contains("main checkout"));
     }
 }

@@ -5,50 +5,104 @@
 //! → Stop → destroy channels → cleanup, with host sentinels unchanged.
 
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::backend::{honest_harness_evidence_class, IsolatedSurfaceBackend, VfLaunchReceipt};
 use crate::channels::ChannelRegistry;
 use crate::error::{HarnessError, HarnessErrorCode, HarnessResult};
 use crate::lifecycle::{
     GuestLifecycle, GuestLifecycleDisposition, GuestLifecyclePhase, ProofEvidenceClass,
 };
 use crate::sentinel::{HostSentinelRegistry, HostSentinelSnapshot, SyntheticHostProbe};
-use crate::simulator::{InjectOutcome, SyntheticGuest, SyntheticGuestAction};
+use crate::simulator::{GuestFrame, GuestLocalAction, InjectOutcome, SyntheticGuest};
 use crate::store::HarnessSnapshot;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StopEvidence {
     pub surface_id: String,
     pub channels_destroyed: usize,
     pub host_sentinels_unchanged: bool,
     pub host_sentinel_probe_error: Option<HarnessError>,
+    pub backend_fence_error: Option<HarnessError>,
+    pub backend_destroy_error: Option<HarnessError>,
     pub disposition: Option<GuestLifecycleDisposition>,
 }
 
-pub struct IsolatedSurfaceHarness {
+pub struct IsolatedSurfaceHarness<B: IsolatedSurfaceBackend = SyntheticGuest> {
     lifecycle: GuestLifecycle,
     sentinels: HostSentinelRegistry,
     host_probe: SyntheticHostProbe,
-    guest: SyntheticGuest,
+    backend: B,
     channels: ChannelRegistry,
     snapshot_root: Option<std::path::PathBuf>,
     auto_retry_attempts: u32,
     last_channels_destroyed: usize,
+    declared_evidence_class: ProofEvidenceClass,
 }
 
-impl IsolatedSurfaceHarness {
+impl IsolatedSurfaceHarness<SyntheticGuest> {
     pub fn new(baseline: HostSentinelSnapshot) -> Self {
+        Self::with_backend(baseline, SyntheticGuest::new())
+            .expect("synthetic backend is always permitted")
+    }
+}
+
+impl<B: IsolatedSurfaceBackend> IsolatedSurfaceHarness<B> {
+    /// Construct a harness with an honest evidence class. Rejects
+    /// `VirtualizationFramework` unless attached via [`with_vf_backend`].
+    pub fn with_backend(baseline: HostSentinelSnapshot, backend: B) -> HarnessResult<Self> {
+        let declared_evidence_class = honest_harness_evidence_class(backend.evidence_class())?;
+        Ok(Self::with_declared_class(
+            baseline,
+            backend,
+            declared_evidence_class,
+        ))
+    }
+
+    /// Physical Mac VF proof only — requires a launch receipt; not used until Sep 18 gate.
+    pub fn with_vf_backend(
+        baseline: HostSentinelSnapshot,
+        backend: B,
+        receipt: VfLaunchReceipt,
+    ) -> HarnessResult<Self> {
+        if backend.evidence_class() != ProofEvidenceClass::VirtualizationFramework {
+            return Err(HarnessError::invalid_state(
+                "with_vf_backend requires a VirtualizationFramework backend",
+            ));
+        }
+        if receipt.physical_mac_proof_id.trim().is_empty() {
+            return Err(HarnessError::invalid_state(
+                "VF launch receipt requires a non-empty physical_mac_proof_id",
+            ));
+        }
+        Ok(Self::with_declared_class(
+            baseline,
+            backend,
+            ProofEvidenceClass::VirtualizationFramework,
+        ))
+    }
+
+    fn with_declared_class(
+        baseline: HostSentinelSnapshot,
+        backend: B,
+        declared_evidence_class: ProofEvidenceClass,
+    ) -> Self {
         let surface_id = Uuid::new_v4().to_string();
         let now = Utc::now();
+        let mut lifecycle = GuestLifecycle::new(surface_id, now);
+        lifecycle.evidence_class = declared_evidence_class;
         Self {
-            lifecycle: GuestLifecycle::new(surface_id, now),
+            lifecycle,
             sentinels: HostSentinelRegistry::capture(baseline.clone()),
             host_probe: SyntheticHostProbe::new(baseline),
-            guest: SyntheticGuest::new(),
+            backend,
             channels: ChannelRegistry::new(),
             snapshot_root: None,
             auto_retry_attempts: 0,
             last_channels_destroyed: 0,
+            declared_evidence_class,
         }
     }
 
@@ -74,7 +128,7 @@ impl IsolatedSurfaceHarness {
     }
 
     pub fn evidence_class(&self) -> ProofEvidenceClass {
-        self.lifecycle.evidence_class
+        self.declared_evidence_class
     }
 
     pub fn auto_retry_attempts(&self) -> u32 {
@@ -82,7 +136,7 @@ impl IsolatedSurfaceHarness {
     }
 
     pub fn guest_is_booted(&self) -> bool {
-        self.guest.is_booted()
+        self.backend.is_booted()
     }
 
     fn probe_host_sentinels(&mut self) -> HarnessResult<()> {
@@ -96,7 +150,7 @@ impl IsolatedSurfaceHarness {
         self.lifecycle.begin_boot(now)?;
         self.channels.open_channel("frame")?;
         self.channels.open_channel("input")?;
-        let frame = self.guest.boot()?;
+        let frame = self.backend.boot()?;
         self.lifecycle.frame_epoch = frame.epoch;
         self.lifecycle
             .complete_boot(now + chrono::Duration::milliseconds(1))?;
@@ -106,7 +160,7 @@ impl IsolatedSurfaceHarness {
     }
 
     /// capture frame (read-only)
-    pub fn observe_frame(&self) -> HarnessResult<crate::simulator::GuestFrame> {
+    pub fn observe_frame(&self) -> HarnessResult<GuestFrame> {
         if self.lifecycle.phase != GuestLifecyclePhase::Ready
             && self.lifecycle.phase != GuestLifecyclePhase::Acting
         {
@@ -114,13 +168,13 @@ impl IsolatedSurfaceHarness {
                 "frame observation requires Ready or Acting",
             ));
         }
-        Ok(self.guest.current_frame())
+        self.backend.observe_frame()
     }
 
     /// inject ONE guest-local action; changed frame on success
     pub fn inject_guest_action(
         &mut self,
-        action: SyntheticGuestAction,
+        action: GuestLocalAction,
     ) -> HarnessResult<crate::simulator::FrameDelta> {
         if !self.lifecycle.allows_inject() {
             return Err(HarnessError::inject_fenced("inject is not allowed"));
@@ -130,7 +184,17 @@ impl IsolatedSurfaceHarness {
         self.lifecycle.begin_act(now)?;
         self.persist_snapshot()?;
 
-        let outcome = self.guest.inject(action)?;
+        let outcome = match self.backend.inject_guest_local(action) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                if self.lifecycle.guest_input_possible {
+                    self.lifecycle
+                        .mark_uncertain(Utc::now() + chrono::Duration::milliseconds(1))?;
+                    self.persist_snapshot()?;
+                }
+                return Err(err);
+            }
+        };
         match outcome {
             InjectOutcome::Changed(delta) => {
                 self.lifecycle
@@ -163,9 +227,10 @@ impl IsolatedSurfaceHarness {
     pub fn stop(&mut self) -> HarnessResult<StopEvidence> {
         let now = Utc::now();
         self.lifecycle.begin_stop(now)?;
+        let backend_fence_error = self.backend.stop_fence_first().err();
         self.persist_snapshot()?;
 
-        self.teardown(now + chrono::Duration::milliseconds(1))?;
+        let backend_destroy_error = self.teardown(now + chrono::Duration::milliseconds(1))?;
 
         let probe_error = self.probe_host_sentinels().err();
         let host_sentinels_unchanged = probe_error.is_none() && self.sentinels.verified_via_probe();
@@ -177,35 +242,33 @@ impl IsolatedSurfaceHarness {
             channels_destroyed: self.last_channels_destroyed,
             host_sentinels_unchanged,
             host_sentinel_probe_error: probe_error,
+            backend_fence_error,
+            backend_destroy_error,
             disposition: self.lifecycle.disposition,
         })
     }
 
-    fn teardown(&mut self, now: DateTime<Utc>) -> HarnessResult<()> {
+    /// Always destroy channels and guest; backend/destroy errors are returned
+    /// separately and never skip cleanup.
+    fn teardown(&mut self, now: DateTime<Utc>) -> HarnessResult<Option<HarnessError>> {
         self.last_channels_destroyed = self.channels.open_count();
         if self.last_channels_destroyed > 0 {
             self.channels.destroy_all()?;
         }
-        if self.guest.is_booted() {
-            self.guest.shutdown()?;
-        }
+        let backend_destroy_error = if self.backend.is_booted() {
+            self.backend.destroy().err()
+        } else {
+            None
+        };
         if self.lifecycle.phase != GuestLifecyclePhase::Destroyed {
             self.lifecycle.complete_destroy(now)?;
         }
         self.persist_snapshot()?;
-        Ok(())
-    }
-
-    pub fn schedule_crash_on_next_inject(&mut self) {
-        self.guest.schedule_crash_on_inject();
-    }
-
-    pub fn schedule_uncertain_on_next_inject(&mut self) {
-        self.guest.schedule_uncertain_on_inject();
+        Ok(backend_destroy_error)
     }
 
     /// Simulated process restart: reload durable snapshot, recover fail-closed, destroy.
-    pub fn recover_after_restart(&mut self) -> HarnessResult<()> {
+    pub fn recover_after_restart(&mut self) -> HarnessResult<StopEvidence> {
         let root = self
             .snapshot_root
             .as_ref()
@@ -217,14 +280,23 @@ impl IsolatedSurfaceHarness {
         self.lifecycle.reconcile_invariants()?;
         let now = Utc::now();
         self.lifecycle.recover_after_restart(now)?;
-        self.teardown(now + chrono::Duration::milliseconds(1))?;
-        Ok(())
+        let backend_destroy_error = self.teardown(now + chrono::Duration::milliseconds(1))?;
+        self.channels.assert_all_destroyed()?;
+        Ok(StopEvidence {
+            surface_id: self.lifecycle.surface_id.clone(),
+            channels_destroyed: self.last_channels_destroyed,
+            host_sentinels_unchanged: false,
+            host_sentinel_probe_error: None,
+            backend_fence_error: None,
+            backend_destroy_error,
+            disposition: self.lifecycle.disposition,
+        })
     }
 
     /// Explicit retry after uncertain — must be rejected (no auto-retry policy).
     pub fn retry_inject_after_uncertain(
         &mut self,
-        action: SyntheticGuestAction,
+        action: GuestLocalAction,
     ) -> HarnessResult<crate::simulator::FrameDelta> {
         if self.lifecycle.disposition == Some(GuestLifecycleDisposition::Uncertain) {
             self.auto_retry_attempts = self.auto_retry_attempts.saturating_add(1);
@@ -253,7 +325,7 @@ impl IsolatedSurfaceHarness {
     pub fn run_canonical_proof(&mut self) -> HarnessResult<StopEvidence> {
         self.boot()?;
         let before = self.observe_frame()?;
-        let delta = self.inject_guest_action(SyntheticGuestAction::ClickGuestButton)?;
+        let delta = self.inject_guest_action(GuestLocalAction::ClickGuestButton)?;
         let after = self.observe_frame()?;
         if !delta.guest_local_change || before.digest == after.digest {
             return Err(HarnessError::invalid_state(
@@ -261,5 +333,15 @@ impl IsolatedSurfaceHarness {
             ));
         }
         self.stop()
+    }
+}
+
+impl IsolatedSurfaceHarness<SyntheticGuest> {
+    pub fn schedule_crash_on_next_inject(&mut self) {
+        self.backend.schedule_crash_on_inject();
+    }
+
+    pub fn schedule_uncertain_on_next_inject(&mut self) {
+        self.backend.schedule_uncertain_on_inject();
     }
 }

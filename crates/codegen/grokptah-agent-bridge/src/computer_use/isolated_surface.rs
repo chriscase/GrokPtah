@@ -5,11 +5,15 @@
 //! Virtualization.framework adapter passes the Sep 18 physical proof checklist.
 
 pub use grokptah_isolated_surface::{
-    isolated_surface_admission_available, ChannelRegistry, FrameDelta, GuestFrame, GuestLifecycle,
-    GuestLifecycleDisposition, GuestLifecyclePhase, HarnessError, HarnessErrorCode, HarnessResult,
-    HostSentinelDiff, HostSentinelProbe, HostSentinelRegistry, HostSentinelSnapshot,
-    IsolatedSurfaceHarness, ProofEvidenceClass, StopEvidence, SyntheticGuestAction,
-    SyntheticHostProbe, SYNTHETIC_HARNESS_NONCLAIM,
+    assert_evidence_class_unchanged, honest_harness_evidence_class,
+    isolated_surface_admission_available, ChannelRegistry, ChecklistStep, ContainedBrowserBackend,
+    FaultInjectingBackend, FaultMatrixCase, FrameDelta, GuestFrame, GuestLifecycle,
+    GuestLifecycleDisposition, GuestLifecyclePhase, GuestLocalAction, HarnessError,
+    HarnessErrorCode, HarnessResult, HostSentinelDiff, HostSentinelProbe, HostSentinelRegistry,
+    HostSentinelSnapshot, IsolatedSurfaceBackend, IsolatedSurfaceHarness, MainCheckoutFence,
+    ProofEvidenceClass, SealedProofEvidence, Sep18NoModelProofSequencer, StopEvidence,
+    SyntheticGuest, SyntheticGuestAction, SyntheticHostProbe, VfLaunchReceipt,
+    SYNTHETIC_HARNESS_NONCLAIM,
 };
 
 /// Bridge-level admission check. Remains unavailable until physical Mac proof.

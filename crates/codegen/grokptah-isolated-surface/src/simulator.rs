@@ -6,14 +6,20 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::backend::IsolatedSurfaceBackend;
 use crate::error::{HarnessError, HarnessResult};
+use crate::lifecycle::ProofEvidenceClass;
 
+/// Guest-local action dispatched through the backend SPI (never host paths).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum SyntheticGuestAction {
+pub enum GuestLocalAction {
     ClickGuestButton,
     TypeGuestText,
 }
+
+/// Backward-compatible alias for pre-SPI naming.
+pub type SyntheticGuestAction = GuestLocalAction;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -40,6 +46,7 @@ pub struct SyntheticGuest {
     guest_button_pressed: bool,
     crash_on_next_inject: bool,
     uncertain_on_next_inject: bool,
+    inject_fenced: bool,
 }
 
 impl SyntheticGuest {
@@ -50,6 +57,7 @@ impl SyntheticGuest {
             guest_button_pressed: false,
             crash_on_next_inject: false,
             uncertain_on_next_inject: false,
+            inject_fenced: false,
         }
     }
 
@@ -82,9 +90,12 @@ impl SyntheticGuest {
         }
     }
 
-    pub fn inject(&mut self, action: SyntheticGuestAction) -> HarnessResult<InjectOutcome> {
+    pub fn inject(&mut self, action: GuestLocalAction) -> HarnessResult<InjectOutcome> {
         if !self.booted {
             return Err(HarnessError::invalid_state("guest is not booted"));
+        }
+        if self.inject_fenced {
+            return Err(HarnessError::inject_fenced("guest inject is fenced"));
         }
 
         if self.crash_on_next_inject {
@@ -98,10 +109,10 @@ impl SyntheticGuest {
 
         let before = self.current_frame();
         match action {
-            SyntheticGuestAction::ClickGuestButton => {
+            GuestLocalAction::ClickGuestButton => {
                 self.guest_button_pressed = true;
             }
-            SyntheticGuestAction::TypeGuestText => {
+            GuestLocalAction::TypeGuestText => {
                 // Guest-local only; no host keyboard path exists in the harness.
             }
         }
@@ -120,6 +131,44 @@ impl SyntheticGuest {
     pub fn shutdown(&mut self) -> HarnessResult<()> {
         self.booted = false;
         Ok(())
+    }
+
+    pub fn fence_inject(&mut self) {
+        self.inject_fenced = true;
+    }
+}
+
+impl IsolatedSurfaceBackend for SyntheticGuest {
+    fn evidence_class(&self) -> ProofEvidenceClass {
+        ProofEvidenceClass::Synthetic
+    }
+
+    fn boot(&mut self) -> HarnessResult<GuestFrame> {
+        SyntheticGuest::boot(self)
+    }
+
+    fn observe_frame(&self) -> HarnessResult<GuestFrame> {
+        if !self.booted {
+            return Err(HarnessError::invalid_state("guest is not booted"));
+        }
+        Ok(self.current_frame())
+    }
+
+    fn inject_guest_local(&mut self, action: GuestLocalAction) -> HarnessResult<InjectOutcome> {
+        self.inject(action)
+    }
+
+    fn stop_fence_first(&mut self) -> HarnessResult<()> {
+        self.fence_inject();
+        Ok(())
+    }
+
+    fn destroy(&mut self) -> HarnessResult<()> {
+        self.shutdown()
+    }
+
+    fn is_booted(&self) -> bool {
+        self.booted
     }
 }
 
@@ -141,5 +190,64 @@ fn frame_digest(epoch: u64, guest_button_pressed: bool) -> String {
 impl Default for SyntheticGuest {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Test/diagnostic wrapper that can fail selected backend SPI hooks.
+#[derive(Debug)]
+pub struct FaultInjectingBackend<B: IsolatedSurfaceBackend> {
+    inner: B,
+    pub fail_stop_fence: bool,
+    pub fail_inject_with_err: bool,
+}
+
+impl<B: IsolatedSurfaceBackend> FaultInjectingBackend<B> {
+    pub fn new(inner: B) -> Self {
+        Self {
+            inner,
+            fail_stop_fence: false,
+            fail_inject_with_err: false,
+        }
+    }
+}
+
+impl<B: IsolatedSurfaceBackend> IsolatedSurfaceBackend for FaultInjectingBackend<B> {
+    fn evidence_class(&self) -> ProofEvidenceClass {
+        self.inner.evidence_class()
+    }
+
+    fn boot(&mut self) -> HarnessResult<GuestFrame> {
+        self.inner.boot()
+    }
+
+    fn observe_frame(&self) -> HarnessResult<GuestFrame> {
+        self.inner.observe_frame()
+    }
+
+    fn inject_guest_local(&mut self, action: GuestLocalAction) -> HarnessResult<InjectOutcome> {
+        if self.fail_inject_with_err {
+            return Err(HarnessError::backend_unavailable(
+                "injected backend inject error for fault matrix",
+            ));
+        }
+        self.inner.inject_guest_local(action)
+    }
+
+    fn stop_fence_first(&mut self) -> HarnessResult<()> {
+        if self.fail_stop_fence {
+            self.inner.stop_fence_first()?;
+            return Err(HarnessError::backend_unavailable(
+                "injected backend stop_fence_first error for fault matrix",
+            ));
+        }
+        self.inner.stop_fence_first()
+    }
+
+    fn destroy(&mut self) -> HarnessResult<()> {
+        self.inner.destroy()
+    }
+
+    fn is_booted(&self) -> bool {
+        self.inner.is_booted()
     }
 }

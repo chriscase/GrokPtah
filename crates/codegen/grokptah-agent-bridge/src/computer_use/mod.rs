@@ -35,14 +35,18 @@ pub use adaptive::{
     AdaptiveProfile, AdaptiveReason, AdaptiveThresholds, AmbiguityAssessment,
 };
 pub use isolated_surface::{
-    computer_use_isolated_surface_admission, isolated_surface_admission_available,
-    ChannelRegistry as IsolatedChannelRegistry, FrameDelta as IsolatedFrameDelta,
+    assert_evidence_class_unchanged, computer_use_isolated_surface_admission,
+    honest_harness_evidence_class, isolated_surface_admission_available,
+    ChannelRegistry as IsolatedChannelRegistry, ChecklistStep, ContainedBrowserBackend,
+    FaultInjectingBackend, FaultMatrixCase, FrameDelta as IsolatedFrameDelta,
     GuestFrame as IsolatedGuestFrame, GuestLifecycle, GuestLifecycleDisposition,
-    GuestLifecyclePhase, HarnessError as IsolatedHarnessError,
+    GuestLifecyclePhase, GuestLocalAction, HarnessError as IsolatedHarnessError,
     HarnessErrorCode as IsolatedHarnessErrorCode, HarnessResult as IsolatedHarnessResult,
     HostSentinelDiff, HostSentinelProbe, HostSentinelRegistry, HostSentinelSnapshot,
-    IsolatedSurfaceHarness, ProofEvidenceClass, StopEvidence as IsolatedStopEvidence,
-    SyntheticGuestAction, SyntheticHostProbe, SYNTHETIC_HARNESS_NONCLAIM,
+    IsolatedSurfaceBackend, IsolatedSurfaceHarness, MainCheckoutFence, ProofEvidenceClass,
+    SealedProofEvidence, Sep18NoModelProofSequencer, StopEvidence as IsolatedStopEvidence,
+    SyntheticGuest, SyntheticGuestAction, SyntheticHostProbe, VfLaunchReceipt,
+    SYNTHETIC_HARNESS_NONCLAIM,
 };
 pub use macos_observation::MacOsObservationPlatform;
 pub use platform::{

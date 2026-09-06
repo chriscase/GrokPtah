@@ -16,10 +16,7 @@ fn harness_with_snapshot() -> (IsolatedSurfaceHarness, TempDir) {
 #[test]
 fn canonical_proof_sequence_succeeds_with_unchanged_host_sentinels() {
     let mut harness = IsolatedSurfaceHarness::new(HostSentinelSnapshot::synthetic_baseline());
-    assert_eq!(
-        harness.evidence_class(),
-        ProofEvidenceClass::SyntheticHarnessIneligible
-    );
+    assert_eq!(harness.evidence_class(), ProofEvidenceClass::Synthetic);
 
     let evidence = harness.run_canonical_proof().expect("canonical proof");
     assert!(evidence.host_sentinels_unchanged);
