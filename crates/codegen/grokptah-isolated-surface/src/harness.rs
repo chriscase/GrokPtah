@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::backend::IsolatedSurfaceBackend;
+use crate::backend::{honest_harness_evidence_class, IsolatedSurfaceBackend, VfLaunchReceipt};
 use crate::channels::ChannelRegistry;
 use crate::error::{HarnessError, HarnessErrorCode, HarnessResult};
 use crate::lifecycle::{
@@ -25,6 +25,8 @@ pub struct StopEvidence {
     pub channels_destroyed: usize,
     pub host_sentinels_unchanged: bool,
     pub host_sentinel_probe_error: Option<HarnessError>,
+    pub backend_fence_error: Option<HarnessError>,
+    pub backend_destroy_error: Option<HarnessError>,
     pub disposition: Option<GuestLifecycleDisposition>,
 }
 
@@ -43,14 +45,52 @@ pub struct IsolatedSurfaceHarness<B: IsolatedSurfaceBackend = SyntheticGuest> {
 impl IsolatedSurfaceHarness<SyntheticGuest> {
     pub fn new(baseline: HostSentinelSnapshot) -> Self {
         Self::with_backend(baseline, SyntheticGuest::new())
+            .expect("synthetic backend is always permitted")
     }
 }
 
 impl<B: IsolatedSurfaceBackend> IsolatedSurfaceHarness<B> {
-    pub fn with_backend(baseline: HostSentinelSnapshot, backend: B) -> Self {
+    /// Construct a harness with an honest evidence class. Rejects
+    /// `VirtualizationFramework` unless attached via [`with_vf_backend`].
+    pub fn with_backend(baseline: HostSentinelSnapshot, backend: B) -> HarnessResult<Self> {
+        let declared_evidence_class = honest_harness_evidence_class(backend.evidence_class())?;
+        Ok(Self::with_declared_class(
+            baseline,
+            backend,
+            declared_evidence_class,
+        ))
+    }
+
+    /// Physical Mac VF proof only — requires a launch receipt; not used until Sep 18 gate.
+    pub fn with_vf_backend(
+        baseline: HostSentinelSnapshot,
+        backend: B,
+        receipt: VfLaunchReceipt,
+    ) -> HarnessResult<Self> {
+        if backend.evidence_class() != ProofEvidenceClass::VirtualizationFramework {
+            return Err(HarnessError::invalid_state(
+                "with_vf_backend requires a VirtualizationFramework backend",
+            ));
+        }
+        if receipt.physical_mac_proof_id.trim().is_empty() {
+            return Err(HarnessError::invalid_state(
+                "VF launch receipt requires a non-empty physical_mac_proof_id",
+            ));
+        }
+        Ok(Self::with_declared_class(
+            baseline,
+            backend,
+            ProofEvidenceClass::VirtualizationFramework,
+        ))
+    }
+
+    fn with_declared_class(
+        baseline: HostSentinelSnapshot,
+        backend: B,
+        declared_evidence_class: ProofEvidenceClass,
+    ) -> Self {
         let surface_id = Uuid::new_v4().to_string();
         let now = Utc::now();
-        let declared_evidence_class = backend.evidence_class();
         let mut lifecycle = GuestLifecycle::new(surface_id, now);
         lifecycle.evidence_class = declared_evidence_class;
         Self {
@@ -144,7 +184,17 @@ impl<B: IsolatedSurfaceBackend> IsolatedSurfaceHarness<B> {
         self.lifecycle.begin_act(now)?;
         self.persist_snapshot()?;
 
-        let outcome = self.backend.inject_guest_local(action)?;
+        let outcome = match self.backend.inject_guest_local(action) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                if self.lifecycle.guest_input_possible {
+                    self.lifecycle
+                        .mark_uncertain(Utc::now() + chrono::Duration::milliseconds(1))?;
+                    self.persist_snapshot()?;
+                }
+                return Err(err);
+            }
+        };
         match outcome {
             InjectOutcome::Changed(delta) => {
                 self.lifecycle
@@ -177,10 +227,10 @@ impl<B: IsolatedSurfaceBackend> IsolatedSurfaceHarness<B> {
     pub fn stop(&mut self) -> HarnessResult<StopEvidence> {
         let now = Utc::now();
         self.lifecycle.begin_stop(now)?;
-        self.backend.stop_fence_first()?;
+        let backend_fence_error = self.backend.stop_fence_first().err();
         self.persist_snapshot()?;
 
-        self.teardown(now + chrono::Duration::milliseconds(1))?;
+        let backend_destroy_error = self.teardown(now + chrono::Duration::milliseconds(1))?;
 
         let probe_error = self.probe_host_sentinels().err();
         let host_sentinels_unchanged = probe_error.is_none() && self.sentinels.verified_via_probe();
@@ -192,27 +242,33 @@ impl<B: IsolatedSurfaceBackend> IsolatedSurfaceHarness<B> {
             channels_destroyed: self.last_channels_destroyed,
             host_sentinels_unchanged,
             host_sentinel_probe_error: probe_error,
+            backend_fence_error,
+            backend_destroy_error,
             disposition: self.lifecycle.disposition,
         })
     }
 
-    fn teardown(&mut self, now: DateTime<Utc>) -> HarnessResult<()> {
+    /// Always destroy channels and guest; backend/destroy errors are returned
+    /// separately and never skip cleanup.
+    fn teardown(&mut self, now: DateTime<Utc>) -> HarnessResult<Option<HarnessError>> {
         self.last_channels_destroyed = self.channels.open_count();
         if self.last_channels_destroyed > 0 {
             self.channels.destroy_all()?;
         }
-        if self.backend.is_booted() {
-            self.backend.destroy()?;
-        }
+        let backend_destroy_error = if self.backend.is_booted() {
+            self.backend.destroy().err()
+        } else {
+            None
+        };
         if self.lifecycle.phase != GuestLifecyclePhase::Destroyed {
             self.lifecycle.complete_destroy(now)?;
         }
         self.persist_snapshot()?;
-        Ok(())
+        Ok(backend_destroy_error)
     }
 
     /// Simulated process restart: reload durable snapshot, recover fail-closed, destroy.
-    pub fn recover_after_restart(&mut self) -> HarnessResult<()> {
+    pub fn recover_after_restart(&mut self) -> HarnessResult<StopEvidence> {
         let root = self
             .snapshot_root
             .as_ref()
@@ -224,8 +280,17 @@ impl<B: IsolatedSurfaceBackend> IsolatedSurfaceHarness<B> {
         self.lifecycle.reconcile_invariants()?;
         let now = Utc::now();
         self.lifecycle.recover_after_restart(now)?;
-        self.teardown(now + chrono::Duration::milliseconds(1))?;
-        Ok(())
+        let backend_destroy_error = self.teardown(now + chrono::Duration::milliseconds(1))?;
+        self.channels.assert_all_destroyed()?;
+        Ok(StopEvidence {
+            surface_id: self.lifecycle.surface_id.clone(),
+            channels_destroyed: self.last_channels_destroyed,
+            host_sentinels_unchanged: false,
+            host_sentinel_probe_error: None,
+            backend_fence_error: None,
+            backend_destroy_error,
+            disposition: self.lifecycle.disposition,
+        })
     }
 
     /// Explicit retry after uncertain — must be rejected (no auto-retry policy).

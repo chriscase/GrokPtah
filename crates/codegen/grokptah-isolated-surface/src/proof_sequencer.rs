@@ -249,11 +249,15 @@ impl Sep18NoModelProofSequencer {
 
         let mut restarted =
             IsolatedSurfaceHarness::new(self.baseline.clone()).with_snapshot_root(root);
-        restarted.recover_after_restart()?;
+        let stop_evidence = restarted.recover_after_restart()?;
         assert_eq!(restarted.lifecycle().phase, GuestLifecyclePhase::Destroyed);
         assert_eq!(
             restarted.lifecycle().disposition,
             Some(GuestLifecycleDisposition::Uncertain)
+        );
+        assert!(
+            stop_evidence.channels_destroyed > 0 || restarted.channels().open_count() == 0,
+            "restart recovery must tear down channels from snapshot"
         );
 
         let retry_err = restarted
@@ -266,13 +270,7 @@ impl Sep18NoModelProofSequencer {
 
         Ok(SealedProofEvidence {
             evidence_class: declared_class,
-            stop_evidence: StopEvidence {
-                surface_id: restarted.lifecycle().surface_id.clone(),
-                channels_destroyed: 0,
-                host_sentinels_unchanged: false,
-                host_sentinel_probe_error: None,
-                disposition: restarted.lifecycle().disposition,
-            },
+            stop_evidence,
             checklist_steps: vec![
                 ChecklistStep::Armed,
                 ChecklistStep::Booted,

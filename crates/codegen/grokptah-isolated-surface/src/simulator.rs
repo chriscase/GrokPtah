@@ -192,3 +192,62 @@ impl Default for SyntheticGuest {
         Self::new()
     }
 }
+
+/// Test/diagnostic wrapper that can fail selected backend SPI hooks.
+#[derive(Debug)]
+pub struct FaultInjectingBackend<B: IsolatedSurfaceBackend> {
+    inner: B,
+    pub fail_stop_fence: bool,
+    pub fail_inject_with_err: bool,
+}
+
+impl<B: IsolatedSurfaceBackend> FaultInjectingBackend<B> {
+    pub fn new(inner: B) -> Self {
+        Self {
+            inner,
+            fail_stop_fence: false,
+            fail_inject_with_err: false,
+        }
+    }
+}
+
+impl<B: IsolatedSurfaceBackend> IsolatedSurfaceBackend for FaultInjectingBackend<B> {
+    fn evidence_class(&self) -> ProofEvidenceClass {
+        self.inner.evidence_class()
+    }
+
+    fn boot(&mut self) -> HarnessResult<GuestFrame> {
+        self.inner.boot()
+    }
+
+    fn observe_frame(&self) -> HarnessResult<GuestFrame> {
+        self.inner.observe_frame()
+    }
+
+    fn inject_guest_local(&mut self, action: GuestLocalAction) -> HarnessResult<InjectOutcome> {
+        if self.fail_inject_with_err {
+            return Err(HarnessError::backend_unavailable(
+                "injected backend inject error for fault matrix",
+            ));
+        }
+        self.inner.inject_guest_local(action)
+    }
+
+    fn stop_fence_first(&mut self) -> HarnessResult<()> {
+        if self.fail_stop_fence {
+            self.inner.stop_fence_first()?;
+            return Err(HarnessError::backend_unavailable(
+                "injected backend stop_fence_first error for fault matrix",
+            ));
+        }
+        self.inner.stop_fence_first()
+    }
+
+    fn destroy(&mut self) -> HarnessResult<()> {
+        self.inner.destroy()
+    }
+
+    fn is_booted(&self) -> bool {
+        self.inner.is_booted()
+    }
+}

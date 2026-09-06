@@ -41,3 +41,21 @@ pub fn assert_evidence_class_unchanged(
     }
     Ok(())
 }
+
+/// Receipt attesting a physical Mac VF launch for Sep 18 proof gate only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VfLaunchReceipt {
+    pub physical_mac_proof_id: String,
+}
+
+/// Evidence class permitted at harness construction without a VF receipt.
+pub fn honest_harness_evidence_class(
+    backend_class: ProofEvidenceClass,
+) -> HarnessResult<ProofEvidenceClass> {
+    match backend_class {
+        ProofEvidenceClass::VirtualizationFramework => Err(HarnessError::invalid_state(
+            "VirtualizationFramework evidence class requires a physical VF launch receipt; use with_vf_backend",
+        )),
+        other => Ok(other),
+    }
+}

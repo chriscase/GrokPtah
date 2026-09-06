@@ -15,7 +15,10 @@ mod sentinel;
 mod simulator;
 mod store;
 
-pub use backend::{assert_evidence_class_unchanged, IsolatedSurfaceBackend};
+pub use backend::{
+    assert_evidence_class_unchanged, honest_harness_evidence_class, IsolatedSurfaceBackend,
+    VfLaunchReceipt,
+};
 pub use channels::ChannelRegistry;
 pub use contained_browser::ContainedBrowserBackend;
 pub use error::{HarnessError, HarnessErrorCode, HarnessResult};
@@ -32,7 +35,8 @@ pub use sentinel::{
     MainCheckoutFence, SyntheticHostProbe,
 };
 pub use simulator::{
-    FrameDelta, GuestFrame, GuestLocalAction, InjectOutcome, SyntheticGuest, SyntheticGuestAction,
+    FaultInjectingBackend, FrameDelta, GuestFrame, GuestLocalAction, InjectOutcome, SyntheticGuest,
+    SyntheticGuestAction,
 };
 pub use store::{snapshot_root, HarnessSnapshot, SNAPSHOT_FILE, SNAPSHOT_SCHEMA_VERSION};
 
