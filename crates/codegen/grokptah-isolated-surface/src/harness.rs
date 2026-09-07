@@ -27,8 +27,24 @@ pub struct StopEvidence {
     pub host_sentinel_probes_performed: u32,
     pub host_sentinel_probe_error: Option<HarnessError>,
     pub backend_fence_error: Option<HarnessError>,
+    pub persist_snapshot_error: Option<HarnessError>,
     pub backend_destroy_error: Option<HarnessError>,
     pub disposition: Option<GuestLifecycleDisposition>,
+}
+
+impl StopEvidence {
+    /// True only when backend destroy succeeded (or was not required) and lifecycle
+    /// reached `Destroyed`. Failed destroy must not stamp `StopDestroyed`.
+    pub fn destroy_confirmed(&self, lifecycle_phase: GuestLifecyclePhase) -> bool {
+        self.backend_destroy_error.is_none() && lifecycle_phase == GuestLifecyclePhase::Destroyed
+    }
+}
+
+/// Teardown outcome collected during Stop — errors are surfaced separately and
+/// never skip the destroy attempt.
+struct TeardownOutcome {
+    backend_destroy_error: Option<HarnessError>,
+    persist_snapshot_error: Option<HarnessError>,
 }
 
 pub struct IsolatedSurfaceHarness<B: IsolatedSurfaceBackend = SyntheticGuest> {
@@ -235,9 +251,10 @@ impl<B: IsolatedSurfaceBackend> IsolatedSurfaceHarness<B> {
         let now = Utc::now();
         self.lifecycle.begin_stop(now)?;
         let backend_fence_error = self.backend.stop_fence_first().err();
-        self.persist_snapshot()?;
+        let persist_snapshot_error = self.persist_snapshot().err();
 
-        let backend_destroy_error = self.teardown(now + chrono::Duration::milliseconds(1))?;
+        let teardown = self.teardown(now + chrono::Duration::milliseconds(1));
+        let persist_snapshot_error = persist_snapshot_error.or(teardown.persist_snapshot_error);
 
         let probe_error = self.probe_host_sentinels().err();
         let host_sentinels_unchanged = probe_error.is_none() && self.sentinels.verified_via_probe();
@@ -251,28 +268,35 @@ impl<B: IsolatedSurfaceBackend> IsolatedSurfaceHarness<B> {
             host_sentinel_probes_performed: self.sentinels.probes_performed(),
             host_sentinel_probe_error: probe_error,
             backend_fence_error,
-            backend_destroy_error,
+            persist_snapshot_error,
+            backend_destroy_error: teardown.backend_destroy_error,
             disposition: self.lifecycle.disposition,
         })
     }
 
-    /// Always destroy channels and guest; backend/destroy errors are returned
-    /// separately and never skip cleanup.
-    fn teardown(&mut self, now: DateTime<Utc>) -> HarnessResult<Option<HarnessError>> {
+    /// Always destroy channels and guest; fallible steps before backend destroy
+    /// are collected and never skip the destroy attempt. Lifecycle advances to
+    /// `Destroyed` only when backend destroy is confirmed (or not required).
+    fn teardown(&mut self, now: DateTime<Utc>) -> TeardownOutcome {
         self.last_channels_destroyed = self.channels.open_count();
         if self.last_channels_destroyed > 0 {
-            self.channels.destroy_all()?;
+            // Channel teardown must not prevent backend destroy.
+            let _ = self.channels.destroy_all();
         }
         let backend_destroy_error = if self.backend.is_booted() {
             self.backend.destroy().err()
         } else {
             None
         };
-        if self.lifecycle.phase != GuestLifecyclePhase::Destroyed {
-            self.lifecycle.complete_destroy(now)?;
+        if backend_destroy_error.is_none() && self.lifecycle.phase != GuestLifecyclePhase::Destroyed
+        {
+            let _ = self.lifecycle.complete_destroy(now);
         }
-        self.persist_snapshot()?;
-        Ok(backend_destroy_error)
+        let persist_snapshot_error = self.persist_snapshot().err();
+        TeardownOutcome {
+            backend_destroy_error,
+            persist_snapshot_error,
+        }
     }
 
     /// Simulated process restart: reload durable snapshot, recover fail-closed, destroy.
@@ -288,7 +312,7 @@ impl<B: IsolatedSurfaceBackend> IsolatedSurfaceHarness<B> {
         self.lifecycle.reconcile_invariants()?;
         let now = Utc::now();
         self.lifecycle.recover_after_restart(now)?;
-        let backend_destroy_error = self.teardown(now + chrono::Duration::milliseconds(1))?;
+        let teardown = self.teardown(now + chrono::Duration::milliseconds(1));
         self.channels.assert_all_destroyed()?;
         Ok(StopEvidence {
             surface_id: self.lifecycle.surface_id.clone(),
@@ -297,7 +321,8 @@ impl<B: IsolatedSurfaceBackend> IsolatedSurfaceHarness<B> {
             host_sentinel_probes_performed: self.sentinels.probes_performed(),
             host_sentinel_probe_error: None,
             backend_fence_error: None,
-            backend_destroy_error,
+            persist_snapshot_error: teardown.persist_snapshot_error,
+            backend_destroy_error: teardown.backend_destroy_error,
             disposition: self.lifecycle.disposition,
         })
     }

@@ -199,6 +199,7 @@ pub struct FaultInjectingBackend<B: IsolatedSurfaceBackend> {
     inner: B,
     pub fail_stop_fence: bool,
     pub fail_inject_with_err: bool,
+    pub fail_destroy: bool,
 }
 
 impl<B: IsolatedSurfaceBackend> FaultInjectingBackend<B> {
@@ -207,6 +208,7 @@ impl<B: IsolatedSurfaceBackend> FaultInjectingBackend<B> {
             inner,
             fail_stop_fence: false,
             fail_inject_with_err: false,
+            fail_destroy: false,
         }
     }
 }
@@ -244,6 +246,11 @@ impl<B: IsolatedSurfaceBackend> IsolatedSurfaceBackend for FaultInjectingBackend
     }
 
     fn destroy(&mut self) -> HarnessResult<()> {
+        if self.fail_destroy {
+            return Err(HarnessError::backend_unavailable(
+                "injected backend destroy error for fault matrix",
+            ));
+        }
         self.inner.destroy()
     }
 

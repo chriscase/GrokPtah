@@ -13,6 +13,15 @@ fn harness_with_snapshot() -> (IsolatedSurfaceHarness, TempDir) {
     (harness, dir)
 }
 
+#[cfg(unix)]
+fn make_snapshot_persist_fail(dir: &TempDir) {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    let snapshot_path = dir.path().join(grokptah_isolated_surface::SNAPSHOT_FILE);
+    fs::set_permissions(&snapshot_path, fs::Permissions::from_mode(0o444))
+        .expect("chmod snapshot read-only");
+}
+
 #[test]
 fn canonical_proof_sequence_succeeds_with_unchanged_host_sentinels() {
     let mut harness = IsolatedSurfaceHarness::new(HostSentinelSnapshot::synthetic_baseline());
@@ -160,4 +169,185 @@ fn stop_after_uncertain_still_tears_down_cleanly() {
     );
     harness.channels().assert_all_destroyed().expect("channels");
     harness.sentinels().assert_unchanged().expect("sentinels");
+}
+
+#[cfg(unix)]
+#[test]
+fn persist_snapshot_error_still_tears_down_channels_and_backend() {
+    let (mut harness, dir) = harness_with_snapshot();
+    harness.boot().expect("boot");
+    assert_eq!(harness.channels().open_count(), 2);
+    assert!(harness.guest_is_booted());
+
+    make_snapshot_persist_fail(&dir);
+
+    let evidence = harness
+        .stop()
+        .expect("stop completes teardown despite persist failure");
+    assert!(
+        evidence.persist_snapshot_error.is_some(),
+        "persist failure must be recorded"
+    );
+    assert!(evidence.backend_destroy_error.is_none());
+    assert_eq!(evidence.channels_destroyed, 2);
+    assert_eq!(harness.lifecycle().phase, GuestLifecyclePhase::Destroyed);
+    assert!(!harness.guest_is_booted());
+    harness.channels().assert_all_destroyed().expect("channels");
+}
+
+#[test]
+fn backend_destroy_error_does_not_claim_destroyed() {
+    use grokptah_isolated_surface::FaultInjectingBackend;
+
+    let mut wrapped = FaultInjectingBackend::new(grokptah_isolated_surface::SyntheticGuest::new());
+    wrapped.fail_destroy = true;
+
+    let mut harness =
+        IsolatedSurfaceHarness::with_backend(HostSentinelSnapshot::synthetic_baseline(), wrapped)
+            .expect("synthetic permitted");
+    harness.boot().expect("boot");
+    assert_eq!(harness.channels().open_count(), 2);
+
+    let evidence = harness
+        .stop()
+        .expect("stop completes despite destroy failure");
+    assert!(evidence.backend_destroy_error.is_some());
+    assert_eq!(harness.lifecycle().phase, GuestLifecyclePhase::Stopping);
+    assert!(
+        harness.guest_is_booted(),
+        "failed destroy must leave guest alive"
+    );
+    assert_eq!(evidence.channels_destroyed, 2);
+    harness
+        .channels()
+        .assert_all_destroyed()
+        .expect("channels torn down");
+}
+
+#[test]
+fn recover_after_restart_fail_destroy_does_not_claim_destroyed() {
+    use grokptah_isolated_surface::FaultInjectingBackend;
+
+    let dir = TempDir::new().expect("tempdir");
+    let mut wrapped = FaultInjectingBackend::new(grokptah_isolated_surface::SyntheticGuest::new());
+    wrapped.fail_destroy = true;
+
+    let mut harness =
+        IsolatedSurfaceHarness::with_backend(HostSentinelSnapshot::synthetic_baseline(), wrapped)
+            .expect("synthetic permitted")
+            .with_snapshot_root(dir.path());
+    harness.boot().expect("boot");
+    assert!(harness.guest_is_booted());
+
+    let evidence = harness
+        .recover_after_restart()
+        .expect("recover completes despite destroy failure");
+    assert!(evidence.backend_destroy_error.is_some());
+    assert_eq!(harness.lifecycle().phase, GuestLifecyclePhase::Stopping);
+    assert!(
+        harness.guest_is_booted(),
+        "recover destroy failure must leave guest alive"
+    );
+    harness
+        .channels()
+        .assert_all_destroyed()
+        .expect("channels torn down");
+}
+
+#[test]
+fn stop_fence_first_order_preserved_before_teardown() {
+    use grokptah_isolated_surface::{
+        FaultInjectingBackend, GuestFrame, GuestLocalAction, HarnessError, HarnessResult,
+        InjectOutcome, IsolatedSurfaceBackend,
+    };
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct StopOrder {
+        events: Vec<String>,
+    }
+
+    struct OrderTrackingBackend {
+        order: Arc<Mutex<StopOrder>>,
+        booted: bool,
+    }
+
+    impl OrderTrackingBackend {
+        fn record(&self, event: impl Into<String>) {
+            self.order
+                .lock()
+                .expect("order lock")
+                .events
+                .push(event.into());
+        }
+    }
+
+    impl IsolatedSurfaceBackend for OrderTrackingBackend {
+        fn evidence_class(&self) -> ProofEvidenceClass {
+            ProofEvidenceClass::Synthetic
+        }
+
+        fn boot(&mut self) -> HarnessResult<GuestFrame> {
+            self.booted = true;
+            Ok(GuestFrame {
+                epoch: 1,
+                digest: "order-test".into(),
+                guest_button_pressed: false,
+            })
+        }
+
+        fn observe_frame(&self) -> HarnessResult<GuestFrame> {
+            Ok(GuestFrame {
+                epoch: 1,
+                digest: "order-test".into(),
+                guest_button_pressed: false,
+            })
+        }
+
+        fn inject_guest_local(
+            &mut self,
+            _action: GuestLocalAction,
+        ) -> HarnessResult<InjectOutcome> {
+            Err(HarnessError::backend_unavailable("not used"))
+        }
+
+        fn stop_fence_first(&mut self) -> HarnessResult<()> {
+            self.record("fence");
+            Ok(())
+        }
+
+        fn destroy(&mut self) -> HarnessResult<()> {
+            self.record("destroy");
+            self.booted = false;
+            Ok(())
+        }
+
+        fn is_booted(&self) -> bool {
+            self.booted
+        }
+    }
+
+    let order = Arc::new(Mutex::new(StopOrder::default()));
+    let inner = OrderTrackingBackend {
+        order: order.clone(),
+        booted: false,
+    };
+    let mut wrapped = FaultInjectingBackend::new(inner);
+    wrapped.fail_stop_fence = true;
+
+    let mut harness =
+        IsolatedSurfaceHarness::with_backend(HostSentinelSnapshot::synthetic_baseline(), wrapped)
+            .expect("synthetic permitted");
+    harness.boot().expect("boot");
+
+    let evidence = harness.stop().expect("stop");
+    assert!(evidence.backend_fence_error.is_some());
+
+    let events = order.lock().expect("order lock").events.clone();
+    assert!(
+        events.windows(2).any(|pair| pair == ["fence", "destroy"]),
+        "fence must precede destroy, got {:?}",
+        events
+    );
+    assert_eq!(harness.lifecycle().phase, GuestLifecyclePhase::Destroyed);
 }

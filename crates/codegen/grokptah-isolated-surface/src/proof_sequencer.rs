@@ -161,7 +161,9 @@ impl Sep18NoModelProofSequencer {
         steps.push(ChecklistStep::PostconditionVerified);
 
         let stop_evidence = harness.stop()?;
-        steps.push(ChecklistStep::StopDestroyed);
+        if stop_evidence.destroy_confirmed(harness.lifecycle().phase) {
+            steps.push(ChecklistStep::StopDestroyed);
+        }
 
         let inject_err = harness
             .inject_guest_action(GuestLocalAction::ClickGuestButton)
@@ -192,15 +194,15 @@ impl Sep18NoModelProofSequencer {
         harness.boot()?;
         let stop_evidence = harness.stop()?;
         assert_evidence_class_unchanged(declared_class, harness.evidence_class())?;
+        let mut checklist_steps = vec![ChecklistStep::Armed, ChecklistStep::Booted];
+        if stop_evidence.destroy_confirmed(harness.lifecycle().phase) {
+            checklist_steps.push(ChecklistStep::StopDestroyed);
+        }
+        checklist_steps.push(ChecklistStep::EvidenceSealed);
         Ok(SealedProofEvidence {
             evidence_class: declared_class,
             stop_evidence,
-            checklist_steps: vec![
-                ChecklistStep::Armed,
-                ChecklistStep::Booted,
-                ChecklistStep::StopDestroyed,
-                ChecklistStep::EvidenceSealed,
-            ],
+            checklist_steps,
             fault_matrix_case: Some(FaultMatrixCase::BootStop),
             sealed_at: Utc::now(),
             nonclaim: SYNTHETIC_HARNESS_NONCLAIM.into(),
@@ -219,16 +221,19 @@ impl Sep18NoModelProofSequencer {
             Some(GuestLifecycleDisposition::Stopped)
         );
         assert_evidence_class_unchanged(declared_class, harness.evidence_class())?;
+        let mut checklist_steps = vec![
+            ChecklistStep::Armed,
+            ChecklistStep::Booted,
+            ChecklistStep::FrameChallenge,
+        ];
+        if stop_evidence.destroy_confirmed(harness.lifecycle().phase) {
+            checklist_steps.push(ChecklistStep::StopDestroyed);
+        }
+        checklist_steps.push(ChecklistStep::EvidenceSealed);
         Ok(SealedProofEvidence {
             evidence_class: declared_class,
             stop_evidence,
-            checklist_steps: vec![
-                ChecklistStep::Armed,
-                ChecklistStep::Booted,
-                ChecklistStep::FrameChallenge,
-                ChecklistStep::StopDestroyed,
-                ChecklistStep::EvidenceSealed,
-            ],
+            checklist_steps,
             fault_matrix_case: Some(FaultMatrixCase::PreDispatchStop),
             sealed_at: Utc::now(),
             nonclaim: SYNTHETIC_HARNESS_NONCLAIM.into(),
@@ -251,16 +256,19 @@ impl Sep18NoModelProofSequencer {
             Some(GuestLifecycleDisposition::Uncertain)
         );
         assert_evidence_class_unchanged(declared_class, harness.evidence_class())?;
+        let mut checklist_steps = vec![
+            ChecklistStep::Armed,
+            ChecklistStep::Booted,
+            ChecklistStep::GuestLocalActionMarkedPossible,
+        ];
+        if stop_evidence.destroy_confirmed(harness.lifecycle().phase) {
+            checklist_steps.push(ChecklistStep::StopDestroyed);
+        }
+        checklist_steps.push(ChecklistStep::EvidenceSealed);
         Ok(SealedProofEvidence {
             evidence_class: declared_class,
             stop_evidence,
-            checklist_steps: vec![
-                ChecklistStep::Armed,
-                ChecklistStep::Booted,
-                ChecklistStep::GuestLocalActionMarkedPossible,
-                ChecklistStep::StopDestroyed,
-                ChecklistStep::EvidenceSealed,
-            ],
+            checklist_steps,
             fault_matrix_case: Some(FaultMatrixCase::LostAckUncertain),
             sealed_at: Utc::now(),
             nonclaim: SYNTHETIC_HARNESS_NONCLAIM.into(),
@@ -299,17 +307,20 @@ impl Sep18NoModelProofSequencer {
         let declared_class = restarted.evidence_class();
         assert_evidence_class_unchanged(declared_class, ProofEvidenceClass::Synthetic)?;
 
+        let mut checklist_steps = vec![
+            ChecklistStep::Armed,
+            ChecklistStep::Booted,
+            ChecklistStep::GuestLocalActionMarkedPossible,
+        ];
+        if stop_evidence.destroy_confirmed(restarted.lifecycle().phase) {
+            checklist_steps.push(ChecklistStep::StopDestroyed);
+        }
+        checklist_steps.push(ChecklistStep::StaleTokensRejected);
+        checklist_steps.push(ChecklistStep::EvidenceSealed);
         Ok(SealedProofEvidence {
             evidence_class: declared_class,
             stop_evidence,
-            checklist_steps: vec![
-                ChecklistStep::Armed,
-                ChecklistStep::Booted,
-                ChecklistStep::GuestLocalActionMarkedPossible,
-                ChecklistStep::StopDestroyed,
-                ChecklistStep::StaleTokensRejected,
-                ChecklistStep::EvidenceSealed,
-            ],
+            checklist_steps,
             fault_matrix_case: Some(FaultMatrixCase::RestartNoReplay),
             sealed_at: Utc::now(),
             nonclaim: SYNTHETIC_HARNESS_NONCLAIM.into(),
