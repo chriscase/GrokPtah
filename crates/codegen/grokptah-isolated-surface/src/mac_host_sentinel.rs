@@ -103,13 +103,11 @@ mod platform {
 
     fn collect_foreground_window() -> HarnessResult<(String, String)> {
         let workspace = ns_workspace()?;
-        let frontmost: Retained<AnyObject> =
+        let frontmost: Option<Retained<AnyObject>> =
             unsafe { objc2::msg_send![&*workspace, frontmostApplication] };
-        if frontmost.is_null() {
-            return Err(HarnessError::backend_unavailable(
-                "Mac host sentinel foreground app unavailable",
-            ));
-        }
+        let frontmost = frontmost.ok_or_else(|| {
+            HarnessError::backend_unavailable("Mac host sentinel foreground app unavailable")
+        })?;
         let bundle_id: Option<Retained<AnyObject>> =
             unsafe { objc2::msg_send![&*frontmost, bundleIdentifier] };
         let bundle_id =
@@ -290,13 +288,13 @@ mod platform {
         let cls = AnyClass::get(c"NSWorkspace").ok_or_else(|| {
             HarnessError::backend_unavailable("Mac host sentinel NSWorkspace unavailable")
         })?;
-        let shared: Retained<AnyObject> = unsafe { objc2::msg_send![cls, sharedWorkspace] };
-        if shared.is_null() {
-            return Err(HarnessError::backend_unavailable(
+        let shared: Option<Retained<AnyObject>> =
+            unsafe { objc2::msg_send![cls, sharedWorkspace] };
+        shared.ok_or_else(|| {
+            HarnessError::backend_unavailable(
                 "Mac host sentinel NSWorkspace.sharedWorkspace unavailable",
-            ));
-        }
-        Ok(shared)
+            )
+        })
     }
 
     fn general_pasteboard() -> Option<Retained<AnyObject>> {
