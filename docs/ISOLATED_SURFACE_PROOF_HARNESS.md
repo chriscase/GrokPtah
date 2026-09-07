@@ -196,11 +196,15 @@ cargo run --locked --manifest-path crates/codegen/grokptah-isolated-surface/Carg
 | Code | Trigger |
 |---|---|
 | `admission_must_stay_false` | `admission_available == true` |
-| `physical_pass_without_mac_markers` | PASS claimed without Mac worker + live sentinel collection |
-| `stop_channels_still_open` | `channels_open_after_stop > 0` |
-| `uncertain_downgraded_after_possible_inject` | LostAckUncertain / RestartNoReplay with `Stopped` disposition |
-| `evidence_class_tampered` | Pack label ≠ sealed label |
-| `vf_dry_run_cannot_qualify_physical_pass` | VF dry-run artifact with PASS claim |
+| `vf_dry_run_cannot_qualify_physical_pass` / `vf_pass_claim_on_dry_run` / `isolation_pass_claim_on_dry_run` | PASS or isolation claim on any current dry-run / synthetic substrate |
+| `stop_channels_still_open` | `channels_open_after_stop > 0` or `StopDestroyed` with `channels_destroyed == 0` |
+| `uncertain_downgraded_after_possible_inject` | Guest-local inject without postcondition but `Stopped` disposition; LostAck/Restart fault with non-Uncertain disposition |
+| `fault_matrix_disposition_mismatch` | Probe-count fingerprint mismatch (e.g. probes=4 without LostAckUncertain+Uncertain); fault-matrix encoding inconsistent with checklist |
+| `checklist_incomplete` | Missing `Booted`/`StopDestroyed` when sealed; `fault_matrix_case: None` not exact happy-path; checklist steps out of canonical order or wrong exact set |
+| `evidence_class_tampered` | Pack label ≠ sealed label or inconsistent with substrate |
+| `host_sentinel_probe_summary_mismatch` | Pack probe summary ≠ sealed `stop_evidence` |
+| `substrate_nested_evidence_missing` | CB pack sealed without nested `contained_browser.sealed_evidence` |
+| `pack_sealed_evidence_mismatch` | Pack vs nested CB sealed copies differ |
 
 Maps to Astra Sep 18 one-Mac checklist steps 1–11: runner exercises steps 2–10 on
 simulator substrate; verifier is the independent gate for sealed artifacts before

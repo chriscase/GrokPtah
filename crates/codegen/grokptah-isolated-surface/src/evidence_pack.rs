@@ -346,6 +346,30 @@ fn verify_sealed_evidence(
         ));
     }
 
+    if !sealed.checklist_steps.contains(&ChecklistStep::Booted) {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::ChecklistIncomplete,
+            "sealed checklist must include Booted",
+        ));
+    }
+
+    if let Some(decision) = verify_probe_encoding_binding(
+        sealed.fault_matrix_case,
+        sealed.stop_evidence.host_sentinel_probes_performed,
+        sealed.stop_evidence.disposition,
+        &sealed.checklist_steps,
+    ) {
+        return Some(decision);
+    }
+
+    if let Some(decision) = verify_checklist_step_order(&sealed.checklist_steps) {
+        return Some(decision);
+    }
+
+    if let Some(decision) = verify_exact_fault_matrix_steps(sealed) {
+        return Some(decision);
+    }
+
     if let Some(decision) = verify_checklist_shape(sealed) {
         return Some(decision);
     }
@@ -373,9 +397,6 @@ fn verify_sealed_evidence(
 
 fn verify_checklist_shape(sealed: &SealedProofEvidence) -> Option<EvidenceVerifierDecision> {
     let steps = &sealed.checklist_steps;
-    if !steps.contains(&ChecklistStep::Booted) || !steps.contains(&ChecklistStep::StopDestroyed) {
-        return None;
-    }
 
     match sealed.fault_matrix_case {
         Some(FaultMatrixCase::BootStop) | Some(FaultMatrixCase::PreDispatchStop) => return None,
@@ -515,10 +536,16 @@ fn verify_fault_matrix_encoding(sealed: &SealedProofEvidence) -> Option<Evidence
             }
         }
         None => {
-            if has_guest && has_post && (!has_frame || !has_stale || probes != 5) {
+            if !has_frame
+                || !has_guest
+                || !has_post
+                || !has_stale
+                || probes != 5
+                || sealed.stop_evidence.disposition != Some(GuestLifecycleDisposition::Stopped)
+            {
                 return Some(EvidenceVerifierDecision::reject(
                     EvidenceVerifierCode::ChecklistIncomplete,
-                    "happy-path checklist shape is inconsistent with sealed stop evidence",
+                    "fault_matrix_case None requires exact happy-path checklist encoding",
                 ));
             }
         }
@@ -527,9 +554,184 @@ fn verify_fault_matrix_encoding(sealed: &SealedProofEvidence) -> Option<Evidence
     None
 }
 
+fn checklist_step_index(step: &ChecklistStep) -> usize {
+    match step {
+        ChecklistStep::Armed => 0,
+        ChecklistStep::Booted => 1,
+        ChecklistStep::FrameChallenge => 2,
+        ChecklistStep::GuestLocalActionMarkedPossible => 3,
+        ChecklistStep::PostconditionVerified => 4,
+        ChecklistStep::StopDestroyed => 5,
+        ChecklistStep::StaleTokensRejected => 6,
+        ChecklistStep::EvidenceSealed => 7,
+    }
+}
+
+fn verify_checklist_step_order(steps: &[ChecklistStep]) -> Option<EvidenceVerifierDecision> {
+    let mut last_index = None;
+    for step in steps {
+        let index = checklist_step_index(step);
+        if let Some(prev) = last_index {
+            if index <= prev {
+                return Some(EvidenceVerifierDecision::reject(
+                    EvidenceVerifierCode::ChecklistIncomplete,
+                    "sealed checklist steps must follow canonical rehearsal order",
+                ));
+            }
+        }
+        last_index = Some(index);
+    }
+    None
+}
+
+fn expected_steps_for_fault(
+    fault_matrix_case: Option<FaultMatrixCase>,
+) -> &'static [ChecklistStep] {
+    match fault_matrix_case {
+        None => &[
+            ChecklistStep::Armed,
+            ChecklistStep::Booted,
+            ChecklistStep::FrameChallenge,
+            ChecklistStep::GuestLocalActionMarkedPossible,
+            ChecklistStep::PostconditionVerified,
+            ChecklistStep::StopDestroyed,
+            ChecklistStep::StaleTokensRejected,
+            ChecklistStep::EvidenceSealed,
+        ],
+        Some(FaultMatrixCase::BootStop) => &[
+            ChecklistStep::Armed,
+            ChecklistStep::Booted,
+            ChecklistStep::StopDestroyed,
+            ChecklistStep::EvidenceSealed,
+        ],
+        Some(FaultMatrixCase::PreDispatchStop) => &[
+            ChecklistStep::Armed,
+            ChecklistStep::Booted,
+            ChecklistStep::FrameChallenge,
+            ChecklistStep::StopDestroyed,
+            ChecklistStep::EvidenceSealed,
+        ],
+        Some(FaultMatrixCase::LostAckUncertain) => &[
+            ChecklistStep::Armed,
+            ChecklistStep::Booted,
+            ChecklistStep::GuestLocalActionMarkedPossible,
+            ChecklistStep::StopDestroyed,
+            ChecklistStep::EvidenceSealed,
+        ],
+        Some(FaultMatrixCase::RestartNoReplay) => &[
+            ChecklistStep::Armed,
+            ChecklistStep::Booted,
+            ChecklistStep::GuestLocalActionMarkedPossible,
+            ChecklistStep::StopDestroyed,
+            ChecklistStep::StaleTokensRejected,
+            ChecklistStep::EvidenceSealed,
+        ],
+    }
+}
+
+fn verify_exact_fault_matrix_steps(
+    sealed: &SealedProofEvidence,
+) -> Option<EvidenceVerifierDecision> {
+    let expected = expected_steps_for_fault(sealed.fault_matrix_case);
+    if sealed.checklist_steps.as_slice() != expected {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::ChecklistIncomplete,
+            "checklist steps do not exactly match fault_matrix_case encoding",
+        ));
+    }
+    None
+}
+
+fn verify_probe_encoding_binding(
+    fault_matrix_case: Option<FaultMatrixCase>,
+    probes: u32,
+    disposition: Option<GuestLifecycleDisposition>,
+    steps: &[ChecklistStep],
+) -> Option<EvidenceVerifierDecision> {
+    let has_frame = steps.contains(&ChecklistStep::FrameChallenge);
+    let has_guest = steps.contains(&ChecklistStep::GuestLocalActionMarkedPossible);
+    let has_post = steps.contains(&ChecklistStep::PostconditionVerified);
+    let has_stale = steps.contains(&ChecklistStep::StaleTokensRejected);
+
+    if probes == 4
+        && (fault_matrix_case != Some(FaultMatrixCase::LostAckUncertain)
+            || disposition != Some(GuestLifecycleDisposition::Uncertain)
+            || !has_guest
+            || has_post
+            || has_frame)
+    {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::FaultMatrixDispositionMismatch,
+            "probe count 4 requires LostAckUncertain encoding with Uncertain disposition",
+        ));
+    }
+
+    if probes == 3 {
+        match fault_matrix_case {
+            Some(FaultMatrixCase::BootStop) => {
+                if has_frame
+                    || has_guest
+                    || has_post
+                    || disposition != Some(GuestLifecycleDisposition::Stopped)
+                {
+                    return Some(EvidenceVerifierDecision::reject(
+                        EvidenceVerifierCode::FaultMatrixDispositionMismatch,
+                        "probe count 3 BootStop encoding is inconsistent with sealed checklist",
+                    ));
+                }
+            }
+            Some(FaultMatrixCase::PreDispatchStop) => {
+                if !has_frame
+                    || has_guest
+                    || has_post
+                    || disposition != Some(GuestLifecycleDisposition::Stopped)
+                {
+                    return Some(EvidenceVerifierDecision::reject(
+                        EvidenceVerifierCode::FaultMatrixDispositionMismatch,
+                        "probe count 3 PreDispatchStop encoding is inconsistent with sealed checklist",
+                    ));
+                }
+            }
+            _ => {
+                return Some(EvidenceVerifierDecision::reject(
+                    EvidenceVerifierCode::FaultMatrixDispositionMismatch,
+                    "probe count 3 requires BootStop or PreDispatchStop encoding",
+                ));
+            }
+        }
+    }
+
+    if probes == 5
+        && (fault_matrix_case.is_some()
+            || !has_frame
+            || !has_guest
+            || !has_post
+            || !has_stale
+            || disposition != Some(GuestLifecycleDisposition::Stopped))
+    {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::ChecklistIncomplete,
+            "probe count 5 requires exact happy-path encoding",
+        ));
+    }
+
+    None
+}
+
 fn verify_pack_level_uncertain_triggers(
     pack: &Sep18EvidencePack,
 ) -> Option<EvidenceVerifierDecision> {
+    if let Some(sealed) = &pack.sealed_evidence {
+        if let Some(decision) = verify_probe_encoding_binding(
+            pack.fault_matrix_case,
+            pack.host_sentinel_probes.probes_performed,
+            sealed.stop_evidence.disposition,
+            &sealed.checklist_steps,
+        ) {
+            return Some(decision);
+        }
+    }
+
     match pack.fault_matrix_case {
         Some(FaultMatrixCase::LostAckUncertain) | Some(FaultMatrixCase::RestartNoReplay) => {
             let disposition = pack
@@ -561,6 +763,26 @@ fn verify_sealed_evidence_presence(pack: &Sep18EvidencePack) -> Option<EvidenceV
             EvidenceVerifierCode::ChecklistIncomplete,
             "stop or checklist progress requires sealed_evidence",
         ));
+    }
+
+    if matches!(
+        pack.substrate,
+        Sep18ChecklistSubstrate::ContainedBrowserDryRun | Sep18ChecklistSubstrate::SyntheticHarness
+    ) && pack.sealed_evidence.is_none()
+    {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::ChecklistIncomplete,
+            "substrate checklist requires sealed_evidence",
+        ));
+    }
+
+    if let Some(cb) = &pack.contained_browser {
+        if cb.checklist_completed && pack.sealed_evidence.is_none() {
+            return Some(EvidenceVerifierDecision::reject(
+                EvidenceVerifierCode::ChecklistIncomplete,
+                "contained_browser checklist_completed requires pack sealed_evidence",
+            ));
+        }
     }
 
     if matches!(
