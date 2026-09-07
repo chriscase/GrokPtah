@@ -32,6 +32,14 @@ pub struct StopEvidence {
     pub disposition: Option<GuestLifecycleDisposition>,
 }
 
+impl StopEvidence {
+    /// True only when backend destroy succeeded (or was not required) and lifecycle
+    /// reached `Destroyed`. Failed destroy must not stamp `StopDestroyed`.
+    pub fn destroy_confirmed(&self, lifecycle_phase: GuestLifecyclePhase) -> bool {
+        self.backend_destroy_error.is_none() && lifecycle_phase == GuestLifecyclePhase::Destroyed
+    }
+}
+
 /// Teardown outcome collected during Stop — errors are surfaced separately and
 /// never skip the destroy attempt.
 struct TeardownOutcome {

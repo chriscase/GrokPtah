@@ -213,7 +213,41 @@ fn backend_destroy_error_does_not_claim_destroyed() {
         .expect("stop completes despite destroy failure");
     assert!(evidence.backend_destroy_error.is_some());
     assert_eq!(harness.lifecycle().phase, GuestLifecyclePhase::Stopping);
+    assert!(
+        harness.guest_is_booted(),
+        "failed destroy must leave guest alive"
+    );
     assert_eq!(evidence.channels_destroyed, 2);
+    harness
+        .channels()
+        .assert_all_destroyed()
+        .expect("channels torn down");
+}
+
+#[test]
+fn recover_after_restart_fail_destroy_does_not_claim_destroyed() {
+    use grokptah_isolated_surface::FaultInjectingBackend;
+
+    let dir = TempDir::new().expect("tempdir");
+    let mut wrapped = FaultInjectingBackend::new(grokptah_isolated_surface::SyntheticGuest::new());
+    wrapped.fail_destroy = true;
+
+    let mut harness =
+        IsolatedSurfaceHarness::with_backend(HostSentinelSnapshot::synthetic_baseline(), wrapped)
+            .expect("synthetic permitted")
+            .with_snapshot_root(dir.path());
+    harness.boot().expect("boot");
+    assert!(harness.guest_is_booted());
+
+    let evidence = harness
+        .recover_after_restart()
+        .expect("recover completes despite destroy failure");
+    assert!(evidence.backend_destroy_error.is_some());
+    assert_eq!(harness.lifecycle().phase, GuestLifecyclePhase::Stopping);
+    assert!(
+        harness.guest_is_booted(),
+        "recover destroy failure must leave guest alive"
+    );
     harness
         .channels()
         .assert_all_destroyed()

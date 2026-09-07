@@ -385,6 +385,17 @@ fn verify_sealed_evidence(
         ));
     }
 
+    if sealed
+        .checklist_steps
+        .contains(&ChecklistStep::StopDestroyed)
+        && stop.backend_destroy_error.is_some()
+    {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::ChecklistIncomplete,
+            "StopDestroyed requires confirmed backend destroy",
+        ));
+    }
+
     if stop.host_sentinel_probe_error.is_some() && stop.host_sentinels_unchanged {
         return Some(EvidenceVerifierDecision::reject(
             EvidenceVerifierCode::StopSentinelProbeMissing,

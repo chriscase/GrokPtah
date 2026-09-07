@@ -218,7 +218,8 @@ impl GuestLifecycle {
         Ok(())
     }
 
-    /// Restart recovery: uncertain or interrupted surfaces are destroyed fail-closed.
+    /// Restart recovery: fence fail-closed and enter Stopping. Confirmed `Destroyed`
+    /// is the harness teardown path after backend destroy succeeds (or is not required).
     pub fn recover_after_restart(&mut self, now: DateTime<Utc>) -> HarnessResult<()> {
         if self.phase == GuestLifecyclePhase::Destroyed {
             return Ok(());
@@ -230,7 +231,11 @@ impl GuestLifecycle {
         }
         self.inject_fenced = true;
         self.guest_input_possible = false;
-        self.advance(GuestLifecyclePhase::Destroyed, now);
+        if self.phase != GuestLifecyclePhase::Stopping {
+            self.advance(GuestLifecyclePhase::Stopping, now);
+        } else {
+            self.updated_at = now;
+        }
         Ok(())
     }
 
