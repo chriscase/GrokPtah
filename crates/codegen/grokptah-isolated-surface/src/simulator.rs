@@ -158,6 +158,9 @@ impl IsolatedSurfaceBackend for SyntheticGuest {
         self.inject(action)
     }
 
+    /// Test-only explicit fence: halts synthetic guest inject dispatch.
+    /// Production adapters must not rely on a trait default — implement fence with
+    /// real ack or explicit failure.
     fn stop_fence_first(&mut self) -> HarnessResult<()> {
         self.fence_inject();
         Ok(())

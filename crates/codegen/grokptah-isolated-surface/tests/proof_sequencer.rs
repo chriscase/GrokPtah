@@ -155,6 +155,13 @@ fn with_backend_rejects_vf_without_receipt() {
         {
             Err(grokptah_isolated_surface::HarnessError::backend_unavailable("stub"))
         }
+        fn stop_fence_first(&mut self) -> grokptah_isolated_surface::HarnessResult<()> {
+            Err(
+                grokptah_isolated_surface::HarnessError::backend_unavailable(
+                    "stub VF backend fence not implemented",
+                ),
+            )
+        }
         fn destroy(&mut self) -> grokptah_isolated_surface::HarnessResult<()> {
             Ok(())
         }

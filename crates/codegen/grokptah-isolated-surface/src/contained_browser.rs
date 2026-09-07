@@ -200,6 +200,7 @@ impl IsolatedSurfaceBackend for ContainedBrowserBackend {
         }
     }
 
+    /// Production fence: halts browser guest-local inject dispatch before teardown.
     fn stop_fence_first(&mut self) -> HarnessResult<()> {
         self.fence_inject();
         Ok(())
