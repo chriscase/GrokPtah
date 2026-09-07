@@ -351,3 +351,90 @@ fn stop_fence_first_order_preserved_before_teardown() {
     );
     assert_eq!(harness.lifecycle().phase, GuestLifecyclePhase::Destroyed);
 }
+
+#[test]
+fn unimplemented_stop_fence_cannot_claim_fence_ack() {
+    use grokptah_isolated_surface::{
+        GuestFrame, GuestLocalAction, HarnessError, HarnessErrorCode, HarnessResult, InjectOutcome,
+        IsolatedSurfaceBackend,
+    };
+
+    /// Simulates a production adapter stub that does not inherit the removed no-op default.
+    struct UnimplementedFenceBackend {
+        booted: bool,
+    }
+
+    impl IsolatedSurfaceBackend for UnimplementedFenceBackend {
+        fn evidence_class(&self) -> ProofEvidenceClass {
+            ProofEvidenceClass::Synthetic
+        }
+
+        fn boot(&mut self) -> HarnessResult<GuestFrame> {
+            self.booted = true;
+            Ok(GuestFrame {
+                epoch: 1,
+                digest: "unimplemented-fence".into(),
+                guest_button_pressed: false,
+            })
+        }
+
+        fn observe_frame(&self) -> HarnessResult<GuestFrame> {
+            Ok(GuestFrame {
+                epoch: 1,
+                digest: "unimplemented-fence".into(),
+                guest_button_pressed: false,
+            })
+        }
+
+        fn inject_guest_local(
+            &mut self,
+            _action: GuestLocalAction,
+        ) -> HarnessResult<InjectOutcome> {
+            Err(HarnessError::backend_unavailable("not used"))
+        }
+
+        fn stop_fence_first(&mut self) -> HarnessResult<()> {
+            Err(HarnessError::backend_unavailable(
+                "production fence not implemented — no silent Ok default",
+            ))
+        }
+
+        fn destroy(&mut self) -> HarnessResult<()> {
+            self.booted = false;
+            Ok(())
+        }
+
+        fn is_booted(&self) -> bool {
+            self.booted
+        }
+    }
+
+    let mut harness = IsolatedSurfaceHarness::with_backend(
+        HostSentinelSnapshot::synthetic_baseline(),
+        UnimplementedFenceBackend { booted: false },
+    )
+    .expect("synthetic permitted");
+    harness.boot().expect("boot");
+
+    let evidence = harness.stop().expect("stop still tears down");
+    let fence_err = evidence
+        .backend_fence_error
+        .expect("unimplemented fence must not claim ack");
+    assert_eq!(fence_err.code, HarnessErrorCode::BackendUnavailable);
+    assert_eq!(harness.lifecycle().phase, GuestLifecyclePhase::Destroyed);
+    assert_eq!(evidence.channels_destroyed, 2);
+    harness.channels().assert_all_destroyed().expect("channels");
+}
+
+#[test]
+fn explicit_synthetic_fence_ack_recorded_on_successful_stop() {
+    let mut harness = IsolatedSurfaceHarness::new(HostSentinelSnapshot::synthetic_baseline());
+    harness.boot().expect("boot");
+
+    let evidence = harness.stop().expect("stop");
+    assert!(
+        evidence.backend_fence_error.is_none(),
+        "explicit synthetic fence ack must clear backend_fence_error"
+    );
+    assert_eq!(harness.lifecycle().phase, GuestLifecyclePhase::Destroyed);
+}

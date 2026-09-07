@@ -18,10 +18,14 @@ pub trait IsolatedSurfaceBackend {
 
     fn inject_guest_local(&mut self, action: GuestLocalAction) -> HarnessResult<InjectOutcome>;
 
-    /// Fence guest-local inject before teardown (Stop-path). Default is no-op.
-    fn stop_fence_first(&mut self) -> HarnessResult<()> {
-        Ok(())
-    }
+    /// Fence the backend dispatch mechanism before teardown (Stop-path).
+    ///
+    /// Production adapters must implement this explicitly: fence guest-local inject
+    /// (or equivalent dispatch halt) and return `Ok(())` only on acknowledged fence
+    /// success. Unimplemented or unavailable fences must return
+    /// [`HarnessError::backend_unavailable`] (or another explicit error) — never
+    /// inherit a silent success default.
+    fn stop_fence_first(&mut self) -> HarnessResult<()>;
 
     fn destroy(&mut self) -> HarnessResult<()>;
 

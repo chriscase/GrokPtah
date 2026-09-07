@@ -19,10 +19,11 @@ surface), [#267](https://github.com/chriscase/GrokPtah/issues/267) (epic).
 | Sep 6–12 | Packet 3 — Mac VF backend behind SPI, feature-gated (#545) | **Landed** — `VirtualizationFrameworkBackend`, VF dry-run path, Mac sentinel hooks |
 | Sep 6–12 | Packet 4 — Contained Browser substrate v0 (#546) | **Landed** — real browser lifecycle on simulator substrate, CB dry-run path, admission false |
 | Sep 6–12 | Packet 5 — Sep 18 checklist runner + evidence-pack verifier (#547) | **Landed** — `grokptah-sep18-checklist` CLI, sealed pack + independent verifier |
-| Sep 6–12 | Packet 6 — Harness Stop honesty (#TBD) | **This slice** — Stop cleanup survives disk/audit failure; `Destroyed` is confirmed-only |
+| Sep 6–12 | Packet 6 — Harness Stop honesty (#548) | **Landed** — Stop cleanup survives disk/audit failure; `Destroyed` is confirmed-only |
+| Sep 6–12 | Packet 7 — `stop_fence_first` no default (#TBD) | **This slice** — trait default removed; production adapters must fence with ack/failure |
 | Sep 18 | Physical Mac gate | VF PASS or honest Contained Browser pivot |
 
-## Exact-main inventory (base `e33ff26c2e0e23af00c64b9e1bb0847c3c25e2e6` + packet 5)
+## Exact-main inventory (base `e1b1cc9611993d6456e2b73b110d2b60397cf38f` + packet 7)
 
 ### Already satisfies Windowed Coding Run noninterference (semantic macOS path)
 
@@ -73,6 +74,7 @@ NotStarted → Booting → Ready → Acting → Stopping → Destroyed
 
 - **Uncertain** is a disposition, not a resumable phase.
 - **Stop is fence-first:** `begin_stop` + `backend.stop_fence_first()` before teardown.
+- **`stop_fence_first` has no trait default:** production adapters (Contained Browser, VF when feature-gated, any non-test SPI impl) must implement an explicit fence that acknowledges success or returns `BackendUnavailable`/other explicit error. A silent `Ok(())` default does not qualify as a fence.
 - **Stop cleanup survives disk/audit failure:** `persist_snapshot` errors during Stop are recorded in `StopEvidence.persist_snapshot_error` but never skip channel/backend teardown.
 - **`Destroyed` is confirmed-only:** lifecycle advances to `Destroyed` only when backend destroy succeeds (or was not required). A failed backend destroy leaves the surface in `Stopping` with `backend_destroy_error` set.
 - **No auto-retry** after uncertain inject.
@@ -298,7 +300,9 @@ cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Car
   --features vf-backend --test proof_sequencer sep18_vf_dry_run -- --test-threads=1
 ```
 
-## Residuals (honest, post-packet-6)
+## Residuals (honest, post-packet-7)
+
+- `IsolatedSurfaceBackend::stop_fence_first` has no trait default — production adapters must wire real fence ack/failure.
 
 - Checklist runner seals dry-run packs only — no live Mac VF IPC or packaged helper.
 - Independent verifier is pack-only; physical Mac worker still required for VF PASS rung.
