@@ -180,6 +180,10 @@ pub fn verify_evidence_pack(pack: &Sep18EvidencePack) -> EvidenceVerifierDecisio
         return decision;
     }
 
+    if let Some(decision) = verify_sealed_evidence_presence(pack) {
+        return decision;
+    }
+
     if pack.physical_pass_claimed && !pack.physical_proof_markers.qualifies_vf_physical_pass() {
         return EvidenceVerifierDecision::reject(
             EvidenceVerifierCode::PhysicalPassWithoutMacMarkers,
@@ -238,11 +242,6 @@ pub fn verify_evidence_pack(pack: &Sep18EvidencePack) -> EvidenceVerifierDecisio
         if let Some(decision) = verify_sealed_evidence(pack, sealed) {
             return decision;
         }
-    } else if pack.checklist_completed {
-        return EvidenceVerifierDecision::reject(
-            EvidenceVerifierCode::ChecklistIncomplete,
-            "checklist_completed requires sealed_evidence",
-        );
     }
 
     if !expected_nonclaim(pack).is_empty() && pack.nonclaim != expected_nonclaim(pack) {
@@ -272,6 +271,9 @@ pub fn verify_evidence_pack(pack: &Sep18EvidencePack) -> EvidenceVerifierDecisio
         if let Some(decision) = verify_uncertain_invariants(sealed) {
             return decision;
         }
+        if let Some(decision) = verify_fault_matrix_encoding(sealed) {
+            return decision;
+        }
         if let Some(decision) = verify_fault_matrix_disposition(sealed) {
             return decision;
         }
@@ -282,10 +284,17 @@ pub fn verify_evidence_pack(pack: &Sep18EvidencePack) -> EvidenceVerifierDecisio
             if let Some(decision) = verify_uncertain_invariants(cb_sealed) {
                 return decision;
             }
+            if let Some(decision) = verify_fault_matrix_encoding(cb_sealed) {
+                return decision;
+            }
             if let Some(decision) = verify_fault_matrix_disposition(cb_sealed) {
                 return decision;
             }
         }
+    }
+
+    if let Some(decision) = verify_pack_level_uncertain_triggers(pack) {
+        return decision;
     }
 
     EvidenceVerifierDecision::accept()
@@ -395,15 +404,36 @@ fn verify_checklist_shape(sealed: &SealedProofEvidence) -> Option<EvidenceVerifi
 }
 
 fn verify_uncertain_invariants(sealed: &SealedProofEvidence) -> Option<EvidenceVerifierDecision> {
-    let guest_action_marked = sealed
-        .checklist_steps
-        .contains(&ChecklistStep::GuestLocalActionMarkedPossible);
-    let postcondition_verified = sealed
-        .checklist_steps
-        .contains(&ChecklistStep::PostconditionVerified);
+    let steps = &sealed.checklist_steps;
+    let guest_action_marked = steps.contains(&ChecklistStep::GuestLocalActionMarkedPossible);
+    let frame_challenge = steps.contains(&ChecklistStep::FrameChallenge);
+    let postcondition_verified = steps.contains(&ChecklistStep::PostconditionVerified);
     let disposition = sealed.stop_evidence.disposition;
 
+    if postcondition_verified && !frame_challenge {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::UncertainDowngradedAfterPossibleInject,
+            "PostconditionVerified is only valid on the FrameChallenge happy path",
+        ));
+    }
+
+    if guest_action_marked && !frame_challenge {
+        if postcondition_verified {
+            return Some(EvidenceVerifierDecision::reject(
+                EvidenceVerifierCode::UncertainDowngradedAfterPossibleInject,
+                "inject-uncertain checklist forbids PostconditionVerified",
+            ));
+        }
+        if disposition != Some(GuestLifecycleDisposition::Uncertain) {
+            return Some(EvidenceVerifierDecision::reject(
+                EvidenceVerifierCode::UncertainDowngradedAfterPossibleInject,
+                "guest inject without postcondition requires Uncertain disposition at Stop",
+            ));
+        }
+    }
+
     if guest_action_marked
+        && frame_challenge
         && !postcondition_verified
         && disposition != Some(GuestLifecycleDisposition::Uncertain)
     {
@@ -420,6 +450,131 @@ fn verify_uncertain_invariants(sealed: &SealedProofEvidence) -> Option<EvidenceV
             EvidenceVerifierCode::UncertainDowngradedAfterPossibleInject,
             "LostAckUncertain fault matrix requires Uncertain disposition at Stop",
         ));
+    }
+
+    None
+}
+
+fn verify_fault_matrix_encoding(sealed: &SealedProofEvidence) -> Option<EvidenceVerifierDecision> {
+    let steps = &sealed.checklist_steps;
+    let has_frame = steps.contains(&ChecklistStep::FrameChallenge);
+    let has_guest = steps.contains(&ChecklistStep::GuestLocalActionMarkedPossible);
+    let has_post = steps.contains(&ChecklistStep::PostconditionVerified);
+    let has_stale = steps.contains(&ChecklistStep::StaleTokensRejected);
+    let probes = sealed.stop_evidence.host_sentinel_probes_performed;
+
+    match sealed.fault_matrix_case {
+        Some(FaultMatrixCase::BootStop) => {
+            if has_frame || has_guest || has_post {
+                return Some(EvidenceVerifierDecision::reject(
+                    EvidenceVerifierCode::FaultMatrixDispositionMismatch,
+                    "BootStop checklist must not record inject or postcondition steps",
+                ));
+            }
+            if probes != 3 {
+                return Some(EvidenceVerifierDecision::reject(
+                    EvidenceVerifierCode::FaultMatrixDispositionMismatch,
+                    "BootStop fault matrix is inconsistent with sealed stop probe count",
+                ));
+            }
+        }
+        Some(FaultMatrixCase::PreDispatchStop) => {
+            if !has_frame || has_guest || has_post {
+                return Some(EvidenceVerifierDecision::reject(
+                    EvidenceVerifierCode::FaultMatrixDispositionMismatch,
+                    "PreDispatchStop checklist must record FrameChallenge without guest inject",
+                ));
+            }
+            if probes != 3 {
+                return Some(EvidenceVerifierDecision::reject(
+                    EvidenceVerifierCode::FaultMatrixDispositionMismatch,
+                    "PreDispatchStop fault matrix is inconsistent with sealed stop probe count",
+                ));
+            }
+        }
+        Some(FaultMatrixCase::LostAckUncertain) => {
+            if has_frame || has_post || !has_guest {
+                return Some(EvidenceVerifierDecision::reject(
+                    EvidenceVerifierCode::FaultMatrixDispositionMismatch,
+                    "LostAckUncertain checklist must record guest inject without postcondition",
+                ));
+            }
+            if probes != 4 {
+                return Some(EvidenceVerifierDecision::reject(
+                    EvidenceVerifierCode::FaultMatrixDispositionMismatch,
+                    "LostAckUncertain fault matrix is inconsistent with sealed stop probe count",
+                ));
+            }
+        }
+        Some(FaultMatrixCase::RestartNoReplay) => {
+            if has_frame || has_post || !has_guest || !has_stale {
+                return Some(EvidenceVerifierDecision::reject(
+                    EvidenceVerifierCode::FaultMatrixDispositionMismatch,
+                    "RestartNoReplay checklist must record guest inject and stale-token rejection",
+                ));
+            }
+        }
+        None => {
+            if has_guest && has_post && (!has_frame || !has_stale || probes != 5) {
+                return Some(EvidenceVerifierDecision::reject(
+                    EvidenceVerifierCode::ChecklistIncomplete,
+                    "happy-path checklist shape is inconsistent with sealed stop evidence",
+                ));
+            }
+        }
+    }
+
+    None
+}
+
+fn verify_pack_level_uncertain_triggers(
+    pack: &Sep18EvidencePack,
+) -> Option<EvidenceVerifierDecision> {
+    match pack.fault_matrix_case {
+        Some(FaultMatrixCase::LostAckUncertain) | Some(FaultMatrixCase::RestartNoReplay) => {
+            let disposition = pack
+                .sealed_evidence
+                .as_ref()
+                .and_then(|sealed| sealed.stop_evidence.disposition);
+            if disposition != Some(GuestLifecycleDisposition::Uncertain) {
+                return Some(EvidenceVerifierDecision::reject(
+                    EvidenceVerifierCode::UncertainDowngradedAfterPossibleInject,
+                    "pack fault_matrix_case requires Uncertain disposition at Stop",
+                ));
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
+fn pack_implies_sealed_stop_story(pack: &Sep18EvidencePack) -> bool {
+    pack.fault_matrix_case.is_some()
+        || pack.checklist_completed
+        || pack.host_sentinel_probes.channels_destroyed > 0
+        || pack.host_sentinel_probes.probes_performed > 0
+}
+
+fn verify_sealed_evidence_presence(pack: &Sep18EvidencePack) -> Option<EvidenceVerifierDecision> {
+    if pack.sealed_evidence.is_none() && pack_implies_sealed_stop_story(pack) {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::ChecklistIncomplete,
+            "stop or checklist progress requires sealed_evidence",
+        ));
+    }
+
+    if matches!(
+        pack.substrate,
+        Sep18ChecklistSubstrate::ContainedBrowserDryRun
+    ) && pack.sealed_evidence.is_some()
+    {
+        let cb = pack.contained_browser.as_ref()?;
+        if cb.sealed_evidence.is_none() {
+            return Some(EvidenceVerifierDecision::reject(
+                EvidenceVerifierCode::SubstrateNestedEvidenceMissing,
+                "ContainedBrowserDryRun requires contained_browser.sealed_evidence when pack sealed_evidence is present",
+            ));
+        }
     }
 
     None
@@ -536,12 +691,21 @@ fn verify_pack_sealed_consistency(
     }
 
     if let Some(cb) = &pack.contained_browser {
-        if let Some(cb_sealed) = &cb.sealed_evidence {
-            if cb_sealed != sealed {
-                return Some(EvidenceVerifierDecision::reject(
-                    EvidenceVerifierCode::PackSealedEvidenceMismatch,
-                    "contained_browser.sealed_evidence does not match pack.sealed_evidence",
-                ));
+        if pack.sealed_evidence.is_some() {
+            match &cb.sealed_evidence {
+                None => {
+                    return Some(EvidenceVerifierDecision::reject(
+                        EvidenceVerifierCode::SubstrateNestedEvidenceMissing,
+                        "contained_browser.sealed_evidence required when pack sealed_evidence is present",
+                    ));
+                }
+                Some(cb_sealed) if cb_sealed != sealed => {
+                    return Some(EvidenceVerifierDecision::reject(
+                        EvidenceVerifierCode::PackSealedEvidenceMismatch,
+                        "contained_browser.sealed_evidence does not match pack.sealed_evidence",
+                    ));
+                }
+                _ => {}
             }
         }
     }

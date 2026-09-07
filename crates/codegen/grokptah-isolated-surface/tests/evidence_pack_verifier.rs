@@ -520,6 +520,172 @@ mod cb_happy_path {
         );
     }
 
+    fn sync_both_sealed(
+        pack: &mut grokptah_isolated_surface::Sep18EvidencePack,
+        tamper: impl FnOnce(&mut grokptah_isolated_surface::SealedProofEvidence),
+    ) {
+        if let Some(sealed) = pack.sealed_evidence.as_mut() {
+            tamper(sealed);
+            let synced = sealed.clone();
+            if let Some(cb) = pack.contained_browser.as_mut() {
+                cb.sealed_evidence = Some(synced);
+            }
+        }
+    }
+
+    #[test]
+    fn uncertain_both_copies_fabricated_postcondition_stopped_is_rejected() {
+        use grokptah_isolated_surface::{
+            ChecklistStep, FaultMatrixCase, GuestLifecycleDisposition,
+        };
+
+        let outcome = run_sep18_checklist(
+            HostSentinelSnapshot::synthetic_baseline(),
+            Sep18ChecklistRunnerConfig::contained_browser_default()
+                .with_fault_matrix(FaultMatrixCase::LostAckUncertain),
+        );
+        let mut pack = outcome.pack;
+        sync_both_sealed(&mut pack, |sealed| {
+            sealed.fault_matrix_case = None;
+            sealed.stop_evidence.disposition = Some(GuestLifecycleDisposition::Stopped);
+            if !sealed
+                .checklist_steps
+                .contains(&ChecklistStep::PostconditionVerified)
+            {
+                sealed
+                    .checklist_steps
+                    .push(ChecklistStep::PostconditionVerified);
+            }
+        });
+        pack.fault_matrix_case = None;
+        let decision = verify_evidence_pack(&pack);
+        assert!(!decision.accepted);
+        assert_eq!(
+            decision.code,
+            EvidenceVerifierCode::UncertainDowngradedAfterPossibleInject
+        );
+    }
+
+    #[test]
+    fn uncertain_drop_nested_cb_sealed_while_pack_fabricated_is_rejected() {
+        use grokptah_isolated_surface::{
+            ChecklistStep, FaultMatrixCase, GuestLifecycleDisposition,
+        };
+
+        let outcome = run_sep18_checklist(
+            HostSentinelSnapshot::synthetic_baseline(),
+            Sep18ChecklistRunnerConfig::contained_browser_default()
+                .with_fault_matrix(FaultMatrixCase::LostAckUncertain),
+        );
+        let mut pack = outcome.pack;
+        sync_both_sealed(&mut pack, |sealed| {
+            sealed.fault_matrix_case = None;
+            sealed.stop_evidence.disposition = Some(GuestLifecycleDisposition::Stopped);
+            if !sealed
+                .checklist_steps
+                .contains(&ChecklistStep::PostconditionVerified)
+            {
+                sealed
+                    .checklist_steps
+                    .push(ChecklistStep::PostconditionVerified);
+            }
+        });
+        pack.fault_matrix_case = None;
+        if let Some(cb) = pack.contained_browser.as_mut() {
+            cb.sealed_evidence = None;
+        }
+        let decision = verify_evidence_pack(&pack);
+        assert!(!decision.accepted);
+        assert_eq!(
+            decision.code,
+            EvidenceVerifierCode::SubstrateNestedEvidenceMissing
+        );
+    }
+
+    #[test]
+    fn uncertain_relabel_boot_stop_with_scrubbed_triggers_is_rejected() {
+        use grokptah_isolated_surface::{
+            ChecklistStep, FaultMatrixCase, GuestLifecycleDisposition,
+        };
+
+        let outcome = run_sep18_checklist(
+            HostSentinelSnapshot::synthetic_baseline(),
+            Sep18ChecklistRunnerConfig::contained_browser_default()
+                .with_fault_matrix(FaultMatrixCase::LostAckUncertain),
+        );
+        let mut pack = outcome.pack;
+        sync_both_sealed(&mut pack, |sealed| {
+            sealed.fault_matrix_case = Some(FaultMatrixCase::BootStop);
+            sealed.stop_evidence.disposition = Some(GuestLifecycleDisposition::Stopped);
+            sealed.checklist_steps.retain(|step| {
+                !matches!(
+                    step,
+                    ChecklistStep::GuestLocalActionMarkedPossible | ChecklistStep::FrameChallenge
+                )
+            });
+        });
+        pack.fault_matrix_case = Some(FaultMatrixCase::BootStop);
+        let decision = verify_evidence_pack(&pack);
+        assert!(!decision.accepted);
+        assert_eq!(
+            decision.code,
+            EvidenceVerifierCode::FaultMatrixDispositionMismatch
+        );
+    }
+
+    #[test]
+    fn synthetic_lost_ack_fabricated_postcondition_stopped_is_rejected() {
+        use grokptah_isolated_surface::{
+            ChecklistStep, FaultMatrixCase, GuestLifecycleDisposition, Sep18ChecklistSubstrate,
+        };
+
+        let mut config = Sep18ChecklistRunnerConfig::contained_browser_default();
+        config.substrate = Sep18ChecklistSubstrate::SyntheticHarness;
+        config = config.with_fault_matrix(FaultMatrixCase::LostAckUncertain);
+        let outcome = run_sep18_checklist(HostSentinelSnapshot::synthetic_baseline(), config);
+        assert!(outcome.runner_error.is_none());
+        let mut pack = outcome.pack;
+        if let Some(sealed) = pack.sealed_evidence.as_mut() {
+            sealed.fault_matrix_case = None;
+            sealed.stop_evidence.disposition = Some(GuestLifecycleDisposition::Stopped);
+            if !sealed
+                .checklist_steps
+                .contains(&ChecklistStep::PostconditionVerified)
+            {
+                sealed
+                    .checklist_steps
+                    .push(ChecklistStep::PostconditionVerified);
+            }
+        }
+        pack.fault_matrix_case = None;
+        let decision = verify_evidence_pack(&pack);
+        assert!(!decision.accepted);
+        assert_eq!(
+            decision.code,
+            EvidenceVerifierCode::UncertainDowngradedAfterPossibleInject
+        );
+    }
+
+    #[test]
+    fn sealed_evidence_omitted_with_stop_story_is_rejected() {
+        use grokptah_isolated_surface::FaultMatrixCase;
+
+        let outcome = run_sep18_checklist(
+            HostSentinelSnapshot::synthetic_baseline(),
+            Sep18ChecklistRunnerConfig::contained_browser_default()
+                .with_fault_matrix(FaultMatrixCase::LostAckUncertain),
+        );
+        let mut pack = outcome.pack;
+        pack.sealed_evidence = None;
+        pack.checklist_completed = false;
+        if let Some(cb) = pack.contained_browser.as_mut() {
+            cb.sealed_evidence = None;
+        }
+        let decision = verify_evidence_pack(&pack);
+        assert!(!decision.accepted);
+        assert_eq!(decision.code, EvidenceVerifierCode::ChecklistIncomplete);
+    }
+
     #[test]
     fn synthetic_isolation_pass_claimed_is_rejected() {
         use grokptah_isolated_surface::{
