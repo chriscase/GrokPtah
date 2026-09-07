@@ -25,6 +25,8 @@ pub struct StopEvidence {
     pub channels_destroyed: usize,
     pub host_sentinels_unchanged: bool,
     pub host_sentinel_probes_performed: u32,
+    /// True only when at least one successful native Mac host probe occurred.
+    pub live_host_sentinel_collection: bool,
     pub host_sentinel_probe_error: Option<HarnessError>,
     pub backend_fence_error: Option<HarnessError>,
     pub persist_snapshot_error: Option<HarnessError>,
@@ -136,10 +138,20 @@ impl<B: IsolatedSurfaceBackend> IsolatedSurfaceHarness<B> {
         &self.sentinels
     }
 
-    /// Mac physical proof hook: compare an externally collected host snapshot to the
-    /// harness baseline via [`HostSentinelRegistry::refresh_from_host`].
+    /// Mac physical proof hook: compare an externally supplied snapshot to the
+    /// harness baseline. Does **not** count as native Mac collection — use
+    /// [`Self::refresh_host_sentinels_from_collector`] for physical proof.
     pub fn refresh_host_sentinels(&mut self, snapshot: HostSentinelSnapshot) -> HarnessResult<()> {
         self.sentinels.refresh_from_host(snapshot)
+    }
+
+    /// Native Mac physical proof hook: collect live host state then compare.
+    #[cfg(target_os = "macos")]
+    pub fn refresh_host_sentinels_from_collector(
+        &mut self,
+        collector: &crate::sentinel::MacHostSentinelCollector,
+    ) -> HarnessResult<()> {
+        self.sentinels.refresh_from_native_collector(collector)
     }
 
     pub fn host_probe_mut(&mut self) -> &mut SyntheticHostProbe {
@@ -266,6 +278,7 @@ impl<B: IsolatedSurfaceBackend> IsolatedSurfaceHarness<B> {
             channels_destroyed: self.last_channels_destroyed,
             host_sentinels_unchanged,
             host_sentinel_probes_performed: self.sentinels.probes_performed(),
+            live_host_sentinel_collection: self.sentinels.live_host_collection_verified(),
             host_sentinel_probe_error: probe_error,
             backend_fence_error,
             persist_snapshot_error,
@@ -319,6 +332,7 @@ impl<B: IsolatedSurfaceBackend> IsolatedSurfaceHarness<B> {
             channels_destroyed: self.last_channels_destroyed,
             host_sentinels_unchanged: false,
             host_sentinel_probes_performed: self.sentinels.probes_performed(),
+            live_host_sentinel_collection: false,
             host_sentinel_probe_error: None,
             backend_fence_error: None,
             persist_snapshot_error: teardown.persist_snapshot_error,

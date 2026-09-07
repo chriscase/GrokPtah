@@ -13,6 +13,9 @@ mod error;
 mod evidence_pack;
 mod harness;
 mod lifecycle;
+mod mac_host_sentinel;
+#[cfg(any(target_os = "macos", test))]
+mod main_checkout_fence;
 mod proof_sequencer;
 mod sentinel;
 mod simulator;
@@ -46,14 +49,15 @@ pub use lifecycle::{
     GuestLifecycle, GuestLifecycleDisposition, GuestLifecyclePhase, ProofEvidenceClass,
     LIFECYCLE_SCHEMA_VERSION,
 };
+pub use mac_host_sentinel::{mac_host_sentinel_platform_support, MacHostSentinelPlatformSupport};
 pub use proof_sequencer::{
     ChecklistStep, FaultMatrixCase, SealedProofEvidence, Sep18NoModelProofSequencer,
 };
 #[cfg(target_os = "macos")]
 pub use sentinel::MacHostSentinelCollector;
 pub use sentinel::{
-    HostSentinelDiff, HostSentinelProbe, HostSentinelRegistry, HostSentinelSnapshot,
-    MainCheckoutFence, SyntheticHostProbe,
+    HostSentinelDiff, HostSentinelProbe, HostSentinelProbeKind, HostSentinelRegistry,
+    HostSentinelSnapshot, MainCheckoutFence, SyntheticHostProbe,
 };
 pub use simulator::{
     FaultInjectingBackend, FrameDelta, GuestFrame, GuestLocalAction, InjectOutcome, SyntheticGuest,

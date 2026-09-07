@@ -60,20 +60,35 @@ impl HostSentinelSnapshot {
     }
 }
 
+/// Provenance for host sentinel probes — physical proof requires native reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostSentinelProbeKind {
+    /// Harness/rehearsal self-compare only — ineligible for physical Mac markers.
+    SyntheticRehearsal,
+    /// Live Mac host read via [`MacHostSentinelCollector`].
+    NativeMacHost,
+}
+
 /// Reads live host sentinel state. Native Mac adapters implement this with real
 /// AX/CGEvent/clipboard evidence and main-checkout digest/mtime fence; the
 /// synthetic harness uses [`SyntheticHostProbe`].
 pub trait HostSentinelProbe {
     fn probe_host(&self) -> HarnessResult<HostSentinelSnapshot>;
+
+    fn probe_kind(&self) -> HostSentinelProbeKind {
+        HostSentinelProbeKind::SyntheticRehearsal
+    }
 }
 
 /// Mac physical proof hook for live host sentinel collection.
 ///
 /// On Sep 18, a Mac worker collects pointer, foreground app/window, clipboard digest,
 /// unrelated host window, and `MainCheckoutFence`, then passes the snapshot to
-/// [`HostSentinelRegistry::refresh_from_host`] (or [`IsolatedSurfaceHarness::refresh_host_sentinels`])
-/// at boot, inject, and Stop probe points. This dry-run stub fails closed until the
-/// physical checklist wires real AX/clipboard/main-checkout reads.
+/// [`HostSentinelRegistry::refresh_from_native_collector`] (or
+/// [`IsolatedSurfaceHarness::refresh_host_sentinels_from_collector`]) at boot,
+/// inject, and Stop probe points. Fails closed when Accessibility trust or other
+/// required host reads are unavailable.
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone)]
 pub struct MacHostSentinelCollector {
@@ -94,10 +109,7 @@ impl MacHostSentinelCollector {
 
     /// Collect live host sentinel state for [`HostSentinelRegistry::refresh_from_host`].
     pub fn collect(&self) -> HarnessResult<HostSentinelSnapshot> {
-        let _ = &self.checkout_path;
-        Err(HarnessError::backend_unavailable(
-            "Mac host sentinel collection is not wired in dry-run; use physical Sep 18 checklist",
-        ))
+        crate::mac_host_sentinel::collect(&self.checkout_path)
     }
 }
 
@@ -106,13 +118,23 @@ impl HostSentinelProbe for MacHostSentinelCollector {
     fn probe_host(&self) -> HarnessResult<HostSentinelSnapshot> {
         self.collect()
     }
+
+    fn probe_kind(&self) -> HostSentinelProbeKind {
+        HostSentinelProbeKind::NativeMacHost
+    }
 }
 
-/// Synthetic host-side state for harness tests. Starts at the baseline and may
-/// only diverge when a test simulates host mutation.
+/// Synthetic host-side state for harness tests and rehearsal only.
+///
+/// Self-compare against the harness baseline is **not** physical Mac proof.
 #[derive(Debug, Clone)]
 pub struct SyntheticHostProbe {
     state: HostSentinelSnapshot,
+}
+
+impl SyntheticHostProbe {
+    /// Explicit rehearsal label — not eligible for physical proof markers.
+    pub const PROBE_LABEL: &'static str = "synthetic-rehearsal-only-not-physical-proof";
 }
 
 impl SyntheticHostProbe {
@@ -154,6 +176,10 @@ impl HostSentinelProbe for SyntheticHostProbe {
     fn probe_host(&self) -> HarnessResult<HostSentinelSnapshot> {
         Ok(self.state.clone())
     }
+
+    fn probe_kind(&self) -> HostSentinelProbeKind {
+        HostSentinelProbeKind::SyntheticRehearsal
+    }
 }
 
 /// Tracks host sentinel drift during a harness run. Guest operations must never
@@ -164,6 +190,7 @@ pub struct HostSentinelRegistry {
     baseline: HostSentinelSnapshot,
     violation: Option<String>,
     probes_performed: u32,
+    native_host_probes_performed: u32,
     last_probe_matches_baseline: bool,
 }
 
@@ -173,6 +200,7 @@ impl HostSentinelRegistry {
             baseline,
             violation: None,
             probes_performed: 0,
+            native_host_probes_performed: 0,
             last_probe_matches_baseline: false,
         }
     }
@@ -183,6 +211,17 @@ impl HostSentinelRegistry {
 
     pub fn probes_performed(&self) -> u32 {
         self.probes_performed
+    }
+
+    pub fn native_host_probes_performed(&self) -> u32 {
+        self.native_host_probes_performed
+    }
+
+    /// True only when at least one native Mac host probe matched baseline.
+    pub fn live_host_collection_verified(&self) -> bool {
+        self.native_host_probes_performed > 0
+            && self.violation.is_none()
+            && self.last_probe_matches_baseline
     }
 
     /// Compare a live host probe to the baseline. This is the only path that may
@@ -205,14 +244,39 @@ impl HostSentinelRegistry {
 
     /// Run a host probe and compare to baseline.
     pub fn probe_and_verify(&mut self, probe: &dyn HostSentinelProbe) -> HarnessResult<()> {
+        let kind = probe.probe_kind();
         let observed = probe.probe_host()?;
-        self.verify_via_probe(observed)
+        self.verify_via_probe_with_kind(observed, kind)
     }
 
-    /// Extension point for native Mac evidence collectors that already performed
-    /// an external read — still requires comparison to baseline.
+    /// Compare an externally supplied snapshot to baseline.
+    ///
+    /// Does **not** count as native Mac collection — callers must use
+    /// [`Self::refresh_from_native_collector`] for physical proof provenance.
     pub fn refresh_from_host(&mut self, snapshot: HostSentinelSnapshot) -> HarnessResult<()> {
-        self.verify_via_probe(snapshot)
+        self.verify_via_probe_with_kind(snapshot, HostSentinelProbeKind::SyntheticRehearsal)
+    }
+
+    /// Native Mac physical proof hook: collect then compare to baseline.
+    #[cfg(target_os = "macos")]
+    pub fn refresh_from_native_collector(
+        &mut self,
+        collector: &MacHostSentinelCollector,
+    ) -> HarnessResult<()> {
+        let snapshot = collector.collect()?;
+        self.verify_via_probe_with_kind(snapshot, HostSentinelProbeKind::NativeMacHost)
+    }
+
+    fn verify_via_probe_with_kind(
+        &mut self,
+        observed: HostSentinelSnapshot,
+        kind: HostSentinelProbeKind,
+    ) -> HarnessResult<()> {
+        let result = self.verify_via_probe(observed);
+        if result.is_ok() && kind == HostSentinelProbeKind::NativeMacHost {
+            self.native_host_probes_performed = self.native_host_probes_performed.saturating_add(1);
+        }
+        result
     }
 
     pub fn verified_via_probe(&self) -> bool {
@@ -308,5 +372,38 @@ mod tests {
             crate::error::HarnessErrorCode::HostSentinelViolation
         );
         assert!(err.message.contains("main checkout"));
+    }
+
+    #[test]
+    fn synthetic_probe_kind_is_rehearsal_only() {
+        let probe = SyntheticHostProbe::new(HostSentinelSnapshot::synthetic_baseline());
+        assert_eq!(
+            probe.probe_kind(),
+            HostSentinelProbeKind::SyntheticRehearsal
+        );
+        assert_eq!(
+            SyntheticHostProbe::PROBE_LABEL,
+            "synthetic-rehearsal-only-not-physical-proof"
+        );
+    }
+
+    #[test]
+    fn refresh_from_host_does_not_count_as_native_collection() {
+        let baseline = HostSentinelSnapshot::synthetic_baseline();
+        let mut registry = HostSentinelRegistry::capture(baseline.clone());
+        registry
+            .refresh_from_host(baseline)
+            .expect("synthetic refresh");
+        assert_eq!(registry.native_host_probes_performed(), 0);
+        assert!(!registry.live_host_collection_verified());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn mac_host_sentinel_unavailable_off_macos() {
+        assert_eq!(
+            crate::mac_host_sentinel::mac_host_sentinel_platform_support(),
+            crate::mac_host_sentinel::MacHostSentinelPlatformSupport::UnavailableNonMacOs
+        );
     }
 }

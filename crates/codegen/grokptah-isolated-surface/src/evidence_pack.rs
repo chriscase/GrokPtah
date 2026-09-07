@@ -62,6 +62,7 @@ impl PhysicalProofMarkers {
 #[serde(rename_all = "camelCase")]
 pub struct HostSentinelProbeSummary {
     pub probes_performed: u32,
+    pub live_host_sentinel_collection_at_stop: bool,
     pub host_sentinels_unchanged_at_stop: bool,
     pub channels_destroyed: usize,
     pub channels_open_after_stop: usize,
@@ -71,6 +72,7 @@ impl HostSentinelProbeSummary {
     pub fn from_stop_evidence(stop: &crate::harness::StopEvidence, channels_open: usize) -> Self {
         Self {
             probes_performed: stop.host_sentinel_probes_performed,
+            live_host_sentinel_collection_at_stop: stop.live_host_sentinel_collection,
             host_sentinels_unchanged_at_stop: stop.host_sentinels_unchanged,
             channels_destroyed: stop.channels_destroyed,
             channels_open_after_stop: channels_open,
@@ -189,6 +191,25 @@ pub fn verify_evidence_pack(pack: &Sep18EvidencePack) -> EvidenceVerifierDecisio
             EvidenceVerifierCode::PhysicalPassWithoutMacMarkers,
             "physical_pass_claimed requires Mac worker attestation, live host sentinel collection, and physical_mac_proof_id",
         );
+    }
+
+    if pack.physical_proof_markers.live_host_sentinel_collection {
+        if let Some(sealed) = &pack.sealed_evidence {
+            if !sealed.stop_evidence.live_host_sentinel_collection {
+                return EvidenceVerifierDecision::reject(
+                    EvidenceVerifierCode::PhysicalPassWithoutMacMarkers,
+                    "live_host_sentinel_collection marker requires successful native Mac host probes in stop_evidence",
+                );
+            }
+        } else if !pack
+            .host_sentinel_probes
+            .live_host_sentinel_collection_at_stop
+        {
+            return EvidenceVerifierDecision::reject(
+                EvidenceVerifierCode::PhysicalPassWithoutMacMarkers,
+                "live_host_sentinel_collection marker requires native Mac host probes at Stop",
+            );
+        }
     }
 
     if pack.vf_pass_claimed && !pack.physical_proof_markers.qualifies_vf_physical_pass() {
@@ -316,6 +337,17 @@ fn verify_sealed_evidence(
         return Some(EvidenceVerifierDecision::reject(
             EvidenceVerifierCode::HostSentinelProbeSummaryMismatch,
             "host_sentinel_probes_performed mismatch between pack and sealed stop_evidence",
+        ));
+    }
+
+    if pack
+        .host_sentinel_probes
+        .live_host_sentinel_collection_at_stop
+        != stop.live_host_sentinel_collection
+    {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::HostSentinelProbeSummaryMismatch,
+            "live_host_sentinel_collection mismatch between pack and sealed stop_evidence",
         ));
     }
 
@@ -1011,6 +1043,7 @@ pub fn seal_contained_browser_dry_run_pack(
         .map(|sealed| HostSentinelProbeSummary::from_stop_evidence(&sealed.stop_evidence, 0))
         .unwrap_or(HostSentinelProbeSummary {
             probes_performed: 0,
+            live_host_sentinel_collection_at_stop: false,
             host_sentinels_unchanged_at_stop: false,
             channels_destroyed: 0,
             channels_open_after_stop: 0,
@@ -1052,6 +1085,7 @@ pub fn seal_vf_dry_run_pack(evidence: VfDryRunEvidence) -> Sep18EvidencePack {
         nonclaim: evidence.nonclaim.clone(),
         host_sentinel_probes: HostSentinelProbeSummary {
             probes_performed: 0,
+            live_host_sentinel_collection_at_stop: false,
             host_sentinels_unchanged_at_stop: false,
             channels_destroyed: 0,
             channels_open_after_stop: 0,

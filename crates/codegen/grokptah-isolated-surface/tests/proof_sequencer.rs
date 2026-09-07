@@ -304,6 +304,15 @@ fn harness_refresh_host_sentinels_uses_probe_path() {
         .refresh_host_sentinels(HostSentinelSnapshot::synthetic_baseline())
         .expect("refresh matches baseline");
     assert!(harness.sentinels().verified_via_probe());
+    assert_eq!(harness.sentinels().native_host_probes_performed(), 0);
+}
+
+#[test]
+fn synthetic_harness_stop_never_claims_live_host_collection() {
+    let mut harness = IsolatedSurfaceHarness::new(HostSentinelSnapshot::synthetic_baseline());
+    let evidence = harness.run_canonical_proof().expect("canonical proof");
+    assert!(!evidence.live_host_sentinel_collection);
+    assert!(evidence.host_sentinels_unchanged);
 }
 
 #[cfg(not(feature = "browser-engine"))]

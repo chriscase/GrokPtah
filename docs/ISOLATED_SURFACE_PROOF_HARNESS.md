@@ -20,10 +20,11 @@ surface), [#267](https://github.com/chriscase/GrokPtah/issues/267) (epic).
 | Sep 6–12 | Packet 4 — Contained Browser substrate v0 (#546) | **Landed** — real browser lifecycle on simulator substrate, CB dry-run path, admission false |
 | Sep 6–12 | Packet 5 — Sep 18 checklist runner + evidence-pack verifier (#547) | **Landed** — `grokptah-sep18-checklist` CLI, sealed pack + independent verifier |
 | Sep 6–12 | Packet 6 — Harness Stop honesty (#548) | **Landed** — Stop cleanup survives disk/audit failure; `Destroyed` is confirmed-only |
-| Sep 6–12 | Packet 7 — `stop_fence_first` no default (#TBD) | **This slice** — trait default removed; production adapters must fence with ack/failure |
+| Sep 6–12 | Packet 7 — `stop_fence_first` no default (#549) | **Landed** — trait default removed; production adapters must fence with ack/failure |
+| Sep 6–12 | Packet 8 — Mac host sentinel provenance (#TBD) | **This slice** — `MacHostSentinelCollector::collect()` wired; synthetic self-compare ineligible for physical markers |
 | Sep 18 | Physical Mac gate | VF PASS or honest Contained Browser pivot |
 
-## Exact-main inventory (base `e1b1cc9611993d6456e2b73b110d2b60397cf38f` + packet 7)
+## Exact-main inventory (base `c22faa9c0479dab8a96503d6c15c3bdf76964ec1` + packet 8)
 
 ### Already satisfies Windowed Coding Run noninterference (semantic macOS path)
 
@@ -88,9 +89,21 @@ case in `proof_sequencer` tests.
 
 **Mac physical proof hooks:**
 
-1. Capture baseline before launch with `MacHostSentinelCollector::collect()` (stub fails closed until wired).
-2. At boot, inject, and Stop probe points, call `IsolatedSurfaceHarness::refresh_host_sentinels(snapshot)` which delegates to `HostSentinelRegistry::refresh_from_host`.
+1. Capture baseline before launch with `MacHostSentinelCollector::collect()` (native AX/CGEvent/clipboard/checkout fence; fails closed without Accessibility trust on macOS).
+2. At boot, inject, and Stop probe points, call `IsolatedSurfaceHarness::refresh_host_sentinels_from_collector(collector)` which collects live host state and compares to baseline via [`HostSentinelRegistry::refresh_from_native_collector`].
 3. `StopEvidence.host_sentinels_unchanged` remains authoritative only when probes match baseline.
+4. `StopEvidence.live_host_sentinel_collection` is **true** only after at least one successful native Mac probe — never from [`SyntheticHostProbe`] rehearsal self-compare.
+5. `PhysicalProofMarkers.live_host_sentinel_collection` must align with sealed `stop_evidence.live_host_sentinel_collection`; the independent verifier rejects forged markers.
+
+**Sentinel provenance (packet 8):**
+
+| Probe source | Rehearsal / unit tests | Physical Mac proof markers |
+|---|---|---|
+| [`SyntheticHostProbe`] (`synthetic-rehearsal-only-not-physical-proof`) | Yes — default harness path | **Never** |
+| [`MacHostSentinelCollector::collect()`] + `refresh_from_native_collector` | macOS worker with Accessibility trust | Required for live collection marker |
+| `refresh_host_sentinels(snapshot)` with pre-built snapshot | Compare-only hook | **Not** native collection |
+
+Synthetic harness / Linux CI / dry-run packs never set `live_host_sentinel_collection: true`. #288 packaged-VM acceptance stays open.
 
 ### Evidence class (`ProofEvidenceClass`)
 
@@ -235,10 +248,10 @@ separate gate enables it after honest PASS.
 
 | Step | Action | Pass criterion |
 |---|---|---|
-| 1 | Capture host baseline | `MacHostSentinelCollector::collect()` → store snapshot |
+| 1 | Capture host baseline | `MacHostSentinelCollector::collect()` → store snapshot (native; fails closed without Accessibility trust) |
 | 2 | Arm harness | `IsolatedSurfaceHarness::with_vf_backend(baseline, backend, receipt)` |
 | 3 | Launch + boot guest | `boot()` → `Ready`, first frame epoch > 0 |
-| 4 | Probe sentinels | `refresh_host_sentinels(collect())` — no drift |
+| 4 | Probe sentinels | `refresh_host_sentinels_from_collector(collector)` — no drift; native provenance recorded |
 | 5 | Capture frame | `observe_frame()` |
 | 6 | Inject ONE guest-local action | `inject_guest_action(ClickGuestButton)` — guest-local change only |
 | 7 | Verify postcondition | Frame digest/epoch changed; host sentinels still match baseline |
@@ -300,9 +313,11 @@ cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Car
   --features vf-backend --test proof_sequencer sep18_vf_dry_run -- --test-threads=1
 ```
 
-## Residuals (honest, post-packet-7)
+## Residuals (honest, post-packet-8)
 
 - `IsolatedSurfaceBackend::stop_fence_first` has no trait default — production adapters must wire real fence ack/failure.
+- `MacHostSentinelCollector` requires macOS Accessibility trust for foreground/unrelated window evidence; missing TCC → honest `BackendUnavailable`, not synthetic PASS.
+- Default harness rehearsal still uses [`SyntheticHostProbe`] — physical Sep 18 runner must wire `refresh_host_sentinels_from_collector`.
 
 - Checklist runner seals dry-run packs only — no live Mac VF IPC or packaged helper.
 - Independent verifier is pack-only; physical Mac worker still required for VF PASS rung.
@@ -320,4 +335,5 @@ cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Car
 - Simulator / Linux CI does **not** qualify a packaged VM.
 - VF dry-run does **not** claim Sep 18 physical PASS.
 - Synthetic harness success does **not** enable isolated visual Computer Use in production.
+- [`SyntheticHostProbe`] self-compare does **not** qualify as physical Mac host sentinel collection.
 - `ContainedBrowser` substrate v0 does **not** prove browser isolation — only exercises the SPI lifecycle on a simulator.

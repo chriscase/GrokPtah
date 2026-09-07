@@ -98,6 +98,32 @@ mod cb_happy_path {
     }
 
     #[test]
+    fn forged_live_host_sentinel_marker_without_native_probes_is_rejected() {
+        use grokptah_isolated_surface::PhysicalProofMarkers;
+
+        let outcome = run_sep18_checklist(
+            HostSentinelSnapshot::synthetic_baseline(),
+            Sep18ChecklistRunnerConfig::contained_browser_default(),
+        );
+        let mut pack = outcome.pack;
+        pack.physical_proof_markers = PhysicalProofMarkers {
+            mac_worker_attested: true,
+            live_host_sentinel_collection: true,
+            physical_mac_proof_id: Some("forged-without-native-probes".into()),
+        };
+        let decision = verify_evidence_pack(&pack);
+        assert!(!decision.accepted);
+        assert_eq!(
+            decision.code,
+            EvidenceVerifierCode::PhysicalPassWithoutMacMarkers
+        );
+        assert!(pack
+            .sealed_evidence
+            .as_ref()
+            .is_some_and(|sealed| !sealed.stop_evidence.live_host_sentinel_collection));
+    }
+
+    #[test]
     fn tampered_stop_teardown_omission_is_rejected() {
         let outcome = run_sep18_checklist(
             HostSentinelSnapshot::synthetic_baseline(),

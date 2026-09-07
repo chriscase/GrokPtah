@@ -30,6 +30,7 @@ fn canonical_proof_sequence_succeeds_with_unchanged_host_sentinels() {
     let evidence = harness.run_canonical_proof().expect("canonical proof");
     assert!(evidence.host_sentinels_unchanged);
     assert!(evidence.host_sentinel_probe_error.is_none());
+    assert!(!evidence.live_host_sentinel_collection);
     assert!(harness.sentinels().verified_via_probe());
     assert_eq!(evidence.channels_destroyed, 2);
     assert_eq!(harness.lifecycle().phase, GuestLifecyclePhase::Destroyed);
