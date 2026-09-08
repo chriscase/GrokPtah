@@ -192,6 +192,10 @@ pub struct HostSentinelRegistry {
     probes_performed: u32,
     native_host_probes_performed: u32,
     last_probe_matches_baseline: bool,
+    /// Kind of the most recent probe comparison. Missing on old records so they
+    /// cannot deserialize into a live collection claim.
+    #[serde(default)]
+    last_probe_kind: Option<HostSentinelProbeKind>,
 }
 
 impl HostSentinelRegistry {
@@ -202,6 +206,7 @@ impl HostSentinelRegistry {
             probes_performed: 0,
             native_host_probes_performed: 0,
             last_probe_matches_baseline: false,
+            last_probe_kind: None,
         }
     }
 
@@ -217,36 +222,33 @@ impl HostSentinelRegistry {
         self.native_host_probes_performed
     }
 
-    /// True only when at least one native Mac host probe matched baseline.
+    /// True only when the latest completed probe was a successful native Mac host
+    /// read that matched baseline. A later synthetic self-compare clears this.
+    /// Cumulative `native_host_probes_performed` is audit evidence and does not
+    /// latch this marker by itself.
     pub fn live_host_collection_verified(&self) -> bool {
-        self.native_host_probes_performed > 0
+        self.last_probe_kind == Some(HostSentinelProbeKind::NativeMacHost)
+            && self.native_host_probes_performed > 0
             && self.violation.is_none()
             && self.last_probe_matches_baseline
     }
 
-    /// Compare a live host probe to the baseline. This is the only path that may
-    /// authorize an unchanged claim.
+    /// Compare a live host probe to the baseline. Untyped callers are recorded as
+    /// synthetic rehearsal so they cannot qualify a live collection claim.
     pub fn verify_via_probe(&mut self, observed: HostSentinelSnapshot) -> HarnessResult<()> {
-        self.probes_performed = self.probes_performed.saturating_add(1);
-        if observed != self.baseline {
-            self.last_probe_matches_baseline = false;
-            let detail = if observed.main_checkout_fence != self.baseline.main_checkout_fence {
-                "main checkout fence drift detected by probe"
-            } else {
-                "host sentinel drift detected by probe"
-            };
-            self.violation = Some(detail.into());
-            return Err(HarnessError::host_sentinel_violation(detail));
-        }
-        self.last_probe_matches_baseline = true;
-        Ok(())
+        self.verify_via_probe_with_kind(observed, HostSentinelProbeKind::SyntheticRehearsal)
     }
 
     /// Run a host probe and compare to baseline.
     pub fn probe_and_verify(&mut self, probe: &dyn HostSentinelProbe) -> HarnessResult<()> {
         let kind = probe.probe_kind();
-        let observed = probe.probe_host()?;
-        self.verify_via_probe_with_kind(observed, kind)
+        match probe.probe_host() {
+            Ok(observed) => self.verify_via_probe_with_kind(observed, kind),
+            Err(err) => {
+                self.record_unsuccessful_probe(kind);
+                Err(err)
+            }
+        }
     }
 
     /// Compare an externally supplied snapshot to baseline.
@@ -263,8 +265,20 @@ impl HostSentinelRegistry {
         &mut self,
         collector: &MacHostSentinelCollector,
     ) -> HarnessResult<()> {
-        let snapshot = collector.collect()?;
-        self.verify_via_probe_with_kind(snapshot, HostSentinelProbeKind::NativeMacHost)
+        match collector.collect() {
+            Ok(snapshot) => {
+                self.verify_via_probe_with_kind(snapshot, HostSentinelProbeKind::NativeMacHost)
+            }
+            Err(err) => {
+                self.record_unsuccessful_probe(HostSentinelProbeKind::NativeMacHost);
+                Err(err)
+            }
+        }
+    }
+
+    fn record_unsuccessful_probe(&mut self, kind: HostSentinelProbeKind) {
+        self.last_probe_kind = Some(kind);
+        self.last_probe_matches_baseline = false;
     }
 
     fn verify_via_probe_with_kind(
@@ -272,11 +286,23 @@ impl HostSentinelRegistry {
         observed: HostSentinelSnapshot,
         kind: HostSentinelProbeKind,
     ) -> HarnessResult<()> {
-        let result = self.verify_via_probe(observed);
-        if result.is_ok() && kind == HostSentinelProbeKind::NativeMacHost {
+        self.probes_performed = self.probes_performed.saturating_add(1);
+        self.last_probe_kind = Some(kind);
+        if observed != self.baseline {
+            self.last_probe_matches_baseline = false;
+            let detail = if observed.main_checkout_fence != self.baseline.main_checkout_fence {
+                "main checkout fence drift detected by probe"
+            } else {
+                "host sentinel drift detected by probe"
+            };
+            self.violation = Some(detail.into());
+            return Err(HarnessError::host_sentinel_violation(detail));
+        }
+        self.last_probe_matches_baseline = true;
+        if kind == HostSentinelProbeKind::NativeMacHost {
             self.native_host_probes_performed = self.native_host_probes_performed.saturating_add(1);
         }
-        result
+        Ok(())
     }
 
     pub fn verified_via_probe(&self) -> bool {
@@ -405,5 +431,105 @@ mod tests {
             crate::mac_host_sentinel::mac_host_sentinel_platform_support(),
             crate::mac_host_sentinel::MacHostSentinelPlatformSupport::UnavailableNonMacOs
         );
+    }
+
+    /// Test-only probe that reports `NativeMacHost` without binding a physical collector.
+    struct NativeMacHostTestProbe {
+        state: HostSentinelSnapshot,
+    }
+
+    impl HostSentinelProbe for NativeMacHostTestProbe {
+        fn probe_host(&self) -> HarnessResult<HostSentinelSnapshot> {
+            Ok(self.state.clone())
+        }
+
+        fn probe_kind(&self) -> HostSentinelProbeKind {
+            HostSentinelProbeKind::NativeMacHost
+        }
+    }
+
+    #[test]
+    fn latest_successful_native_match_verifies_live_collection() {
+        let baseline = HostSentinelSnapshot::synthetic_baseline();
+        let native = NativeMacHostTestProbe {
+            state: baseline.clone(),
+        };
+        let mut registry = HostSentinelRegistry::capture(baseline);
+        registry.probe_and_verify(&native).expect("native match");
+        assert_eq!(registry.native_host_probes_performed(), 1);
+        assert_eq!(
+            registry.last_probe_kind,
+            Some(HostSentinelProbeKind::NativeMacHost)
+        );
+        assert!(registry.live_host_collection_verified());
+    }
+
+    #[test]
+    fn native_match_then_synthetic_match_clears_live_marker_and_keeps_native_count() {
+        let baseline = HostSentinelSnapshot::synthetic_baseline();
+        let native = NativeMacHostTestProbe {
+            state: baseline.clone(),
+        };
+        let synthetic = SyntheticHostProbe::new(baseline.clone());
+        let mut registry = HostSentinelRegistry::capture(baseline);
+        registry.probe_and_verify(&native).expect("native match");
+        assert!(registry.live_host_collection_verified());
+
+        registry
+            .probe_and_verify(&synthetic)
+            .expect("synthetic match");
+        assert_eq!(registry.native_host_probes_performed(), 1);
+        assert_eq!(
+            registry.last_probe_kind,
+            Some(HostSentinelProbeKind::SyntheticRehearsal)
+        );
+        assert!(!registry.live_host_collection_verified());
+    }
+
+    #[test]
+    fn native_drift_never_verifies_live_collection() {
+        let baseline = HostSentinelSnapshot::synthetic_baseline();
+        let mut drifted = baseline.clone();
+        drifted.pointer_x += 1;
+        let matching = NativeMacHostTestProbe {
+            state: baseline.clone(),
+        };
+        let drifting = NativeMacHostTestProbe { state: drifted };
+        let mut registry = HostSentinelRegistry::capture(baseline);
+        registry.probe_and_verify(&matching).expect("native match");
+        assert!(registry.live_host_collection_verified());
+
+        let err = registry
+            .probe_and_verify(&drifting)
+            .expect_err("native drift");
+        assert_eq!(
+            err.code,
+            crate::error::HarnessErrorCode::HostSentinelViolation
+        );
+        assert_eq!(registry.native_host_probes_performed(), 1);
+        assert!(!registry.live_host_collection_verified());
+    }
+
+    #[test]
+    fn missing_last_probe_kind_deserializes_fail_closed() {
+        let baseline = HostSentinelSnapshot::synthetic_baseline();
+        let native = NativeMacHostTestProbe {
+            state: baseline.clone(),
+        };
+        let mut registry = HostSentinelRegistry::capture(baseline);
+        registry.probe_and_verify(&native).expect("native match");
+        assert!(registry.live_host_collection_verified());
+
+        let mut value = serde_json::to_value(&registry).expect("serialize registry");
+        value
+            .as_object_mut()
+            .expect("registry object")
+            .remove("lastProbeKind");
+        let restored: HostSentinelRegistry =
+            serde_json::from_value(value).expect("old snapshot without lastProbeKind");
+        assert_eq!(restored.native_host_probes_performed(), 1);
+        assert!(restored.last_probe_matches_baseline);
+        assert_eq!(restored.last_probe_kind, None);
+        assert!(!restored.live_host_collection_verified());
     }
 }

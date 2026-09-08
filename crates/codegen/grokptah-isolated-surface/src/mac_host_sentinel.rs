@@ -110,12 +110,11 @@ mod platform {
         })?;
         let bundle_id: Option<Retained<AnyObject>> =
             unsafe { objc2::msg_send![&*frontmost, bundleIdentifier] };
-        let bundle_id =
-            nsstring_to_string(bundle_id.as_ref().map(|value| &**value)).ok_or_else(|| {
-                HarnessError::backend_unavailable(
-                    "Mac host sentinel foreground bundleIdentifier unavailable",
-                )
-            })?;
+        let bundle_id = nsstring_to_string(bundle_id.as_deref()).ok_or_else(|| {
+            HarnessError::backend_unavailable(
+                "Mac host sentinel foreground bundleIdentifier unavailable",
+            )
+        })?;
         let pid: i32 = unsafe { objc2::msg_send![&*frontmost, processIdentifier] };
         let window_id = ax_focused_window_id(pid).ok_or_else(|| {
             HarnessError::backend_unavailable(
@@ -161,8 +160,7 @@ mod platform {
                 unsafe { objc2::msg_send![&*apps, objectAtIndex: index] };
             let bundle_id: Option<Retained<AnyObject>> =
                 unsafe { objc2::msg_send![&*app, bundleIdentifier] };
-            let Some(bundle_id) = nsstring_to_string(bundle_id.as_ref().map(|value| &**value))
-            else {
+            let Some(bundle_id) = nsstring_to_string(bundle_id.as_deref()) else {
                 continue;
             };
             if bundle_id == foreground_app_id {
@@ -215,6 +213,7 @@ mod platform {
             if status != K_AX_ERROR_SUCCESS || windows.is_null() {
                 return None;
             }
+            // Copy-rule array; CFArrayGetValueAtIndex is Get-rule — do not CFRelease elements.
             let count = cf_array_len(windows);
             for index in 0..count {
                 let window = cf_array_value_at(windows, index);
@@ -222,13 +221,11 @@ mod platform {
                     continue;
                 }
                 if let Some((window_id, title_hash)) = ax_window_fingerprint(window) {
-                    CFRelease(window);
                     if window_id != exclude_window_id {
                         CFRelease(windows);
                         return Some((window_id, title_hash));
                     }
                 }
-                CFRelease(window);
             }
             CFRelease(windows);
             None
