@@ -106,8 +106,12 @@ function stopCauseLabel(run: DurableRun): string | null {
 
 function runOriginLabel(run: DurableRun): string {
   if (run.clientId === "mcp") return "MCP coordinator";
-  if (run.clientId === "desktop") return "Desktop";
+  if (run.clientId === "local-desktop") return "Desktop";
   return run.clientId || "Unknown origin";
+}
+
+function isLocalDesktopKeepOrigin(run: DurableRun): boolean {
+  return run.clientId === "local-desktop";
 }
 
 function runExecutionLabel(run: DurableRun): string {
@@ -283,8 +287,8 @@ export function RunInspector({
     : localRuns.filter((run) => {
         if (originFilter === "all") return true;
         if (originFilter === "mcp") return run.clientId === "mcp";
-        if (originFilter === "desktop") return run.clientId === "desktop";
-        return run.clientId !== "mcp" && run.clientId !== "desktop";
+        if (originFilter === "desktop") return run.clientId === "local-desktop";
+        return run.clientId !== "mcp" && run.clientId !== "local-desktop";
       });
 
   async function review(runId: string) {
@@ -910,8 +914,9 @@ export function RunInspector({
                       )}
                       {currentReview?.diffTruncated && (
                         <div className="run-callout run-promotion-truncated" role="status">
-                          This review is truncated, so the exact patch is not fully visible. Keep
-                          and Apply stay unavailable until a complete reviewable patch is available.
+                          {run.execution.promotionState === "kept_for_review"
+                            ? "This retained worktree review is truncated, so the exact patch is not fully visible. Keep is terminal and did not write the source workspace; Apply and Discard stay unavailable."
+                            : "This review is truncated, so the exact patch is not fully visible. Keep and Apply stay unavailable until a complete reviewable patch is available."}
                         </div>
                       )}
                       <div className="run-actions">
@@ -945,7 +950,7 @@ export function RunInspector({
                         {run.execution.promotionState === "ready" &&
                           currentReview &&
                           !currentReview.diffTruncated &&
-                          run.clientId === "desktop" && (
+                          isLocalDesktopKeepOrigin(run) && (
                             <>
                               <p
                                 className="run-promotion-keep-copy"

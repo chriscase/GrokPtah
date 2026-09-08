@@ -37,7 +37,8 @@ function run(overrides: Partial<DurableRun> = {}): DurableRun {
 describe("activeRunOrigin", () => {
   it("recognizes active MCP and desktop runs", () => {
     expect(activeRunOrigin([run()])).toBe("mcp");
-    expect(activeRunOrigin([run({ clientId: "desktop" })])).toBe("desktop");
+    expect(activeRunOrigin([run({ clientId: "local-desktop" })])).toBe("desktop");
+    expect(activeRunOrigin([run({ clientId: "desktop" })])).toBe("other");
     expect(activeRunOrigin([run({ clientId: "unknown" })])).toBe("other");
   });
 

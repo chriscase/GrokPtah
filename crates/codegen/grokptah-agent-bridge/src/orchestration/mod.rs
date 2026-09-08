@@ -20,8 +20,8 @@ mod worker;
 mod workload;
 
 pub use authz::{
-    authenticate_bearer, canonical_workspace, constant_time_eq, require_bearer, AuthContext,
-    AuthCredential, WorkspaceAllowlist,
+    authenticate_bearer, canonical_workspace, constant_time_eq, require_bearer,
+    validate_auth_credential_id, AuthContext, AuthCredential, WorkspaceAllowlist,
 };
 pub use continuation::{
     assemble_continuation_context, AgentContinuationPlan, ContinuationAssemblyFailure,
@@ -98,7 +98,7 @@ pub use types::{
     RunAggregates, RunApproval, RunBounds, RunExecution, RunExecutionMode, RunProgress, RunPurpose,
     RunRecord, RunState, RunStopCause, TestObservation, AGENT_SPEC_SCHEMA_VERSION, CONTROL_TOOLS,
     DEFAULT_AGENT_TOOL_IDS, DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS, FORBIDDEN_TOOLS,
-    MAX_AGENT_CONTEXT_BYTES,
+    LEGACY_DESKTOP_CLIENT_ID, LOCAL_DESKTOP_ORIGIN_ID, MAX_AGENT_CONTEXT_BYTES,
 };
 pub use worker::{
     reject_privilege_amplification, MeasuredCapability, WorkerHostKind, WorkerLivenessState,

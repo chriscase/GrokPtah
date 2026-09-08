@@ -4,6 +4,6 @@ import type { DurableRun, RunOrigin } from "./protocol";
 export function activeRunOrigin(runs: DurableRun[]): RunOrigin | null {
   const live = runs.find((run) => run.state === "running" || run.state === "queued");
   if (live?.clientId === "mcp") return "mcp";
-  if (live?.clientId === "desktop") return "desktop";
+  if (live?.clientId === "local-desktop") return "desktop";
   return live ? "other" : null;
 }

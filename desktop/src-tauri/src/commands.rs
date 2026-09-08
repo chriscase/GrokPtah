@@ -771,10 +771,7 @@ pub async fn persistent_agent_get(
     }
     let host = state.host.clone();
     let agent = run_blocking(move || host.get_persistent_agent(&agent_id).map_err(map_err)).await?;
-    agent
-        .map(serde_json::to_value)
-        .transpose()
-        .map_err(map_err)
+    agent.map(serde_json::to_value).transpose().map_err(map_err)
 }
 
 #[tauri::command]
@@ -1637,28 +1634,35 @@ pub async fn run_review(
     run_blocking(move || host.review_run_view(id, &run_id).map_err(map_err)).await
 }
 
-/// Persist an exact-scope approval for an MCP-owned isolated run. The desktop
-/// uses the same durable approval contract as an external coordinator so an
-/// approval remains visible and valid across restart.
-#[tauri::command]
-pub async fn run_approve(
-    state: State<'_, AppState>,
-    session_id: String,
-    run_id: String,
+fn require_complete_reviewable_patch(
+    review: &grokptah_agent_bridge::RunReview,
+) -> Result<(), String> {
+    if review.diff_truncated {
+        return Err(
+            "reviewed diff is truncated; applying the exact patch requires a complete reviewable patch"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+async fn persist_mcp_isolated_run_approval(
+    host: &grokptah_agent_bridge::AgentHostHandle,
+    orch: &grokptah_agent_bridge::OrchestrationService,
+    token: &str,
+    session_id: Uuid,
+    run_id: &str,
     ttl_ms: Option<u64>,
 ) -> Result<grokptah_agent_bridge::RunRecord, String> {
-    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
-    let (orch, token) = desktop_mcp_orchestration(&state)?;
     let auth = orch
         .auth_header(Some(&format!("Bearer {token}")))
         .map_err(map_err)?;
-    let session = state.host.session_load(session_id).map_err(map_err)?;
+    let session = host.session_load(session_id).map_err(map_err)?;
     if session.cwd.is_empty() {
         return Err("the session has no workspace".into());
     }
-    let source = state
-        .host
-        .get_session_run(session_id, &run_id)
+    let source = host
+        .get_session_run(session_id, run_id)
         .map_err(map_err)?
         .ok_or_else(|| "unknown run for this session".to_string())?;
     if source.client_id.as_deref() != Some("mcp") {
@@ -1671,16 +1675,14 @@ pub async fn run_approve(
     if execution.mode != RunExecutionMode::IsolatedWorktree {
         return Err("run used shared execution and cannot be approved".into());
     }
-    let review = state
-        .host
-        .review_run(session_id, &run_id)
-        .map_err(map_err)?;
+    let review = host.review_run(session_id, run_id).map_err(map_err)?;
+    require_complete_reviewable_patch(&review)?;
     orch.approve_run(
         &auth,
         &Uuid::new_v4().to_string(),
         session_id,
         &PathBuf::from(&session.cwd),
-        &run_id,
+        run_id,
         execution.source_fingerprint,
         review.fingerprint,
         review.changed_files,
@@ -1688,11 +1690,24 @@ pub async fn run_approve(
     )
     .await
     .map_err(map_err)?;
-    state
-        .host
-        .get_session_run(session_id, &run_id)
+    host.get_session_run(session_id, run_id)
         .map_err(map_err)?
         .ok_or_else(|| "run disappeared after approval".into())
+}
+
+/// Persist an exact-scope approval for an MCP-owned isolated run. The desktop
+/// uses the same durable approval contract as an external coordinator so an
+/// approval remains visible and valid across restart.
+#[tauri::command]
+pub async fn run_approve(
+    state: State<'_, AppState>,
+    session_id: String,
+    run_id: String,
+    ttl_ms: Option<u64>,
+) -> Result<grokptah_agent_bridge::RunRecord, String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    let (orch, token) = desktop_mcp_orchestration(&state)?;
+    persist_mcp_isolated_run_approval(&state.host, &orch, &token, session_id, &run_id, ttl_ms).await
 }
 
 /// Promote a reviewed isolated run into its unchanged source workspace.
@@ -2391,4 +2406,33 @@ pub fn pty_create_command(
         .pty
         .create_command(&command, cols, rows)
         .map_err(map_err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn review(diff_truncated: bool) -> grokptah_agent_bridge::RunReview {
+        grokptah_agent_bridge::RunReview {
+            changed_files: Vec::new(),
+            diff: "diff --git a/src/lib.rs b/src/lib.rs\n".into(),
+            diff_truncated,
+            fingerprint: "fp".into(),
+        }
+    }
+
+    #[test]
+    fn require_complete_reviewable_patch_rejects_truncated_diff() {
+        let err = require_complete_reviewable_patch(&review(true)).unwrap_err();
+        assert!(
+            err.to_lowercase().contains("truncated"),
+            "expected truncated refusal, got {err}"
+        );
+    }
+
+    #[test]
+    fn require_complete_reviewable_patch_accepts_complete_diff() {
+        require_complete_reviewable_patch(&review(false))
+            .expect("complete review must be accepted");
+    }
 }
