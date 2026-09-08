@@ -4283,6 +4283,10 @@ button:disabled {
   background: rgba(240, 113, 120, 0.08);
 }
 
+.run-promotion-kept {
+  color: var(--muted);
+}
+
 .run-actions {
   display: flex;
   flex-wrap: wrap;

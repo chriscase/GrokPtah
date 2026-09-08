@@ -453,7 +453,8 @@ export type PromotionState =
   | "ready"
   | "promoted"
   | "conflicted"
-  | "discarded";
+  | "discarded"
+  | "kept_for_review";
 
 export interface RunExecution {
   mode: RunExecutionMode;

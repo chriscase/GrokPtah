@@ -122,6 +122,7 @@ const actions = {
   onReview: vi.fn(async () => review),
   onApprove: vi.fn(async () => undefined),
   onPromote: vi.fn(async () => undefined),
+  onKeepForReview: vi.fn(async () => undefined),
   onDiscard: vi.fn(async () => undefined),
   onRetry: vi.fn(async () => undefined),
   onSteer: vi.fn(async () => undefined),
@@ -451,10 +452,12 @@ describe("RunInspector", () => {
 
     expect(screen.getByText(/Isolated · ready/)).toBeTruthy();
     expect(screen.getByText("Isolated worktree", { selector: ".run-execution-mode" })).toBeTruthy();
-    expect(screen.queryByText("Promote reviewed changes")).toBeNull();
+    expect(screen.queryByText("Apply exact reviewed patch")).toBeNull();
+    expect(screen.queryByText("Keep for review")).toBeNull();
     fireEvent.click(screen.getByText("Review diff"));
     expect(await screen.findByText(/1 changed files/)).toBeTruthy();
-    expect(screen.getByText("Promote reviewed changes")).toBeTruthy();
+    expect(screen.getByText("Keep for review")).toBeTruthy();
+    expect(screen.getByText("Apply exact reviewed patch")).toBeTruthy();
     expect(screen.getByText(/diff --git/)).toBeTruthy();
   });
 
@@ -492,9 +495,11 @@ describe("RunInspector", () => {
     );
 
     expect(screen.getByText(/Approval active until/)).toBeTruthy();
-    expect(screen.queryByText("Promote reviewed changes")).toBeNull();
+    expect(screen.queryByText("Apply exact reviewed patch")).toBeNull();
+    expect(screen.queryByText("Keep for review")).toBeNull();
     fireEvent.click(screen.getByText("Review diff"));
-    expect(await screen.findByText("Promote reviewed changes")).toBeTruthy();
+    expect(await screen.findByText("Apply exact reviewed patch")).toBeTruthy();
+    expect(screen.queryByText("Keep for review")).toBeNull();
   });
 
   it("surfaces an isolated promotion conflict as a blocking state", () => {
@@ -589,7 +594,8 @@ describe("RunInspector", () => {
     expect(screen.queryByText("Isolated worktree")).toBeNull();
     expect(screen.queryByLabelText("Filter task runs by source")).toBeNull();
     expect(screen.queryByText("Review diff")).toBeNull();
-    expect(screen.queryByText("Promote reviewed changes")).toBeNull();
+    expect(screen.queryByText("Apply exact reviewed patch")).toBeNull();
+    expect(screen.queryByText("Keep for review")).toBeNull();
     expect(screen.queryByLabelText("Fresh recovery prompt")).toBeNull();
   });
 
@@ -631,7 +637,8 @@ describe("RunInspector", () => {
     expect(screen.queryByText("Handoff")).toBeNull();
     expect(screen.queryByText("Review diff")).toBeNull();
     expect(screen.queryByText("Approve for promotion")).toBeNull();
-    expect(screen.queryByText("Promote reviewed changes")).toBeNull();
+    expect(screen.queryByText("Apply exact reviewed patch")).toBeNull();
+    expect(screen.queryByText("Keep for review")).toBeNull();
     expect(screen.queryByText("Discard")).toBeNull();
     expect(screen.queryByText("Verification: verified")).toBeNull();
     expect(screen.queryByText("Stop cause: token ceiling")).toBeNull();
@@ -676,7 +683,8 @@ describe("RunInspector", () => {
     expect(screen.getByText("Isolated worktree", { selector: ".run-execution-mode" })).toBeTruthy();
     expect(screen.getByLabelText("Filter task runs by source")).toBeTruthy();
     fireEvent.click(screen.getByText("Review diff"));
-    expect(await screen.findByText("Promote reviewed changes")).toBeTruthy();
+    expect(await screen.findByText("Apply exact reviewed patch")).toBeTruthy();
+    expect(screen.getByText("Keep for review")).toBeTruthy();
   });
 
   it("does not replay or render raw remote journal events", async () => {
@@ -744,6 +752,102 @@ describe("RunInspector", () => {
     expect(screen.queryByRole("button", { name: "Retry interrupted run" })).toBeNull();
     expect(screen.queryByText("Review diff")).toBeNull();
     expect(screen.queryByText("Discard")).toBeNull();
+    expect(screen.queryByText("Keep for review")).toBeNull();
+    expect(screen.queryByText("Apply exact reviewed patch")).toBeNull();
     expect(screen.queryByRole("button", { name: "Steer now" })).toBeNull();
+  });
+
+  it("keeps a reviewed local desktop run without applying", async () => {
+    const isolated = run({
+      execution: {
+        mode: "isolated_worktree",
+        sourceWorkspace: "/tmp/demo",
+        executionWorkspace: "/tmp/demo/.grokptah/worktrees/runs/run-1",
+        baseRevision: "base",
+        sourceFingerprint: "source",
+        finalFingerprint: "abc123",
+        promotionState: "ready",
+        promotedAt: null,
+      },
+    });
+    const onKeepForReview = vi.fn(async () => undefined);
+    const onRefresh = vi.fn();
+    render(
+      <RunInspector
+        runs={[isolated]}
+        onRefresh={onRefresh}
+        {...actions}
+        onKeepForReview={onKeepForReview}
+      />,
+    );
+
+    fireEvent.click(screen.getByText("Review diff"));
+    fireEvent.click(await screen.findByRole("button", { name: "Keep for review" }));
+    expect(onKeepForReview).toHaveBeenCalledWith("desktop-run-1");
+    await waitFor(() => expect(onRefresh).toHaveBeenCalledTimes(1));
+  });
+
+  it("does not report keep success when the local action fails", async () => {
+    const isolated = run({
+      execution: {
+        mode: "isolated_worktree",
+        sourceWorkspace: "/tmp/demo",
+        executionWorkspace: "/tmp/demo/.grokptah/worktrees/runs/run-1",
+        baseRevision: "base",
+        sourceFingerprint: "source",
+        finalFingerprint: "abc123",
+        promotionState: "ready",
+        promotedAt: null,
+      },
+    });
+    const onKeepForReview = vi.fn(async () => {
+      throw new Error("isolated worktree changed after review");
+    });
+    const onRefresh = vi.fn();
+    render(
+      <RunInspector
+        runs={[isolated]}
+        onRefresh={onRefresh}
+        {...actions}
+        onKeepForReview={onKeepForReview}
+      />,
+    );
+
+    fireEvent.click(screen.getByText("Review diff"));
+    fireEvent.click(await screen.findByRole("button", { name: "Keep for review" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "isolated worktree changed after review",
+    );
+    expect(onRefresh).not.toHaveBeenCalled();
+  });
+
+  it("hides mutation controls after keep for review", () => {
+    render(
+      <RunInspector
+        runs={[
+          run({
+            execution: {
+              mode: "isolated_worktree",
+              sourceWorkspace: "/tmp/demo",
+              executionWorkspace: "/tmp/demo/.grokptah/worktrees/runs/run-1",
+              baseRevision: "base",
+              sourceFingerprint: "source",
+              finalFingerprint: "abc123",
+              promotionState: "kept_for_review",
+              promotedAt: null,
+            },
+          }),
+        ]}
+        onRefresh={vi.fn()}
+        {...actions}
+      />,
+    );
+
+    expect(screen.getByText(/Isolated · kept for review/)).toBeTruthy();
+    expect(screen.getByText(/Exact reviewed patch retained/)).toBeTruthy();
+    expect(screen.queryByText("Keep for review")).toBeNull();
+    expect(screen.queryByText("Apply exact reviewed patch")).toBeNull();
+    expect(screen.queryByText("Discard")).toBeNull();
+    expect(screen.queryByText("Review diff")).toBeNull();
   });
 });

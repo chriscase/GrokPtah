@@ -131,6 +131,11 @@ pub enum RunExecutionMode {
     IsolatedWorktree,
 }
 
+/// Durable isolated-run disposition recorded on `RunRecord`.
+///
+/// `Promoted` (apply), `Discarded`, and `KeptForReview` are terminal and
+/// mutually exclusive. Keep retains the registered worktree and exact reviewed
+/// patch without writing the source workspace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PromotionState {
@@ -141,6 +146,7 @@ pub enum PromotionState {
     Promoted,
     Conflicted,
     Discarded,
+    KeptForReview,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2219,5 +2225,23 @@ mod tests {
         let encoded = serde_json::to_vec(&plan).unwrap();
         let decoded: AgentResumePlan = serde_json::from_slice(&encoded).unwrap();
         assert!(decoded.validate_for(session_id, "/tmp/project").is_ok());
+    }
+
+    #[test]
+    fn kept_for_review_is_a_durable_terminal_promotion_state() {
+        let encoded = serde_json::to_string(&PromotionState::KeptForReview).unwrap();
+        assert_eq!(encoded, "\"kept_for_review\"");
+        let decoded: PromotionState = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, PromotionState::KeptForReview);
+        assert_ne!(PromotionState::KeptForReview, PromotionState::Promoted);
+        assert_ne!(PromotionState::KeptForReview, PromotionState::Discarded);
+        assert_ne!(PromotionState::KeptForReview, PromotionState::Ready);
+    }
+
+    #[test]
+    fn keep_for_review_is_not_an_mcp_control_tool() {
+        assert!(!CONTROL_TOOLS.contains(&"ptah_keep_run"));
+        assert!(!CONTROL_TOOLS.contains(&"ptah_keep_run_for_review"));
+        assert!(!CONTROL_TOOLS.iter().any(|tool| tool.contains("keep")));
     }
 }

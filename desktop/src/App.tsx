@@ -4626,6 +4626,11 @@ export default function App() {
                 if (!activeSessionId) throw new Error("No active session");
                 await api.runPromote(activeSessionId, runId);
               }}
+              onKeepForReview={async (runId) => {
+                if (remoteServiceStatus.connected) throw new Error("Remote keep for review is not available in this view");
+                if (!activeSessionId) throw new Error("No active session");
+                await api.runKeepForReview(activeSessionId, runId);
+              }}
               onDiscard={async (runId) => {
                 if (remoteServiceStatus.connected) throw new Error("Remote discard is not available in this view");
                 if (!activeSessionId) throw new Error("No active session");

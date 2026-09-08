@@ -29,6 +29,7 @@ type RunInspectorProps = {
   onReview: (runId: string) => Promise<RunReview>;
   onApprove: (runId: string) => Promise<void>;
   onPromote: (runId: string) => Promise<void>;
+  onKeepForReview: (runId: string) => Promise<void>;
   onDiscard: (runId: string) => Promise<void>;
   onRetry: (runId: string, prompt: string) => Promise<void>;
   onSteer: (runId: string, text: string) => Promise<void>;
@@ -183,6 +184,7 @@ export function RunInspector({
   onReview,
   onApprove,
   onPromote,
+  onKeepForReview,
   onDiscard,
   onRetry,
   onSteer,
@@ -277,6 +279,19 @@ export function RunInspector({
     setActionError(null);
     try {
       await onApprove(runId);
+      onRefresh();
+    } catch (error) {
+      setActionError(String(error));
+    } finally {
+      setReviewing(null);
+    }
+  }
+
+  async function keepForReview(runId: string) {
+    setReviewing(runId);
+    setActionError(null);
+    try {
+      await onKeepForReview(runId);
       onRefresh();
     } catch (error) {
       setActionError(String(error));
@@ -806,6 +821,12 @@ export function RunInspector({
                           Discard this run and start a fresh isolated attempt.
                         </div>
                       )}
+                      {run.execution.promotionState === "kept_for_review" && (
+                        <div className="run-callout run-promotion-kept" role="status">
+                          Exact reviewed patch retained in the isolated worktree. Source workspace
+                          was not written.
+                        </div>
+                      )}
                       <div className="run-actions">
                         {run.execution.promotionState === "ready" && (
                           <button
@@ -834,6 +855,18 @@ export function RunInspector({
                           )}
                         {run.execution.promotionState === "ready" &&
                           reviews[run.runId] &&
+                          run.clientId === "desktop" && (
+                            <button
+                              type="button"
+                              className="composer-chip"
+                              onClick={() => void keepForReview(run.runId)}
+                              disabled={reviewing === run.runId}
+                            >
+                              {reviewing === run.runId ? "Keeping…" : "Keep for review"}
+                            </button>
+                          )}
+                        {run.execution.promotionState === "ready" &&
+                          reviews[run.runId] &&
                           (!requiresDurableApproval || approvalActive) && (
                             <button
                               type="button"
@@ -841,11 +874,12 @@ export function RunInspector({
                               onClick={() => void promote(run.runId)}
                               disabled={reviewing === run.runId}
                             >
-                              Promote reviewed changes
+                              Apply exact reviewed patch
                             </button>
                           )}
                         {run.execution.promotionState !== "promoted" &&
-                          run.execution.promotionState !== "discarded" && (
+                          run.execution.promotionState !== "discarded" &&
+                          run.execution.promotionState !== "kept_for_review" && (
                             <button
                               type="button"
                               className="composer-chip quiet"

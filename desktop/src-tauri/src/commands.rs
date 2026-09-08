@@ -1718,6 +1718,18 @@ pub async fn run_promote(
     .await
 }
 
+/// Keep a reviewed local isolated run without writing the source workspace.
+#[tauri::command]
+pub async fn run_keep_for_review(
+    state: State<'_, AppState>,
+    session_id: String,
+    run_id: String,
+) -> Result<grokptah_agent_bridge::RunRecord, String> {
+    let host = state.host.clone();
+    let id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    run_blocking(move || host.keep_run_for_review(id, &run_id).map_err(map_err)).await
+}
+
 /// Discard an isolated run and remove only its managed worktree.
 #[tauri::command]
 pub async fn run_discard(
