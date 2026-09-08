@@ -27,6 +27,21 @@ pub struct GuestFrame {
     pub epoch: u64,
     pub digest: String,
     pub guest_button_pressed: bool,
+    /// Contained Browser captured-frame metadata. Absent on synthetic-harness
+    /// backends that still use label digests. Never contains raw frame bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub captured_frame: Option<crate::captured_frame::CapturedFrameEvidence>,
+}
+
+impl GuestFrame {
+    pub fn new(epoch: u64, digest: impl Into<String>, guest_button_pressed: bool) -> Self {
+        Self {
+            epoch,
+            digest: digest.into(),
+            guest_button_pressed,
+            captured_frame: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,11 +98,11 @@ impl SyntheticGuest {
     }
 
     pub fn current_frame(&self) -> GuestFrame {
-        GuestFrame {
-            epoch: self.frame_epoch,
-            digest: frame_digest(self.frame_epoch, self.guest_button_pressed),
-            guest_button_pressed: self.guest_button_pressed,
-        }
+        GuestFrame::new(
+            self.frame_epoch,
+            frame_digest(self.frame_epoch, self.guest_button_pressed),
+            self.guest_button_pressed,
+        )
     }
 
     pub fn inject(&mut self, action: GuestLocalAction) -> HarnessResult<InjectOutcome> {

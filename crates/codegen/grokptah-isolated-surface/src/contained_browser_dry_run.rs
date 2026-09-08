@@ -6,6 +6,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::captured_frame::CapturedFramePair;
 use crate::contained_browser::ContainedBrowserBackend;
 use crate::error::{HarnessError, HarnessErrorCode, HarnessResult};
 use crate::harness::IsolatedSurfaceHarness;
@@ -55,6 +56,9 @@ pub struct ContainedBrowserDryRunEvidence {
     pub vf_pass_claimed: bool,
     pub nonclaim: String,
     pub sealed_evidence: Option<SealedProofEvidence>,
+    /// Public captured-frame metadata from a completed postcondition. Never raw bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub captured_frames: Option<CapturedFramePair>,
     pub recorded_at: DateTime<Utc>,
 }
 
@@ -143,6 +147,7 @@ fn run_contained_browser_engine_unavailable(
         vf_pass_claimed: false,
         nonclaim: CONTAINED_BROWSER_DRY_RUN_NONCLAIM.into(),
         sealed_evidence: None,
+        captured_frames: None,
         recorded_at: Utc::now(),
     })
 }
@@ -160,7 +165,7 @@ fn run_contained_browser_simulator_checklist(
         harness = harness.with_snapshot_root(root);
     }
 
-    let sealed = run_contained_browser_checklist(&mut harness, None)?;
+    let (sealed, captured_frames) = run_contained_browser_checklist(&mut harness, None)?;
 
     Ok(ContainedBrowserDryRunEvidence {
         platform: ContainedBrowserDryRunPlatform::SimulatorSubstrate,
@@ -171,6 +176,7 @@ fn run_contained_browser_simulator_checklist(
         vf_pass_claimed: false,
         nonclaim: CONTAINED_BROWSER_DRY_RUN_NONCLAIM.into(),
         sealed_evidence: Some(sealed),
+        captured_frames: Some(captured_frames),
         recorded_at: Utc::now(),
     })
 }
@@ -179,7 +185,7 @@ fn run_contained_browser_simulator_checklist(
 fn run_contained_browser_checklist(
     harness: &mut IsolatedSurfaceHarness<ContainedBrowserBackend>,
     fault_case: Option<FaultMatrixCase>,
-) -> HarnessResult<SealedProofEvidence> {
+) -> HarnessResult<(SealedProofEvidence, CapturedFramePair)> {
     let declared_class = harness.evidence_class();
     assert_evidence_class_unchanged(declared_class, ProofEvidenceClass::ContainedBrowser)?;
 
@@ -201,11 +207,16 @@ fn run_contained_browser_checklist(
     steps.push(ChecklistStep::GuestLocalActionMarkedPossible);
 
     let after = harness.observe_frame()?;
-    if !delta.guest_local_change || before.digest == after.digest {
+    crate::captured_frame::assert_postcondition_change(&before, &after)?;
+    if !delta.guest_local_change {
         return Err(HarnessError::invalid_state(
             "postcondition requires guest-local frame change",
         ));
     }
+    let captured_frames = CapturedFramePair {
+        before: crate::captured_frame::require_frame_for_postcondition(&before)?.clone(),
+        after: crate::captured_frame::require_frame_for_postcondition(&after)?.clone(),
+    };
     steps.push(ChecklistStep::PostconditionVerified);
 
     let stop_evidence = harness.stop()?;
@@ -224,14 +235,17 @@ fn run_contained_browser_checklist(
     assert_evidence_class_unchanged(declared_class, harness.evidence_class())?;
     steps.push(ChecklistStep::EvidenceSealed);
 
-    Ok(SealedProofEvidence {
-        evidence_class: declared_class,
-        stop_evidence,
-        checklist_steps: steps,
-        fault_matrix_case: fault_case,
-        sealed_at: Utc::now(),
-        nonclaim: CONTAINED_BROWSER_DRY_RUN_NONCLAIM.into(),
-    })
+    Ok((
+        SealedProofEvidence {
+            evidence_class: declared_class,
+            stop_evidence,
+            checklist_steps: steps,
+            fault_matrix_case: fault_case,
+            sealed_at: Utc::now(),
+            nonclaim: CONTAINED_BROWSER_DRY_RUN_NONCLAIM.into(),
+        },
+        captured_frames,
+    ))
 }
 
 #[cfg(not(feature = "browser-engine"))]

@@ -6,6 +6,9 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::captured_frame::{
+    validate_public_evidence, CapturedFrameMediaKind, CapturedFrameSource,
+};
 use crate::contained_browser_dry_run::ContainedBrowserDryRunEvidence;
 use crate::lifecycle::{GuestLifecycleDisposition, ProofEvidenceClass};
 use crate::proof_sequencer::{ChecklistStep, FaultMatrixCase, SealedProofEvidence};
@@ -123,6 +126,7 @@ pub enum EvidenceVerifierCode {
     HostSentinelProbeSummaryMismatch,
     PackSealedEvidenceMismatch,
     SubstrateNestedEvidenceMissing,
+    CapturedFrameEvidenceInvalid,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -315,6 +319,10 @@ pub fn verify_evidence_pack(pack: &Sep18EvidencePack) -> EvidenceVerifierDecisio
     }
 
     if let Some(decision) = verify_pack_level_uncertain_triggers(pack) {
+        return decision;
+    }
+
+    if let Some(decision) = verify_captured_frame_pack(pack) {
         return decision;
     }
 
@@ -1013,6 +1021,55 @@ fn verify_substrate_evidence_class(pack: &Sep18EvidencePack) -> Option<EvidenceV
     None
 }
 
+fn verify_captured_frame_pack(pack: &Sep18EvidencePack) -> Option<EvidenceVerifierDecision> {
+    let cb = pack.contained_browser.as_ref()?;
+
+    let postcondition_verified = cb.sealed_evidence.as_ref().is_some_and(|sealed| {
+        sealed
+            .checklist_steps
+            .contains(&ChecklistStep::PostconditionVerified)
+    });
+
+    if postcondition_verified && cb.captured_frames.is_none() {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::CapturedFrameEvidenceInvalid,
+            "PostconditionVerified requires sealed captured-frame metadata",
+        ));
+    }
+
+    let frames = cb.captured_frames.as_ref()?;
+
+    if let Err(err) = validate_public_evidence(&frames.before) {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::CapturedFrameEvidenceInvalid,
+            format!("before captured-frame evidence is invalid: {}", err.message),
+        ));
+    }
+    if let Err(err) = validate_public_evidence(&frames.after) {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::CapturedFrameEvidenceInvalid,
+            format!("after captured-frame evidence is invalid: {}", err.message),
+        ));
+    }
+    if frames.before.source != CapturedFrameSource::SyntheticSimulator
+        || frames.after.source != CapturedFrameSource::SyntheticSimulator
+        || frames.before.media_kind != CapturedFrameMediaKind::SyntheticPayload
+        || frames.after.media_kind != CapturedFrameMediaKind::SyntheticPayload
+    {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::CapturedFrameEvidenceInvalid,
+            "sealed captured-frame source must remain synthetic simulator payload",
+        ));
+    }
+    if frames.before.digest == frames.after.digest || frames.before.epoch >= frames.after.epoch {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::CapturedFrameEvidenceInvalid,
+            "sealed captured-frame pair must record a truthful epoch and digest change",
+        ));
+    }
+    None
+}
+
 fn expected_nonclaim(pack: &Sep18EvidencePack) -> String {
     match pack.substrate {
         Sep18ChecklistSubstrate::ContainedBrowserDryRun => {
@@ -1149,6 +1206,7 @@ pub fn verifier_exit_code(decision: &EvidenceVerifierDecision) -> i32 {
             EvidenceVerifierCode::HostSentinelProbeSummaryMismatch => 23,
             EvidenceVerifierCode::PackSealedEvidenceMismatch => 24,
             EvidenceVerifierCode::SubstrateNestedEvidenceMissing => 25,
+            EvidenceVerifierCode::CapturedFrameEvidenceInvalid => 26,
         }
     }
 }

@@ -119,6 +119,7 @@ fn run_contained_browser(
                     vf_pass_claimed: false,
                     nonclaim: sealed.nonclaim.clone(),
                     sealed_evidence: Some(sealed),
+                    captured_frames: None,
                     recorded_at: chrono::Utc::now(),
                 };
                 evidence.checklist_completed = evidence

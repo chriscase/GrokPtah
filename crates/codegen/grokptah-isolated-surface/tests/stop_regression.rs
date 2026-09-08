@@ -290,19 +290,11 @@ fn stop_fence_first_order_preserved_before_teardown() {
 
         fn boot(&mut self) -> HarnessResult<GuestFrame> {
             self.booted = true;
-            Ok(GuestFrame {
-                epoch: 1,
-                digest: "order-test".into(),
-                guest_button_pressed: false,
-            })
+            Ok(GuestFrame::new(1, "order-test", false))
         }
 
         fn observe_frame(&self) -> HarnessResult<GuestFrame> {
-            Ok(GuestFrame {
-                epoch: 1,
-                digest: "order-test".into(),
-                guest_button_pressed: false,
-            })
+            Ok(GuestFrame::new(1, "order-test", false))
         }
 
         fn inject_guest_local(
@@ -372,19 +364,11 @@ fn unimplemented_stop_fence_cannot_claim_fence_ack() {
 
         fn boot(&mut self) -> HarnessResult<GuestFrame> {
             self.booted = true;
-            Ok(GuestFrame {
-                epoch: 1,
-                digest: "unimplemented-fence".into(),
-                guest_button_pressed: false,
-            })
+            Ok(GuestFrame::new(1, "unimplemented-fence", false))
         }
 
         fn observe_frame(&self) -> HarnessResult<GuestFrame> {
-            Ok(GuestFrame {
-                epoch: 1,
-                digest: "unimplemented-fence".into(),
-                guest_button_pressed: false,
-            })
+            Ok(GuestFrame::new(1, "unimplemented-fence", false))
         }
 
         fn inject_guest_local(

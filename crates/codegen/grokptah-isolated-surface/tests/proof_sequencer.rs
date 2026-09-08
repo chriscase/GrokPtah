@@ -341,12 +341,24 @@ fn sep18_contained_browser_dry_run_simulator_on_linux_ci() {
     assert!(evidence.nonclaim.contains("not isolation PASS"));
     assert!(!grokptah_isolated_surface::isolated_surface_admission_available());
 
+    let frames = evidence.captured_frames.clone().expect("captured frames");
     let sealed = evidence.sealed_evidence.expect("sealed checklist");
     assert_eq!(sealed.evidence_class, ProofEvidenceClass::ContainedBrowser);
     assert!(!sealed.evidence_class.is_vf_qualification_eligible());
     assert!(sealed
         .checklist_steps
         .contains(&ChecklistStep::EvidenceSealed));
+    assert!(grokptah_isolated_surface::is_canonical_sha256_digest(
+        &frames.before.digest
+    ));
+    assert!(grokptah_isolated_surface::is_canonical_sha256_digest(
+        &frames.after.digest
+    ));
+    assert_ne!(frames.before.digest, frames.after.digest);
+    assert_eq!(
+        frames.before.source,
+        grokptah_isolated_surface::CapturedFrameSource::SyntheticSimulator
+    );
 }
 
 #[cfg(not(feature = "browser-engine"))]

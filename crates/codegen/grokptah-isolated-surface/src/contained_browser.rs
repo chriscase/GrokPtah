@@ -9,6 +9,7 @@
 //! substrate still fails closed until a real isolated browser engine is wired.
 
 use crate::backend::IsolatedSurfaceBackend;
+use crate::captured_frame::BoundedCapturedFrame;
 use crate::error::{HarnessError, HarnessResult};
 use crate::lifecycle::ProofEvidenceClass;
 use crate::simulator::{GuestFrame, GuestLocalAction, InjectOutcome};
@@ -80,12 +81,14 @@ impl ContainedBrowserBackend {
         self.crash_on_next_inject = true;
     }
 
-    fn current_frame(&self) -> GuestFrame {
-        GuestFrame {
-            epoch: self.frame_epoch,
-            digest: browser_frame_digest(self.frame_epoch, self.guest_link_clicked),
-            guest_button_pressed: self.guest_link_clicked,
-        }
+    fn current_capture(&self) -> HarnessResult<BoundedCapturedFrame> {
+        BoundedCapturedFrame::admit_simulator_capture(self.frame_epoch, self.guest_link_clicked)
+    }
+
+    fn current_frame(&self) -> HarnessResult<GuestFrame> {
+        Ok(self
+            .current_capture()?
+            .to_guest_frame(self.guest_link_clicked))
     }
 
     fn fence_inject(&mut self) {
@@ -98,7 +101,7 @@ impl ContainedBrowserBackend {
         }
         self.booted = true;
         self.frame_epoch = 1;
-        Ok(self.current_frame())
+        self.current_frame()
     }
 
     fn inject_browser_local(&mut self, action: GuestLocalAction) -> HarnessResult<InjectOutcome> {
@@ -120,7 +123,7 @@ impl ContainedBrowserBackend {
             return Ok(InjectOutcome::Uncertain);
         }
 
-        let before = self.current_frame();
+        let before = self.current_frame()?;
         match action {
             GuestLocalAction::ClickGuestButton => {
                 // Guest-local link click inside contained browser DOM only.
@@ -131,7 +134,7 @@ impl ContainedBrowserBackend {
             }
         }
         self.frame_epoch = self.frame_epoch.saturating_add(1);
-        let after = self.current_frame();
+        let after = self.current_frame()?;
         let guest_local_change = before.digest != after.digest;
         Ok(InjectOutcome::Changed(crate::simulator::FrameDelta {
             before_epoch: before.epoch,
@@ -160,14 +163,6 @@ fn default_substrate_mode() -> SubstrateMode {
     }
 }
 
-fn browser_frame_digest(epoch: u64, guest_link_clicked: bool) -> String {
-    format!(
-        "sha256:contained-browser-frame:{epoch}:link={guest_link_clicked}",
-        epoch = epoch,
-        guest_link_clicked = guest_link_clicked
-    )
-}
-
 impl IsolatedSurfaceBackend for ContainedBrowserBackend {
     fn evidence_class(&self) -> ProofEvidenceClass {
         ProofEvidenceClass::ContainedBrowser
@@ -187,7 +182,7 @@ impl IsolatedSurfaceBackend for ContainedBrowserBackend {
         if !self.booted {
             return Err(HarnessError::invalid_state("browser guest is not booted"));
         }
-        Ok(self.current_frame())
+        self.current_frame()
     }
 
     fn inject_guest_local(&mut self, action: GuestLocalAction) -> HarnessResult<InjectOutcome> {
@@ -232,15 +227,26 @@ mod tests {
 
         let frame = backend.boot().expect("boot");
         assert_eq!(frame.epoch, 1);
+        assert!(crate::captured_frame::is_canonical_sha256_digest(
+            &frame.digest
+        ));
+        assert_eq!(
+            frame.captured_frame.as_ref().map(|ev| ev.source),
+            Some(crate::captured_frame::CapturedFrameSource::SyntheticSimulator)
+        );
         assert!(backend.is_booted());
 
         let observed = backend.observe_frame().expect("observe");
         assert_eq!(observed.epoch, 1);
+        assert_eq!(observed.digest, frame.digest);
 
         let outcome = backend
             .inject_guest_local(GuestLocalAction::ClickGuestButton)
             .expect("inject");
         assert!(matches!(outcome, InjectOutcome::Changed(_)));
+        let after = backend.observe_frame().expect("after");
+        assert_ne!(after.digest, frame.digest);
+        crate::captured_frame::assert_postcondition_change(&frame, &after).expect("postcondition");
 
         backend.stop_fence_first().expect("fence");
         backend.destroy().expect("destroy");
