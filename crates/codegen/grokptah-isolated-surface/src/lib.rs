@@ -5,6 +5,7 @@
 //! qualification from Linux CI or simulator evidence alone.
 
 mod backend;
+mod captured_frame;
 mod channels;
 mod checklist_runner;
 mod contained_browser;
@@ -27,6 +28,14 @@ mod vf_dry_run;
 pub use backend::{
     assert_evidence_class_unchanged, honest_harness_evidence_class, IsolatedSurfaceBackend,
     VfLaunchReceipt,
+};
+pub use captured_frame::{
+    admit_browser_engine_capture, admit_captured_frame_with_claimed_digest,
+    assert_postcondition_change, canonical_sha256_digest, is_canonical_sha256_digest,
+    require_frame_for_postcondition, simulator_synthetic_frame_bytes, BoundedCapturedFrame,
+    CapturedFrameEvidence, CapturedFrameMediaKind, CapturedFramePair, CapturedFrameSource,
+    MAX_CAPTURED_FRAME_BYTES, SYNTHETIC_FRAME_HEIGHT, SYNTHETIC_FRAME_PAYLOAD_NEEDLE,
+    SYNTHETIC_FRAME_WIDTH,
 };
 pub use channels::ChannelRegistry;
 pub use checklist_runner::{

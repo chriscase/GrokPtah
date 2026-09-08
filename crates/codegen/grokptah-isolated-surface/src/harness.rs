@@ -375,6 +375,9 @@ impl<B: IsolatedSurfaceBackend> IsolatedSurfaceHarness<B> {
         let before = self.observe_frame()?;
         let delta = self.inject_guest_action(GuestLocalAction::ClickGuestButton)?;
         let after = self.observe_frame()?;
+        if before.captured_frame.is_some() || after.captured_frame.is_some() {
+            crate::captured_frame::assert_postcondition_change(&before, &after)?;
+        }
         if !delta.guest_local_change || before.digest == after.digest {
             return Err(HarnessError::invalid_state(
                 "canonical proof requires a guest-local frame change",

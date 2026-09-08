@@ -2,7 +2,7 @@
 
 This document inventories the current `main` Computer Use / isolated-guest code,
 defines the synthetic proof harness, and maps it to the Sep 5–18 2026 calendar
-(Phase-1 packet 4: Contained Browser substrate v0 behind SPI). It does **not**
+(Phase-1 packet 9: honest Contained Browser captured-frame hashes). It does **not**
 claim packaged Virtualization.framework qualification from Linux CI or dry-run
 artifacts.
 
@@ -21,10 +21,11 @@ surface), [#267](https://github.com/chriscase/GrokPtah/issues/267) (epic).
 | Sep 6–12 | Packet 5 — Sep 18 checklist runner + evidence-pack verifier (#547) | **Landed** — `grokptah-sep18-checklist` CLI, sealed pack + independent verifier |
 | Sep 6–12 | Packet 6 — Harness Stop honesty (#548) | **Landed** — Stop cleanup survives disk/audit failure; `Destroyed` is confirmed-only |
 | Sep 6–12 | Packet 7 — `stop_fence_first` no default (#549) | **Landed** — trait default removed; production adapters must fence with ack/failure |
-| Sep 6–12 | Packet 8 — Mac host sentinel provenance (#TBD) | **This slice** — `MacHostSentinelCollector::collect()` wired; synthetic self-compare ineligible for physical markers |
+| Sep 6–12 | Packet 8 — Mac host sentinel provenance (#550) | **Landed** — `MacHostSentinelCollector::collect()` wired; synthetic self-compare ineligible for physical markers |
+| Sep 6–12 | Packet 9 — Honest Contained Browser captured-frame hashes | **This slice** — `GuestFrame.digest` is `sha256:<64 hex>` over bounded capture bytes; simulator payloads labeled synthetic |
 | Sep 18 | Physical Mac gate | VF PASS or honest Contained Browser pivot |
 
-## Exact-main inventory (base `c22faa9c0479dab8a96503d6c15c3bdf76964ec1` + packet 8)
+## Exact-main inventory (base `40e2b5d70b2ef616ed0e8f9830f9890859b5a7ee` + packet 9)
 
 ### Already satisfies Windowed Coding Run noninterference (semantic macOS path)
 
@@ -48,6 +49,7 @@ surface), [#267](https://github.com/chriscase/GrokPtah/issues/267) (epic).
 | `IsolatedSurfaceBackend` SPI | `backend.rs` — boot / observe_frame / inject_guest_local / stop_fence_first / destroy |
 | Synthetic backend (SPI impl) | `simulator.rs` — `SyntheticGuest` |
 | Contained Browser substrate v0 (simulator) | `contained_browser.rs` — honest `ContainedBrowser` label, browser-only lifecycle, not isolation PASS |
+| Content-addressed captured-frame seam | `captured_frame.rs` — digest from bounded bytes only; public metadata is length/source/media/dimensions |
 | Contained Browser dry-run sequencer path | `contained_browser_dry_run.rs` + `Sep18NoModelProofSequencer::run_contained_browser_dry_run` |
 | Contained Browser fault matrix | `run_contained_browser_fault_matrix` — bounded fault cuts on CB substrate |
 | Contained Browser regression | `tests/contained_browser_regression.rs` |
@@ -65,6 +67,7 @@ surface), [#267](https://github.com/chriscase/GrokPtah/issues/267) (epic).
 | Sealed evidence pack + verifier | `evidence_pack.rs` — independent accept/reject with explicit codes |
 | Checklist CLI | `src/bin/grokptah-sep18-checklist.rs` — `run` + `verify` subcommands |
 | Evidence-pack verifier tests | `tests/evidence_pack_verifier.rs` — happy path + tamper rejection |
+| Captured-frame adversarial tests | `tests/captured_frame_evidence.rs` — digest recomputation, tamper/oversize, no raw-byte leak |
 
 ### Lifecycle phases
 
@@ -118,6 +121,28 @@ Linux CI never produces `VirtualizationFramework` PASS. VF dry-run artifacts car
 `VF_DRY_RUN_NONCLAIM` and set `physical_pass_claimed: false`. Contained Browser
 dry-run artifacts carry `CONTAINED_BROWSER_DRY_RUN_NONCLAIM` and set
 `isolation_pass_claimed: false`.
+
+### Contained Browser captured-frame hashes (packet 9)
+
+Every Contained Browser `GuestFrame.digest` is canonical `sha256:` + 64 lowercase
+hex computed from the **exact bounded capture bytes**. Digests are never built
+from labels, booleans, paths, or caller-provided digest claims.
+
+Public/sealed metadata is limited to byte length, source/media classification, and
+fixed simulator dimensions. Raw frame bytes must not appear in `GuestFrame` JSON,
+sealed packs, snapshots, logs, or error strings.
+
+The default simulator emits deterministic explicit synthetic payload bytes for CI,
+labeled `synthetic_simulator` / `synthetic_payload`. That is **not** a real browser
+capture and does **not** change `CONTAINED_BROWSER_DRY_RUN_NONCLAIM`.
+
+The optional `browser-engine` feature stays fail-closed: this slice does not wire an
+engine capture, fabricate an engine receipt, emit native/physical markers, or claim
+PASS. Admission and Computer Mode stay false.
+
+Empty, oversized, malformed, caller-digest, one-byte-tampered, stale/misbound, and
+source-upgraded frames are rejected before postcondition evidence can be sealed.
+Epoch still increments on inject; digest change tracks captured-byte change.
 
 Bridge admission `isolated_surface_admission_available()` remains **false**.
 
@@ -208,6 +233,7 @@ cargo run --locked --manifest-path crates/codegen/grokptah-isolated-surface/Carg
 - `admission_available`: **false** (verifier rejects `true`)
 - `host_sentinel_probes`: probe counts + channel teardown summary from Stop evidence
 - `sealed_evidence`: checklist steps + Stop/Uncertain disposition when checklist completes
+- `contained_browser.captured_frames`: public before/after hashes (byte length, source, dimensions) — never raw bytes
 
 ### Verifier reject codes (subset)
 
@@ -223,6 +249,7 @@ cargo run --locked --manifest-path crates/codegen/grokptah-isolated-surface/Carg
 | `host_sentinel_probe_summary_mismatch` | Pack probe summary ≠ sealed `stop_evidence` |
 | `substrate_nested_evidence_missing` | CB pack sealed without nested `contained_browser.sealed_evidence` |
 | `pack_sealed_evidence_mismatch` | Pack vs nested CB sealed copies differ |
+| `captured_frame_evidence_invalid` | Missing, non-canonical, source-upgraded, or non-changing sealed captured-frame metadata |
 
 Maps to Astra Sep 18 one-Mac checklist steps 1–11: runner exercises steps 2–10 on
 simulator substrate; verifier is the independent gate for sealed artifacts before
@@ -297,6 +324,9 @@ cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Car
 cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Cargo.toml \
   --test evidence_pack_verifier -- --test-threads=1
 
+cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Cargo.toml \
+  --test captured_frame_evidence -- --test-threads=1
+
 # Checklist runner CLI smoke (CB default)
 cargo run --locked --manifest-path crates/codegen/grokptah-isolated-surface/Cargo.toml \
   --bin grokptah-sep18-checklist -- run -o /tmp/sep18-evidence-pack.json
@@ -313,7 +343,7 @@ cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Car
   --features vf-backend --test proof_sequencer sep18_vf_dry_run -- --test-threads=1
 ```
 
-## Residuals (honest, post-packet-8)
+## Residuals (honest, post-packet-9)
 
 - `IsolatedSurfaceBackend::stop_fence_first` has no trait default — production adapters must wire real fence ack/failure.
 - `MacHostSentinelCollector` requires macOS Accessibility trust for foreground/unrelated window evidence; missing TCC → honest `BackendUnavailable`, not synthetic PASS.
@@ -322,7 +352,8 @@ cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Car
 - Checklist runner seals dry-run packs only — no live Mac VF IPC or packaged helper.
 - Independent verifier is pack-only; physical Mac worker still required for VF PASS rung.
 - Contained Browser substrate v0 uses an in-process simulator — not a real isolated browser engine.
-- Optional `browser-engine` feature fails closed until native engine wiring lands.
+- Simulator captured-frame bytes are explicit synthetic payloads, content-addressed and labeled synthetic — not a real browser capture.
+- Optional `browser-engine` feature fails closed until a bounded engine capture is actually wired; this slice fabricates no engine receipt or PASS.
 - No TCC entitlement or notarization claims.
 - No Windows/Linux isolated surface.
 - No agent-owned cursor / surface-event stream (#286 UI layer still disposition-only).
@@ -337,3 +368,4 @@ cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Car
 - Synthetic harness success does **not** enable isolated visual Computer Use in production.
 - [`SyntheticHostProbe`] self-compare does **not** qualify as physical Mac host sentinel collection.
 - `ContainedBrowser` substrate v0 does **not** prove browser isolation — only exercises the SPI lifecycle on a simulator.
+- Simulator captured-frame hashes are **not** a real browser capture; they content-address labeled synthetic payload bytes.

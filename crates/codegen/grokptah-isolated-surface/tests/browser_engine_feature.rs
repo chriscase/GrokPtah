@@ -27,6 +27,7 @@ fn browser_engine_boot_fails_closed() {
     let err = backend.boot().expect_err("engine boot fails closed");
     assert_eq!(err.code, HarnessErrorCode::BackendUnavailable);
     assert!(!backend.is_booted());
+    assert!(grokptah_isolated_surface::admit_browser_engine_capture(vec![1, 2, 3], 8, 8).is_err());
 }
 
 #[test]
