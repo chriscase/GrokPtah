@@ -4569,6 +4569,7 @@ export default function App() {
         {rightTab === "tasks" && (
           <>
             <RunInspector
+              key={`runs:${runScope.laneId ?? ""}:${runScope.workspacePath ?? ""}:${remoteServiceStatus.connected ? "remote" : "local"}`}
               scope={runScope}
               laneTitle={
                 executionTarget === "remote" && selectedRemoteLane

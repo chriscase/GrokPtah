@@ -5,9 +5,9 @@ use grokptah_agent_bridge::{
     ComputerPermissionStatus, ComputerPlatformStatus, ComputerTargetCandidate, EffortLevel,
     JournalPage, McpServerInfo, ModelInfo, PermissionDecision, PluginInfo, PromptQueueEntry,
     PromptQueueRunNextResult, PromptQueueSnapshot, PromptQueueTakeResult, ProviderDeadlineClass,
-    ProviderProfileUpdate, ProviderQualificationReport, RunExecutionMode, RunReview, RunState,
-    SearchHit, SearchQuery, SessionCompletion, SessionKind, SessionSummary, SkillInfo,
-    SteeringReceipt, SubagentInfo, TranscriptEntry, WorkspaceUiState, BRIDGE_VERSION, PRODUCT_NAME,
+    ProviderProfileUpdate, ProviderQualificationReport, RunExecutionMode, RunState, SearchHit,
+    SearchQuery, SessionCompletion, SessionKind, SessionSummary, SkillInfo, SteeringReceipt,
+    SubagentInfo, TranscriptEntry, WorkspaceUiState, BRIDGE_VERSION, PRODUCT_NAME,
 };
 use tauri::{AppHandle, State};
 use tauri_plugin_dialog::DialogExt;
@@ -1624,16 +1624,17 @@ pub async fn run_events(
     .await
 }
 
-/// Read the bounded diff for a completed isolated run.
+/// Read the bounded diff for a completed isolated run, including current
+/// kept-run retention verification when applicable.
 #[tauri::command]
 pub async fn run_review(
     state: State<'_, AppState>,
     session_id: String,
     run_id: String,
-) -> Result<RunReview, String> {
+) -> Result<serde_json::Value, String> {
     let host = state.host.clone();
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
-    run_blocking(move || host.review_run(id, &run_id).map_err(map_err)).await
+    run_blocking(move || host.review_run_view(id, &run_id).map_err(map_err)).await
 }
 
 /// Persist an exact-scope approval for an MCP-owned isolated run. The desktop

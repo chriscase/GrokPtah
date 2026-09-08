@@ -135,7 +135,11 @@ pub enum RunExecutionMode {
 ///
 /// `Promoted` (apply), `Discarded`, and `KeptForReview` are terminal and
 /// mutually exclusive. Keep retains the registered worktree and exact reviewed
-/// patch without writing the source workspace.
+/// patch without writing the source workspace. Later review of a kept run is
+/// observational: it reports whether the present worktree currently matches the
+/// recorded retained fingerprint, or is drifted or missing, and must not rewrite
+/// this terminal state. That check is current verification, not immutable
+/// retention.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PromotionState {

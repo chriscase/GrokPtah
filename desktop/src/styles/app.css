@@ -4287,6 +4287,24 @@ button:disabled {
   color: var(--muted);
 }
 
+.run-promotion-kept:focus {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.run-promotion-truncated {
+  color: var(--danger, #f07178);
+  background: rgba(240, 113, 120, 0.08);
+}
+
+.run-promotion-keep-copy {
+  flex: 1 0 100%;
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
 .run-actions {
   display: flex;
   flex-wrap: wrap;
