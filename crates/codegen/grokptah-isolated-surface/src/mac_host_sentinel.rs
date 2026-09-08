@@ -288,8 +288,7 @@ mod platform {
         let cls = AnyClass::get(c"NSWorkspace").ok_or_else(|| {
             HarnessError::backend_unavailable("Mac host sentinel NSWorkspace unavailable")
         })?;
-        let shared: Option<Retained<AnyObject>> =
-            unsafe { objc2::msg_send![cls, sharedWorkspace] };
+        let shared: Option<Retained<AnyObject>> = unsafe { objc2::msg_send![cls, sharedWorkspace] };
         shared.ok_or_else(|| {
             HarnessError::backend_unavailable(
                 "Mac host sentinel NSWorkspace.sharedWorkspace unavailable",
