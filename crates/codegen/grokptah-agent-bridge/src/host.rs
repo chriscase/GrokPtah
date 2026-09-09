@@ -2784,6 +2784,7 @@ impl AgentHostHandle {
             bail!("isolated worktree changed after the run; promotion is blocked");
         }
         if mark_reviewed
+            && run.is_local_desktop_keep_origin()
             && !review.diff_truncated
             && execution.promotion_state == PromotionState::Ready
         {
@@ -2869,8 +2870,13 @@ impl AgentHostHandle {
                     "reviewed diff is truncated; applying the exact patch requires a complete reviewable patch"
                 );
             }
-            if !self.reviewed_runs.lock().contains(run_id) && durable_approval.is_none() {
-                bail!("review the isolated run before promotion");
+            if durable_approval.is_none() {
+                if !run.is_local_desktop_keep_origin() {
+                    bail!("promotion requires a persisted approval");
+                }
+                if !self.reviewed_runs.lock().contains(run_id) {
+                    bail!("review the isolated run before promotion");
+                }
             }
             if let Some(approval) = durable_approval.as_ref() {
                 if current_review.fingerprint != approval.final_fingerprint
@@ -13869,12 +13875,12 @@ mod tests {
         state: RunState,
         promotion_state: PromotionState,
     ) -> PathBuf {
-        save_isolated_desktop_run_with(
+        save_isolated_run_with_client(
             host,
             session_id,
             workspace,
             run_id,
-            client_id,
+            Some(client_id),
             state,
             promotion_state,
             None,
@@ -13888,6 +13894,29 @@ mod tests {
         workspace: &Path,
         run_id: &str,
         client_id: &str,
+        state: RunState,
+        promotion_state: PromotionState,
+        extra_text_lines: Option<usize>,
+    ) -> PathBuf {
+        save_isolated_run_with_client(
+            host,
+            session_id,
+            workspace,
+            run_id,
+            Some(client_id),
+            state,
+            promotion_state,
+            extra_text_lines,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn save_isolated_run_with_client(
+        host: &HostRuntime,
+        session_id: Uuid,
+        workspace: &Path,
+        run_id: &str,
+        client_id: Option<&str>,
         state: RunState,
         promotion_state: PromotionState,
         extra_text_lines: Option<usize>,
@@ -13913,7 +13942,7 @@ mod tests {
             session_id,
             workspace: source.display().to_string(),
             request_id: format!("request-{run_id}"),
-            client_id: Some(client_id.into()),
+            client_id: client_id.map(str::to_string),
             state,
             purpose: RunPurpose::Execution,
             agent_id: None,
@@ -13989,6 +14018,40 @@ mod tests {
 
     fn promotion_state_of(run: &RunRecord) -> PromotionState {
         run.execution.as_ref().unwrap().promotion_state
+    }
+
+    fn has_local_review_marker(host: &HostRuntime, run_id: &str) -> bool {
+        host.reviewed_runs.lock().contains(run_id)
+    }
+
+    fn assert_source_unwritten(workspace: &Path) {
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("README.md")).unwrap(),
+            "baseline\n"
+        );
+    }
+
+    fn assert_promote_requires_persisted_approval(
+        host: &HostRuntime,
+        session_id: Uuid,
+        run_id: &str,
+        workspace: &Path,
+    ) {
+        let error = host
+            .promote_run(session_id, run_id)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.to_lowercase().contains("persisted approval"),
+            "non-local promotion without durable approval must fail closed, got {error}"
+        );
+        let after = host.get_session_run(session_id, run_id).unwrap().unwrap();
+        assert_eq!(promotion_state_of(&after), PromotionState::Ready);
+        assert_source_unwritten(workspace);
+        assert!(
+            !has_local_review_marker(host, run_id),
+            "unauthorized local review marker must not persist for {run_id}"
+        );
     }
 
     fn test_orchestration_service(
@@ -14572,6 +14635,209 @@ mod tests {
             std::fs::read_to_string(workspace.path().join("README.md")).unwrap(),
             "baseline\n"
         );
+    }
+
+    #[test]
+    fn review_then_promote_without_approval_refuses_non_local_origins() {
+        let (_home, host, session_id) = test_host();
+        let workspace = git_fixture();
+        let origins: [(&str, Option<&str>); 5] = [
+            ("mcp", Some("mcp")),
+            ("named-external", Some("laptop")),
+            ("legacy-desktop", Some(LEGACY_DESKTOP_CLIENT_ID)),
+            ("missing", None),
+            ("empty", Some("")),
+        ];
+        for (label, origin) in origins {
+            let run_id = format!("{label}-{}", Uuid::new_v4());
+            save_isolated_run_with_client(
+                &host,
+                session_id,
+                workspace.path(),
+                &run_id,
+                origin,
+                RunState::Completed,
+                PromotionState::Ready,
+                None,
+            );
+            host.review_run(session_id, &run_id).unwrap();
+            assert!(
+                !has_local_review_marker(&host, &run_id),
+                "review_run must not mint local authority for {label}"
+            );
+            assert_promote_requires_persisted_approval(
+                &host,
+                session_id,
+                &run_id,
+                workspace.path(),
+            );
+
+            host.review_run_view(session_id, &run_id).unwrap();
+            assert!(
+                !has_local_review_marker(&host, &run_id),
+                "review_run_view must not mint local authority for {label}"
+            );
+            assert_promote_requires_persisted_approval(
+                &host,
+                session_id,
+                &run_id,
+                workspace.path(),
+            );
+
+            host.inspect_run(session_id, &run_id).unwrap();
+            assert!(
+                !has_local_review_marker(&host, &run_id),
+                "inspect_run must not mint local authority for {label}"
+            );
+            assert_promote_requires_persisted_approval(
+                &host,
+                session_id,
+                &run_id,
+                workspace.path(),
+            );
+        }
+
+        let planted = format!("planted-mcp-{}", Uuid::new_v4());
+        save_isolated_desktop_run(
+            &host,
+            session_id,
+            workspace.path(),
+            &planted,
+            "mcp",
+            RunState::Completed,
+            PromotionState::Ready,
+        );
+        host.review_run(session_id, &planted).unwrap();
+        host.reviewed_runs.lock().insert(planted.clone());
+        let planted_error = host
+            .promote_run(session_id, &planted)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            planted_error.to_lowercase().contains("persisted approval"),
+            "a planted local review marker must not promote MCP, got {planted_error}"
+        );
+        host.reviewed_runs.lock().remove(&planted);
+        assert_source_unwritten(workspace.path());
+        assert_eq!(
+            promotion_state_of(&host.get_session_run(session_id, &planted).unwrap().unwrap()),
+            PromotionState::Ready
+        );
+    }
+
+    #[test]
+    fn local_desktop_review_then_promote_succeeds_without_durable_approval() {
+        let (_home, host, session_id) = test_host();
+        let review_workspace = git_fixture();
+        let review_id = desktop_run_id();
+        save_isolated_desktop_run(
+            &host,
+            session_id,
+            review_workspace.path(),
+            &review_id,
+            LOCAL_DESKTOP_ORIGIN_ID,
+            RunState::Completed,
+            PromotionState::Ready,
+        );
+        host.review_run(session_id, &review_id).unwrap();
+        assert!(
+            has_local_review_marker(&host, &review_id),
+            "local-desktop review_run must mint the in-memory promotion marker"
+        );
+        let promoted = host.promote_run(session_id, &review_id).unwrap();
+        assert_eq!(promotion_state_of(&promoted), PromotionState::Promoted);
+        assert_eq!(
+            std::fs::read_to_string(review_workspace.path().join("README.md")).unwrap(),
+            "isolated edit\n"
+        );
+        assert!(!has_local_review_marker(&host, &review_id));
+
+        let view_workspace = git_fixture();
+        let view_id = desktop_run_id();
+        save_isolated_desktop_run(
+            &host,
+            session_id,
+            view_workspace.path(),
+            &view_id,
+            LOCAL_DESKTOP_ORIGIN_ID,
+            RunState::Completed,
+            PromotionState::Ready,
+        );
+        host.review_run_view(session_id, &view_id).unwrap();
+        assert!(
+            has_local_review_marker(&host, &view_id),
+            "local-desktop review_run_view must mint the in-memory promotion marker"
+        );
+        host.promote_run(session_id, &view_id).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(view_workspace.path().join("README.md")).unwrap(),
+            "isolated edit\n"
+        );
+        assert!(!has_local_review_marker(&host, &view_id));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn inspect_then_scoped_durable_approval_promotes_external_without_local_marker() {
+        let (_home, host, session_id) = test_host();
+        for origin in ["mcp", "laptop"] {
+            let workspace = git_fixture();
+            let run_id = format!("{origin}-{}", Uuid::new_v4());
+            save_isolated_run_with_client(
+                &host,
+                session_id,
+                workspace.path(),
+                &run_id,
+                Some(origin),
+                RunState::Completed,
+                PromotionState::Ready,
+                None,
+            );
+            let review = host.inspect_run(session_id, &run_id).unwrap();
+            assert!(
+                !has_local_review_marker(&host, &run_id),
+                "inspect must not mint local review authority for {origin}"
+            );
+            let stored = host.get_session_run(session_id, &run_id).unwrap().unwrap();
+            let source_fingerprint = stored
+                .execution
+                .as_ref()
+                .unwrap()
+                .source_fingerprint
+                .clone();
+            let orch = test_orchestration_service(&host, workspace.path(), "t");
+            let auth = orch.auth_header(Some("Bearer t")).unwrap();
+            let approved = orch
+                .approve_run(
+                    &auth,
+                    &format!("approve-{run_id}"),
+                    session_id,
+                    workspace.path(),
+                    &run_id,
+                    source_fingerprint,
+                    review.fingerprint.clone(),
+                    review.changed_files.clone(),
+                    Some(60_000),
+                )
+                .await
+                .unwrap();
+            assert!(
+                !has_local_review_marker(&host, &run_id),
+                "durable approval must not mint local review authority for {origin}"
+            );
+            let approval_id = approved["approvalId"]
+                .as_str()
+                .expect("approve_run returns approvalId");
+            let promoted = host
+                .promote_run_with_approval(session_id, &run_id, Some(approval_id))
+                .unwrap();
+            assert_eq!(promotion_state_of(&promoted), PromotionState::Promoted);
+            assert_eq!(
+                std::fs::read_to_string(workspace.path().join("README.md")).unwrap(),
+                "isolated edit\n"
+            );
+            assert!(!has_local_review_marker(&host, &run_id));
+        }
     }
 
     #[test]

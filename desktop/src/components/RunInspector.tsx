@@ -123,14 +123,30 @@ function isLocalDesktopKeepOrigin(run: DurableRun): boolean {
 
 const MISSING_RETAINED_WORKTREE_DIFF = "Diff unavailable — retained worktree is missing.";
 
+function retentionFingerprintsAgree(
+  recorded: string | null | undefined,
+  present: string | null | undefined,
+): boolean {
+  return Boolean(recorded && present && recorded === present);
+}
+
+function reviewClaimsMatchedRetention(review: RunReview): boolean {
+  return (
+    review.retentionVerification === "matched" &&
+    retentionFingerprintsAgree(review.retainedFingerprint, review.presentFingerprint)
+  );
+}
+
 function reviewSummary(review: RunReview): string {
   if (review.retentionVerification === "worktree_missing") {
     return MISSING_RETAINED_WORKTREE_DIFF;
   }
   const truncated = review.diffTruncated ? " · diff truncated" : "";
-  const retention = review.retentionVerification
-    ? ` · retention ${review.retentionVerification.replaceAll("_", " ")}`
-    : "";
+  const status = review.retentionVerification;
+  const retention =
+    status && (status !== "matched" || reviewClaimsMatchedRetention(review))
+      ? ` · retention ${status.replaceAll("_", " ")}`
+      : "";
   return `${review.changedFiles.length} changed files${truncated}${retention}`;
 }
 
@@ -213,7 +229,7 @@ function keptRetentionCopy(run: DurableRun, review?: RunReview): string {
   if (status === "drifted") {
     return `Keep is terminal and did not write the source workspace. Recorded retained fingerprint ${recorded ?? "unknown"} differs from the present worktree ${present ?? "unknown"}. This is current verification, not immutable retention.`;
   }
-  if (status === "matched") {
+  if (status === "matched" && retentionFingerprintsAgree(recorded, present)) {
     return `Keep is terminal and did not write the source workspace. The present worktree ${present ?? "unknown"} currently matches the recorded retained fingerprint ${recorded ?? "unknown"}. This is current verification, not a guarantee that the worktree cannot change later.`;
   }
   return "Isolated worktree retained without writing the source workspace. Keep is terminal. Review remains available to verify the present worktree against the recorded retained fingerprint; that check is current verification, not immutable retention.";

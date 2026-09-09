@@ -1179,16 +1179,16 @@ describe("RunInspector", () => {
         executionWorkspace: "/tmp/demo/.grokptah/worktrees/runs/run-1",
         baseRevision: "base",
         sourceFingerprint: "source",
-        finalFingerprint: "recorded-fp",
+        finalFingerprint: "same-fp",
         promotionState: "kept_for_review",
         promotedAt: null,
       },
     });
     const matched: RunReview = {
       ...review,
-      fingerprint: "present-fp",
-      retainedFingerprint: "recorded-fp",
-      presentFingerprint: "present-fp",
+      fingerprint: "same-fp",
+      retainedFingerprint: "same-fp",
+      presentFingerprint: "same-fp",
       retentionVerification: "matched",
     };
     const onReview = vi.fn(async () => matched);
@@ -1198,12 +1198,50 @@ describe("RunInspector", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Review diff" }));
     expect(
-      await screen.findByText(/present worktree present-fp currently matches the recorded retained fingerprint recorded-fp/i),
+      await screen.findByText(/present worktree same-fp currently matches the recorded retained fingerprint same-fp/i),
     ).toBeTruthy();
+    expect(screen.getByText(/retention matched/i)).toBeTruthy();
     expect(
       screen.getByText(/This is current verification, not a guarantee that the worktree cannot change later/),
     ).toBeTruthy();
     expect(screen.queryByText(/immutable retention/i)).toBeNull();
+    expect(screen.queryByText("Keep for review")).toBeNull();
+    expect(screen.queryByText("Apply exact reviewed patch")).toBeNull();
+    expect(screen.queryByText("Discard")).toBeNull();
+  });
+
+  it("does not claim a match when retained fingerprints are unequal under a matched status", async () => {
+    const kept = run({
+      execution: {
+        mode: "isolated_worktree",
+        sourceWorkspace: "/tmp/demo",
+        executionWorkspace: "/tmp/demo/.grokptah/worktrees/runs/run-1",
+        baseRevision: "base",
+        sourceFingerprint: "source",
+        finalFingerprint: "recorded-fp",
+        promotionState: "kept_for_review",
+        promotedAt: null,
+      },
+    });
+    const malformed: RunReview = {
+      ...review,
+      fingerprint: "present-fp",
+      retainedFingerprint: "recorded-fp",
+      presentFingerprint: "present-fp",
+      retentionVerification: "matched",
+    };
+    const onReview = vi.fn(async () => malformed);
+    render(
+      <RunInspector runs={[kept]} onRefresh={vi.fn()} {...actions} onReview={onReview} />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Review diff" }));
+    expect(await screen.findByText("1 changed files")).toBeTruthy();
+    expect(
+      screen.getByText(/Review remains available to verify the present worktree/i),
+    ).toBeTruthy();
+    expect(screen.queryByText(/currently matches/i)).toBeNull();
+    expect(screen.queryByText(/retention matched/i)).toBeNull();
     expect(screen.queryByText("Keep for review")).toBeNull();
     expect(screen.queryByText("Apply exact reviewed patch")).toBeNull();
     expect(screen.queryByText("Discard")).toBeNull();
