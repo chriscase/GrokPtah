@@ -109,6 +109,17 @@ impl Sep18NoModelProofSequencer {
         )
     }
 
+    /// Native host-sentinel runner. Ignores the sequencer's synthetic baseline:
+    /// macOS collects a live baseline from [`crate::sentinel::MacHostSentinelCollector`]
+    /// and probes exclusively with it; non-macOS returns an honest unsupported
+    /// artifact without synthetic fallback. Never claims PASS or admission.
+    pub fn run_native_host_sentinel(
+        &self,
+        checkout_path: impl AsRef<std::path::Path>,
+    ) -> HarnessResult<crate::NativeSentinelEvidence> {
+        crate::run_native_host_sentinel(checkout_path.as_ref(), self.snapshot_root.as_deref())
+    }
+
     /// Run one bounded fault-matrix case.
     pub fn run_fault_matrix(&self, case: FaultMatrixCase) -> HarnessResult<SealedProofEvidence> {
         match case {

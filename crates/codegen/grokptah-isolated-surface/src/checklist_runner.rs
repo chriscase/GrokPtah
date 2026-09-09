@@ -11,8 +11,9 @@ use crate::backend::VfLaunchReceipt;
 use crate::contained_browser_dry_run::ContainedBrowserDryRunEvidence;
 use crate::error::{HarnessError, HarnessResult};
 use crate::evidence_pack::{
-    seal_contained_browser_dry_run_pack, seal_synthetic_harness_pack, seal_vf_dry_run_pack,
-    serialize_evidence_pack, Sep18ChecklistSubstrate, Sep18EvidencePack,
+    seal_contained_browser_dry_run_pack, seal_native_host_sentinel_pack,
+    seal_synthetic_harness_pack, seal_vf_dry_run_pack, serialize_evidence_pack,
+    Sep18ChecklistSubstrate, Sep18EvidencePack,
 };
 use crate::proof_sequencer::{FaultMatrixCase, Sep18NoModelProofSequencer};
 use crate::sentinel::HostSentinelSnapshot;
@@ -26,6 +27,7 @@ pub struct Sep18ChecklistRunnerConfig {
     pub fault_matrix_case: Option<FaultMatrixCase>,
     pub vf_physical_mac_proof_id: Option<String>,
     pub snapshot_root: Option<std::path::PathBuf>,
+    pub checkout_path: Option<std::path::PathBuf>,
 }
 
 impl Default for Sep18ChecklistRunnerConfig {
@@ -35,6 +37,7 @@ impl Default for Sep18ChecklistRunnerConfig {
             fault_matrix_case: None,
             vf_physical_mac_proof_id: None,
             snapshot_root: None,
+            checkout_path: None,
         }
     }
 }
@@ -60,6 +63,14 @@ impl Sep18ChecklistRunnerConfig {
     pub fn with_snapshot_root(mut self, root: impl Into<std::path::PathBuf>) -> Self {
         self.snapshot_root = Some(root.into());
         self
+    }
+
+    pub fn native_host_sentinel(checkout_path: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            substrate: Sep18ChecklistSubstrate::NativeHostSentinel,
+            checkout_path: Some(checkout_path.into()),
+            ..Self::default()
+        }
     }
 }
 
@@ -99,6 +110,7 @@ pub fn run_sep18_checklist(
         Sep18ChecklistSubstrate::ContainedBrowserDryRun => run_contained_browser(config, sequencer),
         Sep18ChecklistSubstrate::VfDryRun => run_vf_dry_run(config, sequencer),
         Sep18ChecklistSubstrate::SyntheticHarness => run_synthetic(config, sequencer),
+        Sep18ChecklistSubstrate::NativeHostSentinel => run_native_host_sentinel(config, sequencer),
     }
 }
 
@@ -194,17 +206,51 @@ fn run_synthetic(
     }
 }
 
+fn run_native_host_sentinel(
+    config: Sep18ChecklistRunnerConfig,
+    sequencer: Sep18NoModelProofSequencer,
+) -> Sep18ChecklistRunOutcome {
+    if config.fault_matrix_case.is_some() {
+        return Sep18ChecklistRunOutcome {
+            pack: empty_rejected_pack(Sep18ChecklistSubstrate::NativeHostSentinel),
+            runner_error: Some(HarnessError::invalid_state(
+                "native host-sentinel runner does not accept a fault-matrix subset",
+            )),
+        };
+    }
+
+    let checkout = config
+        .checkout_path
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+    match sequencer.run_native_host_sentinel(checkout) {
+        Ok(evidence) => Sep18ChecklistRunOutcome {
+            pack: seal_native_host_sentinel_pack(evidence),
+            runner_error: None,
+        },
+        Err(err) => Sep18ChecklistRunOutcome {
+            pack: empty_rejected_pack(Sep18ChecklistSubstrate::NativeHostSentinel),
+            runner_error: Some(err),
+        },
+    }
+}
+
 fn empty_rejected_pack(substrate: Sep18ChecklistSubstrate) -> Sep18EvidencePack {
-    seal_vf_dry_run_pack(VfDryRunEvidence {
-        platform: crate::vf_dry_run::VfDryRunPlatform::NonMacOs,
-        outcome: crate::vf_dry_run::VfDryRunOutcome::UnsupportedPlatform,
-        evidence_class: crate::lifecycle::ProofEvidenceClass::Synthetic,
-        boot_attempted: false,
-        physical_pass_claimed: false,
-        nonclaim: crate::SYNTHETIC_HARNESS_NONCLAIM.into(),
-        recorded_at: chrono::Utc::now(),
-    })
-    .into_placeholder(substrate)
+    match substrate {
+        Sep18ChecklistSubstrate::NativeHostSentinel => {
+            seal_native_host_sentinel_pack(crate::NativeSentinelEvidence::unsupported_non_macos())
+        }
+        other => seal_vf_dry_run_pack(VfDryRunEvidence {
+            platform: crate::vf_dry_run::VfDryRunPlatform::NonMacOs,
+            outcome: crate::vf_dry_run::VfDryRunOutcome::UnsupportedPlatform,
+            evidence_class: crate::lifecycle::ProofEvidenceClass::Synthetic,
+            boot_attempted: false,
+            physical_pass_claimed: false,
+            nonclaim: crate::SYNTHETIC_HARNESS_NONCLAIM.into(),
+            recorded_at: chrono::Utc::now(),
+        })
+        .into_placeholder(other),
+    }
 }
 
 trait PlaceholderPack {

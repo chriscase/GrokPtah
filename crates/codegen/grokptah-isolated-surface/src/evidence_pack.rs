@@ -11,11 +11,14 @@ use crate::captured_frame::{
 };
 use crate::contained_browser_dry_run::ContainedBrowserDryRunEvidence;
 use crate::lifecycle::{GuestLifecycleDisposition, ProofEvidenceClass};
+use crate::native_sentinel_runner::{
+    NativeSentinelEvidence, NativeSentinelRunnerOutcome, NativeSentinelRunnerPlatform,
+};
 use crate::proof_sequencer::{ChecklistStep, FaultMatrixCase, SealedProofEvidence};
 use crate::vf_dry_run::{VfDryRunEvidence, VfDryRunOutcome, VfDryRunPlatform};
 use crate::{
     isolated_surface_admission_available, CONTAINED_BROWSER_DRY_RUN_NONCLAIM,
-    SYNTHETIC_HARNESS_NONCLAIM, VF_DRY_RUN_NONCLAIM,
+    NATIVE_HOST_SENTINEL_NONCLAIM, SYNTHETIC_HARNESS_NONCLAIM, VF_DRY_RUN_NONCLAIM,
 };
 
 pub const EVIDENCE_PACK_SCHEMA_VERSION: u32 = 1;
@@ -30,6 +33,8 @@ pub enum Sep18ChecklistSubstrate {
     VfDryRun,
     /// Synthetic harness happy-path or fault-matrix subset.
     SyntheticHarness,
+    /// Explicit native Mac host-sentinel runner (collector exclusive).
+    NativeHostSentinel,
 }
 
 /// Mac physical proof markers required before any VF PASS claim is accepted.
@@ -101,6 +106,8 @@ pub struct Sep18EvidencePack {
     pub checklist_completed: bool,
     pub fault_matrix_case: Option<FaultMatrixCase>,
     pub sealed_evidence: Option<SealedProofEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_host_sentinel: Option<NativeSentinelEvidence>,
     pub contained_browser: Option<ContainedBrowserDryRunEvidence>,
     pub vf_dry_run: Option<VfDryRunEvidence>,
 }
@@ -127,6 +134,9 @@ pub enum EvidenceVerifierCode {
     PackSealedEvidenceMismatch,
     SubstrateNestedEvidenceMissing,
     CapturedFrameEvidenceInvalid,
+    NativeSentinelSyntheticFallback,
+    NativeSentinelLiveClaimOnUnsupportedPlatform,
+    NativeSentinelCannotQualifyPhysicalPass,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -183,6 +193,10 @@ pub fn verify_evidence_pack(pack: &Sep18EvidencePack) -> EvidenceVerifierDecisio
     }
 
     if let Some(decision) = verify_substrate_nested_evidence(pack) {
+        return decision;
+    }
+
+    if let Some(decision) = verify_native_host_sentinel(pack) {
         return decision;
     }
 
@@ -926,6 +940,21 @@ fn verify_substrate_pass_claims(pack: &Sep18EvidencePack) -> Option<EvidenceVeri
         }
     }
 
+    if let Some(native) = &pack.native_host_sentinel {
+        if native.physical_pass_claimed || native.vf_pass_claimed {
+            return Some(EvidenceVerifierDecision::reject(
+                EvidenceVerifierCode::NativeSentinelCannotQualifyPhysicalPass,
+                "native host-sentinel runner cannot claim VF or physical PASS",
+            ));
+        }
+        if native.isolation_pass_claimed {
+            return Some(EvidenceVerifierDecision::reject(
+                EvidenceVerifierCode::IsolationPassClaimOnDryRun,
+                "native host-sentinel runner cannot claim isolation PASS",
+            ));
+        }
+    }
+
     None
 }
 
@@ -948,7 +977,95 @@ fn verify_substrate_nested_evidence(pack: &Sep18EvidencePack) -> Option<Evidence
             }
         }
         Sep18ChecklistSubstrate::SyntheticHarness => {}
+        Sep18ChecklistSubstrate::NativeHostSentinel => {
+            if pack.native_host_sentinel.is_none() {
+                return Some(EvidenceVerifierDecision::reject(
+                    EvidenceVerifierCode::SubstrateNestedEvidenceMissing,
+                    "NativeHostSentinel requires native_host_sentinel nested evidence",
+                ));
+            }
+        }
     }
+    None
+}
+
+fn verify_native_host_sentinel(pack: &Sep18EvidencePack) -> Option<EvidenceVerifierDecision> {
+    if pack.substrate != Sep18ChecklistSubstrate::NativeHostSentinel {
+        return None;
+    }
+    let native = pack.native_host_sentinel.as_ref()?;
+
+    if native.synthetic_fallback_used {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::NativeSentinelSyntheticFallback,
+            "native host-sentinel runner must never fall back to synthetic probes",
+        ));
+    }
+
+    if pack.physical_proof_markers != PhysicalProofMarkers::dry_run_none() {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::NativeSentinelCannotQualifyPhysicalPass,
+            "native host-sentinel runner must keep PhysicalProofMarkers::dry_run_none",
+        ));
+    }
+
+    if native.platform == NativeSentinelRunnerPlatform::NonMacOs
+        && (native.live_host_sentinel_collection
+            || pack
+                .host_sentinel_probes
+                .live_host_sentinel_collection_at_stop
+            || native.outcome != NativeSentinelRunnerOutcome::UnsupportedPlatform)
+    {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::NativeSentinelLiveClaimOnUnsupportedPlatform,
+            "non-macOS native host-sentinel runner cannot claim live collection or completed probes",
+        ));
+    }
+
+    if native.outcome != NativeSentinelRunnerOutcome::NativeProbesCompleted
+        && (native.live_host_sentinel_collection
+            || native.independent_collection_verified
+            || native.checklist_completed
+            || pack
+                .host_sentinel_probes
+                .live_host_sentinel_collection_at_stop)
+    {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::NativeSentinelLiveClaimOnUnsupportedPlatform,
+            "live native host-sentinel collection requires NativeProbesCompleted",
+        ));
+    }
+
+    if native.outcome == NativeSentinelRunnerOutcome::NativeProbesCompleted {
+        if pack.sealed_evidence.is_none() || native.sealed_evidence.is_none() {
+            return Some(EvidenceVerifierDecision::reject(
+                EvidenceVerifierCode::ChecklistIncomplete,
+                "NativeProbesCompleted requires sealed_evidence",
+            ));
+        }
+        if !native.live_host_sentinel_collection
+            || !native.independent_collection_verified
+            || !native.post_stop_inject_fenced
+            || native.channels_destroyed == 0
+        {
+            return Some(EvidenceVerifierDecision::reject(
+                EvidenceVerifierCode::ChecklistIncomplete,
+                "NativeProbesCompleted requires live native probes, independent collection, Stop fence, and destroyed channels",
+            ));
+        }
+    }
+
+    if let (Some(pack_sealed), Some(native_sealed)) =
+        (&pack.sealed_evidence, &native.sealed_evidence)
+    {
+        if pack_sealed != native_sealed {
+            return Some(EvidenceVerifierDecision::reject(
+                EvidenceVerifierCode::PackSealedEvidenceMismatch,
+                "native_host_sentinel.sealed_evidence does not match pack.sealed_evidence",
+            ));
+        }
+    }
+
     None
 }
 
@@ -990,7 +1107,9 @@ fn verify_substrate_evidence_class(pack: &Sep18EvidencePack) -> Option<EvidenceV
     let expected = match pack.substrate {
         Sep18ChecklistSubstrate::ContainedBrowserDryRun => ProofEvidenceClass::ContainedBrowser,
         Sep18ChecklistSubstrate::VfDryRun => ProofEvidenceClass::VirtualizationFramework,
-        Sep18ChecklistSubstrate::SyntheticHarness => ProofEvidenceClass::Synthetic,
+        Sep18ChecklistSubstrate::SyntheticHarness | Sep18ChecklistSubstrate::NativeHostSentinel => {
+            ProofEvidenceClass::Synthetic
+        }
     };
 
     if pack.evidence_class != expected {
@@ -1005,6 +1124,15 @@ fn verify_substrate_evidence_class(pack: &Sep18EvidencePack) -> Option<EvidenceV
             return Some(EvidenceVerifierDecision::reject(
                 EvidenceVerifierCode::EvidenceClassTampered,
                 "contained_browser evidence_class is inconsistent with substrate",
+            ));
+        }
+    }
+
+    if let Some(native) = &pack.native_host_sentinel {
+        if native.evidence_class != expected {
+            return Some(EvidenceVerifierDecision::reject(
+                EvidenceVerifierCode::EvidenceClassTampered,
+                "native_host_sentinel evidence_class is inconsistent with substrate",
             ));
         }
     }
@@ -1077,6 +1205,7 @@ fn expected_nonclaim(pack: &Sep18EvidencePack) -> String {
         }
         Sep18ChecklistSubstrate::VfDryRun => VF_DRY_RUN_NONCLAIM.into(),
         Sep18ChecklistSubstrate::SyntheticHarness => SYNTHETIC_HARNESS_NONCLAIM.into(),
+        Sep18ChecklistSubstrate::NativeHostSentinel => NATIVE_HOST_SENTINEL_NONCLAIM.into(),
     }
 }
 
@@ -1124,6 +1253,7 @@ pub fn seal_contained_browser_dry_run_pack(
             .as_ref()
             .and_then(|s| s.fault_matrix_case),
         sealed_evidence: evidence.sealed_evidence.clone(),
+        native_host_sentinel: None,
         contained_browser: Some(evidence),
         vf_dry_run: None,
     }
@@ -1151,6 +1281,7 @@ pub fn seal_vf_dry_run_pack(evidence: VfDryRunEvidence) -> Sep18EvidencePack {
         checklist_completed: false,
         fault_matrix_case: None,
         sealed_evidence: None,
+        native_host_sentinel: None,
         contained_browser: None,
         vf_dry_run: Some(evidence),
     }
@@ -1178,6 +1309,41 @@ pub fn seal_synthetic_harness_pack(
         checklist_completed,
         fault_matrix_case: sealed.fault_matrix_case,
         sealed_evidence: Some(sealed),
+        native_host_sentinel: None,
+        contained_browser: None,
+        vf_dry_run: None,
+    }
+}
+
+pub fn seal_native_host_sentinel_pack(evidence: NativeSentinelEvidence) -> Sep18EvidencePack {
+    let host_sentinel_probes = evidence
+        .sealed_evidence
+        .as_ref()
+        .map(|sealed| HostSentinelProbeSummary::from_stop_evidence(&sealed.stop_evidence, 0))
+        .unwrap_or(HostSentinelProbeSummary {
+            probes_performed: 0,
+            live_host_sentinel_collection_at_stop: evidence.live_host_sentinel_collection,
+            host_sentinels_unchanged_at_stop: false,
+            channels_destroyed: evidence.channels_destroyed,
+            channels_open_after_stop: 0,
+        });
+
+    Sep18EvidencePack {
+        schema_version: EVIDENCE_PACK_SCHEMA_VERSION,
+        sealed_at: Utc::now(),
+        substrate: Sep18ChecklistSubstrate::NativeHostSentinel,
+        evidence_class: evidence.evidence_class,
+        physical_pass_claimed: evidence.physical_pass_claimed,
+        isolation_pass_claimed: evidence.isolation_pass_claimed,
+        vf_pass_claimed: evidence.vf_pass_claimed,
+        admission_available: isolated_surface_admission_available(),
+        nonclaim: evidence.nonclaim.clone(),
+        host_sentinel_probes,
+        physical_proof_markers: PhysicalProofMarkers::dry_run_none(),
+        checklist_completed: evidence.checklist_completed,
+        fault_matrix_case: None,
+        sealed_evidence: evidence.sealed_evidence.clone(),
+        native_host_sentinel: Some(evidence),
         contained_browser: None,
         vf_dry_run: None,
     }
@@ -1207,6 +1373,9 @@ pub fn verifier_exit_code(decision: &EvidenceVerifierDecision) -> i32 {
             EvidenceVerifierCode::PackSealedEvidenceMismatch => 24,
             EvidenceVerifierCode::SubstrateNestedEvidenceMissing => 25,
             EvidenceVerifierCode::CapturedFrameEvidenceInvalid => 26,
+            EvidenceVerifierCode::NativeSentinelSyntheticFallback => 27,
+            EvidenceVerifierCode::NativeSentinelLiveClaimOnUnsupportedPlatform => 28,
+            EvidenceVerifierCode::NativeSentinelCannotQualifyPhysicalPass => 29,
         }
     }
 }

@@ -53,6 +53,10 @@ pub struct IsolatedSurfaceHarness<B: IsolatedSurfaceBackend = SyntheticGuest> {
     lifecycle: GuestLifecycle,
     sentinels: HostSentinelRegistry,
     host_probe: SyntheticHostProbe,
+    /// Exclusive native Mac collector. Once attached, synthetic self-compare
+    /// and compare-only snapshot refresh are forbidden for the rest of the run.
+    #[cfg(target_os = "macos")]
+    native_collector: Option<crate::sentinel::MacHostSentinelCollector>,
     backend: B,
     channels: ChannelRegistry,
     snapshot_root: Option<std::path::PathBuf>,
@@ -116,6 +120,8 @@ impl<B: IsolatedSurfaceBackend> IsolatedSurfaceHarness<B> {
             lifecycle,
             sentinels: HostSentinelRegistry::capture(baseline.clone()),
             host_probe: SyntheticHostProbe::new(baseline),
+            #[cfg(target_os = "macos")]
+            native_collector: None,
             backend,
             channels: ChannelRegistry::new(),
             snapshot_root: None,
@@ -141,7 +147,15 @@ impl<B: IsolatedSurfaceBackend> IsolatedSurfaceHarness<B> {
     /// Mac physical proof hook: compare an externally supplied snapshot to the
     /// harness baseline. Does **not** count as native Mac collection — use
     /// [`Self::refresh_host_sentinels_from_collector`] for physical proof.
+    ///
+    /// Forbidden after [`Self::attach_native_collector`]: a later synthetic
+    /// compare-only refresh would clear live native provenance.
     pub fn refresh_host_sentinels(&mut self, snapshot: HostSentinelSnapshot) -> HarnessResult<()> {
+        if self.native_host_collector_attached() {
+            return Err(HarnessError::invalid_state(
+                "compare-only snapshot refresh is forbidden after native collector attachment",
+            ));
+        }
         self.sentinels.refresh_from_host(snapshot)
     }
 
@@ -152,6 +166,40 @@ impl<B: IsolatedSurfaceBackend> IsolatedSurfaceHarness<B> {
         collector: &crate::sentinel::MacHostSentinelCollector,
     ) -> HarnessResult<()> {
         self.sentinels.refresh_from_native_collector(collector)
+    }
+
+    /// Attach the live Mac collector **before** any host probe. After this,
+    /// boot/inject/Stop probes use the collector exclusively and never fall back
+    /// to [`SyntheticHostProbe`].
+    #[cfg(target_os = "macos")]
+    pub fn attach_native_collector(
+        &mut self,
+        collector: crate::sentinel::MacHostSentinelCollector,
+    ) -> HarnessResult<()> {
+        if self.sentinels.probes_performed() > 0 {
+            return Err(HarnessError::invalid_state(
+                "native collector must be attached before any host sentinel probe",
+            ));
+        }
+        if self.native_collector.is_some() {
+            return Err(HarnessError::invalid_state(
+                "native collector is already attached",
+            ));
+        }
+        self.native_collector = Some(collector);
+        Ok(())
+    }
+
+    /// True only when the native Mac collector is attached for exclusive probes.
+    pub fn native_host_collector_attached(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            self.native_collector.is_some()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
     }
 
     pub fn host_probe_mut(&mut self) -> &mut SyntheticHostProbe {
@@ -175,6 +223,12 @@ impl<B: IsolatedSurfaceBackend> IsolatedSurfaceHarness<B> {
     }
 
     fn probe_host_sentinels(&mut self) -> HarnessResult<()> {
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(collector) = self.native_collector.clone() {
+                return self.sentinels.refresh_from_native_collector(&collector);
+            }
+        }
         self.sentinels.probe_and_verify(&self.host_probe)
     }
 

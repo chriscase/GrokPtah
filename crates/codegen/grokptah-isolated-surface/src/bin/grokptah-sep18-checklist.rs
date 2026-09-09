@@ -12,10 +12,11 @@ use grokptah_isolated_surface::{
 fn usage() -> ! {
     eprintln!(
         "Usage:\n\
-          grokptah-sep18-checklist run [--output PATH] [--vf-dry-run] [--fault-matrix CASE]\n\
+          grokptah-sep18-checklist run [--output PATH] [--vf-dry-run] [--native-host-sentinels] [--checkout PATH] [--fault-matrix CASE]\n\
           grokptah-sep18-checklist verify PATH\n\
          \n\
          Default substrate: Contained Browser dry-run (Linux CI / one-Mac rehearsal).\n\
+         --native-host-sentinels is exclusive (not combined with --vf-dry-run, --synthetic, or --fault-matrix).\n\
          Admission stays false; physical_pass_claimed=false unless a future physical gate flips it."
     );
     process::exit(2);
@@ -38,6 +39,10 @@ fn main() {
 fn exit_run(args: &[String]) {
     let mut output = PathBuf::from("sep18-evidence-pack.json");
     let mut config = Sep18ChecklistRunnerConfig::contained_browser_default();
+    let mut native_host_sentinels = false;
+    let mut vf_dry_run = false;
+    let mut synthetic = false;
+    let mut checkout: Option<PathBuf> = None;
 
     let mut idx = 0;
     while idx < args.len() {
@@ -47,10 +52,17 @@ fn exit_run(args: &[String]) {
                 output = PathBuf::from(args.get(idx).unwrap_or_else(|| usage()));
             }
             "--vf-dry-run" => {
-                config = Sep18ChecklistRunnerConfig::vf_dry_run("sep18-cli-vf-dry-run");
+                vf_dry_run = true;
             }
             "--synthetic" => {
-                config.substrate = Sep18ChecklistSubstrate::SyntheticHarness;
+                synthetic = true;
+            }
+            "--native-host-sentinels" => {
+                native_host_sentinels = true;
+            }
+            "--checkout" => {
+                idx += 1;
+                checkout = Some(PathBuf::from(args.get(idx).unwrap_or_else(|| usage())));
             }
             "--fault-matrix" => {
                 idx += 1;
@@ -63,6 +75,31 @@ fn exit_run(args: &[String]) {
             }
         }
         idx += 1;
+    }
+
+    if native_host_sentinels && (vf_dry_run || synthetic || config.fault_matrix_case.is_some()) {
+        eprintln!(
+            "--native-host-sentinels cannot be combined with --vf-dry-run, --synthetic, or --fault-matrix"
+        );
+        usage();
+    }
+
+    if vf_dry_run {
+        config = Sep18ChecklistRunnerConfig::vf_dry_run("sep18-cli-vf-dry-run");
+    } else if synthetic {
+        config.substrate = Sep18ChecklistSubstrate::SyntheticHarness;
+    } else if native_host_sentinels {
+        config = Sep18ChecklistRunnerConfig::native_host_sentinel(
+            checkout.clone().unwrap_or_else(|| PathBuf::from(".")),
+        );
+    }
+
+    if let Some(path) = checkout {
+        if !native_host_sentinels {
+            eprintln!("--checkout is only valid with --native-host-sentinels");
+            usage();
+        }
+        config.checkout_path = Some(path);
     }
 
     let outcome = run_sep18_checklist(HostSentinelSnapshot::synthetic_baseline(), config);

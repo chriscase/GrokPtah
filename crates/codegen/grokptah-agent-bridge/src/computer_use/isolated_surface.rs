@@ -17,7 +17,7 @@ pub use grokptah_isolated_surface::{
     ProofEvidenceClass, SealedProofEvidence, Sep18NoModelProofSequencer, StopEvidence,
     SyntheticGuest, SyntheticGuestAction, SyntheticHostProbe, VfDryRunEvidence, VfDryRunOutcome,
     VfDryRunPlatform, VfLaunchReceipt, CONTAINED_BROWSER_DRY_RUN_NONCLAIM,
-    SYNTHETIC_HARNESS_NONCLAIM, VF_DRY_RUN_NONCLAIM,
+    NATIVE_HOST_SENTINEL_NONCLAIM, SYNTHETIC_HARNESS_NONCLAIM, VF_DRY_RUN_NONCLAIM,
 };
 
 /// Bridge-level admission check. Remains unavailable until physical Mac proof.

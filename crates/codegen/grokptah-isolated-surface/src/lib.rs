@@ -17,6 +17,7 @@ mod lifecycle;
 mod mac_host_sentinel;
 #[cfg(any(target_os = "macos", test))]
 mod main_checkout_fence;
+mod native_sentinel_runner;
 mod proof_sequencer;
 mod sentinel;
 mod simulator;
@@ -48,10 +49,10 @@ pub use contained_browser_dry_run::{
 };
 pub use error::{HarnessError, HarnessErrorCode, HarnessResult};
 pub use evidence_pack::{
-    parse_evidence_pack, seal_contained_browser_dry_run_pack, seal_synthetic_harness_pack,
-    seal_vf_dry_run_pack, serialize_evidence_pack, verifier_exit_code, verify_evidence_pack,
-    EvidenceVerifierCode, EvidenceVerifierDecision, HostSentinelProbeSummary, PhysicalProofMarkers,
-    Sep18ChecklistSubstrate, Sep18EvidencePack, EVIDENCE_PACK_SCHEMA_VERSION,
+    parse_evidence_pack, seal_contained_browser_dry_run_pack, seal_native_host_sentinel_pack,
+    seal_synthetic_harness_pack, seal_vf_dry_run_pack, serialize_evidence_pack, verifier_exit_code,
+    verify_evidence_pack, EvidenceVerifierCode, EvidenceVerifierDecision, HostSentinelProbeSummary,
+    PhysicalProofMarkers, Sep18ChecklistSubstrate, Sep18EvidencePack, EVIDENCE_PACK_SCHEMA_VERSION,
 };
 pub use harness::{IsolatedSurfaceHarness, StopEvidence};
 pub use lifecycle::{
@@ -59,6 +60,10 @@ pub use lifecycle::{
     LIFECYCLE_SCHEMA_VERSION,
 };
 pub use mac_host_sentinel::{mac_host_sentinel_platform_support, MacHostSentinelPlatformSupport};
+pub use native_sentinel_runner::{
+    run_native_host_sentinel, NativeSentinelEvidence, NativeSentinelRunnerOutcome,
+    NativeSentinelRunnerPlatform,
+};
 pub use proof_sequencer::{
     ChecklistStep, FaultMatrixCase, SealedProofEvidence, Sep18NoModelProofSequencer,
 };
@@ -94,3 +99,7 @@ pub const VF_DRY_RUN_NONCLAIM: &str =
 /// Non-claim for Contained Browser dry-run artifacts. Substrate rehearsal only.
 pub const CONTAINED_BROWSER_DRY_RUN_NONCLAIM: &str =
     "Contained Browser substrate v0 is not isolation PASS; never claim Virtualization.framework PASS or enable admission.";
+
+/// Non-claim for the native host-sentinel runner. Live collection is not PASS.
+pub const NATIVE_HOST_SENTINEL_NONCLAIM: &str =
+    "Native host-sentinel runner is not VF/isolation/physical PASS; live collection never enables admission or Computer Mode.";
