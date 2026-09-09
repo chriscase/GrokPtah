@@ -1646,6 +1646,16 @@ fn require_complete_reviewable_patch(
     Ok(())
 }
 
+/// MCP primary (`mcp`) and named external credential ids may use desktop
+/// `run_approve`. Host-minted `local-desktop`, legacy `desktop`, missing, and
+/// empty origins fail closed and never inherit local authority.
+fn isolated_run_accepts_desktop_durable_approval(client_id: Option<&str>) -> bool {
+    matches!(
+        client_id,
+        Some(id) if !id.is_empty() && id != "local-desktop" && id != "desktop"
+    )
+}
+
 async fn persist_mcp_isolated_run_approval(
     host: &grokptah_agent_bridge::AgentHostHandle,
     orch: &grokptah_agent_bridge::OrchestrationService,
@@ -1665,8 +1675,8 @@ async fn persist_mcp_isolated_run_approval(
         .get_session_run(session_id, run_id)
         .map_err(map_err)?
         .ok_or_else(|| "unknown run for this session".to_string())?;
-    if source.client_id.as_deref() != Some("mcp") {
-        return Err("desktop approval is limited to MCP-owned runs".into());
+    if !isolated_run_accepts_desktop_durable_approval(source.client_id.as_deref()) {
+        return Err("desktop approval is limited to MCP and named external runs".into());
     }
     let execution = source
         .execution
@@ -1695,9 +1705,10 @@ async fn persist_mcp_isolated_run_approval(
         .ok_or_else(|| "run disappeared after approval".into())
 }
 
-/// Persist an exact-scope approval for an MCP-owned isolated run. The desktop
-/// uses the same durable approval contract as an external coordinator so an
-/// approval remains visible and valid across restart.
+/// Persist an exact-scope approval for an MCP or named-external isolated run.
+/// The desktop uses the same durable approval contract as an external
+/// coordinator so an approval remains visible and valid across restart.
+/// Session, workspace, owner, fingerprint, and truncation checks are unchanged.
 #[tauri::command]
 pub async fn run_approve(
     state: State<'_, AppState>,
@@ -2434,5 +2445,32 @@ mod tests {
     fn require_complete_reviewable_patch_accepts_complete_diff() {
         require_complete_reviewable_patch(&review(false))
             .expect("complete review must be accepted");
+    }
+
+    #[test]
+    fn desktop_durable_approval_accepts_mcp_and_named_external_origins() {
+        assert!(isolated_run_accepts_desktop_durable_approval(Some("mcp")));
+        assert!(isolated_run_accepts_desktop_durable_approval(Some(
+            "laptop"
+        )));
+        assert!(isolated_run_accepts_desktop_durable_approval(Some(
+            "ci-bot"
+        )));
+    }
+
+    #[test]
+    fn desktop_durable_approval_does_not_treat_local_desktop_as_external() {
+        assert!(!isolated_run_accepts_desktop_durable_approval(Some(
+            "local-desktop"
+        )));
+    }
+
+    #[test]
+    fn desktop_durable_approval_fails_closed_on_legacy_and_missing_origins() {
+        assert!(!isolated_run_accepts_desktop_durable_approval(Some(
+            "desktop"
+        )));
+        assert!(!isolated_run_accepts_desktop_durable_approval(None));
+        assert!(!isolated_run_accepts_desktop_durable_approval(Some("")));
     }
 }

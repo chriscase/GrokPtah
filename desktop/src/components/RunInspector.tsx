@@ -11,6 +11,13 @@ import {
   type PublicRunV1,
   type RemotePublicRun,
 } from "../lib/publicRun";
+import {
+  isLocalDesktopRunOrigin,
+  isScopedDurableApprovalOrigin,
+  LOCAL_DESKTOP_RUN_CLIENT_ID,
+  MCP_RUN_CLIENT_ID,
+  runRequiresDurableApproval,
+} from "../lib/runOrigin";
 import { LaneScopeLine, type LaneScope } from "./LaneScopeLine";
 import { StateCard } from "./StateCard";
 
@@ -105,13 +112,33 @@ function stopCauseLabel(run: DurableRun): string | null {
 }
 
 function runOriginLabel(run: DurableRun): string {
-  if (run.clientId === "mcp") return "MCP coordinator";
-  if (run.clientId === "local-desktop") return "Desktop";
+  if (run.clientId === MCP_RUN_CLIENT_ID) return "MCP coordinator";
+  if (run.clientId === LOCAL_DESKTOP_RUN_CLIENT_ID) return "Desktop";
   return run.clientId || "Unknown origin";
 }
 
 function isLocalDesktopKeepOrigin(run: DurableRun): boolean {
-  return run.clientId === "local-desktop";
+  return isLocalDesktopRunOrigin(run.clientId);
+}
+
+const MISSING_RETAINED_WORKTREE_DIFF = "Diff unavailable — retained worktree is missing.";
+
+function reviewSummary(review: RunReview): string {
+  if (review.retentionVerification === "worktree_missing") {
+    return MISSING_RETAINED_WORKTREE_DIFF;
+  }
+  const truncated = review.diffTruncated ? " · diff truncated" : "";
+  const retention = review.retentionVerification
+    ? ` · retention ${review.retentionVerification.replaceAll("_", " ")}`
+    : "";
+  return `${review.changedFiles.length} changed files${truncated}${retention}`;
+}
+
+function reviewDiffText(review: RunReview): string {
+  if (review.retentionVerification === "worktree_missing") {
+    return MISSING_RETAINED_WORKTREE_DIFF;
+  }
+  return review.diff || "No changes";
 }
 
 function runExecutionLabel(run: DurableRun): string {
@@ -187,7 +214,7 @@ function keptRetentionCopy(run: DurableRun, review?: RunReview): string {
     return `Keep is terminal and did not write the source workspace. Recorded retained fingerprint ${recorded ?? "unknown"} differs from the present worktree ${present ?? "unknown"}. This is current verification, not immutable retention.`;
   }
   if (status === "matched") {
-    return `Keep is terminal and did not write the source workspace. The present worktree currently matches the recorded retained fingerprint ${recorded ?? "unknown"}. This is current verification, not a guarantee that the worktree cannot change later.`;
+    return `Keep is terminal and did not write the source workspace. The present worktree ${present ?? "unknown"} currently matches the recorded retained fingerprint ${recorded ?? "unknown"}. This is current verification, not a guarantee that the worktree cannot change later.`;
   }
   return "Isolated worktree retained without writing the source workspace. Keep is terminal. Review remains available to verify the present worktree against the recorded retained fingerprint; that check is current verification, not immutable retention.";
 }
@@ -286,9 +313,9 @@ export function RunInspector({
     ? publicRuns
     : localRuns.filter((run) => {
         if (originFilter === "all") return true;
-        if (originFilter === "mcp") return run.clientId === "mcp";
-        if (originFilter === "desktop") return run.clientId === "local-desktop";
-        return run.clientId !== "mcp" && run.clientId !== "local-desktop";
+        if (originFilter === "mcp") return run.clientId === MCP_RUN_CLIENT_ID;
+        if (originFilter === "desktop") return isLocalDesktopRunOrigin(run.clientId);
+        return run.clientId !== MCP_RUN_CLIENT_ID && !isLocalDesktopRunOrigin(run.clientId);
       });
 
   async function review(runId: string) {
@@ -687,7 +714,8 @@ export function RunInspector({
             const eventError = eventErrors[run.runId];
             const approvalExpiry = run.approval ? Date.parse(run.approval.expiresAt) : NaN;
             const approvalActive = Number.isFinite(approvalExpiry) && approvalExpiry > Date.now();
-            const requiresDurableApproval = run.clientId === "mcp";
+            const requiresDurableApproval = runRequiresDurableApproval(run.clientId);
+            const canPersistDesktopApproval = isScopedDurableApprovalOrigin(run.clientId);
             const tokens = tokenLabel(run);
             const stopCause = stopCauseLabel(run);
             return (
@@ -754,7 +782,7 @@ export function RunInspector({
                     This run stopped after restart. Review it before starting a linked retry.
                   </div>
                 )}
-                {!remote && run.state === "interrupted" && run.clientId === "mcp" && (
+                {!remote && run.state === "interrupted" && run.clientId === MCP_RUN_CLIENT_ID && (
                   <div className="run-retry">
                     <label htmlFor={`retry-prompt-${run.runId}`}>Fresh recovery prompt</label>
                     <textarea
@@ -780,7 +808,7 @@ export function RunInspector({
                     </button>
                   </div>
                 )}
-                {run.clientId === "mcp" &&
+                {run.clientId === MCP_RUN_CLIENT_ID &&
                   (run.state === "running" || run.state === "queued") && (
                     <div className="run-control">
                       <label htmlFor={`steer-prompt-${run.runId}`}>Steering prompt</label>
@@ -931,7 +959,7 @@ export function RunInspector({
                             {reviewing === run.runId ? "Reviewing…" : "Review diff"}
                           </button>
                         )}
-                        {requiresDurableApproval &&
+                        {canPersistDesktopApproval &&
                           run.execution.promotionState === "ready" &&
                           currentReview &&
                           !currentReview.diffTruncated &&
@@ -973,7 +1001,8 @@ export function RunInspector({
                         {run.execution.promotionState === "ready" &&
                           currentReview &&
                           !currentReview.diffTruncated &&
-                          (!requiresDurableApproval || approvalActive) && (
+                          (!requiresDurableApproval ||
+                            (canPersistDesktopApproval && approvalActive)) && (
                             <button
                               type="button"
                               className="composer-chip on"
@@ -998,14 +1027,8 @@ export function RunInspector({
                       </div>
                       {currentReview && (
                         <details className="run-review" open>
-                          <summary>
-                            {currentReview.changedFiles.length} changed files
-                            {currentReview.diffTruncated ? " · diff truncated" : ""}
-                            {currentReview.retentionVerification
-                              ? ` · retention ${currentReview.retentionVerification.replaceAll("_", " ")}`
-                              : ""}
-                          </summary>
-                          <pre>{currentReview.diff || "No changes"}</pre>
+                          <summary>{reviewSummary(currentReview)}</summary>
+                          <pre>{reviewDiffText(currentReview)}</pre>
                         </details>
                       )}
                     </div>

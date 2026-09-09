@@ -458,6 +458,7 @@ describe("RunInspector", () => {
     expect(await screen.findByText(/1 changed files/)).toBeTruthy();
     expect(screen.getByText("Keep for review")).toBeTruthy();
     expect(screen.getByText("Apply exact reviewed patch")).toBeTruthy();
+    expect(screen.queryByText("Approve for promotion")).toBeNull();
     expect(screen.getByText(/diff --git/)).toBeTruthy();
   });
 
@@ -931,7 +932,7 @@ describe("RunInspector", () => {
     expect(onPromote).not.toHaveBeenCalled();
   });
 
-  it("does not enable Keep for a legacy or named-credential desktop client id", async () => {
+  it("does not enable Keep or Apply for a legacy desktop client id", async () => {
     const isolated = run({
       clientId: "desktop",
       execution: {
@@ -947,7 +948,112 @@ describe("RunInspector", () => {
     });
     render(<RunInspector runs={[isolated]} onRefresh={vi.fn()} {...actions} />);
     fireEvent.click(screen.getByText("Review diff"));
+    expect(await screen.findByText(/1 changed files/)).toBeTruthy();
+    expect(screen.queryByText("Keep for review")).toBeNull();
+    expect(screen.queryByText("Approve for promotion")).toBeNull();
+    expect(screen.queryByText("Apply exact reviewed patch")).toBeNull();
+  });
+
+  it("does not enable Keep, Approve, or Apply when origin is missing", async () => {
+    const isolated = run({
+      clientId: null,
+      execution: {
+        mode: "isolated_worktree",
+        sourceWorkspace: "/tmp/demo",
+        executionWorkspace: "/tmp/demo/.grokptah/worktrees/runs/run-1",
+        baseRevision: "base",
+        sourceFingerprint: "source",
+        finalFingerprint: "abc123",
+        promotionState: "ready",
+        promotedAt: null,
+      },
+    });
+    render(<RunInspector runs={[isolated]} onRefresh={vi.fn()} {...actions} />);
+    fireEvent.click(screen.getByText("Review diff"));
+    expect(await screen.findByText(/1 changed files/)).toBeTruthy();
+    expect(screen.queryByText("Keep for review")).toBeNull();
+    expect(screen.queryByText("Approve for promotion")).toBeNull();
+    expect(screen.queryByText("Apply exact reviewed patch")).toBeNull();
+  });
+
+  it("does not show Apply for a named credential without durable approval", async () => {
+    const isolated = run({
+      clientId: "laptop",
+      execution: {
+        mode: "isolated_worktree",
+        sourceWorkspace: "/tmp/demo",
+        executionWorkspace: "/tmp/demo/.grokptah/worktrees/runs/run-1",
+        baseRevision: "base",
+        sourceFingerprint: "source",
+        finalFingerprint: "abc123",
+        promotionState: "ready",
+        promotedAt: null,
+      },
+    });
+    render(<RunInspector runs={[isolated]} onRefresh={vi.fn()} {...actions} />);
+    fireEvent.click(screen.getByText("Review diff"));
+    expect(await screen.findByRole("button", { name: "Approve for promotion" })).toBeTruthy();
+    expect(screen.queryByText("Keep for review")).toBeNull();
+    expect(screen.queryByText("Apply exact reviewed patch")).toBeNull();
+  });
+
+  it("uses the existing approval flow for an authorized named credential", async () => {
+    const isolated = run({
+      clientId: "laptop",
+      execution: {
+        mode: "isolated_worktree",
+        sourceWorkspace: "/tmp/demo",
+        executionWorkspace: "/tmp/demo/.grokptah/worktrees/runs/named-1",
+        baseRevision: "base",
+        sourceFingerprint: "source",
+        finalFingerprint: "abc123",
+        promotionState: "ready",
+        promotedAt: null,
+      },
+    });
+    const onApprove = vi.fn(async () => undefined);
+    const onRefresh = vi.fn();
+    const { rerender } = render(
+      <RunInspector
+        runs={[isolated]}
+        onRefresh={onRefresh}
+        {...actions}
+        onApprove={onApprove}
+      />,
+    );
+
+    fireEvent.click(screen.getByText("Review diff"));
+    fireEvent.click(await screen.findByRole("button", { name: "Approve for promotion" }));
+    expect(onApprove).toHaveBeenCalledWith("desktop-run-1");
+    await waitFor(() => expect(onRefresh).toHaveBeenCalledTimes(1));
+
+    rerender(
+      <RunInspector
+        runs={[
+          run({
+            clientId: "laptop",
+            execution: isolated.execution,
+            approval: {
+              approvalId: "approval-named",
+              runId: "desktop-run-1",
+              sessionId: "session-1",
+              workspace: "/tmp/demo",
+              sourceFingerprint: "source",
+              finalFingerprint: "abc123",
+              changedFiles: review.changedFiles,
+              issuedAt: "2026-08-11T12:00:00Z",
+              expiresAt: "2099-08-11T12:05:00Z",
+            },
+          }),
+        ]}
+        onRefresh={onRefresh}
+        {...actions}
+        onApprove={onApprove}
+      />,
+    );
+    fireEvent.click(screen.getByText("Review diff"));
     expect(await screen.findByText("Apply exact reviewed patch")).toBeTruthy();
+    expect(screen.queryByText("Approve for promotion")).toBeNull();
     expect(screen.queryByText("Keep for review")).toBeNull();
   });
 
@@ -1052,9 +1158,52 @@ describe("RunInspector", () => {
     );
 
     fireEvent.click(screen.getByRole("button", { name: "Review diff" }));
+    expect(
+      await screen.findAllByText("Diff unavailable — retained worktree is missing."),
+    ).not.toHaveLength(0);
+    expect(screen.queryByText("0 changed files")).toBeNull();
+    expect(screen.queryByText("No changes")).toBeNull();
     expect(await screen.findByText(/isolated worktree is no longer present/i)).toBeTruthy();
     expect(screen.getByText(/recorded retained fingerprint abc123/i)).toBeTruthy();
     expect(screen.queryByText(/until a complete reviewable patch/i)).toBeNull();
+    expect(screen.queryByText("Keep for review")).toBeNull();
+    expect(screen.queryByText("Apply exact reviewed patch")).toBeNull();
+    expect(screen.queryByText("Discard")).toBeNull();
+  });
+
+  it("presents matched retained worktree fingerprints as current verification, not immutable retention", async () => {
+    const kept = run({
+      execution: {
+        mode: "isolated_worktree",
+        sourceWorkspace: "/tmp/demo",
+        executionWorkspace: "/tmp/demo/.grokptah/worktrees/runs/run-1",
+        baseRevision: "base",
+        sourceFingerprint: "source",
+        finalFingerprint: "recorded-fp",
+        promotionState: "kept_for_review",
+        promotedAt: null,
+      },
+    });
+    const matched: RunReview = {
+      ...review,
+      fingerprint: "present-fp",
+      retainedFingerprint: "recorded-fp",
+      presentFingerprint: "present-fp",
+      retentionVerification: "matched",
+    };
+    const onReview = vi.fn(async () => matched);
+    render(
+      <RunInspector runs={[kept]} onRefresh={vi.fn()} {...actions} onReview={onReview} />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Review diff" }));
+    expect(
+      await screen.findByText(/present worktree present-fp currently matches the recorded retained fingerprint recorded-fp/i),
+    ).toBeTruthy();
+    expect(
+      screen.getByText(/This is current verification, not a guarantee that the worktree cannot change later/),
+    ).toBeTruthy();
+    expect(screen.queryByText(/immutable retention/i)).toBeNull();
     expect(screen.queryByText("Keep for review")).toBeNull();
     expect(screen.queryByText("Apply exact reviewed patch")).toBeNull();
     expect(screen.queryByText("Discard")).toBeNull();
