@@ -58,6 +58,23 @@ impl HostSentinelSnapshot {
             main_checkout_fence: MainCheckoutFence::synthetic(),
         }
     }
+
+    /// True when a native Mac reading includes every required sentinel field.
+    /// Incomplete native snapshots fail closed and must not fall back to synthetic.
+    /// Does not inspect or return clipboard content, window titles, paths, or handles.
+    pub fn native_reading_is_complete(&self) -> bool {
+        fn digest_field(value: &str) -> bool {
+            value.starts_with("sha256:") && value.len() > "sha256:".len()
+        }
+        !self.foreground_app_id.is_empty()
+            && !self.foreground_window_id.is_empty()
+            && digest_field(&self.clipboard_digest)
+            && !self.unrelated_window_app_id.is_empty()
+            && !self.unrelated_window_id.is_empty()
+            && digest_field(&self.unrelated_window_title_hash)
+            && !self.main_checkout_fence.checkout_path.is_empty()
+            && digest_field(&self.main_checkout_fence.content_digest)
+    }
 }
 
 /// Provenance for host sentinel probes — physical proof requires native reads.
@@ -222,6 +239,10 @@ impl HostSentinelRegistry {
         self.native_host_probes_performed
     }
 
+    pub fn last_probe_kind(&self) -> Option<HostSentinelProbeKind> {
+        self.last_probe_kind
+    }
+
     /// True only when the latest completed probe was a successful native Mac host
     /// read that matched baseline. A later synthetic self-compare clears this.
     /// Cumulative `native_host_probes_performed` is audit evidence and does not
@@ -286,6 +307,12 @@ impl HostSentinelRegistry {
         observed: HostSentinelSnapshot,
         kind: HostSentinelProbeKind,
     ) -> HarnessResult<()> {
+        if kind == HostSentinelProbeKind::NativeMacHost && !observed.native_reading_is_complete() {
+            self.record_unsuccessful_probe(kind);
+            return Err(HarnessError::backend_unavailable(
+                "native host sentinel reading is incomplete",
+            ));
+        }
         self.probes_performed = self.probes_performed.saturating_add(1);
         self.last_probe_kind = Some(kind);
         if observed != self.baseline {
@@ -484,6 +511,29 @@ mod tests {
             Some(HostSentinelProbeKind::SyntheticRehearsal)
         );
         assert!(!registry.live_host_collection_verified());
+    }
+
+    #[test]
+    fn incomplete_native_reading_fails_closed_without_synthetic_fallback() {
+        let baseline = HostSentinelSnapshot::synthetic_baseline();
+        let mut incomplete = baseline.clone();
+        incomplete.clipboard_digest.clear();
+        let native = NativeMacHostTestProbe { state: incomplete };
+        let mut registry = HostSentinelRegistry::capture(baseline);
+        let err = registry
+            .probe_and_verify(&native)
+            .expect_err("incomplete native");
+        assert_eq!(err.code, crate::error::HarnessErrorCode::BackendUnavailable);
+        assert!(err.message.contains("incomplete"));
+        assert!(!err.message.contains("sha256:"));
+        assert_eq!(registry.probes_performed(), 0);
+        assert_eq!(registry.native_host_probes_performed(), 0);
+        assert_eq!(
+            registry.last_probe_kind(),
+            Some(HostSentinelProbeKind::NativeMacHost)
+        );
+        assert!(!registry.live_host_collection_verified());
+        assert!(!registry.verified_via_probe());
     }
 
     #[test]

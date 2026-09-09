@@ -1247,4 +1247,56 @@ mod tests {
             EvidenceVerifierCode::VfDryRunCannotQualifyPhysicalPass
         );
     }
+
+    #[test]
+    fn native_stop_provenance_is_carried_without_promotion_or_secrets() {
+        use crate::sentinel::HostSentinelProbeKind;
+
+        let sequencer = Sep18NoModelProofSequencer::new(HostSentinelSnapshot::synthetic_baseline());
+        let mut evidence = sequencer
+            .run_vf_dry_run(VfLaunchReceipt {
+                physical_mac_proof_id: "linux-ci-dry-run".into(),
+            })
+            .expect("vf dry-run");
+        evidence.native_host_sentinels_requested = true;
+        evidence.host_sentinel_probe_kind = Some(HostSentinelProbeKind::NativeMacHost);
+        evidence.host_sentinel_probes_performed = 2;
+        evidence.host_sentinels_unchanged_at_stop = true;
+        evidence.live_host_sentinel_collection_at_stop = true;
+        evidence.channels_destroyed = 2;
+
+        let pack = seal_vf_dry_run_pack(evidence);
+        assert!(!pack.physical_pass_claimed);
+        assert!(!pack.vf_pass_claimed);
+        assert!(!pack.isolation_pass_claimed);
+        assert!(!pack.admission_available);
+        assert!(!pack.physical_proof_markers.mac_worker_attested);
+        assert!(!pack.physical_proof_markers.live_host_sentinel_collection);
+        assert!(pack.physical_proof_markers.physical_mac_proof_id.is_none());
+        assert_eq!(pack.host_sentinel_probes.probes_performed, 0);
+        assert!(
+            !pack
+                .host_sentinel_probes
+                .live_host_sentinel_collection_at_stop
+        );
+        let vf = pack.vf_dry_run.as_ref().expect("nested vf evidence");
+        assert!(vf.native_host_sentinels_requested);
+        assert_eq!(
+            vf.host_sentinel_probe_kind,
+            Some(HostSentinelProbeKind::NativeMacHost)
+        );
+        assert_eq!(vf.host_sentinel_probes_performed, 2);
+        assert!(vf.host_sentinels_unchanged_at_stop);
+        assert!(vf.live_host_sentinel_collection_at_stop);
+        assert!(!vf.physical_pass_claimed);
+
+        let json = serialize_evidence_pack(&pack).expect("serialize");
+        let lowered = json.to_ascii_lowercase();
+        assert!(!lowered.contains("clipboard content"));
+        assert!(!json.contains("/workspace"));
+        assert!(!lowered.contains("window title"));
+        assert!(!lowered.contains("cgevent"));
+        let decision = verify_evidence_pack(&pack);
+        assert!(decision.accepted, "{:?}", decision);
+    }
 }
