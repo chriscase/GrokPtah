@@ -4569,6 +4569,7 @@ export default function App() {
         {rightTab === "tasks" && (
           <>
             <RunInspector
+              key={`runs:${runScope.laneId ?? ""}:${runScope.workspacePath ?? ""}:${remoteServiceStatus.connected ? "remote" : "local"}`}
               scope={runScope}
               laneTitle={
                 executionTarget === "remote" && selectedRemoteLane
@@ -4625,6 +4626,11 @@ export default function App() {
                 if (remoteServiceStatus.connected) throw new Error("Remote promotion is not available in this view");
                 if (!activeSessionId) throw new Error("No active session");
                 await api.runPromote(activeSessionId, runId);
+              }}
+              onKeepForReview={async (runId) => {
+                if (remoteServiceStatus.connected) throw new Error("Remote keep for review is not available in this view");
+                if (!activeSessionId) throw new Error("No active session");
+                await api.runKeepForReview(activeSessionId, runId);
               }}
               onDiscard={async (runId) => {
                 if (remoteServiceStatus.connected) throw new Error("Remote discard is not available in this view");

@@ -131,6 +131,15 @@ pub enum RunExecutionMode {
     IsolatedWorktree,
 }
 
+/// Durable isolated-run disposition recorded on `RunRecord`.
+///
+/// `Promoted` (apply), `Discarded`, and `KeptForReview` are terminal and
+/// mutually exclusive. Keep retains the registered worktree and exact reviewed
+/// patch without writing the source workspace. Later review of a kept run is
+/// observational: it reports whether the present worktree currently matches the
+/// recorded retained fingerprint, or is drifted or missing, and must not rewrite
+/// this terminal state. That check is current verification, not immutable
+/// retention.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PromotionState {
@@ -141,6 +150,7 @@ pub enum PromotionState {
     Promoted,
     Conflicted,
     Discarded,
+    KeptForReview,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -478,6 +488,19 @@ pub struct RunRecord {
     pub approval: Option<RunApproval>,
 }
 
+/// Origin identity minted only by local desktop `begin_desktop_run`.
+///
+/// This value is reserved: MCP `AuthCredential` ids cannot be this marker
+/// (`AuthCredential::new` and `set_auth_credentials` reject it). Keep and the
+/// local desktop Keep action accept only this `client_id`. The historical
+/// wire value `desktop` remains valid MCP attribution for a named credential
+/// and for legacy rows, but those records fail closed for Keep. Public-run
+/// payloads still omit `clientId`.
+pub const LOCAL_DESKTOP_ORIGIN_ID: &str = "local-desktop";
+
+/// Historical MCP/desktop attribution string. Not Keep-eligible.
+pub const LEGACY_DESKTOP_CLIENT_ID: &str = "desktop";
+
 impl RunRecord {
     /// Product Lane identity during the session-to-Lane compatibility period.
     ///
@@ -486,6 +509,14 @@ impl RunRecord {
     /// explicit to new callers.
     pub fn lane_id(&self) -> Uuid {
         self.session_id
+    }
+
+    /// Durable Keep origin: host-minted `local-desktop` client_id only.
+    ///
+    /// Migration seam: rename any MCP credential whose id is `local-desktop`.
+    /// Legacy `client_id == "desktop"` rows fail closed and are not Keep-eligible.
+    pub fn is_local_desktop_keep_origin(&self) -> bool {
+        self.client_id.as_deref() == Some(LOCAL_DESKTOP_ORIGIN_ID)
     }
 
     /// Close a durable provider-attempt marker that can no longer be
@@ -2219,5 +2250,66 @@ mod tests {
         let encoded = serde_json::to_vec(&plan).unwrap();
         let decoded: AgentResumePlan = serde_json::from_slice(&encoded).unwrap();
         assert!(decoded.validate_for(session_id, "/tmp/project").is_ok());
+    }
+
+    #[test]
+    fn kept_for_review_is_a_durable_terminal_promotion_state() {
+        let encoded = serde_json::to_string(&PromotionState::KeptForReview).unwrap();
+        assert_eq!(encoded, "\"kept_for_review\"");
+        let decoded: PromotionState = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, PromotionState::KeptForReview);
+        assert_ne!(PromotionState::KeptForReview, PromotionState::Promoted);
+        assert_ne!(PromotionState::KeptForReview, PromotionState::Discarded);
+        assert_ne!(PromotionState::KeptForReview, PromotionState::Ready);
+    }
+
+    #[test]
+    fn keep_for_review_is_not_an_mcp_control_tool() {
+        assert!(!CONTROL_TOOLS.contains(&"ptah_keep_run"));
+        assert!(!CONTROL_TOOLS.contains(&"ptah_keep_run_for_review"));
+        assert!(!CONTROL_TOOLS.iter().any(|tool| tool.contains("keep")));
+    }
+
+    #[test]
+    fn local_desktop_keep_origin_is_the_reserved_client_id_only() {
+        let mut run = RunRecord {
+            run_id: Uuid::new_v4().to_string(),
+            session_id: Uuid::nil(),
+            workspace: "/tmp/project".into(),
+            request_id: "request".into(),
+            client_id: Some(LOCAL_DESKTOP_ORIGIN_ID.into()),
+            state: RunState::Completed,
+            purpose: RunPurpose::Execution,
+            agent_id: None,
+            retry_of: None,
+            parent_run_id: None,
+            agent_spec_revision: None,
+            checkpoint_id: None,
+            continuation_context_id: None,
+            continuation_context_hash: None,
+            continuation_fidelity: None,
+            queue_position: None,
+            bounds: RunBounds::default(),
+            prompt_preview: "keep origin".into(),
+            start_seq: None,
+            end_seq: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            terminal_result: None,
+            final_response: None,
+            error_code: None,
+            stop_cause: None,
+            aggregates: RunAggregates::default(),
+            progress: None,
+            execution: None,
+            approval: None,
+        };
+        assert!(run.is_local_desktop_keep_origin());
+        run.client_id = Some(LEGACY_DESKTOP_CLIENT_ID.into());
+        assert!(!run.is_local_desktop_keep_origin());
+        run.client_id = Some("mcp".into());
+        assert!(!run.is_local_desktop_keep_origin());
+        run.client_id = None;
+        assert!(!run.is_local_desktop_keep_origin());
     }
 }

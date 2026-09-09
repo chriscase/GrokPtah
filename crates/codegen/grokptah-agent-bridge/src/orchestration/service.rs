@@ -22,8 +22,8 @@ use crate::prompt_queue::{PromptQueueEntry, SteeringDisposition};
 use crate::session::{SessionKind, WorkspaceStatus};
 
 use super::authz::{
-    authenticate_bearer, canonical_workspace, require_workspace_match, AuthContext, AuthCredential,
-    WorkspaceAllowlist,
+    authenticate_bearer, canonical_workspace, require_workspace_match, validate_auth_credential_id,
+    AuthContext, AuthCredential, WorkspaceAllowlist,
 };
 use super::graph::{validate_scoped_dependency_graph, GraphScope};
 use super::managed::{
@@ -2168,6 +2168,11 @@ impl OrchestrationService {
                 OrchErrorCode::InvalidRequest,
                 "auth credentials must include the primary credential",
             ));
+        }
+        for credential in &credentials {
+            // `AuthCredential.id` is public; revalidate at install time so a
+            // mutated id cannot mint the reserved local-desktop origin.
+            validate_auth_credential_id(&credential.id)?;
         }
         let primary_token = credentials
             .iter()
@@ -7274,6 +7279,18 @@ impl OrchestrationService {
                 ))
             }
         };
+        if review.diff_truncated {
+            return Err(self.fail_claim(
+                &mut lease,
+                Some(run_id.to_string()),
+                session_id,
+                Path::new(&run.workspace),
+                OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "reviewed diff is truncated; applying the exact patch requires a complete reviewable patch",
+                ),
+            ));
+        }
         let Some(execution) = run.execution.as_ref() else {
             unreachable!("isolated_review guarantees execution");
         };

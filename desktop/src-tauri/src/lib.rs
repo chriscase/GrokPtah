@@ -223,6 +223,7 @@ fn run_inner() -> anyhow::Result<()> {
             commands::run_review,
             commands::run_approve,
             commands::run_promote,
+            commands::run_keep_for_review,
             commands::run_discard,
             commands::run_retry,
             commands::run_steer,

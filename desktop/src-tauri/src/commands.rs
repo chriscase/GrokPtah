@@ -5,9 +5,9 @@ use grokptah_agent_bridge::{
     ComputerPermissionStatus, ComputerPlatformStatus, ComputerTargetCandidate, EffortLevel,
     JournalPage, McpServerInfo, ModelInfo, PermissionDecision, PluginInfo, PromptQueueEntry,
     PromptQueueRunNextResult, PromptQueueSnapshot, PromptQueueTakeResult, ProviderDeadlineClass,
-    ProviderProfileUpdate, ProviderQualificationReport, RunExecutionMode, RunReview, RunState,
-    SearchHit, SearchQuery, SessionCompletion, SessionKind, SessionSummary, SkillInfo,
-    SteeringReceipt, SubagentInfo, TranscriptEntry, WorkspaceUiState, BRIDGE_VERSION, PRODUCT_NAME,
+    ProviderProfileUpdate, ProviderQualificationReport, RunExecutionMode, RunState, SearchHit,
+    SearchQuery, SessionCompletion, SessionKind, SessionSummary, SkillInfo, SteeringReceipt,
+    SubagentInfo, TranscriptEntry, WorkspaceUiState, BRIDGE_VERSION, PRODUCT_NAME,
 };
 use tauri::{AppHandle, State};
 use tauri_plugin_dialog::DialogExt;
@@ -771,10 +771,7 @@ pub async fn persistent_agent_get(
     }
     let host = state.host.clone();
     let agent = run_blocking(move || host.get_persistent_agent(&agent_id).map_err(map_err)).await?;
-    agent
-        .map(serde_json::to_value)
-        .transpose()
-        .map_err(map_err)
+    agent.map(serde_json::to_value).transpose().map_err(map_err)
 }
 
 #[tauri::command]
@@ -1624,21 +1621,94 @@ pub async fn run_events(
     .await
 }
 
-/// Read the bounded diff for a completed isolated run.
+/// Read the bounded diff for a completed isolated run, including current
+/// kept-run retention verification when applicable.
 #[tauri::command]
 pub async fn run_review(
     state: State<'_, AppState>,
     session_id: String,
     run_id: String,
-) -> Result<RunReview, String> {
+) -> Result<serde_json::Value, String> {
     let host = state.host.clone();
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
-    run_blocking(move || host.review_run(id, &run_id).map_err(map_err)).await
+    run_blocking(move || host.review_run_view(id, &run_id).map_err(map_err)).await
 }
 
-/// Persist an exact-scope approval for an MCP-owned isolated run. The desktop
-/// uses the same durable approval contract as an external coordinator so an
-/// approval remains visible and valid across restart.
+fn require_complete_reviewable_patch(
+    review: &grokptah_agent_bridge::RunReview,
+) -> Result<(), String> {
+    if review.diff_truncated {
+        return Err(
+            "reviewed diff is truncated; applying the exact patch requires a complete reviewable patch"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// MCP primary (`mcp`) and named external credential ids may use desktop
+/// `run_approve`. Host-minted `local-desktop`, legacy `desktop`, missing, and
+/// empty origins fail closed and never inherit local authority.
+fn isolated_run_accepts_desktop_durable_approval(client_id: Option<&str>) -> bool {
+    matches!(
+        client_id,
+        Some(id) if !id.is_empty() && id != "local-desktop" && id != "desktop"
+    )
+}
+
+async fn persist_mcp_isolated_run_approval(
+    host: &grokptah_agent_bridge::AgentHostHandle,
+    orch: &grokptah_agent_bridge::OrchestrationService,
+    token: &str,
+    session_id: Uuid,
+    run_id: &str,
+    ttl_ms: Option<u64>,
+) -> Result<grokptah_agent_bridge::RunRecord, String> {
+    let auth = orch
+        .auth_header(Some(&format!("Bearer {token}")))
+        .map_err(map_err)?;
+    let session = host.session_load(session_id).map_err(map_err)?;
+    if session.cwd.is_empty() {
+        return Err("the session has no workspace".into());
+    }
+    let source = host
+        .get_session_run(session_id, run_id)
+        .map_err(map_err)?
+        .ok_or_else(|| "unknown run for this session".to_string())?;
+    if !isolated_run_accepts_desktop_durable_approval(source.client_id.as_deref()) {
+        return Err("desktop approval is limited to MCP and named external runs".into());
+    }
+    let execution = source
+        .execution
+        .clone()
+        .ok_or_else(|| "run used shared execution and has no isolated diff".to_string())?;
+    if execution.mode != RunExecutionMode::IsolatedWorktree {
+        return Err("run used shared execution and cannot be approved".into());
+    }
+    let review = host.review_run(session_id, run_id).map_err(map_err)?;
+    require_complete_reviewable_patch(&review)?;
+    orch.approve_run(
+        &auth,
+        &Uuid::new_v4().to_string(),
+        session_id,
+        &PathBuf::from(&session.cwd),
+        run_id,
+        execution.source_fingerprint,
+        review.fingerprint,
+        review.changed_files,
+        ttl_ms,
+    )
+    .await
+    .map_err(map_err)?;
+    host.get_session_run(session_id, run_id)
+        .map_err(map_err)?
+        .ok_or_else(|| "run disappeared after approval".into())
+}
+
+/// Persist an exact-scope approval for an MCP or named-external isolated run.
+/// The desktop uses the same durable approval contract as an external
+/// coordinator so an approval remains visible and valid across restart.
+/// Session, workspace, owner, fingerprint, and truncation checks are unchanged.
 #[tauri::command]
 pub async fn run_approve(
     state: State<'_, AppState>,
@@ -1648,50 +1718,7 @@ pub async fn run_approve(
 ) -> Result<grokptah_agent_bridge::RunRecord, String> {
     let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
     let (orch, token) = desktop_mcp_orchestration(&state)?;
-    let auth = orch
-        .auth_header(Some(&format!("Bearer {token}")))
-        .map_err(map_err)?;
-    let session = state.host.session_load(session_id).map_err(map_err)?;
-    if session.cwd.is_empty() {
-        return Err("the session has no workspace".into());
-    }
-    let source = state
-        .host
-        .get_session_run(session_id, &run_id)
-        .map_err(map_err)?
-        .ok_or_else(|| "unknown run for this session".to_string())?;
-    if source.client_id.as_deref() != Some("mcp") {
-        return Err("desktop approval is limited to MCP-owned runs".into());
-    }
-    let execution = source
-        .execution
-        .clone()
-        .ok_or_else(|| "run used shared execution and has no isolated diff".to_string())?;
-    if execution.mode != RunExecutionMode::IsolatedWorktree {
-        return Err("run used shared execution and cannot be approved".into());
-    }
-    let review = state
-        .host
-        .review_run(session_id, &run_id)
-        .map_err(map_err)?;
-    orch.approve_run(
-        &auth,
-        &Uuid::new_v4().to_string(),
-        session_id,
-        &PathBuf::from(&session.cwd),
-        &run_id,
-        execution.source_fingerprint,
-        review.fingerprint,
-        review.changed_files,
-        ttl_ms,
-    )
-    .await
-    .map_err(map_err)?;
-    state
-        .host
-        .get_session_run(session_id, &run_id)
-        .map_err(map_err)?
-        .ok_or_else(|| "run disappeared after approval".into())
+    persist_mcp_isolated_run_approval(&state.host, &orch, &token, session_id, &run_id, ttl_ms).await
 }
 
 /// Promote a reviewed isolated run into its unchanged source workspace.
@@ -1716,6 +1743,18 @@ pub async fn run_promote(
         }
     })
     .await
+}
+
+/// Keep a reviewed local isolated run without writing the source workspace.
+#[tauri::command]
+pub async fn run_keep_for_review(
+    state: State<'_, AppState>,
+    session_id: String,
+    run_id: String,
+) -> Result<grokptah_agent_bridge::RunRecord, String> {
+    let host = state.host.clone();
+    let id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    run_blocking(move || host.keep_run_for_review(id, &run_id).map_err(map_err)).await
 }
 
 /// Discard an isolated run and remove only its managed worktree.
@@ -2378,4 +2417,60 @@ pub fn pty_create_command(
         .pty
         .create_command(&command, cols, rows)
         .map_err(map_err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn review(diff_truncated: bool) -> grokptah_agent_bridge::RunReview {
+        grokptah_agent_bridge::RunReview {
+            changed_files: Vec::new(),
+            diff: "diff --git a/src/lib.rs b/src/lib.rs\n".into(),
+            diff_truncated,
+            fingerprint: "fp".into(),
+        }
+    }
+
+    #[test]
+    fn require_complete_reviewable_patch_rejects_truncated_diff() {
+        let err = require_complete_reviewable_patch(&review(true)).unwrap_err();
+        assert!(
+            err.to_lowercase().contains("truncated"),
+            "expected truncated refusal, got {err}"
+        );
+    }
+
+    #[test]
+    fn require_complete_reviewable_patch_accepts_complete_diff() {
+        require_complete_reviewable_patch(&review(false))
+            .expect("complete review must be accepted");
+    }
+
+    #[test]
+    fn desktop_durable_approval_accepts_mcp_and_named_external_origins() {
+        assert!(isolated_run_accepts_desktop_durable_approval(Some("mcp")));
+        assert!(isolated_run_accepts_desktop_durable_approval(Some(
+            "laptop"
+        )));
+        assert!(isolated_run_accepts_desktop_durable_approval(Some(
+            "ci-bot"
+        )));
+    }
+
+    #[test]
+    fn desktop_durable_approval_does_not_treat_local_desktop_as_external() {
+        assert!(!isolated_run_accepts_desktop_durable_approval(Some(
+            "local-desktop"
+        )));
+    }
+
+    #[test]
+    fn desktop_durable_approval_fails_closed_on_legacy_and_missing_origins() {
+        assert!(!isolated_run_accepts_desktop_durable_approval(Some(
+            "desktop"
+        )));
+        assert!(!isolated_run_accepts_desktop_durable_approval(None));
+        assert!(!isolated_run_accepts_desktop_durable_approval(Some("")));
+    }
 }

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type {
   DurableRun,
   DurableRunEvent,
@@ -11,6 +11,13 @@ import {
   type PublicRunV1,
   type RemotePublicRun,
 } from "../lib/publicRun";
+import {
+  isLocalDesktopRunOrigin,
+  isScopedDurableApprovalOrigin,
+  LOCAL_DESKTOP_RUN_CLIENT_ID,
+  MCP_RUN_CLIENT_ID,
+  runRequiresDurableApproval,
+} from "../lib/runOrigin";
 import { LaneScopeLine, type LaneScope } from "./LaneScopeLine";
 import { StateCard } from "./StateCard";
 
@@ -29,6 +36,7 @@ type RunInspectorProps = {
   onReview: (runId: string) => Promise<RunReview>;
   onApprove: (runId: string) => Promise<void>;
   onPromote: (runId: string) => Promise<void>;
+  onKeepForReview: (runId: string) => Promise<void>;
   onDiscard: (runId: string) => Promise<void>;
   onRetry: (runId: string, prompt: string) => Promise<void>;
   onSteer: (runId: string, text: string) => Promise<void>;
@@ -104,9 +112,49 @@ function stopCauseLabel(run: DurableRun): string | null {
 }
 
 function runOriginLabel(run: DurableRun): string {
-  if (run.clientId === "mcp") return "MCP coordinator";
-  if (run.clientId === "desktop") return "Desktop";
+  if (run.clientId === MCP_RUN_CLIENT_ID) return "MCP coordinator";
+  if (run.clientId === LOCAL_DESKTOP_RUN_CLIENT_ID) return "Desktop";
   return run.clientId || "Unknown origin";
+}
+
+function isLocalDesktopKeepOrigin(run: DurableRun): boolean {
+  return isLocalDesktopRunOrigin(run.clientId);
+}
+
+const MISSING_RETAINED_WORKTREE_DIFF = "Diff unavailable — retained worktree is missing.";
+
+function retentionFingerprintsAgree(
+  recorded: string | null | undefined,
+  present: string | null | undefined,
+): boolean {
+  return Boolean(recorded && present && recorded === present);
+}
+
+function reviewClaimsMatchedRetention(review: RunReview): boolean {
+  return (
+    review.retentionVerification === "matched" &&
+    retentionFingerprintsAgree(review.retainedFingerprint, review.presentFingerprint)
+  );
+}
+
+function reviewSummary(review: RunReview): string {
+  if (review.retentionVerification === "worktree_missing") {
+    return MISSING_RETAINED_WORKTREE_DIFF;
+  }
+  const truncated = review.diffTruncated ? " · diff truncated" : "";
+  const status = review.retentionVerification;
+  const retention =
+    status && (status !== "matched" || reviewClaimsMatchedRetention(review))
+      ? ` · retention ${status.replaceAll("_", " ")}`
+      : "";
+  return `${review.changedFiles.length} changed files${truncated}${retention}`;
+}
+
+function reviewDiffText(review: RunReview): string {
+  if (review.retentionVerification === "worktree_missing") {
+    return MISSING_RETAINED_WORKTREE_DIFF;
+  }
+  return review.diff || "No changes";
 }
 
 function runExecutionLabel(run: DurableRun): string {
@@ -168,6 +216,25 @@ function eventLabel(update: SessionUpdate): string {
   }
 }
 
+const KEEP_CONFIRMATION =
+  "Keep this isolated run for review? This is irreversible. The exact reviewed patch stays in the isolated worktree, the source workspace is not written, and Apply and Discard will no longer be available.";
+
+function keptRetentionCopy(run: DurableRun, review?: RunReview): string {
+  const recorded = review?.retainedFingerprint ?? run.execution?.finalFingerprint ?? null;
+  const present = review?.presentFingerprint ?? null;
+  const status = review?.retentionVerification;
+  if (status === "worktree_missing") {
+    return `Keep is terminal and did not write the source workspace. Recorded retained fingerprint ${recorded ?? "unknown"} is still on the run, but the isolated worktree is no longer present. This is current verification, not immutable retention.`;
+  }
+  if (status === "drifted") {
+    return `Keep is terminal and did not write the source workspace. Recorded retained fingerprint ${recorded ?? "unknown"} differs from the present worktree ${present ?? "unknown"}. This is current verification, not immutable retention.`;
+  }
+  if (status === "matched" && retentionFingerprintsAgree(recorded, present)) {
+    return `Keep is terminal and did not write the source workspace. The present worktree ${present ?? "unknown"} currently matches the recorded retained fingerprint ${recorded ?? "unknown"}. This is current verification, not a guarantee that the worktree cannot change later.`;
+  }
+  return "Isolated worktree retained without writing the source workspace. Keep is terminal. Review remains available to verify the present worktree against the recorded retained fingerprint; that check is current verification, not immutable retention.";
+}
+
 export function RunInspector({
   runs,
   laneTitle = null,
@@ -183,6 +250,7 @@ export function RunInspector({
   onReview,
   onApprove,
   onPromote,
+  onKeepForReview,
   onDiscard,
   onRetry,
   onSteer,
@@ -199,7 +267,11 @@ export function RunInspector({
   const [eventErrors, setEventErrors] = useState<Record<string, string>>({});
   const [retryPrompts, setRetryPrompts] = useState<Record<string, string>>({});
   const [steerPrompts, setSteerPrompts] = useState<Record<string, string>>({});
+  const [focusKeptRunId, setFocusKeptRunId] = useState<string | null>(null);
   const watchValue = watching ?? localWatching;
+  const actionEpochRef = useRef(0);
+  const keptStatusRef = useRef<HTMLDivElement | null>(null);
+  const scopeIdentity = `${remote ? "remote" : "local"}:${scope?.laneId ?? ""}:${scope?.workspacePath ?? ""}`;
 
   useEffect(() => {
     if (remote || !liveEvents) return;
@@ -223,7 +295,28 @@ export function RunInspector({
       }
       return changed ? next : current;
     });
-  }, [liveEvents]);
+  }, [liveEvents, remote]);
+
+  useEffect(() => {
+    actionEpochRef.current += 1;
+    setReviews({});
+    setActionError(null);
+    setReviewing(null);
+    setEventPages({});
+    setEventErrors({});
+    setFocusKeptRunId(null);
+    return () => {
+      actionEpochRef.current += 1;
+    };
+  }, [scopeIdentity]);
+
+  useEffect(() => {
+    if (!focusKeptRunId) return;
+    const node = keptStatusRef.current;
+    if (!node) return;
+    node.focus();
+    setFocusKeptRunId(null);
+  }, [runs, focusKeptRunId]);
 
   function setWatchValue(next: boolean) {
     setLocalWatching(next);
@@ -236,29 +329,34 @@ export function RunInspector({
     ? publicRuns
     : localRuns.filter((run) => {
         if (originFilter === "all") return true;
-        if (originFilter === "mcp") return run.clientId === "mcp";
-        if (originFilter === "desktop") return run.clientId === "desktop";
-        return run.clientId !== "mcp" && run.clientId !== "desktop";
+        if (originFilter === "mcp") return run.clientId === MCP_RUN_CLIENT_ID;
+        if (originFilter === "desktop") return isLocalDesktopRunOrigin(run.clientId);
+        return run.clientId !== MCP_RUN_CLIENT_ID && !isLocalDesktopRunOrigin(run.clientId);
       });
 
   async function review(runId: string) {
+    const epoch = actionEpochRef.current;
     setReviewing(runId);
     setActionError(null);
     try {
       const result = await onReview(runId);
+      if (epoch !== actionEpochRef.current) return;
       setReviews((current) => ({ ...current, [runId]: result }));
     } catch (error) {
+      if (epoch !== actionEpochRef.current) return;
       setActionError(String(error));
     } finally {
-      setReviewing(null);
+      if (epoch === actionEpochRef.current) setReviewing(null);
     }
   }
 
   async function promote(runId: string) {
+    const epoch = actionEpochRef.current;
     setReviewing(runId);
     setActionError(null);
     try {
       await onPromote(runId);
+      if (epoch !== actionEpochRef.current) return;
       setReviews((current) => {
         const next = { ...current };
         delete next[runId];
@@ -266,22 +364,46 @@ export function RunInspector({
       });
       onRefresh();
     } catch (error) {
+      if (epoch !== actionEpochRef.current) return;
       setActionError(String(error));
     } finally {
-      setReviewing(null);
+      if (epoch === actionEpochRef.current) setReviewing(null);
     }
   }
 
   async function approve(runId: string) {
+    const epoch = actionEpochRef.current;
     setReviewing(runId);
     setActionError(null);
     try {
       await onApprove(runId);
+      if (epoch !== actionEpochRef.current) return;
       onRefresh();
     } catch (error) {
+      if (epoch !== actionEpochRef.current) return;
       setActionError(String(error));
     } finally {
-      setReviewing(null);
+      if (epoch === actionEpochRef.current) setReviewing(null);
+    }
+  }
+
+  async function keepForReview(runId: string) {
+    if (!window.confirm(KEEP_CONFIRMATION)) {
+      return;
+    }
+    const epoch = actionEpochRef.current;
+    setReviewing(runId);
+    setActionError(null);
+    try {
+      await onKeepForReview(runId);
+      if (epoch !== actionEpochRef.current) return;
+      setFocusKeptRunId(runId);
+      onRefresh();
+    } catch (error) {
+      if (epoch !== actionEpochRef.current) return;
+      setActionError(String(error));
+    } finally {
+      if (epoch === actionEpochRef.current) setReviewing(null);
     }
   }
 
@@ -289,66 +411,79 @@ export function RunInspector({
     if (!window.confirm("Discard this isolated run and its unpromoted changes?")) {
       return;
     }
+    const epoch = actionEpochRef.current;
     setReviewing(runId);
     setActionError(null);
     try {
       await onDiscard(runId);
+      if (epoch !== actionEpochRef.current) return;
       onRefresh();
     } catch (error) {
+      if (epoch !== actionEpochRef.current) return;
       setActionError(String(error));
     } finally {
-      setReviewing(null);
+      if (epoch === actionEpochRef.current) setReviewing(null);
     }
   }
 
   async function retry(runId: string) {
     const prompt = retryPrompts[runId]?.trim() ?? "";
     if (!prompt) return;
+    const epoch = actionEpochRef.current;
     setReviewing(runId);
     setActionError(null);
     try {
       await onRetry(runId, prompt);
+      if (epoch !== actionEpochRef.current) return;
       setRetryPrompts((current) => ({ ...current, [runId]: "" }));
       onRefresh();
     } catch (error) {
+      if (epoch !== actionEpochRef.current) return;
       setActionError(String(error));
     } finally {
-      setReviewing(null);
+      if (epoch === actionEpochRef.current) setReviewing(null);
     }
   }
 
   async function steer(runId: string) {
     const text = steerPrompts[runId]?.trim() ?? "";
     if (!text) return;
+    const epoch = actionEpochRef.current;
     setReviewing(runId);
     setActionError(null);
     try {
       await onSteer(runId, text);
+      if (epoch !== actionEpochRef.current) return;
       setSteerPrompts((current) => ({ ...current, [runId]: "" }));
       onRefresh();
     } catch (error) {
+      if (epoch !== actionEpochRef.current) return;
       setActionError(String(error));
     } finally {
-      setReviewing(null);
+      if (epoch === actionEpochRef.current) setReviewing(null);
     }
   }
 
   async function cancel(runId: string) {
     if (!window.confirm(remote ? "Cancel this remote run?" : "Cancel this MCP-owned run?")) return;
+    const epoch = actionEpochRef.current;
     setReviewing(runId);
     setActionError(null);
     try {
       await onCancel(runId);
+      if (epoch !== actionEpochRef.current) return;
       onRefresh();
     } catch (error) {
+      if (epoch !== actionEpochRef.current) return;
       setActionError(String(error));
     } finally {
-      setReviewing(null);
+      if (epoch === actionEpochRef.current) setReviewing(null);
     }
   }
 
   async function loadEvents(runId: string, afterSeq = 0) {
     if (remote) return;
+    const epoch = actionEpochRef.current;
     setEventLoading(runId);
     setEventErrors((current) => {
       const next = { ...current };
@@ -357,6 +492,7 @@ export function RunInspector({
     });
     try {
       const page = await onEvents(runId, afterSeq, 80);
+      if (epoch !== actionEpochRef.current) return;
       setEventPages((current) => {
         const previous = afterSeq === 0 ? undefined : current[runId];
         const entries = [...(previous?.entries ?? []), ...page.entries].filter(
@@ -368,9 +504,10 @@ export function RunInspector({
         };
       });
     } catch (error) {
+      if (epoch !== actionEpochRef.current) return;
       setEventErrors((current) => ({ ...current, [runId]: String(error) }));
     } finally {
-      setEventLoading(null);
+      if (epoch === actionEpochRef.current) setEventLoading(null);
     }
   }
 
@@ -588,11 +725,13 @@ export function RunInspector({
               })
             : (visibleRuns as DurableRun[]).map((run) => {
             const verification = run.aggregates.verification;
+            const currentReview = reviews[run.runId];
             const eventPage = eventPages[run.runId];
             const eventError = eventErrors[run.runId];
             const approvalExpiry = run.approval ? Date.parse(run.approval.expiresAt) : NaN;
             const approvalActive = Number.isFinite(approvalExpiry) && approvalExpiry > Date.now();
-            const requiresDurableApproval = run.clientId === "mcp";
+            const requiresDurableApproval = runRequiresDurableApproval(run.clientId);
+            const canPersistDesktopApproval = isScopedDurableApprovalOrigin(run.clientId);
             const tokens = tokenLabel(run);
             const stopCause = stopCauseLabel(run);
             return (
@@ -659,7 +798,7 @@ export function RunInspector({
                     This run stopped after restart. Review it before starting a linked retry.
                   </div>
                 )}
-                {!remote && run.state === "interrupted" && run.clientId === "mcp" && (
+                {!remote && run.state === "interrupted" && run.clientId === MCP_RUN_CLIENT_ID && (
                   <div className="run-retry">
                     <label htmlFor={`retry-prompt-${run.runId}`}>Fresh recovery prompt</label>
                     <textarea
@@ -685,7 +824,7 @@ export function RunInspector({
                     </button>
                   </div>
                 )}
-                {run.clientId === "mcp" &&
+                {run.clientId === MCP_RUN_CLIENT_ID &&
                   (run.state === "running" || run.state === "queued") && (
                     <div className="run-control">
                       <label htmlFor={`steer-prompt-${run.runId}`}>Steering prompt</label>
@@ -806,8 +945,27 @@ export function RunInspector({
                           Discard this run and start a fresh isolated attempt.
                         </div>
                       )}
+                      {run.execution.promotionState === "kept_for_review" && (
+                        <div
+                          className="run-callout run-promotion-kept"
+                          role="status"
+                          aria-live="polite"
+                          tabIndex={-1}
+                          ref={run.runId === focusKeptRunId ? keptStatusRef : undefined}
+                        >
+                          {keptRetentionCopy(run, currentReview)}
+                        </div>
+                      )}
+                      {currentReview?.diffTruncated && (
+                        <div className="run-callout run-promotion-truncated" role="status">
+                          {run.execution.promotionState === "kept_for_review"
+                            ? "This retained worktree review is truncated, so the exact patch is not fully visible. Keep is terminal and did not write the source workspace; Apply and Discard stay unavailable."
+                            : "This review is truncated, so the exact patch is not fully visible. Keep and Apply stay unavailable until a complete reviewable patch is available."}
+                        </div>
+                      )}
                       <div className="run-actions">
-                        {run.execution.promotionState === "ready" && (
+                        {(run.execution.promotionState === "ready" ||
+                          run.execution.promotionState === "kept_for_review") && (
                           <button
                             type="button"
                             className="composer-chip"
@@ -817,9 +975,10 @@ export function RunInspector({
                             {reviewing === run.runId ? "Reviewing…" : "Review diff"}
                           </button>
                         )}
-                        {requiresDurableApproval &&
+                        {canPersistDesktopApproval &&
                           run.execution.promotionState === "ready" &&
-                          reviews[run.runId] &&
+                          currentReview &&
+                          !currentReview.diffTruncated &&
                           !approvalActive && (
                             <button
                               type="button"
@@ -833,19 +992,45 @@ export function RunInspector({
                             </button>
                           )}
                         {run.execution.promotionState === "ready" &&
-                          reviews[run.runId] &&
-                          (!requiresDurableApproval || approvalActive) && (
+                          currentReview &&
+                          !currentReview.diffTruncated &&
+                          isLocalDesktopKeepOrigin(run) && (
+                            <>
+                              <p
+                                className="run-promotion-keep-copy"
+                                id={`keep-irreversible-${run.runId}`}
+                              >
+                                Keep is irreversible. It does not write the source workspace, and
+                                Apply and Discard will no longer be available.
+                              </p>
+                              <button
+                                type="button"
+                                className="composer-chip"
+                                onClick={() => void keepForReview(run.runId)}
+                                disabled={reviewing === run.runId}
+                                aria-describedby={`keep-irreversible-${run.runId}`}
+                              >
+                                {reviewing === run.runId ? "Keeping…" : "Keep for review"}
+                              </button>
+                            </>
+                          )}
+                        {run.execution.promotionState === "ready" &&
+                          currentReview &&
+                          !currentReview.diffTruncated &&
+                          (!requiresDurableApproval ||
+                            (canPersistDesktopApproval && approvalActive)) && (
                             <button
                               type="button"
                               className="composer-chip on"
                               onClick={() => void promote(run.runId)}
                               disabled={reviewing === run.runId}
                             >
-                              Promote reviewed changes
+                              Apply exact reviewed patch
                             </button>
                           )}
                         {run.execution.promotionState !== "promoted" &&
-                          run.execution.promotionState !== "discarded" && (
+                          run.execution.promotionState !== "discarded" &&
+                          run.execution.promotionState !== "kept_for_review" && (
                             <button
                               type="button"
                               className="composer-chip quiet"
@@ -856,13 +1041,10 @@ export function RunInspector({
                             </button>
                           )}
                       </div>
-                      {reviews[run.runId] && (
+                      {currentReview && (
                         <details className="run-review" open>
-                          <summary>
-                            {reviews[run.runId].changedFiles.length} changed files
-                            {reviews[run.runId].diffTruncated ? " · diff truncated" : ""}
-                          </summary>
-                          <pre>{reviews[run.runId].diff || "No changes"}</pre>
+                          <summary>{reviewSummary(currentReview)}</summary>
+                          <pre>{reviewDiffText(currentReview)}</pre>
                         </details>
                       )}
                     </div>

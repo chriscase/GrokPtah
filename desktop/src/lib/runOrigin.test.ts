@@ -1,6 +1,14 @@
 import { describe, expect, it } from "vitest";
 import type { DurableRun } from "./protocol";
-import { activeRunOrigin } from "./runOrigin";
+import {
+  activeRunOrigin,
+  isLocalDesktopRunOrigin,
+  isScopedDurableApprovalOrigin,
+  LEGACY_DESKTOP_RUN_CLIENT_ID,
+  LOCAL_DESKTOP_RUN_CLIENT_ID,
+  MCP_RUN_CLIENT_ID,
+  runRequiresDurableApproval,
+} from "./runOrigin";
 
 function run(overrides: Partial<DurableRun> = {}): DurableRun {
   return {
@@ -34,10 +42,40 @@ function run(overrides: Partial<DurableRun> = {}): DurableRun {
   };
 }
 
+describe("durable approval origin", () => {
+  it("reserves local-desktop as the sole host-minted local origin", () => {
+    expect(isLocalDesktopRunOrigin(LOCAL_DESKTOP_RUN_CLIENT_ID)).toBe(true);
+    expect(runRequiresDurableApproval(LOCAL_DESKTOP_RUN_CLIENT_ID)).toBe(false);
+    expect(isScopedDurableApprovalOrigin(LOCAL_DESKTOP_RUN_CLIENT_ID)).toBe(false);
+  });
+
+  it("allows MCP and named external credentials to use scoped durable approval", () => {
+    expect(isScopedDurableApprovalOrigin(MCP_RUN_CLIENT_ID)).toBe(true);
+    expect(isScopedDurableApprovalOrigin("laptop")).toBe(true);
+    expect(runRequiresDurableApproval(MCP_RUN_CLIENT_ID)).toBe(true);
+    expect(runRequiresDurableApproval("laptop")).toBe(true);
+    expect(isLocalDesktopRunOrigin("laptop")).toBe(false);
+  });
+
+  it("fails closed on legacy desktop and missing origins", () => {
+    expect(isLocalDesktopRunOrigin(LEGACY_DESKTOP_RUN_CLIENT_ID)).toBe(false);
+    expect(isScopedDurableApprovalOrigin(LEGACY_DESKTOP_RUN_CLIENT_ID)).toBe(false);
+    expect(runRequiresDurableApproval(LEGACY_DESKTOP_RUN_CLIENT_ID)).toBe(true);
+    expect(isLocalDesktopRunOrigin(null)).toBe(false);
+    expect(isLocalDesktopRunOrigin(undefined)).toBe(false);
+    expect(isScopedDurableApprovalOrigin(null)).toBe(false);
+    expect(isScopedDurableApprovalOrigin(undefined)).toBe(false);
+    expect(isScopedDurableApprovalOrigin("")).toBe(false);
+    expect(runRequiresDurableApproval(null)).toBe(true);
+    expect(runRequiresDurableApproval(undefined)).toBe(true);
+  });
+});
+
 describe("activeRunOrigin", () => {
   it("recognizes active MCP and desktop runs", () => {
     expect(activeRunOrigin([run()])).toBe("mcp");
-    expect(activeRunOrigin([run({ clientId: "desktop" })])).toBe("desktop");
+    expect(activeRunOrigin([run({ clientId: LOCAL_DESKTOP_RUN_CLIENT_ID })])).toBe("desktop");
+    expect(activeRunOrigin([run({ clientId: LEGACY_DESKTOP_RUN_CLIENT_ID })])).toBe("other");
     expect(activeRunOrigin([run({ clientId: "unknown" })])).toBe("other");
   });
 

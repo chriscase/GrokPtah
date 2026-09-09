@@ -267,7 +267,7 @@ async fn session_lifecycle_prompt_streams_message() {
     let runs = host.list_session_runs(session.id).unwrap();
     assert_eq!(runs.len(), 1, "Build turn should create one durable run");
     assert_eq!(runs[0].state, RunState::Completed);
-    assert_eq!(runs[0].client_id.as_deref(), Some("desktop"));
+    assert_eq!(runs[0].client_id.as_deref(), Some("local-desktop"));
     assert_eq!(
         runs[0].aggregates.verification,
         Some(history[0].evidence.clone())

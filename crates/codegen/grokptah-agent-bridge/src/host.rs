@@ -52,7 +52,7 @@ use crate::orchestration::{
     RoutineLifecycle, RoutineRecord, RoutineRetryPolicy, RoutineSnapshot, RoutineTrigger,
     RunAggregates, RunBounds, RunExecution, RunExecutionMode, RunPurpose, RunRecord, RunState,
     RunStopCause, WorkAttemptView, WorkItem, WorkItemSnapshot, WorkPolicy, WorkTemplate,
-    DEFAULT_AGENT_TOOL_IDS,
+    DEFAULT_AGENT_TOOL_IDS, LOCAL_DESKTOP_ORIGIN_ID,
 };
 use crate::permission::{
     evaluate_tool_gate, PendingPermissionView, PermissionDecision, PermissionRequest, ToolGate,
@@ -700,6 +700,61 @@ async fn kill_shells(live_shells: local_tools::LiveShellMap, kill_ids: Vec<Uuid>
     }
 }
 
+struct IsolatedReviewOutcome {
+    review: RunReview,
+    retained_fingerprint: Option<String>,
+    present_fingerprint: Option<String>,
+    retention_verification: Option<&'static str>,
+}
+
+fn kept_missing_review_outcome(recorded: Option<String>) -> IsolatedReviewOutcome {
+    IsolatedReviewOutcome {
+        review: RunReview {
+            changed_files: Vec::new(),
+            diff: String::new(),
+            diff_truncated: false,
+            fingerprint: recorded.clone().unwrap_or_default(),
+        },
+        retained_fingerprint: recorded,
+        present_fingerprint: None,
+        retention_verification: Some("worktree_missing"),
+    }
+}
+
+fn non_view_isolated_review(outcome: IsolatedReviewOutcome) -> Result<RunReview> {
+    if outcome.retention_verification == Some("worktree_missing") {
+        bail!(
+            "kept isolated worktree is missing; the recorded fingerprint is not a complete review"
+        );
+    }
+    Ok(outcome.review)
+}
+
+fn isolated_review_view_json(outcome: IsolatedReviewOutcome) -> Result<serde_json::Value> {
+    let mut value = serde_json::to_value(&outcome.review).context("serialize isolated review")?;
+    if let Some(object) = value.as_object_mut() {
+        if let Some(retained) = outcome.retained_fingerprint {
+            object.insert(
+                "retainedFingerprint".into(),
+                serde_json::Value::String(retained),
+            );
+        }
+        if let Some(present) = outcome.present_fingerprint {
+            object.insert(
+                "presentFingerprint".into(),
+                serde_json::Value::String(present),
+            );
+        }
+        if let Some(status) = outcome.retention_verification {
+            object.insert(
+                "retentionVerification".into(),
+                serde_json::Value::String(status.into()),
+            );
+        }
+    }
+    Ok(value)
+}
+
 fn canonical_session_workspace(
     host: &AgentHostHandle,
     session_id: Uuid,
@@ -757,7 +812,7 @@ pub struct AgentHostHandle {
     /// an exclusive file lock, so the desktop cockpit and the MCP control
     /// plane must share this handle instead of opening their own.
     computer_store: Arc<Mutex<Option<crate::computer_use::ComputerStore>>>,
-    /// Prevent concurrent desktop promotion/discard operations for one run.
+    /// Prevent concurrent desktop promotion/discard/keep operations for one run.
     promotion_locks: Arc<Mutex<HashSet<String>>>,
     reviewed_runs: Arc<Mutex<HashSet<String>>>,
     /// Wakes every embedded orchestration service after a global admission
@@ -2643,21 +2698,34 @@ impl AgentHostHandle {
 
     /// Read the bounded Git diff for an isolated terminal run.
     pub fn review_run(&self, session_id: Uuid, run_id: &str) -> Result<RunReview> {
-        self.review_run_internal(session_id, run_id, true)
+        self.with_promotion_lock(run_id, || {
+            non_view_isolated_review(self.review_run_locked(session_id, run_id, true)?)
+        })
+    }
+
+    /// Desktop review payload, including current kept-run retention verification.
+    pub fn review_run_view(&self, session_id: Uuid, run_id: &str) -> Result<serde_json::Value> {
+        self.with_promotion_lock(run_id, || {
+            let outcome = self.review_run_locked(session_id, run_id, true)?;
+            isolated_review_view_json(outcome)
+        })
     }
 
     /// Inspect an isolated run without granting the desktop-only in-memory
     /// promotion marker. External coordinators must use durable approval.
     pub(crate) fn inspect_run(&self, session_id: Uuid, run_id: &str) -> Result<RunReview> {
-        self.review_run_internal(session_id, run_id, false)
+        self.with_promotion_lock(run_id, || {
+            non_view_isolated_review(self.review_run_locked(session_id, run_id, false)?)
+        })
     }
 
-    fn review_run_internal(
+    /// Assumes the per-run promotion lock is already held.
+    fn review_run_locked(
         &self,
         session_id: Uuid,
         run_id: &str,
         mark_reviewed: bool,
-    ) -> Result<RunReview> {
+    ) -> Result<IsolatedReviewOutcome> {
         let store = self.ensure_orchestration_store()?;
         let run = store
             .load_run(run_id)?
@@ -2674,29 +2742,60 @@ impl AgentHostHandle {
             bail!("run used shared execution and has no isolated diff");
         }
         let source = canonical_session_workspace(self, session_id, &execution.source_workspace)?;
-        run_promotion::validate_managed_worktree(
-            &source,
-            Path::new(&execution.execution_workspace),
-        )?;
-        let review = run_promotion::review(
-            Path::new(&execution.execution_workspace),
-            &execution.base_revision,
-        )?;
-        if execution.final_fingerprint.as_deref() != Some(review.fingerprint.as_str()) {
-            let _ = store.update_run(run_id, |current| {
-                if let Some(execution) = current.execution.as_mut() {
-                    execution.promotion_state = PromotionState::Conflicted;
-                }
-                current.error_code = Some("promotion_conflict".into());
-                current.updated_at = Utc::now();
-                Ok(())
+        let worktree = Path::new(&execution.execution_workspace);
+        let recorded = execution.final_fingerprint.clone();
+        let kept = execution.promotion_state == PromotionState::KeptForReview;
+
+        if kept {
+            if !worktree.exists() {
+                return Ok(kept_missing_review_outcome(recorded));
+            }
+            run_promotion::validate_managed_worktree(&source, worktree)?;
+            let review = run_promotion::review(worktree, &execution.base_revision)?;
+            let present = review.fingerprint.clone();
+            let status = if recorded.as_deref() == Some(present.as_str()) {
+                "matched"
+            } else {
+                "drifted"
+            };
+            return Ok(IsolatedReviewOutcome {
+                review,
+                retained_fingerprint: recorded,
+                present_fingerprint: Some(present),
+                retention_verification: Some(status),
             });
+        }
+
+        run_promotion::validate_managed_worktree(&source, worktree)?;
+        let review = run_promotion::review(worktree, &execution.base_revision)?;
+        if execution.final_fingerprint.as_deref() != Some(review.fingerprint.as_str()) {
+            if execution.promotion_state == PromotionState::Ready {
+                let _ = store.update_run(run_id, |current| {
+                    if let Some(execution) = current.execution.as_mut() {
+                        if execution.promotion_state == PromotionState::Ready {
+                            execution.promotion_state = PromotionState::Conflicted;
+                        }
+                    }
+                    current.error_code = Some("promotion_conflict".into());
+                    current.updated_at = Utc::now();
+                    Ok(())
+                });
+            }
             bail!("isolated worktree changed after the run; promotion is blocked");
         }
-        if mark_reviewed {
+        if mark_reviewed
+            && run.is_local_desktop_keep_origin()
+            && !review.diff_truncated
+            && execution.promotion_state == PromotionState::Ready
+        {
             self.reviewed_runs.lock().insert(run_id.to_string());
         }
-        Ok(review)
+        Ok(IsolatedReviewOutcome {
+            review,
+            retained_fingerprint: None,
+            present_fingerprint: None,
+            retention_verification: None,
+        })
     }
 
     /// Promote an explicitly reviewed isolated run into its original clean
@@ -2752,9 +2851,6 @@ impl AgentHostHandle {
             if let Some(approval) = durable_approval.as_ref() {
                 validate_run_approval(&run, approval, Utc::now())?;
             }
-            if !self.reviewed_runs.lock().contains(run_id) && durable_approval.is_none() {
-                bail!("review the isolated run before promotion");
-            }
             let source =
                 canonical_session_workspace(self, session_id, &execution.source_workspace)?;
             let final_fingerprint = execution
@@ -2765,11 +2861,24 @@ impl AgentHostHandle {
                 &source,
                 Path::new(&execution.execution_workspace),
             )?;
+            let current_review = run_promotion::review(
+                Path::new(&execution.execution_workspace),
+                &execution.base_revision,
+            )?;
+            if current_review.diff_truncated {
+                bail!(
+                    "reviewed diff is truncated; applying the exact patch requires a complete reviewable patch"
+                );
+            }
+            if durable_approval.is_none() {
+                if !run.is_local_desktop_keep_origin() {
+                    bail!("promotion requires a persisted approval");
+                }
+                if !self.reviewed_runs.lock().contains(run_id) {
+                    bail!("review the isolated run before promotion");
+                }
+            }
             if let Some(approval) = durable_approval.as_ref() {
-                let current_review = run_promotion::review(
-                    Path::new(&execution.execution_workspace),
-                    &execution.base_revision,
-                )?;
                 if current_review.fingerprint != approval.final_fingerprint
                     || current_review.changed_files != approval.changed_files
                 {
@@ -2830,6 +2939,9 @@ impl AgentHostHandle {
             if execution.promotion_state == PromotionState::Promoted {
                 bail!("a promoted run cannot be discarded from the source workspace");
             }
+            if execution.promotion_state == PromotionState::KeptForReview {
+                bail!("a kept-for-review run cannot be discarded");
+            }
             let source =
                 canonical_session_workspace(self, session_id, &execution.source_workspace)?;
             run_promotion::discard(&source, Path::new(&execution.execution_workspace))?;
@@ -2844,6 +2956,98 @@ impl AgentHostHandle {
         })
     }
 
+    /// Keep a reviewed local isolated run without writing the source workspace.
+    ///
+    /// The registered worktree and exact reviewed patch are retained. Keep,
+    /// discard, and apply (`promote_run`) are terminal and mutually exclusive.
+    /// Durable `RunRecord.execution.promotion_state` is the authority; this
+    /// does not create a second ledger. Unknown, cross-session, cross-workspace,
+    /// non-local, stale, foreign, failed, or uncertain cases fail closed and
+    /// never report success.
+    pub fn keep_run_for_review(&self, session_id: Uuid, run_id: &str) -> Result<RunRecord> {
+        self.with_promotion_lock(run_id, || {
+            let store = self.ensure_orchestration_store()?;
+            let mut run = store
+                .load_run(run_id)?
+                .filter(|run| run.session_id == session_id)
+                .ok_or_else(|| anyhow!("unknown run"))?;
+            if !run.is_local_desktop_keep_origin() {
+                bail!("keep for review is limited to local desktop runs");
+            }
+            if run.state != RunState::Completed {
+                bail!("only completed isolated runs can be kept for review");
+            }
+            let mut execution = run.execution.clone().ok_or_else(|| {
+                anyhow!("run used shared execution and cannot be kept for review")
+            })?;
+            if execution.mode != RunExecutionMode::IsolatedWorktree {
+                bail!("run used shared execution and cannot be kept for review");
+            }
+            if execution.promotion_state == PromotionState::Promoted {
+                bail!("a promoted run cannot be kept for review");
+            }
+            if execution.promotion_state == PromotionState::Discarded {
+                bail!("a discarded run cannot be kept for review");
+            }
+            let already_kept = execution.promotion_state == PromotionState::KeptForReview;
+            if !already_kept && execution.promotion_state != PromotionState::Ready {
+                bail!("isolated run is not ready to keep for review");
+            }
+            let source =
+                canonical_session_workspace(self, session_id, &execution.source_workspace)?;
+            let recorded_workspace =
+                dunce::canonicalize(&run.workspace).context("canonicalize run workspace")?;
+            if recorded_workspace != source {
+                bail!("run workspace no longer matches the session workspace");
+            }
+            let worktree = Path::new(&execution.execution_workspace);
+            run_promotion::validate_managed_worktree(&source, worktree)?;
+            let final_fingerprint = execution
+                .final_fingerprint
+                .as_deref()
+                .ok_or_else(|| anyhow!("isolated run has no verified final fingerprint"))?;
+            let current_review = run_promotion::review(worktree, &execution.base_revision)?;
+            if current_review.fingerprint != final_fingerprint {
+                if !already_kept {
+                    let _ = store.update_run(run_id, |current| {
+                        if let Some(execution) = current.execution.as_mut() {
+                            if execution.promotion_state == PromotionState::Ready {
+                                execution.promotion_state = PromotionState::Conflicted;
+                            }
+                        }
+                        current.error_code = Some("promotion_conflict".into());
+                        current.updated_at = Utc::now();
+                        Ok(())
+                    });
+                }
+                bail!("isolated worktree changed after review; keep for review is blocked");
+            }
+            if already_kept {
+                return Ok(run);
+            }
+            if current_review.diff_truncated {
+                bail!(
+                    "reviewed diff is truncated; keep for review requires a complete reviewable patch"
+                );
+            }
+            if !self.reviewed_runs.lock().contains(run_id) {
+                bail!("review the isolated run before keeping it for review");
+            }
+            execution.promotion_state = PromotionState::KeptForReview;
+            run.execution = Some(execution);
+            run.error_code = None;
+            run.updated_at = Utc::now();
+            let updated = store.update_run(run_id, |current| {
+                *current = run.clone();
+                Ok(())
+            })?;
+            let kept =
+                updated.ok_or_else(|| anyhow!("run disappeared while keeping for review"))?;
+            self.reviewed_runs.lock().remove(run_id);
+            Ok(kept)
+        })
+    }
+
     fn with_promotion_lock<T>(
         &self,
         run_id: &str,
@@ -2852,9 +3056,20 @@ impl AgentHostHandle {
         if !self.promotion_locks.lock().insert(run_id.to_string()) {
             bail!("run promotion operation is already in progress");
         }
-        let result = action();
-        self.promotion_locks.lock().remove(run_id);
-        result
+        struct PromotionLockGuard<'a> {
+            locks: &'a Mutex<HashSet<String>>,
+            run_id: String,
+        }
+        impl Drop for PromotionLockGuard<'_> {
+            fn drop(&mut self) {
+                self.locks.lock().remove(&self.run_id);
+            }
+        }
+        let _guard = PromotionLockGuard {
+            locks: &self.promotion_locks,
+            run_id: run_id.to_string(),
+        };
+        action()
     }
 
     #[allow(clippy::too_many_arguments)] // Keeps durable run identity inputs explicit.
@@ -2890,7 +3105,7 @@ impl AgentHostHandle {
             session_id,
             workspace: durable_workspace,
             request_id: format!("desktop-turn-{turn_id}"),
-            client_id: Some("desktop".into()),
+            client_id: Some(LOCAL_DESKTOP_ORIGIN_ID.into()),
             state: RunState::Running,
             purpose: RunPurpose::Execution,
             agent_id: agent_id.clone(),
@@ -12058,7 +12273,10 @@ mod tests {
     use super::*;
     use crate::discover::{home_override_serial, set_grokptah_home_override};
     use crate::event_bus::EventReceiver;
-    use crate::orchestration::WorkPolicy;
+    use crate::orchestration::{
+        AuthCredential, OrchErrorCode, OrchestrationConfig, OrchestrationService, RunApproval,
+        WorkPolicy, WorkspaceAllowlist, LEGACY_DESKTOP_CLIENT_ID,
+    };
 
     struct TestHome {
         _tmp: tempfile::TempDir,
@@ -13618,5 +13836,1177 @@ mod tests {
             "unexpected error: {error}"
         );
         assert_ne!(first.work_id, second.work_id);
+    }
+
+    fn git_fixture() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .env("GIT_AUTHOR_NAME", "GrokPtah tests")
+                .env("GIT_AUTHOR_EMAIL", "tests@grokptah.invalid")
+                .env("GIT_COMMITTER_NAME", "GrokPtah tests")
+                .env("GIT_COMMITTER_EMAIL", "tests@grokptah.invalid")
+                .output()
+                .expect("git");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "GrokPtah tests"]);
+        git(&["config", "user.email", "tests@grokptah.invalid"]);
+        std::fs::write(dir.path().join("README.md"), "baseline\n").unwrap();
+        std::fs::write(dir.path().join(".gitignore"), ".grokptah/\n").unwrap();
+        git(&["add", "README.md", ".gitignore"]);
+        git(&["commit", "-qm", "baseline"]);
+        dir
+    }
+
+    fn save_isolated_desktop_run(
+        host: &HostRuntime,
+        session_id: Uuid,
+        workspace: &Path,
+        run_id: &str,
+        client_id: &str,
+        state: RunState,
+        promotion_state: PromotionState,
+    ) -> PathBuf {
+        save_isolated_run_with_client(
+            host,
+            session_id,
+            workspace,
+            run_id,
+            Some(client_id),
+            state,
+            promotion_state,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn save_isolated_desktop_run_with(
+        host: &HostRuntime,
+        session_id: Uuid,
+        workspace: &Path,
+        run_id: &str,
+        client_id: &str,
+        state: RunState,
+        promotion_state: PromotionState,
+        extra_text_lines: Option<usize>,
+    ) -> PathBuf {
+        save_isolated_run_with_client(
+            host,
+            session_id,
+            workspace,
+            run_id,
+            Some(client_id),
+            state,
+            promotion_state,
+            extra_text_lines,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn save_isolated_run_with_client(
+        host: &HostRuntime,
+        session_id: Uuid,
+        workspace: &Path,
+        run_id: &str,
+        client_id: Option<&str>,
+        state: RunState,
+        promotion_state: PromotionState,
+        extra_text_lines: Option<usize>,
+    ) -> PathBuf {
+        host.session_set_cwd(session_id, workspace)
+            .expect("bind isolated fixture workspace");
+        let prepared = run_promotion::prepare(workspace, run_id).unwrap();
+        std::fs::write(prepared.cwd.join("README.md"), "isolated edit\n").unwrap();
+        if let Some(lines) = extra_text_lines {
+            let mut body = String::with_capacity(lines.saturating_mul(48));
+            for index in 0..lines {
+                body.push_str("line-");
+                body.push_str(&index.to_string());
+                body.push_str("-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n");
+            }
+            std::fs::write(prepared.cwd.join("large.txt"), body).unwrap();
+        }
+        let snapshot = run_promotion::snapshot(&prepared.cwd, &prepared.base_revision).unwrap();
+        let source = dunce::canonicalize(workspace).unwrap();
+        let now = Utc::now();
+        let run = RunRecord {
+            run_id: run_id.into(),
+            session_id,
+            workspace: source.display().to_string(),
+            request_id: format!("request-{run_id}"),
+            client_id: client_id.map(str::to_string),
+            state,
+            purpose: RunPurpose::Execution,
+            agent_id: None,
+            retry_of: None,
+            parent_run_id: None,
+            agent_spec_revision: None,
+            checkpoint_id: None,
+            continuation_context_id: None,
+            continuation_context_hash: None,
+            continuation_fidelity: None,
+            queue_position: None,
+            bounds: RunBounds::default(),
+            prompt_preview: "isolated keep fixture".into(),
+            start_seq: Some(1),
+            end_seq: Some(2),
+            created_at: now,
+            updated_at: now,
+            terminal_result: Some("completed".into()),
+            final_response: Some("isolated edit".into()),
+            error_code: None,
+            stop_cause: Some(RunStopCause::Completed),
+            aggregates: RunAggregates::default(),
+            progress: None,
+            execution: Some(RunExecution {
+                mode: RunExecutionMode::IsolatedWorktree,
+                source_workspace: source.display().to_string(),
+                execution_workspace: prepared.cwd.display().to_string(),
+                base_revision: prepared.base_revision,
+                source_fingerprint: prepared.source_fingerprint,
+                final_fingerprint: Some(snapshot.fingerprint),
+                promotion_state,
+                promoted_at: None,
+            }),
+            approval: None,
+        };
+        host.ensure_orchestration_store()
+            .unwrap()
+            .save_run(&run)
+            .unwrap();
+        prepared.cwd
+    }
+
+    fn desktop_run_id() -> String {
+        format!("desktop-{}", Uuid::new_v4())
+    }
+
+    fn assert_keep_failed(result: Result<RunRecord, anyhow::Error>, needle: &str) {
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.to_lowercase().contains(&needle.to_lowercase()),
+            "expected keep failure containing {needle:?}, got {error}"
+        );
+    }
+
+    fn retry_busy<T>(mut op: impl FnMut() -> Result<T, anyhow::Error>) -> Result<T, anyhow::Error> {
+        let started = std::time::Instant::now();
+        loop {
+            match op() {
+                Err(error)
+                    if error
+                        .to_string()
+                        .contains("run promotion operation is already in progress") =>
+                {
+                    if started.elapsed() > std::time::Duration::from_secs(15) {
+                        return Err(error);
+                    }
+                    std::thread::yield_now();
+                }
+                other => return other,
+            }
+        }
+    }
+
+    fn promotion_state_of(run: &RunRecord) -> PromotionState {
+        run.execution.as_ref().unwrap().promotion_state
+    }
+
+    fn has_local_review_marker(host: &HostRuntime, run_id: &str) -> bool {
+        host.reviewed_runs.lock().contains(run_id)
+    }
+
+    fn assert_source_unwritten(workspace: &Path) {
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("README.md")).unwrap(),
+            "baseline\n"
+        );
+    }
+
+    fn assert_promote_requires_persisted_approval(
+        host: &HostRuntime,
+        session_id: Uuid,
+        run_id: &str,
+        workspace: &Path,
+    ) {
+        let error = host
+            .promote_run(session_id, run_id)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.to_lowercase().contains("persisted approval"),
+            "non-local promotion without durable approval must fail closed, got {error}"
+        );
+        let after = host.get_session_run(session_id, run_id).unwrap().unwrap();
+        assert_eq!(promotion_state_of(&after), PromotionState::Ready);
+        assert_source_unwritten(workspace);
+        assert!(
+            !has_local_review_marker(host, run_id),
+            "unauthorized local review marker must not persist for {run_id}"
+        );
+    }
+
+    fn test_orchestration_service(
+        host: &HostRuntime,
+        workspace: &Path,
+        bearer_token: &str,
+    ) -> Arc<OrchestrationService> {
+        let store = host.ensure_orchestration_store().unwrap();
+        OrchestrationService::new(
+            host.handle(),
+            host.event_bus(),
+            store,
+            OrchestrationConfig {
+                bearer_token: bearer_token.into(),
+                allowlist: WorkspaceAllowlist::new([workspace.to_path_buf()]),
+                max_concurrent_runs: 4,
+                bounds: RunBounds::default(),
+            },
+        )
+    }
+
+    async fn wait_service_run_terminal(
+        orch: &OrchestrationService,
+        auth: &crate::orchestration::AuthContext,
+        run_id: &str,
+    ) -> RunState {
+        let started = std::time::Instant::now();
+        loop {
+            let value = orch.get_run(auth, run_id).unwrap();
+            let state: RunState = serde_json::from_value(value["state"].clone()).unwrap();
+            if !matches!(state, RunState::Running | RunState::Queued) {
+                return state;
+            }
+            if started.elapsed() > std::time::Duration::from_secs(10) {
+                panic!("run {run_id} still {state:?} after 10s");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    #[test]
+    fn keep_run_for_review_retains_worktree_without_writing_source() {
+        let (_home, host, session_id) = test_host();
+        let workspace = git_fixture();
+        let run_id = desktop_run_id();
+        let worktree = save_isolated_desktop_run(
+            &host,
+            session_id,
+            workspace.path(),
+            &run_id,
+            LOCAL_DESKTOP_ORIGIN_ID,
+            RunState::Completed,
+            PromotionState::Ready,
+        );
+        host.review_run(session_id, &run_id).unwrap();
+        let kept = host.keep_run_for_review(session_id, &run_id).unwrap();
+        assert_eq!(
+            kept.execution.as_ref().unwrap().promotion_state,
+            PromotionState::KeptForReview
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("README.md")).unwrap(),
+            "baseline\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("README.md")).unwrap(),
+            "isolated edit\n"
+        );
+        assert!(worktree.exists());
+
+        let again = host.keep_run_for_review(session_id, &run_id).unwrap();
+        assert_eq!(
+            again.execution.as_ref().unwrap().promotion_state,
+            PromotionState::KeptForReview
+        );
+        assert!(host.promote_run(session_id, &run_id).is_err());
+        assert!(host.discard_run(session_id, &run_id).is_err());
+        assert!(worktree.exists());
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("README.md")).unwrap(),
+            "baseline\n"
+        );
+    }
+
+    #[test]
+    fn keep_discard_and_apply_are_terminal_and_mutually_exclusive() {
+        let (_home, host, session_id) = test_host();
+        let apply_workspace = git_fixture();
+        let promoted_id = desktop_run_id();
+        save_isolated_desktop_run(
+            &host,
+            session_id,
+            apply_workspace.path(),
+            &promoted_id,
+            LOCAL_DESKTOP_ORIGIN_ID,
+            RunState::Completed,
+            PromotionState::Ready,
+        );
+        host.review_run(session_id, &promoted_id).unwrap();
+        host.promote_run(session_id, &promoted_id).unwrap();
+        assert_keep_failed(
+            host.keep_run_for_review(session_id, &promoted_id),
+            "promoted",
+        );
+
+        let discard_workspace = git_fixture();
+        let discarded_id = desktop_run_id();
+        save_isolated_desktop_run(
+            &host,
+            session_id,
+            discard_workspace.path(),
+            &discarded_id,
+            LOCAL_DESKTOP_ORIGIN_ID,
+            RunState::Completed,
+            PromotionState::Ready,
+        );
+        host.discard_run(session_id, &discarded_id).unwrap();
+        assert_keep_failed(
+            host.keep_run_for_review(session_id, &discarded_id),
+            "discarded",
+        );
+    }
+
+    #[test]
+    fn keep_run_for_review_collapses_unsafe_cases_without_success() {
+        let (_home, host, session_id) = test_host();
+        let workspace = git_fixture();
+        let other = host.session_new().unwrap();
+        let other_workspace = git_fixture();
+
+        assert_keep_failed(
+            host.keep_run_for_review(session_id, "missing-run"),
+            "unknown run",
+        );
+
+        let cross_session = desktop_run_id();
+        save_isolated_desktop_run(
+            &host,
+            session_id,
+            workspace.path(),
+            &cross_session,
+            LOCAL_DESKTOP_ORIGIN_ID,
+            RunState::Completed,
+            PromotionState::Ready,
+        );
+        host.review_run(session_id, &cross_session).unwrap();
+        assert_keep_failed(
+            host.keep_run_for_review(other.id, &cross_session),
+            "unknown run",
+        );
+
+        let cross_workspace = desktop_run_id();
+        save_isolated_desktop_run(
+            &host,
+            session_id,
+            workspace.path(),
+            &cross_workspace,
+            LOCAL_DESKTOP_ORIGIN_ID,
+            RunState::Completed,
+            PromotionState::Ready,
+        );
+        host.review_run(session_id, &cross_workspace).unwrap();
+        host.session_set_cwd(session_id, other_workspace.path())
+            .unwrap();
+        assert_keep_failed(
+            host.keep_run_for_review(session_id, &cross_workspace),
+            "workspace",
+        );
+        host.session_set_cwd(session_id, workspace.path()).unwrap();
+
+        let mcp = Uuid::new_v4().to_string();
+        save_isolated_desktop_run(
+            &host,
+            session_id,
+            workspace.path(),
+            &mcp,
+            "mcp",
+            RunState::Completed,
+            PromotionState::Ready,
+        );
+        assert_keep_failed(host.keep_run_for_review(session_id, &mcp), "local desktop");
+
+        let spoofed_named_desktop = Uuid::new_v4().to_string();
+        save_isolated_desktop_run(
+            &host,
+            session_id,
+            workspace.path(),
+            &spoofed_named_desktop,
+            LEGACY_DESKTOP_CLIENT_ID,
+            RunState::Completed,
+            PromotionState::Ready,
+        );
+        host.review_run(session_id, &spoofed_named_desktop).unwrap();
+        assert_keep_failed(
+            host.keep_run_for_review(session_id, &spoofed_named_desktop),
+            "local desktop",
+        );
+
+        let failed = desktop_run_id();
+        save_isolated_desktop_run(
+            &host,
+            session_id,
+            workspace.path(),
+            &failed,
+            LOCAL_DESKTOP_ORIGIN_ID,
+            RunState::Failed,
+            PromotionState::Ready,
+        );
+        assert_keep_failed(host.keep_run_for_review(session_id, &failed), "completed");
+
+        let unreviewed = desktop_run_id();
+        save_isolated_desktop_run(
+            &host,
+            session_id,
+            workspace.path(),
+            &unreviewed,
+            LOCAL_DESKTOP_ORIGIN_ID,
+            RunState::Completed,
+            PromotionState::Ready,
+        );
+        assert_keep_failed(
+            host.keep_run_for_review(session_id, &unreviewed),
+            "review the isolated run",
+        );
+
+        let stale = desktop_run_id();
+        let stale_tree = save_isolated_desktop_run(
+            &host,
+            session_id,
+            workspace.path(),
+            &stale,
+            LOCAL_DESKTOP_ORIGIN_ID,
+            RunState::Completed,
+            PromotionState::Ready,
+        );
+        host.review_run(session_id, &stale).unwrap();
+        std::fs::write(stale_tree.join("README.md"), "drifted after review\n").unwrap();
+        assert_keep_failed(
+            host.keep_run_for_review(session_id, &stale),
+            "changed after review",
+        );
+        let after = host.get_session_run(session_id, &stale).unwrap().unwrap();
+        assert_eq!(
+            after.execution.as_ref().unwrap().promotion_state,
+            PromotionState::Conflicted
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("README.md")).unwrap(),
+            "baseline\n"
+        );
+
+        let foreign = desktop_run_id();
+        save_isolated_desktop_run(
+            &host,
+            session_id,
+            workspace.path(),
+            &foreign,
+            LOCAL_DESKTOP_ORIGIN_ID,
+            RunState::Completed,
+            PromotionState::Ready,
+        );
+        host.review_run(session_id, &foreign).unwrap();
+        let store = host.ensure_orchestration_store().unwrap();
+        store
+            .update_run(&foreign, |current| {
+                if let Some(execution) = current.execution.as_mut() {
+                    execution.execution_workspace = workspace.path().display().to_string();
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_keep_failed(host.keep_run_for_review(session_id, &foreign), "outside");
+    }
+
+    #[test]
+    fn truncated_review_does_not_grant_keep_or_apply() {
+        let (_home, host, session_id) = test_host();
+        let workspace = git_fixture();
+        let run_id = desktop_run_id();
+        save_isolated_desktop_run_with(
+            &host,
+            session_id,
+            workspace.path(),
+            &run_id,
+            LOCAL_DESKTOP_ORIGIN_ID,
+            RunState::Completed,
+            PromotionState::Ready,
+            Some(8_000),
+        );
+        let review = host.review_run(session_id, &run_id).unwrap();
+        assert!(
+            review.diff_truncated,
+            "fixture must exceed the review display bound"
+        );
+        assert_keep_failed(host.keep_run_for_review(session_id, &run_id), "truncated");
+        let after_keep = host.get_session_run(session_id, &run_id).unwrap().unwrap();
+        assert_eq!(
+            promotion_state_of(&after_keep),
+            PromotionState::Ready,
+            "truncated review must not keep or conflict the run"
+        );
+        let promote_error = host
+            .promote_run(session_id, &run_id)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            promote_error.to_lowercase().contains("truncated"),
+            "truncated review must fail closed on apply, got {promote_error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("README.md")).unwrap(),
+            "baseline\n"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn begin_desktop_run_mints_reserved_local_desktop_origin() {
+        let (_home, host, session_id) = test_host();
+        let workspace = git_fixture();
+        host.session_set_cwd(session_id, workspace.path()).unwrap();
+        let _offline = TestEnvOverride::set("GROKPTAH_AGENT_OFFLINE", "1");
+        host.session_prompt(session_id, "say hello".into())
+            .await
+            .unwrap();
+        let runs = host.list_session_runs(session_id).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].client_id.as_deref(), Some(LOCAL_DESKTOP_ORIGIN_ID));
+        assert!(runs[0].is_local_desktop_keep_origin());
+        assert_ne!(runs[0].client_id.as_deref(), Some(LEGACY_DESKTOP_CLIENT_ID));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn named_desktop_credential_submit_cannot_mint_keep_origin() {
+        let (_home, host, session_id) = test_host();
+        let workspace = git_fixture();
+        host.set_project_cwd(workspace.path()).unwrap();
+        host.session_set_cwd(session_id, workspace.path()).unwrap();
+        let _offline = TestEnvOverride::set("GROKPTAH_AGENT_OFFLINE", "1");
+        let orch = test_orchestration_service(&host, workspace.path(), "primary-tok");
+
+        let reserved = AuthCredential::new(LOCAL_DESKTOP_ORIGIN_ID, "reserved-tok").unwrap_err();
+        assert!(
+            reserved.message.contains("reserved"),
+            "constructor must reject the Keep origin marker, got {}",
+            reserved.message
+        );
+
+        let mut spoofed = AuthCredential::new(LEGACY_DESKTOP_CLIENT_ID, "desktop-tok").unwrap();
+        spoofed.id = LOCAL_DESKTOP_ORIGIN_ID.into();
+        let install_err = orch
+            .set_auth_credentials(vec![
+                AuthCredential::new("primary", "primary-tok").unwrap(),
+                spoofed,
+            ])
+            .unwrap_err();
+        assert!(
+            install_err.message.contains("reserved"),
+            "set_auth_credentials must revalidate public id, got {}",
+            install_err.message
+        );
+        assert!(orch.auth_header(Some("Bearer desktop-tok")).is_err());
+
+        orch.set_auth_credentials(vec![
+            AuthCredential::new("primary", "primary-tok").unwrap(),
+            AuthCredential::new(LEGACY_DESKTOP_CLIENT_ID, "desktop-tok").unwrap(),
+        ])
+        .unwrap();
+
+        let desktop_auth = orch.auth_header(Some("Bearer desktop-tok")).unwrap();
+        assert_eq!(desktop_auth.token_id, LEGACY_DESKTOP_CLIENT_ID);
+        let desktop_resp = orch
+            .submit_task(
+                &desktop_auth,
+                "adv-desktop-1",
+                session_id,
+                workspace.path(),
+                "list files please".into(),
+                Some(serde_json::json!({
+                    "maxPromptBytes": 10000,
+                    "maxRounds": 2,
+                    "maxDurationMs": 30000
+                })),
+            )
+            .await
+            .unwrap();
+        let desktop_run_id = desktop_resp["runId"].as_str().unwrap().to_string();
+        let _ = wait_service_run_terminal(&orch, &desktop_auth, &desktop_run_id).await;
+        let desktop_run = orch
+            .store()
+            .load_run(&desktop_run_id)
+            .unwrap()
+            .expect("named desktop credential must persist a run");
+        assert_eq!(
+            desktop_run.client_id.as_deref(),
+            Some(LEGACY_DESKTOP_CLIENT_ID)
+        );
+        assert!(!desktop_run.is_local_desktop_keep_origin());
+        let private = orch.get_run(&desktop_auth, &desktop_run_id).unwrap();
+        assert_eq!(private["clientId"], LEGACY_DESKTOP_CLIENT_ID);
+        let public = orch
+            .get_run_scoped(&desktop_auth, session_id, workspace.path(), &desktop_run_id)
+            .unwrap();
+        assert!(
+            public.get("clientId").is_none(),
+            "public-run wire must still omit clientId, got {public}"
+        );
+        assert_keep_failed(
+            host.keep_run_for_review(session_id, &desktop_run_id),
+            "local desktop",
+        );
+
+        let mcp_auth = orch.auth_header(Some("Bearer primary-tok")).unwrap();
+        assert_eq!(mcp_auth.token_id, "primary");
+        let mcp_resp = orch
+            .submit_task(
+                &mcp_auth,
+                "adv-mcp-1",
+                session_id,
+                workspace.path(),
+                "list files please".into(),
+                Some(serde_json::json!({
+                    "maxPromptBytes": 10000,
+                    "maxRounds": 2,
+                    "maxDurationMs": 30000
+                })),
+            )
+            .await
+            .unwrap();
+        let mcp_run_id = mcp_resp["runId"].as_str().unwrap().to_string();
+        let _ = wait_service_run_terminal(&orch, &mcp_auth, &mcp_run_id).await;
+        let mcp_run = orch
+            .store()
+            .load_run(&mcp_run_id)
+            .unwrap()
+            .expect("primary credential must persist an MCP-attributed run");
+        assert_eq!(mcp_run.client_id.as_deref(), Some("mcp"));
+        assert!(!mcp_run.is_local_desktop_keep_origin());
+        assert_keep_failed(
+            host.keep_run_for_review(session_id, &mcp_run_id),
+            "local desktop",
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn approve_run_rejects_truncated_review_before_persisting_approval() {
+        let (_home, host, session_id) = test_host();
+        let workspace = git_fixture();
+        let run_id = Uuid::new_v4().to_string();
+        save_isolated_desktop_run_with(
+            &host,
+            session_id,
+            workspace.path(),
+            &run_id,
+            "mcp",
+            RunState::Completed,
+            PromotionState::Ready,
+            Some(8_000),
+        );
+        let review = host.inspect_run(session_id, &run_id).unwrap();
+        assert!(
+            review.diff_truncated,
+            "fixture must exceed the 200 KiB review display bound"
+        );
+        let stored = host.get_session_run(session_id, &run_id).unwrap().unwrap();
+        let source_fingerprint = stored
+            .execution
+            .as_ref()
+            .unwrap()
+            .source_fingerprint
+            .clone();
+        let orch = test_orchestration_service(&host, workspace.path(), "t");
+        let auth = orch.auth_header(Some("Bearer t")).unwrap();
+        let err = orch
+            .approve_run(
+                &auth,
+                "approve-truncated-1",
+                session_id,
+                workspace.path(),
+                &run_id,
+                source_fingerprint,
+                review.fingerprint.clone(),
+                review.changed_files.clone(),
+                Some(60_000),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, OrchErrorCode::Conflict);
+        assert!(
+            err.message.to_lowercase().contains("truncated"),
+            "approve_run must fail closed on truncation, got {}",
+            err.message
+        );
+        let after = host.get_session_run(session_id, &run_id).unwrap().unwrap();
+        assert!(
+            after.approval.is_none(),
+            "truncated review must not persist durable approval"
+        );
+        assert_eq!(promotion_state_of(&after), PromotionState::Ready);
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("README.md")).unwrap(),
+            "baseline\n"
+        );
+    }
+
+    #[test]
+    fn truncated_review_cannot_be_applied_even_with_matching_durable_approval() {
+        let (_home, host, session_id) = test_host();
+        let workspace = git_fixture();
+        let run_id = desktop_run_id();
+        save_isolated_desktop_run_with(
+            &host,
+            session_id,
+            workspace.path(),
+            &run_id,
+            "mcp",
+            RunState::Completed,
+            PromotionState::Ready,
+            Some(8_000),
+        );
+        let review = host.review_run(session_id, &run_id).unwrap();
+        assert!(
+            review.diff_truncated,
+            "fixture must exceed the 200 KiB review display bound"
+        );
+        let stored = host.get_session_run(session_id, &run_id).unwrap().unwrap();
+        let source_fingerprint = stored
+            .execution
+            .as_ref()
+            .unwrap()
+            .source_fingerprint
+            .clone();
+        assert_eq!(
+            review.fingerprint,
+            stored
+                .execution
+                .as_ref()
+                .unwrap()
+                .final_fingerprint
+                .clone()
+                .unwrap()
+        );
+        host.ensure_orchestration_store()
+            .unwrap()
+            .update_run(&run_id, |current| {
+                current.approval = Some(RunApproval {
+                    approval_id: "planted-truncated-approval".into(),
+                    run_id: run_id.clone(),
+                    session_id,
+                    workspace: current.workspace.clone(),
+                    source_fingerprint: source_fingerprint.clone(),
+                    final_fingerprint: review.fingerprint.clone(),
+                    changed_files: review.changed_files.clone(),
+                    issued_at: Utc::now(),
+                    expires_at: Utc::now() + chrono::Duration::hours(1),
+                });
+                Ok(())
+            })
+            .unwrap();
+        let promote_error = host
+            .promote_run_with_approval(session_id, &run_id, Some("planted-truncated-approval"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            promote_error.to_lowercase().contains("truncated"),
+            "matching durable approval must not apply a truncated review, got {promote_error}"
+        );
+        let after = host.get_session_run(session_id, &run_id).unwrap().unwrap();
+        assert_eq!(promotion_state_of(&after), PromotionState::Ready);
+        assert_eq!(
+            after.approval.as_ref().unwrap().final_fingerprint,
+            review.fingerprint
+        );
+        assert_eq!(
+            after.approval.as_ref().unwrap().changed_files,
+            review.changed_files
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("README.md")).unwrap(),
+            "baseline\n"
+        );
+    }
+
+    #[test]
+    fn review_then_promote_without_approval_refuses_non_local_origins() {
+        let (_home, host, session_id) = test_host();
+        let workspace = git_fixture();
+        let origins: [(&str, Option<&str>); 5] = [
+            ("mcp", Some("mcp")),
+            ("named-external", Some("laptop")),
+            ("legacy-desktop", Some(LEGACY_DESKTOP_CLIENT_ID)),
+            ("missing", None),
+            ("empty", Some("")),
+        ];
+        for (label, origin) in origins {
+            let run_id = format!("{label}-{}", Uuid::new_v4());
+            save_isolated_run_with_client(
+                &host,
+                session_id,
+                workspace.path(),
+                &run_id,
+                origin,
+                RunState::Completed,
+                PromotionState::Ready,
+                None,
+            );
+            host.review_run(session_id, &run_id).unwrap();
+            assert!(
+                !has_local_review_marker(&host, &run_id),
+                "review_run must not mint local authority for {label}"
+            );
+            assert_promote_requires_persisted_approval(
+                &host,
+                session_id,
+                &run_id,
+                workspace.path(),
+            );
+
+            host.review_run_view(session_id, &run_id).unwrap();
+            assert!(
+                !has_local_review_marker(&host, &run_id),
+                "review_run_view must not mint local authority for {label}"
+            );
+            assert_promote_requires_persisted_approval(
+                &host,
+                session_id,
+                &run_id,
+                workspace.path(),
+            );
+
+            host.inspect_run(session_id, &run_id).unwrap();
+            assert!(
+                !has_local_review_marker(&host, &run_id),
+                "inspect_run must not mint local authority for {label}"
+            );
+            assert_promote_requires_persisted_approval(
+                &host,
+                session_id,
+                &run_id,
+                workspace.path(),
+            );
+        }
+
+        let planted = format!("planted-mcp-{}", Uuid::new_v4());
+        save_isolated_desktop_run(
+            &host,
+            session_id,
+            workspace.path(),
+            &planted,
+            "mcp",
+            RunState::Completed,
+            PromotionState::Ready,
+        );
+        host.review_run(session_id, &planted).unwrap();
+        host.reviewed_runs.lock().insert(planted.clone());
+        let planted_error = host
+            .promote_run(session_id, &planted)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            planted_error.to_lowercase().contains("persisted approval"),
+            "a planted local review marker must not promote MCP, got {planted_error}"
+        );
+        host.reviewed_runs.lock().remove(&planted);
+        assert_source_unwritten(workspace.path());
+        assert_eq!(
+            promotion_state_of(&host.get_session_run(session_id, &planted).unwrap().unwrap()),
+            PromotionState::Ready
+        );
+    }
+
+    #[test]
+    fn local_desktop_review_then_promote_succeeds_without_durable_approval() {
+        let (_home, host, session_id) = test_host();
+        let review_workspace = git_fixture();
+        let review_id = desktop_run_id();
+        save_isolated_desktop_run(
+            &host,
+            session_id,
+            review_workspace.path(),
+            &review_id,
+            LOCAL_DESKTOP_ORIGIN_ID,
+            RunState::Completed,
+            PromotionState::Ready,
+        );
+        host.review_run(session_id, &review_id).unwrap();
+        assert!(
+            has_local_review_marker(&host, &review_id),
+            "local-desktop review_run must mint the in-memory promotion marker"
+        );
+        let promoted = host.promote_run(session_id, &review_id).unwrap();
+        assert_eq!(promotion_state_of(&promoted), PromotionState::Promoted);
+        assert_eq!(
+            std::fs::read_to_string(review_workspace.path().join("README.md")).unwrap(),
+            "isolated edit\n"
+        );
+        assert!(!has_local_review_marker(&host, &review_id));
+
+        let view_workspace = git_fixture();
+        let view_id = desktop_run_id();
+        save_isolated_desktop_run(
+            &host,
+            session_id,
+            view_workspace.path(),
+            &view_id,
+            LOCAL_DESKTOP_ORIGIN_ID,
+            RunState::Completed,
+            PromotionState::Ready,
+        );
+        host.review_run_view(session_id, &view_id).unwrap();
+        assert!(
+            has_local_review_marker(&host, &view_id),
+            "local-desktop review_run_view must mint the in-memory promotion marker"
+        );
+        host.promote_run(session_id, &view_id).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(view_workspace.path().join("README.md")).unwrap(),
+            "isolated edit\n"
+        );
+        assert!(!has_local_review_marker(&host, &view_id));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn inspect_then_scoped_durable_approval_promotes_external_without_local_marker() {
+        let (_home, host, session_id) = test_host();
+        for origin in ["mcp", "laptop"] {
+            let workspace = git_fixture();
+            let run_id = format!("{origin}-{}", Uuid::new_v4());
+            save_isolated_run_with_client(
+                &host,
+                session_id,
+                workspace.path(),
+                &run_id,
+                Some(origin),
+                RunState::Completed,
+                PromotionState::Ready,
+                None,
+            );
+            let review = host.inspect_run(session_id, &run_id).unwrap();
+            assert!(
+                !has_local_review_marker(&host, &run_id),
+                "inspect must not mint local review authority for {origin}"
+            );
+            let stored = host.get_session_run(session_id, &run_id).unwrap().unwrap();
+            let source_fingerprint = stored
+                .execution
+                .as_ref()
+                .unwrap()
+                .source_fingerprint
+                .clone();
+            let orch = test_orchestration_service(&host, workspace.path(), "t");
+            let auth = orch.auth_header(Some("Bearer t")).unwrap();
+            let approved = orch
+                .approve_run(
+                    &auth,
+                    &format!("approve-{run_id}"),
+                    session_id,
+                    workspace.path(),
+                    &run_id,
+                    source_fingerprint,
+                    review.fingerprint.clone(),
+                    review.changed_files.clone(),
+                    Some(60_000),
+                )
+                .await
+                .unwrap();
+            assert!(
+                !has_local_review_marker(&host, &run_id),
+                "durable approval must not mint local review authority for {origin}"
+            );
+            let approval_id = approved["approvalId"]
+                .as_str()
+                .expect("approve_run returns approvalId");
+            let promoted = host
+                .promote_run_with_approval(session_id, &run_id, Some(approval_id))
+                .unwrap();
+            assert_eq!(promotion_state_of(&promoted), PromotionState::Promoted);
+            assert_eq!(
+                std::fs::read_to_string(workspace.path().join("README.md")).unwrap(),
+                "isolated edit\n"
+            );
+            assert!(!has_local_review_marker(&host, &run_id));
+        }
+    }
+
+    #[test]
+    fn kept_run_review_reports_drift_and_missing_worktree_without_rewriting_state() {
+        let (_home, host, session_id) = test_host();
+        let workspace = git_fixture();
+        let run_id = desktop_run_id();
+        let worktree = save_isolated_desktop_run(
+            &host,
+            session_id,
+            workspace.path(),
+            &run_id,
+            LOCAL_DESKTOP_ORIGIN_ID,
+            RunState::Completed,
+            PromotionState::Ready,
+        );
+        host.review_run(session_id, &run_id).unwrap();
+        host.keep_run_for_review(session_id, &run_id).unwrap();
+
+        let matched = host.review_run_view(session_id, &run_id).unwrap();
+        assert_eq!(matched["retentionVerification"], "matched");
+        assert_eq!(
+            matched["retainedFingerprint"],
+            matched["presentFingerprint"]
+        );
+        let after_match = host.get_session_run(session_id, &run_id).unwrap().unwrap();
+        assert_eq!(
+            promotion_state_of(&after_match),
+            PromotionState::KeptForReview
+        );
+        assert!(after_match.error_code.is_none());
+
+        std::fs::write(worktree.join("README.md"), "drifted after keep\n").unwrap();
+        let drifted = host.review_run_view(session_id, &run_id).unwrap();
+        assert_eq!(drifted["retentionVerification"], "drifted");
+        assert_ne!(
+            drifted["retainedFingerprint"],
+            drifted["presentFingerprint"]
+        );
+        let after_drift = host.get_session_run(session_id, &run_id).unwrap().unwrap();
+        assert_eq!(
+            promotion_state_of(&after_drift),
+            PromotionState::KeptForReview
+        );
+        assert!(after_drift.error_code.is_none());
+        assert!(host.promote_run(session_id, &run_id).is_err());
+        assert!(host.discard_run(session_id, &run_id).is_err());
+
+        std::fs::remove_dir_all(&worktree).unwrap();
+        let missing = host.review_run_view(session_id, &run_id).unwrap();
+        assert_eq!(missing["retentionVerification"], "worktree_missing");
+        assert!(missing.get("presentFingerprint").is_none());
+        assert!(missing["retainedFingerprint"].as_str().is_some());
+        let missing_review = host
+            .review_run(session_id, &run_id)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing_review.to_lowercase().contains("missing"),
+            "non-view review_run must not synthesize a complete review, got {missing_review}"
+        );
+        let missing_inspect = host
+            .inspect_run(session_id, &run_id)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing_inspect.to_lowercase().contains("missing"),
+            "non-view inspect_run must not synthesize a complete review, got {missing_inspect}"
+        );
+        let after_missing = host.get_session_run(session_id, &run_id).unwrap().unwrap();
+        assert_eq!(
+            promotion_state_of(&after_missing),
+            PromotionState::KeptForReview
+        );
+        assert!(after_missing.error_code.is_none());
+        assert!(host.promote_run(session_id, &run_id).is_err());
+        assert!(host.discard_run(session_id, &run_id).is_err());
+        assert!(host.keep_run_for_review(session_id, &run_id).is_err());
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("README.md")).unwrap(),
+            "baseline\n"
+        );
+    }
+
+    #[test]
+    fn concurrent_review_keep_discard_promote_one_terminal_disposition() {
+        let (_home, runtime, session_id) = test_host();
+        let workspace = git_fixture();
+        let run_id = desktop_run_id();
+        save_isolated_desktop_run(
+            &runtime,
+            session_id,
+            workspace.path(),
+            &run_id,
+            LOCAL_DESKTOP_ORIGIN_ID,
+            RunState::Completed,
+            PromotionState::Ready,
+        );
+        runtime.review_run(session_id, &run_id).unwrap();
+        let host = runtime.handle();
+        let run_id_owned = run_id.clone();
+
+        let (keep, discard, promote, review) = std::thread::scope(|scope| {
+            let keep_host = host.clone();
+            let keep_id = run_id_owned.clone();
+            let keep = scope
+                .spawn(move || retry_busy(|| keep_host.keep_run_for_review(session_id, &keep_id)));
+            let discard_host = host.clone();
+            let discard_id = run_id_owned.clone();
+            let discard = scope
+                .spawn(move || retry_busy(|| discard_host.discard_run(session_id, &discard_id)));
+            let promote_host = host.clone();
+            let promote_id = run_id_owned.clone();
+            let promote = scope
+                .spawn(move || retry_busy(|| promote_host.promote_run(session_id, &promote_id)));
+            let review_host = host.clone();
+            let review_id = run_id_owned.clone();
+            let review =
+                scope.spawn(move || retry_busy(|| review_host.review_run(session_id, &review_id)));
+            (
+                keep.join().expect("keep thread"),
+                discard.join().expect("discard thread"),
+                promote.join().expect("promote thread"),
+                review.join().expect("review thread"),
+            )
+        });
+
+        let keep_ok = keep.is_ok();
+        let discard_ok = discard.is_ok();
+        let promote_ok = promote.is_ok();
+        let terminals = [keep_ok, discard_ok, promote_ok]
+            .into_iter()
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(
+            terminals, 1,
+            "keep={keep:?} discard={discard:?} promote={promote:?} review={review:?}"
+        );
+
+        let final_run = host.get_session_run(session_id, &run_id).unwrap().unwrap();
+        let state = promotion_state_of(&final_run);
+        if keep_ok {
+            assert_eq!(state, PromotionState::KeptForReview);
+            assert!(promote.is_err());
+            assert!(discard.is_err());
+        } else if discard_ok {
+            assert_eq!(state, PromotionState::Discarded);
+            assert!(keep.is_err(), "keep must not escape after discard");
+            assert!(promote.is_err());
+        } else {
+            assert_eq!(state, PromotionState::Promoted);
+            assert!(keep.is_err(), "keep must not escape after apply");
+            assert!(discard.is_err());
+        }
+        assert_ne!(state, PromotionState::Ready);
+        assert_ne!(state, PromotionState::Conflicted);
+        if state == PromotionState::KeptForReview {
+            let again = host.review_run_view(session_id, &run_id).unwrap();
+            assert_eq!(again["retentionVerification"], "matched");
+            assert_eq!(
+                host.get_session_run(session_id, &run_id)
+                    .unwrap()
+                    .unwrap()
+                    .execution
+                    .as_ref()
+                    .unwrap()
+                    .promotion_state,
+                PromotionState::KeptForReview
+            );
+        }
     }
 }

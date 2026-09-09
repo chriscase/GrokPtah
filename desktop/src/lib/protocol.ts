@@ -453,7 +453,8 @@ export type PromotionState =
   | "ready"
   | "promoted"
   | "conflicted"
-  | "discarded";
+  | "discarded"
+  | "kept_for_review";
 
 export interface RunExecution {
   mode: RunExecutionMode;
@@ -466,11 +467,19 @@ export interface RunExecution {
   promotedAt?: string | null;
 }
 
+export type RetentionVerification = "matched" | "drifted" | "worktree_missing";
+
 export interface RunReview {
   changedFiles: Array<{ path: string; summary: string }>;
   diff: string;
   diffTruncated: boolean;
   fingerprint: string;
+  /** Recorded retained fingerprint for a kept run. Absent on ready-run reviews. */
+  retainedFingerprint?: string | null;
+  /** Present worktree fingerprint when the kept worktree can be read. */
+  presentFingerprint?: string | null;
+  /** Current verification of a kept worktree; not a claim of immutable retention. */
+  retentionVerification?: RetentionVerification | null;
 }
 
 export interface RunApproval {

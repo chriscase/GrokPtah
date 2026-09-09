@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::types::{OrchError, OrchErrorCode};
+use super::types::{OrchError, OrchErrorCode, LOCAL_DESKTOP_ORIGIN_ID};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthContext {
@@ -39,17 +39,7 @@ impl AuthCredential {
     pub fn new(id: impl Into<String>, token: impl Into<String>) -> Result<Self, OrchError> {
         let id = id.into().trim().to_string();
         let token = token.into().trim().to_string();
-        if id.is_empty()
-            || id.len() > 128
-            || !id
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-        {
-            return Err(OrchError::new(
-                OrchErrorCode::InvalidRequest,
-                "auth credential id must contain only ASCII letters, numbers, '-', '_', or '.'",
-            ));
-        }
+        validate_auth_credential_id(&id)?;
         if token.is_empty() {
             return Err(OrchError::new(
                 OrchErrorCode::InvalidRequest,
@@ -62,6 +52,30 @@ impl AuthCredential {
     pub fn token(&self) -> &str {
         &self.token
     }
+}
+
+/// Validate a credential identity at construction and again at installation.
+/// `AuthCredential.id` is public, so `set_auth_credentials` must re-run this
+/// instead of trusting a previously constructed value.
+pub fn validate_auth_credential_id(id: &str) -> Result<(), OrchError> {
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        return Err(OrchError::new(
+            OrchErrorCode::InvalidRequest,
+            "auth credential id must contain only ASCII letters, numbers, '-', '_', or '.'",
+        ));
+    }
+    if id == LOCAL_DESKTOP_ORIGIN_ID {
+        return Err(OrchError::new(
+            OrchErrorCode::InvalidRequest,
+            "auth credential id 'local-desktop' is reserved for host-minted local desktop origin",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Default)]
@@ -227,6 +241,17 @@ mod tests {
         assert_eq!(auth.token_id, "laptop");
         assert_eq!(auth.owner_id, "account-1");
         assert!(authenticate_bearer(Some("Bearer unknown"), &credentials, "account-1").is_err());
+    }
+
+    #[test]
+    fn reserved_local_desktop_origin_cannot_be_an_auth_credential() {
+        let err = AuthCredential::new(LOCAL_DESKTOP_ORIGIN_ID, "tok").unwrap_err();
+        assert!(err.message.contains("reserved"));
+        assert!(AuthCredential::new("desktop", "tok").is_ok());
+        assert!(AuthCredential::new("primary", "tok").is_ok());
+        assert!(AuthCredential::new("laptop", "tok").is_ok());
+        assert!(validate_auth_credential_id(LOCAL_DESKTOP_ORIGIN_ID).is_err());
+        assert!(validate_auth_credential_id("desktop").is_ok());
     }
 
     #[test]

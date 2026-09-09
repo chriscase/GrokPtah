@@ -15,7 +15,7 @@ function run(overrides: Partial<DurableRun> = {}): DurableRun {
     sessionId: "session-1",
     workspace: "/tmp/demo",
     requestId: "desktop-turn-1",
-    clientId: "desktop",
+    clientId: "local-desktop",
     state: "completed",
     bounds: { maxPromptBytes: 1000, maxRounds: 8, maxDurationMs: 1000 },
     promptPreview: "Fix the failing test",
@@ -122,6 +122,7 @@ const actions = {
   onReview: vi.fn(async () => review),
   onApprove: vi.fn(async () => undefined),
   onPromote: vi.fn(async () => undefined),
+  onKeepForReview: vi.fn(async () => undefined),
   onDiscard: vi.fn(async () => undefined),
   onRetry: vi.fn(async () => undefined),
   onSteer: vi.fn(async () => undefined),
@@ -323,7 +324,7 @@ describe("RunInspector", () => {
     render(
       <RunInspector
         runs={[
-          run({ runId: "desktop-run", promptPreview: "Desktop task", clientId: "desktop" }),
+          run({ runId: "desktop-run", promptPreview: "Desktop task", clientId: "local-desktop" }),
           run({ runId: "mcp-run", promptPreview: "Coordinator task", clientId: "mcp" }),
         ]}
         watching
@@ -451,10 +452,13 @@ describe("RunInspector", () => {
 
     expect(screen.getByText(/Isolated · ready/)).toBeTruthy();
     expect(screen.getByText("Isolated worktree", { selector: ".run-execution-mode" })).toBeTruthy();
-    expect(screen.queryByText("Promote reviewed changes")).toBeNull();
+    expect(screen.queryByText("Apply exact reviewed patch")).toBeNull();
+    expect(screen.queryByText("Keep for review")).toBeNull();
     fireEvent.click(screen.getByText("Review diff"));
     expect(await screen.findByText(/1 changed files/)).toBeTruthy();
-    expect(screen.getByText("Promote reviewed changes")).toBeTruthy();
+    expect(screen.getByText("Keep for review")).toBeTruthy();
+    expect(screen.getByText("Apply exact reviewed patch")).toBeTruthy();
+    expect(screen.queryByText("Approve for promotion")).toBeNull();
     expect(screen.getByText(/diff --git/)).toBeTruthy();
   });
 
@@ -492,9 +496,11 @@ describe("RunInspector", () => {
     );
 
     expect(screen.getByText(/Approval active until/)).toBeTruthy();
-    expect(screen.queryByText("Promote reviewed changes")).toBeNull();
+    expect(screen.queryByText("Apply exact reviewed patch")).toBeNull();
+    expect(screen.queryByText("Keep for review")).toBeNull();
     fireEvent.click(screen.getByText("Review diff"));
-    expect(await screen.findByText("Promote reviewed changes")).toBeTruthy();
+    expect(await screen.findByText("Apply exact reviewed patch")).toBeTruthy();
+    expect(screen.queryByText("Keep for review")).toBeNull();
   });
 
   it("surfaces an isolated promotion conflict as a blocking state", () => {
@@ -589,7 +595,8 @@ describe("RunInspector", () => {
     expect(screen.queryByText("Isolated worktree")).toBeNull();
     expect(screen.queryByLabelText("Filter task runs by source")).toBeNull();
     expect(screen.queryByText("Review diff")).toBeNull();
-    expect(screen.queryByText("Promote reviewed changes")).toBeNull();
+    expect(screen.queryByText("Apply exact reviewed patch")).toBeNull();
+    expect(screen.queryByText("Keep for review")).toBeNull();
     expect(screen.queryByLabelText("Fresh recovery prompt")).toBeNull();
   });
 
@@ -631,7 +638,8 @@ describe("RunInspector", () => {
     expect(screen.queryByText("Handoff")).toBeNull();
     expect(screen.queryByText("Review diff")).toBeNull();
     expect(screen.queryByText("Approve for promotion")).toBeNull();
-    expect(screen.queryByText("Promote reviewed changes")).toBeNull();
+    expect(screen.queryByText("Apply exact reviewed patch")).toBeNull();
+    expect(screen.queryByText("Keep for review")).toBeNull();
     expect(screen.queryByText("Discard")).toBeNull();
     expect(screen.queryByText("Verification: verified")).toBeNull();
     expect(screen.queryByText("Stop cause: token ceiling")).toBeNull();
@@ -676,7 +684,8 @@ describe("RunInspector", () => {
     expect(screen.getByText("Isolated worktree", { selector: ".run-execution-mode" })).toBeTruthy();
     expect(screen.getByLabelText("Filter task runs by source")).toBeTruthy();
     fireEvent.click(screen.getByText("Review diff"));
-    expect(await screen.findByText("Promote reviewed changes")).toBeTruthy();
+    expect(await screen.findByText("Apply exact reviewed patch")).toBeTruthy();
+    expect(screen.getByText("Keep for review")).toBeTruthy();
   });
 
   it("does not replay or render raw remote journal events", async () => {
@@ -744,6 +753,632 @@ describe("RunInspector", () => {
     expect(screen.queryByRole("button", { name: "Retry interrupted run" })).toBeNull();
     expect(screen.queryByText("Review diff")).toBeNull();
     expect(screen.queryByText("Discard")).toBeNull();
+    expect(screen.queryByText("Keep for review")).toBeNull();
+    expect(screen.queryByText("Apply exact reviewed patch")).toBeNull();
     expect(screen.queryByRole("button", { name: "Steer now" })).toBeNull();
+  });
+
+  it("keeps a reviewed local desktop run without applying", async () => {
+    const isolated = run({
+      execution: {
+        mode: "isolated_worktree",
+        sourceWorkspace: "/tmp/demo",
+        executionWorkspace: "/tmp/demo/.grokptah/worktrees/runs/run-1",
+        baseRevision: "base",
+        sourceFingerprint: "source",
+        finalFingerprint: "abc123",
+        promotionState: "ready",
+        promotedAt: null,
+      },
+    });
+    const onKeepForReview = vi.fn(async () => undefined);
+    const onRefresh = vi.fn();
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    render(
+      <RunInspector
+        runs={[isolated]}
+        onRefresh={onRefresh}
+        {...actions}
+        onKeepForReview={onKeepForReview}
+      />,
+    );
+
+    fireEvent.click(screen.getByText("Review diff"));
+    expect(await screen.findByText(/Keep is irreversible/)).toBeTruthy();
+    fireEvent.click(await screen.findByRole("button", { name: "Keep for review" }));
+    expect(confirm).toHaveBeenCalledWith(expect.stringMatching(/irreversible/i));
+    expect(onKeepForReview).toHaveBeenCalledWith("desktop-run-1");
+    await waitFor(() => expect(onRefresh).toHaveBeenCalledTimes(1));
+  });
+
+  it("does not keep when the irreversible confirmation is declined", async () => {
+    const isolated = run({
+      execution: {
+        mode: "isolated_worktree",
+        sourceWorkspace: "/tmp/demo",
+        executionWorkspace: "/tmp/demo/.grokptah/worktrees/runs/run-1",
+        baseRevision: "base",
+        sourceFingerprint: "source",
+        finalFingerprint: "abc123",
+        promotionState: "ready",
+        promotedAt: null,
+      },
+    });
+    const onKeepForReview = vi.fn(async () => undefined);
+    vi.spyOn(window, "confirm").mockReturnValue(false);
+    render(
+      <RunInspector
+        runs={[isolated]}
+        onRefresh={vi.fn()}
+        {...actions}
+        onKeepForReview={onKeepForReview}
+      />,
+    );
+
+    fireEvent.click(screen.getByText("Review diff"));
+    fireEvent.click(await screen.findByRole("button", { name: "Keep for review" }));
+    expect(onKeepForReview).not.toHaveBeenCalled();
+  });
+
+  it("does not report keep success when the local action fails", async () => {
+    const isolated = run({
+      execution: {
+        mode: "isolated_worktree",
+        sourceWorkspace: "/tmp/demo",
+        executionWorkspace: "/tmp/demo/.grokptah/worktrees/runs/run-1",
+        baseRevision: "base",
+        sourceFingerprint: "source",
+        finalFingerprint: "abc123",
+        promotionState: "ready",
+        promotedAt: null,
+      },
+    });
+    const onKeepForReview = vi.fn(async () => {
+      throw new Error("isolated worktree changed after review");
+    });
+    const onRefresh = vi.fn();
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    render(
+      <RunInspector
+        runs={[isolated]}
+        onRefresh={onRefresh}
+        {...actions}
+        onKeepForReview={onKeepForReview}
+      />,
+    );
+
+    fireEvent.click(screen.getByText("Review diff"));
+    fireEvent.click(await screen.findByRole("button", { name: "Keep for review" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "isolated worktree changed after review",
+    );
+    expect(onRefresh).not.toHaveBeenCalled();
+  });
+
+  it("keeps Review available after keep without enabling Discard or Apply", async () => {
+    const kept = run({
+      execution: {
+        mode: "isolated_worktree",
+        sourceWorkspace: "/tmp/demo",
+        executionWorkspace: "/tmp/demo/.grokptah/worktrees/runs/run-1",
+        baseRevision: "base",
+        sourceFingerprint: "source",
+        finalFingerprint: "abc123",
+        promotionState: "kept_for_review",
+        promotedAt: null,
+      },
+    });
+    const drifted: RunReview = {
+      ...review,
+      fingerprint: "drifted-now",
+      retainedFingerprint: "abc123",
+      presentFingerprint: "drifted-now",
+      retentionVerification: "drifted",
+    };
+    const onReview = vi.fn(async () => drifted);
+    render(
+      <RunInspector runs={[kept]} onRefresh={vi.fn()} {...actions} onReview={onReview} />,
+    );
+
+    expect(screen.getByText(/Isolated · kept for review/)).toBeTruthy();
+    expect(screen.getByText(/current verification, not immutable retention/i)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Review diff" })).toBeTruthy();
+    expect(screen.queryByText("Keep for review")).toBeNull();
+    expect(screen.queryByText("Apply exact reviewed patch")).toBeNull();
+    expect(screen.queryByText("Discard")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Review diff" }));
+    expect(await screen.findByText(/retention drifted/)).toBeTruthy();
+    expect(screen.getByText(/differs from the present worktree/)).toBeTruthy();
+    expect(screen.queryByText("Keep for review")).toBeNull();
+    expect(screen.queryByText("Apply exact reviewed patch")).toBeNull();
+    expect(screen.queryByText("Discard")).toBeNull();
+  });
+
+  it("does not enable Keep or Apply when the reviewed diff is truncated", async () => {
+    const isolated = run({
+      execution: {
+        mode: "isolated_worktree",
+        sourceWorkspace: "/tmp/demo",
+        executionWorkspace: "/tmp/demo/.grokptah/worktrees/runs/run-1",
+        baseRevision: "base",
+        sourceFingerprint: "source",
+        finalFingerprint: "abc123",
+        promotionState: "ready",
+        promotedAt: null,
+      },
+    });
+    const truncated: RunReview = { ...review, diffTruncated: true };
+    const onReview = vi.fn(async () => truncated);
+    const onKeepForReview = vi.fn(async () => undefined);
+    const onPromote = vi.fn(async () => undefined);
+    render(
+      <RunInspector
+        runs={[isolated]}
+        onRefresh={vi.fn()}
+        {...actions}
+        onReview={onReview}
+        onKeepForReview={onKeepForReview}
+        onPromote={onPromote}
+      />,
+    );
+
+    fireEvent.click(screen.getByText("Review diff"));
+    expect(await screen.findByText(/diff truncated/)).toBeTruthy();
+    expect(screen.getByText(/exact patch is not fully visible/i)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Keep for review" })).toBeNull();
+    expect(screen.queryByText("Apply exact reviewed patch")).toBeNull();
+    expect(onKeepForReview).not.toHaveBeenCalled();
+    expect(onPromote).not.toHaveBeenCalled();
+  });
+
+  it("does not enable Keep or Apply for a legacy desktop client id", async () => {
+    const isolated = run({
+      clientId: "desktop",
+      execution: {
+        mode: "isolated_worktree",
+        sourceWorkspace: "/tmp/demo",
+        executionWorkspace: "/tmp/demo/.grokptah/worktrees/runs/run-1",
+        baseRevision: "base",
+        sourceFingerprint: "source",
+        finalFingerprint: "abc123",
+        promotionState: "ready",
+        promotedAt: null,
+      },
+    });
+    render(<RunInspector runs={[isolated]} onRefresh={vi.fn()} {...actions} />);
+    fireEvent.click(screen.getByText("Review diff"));
+    expect(await screen.findByText(/1 changed files/)).toBeTruthy();
+    expect(screen.queryByText("Keep for review")).toBeNull();
+    expect(screen.queryByText("Approve for promotion")).toBeNull();
+    expect(screen.queryByText("Apply exact reviewed patch")).toBeNull();
+  });
+
+  it("does not enable Keep, Approve, or Apply when origin is missing", async () => {
+    const isolated = run({
+      clientId: null,
+      execution: {
+        mode: "isolated_worktree",
+        sourceWorkspace: "/tmp/demo",
+        executionWorkspace: "/tmp/demo/.grokptah/worktrees/runs/run-1",
+        baseRevision: "base",
+        sourceFingerprint: "source",
+        finalFingerprint: "abc123",
+        promotionState: "ready",
+        promotedAt: null,
+      },
+    });
+    render(<RunInspector runs={[isolated]} onRefresh={vi.fn()} {...actions} />);
+    fireEvent.click(screen.getByText("Review diff"));
+    expect(await screen.findByText(/1 changed files/)).toBeTruthy();
+    expect(screen.queryByText("Keep for review")).toBeNull();
+    expect(screen.queryByText("Approve for promotion")).toBeNull();
+    expect(screen.queryByText("Apply exact reviewed patch")).toBeNull();
+  });
+
+  it("does not show Apply for a named credential without durable approval", async () => {
+    const isolated = run({
+      clientId: "laptop",
+      execution: {
+        mode: "isolated_worktree",
+        sourceWorkspace: "/tmp/demo",
+        executionWorkspace: "/tmp/demo/.grokptah/worktrees/runs/run-1",
+        baseRevision: "base",
+        sourceFingerprint: "source",
+        finalFingerprint: "abc123",
+        promotionState: "ready",
+        promotedAt: null,
+      },
+    });
+    render(<RunInspector runs={[isolated]} onRefresh={vi.fn()} {...actions} />);
+    fireEvent.click(screen.getByText("Review diff"));
+    expect(await screen.findByRole("button", { name: "Approve for promotion" })).toBeTruthy();
+    expect(screen.queryByText("Keep for review")).toBeNull();
+    expect(screen.queryByText("Apply exact reviewed patch")).toBeNull();
+  });
+
+  it("uses the existing approval flow for an authorized named credential", async () => {
+    const isolated = run({
+      clientId: "laptop",
+      execution: {
+        mode: "isolated_worktree",
+        sourceWorkspace: "/tmp/demo",
+        executionWorkspace: "/tmp/demo/.grokptah/worktrees/runs/named-1",
+        baseRevision: "base",
+        sourceFingerprint: "source",
+        finalFingerprint: "abc123",
+        promotionState: "ready",
+        promotedAt: null,
+      },
+    });
+    const onApprove = vi.fn(async () => undefined);
+    const onRefresh = vi.fn();
+    const { rerender } = render(
+      <RunInspector
+        runs={[isolated]}
+        onRefresh={onRefresh}
+        {...actions}
+        onApprove={onApprove}
+      />,
+    );
+
+    fireEvent.click(screen.getByText("Review diff"));
+    fireEvent.click(await screen.findByRole("button", { name: "Approve for promotion" }));
+    expect(onApprove).toHaveBeenCalledWith("desktop-run-1");
+    await waitFor(() => expect(onRefresh).toHaveBeenCalledTimes(1));
+
+    rerender(
+      <RunInspector
+        runs={[
+          run({
+            clientId: "laptop",
+            execution: isolated.execution,
+            approval: {
+              approvalId: "approval-named",
+              runId: "desktop-run-1",
+              sessionId: "session-1",
+              workspace: "/tmp/demo",
+              sourceFingerprint: "source",
+              finalFingerprint: "abc123",
+              changedFiles: review.changedFiles,
+              issuedAt: "2026-08-11T12:00:00Z",
+              expiresAt: "2099-08-11T12:05:00Z",
+            },
+          }),
+        ]}
+        onRefresh={onRefresh}
+        {...actions}
+        onApprove={onApprove}
+      />,
+    );
+    fireEvent.click(screen.getByText("Review diff"));
+    expect(await screen.findByText("Apply exact reviewed patch")).toBeTruthy();
+    expect(screen.queryByText("Approve for promotion")).toBeNull();
+    expect(screen.queryByText("Keep for review")).toBeNull();
+  });
+
+  it("does not enable Apply on a truncated MCP review even with an active approval", async () => {
+    const mcpRun = run({
+      clientId: "mcp",
+      execution: {
+        mode: "isolated_worktree",
+        sourceWorkspace: "/tmp/demo",
+        executionWorkspace: "/tmp/demo/.grokptah/worktrees/runs/mcp-1",
+        baseRevision: "base",
+        sourceFingerprint: "source",
+        finalFingerprint: "abc123",
+        promotionState: "ready",
+        promotedAt: null,
+      },
+      approval: {
+        approvalId: "approval-1",
+        runId: "desktop-run-1",
+        sessionId: "session-1",
+        workspace: "/tmp/demo",
+        sourceFingerprint: "source",
+        finalFingerprint: "abc123",
+        changedFiles: review.changedFiles,
+        issuedAt: "2026-08-11T12:00:00Z",
+        expiresAt: "2099-08-11T12:05:00Z",
+      },
+    });
+    const onReview = vi.fn(async () => ({ ...review, diffTruncated: true }));
+    render(
+      <RunInspector runs={[mcpRun]} onRefresh={vi.fn()} {...actions} onReview={onReview} />,
+    );
+
+    fireEvent.click(screen.getByText("Review diff"));
+    expect(await screen.findByText(/exact patch is not fully visible/i)).toBeTruthy();
+    expect(screen.queryByText("Apply exact reviewed patch")).toBeNull();
+    expect(screen.queryByText("Keep for review")).toBeNull();
+  });
+
+  it("uses terminal retained-worktree wording when a kept review is truncated", async () => {
+    const kept = run({
+      execution: {
+        mode: "isolated_worktree",
+        sourceWorkspace: "/tmp/demo",
+        executionWorkspace: "/tmp/demo/.grokptah/worktrees/runs/run-1",
+        baseRevision: "base",
+        sourceFingerprint: "source",
+        finalFingerprint: "abc123",
+        promotionState: "kept_for_review",
+        promotedAt: null,
+      },
+    });
+    const truncated: RunReview = {
+      ...review,
+      diffTruncated: true,
+      retainedFingerprint: "abc123",
+      presentFingerprint: "abc123",
+      retentionVerification: "matched",
+    };
+    const onReview = vi.fn(async () => truncated);
+    render(
+      <RunInspector runs={[kept]} onRefresh={vi.fn()} {...actions} onReview={onReview} />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Review diff" }));
+    expect(await screen.findByText(/retained worktree review is truncated/i)).toBeTruthy();
+    expect(
+      screen.getAllByText(/Keep is terminal and did not write the source workspace/i).length,
+    ).toBeGreaterThanOrEqual(2);
+    expect(screen.queryByText(/until a complete reviewable patch/i)).toBeNull();
+    expect(screen.queryByText("Keep for review")).toBeNull();
+    expect(screen.queryByText("Apply exact reviewed patch")).toBeNull();
+    expect(screen.queryByText("Discard")).toBeNull();
+  });
+
+  it("renders missing retained worktree verification without implying a complete review", async () => {
+    const kept = run({
+      execution: {
+        mode: "isolated_worktree",
+        sourceWorkspace: "/tmp/demo",
+        executionWorkspace: "/tmp/demo/.grokptah/worktrees/runs/run-1",
+        baseRevision: "base",
+        sourceFingerprint: "source",
+        finalFingerprint: "abc123",
+        promotionState: "kept_for_review",
+        promotedAt: null,
+      },
+    });
+    const missing: RunReview = {
+      ...review,
+      changedFiles: [],
+      diff: "",
+      diffTruncated: false,
+      fingerprint: "abc123",
+      retainedFingerprint: "abc123",
+      presentFingerprint: null,
+      retentionVerification: "worktree_missing",
+    };
+    const onReview = vi.fn(async () => missing);
+    render(
+      <RunInspector runs={[kept]} onRefresh={vi.fn()} {...actions} onReview={onReview} />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Review diff" }));
+    expect(
+      await screen.findAllByText("Diff unavailable — retained worktree is missing."),
+    ).not.toHaveLength(0);
+    expect(screen.queryByText("0 changed files")).toBeNull();
+    expect(screen.queryByText("No changes")).toBeNull();
+    expect(await screen.findByText(/isolated worktree is no longer present/i)).toBeTruthy();
+    expect(screen.getByText(/recorded retained fingerprint abc123/i)).toBeTruthy();
+    expect(screen.queryByText(/until a complete reviewable patch/i)).toBeNull();
+    expect(screen.queryByText("Keep for review")).toBeNull();
+    expect(screen.queryByText("Apply exact reviewed patch")).toBeNull();
+    expect(screen.queryByText("Discard")).toBeNull();
+  });
+
+  it("presents matched retained worktree fingerprints as current verification, not immutable retention", async () => {
+    const kept = run({
+      execution: {
+        mode: "isolated_worktree",
+        sourceWorkspace: "/tmp/demo",
+        executionWorkspace: "/tmp/demo/.grokptah/worktrees/runs/run-1",
+        baseRevision: "base",
+        sourceFingerprint: "source",
+        finalFingerprint: "same-fp",
+        promotionState: "kept_for_review",
+        promotedAt: null,
+      },
+    });
+    const matched: RunReview = {
+      ...review,
+      fingerprint: "same-fp",
+      retainedFingerprint: "same-fp",
+      presentFingerprint: "same-fp",
+      retentionVerification: "matched",
+    };
+    const onReview = vi.fn(async () => matched);
+    render(
+      <RunInspector runs={[kept]} onRefresh={vi.fn()} {...actions} onReview={onReview} />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Review diff" }));
+    expect(
+      await screen.findByText(/present worktree same-fp currently matches the recorded retained fingerprint same-fp/i),
+    ).toBeTruthy();
+    expect(screen.getByText(/retention matched/i)).toBeTruthy();
+    expect(
+      screen.getByText(/This is current verification, not a guarantee that the worktree cannot change later/),
+    ).toBeTruthy();
+    expect(screen.queryByText(/immutable retention/i)).toBeNull();
+    expect(screen.queryByText("Keep for review")).toBeNull();
+    expect(screen.queryByText("Apply exact reviewed patch")).toBeNull();
+    expect(screen.queryByText("Discard")).toBeNull();
+  });
+
+  it("does not claim a match when retained fingerprints are unequal under a matched status", async () => {
+    const kept = run({
+      execution: {
+        mode: "isolated_worktree",
+        sourceWorkspace: "/tmp/demo",
+        executionWorkspace: "/tmp/demo/.grokptah/worktrees/runs/run-1",
+        baseRevision: "base",
+        sourceFingerprint: "source",
+        finalFingerprint: "recorded-fp",
+        promotionState: "kept_for_review",
+        promotedAt: null,
+      },
+    });
+    const malformed: RunReview = {
+      ...review,
+      fingerprint: "present-fp",
+      retainedFingerprint: "recorded-fp",
+      presentFingerprint: "present-fp",
+      retentionVerification: "matched",
+    };
+    const onReview = vi.fn(async () => malformed);
+    render(
+      <RunInspector runs={[kept]} onRefresh={vi.fn()} {...actions} onReview={onReview} />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Review diff" }));
+    expect(await screen.findByText("1 changed files")).toBeTruthy();
+    expect(
+      screen.getByText(/Review remains available to verify the present worktree/i),
+    ).toBeTruthy();
+    expect(screen.queryByText(/currently matches/i)).toBeNull();
+    expect(screen.queryByText(/retention matched/i)).toBeNull();
+    expect(screen.queryByText("Keep for review")).toBeNull();
+    expect(screen.queryByText("Apply exact reviewed patch")).toBeNull();
+    expect(screen.queryByText("Discard")).toBeNull();
+  });
+
+  it("ignores a delayed review after the lane scope changes", async () => {
+    const isolated = run({
+      execution: {
+        mode: "isolated_worktree",
+        sourceWorkspace: "/tmp/demo",
+        executionWorkspace: "/tmp/demo/.grokptah/worktrees/runs/run-1",
+        baseRevision: "base",
+        sourceFingerprint: "source",
+        finalFingerprint: "abc123",
+        promotionState: "ready",
+        promotedAt: null,
+      },
+    });
+    let resolveReview: ((value: RunReview) => void) | undefined;
+    const onReview = vi.fn(
+      () =>
+        new Promise<RunReview>((resolve) => {
+          resolveReview = resolve;
+        }),
+    );
+    const { rerender } = render(
+      <RunInspector
+        runs={[isolated]}
+        scope={{ laneId: "session-1", workspacePath: "/tmp/demo" }}
+        onRefresh={vi.fn()}
+        {...actions}
+        onReview={onReview}
+      />,
+    );
+
+    fireEvent.click(screen.getByText("Review diff"));
+    rerender(
+      <RunInspector
+        runs={[isolated]}
+        scope={{ laneId: "session-2", workspacePath: "/tmp/other" }}
+        onRefresh={vi.fn()}
+        {...actions}
+        onReview={onReview}
+      />,
+    );
+    resolveReview?.(review);
+    await waitFor(() => expect(onReview).toHaveBeenCalledTimes(1));
+    expect(screen.queryByText("Apply exact reviewed patch")).toBeNull();
+    expect(screen.queryByText("Keep for review")).toBeNull();
+    expect(screen.queryByText(/1 changed files/)).toBeNull();
+  });
+
+  it("does not apply a delayed keep error after unmount", async () => {
+    const isolated = run({
+      execution: {
+        mode: "isolated_worktree",
+        sourceWorkspace: "/tmp/demo",
+        executionWorkspace: "/tmp/demo/.grokptah/worktrees/runs/run-1",
+        baseRevision: "base",
+        sourceFingerprint: "source",
+        finalFingerprint: "abc123",
+        promotionState: "ready",
+        promotedAt: null,
+      },
+    });
+    let rejectKeep: ((reason: Error) => void) | undefined;
+    const onKeepForReview = vi.fn(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectKeep = reject;
+        }),
+    );
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    const { unmount } = render(
+      <RunInspector
+        runs={[isolated]}
+        onRefresh={vi.fn()}
+        {...actions}
+        onKeepForReview={onKeepForReview}
+      />,
+    );
+
+    fireEvent.click(screen.getByText("Review diff"));
+    fireEvent.click(await screen.findByRole("button", { name: "Keep for review" }));
+    unmount();
+    expect(() => rejectKeep?.(new Error("late keep failure"))).not.toThrow();
+  });
+
+  it("moves accessible focus to kept status after keep succeeds", async () => {
+    const isolated = run({
+      execution: {
+        mode: "isolated_worktree",
+        sourceWorkspace: "/tmp/demo",
+        executionWorkspace: "/tmp/demo/.grokptah/worktrees/runs/run-1",
+        baseRevision: "base",
+        sourceFingerprint: "source",
+        finalFingerprint: "abc123",
+        promotionState: "ready",
+        promotedAt: null,
+      },
+    });
+    const kept = run({
+      execution: {
+        mode: "isolated_worktree",
+        sourceWorkspace: "/tmp/demo",
+        executionWorkspace: "/tmp/demo/.grokptah/worktrees/runs/run-1",
+        baseRevision: "base",
+        sourceFingerprint: "source",
+        finalFingerprint: "abc123",
+        promotionState: "kept_for_review",
+        promotedAt: null,
+      },
+    });
+    const onKeepForReview = vi.fn(async () => undefined);
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    const { rerender } = render(
+      <RunInspector
+        runs={[isolated]}
+        onRefresh={vi.fn()}
+        {...actions}
+        onKeepForReview={onKeepForReview}
+      />,
+    );
+
+    fireEvent.click(screen.getByText("Review diff"));
+    fireEvent.click(await screen.findByRole("button", { name: "Keep for review" }));
+    await waitFor(() => expect(onKeepForReview).toHaveBeenCalled());
+    rerender(
+      <RunInspector
+        runs={[kept]}
+        onRefresh={vi.fn()}
+        {...actions}
+        onKeepForReview={onKeepForReview}
+      />,
+    );
+    await waitFor(() => {
+      expect(document.activeElement).toHaveTextContent(/Keep is terminal/i);
+    });
   });
 });

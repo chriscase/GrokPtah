@@ -705,6 +705,8 @@ export const api = {
     invoke<DurableRun>("run_approve", { sessionId, runId, ttlMs }),
   runPromote: (sessionId: string, runId: string) =>
     invoke<DurableRun>("run_promote", { sessionId, runId }),
+  runKeepForReview: (sessionId: string, runId: string) =>
+    invoke<DurableRun>("run_keep_for_review", { sessionId, runId }),
   runDiscard: (sessionId: string, runId: string) =>
     invoke<DurableRun>("run_discard", { sessionId, runId }),
   runRetry: (sessionId: string, runId: string, prompt: string) =>
