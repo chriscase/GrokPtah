@@ -961,7 +961,7 @@ mod cb_happy_path {
 fn vf_dry_run_pack_never_qualifies_physical_pass_on_linux() {
     use grokptah_isolated_surface::{
         run_sep18_checklist, verify_evidence_pack, EvidenceVerifierCode, HostSentinelSnapshot,
-        Sep18ChecklistRunnerConfig,
+        Sep18ChecklistRunnerConfig, VfDryRunHostObservationKind,
     };
 
     let outcome = run_sep18_checklist(
@@ -971,6 +971,27 @@ fn vf_dry_run_pack_never_qualifies_physical_pass_on_linux() {
     assert!(outcome.runner_error.is_none());
     assert!(!outcome.pack.physical_pass_claimed);
     assert!(!outcome.pack.vf_pass_claimed);
+    let vf = outcome.pack.vf_dry_run.as_ref().expect("vf nested");
+    match vf.platform {
+        grokptah_isolated_surface::VfDryRunPlatform::NonMacOs
+        | grokptah_isolated_surface::VfDryRunPlatform::MacOsFeatureDisabled => {
+            assert!(vf.is_synthetic_host_self_compare());
+            assert_eq!(
+                vf.host_observation_kind,
+                VfDryRunHostObservationKind::SyntheticHostProbeSelfCompare
+            );
+            assert!(!vf.native_collector_invoked);
+            assert!(!vf.live_host_sentinel_collection);
+        }
+        grokptah_isolated_surface::VfDryRunPlatform::MacOsDryRun => {
+            assert!(vf.native_collector_invoked);
+            assert_eq!(
+                vf.host_observation_kind,
+                VfDryRunHostObservationKind::NativeMacHostCollector
+            );
+            assert!(!vf.physical_pass_claimed);
+        }
+    }
 
     let decision = verify_evidence_pack(&outcome.pack);
     assert!(decision.accepted, "{:?}", decision);
@@ -983,6 +1004,56 @@ fn vf_dry_run_pack_never_qualifies_physical_pass_on_linux() {
     assert_eq!(
         decision.code,
         EvidenceVerifierCode::VfDryRunCannotQualifyPhysicalPass
+    );
+}
+
+#[cfg(not(all(target_os = "macos", feature = "vf-backend")))]
+#[test]
+fn vf_dry_run_forged_native_observation_without_collector_is_rejected() {
+    use grokptah_isolated_surface::{
+        run_sep18_checklist, verify_evidence_pack, EvidenceVerifierCode, HostSentinelProbeKind,
+        HostSentinelSnapshot, Sep18ChecklistRunnerConfig, VfDryRunHostObservationKind,
+    };
+
+    let outcome = run_sep18_checklist(
+        HostSentinelSnapshot::synthetic_baseline(),
+        Sep18ChecklistRunnerConfig::vf_dry_run("linux-ci-vf-dry-run"),
+    );
+    let mut pack = outcome.pack;
+    let vf = pack.vf_dry_run.as_mut().expect("vf nested");
+    vf.live_host_sentinel_collection = true;
+    vf.host_observation_kind = VfDryRunHostObservationKind::NativeMacHostCollector;
+    vf.last_host_sentinel_probe_kind = Some(HostSentinelProbeKind::NativeMacHost);
+    // invoked stays false — synthetic self-compare cannot claim native observation
+    let decision = verify_evidence_pack(&pack);
+    assert!(!decision.accepted);
+    assert_eq!(
+        decision.code,
+        EvidenceVerifierCode::PhysicalPassWithoutMacMarkers
+    );
+}
+
+#[cfg(not(all(target_os = "macos", feature = "vf-backend")))]
+#[test]
+fn vf_dry_run_forged_collector_invocation_on_linux_is_rejected() {
+    use grokptah_isolated_surface::{
+        run_sep18_checklist, verify_evidence_pack, EvidenceVerifierCode, HostSentinelSnapshot,
+        Sep18ChecklistRunnerConfig, VfDryRunHostObservationKind,
+    };
+
+    let outcome = run_sep18_checklist(
+        HostSentinelSnapshot::synthetic_baseline(),
+        Sep18ChecklistRunnerConfig::vf_dry_run("linux-ci-vf-dry-run"),
+    );
+    let mut pack = outcome.pack;
+    let vf = pack.vf_dry_run.as_mut().expect("vf nested");
+    vf.native_collector_invoked = true;
+    vf.host_observation_kind = VfDryRunHostObservationKind::NativeMacHostCollector;
+    let decision = verify_evidence_pack(&pack);
+    assert!(!decision.accepted);
+    assert_eq!(
+        decision.code,
+        EvidenceVerifierCode::HostSentinelProbeSummaryMismatch
     );
 }
 

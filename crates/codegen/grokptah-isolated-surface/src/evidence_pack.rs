@@ -12,7 +12,10 @@ use crate::captured_frame::{
 use crate::contained_browser_dry_run::ContainedBrowserDryRunEvidence;
 use crate::lifecycle::{GuestLifecycleDisposition, ProofEvidenceClass};
 use crate::proof_sequencer::{ChecklistStep, FaultMatrixCase, SealedProofEvidence};
-use crate::vf_dry_run::{VfDryRunEvidence, VfDryRunOutcome, VfDryRunPlatform};
+use crate::sentinel::HostSentinelProbeKind;
+use crate::vf_dry_run::{
+    VfDryRunEvidence, VfDryRunHostObservationKind, VfDryRunOutcome, VfDryRunPlatform,
+};
 use crate::{
     isolated_surface_admission_available, CONTAINED_BROWSER_DRY_RUN_NONCLAIM,
     SYNTHETIC_HARNESS_NONCLAIM, VF_DRY_RUN_NONCLAIM,
@@ -69,6 +72,9 @@ pub struct HostSentinelProbeSummary {
     pub host_sentinels_unchanged_at_stop: bool,
     pub channels_destroyed: usize,
     pub channels_open_after_stop: usize,
+    /// Last probe kind at Stop. Missing on old packs so they cannot claim native.
+    #[serde(default)]
+    pub last_probe_kind: Option<crate::sentinel::HostSentinelProbeKind>,
 }
 
 impl HostSentinelProbeSummary {
@@ -79,6 +85,7 @@ impl HostSentinelProbeSummary {
             host_sentinels_unchanged_at_stop: stop.host_sentinels_unchanged,
             channels_destroyed: stop.channels_destroyed,
             channels_open_after_stop: channels_open,
+            last_probe_kind: stop.last_host_sentinel_probe_kind,
         }
     }
 }
@@ -205,6 +212,14 @@ pub fn verify_evidence_pack(pack: &Sep18EvidencePack) -> EvidenceVerifierDecisio
                     "live_host_sentinel_collection marker requires successful native Mac host probes in stop_evidence",
                 );
             }
+            if sealed.stop_evidence.last_host_sentinel_probe_kind
+                != Some(HostSentinelProbeKind::NativeMacHost)
+            {
+                return EvidenceVerifierDecision::reject(
+                    EvidenceVerifierCode::PhysicalPassWithoutMacMarkers,
+                    "live_host_sentinel_collection marker requires NativeMacHost probe kind, not SyntheticHostProbe self-compare",
+                );
+            }
         } else if !pack
             .host_sentinel_probes
             .live_host_sentinel_collection_at_stop
@@ -214,6 +229,10 @@ pub fn verify_evidence_pack(pack: &Sep18EvidencePack) -> EvidenceVerifierDecisio
                 "live_host_sentinel_collection marker requires native Mac host probes at Stop",
             );
         }
+    }
+
+    if let Some(decision) = verify_vf_dry_run_host_observation(pack) {
+        return decision;
     }
 
     if pack.vf_pass_claimed && !pack.physical_proof_markers.qualifies_vf_physical_pass() {
@@ -356,6 +375,22 @@ fn verify_sealed_evidence(
         return Some(EvidenceVerifierDecision::reject(
             EvidenceVerifierCode::HostSentinelProbeSummaryMismatch,
             "live_host_sentinel_collection mismatch between pack and sealed stop_evidence",
+        ));
+    }
+
+    if pack.host_sentinel_probes.last_probe_kind != stop.last_host_sentinel_probe_kind {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::HostSentinelProbeSummaryMismatch,
+            "last_probe_kind mismatch between pack and sealed stop_evidence",
+        ));
+    }
+
+    if stop.live_host_sentinel_collection
+        && stop.last_host_sentinel_probe_kind != Some(HostSentinelProbeKind::NativeMacHost)
+    {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::PhysicalPassWithoutMacMarkers,
+            "stop_evidence live_host_sentinel_collection requires NativeMacHost probe kind",
         ));
     }
 
@@ -929,6 +964,46 @@ fn verify_substrate_pass_claims(pack: &Sep18EvidencePack) -> Option<EvidenceVeri
     None
 }
 
+fn verify_vf_dry_run_host_observation(
+    pack: &Sep18EvidencePack,
+) -> Option<EvidenceVerifierDecision> {
+    let vf = pack.vf_dry_run.as_ref()?;
+
+    if vf.native_collector_invoked
+        && matches!(
+            vf.platform,
+            VfDryRunPlatform::NonMacOs | VfDryRunPlatform::MacOsFeatureDisabled
+        )
+    {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::HostSentinelProbeSummaryMismatch,
+            "MacHostSentinelCollector cannot be invoked on non-macOS or feature-disabled VF dry-run",
+        ));
+    }
+
+    if vf.host_observation_kind == VfDryRunHostObservationKind::NativeMacHostCollector
+        && !vf.native_collector_invoked
+    {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::HostSentinelProbeSummaryMismatch,
+            "NativeMacHostCollector observation kind requires collector invocation",
+        ));
+    }
+
+    if vf.live_host_sentinel_collection
+        && (!vf.native_collector_invoked
+            || vf.host_observation_kind != VfDryRunHostObservationKind::NativeMacHostCollector
+            || vf.last_host_sentinel_probe_kind != Some(HostSentinelProbeKind::NativeMacHost))
+    {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::PhysicalPassWithoutMacMarkers,
+            "VF dry-run live_host_sentinel_collection requires MacHostSentinelCollector, not SyntheticHostProbe self-compare",
+        ));
+    }
+
+    None
+}
+
 fn verify_substrate_nested_evidence(pack: &Sep18EvidencePack) -> Option<EvidenceVerifierDecision> {
     match pack.substrate {
         Sep18ChecklistSubstrate::ContainedBrowserDryRun => {
@@ -1104,6 +1179,7 @@ pub fn seal_contained_browser_dry_run_pack(
             host_sentinels_unchanged_at_stop: false,
             channels_destroyed: 0,
             channels_open_after_stop: 0,
+            last_probe_kind: None,
         });
 
     Sep18EvidencePack {
@@ -1146,6 +1222,7 @@ pub fn seal_vf_dry_run_pack(evidence: VfDryRunEvidence) -> Sep18EvidencePack {
             host_sentinels_unchanged_at_stop: false,
             channels_destroyed: 0,
             channels_open_after_stop: 0,
+            last_probe_kind: None,
         },
         physical_proof_markers: PhysicalProofMarkers::dry_run_none(),
         checklist_completed: false,

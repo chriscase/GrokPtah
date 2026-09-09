@@ -43,12 +43,13 @@ pub use isolated_surface::{
     GuestFrame as IsolatedGuestFrame, GuestLifecycle, GuestLifecycleDisposition,
     GuestLifecyclePhase, GuestLocalAction, HarnessError as IsolatedHarnessError,
     HarnessErrorCode as IsolatedHarnessErrorCode, HarnessResult as IsolatedHarnessResult,
-    HostSentinelDiff, HostSentinelProbe, HostSentinelRegistry, HostSentinelSnapshot,
-    IsolatedSurfaceBackend, IsolatedSurfaceHarness, MainCheckoutFence, ProofEvidenceClass,
-    SealedProofEvidence, Sep18NoModelProofSequencer, StopEvidence as IsolatedStopEvidence,
-    SyntheticGuest, SyntheticGuestAction, SyntheticHostProbe, VfDryRunEvidence, VfDryRunOutcome,
-    VfDryRunPlatform, VfLaunchReceipt, CONTAINED_BROWSER_DRY_RUN_NONCLAIM,
-    SYNTHETIC_HARNESS_NONCLAIM, VF_DRY_RUN_NONCLAIM,
+    HostSentinelDiff, HostSentinelProbe, HostSentinelProbeKind, HostSentinelRegistry,
+    HostSentinelSnapshot, IsolatedSurfaceBackend, IsolatedSurfaceHarness, MainCheckoutFence,
+    ProofEvidenceClass, SealedProofEvidence, Sep18NoModelProofSequencer,
+    StopEvidence as IsolatedStopEvidence, SyntheticGuest, SyntheticGuestAction, SyntheticHostProbe,
+    VfDryRunEvidence, VfDryRunHostObservationKind, VfDryRunOutcome, VfDryRunPlatform,
+    VfLaunchReceipt, CONTAINED_BROWSER_DRY_RUN_NONCLAIM, SYNTHETIC_HARNESS_NONCLAIM,
+    VF_DRY_RUN_NONCLAIM,
 };
 pub use macos_observation::MacOsObservationPlatform;
 pub use platform::{

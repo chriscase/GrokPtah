@@ -281,6 +281,10 @@ fn sep18_vf_dry_run_unsupported_on_linux_ci() {
     assert_eq!(evidence.outcome, VfDryRunOutcome::UnsupportedPlatform);
     assert!(!evidence.physical_pass_claimed);
     assert!(!evidence.boot_attempted);
+    assert!(evidence.is_synthetic_host_self_compare());
+    assert!(!evidence.native_collector_invoked);
+    assert!(!evidence.live_host_sentinel_collection);
+    assert_eq!(evidence.last_host_sentinel_probe_kind, None);
     assert!(evidence.nonclaim.contains("never claim Sep 18 PASS"));
     assert_eq!(evidence.nonclaim, VF_DRY_RUN_NONCLAIM);
 }
@@ -312,7 +316,49 @@ fn synthetic_harness_stop_never_claims_live_host_collection() {
     let mut harness = IsolatedSurfaceHarness::new(HostSentinelSnapshot::synthetic_baseline());
     let evidence = harness.run_canonical_proof().expect("canonical proof");
     assert!(!evidence.live_host_sentinel_collection);
+    assert_eq!(
+        evidence.last_host_sentinel_probe_kind,
+        Some(grokptah_isolated_surface::HostSentinelProbeKind::SyntheticRehearsal)
+    );
     assert!(evidence.host_sentinels_unchanged);
+}
+
+#[test]
+fn sep18_vf_dry_run_distinguishes_native_collector_from_synthetic_self_compare() {
+    use grokptah_isolated_surface::{HostSentinelProbeKind, VfDryRunHostObservationKind};
+
+    let sequencer = Sep18NoModelProofSequencer::new(HostSentinelSnapshot::synthetic_baseline());
+    let evidence = sequencer
+        .run_vf_dry_run(VfLaunchReceipt {
+            physical_mac_proof_id: "sep18-observation-provenance".into(),
+        })
+        .expect("dry-run artifact");
+    assert!(!evidence.physical_pass_claimed);
+    assert_eq!(evidence.nonclaim, VF_DRY_RUN_NONCLAIM);
+    match evidence.platform {
+        VfDryRunPlatform::NonMacOs | VfDryRunPlatform::MacOsFeatureDisabled => {
+            assert!(evidence.is_synthetic_host_self_compare());
+            assert_eq!(
+                evidence.host_observation_kind,
+                VfDryRunHostObservationKind::SyntheticHostProbeSelfCompare
+            );
+            assert!(!evidence.native_collector_invoked);
+            assert!(!evidence.live_host_sentinel_collection);
+            assert_eq!(evidence.last_host_sentinel_probe_kind, None);
+        }
+        VfDryRunPlatform::MacOsDryRun => {
+            assert!(evidence.native_collector_invoked);
+            assert_eq!(
+                evidence.host_observation_kind,
+                VfDryRunHostObservationKind::NativeMacHostCollector
+            );
+            assert_eq!(
+                evidence.last_host_sentinel_probe_kind,
+                Some(HostSentinelProbeKind::NativeMacHost)
+            );
+            assert!(!evidence.physical_pass_claimed);
+        }
+    }
 }
 
 #[cfg(not(feature = "browser-engine"))]

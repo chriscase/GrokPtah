@@ -102,11 +102,12 @@ case in `proof_sequencer` tests.
 
 | Probe source | Rehearsal / unit tests | Physical Mac proof markers |
 |---|---|---|
-| [`SyntheticHostProbe`] (`synthetic-rehearsal-only-not-physical-proof`) | Yes — default harness path | **Never** |
+| [`SyntheticHostProbe`] (`synthetic-rehearsal-only-not-physical-proof`) | Yes — default harness + Linux/feature-disabled VF dry-run (`SyntheticHostProbeSelfCompare`) | **Never** |
+| [`MacHostSentinelCollector`] on macOS `vf-backend` VF dry-run | Yes — harness boot/inject/Stop probes (`NativeMacHostCollector`) | Observation fact only; **not** physical PASS |
 | [`MacHostSentinelCollector::collect()`] + `refresh_from_native_collector` | macOS worker with Accessibility trust | Required for live collection marker |
 | `refresh_host_sentinels(snapshot)` with pre-built snapshot | Compare-only hook | **Not** native collection |
 
-Synthetic harness / Linux CI / dry-run packs never set `live_host_sentinel_collection: true`. #288 packaged-VM acceptance stays open.
+Linux CI VF dry-run packs record `SyntheticHostProbeSelfCompare` and never invoke the Mac collector. macOS `vf-backend` rehearsal invokes the collector and seals `native_collector_invoked`. Nested live collection during dry-run is **not** `PhysicalProofMarkers` qualification and never sets `physical_pass_claimed`. #288 packaged-VM acceptance stays open.
 
 ### Evidence class (`ProofEvidenceClass`)
 
@@ -232,6 +233,7 @@ cargo run --locked --manifest-path crates/codegen/grokptah-isolated-surface/Carg
 - `physical_pass_claimed`: **false** unless a future physical gate flips it with Mac markers
 - `admission_available`: **false** (verifier rejects `true`)
 - `host_sentinel_probes`: probe counts + channel teardown summary from Stop evidence
+- `vf_dry_run.host_observation_kind`: `synthetic_host_probe_self_compare` (Linux / feature-disabled) vs `native_mac_host_collector` (macOS `vf-backend` rehearsal). Native observation is not physical PASS.
 - `sealed_evidence`: checklist steps + Stop/Uncertain disposition when checklist completes
 - `contained_browser.captured_frames`: public before/after hashes (byte length, source, dimensions) — never raw bytes
 
@@ -347,7 +349,8 @@ cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Car
 
 - `IsolatedSurfaceBackend::stop_fence_first` has no trait default — production adapters must wire real fence ack/failure.
 - `MacHostSentinelCollector` requires macOS Accessibility trust for foreground/unrelated window evidence; missing TCC → honest `BackendUnavailable`, not synthetic PASS.
-- Default harness rehearsal still uses [`SyntheticHostProbe`] — physical Sep 18 runner must wire `refresh_host_sentinels_from_collector`.
+- Default synthetic / Contained Browser rehearsal still uses [`SyntheticHostProbe`].
+- macOS `vf-backend` VF dry-run wires [`MacHostSentinelCollector`] into harness boot/inject/Stop probes so Sep 18 evidence records `NativeMacHostCollector` vs `SyntheticHostProbeSelfCompare`. Native observation on that path is **not** physical PASS.
 
 - Checklist runner seals dry-run packs only — no live Mac VF IPC or packaged helper.
 - Independent verifier is pack-only; physical Mac worker still required for VF PASS rung.
@@ -367,5 +370,6 @@ cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Car
 - VF dry-run does **not** claim Sep 18 physical PASS.
 - Synthetic harness success does **not** enable isolated visual Computer Use in production.
 - [`SyntheticHostProbe`] self-compare does **not** qualify as physical Mac host sentinel collection.
+- VF dry-run native collector wiring does **not** qualify Sep 18 physical PASS.
 - `ContainedBrowser` substrate v0 does **not** prove browser isolation — only exercises the SPI lifecycle on a simulator.
 - Simulator captured-frame hashes are **not** a real browser capture; they content-address labeled synthetic payload bytes.

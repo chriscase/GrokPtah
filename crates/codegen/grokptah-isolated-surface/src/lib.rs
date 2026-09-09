@@ -75,7 +75,9 @@ pub use simulator::{
 pub use store::{snapshot_root, HarnessSnapshot, SNAPSHOT_FILE, SNAPSHOT_SCHEMA_VERSION};
 #[cfg(all(target_os = "macos", feature = "vf-backend"))]
 pub use vf_backend::VirtualizationFrameworkBackend;
-pub use vf_dry_run::{VfDryRunEvidence, VfDryRunOutcome, VfDryRunPlatform};
+pub use vf_dry_run::{
+    VfDryRunEvidence, VfDryRunHostObservationKind, VfDryRunOutcome, VfDryRunPlatform,
+};
 
 /// Fail-closed admission gate for bridge integration. Remains false until a
 /// native adapter passes the physical Mac proof checklist.

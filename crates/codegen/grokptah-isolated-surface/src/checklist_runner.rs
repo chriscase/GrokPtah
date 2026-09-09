@@ -203,6 +203,13 @@ fn empty_rejected_pack(substrate: Sep18ChecklistSubstrate) -> Sep18EvidencePack 
         physical_pass_claimed: false,
         nonclaim: crate::SYNTHETIC_HARNESS_NONCLAIM.into(),
         recorded_at: chrono::Utc::now(),
+        host_observation_kind:
+            crate::vf_dry_run::VfDryRunHostObservationKind::SyntheticHostProbeSelfCompare,
+        native_collector_invoked: false,
+        live_host_sentinel_collection: false,
+        native_collect_error: None,
+        host_sentinel_probes_performed: 0,
+        last_host_sentinel_probe_kind: None,
     })
     .into_placeholder(substrate)
 }

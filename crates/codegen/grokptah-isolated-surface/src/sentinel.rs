@@ -222,6 +222,11 @@ impl HostSentinelRegistry {
         self.native_host_probes_performed
     }
 
+    /// Kind of the most recent probe comparison, if any probe has run.
+    pub fn last_probe_kind(&self) -> Option<HostSentinelProbeKind> {
+        self.last_probe_kind
+    }
+
     /// True only when the latest completed probe was a successful native Mac host
     /// read that matched baseline. A later synthetic self-compare clears this.
     /// Cumulative `native_host_probes_performed` is audit evidence and does not

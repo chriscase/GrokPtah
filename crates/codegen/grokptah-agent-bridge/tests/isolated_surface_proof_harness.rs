@@ -89,15 +89,21 @@ fn bridge_vf_dry_run_honest_nonclaim() {
     match evidence.platform {
         VfDryRunPlatform::NonMacOs => {
             assert_eq!(evidence.outcome, VfDryRunOutcome::UnsupportedPlatform);
+            assert!(evidence.is_synthetic_host_self_compare());
+            assert!(!evidence.native_collector_invoked);
         }
         VfDryRunPlatform::MacOsFeatureDisabled => {
             assert_eq!(evidence.outcome, VfDryRunOutcome::FeatureDisabled);
+            assert!(evidence.is_synthetic_host_self_compare());
+            assert!(!evidence.native_collector_invoked);
         }
         VfDryRunPlatform::MacOsDryRun => {
-            panic!("vf-backend dry-run is not exercised by this bridge integration test");
+            assert!(evidence.native_collector_invoked);
+            assert!(!evidence.is_synthetic_host_self_compare());
         }
     }
     assert!(!evidence.physical_pass_claimed);
+    assert!(!evidence.live_host_sentinel_collection || evidence.native_collector_invoked);
     assert_eq!(evidence.nonclaim, VF_DRY_RUN_NONCLAIM);
     assert!(evidence.nonclaim.contains("never claim Sep 18 PASS"));
     assert!(!computer_use_isolated_surface_admission());
