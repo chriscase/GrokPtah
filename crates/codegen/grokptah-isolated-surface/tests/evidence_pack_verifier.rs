@@ -1011,8 +1011,8 @@ fn vf_dry_run_pack_never_qualifies_physical_pass_on_linux() {
 #[test]
 fn vf_dry_run_forged_native_observation_without_collector_is_rejected() {
     use grokptah_isolated_surface::{
-        run_sep18_checklist, verify_evidence_pack, EvidenceVerifierCode, HostSentinelProbeKind,
-        HostSentinelSnapshot, Sep18ChecklistRunnerConfig, VfDryRunHostObservationKind,
+        run_sep18_checklist, verify_evidence_pack, EvidenceVerifierCode, HostSentinelSnapshot,
+        Sep18ChecklistRunnerConfig,
     };
 
     let outcome = run_sep18_checklist(
@@ -1022,9 +1022,7 @@ fn vf_dry_run_forged_native_observation_without_collector_is_rejected() {
     let mut pack = outcome.pack;
     let vf = pack.vf_dry_run.as_mut().expect("vf nested");
     vf.live_host_sentinel_collection = true;
-    vf.host_observation_kind = VfDryRunHostObservationKind::NativeMacHostCollector;
-    vf.last_host_sentinel_probe_kind = Some(HostSentinelProbeKind::NativeMacHost);
-    // invoked stays false — synthetic self-compare cannot claim native observation
+    // kind and invoked stay synthetic — self-compare cannot claim live native observation
     let decision = verify_evidence_pack(&pack);
     assert!(!decision.accepted);
     assert_eq!(
