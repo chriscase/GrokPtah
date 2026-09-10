@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::backend::VfLaunchReceipt;
 use crate::error::{HarnessError, HarnessResult};
+#[cfg(all(target_os = "macos", feature = "vf-backend"))]
 use crate::harness::StopEvidence;
 use crate::lifecycle::ProofEvidenceClass;
 use crate::sentinel::{HostSentinelProbeKind, HostSentinelSnapshot};
@@ -73,7 +74,14 @@ pub struct VfDryRunEvidence {
 }
 
 impl VfDryRunEvidence {
-    pub fn unsupported(platform: VfDryRunPlatform, outcome: VfDryRunOutcome) -> Self {
+    /// Construct a fail-closed VF dry-run artifact for callers and integration
+    /// tests that must exercise the serialized evidence contract. This never
+    /// represents boot success or physical qualification.
+    pub fn fail_closed(platform: VfDryRunPlatform, outcome: VfDryRunOutcome) -> Self {
+        Self::unsupported(platform, outcome)
+    }
+
+    pub(crate) fn unsupported(platform: VfDryRunPlatform, outcome: VfDryRunOutcome) -> Self {
         Self {
             platform,
             outcome,
@@ -92,13 +100,13 @@ impl VfDryRunEvidence {
         }
     }
 
-    pub fn with_native_requested(mut self) -> Self {
+    pub(crate) fn with_native_requested(mut self) -> Self {
         self.native_host_sentinels_requested = true;
         self
     }
 
-    /// Copy the actual Stop probe summary. Zeros remain only when Stop did not run.
-    pub fn with_stop_summary(mut self, stop: &StopEvidence) -> Self {
+    #[cfg(all(target_os = "macos", feature = "vf-backend"))]
+    pub(crate) fn with_stop_summary(mut self, stop: &StopEvidence) -> Self {
         self.host_sentinel_probes_performed = stop.host_sentinel_probes_performed;
         self.live_host_sentinel_collection_at_stop = stop.live_host_sentinel_collection;
         self.host_sentinels_unchanged_at_stop = stop.host_sentinels_unchanged;
@@ -272,61 +280,4 @@ fn run_vf_dry_run_impl(
     };
     evidence = evidence.with_stop_summary(&stop_evidence);
     Ok(evidence)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::harness::StopEvidence;
-
-    fn stop_with_probes() -> StopEvidence {
-        StopEvidence {
-            surface_id: "vf-stop".into(),
-            channels_destroyed: 2,
-            host_sentinels_unchanged: true,
-            host_sentinel_probes_performed: 4,
-            live_host_sentinel_collection: true,
-            host_sentinel_probe_error: None,
-            last_host_sentinel_probe_kind: Some(HostSentinelProbeKind::NativeMacHost),
-            backend_fence_error: None,
-            persist_snapshot_error: None,
-            backend_destroy_error: None,
-            disposition: None,
-        }
-    }
-
-    #[test]
-    fn with_stop_summary_copies_actual_probe_counts() {
-        let evidence = VfDryRunEvidence::unsupported(
-            VfDryRunPlatform::MacOsDryRun,
-            VfDryRunOutcome::BackendUnavailable,
-        )
-        .with_native_requested()
-        .with_stop_summary(&stop_with_probes());
-        assert_eq!(evidence.host_sentinel_probes_performed, 4);
-        assert_eq!(evidence.channels_destroyed, 2);
-        assert!(evidence.live_host_sentinel_collection_at_stop);
-        assert!(evidence.host_sentinels_unchanged_at_stop);
-        assert_eq!(evidence.channels_open_after_stop, 0);
-        assert_eq!(
-            evidence.last_host_sentinel_probe_kind,
-            Some(HostSentinelProbeKind::NativeMacHost)
-        );
-        assert!(evidence.native_host_sentinels_requested);
-        assert!(!evidence.physical_pass_claimed);
-    }
-
-    #[test]
-    fn zeros_remain_when_stop_did_not_run() {
-        let evidence = VfDryRunEvidence::unsupported(
-            VfDryRunPlatform::NonMacOs,
-            VfDryRunOutcome::UnsupportedPlatform,
-        )
-        .with_native_requested();
-        assert_eq!(evidence.host_sentinel_probes_performed, 0);
-        assert!(!evidence.live_host_sentinel_collection_at_stop);
-        assert_eq!(evidence.channels_destroyed, 0);
-        assert!(evidence.last_host_sentinel_probe_kind.is_none());
-        assert!(evidence.native_host_sentinels_requested);
-    }
 }

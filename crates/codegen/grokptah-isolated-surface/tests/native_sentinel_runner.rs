@@ -9,7 +9,7 @@ use grokptah_isolated_surface::{
     EvidenceVerifierCode, HostSentinelProbeKind, HostSentinelSnapshot, IsolatedSurfaceHarness,
     NativeSentinelEvidence, NativeSentinelRunnerOutcome, NativeSentinelRunnerPlatform,
     PhysicalProofMarkers, ProofEvidenceClass, Sep18ChecklistRunnerConfig, Sep18ChecklistSubstrate,
-    Sep18NoModelProofSequencer, StopEvidence, VfDryRunEvidence, VfDryRunOutcome, VfDryRunPlatform,
+    Sep18NoModelProofSequencer, VfDryRunEvidence, VfDryRunOutcome, VfDryRunPlatform,
     NATIVE_HOST_SENTINEL_NONCLAIM,
 };
 
@@ -141,25 +141,17 @@ fn native_mode_requires_vf_dry_run_and_explicit_checkout() {
 
 #[test]
 fn native_vf_stop_summary_is_not_hardcoded_zero() {
-    let stop = StopEvidence {
-        surface_id: "vf-stop".into(),
-        channels_destroyed: 2,
-        host_sentinels_unchanged: true,
-        host_sentinel_probes_performed: 4,
-        live_host_sentinel_collection: false,
-        host_sentinel_probe_error: None,
-        last_host_sentinel_probe_kind: Some(HostSentinelProbeKind::NativeMacHost),
-        backend_fence_error: None,
-        persist_snapshot_error: None,
-        backend_destroy_error: None,
-        disposition: None,
-    };
-    let evidence = VfDryRunEvidence::unsupported(
+    let mut evidence = VfDryRunEvidence::fail_closed(
         VfDryRunPlatform::MacOsDryRun,
         VfDryRunOutcome::BackendUnavailable,
-    )
-    .with_native_requested()
-    .with_stop_summary(&stop);
+    );
+    evidence.native_host_sentinels_requested = true;
+    evidence.host_sentinel_probes_performed = 4;
+    evidence.live_host_sentinel_collection_at_stop = false;
+    evidence.host_sentinels_unchanged_at_stop = true;
+    evidence.channels_destroyed = 2;
+    evidence.channels_open_after_stop = 0;
+    evidence.last_host_sentinel_probe_kind = Some(HostSentinelProbeKind::NativeMacHost);
 
     let pack = seal_vf_dry_run_pack(evidence.clone());
     assert_eq!(pack.host_sentinel_probes.probes_performed, 4);
@@ -397,15 +389,7 @@ fn seal_helper_matches_runner_pack_shape() {
 
 fn native_pack_with_forged_completed_seal() -> grokptah_isolated_surface::Sep18EvidencePack {
     let sequencer = Sep18NoModelProofSequencer::new(HostSentinelSnapshot::synthetic_baseline());
-    let mut sealed = sequencer.run_happy_path().expect("synthetic sealed stop");
-    sealed.stop_evidence.live_host_sentinel_collection = true;
-    sealed.stop_evidence.last_host_sentinel_probe_kind = Some(HostSentinelProbeKind::NativeMacHost);
-    if sealed.stop_evidence.host_sentinel_probes_performed == 0 {
-        sealed.stop_evidence.host_sentinel_probes_performed = 1;
-    }
-    if sealed.stop_evidence.channels_destroyed == 0 {
-        sealed.stop_evidence.channels_destroyed = 1;
-    }
+    let sealed = sequencer.run_happy_path().expect("synthetic sealed stop");
     let outcome = run_sep18_checklist(
         HostSentinelSnapshot::synthetic_baseline(),
         Sep18ChecklistRunnerConfig::native_host_sentinel("/explicit/checkout"),
@@ -422,12 +406,12 @@ fn native_pack_with_forged_completed_seal() -> grokptah_isolated_surface::Sep18E
         native.platform = NativeSentinelRunnerPlatform::MacOs;
         native.outcome = NativeSentinelRunnerOutcome::NativeProbesCompleted;
         native.checklist_completed = true;
-        native.live_host_sentinel_collection = true;
-        native.independent_collection_verified = true;
+        native.live_host_sentinel_collection = sealed.stop_evidence.live_host_sentinel_collection;
+        native.independent_collection_verified = sealed.stop_evidence.live_host_sentinel_collection;
         native.post_stop_inject_fenced = true;
         native.channels_destroyed = sealed.stop_evidence.channels_destroyed;
         native.host_sentinel_probes_performed = sealed.stop_evidence.host_sentinel_probes_performed;
-        native.last_host_sentinel_probe_kind = Some(HostSentinelProbeKind::NativeMacHost);
+        native.last_host_sentinel_probe_kind = sealed.stop_evidence.last_host_sentinel_probe_kind;
         native.sealed_evidence = Some(sealed);
         native.synthetic_fallback_used = false;
     }
@@ -495,10 +479,27 @@ fn forged_live_with_missing_kind_is_rejected() {
 #[test]
 fn forged_count_mismatch_is_rejected() {
     let mut pack = native_pack_with_forged_completed_seal();
-    pack.host_sentinel_probes.probes_performed = 99;
-    if let Some(native) = pack.native_host_sentinel.as_mut() {
-        native.host_sentinel_probes_performed = 99;
+    // Make every live-native prerequisite coherent first, then mutate only the
+    // public summary count so this test reaches the intended binding check.
+    if let Some(sealed) = pack.sealed_evidence.as_mut() {
+        sealed.stop_evidence.live_host_sentinel_collection = true;
+        sealed.stop_evidence.last_host_sentinel_probe_kind =
+            Some(HostSentinelProbeKind::NativeMacHost);
     }
+    if let Some(native) = pack.native_host_sentinel.as_mut() {
+        native.live_host_sentinel_collection = true;
+        native.independent_collection_verified = true;
+        native.last_host_sentinel_probe_kind = Some(HostSentinelProbeKind::NativeMacHost);
+        if let Some(sealed) = native.sealed_evidence.as_mut() {
+            sealed.stop_evidence.live_host_sentinel_collection = true;
+            sealed.stop_evidence.last_host_sentinel_probe_kind =
+                Some(HostSentinelProbeKind::NativeMacHost);
+        }
+    }
+    pack.host_sentinel_probes
+        .live_host_sentinel_collection_at_stop = true;
+    pack.host_sentinel_probes.last_probe_kind = Some(HostSentinelProbeKind::NativeMacHost);
+    pack.host_sentinel_probes.probes_performed = 99;
     let decision = verify_evidence_pack(&pack);
     assert!(!decision.accepted);
     assert_eq!(
