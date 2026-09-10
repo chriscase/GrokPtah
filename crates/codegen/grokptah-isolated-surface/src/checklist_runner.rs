@@ -428,6 +428,8 @@ fn run_native_host_sentinel(
 fn run_clipboard_kill_gate_substrate(
     config: Sep18ChecklistRunnerConfig,
 ) -> Sep18ChecklistRunOutcome {
+    // Native WebKit is authorized only by the exclusive physical CLI, never
+    // by `cargo test` or this library helper.
     if config.fault_matrix_case.is_some() {
         return Sep18ChecklistRunOutcome {
             pack: empty_rejected_pack(Sep18ChecklistSubstrate::ClipboardKillGate),

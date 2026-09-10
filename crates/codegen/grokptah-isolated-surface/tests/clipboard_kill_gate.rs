@@ -7,14 +7,15 @@
 use grokptah_isolated_surface::{
     admit_private_world_handler_messages, admit_probe_reply, clipboard_kill_gate_may_claim_pass,
     decode_page_result_bytes, host_clipboard_unchanged, isolated_surface_admission_available,
-    page_world_initiator_source, parse_sep18_checklist_run_args, probe_reply_from_page_result,
-    run_sep18_checklist, seal_clipboard_kill_gate_pack, verify_clipboard_kill_gate_evidence,
-    verify_evidence_pack, ClipboardKillGateEvidence, ClipboardKillGateOutcome,
-    ClipboardKillGatePlatform, ClipboardKillGateProvenance, ClipboardKillGateVerdict,
-    ClipboardOperation, ClipboardProbeFailClosedReason, ContentWorld, EvidenceVerifierCode,
-    HostClipboardDigest, HostSentinelSnapshot, PageLocalClipboardReceipt, PhysicalProofMarkers,
-    ProbePull, ProbeReply, ProofEvidenceClass, ReceiptInitiator, ReplyChannel,
-    ScriptEvaluationPath, Sep18ChecklistRunnerConfig, Sep18ChecklistSubstrate,
+    native_clipboard_probe_authorized, page_world_initiator_source, parse_evidence_pack,
+    parse_sep18_checklist_run_args, probe_reply_from_page_result, receipts_all_fulfilled,
+    run_sep18_checklist, seal_clipboard_kill_gate_pack, serialize_evidence_pack,
+    verify_clipboard_kill_gate_evidence, verify_evidence_pack, ClipboardKillGateEvidence,
+    ClipboardKillGateOutcome, ClipboardKillGatePlatform, ClipboardKillGateProvenance,
+    ClipboardKillGateVerdict, ClipboardOperation, ClipboardProbeFailClosedReason, ContentWorld,
+    EvidenceVerifierCode, HostClipboardDigest, HostSentinelSnapshot, PageLocalClipboardReceipt,
+    PhysicalProofMarkers, ProbePull, ProbeReply, ProofEvidenceClass, ReceiptInitiator,
+    ReplyChannel, ScriptEvaluationPath, Sep18ChecklistRunnerConfig, Sep18ChecklistSubstrate,
     CLIPBOARD_KILL_GATE_NONCLAIM, MAX_PROBE_REPLY_BYTES, PAGE_RESULT_ATTRIBUTE,
     PAGE_WORLD_INTERCEPTOR_SOURCE, PRIVATE_REPLY_TITLE_PREFIX, PRIVATE_WORLD_PULL_SOURCE,
 };
@@ -30,9 +31,12 @@ fn mediated_receipts(generation: u64, epoch: u64) -> Vec<PageLocalClipboardRecei
             operation,
             generation,
             epoch,
-            mediated_page_local: true,
-            host_pasteboard_touched: false,
             initiator: ReceiptInitiator::PageWorld,
+            attempted: true,
+            settled: true,
+            fulfilled: true,
+            unavailable: false,
+            api: operation.api_name(),
         })
         .collect()
 }
@@ -45,9 +49,12 @@ fn page_result_json(generation: u64, epoch: u64) -> String {
                 "operation": operation,
                 "generation": generation,
                 "epoch": epoch,
-                "mediatedPageLocal": true,
-                "hostPasteboardTouched": false,
                 "initiator": "page_world",
+                "attempted": true,
+                "settled": true,
+                "fulfilled": true,
+                "unavailable": false,
+                "api": operation.api_name(),
             })
         })
         .collect();
@@ -88,6 +95,7 @@ fn forged_native_pass_evidence() -> ClipboardKillGateEvidence {
         admission_available: false,
         nonclaim: CLIPBOARD_KILL_GATE_NONCLAIM.into(),
         recorded_at: chrono::Utc::now(),
+        live_authority: None,
     }
 }
 
@@ -182,21 +190,26 @@ fn forged_pass_on_linux_pack_is_rejected() {
 }
 
 #[test]
-fn forged_macos_pass_is_rejected_on_non_macos_verifier() {
+fn forged_macos_pass_is_rejected_without_live_witness() {
     let pack = seal_clipboard_kill_gate_pack(forged_native_pass_evidence());
     let decision = verify_evidence_pack(&pack);
-    #[cfg(not(target_os = "macos"))]
-    {
-        assert!(!decision.accepted);
-        assert_eq!(
-            decision.code,
-            EvidenceVerifierCode::ClipboardKillGatePassOnUnsupportedPlatform
-        );
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let _ = decision;
-    }
+    assert!(!decision.accepted);
+    assert!(
+        decision.code == EvidenceVerifierCode::ClipboardKillGateLiveWitnessMissing
+            || decision.code == EvidenceVerifierCode::ClipboardKillGatePassOnUnsupportedPlatform
+            || decision.code == EvidenceVerifierCode::ClipboardKillGateUncertainCannotPass,
+        "{decision:?}"
+    );
+    assert!(!clipboard_kill_gate_may_claim_pass(
+        pack.clipboard_kill_gate.as_ref().expect("nested")
+    ));
+
+    let json = serialize_evidence_pack(&pack).expect("json");
+    let parsed = parse_evidence_pack(&json).expect("parse");
+    let parsed_gate = parsed.clipboard_kill_gate.as_ref().expect("nested");
+    assert!(parsed_gate.live_authority.is_none());
+    let roundtrip = verify_evidence_pack(&parsed);
+    assert!(!roundtrip.accepted);
 }
 
 #[test]
@@ -225,6 +238,7 @@ fn host_digest_drift_rejects_pass() {
         EvidenceVerifierCode::ClipboardKillGateHostDigestDrift
             | EvidenceVerifierCode::ClipboardKillGatePassOnUnsupportedPlatform
             | EvidenceVerifierCode::ClipboardKillGateUncertainCannotPass
+            | EvidenceVerifierCode::ClipboardKillGateLiveWitnessMissing
     ));
 }
 
@@ -283,6 +297,7 @@ fn duplicate_and_missing_replies_are_rejected() {
         EvidenceVerifierCode::ClipboardKillGateMissingReply
             | EvidenceVerifierCode::ClipboardKillGatePassOnUnsupportedPlatform
             | EvidenceVerifierCode::ClipboardKillGateUncertainCannotPass
+            | EvidenceVerifierCode::ClipboardKillGateLiveWitnessMissing
     ));
 }
 
@@ -539,9 +554,10 @@ fn stale_challenge_and_duplicate_handler_messages_cannot_pass() {
 }
 
 #[test]
-fn private_world_script_is_read_only_and_page_world_initiates() {
+fn private_world_script_is_read_only_and_page_world_initiates_async_clipboard() {
     assert!(!PRIVATE_WORLD_PULL_SOURCE.contains("execCommand"));
     assert!(!PRIVATE_WORLD_PULL_SOURCE.contains("writeText"));
+    assert!(!PRIVATE_WORLD_PULL_SOURCE.contains("readText"));
     assert!(!PRIVATE_WORLD_PULL_SOURCE.contains("document.title"));
     assert!(!PRIVATE_WORLD_PULL_SOURCE.contains(PRIVATE_REPLY_TITLE_PREFIX));
     assert!(!PRIVATE_WORLD_PULL_SOURCE.contains("mediatedPageLocal"));
@@ -550,14 +566,91 @@ fn private_world_script_is_read_only_and_page_world_initiates() {
 
     assert!(!PAGE_WORLD_INTERCEPTOR_SOURCE.contains("execCommand"));
     assert!(!PAGE_WORLD_INTERCEPTOR_SOURCE.contains(PAGE_RESULT_ATTRIBUTE));
+    assert!(!PAGE_WORLD_INTERCEPTOR_SOURCE.contains("writeText ="));
+    assert!(!PAGE_WORLD_INTERCEPTOR_SOURCE.contains("readText ="));
 
     let initiator = page_world_initiator_source(11, 4);
-    assert!(initiator.contains("execCommand"));
-    assert!(initiator.contains("writeText"));
+    assert!(!initiator.contains("execCommand"));
+    assert!(!initiator.contains("mediatedPageLocal"));
+    assert!(initiator.contains("clip.readText"));
+    assert!(initiator.contains("clip.writeText"));
+    assert!(initiator.contains("invoke(\"read\", \"read\""));
+    assert!(initiator.contains("invoke(\"write\", \"write\""));
     assert!(initiator.contains("var generation = 11;"));
     assert!(initiator.contains("initiator: \"page_world\""));
     assert!(!initiator.contains("document.title"));
     assert!(!initiator.contains("postMessage"));
+    assert!(!initiator.contains("writeText = function"));
+}
+
+#[test]
+fn cargo_test_never_authorizes_native_webkit() {
+    assert!(!native_clipboard_probe_authorized());
+}
+
+#[test]
+fn stubbed_hardcoded_and_incomplete_async_clipboard_receipts_cannot_pass() {
+    let hardcoded = serde_json::json!({
+        "generation": 1,
+        "epoch": 1,
+        "initiator": "page_world",
+        "receipts": [{
+            "operation": "copy",
+            "generation": 1,
+            "epoch": 1,
+            "mediatedPageLocal": true,
+            "hostPasteboardTouched": false,
+            "initiator": "page_world"
+        }]
+    })
+    .to_string();
+    let err = decode_page_result_bytes(hardcoded.as_bytes()).expect_err("hardcoded copy");
+    assert!(
+        err == ClipboardProbeFailClosedReason::UnknownWireField
+            || err == ClipboardProbeFailClosedReason::MalformedReply
+    );
+
+    let pull = ProbePull::private(1, 1);
+    let mut reply = ProbeReply {
+        generation: 1,
+        epoch: 1,
+        world: ContentWorld::PrivateProbe,
+        path: ScriptEvaluationPath::PrivateContentWorldPull,
+        reply_channel: ReplyChannel::PrivateWorldScriptMessageHandler,
+        page_world_participated: true,
+        private_world_initiated_operations: false,
+        receipts: mediated_receipts(1, 1),
+    };
+    reply.receipts[0].attempted = false;
+    reply.receipts[0].unavailable = true;
+    let err = admit_probe_reply(&pull, &reply, &[]).expect_err("unavailable");
+    assert_eq!(err, ClipboardProbeFailClosedReason::ClipboardApiUnavailable);
+
+    let mut missing_read = mediated_receipts(1, 1);
+    missing_read.retain(|receipt| receipt.operation != ClipboardOperation::ReadText);
+    let mut reply = ProbeReply {
+        generation: 1,
+        epoch: 1,
+        world: ContentWorld::PrivateProbe,
+        path: ScriptEvaluationPath::PrivateContentWorldPull,
+        reply_channel: ReplyChannel::PrivateWorldScriptMessageHandler,
+        page_world_participated: true,
+        private_world_initiated_operations: false,
+        receipts: missing_read,
+    };
+    let err = admit_probe_reply(&pull, &reply, &[]).expect_err("missing readText");
+    assert_eq!(err, ClipboardProbeFailClosedReason::MissingReply);
+
+    reply.receipts = mediated_receipts(1, 1);
+    reply.receipts[3].fulfilled = false;
+    let admitted = admit_probe_reply(&pull, &reply, &[]).expect("settled but unfulfilled");
+    assert!(!receipts_all_fulfilled(&admitted.receipts));
+
+    let mut evidence = forged_native_pass_evidence();
+    evidence.receipts[3].fulfilled = false;
+    assert!(!clipboard_kill_gate_may_claim_pass(&evidence));
+    let err = verify_clipboard_kill_gate_evidence(&evidence).expect_err("unfulfilled");
+    assert_eq!(err, ClipboardProbeFailClosedReason::ClipboardApiUnavailable);
 }
 
 #[test]

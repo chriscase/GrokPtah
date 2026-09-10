@@ -189,6 +189,7 @@ pub enum EvidenceVerifierCode {
     ClipboardKillGatePageWorldNonparticipation,
     ClipboardKillGateOversizedReply,
     ClipboardKillGateUnknownWireField,
+    ClipboardKillGateLiveWitnessMissing,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1306,6 +1307,20 @@ fn verify_clipboard_kill_gate(pack: &Sep18EvidencePack) -> Option<EvidenceVerifi
                 "clipboard kill-gate reply contained unknown wire fields",
             ));
         }
+        Err(ClipboardProbeFailClosedReason::LiveWitnessMissing) => {
+            return Some(EvidenceVerifierDecision::reject(
+                EvidenceVerifierCode::ClipboardKillGateLiveWitnessMissing,
+                "clipboard kill-gate Pass requires a process-private live witness; public JSON cannot reconstruct Pass",
+            ));
+        }
+        Err(ClipboardProbeFailClosedReason::ClipboardApiUnavailable) => {
+            if gate.verdict == ClipboardKillGateVerdict::Pass {
+                return Some(EvidenceVerifierDecision::reject(
+                    EvidenceVerifierCode::ClipboardKillGateUncertainCannotPass,
+                    "clipboard kill-gate Pass requires fulfilled Async Clipboard attempts",
+                ));
+            }
+        }
         Err(ClipboardProbeFailClosedReason::UnsupportedPlatform) => {
             return Some(EvidenceVerifierDecision::reject(
                 EvidenceVerifierCode::ClipboardKillGatePassOnUnsupportedPlatform,
@@ -1332,6 +1347,12 @@ fn verify_clipboard_kill_gate(pack: &Sep18EvidencePack) -> Option<EvidenceVerifi
         }
         #[cfg(target_os = "macos")]
         {
+            if gate.live_authority.is_none() {
+                return Some(EvidenceVerifierDecision::reject(
+                    EvidenceVerifierCode::ClipboardKillGateLiveWitnessMissing,
+                    "portable clipboard kill-gate verification cannot reconstruct Pass from JSON or typed NativeWebKit fields",
+                ));
+            }
             if !crate::clipboard_kill_gate::clipboard_kill_gate_may_claim_pass(gate) {
                 return Some(EvidenceVerifierDecision::reject(
                     EvidenceVerifierCode::ClipboardKillGateUncertainCannotPass,
@@ -1826,6 +1847,7 @@ pub fn verifier_exit_code(decision: &EvidenceVerifierDecision) -> i32 {
             EvidenceVerifierCode::ClipboardKillGatePageWorldNonparticipation => 42,
             EvidenceVerifierCode::ClipboardKillGateOversizedReply => 43,
             EvidenceVerifierCode::ClipboardKillGateUnknownWireField => 44,
+            EvidenceVerifierCode::ClipboardKillGateLiveWitnessMissing => 45,
         }
     }
 }

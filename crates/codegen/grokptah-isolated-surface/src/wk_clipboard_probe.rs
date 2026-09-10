@@ -1,16 +1,23 @@
-//! WKClipboardProbe — page-world initiation + private-world pull protocol.
+//! WKClipboardProbe — page-world Async Clipboard initiation + private-world pull.
 //!
-//! The contained **page world** must initiate copy/cut/paste/write and bind
-//! results to a host-issued generation/epoch challenge. The host never targets
-//! the page with `evaluateJavaScript` or `callAsyncJavaScript`. Private world
-//! may only read the already-produced bounded page result and forward it
-//! through a registered `WKScriptMessageHandler` in that private world. It
-//! must not initiate clipboard operations or construct success facts.
+//! The contained **page world** must genuinely invoke `navigator.clipboard`
+//! `readText()`, `writeText()`, `read()`, and `write()` and bind the actual
+//! attempt/settlement results to a host-issued generation/epoch challenge. The
+//! host never targets the page with `evaluateJavaScript` or
+//! `callAsyncJavaScript`. Private world may only read the already-produced
+//! bounded page result and forward it through a registered
+//! `WKScriptMessageHandler`. It must not initiate clipboard operations, wrap
+//! those APIs, or construct success facts.
 //!
 //! Host receive is the private-world script-message handler only. Polling
 //! `document.title`, DOM attribute self-attestation, or page-world evaluation
-//! is untrusted and can never Pass. If a trustworthy page→private→host channel
-//! cannot be registered, the probe is INCONCLUSIVE / fail closed.
+//! is untrusted and can never Pass. Host-injected replacements of the Async
+//! Clipboard APIs and hardcoded receipts cannot certify Pass. If a
+//! trustworthy page→private→host channel cannot be registered, or if
+//! API/gesture/secure-context requirements prevent proof, the probe is
+//! INCONCLUSIVE / fail closed.
+
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -32,9 +39,10 @@ pub const PAGE_RESULT_MAILBOX_ID: &str = "grokptah-clipboard-probe-mailbox";
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub const PAGE_RESULT_ATTRIBUTE: &str = "data-grokptah-page-result";
 
-/// Maximum wait for a private-world handler message.
+/// Maximum wait for a private-world handler message. Async Clipboard promises
+/// need more than a synchronous execCommand budget.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2_000);
+pub const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(5_000);
 
 /// Hard cap on the handler body. Oversized replies fail closed.
 pub const MAX_PROBE_REPLY_BYTES: usize = 4096;
@@ -46,23 +54,57 @@ pub const MAX_RECEIPT_COUNT: usize = ClipboardOperation::ALL.len();
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub const PRIVATE_REPLY_TITLE_PREFIX: &str = "GROKPTAH-CLIPBOARD-REPLY:";
 
-/// Clipboard operations the kill-gate must mediate page-locally.
+/// Process-local authorization for native WebKit. Ordinary `cargo test`
+/// must never set this. Only the exclusive physical CLI/runner may.
+static NATIVE_PROBE_AUTHORIZED: AtomicBool = AtomicBool::new(false);
+
+/// Authorize native WebKit clipboard probing. Call only from the exclusive
+/// physical CLI (`grokptah-sep18-checklist run --clipboard-kill-gate`).
+pub fn authorize_native_clipboard_probe_for_physical_cli() {
+    NATIVE_PROBE_AUTHORIZED.store(true, Ordering::SeqCst);
+}
+
+/// Whether the current process may initialize WebKit for this probe.
+pub fn native_clipboard_probe_authorized() -> bool {
+    NATIVE_PROBE_AUTHORIZED.load(Ordering::SeqCst)
+}
+
+/// Async Clipboard operations the page world must actually invoke.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClipboardOperation {
-    Copy,
-    Cut,
-    Paste,
+    ReadText,
+    WriteText,
+    Read,
     Write,
 }
 
 impl ClipboardOperation {
     pub const ALL: [ClipboardOperation; 4] = [
-        ClipboardOperation::Copy,
-        ClipboardOperation::Cut,
-        ClipboardOperation::Paste,
+        ClipboardOperation::ReadText,
+        ClipboardOperation::WriteText,
+        ClipboardOperation::Read,
         ClipboardOperation::Write,
     ];
+
+    pub fn api_name(self) -> ClipboardApiName {
+        match self {
+            ClipboardOperation::ReadText => ClipboardApiName::ReadText,
+            ClipboardOperation::WriteText => ClipboardApiName::WriteText,
+            ClipboardOperation::Read => ClipboardApiName::Read,
+            ClipboardOperation::Write => ClipboardApiName::Write,
+        }
+    }
+}
+
+/// `navigator.clipboard` method that was invoked (or found missing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ClipboardApiName {
+    ReadText,
+    WriteText,
+    Read,
+    Write,
 }
 
 /// Which JS world produced or observed a reply.
@@ -125,6 +167,10 @@ pub enum ClipboardProbeFailClosedReason {
     PageWorldNonparticipation,
     OversizedReply,
     UnknownWireField,
+    NativeProbeNotAuthorized,
+    ClipboardApiUnavailable,
+    LiveWitnessMissing,
+    HandlerBodyNotString,
 }
 
 /// Host pull request bound to one generation and navigation epoch.
@@ -148,16 +194,22 @@ impl ProbePull {
     }
 }
 
-/// One page-local mediation receipt. Never carries clipboard payload bytes.
+/// One page-local Async Clipboard attempt receipt. Never carries payload bytes.
+///
+/// `attempted` / `settled` / `fulfilled` / `unavailable` are derived from the
+/// page-world operation, not host-injected stubs or hardcoded success.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PageLocalClipboardReceipt {
     pub operation: ClipboardOperation,
     pub generation: u64,
     pub epoch: u64,
-    pub mediated_page_local: bool,
-    pub host_pasteboard_touched: bool,
     pub initiator: ReceiptInitiator,
+    pub attempted: bool,
+    pub settled: bool,
+    pub fulfilled: bool,
+    pub unavailable: bool,
+    pub api: ClipboardApiName,
 }
 
 /// Bounded page-world result. This is the only success-fact document; private
@@ -194,43 +246,15 @@ pub struct AdmittedProbeReply {
     pub receipts: Vec<PageLocalClipboardReceipt>,
 }
 
-/// Page-world user script: intercept copy/cut/paste/write into a **page-world
-/// JS store**. Never writes the host-bound mailbox and never invokes host
-/// pasteboard APIs. Installed as a WKUserScript at document-start in the page
-/// world (not via evaluateJavaScript).
+/// Intentionally does **not** wrap `navigator.clipboard`. Host-injected
+/// replacements of `readText` / `writeText` / `read` / `write` manufacture
+/// receipts and are forbidden. Kept as a documented no-op so tests can lock
+/// the non-wrapping contract. Not installed into the web view.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub const PAGE_WORLD_INTERCEPTOR_SOURCE: &str = r#"
 (function () {
-  if (window.__grokptahClipboardInterceptorInstalled) { return; }
-  window.__grokptahClipboardInterceptorInstalled = true;
-  window.__grokptahClipboardOps = [];
-  function record(op) {
-    window.__grokptahClipboardOps.push(op);
-  }
-  document.addEventListener("copy", function (e) {
-    e.preventDefault();
-    record("copy");
-  }, true);
-  document.addEventListener("cut", function (e) {
-    e.preventDefault();
-    record("cut");
-  }, true);
-  document.addEventListener("paste", function (e) {
-    e.preventDefault();
-    record("paste");
-  }, true);
-  if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText = function (text) {
-      record("write");
-      return Promise.resolve();
-    };
-  }
-  if (navigator.clipboard && navigator.clipboard.write) {
-    navigator.clipboard.write = function () {
-      record("write");
-      return Promise.resolve();
-    };
-  }
+  // Do not replace navigator.clipboard.readText/writeText/read/write.
+  // Host-injected stubs cannot certify Async Clipboard initiation.
 })();
 "#;
 
@@ -263,66 +287,90 @@ pub const PRIVATE_WORLD_PULL_SOURCE: &str = r#"
   (function poll() {
     var el = document.getElementById("grokptah-clipboard-probe-mailbox");
     var ready = el && el.getAttribute("data-grokptah-page-result");
-    if (ready || tries >= 50) {
+    if (ready || tries >= 80) {
       postMailbox();
       return;
     }
     tries += 1;
-    setTimeout(poll, 20);
+    setTimeout(poll, 50);
   })();
 })();
 "#;
 
 /// Page-world initiator. Host bakes the unforgeable generation/epoch challenge
-/// into this script. Page world performs the four actual clipboard attempts
-/// and writes the bounded mailbox result. Private world must not run this.
+/// into this script. Page world **awaits** the four real Async Clipboard APIs
+/// and writes settlement-derived receipts. Private world must not run this.
 pub fn page_world_initiator_source(generation: u64, epoch: u64) -> String {
     format!(
         r#"
 (function () {{
   var generation = {generation};
   var epoch = {epoch};
-  var field = document.getElementById("probe-field");
-  if (field) {{
-    field.focus();
-    field.select();
-  }}
-  try {{ document.execCommand("copy"); }} catch (e) {{}}
-  try {{ document.execCommand("cut"); }} catch (e) {{}}
-  try {{ document.execCommand("paste"); }} catch (e) {{}}
-  if (navigator.clipboard && navigator.clipboard.writeText) {{
-    try {{ navigator.clipboard.writeText("page-local-write"); }} catch (e) {{}}
-  }}
-  var ops = window.__grokptahClipboardOps || [];
-  var seen = {{}};
-  var receipts = [];
-  for (var i = 0; i < ops.length; i++) {{
-    var op = ops[i];
-    if (seen[op]) {{ continue; }}
-    seen[op] = true;
-    receipts.push({{
+  function receipt(op, api, attempted, settled, fulfilled, unavailable) {{
+    return {{
       operation: op,
       generation: generation,
       epoch: epoch,
-      mediatedPageLocal: true,
-      hostPasteboardTouched: false,
-      initiator: "page_world"
-    }});
+      initiator: "page_world",
+      attempted: attempted,
+      settled: settled,
+      fulfilled: fulfilled,
+      unavailable: unavailable,
+      api: api
+    }};
   }}
-  var payload = {{
-    generation: generation,
-    epoch: epoch,
-    initiator: "page_world",
-    receipts: receipts
-  }};
-  var el = document.getElementById("grokptah-clipboard-probe-mailbox");
-  if (!el) {{
-    el = document.createElement("div");
-    el.id = "grokptah-clipboard-probe-mailbox";
-    el.setAttribute("hidden", "hidden");
-    (document.documentElement || document.body).appendChild(el);
+  function finish(receipts) {{
+    var payload = {{
+      generation: generation,
+      epoch: epoch,
+      initiator: "page_world",
+      receipts: receipts
+    }};
+    var el = document.getElementById("grokptah-clipboard-probe-mailbox");
+    if (!el) {{
+      el = document.createElement("div");
+      el.id = "grokptah-clipboard-probe-mailbox";
+      el.setAttribute("hidden", "hidden");
+      (document.documentElement || document.body).appendChild(el);
+    }}
+    el.setAttribute("data-grokptah-page-result", JSON.stringify(payload));
   }}
-  el.setAttribute("data-grokptah-page-result", JSON.stringify(payload));
+  var clip = navigator.clipboard;
+  function invoke(op, api, fn) {{
+    if (!clip || typeof fn !== "function") {{
+      return Promise.resolve(receipt(op, api, false, true, false, true));
+    }}
+    try {{
+      var pending = fn.call(clip);
+      if (!pending || typeof pending.then !== "function") {{
+        return Promise.resolve(receipt(op, api, true, false, false, true));
+      }}
+      return pending.then(function () {{
+        return receipt(op, api, true, true, true, false);
+      }}, function () {{
+        return receipt(op, api, true, true, false, false);
+      }});
+    }} catch (e) {{
+      return Promise.resolve(receipt(op, api, true, true, false, false));
+    }}
+  }}
+  Promise.all([
+    invoke("read_text", "readText", clip && clip.readText),
+    invoke("write_text", "writeText", clip && clip.writeText ? function () {{
+      return clip.writeText("grokptah-page-world-write");
+    }} : null),
+    invoke("read", "read", clip && clip.read),
+    invoke("write", "write", clip && clip.write ? function () {{
+      if (typeof ClipboardItem === "undefined") {{
+        return Promise.reject(new Error("ClipboardItem unavailable"));
+      }}
+      return clip.write([new ClipboardItem({{
+        "text/plain": new Blob(["grokptah-page-world-write"], {{ type: "text/plain" }})
+      }})]);
+    }} : null)
+  ]).then(finish, function () {{
+    finish([]);
+  }});
 }})();
 "#
     )
@@ -351,9 +399,12 @@ struct WireReceipt {
     operation: ClipboardOperation,
     generation: u64,
     epoch: u64,
-    mediated_page_local: bool,
-    host_pasteboard_touched: bool,
     initiator: ReceiptInitiator,
+    attempted: bool,
+    settled: bool,
+    fulfilled: bool,
+    unavailable: bool,
+    api: ClipboardApiName,
 }
 
 fn map_wire_decode_error(err: &serde_json::Error) -> ClipboardProbeFailClosedReason {
@@ -399,9 +450,12 @@ pub fn decode_page_result_bytes(
             operation: item.operation,
             generation: item.generation,
             epoch: item.epoch,
-            mediated_page_local: item.mediated_page_local,
-            host_pasteboard_touched: item.host_pasteboard_touched,
             initiator: item.initiator,
+            attempted: item.attempted,
+            settled: item.settled,
+            fulfilled: item.fulfilled,
+            unavailable: item.unavailable,
+            api: item.api,
         });
     }
     Ok(PageWorldResult {
@@ -437,6 +491,29 @@ pub fn probe_reply_from_page_result(
     }
 }
 
+/// True when the four Async Clipboard APIs were actually invoked and settled.
+pub fn receipts_are_genuine_async_clipboard_attempts(
+    receipts: &[PageLocalClipboardReceipt],
+) -> bool {
+    if receipts.len() != ClipboardOperation::ALL.len() {
+        return false;
+    }
+    receipts.iter().all(|receipt| {
+        receipt.initiator == ReceiptInitiator::PageWorld
+            && receipt.attempted
+            && receipt.settled
+            && !receipt.unavailable
+            && receipt.api == receipt.operation.api_name()
+    })
+}
+
+/// True when every genuine attempt fulfilled. Gesture/secure-context
+/// failures leave this false so the runner cannot seal Pass.
+pub fn receipts_all_fulfilled(receipts: &[PageLocalClipboardReceipt]) -> bool {
+    receipts_are_genuine_async_clipboard_attempts(receipts)
+        && receipts.iter().all(|receipt| receipt.fulfilled)
+}
+
 /// Admit handler bodies received on the private-world script-message handler.
 /// Zero messages is missing; two or more is duplicate. Title/DOM channels are
 /// not modeled here — callers that did not use the handler must not call this.
@@ -460,7 +537,8 @@ pub fn admit_private_world_handler_messages(
 /// Admit a private-world reply against the expected pull.
 ///
 /// Synthetic callers may use this to prove verifier behavior. A successful
-/// admit is **not** a physical Mac Pass.
+/// admit is **not** a physical Mac Pass. Hardcoded `mediatedPageLocal` success
+/// is not a substitute for attempted/settled Async Clipboard receipts.
 pub fn admit_probe_reply(
     expected: &ProbePull,
     reply: &ProbeReply,
@@ -515,10 +593,13 @@ pub fn admit_probe_reply(
         if receipt.initiator != ReceiptInitiator::PageWorld {
             return Err(ClipboardProbeFailClosedReason::PrivateWorldGeneratedReceipts);
         }
-        if receipt.host_pasteboard_touched {
-            return Err(ClipboardProbeFailClosedReason::UnexpectedHostClipboardChange);
+        if receipt.api != receipt.operation.api_name() {
+            return Err(ClipboardProbeFailClosedReason::MalformedReply);
         }
-        if !receipt.mediated_page_local {
+        if receipt.unavailable || !receipt.attempted {
+            return Err(ClipboardProbeFailClosedReason::ClipboardApiUnavailable);
+        }
+        if !receipt.settled {
             return Err(ClipboardProbeFailClosedReason::Uncertain);
         }
         if seen_ops.contains(&receipt.operation) {
@@ -546,6 +627,9 @@ pub struct WKClipboardProbe;
 
 impl WKClipboardProbe {
     pub fn webkit_available() -> bool {
+        if !native_clipboard_probe_authorized() {
+            return false;
+        }
         #[cfg(target_os = "macos")]
         {
             macos::webkit_available()
@@ -558,9 +642,11 @@ impl WKClipboardProbe {
 
     /// Execute one generation pull. Never evaluates into the page world.
     ///
-    /// Non-macOS is deterministic unsupported. macOS missing WebKit, missing
-    /// private-world handler registration, timeout, or permission prompts
-    /// fail closed and never claim Pass.
+    /// Ordinary `cargo test` is unauthorized and returns before WebKit
+    /// `dlopen`. Non-macOS is deterministic unsupported. macOS missing WebKit,
+    /// missing private-world handler registration, timeout, permission
+    /// prompts, or API/gesture/secure-context failure fail closed and never
+    /// claim Pass.
     pub fn pull(expected: &ProbePull) -> HarnessResult<ProbeReply> {
         if expected.world != ContentWorld::PrivateProbe
             || expected.path != ScriptEvaluationPath::PrivateContentWorldPull
@@ -571,6 +657,11 @@ impl WKClipboardProbe {
         }
         #[cfg(target_os = "macos")]
         {
+            if !native_clipboard_probe_authorized() {
+                return Err(harness_error_for_probe_reason(
+                    ClipboardProbeFailClosedReason::NativeProbeNotAuthorized,
+                ));
+            }
             macos::pull(expected)
         }
         #[cfg(not(target_os = "macos"))]
@@ -588,6 +679,17 @@ pub fn fail_closed_reason_from_harness(err: &HarnessError) -> ClipboardProbeFail
     let message = err.message.to_ascii_lowercase();
     if message.contains("unsupported on non-macos") {
         ClipboardProbeFailClosedReason::UnsupportedPlatform
+    } else if message.contains("not authorized") || message.contains("must not initialize webkit") {
+        ClipboardProbeFailClosedReason::NativeProbeNotAuthorized
+    } else if message.contains("live witness") {
+        ClipboardProbeFailClosedReason::LiveWitnessMissing
+    } else if message.contains("clipboard api")
+        || message.contains("secure-context")
+        || message.contains("user gesture")
+    {
+        ClipboardProbeFailClosedReason::ClipboardApiUnavailable
+    } else if message.contains("handler body") && message.contains("string") {
+        ClipboardProbeFailClosedReason::HandlerBodyNotString
     } else if message.contains("timeout") {
         ClipboardProbeFailClosedReason::Timeout
     } else if message.contains("permission") || message.contains("prompt") {
@@ -673,6 +775,18 @@ pub fn harness_error_for_probe_reason(reason: ClipboardProbeFailClosedReason) ->
         ClipboardProbeFailClosedReason::UnexpectedHostClipboardChange => {
             HarnessError::invalid_state("WKClipboardProbe unexpected host clipboard change")
         }
+        ClipboardProbeFailClosedReason::NativeProbeNotAuthorized => HarnessError::invalid_state(
+            "WKClipboardProbe native probe is not authorized; ordinary cargo test must not initialize WebKit",
+        ),
+        ClipboardProbeFailClosedReason::ClipboardApiUnavailable => HarnessError::uncertain_outcome(
+            "WKClipboardProbe Async Clipboard API/gesture/secure-context requirements prevented proof",
+        ),
+        ClipboardProbeFailClosedReason::LiveWitnessMissing => HarnessError::invalid_state(
+            "WKClipboardProbe Pass requires a process-private live witness; public JSON cannot reconstruct it",
+        ),
+        ClipboardProbeFailClosedReason::HandlerBodyNotString => HarnessError::invalid_state(
+            "WKClipboardProbe handler body was not an NSString",
+        ),
         ClipboardProbeFailClosedReason::Uncertain => {
             HarnessError::uncertain_outcome("WKClipboardProbe private-world pull is uncertain")
         }
@@ -703,38 +817,73 @@ mod macos {
     use objc2::rc::{Allocated, Retained};
     use objc2::runtime::{AnyClass, AnyObject, AnyProtocol, ClassBuilder, NSObject, Sel};
     use objc2::{sel, ClassType};
+    use std::collections::HashMap;
     use std::ffi::CString;
     use std::sync::{Mutex, OnceLock};
     use std::time::Instant;
 
+    const MAX_INBOX_MESSAGES: usize = 8;
+
+    #[derive(Clone)]
     struct HandlerInbox {
         messages: Vec<Vec<u8>>,
+        non_string_body: bool,
     }
 
-    fn inbox() -> &'static Mutex<HandlerInbox> {
-        static INBOX: OnceLock<Mutex<HandlerInbox>> = OnceLock::new();
-        INBOX.get_or_init(|| {
-            Mutex::new(HandlerInbox {
-                messages: Vec::new(),
-            })
-        })
+    fn inboxes() -> &'static Mutex<HashMap<usize, HandlerInbox>> {
+        static INBOXES: OnceLock<Mutex<HashMap<usize, HandlerInbox>>> = OnceLock::new();
+        INBOXES.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
-    fn reset_inbox() {
-        if let Ok(mut guard) = inbox().lock() {
-            guard.messages.clear();
+    fn handler_key(this: &AnyObject) -> usize {
+        this as *const AnyObject as usize
+    }
+
+    fn push_inbox(this: &AnyObject, bytes: Vec<u8>) {
+        if let Ok(mut guard) = inboxes().lock() {
+            let slot = guard
+                .entry(handler_key(this))
+                .or_insert_with(|| HandlerInbox {
+                    messages: Vec::new(),
+                    non_string_body: false,
+                });
+            if slot.messages.len() >= MAX_INBOX_MESSAGES {
+                return;
+            }
+            let stored = if bytes.len() > MAX_PROBE_REPLY_BYTES {
+                bytes[..MAX_PROBE_REPLY_BYTES.saturating_add(1)].to_vec()
+            } else {
+                bytes
+            };
+            slot.messages.push(stored);
         }
     }
 
-    fn snapshot_inbox() -> Vec<Vec<u8>> {
-        inbox()
+    fn mark_non_string_body(this: &AnyObject) {
+        if let Ok(mut guard) = inboxes().lock() {
+            let slot = guard
+                .entry(handler_key(this))
+                .or_insert_with(|| HandlerInbox {
+                    messages: Vec::new(),
+                    non_string_body: false,
+                });
+            slot.non_string_body = true;
+        }
+    }
+
+    fn take_inbox(key: usize) -> HandlerInbox {
+        inboxes()
             .lock()
-            .map(|guard| guard.messages.clone())
-            .unwrap_or_default()
+            .ok()
+            .and_then(|mut guard| guard.remove(&key))
+            .unwrap_or(HandlerInbox {
+                messages: Vec::new(),
+                non_string_body: false,
+            })
     }
 
     unsafe extern "C-unwind" fn did_receive_script_message(
-        _this: &AnyObject,
+        this: &AnyObject,
         _cmd: Sel,
         _controller: *mut AnyObject,
         message: &AnyObject,
@@ -746,27 +895,33 @@ mod macos {
         }
         let body: Option<Retained<AnyObject>> = unsafe { objc2::msg_send![message, body] };
         let Some(body) = body else {
+            mark_non_string_body(this);
             return;
         };
-        let Some(bytes) = nsstring_to_bytes(&body) else {
-            if let Ok(mut guard) = inbox().lock() {
-                guard.messages.push(Vec::new());
-            }
+        let Some(nsstring_cls) = AnyClass::get(c"NSString") else {
+            mark_non_string_body(this);
             return;
         };
-        if let Ok(mut guard) = inbox().lock() {
-            guard.messages.push(bytes);
+        let is_string: bool = unsafe { objc2::msg_send![&*body, isKindOfClass: nsstring_cls] };
+        if !is_string {
+            mark_non_string_body(this);
+            return;
         }
+        let Some(bytes) = nsstring_to_bytes(&body) else {
+            mark_non_string_body(this);
+            return;
+        };
+        push_inbox(this, bytes);
     }
 
     fn handler_class() -> Option<&'static AnyClass> {
         static CLASS: OnceLock<Option<&'static AnyClass>> = OnceLock::new();
         *CLASS.get_or_init(|| {
-            if let Some(existing) = AnyClass::get(c"GrokptahClipboardReplyHandlerV1") {
+            if let Some(existing) = AnyClass::get(c"GrokptahClipboardReplyHandlerV2") {
                 return Some(existing);
             }
             let mut builder =
-                ClassBuilder::new(c"GrokptahClipboardReplyHandlerV1", NSObject::class())?;
+                ClassBuilder::new(c"GrokptahClipboardReplyHandlerV2", NSObject::class())?;
             if let Some(protocol) = AnyProtocol::get(c"WKScriptMessageHandler") {
                 let _ = builder.add_protocol(protocol);
             }
@@ -804,6 +959,26 @@ mod macos {
         responds
     }
 
+    struct PrivateHandlerGuard {
+        controller: Retained<AnyObject>,
+        handler_name: Retained<AnyObject>,
+        private_world: Retained<AnyObject>,
+        key: usize,
+    }
+
+    impl Drop for PrivateHandlerGuard {
+        fn drop(&mut self) {
+            let _: () = unsafe {
+                objc2::msg_send![
+                    &*self.controller,
+                    removeScriptMessageHandlerForName: &*self.handler_name,
+                    contentWorld: &*self.private_world
+                ]
+            };
+            let _ = take_inbox(self.key);
+        }
+    }
+
     pub fn pull(expected: &ProbePull) -> HarnessResult<ProbeReply> {
         if !webkit_available() {
             return Err(harness_error_for_probe_reason(
@@ -816,15 +991,8 @@ mod macos {
             ));
         }
 
-        reset_inbox();
-
         let html = nsstring(PROBE_FIXTURE_HTML).ok_or_else(|| {
             HarnessError::backend_unavailable("WKClipboardProbe fixture HTML NSString unavailable")
-        })?;
-        let page_interceptor = nsstring(PAGE_WORLD_INTERCEPTOR_SOURCE).ok_or_else(|| {
-            HarnessError::backend_unavailable(
-                "WKClipboardProbe page interceptor NSString unavailable",
-            )
         })?;
         let page_initiator = nsstring(&page_world_initiator_source(
             expected.generation,
@@ -867,6 +1035,7 @@ mod macos {
             harness_error_for_probe_reason(ClipboardProbeFailClosedReason::MissingWebKitCapability)
         })?;
         let handler: Retained<AnyObject> = unsafe { objc2::msg_send![handler_cls, new] };
+        let key = handler_key(&*handler);
 
         let controller: Option<Retained<AnyObject>> =
             unsafe { objc2::msg_send![&*config, userContentController] };
@@ -896,15 +1065,8 @@ mod macos {
 
         let user_script_cls = AnyClass::get(c"WKUserScript")
             .ok_or_else(|| HarnessError::backend_unavailable("WKUserScript unavailable"))?;
-        // WKUserScriptInjectionTimeAtDocumentStart = 0; AtDocumentEnd = 1
-        let interceptor_script =
-            init_user_script(user_script_cls, &page_interceptor, 0, true, &page_world).ok_or_else(
-                || {
-                    HarnessError::backend_unavailable(
-                        "WKUserScript page interceptor init unavailable",
-                    )
-                },
-            )?;
+        // WKUserScriptInjectionTimeAtDocumentEnd = 1. Do not install a
+        // page-world interceptor that replaces clipboard APIs.
         let initiator_script =
             init_user_script(user_script_cls, &page_initiator, 1, true, &page_world).ok_or_else(
                 || {
@@ -919,7 +1081,6 @@ mod macos {
                     HarnessError::backend_unavailable("WKUserScript private pull init unavailable")
                 })?;
 
-        let _: () = unsafe { objc2::msg_send![&*controller, addUserScript: &*interceptor_script] };
         let _: () = unsafe { objc2::msg_send![&*controller, addUserScript: &*initiator_script] };
         let _: () = unsafe { objc2::msg_send![&*controller, addUserScript: &*private_script] };
 
@@ -938,33 +1099,39 @@ mod macos {
             objc2::msg_send![&*webview, loadHTMLString: &*html, baseURL: None::<&AnyObject>]
         };
 
+        let guard = PrivateHandlerGuard {
+            controller: controller.clone(),
+            handler_name: handler_name.clone(),
+            private_world: private_world.clone(),
+            key,
+        };
+
         // Host receive is the private-world WKScriptMessageHandler. Never poll
         // WKWebView.title, never evaluateJavaScript / callAsyncJavaScript.
         let started = Instant::now();
         loop {
             if started.elapsed() > PROBE_TIMEOUT {
-                let _: () = unsafe {
-                    objc2::msg_send![
-                        &*controller,
-                        removeScriptMessageHandlerForName: &*handler_name,
-                        contentWorld: &*private_world
-                    ]
-                };
+                drop(guard);
                 return Err(harness_error_for_probe_reason(
                     ClipboardProbeFailClosedReason::Timeout,
                 ));
             }
             pump_runloop_briefly();
-            let messages = snapshot_inbox();
-            if !messages.is_empty() {
-                let _: () = unsafe {
-                    objc2::msg_send![
-                        &*controller,
-                        removeScriptMessageHandlerForName: &*handler_name,
-                        contentWorld: &*private_world
-                    ]
-                };
-                return admit_private_world_handler_messages(expected, &messages, &[])
+            let ready = inboxes()
+                .lock()
+                .ok()
+                .and_then(|guard| guard.get(&key).cloned())
+                .map(|inbox| !inbox.messages.is_empty() || inbox.non_string_body)
+                .unwrap_or(false);
+            if ready {
+                let inbox = take_inbox(key);
+                drop(guard);
+                if inbox.non_string_body {
+                    return Err(harness_error_for_probe_reason(
+                        ClipboardProbeFailClosedReason::HandlerBodyNotString,
+                    ));
+                }
+                return admit_private_world_handler_messages(expected, &inbox.messages, &[])
                     .map_err(harness_error_for_probe_reason)
                     .map(|admitted| ProbeReply {
                         generation: admitted.generation,
@@ -1035,9 +1202,10 @@ mod macos {
         let Some(date) = date else {
             return;
         };
-        let _: bool = unsafe {
-            objc2::msg_send![&*current, runMode: &*nsstring("NSDefaultRunLoopMode").expect("mode"), beforeDate: &*date]
+        let Some(mode) = nsstring("NSDefaultRunLoopMode") else {
+            return;
         };
+        let _: bool = unsafe { objc2::msg_send![&*current, runMode: &*mode, beforeDate: &*date] };
     }
 
     fn ns_app_activation_policy_regular_would_prompt() -> bool {
@@ -1120,9 +1288,12 @@ mod tests {
                 operation,
                 generation,
                 epoch,
-                mediated_page_local: true,
-                host_pasteboard_touched: false,
                 initiator: ReceiptInitiator::PageWorld,
+                attempted: true,
+                settled: true,
+                fulfilled: true,
+                unavailable: false,
+                api: operation.api_name(),
             })
             .collect()
     }
@@ -1135,9 +1306,12 @@ mod tests {
                     "operation": operation,
                     "generation": generation,
                     "epoch": epoch,
-                    "mediatedPageLocal": true,
-                    "hostPasteboardTouched": false,
                     "initiator": "page_world",
+                    "attempted": true,
+                    "settled": true,
+                    "fulfilled": true,
+                    "unavailable": false,
+                    "api": operation.api_name(),
                 })
             })
             .collect();
@@ -1176,6 +1350,7 @@ mod tests {
         let admitted = admit_probe_reply(&pull, &valid_reply(3, 1), &[]).expect("admit");
         assert_eq!(admitted.generation, 3);
         assert_eq!(admitted.receipts.len(), 4);
+        assert!(receipts_all_fulfilled(&admitted.receipts));
     }
 
     #[test]
@@ -1404,11 +1579,59 @@ mod tests {
     }
 
     #[test]
+    fn hardcoded_and_stubbed_receipts_cannot_pass() {
+        let hardcoded = serde_json::json!({
+            "generation": 1,
+            "epoch": 1,
+            "initiator": "page_world",
+            "receipts": [{
+                "operation": "copy",
+                "generation": 1,
+                "epoch": 1,
+                "mediatedPageLocal": true,
+                "hostPasteboardTouched": false,
+                "initiator": "page_world"
+            }]
+        })
+        .to_string();
+        let err = decode_page_result_bytes(hardcoded.as_bytes()).expect_err("hardcoded");
+        assert!(
+            err == ClipboardProbeFailClosedReason::UnknownWireField
+                || err == ClipboardProbeFailClosedReason::MalformedReply
+        );
+
+        let pull = ProbePull::private(1, 1);
+        let mut reply = valid_reply(1, 1);
+        reply.receipts[0].attempted = false;
+        reply.receipts[0].unavailable = true;
+        let err = admit_probe_reply(&pull, &reply, &[]).expect_err("unavailable");
+        assert_eq!(err, ClipboardProbeFailClosedReason::ClipboardApiUnavailable);
+
+        let mut unsettled = valid_reply(1, 1);
+        unsettled.receipts[2].settled = false;
+        let err = admit_probe_reply(&pull, &unsettled, &[]).expect_err("unsettled");
+        assert_eq!(err, ClipboardProbeFailClosedReason::Uncertain);
+
+        let mut missing_read = valid_reply(1, 1);
+        missing_read.receipts.retain(|receipt| {
+            receipt.operation != ClipboardOperation::ReadText
+                && receipt.operation != ClipboardOperation::Read
+        });
+        let err = admit_probe_reply(&pull, &missing_read, &[]).expect_err("missing read APIs");
+        assert_eq!(err, ClipboardProbeFailClosedReason::MissingReply);
+        assert!(!receipts_are_genuine_async_clipboard_attempts(
+            &missing_read.receipts
+        ));
+    }
+
+    #[test]
     fn private_world_script_is_read_only_pull() {
         let source = PRIVATE_WORLD_PULL_SOURCE;
         assert!(!source.contains("execCommand"));
         assert!(!source.contains("writeText"));
+        assert!(!source.contains("readText"));
         assert!(!source.contains("clipboard.write"));
+        assert!(!source.contains("clipboard.read"));
         assert!(!source.contains("document.title"));
         assert!(!source.contains(PRIVATE_REPLY_TITLE_PREFIX));
         assert!(!source.contains("mediatedPageLocal"));
@@ -1420,15 +1643,23 @@ mod tests {
     }
 
     #[test]
-    fn page_world_script_initiates_four_ops_and_binds_challenge() {
+    fn page_world_script_initiates_four_async_clipboard_apis() {
         let interceptor = PAGE_WORLD_INTERCEPTOR_SOURCE;
         assert!(!interceptor.contains(PAGE_RESULT_ATTRIBUTE));
         assert!(!interceptor.contains("execCommand"));
-        assert!(interceptor.contains("preventDefault"));
+        assert!(!interceptor.contains("writeText ="));
+        assert!(!interceptor.contains("clipboard.write ="));
+        assert!(!interceptor.contains("readText ="));
+        assert!(!interceptor.contains("clipboard.read ="));
+        assert!(!interceptor.contains("preventDefault"));
 
         let initiator = page_world_initiator_source(7, 3);
-        assert!(initiator.contains("execCommand"));
-        assert!(initiator.contains("writeText"));
+        assert!(!initiator.contains("execCommand"));
+        assert!(!initiator.contains("mediatedPageLocal"));
+        assert!(initiator.contains("clip.readText"));
+        assert!(initiator.contains("clip.writeText"));
+        assert!(initiator.contains("clip.read"));
+        assert!(initiator.contains("clip.write"));
         assert!(initiator.contains("var generation = 7;"));
         assert!(initiator.contains("var epoch = 3;"));
         assert!(initiator.contains("page_world"));
@@ -1436,16 +1667,19 @@ mod tests {
         assert!(!initiator.contains("document.title"));
         assert!(!initiator.contains(PRIVATE_REPLY_TITLE_PREFIX));
         assert!(!initiator.contains("postMessage"));
+        assert!(!initiator.contains("writeText = function"));
+        assert!(!initiator.contains("clipboard.write = function"));
     }
 
     #[test]
-    fn non_macos_pull_is_unsupported() {
+    fn ordinary_tests_never_authorize_or_initialize_webkit() {
+        assert!(!native_clipboard_probe_authorized());
+        assert!(!WKClipboardProbe::webkit_available());
         let result = WKClipboardProbe::pull(&ProbePull::private(1, 1));
         #[cfg(not(target_os = "macos"))]
         {
             let err = result.expect_err("linux");
             assert_eq!(err.code, crate::error::HarnessErrorCode::BackendUnavailable);
-            assert!(!WKClipboardProbe::webkit_available());
             assert_eq!(
                 fail_closed_reason_from_harness(&err),
                 ClipboardProbeFailClosedReason::UnsupportedPlatform
@@ -1453,7 +1687,11 @@ mod tests {
         }
         #[cfg(target_os = "macos")]
         {
-            let _ = result;
+            let err = result.expect_err("unauthorized");
+            assert_eq!(
+                fail_closed_reason_from_harness(&err),
+                ClipboardProbeFailClosedReason::NativeProbeNotAuthorized
+            );
         }
     }
 }

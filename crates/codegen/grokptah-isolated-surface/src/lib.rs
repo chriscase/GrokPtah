@@ -50,6 +50,7 @@ pub use clipboard_kill_gate::{
     clipboard_kill_gate_may_claim_pass, run_clipboard_kill_gate,
     verify_clipboard_kill_gate_evidence, ClipboardKillGateEvidence, ClipboardKillGateOutcome,
     ClipboardKillGatePlatform, ClipboardKillGateProvenance, ClipboardKillGateVerdict,
+    LiveKillGateAuthority,
 };
 pub use clipboard_witness::{
     host_clipboard_unchanged, ClipboardWitness, ClipboardWitnessPlatform, HostClipboardDigest,
@@ -97,13 +98,15 @@ pub use vf_dry_run::{
     run_vf_dry_run_with_native_host_sentinels, VfDryRunEvidence, VfDryRunOutcome, VfDryRunPlatform,
 };
 pub use wk_clipboard_probe::{
-    admit_private_world_handler_messages, admit_probe_reply, decode_page_result_bytes,
-    page_world_initiator_source, probe_reply_from_page_result, ClipboardOperation,
-    ClipboardProbeFailClosedReason, ContentWorld, PageLocalClipboardReceipt, PageWorldResult,
-    ProbePull, ProbeReply, ReceiptInitiator, ReplyChannel, ScriptEvaluationPath, WKClipboardProbe,
-    MAX_PROBE_REPLY_BYTES, MAX_RECEIPT_COUNT, PAGE_RESULT_ATTRIBUTE, PAGE_RESULT_MAILBOX_ID,
-    PAGE_WORLD_INTERCEPTOR_SOURCE, PRIVATE_PROBE_WORLD_NAME, PRIVATE_REPLY_HANDLER_NAME,
-    PRIVATE_REPLY_TITLE_PREFIX, PRIVATE_WORLD_PULL_SOURCE,
+    admit_private_world_handler_messages, admit_probe_reply,
+    authorize_native_clipboard_probe_for_physical_cli, decode_page_result_bytes,
+    native_clipboard_probe_authorized, page_world_initiator_source, probe_reply_from_page_result,
+    receipts_all_fulfilled, receipts_are_genuine_async_clipboard_attempts, ClipboardApiName,
+    ClipboardOperation, ClipboardProbeFailClosedReason, ContentWorld, PageLocalClipboardReceipt,
+    PageWorldResult, ProbePull, ProbeReply, ReceiptInitiator, ReplyChannel, ScriptEvaluationPath,
+    WKClipboardProbe, MAX_PROBE_REPLY_BYTES, MAX_RECEIPT_COUNT, PAGE_RESULT_ATTRIBUTE,
+    PAGE_RESULT_MAILBOX_ID, PAGE_WORLD_INTERCEPTOR_SOURCE, PRIVATE_PROBE_WORLD_NAME,
+    PRIVATE_REPLY_HANDLER_NAME, PRIVATE_REPLY_TITLE_PREFIX, PRIVATE_WORLD_PULL_SOURCE,
 };
 
 /// Fail-closed admission gate for bridge integration. Remains false until a
@@ -130,4 +133,4 @@ pub const NATIVE_HOST_SENTINEL_NONCLAIM: &str =
 
 /// Non-claim for the Contained Browser clipboard isolation kill-gate.
 pub const CLIPBOARD_KILL_GATE_NONCLAIM: &str =
-    "Contained Browser clipboard kill-gate is not VF/isolation/physical PASS; synthetic verifier fixtures never enable admission or Computer Mode; only exact-head native Mac WebKit evidence may seal kill-gate Pass.";
+    "Contained Browser clipboard kill-gate is not VF/isolation/physical PASS; synthetic verifier fixtures never enable admission or Computer Mode; public JSON cannot reconstruct Pass; only a process-private live native Mac WebKit witness may seal kill-gate Pass.";

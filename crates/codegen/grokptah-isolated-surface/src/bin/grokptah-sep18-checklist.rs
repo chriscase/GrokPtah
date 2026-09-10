@@ -5,8 +5,9 @@ use std::path::PathBuf;
 use std::process;
 
 use grokptah_isolated_surface::{
-    parse_evidence_pack, parse_sep18_checklist_run_args, run_sep18_checklist, verifier_exit_code,
-    verify_evidence_pack, HostSentinelSnapshot,
+    authorize_native_clipboard_probe_for_physical_cli, parse_evidence_pack,
+    parse_sep18_checklist_run_args, run_sep18_checklist, verifier_exit_code, verify_evidence_pack,
+    HostSentinelSnapshot, Sep18ChecklistSubstrate,
 };
 
 fn usage() -> ! {
@@ -43,6 +44,10 @@ fn exit_run(args: &[String]) {
         eprintln!("{err}");
         usage();
     });
+
+    if request.config.substrate == Sep18ChecklistSubstrate::ClipboardKillGate {
+        authorize_native_clipboard_probe_for_physical_cli();
+    }
 
     let outcome = run_sep18_checklist(HostSentinelSnapshot::synthetic_baseline(), request.config);
     if let Some(err) = &outcome.runner_error {

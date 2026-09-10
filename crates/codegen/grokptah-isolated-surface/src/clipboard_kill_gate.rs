@@ -3,7 +3,12 @@
 //! Orchestrates [`ClipboardWitness`] and [`WKClipboardProbe`] into one
 //! independently reviewable evidence artifact. Computer Mode, bridge
 //! admission, VF PASS, and isolation PASS stay false. Synthetic fixtures can
-//! prove the verifier; they cannot establish physical Mac Pass.
+//! prove the verifier; they cannot establish physical Mac Pass. Public JSON
+//! packs cannot reconstruct Pass: native Pass requires a process-private
+//! runner-issued live witness that is skipped on serialize.
+
+use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -14,12 +19,48 @@ use crate::clipboard_witness::{
 use crate::error::HarnessResult;
 use crate::lifecycle::ProofEvidenceClass;
 #[cfg(target_os = "macos")]
+use crate::wk_clipboard_probe::native_clipboard_probe_authorized;
+#[cfg(target_os = "macos")]
 use crate::wk_clipboard_probe::{admit_probe_reply, ProbePull, ProbeReply, WKClipboardProbe};
 use crate::wk_clipboard_probe::{
-    ClipboardOperation, ClipboardProbeFailClosedReason, PageLocalClipboardReceipt,
-    ReceiptInitiator, ReplyChannel, ScriptEvaluationPath,
+    receipts_all_fulfilled, ClipboardOperation, ClipboardProbeFailClosedReason,
+    PageLocalClipboardReceipt, ReceiptInitiator, ReplyChannel, ScriptEvaluationPath,
 };
 use crate::CLIPBOARD_KILL_GATE_NONCLAIM;
+
+/// Process-private runner-issued witness. Not a cryptographic signature and
+/// not present in serialized JSON. Public pack verification therefore cannot
+/// promote a NativeWebKit-shaped Pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveKillGateAuthority {
+    token: u64,
+}
+
+fn live_authority_tokens() -> &'static Mutex<HashSet<u64>> {
+    static TOKENS: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
+    TOKENS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+#[cfg(target_os = "macos")]
+fn issue_live_kill_gate_authority() -> LiveKillGateAuthority {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let token = NEXT.fetch_add(1, Ordering::Relaxed);
+    let token = if token == 0 { 1 } else { token };
+    live_authority_tokens()
+        .lock()
+        .expect("live kill-gate authority registry")
+        .insert(token);
+    LiveKillGateAuthority { token }
+}
+
+fn live_kill_gate_authority_is_registered(auth: &LiveKillGateAuthority) -> bool {
+    auth.token != 0
+        && live_authority_tokens()
+            .lock()
+            .map(|guard| guard.contains(&auth.token))
+            .unwrap_or(false)
+}
 
 /// Where the kill-gate executed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,6 +130,10 @@ pub struct ClipboardKillGateEvidence {
     pub admission_available: bool,
     pub nonclaim: String,
     pub recorded_at: DateTime<Utc>,
+    /// Runner-issued, process-private witness. Always `None` after JSON
+    /// deserialize. Not a cryptographic key.
+    #[serde(default, skip)]
+    pub live_authority: Option<LiveKillGateAuthority>,
 }
 
 impl ClipboardKillGateEvidence {
@@ -123,6 +168,7 @@ impl ClipboardKillGateEvidence {
             admission_available: crate::isolated_surface_admission_available(),
             nonclaim: CLIPBOARD_KILL_GATE_NONCLAIM.into(),
             recorded_at: Utc::now(),
+            live_authority: None,
         }
     }
 
@@ -170,7 +216,9 @@ impl ClipboardKillGateEvidence {
     }
 }
 
-/// Derived Pass contract. Any uncertainty or synthetic provenance fails closed.
+/// Derived Pass contract. Any uncertainty, synthetic provenance, or missing
+/// process-private live witness fails closed. Typed/JSON clones with matching
+/// public fields are not enough.
 pub fn clipboard_kill_gate_may_claim_pass(evidence: &ClipboardKillGateEvidence) -> bool {
     evidence.platform == ClipboardKillGatePlatform::MacOs
         && evidence.outcome == ClipboardKillGateOutcome::MediationProven
@@ -184,6 +232,7 @@ pub fn clipboard_kill_gate_may_claim_pass(evidence: &ClipboardKillGateEvidence) 
             .receipts
             .iter()
             .all(|receipt| receipt.initiator == ReceiptInitiator::PageWorld)
+        && receipts_all_fulfilled(&evidence.receipts)
         && !evidence.page_world_evaluate_javascript_used
         && !evidence.call_async_javascript_used
         && evidence.host_clipboard_unchanged
@@ -204,9 +253,17 @@ pub fn clipboard_kill_gate_may_claim_pass(evidence: &ClipboardKillGateEvidence) 
         && !evidence.computer_mode_enabled
         && !evidence.admission_available
         && evidence.evidence_class == ProofEvidenceClass::ContainedBrowser
+        && evidence
+            .live_authority
+            .as_ref()
+            .is_some_and(live_kill_gate_authority_is_registered)
 }
 
 /// Independent machine verifier for a sealed kill-gate artifact.
+///
+/// Portable/public JSON verification cannot report Pass: the live witness is
+/// skipped on serialize. A NativeWebKit-shaped Pass without a registered
+/// process-private witness is rejected as [`LiveWitnessMissing`].
 pub fn verify_clipboard_kill_gate_evidence(
     evidence: &ClipboardKillGateEvidence,
 ) -> Result<(), ClipboardProbeFailClosedReason> {
@@ -264,6 +321,16 @@ pub fn verify_clipboard_kill_gate_evidence(
         }
         if !evidence.page_world_participated {
             return Err(ClipboardProbeFailClosedReason::PageWorldNonparticipation);
+        }
+        if !receipts_all_fulfilled(&evidence.receipts) {
+            return Err(ClipboardProbeFailClosedReason::ClipboardApiUnavailable);
+        }
+        let live_ok = evidence
+            .live_authority
+            .as_ref()
+            .is_some_and(live_kill_gate_authority_is_registered);
+        if !live_ok {
+            return Err(ClipboardProbeFailClosedReason::LiveWitnessMissing);
         }
     }
 
@@ -323,8 +390,8 @@ pub fn verify_clipboard_kill_gate_evidence(
     Ok(())
 }
 
-/// Run the kill-gate. Linux is deterministic unsupported. macOS attempts a
-/// native private-world probe and seals an honest verdict.
+/// Run the kill-gate. Linux is deterministic unsupported. macOS native WebKit
+/// runs only after the physical CLI authorizes it.
 pub fn run_clipboard_kill_gate() -> HarnessResult<ClipboardKillGateEvidence> {
     match ClipboardWitness::platform() {
         ClipboardWitnessPlatform::NonMacOs => {
@@ -341,6 +408,13 @@ fn run_macos_kill_gate() -> HarnessResult<ClipboardKillGateEvidence> {
 
 #[cfg(target_os = "macos")]
 fn run_macos_kill_gate() -> HarnessResult<ClipboardKillGateEvidence> {
+    if !native_clipboard_probe_authorized() {
+        return Ok(ClipboardKillGateEvidence::macos_fail_closed(
+            ClipboardProbeFailClosedReason::NativeProbeNotAuthorized,
+            "ordinary cargo test must not initialize WebKit",
+        ));
+    }
+
     let generation = crate::wk_clipboard_probe::host_issued_generation();
     let epoch = 1;
     let before = match ClipboardWitness::seal_digest() {
@@ -413,6 +487,23 @@ fn seal_macos_result(
 
     match admit_probe_reply(&ProbePull::private(generation, epoch), &reply, &[]) {
         Ok(admitted) => {
+            if !receipts_all_fulfilled(&admitted.receipts) {
+                let mut evidence = ClipboardKillGateEvidence::macos_fail_closed(
+                    ClipboardProbeFailClosedReason::ClipboardApiUnavailable,
+                    "Async Clipboard API/gesture/secure-context prevented fulfillment",
+                );
+                evidence.host_clipboard_before = Some(before);
+                evidence.host_clipboard_after = Some(after);
+                evidence.host_clipboard_unchanged = unchanged;
+                evidence.generation = admitted.generation;
+                evidence.epoch = admitted.epoch;
+                evidence.receipts = admitted.receipts;
+                evidence.script_evaluation_path = ScriptEvaluationPath::PrivateContentWorldPull;
+                evidence.reply_channel = ReplyChannel::PrivateWorldScriptMessageHandler;
+                evidence.page_world_participated = true;
+                evidence.private_world_initiated_operations = false;
+                return Ok(evidence);
+            }
             let mut evidence = ClipboardKillGateEvidence::honest_shell(
                 ClipboardKillGatePlatform::MacOs,
                 ClipboardKillGateOutcome::MediationProven,
@@ -428,10 +519,12 @@ fn seal_macos_result(
             evidence.reply_channel = ReplyChannel::PrivateWorldScriptMessageHandler;
             evidence.page_world_participated = true;
             evidence.private_world_initiated_operations = false;
+            evidence.live_authority = Some(issue_live_kill_gate_authority());
             if !clipboard_kill_gate_may_claim_pass(&evidence) {
                 evidence.outcome = ClipboardKillGateOutcome::FailClosed;
                 evidence.verdict = ClipboardKillGateVerdict::Inconclusive;
                 evidence.fail_closed_reason = Some(ClipboardProbeFailClosedReason::Uncertain);
+                evidence.live_authority = None;
             }
             Ok(evidence)
         }
@@ -481,6 +574,15 @@ mod tests {
             assert_eq!(evidence.verdict, ClipboardKillGateVerdict::Unsupported);
             assert_ne!(evidence.verdict, ClipboardKillGateVerdict::Pass);
         }
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(evidence.verdict, ClipboardKillGateVerdict::Inconclusive);
+            assert_eq!(
+                evidence.fail_closed_reason,
+                Some(ClipboardProbeFailClosedReason::NativeProbeNotAuthorized)
+            );
+            assert!(evidence.live_authority.is_none());
+        }
     }
 
     #[test]
@@ -492,5 +594,60 @@ mod tests {
         let err = verify_clipboard_kill_gate_evidence(&evidence).expect_err("synthetic pass");
         assert_eq!(err, ClipboardProbeFailClosedReason::Uncertain);
         assert!(!clipboard_kill_gate_may_claim_pass(&evidence));
+    }
+
+    #[test]
+    fn forged_native_pass_without_live_witness_is_rejected() {
+        let digest = HostClipboardDigest::canonical(b"stable-host-clipboard", 2);
+        let evidence = ClipboardKillGateEvidence {
+            platform: ClipboardKillGatePlatform::MacOs,
+            outcome: ClipboardKillGateOutcome::MediationProven,
+            verdict: ClipboardKillGateVerdict::Pass,
+            fail_closed_reason: None,
+            provenance: ClipboardKillGateProvenance::NativeWebKit,
+            script_evaluation_path: ScriptEvaluationPath::PrivateContentWorldPull,
+            reply_channel: ReplyChannel::PrivateWorldScriptMessageHandler,
+            page_world_participated: true,
+            private_world_initiated_operations: false,
+            page_world_evaluate_javascript_used: false,
+            call_async_javascript_used: false,
+            host_clipboard_before: Some(digest.clone()),
+            host_clipboard_after: Some(digest),
+            host_clipboard_unchanged: true,
+            receipts: ClipboardOperation::ALL
+                .into_iter()
+                .map(|operation| PageLocalClipboardReceipt {
+                    operation,
+                    generation: 1,
+                    epoch: 1,
+                    initiator: ReceiptInitiator::PageWorld,
+                    attempted: true,
+                    settled: true,
+                    fulfilled: true,
+                    unavailable: false,
+                    api: operation.api_name(),
+                })
+                .collect(),
+            generation: 1,
+            epoch: 1,
+            evidence_class: ProofEvidenceClass::ContainedBrowser,
+            physical_pass_claimed: false,
+            isolation_pass_claimed: false,
+            vf_pass_claimed: false,
+            computer_mode_enabled: false,
+            admission_available: false,
+            nonclaim: CLIPBOARD_KILL_GATE_NONCLAIM.into(),
+            recorded_at: Utc::now(),
+            live_authority: None,
+        };
+        assert!(!clipboard_kill_gate_may_claim_pass(&evidence));
+        let err = verify_clipboard_kill_gate_evidence(&evidence).expect_err("forged");
+        assert_eq!(err, ClipboardProbeFailClosedReason::LiveWitnessMissing);
+
+        let json = serde_json::to_string(&evidence).expect("json");
+        let parsed: ClipboardKillGateEvidence = serde_json::from_str(&json).expect("parse");
+        assert!(parsed.live_authority.is_none());
+        let err = verify_clipboard_kill_gate_evidence(&parsed).expect_err("json");
+        assert_eq!(err, ClipboardProbeFailClosedReason::LiveWitnessMissing);
     }
 }

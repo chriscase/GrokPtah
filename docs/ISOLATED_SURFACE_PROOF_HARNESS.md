@@ -162,23 +162,23 @@ isolation PASS, Computer Mode, or admission.
 | Component | Role |
 |---|---|
 | `ClipboardWitness` | Seals before/after host clipboard **digests** from change-count + type names only. Never reads pasteboard data, never writes the general pasteboard, never uses CGEvent, Accessibility, or AppleScript. |
-| `WKClipboardProbe` | Page-world injected code initiates copy/cut/paste/write and binds receipts to a host-issued generation/epoch challenge. Private `WKContentWorld` (`grokptah.clipboard.probe.v1`) may only read the bounded page mailbox and forward it via a registered `WKScriptMessageHandler` (`addScriptMessageHandler:contentWorld:name:`). Host never uses `evaluateJavaScript`, `callAsyncJavaScript`, `document.title` polling, or DOM attribute self-attestation as the receive channel. |
+| `WKClipboardProbe` | Page-world injected code genuinely awaits `navigator.clipboard.readText()`, `writeText()`, `read()`, and `write()` and binds settlement-derived receipts to a host-issued generation/epoch challenge. Private `WKContentWorld` (`grokptah.clipboard.probe.v1`) may only read the bounded page mailbox and forward it via a registered `WKScriptMessageHandler` (`addScriptMessageHandler:contentWorld:name:`). Host never uses `evaluateJavaScript`, `callAsyncJavaScript`, `document.title` polling, DOM attribute self-attestation, or host-injected clipboard API stubs as the receive channel. Ordinary `cargo test` never initializes WebKit. |
 | `run_clipboard_kill_gate` | Orchestrates witness + probe; seals typed evidence with verdict `pass` / `fail` / `inconclusive` / `unsupported`. |
 
 **Trust split:**
 
-- **Page world** initiates the four actual clipboard attempts and writes the challenge-bound mailbox (`data-grokptah-page-result`).
-- **Private world** is read-only: it pulls that mailbox blob and `postMessage`s it to `grokptahClipboardReply`. It must not `execCommand`, `writeText`, stamp receipts, or write `document.title`.
-- **Host** admits only `ReplyChannel::PrivateWorldScriptMessageHandler` after strict `deny_unknown_fields` decode (max 4096 bytes, exact four unique operations, `initiator=page_world`). If the private-world handler cannot be registered, the probe is INCONCLUSIVE / fail closed — never Pass.
+- **Page world** genuinely invokes the four Async Clipboard APIs (`readText` / `writeText` / `read` / `write`) and writes settlement-derived challenge-bound mailbox JSON (`data-grokptah-page-result`). Host-injected API stubs and hardcoded `mediatedPageLocal` receipts cannot certify Pass.
+- **Private world** is read-only: it pulls that mailbox blob and `postMessage`s it to `grokptahClipboardReply`. It must not `execCommand`, call clipboard APIs, stamp receipts, or write `document.title`.
+- **Host** admits only `ReplyChannel::PrivateWorldScriptMessageHandler` after strict `deny_unknown_fields` decode (max 4096 bytes, exact four unique operations, `initiator=page_world`, attempted+settled receipts). Isolation is the host clipboard digest (change-count + type names), not a page-attested pasteboard flag. If the private-world handler cannot be registered, or API/gesture/secure-context requirements prevent fulfillment, the probe is INCONCLUSIVE / fail closed — never Pass. Portable JSON verification cannot reconstruct Pass; native Pass requires a process-private runner-issued live witness.
 
 **Verdict contract (fail closed):**
 
 | Verdict | Meaning | Who may seal it |
 |---|---|---|
 | `unsupported` | Non-macOS / no WebKit | Linux CI (deterministic) |
-| `inconclusive` | Timeout, navigation/epoch drift, malformed/duplicate/missing reply, missing handler, untrusted channel, private-world receipts, page-world nonparticipation, unknown fields, oversized reply, missing WebKit, permission prompt, uncertain | Any platform; never Pass |
+| `inconclusive` | Timeout, navigation/epoch drift, malformed/duplicate/missing reply, missing handler, untrusted channel, private-world receipts, page-world nonparticipation, unknown fields, oversized reply, missing WebKit, permission prompt, unauthorized native probe, API/gesture/secure-context failure, missing live witness, uncertain | Any platform; never Pass |
 | `fail` | Host clipboard digest changed (isolation broken) | Native Mac probe only |
-| `pass` | Native Mac WebKit, page-world initiated four mediated receipts, private-world handler receive, host digest unchanged | **Only** exact-head native Mac worker; Linux verifiers reject Pass |
+| `pass` | Native Mac WebKit authorized by the physical CLI, page-world initiated and fulfilled all four Async Clipboard APIs, private-world handler receive, host digest unchanged, process-private live witness | **Only** the live native Mac runner process; Linux verifiers and public JSON reject Pass |
 
 Any timeout, navigation/epoch drift, malformed/duplicate reply, unexpected host
 clipboard change, unsupported platform, missing WebKit capability, permission
@@ -212,9 +212,10 @@ cargo run --locked --manifest-path crates/codegen/grokptah-isolated-surface/Carg
 
 Inspect `clipboardKillGate.verdict`:
 
-- `pass` — page-world initiated the four attempts; host received the
+- `pass` — page-world initiated and fulfilled the four Async Clipboard APIs; host received the
   challenge-bound result through the private-world script-message handler;
-  host digest unchanged. Still `physicalPassClaimed=false`,
+  host digest unchanged; live witness is process-private (serialized packs
+  cannot independently re-establish Pass). Still `physicalPassClaimed=false`,
   `isolationPassClaimed=false`, `vfPassClaimed=false`,
   `admissionAvailable=false`.
 - `fail` — host digest changed; page-local mediation did not hold.
@@ -356,6 +357,7 @@ cargo run --locked --manifest-path crates/codegen/grokptah-isolated-surface/Carg
 | `clipboard_kill_gate_page_world_nonparticipation` | Page world did not produce the challenge-bound result |
 | `clipboard_kill_gate_oversized_reply` / `unknown_wire_field` | Bounded deny-unknown-fields wire decode failed |
 | `clipboard_kill_gate_uncertain_cannot_pass` | Uncertain/incomplete native contract claimed Pass |
+| `clipboard_kill_gate_live_witness_missing` | NativeWebKit-shaped Pass without a process-private live witness (including public JSON) |
 | `clipboard_kill_gate_cannot_qualify_physical_pass` | Forged VF/physical markers on the clipboard kill-gate substrate |
 
 Maps to Astra Sep 18 one-Mac checklist steps 1–11: runner exercises steps 2–10 on
@@ -470,7 +472,7 @@ cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Car
 - Simulator captured-frame bytes are explicit synthetic payloads, content-addressed and labeled synthetic — not a real browser capture.
 - Optional `browser-engine` feature fails closed until a bounded engine capture is actually wired; this slice fabricates no engine receipt or PASS.
 - Native host-sentinel live collection is **not** VF PASS, isolation PASS, or admission enablement.
-- Clipboard kill-gate Pass is **not** VF PASS, isolation PASS, Computer Mode, or admission. Linux CI is deterministic `unsupported`. Pass requires page-world initiation of all four operations, an unforgeable host-issued generation/epoch challenge, and host receive through a registered private-world `WKScriptMessageHandler`. Title polling, DOM self-attestation, private-world self-simulation, and missing handler registration are INCONCLUSIVE and never Pass. Linux verifiers reject Pass.
+- Clipboard kill-gate Pass is **not** VF PASS, isolation PASS, Computer Mode, or admission. Linux CI is deterministic `unsupported`. Ordinary `cargo test` never initializes WebKit. Pass requires genuine page-world initiation and fulfillment of `navigator.clipboard.readText/writeText/read/write`, an unforgeable host-issued generation/epoch challenge, host receive through a registered private-world `WKScriptMessageHandler`, unchanged host clipboard digest, and a process-private live witness. Public JSON / typed NativeWebKit-shaped packs cannot reconstruct Pass. Title polling, DOM self-attestation, private-world self-simulation, host-injected clipboard stubs, hardcoded receipts, and missing handler registration are INCONCLUSIVE and never Pass. Linux verifiers reject Pass.
 - No TCC entitlement or notarization claims.
 - No Windows/Linux isolated surface.
 - No agent-owned cursor / surface-event stream (#286 UI layer still disposition-only).
