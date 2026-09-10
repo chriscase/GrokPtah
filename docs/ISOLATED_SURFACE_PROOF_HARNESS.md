@@ -232,7 +232,8 @@ cargo run --locked --manifest-path crates/codegen/grokptah-isolated-surface/Carg
 
 # Native host-sentinel runner (Linux: honest UnsupportedPlatform pack; macOS uses live collector)
 cargo run --locked --manifest-path crates/codegen/grokptah-isolated-surface/Cargo.toml \
-  --bin grokptah-sep18-checklist -- run --native-host-sentinels -o native-sentinel-pack.json
+  --bin grokptah-sep18-checklist -- run --native-host-sentinels --vf-dry-run \
+  --checkout /absolute/path/to/disposable/checkout -o native-sentinel-pack.json
 ```
 
 ### Sealed pack fields (honest defaults)
@@ -359,7 +360,9 @@ cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Car
 
 - `IsolatedSurfaceBackend::stop_fence_first` has no trait default — production adapters must wire real fence ack/failure.
 - `MacHostSentinelCollector` requires macOS Accessibility trust for foreground/unrelated window evidence; missing TCC → honest `BackendUnavailable`, not synthetic PASS.
-- Default harness rehearsal still uses [`SyntheticHostProbe`]. The native runner attaches the collector exclusively; combining `--native-host-sentinels` with `--vf-dry-run` is deferred (packet 11).
+- Default harness rehearsal still uses [`SyntheticHostProbe`]. Native mode requires
+  `--native-host-sentinels`, `--vf-dry-run`, and an explicit disposable `--checkout PATH`;
+  it attaches the collector before VF boot/lifecycle/Stop and never falls back to synthetic probes.
 
 - Checklist runner seals dry-run / native-sentinel packs only — no live Mac VF IPC or packaged helper.
 - Independent verifier is pack-only; physical Mac worker still required for VF PASS rung.
