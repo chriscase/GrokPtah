@@ -4,8 +4,9 @@
 //! baseline and every lifecycle/Stop probe come from the native collector.
 //! Native mode also requires VF dry-run: the collector is attached **before**
 //! VF boot/lifecycle/Stop. Never falls back to [`SyntheticHostProbe`] on TCC,
-//! timeout, or failure. Live collection is **not** VF/isolation/physical PASS
-//! and never enables admission or Computer Mode.
+//! timeout, or failure. This labeled runner is **not** a complete exclusive
+//! physical proof: live collection is **not** VF/isolation/physical PASS and
+//! never enables admission or Computer Mode.
 //!
 //! Linux CI / non-macOS: honest `UnsupportedPlatform` artifact. Guest remains
 //! the synthetic backend; only host-sentinel provenance is native on macOS.

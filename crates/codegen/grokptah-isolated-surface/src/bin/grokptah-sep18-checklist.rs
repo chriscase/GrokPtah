@@ -16,8 +16,9 @@ fn usage() -> ! {
           grokptah-sep18-checklist verify PATH\n\
          \n\
          Default substrate: Contained Browser dry-run (Linux CI / one-Mac rehearsal).\n\
-         Native mode requires --native-host-sentinels, --vf-dry-run, and an explicitly supplied --checkout PATH.\n\
-         Admission stays false; physical_pass_claimed=false unless a future physical gate flips it."
+         Native mode requires BOTH --native-host-sentinels AND --vf-dry-run plus an explicitly supplied --checkout PATH (never defaulted to .).\n\
+         Native VF dry-run attaches MacHostSentinelCollector before VF boot/lifecycle/Stop; VF evidence carries the actual Stop HostSentinelProbeSummary (zeros only when Stop did not run).\n\
+         This labeled runner is not a complete exclusive physical proof. Admission stays false; physical_pass_claimed=false; vf_pass_claimed=false."
     );
     process::exit(2);
 }
