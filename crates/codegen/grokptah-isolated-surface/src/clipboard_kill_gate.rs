@@ -17,7 +17,7 @@ use crate::lifecycle::ProofEvidenceClass;
 use crate::wk_clipboard_probe::{admit_probe_reply, ProbePull, ProbeReply, WKClipboardProbe};
 use crate::wk_clipboard_probe::{
     ClipboardOperation, ClipboardProbeFailClosedReason, PageLocalClipboardReceipt,
-    ScriptEvaluationPath,
+    ReceiptInitiator, ReplyChannel, ScriptEvaluationPath,
 };
 use crate::CLIPBOARD_KILL_GATE_NONCLAIM;
 
@@ -68,6 +68,9 @@ pub struct ClipboardKillGateEvidence {
     pub fail_closed_reason: Option<ClipboardProbeFailClosedReason>,
     pub provenance: ClipboardKillGateProvenance,
     pub script_evaluation_path: ScriptEvaluationPath,
+    pub reply_channel: ReplyChannel,
+    pub page_world_participated: bool,
+    pub private_world_initiated_operations: bool,
     pub page_world_evaluate_javascript_used: bool,
     pub call_async_javascript_used: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -101,6 +104,9 @@ impl ClipboardKillGateEvidence {
             fail_closed_reason: None,
             provenance: ClipboardKillGateProvenance::NativeWebKit,
             script_evaluation_path: ScriptEvaluationPath::PrivateContentWorldPull,
+            reply_channel: ReplyChannel::PrivateWorldScriptMessageHandler,
+            page_world_participated: false,
+            private_world_initiated_operations: false,
             page_world_evaluate_javascript_used: false,
             call_async_javascript_used: false,
             host_clipboard_before: None,
@@ -171,6 +177,13 @@ pub fn clipboard_kill_gate_may_claim_pass(evidence: &ClipboardKillGateEvidence) 
         && evidence.verdict == ClipboardKillGateVerdict::Pass
         && evidence.provenance == ClipboardKillGateProvenance::NativeWebKit
         && evidence.script_evaluation_path == ScriptEvaluationPath::PrivateContentWorldPull
+        && evidence.reply_channel == ReplyChannel::PrivateWorldScriptMessageHandler
+        && evidence.page_world_participated
+        && !evidence.private_world_initiated_operations
+        && evidence
+            .receipts
+            .iter()
+            .all(|receipt| receipt.initiator == ReceiptInitiator::PageWorld)
         && !evidence.page_world_evaluate_javascript_used
         && !evidence.call_async_javascript_used
         && evidence.host_clipboard_unchanged
@@ -237,6 +250,23 @@ pub fn verify_clipboard_kill_gate_evidence(
         }
     }
 
+    if evidence.verdict == ClipboardKillGateVerdict::Pass {
+        if evidence.reply_channel != ReplyChannel::PrivateWorldScriptMessageHandler {
+            return Err(ClipboardProbeFailClosedReason::UntrustedReplyChannel);
+        }
+        if evidence.private_world_initiated_operations
+            || evidence
+                .receipts
+                .iter()
+                .any(|receipt| receipt.initiator != ReceiptInitiator::PageWorld)
+        {
+            return Err(ClipboardProbeFailClosedReason::PrivateWorldGeneratedReceipts);
+        }
+        if !evidence.page_world_participated {
+            return Err(ClipboardProbeFailClosedReason::PageWorldNonparticipation);
+        }
+    }
+
     if let Some(reason) = evidence.fail_closed_reason {
         if evidence.verdict == ClipboardKillGateVerdict::Pass {
             return Err(reason);
@@ -278,6 +308,9 @@ pub fn verify_clipboard_kill_gate_evidence(
                 epoch: evidence.epoch,
                 world: crate::wk_clipboard_probe::ContentWorld::PrivateProbe,
                 path: evidence.script_evaluation_path,
+                reply_channel: evidence.reply_channel,
+                page_world_participated: evidence.page_world_participated,
+                private_world_initiated_operations: evidence.private_world_initiated_operations,
                 receipts: evidence.receipts.clone(),
             };
             admit_probe_reply(&pull, &reply, &[]).map(|_| ())?;
@@ -308,7 +341,7 @@ fn run_macos_kill_gate() -> HarnessResult<ClipboardKillGateEvidence> {
 
 #[cfg(target_os = "macos")]
 fn run_macos_kill_gate() -> HarnessResult<ClipboardKillGateEvidence> {
-    let generation = 1;
+    let generation = crate::wk_clipboard_probe::host_issued_generation();
     let epoch = 1;
     let before = match ClipboardWitness::seal_digest() {
         Ok(digest) => digest,
@@ -368,6 +401,9 @@ fn seal_macos_result(
         evidence.epoch = epoch;
         evidence.receipts = reply.receipts;
         evidence.script_evaluation_path = reply.path;
+        evidence.reply_channel = reply.reply_channel;
+        evidence.page_world_participated = reply.page_world_participated;
+        evidence.private_world_initiated_operations = reply.private_world_initiated_operations;
         evidence.page_world_evaluate_javascript_used =
             reply.path == ScriptEvaluationPath::PageWorldEvaluateJavaScript;
         evidence.call_async_javascript_used =
@@ -389,6 +425,9 @@ fn seal_macos_result(
             evidence.epoch = admitted.epoch;
             evidence.receipts = admitted.receipts;
             evidence.script_evaluation_path = ScriptEvaluationPath::PrivateContentWorldPull;
+            evidence.reply_channel = ReplyChannel::PrivateWorldScriptMessageHandler;
+            evidence.page_world_participated = true;
+            evidence.private_world_initiated_operations = false;
             if !clipboard_kill_gate_may_claim_pass(&evidence) {
                 evidence.outcome = ClipboardKillGateOutcome::FailClosed;
                 evidence.verdict = ClipboardKillGateVerdict::Inconclusive;
@@ -405,6 +444,9 @@ fn seal_macos_result(
             evidence.epoch = epoch;
             evidence.receipts = reply.receipts;
             evidence.script_evaluation_path = reply.path;
+            evidence.reply_channel = reply.reply_channel;
+            evidence.page_world_participated = reply.page_world_participated;
+            evidence.private_world_initiated_operations = reply.private_world_initiated_operations;
             evidence.page_world_evaluate_javascript_used =
                 reply.path == ScriptEvaluationPath::PageWorldEvaluateJavaScript;
             evidence.call_async_javascript_used =
