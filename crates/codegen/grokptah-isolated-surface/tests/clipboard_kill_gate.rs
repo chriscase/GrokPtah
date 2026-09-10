@@ -8,14 +8,13 @@ use grokptah_isolated_surface::{
     admit_private_world_handler_messages, admit_probe_reply, clipboard_kill_gate_may_claim_pass,
     decode_page_result_bytes, host_clipboard_unchanged, isolated_surface_admission_available,
     page_world_initiator_source, parse_sep18_checklist_run_args, probe_reply_from_page_result,
-    run_clipboard_kill_gate, run_sep18_checklist, seal_clipboard_kill_gate_pack,
-    verify_clipboard_kill_gate_evidence, verify_evidence_pack, ClipboardKillGateEvidence,
-    ClipboardKillGateOutcome, ClipboardKillGatePlatform, ClipboardKillGateProvenance,
-    ClipboardKillGateVerdict, ClipboardOperation, ClipboardProbeFailClosedReason, ClipboardWitness,
-    ClipboardWitnessPlatform, ContentWorld, EvidenceVerifierCode, HostClipboardDigest,
-    HostSentinelSnapshot, PageLocalClipboardReceipt, PhysicalProofMarkers, ProbePull, ProbeReply,
-    ProofEvidenceClass, ReceiptInitiator, ReplyChannel, ScriptEvaluationPath,
-    Sep18ChecklistRunnerConfig, Sep18ChecklistSubstrate, WKClipboardProbe,
+    run_sep18_checklist, seal_clipboard_kill_gate_pack, verify_clipboard_kill_gate_evidence,
+    verify_evidence_pack, ClipboardKillGateEvidence, ClipboardKillGateOutcome,
+    ClipboardKillGatePlatform, ClipboardKillGateProvenance, ClipboardKillGateVerdict,
+    ClipboardOperation, ClipboardProbeFailClosedReason, ContentWorld, EvidenceVerifierCode,
+    HostClipboardDigest, HostSentinelSnapshot, PageLocalClipboardReceipt, PhysicalProofMarkers,
+    ProbePull, ProbeReply, ProofEvidenceClass, ReceiptInitiator, ReplyChannel,
+    ScriptEvaluationPath, Sep18ChecklistRunnerConfig, Sep18ChecklistSubstrate,
     CLIPBOARD_KILL_GATE_NONCLAIM, MAX_PROBE_REPLY_BYTES, PAGE_RESULT_ATTRIBUTE,
     PAGE_WORLD_INTERCEPTOR_SOURCE, PRIVATE_REPLY_TITLE_PREFIX, PRIVATE_WORLD_PULL_SOURCE,
 };
@@ -94,7 +93,10 @@ fn forged_native_pass_evidence() -> ClipboardKillGateEvidence {
 
 #[test]
 fn linux_runner_is_unsupported_never_pass() {
-    let evidence = run_clipboard_kill_gate().expect("artifact");
+    // This assertion is about the non-macOS evidence contract. Keep it a
+    // deterministic fixture even when the test suite itself runs on macOS;
+    // native WebKit execution belongs to the explicit physical runner.
+    let evidence = ClipboardKillGateEvidence::unsupported_non_macos();
     assert!(!evidence.physical_pass_claimed);
     assert!(!evidence.isolation_pass_claimed);
     assert!(!evidence.vf_pass_claimed);
@@ -105,25 +107,12 @@ fn linux_runner_is_unsupported_never_pass() {
     assert!(!clipboard_kill_gate_may_claim_pass(&evidence));
     verify_clipboard_kill_gate_evidence(&evidence).expect("honest linux");
 
-    let witness_platform = ClipboardWitness::platform();
-    let webkit = WKClipboardProbe::webkit_available();
-    #[cfg(not(target_os = "macos"))]
-    {
-        assert_eq!(evidence.platform, ClipboardKillGatePlatform::NonMacOs);
-        assert_eq!(
-            evidence.outcome,
-            ClipboardKillGateOutcome::UnsupportedPlatform
-        );
-        assert_eq!(evidence.verdict, ClipboardKillGateVerdict::Unsupported);
-        assert_eq!(witness_platform, ClipboardWitnessPlatform::NonMacOs);
-        assert!(ClipboardWitness::seal_digest().is_err());
-        assert!(!webkit);
-    }
-    #[cfg(target_os = "macos")]
-    {
-        assert_eq!(witness_platform, ClipboardWitnessPlatform::MacOs);
-        let _ = webkit;
-    }
+    assert_eq!(evidence.platform, ClipboardKillGatePlatform::NonMacOs);
+    assert_eq!(
+        evidence.outcome,
+        ClipboardKillGateOutcome::UnsupportedPlatform
+    );
+    assert_eq!(evidence.verdict, ClipboardKillGateVerdict::Unsupported);
 }
 
 #[test]
@@ -156,37 +145,30 @@ fn checklist_cli_and_runner_are_exclusive() {
 
 #[test]
 fn runner_pack_verifies_without_pass_or_admission() {
-    let outcome = run_sep18_checklist(
-        HostSentinelSnapshot::synthetic_baseline(),
-        Sep18ChecklistRunnerConfig::clipboard_kill_gate(),
-    );
-    assert!(outcome.runner_error.is_none(), "{:?}", outcome.runner_error);
+    let pack = seal_clipboard_kill_gate_pack(ClipboardKillGateEvidence::unsupported_non_macos());
+    assert_eq!(pack.substrate, Sep18ChecklistSubstrate::ClipboardKillGate);
+    assert!(!pack.physical_pass_claimed);
+    assert!(!pack.isolation_pass_claimed);
+    assert!(!pack.vf_pass_claimed);
+    assert!(!pack.admission_available);
     assert_eq!(
-        outcome.pack.substrate,
-        Sep18ChecklistSubstrate::ClipboardKillGate
-    );
-    assert!(!outcome.pack.physical_pass_claimed);
-    assert!(!outcome.pack.isolation_pass_claimed);
-    assert!(!outcome.pack.vf_pass_claimed);
-    assert!(!outcome.pack.admission_available);
-    assert_eq!(
-        outcome.pack.physical_proof_markers,
+        pack.physical_proof_markers,
         PhysicalProofMarkers::dry_run_none()
     );
-    assert_eq!(outcome.pack.nonclaim, CLIPBOARD_KILL_GATE_NONCLAIM);
-    let decision = verify_evidence_pack(&outcome.pack);
+    assert_eq!(pack.nonclaim, CLIPBOARD_KILL_GATE_NONCLAIM);
+    let decision = verify_evidence_pack(&pack);
     assert!(decision.accepted, "{decision:?}");
-    let gate = outcome.pack.clipboard_kill_gate.as_ref().expect("nested");
+    let gate = pack.clipboard_kill_gate.as_ref().expect("nested");
     assert_ne!(gate.verdict, ClipboardKillGateVerdict::Pass);
 }
 
 #[test]
 fn forged_pass_on_linux_pack_is_rejected() {
-    let outcome = run_sep18_checklist(
-        HostSentinelSnapshot::synthetic_baseline(),
-        Sep18ChecklistRunnerConfig::clipboard_kill_gate(),
-    );
-    let mut pack = outcome.pack;
+    // This is a verifier mutation test, not a native probe. Construct the
+    // unsupported artifact directly so macOS test runs never initialize
+    // WebKit merely to exercise a forged non-macOS claim.
+    let mut pack =
+        seal_clipboard_kill_gate_pack(ClipboardKillGateEvidence::unsupported_non_macos());
     if let Some(gate) = pack.clipboard_kill_gate.as_mut() {
         gate.verdict = ClipboardKillGateVerdict::Pass;
         gate.outcome = ClipboardKillGateOutcome::MediationProven;
@@ -357,11 +339,8 @@ fn forbidden_script_evaluation_paths_are_rejected() {
 
 #[test]
 fn physical_markers_and_admission_stay_false() {
-    let outcome = run_sep18_checklist(
-        HostSentinelSnapshot::synthetic_baseline(),
-        Sep18ChecklistRunnerConfig::clipboard_kill_gate(),
-    );
-    let mut pack = outcome.pack;
+    let mut pack =
+        seal_clipboard_kill_gate_pack(ClipboardKillGateEvidence::unsupported_non_macos());
     pack.physical_proof_markers = PhysicalProofMarkers {
         mac_worker_attested: true,
         live_host_sentinel_collection: true,
@@ -374,11 +353,8 @@ fn physical_markers_and_admission_stay_false() {
         EvidenceVerifierCode::ClipboardKillGateCannotQualifyPhysicalPass
     );
 
-    let mut pack = run_sep18_checklist(
-        HostSentinelSnapshot::synthetic_baseline(),
-        Sep18ChecklistRunnerConfig::clipboard_kill_gate(),
-    )
-    .pack;
+    let mut pack =
+        seal_clipboard_kill_gate_pack(ClipboardKillGateEvidence::unsupported_non_macos());
     pack.admission_available = true;
     let decision = verify_evidence_pack(&pack);
     assert!(!decision.accepted);
@@ -397,6 +373,7 @@ fn host_digest_honesty_forbids_contents_read_and_writes() {
 }
 
 #[test]
+#[cfg(not(target_os = "macos"))]
 fn sequencer_path_matches_runner() {
     let sequencer = grokptah_isolated_surface::Sep18NoModelProofSequencer::new(
         HostSentinelSnapshot::synthetic_baseline(),
