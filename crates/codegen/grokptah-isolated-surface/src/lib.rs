@@ -40,7 +40,8 @@ pub use captured_frame::{
 };
 pub use channels::ChannelRegistry;
 pub use checklist_runner::{
-    run_sep18_checklist, Sep18ChecklistRunOutcome, Sep18ChecklistRunnerConfig,
+    parse_sep18_checklist_run_args, run_sep18_checklist, Sep18ChecklistRunOutcome,
+    Sep18ChecklistRunRequest, Sep18ChecklistRunnerConfig,
 };
 pub use contained_browser::ContainedBrowserBackend;
 pub use contained_browser_dry_run::{
@@ -80,7 +81,9 @@ pub use simulator::{
 pub use store::{snapshot_root, HarnessSnapshot, SNAPSHOT_FILE, SNAPSHOT_SCHEMA_VERSION};
 #[cfg(all(target_os = "macos", feature = "vf-backend"))]
 pub use vf_backend::VirtualizationFrameworkBackend;
-pub use vf_dry_run::{VfDryRunEvidence, VfDryRunOutcome, VfDryRunPlatform};
+pub use vf_dry_run::{
+    run_vf_dry_run_with_native_host_sentinels, VfDryRunEvidence, VfDryRunOutcome, VfDryRunPlatform,
+};
 
 /// Fail-closed admission gate for bridge integration. Remains false until a
 /// native adapter passes the physical Mac proof checklist.

@@ -3,7 +3,7 @@
 //! Default substrate is Contained Browser dry-run. Optional VF dry-run when
 //! features allow. Never enables admission or claims physical PASS.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -15,6 +15,7 @@ use crate::evidence_pack::{
     seal_synthetic_harness_pack, seal_vf_dry_run_pack, serialize_evidence_pack,
     Sep18ChecklistSubstrate, Sep18EvidencePack,
 };
+use crate::native_sentinel_runner::NativeSentinelEvidence;
 use crate::proof_sequencer::{FaultMatrixCase, Sep18NoModelProofSequencer};
 use crate::sentinel::HostSentinelSnapshot;
 use crate::vf_dry_run::VfDryRunEvidence;
@@ -69,8 +70,160 @@ impl Sep18ChecklistRunnerConfig {
         Self {
             substrate: Sep18ChecklistSubstrate::NativeHostSentinel,
             checkout_path: Some(checkout_path.into()),
+            vf_physical_mac_proof_id: Some("sep18-native-vf-dry-run".into()),
             ..Self::default()
         }
+    }
+}
+
+/// Parsed `run` CLI request. Validation completes before any checklist side effect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sep18ChecklistRunRequest {
+    pub output: PathBuf,
+    pub config: Sep18ChecklistRunnerConfig,
+}
+
+/// Parse `run` flags. Native mode requires `--native-host-sentinels`,
+/// `--vf-dry-run`, and an explicitly supplied `--checkout PATH`.
+pub fn parse_sep18_checklist_run_args(args: &[String]) -> HarnessResult<Sep18ChecklistRunRequest> {
+    let mut output: Option<PathBuf> = None;
+    let mut vf_dry_run = false;
+    let mut native_host_sentinels = false;
+    let mut synthetic = false;
+    let mut checkout: Option<PathBuf> = None;
+    let mut fault_matrix: Option<FaultMatrixCase> = None;
+
+    let mut idx = 0;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "--output" | "-o" => {
+                if output.is_some() {
+                    return Err(HarnessError::invalid_state("duplicate flag: --output"));
+                }
+                idx += 1;
+                let value = args.get(idx).ok_or_else(|| {
+                    HarnessError::invalid_state("--output requires a path argument")
+                })?;
+                output = Some(PathBuf::from(value));
+            }
+            "--vf-dry-run" => {
+                if vf_dry_run {
+                    return Err(HarnessError::invalid_state("duplicate flag: --vf-dry-run"));
+                }
+                vf_dry_run = true;
+            }
+            "--native-host-sentinels" => {
+                if native_host_sentinels {
+                    return Err(HarnessError::invalid_state(
+                        "duplicate flag: --native-host-sentinels",
+                    ));
+                }
+                native_host_sentinels = true;
+            }
+            "--checkout" => {
+                if checkout.is_some() {
+                    return Err(HarnessError::invalid_state("duplicate flag: --checkout"));
+                }
+                idx += 1;
+                let value = args.get(idx).ok_or_else(|| {
+                    HarnessError::invalid_state("--checkout requires a PATH argument")
+                })?;
+                if value.is_empty() {
+                    return Err(HarnessError::invalid_state(
+                        "native host-sentinel runner requires an explicitly supplied --checkout PATH",
+                    ));
+                }
+                checkout = Some(PathBuf::from(value));
+            }
+            "--synthetic" => {
+                if synthetic {
+                    return Err(HarnessError::invalid_state("duplicate flag: --synthetic"));
+                }
+                synthetic = true;
+            }
+            "--fault-matrix" => {
+                if fault_matrix.is_some() {
+                    return Err(HarnessError::invalid_state(
+                        "duplicate flag: --fault-matrix",
+                    ));
+                }
+                idx += 1;
+                let value = args.get(idx).ok_or_else(|| {
+                    HarnessError::invalid_state("--fault-matrix requires a case argument")
+                })?;
+                fault_matrix = Some(parse_fault_matrix_case(value)?);
+            }
+            other => {
+                return Err(HarnessError::invalid_state(format!(
+                    "unknown run flag: {other}"
+                )));
+            }
+        }
+        idx += 1;
+    }
+
+    if native_host_sentinels {
+        if !vf_dry_run {
+            return Err(HarnessError::invalid_state(
+                "native mode requires --native-host-sentinels, --vf-dry-run, and an explicitly supplied --checkout PATH",
+            ));
+        }
+        if checkout.is_none() {
+            return Err(HarnessError::invalid_state(
+                "native mode requires an explicitly supplied --checkout PATH (never defaulted to .)",
+            ));
+        }
+        if synthetic || fault_matrix.is_some() {
+            return Err(HarnessError::invalid_state(
+                "--native-host-sentinels cannot be combined with --synthetic or --fault-matrix",
+            ));
+        }
+    } else if checkout.is_some() {
+        return Err(HarnessError::invalid_state(
+            "--checkout is only valid with --native-host-sentinels",
+        ));
+    }
+
+    if vf_dry_run && synthetic {
+        return Err(HarnessError::invalid_state(
+            "--vf-dry-run and --synthetic are mutually exclusive",
+        ));
+    }
+
+    let mut config = if native_host_sentinels {
+        let checkout_path = checkout.ok_or_else(|| {
+            HarnessError::invalid_state(
+                "native mode requires an explicitly supplied --checkout PATH (never defaulted to .)",
+            )
+        })?;
+        Sep18ChecklistRunnerConfig::native_host_sentinel(checkout_path)
+    } else if vf_dry_run {
+        Sep18ChecklistRunnerConfig::vf_dry_run("sep18-cli-vf-dry-run")
+    } else if synthetic {
+        Sep18ChecklistRunnerConfig {
+            substrate: Sep18ChecklistSubstrate::SyntheticHarness,
+            ..Sep18ChecklistRunnerConfig::default()
+        }
+    } else {
+        Sep18ChecklistRunnerConfig::contained_browser_default()
+    };
+    config.fault_matrix_case = fault_matrix;
+
+    Ok(Sep18ChecklistRunRequest {
+        output: output.unwrap_or_else(|| PathBuf::from("sep18-evidence-pack.json")),
+        config,
+    })
+}
+
+fn parse_fault_matrix_case(value: &str) -> HarnessResult<FaultMatrixCase> {
+    match value {
+        "boot_stop" | "BootStop" => Ok(FaultMatrixCase::BootStop),
+        "pre_dispatch_stop" | "PreDispatchStop" => Ok(FaultMatrixCase::PreDispatchStop),
+        "lost_ack_uncertain" | "LostAckUncertain" => Ok(FaultMatrixCase::LostAckUncertain),
+        "restart_no_replay" | "RestartNoReplay" => Ok(FaultMatrixCase::RestartNoReplay),
+        other => Err(HarnessError::invalid_state(format!(
+            "unknown fault matrix case: {other}"
+        ))),
     }
 }
 
@@ -219,9 +372,18 @@ fn run_native_host_sentinel(
         };
     }
 
-    let checkout = config
-        .checkout_path
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let checkout = match config.checkout_path {
+        Some(path) if !path.as_os_str().is_empty() => path,
+        _ => {
+            let err = HarnessError::invalid_state(
+                "native host-sentinel runner requires an explicitly supplied checkout PATH",
+            );
+            return Sep18ChecklistRunOutcome {
+                pack: native_fail_closed_pack(&err),
+                runner_error: Some(err),
+            };
+        }
+    };
 
     match sequencer.run_native_host_sentinel(checkout) {
         Ok(evidence) => Sep18ChecklistRunOutcome {
@@ -229,27 +391,32 @@ fn run_native_host_sentinel(
             runner_error: None,
         },
         Err(err) => Sep18ChecklistRunOutcome {
-            pack: empty_rejected_pack(Sep18ChecklistSubstrate::NativeHostSentinel),
+            pack: native_fail_closed_pack(&err),
             runner_error: Some(err),
         },
     }
 }
 
+fn native_fail_closed_pack(err: &HarnessError) -> Sep18EvidencePack {
+    seal_native_host_sentinel_pack(NativeSentinelEvidence::fail_closed_for_current_platform(
+        err,
+    ))
+}
+
 fn empty_rejected_pack(substrate: Sep18ChecklistSubstrate) -> Sep18EvidencePack {
     match substrate {
-        Sep18ChecklistSubstrate::NativeHostSentinel => {
-            seal_native_host_sentinel_pack(crate::NativeSentinelEvidence::unsupported_non_macos())
+        Sep18ChecklistSubstrate::NativeHostSentinel => native_fail_closed_pack(
+            &HarnessError::invalid_state("native host-sentinel runner failed closed"),
+        ),
+        other => {
+            let mut evidence = VfDryRunEvidence::unsupported(
+                crate::vf_dry_run::VfDryRunPlatform::NonMacOs,
+                crate::vf_dry_run::VfDryRunOutcome::UnsupportedPlatform,
+            );
+            evidence.evidence_class = crate::lifecycle::ProofEvidenceClass::Synthetic;
+            evidence.nonclaim = crate::SYNTHETIC_HARNESS_NONCLAIM.into();
+            seal_vf_dry_run_pack(evidence).into_placeholder(other)
         }
-        other => seal_vf_dry_run_pack(VfDryRunEvidence {
-            platform: crate::vf_dry_run::VfDryRunPlatform::NonMacOs,
-            outcome: crate::vf_dry_run::VfDryRunOutcome::UnsupportedPlatform,
-            evidence_class: crate::lifecycle::ProofEvidenceClass::Synthetic,
-            boot_attempted: false,
-            physical_pass_claimed: false,
-            nonclaim: crate::SYNTHETIC_HARNESS_NONCLAIM.into(),
-            recorded_at: chrono::Utc::now(),
-        })
-        .into_placeholder(other),
     }
 }
 

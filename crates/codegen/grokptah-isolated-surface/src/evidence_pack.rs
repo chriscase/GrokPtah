@@ -15,6 +15,7 @@ use crate::native_sentinel_runner::{
     NativeSentinelEvidence, NativeSentinelRunnerOutcome, NativeSentinelRunnerPlatform,
 };
 use crate::proof_sequencer::{ChecklistStep, FaultMatrixCase, SealedProofEvidence};
+use crate::sentinel::HostSentinelProbeKind;
 use crate::vf_dry_run::{VfDryRunEvidence, VfDryRunOutcome, VfDryRunPlatform};
 use crate::{
     isolated_surface_admission_available, CONTAINED_BROWSER_DRY_RUN_NONCLAIM,
@@ -74,9 +75,23 @@ pub struct HostSentinelProbeSummary {
     pub host_sentinels_unchanged_at_stop: bool,
     pub channels_destroyed: usize,
     pub channels_open_after_stop: usize,
+    /// Kind of the last Stop probe. Missing deserializes fail-closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_probe_kind: Option<HostSentinelProbeKind>,
 }
 
 impl HostSentinelProbeSummary {
+    pub fn empty() -> Self {
+        Self {
+            probes_performed: 0,
+            live_host_sentinel_collection_at_stop: false,
+            host_sentinels_unchanged_at_stop: false,
+            channels_destroyed: 0,
+            channels_open_after_stop: 0,
+            last_probe_kind: None,
+        }
+    }
+
     pub fn from_stop_evidence(stop: &crate::harness::StopEvidence, channels_open: usize) -> Self {
         Self {
             probes_performed: stop.host_sentinel_probes_performed,
@@ -84,6 +99,18 @@ impl HostSentinelProbeSummary {
             host_sentinels_unchanged_at_stop: stop.host_sentinels_unchanged,
             channels_destroyed: stop.channels_destroyed,
             channels_open_after_stop: channels_open,
+            last_probe_kind: stop.last_host_sentinel_probe_kind,
+        }
+    }
+
+    pub fn from_vf_dry_run(evidence: &VfDryRunEvidence) -> Self {
+        Self {
+            probes_performed: evidence.host_sentinel_probes_performed,
+            live_host_sentinel_collection_at_stop: evidence.live_host_sentinel_collection_at_stop,
+            host_sentinels_unchanged_at_stop: evidence.host_sentinels_unchanged_at_stop,
+            channels_destroyed: evidence.channels_destroyed,
+            channels_open_after_stop: evidence.channels_open_after_stop,
+            last_probe_kind: evidence.last_host_sentinel_probe_kind,
         }
     }
 }
@@ -197,6 +224,10 @@ pub fn verify_evidence_pack(pack: &Sep18EvidencePack) -> EvidenceVerifierDecisio
     }
 
     if let Some(decision) = verify_native_host_sentinel(pack) {
+        return decision;
+    }
+
+    if let Some(decision) = verify_vf_dry_run_stop_summary(pack) {
         return decision;
     }
 
@@ -377,6 +408,13 @@ fn verify_sealed_evidence(
         return Some(EvidenceVerifierDecision::reject(
             EvidenceVerifierCode::HostSentinelProbeSummaryMismatch,
             "channels_destroyed mismatch between pack summary and sealed stop_evidence",
+        ));
+    }
+
+    if pack.host_sentinel_probes.last_probe_kind != stop.last_host_sentinel_probe_kind {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::HostSentinelProbeSummaryMismatch,
+            "last probe kind mismatch between pack summary and sealed stop_evidence",
         ));
     }
 
@@ -824,10 +862,14 @@ fn pack_implies_sealed_stop_story(pack: &Sep18EvidencePack) -> bool {
 
 fn verify_sealed_evidence_presence(pack: &Sep18EvidencePack) -> Option<EvidenceVerifierDecision> {
     if pack.sealed_evidence.is_none() && pack_implies_sealed_stop_story(pack) {
-        return Some(EvidenceVerifierDecision::reject(
-            EvidenceVerifierCode::ChecklistIncomplete,
-            "stop or checklist progress requires sealed_evidence",
-        ));
+        if pack.substrate == Sep18ChecklistSubstrate::VfDryRun && pack.vf_dry_run.is_some() {
+            // VF dry-run carries Stop summary on nested evidence without a full checklist seal.
+        } else {
+            return Some(EvidenceVerifierDecision::reject(
+                EvidenceVerifierCode::ChecklistIncomplete,
+                "stop or checklist progress requires sealed_evidence",
+            ));
+        }
     }
 
     if matches!(
@@ -989,6 +1031,21 @@ fn verify_substrate_nested_evidence(pack: &Sep18EvidencePack) -> Option<Evidence
     None
 }
 
+fn verify_vf_dry_run_stop_summary(pack: &Sep18EvidencePack) -> Option<EvidenceVerifierDecision> {
+    if pack.substrate != Sep18ChecklistSubstrate::VfDryRun {
+        return None;
+    }
+    let vf = pack.vf_dry_run.as_ref()?;
+    let expected = HostSentinelProbeSummary::from_vf_dry_run(vf);
+    if pack.host_sentinel_probes != expected {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::HostSentinelProbeSummaryMismatch,
+            "VF dry-run pack.host_sentinel_probes must match nested VfDryRunEvidence Stop summary",
+        ));
+    }
+    None
+}
+
 fn verify_native_host_sentinel(pack: &Sep18EvidencePack) -> Option<EvidenceVerifierDecision> {
     if pack.substrate != Sep18ChecklistSubstrate::NativeHostSentinel {
         return None;
@@ -1062,6 +1119,143 @@ fn verify_native_host_sentinel(pack: &Sep18EvidencePack) -> Option<EvidenceVerif
             return Some(EvidenceVerifierDecision::reject(
                 EvidenceVerifierCode::PackSealedEvidenceMismatch,
                 "native_host_sentinel.sealed_evidence does not match pack.sealed_evidence",
+            ));
+        }
+    }
+
+    if let (Some(pack_vf), Some(native_vf)) = (&pack.vf_dry_run, &native.vf_dry_run) {
+        if pack_vf != native_vf {
+            return Some(EvidenceVerifierDecision::reject(
+                EvidenceVerifierCode::PackSealedEvidenceMismatch,
+                "native_host_sentinel.vf_dry_run does not match pack.vf_dry_run",
+            ));
+        }
+    }
+
+    if let Some(decision) = verify_native_live_kind_and_counts(pack, native) {
+        return Some(decision);
+    }
+
+    None
+}
+
+fn verify_native_live_kind_and_counts(
+    pack: &Sep18EvidencePack,
+    native: &NativeSentinelEvidence,
+) -> Option<EvidenceVerifierDecision> {
+    let stop = native
+        .sealed_evidence
+        .as_ref()
+        .or(pack.sealed_evidence.as_ref())
+        .map(|sealed| &sealed.stop_evidence);
+    let probes = &pack.host_sentinel_probes;
+
+    if native.live_host_sentinel_collection != probes.live_host_sentinel_collection_at_stop {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::HostSentinelProbeSummaryMismatch,
+            "native live_host_sentinel_collection does not match pack.host_sentinel_probes",
+        ));
+    }
+    if native.channels_destroyed != probes.channels_destroyed {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::HostSentinelProbeSummaryMismatch,
+            "native channels_destroyed does not match pack.host_sentinel_probes",
+        ));
+    }
+    if native.host_sentinel_probes_performed != probes.probes_performed {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::HostSentinelProbeSummaryMismatch,
+            "native host_sentinel_probes_performed does not match pack.host_sentinel_probes",
+        ));
+    }
+    if native.last_host_sentinel_probe_kind != probes.last_probe_kind {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::HostSentinelProbeSummaryMismatch,
+            "native last_host_sentinel_probe_kind does not match pack.host_sentinel_probes",
+        ));
+    }
+
+    if let Some(stop) = stop {
+        if native.live_host_sentinel_collection != stop.live_host_sentinel_collection
+            || probes.live_host_sentinel_collection_at_stop != stop.live_host_sentinel_collection
+        {
+            return Some(EvidenceVerifierDecision::reject(
+                EvidenceVerifierCode::HostSentinelProbeSummaryMismatch,
+                "live_host_sentinel_collection mismatch versus sealed.stop_evidence",
+            ));
+        }
+        if native.channels_destroyed != stop.channels_destroyed
+            || probes.channels_destroyed != stop.channels_destroyed
+        {
+            return Some(EvidenceVerifierDecision::reject(
+                EvidenceVerifierCode::HostSentinelProbeSummaryMismatch,
+                "channels_destroyed mismatch versus sealed.stop_evidence",
+            ));
+        }
+        if native.host_sentinel_probes_performed != stop.host_sentinel_probes_performed
+            || probes.probes_performed != stop.host_sentinel_probes_performed
+        {
+            return Some(EvidenceVerifierDecision::reject(
+                EvidenceVerifierCode::HostSentinelProbeSummaryMismatch,
+                "host_sentinel_probes_performed mismatch versus sealed.stop_evidence",
+            ));
+        }
+        if native.last_host_sentinel_probe_kind != stop.last_host_sentinel_probe_kind
+            || probes.last_probe_kind != stop.last_host_sentinel_probe_kind
+        {
+            return Some(EvidenceVerifierDecision::reject(
+                EvidenceVerifierCode::HostSentinelProbeSummaryMismatch,
+                "last probe kind mismatch versus sealed.stop_evidence",
+            ));
+        }
+        if native.independent_collection_verified != native.live_host_sentinel_collection {
+            return Some(EvidenceVerifierDecision::reject(
+                EvidenceVerifierCode::HostSentinelProbeSummaryMismatch,
+                "independent_collection_verified must match live_host_sentinel_collection",
+            ));
+        }
+    } else if native.independent_collection_verified {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::HostSentinelProbeSummaryMismatch,
+            "independent_collection_verified requires sealed.stop_evidence",
+        ));
+    }
+
+    let live_claimed = native.live_host_sentinel_collection
+        || probes.live_host_sentinel_collection_at_stop
+        || stop
+            .map(|s| s.live_host_sentinel_collection)
+            .unwrap_or(false);
+    if live_claimed {
+        let kind = native
+            .last_host_sentinel_probe_kind
+            .or(probes.last_probe_kind)
+            .or(stop.and_then(|s| s.last_host_sentinel_probe_kind));
+        match kind {
+            Some(HostSentinelProbeKind::NativeMacHost) => {}
+            Some(HostSentinelProbeKind::SyntheticRehearsal) => {
+                return Some(EvidenceVerifierDecision::reject(
+                    EvidenceVerifierCode::NativeSentinelSyntheticFallback,
+                    "live native collection cannot be attested by a synthetic last probe kind",
+                ));
+            }
+            None => {
+                return Some(EvidenceVerifierDecision::reject(
+                    EvidenceVerifierCode::HostSentinelProbeSummaryMismatch,
+                    "live native collection requires last probe kind NativeMacHost",
+                ));
+            }
+        }
+        if native.last_host_sentinel_probe_kind != Some(HostSentinelProbeKind::NativeMacHost)
+            || probes.last_probe_kind != Some(HostSentinelProbeKind::NativeMacHost)
+            || stop
+                .map(|s| s.last_host_sentinel_probe_kind)
+                .unwrap_or(None)
+                != Some(HostSentinelProbeKind::NativeMacHost)
+        {
+            return Some(EvidenceVerifierDecision::reject(
+                EvidenceVerifierCode::HostSentinelProbeSummaryMismatch,
+                "live native collection must bind NativeMacHost across native, pack, and stop_evidence",
             ));
         }
     }
@@ -1227,13 +1421,7 @@ pub fn seal_contained_browser_dry_run_pack(
         .sealed_evidence
         .as_ref()
         .map(|sealed| HostSentinelProbeSummary::from_stop_evidence(&sealed.stop_evidence, 0))
-        .unwrap_or(HostSentinelProbeSummary {
-            probes_performed: 0,
-            live_host_sentinel_collection_at_stop: false,
-            host_sentinels_unchanged_at_stop: false,
-            channels_destroyed: 0,
-            channels_open_after_stop: 0,
-        });
+        .unwrap_or_else(HostSentinelProbeSummary::empty);
 
     Sep18EvidencePack {
         schema_version: EVIDENCE_PACK_SCHEMA_VERSION,
@@ -1260,6 +1448,7 @@ pub fn seal_contained_browser_dry_run_pack(
 }
 
 pub fn seal_vf_dry_run_pack(evidence: VfDryRunEvidence) -> Sep18EvidencePack {
+    let host_sentinel_probes = HostSentinelProbeSummary::from_vf_dry_run(&evidence);
     Sep18EvidencePack {
         schema_version: EVIDENCE_PACK_SCHEMA_VERSION,
         sealed_at: Utc::now(),
@@ -1270,13 +1459,7 @@ pub fn seal_vf_dry_run_pack(evidence: VfDryRunEvidence) -> Sep18EvidencePack {
         vf_pass_claimed: false,
         admission_available: isolated_surface_admission_available(),
         nonclaim: evidence.nonclaim.clone(),
-        host_sentinel_probes: HostSentinelProbeSummary {
-            probes_performed: 0,
-            live_host_sentinel_collection_at_stop: false,
-            host_sentinels_unchanged_at_stop: false,
-            channels_destroyed: 0,
-            channels_open_after_stop: 0,
-        },
+        host_sentinel_probes,
         physical_proof_markers: PhysicalProofMarkers::dry_run_none(),
         checklist_completed: false,
         fault_matrix_case: None,
@@ -1321,12 +1504,14 @@ pub fn seal_native_host_sentinel_pack(evidence: NativeSentinelEvidence) -> Sep18
         .as_ref()
         .map(|sealed| HostSentinelProbeSummary::from_stop_evidence(&sealed.stop_evidence, 0))
         .unwrap_or(HostSentinelProbeSummary {
-            probes_performed: 0,
+            probes_performed: evidence.host_sentinel_probes_performed,
             live_host_sentinel_collection_at_stop: evidence.live_host_sentinel_collection,
             host_sentinels_unchanged_at_stop: false,
             channels_destroyed: evidence.channels_destroyed,
             channels_open_after_stop: 0,
+            last_probe_kind: evidence.last_host_sentinel_probe_kind,
         });
+    let vf_dry_run = evidence.vf_dry_run.clone();
 
     Sep18EvidencePack {
         schema_version: EVIDENCE_PACK_SCHEMA_VERSION,
@@ -1345,7 +1530,7 @@ pub fn seal_native_host_sentinel_pack(evidence: NativeSentinelEvidence) -> Sep18
         sealed_evidence: evidence.sealed_evidence.clone(),
         native_host_sentinel: Some(evidence),
         contained_browser: None,
-        vf_dry_run: None,
+        vf_dry_run,
     }
 }
 

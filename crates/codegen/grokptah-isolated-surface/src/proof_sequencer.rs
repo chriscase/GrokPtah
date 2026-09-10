@@ -176,13 +176,19 @@ impl Sep18NoModelProofSequencer {
             steps.push(ChecklistStep::StopDestroyed);
         }
 
-        let inject_err = harness
-            .inject_guest_action(GuestLocalAction::ClickGuestButton)
-            .expect_err("stale inject token must be rejected");
-        if inject_err.code != HarnessErrorCode::InjectFenced {
-            return Err(HarnessError::invalid_state(
-                "stale token rejection must fence inject",
-            ));
+        match harness.inject_guest_action(GuestLocalAction::ClickGuestButton) {
+            Err(err) if err.code == HarnessErrorCode::InjectFenced => {}
+            Err(err) => {
+                return Err(HarnessError::invalid_state(format!(
+                    "stale token rejection must fence inject, got {:?}",
+                    err.code
+                )));
+            }
+            Ok(_) => {
+                return Err(HarnessError::inject_fenced(
+                    "stale inject token must be rejected after Stop",
+                ));
+            }
         }
         steps.push(ChecklistStep::StaleTokensRejected);
 
