@@ -9,6 +9,10 @@ use serde::{Deserialize, Serialize};
 use crate::captured_frame::{
     validate_public_evidence, CapturedFrameMediaKind, CapturedFrameSource,
 };
+use crate::clipboard_kill_gate::{
+    verify_clipboard_kill_gate_evidence, ClipboardKillGateEvidence, ClipboardKillGateOutcome,
+    ClipboardKillGatePlatform, ClipboardKillGateProvenance, ClipboardKillGateVerdict,
+};
 use crate::contained_browser_dry_run::ContainedBrowserDryRunEvidence;
 use crate::lifecycle::{GuestLifecycleDisposition, ProofEvidenceClass};
 use crate::native_sentinel_runner::{
@@ -17,9 +21,11 @@ use crate::native_sentinel_runner::{
 use crate::proof_sequencer::{ChecklistStep, FaultMatrixCase, SealedProofEvidence};
 use crate::sentinel::HostSentinelProbeKind;
 use crate::vf_dry_run::{VfDryRunEvidence, VfDryRunOutcome, VfDryRunPlatform};
+use crate::wk_clipboard_probe::ClipboardProbeFailClosedReason;
 use crate::{
-    isolated_surface_admission_available, CONTAINED_BROWSER_DRY_RUN_NONCLAIM,
-    NATIVE_HOST_SENTINEL_NONCLAIM, SYNTHETIC_HARNESS_NONCLAIM, VF_DRY_RUN_NONCLAIM,
+    isolated_surface_admission_available, CLIPBOARD_KILL_GATE_NONCLAIM,
+    CONTAINED_BROWSER_DRY_RUN_NONCLAIM, NATIVE_HOST_SENTINEL_NONCLAIM, SYNTHETIC_HARNESS_NONCLAIM,
+    VF_DRY_RUN_NONCLAIM,
 };
 
 pub const EVIDENCE_PACK_SCHEMA_VERSION: u32 = 1;
@@ -36,6 +42,8 @@ pub enum Sep18ChecklistSubstrate {
     SyntheticHarness,
     /// Explicit native Mac host-sentinel runner (collector exclusive).
     NativeHostSentinel,
+    /// Contained Browser clipboard isolation kill-gate (Sep 8–17).
+    ClipboardKillGate,
 }
 
 /// Mac physical proof markers required before any VF PASS claim is accepted.
@@ -137,6 +145,8 @@ pub struct Sep18EvidencePack {
     pub native_host_sentinel: Option<NativeSentinelEvidence>,
     pub contained_browser: Option<ContainedBrowserDryRunEvidence>,
     pub vf_dry_run: Option<VfDryRunEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clipboard_kill_gate: Option<ClipboardKillGateEvidence>,
 }
 
 /// Explicit verifier decision codes — independent of runner success.
@@ -164,6 +174,16 @@ pub enum EvidenceVerifierCode {
     NativeSentinelSyntheticFallback,
     NativeSentinelLiveClaimOnUnsupportedPlatform,
     NativeSentinelCannotQualifyPhysicalPass,
+    ClipboardKillGateSyntheticCannotPass,
+    ClipboardKillGatePassOnUnsupportedPlatform,
+    ClipboardKillGateHostDigestDrift,
+    ClipboardKillGateForbiddenScriptEvaluation,
+    ClipboardKillGateStaleGeneration,
+    ClipboardKillGateDuplicateReply,
+    ClipboardKillGateMalformedReply,
+    ClipboardKillGateMissingReply,
+    ClipboardKillGateUncertainCannotPass,
+    ClipboardKillGateCannotQualifyPhysicalPass,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -224,6 +244,10 @@ pub fn verify_evidence_pack(pack: &Sep18EvidencePack) -> EvidenceVerifierDecisio
     }
 
     if let Some(decision) = verify_native_host_sentinel(pack) {
+        return decision;
+    }
+
+    if let Some(decision) = verify_clipboard_kill_gate(pack) {
         return decision;
     }
 
@@ -862,8 +886,10 @@ fn pack_implies_sealed_stop_story(pack: &Sep18EvidencePack) -> bool {
 
 fn verify_sealed_evidence_presence(pack: &Sep18EvidencePack) -> Option<EvidenceVerifierDecision> {
     if pack.sealed_evidence.is_none() && pack_implies_sealed_stop_story(pack) {
-        if pack.substrate == Sep18ChecklistSubstrate::VfDryRun && pack.vf_dry_run.is_some() {
-            // VF dry-run carries Stop summary on nested evidence without a full checklist seal.
+        if (pack.substrate == Sep18ChecklistSubstrate::VfDryRun && pack.vf_dry_run.is_some())
+            || pack.substrate == Sep18ChecklistSubstrate::ClipboardKillGate
+        {
+            // VF dry-run / clipboard kill-gate carry nested evidence without a harness seal.
         } else {
             return Some(EvidenceVerifierDecision::reject(
                 EvidenceVerifierCode::ChecklistIncomplete,
@@ -997,6 +1023,27 @@ fn verify_substrate_pass_claims(pack: &Sep18EvidencePack) -> Option<EvidenceVeri
         }
     }
 
+    if let Some(gate) = &pack.clipboard_kill_gate {
+        if gate.physical_pass_claimed || gate.vf_pass_claimed {
+            return Some(EvidenceVerifierDecision::reject(
+                EvidenceVerifierCode::ClipboardKillGateCannotQualifyPhysicalPass,
+                "clipboard kill-gate cannot claim VF or physical PASS",
+            ));
+        }
+        if gate.isolation_pass_claimed {
+            return Some(EvidenceVerifierDecision::reject(
+                EvidenceVerifierCode::IsolationPassClaimOnDryRun,
+                "clipboard kill-gate cannot claim isolation PASS",
+            ));
+        }
+        if gate.computer_mode_enabled || gate.admission_available {
+            return Some(EvidenceVerifierDecision::reject(
+                EvidenceVerifierCode::AdmissionMustStayFalse,
+                "clipboard kill-gate cannot enable Computer Mode or admission",
+            ));
+        }
+    }
+
     None
 }
 
@@ -1024,6 +1071,14 @@ fn verify_substrate_nested_evidence(pack: &Sep18EvidencePack) -> Option<Evidence
                 return Some(EvidenceVerifierDecision::reject(
                     EvidenceVerifierCode::SubstrateNestedEvidenceMissing,
                     "NativeHostSentinel requires native_host_sentinel nested evidence",
+                ));
+            }
+        }
+        Sep18ChecklistSubstrate::ClipboardKillGate => {
+            if pack.clipboard_kill_gate.is_none() {
+                return Some(EvidenceVerifierDecision::reject(
+                    EvidenceVerifierCode::SubstrateNestedEvidenceMissing,
+                    "ClipboardKillGate requires clipboard_kill_gate nested evidence",
                 ));
             }
         }
@@ -1134,6 +1189,128 @@ fn verify_native_host_sentinel(pack: &Sep18EvidencePack) -> Option<EvidenceVerif
 
     if let Some(decision) = verify_native_live_kind_and_counts(pack, native) {
         return Some(decision);
+    }
+
+    None
+}
+
+fn verify_clipboard_kill_gate(pack: &Sep18EvidencePack) -> Option<EvidenceVerifierDecision> {
+    if pack.substrate != Sep18ChecklistSubstrate::ClipboardKillGate {
+        return None;
+    }
+    let gate = pack.clipboard_kill_gate.as_ref()?;
+
+    if pack.physical_proof_markers != PhysicalProofMarkers::dry_run_none() {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::ClipboardKillGateCannotQualifyPhysicalPass,
+            "clipboard kill-gate must keep PhysicalProofMarkers::dry_run_none",
+        ));
+    }
+
+    if gate.provenance == ClipboardKillGateProvenance::SyntheticVerifierFixture
+        && gate.verdict == ClipboardKillGateVerdict::Pass
+    {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::ClipboardKillGateSyntheticCannotPass,
+            "synthetic clipboard kill-gate fixtures cannot seal Pass",
+        ));
+    }
+
+    if gate.platform == ClipboardKillGatePlatform::NonMacOs
+        && (gate.verdict == ClipboardKillGateVerdict::Pass
+            || gate.outcome == ClipboardKillGateOutcome::MediationProven)
+    {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::ClipboardKillGatePassOnUnsupportedPlatform,
+            "non-macOS clipboard kill-gate cannot claim Pass",
+        ));
+    }
+
+    if gate.page_world_evaluate_javascript_used || gate.call_async_javascript_used {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::ClipboardKillGateForbiddenScriptEvaluation,
+            "clipboard kill-gate forbids page-world evaluateJavaScript and callAsyncJavaScript",
+        ));
+    }
+
+    match verify_clipboard_kill_gate_evidence(gate) {
+        Ok(()) => {}
+        Err(ClipboardProbeFailClosedReason::ForbiddenScriptEvaluation) => {
+            return Some(EvidenceVerifierDecision::reject(
+                EvidenceVerifierCode::ClipboardKillGateForbiddenScriptEvaluation,
+                "clipboard kill-gate forbids page-world script evaluation",
+            ));
+        }
+        Err(ClipboardProbeFailClosedReason::UnexpectedHostClipboardChange) => {
+            return Some(EvidenceVerifierDecision::reject(
+                EvidenceVerifierCode::ClipboardKillGateHostDigestDrift,
+                "clipboard kill-gate host clipboard digest drifted",
+            ));
+        }
+        Err(ClipboardProbeFailClosedReason::StaleGeneration) => {
+            return Some(EvidenceVerifierDecision::reject(
+                EvidenceVerifierCode::ClipboardKillGateStaleGeneration,
+                "clipboard kill-gate reply generation is stale",
+            ));
+        }
+        Err(ClipboardProbeFailClosedReason::DuplicateReply) => {
+            return Some(EvidenceVerifierDecision::reject(
+                EvidenceVerifierCode::ClipboardKillGateDuplicateReply,
+                "clipboard kill-gate reply is duplicated",
+            ));
+        }
+        Err(ClipboardProbeFailClosedReason::MalformedReply) => {
+            return Some(EvidenceVerifierDecision::reject(
+                EvidenceVerifierCode::ClipboardKillGateMalformedReply,
+                "clipboard kill-gate reply is malformed",
+            ));
+        }
+        Err(ClipboardProbeFailClosedReason::MissingReply) => {
+            return Some(EvidenceVerifierDecision::reject(
+                EvidenceVerifierCode::ClipboardKillGateMissingReply,
+                "clipboard kill-gate reply is missing required receipts",
+            ));
+        }
+        Err(ClipboardProbeFailClosedReason::UnsupportedPlatform) => {
+            return Some(EvidenceVerifierDecision::reject(
+                EvidenceVerifierCode::ClipboardKillGatePassOnUnsupportedPlatform,
+                "clipboard kill-gate Pass/mediation is unsupported on this platform",
+            ));
+        }
+        Err(_) => {
+            if gate.verdict == ClipboardKillGateVerdict::Pass {
+                return Some(EvidenceVerifierDecision::reject(
+                    EvidenceVerifierCode::ClipboardKillGateUncertainCannotPass,
+                    "clipboard kill-gate Pass requires a certain native mediation proof",
+                ));
+            }
+        }
+    }
+
+    if gate.verdict == ClipboardKillGateVerdict::Pass {
+        #[cfg(not(target_os = "macos"))]
+        {
+            return Some(EvidenceVerifierDecision::reject(
+                EvidenceVerifierCode::ClipboardKillGatePassOnUnsupportedPlatform,
+                "clipboard kill-gate Pass cannot be accepted on non-macOS verifiers",
+            ));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            if !crate::clipboard_kill_gate::clipboard_kill_gate_may_claim_pass(gate) {
+                return Some(EvidenceVerifierDecision::reject(
+                    EvidenceVerifierCode::ClipboardKillGateUncertainCannotPass,
+                    "clipboard kill-gate Pass contract is not satisfied",
+                ));
+            }
+        }
+    }
+
+    if pack.nonclaim != CLIPBOARD_KILL_GATE_NONCLAIM {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::NonclaimMismatch,
+            "clipboard kill-gate nonclaim string does not match substrate contract",
+        ));
     }
 
     None
@@ -1299,7 +1476,8 @@ fn verify_pack_sealed_consistency(
 
 fn verify_substrate_evidence_class(pack: &Sep18EvidencePack) -> Option<EvidenceVerifierDecision> {
     let expected = match pack.substrate {
-        Sep18ChecklistSubstrate::ContainedBrowserDryRun => ProofEvidenceClass::ContainedBrowser,
+        Sep18ChecklistSubstrate::ContainedBrowserDryRun
+        | Sep18ChecklistSubstrate::ClipboardKillGate => ProofEvidenceClass::ContainedBrowser,
         Sep18ChecklistSubstrate::VfDryRun => ProofEvidenceClass::VirtualizationFramework,
         Sep18ChecklistSubstrate::SyntheticHarness | Sep18ChecklistSubstrate::NativeHostSentinel => {
             ProofEvidenceClass::Synthetic
@@ -1327,6 +1505,15 @@ fn verify_substrate_evidence_class(pack: &Sep18EvidencePack) -> Option<EvidenceV
             return Some(EvidenceVerifierDecision::reject(
                 EvidenceVerifierCode::EvidenceClassTampered,
                 "native_host_sentinel evidence_class is inconsistent with substrate",
+            ));
+        }
+    }
+
+    if let Some(gate) = &pack.clipboard_kill_gate {
+        if gate.evidence_class != expected {
+            return Some(EvidenceVerifierDecision::reject(
+                EvidenceVerifierCode::EvidenceClassTampered,
+                "clipboard_kill_gate evidence_class is inconsistent with substrate",
             ));
         }
     }
@@ -1400,6 +1587,7 @@ fn expected_nonclaim(pack: &Sep18EvidencePack) -> String {
         Sep18ChecklistSubstrate::VfDryRun => VF_DRY_RUN_NONCLAIM.into(),
         Sep18ChecklistSubstrate::SyntheticHarness => SYNTHETIC_HARNESS_NONCLAIM.into(),
         Sep18ChecklistSubstrate::NativeHostSentinel => NATIVE_HOST_SENTINEL_NONCLAIM.into(),
+        Sep18ChecklistSubstrate::ClipboardKillGate => CLIPBOARD_KILL_GATE_NONCLAIM.into(),
     }
 }
 
@@ -1444,6 +1632,7 @@ pub fn seal_contained_browser_dry_run_pack(
         native_host_sentinel: None,
         contained_browser: Some(evidence),
         vf_dry_run: None,
+        clipboard_kill_gate: None,
     }
 }
 
@@ -1467,6 +1656,7 @@ pub fn seal_vf_dry_run_pack(evidence: VfDryRunEvidence) -> Sep18EvidencePack {
         native_host_sentinel: None,
         contained_browser: None,
         vf_dry_run: Some(evidence),
+        clipboard_kill_gate: None,
     }
 }
 
@@ -1495,6 +1685,7 @@ pub fn seal_synthetic_harness_pack(
         native_host_sentinel: None,
         contained_browser: None,
         vf_dry_run: None,
+        clipboard_kill_gate: None,
     }
 }
 
@@ -1531,6 +1722,30 @@ pub fn seal_native_host_sentinel_pack(evidence: NativeSentinelEvidence) -> Sep18
         native_host_sentinel: Some(evidence),
         contained_browser: None,
         vf_dry_run,
+        clipboard_kill_gate: None,
+    }
+}
+
+pub fn seal_clipboard_kill_gate_pack(evidence: ClipboardKillGateEvidence) -> Sep18EvidencePack {
+    Sep18EvidencePack {
+        schema_version: EVIDENCE_PACK_SCHEMA_VERSION,
+        sealed_at: Utc::now(),
+        substrate: Sep18ChecklistSubstrate::ClipboardKillGate,
+        evidence_class: evidence.evidence_class,
+        physical_pass_claimed: evidence.physical_pass_claimed,
+        isolation_pass_claimed: evidence.isolation_pass_claimed,
+        vf_pass_claimed: evidence.vf_pass_claimed,
+        admission_available: isolated_surface_admission_available(),
+        nonclaim: evidence.nonclaim.clone(),
+        host_sentinel_probes: HostSentinelProbeSummary::empty(),
+        physical_proof_markers: PhysicalProofMarkers::dry_run_none(),
+        checklist_completed: false,
+        fault_matrix_case: None,
+        sealed_evidence: None,
+        native_host_sentinel: None,
+        contained_browser: None,
+        vf_dry_run: None,
+        clipboard_kill_gate: Some(evidence),
     }
 }
 
@@ -1561,6 +1776,16 @@ pub fn verifier_exit_code(decision: &EvidenceVerifierDecision) -> i32 {
             EvidenceVerifierCode::NativeSentinelSyntheticFallback => 27,
             EvidenceVerifierCode::NativeSentinelLiveClaimOnUnsupportedPlatform => 28,
             EvidenceVerifierCode::NativeSentinelCannotQualifyPhysicalPass => 29,
+            EvidenceVerifierCode::ClipboardKillGateSyntheticCannotPass => 30,
+            EvidenceVerifierCode::ClipboardKillGatePassOnUnsupportedPlatform => 31,
+            EvidenceVerifierCode::ClipboardKillGateHostDigestDrift => 32,
+            EvidenceVerifierCode::ClipboardKillGateForbiddenScriptEvaluation => 33,
+            EvidenceVerifierCode::ClipboardKillGateStaleGeneration => 34,
+            EvidenceVerifierCode::ClipboardKillGateDuplicateReply => 35,
+            EvidenceVerifierCode::ClipboardKillGateMalformedReply => 36,
+            EvidenceVerifierCode::ClipboardKillGateMissingReply => 37,
+            EvidenceVerifierCode::ClipboardKillGateUncertainCannotPass => 38,
+            EvidenceVerifierCode::ClipboardKillGateCannotQualifyPhysicalPass => 39,
         }
     }
 }

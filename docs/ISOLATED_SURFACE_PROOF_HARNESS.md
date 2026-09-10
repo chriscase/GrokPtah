@@ -2,7 +2,7 @@
 
 This document inventories the current `main` Computer Use / isolated-guest code,
 defines the synthetic proof harness, and maps it to the Sep 5–18 2026 calendar
-(Phase-1 packet 10: native host-sentinel runner). It does **not**
+(Phase-1 packet 11: Contained Browser clipboard isolation kill-gate). It does **not**
 claim packaged Virtualization.framework qualification from Linux CI or dry-run
 artifacts.
 
@@ -23,10 +23,11 @@ surface), [#267](https://github.com/chriscase/GrokPtah/issues/267) (epic).
 | Sep 6–12 | Packet 7 — `stop_fence_first` no default (#549) | **Landed** — trait default removed; production adapters must fence with ack/failure |
 | Sep 6–12 | Packet 8 — Mac host sentinel provenance (#550) | **Landed** — `MacHostSentinelCollector::collect()` wired; synthetic self-compare ineligible for physical markers |
 | Sep 6–12 | Packet 9 — Honest Contained Browser captured-frame hashes (#551) | **Landed** — `GuestFrame.digest` is `sha256:<64 hex>` over bounded capture bytes; simulator payloads labeled synthetic |
-| Sep 18 | Packet 10 — Native host-sentinel runner | **This slice** — exclusive `MacHostSentinelCollector` runner; Linux fail-closed; no PASS/admission |
+| Sep 18 | Packet 10 — Native host-sentinel runner (#554) | **Landed** — exclusive `MacHostSentinelCollector` runner; Linux fail-closed; no PASS/admission |
+| Sep 8–17 | Packet 11 — Contained Browser clipboard isolation kill-gate | **This slice** — `ClipboardWitness` + `WKClipboardProbe` private-world protocol; Linux unsupported; never admission |
 | Sep 18 | Physical Mac gate | VF PASS or honest Contained Browser pivot |
 
-## Exact-main inventory (base `0ed82975d83ec7213883a9b7743253a56b751e28` + packet 10)
+## Exact-main inventory (base `c3dbb8b5f410dad4f411a10ddcbf02dcda6660a0` + packet 11)
 
 ### Already satisfies Windowed Coding Run noninterference (semantic macOS path)
 
@@ -57,6 +58,7 @@ surface), [#267](https://github.com/chriscase/GrokPtah/issues/267) (epic).
 | VF backend stub (Mac + `vf-backend` feature) | `vf_backend.rs` — honest `VirtualizationFramework` label, dry-run only |
 | VF dry-run sequencer path | `vf_dry_run.rs` + `Sep18NoModelProofSequencer::run_vf_dry_run` |
 | Native host-sentinel runner | `native_sentinel_runner.rs` + `Sep18NoModelProofSequencer::run_native_host_sentinel` |
+| Contained Browser clipboard kill-gate | `clipboard_witness.rs` + `wk_clipboard_probe.rs` + `clipboard_kill_gate.rs` |
 | Sep 18 no-model proof sequencer | `proof_sequencer.rs` — checklist + bounded fault matrix |
 | Harness orchestrator | `harness.rs` — backend-generic, `with_vf_backend(receipt)` only for VF label |
 | Channel destroy registry | `channels.rs` |
@@ -67,9 +69,10 @@ surface), [#267](https://github.com/chriscase/GrokPtah/issues/267) (epic).
 | Bridge integration tests | `grokptah-agent-bridge/tests/isolated_surface_proof_harness.rs` |
 | Sep 18 checklist runner | `checklist_runner.rs` — default CB dry-run, optional VF dry-run / native-sentinel / fault matrix |
 | Sealed evidence pack + verifier | `evidence_pack.rs` — independent accept/reject with explicit codes |
-| Checklist CLI | `src/bin/grokptah-sep18-checklist.rs` — `run` + `verify`; `--native-host-sentinels` exclusive |
+| Checklist CLI | `src/bin/grokptah-sep18-checklist.rs` — `run` + `verify`; `--native-host-sentinels` exclusive; `--clipboard-kill-gate` exclusive |
 | Evidence-pack verifier tests | `tests/evidence_pack_verifier.rs` — happy path + tamper rejection |
 | Native host-sentinel runner tests | `tests/native_sentinel_runner.rs` — Linux fail-closed + forged live/fallback/PASS rejection |
+| Clipboard kill-gate tests | `tests/clipboard_kill_gate.rs` — Linux unsupported + forged Pass / host drift / stale generation / duplicate-missing / forbidden eval |
 | Captured-frame adversarial tests | `tests/captured_frame_evidence.rs` — digest recomputation, tamper/oversize, no raw-byte leak |
 
 ### Lifecycle phases
@@ -150,6 +153,74 @@ Epoch still increments on inject; digest change tracks captured-byte change.
 
 Bridge admission `isolated_surface_admission_available()` remains **false**.
 
+### Contained Browser clipboard isolation kill-gate (packet 11 / Sep 8–17)
+
+Phase-1 slice proving whether page-local copy/cut/paste/write can be mediated
+without reading or mutating the host `NSPasteboard`. This is **not** VF PASS,
+isolation PASS, Computer Mode, or admission.
+
+| Component | Role |
+|---|---|
+| `ClipboardWitness` | Seals before/after host clipboard **digests** from change-count + type names only. Never reads pasteboard data, never writes the general pasteboard, never uses CGEvent, Accessibility, or AppleScript. |
+| `WKClipboardProbe` | Private `WKContentWorld` (`grokptah.clipboard.probe.v1`) pull/reply. The contained **page world** is never targeted with `evaluateJavaScript` or `callAsyncJavaScript`. |
+| `run_clipboard_kill_gate` | Orchestrates witness + probe; seals typed evidence with verdict `pass` / `fail` / `inconclusive` / `unsupported`. |
+
+**Verdict contract (fail closed):**
+
+| Verdict | Meaning | Who may seal it |
+|---|---|---|
+| `unsupported` | Non-macOS / no WebKit | Linux CI (deterministic) |
+| `inconclusive` | Timeout, navigation/epoch drift, malformed/duplicate/missing reply, missing WebKit, permission prompt, uncertain | Any platform; never Pass |
+| `fail` | Host clipboard digest changed (isolation broken) | Native Mac probe only |
+| `pass` | Native Mac WebKit private-world pull, four mediated receipts, host digest unchanged | **Only** exact-head native Mac worker; Linux verifiers reject Pass |
+
+Any timeout, navigation/epoch drift, malformed/duplicate reply, unexpected host
+clipboard change, unsupported platform, missing WebKit capability, permission
+prompt, or uncertain result **fails closed and never claims Pass**.
+
+Forbidden on this slice: host CGEvent, Accessibility input, AppleScript, global
+pasteboard writes, browser auth, provider calls, private data, shared dirs,
+network. Concurrent Computer Use, Windows/Linux adapters, and the public SDK
+are untouched.
+
+#### Physical Mac instructions (exact HEAD)
+
+Run on a macOS worker at the **exact** branch HEAD. Linux CI success is **not**
+physical Pass. Do not enable admission.
+
+```sh
+# 1. Confirm HEAD (replace with the merged/review SHA you are proving)
+git rev-parse HEAD
+
+# 2. Run the exclusive clipboard kill-gate (no --vf-dry-run, no --native-host-sentinels)
+cargo run --locked --manifest-path crates/codegen/grokptah-isolated-surface/Cargo.toml \
+  --bin grokptah-sep18-checklist -- run --clipboard-kill-gate \
+  -o clipboard-kill-gate.json
+
+# 3. Independent verify on the same Mac (Linux verifiers reject Pass by contract)
+cargo run --locked --manifest-path crates/codegen/grokptah-isolated-surface/Cargo.toml \
+  --bin grokptah-sep18-checklist -- verify clipboard-kill-gate.json
+```
+
+Inspect `clipboardKillGate.verdict`:
+
+- `pass` — native private-world mediation with unchanged host digest. Still
+  `physicalPassClaimed=false`, `isolationPassClaimed=false`, `vfPassClaimed=false`,
+  `admissionAvailable=false`.
+- `fail` — host digest changed; page-local mediation did not hold.
+- `inconclusive` — timeout / WebKit / protocol / permission; not Pass.
+- `unsupported` — this worker cannot run WebKit (should not happen on macOS;
+  if it does, treat as fail-closed, not Pass).
+
+**Nonclaims for this physical run:**
+
+- Kill-gate Pass is **not** Sep 18 VF PASS, packaged-VM qualification, or
+  Computer Mode.
+- Synthetic / Linux CI tests prove verifier rejection of forged Pass; they
+  **cannot** establish physical Mac Pass.
+- Do not merge this as admission enablement. Do not close #288/#286 on this
+  slice alone.
+
 ## Sep 18 no-model proof sequencer
 
 `Sep18NoModelProofSequencer` runs the checklist against the synthetic backend:
@@ -208,6 +279,7 @@ pack file — no live backend, no runner aggregates.
 | Linux CI / default | CB dry-run pack (`ContainedBrowser`, `physical_pass_claimed: false`) | No |
 | VF rehearsal | VF dry-run pack (`physical_pass_claimed: false`) | No |
 | Native host-sentinel runner | Native pack (`Synthetic` guest, `PhysicalProofMarkers::dry_run_none()`) | No |
+| Clipboard kill-gate | Clipboard pack (`ContainedBrowser`, kill-gate verdict independent of VF PASS) | No — kill-gate Pass ≠ physical VF PASS; Linux verifiers reject Pass |
 | Synthetic fault matrix | Subset sealed packs with explicit fault case | No |
 | Sep 18 Mac worker (future) | VF physical pack with `PhysicalProofMarkers` + live sentinel collection | Only when markers qualify |
 
@@ -234,6 +306,10 @@ cargo run --locked --manifest-path crates/codegen/grokptah-isolated-surface/Carg
 cargo run --locked --manifest-path crates/codegen/grokptah-isolated-surface/Cargo.toml \
   --bin grokptah-sep18-checklist -- run --native-host-sentinels --vf-dry-run \
   --checkout /absolute/path/to/disposable/checkout -o native-sentinel-pack.json
+
+# Contained Browser clipboard isolation kill-gate (Linux: honest Unsupported; macOS: native WK probe)
+cargo run --locked --manifest-path crates/codegen/grokptah-isolated-surface/Cargo.toml \
+  --bin grokptah-sep18-checklist -- run --clipboard-kill-gate -o clipboard-kill-gate.json
 ```
 
 ### Sealed pack fields (honest defaults)
@@ -260,6 +336,13 @@ cargo run --locked --manifest-path crates/codegen/grokptah-isolated-surface/Carg
 | `substrate_nested_evidence_missing` | CB pack sealed without nested `contained_browser.sealed_evidence` |
 | `pack_sealed_evidence_mismatch` | Pack vs nested CB sealed copies differ |
 | `captured_frame_evidence_invalid` | Missing, non-canonical, source-upgraded, or non-changing sealed captured-frame metadata |
+| `clipboard_kill_gate_synthetic_cannot_pass` | Synthetic fixture sealed kill-gate Pass |
+| `clipboard_kill_gate_pass_on_unsupported_platform` | Pass/mediation on non-macOS pack or Linux verifier |
+| `clipboard_kill_gate_host_digest_drift` | Before/after host clipboard digests disagree (or contents were read/written) |
+| `clipboard_kill_gate_forbidden_script_evaluation` | Page-world `evaluateJavaScript` / `callAsyncJavaScript` |
+| `clipboard_kill_gate_stale_generation` / `duplicate_reply` / `malformed_reply` / `missing_reply` | Protocol fail-closed |
+| `clipboard_kill_gate_uncertain_cannot_pass` | Uncertain/incomplete native contract claimed Pass |
+| `clipboard_kill_gate_cannot_qualify_physical_pass` | Forged VF/physical markers on the clipboard kill-gate substrate |
 
 Maps to Astra Sep 18 one-Mac checklist steps 1–11: runner exercises steps 2–10 on
 simulator substrate; verifier is the independent gate for sealed artifacts before
@@ -340,6 +423,9 @@ cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Car
 cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Cargo.toml \
   --test native_sentinel_runner -- --test-threads=1
 
+cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Cargo.toml \
+  --test clipboard_kill_gate -- --test-threads=1
+
 # Checklist runner CLI smoke (CB default)
 cargo run --locked --manifest-path crates/codegen/grokptah-isolated-surface/Cargo.toml \
   --bin grokptah-sep18-checklist -- run -o /tmp/sep18-evidence-pack.json
@@ -356,7 +442,7 @@ cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Car
   --features vf-backend --test proof_sequencer sep18_vf_dry_run -- --test-threads=1
 ```
 
-## Residuals (honest, post-packet-10)
+## Residuals (honest, post-packet-11)
 
 - `IsolatedSurfaceBackend::stop_fence_first` has no trait default — production adapters must wire real fence ack/failure.
 - `MacHostSentinelCollector` requires macOS Accessibility trust for foreground/unrelated window evidence; missing TCC → honest `BackendUnavailable`, not synthetic PASS.
@@ -370,6 +456,7 @@ cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Car
 - Simulator captured-frame bytes are explicit synthetic payloads, content-addressed and labeled synthetic — not a real browser capture.
 - Optional `browser-engine` feature fails closed until a bounded engine capture is actually wired; this slice fabricates no engine receipt or PASS.
 - Native host-sentinel live collection is **not** VF PASS, isolation PASS, or admission enablement.
+- Clipboard kill-gate Pass is **not** VF PASS, isolation PASS, Computer Mode, or admission. Linux CI is deterministic `unsupported`. Only exact-head native Mac WebKit evidence may seal kill-gate Pass, and Linux verifiers reject Pass.
 - No TCC entitlement or notarization claims.
 - No Windows/Linux isolated surface.
 - No agent-owned cursor / surface-event stream (#286 UI layer still disposition-only).
@@ -386,3 +473,4 @@ cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Car
 - `ContainedBrowser` substrate v0 does **not** prove browser isolation — only exercises the SPI lifecycle on a simulator.
 - Simulator captured-frame hashes are **not** a real browser capture; they content-address labeled synthetic payload bytes.
 - Native host-sentinel runner success is **not** VF/isolation/physical PASS and does not enable Computer Mode or admission.
+- Clipboard kill-gate success is **not** VF/isolation/physical PASS. Synthetic verifier fixtures cannot establish physical Mac Pass. Linux CI `unsupported` is not Fail of isolation and not Pass.

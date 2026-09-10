@@ -8,6 +8,8 @@ mod backend;
 mod captured_frame;
 mod channels;
 mod checklist_runner;
+mod clipboard_kill_gate;
+mod clipboard_witness;
 mod contained_browser;
 mod contained_browser_dry_run;
 mod error;
@@ -25,6 +27,7 @@ mod store;
 #[cfg(all(target_os = "macos", feature = "vf-backend"))]
 mod vf_backend;
 mod vf_dry_run;
+mod wk_clipboard_probe;
 
 pub use backend::{
     assert_evidence_class_unchanged, honest_harness_evidence_class, IsolatedSurfaceBackend,
@@ -43,6 +46,14 @@ pub use checklist_runner::{
     parse_sep18_checklist_run_args, run_sep18_checklist, Sep18ChecklistRunOutcome,
     Sep18ChecklistRunRequest, Sep18ChecklistRunnerConfig,
 };
+pub use clipboard_kill_gate::{
+    clipboard_kill_gate_may_claim_pass, run_clipboard_kill_gate,
+    verify_clipboard_kill_gate_evidence, ClipboardKillGateEvidence, ClipboardKillGateOutcome,
+    ClipboardKillGatePlatform, ClipboardKillGateProvenance, ClipboardKillGateVerdict,
+};
+pub use clipboard_witness::{
+    host_clipboard_unchanged, ClipboardWitness, ClipboardWitnessPlatform, HostClipboardDigest,
+};
 pub use contained_browser::ContainedBrowserBackend;
 pub use contained_browser_dry_run::{
     run_contained_browser_fault_matrix, run_contained_browser_stop_fence_regression,
@@ -50,10 +61,11 @@ pub use contained_browser_dry_run::{
 };
 pub use error::{HarnessError, HarnessErrorCode, HarnessResult};
 pub use evidence_pack::{
-    parse_evidence_pack, seal_contained_browser_dry_run_pack, seal_native_host_sentinel_pack,
-    seal_synthetic_harness_pack, seal_vf_dry_run_pack, serialize_evidence_pack, verifier_exit_code,
-    verify_evidence_pack, EvidenceVerifierCode, EvidenceVerifierDecision, HostSentinelProbeSummary,
-    PhysicalProofMarkers, Sep18ChecklistSubstrate, Sep18EvidencePack, EVIDENCE_PACK_SCHEMA_VERSION,
+    parse_evidence_pack, seal_clipboard_kill_gate_pack, seal_contained_browser_dry_run_pack,
+    seal_native_host_sentinel_pack, seal_synthetic_harness_pack, seal_vf_dry_run_pack,
+    serialize_evidence_pack, verifier_exit_code, verify_evidence_pack, EvidenceVerifierCode,
+    EvidenceVerifierDecision, HostSentinelProbeSummary, PhysicalProofMarkers,
+    Sep18ChecklistSubstrate, Sep18EvidencePack, EVIDENCE_PACK_SCHEMA_VERSION,
 };
 pub use harness::{IsolatedSurfaceHarness, StopEvidence};
 pub use lifecycle::{
@@ -84,6 +96,11 @@ pub use vf_backend::VirtualizationFrameworkBackend;
 pub use vf_dry_run::{
     run_vf_dry_run_with_native_host_sentinels, VfDryRunEvidence, VfDryRunOutcome, VfDryRunPlatform,
 };
+pub use wk_clipboard_probe::{
+    admit_probe_reply, ClipboardOperation, ClipboardProbeFailClosedReason, ContentWorld,
+    PageLocalClipboardReceipt, ProbePull, ProbeReply, ScriptEvaluationPath, WKClipboardProbe,
+    PRIVATE_PROBE_WORLD_NAME,
+};
 
 /// Fail-closed admission gate for bridge integration. Remains false until a
 /// native adapter passes the physical Mac proof checklist.
@@ -106,3 +123,7 @@ pub const CONTAINED_BROWSER_DRY_RUN_NONCLAIM: &str =
 /// Non-claim for the native host-sentinel runner. Live collection is not PASS.
 pub const NATIVE_HOST_SENTINEL_NONCLAIM: &str =
     "Native host-sentinel runner is not VF/isolation/physical PASS; live collection never enables admission or Computer Mode.";
+
+/// Non-claim for the Contained Browser clipboard isolation kill-gate.
+pub const CLIPBOARD_KILL_GATE_NONCLAIM: &str =
+    "Contained Browser clipboard kill-gate is not VF/isolation/physical PASS; synthetic verifier fixtures never enable admission or Computer Mode; only exact-head native Mac WebKit evidence may seal kill-gate Pass.";

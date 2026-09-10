@@ -8,12 +8,13 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::backend::VfLaunchReceipt;
+use crate::clipboard_kill_gate::ClipboardKillGateEvidence;
 use crate::contained_browser_dry_run::ContainedBrowserDryRunEvidence;
 use crate::error::{HarnessError, HarnessResult};
 use crate::evidence_pack::{
-    seal_contained_browser_dry_run_pack, seal_native_host_sentinel_pack,
-    seal_synthetic_harness_pack, seal_vf_dry_run_pack, serialize_evidence_pack,
-    Sep18ChecklistSubstrate, Sep18EvidencePack,
+    seal_clipboard_kill_gate_pack, seal_contained_browser_dry_run_pack,
+    seal_native_host_sentinel_pack, seal_synthetic_harness_pack, seal_vf_dry_run_pack,
+    serialize_evidence_pack, Sep18ChecklistSubstrate, Sep18EvidencePack,
 };
 use crate::native_sentinel_runner::NativeSentinelEvidence;
 use crate::proof_sequencer::{FaultMatrixCase, Sep18NoModelProofSequencer};
@@ -74,6 +75,13 @@ impl Sep18ChecklistRunnerConfig {
             ..Self::default()
         }
     }
+
+    pub fn clipboard_kill_gate() -> Self {
+        Self {
+            substrate: Sep18ChecklistSubstrate::ClipboardKillGate,
+            ..Self::default()
+        }
+    }
 }
 
 /// Parsed `run` CLI request. Validation completes before any checklist side effect.
@@ -89,6 +97,7 @@ pub fn parse_sep18_checklist_run_args(args: &[String]) -> HarnessResult<Sep18Che
     let mut output: Option<PathBuf> = None;
     let mut vf_dry_run = false;
     let mut native_host_sentinels = false;
+    let mut clipboard_kill_gate = false;
     let mut synthetic = false;
     let mut checkout: Option<PathBuf> = None;
     let mut fault_matrix: Option<FaultMatrixCase> = None;
@@ -119,6 +128,14 @@ pub fn parse_sep18_checklist_run_args(args: &[String]) -> HarnessResult<Sep18Che
                     ));
                 }
                 native_host_sentinels = true;
+            }
+            "--clipboard-kill-gate" => {
+                if clipboard_kill_gate {
+                    return Err(HarnessError::invalid_state(
+                        "duplicate flag: --clipboard-kill-gate",
+                    ));
+                }
+                clipboard_kill_gate = true;
             }
             "--checkout" => {
                 if checkout.is_some() {
@@ -162,6 +179,14 @@ pub fn parse_sep18_checklist_run_args(args: &[String]) -> HarnessResult<Sep18Che
         idx += 1;
     }
 
+    if clipboard_kill_gate
+        && (native_host_sentinels || vf_dry_run || synthetic || fault_matrix.is_some())
+    {
+        return Err(HarnessError::invalid_state(
+            "--clipboard-kill-gate cannot be combined with --native-host-sentinels, --vf-dry-run, --synthetic, or --fault-matrix",
+        ));
+    }
+
     if native_host_sentinels {
         if !vf_dry_run {
             return Err(HarnessError::invalid_state(
@@ -190,7 +215,9 @@ pub fn parse_sep18_checklist_run_args(args: &[String]) -> HarnessResult<Sep18Che
         ));
     }
 
-    let mut config = if native_host_sentinels {
+    let mut config = if clipboard_kill_gate {
+        Sep18ChecklistRunnerConfig::clipboard_kill_gate()
+    } else if native_host_sentinels {
         let checkout_path = checkout.ok_or_else(|| {
             HarnessError::invalid_state(
                 "native mode requires an explicitly supplied --checkout PATH (never defaulted to .)",
@@ -264,6 +291,7 @@ pub fn run_sep18_checklist(
         Sep18ChecklistSubstrate::VfDryRun => run_vf_dry_run(config, sequencer),
         Sep18ChecklistSubstrate::SyntheticHarness => run_synthetic(config, sequencer),
         Sep18ChecklistSubstrate::NativeHostSentinel => run_native_host_sentinel(config, sequencer),
+        Sep18ChecklistSubstrate::ClipboardKillGate => run_clipboard_kill_gate_substrate(config),
     }
 }
 
@@ -397,6 +425,44 @@ fn run_native_host_sentinel(
     }
 }
 
+fn run_clipboard_kill_gate_substrate(
+    config: Sep18ChecklistRunnerConfig,
+) -> Sep18ChecklistRunOutcome {
+    if config.fault_matrix_case.is_some() {
+        return Sep18ChecklistRunOutcome {
+            pack: empty_rejected_pack(Sep18ChecklistSubstrate::ClipboardKillGate),
+            runner_error: Some(HarnessError::invalid_state(
+                "clipboard kill-gate does not accept a fault-matrix subset",
+            )),
+        };
+    }
+
+    match crate::run_clipboard_kill_gate() {
+        Ok(evidence) => Sep18ChecklistRunOutcome {
+            pack: seal_clipboard_kill_gate_pack(evidence),
+            runner_error: None,
+        },
+        Err(err) => Sep18ChecklistRunOutcome {
+            pack: clipboard_fail_closed_pack(&err),
+            runner_error: Some(err),
+        },
+    }
+}
+
+fn clipboard_fail_closed_pack(err: &HarnessError) -> Sep18EvidencePack {
+    #[cfg(target_os = "macos")]
+    let evidence = ClipboardKillGateEvidence::macos_fail_closed(
+        crate::wk_clipboard_probe::fail_closed_reason_from_harness(err),
+        &err.message,
+    );
+    #[cfg(not(target_os = "macos"))]
+    let evidence = {
+        let _ = err;
+        ClipboardKillGateEvidence::unsupported_non_macos()
+    };
+    seal_clipboard_kill_gate_pack(evidence)
+}
+
 fn native_fail_closed_pack(err: &HarnessError) -> Sep18EvidencePack {
     seal_native_host_sentinel_pack(NativeSentinelEvidence::fail_closed_for_current_platform(
         err,
@@ -407,6 +473,9 @@ fn empty_rejected_pack(substrate: Sep18ChecklistSubstrate) -> Sep18EvidencePack 
     match substrate {
         Sep18ChecklistSubstrate::NativeHostSentinel => native_fail_closed_pack(
             &HarnessError::invalid_state("native host-sentinel runner failed closed"),
+        ),
+        Sep18ChecklistSubstrate::ClipboardKillGate => clipboard_fail_closed_pack(
+            &HarnessError::invalid_state("clipboard kill-gate failed closed"),
         ),
         other => {
             let mut evidence = VfDryRunEvidence::unsupported(
