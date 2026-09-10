@@ -699,7 +699,8 @@ pub fn host_issued_generation() -> u64 {
 #[cfg(target_os = "macos")]
 mod macos {
     use super::*;
-    use objc2::rc::Retained;
+    use objc2::encode::{Encode, Encoding};
+    use objc2::rc::{Allocated, Retained};
     use objc2::runtime::{AnyClass, AnyObject, AnyProtocol, ClassBuilder, NSObject, Sel};
     use objc2::{sel, ClassType};
     use std::ffi::CString;
@@ -738,7 +739,8 @@ mod macos {
         _controller: *mut AnyObject,
         message: &AnyObject,
     ) {
-        let name = nsstring_to_string(unsafe { objc2::msg_send![message, name] });
+        let name_obj: Option<Retained<AnyObject>> = unsafe { objc2::msg_send![message, name] };
+        let name = nsstring_to_string(name_obj.as_deref());
         if name.as_deref() != Some(PRIVATE_REPLY_HANDLER_NAME) {
             return;
         }
@@ -895,39 +897,27 @@ mod macos {
         let user_script_cls = AnyClass::get(c"WKUserScript")
             .ok_or_else(|| HarnessError::backend_unavailable("WKUserScript unavailable"))?;
         // WKUserScriptInjectionTimeAtDocumentStart = 0; AtDocumentEnd = 1
-        let interceptor_script: Retained<AnyObject> =
-            unsafe { objc2::msg_send![user_script_cls, alloc] };
-        let interceptor_script: Retained<AnyObject> = unsafe {
-            objc2::msg_send![
-                &*interceptor_script,
-                initWithSource: &*page_interceptor,
-                injectionTime: 0usize,
-                forMainFrameOnly: true,
-                inContentWorld: &*page_world
-            ]
-        };
-        let initiator_script: Retained<AnyObject> =
-            unsafe { objc2::msg_send![user_script_cls, alloc] };
-        let initiator_script: Retained<AnyObject> = unsafe {
-            objc2::msg_send![
-                &*initiator_script,
-                initWithSource: &*page_initiator,
-                injectionTime: 1usize,
-                forMainFrameOnly: true,
-                inContentWorld: &*page_world
-            ]
-        };
-        let private_script: Retained<AnyObject> =
-            unsafe { objc2::msg_send![user_script_cls, alloc] };
-        let private_script: Retained<AnyObject> = unsafe {
-            objc2::msg_send![
-                &*private_script,
-                initWithSource: &*private_source,
-                injectionTime: 1usize,
-                forMainFrameOnly: true,
-                inContentWorld: &*private_world
-            ]
-        };
+        let interceptor_script =
+            init_user_script(user_script_cls, &page_interceptor, 0, true, &page_world).ok_or_else(
+                || {
+                    HarnessError::backend_unavailable(
+                        "WKUserScript page interceptor init unavailable",
+                    )
+                },
+            )?;
+        let initiator_script =
+            init_user_script(user_script_cls, &page_initiator, 1, true, &page_world).ok_or_else(
+                || {
+                    HarnessError::backend_unavailable(
+                        "WKUserScript page initiator init unavailable",
+                    )
+                },
+            )?;
+        let private_script =
+            init_user_script(user_script_cls, &private_source, 1, true, &private_world)
+                .ok_or_else(|| {
+                    HarnessError::backend_unavailable("WKUserScript private pull init unavailable")
+                })?;
 
         let _: () = unsafe { objc2::msg_send![&*controller, addUserScript: &*interceptor_script] };
         let _: () = unsafe { objc2::msg_send![&*controller, addUserScript: &*initiator_script] };
@@ -936,12 +926,16 @@ mod macos {
         let webview_cls = AnyClass::get(c"WKWebView")
             .ok_or_else(|| HarnessError::backend_unavailable("WKWebView unavailable"))?;
         let frame = cg_rect_zero();
-        let webview: Retained<AnyObject> = unsafe { objc2::msg_send![webview_cls, alloc] };
-        let webview: Retained<AnyObject> =
-            unsafe { objc2::msg_send![&*webview, initWithFrame: frame, configuration: &*config] };
+        let webview_alloc: Allocated<AnyObject> = unsafe { objc2::msg_send![webview_cls, alloc] };
+        let webview: Option<Retained<AnyObject>> = unsafe {
+            objc2::msg_send![webview_alloc, initWithFrame: frame, configuration: &*config]
+        };
+        let webview = webview.ok_or_else(|| {
+            HarnessError::backend_unavailable("WKWebView initWithFrame unavailable")
+        })?;
 
         let _: () = unsafe {
-            objc2::msg_send![&*webview, loadHTMLString: &*html, baseURL: std::ptr::null::<AnyObject>()]
+            objc2::msg_send![&*webview, loadHTMLString: &*html, baseURL: None::<&AnyObject>]
         };
 
         // Host receive is the private-world WKScriptMessageHandler. Never poll
@@ -949,7 +943,7 @@ mod macos {
         let started = Instant::now();
         loop {
             if started.elapsed() > PROBE_TIMEOUT {
-                let _ = unsafe {
+                let _: () = unsafe {
                     objc2::msg_send![
                         &*controller,
                         removeScriptMessageHandlerForName: &*handler_name,
@@ -963,7 +957,7 @@ mod macos {
             pump_runloop_briefly();
             let messages = snapshot_inbox();
             if !messages.is_empty() {
-                let _ = unsafe {
+                let _: () = unsafe {
                     objc2::msg_send![
                         &*controller,
                         removeScriptMessageHandlerForName: &*handler_name,
@@ -986,13 +980,32 @@ mod macos {
         }
     }
 
+    fn init_user_script(
+        cls: &AnyClass,
+        source: &AnyObject,
+        injection_time: isize,
+        main_frame_only: bool,
+        world: &AnyObject,
+    ) -> Option<Retained<AnyObject>> {
+        let allocated: Allocated<AnyObject> = unsafe { objc2::msg_send![cls, alloc] };
+        unsafe {
+            objc2::msg_send![
+                allocated,
+                initWithSource: source,
+                injectionTime: injection_time,
+                forMainFrameOnly: main_frame_only,
+                inContentWorld: world
+            ]
+        }
+    }
+
     fn nsstring_to_bytes(object: &AnyObject) -> Option<Vec<u8>> {
         nsstring_to_string(Some(object)).map(String::into_bytes)
     }
 
-    fn nsstring_to_string(object: Option<Retained<AnyObject>>) -> Option<String> {
+    fn nsstring_to_string(object: Option<&AnyObject>) -> Option<String> {
         let object = object?;
-        let utf8: *const i8 = unsafe { objc2::msg_send![&*object, UTF8String] };
+        let utf8: *const i8 = unsafe { objc2::msg_send![object, UTF8String] };
         if utf8.is_null() {
             return None;
         }
@@ -1031,20 +1044,46 @@ mod macos {
         false
     }
 
+    // CGFloat is f64 on 64-bit Apple platforms (this crate's macOS workers).
+    #[cfg(target_pointer_width = "64")]
+    type CGFloat = f64;
+    #[cfg(not(target_pointer_width = "64"))]
+    type CGFloat = f32;
+
     #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CGPoint {
+        x: CGFloat,
+        y: CGFloat,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CGSize {
+        width: CGFloat,
+        height: CGFloat,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
     struct CGRect {
         origin: CGPoint,
         size: CGSize,
     }
-    #[repr(C)]
-    struct CGPoint {
-        x: f64,
-        y: f64,
+
+    unsafe impl Encode for CGPoint {
+        const ENCODING: Encoding =
+            Encoding::Struct("CGPoint", &[CGFloat::ENCODING, CGFloat::ENCODING]);
     }
-    #[repr(C)]
-    struct CGSize {
-        width: f64,
-        height: f64,
+
+    unsafe impl Encode for CGSize {
+        const ENCODING: Encoding =
+            Encoding::Struct("CGSize", &[CGFloat::ENCODING, CGFloat::ENCODING]);
+    }
+
+    unsafe impl Encode for CGRect {
+        const ENCODING: Encoding =
+            Encoding::Struct("CGRect", &[CGPoint::ENCODING, CGSize::ENCODING]);
     }
 
     fn cg_rect_zero() -> CGRect {

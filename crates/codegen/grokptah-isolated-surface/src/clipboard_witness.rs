@@ -7,7 +7,9 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::error::{HarnessError, HarnessResult};
+#[cfg(not(target_os = "macos"))]
+use crate::error::HarnessError;
+use crate::error::HarnessResult;
 
 const DIGEST_PREFIX: &str = "sha256:";
 

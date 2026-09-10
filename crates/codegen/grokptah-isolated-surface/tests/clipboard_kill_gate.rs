@@ -12,12 +12,12 @@ use grokptah_isolated_surface::{
     verify_clipboard_kill_gate_evidence, verify_evidence_pack, ClipboardKillGateEvidence,
     ClipboardKillGateOutcome, ClipboardKillGatePlatform, ClipboardKillGateProvenance,
     ClipboardKillGateVerdict, ClipboardOperation, ClipboardProbeFailClosedReason, ClipboardWitness,
-    ContentWorld, EvidenceVerifierCode, HostClipboardDigest, HostSentinelSnapshot,
-    PageLocalClipboardReceipt, PhysicalProofMarkers, ProbePull, ProbeReply, ProofEvidenceClass,
-    ReceiptInitiator, ReplyChannel, ScriptEvaluationPath, Sep18ChecklistRunnerConfig,
-    Sep18ChecklistSubstrate, WKClipboardProbe, CLIPBOARD_KILL_GATE_NONCLAIM, MAX_PROBE_REPLY_BYTES,
-    PAGE_RESULT_ATTRIBUTE, PAGE_WORLD_INTERCEPTOR_SOURCE, PRIVATE_REPLY_TITLE_PREFIX,
-    PRIVATE_WORLD_PULL_SOURCE,
+    ClipboardWitnessPlatform, ContentWorld, EvidenceVerifierCode, HostClipboardDigest,
+    HostSentinelSnapshot, PageLocalClipboardReceipt, PhysicalProofMarkers, ProbePull, ProbeReply,
+    ProofEvidenceClass, ReceiptInitiator, ReplyChannel, ScriptEvaluationPath,
+    Sep18ChecklistRunnerConfig, Sep18ChecklistSubstrate, WKClipboardProbe,
+    CLIPBOARD_KILL_GATE_NONCLAIM, MAX_PROBE_REPLY_BYTES, PAGE_RESULT_ATTRIBUTE,
+    PAGE_WORLD_INTERCEPTOR_SOURCE, PRIVATE_REPLY_TITLE_PREFIX, PRIVATE_WORLD_PULL_SOURCE,
 };
 
 fn args(values: &[&str]) -> Vec<String> {
@@ -105,6 +105,8 @@ fn linux_runner_is_unsupported_never_pass() {
     assert!(!clipboard_kill_gate_may_claim_pass(&evidence));
     verify_clipboard_kill_gate_evidence(&evidence).expect("honest linux");
 
+    let witness_platform = ClipboardWitness::platform();
+    let webkit = WKClipboardProbe::webkit_available();
     #[cfg(not(target_os = "macos"))]
     {
         assert_eq!(evidence.platform, ClipboardKillGatePlatform::NonMacOs);
@@ -113,8 +115,14 @@ fn linux_runner_is_unsupported_never_pass() {
             ClipboardKillGateOutcome::UnsupportedPlatform
         );
         assert_eq!(evidence.verdict, ClipboardKillGateVerdict::Unsupported);
+        assert_eq!(witness_platform, ClipboardWitnessPlatform::NonMacOs);
         assert!(ClipboardWitness::seal_digest().is_err());
-        assert!(!WKClipboardProbe::webkit_available());
+        assert!(!webkit);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        assert_eq!(witness_platform, ClipboardWitnessPlatform::MacOs);
+        let _ = webkit;
     }
 }
 
