@@ -9,8 +9,8 @@ use grokptah_agent_bridge::computer_use::{
     ContainedBrowserDryRunOutcome, ContainedBrowserDryRunPlatform, GuestLifecyclePhase,
     HostSentinelSnapshot, IsolatedSurfaceBackend, IsolatedSurfaceHarness, ProofEvidenceClass,
     Sep18NoModelProofSequencer, SyntheticGuestAction, VfDryRunOutcome, VfDryRunPlatform,
-    VfLaunchReceipt, CONTAINED_BROWSER_DRY_RUN_NONCLAIM, SYNTHETIC_HARNESS_NONCLAIM,
-    VF_DRY_RUN_NONCLAIM,
+    VfLaunchReceipt, CONTAINED_BROWSER_DRY_RUN_NONCLAIM, NATIVE_HOST_SENTINEL_NONCLAIM,
+    SYNTHETIC_HARNESS_NONCLAIM, VF_DRY_RUN_NONCLAIM,
 };
 
 #[test]
@@ -100,5 +100,19 @@ fn bridge_vf_dry_run_honest_nonclaim() {
     assert!(!evidence.physical_pass_claimed);
     assert_eq!(evidence.nonclaim, VF_DRY_RUN_NONCLAIM);
     assert!(evidence.nonclaim.contains("never claim Sep 18 PASS"));
+    assert!(!computer_use_isolated_surface_admission());
+}
+
+#[test]
+fn bridge_native_host_sentinel_runner_fail_closed() {
+    let sequencer = Sep18NoModelProofSequencer::new(HostSentinelSnapshot::synthetic_baseline());
+    let evidence = sequencer
+        .run_native_host_sentinel(".")
+        .expect("native runner artifact");
+    assert!(!evidence.synthetic_fallback_used);
+    assert!(!evidence.physical_pass_claimed);
+    assert!(!evidence.isolation_pass_claimed);
+    assert!(!evidence.vf_pass_claimed);
+    assert_eq!(evidence.nonclaim, NATIVE_HOST_SENTINEL_NONCLAIM);
     assert!(!computer_use_isolated_surface_admission());
 }

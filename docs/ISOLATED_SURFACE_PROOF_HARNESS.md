@@ -2,7 +2,7 @@
 
 This document inventories the current `main` Computer Use / isolated-guest code,
 defines the synthetic proof harness, and maps it to the Sep 5–18 2026 calendar
-(Phase-1 packet 9: honest Contained Browser captured-frame hashes). It does **not**
+(Phase-1 packet 10: native host-sentinel runner). It does **not**
 claim packaged Virtualization.framework qualification from Linux CI or dry-run
 artifacts.
 
@@ -22,10 +22,11 @@ surface), [#267](https://github.com/chriscase/GrokPtah/issues/267) (epic).
 | Sep 6–12 | Packet 6 — Harness Stop honesty (#548) | **Landed** — Stop cleanup survives disk/audit failure; `Destroyed` is confirmed-only |
 | Sep 6–12 | Packet 7 — `stop_fence_first` no default (#549) | **Landed** — trait default removed; production adapters must fence with ack/failure |
 | Sep 6–12 | Packet 8 — Mac host sentinel provenance (#550) | **Landed** — `MacHostSentinelCollector::collect()` wired; synthetic self-compare ineligible for physical markers |
-| Sep 6–12 | Packet 9 — Honest Contained Browser captured-frame hashes | **This slice** — `GuestFrame.digest` is `sha256:<64 hex>` over bounded capture bytes; simulator payloads labeled synthetic |
+| Sep 6–12 | Packet 9 — Honest Contained Browser captured-frame hashes (#551) | **Landed** — `GuestFrame.digest` is `sha256:<64 hex>` over bounded capture bytes; simulator payloads labeled synthetic |
+| Sep 18 | Packet 10 — Native host-sentinel runner | **This slice** — exclusive `MacHostSentinelCollector` runner; Linux fail-closed; no PASS/admission |
 | Sep 18 | Physical Mac gate | VF PASS or honest Contained Browser pivot |
 
-## Exact-main inventory (base `40e2b5d70b2ef616ed0e8f9830f9890859b5a7ee` + packet 9)
+## Exact-main inventory (base `0ed82975d83ec7213883a9b7743253a56b751e28` + packet 10)
 
 ### Already satisfies Windowed Coding Run noninterference (semantic macOS path)
 
@@ -55,6 +56,7 @@ surface), [#267](https://github.com/chriscase/GrokPtah/issues/267) (epic).
 | Contained Browser regression | `tests/contained_browser_regression.rs` |
 | VF backend stub (Mac + `vf-backend` feature) | `vf_backend.rs` — honest `VirtualizationFramework` label, dry-run only |
 | VF dry-run sequencer path | `vf_dry_run.rs` + `Sep18NoModelProofSequencer::run_vf_dry_run` |
+| Native host-sentinel runner | `native_sentinel_runner.rs` + `Sep18NoModelProofSequencer::run_native_host_sentinel` |
 | Sep 18 no-model proof sequencer | `proof_sequencer.rs` — checklist + bounded fault matrix |
 | Harness orchestrator | `harness.rs` — backend-generic, `with_vf_backend(receipt)` only for VF label |
 | Channel destroy registry | `channels.rs` |
@@ -63,10 +65,11 @@ surface), [#267](https://github.com/chriscase/GrokPtah/issues/267) (epic).
 | Sequencer + SPI regression | `tests/proof_sequencer.rs` |
 | Bridge fail-closed seam | `grokptah-agent-bridge/src/computer_use/isolated_surface.rs` |
 | Bridge integration tests | `grokptah-agent-bridge/tests/isolated_surface_proof_harness.rs` |
-| Sep 18 checklist runner | `checklist_runner.rs` — default CB dry-run, optional VF dry-run / fault matrix |
+| Sep 18 checklist runner | `checklist_runner.rs` — default CB dry-run, optional VF dry-run / native-sentinel / fault matrix |
 | Sealed evidence pack + verifier | `evidence_pack.rs` — independent accept/reject with explicit codes |
-| Checklist CLI | `src/bin/grokptah-sep18-checklist.rs` — `run` + `verify` subcommands |
+| Checklist CLI | `src/bin/grokptah-sep18-checklist.rs` — `run` + `verify`; `--native-host-sentinels` exclusive |
 | Evidence-pack verifier tests | `tests/evidence_pack_verifier.rs` — happy path + tamper rejection |
+| Native host-sentinel runner tests | `tests/native_sentinel_runner.rs` — Linux fail-closed + forged live/fallback/PASS rejection |
 | Captured-frame adversarial tests | `tests/captured_frame_evidence.rs` — digest recomputation, tamper/oversize, no raw-byte leak |
 
 ### Lifecycle phases
@@ -93,10 +96,11 @@ case in `proof_sequencer` tests.
 **Mac physical proof hooks:**
 
 1. Capture baseline before launch with `MacHostSentinelCollector::collect()` (native AX/CGEvent/clipboard/checkout fence; fails closed without Accessibility trust on macOS).
-2. At boot, inject, and Stop probe points, call `IsolatedSurfaceHarness::refresh_host_sentinels_from_collector(collector)` which collects live host state and compares to baseline via [`HostSentinelRegistry::refresh_from_native_collector`].
-3. `StopEvidence.host_sentinels_unchanged` remains authoritative only when probes match baseline.
-4. `StopEvidence.live_host_sentinel_collection` is **true** only after at least one successful native Mac probe — never from [`SyntheticHostProbe`] rehearsal self-compare.
-5. `PhysicalProofMarkers.live_host_sentinel_collection` must align with sealed `stop_evidence.live_host_sentinel_collection`; the independent verifier rejects forged markers.
+2. Attach the collector with `IsolatedSurfaceHarness::attach_native_collector` **before** any probe, or run `Sep18NoModelProofSequencer::run_native_host_sentinel` / `grokptah-sep18-checklist run --native-host-sentinels`.
+3. At boot, inject, and Stop probe points the attached collector is used exclusively via [`HostSentinelRegistry::refresh_from_native_collector`]. Compare-only `refresh_host_sentinels(snapshot)` is forbidden after attachment.
+4. `StopEvidence.host_sentinels_unchanged` remains authoritative only when probes match baseline.
+5. `StopEvidence.live_host_sentinel_collection` is **true** only after at least one successful native Mac probe — never from [`SyntheticHostProbe`] rehearsal self-compare.
+6. `PhysicalProofMarkers.live_host_sentinel_collection` must stay `dry_run_none()` on this runner; live collection does not qualify VF/isolation PASS. The independent verifier rejects forged markers and any synthetic fallback flag.
 
 **Sentinel provenance (packet 8):**
 
@@ -203,6 +207,7 @@ pack file — no live backend, no runner aggregates.
 |---|---|---|
 | Linux CI / default | CB dry-run pack (`ContainedBrowser`, `physical_pass_claimed: false`) | No |
 | VF rehearsal | VF dry-run pack (`physical_pass_claimed: false`) | No |
+| Native host-sentinel runner | Native pack (`Synthetic` guest, `PhysicalProofMarkers::dry_run_none()`) | No |
 | Synthetic fault matrix | Subset sealed packs with explicit fault case | No |
 | Sep 18 Mac worker (future) | VF physical pack with `PhysicalProofMarkers` + live sentinel collection | Only when markers qualify |
 
@@ -224,6 +229,11 @@ cargo run --locked --manifest-path crates/codegen/grokptah-isolated-surface/Carg
 # Bounded fault-matrix subset on CB substrate
 cargo run --locked --manifest-path crates/codegen/grokptah-isolated-surface/Cargo.toml \
   --bin grokptah-sep18-checklist -- run --fault-matrix lost_ack_uncertain -o fault-pack.json
+
+# Native host-sentinel runner (Linux: honest UnsupportedPlatform pack; macOS uses live collector)
+cargo run --locked --manifest-path crates/codegen/grokptah-isolated-surface/Cargo.toml \
+  --bin grokptah-sep18-checklist -- run --native-host-sentinels --vf-dry-run \
+  --checkout /absolute/path/to/disposable/checkout -o native-sentinel-pack.json
 ```
 
 ### Sealed pack fields (honest defaults)
@@ -327,6 +337,9 @@ cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Car
 cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Cargo.toml \
   --test captured_frame_evidence -- --test-threads=1
 
+cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Cargo.toml \
+  --test native_sentinel_runner -- --test-threads=1
+
 # Checklist runner CLI smoke (CB default)
 cargo run --locked --manifest-path crates/codegen/grokptah-isolated-surface/Cargo.toml \
   --bin grokptah-sep18-checklist -- run -o /tmp/sep18-evidence-pack.json
@@ -343,23 +356,26 @@ cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Car
   --features vf-backend --test proof_sequencer sep18_vf_dry_run -- --test-threads=1
 ```
 
-## Residuals (honest, post-packet-9)
+## Residuals (honest, post-packet-10)
 
 - `IsolatedSurfaceBackend::stop_fence_first` has no trait default — production adapters must wire real fence ack/failure.
 - `MacHostSentinelCollector` requires macOS Accessibility trust for foreground/unrelated window evidence; missing TCC → honest `BackendUnavailable`, not synthetic PASS.
-- Default harness rehearsal still uses [`SyntheticHostProbe`] — physical Sep 18 runner must wire `refresh_host_sentinels_from_collector`.
+- Default harness rehearsal still uses [`SyntheticHostProbe`]. Native mode requires
+  `--native-host-sentinels`, `--vf-dry-run`, and an explicit disposable `--checkout PATH`;
+  it attaches the collector before VF boot/lifecycle/Stop and never falls back to synthetic probes.
 
-- Checklist runner seals dry-run packs only — no live Mac VF IPC or packaged helper.
+- Checklist runner seals dry-run / native-sentinel packs only — no live Mac VF IPC or packaged helper.
 - Independent verifier is pack-only; physical Mac worker still required for VF PASS rung.
 - Contained Browser substrate v0 uses an in-process simulator — not a real isolated browser engine.
 - Simulator captured-frame bytes are explicit synthetic payloads, content-addressed and labeled synthetic — not a real browser capture.
 - Optional `browser-engine` feature fails closed until a bounded engine capture is actually wired; this slice fabricates no engine receipt or PASS.
+- Native host-sentinel live collection is **not** VF PASS, isolation PASS, or admission enablement.
 - No TCC entitlement or notarization claims.
 - No Windows/Linux isolated surface.
 - No agent-owned cursor / surface-event stream (#286 UI layer still disposition-only).
 - No bridge admission enablement — `isolated_surface_admission_available()` stays false.
 - Linux CI proves contract + substrate rehearsal; physical isolation PASS is a separate exact-head gate.
-- #288 packaged-VM acceptance stays open.
+- #288 packaged-VM acceptance stays open. #286 stays open.
 
 ## Non-claims
 
@@ -369,3 +385,4 @@ cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Car
 - [`SyntheticHostProbe`] self-compare does **not** qualify as physical Mac host sentinel collection.
 - `ContainedBrowser` substrate v0 does **not** prove browser isolation — only exercises the SPI lifecycle on a simulator.
 - Simulator captured-frame hashes are **not** a real browser capture; they content-address labeled synthetic payload bytes.
+- Native host-sentinel runner success is **not** VF/isolation/physical PASS and does not enable Computer Mode or admission.

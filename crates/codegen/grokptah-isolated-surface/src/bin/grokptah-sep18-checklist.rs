@@ -5,18 +5,20 @@ use std::path::PathBuf;
 use std::process;
 
 use grokptah_isolated_surface::{
-    parse_evidence_pack, run_sep18_checklist, verifier_exit_code, verify_evidence_pack,
-    FaultMatrixCase, HostSentinelSnapshot, Sep18ChecklistRunnerConfig, Sep18ChecklistSubstrate,
+    parse_evidence_pack, parse_sep18_checklist_run_args, run_sep18_checklist, verifier_exit_code,
+    verify_evidence_pack, HostSentinelSnapshot,
 };
 
 fn usage() -> ! {
     eprintln!(
         "Usage:\n\
-          grokptah-sep18-checklist run [--output PATH] [--vf-dry-run] [--fault-matrix CASE]\n\
+          grokptah-sep18-checklist run [--output PATH] [--vf-dry-run] [--native-host-sentinels --vf-dry-run --checkout PATH] [--fault-matrix CASE]\n\
           grokptah-sep18-checklist verify PATH\n\
          \n\
          Default substrate: Contained Browser dry-run (Linux CI / one-Mac rehearsal).\n\
-         Admission stays false; physical_pass_claimed=false unless a future physical gate flips it."
+         Native mode requires BOTH --native-host-sentinels AND --vf-dry-run plus an explicitly supplied --checkout PATH (never defaulted to .).\n\
+         Native VF dry-run attaches MacHostSentinelCollector before VF boot/lifecycle/Stop; VF evidence carries the actual Stop HostSentinelProbeSummary (zeros only when Stop did not run).\n\
+         This labeled runner is not a complete exclusive physical proof. Admission stays false; physical_pass_claimed=false; vf_pass_claimed=false."
     );
     process::exit(2);
 }
@@ -36,42 +38,18 @@ fn main() {
 }
 
 fn exit_run(args: &[String]) {
-    let mut output = PathBuf::from("sep18-evidence-pack.json");
-    let mut config = Sep18ChecklistRunnerConfig::contained_browser_default();
+    let request = parse_sep18_checklist_run_args(args).unwrap_or_else(|err| {
+        eprintln!("{err}");
+        usage();
+    });
 
-    let mut idx = 0;
-    while idx < args.len() {
-        match args[idx].as_str() {
-            "--output" | "-o" => {
-                idx += 1;
-                output = PathBuf::from(args.get(idx).unwrap_or_else(|| usage()));
-            }
-            "--vf-dry-run" => {
-                config = Sep18ChecklistRunnerConfig::vf_dry_run("sep18-cli-vf-dry-run");
-            }
-            "--synthetic" => {
-                config.substrate = Sep18ChecklistSubstrate::SyntheticHarness;
-            }
-            "--fault-matrix" => {
-                idx += 1;
-                let case = args.get(idx).unwrap_or_else(|| usage());
-                config.fault_matrix_case = Some(parse_fault_matrix(case));
-            }
-            other => {
-                eprintln!("unknown run flag: {other}");
-                usage();
-            }
-        }
-        idx += 1;
-    }
-
-    let outcome = run_sep18_checklist(HostSentinelSnapshot::synthetic_baseline(), config);
+    let outcome = run_sep18_checklist(HostSentinelSnapshot::synthetic_baseline(), request.config);
     if let Some(err) = &outcome.runner_error {
         eprintln!("runner error: {err:?}");
         process::exit(1);
     }
 
-    if let Err(err) = outcome.write_pack(&output) {
+    if let Err(err) = outcome.write_pack(&request.output) {
         eprintln!("failed to write evidence pack: {err:?}");
         process::exit(1);
     }
@@ -79,7 +57,7 @@ fn exit_run(args: &[String]) {
     let decision = verify_evidence_pack(&outcome.pack);
     eprintln!(
         "wrote {} — verifier: {} ({:?})",
-        output.display(),
+        request.output.display(),
         if decision.accepted {
             "accepted"
         } else {
@@ -116,17 +94,4 @@ fn exit_verify(args: &[String]) {
         decision.message
     );
     process::exit(verifier_exit_code(&decision));
-}
-
-fn parse_fault_matrix(value: &str) -> FaultMatrixCase {
-    match value {
-        "boot_stop" | "BootStop" => FaultMatrixCase::BootStop,
-        "pre_dispatch_stop" | "PreDispatchStop" => FaultMatrixCase::PreDispatchStop,
-        "lost_ack_uncertain" | "LostAckUncertain" => FaultMatrixCase::LostAckUncertain,
-        "restart_no_replay" | "RestartNoReplay" => FaultMatrixCase::RestartNoReplay,
-        other => {
-            eprintln!("unknown fault matrix case: {other}");
-            usage();
-        }
-    }
 }

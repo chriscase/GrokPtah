@@ -109,6 +109,17 @@ impl Sep18NoModelProofSequencer {
         )
     }
 
+    /// Native host-sentinel runner. Ignores the sequencer's synthetic baseline:
+    /// macOS collects a live baseline from [`crate::sentinel::MacHostSentinelCollector`]
+    /// and probes exclusively with it; non-macOS returns an honest unsupported
+    /// artifact without synthetic fallback. Never claims PASS or admission.
+    pub fn run_native_host_sentinel(
+        &self,
+        checkout_path: impl AsRef<std::path::Path>,
+    ) -> HarnessResult<crate::NativeSentinelEvidence> {
+        crate::run_native_host_sentinel(checkout_path.as_ref(), self.snapshot_root.as_deref())
+    }
+
     /// Run one bounded fault-matrix case.
     pub fn run_fault_matrix(&self, case: FaultMatrixCase) -> HarnessResult<SealedProofEvidence> {
         match case {
@@ -165,13 +176,19 @@ impl Sep18NoModelProofSequencer {
             steps.push(ChecklistStep::StopDestroyed);
         }
 
-        let inject_err = harness
-            .inject_guest_action(GuestLocalAction::ClickGuestButton)
-            .expect_err("stale inject token must be rejected");
-        if inject_err.code != HarnessErrorCode::InjectFenced {
-            return Err(HarnessError::invalid_state(
-                "stale token rejection must fence inject",
-            ));
+        match harness.inject_guest_action(GuestLocalAction::ClickGuestButton) {
+            Err(err) if err.code == HarnessErrorCode::InjectFenced => {}
+            Err(err) => {
+                return Err(HarnessError::invalid_state(format!(
+                    "stale token rejection must fence inject, got {:?}",
+                    err.code
+                )));
+            }
+            Ok(_) => {
+                return Err(HarnessError::inject_fenced(
+                    "stale inject token must be rejected after Stop",
+                ));
+            }
         }
         steps.push(ChecklistStep::StaleTokensRejected);
 

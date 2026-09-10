@@ -14,7 +14,9 @@ use crate::error::{HarnessError, HarnessErrorCode, HarnessResult};
 use crate::lifecycle::{
     GuestLifecycle, GuestLifecycleDisposition, GuestLifecyclePhase, ProofEvidenceClass,
 };
-use crate::sentinel::{HostSentinelRegistry, HostSentinelSnapshot, SyntheticHostProbe};
+use crate::sentinel::{
+    HostSentinelProbeKind, HostSentinelRegistry, HostSentinelSnapshot, SyntheticHostProbe,
+};
 use crate::simulator::{GuestFrame, GuestLocalAction, InjectOutcome, SyntheticGuest};
 use crate::store::HarnessSnapshot;
 
@@ -28,6 +30,9 @@ pub struct StopEvidence {
     /// True only when at least one successful native Mac host probe occurred.
     pub live_host_sentinel_collection: bool,
     pub host_sentinel_probe_error: Option<HarnessError>,
+    /// Kind of the last host-sentinel probe at Stop. Missing deserializes fail-closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_host_sentinel_probe_kind: Option<HostSentinelProbeKind>,
     pub backend_fence_error: Option<HarnessError>,
     pub persist_snapshot_error: Option<HarnessError>,
     pub backend_destroy_error: Option<HarnessError>,
@@ -53,12 +58,17 @@ pub struct IsolatedSurfaceHarness<B: IsolatedSurfaceBackend = SyntheticGuest> {
     lifecycle: GuestLifecycle,
     sentinels: HostSentinelRegistry,
     host_probe: SyntheticHostProbe,
+    /// Exclusive native Mac collector. Once attached, synthetic self-compare
+    /// and compare-only snapshot refresh are forbidden for the rest of the run.
+    #[cfg(target_os = "macos")]
+    native_collector: Option<crate::sentinel::MacHostSentinelCollector>,
     backend: B,
     channels: ChannelRegistry,
     snapshot_root: Option<std::path::PathBuf>,
     auto_retry_attempts: u32,
     last_channels_destroyed: usize,
     declared_evidence_class: ProofEvidenceClass,
+    last_host_sentinel_probe_kind: Option<HostSentinelProbeKind>,
 }
 
 impl IsolatedSurfaceHarness<SyntheticGuest> {
@@ -116,12 +126,15 @@ impl<B: IsolatedSurfaceBackend> IsolatedSurfaceHarness<B> {
             lifecycle,
             sentinels: HostSentinelRegistry::capture(baseline.clone()),
             host_probe: SyntheticHostProbe::new(baseline),
+            #[cfg(target_os = "macos")]
+            native_collector: None,
             backend,
             channels: ChannelRegistry::new(),
             snapshot_root: None,
             auto_retry_attempts: 0,
             last_channels_destroyed: 0,
             declared_evidence_class,
+            last_host_sentinel_probe_kind: None,
         }
     }
 
@@ -141,7 +154,15 @@ impl<B: IsolatedSurfaceBackend> IsolatedSurfaceHarness<B> {
     /// Mac physical proof hook: compare an externally supplied snapshot to the
     /// harness baseline. Does **not** count as native Mac collection — use
     /// [`Self::refresh_host_sentinels_from_collector`] for physical proof.
+    ///
+    /// Forbidden after [`Self::attach_native_collector`]: a later synthetic
+    /// compare-only refresh would clear live native provenance.
     pub fn refresh_host_sentinels(&mut self, snapshot: HostSentinelSnapshot) -> HarnessResult<()> {
+        if self.native_host_collector_attached() {
+            return Err(HarnessError::invalid_state(
+                "compare-only snapshot refresh is forbidden after native collector attachment",
+            ));
+        }
         self.sentinels.refresh_from_host(snapshot)
     }
 
@@ -152,6 +173,40 @@ impl<B: IsolatedSurfaceBackend> IsolatedSurfaceHarness<B> {
         collector: &crate::sentinel::MacHostSentinelCollector,
     ) -> HarnessResult<()> {
         self.sentinels.refresh_from_native_collector(collector)
+    }
+
+    /// Attach the live Mac collector **before** any host probe. After this,
+    /// boot/inject/Stop probes use the collector exclusively and never fall back
+    /// to [`SyntheticHostProbe`].
+    #[cfg(target_os = "macos")]
+    pub fn attach_native_collector(
+        &mut self,
+        collector: crate::sentinel::MacHostSentinelCollector,
+    ) -> HarnessResult<()> {
+        if self.sentinels.probes_performed() > 0 {
+            return Err(HarnessError::invalid_state(
+                "native collector must be attached before any host sentinel probe",
+            ));
+        }
+        if self.native_collector.is_some() {
+            return Err(HarnessError::invalid_state(
+                "native collector is already attached",
+            ));
+        }
+        self.native_collector = Some(collector);
+        Ok(())
+    }
+
+    /// True only when the native Mac collector is attached for exclusive probes.
+    pub fn native_host_collector_attached(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            self.native_collector.is_some()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
     }
 
     pub fn host_probe_mut(&mut self) -> &mut SyntheticHostProbe {
@@ -175,7 +230,17 @@ impl<B: IsolatedSurfaceBackend> IsolatedSurfaceHarness<B> {
     }
 
     fn probe_host_sentinels(&mut self) -> HarnessResult<()> {
-        self.sentinels.probe_and_verify(&self.host_probe)
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(collector) = self.native_collector.clone() {
+                let result = self.sentinels.refresh_from_native_collector(&collector);
+                self.last_host_sentinel_probe_kind = Some(HostSentinelProbeKind::NativeMacHost);
+                return result;
+            }
+        }
+        let result = self.sentinels.probe_and_verify(&self.host_probe);
+        self.last_host_sentinel_probe_kind = Some(HostSentinelProbeKind::SyntheticRehearsal);
+        result
     }
 
     /// launch → boot guest
@@ -280,6 +345,7 @@ impl<B: IsolatedSurfaceBackend> IsolatedSurfaceHarness<B> {
             host_sentinel_probes_performed: self.sentinels.probes_performed(),
             live_host_sentinel_collection: self.sentinels.live_host_collection_verified(),
             host_sentinel_probe_error: probe_error,
+            last_host_sentinel_probe_kind: self.last_host_sentinel_probe_kind,
             backend_fence_error,
             persist_snapshot_error,
             backend_destroy_error: teardown.backend_destroy_error,
@@ -334,6 +400,7 @@ impl<B: IsolatedSurfaceBackend> IsolatedSurfaceHarness<B> {
             host_sentinel_probes_performed: self.sentinels.probes_performed(),
             live_host_sentinel_collection: false,
             host_sentinel_probe_error: None,
+            last_host_sentinel_probe_kind: None,
             backend_fence_error: None,
             persist_snapshot_error: teardown.persist_snapshot_error,
             backend_destroy_error: teardown.backend_destroy_error,
