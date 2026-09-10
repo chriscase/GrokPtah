@@ -1035,7 +1035,7 @@ mod macos {
             harness_error_for_probe_reason(ClipboardProbeFailClosedReason::MissingWebKitCapability)
         })?;
         let handler: Retained<AnyObject> = unsafe { objc2::msg_send![handler_cls, new] };
-        let key = handler_key(&*handler);
+        let key = handler_key(&handler);
 
         let controller: Option<Retained<AnyObject>> =
             unsafe { objc2::msg_send![&*config, userContentController] };
