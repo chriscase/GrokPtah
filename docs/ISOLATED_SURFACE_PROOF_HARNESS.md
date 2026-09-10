@@ -205,10 +205,19 @@ cargo run --locked --manifest-path crates/codegen/grokptah-isolated-surface/Carg
   --bin grokptah-sep18-checklist -- run --clipboard-kill-gate \
   -o clipboard-kill-gate.json
 
-# 3. Independent verify on the same Mac (Linux verifiers reject Pass by contract)
+# 3. Persisted-pack verify (integrity/provenance only — cannot re-promote Pass)
 cargo run --locked --manifest-path crates/codegen/grokptah-isolated-surface/Cargo.toml \
   --bin grokptah-sep18-checklist -- verify clipboard-kill-gate.json
 ```
+
+`run` verifies the **in-process** live result (the runner-issued `live_authority`
+is still in memory). That is the only path that can accept native Pass.
+
+`verify` of the written JSON checks integrity and provenance (schema, nonclaims,
+host digest, protocol fields). `live_authority` is serde-skipped, so a
+serialized Pass **cannot** be independently re-promoted; file verify of a Pass
+pack is expected to reject with live-witness-missing. Linux verifiers also
+reject Pass by contract.
 
 Inspect `clipboardKillGate.verdict`:
 
@@ -472,7 +481,7 @@ cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Car
 - Simulator captured-frame bytes are explicit synthetic payloads, content-addressed and labeled synthetic — not a real browser capture.
 - Optional `browser-engine` feature fails closed until a bounded engine capture is actually wired; this slice fabricates no engine receipt or PASS.
 - Native host-sentinel live collection is **not** VF PASS, isolation PASS, or admission enablement.
-- Clipboard kill-gate Pass is **not** VF PASS, isolation PASS, Computer Mode, or admission. Linux CI is deterministic `unsupported`. Ordinary `cargo test` never initializes WebKit. Pass requires genuine page-world initiation and fulfillment of `navigator.clipboard.readText/writeText/read/write`, an unforgeable host-issued generation/epoch challenge, host receive through a registered private-world `WKScriptMessageHandler`, unchanged host clipboard digest, and a process-private live witness. Public JSON / typed NativeWebKit-shaped packs cannot reconstruct Pass. Title polling, DOM self-attestation, private-world self-simulation, host-injected clipboard stubs, hardcoded receipts, and missing handler registration are INCONCLUSIVE and never Pass. Linux verifiers reject Pass.
+- Clipboard kill-gate Pass is **not** VF PASS, isolation PASS, Computer Mode, or admission. Linux CI is deterministic `unsupported`. Ordinary `cargo test` never initializes WebKit. Pass requires genuine page-world initiation and fulfillment of `navigator.clipboard.readText/writeText/read/write`, an unforgeable host-issued generation/epoch challenge, host receive through a registered private-world `WKScriptMessageHandler`, unchanged host clipboard digest, and a process-private live witness. In-process verification of the live runner result can accept Pass; persisted JSON verifies integrity/provenance but cannot independently re-promote Pass. Title polling, DOM self-attestation, private-world self-simulation, host-injected clipboard stubs, hardcoded receipts, and missing handler registration are INCONCLUSIVE and never Pass. Linux verifiers reject Pass.
 - No TCC entitlement or notarization claims.
 - No Windows/Linux isolated surface.
 - No agent-owned cursor / surface-event stream (#286 UI layer still disposition-only).

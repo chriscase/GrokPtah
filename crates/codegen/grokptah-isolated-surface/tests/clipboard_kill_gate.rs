@@ -16,8 +16,9 @@ use grokptah_isolated_surface::{
     EvidenceVerifierCode, HostClipboardDigest, HostSentinelSnapshot, PageLocalClipboardReceipt,
     PhysicalProofMarkers, ProbePull, ProbeReply, ProofEvidenceClass, ReceiptInitiator,
     ReplyChannel, ScriptEvaluationPath, Sep18ChecklistRunnerConfig, Sep18ChecklistSubstrate,
-    CLIPBOARD_KILL_GATE_NONCLAIM, MAX_PROBE_REPLY_BYTES, PAGE_RESULT_ATTRIBUTE,
-    PAGE_WORLD_INTERCEPTOR_SOURCE, PRIVATE_REPLY_TITLE_PREFIX, PRIVATE_WORLD_PULL_SOURCE,
+    CF_RUN_LOOP_DEFAULT_MODE, CLIPBOARD_KILL_GATE_NONCLAIM, MAX_PROBE_REPLY_BYTES,
+    PAGE_RESULT_ATTRIBUTE, PAGE_WORLD_INTERCEPTOR_SOURCE, PRIVATE_REPLY_TITLE_PREFIX,
+    PRIVATE_WORLD_PULL_SOURCE,
 };
 
 fn args(values: &[&str]) -> Vec<String> {
@@ -581,6 +582,17 @@ fn private_world_script_is_read_only_and_page_world_initiates_async_clipboard() 
     assert!(!initiator.contains("document.title"));
     assert!(!initiator.contains("postMessage"));
     assert!(!initiator.contains("writeText = function"));
+}
+
+#[test]
+fn runloop_pump_uses_cf_default_mode_not_ns_symbol_name() {
+    assert_eq!(CF_RUN_LOOP_DEFAULT_MODE, "kCFRunLoopDefaultMode");
+    assert_ne!(CF_RUN_LOOP_DEFAULT_MODE, "NSDefaultRunLoopMode");
+    let source = include_str!("../src/wk_clipboard_probe.rs");
+    assert!(source.contains("static kCFRunLoopDefaultMode"));
+    assert!(source.contains("CoreFoundation"));
+    assert!(!source.contains("nsstring(\"NSDefaultRunLoopMode\")"));
+    assert!(!source.contains("\"NSDefaultRunLoopMode\""));
 }
 
 #[test]

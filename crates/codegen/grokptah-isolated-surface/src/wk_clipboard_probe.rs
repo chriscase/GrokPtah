@@ -54,6 +54,13 @@ pub const MAX_RECEIPT_COUNT: usize = ClipboardOperation::ALL.len();
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub const PRIVATE_REPLY_TITLE_PREFIX: &str = "GROKPTAH-CLIPBOARD-REPLY:";
 
+/// CoreFoundation default run-loop mode identifier (`kCFRunLoopDefaultMode`).
+///
+/// The AppKit *symbol name* NSDefaultRunLoopMode is not the mode string.
+/// Fabricating `NSString` from that name does not match registered sources
+/// (WebKit / script-message handlers) and collapses the native probe to timeout.
+pub const CF_RUN_LOOP_DEFAULT_MODE: &str = "kCFRunLoopDefaultMode";
+
 /// Process-local authorization for native WebKit. Ordinary `cargo test`
 /// must never set this. Only the exclusive physical CLI/runner may.
 static NATIVE_PROBE_AUTHORIZED: AtomicBool = AtomicBool::new(false);
@@ -1184,6 +1191,25 @@ mod macos {
         }
     }
 
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        /// Canonical default mode. Toll-free bridged to NSString.
+        static kCFRunLoopDefaultMode: *const AnyObject;
+    }
+
+    fn default_run_loop_mode() -> Option<&'static AnyObject> {
+        let ptr = unsafe { kCFRunLoopDefaultMode };
+        if ptr.is_null() {
+            return None;
+        }
+        let mode = unsafe { &*ptr };
+        debug_assert_eq!(
+            nsstring_to_string(Some(mode)).as_deref(),
+            Some(CF_RUN_LOOP_DEFAULT_MODE)
+        );
+        Some(mode)
+    }
+
     fn pump_runloop_briefly() {
         let cls = match AnyClass::get(c"NSRunLoop") {
             Some(cls) => cls,
@@ -1202,10 +1228,10 @@ mod macos {
         let Some(date) = date else {
             return;
         };
-        let Some(mode) = nsstring("NSDefaultRunLoopMode") else {
+        let Some(mode) = default_run_loop_mode() else {
             return;
         };
-        let _: bool = unsafe { objc2::msg_send![&*current, runMode: &*mode, beforeDate: &*date] };
+        let _: bool = unsafe { objc2::msg_send![&*current, runMode: mode, beforeDate: &*date] };
     }
 
     fn ns_app_activation_policy_regular_would_prompt() -> bool {
@@ -1669,6 +1695,15 @@ mod tests {
         assert!(!initiator.contains("postMessage"));
         assert!(!initiator.contains("writeText = function"));
         assert!(!initiator.contains("clipboard.write = function"));
+    }
+
+    #[test]
+    fn cf_run_loop_default_mode_identifier() {
+        assert_eq!(CF_RUN_LOOP_DEFAULT_MODE, "kCFRunLoopDefaultMode");
+        assert_eq!(
+            CF_RUN_LOOP_DEFAULT_MODE.as_bytes(),
+            b"kCFRunLoopDefaultMode"
+        );
     }
 
     #[test]
