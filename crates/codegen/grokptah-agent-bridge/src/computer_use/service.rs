@@ -645,8 +645,53 @@ impl ComputerUseService {
         run_id: &str,
         expected_version: u64,
     ) -> ComputerResult<ComputerRun> {
+        self.complete_inner(
+            request_id,
+            run_id,
+            expected_version,
+            json!({ "runId": run_id, "expectedVersion": expected_version }),
+            None,
+        )
+    }
+
+    /// Complete against a host-supplied current observation.
+    ///
+    /// The identity must match the live current frame. On match, a positive
+    /// postcondition is bound to that frame and the ordinary completion path
+    /// runs. Stale id or sequence is [`ComputerErrorCode::UnverifiedCompletion`]
+    /// with no terminal mutation. Ordinary [`Self::complete`] is unchanged.
+    pub fn complete_with_observation(
+        &self,
+        request_id: &str,
+        run_id: &str,
+        expected_version: u64,
+        observation_id: &str,
+        sequence: u64,
+    ) -> ComputerResult<ComputerRun> {
+        validate_id("observation_id", observation_id)?;
+        self.complete_inner(
+            request_id,
+            run_id,
+            expected_version,
+            json!({
+                "runId": run_id,
+                "expectedVersion": expected_version,
+                "observationId": observation_id,
+                "sequence": sequence,
+            }),
+            Some((observation_id.to_string(), sequence)),
+        )
+    }
+
+    fn complete_inner(
+        &self,
+        request_id: &str,
+        run_id: &str,
+        expected_version: u64,
+        payload: serde_json::Value,
+        host_observation: Option<(String, u64)>,
+    ) -> ComputerResult<ComputerRun> {
         validate_id("run_id", run_id)?;
-        let payload = json!({ "runId": run_id, "expectedVersion": expected_version });
         if let Some(replayed) = self.begin_mutation(request_id, "complete", &payload)? {
             return replayed;
         }
@@ -655,6 +700,9 @@ impl ComputerUseService {
             .update_run(run_id, |run| {
                 ensure_version(run, expected_version)?;
                 if run.state != ComputerRunState::Completed {
+                    if let Some((observation_id, sequence)) = host_observation.as_ref() {
+                        bind_host_completion_evidence(run, observation_id, *sequence)?;
+                    }
                     self.policy.authorize_completion(run)?;
                 }
                 let verified_observation = run
@@ -1034,6 +1082,30 @@ fn classify_act_failure(error: ComputerError) -> ComputerError {
             ),
         ),
     }
+}
+
+fn bind_host_completion_evidence(
+    run: &mut ComputerRun,
+    observation_id: &str,
+    sequence: u64,
+) -> ComputerResult<()> {
+    let Some(current) = run.current_observation.as_ref() else {
+        return Err(ComputerError::new(
+            ComputerErrorCode::UnverifiedCompletion,
+            "completion evidence does not match the current observation",
+        ));
+    };
+    if current.observation_id != observation_id || current.sequence != sequence {
+        return Err(ComputerError::new(
+            ComputerErrorCode::UnverifiedCompletion,
+            "completion evidence does not match the current observation",
+        ));
+    }
+    run.last_outcome = Some(
+        ActionOutcome::bounded("current observation complete", Some(true))
+            .bind_to_observation(current),
+    );
+    Ok(())
 }
 
 fn ensure_version(run: &ComputerRun, expected_version: u64) -> ComputerResult<()> {
@@ -3101,5 +3173,150 @@ mod tests {
         let persisted = service.get_run(&run.run_id).unwrap().unwrap();
         assert_eq!(persisted.state, ComputerRunState::Ready);
         assert_eq!(persisted.version, version);
+    }
+
+    #[tokio::test]
+    async fn complete_with_observation_admits_the_current_frame_and_replays() {
+        let (_backend, service) = service();
+        let (run, observation) = authorized_observed_run(
+            &service,
+            "model-complete",
+            BTreeSet::from([ActionClass::Semantic, ActionClass::TextEntry]),
+        )
+        .await;
+        assert!(run.last_outcome.is_none());
+        let completed = service
+            .complete_with_observation(
+                "model-complete",
+                &run.run_id,
+                run.version,
+                &observation.observation_id,
+                observation.sequence,
+            )
+            .unwrap();
+        assert_eq!(completed.state, ComputerRunState::Completed);
+        assert!(completed.ended_at.is_some());
+        assert!(completed
+            .grant
+            .as_ref()
+            .is_some_and(|grant| grant.revoked_at.is_some()));
+        assert_eq!(completed.action_count, 0);
+        assert_eq!(
+            completed
+                .last_outcome
+                .as_ref()
+                .and_then(|outcome| outcome.expected_postcondition_met),
+            Some(true)
+        );
+        assert_eq!(
+            completed
+                .last_outcome
+                .as_ref()
+                .and_then(|outcome| outcome.observation_id.as_deref()),
+            Some(observation.observation_id.as_str())
+        );
+        assert_eq!(
+            completed
+                .last_outcome
+                .as_ref()
+                .and_then(|outcome| outcome.sequence),
+            Some(observation.sequence)
+        );
+        assert!(completed.audit.iter().any(|entry| {
+            entry.operation == "complete"
+                && entry.disposition == "completed"
+                && entry.observation_id.as_deref() == Some(observation.observation_id.as_str())
+        }));
+
+        let replay = service
+            .complete_with_observation(
+                "model-complete",
+                &run.run_id,
+                run.version,
+                &observation.observation_id,
+                observation.sequence,
+            )
+            .unwrap();
+        assert_eq!(replay.state, ComputerRunState::Completed);
+        assert_eq!(replay.version, completed.version);
+        assert_eq!(replay.audit.len(), completed.audit.len());
+    }
+
+    #[tokio::test]
+    async fn complete_with_observation_rejects_stale_id_or_sequence() {
+        let (_backend, service) = service();
+        let (run, observation) = authorized_observed_run(
+            &service,
+            "stale-model-complete",
+            BTreeSet::from([ActionClass::Semantic, ActionClass::TextEntry]),
+        )
+        .await;
+        let version = run.version;
+        let audit_len = run.audit.len();
+
+        let stale_id = service
+            .complete_with_observation(
+                "stale-model-id",
+                &run.run_id,
+                version,
+                "stale-observation",
+                observation.sequence,
+            )
+            .unwrap_err();
+        assert_eq!(stale_id.code, ComputerErrorCode::UnverifiedCompletion);
+
+        let after_id = service.get_run(&run.run_id).unwrap().unwrap();
+        assert_eq!(after_id.state, ComputerRunState::Ready);
+        assert_eq!(after_id.version, version);
+        assert!(after_id.ended_at.is_none());
+        assert!(after_id.last_outcome.is_none());
+        assert_eq!(after_id.audit.len(), audit_len + 1);
+        assert!(
+            after_id
+                .grant
+                .as_ref()
+                .is_some_and(|grant| grant.revoked_at.is_none()),
+            "refusal must not revoke authority"
+        );
+
+        let stale_sequence = service
+            .complete_with_observation(
+                "stale-model-seq",
+                &run.run_id,
+                version,
+                &observation.observation_id,
+                observation.sequence.saturating_add(1),
+            )
+            .unwrap_err();
+        assert_eq!(
+            stale_sequence.code,
+            ComputerErrorCode::UnverifiedCompletion
+        );
+
+        let persisted = service.get_run(&run.run_id).unwrap().unwrap();
+        assert_eq!(persisted.state, ComputerRunState::Ready);
+        assert_eq!(persisted.version, version);
+        assert!(persisted.ended_at.is_none());
+        assert!(persisted.last_outcome.is_none());
+        assert_eq!(persisted.audit.len(), audit_len + 2);
+        assert!(persisted
+            .grant
+            .as_ref()
+            .is_some_and(|grant| grant.revoked_at.is_none()));
+
+        let replay = service
+            .complete_with_observation(
+                "stale-model-id",
+                &run.run_id,
+                version,
+                "stale-observation",
+                observation.sequence,
+            )
+            .unwrap_err();
+        assert_eq!(replay.code, ComputerErrorCode::UnverifiedCompletion);
+        let replayed = service.get_run(&run.run_id).unwrap().unwrap();
+        assert_eq!(replayed.version, version);
+        assert_eq!(replayed.state, ComputerRunState::Ready);
+        assert_eq!(replayed.audit.len(), persisted.audit.len());
     }
 }
