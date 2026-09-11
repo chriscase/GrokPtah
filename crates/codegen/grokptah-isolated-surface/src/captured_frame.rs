@@ -13,7 +13,10 @@
 //! engine receipt, captured bytes, native/physical marker, or PASS is
 //! fabricated.
 
+use std::collections::HashMap;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -37,6 +40,7 @@ pub const SYNTHETIC_FRAME_PAYLOAD_NEEDLE: &[u8] = b"raw-synthetic-frame-pixels-m
 const SYNTHETIC_FRAME_MAGIC: &[u8] = b"GROKPTAH-SYNTHETIC-BROWSER-FRAME-v1\0";
 const CANONICAL_DIGEST_PREFIX: &str = "sha256:";
 const CANONICAL_HEX_LEN: usize = 64;
+const RGBA8_BYTES_PER_PIXEL: usize = 4;
 
 /// Who produced the captured bytes. Must never be upgraded at seal time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +83,80 @@ pub struct CapturedFrameEvidence {
 pub struct CapturedFramePair {
     pub before: CapturedFrameEvidence,
     pub after: CapturedFrameEvidence,
+}
+
+/// Process-private authority issued by a trusted native browser adapter.
+///
+/// This deliberately has no public constructor and no serde implementation.
+/// A future macOS adapter may receive one from [`issue_browser_engine_capture_receipt`]
+/// immediately before it hands bounded snapshot bytes to the admission seam.
+/// Possession of a cloned receipt is not a proof of capture by itself; the
+/// token must still be registered in this process and bound to its epoch.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct BrowserEngineCaptureReceipt {
+    token: u64,
+    epoch: u64,
+}
+
+fn browser_engine_receipts() -> &'static Mutex<HashMap<u64, u64>> {
+    static RECEIPTS: OnceLock<Mutex<HashMap<u64, u64>>> = OnceLock::new();
+    RECEIPTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Mint a process-private receipt for a trusted native adapter.
+///
+/// This is crate-private on purpose: there is no public API that can mint a
+/// browser-engine receipt, and serialized/public evidence cannot recreate one.
+#[allow(dead_code)]
+pub(crate) fn issue_browser_engine_capture_receipt(
+    epoch: u64,
+) -> HarnessResult<BrowserEngineCaptureReceipt> {
+    if epoch == 0 {
+        return Err(HarnessError::invalid_state(
+            "browser-engine capture receipt epoch must be bound to a booted frame",
+        ));
+    }
+    static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
+    let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
+    let token = if token == 0 { 1 } else { token };
+    browser_engine_receipts()
+        .lock()
+        .map_err(|_| {
+            HarnessError::invalid_state("browser-engine capture receipt registry poisoned")
+        })?
+        .insert(token, epoch);
+    Ok(BrowserEngineCaptureReceipt { token, epoch })
+}
+
+fn browser_engine_receipt_is_registered(receipt: &BrowserEngineCaptureReceipt) -> bool {
+    receipt.token != 0
+        && browser_engine_receipts()
+            .lock()
+            .map(|guard| guard.get(&receipt.token) == Some(&receipt.epoch))
+            .unwrap_or(false)
+}
+
+fn consume_browser_engine_receipt(receipt: &BrowserEngineCaptureReceipt) -> bool {
+    receipt.token != 0
+        && browser_engine_receipts()
+            .lock()
+            .map(|mut guard| {
+                guard
+                    .get(&receipt.token)
+                    .is_some_and(|epoch| *epoch == receipt.epoch)
+                    && guard.remove(&receipt.token).is_some()
+            })
+            .unwrap_or(false)
+}
+
+impl Drop for BrowserEngineCaptureReceipt {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = browser_engine_receipts().lock() {
+            if guard.get(&self.token) == Some(&self.epoch) {
+                guard.remove(&self.token);
+            }
+        }
+    }
 }
 
 /// Private bounded capture. Bytes are never serialized.
@@ -235,6 +313,41 @@ pub fn admit_browser_engine_capture(
     _height: u32,
 ) -> HarnessResult<BoundedCapturedFrame> {
     Err(engine_capture_unwired_error())
+}
+
+/// Admit exact RGBA8 bytes from a trusted native adapter receipt.
+///
+/// This is a handoff contract only. No native adapter currently calls it, and
+/// engine evidence remains rejected by the public verifier until a separately
+/// qualified physical/isolated path exists. The receipt gate prevents callers
+/// from upgrading simulator bytes or caller-supplied labels into engine facts.
+#[allow(dead_code)]
+pub(crate) fn admit_browser_engine_capture_with_receipt(
+    epoch: u64,
+    bytes: Vec<u8>,
+    width: u32,
+    height: u32,
+    receipt: BrowserEngineCaptureReceipt,
+) -> HarnessResult<BoundedCapturedFrame> {
+    if !browser_engine_receipt_is_registered(&receipt) || receipt.epoch != epoch {
+        return Err(HarnessError::backend_unavailable(
+            "browser-engine capture receipt is stale, unregistered, or misbound",
+        ));
+    }
+    validate_engine_rgba8_bounds(&bytes, width, height)?;
+    if !consume_browser_engine_receipt(&receipt) {
+        return Err(HarnessError::backend_unavailable(
+            "browser-engine capture receipt was already consumed",
+        ));
+    }
+    Ok(BoundedCapturedFrame {
+        epoch,
+        bytes,
+        source: CapturedFrameSource::BrowserEngine,
+        media_kind: CapturedFrameMediaKind::EngineRgba8,
+        width,
+        height,
+    })
 }
 
 /// There is no admit-with-digest API. Caller digest claims fail closed.
@@ -425,6 +538,36 @@ fn validate_admission_bounds(
     Ok(())
 }
 
+fn validate_engine_rgba8_bounds(bytes: &[u8], width: u32, height: u32) -> HarnessResult<()> {
+    if width == 0 || height == 0 {
+        return Err(HarnessError::invalid_state(
+            "browser-engine capture dimensions must be non-zero",
+        ));
+    }
+    let pixels = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or_else(|| HarnessError::invalid_state("browser-engine capture dimensions overflow"))?;
+    let expected_len = pixels
+        .checked_mul(RGBA8_BYTES_PER_PIXEL)
+        .ok_or_else(|| HarnessError::invalid_state("browser-engine RGBA8 byte length overflows"))?;
+    if expected_len > MAX_CAPTURED_FRAME_BYTES {
+        return Err(HarnessError::invalid_state(
+            "browser-engine RGBA8 capture exceeds maximum admitted length",
+        ));
+    }
+    if bytes.is_empty() {
+        return Err(HarnessError::invalid_state(
+            "browser-engine capture bytes are empty",
+        ));
+    }
+    if bytes.len() != expected_len {
+        return Err(HarnessError::invalid_state(
+            "browser-engine capture bytes do not match RGBA8 dimensions",
+        ));
+    }
+    Ok(())
+}
+
 fn engine_capture_unwired_error() -> HarnessError {
     HarnessError::backend_unavailable(
         "browser-engine captured frame is not wired; refusing to fabricate engine receipt, captured bytes, native marker, or isolation PASS",
@@ -589,5 +732,127 @@ mod tests {
         assert!(err.message.contains("not wired"));
         assert!(err.message.contains("refusing to fabricate"));
         assert!(!err.message.contains("isolation is proven"));
+    }
+
+    #[test]
+    fn trusted_engine_receipt_admits_exact_rgba_bytes_but_public_verifier_stays_fail_closed() {
+        let receipt = issue_browser_engine_capture_receipt(7).expect("receipt");
+        let bytes = vec![0x5a; 2 * 3 * RGBA8_BYTES_PER_PIXEL];
+        let capture = admit_browser_engine_capture_with_receipt(7, bytes.clone(), 2, 3, receipt)
+            .expect("trusted engine bytes");
+        assert_eq!(capture.source(), CapturedFrameSource::BrowserEngine);
+        assert_eq!(capture.byte_length(), bytes.len());
+        assert_eq!(capture.digest(), canonical_sha256_digest(&bytes));
+
+        let evidence = capture.public_evidence();
+        let json = serde_json::to_string(&evidence).expect("public evidence json");
+        assert!(!json.contains("\"token\""));
+        assert!(!json.contains("\"authority\""));
+        assert_eq!(
+            validate_public_evidence(&evidence)
+                .expect_err("engine evidence remains gated")
+                .code,
+            crate::error::HarnessErrorCode::BackendUnavailable
+        );
+    }
+
+    #[test]
+    fn engine_receipt_forgery_and_epoch_mismatch_fail_closed() {
+        let forged = BrowserEngineCaptureReceipt {
+            token: u64::MAX,
+            epoch: 11,
+        };
+        let bytes = vec![0x20; 4 * RGBA8_BYTES_PER_PIXEL];
+        let forged_err = admit_browser_engine_capture_with_receipt(11, bytes.clone(), 2, 2, forged)
+            .expect_err("forged token");
+        assert_eq!(
+            forged_err.code,
+            crate::error::HarnessErrorCode::BackendUnavailable
+        );
+
+        let stale_receipt = issue_browser_engine_capture_receipt(11).expect("stale receipt");
+        let stale_err = admit_browser_engine_capture_with_receipt(12, bytes, 2, 2, stale_receipt)
+            .expect_err("epoch mismatch");
+        assert_eq!(
+            stale_err.code,
+            crate::error::HarnessErrorCode::BackendUnavailable
+        );
+
+        let receipt = issue_browser_engine_capture_receipt(11).expect("one-shot receipt");
+        admit_browser_engine_capture_with_receipt(
+            11,
+            vec![0x20; 4 * RGBA8_BYTES_PER_PIXEL],
+            2,
+            2,
+            receipt,
+        )
+        .expect("first valid receipt use");
+        let reuse_receipt = issue_browser_engine_capture_receipt(11).expect("reused receipt");
+        let cloned = BrowserEngineCaptureReceipt {
+            token: reuse_receipt.token,
+            epoch: reuse_receipt.epoch,
+        };
+        admit_browser_engine_capture_with_receipt(
+            11,
+            vec![0x20; 4 * RGBA8_BYTES_PER_PIXEL],
+            2,
+            2,
+            cloned,
+        )
+        .expect("first owner use");
+        let second_use_err = admit_browser_engine_capture_with_receipt(
+            11,
+            vec![0x20; 4 * RGBA8_BYTES_PER_PIXEL],
+            2,
+            2,
+            reuse_receipt,
+        )
+        .expect_err("receipt is one-shot");
+        assert_eq!(
+            second_use_err.code,
+            crate::error::HarnessErrorCode::BackendUnavailable
+        );
+    }
+
+    #[test]
+    fn engine_rgba8_bounds_are_exact_and_overflow_safe() {
+        let receipt = issue_browser_engine_capture_receipt(13).expect("receipt");
+        let wrong_len = vec![0x01; 3];
+        let err = admit_browser_engine_capture_with_receipt(13, wrong_len, 1, 1, receipt)
+            .expect_err("wrong rgba length");
+        assert_eq!(err.code, crate::error::HarnessErrorCode::InvalidState);
+
+        let overflow_receipt = issue_browser_engine_capture_receipt(13).expect("overflow");
+        let overflow = admit_browser_engine_capture_with_receipt(
+            13,
+            vec![0x01],
+            u32::MAX,
+            u32::MAX,
+            overflow_receipt,
+        )
+        .expect_err("oversized dimensions");
+        assert_eq!(overflow.code, crate::error::HarnessErrorCode::InvalidState);
+        assert!(
+            overflow.message.contains("dimensions overflow")
+                || overflow.message.contains("byte length overflows")
+                || overflow.message.contains("exceeds maximum")
+        );
+
+        let max_receipt = issue_browser_engine_capture_receipt(13).expect("max");
+        let max_capture = admit_browser_engine_capture_with_receipt(
+            13,
+            vec![0x01; 512 * 512 * RGBA8_BYTES_PER_PIXEL],
+            512,
+            512,
+            max_receipt,
+        )
+        .expect("maximum bounded RGBA8 capture");
+        assert_eq!(max_capture.byte_length(), MAX_CAPTURED_FRAME_BYTES);
+
+        let over_max_receipt = issue_browser_engine_capture_receipt(13).expect("over max");
+        let over_max =
+            admit_browser_engine_capture_with_receipt(13, vec![0x01], 513, 513, over_max_receipt)
+                .expect_err("over maximum bounded RGBA8 capture");
+        assert!(over_max.message.contains("exceeds maximum"));
     }
 }
