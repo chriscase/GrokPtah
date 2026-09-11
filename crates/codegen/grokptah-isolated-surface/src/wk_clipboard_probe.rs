@@ -1102,7 +1102,11 @@ mod macos {
             HarnessError::backend_unavailable("WKWebView initWithFrame unavailable")
         })?;
 
-        let _: () = unsafe {
+        // `loadHTMLString:baseURL:` returns a nullable WKNavigation pointer,
+        // not void. Keep the navigation alive for the duration of the load
+        // dispatch so objc2 uses the correct ABI and a native probe cannot
+        // panic before producing honest fail-closed evidence.
+        let _navigation: Option<Retained<AnyObject>> = unsafe {
             objc2::msg_send![&*webview, loadHTMLString: &*html, baseURL: None::<&AnyObject>]
         };
 
