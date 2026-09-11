@@ -662,7 +662,31 @@ fn stubbed_hardcoded_and_incomplete_async_clipboard_receipts_cannot_pass() {
     evidence.receipts[3].fulfilled = false;
     assert!(!clipboard_kill_gate_may_claim_pass(&evidence));
     let err = verify_clipboard_kill_gate_evidence(&evidence).expect_err("unfulfilled");
-    assert_eq!(err, ClipboardProbeFailClosedReason::ClipboardApiUnavailable);
+    assert_eq!(
+        err,
+        ClipboardProbeFailClosedReason::ClipboardAttemptUnfulfilled
+    );
+    assert_ne!(err, ClipboardProbeFailClosedReason::ClipboardApiUnavailable);
+}
+
+#[test]
+fn native_load_uses_trustworthy_in_process_fixture_origin() {
+    let source = include_str!("../src/wk_clipboard_probe.rs");
+    assert!(source.contains("const PROBE_FIXTURE_BASE_URL: &str = \"https://127.0.0.1\""));
+    assert!(source.contains("is_trustworthy_in_process_fixture_origin(PROBE_FIXTURE_BASE_URL)"));
+    assert!(source.contains("loadHTMLString: &*html, baseURL: &*base_url"));
+    assert!(source.contains("nonPersistentDataStore"));
+    assert!(source.contains("setWebsiteDataStore: &*data_store"));
+    assert!(source.contains("fn nsurl"));
+    let forbidden_nil_base_url = ["baseURL", ": None"].concat();
+    assert!(!source.contains(&forbidden_nil_base_url));
+    let forbidden_load_request_call = ["msg_send![&*webview, load", "Request"].concat();
+    let forbidden_load_file_url_call = ["msg_send![&*webview, load", "FileURL"].concat();
+    let forbidden_load_html_from_url_call =
+        ["msg_send![&*webview, loadHTMLString", "FromURL"].concat();
+    assert!(!source.contains(&forbidden_load_request_call));
+    assert!(!source.contains(&forbidden_load_file_url_call));
+    assert!(!source.contains(&forbidden_load_html_from_url_call));
 }
 
 #[test]
