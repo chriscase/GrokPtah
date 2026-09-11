@@ -12,10 +12,16 @@
 //! Host receive is the private-world script-message handler only. Polling
 //! `document.title`, DOM attribute self-attestation, or page-world evaluation
 //! is untrusted and can never Pass. Host-injected replacements of the Async
-//! Clipboard APIs and hardcoded receipts cannot certify Pass. If a
-//! trustworthy page→private→host channel cannot be registered, or if
-//! API/gesture/secure-context requirements prevent proof, the probe is
-//! INCONCLUSIVE / fail closed.
+//! Clipboard APIs and hardcoded receipts cannot certify Pass. Native
+//! `loadHTMLString` uses an in-process HTTPS loopback fixture origin so the
+//! page can be a Secure Context; the HTML is never fetched and the origin is
+//! never used with `loadRequest`. If a trustworthy page→private→host channel
+//! cannot be registered, missing `navigator.clipboard` / method is
+//! [`ClipboardProbeFailClosedReason::ClipboardApiUnavailable`], and an
+//! attempted but unfulfilled permission / user-gesture / remaining
+//! secure-context settlement is
+//! [`ClipboardProbeFailClosedReason::ClipboardAttemptUnfulfilled`]. Both are
+//! INCONCLUSIVE / fail closed and never Pass.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -60,6 +66,17 @@ pub const PRIVATE_REPLY_TITLE_PREFIX: &str = "GROKPTAH-CLIPBOARD-REPLY:";
 /// Fabricating `NSString` from that name does not match registered sources
 /// (WebKit / script-message handlers) and collapses the native probe to timeout.
 pub const CF_RUN_LOOP_DEFAULT_MODE: &str = "kCFRunLoopDefaultMode";
+
+/// In-process fixture origin for native `loadHTMLString:baseURL:`.
+///
+/// `https://127.0.0.1` is a potentially trustworthy origin (Secure Context).
+/// The fixture HTML is supplied in-process; this URL is never fetched and must
+/// not be used with `loadRequest` or external navigation. `nil` / `about:blank`
+/// are opaque origins, so `navigator.clipboard` is missing and the probe cannot
+/// distinguish API-unavailable from permission / gesture / remaining
+/// secure-context rejection.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+pub const PROBE_FIXTURE_BASE_URL: &str = "https://127.0.0.1";
 
 /// Process-local authorization for native WebKit. Ordinary `cargo test`
 /// must never set this. Only the exclusive physical CLI/runner may.
@@ -176,6 +193,10 @@ pub enum ClipboardProbeFailClosedReason {
     UnknownWireField,
     NativeProbeNotAuthorized,
     ClipboardApiUnavailable,
+    /// Page world invoked the Async Clipboard methods and they settled without
+    /// fulfillment (permission, user-gesture, or remaining secure-context
+    /// rejection). Distinct from missing `navigator.clipboard` / method.
+    ClipboardAttemptUnfulfilled,
     LiveWitnessMissing,
     HandlerBodyNotString,
 }
@@ -521,6 +542,44 @@ pub fn receipts_all_fulfilled(receipts: &[PageLocalClipboardReceipt]) -> bool {
         && receipts.iter().all(|receipt| receipt.fulfilled)
 }
 
+/// True when `url` is an allowed in-process HTTPS loopback fixture origin.
+///
+/// Opaque (`about:blank`, empty), `file:`, custom schemes, and external hosts
+/// are rejected. Loopback HTTP is also rejected so the native path stays pinned
+/// to HTTPS. This is a source-contract helper; it does not fetch.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+pub fn is_trustworthy_in_process_fixture_origin(url: &str) -> bool {
+    matches!(
+        url,
+        "https://127.0.0.1" | "https://127.0.0.1/" | "https://localhost" | "https://localhost/"
+    )
+}
+
+/// Map page-world receipt facts to a fail-closed reason without claiming Pass.
+///
+/// Missing `navigator.clipboard` / method (`unavailable` or never attempted)
+/// stays [`ClipboardApiUnavailable`]. Attempted, settled, but unfulfilled
+/// permission / user-gesture / remaining secure-context settlement is
+/// [`ClipboardAttemptUnfulfilled`]. Returns `None` only when every genuine
+/// attempt fulfilled — still not a Pass by itself.
+pub fn fail_closed_reason_for_clipboard_receipts(
+    receipts: &[PageLocalClipboardReceipt],
+) -> Option<ClipboardProbeFailClosedReason> {
+    if receipts_all_fulfilled(receipts) {
+        return None;
+    }
+    if receipts
+        .iter()
+        .any(|receipt| receipt.unavailable || !receipt.attempted)
+    {
+        return Some(ClipboardProbeFailClosedReason::ClipboardApiUnavailable);
+    }
+    if receipts_are_genuine_async_clipboard_attempts(receipts) {
+        return Some(ClipboardProbeFailClosedReason::ClipboardAttemptUnfulfilled);
+    }
+    Some(ClipboardProbeFailClosedReason::Uncertain)
+}
+
 /// Admit handler bodies received on the private-world script-message handler.
 /// Zero messages is missing; two or more is duplicate. Title/DOM channels are
 /// not modeled here — callers that did not use the handler must not call this.
@@ -690,11 +749,16 @@ pub fn fail_closed_reason_from_harness(err: &HarnessError) -> ClipboardProbeFail
         ClipboardProbeFailClosedReason::NativeProbeNotAuthorized
     } else if message.contains("live witness") {
         ClipboardProbeFailClosedReason::LiveWitnessMissing
-    } else if message.contains("clipboard api")
-        || message.contains("secure-context")
-        || message.contains("user gesture")
+    } else if message.contains("clipboard api is unavailable")
+        || message.contains("missing navigator.clipboard")
     {
         ClipboardProbeFailClosedReason::ClipboardApiUnavailable
+    } else if message.contains("unfulfilled")
+        || message.contains("user-gesture")
+        || message.contains("user gesture")
+        || message.contains("secure-context")
+    {
+        ClipboardProbeFailClosedReason::ClipboardAttemptUnfulfilled
     } else if message.contains("handler body") && message.contains("string") {
         ClipboardProbeFailClosedReason::HandlerBodyNotString
     } else if message.contains("timeout") {
@@ -786,8 +850,13 @@ pub fn harness_error_for_probe_reason(reason: ClipboardProbeFailClosedReason) ->
             "WKClipboardProbe native probe is not authorized; ordinary cargo test must not initialize WebKit",
         ),
         ClipboardProbeFailClosedReason::ClipboardApiUnavailable => HarnessError::uncertain_outcome(
-            "WKClipboardProbe Async Clipboard API/gesture/secure-context requirements prevented proof",
+            "WKClipboardProbe Async Clipboard API is unavailable (missing navigator.clipboard or method)",
         ),
+        ClipboardProbeFailClosedReason::ClipboardAttemptUnfulfilled => {
+            HarnessError::uncertain_outcome(
+                "WKClipboardProbe Async Clipboard attempt settled unfulfilled (secure-context, permission, or user-gesture)",
+            )
+        }
         ClipboardProbeFailClosedReason::LiveWitnessMissing => HarnessError::invalid_state(
             "WKClipboardProbe Pass requires a process-private live witness; public JSON cannot reconstruct it",
         ),
@@ -1102,13 +1171,23 @@ mod macos {
             HarnessError::backend_unavailable("WKWebView initWithFrame unavailable")
         })?;
 
+        if !is_trustworthy_in_process_fixture_origin(PROBE_FIXTURE_BASE_URL) {
+            return Err(HarnessError::invalid_state(
+                "WKClipboardProbe fixture origin is not a trustworthy in-process origin",
+            ));
+        }
+        let base_url = nsurl(PROBE_FIXTURE_BASE_URL).ok_or_else(|| {
+            HarnessError::backend_unavailable("WKClipboardProbe fixture origin NSURL unavailable")
+        })?;
+
         // `loadHTMLString:baseURL:` returns a nullable WKNavigation pointer,
         // not void. Keep the navigation alive for the duration of the load
         // dispatch so objc2 uses the correct ABI and a native probe cannot
-        // panic before producing honest fail-closed evidence.
-        let _navigation: Option<Retained<AnyObject>> = unsafe {
-            objc2::msg_send![&*webview, loadHTMLString: &*html, baseURL: None::<&AnyObject>]
-        };
+        // panic before producing honest fail-closed evidence. The HTML is
+        // supplied in-process; `base_url` is the Secure Context origin only
+        // and is never fetched via `loadRequest`.
+        let _navigation: Option<Retained<AnyObject>> =
+            unsafe { objc2::msg_send![&*webview, loadHTMLString: &*html, baseURL: &*base_url] };
 
         let guard = PrivateHandlerGuard {
             controller: controller.clone(),
@@ -1305,6 +1384,12 @@ mod macos {
         let cstr = CString::new(value).ok()?;
         unsafe { objc2::msg_send![cls, stringWithUTF8String: cstr.as_ptr()] }
     }
+
+    fn nsurl(value: &str) -> Option<Retained<AnyObject>> {
+        let url_string = nsstring(value)?;
+        let cls = AnyClass::get(c"NSURL")?;
+        unsafe { objc2::msg_send![cls, URLWithString: &*url_string] }
+    }
 }
 
 #[cfg(test)]
@@ -1372,6 +1457,102 @@ mod tests {
         let generation = host_issued_generation();
         assert!(generation > 0);
         assert!(generation < (1u64 << 53));
+    }
+
+    #[test]
+    fn fixture_base_url_is_trustworthy_in_process_origin() {
+        assert_eq!(PROBE_FIXTURE_BASE_URL, "https://127.0.0.1");
+        assert!(is_trustworthy_in_process_fixture_origin(
+            PROBE_FIXTURE_BASE_URL
+        ));
+        assert!(is_trustworthy_in_process_fixture_origin(
+            "https://127.0.0.1/"
+        ));
+        assert!(is_trustworthy_in_process_fixture_origin(
+            "https://localhost"
+        ));
+        assert!(!is_trustworthy_in_process_fixture_origin(""));
+        assert!(!is_trustworthy_in_process_fixture_origin("about:blank"));
+        assert!(!is_trustworthy_in_process_fixture_origin(
+            "http://127.0.0.1"
+        ));
+        assert!(!is_trustworthy_in_process_fixture_origin(
+            "https://example.com"
+        ));
+        assert!(!is_trustworthy_in_process_fixture_origin("file:///"));
+        assert!(!is_trustworthy_in_process_fixture_origin(
+            "grokptah-clipboard-probe://fixture"
+        ));
+        assert!(!is_trustworthy_in_process_fixture_origin("data:text/html,"));
+
+        let source = include_str!("wk_clipboard_probe.rs");
+        assert!(source.contains("PROBE_FIXTURE_BASE_URL"));
+        assert!(source.contains("loadHTMLString: &*html, baseURL: &*base_url"));
+        let forbidden_nil_base_url = ["baseURL", ": None"].concat();
+        assert!(!source.contains(&forbidden_nil_base_url));
+        let forbidden_load_request_call = ["msg_send![&*webview, load", "Request"].concat();
+        let forbidden_load_file_url_call = ["msg_send![&*webview, load", "FileURL"].concat();
+        assert!(!source.contains(&forbidden_load_request_call));
+        assert!(!source.contains(&forbidden_load_file_url_call));
+    }
+
+    #[test]
+    fn missing_api_and_unfulfilled_attempt_are_distinct_fail_closed_reasons() {
+        let unavailable = {
+            let mut receipts = valid_receipts(1, 1);
+            receipts[0].attempted = false;
+            receipts[0].unavailable = true;
+            receipts[0].fulfilled = false;
+            receipts
+        };
+        assert_eq!(
+            fail_closed_reason_for_clipboard_receipts(&unavailable),
+            Some(ClipboardProbeFailClosedReason::ClipboardApiUnavailable)
+        );
+        assert_ne!(
+            fail_closed_reason_for_clipboard_receipts(&unavailable),
+            Some(ClipboardProbeFailClosedReason::ClipboardAttemptUnfulfilled)
+        );
+
+        let unfulfilled = {
+            let mut receipts = valid_receipts(1, 1);
+            receipts[2].fulfilled = false;
+            receipts
+        };
+        assert!(receipts_are_genuine_async_clipboard_attempts(&unfulfilled));
+        assert!(!receipts_all_fulfilled(&unfulfilled));
+        assert_eq!(
+            fail_closed_reason_for_clipboard_receipts(&unfulfilled),
+            Some(ClipboardProbeFailClosedReason::ClipboardAttemptUnfulfilled)
+        );
+        assert_ne!(
+            fail_closed_reason_for_clipboard_receipts(&unfulfilled),
+            Some(ClipboardProbeFailClosedReason::ClipboardApiUnavailable)
+        );
+
+        assert_eq!(
+            fail_closed_reason_for_clipboard_receipts(&valid_receipts(1, 1)),
+            None
+        );
+
+        let api_err =
+            harness_error_for_probe_reason(ClipboardProbeFailClosedReason::ClipboardApiUnavailable);
+        assert_eq!(
+            fail_closed_reason_from_harness(&api_err),
+            ClipboardProbeFailClosedReason::ClipboardApiUnavailable
+        );
+        let unfulfilled_err = harness_error_for_probe_reason(
+            ClipboardProbeFailClosedReason::ClipboardAttemptUnfulfilled,
+        );
+        assert_eq!(
+            fail_closed_reason_from_harness(&unfulfilled_err),
+            ClipboardProbeFailClosedReason::ClipboardAttemptUnfulfilled
+        );
+        assert_eq!(
+            serde_json::to_value(ClipboardProbeFailClosedReason::ClipboardAttemptUnfulfilled)
+                .expect("json"),
+            serde_json::json!("clipboard_attempt_unfulfilled")
+        );
     }
 
     #[test]
