@@ -821,6 +821,9 @@ pub struct AgentHostHandle {
     /// Explicit run-scoped accounting shared by the parent model loop and any
     /// children it spawns. A session counter is not a safe run identity.
     run_usage_trackers: Arc<Mutex<HashMap<Uuid, Arc<RunUsageTracker>>>>,
+    /// Host-authored stationarity markers bridge the turn loop and durable
+    /// finalization even when token accounting has no attached tracker.
+    stationarity_stops: Arc<Mutex<HashSet<Uuid>>>,
     provider_observation: Option<ProviderObservationSession>,
     /// Shared process lifecycle (#455). The handle observes the phase and
     /// registers supervised tasks; it deliberately does **not** own the
@@ -1043,6 +1046,7 @@ impl AgentHost {
             reviewed_runs: Arc::new(Mutex::new(HashSet::new())),
             orchestration_wakeup: Arc::new(Notify::new()),
             run_usage_trackers: Arc::new(Mutex::new(HashMap::new())),
+            stationarity_stops: Arc::new(Mutex::new(HashSet::new())),
             provider_observation: config.provider_observation,
             lifecycle: lifecycle.clone(),
             runtime_home,
@@ -3370,6 +3374,7 @@ impl AgentHostHandle {
                 "cancelled" => Some(RunStopCause::Cancelled),
                 "failed" => Some(RunStopCause::Failed),
                 "max_duration_reached" => Some(RunStopCause::DurationLimit),
+                "stationarity" => Some(RunStopCause::Stationarity),
                 _ => None,
             };
         }
@@ -4883,7 +4888,14 @@ impl AgentHostHandle {
         if let Some(tracker) = self.run_usage_trackers.lock().get(&session_id).cloned() {
             tracker.mark_host_stop(cause, code)?;
         }
+        if cause == RunStopCause::Stationarity {
+            self.stationarity_stops.lock().insert(session_id);
+        }
         Ok(())
+    }
+
+    fn take_stationarity_stop(&self, session_id: Uuid) -> bool {
+        self.stationarity_stops.lock().remove(&session_id)
     }
 
     /// Accumulate token usage for /usage (#159).
@@ -8177,12 +8189,18 @@ impl AgentHostHandle {
             }
             Err(e) => Err(e),
         };
+        let stationarity_stopped = self.take_stationarity_stop(session_id);
         let outcome = if duration_limited {
             "max_duration_reached"
         } else if cancelled {
             "cancelled"
         } else if let Some(code) = durable_stop_code.as_deref() {
             code
+        } else if stationarity_stopped {
+            // This marker is set only by the host-owned detector branch. It
+            // keeps a missing token tracker from turning a guardrail stop into
+            // a successful completion.
+            "stationarity"
         } else if result.is_err() {
             "failed"
         } else {
@@ -12382,6 +12400,17 @@ mod tests {
             execution: None,
             approval: None,
         }
+    }
+
+    #[test]
+    fn stationarity_stop_is_host_marked_without_a_usage_tracker() {
+        let (_home, host, session_id) = test_host();
+
+        host.mark_run_stop(session_id, RunStopCause::Stationarity, "stationarity")
+            .expect("host stationarity marker");
+
+        assert!(host.take_stationarity_stop(session_id));
+        assert!(!host.take_stationarity_stop(session_id));
     }
 
     #[test]
