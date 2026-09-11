@@ -2,11 +2,14 @@
 //!
 //! This backend never touches host pointer/keyboard/clipboard. It models frame
 //! delivery and guest-local inject only. It is ineligible for Virtualization.framework
-//! qualification.
+//! qualification. `GuestFrame.digest` is canonical `sha256:` + 64 lowercase hex
+//! over private bounded synthetic payload bytes; epoch is metadata only and
+//! `captured_frame` stays absent so this path is not a browser or physical capture.
 
 use serde::{Deserialize, Serialize};
 
 use crate::backend::IsolatedSurfaceBackend;
+use crate::captured_frame::{canonical_sha256_digest, simulator_synthetic_frame_bytes};
 use crate::error::{HarnessError, HarnessResult};
 use crate::lifecycle::ProofEvidenceClass;
 
@@ -27,8 +30,9 @@ pub struct GuestFrame {
     pub epoch: u64,
     pub digest: String,
     pub guest_button_pressed: bool,
-    /// Contained Browser captured-frame metadata. Absent on synthetic-harness
-    /// backends that still use label digests. Never contains raw frame bytes.
+    /// Contained Browser captured-frame metadata. Absent on SyntheticGuest:
+    /// the synthetic harness publishes a content digest only and does not
+    /// claim a browser or physical capture. Never contains raw frame bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub captured_frame: Option<crate::captured_frame::CapturedFrameEvidence>,
 }
@@ -100,7 +104,7 @@ impl SyntheticGuest {
     pub fn current_frame(&self) -> GuestFrame {
         GuestFrame::new(
             self.frame_epoch,
-            frame_digest(self.frame_epoch, self.guest_button_pressed),
+            frame_digest(self.guest_button_pressed),
             self.guest_button_pressed,
         )
     }
@@ -197,12 +201,15 @@ pub enum InjectOutcome {
     Crash,
 }
 
-fn frame_digest(epoch: u64, guest_button_pressed: bool) -> String {
-    format!(
-        "sha256:synthetic-frame:{epoch}:btn={guest_button_pressed}",
-        epoch = epoch,
-        guest_button_pressed = guest_button_pressed
-    )
+/// Canonical content digest of the private bounded synthetic payload.
+/// Epoch and labels are not mixed into the hash.
+fn frame_digest(guest_button_pressed: bool) -> String {
+    canonical_sha256_digest(&synthetic_guest_frame_bytes(guest_button_pressed))
+}
+
+/// Private bounded synthetic-guest payload. Never serialized.
+fn synthetic_guest_frame_bytes(guest_button_pressed: bool) -> Vec<u8> {
+    simulator_synthetic_frame_bytes(guest_button_pressed)
 }
 
 impl Default for SyntheticGuest {

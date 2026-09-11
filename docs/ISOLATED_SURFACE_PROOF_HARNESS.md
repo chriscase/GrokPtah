@@ -23,6 +23,7 @@ surface), [#267](https://github.com/chriscase/GrokPtah/issues/267) (epic).
 | Sep 6–12 | Packet 7 — `stop_fence_first` no default (#549) | **Landed** — trait default removed; production adapters must fence with ack/failure |
 | Sep 6–12 | Packet 8 — Mac host sentinel provenance (#550) | **Landed** — `MacHostSentinelCollector::collect()` wired; synthetic self-compare ineligible for physical markers |
 | Sep 6–12 | Packet 9 — Honest Contained Browser captured-frame hashes (#551) | **Landed** — `GuestFrame.digest` is `sha256:<64 hex>` over bounded capture bytes; simulator payloads labeled synthetic |
+| Sep 6–12 | Packet 9 follow-on — Content-addressed synthetic guest frame hashes | **This slice** — `SyntheticGuest` digest is `sha256:<64 hex>` over bounded bytes; `captured_frame` absent; not admission |
 | Sep 18 | Packet 10 — Native host-sentinel runner (#554) | **Landed** — exclusive `MacHostSentinelCollector` runner; Linux fail-closed; no PASS/admission |
 | Sep 8–17 | Packet 11 — Contained Browser clipboard isolation kill-gate | **This slice** — `ClipboardWitness` + `WKClipboardProbe` private-world protocol; Linux unsupported; never admission |
 | Sep 18 | Physical Mac gate | VF PASS or honest Contained Browser pivot |
@@ -49,7 +50,7 @@ surface), [#267](https://github.com/chriscase/GrokPtah/issues/267) (epic).
 | Host sentinel registry + main-checkout fence | `sentinel.rs` — `MainCheckoutFence` digest/mtime hook |
 | Mac host sentinel collector hook | `sentinel.rs` — `MacHostSentinelCollector` + `refresh_from_host` |
 | `IsolatedSurfaceBackend` SPI | `backend.rs` — boot / observe_frame / inject_guest_local / stop_fence_first / destroy |
-| Synthetic backend (SPI impl) | `simulator.rs` — `SyntheticGuest` |
+| Synthetic backend (SPI impl) | `simulator.rs` — `SyntheticGuest`; content-addressed digest, no `captured_frame` |
 | Contained Browser substrate v0 (simulator) | `contained_browser.rs` — honest `ContainedBrowser` label, browser-only lifecycle, not isolation PASS |
 | Content-addressed captured-frame seam | `captured_frame.rs` — digest from bounded bytes only; public metadata is length/source/media/dimensions |
 | Contained Browser dry-run sequencer path | `contained_browser_dry_run.rs` + `Sep18NoModelProofSequencer::run_contained_browser_dry_run` |
@@ -74,6 +75,7 @@ surface), [#267](https://github.com/chriscase/GrokPtah/issues/267) (epic).
 | Native host-sentinel runner tests | `tests/native_sentinel_runner.rs` — Linux fail-closed + forged live/fallback/PASS rejection |
 | Clipboard kill-gate tests | `tests/clipboard_kill_gate.rs` — Linux unsupported + forged Pass / host drift / stale challenge / duplicate-missing / forbidden eval / private-world receipts / title-channel / DOM tamper / unknown fields / oversized reply |
 | Captured-frame adversarial tests | `tests/captured_frame_evidence.rs` — digest recomputation, tamper/oversize, no raw-byte leak |
+| Synthetic guest frame digest tests | `tests/synthetic_guest_frame.rs` — canonical SHA-256, state vs epoch, no payload/legacy-label leak |
 
 ### Lifecycle phases
 
@@ -152,6 +154,19 @@ source-upgraded frames are rejected before postcondition evidence can be sealed.
 Epoch still increments on inject; digest change tracks captured-byte change.
 
 Bridge admission `isolated_surface_admission_available()` remains **false**.
+
+### Synthetic guest frame hashes (packet 9 follow-on)
+
+`SyntheticGuest` no longer emits label-derived `sha256:synthetic-frame:<epoch>:btn=<bool>`
+strings. Its `GuestFrame.digest` is the same canonical `sha256:` + 64 lowercase hex
+helper used by captured-frame evidence, computed from private bounded synthetic
+payload bytes. Epoch still increments on inject; digest tracks visual/button state
+only. `captured_frame` stays **absent** so synthetic harness frames are not labeled
+as a browser or physical capture.
+
+`ProofEvidenceClass::Synthetic`, `SYNTHETIC_HARNESS_NONCLAIM`, and
+`isolated_surface_admission_available() == false` are unchanged. This is not
+Computer Mode, VF PASS, isolation PASS, or admission.
 
 ### Contained Browser clipboard isolation kill-gate (packet 11 / Sep 8–17)
 
@@ -444,6 +459,9 @@ cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Car
 
 cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Cargo.toml \
   --test captured_frame_evidence -- --test-threads=1
+
+cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Cargo.toml \
+  --test synthetic_guest_frame -- --test-threads=1
 
 cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Cargo.toml \
   --test native_sentinel_runner -- --test-threads=1
