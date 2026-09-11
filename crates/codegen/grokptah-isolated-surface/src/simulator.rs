@@ -2,9 +2,10 @@
 //!
 //! This backend never touches host pointer/keyboard/clipboard. It models frame
 //! delivery and guest-local inject only. It is ineligible for Virtualization.framework
-//! qualification. `GuestFrame.digest` is canonical `sha256:` + 64 lowercase hex
-//! over private bounded synthetic payload bytes; epoch is metadata only and
-//! `captured_frame` stays absent so this path is not a browser or physical capture.
+//! qualification. `SyntheticGuest::current_frame().digest` is canonical
+//! `sha256:` + 64 lowercase hex over private bounded synthetic payload bytes;
+//! epoch is metadata only and `captured_frame` stays absent so this path is not
+//! a browser or physical capture.
 
 use serde::{Deserialize, Serialize};
 
@@ -38,6 +39,9 @@ pub struct GuestFrame {
 }
 
 impl GuestFrame {
+    /// Construct a raw DTO for test/dummy backends. This does not seal
+    /// evidence or validate a caller-supplied digest; authoritative backends
+    /// must derive their digest from their own bounded frame bytes.
     pub fn new(epoch: u64, digest: impl Into<String>, guest_button_pressed: bool) -> Self {
         Self {
             epoch,
