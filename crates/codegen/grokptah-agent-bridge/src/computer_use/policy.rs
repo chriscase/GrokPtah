@@ -221,6 +221,46 @@ impl ComputerPolicy {
         Ok(())
     }
 
+    /// Completing a run is allowed only when the last action postcondition is
+    /// positive and bound to the exact current observation.
+    ///
+    /// After a successful dispatch the observation is invalidated for further
+    /// actions (`current_observation` is `None`) but remains the completion
+    /// evidence until a newer observation becomes current. A later observe
+    /// either clears `last_outcome` or leaves it bound to a different
+    /// identity; both fail closed here as [`ComputerErrorCode::UnverifiedCompletion`].
+    pub fn authorize_completion(&self, run: &ComputerRun) -> ComputerResult<()> {
+        if run.state != ComputerRunState::Ready {
+            return Err(ComputerError::new(
+                ComputerErrorCode::InvalidState,
+                "computer run is not ready",
+            ));
+        }
+        let Some(outcome) = &run.last_outcome else {
+            return Err(unverified_completion(
+                "computer run has no verified postcondition on the current observation",
+            ));
+        };
+        if outcome.expected_postcondition_met != Some(true) {
+            return Err(unverified_completion(
+                "completion requires a positive postcondition on the current observation",
+            ));
+        }
+        if outcome.observation_id.is_none() || outcome.sequence.is_none() {
+            return Err(unverified_completion(
+                "completion evidence is not bound to an observation",
+            ));
+        }
+        if let Some(current) = &run.current_observation {
+            if !outcome.verifies_observation(current) {
+                return Err(unverified_completion(
+                    "completion evidence is not bound to the current observation",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn authorize_active_run(&self, run: &ComputerRun, now: DateTime<Utc>) -> ComputerResult<()> {
         if run.state != ComputerRunState::Ready {
             return Err(ComputerError::new(
@@ -247,6 +287,10 @@ impl ComputerPolicy {
     }
 }
 
+fn unverified_completion(message: &str) -> ComputerError {
+    ComputerError::new(ComputerErrorCode::UnverifiedCompletion, message)
+}
+
 fn required_semantic_action(action: &ComputerAction) -> Option<SemanticAction> {
     match action {
         ComputerAction::Invoke { .. } => Some(SemanticAction::Invoke),
@@ -269,8 +313,8 @@ mod tests {
 
     use super::*;
     use crate::computer_use::{
-        ActionClass, ComputerTarget, ComputerUseLimits, EvidenceRef, ObservationGeometry,
-        SemanticElement, Sensitivity,
+        ActionClass, ActionOutcome, ComputerTarget, ComputerUseLimits, EvidenceRef,
+        ObservationGeometry, SemanticElement, Sensitivity,
     };
 
     fn ready_run() -> ComputerRun {
@@ -325,6 +369,62 @@ mod tests {
         };
         run.current_observation = Some(observation);
         run
+    }
+
+    #[test]
+    fn completion_requires_positive_postcondition_bound_to_current_observation() {
+        let mut run = ready_run();
+        let current = run.current_observation.clone().unwrap();
+
+        assert_eq!(
+            ComputerPolicy.authorize_completion(&run).unwrap_err().code,
+            ComputerErrorCode::UnverifiedCompletion
+        );
+
+        run.last_outcome = Some(ActionOutcome::bounded("set demo name", Some(true)));
+        assert_eq!(
+            ComputerPolicy.authorize_completion(&run).unwrap_err().code,
+            ComputerErrorCode::UnverifiedCompletion,
+            "unbound positive postcondition is not current-frame evidence"
+        );
+
+        run.last_outcome = Some(
+            ActionOutcome::bounded("set demo name", Some(false)).bind_to_observation(&current),
+        );
+        assert_eq!(
+            ComputerPolicy.authorize_completion(&run).unwrap_err().code,
+            ComputerErrorCode::UnverifiedCompletion
+        );
+
+        let mut stale = current.clone();
+        stale.observation_id = "obs-old".into();
+        stale.sequence = 0;
+        run.last_outcome =
+            Some(ActionOutcome::bounded("set demo name", Some(true)).bind_to_observation(&stale));
+        assert_eq!(
+            ComputerPolicy.authorize_completion(&run).unwrap_err().code,
+            ComputerErrorCode::UnverifiedCompletion,
+            "a prior frame's positive postcondition cannot complete against a newer observation"
+        );
+
+        run.last_outcome =
+            Some(ActionOutcome::bounded("set demo name", Some(true)).bind_to_observation(&current));
+        ComputerPolicy
+            .authorize_completion(&run)
+            .expect("positive postcondition bound to the current observation is the success path");
+    }
+
+    #[test]
+    fn completion_accepts_bound_postcondition_after_dispatch_invalidates_the_observation() {
+        let mut run = ready_run();
+        let dispatched = run.current_observation.clone().unwrap();
+        run.last_outcome = Some(
+            ActionOutcome::bounded("set demo name", Some(true)).bind_to_observation(&dispatched),
+        );
+        run.current_observation = None;
+        ComputerPolicy
+            .authorize_completion(&run)
+            .expect("dispatch invalidates the observation for further actions, not the postcondition it just verified");
     }
 
     #[test]
