@@ -491,11 +491,19 @@ fn allowlisted_env(grok_home: &Path) -> Result<Vec<(String, String)>, GrokBuildA
     let home = grok_home
         .to_str()
         .ok_or(GrokBuildAdapterError::IsolationFailed)?;
+    let claude_config_dir = grok_home.join("claude-config");
+    let claude_config_dir = claude_config_dir
+        .to_str()
+        .ok_or(GrokBuildAdapterError::IsolationFailed)?;
     Ok(vec![
         ("GROK_HOME".to_string(), home.to_string()),
         ("HOME".to_string(), home.to_string()),
         ("TMPDIR".to_string(), home.to_string()),
         ("PATH".to_string(), BOUNDED_PATH.to_string()),
+        (
+            "CLAUDE_CONFIG_DIR".to_string(),
+            claude_config_dir.to_string(),
+        ),
     ])
 }
 
@@ -710,6 +718,10 @@ impl IsolatedHome {
     }
 
     fn write_minimal_config(&self) -> Result<(), GrokBuildAdapterError> {
+        let claude_config_dir = self.path.join("claude-config");
+        std::fs::create_dir(&claude_config_dir)
+            .map_err(|_| GrokBuildAdapterError::IsolationFailed)?;
+        set_private_dir_permissions(&claude_config_dir)?;
         write_private_file(
             &self.path.join(CONFIG_FILE_NAME),
             ISOLATED_CONFIG.as_bytes(),
@@ -1059,7 +1071,7 @@ fn verify_permissions(value: Option<&serde_json::Value>) -> Result<(), GrokBuild
     let object = value
         .and_then(serde_json::Value::as_object)
         .ok_or(GrokBuildAdapterError::IsolationFailed)?;
-    require_exact_keys(
+    require_allowed_keys(
         object,
         &[
             "loaded",
@@ -1070,6 +1082,21 @@ fn verify_permissions(value: Option<&serde_json::Value>) -> Result<(), GrokBuild
             "mcpServerAllowlist",
             "skipped",
             "sources",
+        ],
+        &[
+            "loaded",
+            "managedSettingsActive",
+            "managedSettingsExists",
+            "managedSettingsPath",
+            "marketplaceAllowlist",
+            "mcpServerAllowlist",
+            "skipped",
+            "sources",
+            "mcpLockdownSources",
+            "mcpManagedServersOnly",
+            "marketplaceLockdownSources",
+            "managedMarketplaces",
+            "claudeBypassLockAdvisory",
         ],
     )?;
     if object.get("loaded").and_then(serde_json::Value::as_u64) != Some(0)
@@ -1092,8 +1119,23 @@ fn verify_permissions(value: Option<&serde_json::Value>) -> Result<(), GrokBuild
         "mcpServerAllowlist",
         "skipped",
         "sources",
+        "mcpLockdownSources",
+        "marketplaceLockdownSources",
+        "managedMarketplaces",
     ] {
-        require_empty_array(object.get(field))?;
+        if let Some(value) = object.get(field) {
+            require_empty_array(Some(value))?;
+        }
+    }
+    if let Some(value) = object.get("mcpManagedServersOnly") {
+        if value.as_str() != Some("off") {
+            return Err(GrokBuildAdapterError::IsolationFailed);
+        }
+    }
+    if let Some(value) = object.get("claudeBypassLockAdvisory") {
+        if value.as_bool() != Some(false) {
+            return Err(GrokBuildAdapterError::IsolationFailed);
+        }
     }
     Ok(())
 }
@@ -2885,13 +2927,16 @@ mod tests {
                 ("HOME".to_string(), "/isolated/home".to_string()),
                 ("TMPDIR".to_string(), "/isolated/home".to_string()),
                 ("PATH".to_string(), BOUNDED_PATH.to_string()),
+                (
+                    "CLAUDE_CONFIG_DIR".to_string(),
+                    "/isolated/home/claude-config".to_string(),
+                ),
             ]
         );
         assert!(!env.iter().any(|(k, _)| k.contains("KEY")
             || k.contains("TOKEN")
             || k.contains("SECRET")
-            || k.contains("XAI")
-            || k.contains("CLAUDE")));
+            || k.contains("XAI")));
     }
 
     #[test]
