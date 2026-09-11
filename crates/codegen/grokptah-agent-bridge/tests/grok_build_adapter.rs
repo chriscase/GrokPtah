@@ -510,11 +510,16 @@ async fn exact_command_argv_and_env() {
             .map(|(_, v)| v.as_str()),
         Some("/usr/bin:/bin:/usr/local/bin")
     );
+    let claude_config_dir = env
+        .iter()
+        .find(|(k, _)| k == "CLAUDE_CONFIG_DIR")
+        .map(|(_, v)| v.as_str())
+        .expect("CLAUDE_CONFIG_DIR");
+    assert!(claude_config_dir.starts_with(home));
     assert!(!env.iter().any(|(k, v)| k == "XAI_API_KEY"
         || k == LEAK_ENV
         || k.contains("TOKEN")
         || k.contains("SECRET")
-        || k.contains("CLAUDE")
         || v.contains(SECRET)));
 
     let config = fs::read_to_string(fx.capture_dir.join("captured-config.toml")).expect("config");
