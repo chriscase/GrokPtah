@@ -3288,10 +3288,7 @@ mod tests {
                 observation.sequence.saturating_add(1),
             )
             .unwrap_err();
-        assert_eq!(
-            stale_sequence.code,
-            ComputerErrorCode::UnverifiedCompletion
-        );
+        assert_eq!(stale_sequence.code, ComputerErrorCode::UnverifiedCompletion);
 
         let persisted = service.get_run(&run.run_id).unwrap().unwrap();
         assert_eq!(persisted.state, ComputerRunState::Ready);
