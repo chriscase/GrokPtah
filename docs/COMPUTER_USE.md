@@ -17,6 +17,12 @@ Computer Use treats observation and action as separate privileged operations:
 4. An observation receives a monotonic ID. Every action must reference the current observation.
 5. Policy is checked again immediately before the backend action.
 6. Successful actions invalidate the observation, forcing the caller to observe again.
+   Each action outcome is bound to the observation it verified. A later observation
+   atomically clears that evidence, so `complete` cannot accept an earlier frame's
+   `expectedPostconditionMet`. Completion is admitted only with a positive postcondition
+   bound to the exact current observation (or the just-dispatched frame, before a newer
+   observation becomes current); otherwise it refuses with `unverified_completion` and
+   does not take the run terminal.
 
 Authorization is fail-closed. Grants do not survive restart, pause, cancellation, completion,
 failure, target changes, or exhausted limits. Secure and system-restricted surfaces are denied
@@ -160,7 +166,8 @@ The cockpit's model loop is deliberately narrower than the native action backend
    An action becomes the same visible one-use local approval used by manual cockpit actions. It does
    not execute automatically.
 6. A `complete` response may only mark the exact current run complete and revoke authority; it
-   cannot contain or cause an OS mutation. **Stop** and **Take over** cancel Computer inference and
+   cannot contain or cause an OS mutation. It is admitted only when a positive postcondition is
+   bound to the exact current observation. **Stop** and **Take over** cancel Computer inference and
    invalidate late responses without cancelling an unrelated Build turn.
 
 The opt-in `computer_agent_live` example exercises the real selected model against only the

@@ -715,18 +715,25 @@ impl DesktopComputerUse {
             }
             ComputerAgentProposal::Complete { summary, .. } => {
                 let (service, run) = self.owned_service(owner_session_id, run_id)?;
+                let Some(current) = run.current_observation.as_ref() else {
+                    return Err("The Computer Run changed while the model was responding".into());
+                };
                 if run.version != expected_version
                     || run.state != ComputerRunState::Ready
-                    || run
-                        .current_observation
-                        .as_ref()
-                        .map(|observation| observation.observation_id.as_str())
-                        != Some(observation_id)
+                    || current.observation_id != observation_id
                 {
                     return Err("The Computer Run changed while the model was responding".into());
                 }
+                let observation_id = current.observation_id.clone();
+                let sequence = current.sequence;
                 service
-                    .complete(&Uuid::new_v4().to_string(), run_id, expected_version)
+                    .complete_with_observation(
+                        &Uuid::new_v4().to_string(),
+                        run_id,
+                        expected_version,
+                        &observation_id,
+                        sequence,
+                    )
                     .map_err(|error| error.to_string())?;
                 Ok(ComputerAgentProposalResult {
                     snapshot: self.cockpit_snapshot(owner_session_id)?,

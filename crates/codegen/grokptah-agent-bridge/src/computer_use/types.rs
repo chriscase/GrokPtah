@@ -29,6 +29,12 @@ pub enum ComputerErrorCode {
     Conflict,
     Pending,
     UncertainOutcome,
+    /// Completion was refused because the run has no positive postcondition
+    /// bound to the exact current observation. Distinct from
+    /// [`Self::StaleObservation`], which refuses an *action* against a stale
+    /// frame, and from [`Self::UncertainOutcome`], which marks a dispatch that
+    /// may already have taken effect.
+    UnverifiedCompletion,
     Interrupted,
     BackendUnavailable,
     BackendFailure,
@@ -413,6 +419,13 @@ impl ComputerAction {
 pub struct ActionOutcome {
     pub summary: String,
     pub expected_postcondition_met: Option<bool>,
+    /// Observation this postcondition verifies. Absent on records written
+    /// before evidence identity existed and on unbounded constructor calls;
+    /// `complete` treats absence as unverified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -432,7 +445,24 @@ impl ActionOutcome {
         Self {
             summary: crate::textutil::truncate_at_char_boundary(&summary.into(), 512).to_string(),
             expected_postcondition_met,
+            observation_id: None,
+            sequence: None,
         }
+    }
+
+    /// Bind this outcome to the observation it actually verified.
+    ///
+    /// The service overwrites any backend-supplied identity so a native
+    /// adapter cannot attach a postcondition to a different frame.
+    pub fn bind_to_observation(mut self, observation: &ComputerObservation) -> Self {
+        self.observation_id = Some(observation.observation_id.clone());
+        self.sequence = Some(observation.sequence);
+        self
+    }
+
+    pub fn verifies_observation(&self, observation: &ComputerObservation) -> bool {
+        self.observation_id.as_deref() == Some(observation.observation_id.as_str())
+            && self.sequence == Some(observation.sequence)
     }
 }
 
