@@ -542,17 +542,14 @@ pub fn receipts_all_fulfilled(receipts: &[PageLocalClipboardReceipt]) -> bool {
         && receipts.iter().all(|receipt| receipt.fulfilled)
 }
 
-/// True when `url` is an allowed in-process HTTPS loopback fixture origin.
+/// True when `url` is the exact in-process HTTPS loopback fixture origin.
 ///
-/// Opaque (`about:blank`, empty), `file:`, custom schemes, and external hosts
-/// are rejected. Loopback HTTP is also rejected so the native path stays pinned
-/// to HTTPS. This is a source-contract helper; it does not fetch.
+/// Opaque (`about:blank`, empty), `file:`, custom schemes, aliases, and
+/// external hosts are rejected. This is a source-contract helper; it does not
+/// fetch.
 #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
 pub fn is_trustworthy_in_process_fixture_origin(url: &str) -> bool {
-    matches!(
-        url,
-        "https://127.0.0.1" | "https://127.0.0.1/" | "https://localhost" | "https://localhost/"
-    )
+    url == PROBE_FIXTURE_BASE_URL
 }
 
 /// Map page-world receipt facts to a fail-closed reason without claiming Pass.
@@ -1093,6 +1090,16 @@ mod macos {
             HarnessError::backend_unavailable("WKWebViewConfiguration unavailable")
         })?;
         let config: Retained<AnyObject> = unsafe { objc2::msg_send![config_cls, new] };
+        let data_store_cls = AnyClass::get(c"WKWebsiteDataStore")
+            .ok_or_else(|| HarnessError::backend_unavailable("WKWebsiteDataStore unavailable"))?;
+        let data_store: Option<Retained<AnyObject>> =
+            unsafe { objc2::msg_send![data_store_cls, nonPersistentDataStore] };
+        let data_store = data_store.ok_or_else(|| {
+            HarnessError::backend_unavailable(
+                "WKWebsiteDataStore.nonPersistentDataStore unavailable",
+            )
+        })?;
+        let _: () = unsafe { objc2::msg_send![&*config, setWebsiteDataStore: &*data_store] };
 
         let world_cls = AnyClass::get(c"WKContentWorld")
             .ok_or_else(|| HarnessError::backend_unavailable("WKContentWorld unavailable"))?;
@@ -1465,10 +1472,10 @@ mod tests {
         assert!(is_trustworthy_in_process_fixture_origin(
             PROBE_FIXTURE_BASE_URL
         ));
-        assert!(is_trustworthy_in_process_fixture_origin(
+        assert!(!is_trustworthy_in_process_fixture_origin(
             "https://127.0.0.1/"
         ));
-        assert!(is_trustworthy_in_process_fixture_origin(
+        assert!(!is_trustworthy_in_process_fixture_origin(
             "https://localhost"
         ));
         assert!(!is_trustworthy_in_process_fixture_origin(""));
@@ -1488,6 +1495,8 @@ mod tests {
         let source = include_str!("wk_clipboard_probe.rs");
         assert!(source.contains("PROBE_FIXTURE_BASE_URL"));
         assert!(source.contains("loadHTMLString: &*html, baseURL: &*base_url"));
+        assert!(source.contains("nonPersistentDataStore"));
+        assert!(source.contains("setWebsiteDataStore: &*data_store"));
         let forbidden_nil_base_url = ["baseURL", ": None"].concat();
         assert!(!source.contains(&forbidden_nil_base_url));
         let forbidden_load_request_call = ["msg_send![&*webview, load", "Request"].concat();

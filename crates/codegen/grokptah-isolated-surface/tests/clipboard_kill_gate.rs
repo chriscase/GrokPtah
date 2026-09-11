@@ -675,6 +675,8 @@ fn native_load_uses_trustworthy_in_process_fixture_origin() {
     assert!(source.contains("const PROBE_FIXTURE_BASE_URL: &str = \"https://127.0.0.1\""));
     assert!(source.contains("is_trustworthy_in_process_fixture_origin(PROBE_FIXTURE_BASE_URL)"));
     assert!(source.contains("loadHTMLString: &*html, baseURL: &*base_url"));
+    assert!(source.contains("nonPersistentDataStore"));
+    assert!(source.contains("setWebsiteDataStore: &*data_store"));
     assert!(source.contains("fn nsurl"));
     let forbidden_nil_base_url = ["baseURL", ": None"].concat();
     assert!(!source.contains(&forbidden_nil_base_url));
