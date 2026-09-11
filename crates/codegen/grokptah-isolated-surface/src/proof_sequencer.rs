@@ -120,6 +120,12 @@ impl Sep18NoModelProofSequencer {
         crate::run_native_host_sentinel(checkout_path.as_ref(), self.snapshot_root.as_deref())
     }
 
+    /// Contained Browser clipboard isolation kill-gate. Non-macOS is
+    /// deterministic unsupported. Never claims VF/isolation PASS or admission.
+    pub fn run_clipboard_kill_gate(&self) -> HarnessResult<crate::ClipboardKillGateEvidence> {
+        crate::run_clipboard_kill_gate()
+    }
+
     /// Run one bounded fault-matrix case.
     pub fn run_fault_matrix(&self, case: FaultMatrixCase) -> HarnessResult<SealedProofEvidence> {
         match case {
