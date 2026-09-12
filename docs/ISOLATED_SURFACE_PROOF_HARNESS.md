@@ -491,9 +491,9 @@ cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Car
 
 The optional macOS snapshot ABI module type-checks the two-object
 `takeSnapshotWithConfiguration:completionHandler:` selector through dynamic
-`objc2::msg_send!` and a cached `block2` callback. It intentionally does not
-load WebKit, create or invoke a `WKWebView`, capture a frame, or enable
-admission. The generated `objc2-web-kit` bindings are not a dependency because
+`objc2::msg_send!` and a `block2` callback constructed per invocation. It
+intentionally does not load WebKit, create or invoke a `WKWebView`, capture a
+frame, or enable admission. The generated `objc2-web-kit` bindings are not a dependency because
 their link surface would violate the ordinary no-WebKit-load test boundary.
 
 This packet proves neither captured-frame bytes nor their layout. In particular,

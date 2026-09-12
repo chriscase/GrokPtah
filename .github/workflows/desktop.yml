@@ -169,6 +169,11 @@ jobs:
           cargo fmt --check
           cargo clippy --locked --all-targets -- -D warnings
           cargo test --locked -- --test-threads=1
+      - name: Isolated-surface snapshot ABI tests
+        working-directory: .
+        # ABI-only integration test. Not physical WebKit, captured pixels,
+        # Computer Mode, or admission.
+        run: cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Cargo.toml --test wk_snapshot_abi -- --test-threads=1
       - name: Shell provider helper compile
         working-directory: .
         run: cargo check --locked --manifest-path crates/codegen/xai-grok-shell/Cargo.toml
