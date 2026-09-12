@@ -219,6 +219,36 @@ function eventLabel(update: SessionUpdate): string {
 const KEEP_CONFIRMATION =
   "Keep this isolated run for review? This is irreversible. The exact reviewed patch stays in the isolated worktree, the source workspace is not written, and Apply and Discard will no longer be available.";
 
+const DISCARD_CONFIRMATION =
+  "Discard this isolated run? This removes only the managed isolated worktree. It does not write or revert the source workspace.";
+
+const DISCARD_STATUS =
+  "Discarded. Only the managed isolated worktree was removed. The source workspace was not written or reverted.";
+
+const CONFLICT_COPY =
+  "Promotion is blocked. Discard this run and start a fresh isolated attempt.";
+
+const MAX_APPROVAL_TIMEOUT_MS = 2_147_483_647;
+
+function nextApprovalExpiryMs(runs: DurableRun[], nowMs: number): number | null {
+  let soonest: number | null = null;
+  for (const run of runs) {
+    const expiry = run.approval ? Date.parse(run.approval.expiresAt) : NaN;
+    if (!Number.isFinite(expiry) || expiry <= nowMs) continue;
+    if (soonest == null || expiry < soonest) soonest = expiry;
+  }
+  return soonest;
+}
+
+function approvalIsActive(
+  approval: DurableRun["approval"] | undefined,
+  nowMs: number,
+): boolean {
+  if (!approval) return false;
+  const expiry = Date.parse(approval.expiresAt);
+  return Number.isFinite(expiry) && expiry > nowMs;
+}
+
 function keptRetentionCopy(run: DurableRun, review?: RunReview): string {
   const recorded = review?.retainedFingerprint ?? run.execution?.finalFingerprint ?? null;
   const present = review?.presentFingerprint ?? null;
@@ -268,6 +298,7 @@ export function RunInspector({
   const [retryPrompts, setRetryPrompts] = useState<Record<string, string>>({});
   const [steerPrompts, setSteerPrompts] = useState<Record<string, string>>({});
   const [focusKeptRunId, setFocusKeptRunId] = useState<string | null>(null);
+  const [approvalNowMs, setApprovalNowMs] = useState(() => Date.now());
   const watchValue = watching ?? localWatching;
   const actionEpochRef = useRef(0);
   const keptStatusRef = useRef<HTMLDivElement | null>(null);
@@ -318,6 +349,18 @@ export function RunInspector({
     setFocusKeptRunId(null);
   }, [runs, focusKeptRunId]);
 
+  useEffect(() => {
+    if (remote) return;
+    const nextExpiry = nextApprovalExpiryMs(runs as DurableRun[], approvalNowMs);
+    if (nextExpiry == null) return;
+    const delay = nextExpiry - Date.now();
+    if (delay > MAX_APPROVAL_TIMEOUT_MS) return;
+    const timer = window.setTimeout(() => {
+      setApprovalNowMs(Date.now());
+    }, Math.max(0, delay));
+    return () => window.clearTimeout(timer);
+  }, [remote, runs, approvalNowMs]);
+
   function setWatchValue(next: boolean) {
     setLocalWatching(next);
     onWatchingChange?.(next);
@@ -351,6 +394,11 @@ export function RunInspector({
   }
 
   async function promote(runId: string) {
+    const target = remote ? undefined : localRuns.find((run) => run.runId === runId);
+    if (target?.approval && !approvalIsActive(target.approval, Date.now())) {
+      setActionError("Approval expired · review and approve again");
+      return;
+    }
     const epoch = actionEpochRef.current;
     setReviewing(runId);
     setActionError(null);
@@ -408,7 +456,7 @@ export function RunInspector({
   }
 
   async function discard(runId: string) {
-    if (!window.confirm("Discard this isolated run and its unpromoted changes?")) {
+    if (!window.confirm(DISCARD_CONFIRMATION)) {
       return;
     }
     const epoch = actionEpochRef.current;
@@ -417,6 +465,11 @@ export function RunInspector({
     try {
       await onDiscard(runId);
       if (epoch !== actionEpochRef.current) return;
+      setReviews((current) => {
+        const next = { ...current };
+        delete next[runId];
+        return next;
+      });
       onRefresh();
     } catch (error) {
       if (epoch !== actionEpochRef.current) return;
@@ -728,8 +781,7 @@ export function RunInspector({
             const currentReview = reviews[run.runId];
             const eventPage = eventPages[run.runId];
             const eventError = eventErrors[run.runId];
-            const approvalExpiry = run.approval ? Date.parse(run.approval.expiresAt) : NaN;
-            const approvalActive = Number.isFinite(approvalExpiry) && approvalExpiry > Date.now();
+            const approvalActive = approvalIsActive(run.approval, approvalNowMs);
             const requiresDurableApproval = runRequiresDurableApproval(run.clientId);
             const canPersistDesktopApproval = isScopedDurableApprovalOrigin(run.clientId);
             const tokens = tokenLabel(run);
@@ -941,8 +993,12 @@ export function RunInspector({
                       )}
                       {run.execution.promotionState === "conflicted" && (
                         <div className="run-callout run-promotion-conflict" role="alert">
-                          Promotion blocked because the isolated workspace changed after review.
-                          Discard this run and start a fresh isolated attempt.
+                          {CONFLICT_COPY}
+                        </div>
+                      )}
+                      {run.execution.promotionState === "discarded" && (
+                        <div className="run-callout" role="status">
+                          {DISCARD_STATUS}
                         </div>
                       )}
                       {run.execution.promotionState === "kept_for_review" && (
@@ -1017,6 +1073,7 @@ export function RunInspector({
                         {run.execution.promotionState === "ready" &&
                           currentReview &&
                           !currentReview.diffTruncated &&
+                          (!run.approval || approvalActive) &&
                           (!requiresDurableApproval ||
                             (canPersistDesktopApproval && approvalActive)) && (
                             <button
@@ -1041,7 +1098,7 @@ export function RunInspector({
                             </button>
                           )}
                       </div>
-                      {currentReview && (
+                      {currentReview && run.execution.promotionState !== "discarded" && (
                         <details className="run-review" open>
                           <summary>{reviewSummary(currentReview)}</summary>
                           <pre>{reviewDiffText(currentReview)}</pre>
