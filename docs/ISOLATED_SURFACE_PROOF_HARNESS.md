@@ -487,6 +487,20 @@ cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Car
 
 ## Residuals (honest, post-packet-11)
 
+### Packet 12: snapshot ABI proof only
+
+The optional macOS snapshot ABI module type-checks the two-object
+`takeSnapshotWithConfiguration:completionHandler:` selector through dynamic
+`objc2::msg_send!` and a `block2` callback constructed per invocation. It
+intentionally does not load WebKit, create or invoke a `WKWebView`, capture a
+frame, or enable admission. The generated `objc2-web-kit` bindings are not a dependency because
+their link surface would violate the ordinary no-WebKit-load test boundary.
+
+This packet proves neither captured-frame bytes nor their layout. In particular,
+RGBA8 channel order, alpha semantics, row stride, Retina scale, and a real
+content digest remain unproven and must be established by a separate native
+capture witness before any admission decision.
+
 - `IsolatedSurfaceBackend::stop_fence_first` has no trait default — production adapters must wire real fence ack/failure.
 - `MacHostSentinelCollector` requires macOS Accessibility trust for foreground/unrelated window evidence; missing TCC → honest `BackendUnavailable`, not synthetic PASS.
 - Default harness rehearsal still uses [`SyntheticHostProbe`]. Native mode requires

@@ -28,6 +28,8 @@ mod store;
 mod vf_backend;
 mod vf_dry_run;
 mod wk_clipboard_probe;
+#[cfg(target_os = "macos")]
+mod wk_snapshot_abi;
 
 pub use backend::{
     assert_evidence_class_unchanged, honest_harness_evidence_class, IsolatedSurfaceBackend,
@@ -109,6 +111,8 @@ pub use wk_clipboard_probe::{
     PRIVATE_PROBE_WORLD_NAME, PRIVATE_REPLY_HANDLER_NAME, PRIVATE_REPLY_TITLE_PREFIX,
     PRIVATE_WORLD_PULL_SOURCE,
 };
+#[cfg(target_os = "macos")]
+pub use wk_snapshot_abi::{send_snapshot_with_callback, snapshot_callback, SnapshotCallback};
 
 /// Fail-closed admission gate for bridge integration. Remains false until a
 /// native adapter passes the physical Mac proof checklist.
