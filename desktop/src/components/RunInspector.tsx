@@ -228,6 +228,8 @@ const DISCARD_STATUS =
 const CONFLICT_COPY =
   "Promotion is blocked. Discard this run and start a fresh isolated attempt.";
 
+const MAX_APPROVAL_TIMEOUT_MS = 2_147_483_647;
+
 function nextApprovalExpiryMs(runs: DurableRun[], nowMs: number): number | null {
   let soonest: number | null = null;
   for (const run of runs) {
@@ -351,10 +353,11 @@ export function RunInspector({
     if (remote) return;
     const nextExpiry = nextApprovalExpiryMs(runs as DurableRun[], approvalNowMs);
     if (nextExpiry == null) return;
-    const delay = Math.max(0, nextExpiry - Date.now());
+    const delay = nextExpiry - Date.now();
+    if (delay > MAX_APPROVAL_TIMEOUT_MS) return;
     const timer = window.setTimeout(() => {
       setApprovalNowMs(Date.now());
-    }, delay);
+    }, Math.max(0, delay));
     return () => window.clearTimeout(timer);
   }, [remote, runs, approvalNowMs]);
 
