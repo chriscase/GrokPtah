@@ -250,3 +250,11 @@ jobs:
               assert ty in ("command", "all", "exact_file"), (t["id"], ty)
           print(f"ok: {len(tasks)} tasks, {len(hard)} hard, structured oracles")
           PY
+      - name: Isolated-surface fmt + clippy + focused tests
+        working-directory: crates/codegen/grokptah-isolated-surface
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked --test captured_frame_evidence --test clipboard_kill_gate --test contained_browser_regression --test evidence_pack_verifier --test proof_sequencer --test stop_regression --test synthetic_guest_frame -- --test-threads=1
+          cargo check --locked --features browser-engine
+          cargo test --locked --features browser-engine --test browser_engine_feature --test browser_engine_receipt_wiring -- --test-threads=1

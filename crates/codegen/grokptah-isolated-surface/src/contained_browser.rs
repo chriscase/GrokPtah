@@ -6,7 +6,8 @@
 //!
 //! Default builds use an in-process browser simulator (Linux CI friendly).
 //! Optional `browser-engine` feature remains default-off; when enabled the
-//! substrate still fails closed until a real isolated browser engine is wired.
+//! substrate routes frame observation through receipt-gated engine capture and
+//! still fails closed at boot until a qualified native adapter is wired.
 
 use crate::backend::IsolatedSurfaceBackend;
 use crate::captured_frame::BoundedCapturedFrame;
@@ -15,8 +16,15 @@ use crate::lifecycle::ProofEvidenceClass;
 use crate::simulator::{GuestFrame, GuestLocalAction, InjectOutcome};
 
 #[cfg(feature = "browser-engine")]
-const ENGINE_UNAVAILABLE: &str =
-    "Contained Browser engine feature is enabled but isolation is not proven; boot fails closed";
+use crate::browser_engine_capture::{
+    begin_browser_engine_frame_capture, complete_browser_engine_frame_capture,
+    install_receipt_gated_capture, native_browser_engine_capture_authorized,
+    require_engine_frame_observation,
+};
+
+#[cfg(feature = "browser-engine")]
+const ENGINE_BOOT_UNAVAILABLE: &str =
+    "Contained Browser browser-engine path is receipt-gated; native boot is not wired and isolation is not proven; boot fails closed";
 
 /// Fail-closed when the optional browser engine path is selected but unwired.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,8 +33,8 @@ enum SubstrateMode {
     #[cfg_attr(feature = "browser-engine", allow(dead_code))]
     Simulator,
     #[cfg(feature = "browser-engine")]
-    /// Reserved for native browser engine wiring; always fails closed in v0.
-    EngineUnavailable,
+    /// Receipt-gated engine capture; never uses simulator bytes.
+    ReceiptGated,
 }
 
 /// Contained Browser backend v0. Honest `ProofEvidenceClass::ContainedBrowser`
@@ -41,6 +49,8 @@ pub struct ContainedBrowserBackend {
     inject_fenced: bool,
     uncertain_on_next_inject: bool,
     crash_on_next_inject: bool,
+    #[cfg(feature = "browser-engine")]
+    receipt_gated_capture: Option<BoundedCapturedFrame>,
 }
 
 impl ContainedBrowserBackend {
@@ -57,6 +67,8 @@ impl ContainedBrowserBackend {
             inject_fenced: false,
             uncertain_on_next_inject: false,
             crash_on_next_inject: false,
+            #[cfg(feature = "browser-engine")]
+            receipt_gated_capture: None,
         }
     }
 
@@ -69,7 +81,7 @@ impl ContainedBrowserBackend {
         match self.mode {
             SubstrateMode::Simulator => "simulator",
             #[cfg(feature = "browser-engine")]
-            SubstrateMode::EngineUnavailable => "engine_unavailable",
+            SubstrateMode::ReceiptGated => "receipt_gated",
         }
     }
 
@@ -82,7 +94,17 @@ impl ContainedBrowserBackend {
     }
 
     fn current_capture(&self) -> HarnessResult<BoundedCapturedFrame> {
-        BoundedCapturedFrame::admit_simulator_capture(self.frame_epoch, self.guest_link_clicked)
+        match self.mode {
+            SubstrateMode::Simulator => BoundedCapturedFrame::admit_simulator_capture(
+                self.frame_epoch,
+                self.guest_link_clicked,
+            ),
+            #[cfg(feature = "browser-engine")]
+            SubstrateMode::ReceiptGated => require_engine_frame_observation(
+                self.frame_epoch,
+                self.receipt_gated_capture.as_ref(),
+            ),
+        }
     }
 
     fn current_frame(&self) -> HarnessResult<GuestFrame> {
@@ -95,6 +117,27 @@ impl ContainedBrowserBackend {
         self.inject_fenced = true;
     }
 
+    #[cfg(feature = "browser-engine")]
+    #[allow(dead_code)] // Native WKWebView adapter seam; boot stays fail-closed until wired.
+    fn admit_receipt_gated_engine_capture(
+        &mut self,
+        rgba8_bytes: Vec<u8>,
+        width: u32,
+        height: u32,
+    ) -> HarnessResult<BoundedCapturedFrame> {
+        if !self.booted {
+            return Err(HarnessError::invalid_state("browser guest is not booted"));
+        }
+        let handoff = begin_browser_engine_frame_capture(self.frame_epoch)?;
+        let capture = complete_browser_engine_frame_capture(handoff, rgba8_bytes, width, height)?;
+        self.receipt_gated_capture =
+            Some(install_receipt_gated_capture(self.frame_epoch, capture)?);
+        Ok(self
+            .receipt_gated_capture
+            .clone()
+            .expect("installed capture"))
+    }
+
     fn boot_simulator(&mut self) -> HarnessResult<GuestFrame> {
         if self.booted {
             return Err(HarnessError::invalid_state("browser guest already booted"));
@@ -102,6 +145,17 @@ impl ContainedBrowserBackend {
         self.booted = true;
         self.frame_epoch = 1;
         self.current_frame()
+    }
+
+    #[cfg(feature = "browser-engine")]
+    fn boot_receipt_gated(&mut self) -> HarnessResult<GuestFrame> {
+        if self.booted {
+            return Err(HarnessError::invalid_state("browser guest already booted"));
+        }
+        if !native_browser_engine_capture_authorized() {
+            return Err(HarnessError::backend_unavailable(ENGINE_BOOT_UNAVAILABLE));
+        }
+        Err(HarnessError::backend_unavailable(ENGINE_BOOT_UNAVAILABLE))
     }
 
     fn inject_browser_local(&mut self, action: GuestLocalAction) -> HarnessResult<InjectOutcome> {
@@ -155,7 +209,7 @@ impl Default for ContainedBrowserBackend {
 fn default_substrate_mode() -> SubstrateMode {
     #[cfg(feature = "browser-engine")]
     {
-        SubstrateMode::EngineUnavailable
+        SubstrateMode::ReceiptGated
     }
     #[cfg(not(feature = "browser-engine"))]
     {
@@ -172,9 +226,7 @@ impl IsolatedSurfaceBackend for ContainedBrowserBackend {
         match self.mode {
             SubstrateMode::Simulator => self.boot_simulator(),
             #[cfg(feature = "browser-engine")]
-            SubstrateMode::EngineUnavailable => {
-                Err(HarnessError::backend_unavailable(ENGINE_UNAVAILABLE))
-            }
+            SubstrateMode::ReceiptGated => self.boot_receipt_gated(),
         }
     }
 
@@ -189,8 +241,11 @@ impl IsolatedSurfaceBackend for ContainedBrowserBackend {
         match self.mode {
             SubstrateMode::Simulator => self.inject_browser_local(action),
             #[cfg(feature = "browser-engine")]
-            SubstrateMode::EngineUnavailable => {
-                Err(HarnessError::backend_unavailable(ENGINE_UNAVAILABLE))
+            SubstrateMode::ReceiptGated => {
+                if !self.booted {
+                    return Err(HarnessError::invalid_state("browser guest is not booted"));
+                }
+                Err(HarnessError::backend_unavailable(ENGINE_BOOT_UNAVAILABLE))
             }
         }
     }
@@ -263,9 +318,78 @@ mod tests {
     #[test]
     fn browser_engine_feature_fails_closed_on_boot() {
         let mut backend = ContainedBrowserBackend::new();
-        assert_eq!(backend.substrate_mode_label(), "engine_unavailable");
+        assert_eq!(backend.substrate_mode_label(), "receipt_gated");
         let err = backend.boot().expect_err("engine path fails closed");
         assert_eq!(err.code, crate::error::HarnessErrorCode::BackendUnavailable);
         assert!(!backend.is_booted());
+    }
+
+    #[cfg(feature = "browser-engine")]
+    #[test]
+    fn receipt_gated_mode_never_uses_simulator_bytes() {
+        let backend = ContainedBrowserBackend::new();
+        assert_eq!(backend.substrate_mode_label(), "receipt_gated");
+        // Force booted state only to exercise observation fail-closed semantics.
+        let mut backend = backend;
+        backend.booted = true;
+        backend.frame_epoch = 1;
+        let err = backend.observe_frame().expect_err("no receipt-gated bytes");
+        assert_eq!(err.code, crate::error::HarnessErrorCode::BackendUnavailable);
+        assert!(err.message.contains("receipt-gated"));
+    }
+
+    #[cfg(feature = "browser-engine")]
+    #[test]
+    fn receipt_mint_admit_observe_round_trip_is_engine_sourced() {
+        use crate::captured_frame::{
+            canonical_sha256_digest, validate_public_evidence, CapturedFrameSource,
+        };
+
+        const RGBA8: usize = 4;
+        let mut backend = ContainedBrowserBackend::new();
+        backend.booted = true;
+        backend.frame_epoch = 2;
+        let bytes = vec![0x7a; 3 * 2 * RGBA8];
+        let capture = backend
+            .admit_receipt_gated_engine_capture(bytes.clone(), 3, 2)
+            .expect("receipt-gated admit");
+        assert_eq!(capture.source(), CapturedFrameSource::BrowserEngine);
+        assert_eq!(capture.digest(), canonical_sha256_digest(&bytes));
+
+        let frame = backend.observe_frame().expect("observe admitted frame");
+        assert_eq!(frame.epoch, 2);
+        assert_eq!(frame.digest, capture.digest());
+        assert_eq!(
+            frame.captured_frame.as_ref().map(|ev| ev.source),
+            Some(CapturedFrameSource::BrowserEngine)
+        );
+
+        let evidence = capture.public_evidence();
+        assert_eq!(
+            validate_public_evidence(&evidence)
+                .expect_err("public verifier stays fail-closed for engine evidence")
+                .code,
+            crate::error::HarnessErrorCode::BackendUnavailable
+        );
+        assert!(!crate::isolated_surface_admission_available());
+    }
+
+    #[cfg(feature = "browser-engine")]
+    #[test]
+    fn stale_epoch_observation_rejected_after_receipt_admit() {
+        const RGBA8: usize = 4;
+        let mut backend = ContainedBrowserBackend::new();
+        backend.booted = true;
+        backend.frame_epoch = 4;
+        backend
+            .admit_receipt_gated_engine_capture(vec![0x02; RGBA8], 1, 1)
+            .expect("admit epoch 4");
+        backend.frame_epoch = 5;
+        let observe_err = backend.observe_frame().expect_err("stale observation");
+        assert_eq!(
+            observe_err.code,
+            crate::error::HarnessErrorCode::InvalidState
+        );
+        assert!(observe_err.message.contains("stale") || observe_err.message.contains("misbound"));
     }
 }

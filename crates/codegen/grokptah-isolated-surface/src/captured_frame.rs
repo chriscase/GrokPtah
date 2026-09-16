@@ -9,9 +9,10 @@
 //! CI. Those bytes are labeled [`CapturedFrameSource::SyntheticSimulator`] and
 //! do **not** constitute a real browser capture or isolation PASS.
 //!
-//! The optional `browser-engine` path stays fail-closed in this slice: no
-//! engine receipt, captured bytes, native/physical marker, or PASS is
-//! fabricated.
+//! The optional `browser-engine` path admits RGBA8 bytes only through a
+//! process-private one-shot receipt handoff in [`browser_engine_capture`].
+//! Public evidence and admission remain fail-closed until a separately
+//! qualified physical path exists.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -317,10 +318,10 @@ pub fn admit_browser_engine_capture(
 
 /// Admit exact RGBA8 bytes from a trusted native adapter receipt.
 ///
-/// This is a handoff contract only. No native adapter currently calls it, and
-/// engine evidence remains rejected by the public verifier until a separately
-/// qualified physical/isolated path exists. The receipt gate prevents callers
-/// from upgrading simulator bytes or caller-supplied labels into engine facts.
+/// This is the admission seam for [`browser_engine_capture`]. Engine evidence
+/// remains rejected by the public verifier until a separately qualified
+/// physical/isolated path exists. The receipt gate prevents callers from
+/// upgrading simulator bytes or caller-supplied labels into engine facts.
 #[allow(dead_code)]
 pub(crate) fn admit_browser_engine_capture_with_receipt(
     epoch: u64,

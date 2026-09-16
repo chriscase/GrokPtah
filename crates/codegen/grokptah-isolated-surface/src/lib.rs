@@ -5,6 +5,8 @@
 //! qualification from Linux CI or simulator evidence alone.
 
 mod backend;
+#[cfg(feature = "browser-engine")]
+mod browser_engine_capture;
 mod captured_frame;
 mod channels;
 mod checklist_runner;
@@ -32,6 +34,11 @@ mod wk_clipboard_probe;
 pub use backend::{
     assert_evidence_class_unchanged, honest_harness_evidence_class, IsolatedSurfaceBackend,
     VfLaunchReceipt,
+};
+#[cfg(feature = "browser-engine")]
+pub use browser_engine_capture::{
+    authorize_native_browser_engine_capture_for_physical_cli,
+    native_browser_engine_capture_authorized,
 };
 pub use captured_frame::{
     admit_browser_engine_capture, admit_captured_frame_with_claimed_digest,
