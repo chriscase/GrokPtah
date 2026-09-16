@@ -270,6 +270,7 @@ fn evidence_class_never_upgrades_at_seal() {
     assert!(!sealed.evidence_class.is_vf_qualification_eligible());
 }
 
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn sep18_vf_dry_run_unsupported_on_linux_ci() {
     let sequencer = Sep18NoModelProofSequencer::new(HostSentinelSnapshot::synthetic_baseline());
