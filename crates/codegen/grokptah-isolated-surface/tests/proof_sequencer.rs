@@ -3,9 +3,10 @@
 use grokptah_isolated_surface::{
     ChecklistStep, ContainedBrowserBackend, FaultMatrixCase, HarnessErrorCode,
     HostSentinelSnapshot, IsolatedSurfaceBackend, IsolatedSurfaceHarness, ProofEvidenceClass,
-    Sep18NoModelProofSequencer, VfDryRunOutcome, VfDryRunPlatform, VfLaunchReceipt,
-    VF_DRY_RUN_NONCLAIM,
+    Sep18NoModelProofSequencer, VfLaunchReceipt,
 };
+#[cfg(not(target_os = "macos"))]
+use grokptah_isolated_surface::{VfDryRunOutcome, VfDryRunPlatform, VF_DRY_RUN_NONCLAIM};
 #[cfg(not(feature = "browser-engine"))]
 use grokptah_isolated_surface::{
     ContainedBrowserDryRunOutcome, ContainedBrowserDryRunPlatform,
