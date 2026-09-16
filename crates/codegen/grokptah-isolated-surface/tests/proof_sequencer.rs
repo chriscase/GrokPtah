@@ -5,13 +5,13 @@ use grokptah_isolated_surface::{
     HostSentinelSnapshot, IsolatedSurfaceBackend, IsolatedSurfaceHarness, ProofEvidenceClass,
     Sep18NoModelProofSequencer, VfLaunchReceipt,
 };
-#[cfg(not(target_os = "macos"))]
-use grokptah_isolated_surface::{VfDryRunOutcome, VfDryRunPlatform, VF_DRY_RUN_NONCLAIM};
 #[cfg(not(feature = "browser-engine"))]
 use grokptah_isolated_surface::{
     ContainedBrowserDryRunOutcome, ContainedBrowserDryRunPlatform,
     CONTAINED_BROWSER_DRY_RUN_NONCLAIM,
 };
+#[cfg(not(target_os = "macos"))]
+use grokptah_isolated_surface::{VfDryRunOutcome, VfDryRunPlatform, VF_DRY_RUN_NONCLAIM};
 use tempfile::TempDir;
 
 #[test]
