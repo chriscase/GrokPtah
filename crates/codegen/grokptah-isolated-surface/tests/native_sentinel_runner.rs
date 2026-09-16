@@ -197,10 +197,14 @@ fn native_vf_stop_summary_is_not_hardcoded_zero() {
 
 #[test]
 fn macos_fail_closed_pack_is_not_labeled_non_macos() {
-    let evidence = NativeSentinelEvidence::macos_fail_closed(
+    let mut evidence = NativeSentinelEvidence::macos_fail_closed(
         NativeSentinelRunnerOutcome::BackendUnavailable,
         "TCC / collector unavailable",
     );
+    evidence.vf_dry_run = Some(paired_native_vf_evidence(
+        VfDryRunPlatform::MacOsDryRun,
+        VfDryRunOutcome::BackendUnavailable,
+    ));
     let pack = seal_native_host_sentinel_pack(evidence);
     let native = pack.native_host_sentinel.as_ref().expect("native nested");
     assert_eq!(native.platform, NativeSentinelRunnerPlatform::MacOs);
@@ -518,4 +522,222 @@ fn flipped_independent_flag_is_rejected() {
     let decision = verify_evidence_pack(&pack);
     assert!(!decision.accepted);
     assert!(!matches!(decision.code, EvidenceVerifierCode::Accepted));
+}
+
+fn runner_native_pack() -> grokptah_isolated_surface::Sep18EvidencePack {
+    let outcome = run_sep18_checklist(
+        HostSentinelSnapshot::synthetic_baseline(),
+        Sep18ChecklistRunnerConfig::native_host_sentinel("/explicit/checkout"),
+    );
+    assert!(outcome.runner_error.is_none(), "{:?}", outcome.runner_error);
+    outcome.pack
+}
+
+fn paired_native_vf_evidence(
+    platform: VfDryRunPlatform,
+    outcome: VfDryRunOutcome,
+) -> VfDryRunEvidence {
+    let mut vf = VfDryRunEvidence::fail_closed(platform, outcome);
+    vf.native_host_sentinels_requested = true;
+    vf
+}
+
+fn set_matching_nested_vf(
+    pack: &mut grokptah_isolated_surface::Sep18EvidencePack,
+    vf: VfDryRunEvidence,
+) {
+    pack.vf_dry_run = Some(vf.clone());
+    if let Some(native) = pack.native_host_sentinel.as_mut() {
+        native.vf_dry_run = Some(vf);
+    }
+}
+
+#[test]
+fn native_pack_missing_nested_vf_is_rejected() {
+    let mut pack = runner_native_pack();
+    pack.vf_dry_run = None;
+    if let Some(native) = pack.native_host_sentinel.as_mut() {
+        native.vf_dry_run = None;
+    }
+    let decision = verify_evidence_pack(&pack);
+    assert!(!decision.accepted);
+    assert_eq!(
+        decision.code,
+        EvidenceVerifierCode::SubstrateNestedEvidenceMissing
+    );
+}
+
+#[test]
+fn native_pack_one_sided_pack_vf_missing_is_rejected() {
+    let mut pack = runner_native_pack();
+    pack.vf_dry_run = None;
+    assert!(pack
+        .native_host_sentinel
+        .as_ref()
+        .and_then(|native| native.vf_dry_run.as_ref())
+        .is_some());
+    let decision = verify_evidence_pack(&pack);
+    assert!(!decision.accepted);
+    assert_eq!(
+        decision.code,
+        EvidenceVerifierCode::SubstrateNestedEvidenceMissing
+    );
+}
+
+#[test]
+fn native_pack_one_sided_native_vf_missing_is_rejected() {
+    let mut pack = runner_native_pack();
+    assert!(pack.vf_dry_run.is_some());
+    if let Some(native) = pack.native_host_sentinel.as_mut() {
+        native.vf_dry_run = None;
+    }
+    let decision = verify_evidence_pack(&pack);
+    assert!(!decision.accepted);
+    assert_eq!(
+        decision.code,
+        EvidenceVerifierCode::SubstrateNestedEvidenceMissing
+    );
+}
+
+#[test]
+fn native_pack_vf_without_native_request_flag_is_rejected() {
+    let mut pack = runner_native_pack();
+    let mut vf = pack.vf_dry_run.clone().expect("pack VF nested");
+    vf.native_host_sentinels_requested = false;
+    set_matching_nested_vf(&mut pack, vf);
+    let decision = verify_evidence_pack(&pack);
+    assert!(!decision.accepted);
+    assert_eq!(
+        decision.code,
+        EvidenceVerifierCode::SubstrateNestedEvidenceMissing
+    );
+}
+
+#[test]
+fn native_pack_mismatched_nested_vf_is_rejected() {
+    let mut pack = runner_native_pack();
+    let mut native_only = paired_native_vf_evidence(
+        VfDryRunPlatform::MacOsDryRun,
+        VfDryRunOutcome::BackendUnavailable,
+    );
+    native_only.host_sentinel_probes_performed = 7;
+    if let Some(native) = pack.native_host_sentinel.as_mut() {
+        native.vf_dry_run = Some(native_only);
+    }
+    let decision = verify_evidence_pack(&pack);
+    assert!(!decision.accepted);
+    assert_eq!(
+        decision.code,
+        EvidenceVerifierCode::PackSealedEvidenceMismatch
+    );
+}
+
+#[test]
+fn native_pack_nested_vf_live_at_stop_wrong_kind_is_rejected() {
+    let mut pack = runner_native_pack();
+    let mut vf = pack.vf_dry_run.clone().expect("pack VF nested");
+    vf.live_host_sentinel_collection_at_stop = true;
+    vf.host_sentinel_probes_performed = 2;
+    vf.host_sentinels_unchanged_at_stop = true;
+    vf.last_host_sentinel_probe_kind = Some(HostSentinelProbeKind::SyntheticRehearsal);
+    set_matching_nested_vf(&mut pack, vf);
+    let decision = verify_evidence_pack(&pack);
+    assert!(!decision.accepted);
+    assert_eq!(
+        decision.code,
+        EvidenceVerifierCode::NativeSentinelSyntheticFallback
+    );
+}
+
+#[test]
+fn native_fail_closed_nested_vf_live_at_stop_native_kind_is_rejected() {
+    let mut evidence = NativeSentinelEvidence::macos_fail_closed(
+        NativeSentinelRunnerOutcome::BackendUnavailable,
+        "TCC / collector unavailable",
+    );
+    let mut vf = paired_native_vf_evidence(
+        VfDryRunPlatform::MacOsDryRun,
+        VfDryRunOutcome::BackendUnavailable,
+    );
+    vf.live_host_sentinel_collection_at_stop = true;
+    vf.host_sentinel_probes_performed = 3;
+    vf.host_sentinels_unchanged_at_stop = true;
+    vf.channels_destroyed = 1;
+    vf.last_host_sentinel_probe_kind = Some(HostSentinelProbeKind::NativeMacHost);
+    evidence.vf_dry_run = Some(vf);
+    let pack = seal_native_host_sentinel_pack(evidence);
+    assert!(
+        !pack
+            .native_host_sentinel
+            .as_ref()
+            .expect("native nested")
+            .live_host_sentinel_collection
+    );
+    assert!(
+        pack.vf_dry_run
+            .as_ref()
+            .expect("pack VF nested")
+            .live_host_sentinel_collection_at_stop
+    );
+    let decision = verify_evidence_pack(&pack);
+    assert!(!decision.accepted);
+    assert_eq!(
+        decision.code,
+        EvidenceVerifierCode::NativeSentinelLiveClaimOnUnsupportedPlatform
+    );
+}
+
+#[test]
+fn runner_native_mutated_vf_live_at_stop_without_native_live_is_rejected() {
+    let mut pack = runner_native_pack();
+    assert!(
+        !pack
+            .native_host_sentinel
+            .as_ref()
+            .expect("native nested")
+            .live_host_sentinel_collection
+    );
+    let mut vf = pack.vf_dry_run.clone().expect("pack VF nested");
+    vf.live_host_sentinel_collection_at_stop = true;
+    vf.host_sentinels_unchanged_at_stop = true;
+    vf.host_sentinel_probes_performed = 3;
+    vf.channels_destroyed = 1;
+    vf.last_host_sentinel_probe_kind = Some(HostSentinelProbeKind::NativeMacHost);
+    vf.native_host_sentinels_requested = true;
+    set_matching_nested_vf(&mut pack, vf);
+    assert!(
+        !pack
+            .host_sentinel_probes
+            .live_host_sentinel_collection_at_stop
+    );
+    let decision = verify_evidence_pack(&pack);
+    assert!(!decision.accepted);
+    assert_eq!(
+        decision.code,
+        EvidenceVerifierCode::NativeSentinelLiveClaimOnUnsupportedPlatform
+    );
+}
+
+#[test]
+fn native_paired_nested_vf_evidence_is_accepted() {
+    let pack = runner_native_pack();
+    let pack_vf = pack.vf_dry_run.as_ref().expect("pack VF nested");
+    let native_vf = pack
+        .native_host_sentinel
+        .as_ref()
+        .expect("native nested")
+        .vf_dry_run
+        .as_ref()
+        .expect("native VF nested");
+    assert_eq!(pack_vf, native_vf);
+    assert!(pack_vf.native_host_sentinels_requested);
+    let decision = verify_evidence_pack(&pack);
+    assert!(decision.accepted, "{decision:?}");
+    assert!(!pack.physical_pass_claimed);
+    assert!(!pack.vf_pass_claimed);
+    assert!(!pack.admission_available);
+    assert_eq!(
+        pack.physical_proof_markers,
+        PhysicalProofMarkers::dry_run_none()
+    );
 }

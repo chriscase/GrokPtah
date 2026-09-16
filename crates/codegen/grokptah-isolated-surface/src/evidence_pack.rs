@@ -1079,6 +1079,12 @@ fn verify_substrate_nested_evidence(pack: &Sep18EvidencePack) -> Option<Evidence
                     "NativeHostSentinel requires native_host_sentinel nested evidence",
                 ));
             }
+            if pack.vf_dry_run.is_none() {
+                return Some(EvidenceVerifierDecision::reject(
+                    EvidenceVerifierCode::SubstrateNestedEvidenceMissing,
+                    "NativeHostSentinel requires matching vf_dry_run nested evidence",
+                ));
+            }
         }
         Sep18ChecklistSubstrate::ClipboardKillGate => {
             if pack.clipboard_kill_gate.is_none() {
@@ -1093,18 +1099,123 @@ fn verify_substrate_nested_evidence(pack: &Sep18EvidencePack) -> Option<Evidence
 }
 
 fn verify_vf_dry_run_stop_summary(pack: &Sep18EvidencePack) -> Option<EvidenceVerifierDecision> {
-    if pack.substrate != Sep18ChecklistSubstrate::VfDryRun {
-        return None;
-    }
     let vf = pack.vf_dry_run.as_ref()?;
-    let expected = HostSentinelProbeSummary::from_vf_dry_run(vf);
-    if pack.host_sentinel_probes != expected {
+
+    // VF nested evidence never qualifies physical PASS; unsigned markers fail closed.
+    if pack.substrate == Sep18ChecklistSubstrate::VfDryRun
+        && pack.physical_proof_markers != PhysicalProofMarkers::dry_run_none()
+    {
         return Some(EvidenceVerifierDecision::reject(
-            EvidenceVerifierCode::HostSentinelProbeSummaryMismatch,
-            "VF dry-run pack.host_sentinel_probes must match nested VfDryRunEvidence Stop summary",
+            EvidenceVerifierCode::VfDryRunCannotQualifyPhysicalPass,
+            "VF dry-run must keep PhysicalProofMarkers::dry_run_none",
         ));
     }
+
+    if pack.substrate == Sep18ChecklistSubstrate::VfDryRun {
+        let expected = HostSentinelProbeSummary::from_vf_dry_run(vf);
+        if pack.host_sentinel_probes != expected {
+            return Some(EvidenceVerifierDecision::reject(
+                EvidenceVerifierCode::HostSentinelProbeSummaryMismatch,
+                "VF dry-run pack.host_sentinel_probes must match nested VfDryRunEvidence Stop summary",
+            ));
+        }
+    }
+
+    let live_at_stop = vf.live_host_sentinel_collection_at_stop
+        || (pack.substrate == Sep18ChecklistSubstrate::VfDryRun
+            && pack
+                .host_sentinel_probes
+                .live_host_sentinel_collection_at_stop);
+    if live_at_stop {
+        if let Some(decision) =
+            reject_non_native_live_at_stop_kind(vf.last_host_sentinel_probe_kind)
+        {
+            return Some(decision);
+        }
+        if pack.substrate == Sep18ChecklistSubstrate::VfDryRun {
+            if let Some(decision) =
+                reject_non_native_live_at_stop_kind(pack.host_sentinel_probes.last_probe_kind)
+            {
+                return Some(decision);
+            }
+        }
+        if let Some(decision) = reject_live_at_stop_without_native_collection(pack, vf) {
+            return Some(decision);
+        }
+    }
+
     None
+}
+
+fn nested_vf_live_at_stop(pack: &Sep18EvidencePack) -> bool {
+    pack.vf_dry_run
+        .as_ref()
+        .is_some_and(|vf| vf.live_host_sentinel_collection_at_stop)
+        || pack
+            .native_host_sentinel
+            .as_ref()
+            .and_then(|native| native.vf_dry_run.as_ref())
+            .is_some_and(|vf| vf.live_host_sentinel_collection_at_stop)
+}
+
+fn native_host_sentinel_collection_occurred(pack: &Sep18EvidencePack) -> bool {
+    pack.native_host_sentinel.as_ref().is_some_and(|native| {
+        native.platform == NativeSentinelRunnerPlatform::MacOs
+            && native.outcome == NativeSentinelRunnerOutcome::NativeProbesCompleted
+            && native.live_host_sentinel_collection
+    })
+}
+
+fn reject_live_at_stop_without_native_collection(
+    pack: &Sep18EvidencePack,
+    vf: &VfDryRunEvidence,
+) -> Option<EvidenceVerifierDecision> {
+    if matches!(
+        vf.platform,
+        VfDryRunPlatform::NonMacOs | VfDryRunPlatform::MacOsFeatureDisabled
+    ) || matches!(
+        vf.outcome,
+        VfDryRunOutcome::UnsupportedPlatform | VfDryRunOutcome::FeatureDisabled
+    ) {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::NativeSentinelLiveClaimOnUnsupportedPlatform,
+            "live-at-stop VF collection cannot be attested on non-macOS or unsupported VF dry-run artifacts",
+        ));
+    }
+
+    if vf.outcome == VfDryRunOutcome::BackendUnavailable
+        && !native_host_sentinel_collection_occurred(pack)
+    {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::NativeSentinelLiveClaimOnUnsupportedPlatform,
+            "live-at-stop VF collection cannot be attested by BackendUnavailable dry-run artifacts without native host-sentinel collection",
+        ));
+    }
+
+    if !native_host_sentinel_collection_occurred(pack) {
+        return Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::NativeSentinelLiveClaimOnUnsupportedPlatform,
+            "live-at-stop VF collection requires native host-sentinel collection to have actually occurred",
+        ));
+    }
+
+    None
+}
+
+fn reject_non_native_live_at_stop_kind(
+    kind: Option<HostSentinelProbeKind>,
+) -> Option<EvidenceVerifierDecision> {
+    match kind {
+        Some(HostSentinelProbeKind::NativeMacHost) => None,
+        Some(HostSentinelProbeKind::SyntheticRehearsal) => Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::NativeSentinelSyntheticFallback,
+            "live-at-stop VF collection cannot be attested by a synthetic last probe kind",
+        )),
+        None => Some(EvidenceVerifierDecision::reject(
+            EvidenceVerifierCode::HostSentinelProbeSummaryMismatch,
+            "live-at-stop VF collection requires last probe kind NativeMacHost",
+        )),
+    }
 }
 
 fn verify_native_host_sentinel(pack: &Sep18EvidencePack) -> Option<EvidenceVerifierDecision> {
@@ -1127,11 +1238,34 @@ fn verify_native_host_sentinel(pack: &Sep18EvidencePack) -> Option<EvidenceVerif
         ));
     }
 
+    let vf_live = nested_vf_live_at_stop(pack);
+    if vf_live {
+        if let Some(vf) = pack.vf_dry_run.as_ref() {
+            if vf.live_host_sentinel_collection_at_stop {
+                if let Some(decision) =
+                    reject_non_native_live_at_stop_kind(vf.last_host_sentinel_probe_kind)
+                {
+                    return Some(decision);
+                }
+            }
+        }
+        if let Some(vf) = native.vf_dry_run.as_ref() {
+            if vf.live_host_sentinel_collection_at_stop {
+                if let Some(decision) =
+                    reject_non_native_live_at_stop_kind(vf.last_host_sentinel_probe_kind)
+                {
+                    return Some(decision);
+                }
+            }
+        }
+    }
+
     if native.platform == NativeSentinelRunnerPlatform::NonMacOs
         && (native.live_host_sentinel_collection
             || pack
                 .host_sentinel_probes
                 .live_host_sentinel_collection_at_stop
+            || vf_live
             || native.outcome != NativeSentinelRunnerOutcome::UnsupportedPlatform)
     {
         return Some(EvidenceVerifierDecision::reject(
@@ -1146,7 +1280,8 @@ fn verify_native_host_sentinel(pack: &Sep18EvidencePack) -> Option<EvidenceVerif
             || native.checklist_completed
             || pack
                 .host_sentinel_probes
-                .live_host_sentinel_collection_at_stop)
+                .live_host_sentinel_collection_at_stop
+            || vf_live)
     {
         return Some(EvidenceVerifierDecision::reject(
             EvidenceVerifierCode::NativeSentinelLiveClaimOnUnsupportedPlatform,
@@ -1184,11 +1319,25 @@ fn verify_native_host_sentinel(pack: &Sep18EvidencePack) -> Option<EvidenceVerif
         }
     }
 
-    if let (Some(pack_vf), Some(native_vf)) = (&pack.vf_dry_run, &native.vf_dry_run) {
-        if pack_vf != native_vf {
+    match (&pack.vf_dry_run, &native.vf_dry_run) {
+        (Some(pack_vf), Some(native_vf)) => {
+            if pack_vf != native_vf {
+                return Some(EvidenceVerifierDecision::reject(
+                    EvidenceVerifierCode::PackSealedEvidenceMismatch,
+                    "native_host_sentinel.vf_dry_run does not match pack.vf_dry_run",
+                ));
+            }
+            if !pack_vf.native_host_sentinels_requested {
+                return Some(EvidenceVerifierDecision::reject(
+                    EvidenceVerifierCode::SubstrateNestedEvidenceMissing,
+                    "NativeHostSentinel requires native_host_sentinels_requested=true on nested vf_dry_run evidence",
+                ));
+            }
+        }
+        _ => {
             return Some(EvidenceVerifierDecision::reject(
-                EvidenceVerifierCode::PackSealedEvidenceMismatch,
-                "native_host_sentinel.vf_dry_run does not match pack.vf_dry_run",
+                EvidenceVerifierCode::SubstrateNestedEvidenceMissing,
+                "NativeHostSentinel requires matching nested vf_dry_run evidence on pack and native_host_sentinel",
             ));
         }
     }
@@ -1458,7 +1607,8 @@ fn verify_native_live_kind_and_counts(
         || probes.live_host_sentinel_collection_at_stop
         || stop
             .map(|s| s.live_host_sentinel_collection)
-            .unwrap_or(false);
+            .unwrap_or(false)
+        || nested_vf_live_at_stop(pack);
     if live_claimed {
         let kind = native
             .last_host_sentinel_probe_kind
