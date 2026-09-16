@@ -650,6 +650,75 @@ fn native_pack_nested_vf_live_at_stop_wrong_kind_is_rejected() {
 }
 
 #[test]
+fn native_fail_closed_nested_vf_live_at_stop_native_kind_is_rejected() {
+    let mut evidence = NativeSentinelEvidence::macos_fail_closed(
+        NativeSentinelRunnerOutcome::BackendUnavailable,
+        "TCC / collector unavailable",
+    );
+    let mut vf = paired_native_vf_evidence(
+        VfDryRunPlatform::MacOsDryRun,
+        VfDryRunOutcome::BackendUnavailable,
+    );
+    vf.live_host_sentinel_collection_at_stop = true;
+    vf.host_sentinel_probes_performed = 3;
+    vf.host_sentinels_unchanged_at_stop = true;
+    vf.channels_destroyed = 1;
+    vf.last_host_sentinel_probe_kind = Some(HostSentinelProbeKind::NativeMacHost);
+    evidence.vf_dry_run = Some(vf);
+    let pack = seal_native_host_sentinel_pack(evidence);
+    assert!(
+        !pack
+            .native_host_sentinel
+            .as_ref()
+            .expect("native nested")
+            .live_host_sentinel_collection
+    );
+    assert!(
+        pack.vf_dry_run
+            .as_ref()
+            .expect("pack VF nested")
+            .live_host_sentinel_collection_at_stop
+    );
+    let decision = verify_evidence_pack(&pack);
+    assert!(!decision.accepted);
+    assert_eq!(
+        decision.code,
+        EvidenceVerifierCode::NativeSentinelLiveClaimOnUnsupportedPlatform
+    );
+}
+
+#[test]
+fn runner_native_mutated_vf_live_at_stop_without_native_live_is_rejected() {
+    let mut pack = runner_native_pack();
+    assert!(
+        !pack
+            .native_host_sentinel
+            .as_ref()
+            .expect("native nested")
+            .live_host_sentinel_collection
+    );
+    let mut vf = pack.vf_dry_run.clone().expect("pack VF nested");
+    vf.live_host_sentinel_collection_at_stop = true;
+    vf.host_sentinels_unchanged_at_stop = true;
+    vf.host_sentinel_probes_performed = 3;
+    vf.channels_destroyed = 1;
+    vf.last_host_sentinel_probe_kind = Some(HostSentinelProbeKind::NativeMacHost);
+    vf.native_host_sentinels_requested = true;
+    set_matching_nested_vf(&mut pack, vf);
+    assert!(
+        !pack
+            .host_sentinel_probes
+            .live_host_sentinel_collection_at_stop
+    );
+    let decision = verify_evidence_pack(&pack);
+    assert!(!decision.accepted);
+    assert_eq!(
+        decision.code,
+        EvidenceVerifierCode::NativeSentinelLiveClaimOnUnsupportedPlatform
+    );
+}
+
+#[test]
 fn native_paired_nested_vf_evidence_is_accepted() {
     let pack = runner_native_pack();
     let pack_vf = pack.vf_dry_run.as_ref().expect("pack VF nested");
