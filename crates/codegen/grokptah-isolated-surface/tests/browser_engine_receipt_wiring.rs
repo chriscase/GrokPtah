@@ -6,8 +6,8 @@
 #![cfg(feature = "browser-engine")]
 
 use grokptah_isolated_surface::{
-    authorize_native_browser_engine_capture_for_physical_cli, ContainedBrowserBackend,
-    HarnessErrorCode, IsolatedSurfaceBackend,
+    native_browser_engine_capture_authorized, ContainedBrowserBackend, HarnessErrorCode,
+    IsolatedSurfaceBackend,
 };
 
 #[test]
@@ -19,10 +19,16 @@ fn receipt_gated_substrate_label_and_no_simulator_fallback() {
 }
 
 #[test]
-fn boot_stays_fail_closed_even_when_native_capture_authorized() {
-    authorize_native_browser_engine_capture_for_physical_cli();
+fn cargo_test_never_authorizes_native_browser_engine_capture() {
+    assert!(!native_browser_engine_capture_authorized());
+}
+
+#[test]
+fn boot_stays_fail_closed_without_native_capture_authorization() {
     let mut backend = ContainedBrowserBackend::new();
-    let err = backend.boot().expect_err("native boot still unwired");
+    let err = backend
+        .boot()
+        .expect_err("native boot unwired and unauthorized");
     assert_eq!(err.code, HarnessErrorCode::BackendUnavailable);
     assert!(!backend.is_booted());
     assert!(err.message.contains("receipt-gated"));

@@ -148,14 +148,19 @@ impl ContainedBrowserBackend {
     }
 
     #[cfg(feature = "browser-engine")]
+    fn receipt_gated_boot_unavailable() -> HarnessResult<GuestFrame> {
+        Err(HarnessError::backend_unavailable(ENGINE_BOOT_UNAVAILABLE))
+    }
+
+    #[cfg(feature = "browser-engine")]
     fn boot_receipt_gated(&mut self) -> HarnessResult<GuestFrame> {
         if self.booted {
             return Err(HarnessError::invalid_state("browser guest already booted"));
         }
         if !native_browser_engine_capture_authorized() {
-            return Err(HarnessError::backend_unavailable(ENGINE_BOOT_UNAVAILABLE));
+            return Self::receipt_gated_boot_unavailable();
         }
-        Err(HarnessError::backend_unavailable(ENGINE_BOOT_UNAVAILABLE))
+        Self::receipt_gated_boot_unavailable()
     }
 
     fn inject_browser_local(&mut self, action: GuestLocalAction) -> HarnessResult<InjectOutcome> {
@@ -258,6 +263,10 @@ impl IsolatedSurfaceBackend for ContainedBrowserBackend {
 
     fn destroy(&mut self) -> HarnessResult<()> {
         self.booted = false;
+        #[cfg(feature = "browser-engine")]
+        {
+            self.receipt_gated_capture = None;
+        }
         Ok(())
     }
 
@@ -326,6 +335,15 @@ mod tests {
 
     #[cfg(feature = "browser-engine")]
     #[test]
+    fn receipt_gated_boot_denies_even_when_authorization_hook_satisfied() {
+        let err = ContainedBrowserBackend::receipt_gated_boot_unavailable()
+            .expect_err("authorized native boot path still unwired");
+        assert_eq!(err.code, crate::error::HarnessErrorCode::BackendUnavailable);
+        assert!(err.message.contains("receipt-gated"));
+    }
+
+    #[cfg(feature = "browser-engine")]
+    #[test]
     fn receipt_gated_mode_never_uses_simulator_bytes() {
         let backend = ContainedBrowserBackend::new();
         assert_eq!(backend.substrate_mode_label(), "receipt_gated");
@@ -372,6 +390,27 @@ mod tests {
             crate::error::HarnessErrorCode::BackendUnavailable
         );
         assert!(!crate::isolated_surface_admission_available());
+    }
+
+    #[cfg(feature = "browser-engine")]
+    #[test]
+    fn destroy_clears_receipt_gated_capture() {
+        const RGBA8: usize = 4;
+        let mut backend = ContainedBrowserBackend::new();
+        backend.booted = true;
+        backend.frame_epoch = 3;
+        backend
+            .admit_receipt_gated_engine_capture(vec![0x55; RGBA8], 1, 1)
+            .expect("admit capture");
+        backend.observe_frame().expect("capture installed");
+
+        backend.destroy().expect("destroy");
+        assert!(!backend.is_booted());
+        backend.booted = true;
+        backend.frame_epoch = 3;
+        let err = backend.observe_frame().expect_err("stale capture cleared");
+        assert_eq!(err.code, crate::error::HarnessErrorCode::BackendUnavailable);
+        assert!(err.message.contains("receipt-gated"));
     }
 
     #[cfg(feature = "browser-engine")]
