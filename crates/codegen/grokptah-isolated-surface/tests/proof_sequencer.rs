@@ -3,14 +3,15 @@
 use grokptah_isolated_surface::{
     ChecklistStep, ContainedBrowserBackend, FaultMatrixCase, HarnessErrorCode,
     HostSentinelSnapshot, IsolatedSurfaceBackend, IsolatedSurfaceHarness, ProofEvidenceClass,
-    Sep18NoModelProofSequencer, VfDryRunOutcome, VfDryRunPlatform, VfLaunchReceipt,
-    VF_DRY_RUN_NONCLAIM,
+    Sep18NoModelProofSequencer, VfLaunchReceipt,
 };
 #[cfg(not(feature = "browser-engine"))]
 use grokptah_isolated_surface::{
     ContainedBrowserDryRunOutcome, ContainedBrowserDryRunPlatform,
     CONTAINED_BROWSER_DRY_RUN_NONCLAIM,
 };
+#[cfg(not(target_os = "macos"))]
+use grokptah_isolated_surface::{VfDryRunOutcome, VfDryRunPlatform, VF_DRY_RUN_NONCLAIM};
 use tempfile::TempDir;
 
 #[test]
@@ -270,6 +271,7 @@ fn evidence_class_never_upgrades_at_seal() {
     assert!(!sealed.evidence_class.is_vf_qualification_eligible());
 }
 
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn sep18_vf_dry_run_unsupported_on_linux_ci() {
     let sequencer = Sep18NoModelProofSequencer::new(HostSentinelSnapshot::synthetic_baseline());

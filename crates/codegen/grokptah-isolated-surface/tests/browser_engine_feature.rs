@@ -16,7 +16,7 @@ use grokptah_isolated_surface::{
 #[test]
 fn browser_engine_boot_fails_closed() {
     let mut backend = ContainedBrowserBackend::new();
-    assert_eq!(backend.substrate_mode_label(), "engine_unavailable");
+    assert_eq!(backend.substrate_mode_label(), "receipt_gated");
     assert!(!backend.isolation_proof_available());
     assert_eq!(
         backend.evidence_class(),

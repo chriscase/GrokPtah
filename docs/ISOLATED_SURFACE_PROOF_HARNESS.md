@@ -145,9 +145,12 @@ The default simulator emits deterministic explicit synthetic payload bytes for C
 labeled `synthetic_simulator` / `synthetic_payload`. That is **not** a real browser
 capture and does **not** change `CONTAINED_BROWSER_DRY_RUN_NONCLAIM`.
 
-The optional `browser-engine` feature stays fail-closed: this slice does not wire an
-engine capture, fabricate an engine receipt, emit native/physical markers, or claim
-PASS. Admission and Computer Mode stay false.
+The optional `browser-engine` feature routes frame observation through a
+process-private one-shot receipt handoff (`browser_engine_capture.rs`):
+mint receipt → bounded RGBA8 admit → observe. No receipt → no frame bytes; the
+substrate never falls back to simulator bytes when the feature is enabled.
+Native boot, WebKit capture, public engine evidence, physical markers, and PASS
+remain fail-closed. Admission and Computer Mode stay false.
 
 Empty, oversized, malformed, caller-digest, one-byte-tampered, stale/misbound, and
 source-upgraded frames are rejected before postcondition evidence can be sealed.
@@ -480,6 +483,9 @@ cargo check --locked --manifest-path crates/codegen/grokptah-isolated-surface/Ca
 cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Cargo.toml \
   --features browser-engine --test browser_engine_feature -- --test-threads=1
 
+cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Cargo.toml \
+  --features browser-engine --test browser_engine_receipt_wiring -- --test-threads=1
+
 # Mac VF dry-run rehearsal (physical worker only)
 cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Cargo.toml \
   --features vf-backend --test proof_sequencer sep18_vf_dry_run -- --test-threads=1
@@ -497,7 +503,7 @@ cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Car
 - Independent verifier is pack-only; physical Mac worker still required for VF PASS rung.
 - Contained Browser substrate v0 uses an in-process simulator — not a real isolated browser engine.
 - Simulator captured-frame bytes are explicit synthetic payloads, content-addressed and labeled synthetic — not a real browser capture.
-- Optional `browser-engine` feature fails closed until a bounded engine capture is actually wired; this slice fabricates no engine receipt or PASS.
+- Optional `browser-engine` feature is receipt-gated: no receipt → no frame bytes; native WebKit boot/capture and public engine evidence remain unwired/fail-closed.
 - Native host-sentinel live collection is **not** VF PASS, isolation PASS, or admission enablement.
 - Clipboard kill-gate Pass is **not** VF PASS, isolation PASS, Computer Mode, or admission. Linux CI is deterministic `unsupported`. Ordinary `cargo test` never initializes WebKit. Pass requires genuine page-world initiation and fulfillment of `navigator.clipboard.readText/writeText/read/write`, an unforgeable host-issued generation/epoch challenge, host receive through a registered private-world `WKScriptMessageHandler`, unchanged host clipboard digest, and a process-private live witness. In-process verification of the live runner result can accept Pass; persisted JSON verifies integrity/provenance but cannot independently re-promote Pass. Title polling, DOM self-attestation, private-world self-simulation, host-injected clipboard stubs, hardcoded receipts, and missing handler registration are INCONCLUSIVE and never Pass. Linux verifiers reject Pass.
 - No TCC entitlement or notarization claims.
