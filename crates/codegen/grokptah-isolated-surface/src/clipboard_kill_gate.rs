@@ -23,8 +23,9 @@ use crate::wk_clipboard_probe::native_clipboard_probe_authorized;
 #[cfg(target_os = "macos")]
 use crate::wk_clipboard_probe::{admit_probe_reply, ProbePull, ProbeReply, WKClipboardProbe};
 use crate::wk_clipboard_probe::{
-    receipts_all_fulfilled, ClipboardOperation, ClipboardProbeFailClosedReason,
-    PageLocalClipboardReceipt, ReceiptInitiator, ReplyChannel, ScriptEvaluationPath,
+    fail_closed_reason_for_clipboard_receipts, receipts_all_fulfilled, ClipboardOperation,
+    ClipboardProbeFailClosedReason, PageLocalClipboardReceipt, ReceiptInitiator, ReplyChannel,
+    ScriptEvaluationPath,
 };
 use crate::CLIPBOARD_KILL_GATE_NONCLAIM;
 
@@ -323,7 +324,10 @@ pub fn verify_clipboard_kill_gate_evidence(
             return Err(ClipboardProbeFailClosedReason::PageWorldNonparticipation);
         }
         if !receipts_all_fulfilled(&evidence.receipts) {
-            return Err(ClipboardProbeFailClosedReason::ClipboardApiUnavailable);
+            return Err(
+                fail_closed_reason_for_clipboard_receipts(&evidence.receipts)
+                    .unwrap_or(ClipboardProbeFailClosedReason::Uncertain),
+            );
         }
         let live_ok = evidence
             .live_authority
@@ -488,9 +492,11 @@ fn seal_macos_result(
     match admit_probe_reply(&ProbePull::private(generation, epoch), &reply, &[]) {
         Ok(admitted) => {
             if !receipts_all_fulfilled(&admitted.receipts) {
+                let reason = fail_closed_reason_for_clipboard_receipts(&admitted.receipts)
+                    .unwrap_or(ClipboardProbeFailClosedReason::ClipboardAttemptUnfulfilled);
                 let mut evidence = ClipboardKillGateEvidence::macos_fail_closed(
-                    ClipboardProbeFailClosedReason::ClipboardApiUnavailable,
-                    "Async Clipboard API/gesture/secure-context prevented fulfillment",
+                    reason,
+                    "Async Clipboard attempt settled unfulfilled",
                 );
                 evidence.host_clipboard_before = Some(before);
                 evidence.host_clipboard_after = Some(after);
