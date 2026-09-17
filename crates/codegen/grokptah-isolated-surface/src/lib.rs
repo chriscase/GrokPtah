@@ -41,6 +41,7 @@ pub use backend::{
 pub use browser_engine_capture::{
     authorize_native_browser_engine_capture_for_physical_cli,
     capture_live_wk_snapshot_through_receipt, native_browser_engine_capture_authorized,
+    LIVE_WK_FIXTURE_CRIMSON_RGB,
 };
 pub use captured_frame::{
     admit_browser_engine_capture, admit_captured_frame_with_claimed_digest,

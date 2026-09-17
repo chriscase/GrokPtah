@@ -51,6 +51,7 @@ fn main() {
             .captured_bytes()
             .windows(SYNTHETIC_FRAME_PAYLOAD_NEEDLE.len())
             .any(|window| window == SYNTHETIC_FRAME_PAYLOAD_NEEDLE));
+        assert_captured_bytes_are_fixture_crimson(capture.captured_bytes());
         assert_eq!(
             capture.digest(),
             canonical_sha256_digest(capture.captured_bytes())
@@ -66,4 +67,29 @@ fn main() {
             evidence.width, evidence.height, evidence.byte_length, evidence.digest
         );
     }
+}
+
+#[cfg(feature = "browser-engine")]
+fn assert_captured_bytes_are_fixture_crimson(bytes: &[u8]) {
+    use grokptah_isolated_surface::LIVE_WK_FIXTURE_CRIMSON_RGB;
+    assert!(!bytes.is_empty(), "live WK raster is empty");
+    assert!(bytes.len().is_multiple_of(4), "live WK raster is not RGBA8");
+    let uniform_white = bytes
+        .chunks_exact(4)
+        .all(|pixel| pixel[0] == 255 && pixel[1] == 255 && pixel[2] == 255);
+    assert!(
+        !uniform_white,
+        "live WK raster is uniform 255,255,255,255 window-white, not fixture #c41e3a"
+    );
+    let [target_r, target_g, target_b] = LIVE_WK_FIXTURE_CRIMSON_RGB;
+    let near = |actual: u8, target: u8| (actual as i16 - target as i16).unsigned_abs() <= 40;
+    let has_fixture = bytes.chunks_exact(4).any(|pixel| {
+        near(pixel[0], target_r) && near(pixel[1], target_g) && near(pixel[2], target_b)
+            || near(pixel[0], target_b) && near(pixel[1], target_g) && near(pixel[2], target_r)
+    });
+    assert!(
+        has_fixture,
+        "live WK raster must contain fixture #c41e3a (RGBA or BGRA); first pixel={:?}",
+        bytes.get(0..4)
+    );
 }

@@ -9,7 +9,7 @@ use grokptah_isolated_surface::{
     admit_browser_engine_capture, canonical_sha256_digest,
     capture_live_wk_snapshot_through_receipt, isolated_surface_admission_available,
     native_browser_engine_capture_authorized, validate_public_evidence, CapturedFrameSource,
-    ContainedBrowserBackend, HarnessErrorCode, IsolatedSurfaceBackend,
+    ContainedBrowserBackend, HarnessErrorCode, IsolatedSurfaceBackend, LIVE_WK_FIXTURE_CRIMSON_RGB,
     SYNTHETIC_FRAME_PAYLOAD_NEEDLE,
 };
 
@@ -62,6 +62,7 @@ fn live_wk_snapshot_fail_closes_off_macos() {
     assert!(err.message.contains("macOS-only") || err.message.contains("fail-closed"));
     assert!(!native_browser_engine_capture_authorized());
     assert!(!isolated_surface_admission_available());
+    let _ = LIVE_WK_FIXTURE_CRIMSON_RGB;
 }
 
 #[cfg(target_os = "macos")]
@@ -87,6 +88,25 @@ fn live_wk_snapshot_mints_receipt_and_completes_engine_rgba8() {
                 .captured_bytes()
                 .windows(SYNTHETIC_FRAME_PAYLOAD_NEEDLE.len())
                 .any(|window| window == SYNTHETIC_FRAME_PAYLOAD_NEEDLE));
+            let bytes = capture.captured_bytes();
+            assert!(
+                !bytes
+                    .chunks_exact(4)
+                    .all(|pixel| pixel[0] == 255 && pixel[1] == 255 && pixel[2] == 255),
+                "window-white raster is not WK-composited fixture"
+            );
+            let [target_r, target_g, target_b] = LIVE_WK_FIXTURE_CRIMSON_RGB;
+            let near =
+                |actual: u8, target: u8| (actual as i16 - target as i16).unsigned_abs() <= 40;
+            assert!(
+                bytes.chunks_exact(4).any(|pixel| {
+                    near(pixel[0], target_r) && near(pixel[1], target_g) && near(pixel[2], target_b)
+                        || near(pixel[0], target_b)
+                            && near(pixel[1], target_g)
+                            && near(pixel[2], target_r)
+                }),
+                "captured bytes must contain fixture #c41e3a"
+            );
             assert_eq!(
                 capture.digest(),
                 canonical_sha256_digest(capture.captured_bytes())

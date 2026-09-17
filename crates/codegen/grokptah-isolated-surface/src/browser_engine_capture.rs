@@ -28,6 +28,10 @@ pub fn native_browser_engine_capture_authorized() -> bool {
     NATIVE_CAPTURE_AUTHORIZED.load(Ordering::SeqCst)
 }
 
+/// CSS `#c41e3a` body background of the live WK fixture. RGBA or BGRA rasters
+/// must contain this crimson; uniform window-white is not engine content.
+pub const LIVE_WK_FIXTURE_CRIMSON_RGB: [u8; 3] = [0xC4, 0x1E, 0x3A];
+
 /// Handoff token minted immediately before a native snapshot attempt.
 ///
 /// Dropping without completion revokes the receipt via

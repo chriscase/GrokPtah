@@ -418,6 +418,16 @@ mod tests {
             .captured_bytes()
             .windows(SYNTHETIC_FRAME_PAYLOAD_NEEDLE.len())
             .any(|window| window == SYNTHETIC_FRAME_PAYLOAD_NEEDLE));
+        let bytes = capture.captured_bytes();
+        assert!(!bytes
+            .chunks_exact(4)
+            .all(|pixel| pixel[0] == 255 && pixel[1] == 255 && pixel[2] == 255));
+        let [target_r, target_g, target_b] = crate::LIVE_WK_FIXTURE_CRIMSON_RGB;
+        let near = |actual: u8, target: u8| (actual as i16 - target as i16).unsigned_abs() <= 40;
+        assert!(bytes.chunks_exact(4).any(|pixel| {
+            near(pixel[0], target_r) && near(pixel[1], target_g) && near(pixel[2], target_b)
+                || near(pixel[0], target_b) && near(pixel[1], target_g) && near(pixel[2], target_r)
+        }));
         assert_eq!(
             capture.digest(),
             canonical_sha256_digest(capture.captured_bytes())

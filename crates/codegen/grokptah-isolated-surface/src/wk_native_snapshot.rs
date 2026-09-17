@@ -1,19 +1,21 @@
 //! Smallest honest native WKWebView raster for receipt-gated capture.
 //!
 //! Creates a real offscreen `WKWebView`, loads a tiny HTML fixture, and copies
-//! RGBA8 from `NSBitmapImageRep` via `cacheDisplayInRect:toBitmapImageRep:`.
-//! This is not `takeSnapshotWithConfiguration:` ABI proof (#564), not isolation
-//! PASS, and never enables admission. Fail-closed when WebKit or AppKit is
-//! unavailable.
+//! RGBA8 from `takeSnapshotWithConfiguration:completionHandler:` (WK-composited
+//! pixels, not `NSView` backing-store white). This is not isolation PASS and
+//! never enables admission. Uniform window-white fail-closes.
 
 use std::ffi::CString;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use block2::RcBlock;
 use objc2::encode::{Encode, Encoding};
 use objc2::rc::{Allocated, Retained};
 use objc2::runtime::{AnyClass, AnyObject};
 use objc2::sel;
 
+use crate::browser_engine_capture::LIVE_WK_FIXTURE_CRIMSON_RGB;
 use crate::error::{HarnessError, HarnessResult};
 
 pub(crate) struct NativeWkRaster {
@@ -24,10 +26,11 @@ pub(crate) struct NativeWkRaster {
 
 const FIXTURE_HTML: &str =
     "<!doctype html><html><body style=\"margin:0;background:#c41e3a\"></body></html>";
-const LOGICAL_WIDTH: f64 = 8.0;
-const LOGICAL_HEIGHT: f64 = 8.0;
+const LOGICAL_WIDTH: f64 = 16.0;
+const LOGICAL_HEIGHT: f64 = 16.0;
 const MAX_PIXEL_EDGE: u32 = 64;
 const LOAD_TIMEOUT: Duration = Duration::from_secs(5);
+const FIXTURE_CHANNEL_TOLERANCE: u16 = 40;
 
 pub(crate) fn rasterize_fixture() -> HarnessResult<NativeWkRaster> {
     if !is_main_thread() {
@@ -72,12 +75,51 @@ pub(crate) fn rasterize_fixture() -> HarnessResult<NativeWkRaster> {
 
     let _navigation: Option<Retained<AnyObject>> =
         unsafe { objc2::msg_send![&*webview, loadHTMLString: &*html, baseURL: None::<&AnyObject>] };
-    wait_until_not_loading(&webview)?;
+    wait_until_loaded(&webview)?;
 
     let _: () = unsafe { objc2::msg_send![&*webview, layoutSubtreeIfNeeded] };
-    pump_runloop_briefly();
+    for _ in 0..8 {
+        pump_runloop_briefly();
+    }
 
-    copy_rgba8_from_view(&webview, frame)
+    let raster = take_wk_snapshot(&webview, frame)?;
+    if raster_is_unpainted_white(&raster.bytes) {
+        return Err(HarnessError::backend_unavailable(
+            "live WK snapshot is unpainted window-white, not WK-composited fixture pixels",
+        ));
+    }
+    if !raster_contains_fixture_crimson(&raster.bytes) {
+        return Err(HarnessError::backend_unavailable(
+            "live WK snapshot does not contain fixture #c41e3a pixels",
+        ));
+    }
+    Ok(raster)
+}
+
+pub(crate) fn raster_is_unpainted_white(bytes: &[u8]) -> bool {
+    !bytes.is_empty()
+        && bytes.len().is_multiple_of(4)
+        && bytes
+            .chunks_exact(4)
+            .all(|pixel| pixel[0] == 255 && pixel[1] == 255 && pixel[2] == 255)
+}
+
+pub(crate) fn raster_contains_fixture_crimson(bytes: &[u8]) -> bool {
+    bytes.chunks_exact(4).any(pixel_near_fixture_crimson)
+}
+
+fn pixel_near_fixture_crimson(pixel: &[u8]) -> bool {
+    let [target_r, target_g, target_b] = LIVE_WK_FIXTURE_CRIMSON_RGB;
+    channel_near(pixel[0], target_r)
+        && channel_near(pixel[1], target_g)
+        && channel_near(pixel[2], target_b)
+        || channel_near(pixel[0], target_b)
+            && channel_near(pixel[1], target_g)
+            && channel_near(pixel[2], target_r)
+}
+
+fn channel_near(actual: u8, target: u8) -> bool {
+    (actual as i16 - target as i16).unsigned_abs() <= FIXTURE_CHANNEL_TOLERANCE
 }
 
 fn ensure_ns_application() -> HarnessResult<()> {
@@ -120,8 +162,9 @@ fn attach_offscreen_window(
     Ok(Some(window))
 }
 
-fn wait_until_not_loading(webview: &AnyObject) -> HarnessResult<()> {
+fn wait_until_loaded(webview: &AnyObject) -> HarnessResult<()> {
     let started = Instant::now();
+    let mut saw_loading = false;
     loop {
         if started.elapsed() > LOAD_TIMEOUT {
             return Err(HarnessError::backend_unavailable(
@@ -129,7 +172,15 @@ fn wait_until_not_loading(webview: &AnyObject) -> HarnessResult<()> {
             ));
         }
         let loading: bool = unsafe { objc2::msg_send![webview, isLoading] };
-        if !loading {
+        if loading {
+            saw_loading = true;
+        }
+        let progress: f64 = unsafe { objc2::msg_send![webview, estimatedProgress] };
+        if (progress >= 1.0 || saw_loading) && !loading {
+            pump_runloop_briefly();
+            return Ok(());
+        }
+        if !saw_loading && !loading && started.elapsed() > Duration::from_millis(250) {
             pump_runloop_briefly();
             return Ok(());
         }
@@ -137,51 +188,113 @@ fn wait_until_not_loading(webview: &AnyObject) -> HarnessResult<()> {
     }
 }
 
-fn copy_rgba8_from_view(webview: &AnyObject, frame: CGRect) -> HarnessResult<NativeWkRaster> {
-    let scale = backing_scale(webview);
-    let width = clamp_edge((LOGICAL_WIDTH * scale).round() as u32);
-    let height = clamp_edge((LOGICAL_HEIGHT * scale).round() as u32);
-    let color_space = nsstring("NSCalibratedRGBColorSpace").ok_or_else(|| {
-        HarnessError::backend_unavailable("NSCalibratedRGBColorSpace NSString unavailable")
+fn take_wk_snapshot(webview: &AnyObject, frame: CGRect) -> HarnessResult<NativeWkRaster> {
+    let responds: bool = unsafe {
+        objc2::msg_send![
+            webview,
+            respondsToSelector: sel!(takeSnapshotWithConfiguration:completionHandler:)
+        ]
+    };
+    if !responds {
+        return Err(HarnessError::backend_unavailable(
+            "WKWebView takeSnapshotWithConfiguration:completionHandler: unavailable",
+        ));
+    }
+    let snap_cls = AnyClass::get(c"WKSnapshotConfiguration").ok_or_else(|| {
+        HarnessError::backend_unavailable("WKSnapshotConfiguration class unavailable")
+    })?;
+    let snap_cfg: Retained<AnyObject> = unsafe { objc2::msg_send![snap_cls, new] };
+    let _: () = unsafe { objc2::msg_send![&*snap_cfg, setRect: frame] };
+    let _: () = unsafe { objc2::msg_send![&*snap_cfg, setAfterScreenUpdates: true] };
+    if let Some(num_cls) = AnyClass::get(c"NSNumber") {
+        let width: Option<Retained<AnyObject>> =
+            unsafe { objc2::msg_send![num_cls, numberWithDouble: LOGICAL_WIDTH] };
+        if let Some(width) = width {
+            let _: () = unsafe { objc2::msg_send![&*snap_cfg, setSnapshotWidth: &*width] };
+        }
+    }
+
+    let (tx, rx) = mpsc::sync_channel::<Result<Retained<AnyObject>, String>>(1);
+    let block = RcBlock::new(move |image: *mut AnyObject, error: *mut AnyObject| {
+        if image.is_null() {
+            let message = nserror_message(error)
+                .unwrap_or_else(|| "takeSnapshot returned a null NSImage".into());
+            let _ = tx.send(Err(message));
+            return;
+        }
+        match unsafe { Retained::retain(image) } {
+            Some(image) => {
+                let _ = tx.send(Ok(image));
+            }
+            None => {
+                let _ = tx.send(Err("takeSnapshot NSImage retain failed".into()));
+            }
+        }
+    });
+
+    let _: () = unsafe {
+        objc2::msg_send![
+            webview,
+            takeSnapshotWithConfiguration: &*snap_cfg,
+            completionHandler: &*block
+        ]
+    };
+
+    let started = Instant::now();
+    loop {
+        match rx.try_recv() {
+            Ok(Ok(image)) => return nsimage_to_rgba8(&image),
+            Ok(Err(message)) => {
+                return Err(HarnessError::backend_unavailable(format!(
+                    "live WK takeSnapshot failed: {message}"
+                )));
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                if started.elapsed() > LOAD_TIMEOUT {
+                    return Err(HarnessError::backend_unavailable(
+                        "live WK takeSnapshot timed out",
+                    ));
+                }
+                pump_runloop_briefly();
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err(HarnessError::backend_unavailable(
+                    "live WK takeSnapshot completion dropped",
+                ));
+            }
+        }
+    }
+}
+
+fn nsimage_to_rgba8(image: &AnyObject) -> HarnessResult<NativeWkRaster> {
+    let tiff: Option<Retained<AnyObject>> = unsafe { objc2::msg_send![image, TIFFRepresentation] };
+    let tiff = tiff.ok_or_else(|| {
+        HarnessError::backend_unavailable("live WK snapshot NSImage has no TIFFRepresentation")
     })?;
     let rep_cls = AnyClass::get(c"NSBitmapImageRep")
         .ok_or_else(|| HarnessError::backend_unavailable("NSBitmapImageRep unavailable"))?;
-    let alloc: Allocated<AnyObject> = unsafe { objc2::msg_send![rep_cls, alloc] };
-    let bytes_per_row = (width as isize).saturating_mul(4);
-    let rep: Option<Retained<AnyObject>> = unsafe {
-        objc2::msg_send![
-            alloc,
-            initWithBitmapDataPlanes: std::ptr::null_mut::<*mut u8>(),
-            pixelsWide: width as isize,
-            pixelsHigh: height as isize,
-            bitsPerSample: 8isize,
-            samplesPerPixel: 4isize,
-            hasAlpha: true,
-            isPlanar: false,
-            colorSpaceName: &*color_space,
-            bytesPerRow: bytes_per_row,
-            bitsPerPixel: 32isize
-        ]
-    };
+    let rep: Option<Retained<AnyObject>> =
+        unsafe { objc2::msg_send![rep_cls, imageRepWithData: &*tiff] };
     let rep = rep.ok_or_else(|| {
-        HarnessError::backend_unavailable("NSBitmapImageRep init for live WK snapshot failed")
+        HarnessError::backend_unavailable("live WK snapshot TIFF is not an NSBitmapImageRep")
     })?;
-    let _: () =
-        unsafe { objc2::msg_send![webview, cacheDisplayInRect: frame, toBitmapImageRep: &*rep] };
+    bitmap_rep_to_rgba8(&rep)
+}
 
-    let pixels_wide: isize = unsafe { objc2::msg_send![&*rep, pixelsWide] };
-    let pixels_high: isize = unsafe { objc2::msg_send![&*rep, pixelsHigh] };
-    let samples: isize = unsafe { objc2::msg_send![&*rep, samplesPerPixel] };
-    let bits_per_pixel: isize = unsafe { objc2::msg_send![&*rep, bitsPerPixel] };
-    let row_bytes: isize = unsafe { objc2::msg_send![&*rep, bytesPerRow] };
+fn bitmap_rep_to_rgba8(rep: &AnyObject) -> HarnessResult<NativeWkRaster> {
+    let pixels_wide: isize = unsafe { objc2::msg_send![rep, pixelsWide] };
+    let pixels_high: isize = unsafe { objc2::msg_send![rep, pixelsHigh] };
+    let samples: isize = unsafe { objc2::msg_send![rep, samplesPerPixel] };
+    let bits_per_pixel: isize = unsafe { objc2::msg_send![rep, bitsPerPixel] };
+    let row_bytes: isize = unsafe { objc2::msg_send![rep, bytesPerRow] };
     if pixels_wide <= 0
         || pixels_high <= 0
-        || samples != 4
-        || bits_per_pixel != 32
-        || row_bytes < pixels_wide.saturating_mul(4)
+        || samples < 3
+        || bits_per_pixel < 24
+        || row_bytes < pixels_wide.saturating_mul(samples)
     {
         return Err(HarnessError::backend_unavailable(
-            "live WK snapshot bitmap is not packed 8-bit RGBA",
+            "live WK snapshot bitmap is not packed 8-bit RGB/RGBA",
         ));
     }
     let out_w = u32::try_from(pixels_wide)
@@ -193,21 +306,27 @@ fn copy_rgba8_from_view(webview: &AnyObject, frame: CGRect) -> HarnessResult<Nat
             "live WK snapshot exceeds bounded raster edge",
         ));
     }
-    let data: *mut u8 = unsafe { objc2::msg_send![&*rep, bitmapData] };
+    let data: *mut u8 = unsafe { objc2::msg_send![rep, bitmapData] };
     if data.is_null() {
         return Err(HarnessError::backend_unavailable(
             "live WK snapshot bitmapData is null",
         ));
     }
+    let spp = samples as usize;
     let packed_row = (out_w as usize).saturating_mul(4);
     let mut bytes = vec![0u8; packed_row.saturating_mul(out_h as usize)];
     let src_stride = row_bytes as usize;
     unsafe {
         for y in 0..out_h as usize {
-            let src = data.add(y.saturating_mul(src_stride));
-            let dst = y.saturating_mul(packed_row);
-            bytes[dst..dst + packed_row]
-                .copy_from_slice(std::slice::from_raw_parts(src, packed_row));
+            let src_row = data.add(y.saturating_mul(src_stride));
+            for x in 0..out_w as usize {
+                let src = std::slice::from_raw_parts(src_row.add(x.saturating_mul(spp)), spp);
+                let dst = y.saturating_mul(packed_row) + x.saturating_mul(4);
+                bytes[dst] = src[0];
+                bytes[dst + 1] = src[1];
+                bytes[dst + 2] = src[2];
+                bytes[dst + 3] = if spp >= 4 { src[3] } else { 255 };
+            }
         }
     }
     Ok(NativeWkRaster {
@@ -217,22 +336,27 @@ fn copy_rgba8_from_view(webview: &AnyObject, frame: CGRect) -> HarnessResult<Nat
     })
 }
 
-fn backing_scale(webview: &AnyObject) -> f64 {
-    let responds: bool =
-        unsafe { objc2::msg_send![webview, respondsToSelector: sel!(backingScaleFactor)] };
-    if !responds {
-        return 1.0;
+fn nserror_message(error: *mut AnyObject) -> Option<String> {
+    if error.is_null() {
+        return None;
     }
-    let scale: f64 = unsafe { objc2::msg_send![webview, backingScaleFactor] };
-    if scale.is_finite() && scale > 0.0 {
-        scale
-    } else {
-        1.0
-    }
+    let desc: Option<Retained<AnyObject>> =
+        unsafe { objc2::msg_send![&*error, localizedDescription] };
+    nsstring_to_string(desc.as_deref())
 }
 
-fn clamp_edge(value: u32) -> u32 {
-    value.clamp(1, MAX_PIXEL_EDGE)
+fn nsstring_to_string(object: Option<&AnyObject>) -> Option<String> {
+    let object = object?;
+    let utf8: *const i8 = unsafe { objc2::msg_send![object, UTF8String] };
+    if utf8.is_null() {
+        return None;
+    }
+    unsafe {
+        std::ffi::CStr::from_ptr(utf8)
+            .to_str()
+            .ok()
+            .map(str::to_owned)
+    }
 }
 
 fn is_main_thread() -> bool {
