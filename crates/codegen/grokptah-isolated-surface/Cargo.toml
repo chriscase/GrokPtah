@@ -28,10 +28,17 @@ uuid = { version = "1", features = ["v4", "serde"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
 objc2 = "0.6.3"
+block2 = "0.6"
 
 [[bin]]
 name = "grokptah-sep18-checklist"
 path = "src/bin/grokptah-sep18-checklist.rs"
+
+[[test]]
+name = "live_wk_snapshot_main"
+path = "tests/live_wk_snapshot_main.rs"
+harness = false
+required-features = ["browser-engine"]
 
 [dev-dependencies]
 tempfile = "3"
