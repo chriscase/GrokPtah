@@ -9,8 +9,8 @@ use grokptah_isolated_surface::{
     admit_browser_engine_capture, canonical_sha256_digest,
     capture_live_wk_snapshot_through_receipt, isolated_surface_admission_available,
     native_browser_engine_capture_authorized, validate_public_evidence, CapturedFrameSource,
-    ContainedBrowserBackend, HarnessErrorCode, IsolatedSurfaceBackend, LIVE_WK_FIXTURE_CRIMSON_RGB,
-    SYNTHETIC_FRAME_PAYLOAD_NEEDLE,
+    ContainedBrowserBackend, HarnessErrorCode, HostSentinelSnapshot, IsolatedSurfaceBackend,
+    IsolatedSurfaceHarness, LIVE_WK_FIXTURE_CRIMSON_RGB, SYNTHETIC_FRAME_PAYLOAD_NEEDLE,
 };
 
 #[test]
@@ -124,4 +124,30 @@ fn live_wk_snapshot_mints_receipt_and_completes_engine_rgba8() {
         }
         Err(err) => panic!("live WK snapshot through shipped receipt path: {err:?}"),
     }
+}
+
+#[test]
+fn harness_receipt_gated_observe_never_falls_back_to_simulator() {
+    let mut harness = IsolatedSurfaceHarness::with_backend(
+        HostSentinelSnapshot::synthetic_baseline(),
+        ContainedBrowserBackend::new(),
+    )
+    .expect("contained browser harness");
+    match harness.capture_and_observe_receipt_gated() {
+        Ok(frame) => {
+            assert_eq!(
+                frame.captured_frame.as_ref().map(|ev| ev.source),
+                Some(CapturedFrameSource::BrowserEngine)
+            );
+            assert_ne!(
+                frame.captured_frame.as_ref().map(|ev| ev.source),
+                Some(CapturedFrameSource::SyntheticSimulator)
+            );
+        }
+        Err(err) => {
+            assert_eq!(err.code, HarnessErrorCode::BackendUnavailable);
+        }
+    }
+    assert!(!native_browser_engine_capture_authorized());
+    assert!(!isolated_surface_admission_available());
 }

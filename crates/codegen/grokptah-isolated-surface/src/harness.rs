@@ -78,6 +78,17 @@ impl IsolatedSurfaceHarness<SyntheticGuest> {
     }
 }
 
+#[cfg(feature = "browser-engine")]
+impl IsolatedSurfaceHarness<crate::ContainedBrowserBackend> {
+    /// ReceiptGated observation through the shipped live WK mint → complete path.
+    ///
+    /// Does not latch the physical-CLI authorize flag and does not enable admission.
+    pub fn capture_and_observe_receipt_gated(&mut self) -> HarnessResult<GuestFrame> {
+        let _capture = self.backend.capture_live_wk_snapshot()?;
+        IsolatedSurfaceBackend::observe_frame(&self.backend)
+    }
+}
+
 impl<B: IsolatedSurfaceBackend> IsolatedSurfaceHarness<B> {
     /// Construct a harness with an honest evidence class. Rejects
     /// `VirtualizationFramework` unless attached via [`with_vf_backend`].

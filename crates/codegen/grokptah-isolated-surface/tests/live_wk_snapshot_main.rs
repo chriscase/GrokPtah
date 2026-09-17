@@ -14,8 +14,9 @@ fn main() {
     use grokptah_isolated_surface::{
         canonical_sha256_digest, capture_live_wk_snapshot_through_receipt,
         isolated_surface_admission_available, native_browser_engine_capture_authorized,
-        validate_public_evidence, CapturedFrameMediaKind, CapturedFrameSource, HarnessErrorCode,
-        SYNTHETIC_FRAME_PAYLOAD_NEEDLE,
+        validate_public_evidence, CapturedFrameMediaKind, CapturedFrameSource,
+        ContainedBrowserBackend, HarnessErrorCode, HostSentinelSnapshot, IsolatedSurfaceBackend,
+        IsolatedSurfaceHarness, SYNTHETIC_FRAME_PAYLOAD_NEEDLE,
     };
 
     assert!(
@@ -65,6 +66,52 @@ fn main() {
         println!(
             "ok: live WK receipt-gated capture {}x{} bytes={} digest={}",
             evidence.width, evidence.height, evidence.byte_length, evidence.digest
+        );
+
+        let mut backend = ContainedBrowserBackend::new();
+        let backend_capture = backend
+            .capture_live_wk_snapshot()
+            .expect("backend capture_live_wk_snapshot through live WK seam");
+        assert_eq!(backend_capture.source(), CapturedFrameSource::BrowserEngine);
+        assert_captured_bytes_are_fixture_crimson(backend_capture.captured_bytes());
+        let observed = backend
+            .observe_frame()
+            .expect("ReceiptGated observe uses stored live WK capture");
+        assert_eq!(observed.digest, backend_capture.digest());
+        assert_eq!(
+            observed.captured_frame.as_ref().map(|ev| ev.source),
+            Some(CapturedFrameSource::BrowserEngine)
+        );
+        backend.destroy().expect("destroy");
+        assert!(!backend.is_booted());
+        backend
+            .observe_frame()
+            .expect_err("destroy unboots; observe cannot inherit stored capture");
+
+        let mut harness = IsolatedSurfaceHarness::with_backend(
+            HostSentinelSnapshot::synthetic_baseline(),
+            ContainedBrowserBackend::new(),
+        )
+        .expect("contained browser harness");
+        let harness_frame = harness
+            .capture_and_observe_receipt_gated()
+            .expect("harness ReceiptGated observe through live WK mint-complete");
+        assert_eq!(
+            harness_frame.captured_frame.as_ref().map(|ev| ev.source),
+            Some(CapturedFrameSource::BrowserEngine)
+        );
+        assert_eq!(
+            harness_frame
+                .captured_frame
+                .as_ref()
+                .map(|ev| ev.media_kind),
+            Some(CapturedFrameMediaKind::EngineRgba8)
+        );
+        assert!(!native_browser_engine_capture_authorized());
+        assert!(!isolated_surface_admission_available());
+        println!(
+            "ok: ReceiptGated backend+harness observe digest={}",
+            harness_frame.digest
         );
     }
 }
