@@ -6,7 +6,7 @@
 use chrono::Utc;
 use grokptah_coding_worktree::{
     digest_path, snapshot_root, CodingWorktreeSession, SessionDisposition, SessionErrorCode,
-    SessionLifecycle, SessionPhase, SessionSnapshot, SYNTHETIC_SESSION_NONCLAIM,
+    SessionLifecycle, SessionPhase, SessionSnapshot, SNAPSHOT_FILE, SYNTHETIC_SESSION_NONCLAIM,
 };
 use tempfile::TempDir;
 
@@ -345,4 +345,138 @@ fn discard_clears_git_worktree_registration() {
 fn nonclaim_documents_synthetic_harness_only() {
     assert!(SYNTHETIC_SESSION_NONCLAIM.contains("developer"));
     assert!(SYNTHETIC_SESSION_NONCLAIM.contains("real"));
+}
+
+#[test]
+fn pause_fences_staging_and_settlement_stop_still_legal() {
+    let dir = TempDir::new().expect("tempdir");
+    init_fixture_repo(dir.path());
+    let mut session = session_with_snapshot(&dir, "HEAD");
+    session
+        .persist_create_metadata()
+        .expect("persist create metadata");
+
+    let pause = session.pause(Utc::now()).expect("pause");
+    assert_eq!(pause.session_id, "test-session");
+    assert_eq!(session.lifecycle().phase, SessionPhase::Paused);
+    assert!(session.lifecycle().pause_fenced);
+
+    let write_err = session
+        .write_worktree_file("README.md", "paused\n")
+        .expect_err("staging fenced");
+    assert_eq!(write_err.code, SessionErrorCode::InvalidState);
+    let stage_err = session.stage_patch().expect_err("stage fenced");
+    assert_eq!(stage_err.code, SessionErrorCode::InvalidState);
+
+    let evidence = session.stop(Utc::now()).expect("stop after pause");
+    assert!(evidence.destroy_confirmed);
+    assert_eq!(evidence.phase, SessionPhase::Destroyed);
+    assert_eq!(evidence.disposition, Some(SessionDisposition::Stopped));
+    assert!(!session.worktree_path().exists());
+}
+
+#[test]
+fn stop_records_destroyed_only_when_destroy_confirmed() {
+    let dir = TempDir::new().expect("tempdir");
+    init_fixture_repo(dir.path());
+    let mut session = session_with_snapshot(&dir, "HEAD");
+    session.fail_next_destroy_for_test();
+
+    let evidence = session.stop(Utc::now()).expect("stop with failed destroy");
+    assert!(!evidence.destroy_confirmed);
+    assert!(!evidence.worktree_removed);
+    assert_eq!(evidence.phase, SessionPhase::Stopped);
+    assert_ne!(evidence.phase, SessionPhase::Destroyed);
+    assert_eq!(evidence.disposition, Some(SessionDisposition::Stopped));
+    assert!(session.worktree_path().exists());
+}
+
+#[test]
+fn persist_failure_does_not_skip_stop_teardown() {
+    let dir = TempDir::new().expect("tempdir");
+    init_fixture_repo(dir.path());
+    let mut session = session_with_snapshot(&dir, "HEAD");
+    session
+        .persist_create_metadata()
+        .expect("persist create metadata");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let snapshot_path = snapshot_root(dir.path().join("snapshots")).join(SNAPSHOT_FILE);
+        std::fs::set_permissions(&snapshot_path, std::fs::Permissions::from_mode(0o444))
+            .expect("chmod snapshot read-only");
+    }
+
+    let evidence = session
+        .stop(Utc::now())
+        .expect("stop completes despite persist failure");
+    assert!(evidence.destroy_confirmed);
+    assert_eq!(evidence.phase, SessionPhase::Destroyed);
+    assert!(!session.worktree_path().exists());
+    #[cfg(unix)]
+    {
+        assert!(evidence.persist_snapshot_error.is_some());
+    }
+}
+
+#[test]
+fn attach_restores_create_metadata_and_uncertain_rejects_retry() {
+    let dir = TempDir::new().expect("tempdir");
+    init_fixture_repo(dir.path());
+    let snap_root = dir.path().join("snapshots");
+    let session = CodingWorktreeSession::create(dir.path(), "HEAD", "attach-test", Utc::now())
+        .expect("create")
+        .with_snapshot_root(&snap_root);
+    session.persist_create_metadata().expect("persist");
+    let expected_id = session.identity().session_id.clone();
+    let expected_sha = session.identity().base_sha.clone();
+    drop(session);
+
+    let attached = CodingWorktreeSession::attach(&snap_root).expect("attach");
+    assert_eq!(attached.identity().session_id, expected_id);
+    assert_eq!(attached.identity().base_sha, expected_sha);
+    assert_eq!(attached.lifecycle().phase, SessionPhase::Active);
+
+    let mut lifecycle = attached.lifecycle().clone();
+    lifecycle.begin_settlement(Utc::now()).unwrap();
+    lifecycle.mark_apply_in_flight(Utc::now()).unwrap();
+    lifecycle.mark_apply_uncertain(Utc::now()).unwrap();
+    let snapshot = SessionSnapshot::new(
+        attached.identity().clone(),
+        lifecycle,
+        attached.patch().cloned(),
+        digest_path(dir.path()).expect("digest"),
+        attached.worktree_path().to_path_buf(),
+        dir.path().to_path_buf(),
+    );
+    snapshot
+        .save(snapshot_root(&snap_root))
+        .expect("save uncertain");
+    let mut uncertain = CodingWorktreeSession::attach(&snap_root).expect("attach uncertain");
+    let pause_err = uncertain
+        .pause(Utc::now())
+        .expect_err("pause after uncertain");
+    assert_eq!(pause_err.code, SessionErrorCode::UncertainOutcome);
+    let accept_err = uncertain
+        .accept(dir.path(), "sha256:any", Utc::now())
+        .expect_err("no auto-retry");
+    assert_eq!(accept_err.code, SessionErrorCode::UncertainOutcome);
+
+    let stop = uncertain.stop(Utc::now()).expect("stop still tears down");
+    assert!(
+        stop.disposition == Some(SessionDisposition::Uncertain)
+            || stop.disposition == Some(SessionDisposition::Stopped)
+    );
+}
+
+#[test]
+fn pause_and_stop_do_not_claim_host_input_or_clipboard() {
+    let dir = TempDir::new().expect("tempdir");
+    init_fixture_repo(dir.path());
+    let mut session = session_with_snapshot(&dir, "HEAD");
+    session.pause(Utc::now()).expect("pause");
+    let evidence = session.stop(Utc::now()).expect("stop");
+    assert!(evidence.destroy_confirmed);
+    assert!(SYNTHETIC_SESSION_NONCLAIM.contains("does not mutate"));
 }

@@ -22,7 +22,7 @@ pub use identity::CodingWorktreeIdentity;
 pub use lifecycle::{SessionDisposition, SessionLifecycle, SessionPhase, LIFECYCLE_SCHEMA_VERSION};
 pub use patch::{digest_bytes, digest_path, PatchArtifact, MAX_PATCH_BYTES, MAX_PATCH_PATHS};
 pub use session::{
-    AcceptEvidence, CodingWorktreeSession, DiscardEvidence, KeepForReviewEvidence,
-    SYNTHETIC_SESSION_NONCLAIM,
+    AcceptEvidence, CodingWorktreeSession, DiscardEvidence, KeepForReviewEvidence, PauseEvidence,
+    StopEvidence, SYNTHETIC_SESSION_NONCLAIM,
 };
 pub use store::{snapshot_root, SessionSnapshot, SNAPSHOT_FILE, SNAPSHOT_SCHEMA_VERSION};

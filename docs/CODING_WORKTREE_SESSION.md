@@ -1,9 +1,10 @@
 # Coding Worktree Session v0 (Reversible code)
 
 This document describes the durable Accept / Discard / Keep-for-review contract
-for a disposable coding worktree added in this slice. It maps to **Windowed
-Coding Run v0 must-have #3 (Reversible code)** and the Sep 18 / Day-30 product
-trains. Computer Mode and `isolated_surface_admission_available()` remain **false**.
+plus local Pause / fence-first Stop for a disposable coding worktree. It maps to
+**Windowed Coding Run v0 must-have #3 (Reversible code)** and the Sep 18 / Day-30
+product trains. Computer Mode and `isolated_surface_admission_available()` remain
+**false**.
 
 Related issues: [#288](https://github.com/chriscase/GrokPtah/issues/288) (isolated
 visual), [#286](https://github.com/chriscase/GrokPtah/issues/286) (agent-owned
@@ -25,8 +26,12 @@ surface), [#267](https://github.com/chriscase/GrokPtah/issues/267) (epic).
 ## Disposition contract
 
 ```text
+Active → Pause (fences staging/settlement; Stop remains legal)
 Active → stage patch → Accept | Discard | KeepForReview → Settled
-                              ↘ Uncertain (apply may have partially happened)
+                              ↘ Uncertain (apply may have partially happened; no auto-retry)
+Active | Paused → Stop (fence-first teardown)
+                  ↘ Destroyed only if worktree destroy is confirmed
+                  ↘ Stopped if destroy fails (never claim Destroyed)
 ```
 
 - **Accept** — apply the staged patch to an explicit `apply_target` only after an
@@ -36,6 +41,10 @@ Active → stage patch → Accept | Discard | KeepForReview → Settled
 - **Keep for review** — retain worktree + staged diff; no apply.
 - **Uncertain** — recorded when apply may have partially happened (crash/restart
   mid-apply). No auto-retry and no auto-Accept on restart.
+- **Pause** — local authority fence; further staging and settlement are rejected.
+  Stop remains legal. Not Computer Mode.
+- **Stop** — fence-first teardown. Persist/snapshot failure does not skip destroy.
+  `Destroyed` is recorded only when worktree destroy is confirmed.
 
 ## Fail-closed invariants
 
@@ -47,7 +56,10 @@ Active → stage patch → Accept | Discard | KeepForReview → Settled
 | Discard cannot leave active worktree | `git worktree remove` + `prune` + `git worktree list` must not list session path |
 | Staging includes untracked files | `git add -N` intent-to-add before diff capture; fail-closed if untracked present but diff empty |
 | Restart/reload cannot auto-Accept | `recover_after_restart` → `Uncertain` when `apply_in_flight` |
-| Uncertain apply → no auto-retry | `enforce_no_auto_retry` on all settlement ops |
+| Uncertain apply → no auto-retry | `enforce_no_auto_retry` on settlement ops and Pause |
+| Pause fences further work | `begin_pause` sets `pause_fenced`; staging/settlement reject |
+| Stop never claims Destroyed without confirmed destroy | `complete_destroy` only when worktree is gone; else `Stopped` |
+| Persist failure does not skip teardown | `stop` records persist errors and still attempts destroy |
 
 ## Test harness policy
 

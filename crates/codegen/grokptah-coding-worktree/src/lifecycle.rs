@@ -11,8 +11,13 @@ pub const LIFECYCLE_SCHEMA_VERSION: u32 = 1;
 #[serde(rename_all = "snake_case")]
 pub enum SessionPhase {
     Active,
+    Paused,
     Settling,
     Settled,
+    Stopping,
+    Stopped,
+    /// Recorded only after backend worktree destroy is confirmed.
+    Destroyed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,6 +28,8 @@ pub enum SessionDisposition {
     KeptForReview,
     /// Apply may have partially happened; fail-closed, no auto-retry.
     Uncertain,
+    /// Local Stop requested. Not isolation PASS.
+    Stopped,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,6 +44,12 @@ pub struct SessionLifecycle {
     pub apply_uncertain: bool,
     /// Settlement fence: further staging or disposition changes are rejected.
     pub settlement_fenced: bool,
+    /// Local Pause fence: further staging/settlement is rejected; Stop remains legal.
+    #[serde(default)]
+    pub pause_fenced: bool,
+    /// True only after worktree destroy is confirmed.
+    #[serde(default)]
+    pub destroy_confirmed: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -50,17 +63,27 @@ impl SessionLifecycle {
             apply_in_flight: false,
             apply_uncertain: false,
             settlement_fenced: false,
+            pause_fenced: false,
+            destroy_confirmed: false,
             created_at: now,
             updated_at: now,
         }
     }
 
     pub fn allows_staging(&self) -> bool {
-        self.phase == SessionPhase::Active && !self.settlement_fenced
+        self.phase == SessionPhase::Active && !self.settlement_fenced && !self.pause_fenced
     }
 
     pub fn allows_settlement(&self) -> bool {
-        self.phase == SessionPhase::Active && !self.settlement_fenced
+        self.phase == SessionPhase::Active && !self.settlement_fenced && !self.pause_fenced
+    }
+
+    pub fn allows_pause(&self) -> bool {
+        self.phase == SessionPhase::Active && !self.settlement_fenced && !self.pause_fenced
+    }
+
+    pub fn allows_stop(&self) -> bool {
+        !matches!(self.phase, SessionPhase::Destroyed)
     }
 
     pub fn reconcile_invariants(&mut self) -> SessionResult<()> {
@@ -77,6 +100,78 @@ impl SessionLifecycle {
                 "fenced Active lifecycle is invalid",
             ));
         }
+        if self.pause_fenced && self.phase == SessionPhase::Active {
+            return Err(SessionError::invalid_state(
+                "pause-fenced Active lifecycle is invalid",
+            ));
+        }
+        if self.phase == SessionPhase::Paused && !self.pause_fenced {
+            return Err(SessionError::invalid_state(
+                "Paused lifecycle requires pause_fenced",
+            ));
+        }
+        if self.phase == SessionPhase::Destroyed && !self.destroy_confirmed {
+            return Err(SessionError::invalid_state(
+                "Destroyed lifecycle requires confirmed worktree destroy",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn begin_pause(&mut self, now: DateTime<Utc>) -> SessionResult<()> {
+        if !self.allows_pause() {
+            return Err(SessionError::invalid_state(
+                "pause requires Active unfenced lifecycle",
+            ));
+        }
+        self.pause_fenced = true;
+        self.phase = SessionPhase::Paused;
+        self.updated_at = now;
+        Ok(())
+    }
+
+    pub fn begin_stop(&mut self, now: DateTime<Utc>) -> SessionResult<()> {
+        if !self.allows_stop() {
+            return Err(SessionError::invalid_state("session is already destroyed"));
+        }
+        if self.phase == SessionPhase::Stopping {
+            return Ok(());
+        }
+        self.pause_fenced = true;
+        self.settlement_fenced = true;
+        if self.apply_in_flight || self.apply_uncertain {
+            self.disposition = Some(SessionDisposition::Uncertain);
+        } else if self.disposition.is_none() {
+            self.disposition = Some(SessionDisposition::Stopped);
+        }
+        self.apply_in_flight = false;
+        self.phase = SessionPhase::Stopping;
+        self.updated_at = now;
+        Ok(())
+    }
+
+    pub fn complete_destroy(&mut self, now: DateTime<Utc>) -> SessionResult<()> {
+        if self.phase != SessionPhase::Stopping {
+            return Err(SessionError::invalid_state(
+                "destroy requires Stopping phase",
+            ));
+        }
+        self.destroy_confirmed = true;
+        self.phase = SessionPhase::Destroyed;
+        self.updated_at = now;
+        Ok(())
+    }
+
+    pub fn complete_stop_unconfirmed(&mut self, now: DateTime<Utc>) -> SessionResult<()> {
+        if self.phase != SessionPhase::Stopping {
+            return Err(SessionError::invalid_state("stop requires Stopping phase"));
+        }
+        self.destroy_confirmed = false;
+        self.phase = SessionPhase::Stopped;
+        if self.disposition.is_none() {
+            self.disposition = Some(SessionDisposition::Stopped);
+        }
+        self.updated_at = now;
         Ok(())
     }
 
@@ -103,6 +198,7 @@ impl SessionLifecycle {
         }
         self.disposition = Some(disposition);
         self.settlement_fenced = true;
+        self.pause_fenced = true;
         self.apply_in_flight = false;
         self.phase = SessionPhase::Settled;
         self.updated_at = now;
@@ -127,6 +223,7 @@ impl SessionLifecycle {
         self.apply_uncertain = true;
         self.disposition = Some(SessionDisposition::Uncertain);
         self.settlement_fenced = true;
+        self.pause_fenced = true;
         self.apply_in_flight = false;
         self.phase = SessionPhase::Settled;
         self.updated_at = now;
@@ -135,13 +232,17 @@ impl SessionLifecycle {
 
     /// Restart recovery: never auto-Accept; uncertain if apply was in flight.
     pub fn recover_after_restart(&mut self, now: DateTime<Utc>) -> SessionResult<()> {
-        if self.phase == SessionPhase::Settled {
+        if matches!(
+            self.phase,
+            SessionPhase::Settled | SessionPhase::Stopped | SessionPhase::Destroyed
+        ) {
             return Ok(());
         }
         if self.apply_in_flight || self.apply_uncertain {
             self.disposition = Some(SessionDisposition::Uncertain);
         }
         self.settlement_fenced = true;
+        self.pause_fenced = true;
         self.apply_in_flight = false;
         self.phase = SessionPhase::Settled;
         self.updated_at = now;

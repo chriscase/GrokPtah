@@ -6,7 +6,8 @@
 
 use chrono::Utc;
 use grokptah_agent_bridge::{
-    CodingWorktreeSession, SessionDisposition, SessionPhase, SYNTHETIC_SESSION_NONCLAIM,
+    CodingWorktreeSession, SessionDisposition, SessionErrorCode, SessionPhase,
+    SYNTHETIC_SESSION_NONCLAIM,
 };
 use tempfile::TempDir;
 
@@ -62,4 +63,21 @@ fn bridge_session_identity_records_base_and_worktree_digest() {
     assert!(!identity.base_sha.is_empty());
     assert!(identity.worktree_path_digest.starts_with("sha256:"));
     assert!(identity.branch_name.contains("identity-test"));
+}
+
+#[test]
+fn bridge_pause_fences_then_stop_confirms_destroy() {
+    let dir = TempDir::new().expect("tempdir");
+    init_fixture_repo(dir.path());
+    let mut session = CodingWorktreeSession::create(dir.path(), "HEAD", "pause-stop", Utc::now())
+        .expect("create");
+    session.pause(Utc::now()).expect("pause");
+    assert_eq!(session.lifecycle().phase, SessionPhase::Paused);
+    let write_err = session
+        .write_worktree_file("README.md", "nope\n")
+        .expect_err("paused");
+    assert_eq!(write_err.code, SessionErrorCode::InvalidState);
+    let evidence = session.stop(Utc::now()).expect("stop");
+    assert!(evidence.destroy_confirmed);
+    assert_eq!(evidence.phase, SessionPhase::Destroyed);
 }

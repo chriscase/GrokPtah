@@ -37,6 +37,22 @@ pub struct KeepForReviewEvidence {
     pub patch_digest: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PauseEvidence {
+    pub session_id: String,
+    pub worktree_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StopEvidence {
+    pub session_id: String,
+    pub worktree_removed: bool,
+    pub destroy_confirmed: bool,
+    pub persist_snapshot_error: Option<SessionError>,
+    pub disposition: Option<SessionDisposition>,
+    pub phase: SessionPhase,
+}
+
 pub struct CodingWorktreeSession {
     identity: CodingWorktreeIdentity,
     lifecycle: SessionLifecycle,
@@ -47,6 +63,7 @@ pub struct CodingWorktreeSession {
     worktree_path: PathBuf,
     snapshot_root: Option<PathBuf>,
     auto_retry_attempts: u32,
+    fail_next_destroy: bool,
 }
 
 impl CodingWorktreeSession {
@@ -88,12 +105,27 @@ impl CodingWorktreeSession {
             worktree_path,
             snapshot_root: None,
             auto_retry_attempts: 0,
+            fail_next_destroy: false,
         })
     }
 
     pub fn with_snapshot_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.snapshot_root = Some(root.into());
         self
+    }
+
+    /// Persist create/attach metadata. Local authority only; not admission.
+    pub fn persist_create_metadata(&self) -> SessionResult<()> {
+        self.persist_snapshot()
+    }
+
+    /// Attach a previously persisted session from durable snapshot metadata.
+    pub fn attach(snapshot_base: impl AsRef<Path>) -> SessionResult<Self> {
+        let base = snapshot_base.as_ref().to_path_buf();
+        let snapshot = SessionSnapshot::load(snapshot_root(&base))?;
+        let mut session = Self::restore_from_snapshot(snapshot)?;
+        session.snapshot_root = Some(base);
+        Ok(session)
     }
 
     pub fn identity(&self) -> &CodingWorktreeIdentity {
@@ -238,6 +270,48 @@ impl CodingWorktreeSession {
         })
     }
 
+    /// Local Pause: fences further staging and settlement. Stop remains legal.
+    pub fn pause(&mut self, now: DateTime<Utc>) -> SessionResult<PauseEvidence> {
+        self.enforce_no_auto_retry("pause")?;
+        self.lifecycle.begin_pause(now)?;
+        let persist_err = self.persist_snapshot();
+        persist_err?;
+        Ok(PauseEvidence {
+            session_id: self.identity.session_id.clone(),
+            worktree_path: self.worktree_path.clone(),
+        })
+    }
+
+    /// Fence-first Stop: persist errors never skip teardown. Destroyed is
+    /// recorded only when worktree destroy is confirmed.
+    pub fn stop(&mut self, now: DateTime<Utc>) -> SessionResult<StopEvidence> {
+        self.lifecycle.begin_stop(now)?;
+        let persist_before = self.persist_snapshot().err();
+
+        let destroy_err = self.remove_worktree_best_effort().err();
+        let worktree_removed = !self.worktree_path.exists();
+        let destroy_confirmed = destroy_err.is_none() && worktree_removed;
+        if destroy_confirmed {
+            self.lifecycle.complete_destroy(now)?;
+        } else {
+            self.lifecycle.complete_stop_unconfirmed(now)?;
+        }
+        let persist_after = self.persist_snapshot().err();
+
+        Ok(StopEvidence {
+            session_id: self.identity.session_id.clone(),
+            worktree_removed,
+            destroy_confirmed,
+            persist_snapshot_error: persist_before.or(persist_after),
+            disposition: self.lifecycle.disposition,
+            phase: self.lifecycle.phase,
+        })
+    }
+
+    pub fn fail_next_destroy_for_test(&mut self) {
+        self.fail_next_destroy = true;
+    }
+
     /// Restart recovery from durable snapshot. Never auto-Accept.
     pub fn recover_after_restart(&mut self, now: DateTime<Utc>) -> SessionResult<()> {
         self.lifecycle.recover_after_restart(now)?;
@@ -267,6 +341,7 @@ impl CodingWorktreeSession {
             worktree_path: snapshot.worktree_path,
             snapshot_root: None,
             auto_retry_attempts: snapshot.auto_retry_attempts,
+            fail_next_destroy: false,
         })
     }
 
@@ -282,6 +357,13 @@ impl CodingWorktreeSession {
     }
 
     fn remove_worktree_best_effort(&mut self) -> SessionResult<()> {
+        if self.fail_next_destroy {
+            self.fail_next_destroy = false;
+            return Err(SessionError::new(
+                SessionErrorCode::Internal,
+                "injected worktree destroy failure",
+            ));
+        }
         remove_worktree(&self.repo_root, &self.worktree_path)?;
         if self.worktree_path.exists() {
             std::fs::remove_dir_all(&self.worktree_path).map_err(|error| {
