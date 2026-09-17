@@ -30,6 +30,8 @@ mod store;
 mod vf_backend;
 mod vf_dry_run;
 mod wk_clipboard_probe;
+#[cfg(all(target_os = "macos", feature = "browser-engine"))]
+mod wk_native_snapshot;
 
 pub use backend::{
     assert_evidence_class_unchanged, honest_harness_evidence_class, IsolatedSurfaceBackend,
@@ -38,15 +40,15 @@ pub use backend::{
 #[cfg(feature = "browser-engine")]
 pub use browser_engine_capture::{
     authorize_native_browser_engine_capture_for_physical_cli,
-    native_browser_engine_capture_authorized,
+    capture_live_wk_snapshot_through_receipt, native_browser_engine_capture_authorized,
 };
 pub use captured_frame::{
     admit_browser_engine_capture, admit_captured_frame_with_claimed_digest,
     assert_postcondition_change, canonical_sha256_digest, is_canonical_sha256_digest,
-    require_frame_for_postcondition, simulator_synthetic_frame_bytes, BoundedCapturedFrame,
-    CapturedFrameEvidence, CapturedFrameMediaKind, CapturedFramePair, CapturedFrameSource,
-    MAX_CAPTURED_FRAME_BYTES, SYNTHETIC_FRAME_HEIGHT, SYNTHETIC_FRAME_PAYLOAD_NEEDLE,
-    SYNTHETIC_FRAME_WIDTH,
+    require_frame_for_postcondition, simulator_synthetic_frame_bytes, validate_public_evidence,
+    BoundedCapturedFrame, CapturedFrameEvidence, CapturedFrameMediaKind, CapturedFramePair,
+    CapturedFrameSource, MAX_CAPTURED_FRAME_BYTES, SYNTHETIC_FRAME_HEIGHT,
+    SYNTHETIC_FRAME_PAYLOAD_NEEDLE, SYNTHETIC_FRAME_WIDTH,
 };
 pub use channels::ChannelRegistry;
 pub use checklist_runner::{

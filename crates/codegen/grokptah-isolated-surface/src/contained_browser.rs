@@ -6,8 +6,10 @@
 //!
 //! Default builds use an in-process browser simulator (Linux CI friendly).
 //! Optional `browser-engine` feature remains default-off; when enabled the
-//! substrate routes frame observation through receipt-gated engine capture and
-//! still fails closed at boot until a qualified native adapter is wired.
+//! substrate routes frame observation through receipt-gated engine capture.
+//! Live macOS WK rasters mint a process-private receipt then complete; ordinary
+//! `cargo test` never latches the physical-CLI authorize flag. Boot without
+//! that flag stays fail-closed. Isolation is not proven.
 
 use crate::backend::IsolatedSurfaceBackend;
 use crate::captured_frame::BoundedCapturedFrame;
@@ -17,9 +19,9 @@ use crate::simulator::{GuestFrame, GuestLocalAction, InjectOutcome};
 
 #[cfg(feature = "browser-engine")]
 use crate::browser_engine_capture::{
-    begin_browser_engine_frame_capture, complete_browser_engine_frame_capture,
-    install_receipt_gated_capture, native_browser_engine_capture_authorized,
-    require_engine_frame_observation,
+    begin_browser_engine_frame_capture, capture_live_wk_snapshot_through_receipt,
+    complete_browser_engine_frame_capture, install_receipt_gated_capture,
+    native_browser_engine_capture_authorized, require_engine_frame_observation,
 };
 
 #[cfg(feature = "browser-engine")]
@@ -118,7 +120,7 @@ impl ContainedBrowserBackend {
     }
 
     #[cfg(feature = "browser-engine")]
-    #[allow(dead_code)] // Native WKWebView adapter seam; boot stays fail-closed until wired.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn admit_receipt_gated_engine_capture(
         &mut self,
         rgba8_bytes: Vec<u8>,
@@ -160,7 +162,49 @@ impl ContainedBrowserBackend {
         if !native_browser_engine_capture_authorized() {
             return Self::receipt_gated_boot_unavailable();
         }
-        Self::receipt_gated_boot_unavailable()
+        #[cfg(target_os = "macos")]
+        {
+            self.boot_receipt_gated_live_wk()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Self::receipt_gated_boot_unavailable()
+        }
+    }
+
+    #[cfg(all(feature = "browser-engine", target_os = "macos"))]
+    fn boot_receipt_gated_live_wk(&mut self) -> HarnessResult<GuestFrame> {
+        self.booted = true;
+        self.frame_epoch = 1;
+        match capture_live_wk_snapshot_through_receipt(self.frame_epoch) {
+            Ok(capture) => {
+                self.receipt_gated_capture =
+                    Some(install_receipt_gated_capture(self.frame_epoch, capture)?);
+                self.current_frame()
+            }
+            Err(err) => {
+                self.booted = false;
+                self.frame_epoch = 0;
+                self.receipt_gated_capture = None;
+                Err(err)
+            }
+        }
+    }
+
+    /// Admit a live WK raster through the shipped receipt mint → complete path.
+    /// Does not latch the physical-CLI authorize flag.
+    #[cfg(feature = "browser-engine")]
+    pub fn capture_live_wk_snapshot(&mut self) -> HarnessResult<BoundedCapturedFrame> {
+        if !self.booted {
+            return Err(HarnessError::invalid_state("browser guest is not booted"));
+        }
+        let capture = capture_live_wk_snapshot_through_receipt(self.frame_epoch)?;
+        self.receipt_gated_capture =
+            Some(install_receipt_gated_capture(self.frame_epoch, capture)?);
+        Ok(self
+            .receipt_gated_capture
+            .clone()
+            .expect("installed live WK capture"))
     }
 
     fn inject_browser_local(&mut self, action: GuestLocalAction) -> HarnessResult<InjectOutcome> {
@@ -337,9 +381,79 @@ mod tests {
     #[test]
     fn receipt_gated_boot_denies_even_when_authorization_hook_satisfied() {
         let err = ContainedBrowserBackend::receipt_gated_boot_unavailable()
-            .expect_err("authorized native boot path still unwired");
+            .expect_err("unauthorized / non-macOS boot helper stays fail-closed");
         assert_eq!(err.code, crate::error::HarnessErrorCode::BackendUnavailable);
         assert!(err.message.contains("receipt-gated"));
+        assert!(!native_browser_engine_capture_authorized());
+    }
+
+    #[cfg(all(feature = "browser-engine", target_os = "macos"))]
+    #[test]
+    fn live_wk_snapshot_installs_engine_bytes_without_authorize_flag() {
+        use crate::captured_frame::{
+            canonical_sha256_digest, validate_public_evidence, CapturedFrameSource,
+            SYNTHETIC_FRAME_PAYLOAD_NEEDLE,
+        };
+
+        assert!(!native_browser_engine_capture_authorized());
+        let mut backend = ContainedBrowserBackend::new();
+        backend.booted = true;
+        backend.frame_epoch = 1;
+        let capture = match backend.capture_live_wk_snapshot() {
+            Ok(capture) => capture,
+            Err(err) if err.message.contains("main thread") => {
+                // libtest worker threads are not main; the shipped entry fail-closes
+                // instead of trapping. The harness-free main-thread test covers success.
+                assert_eq!(err.code, crate::error::HarnessErrorCode::BackendUnavailable);
+                assert!(!native_browser_engine_capture_authorized());
+                return;
+            }
+            Err(err) => panic!("live WK receipt-gated capture: {err:?}"),
+        };
+        assert!(!native_browser_engine_capture_authorized());
+        assert!(!crate::isolated_surface_admission_available());
+        assert_eq!(capture.source(), CapturedFrameSource::BrowserEngine);
+        assert_eq!(capture.epoch(), 1);
+        assert!(!capture
+            .captured_bytes()
+            .windows(SYNTHETIC_FRAME_PAYLOAD_NEEDLE.len())
+            .any(|window| window == SYNTHETIC_FRAME_PAYLOAD_NEEDLE));
+        assert_eq!(
+            capture.digest(),
+            canonical_sha256_digest(capture.captured_bytes())
+        );
+
+        let frame = backend.observe_frame().expect("observe live WK frame");
+        assert_eq!(frame.digest, capture.digest());
+        assert_eq!(
+            validate_public_evidence(&capture.public_evidence())
+                .expect_err("public verifier stays fail-closed")
+                .code,
+            crate::error::HarnessErrorCode::BackendUnavailable
+        );
+
+        backend.destroy().expect("destroy");
+        assert!(!backend.is_booted());
+        backend.booted = true;
+        backend.frame_epoch = 1;
+        let err = backend
+            .observe_frame()
+            .expect_err("destroy cleared capture");
+        assert_eq!(err.code, crate::error::HarnessErrorCode::BackendUnavailable);
+    }
+
+    #[cfg(all(feature = "browser-engine", not(target_os = "macos")))]
+    #[test]
+    fn live_wk_snapshot_fail_closes_off_macos() {
+        let mut backend = ContainedBrowserBackend::new();
+        backend.booted = true;
+        backend.frame_epoch = 1;
+        let err = backend
+            .capture_live_wk_snapshot()
+            .expect_err("live WK is macOS-only");
+        assert_eq!(err.code, crate::error::HarnessErrorCode::BackendUnavailable);
+        assert!(!native_browser_engine_capture_authorized());
+        assert!(!crate::isolated_surface_admission_available());
     }
 
     #[cfg(feature = "browser-engine")]

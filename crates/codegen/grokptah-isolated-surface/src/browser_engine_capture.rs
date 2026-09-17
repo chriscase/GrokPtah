@@ -1,10 +1,9 @@
 //! Browser-engine captured-frame receipt wiring (Phase-1 fail-closed).
 //!
 //! Process-private one-shot receipts bind bounded RGBA8 snapshot bytes to a
-//! booted frame epoch. No receipt → no frame bytes. This module is the handoff
-//! seam between a future native `WKWebView` snapshot adapter and
-//! [`ContainedBrowserBackend`]. It does not load WebKit, capture pixels, or
-//! enable admission.
+//! booted frame epoch. No receipt → no frame bytes. Live macOS `WKWebView`
+//! rasters enter only through [`capture_live_wk_snapshot_through_receipt`].
+//! Admission and Computer Mode stay false.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -33,14 +32,12 @@ pub fn native_browser_engine_capture_authorized() -> bool {
 ///
 /// Dropping without completion revokes the receipt via
 /// [`BrowserEngineCaptureReceipt`]'s `Drop` implementation.
-#[allow(dead_code)] // Native WKWebView adapter seam; boot stays fail-closed until wired.
 pub(crate) struct BrowserEngineCaptureHandoff {
     epoch: u64,
     receipt: BrowserEngineCaptureReceipt,
 }
 
 impl BrowserEngineCaptureHandoff {
-    #[allow(dead_code)] // Used by native adapter seam tests and future wiring.
     pub(crate) fn epoch(&self) -> u64 {
         self.epoch
     }
@@ -49,7 +46,6 @@ impl BrowserEngineCaptureHandoff {
 /// Mint a process-private one-shot receipt bound to `epoch`.
 ///
 /// Call this immediately before the native adapter requests snapshot bytes.
-#[allow(dead_code)] // Native WKWebView adapter seam; boot stays fail-closed until wired.
 pub(crate) fn begin_browser_engine_frame_capture(
     epoch: u64,
 ) -> HarnessResult<BrowserEngineCaptureHandoff> {
@@ -67,7 +63,6 @@ pub(crate) fn begin_browser_engine_frame_capture(
 /// The receipt is consumed one-shot; bytes without a valid registered receipt
 /// are rejected. This is the only path that may label bytes as
 /// [`CapturedFrameSource::BrowserEngine`].
-#[allow(dead_code)] // Native WKWebView adapter seam; boot stays fail-closed until wired.
 pub(crate) fn complete_browser_engine_frame_capture(
     handoff: BrowserEngineCaptureHandoff,
     rgba8_bytes: Vec<u8>,
@@ -108,8 +103,36 @@ pub(crate) fn require_engine_frame_observation(
     Ok(capture.clone())
 }
 
+/// Raster a live macOS `WKWebView` fixture and admit RGBA8 only through a
+/// process-private one-shot receipt. Does not set the physical-CLI authorize
+/// flag. Non-macOS builds fail closed.
+pub fn capture_live_wk_snapshot_through_receipt(epoch: u64) -> HarnessResult<BoundedCapturedFrame> {
+    if epoch == 0 {
+        return Err(HarnessError::invalid_state(
+            "browser-engine capture handoff requires a booted frame epoch",
+        ));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let raster = crate::wk_native_snapshot::rasterize_fixture()?;
+        let handoff = begin_browser_engine_frame_capture(epoch)?;
+        if handoff.epoch() != epoch {
+            return Err(HarnessError::invalid_state(
+                "live WK snapshot receipt epoch drifted before admit",
+            ));
+        }
+        complete_browser_engine_frame_capture(handoff, raster.bytes, raster.width, raster.height)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = epoch;
+        Err(HarnessError::backend_unavailable(
+            "live WK snapshot is macOS-only; receipt-gated capture stays fail-closed on this platform",
+        ))
+    }
+}
+
 /// Install a receipt-gated capture into backend state after admission.
-#[allow(dead_code)] // Native WKWebView adapter seam; boot stays fail-closed until wired.
 pub(crate) fn install_receipt_gated_capture(
     frame_epoch: u64,
     capture: BoundedCapturedFrame,

@@ -33,5 +33,11 @@ objc2 = "0.6.3"
 name = "grokptah-sep18-checklist"
 path = "src/bin/grokptah-sep18-checklist.rs"
 
+[[test]]
+name = "live_wk_snapshot_main"
+path = "tests/live_wk_snapshot_main.rs"
+harness = false
+required-features = ["browser-engine"]
+
 [dev-dependencies]
 tempfile = "3"
