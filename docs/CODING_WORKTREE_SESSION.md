@@ -39,6 +39,8 @@ Active | Paused → Stop (fence-first teardown)
 - **Discard** — remove the disposable worktree and clear session records; the
   worktree must not remain registered or on disk.
 - **Keep for review** — retain worktree + staged diff; no apply.
+  Attach/restore after Accept, Discard, or Keep-for-review keeps that disposition
+  and cannot re-enter staging, settlement, or Pause.
 - **Uncertain** — recorded when apply may have partially happened (crash/restart
   mid-apply). No auto-retry and no auto-Accept on restart.
 - **Pause** — local authority fence; further staging and settlement are rejected.
@@ -57,6 +59,7 @@ Active | Paused → Stop (fence-first teardown)
 | Staging includes untracked files | `git add -N` intent-to-add before diff capture; fail-closed if untracked present but diff empty |
 | Restart/reload cannot auto-Accept | `recover_after_restart` → `Uncertain` when `apply_in_flight` |
 | Uncertain apply → no auto-retry | `enforce_no_auto_retry` on settlement ops and Pause |
+| Attach after settlement cannot retry | `reconcile_invariants` fences Accepted/Discarded/KeptForReview; Pause and settlement stay closed |
 | Pause fences further work | `begin_pause` sets `pause_fenced`; staging/settlement reject |
 | Stop never claims Destroyed without confirmed destroy | `complete_destroy` only when worktree is gone; else `Stopped` |
 | Persist failure does not skip teardown | `stop` records persist errors and still attempts destroy |

@@ -89,9 +89,26 @@ impl SessionLifecycle {
     pub fn reconcile_invariants(&mut self) -> SessionResult<()> {
         if self.disposition == Some(SessionDisposition::Uncertain) {
             self.settlement_fenced = true;
+            self.pause_fenced = true;
             if self.apply_in_flight {
                 return Err(SessionError::invalid_state(
                     "restored Uncertain lifecycle cannot have apply_in_flight",
+                ));
+            }
+        }
+        if matches!(
+            self.disposition,
+            Some(
+                SessionDisposition::Accepted
+                    | SessionDisposition::Discarded
+                    | SessionDisposition::KeptForReview
+            )
+        ) {
+            self.settlement_fenced = true;
+            self.pause_fenced = true;
+            if self.phase == SessionPhase::Active {
+                return Err(SessionError::invalid_state(
+                    "restored settled disposition cannot re-enter Active",
                 ));
             }
         }
@@ -272,6 +289,25 @@ mod tests {
         lifecycle.apply_in_flight = false;
 
         assert!(lifecycle.reconcile_invariants().is_err());
+        assert!(!lifecycle.allows_staging());
+        assert!(!lifecycle.allows_pause());
+    }
+
+    #[test]
+    fn hostile_restore_of_accepted_cannot_reenter_active() {
+        let mut lifecycle = SessionLifecycle::new(now());
+        lifecycle.begin_settlement(now()).expect("begin settlement");
+        lifecycle
+            .complete_settlement(SessionDisposition::Accepted, now())
+            .expect("accept");
+
+        lifecycle.phase = SessionPhase::Active;
+        lifecycle.settlement_fenced = false;
+        lifecycle.pause_fenced = false;
+
+        assert!(lifecycle.reconcile_invariants().is_err());
+        assert!(!lifecycle.allows_settlement());
+        assert!(!lifecycle.allows_pause());
         assert!(!lifecycle.allows_staging());
     }
 
