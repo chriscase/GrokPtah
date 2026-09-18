@@ -172,6 +172,120 @@ fn keep_for_review_retains_worktree_and_patch_without_apply() {
     );
 }
 
+fn assert_paused_or_settled_rejects_settlement_and_pause(
+    session: &mut CodingWorktreeSession,
+    apply_target: &std::path::Path,
+    digest: &str,
+) {
+    let pause_err = session.pause(Utc::now()).expect_err("pause fenced");
+    assert_eq!(pause_err.code, SessionErrorCode::InvalidState);
+    let accept_err = session
+        .accept(apply_target, digest, Utc::now())
+        .expect_err("accept fenced");
+    assert_eq!(accept_err.code, SessionErrorCode::InvalidState);
+    let discard_err = session.discard(Utc::now()).expect_err("discard fenced");
+    assert_eq!(discard_err.code, SessionErrorCode::InvalidState);
+    let keep_err = session
+        .keep_for_review(Utc::now())
+        .expect_err("keep_for_review fenced");
+    assert_eq!(keep_err.code, SessionErrorCode::InvalidState);
+}
+
+#[test]
+fn attach_after_accept_cannot_retry_settlement_or_pause() {
+    let dir = TempDir::new().expect("tempdir");
+    init_fixture_repo(dir.path());
+    let snap_root = dir.path().join("snapshots");
+    let mut session = session_with_snapshot(&dir, "HEAD");
+    session
+        .write_worktree_file("README.md", "agent edit\n")
+        .expect("write");
+    let patch = session.stage_patch().expect("stage");
+    let apply_root = clone_apply_target(dir.path());
+    session
+        .accept(apply_root.path(), &patch.digest, Utc::now())
+        .expect("accept");
+    drop(session);
+
+    let mut restored = CodingWorktreeSession::attach(&snap_root).expect("attach after accept");
+    assert_eq!(
+        restored.lifecycle().disposition,
+        Some(SessionDisposition::Accepted)
+    );
+    assert_eq!(restored.lifecycle().phase, SessionPhase::Settled);
+    assert!(restored.lifecycle().settlement_fenced);
+    assert!(restored.lifecycle().pause_fenced);
+    assert_paused_or_settled_rejects_settlement_and_pause(
+        &mut restored,
+        apply_root.path(),
+        &patch.digest,
+    );
+}
+
+#[test]
+fn attach_after_discard_cannot_retry_settlement_or_pause() {
+    let dir = TempDir::new().expect("tempdir");
+    init_fixture_repo(dir.path());
+    let snap_root = dir.path().join("snapshots");
+    let mut session = session_with_snapshot(&dir, "HEAD");
+    session
+        .write_worktree_file("README.md", "discard me\n")
+        .expect("write");
+    let patch = session.stage_patch().expect("stage");
+    session.discard(Utc::now()).expect("discard");
+    drop(session);
+
+    let mut restored = CodingWorktreeSession::attach(&snap_root).expect("attach after discard");
+    assert_eq!(
+        restored.lifecycle().disposition,
+        Some(SessionDisposition::Discarded)
+    );
+    assert_eq!(restored.lifecycle().phase, SessionPhase::Settled);
+    let apply_root = clone_apply_target(dir.path());
+    assert_paused_or_settled_rejects_settlement_and_pause(
+        &mut restored,
+        apply_root.path(),
+        &patch.digest,
+    );
+}
+
+#[test]
+fn attach_after_keep_for_review_cannot_retry_settlement_or_pause() {
+    let dir = TempDir::new().expect("tempdir");
+    init_fixture_repo(dir.path());
+    let snap_root = dir.path().join("snapshots");
+    let mut session = session_with_snapshot(&dir, "HEAD");
+    session
+        .write_worktree_file("README.md", "review me\n")
+        .expect("write");
+    let patch = session.stage_patch().expect("stage");
+    let worktree = session.worktree_path().to_path_buf();
+    session.keep_for_review(Utc::now()).expect("keep");
+    drop(session);
+
+    let mut restored = CodingWorktreeSession::attach(&snap_root).expect("attach after keep");
+    assert_eq!(
+        restored.lifecycle().disposition,
+        Some(SessionDisposition::KeptForReview)
+    );
+    assert_eq!(restored.lifecycle().phase, SessionPhase::Settled);
+    assert!(worktree.exists());
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("README.md")).expect("retained"),
+        "review me\n"
+    );
+    let apply_root = clone_apply_target(dir.path());
+    assert_paused_or_settled_rejects_settlement_and_pause(
+        &mut restored,
+        apply_root.path(),
+        &patch.digest,
+    );
+    let write_err = restored
+        .write_worktree_file("README.md", "reopen\n")
+        .expect_err("staging fenced after keep-for-review attach");
+    assert_eq!(write_err.code, SessionErrorCode::InvalidState);
+}
+
 #[test]
 fn restart_with_apply_in_flight_becomes_uncertain_no_auto_accept() {
     let dir = TempDir::new().expect("tempdir");
