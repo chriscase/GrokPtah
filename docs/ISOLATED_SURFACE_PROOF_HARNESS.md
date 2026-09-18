@@ -158,6 +158,19 @@ Epoch still increments on inject; digest change tracks captured-byte change.
 
 Bridge admission `isolated_surface_admission_available()` remains **false**.
 
+### Contained Browser v0 page containment
+
+The first software slice on the ReceiptGated / live-WK substrate admits **one owned
+fixture page** (`https://grokptah.owned.invalid/cb-v0/`). Simulator boot and live WK
+`loadHTMLString` both call the same `owned_page_for_boot()` helper; off-allowlist
+navigation is fail-closed. Guest actions are **main-frame DOM only**. Secondary
+windows, `_blank`, and host keyboard / pointer / clipboard claims are refused.
+Each boot mints a fresh nonpersistent website-data store (live WK attaches
+`WKWebsiteDataStore.nonPersistentDataStore`; the backend token is unique per run
+and cleared on destroy). Stop stays fence-first; `Destroyed` is confirmed-only;
+Uncertain rejects auto-retry. This is **not** isolation PASS, VF PASS, Computer
+Mode, or admission.
+
 ### Synthetic guest frame hashes (packet 9 follow-on)
 
 `SyntheticGuest` no longer emits label-derived `sha256:synthetic-frame:<epoch>:btn=<bool>`
@@ -501,7 +514,7 @@ cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Car
 
 - Checklist runner seals dry-run / native-sentinel packs only — no live Mac VF IPC or packaged helper.
 - Independent verifier is pack-only; physical Mac worker still required for VF PASS rung.
-- Contained Browser substrate v0 uses an in-process simulator — not a real isolated browser engine.
+- Contained Browser substrate v0 uses an in-process simulator plus an optional live-WK receipt-gated raster — not a real isolated browser engine, not isolation PASS.
 - Simulator captured-frame bytes are explicit synthetic payloads, content-addressed and labeled synthetic — not a real browser capture.
 - Optional `browser-engine` feature is receipt-gated: ReceiptGated observe/capture goes through live WK mint → `takeSnapshotWithConfiguration` → complete. No receipt → no frame bytes; caller-supplied RGBA cannot be labeled engine content. Public engine evidence, admission, and Computer Mode stay fail-closed. Ordinary `cargo test` never latches the physical-CLI authorize flag. Drafts 563 (clipboard kill-gate) and 564 (snapshot ABI) are not absorbed and still need rebase onto current main.
 - Native host-sentinel live collection is **not** VF PASS, isolation PASS, or admission enablement.
@@ -519,7 +532,7 @@ cargo test --locked --manifest-path crates/codegen/grokptah-isolated-surface/Car
 - VF dry-run does **not** claim Sep 18 physical PASS.
 - Synthetic harness success does **not** enable isolated visual Computer Use in production.
 - [`SyntheticHostProbe`] self-compare does **not** qualify as physical Mac host sentinel collection.
-- `ContainedBrowser` substrate v0 does **not** prove browser isolation — only exercises the SPI lifecycle on a simulator.
+- `ContainedBrowser` substrate v0 does **not** prove browser isolation — owned-page allowlist + main-frame DOM + nonpersistent store + locally authoritative Stop are software containment, not isolation PASS.
 - Simulator captured-frame hashes are **not** a real browser capture; they content-address labeled synthetic payload bytes.
 - Native host-sentinel runner success is **not** VF/isolation/physical PASS and does not enable Computer Mode or admission.
 - Clipboard kill-gate success is **not** VF/isolation/physical PASS. Synthetic verifier fixtures cannot establish physical Mac Pass. Linux CI `unsupported` is not Fail of isolation and not Pass.

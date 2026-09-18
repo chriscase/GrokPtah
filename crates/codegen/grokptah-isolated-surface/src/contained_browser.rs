@@ -13,6 +13,10 @@
 
 use crate::backend::IsolatedSurfaceBackend;
 use crate::captured_frame::BoundedCapturedFrame;
+use crate::cb_containment::{
+    admit_frame_action, admit_guest_local_action, admit_navigation, owned_page_for_boot,
+    ActionChannel, FrameKind, NonpersistentWebsiteDataStore,
+};
 use crate::error::{HarnessError, HarnessResult};
 use crate::lifecycle::ProofEvidenceClass;
 use crate::simulator::{GuestFrame, GuestLocalAction, InjectOutcome};
@@ -53,6 +57,8 @@ pub struct ContainedBrowserBackend {
     inject_fenced: bool,
     uncertain_on_next_inject: bool,
     crash_on_next_inject: bool,
+    current_page: Option<String>,
+    website_data_store: Option<NonpersistentWebsiteDataStore>,
     #[cfg(feature = "browser-engine")]
     receipt_gated_capture: RefCell<Option<BoundedCapturedFrame>>,
 }
@@ -71,9 +77,47 @@ impl ContainedBrowserBackend {
             inject_fenced: false,
             uncertain_on_next_inject: false,
             crash_on_next_inject: false,
+            current_page: None,
+            website_data_store: None,
             #[cfg(feature = "browser-engine")]
             receipt_gated_capture: RefCell::new(None),
         }
+    }
+
+    pub fn current_page(&self) -> Option<&str> {
+        self.current_page.as_deref()
+    }
+
+    pub fn website_data_store_id(&self) -> Option<&str> {
+        self.website_data_store.as_ref().map(|store| store.run_id())
+    }
+
+    /// Fail-closed navigation onto the owned-page allowlist only.
+    pub fn navigate(&mut self, url: &str) -> HarnessResult<()> {
+        if !self.booted {
+            return Err(HarnessError::invalid_state("browser guest is not booted"));
+        }
+        if self.inject_fenced {
+            return Err(HarnessError::inject_fenced(
+                "browser guest navigation is fenced",
+            ));
+        }
+        admit_navigation(url)?;
+        self.current_page = Some(url.to_string());
+        Ok(())
+    }
+
+    /// Guest-local inject with explicit frame/channel. Host input and `_blank`
+    /// are refused. SPI [`inject_guest_local`] is main-frame DOM only.
+    pub fn inject_dom_action(
+        &mut self,
+        action: GuestLocalAction,
+        frame: FrameKind,
+        channel: ActionChannel,
+    ) -> HarnessResult<InjectOutcome> {
+        admit_frame_action(frame, channel)?;
+        admit_guest_local_action(action)?;
+        self.inject_browser_local(action)
     }
 
     /// v0 never proves browser isolation — substrate rehearsal only.
@@ -132,10 +176,18 @@ impl ContainedBrowserBackend {
         self.inject_fenced = true;
     }
 
+    fn arm_owned_page(&mut self) -> HarnessResult<()> {
+        let url = owned_page_for_boot()?;
+        self.website_data_store = Some(NonpersistentWebsiteDataStore::mint());
+        self.current_page = Some(url.to_string());
+        Ok(())
+    }
+
     fn boot_simulator(&mut self) -> HarnessResult<GuestFrame> {
         if self.booted {
             return Err(HarnessError::invalid_state("browser guest already booted"));
         }
+        self.arm_owned_page()?;
         self.booted = true;
         self.frame_epoch = 1;
         self.current_frame()
@@ -166,6 +218,7 @@ impl ContainedBrowserBackend {
 
     #[cfg(all(feature = "browser-engine", target_os = "macos"))]
     fn boot_receipt_gated_live_wk(&mut self) -> HarnessResult<GuestFrame> {
+        self.arm_owned_page()?;
         self.booted = true;
         self.frame_epoch = 1;
         match capture_live_wk_snapshot_through_receipt(self.frame_epoch) {
@@ -177,6 +230,8 @@ impl ContainedBrowserBackend {
             Err(err) => {
                 self.booted = false;
                 self.frame_epoch = 0;
+                self.current_page = None;
+                self.website_data_store = None;
                 *self.receipt_gated_capture.borrow_mut() = None;
                 Err(err)
             }
@@ -192,6 +247,7 @@ impl ContainedBrowserBackend {
     pub fn capture_live_wk_snapshot(&mut self) -> HarnessResult<BoundedCapturedFrame> {
         let started_booted = self.booted;
         if !self.booted {
+            self.arm_owned_page()?;
             self.booted = true;
             self.frame_epoch = 1;
         }
@@ -205,6 +261,8 @@ impl ContainedBrowserBackend {
                 if !started_booted {
                     self.booted = false;
                     self.frame_epoch = 0;
+                    self.current_page = None;
+                    self.website_data_store = None;
                     *self.receipt_gated_capture.borrow_mut() = None;
                 }
                 Err(err)
@@ -292,16 +350,7 @@ impl IsolatedSurfaceBackend for ContainedBrowserBackend {
     }
 
     fn inject_guest_local(&mut self, action: GuestLocalAction) -> HarnessResult<InjectOutcome> {
-        match self.mode {
-            SubstrateMode::Simulator => self.inject_browser_local(action),
-            #[cfg(feature = "browser-engine")]
-            SubstrateMode::ReceiptGated => {
-                if !self.booted {
-                    return Err(HarnessError::invalid_state("browser guest is not booted"));
-                }
-                Err(HarnessError::backend_unavailable(ENGINE_BOOT_UNAVAILABLE))
-            }
-        }
+        self.inject_dom_action(action, FrameKind::MainFrame, ActionChannel::MainFrameDom)
     }
 
     /// Production fence: halts browser guest-local inject dispatch before teardown.
@@ -312,6 +361,8 @@ impl IsolatedSurfaceBackend for ContainedBrowserBackend {
 
     fn destroy(&mut self) -> HarnessResult<()> {
         self.booted = false;
+        self.current_page = None;
+        self.website_data_store = None;
         #[cfg(feature = "browser-engine")]
         {
             *self.receipt_gated_capture.borrow_mut() = None;
@@ -327,6 +378,8 @@ impl IsolatedSurfaceBackend for ContainedBrowserBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(feature = "browser-engine"))]
+    use crate::OWNED_PAGE_URL;
 
     #[cfg(not(feature = "browser-engine"))]
     #[test]
@@ -370,6 +423,120 @@ mod tests {
     fn contained_browser_never_vf_eligible() {
         let backend = ContainedBrowserBackend::new();
         assert!(!backend.evidence_class().is_vf_qualification_eligible());
+        assert!(!crate::isolated_surface_admission_available());
+    }
+
+    #[cfg(not(feature = "browser-engine"))]
+    #[test]
+    fn owned_page_allowlist_and_main_frame_only_and_fresh_store() {
+        let mut backend = ContainedBrowserBackend::new();
+        backend.boot().expect("boot");
+        assert_eq!(backend.current_page(), Some(OWNED_PAGE_URL));
+        let first_store = backend
+            .website_data_store_id()
+            .expect("store minted")
+            .to_string();
+
+        backend
+            .navigate("https://example.com/")
+            .expect_err("off-allowlist");
+        backend
+            .navigate("https://grokptah.owned.invalid/other")
+            .expect_err("same-origin other path");
+        backend.navigate(OWNED_PAGE_URL).expect("owned page");
+
+        backend
+            .inject_dom_action(
+                GuestLocalAction::ClickGuestButton,
+                FrameKind::BlankTarget,
+                ActionChannel::MainFrameDom,
+            )
+            .expect_err("_blank");
+        backend
+            .inject_dom_action(
+                GuestLocalAction::ClickGuestButton,
+                FrameKind::SecondaryWindow,
+                ActionChannel::MainFrameDom,
+            )
+            .expect_err("secondary");
+        backend
+            .inject_dom_action(
+                GuestLocalAction::ClickGuestButton,
+                FrameKind::MainFrame,
+                ActionChannel::HostKeyboard,
+            )
+            .expect_err("keyboard");
+        backend
+            .inject_dom_action(
+                GuestLocalAction::ClickGuestButton,
+                FrameKind::MainFrame,
+                ActionChannel::HostPointer,
+            )
+            .expect_err("pointer");
+        backend
+            .inject_dom_action(
+                GuestLocalAction::ClickGuestButton,
+                FrameKind::MainFrame,
+                ActionChannel::HostClipboard,
+            )
+            .expect_err("clipboard");
+        backend
+            .inject_dom_action(
+                GuestLocalAction::ClickGuestButton,
+                FrameKind::MainFrame,
+                ActionChannel::MainFrameDom,
+            )
+            .expect("main-frame DOM");
+
+        backend.stop_fence_first().expect("fence");
+        backend.destroy().expect("destroy");
+        assert!(backend.website_data_store_id().is_none());
+        backend.boot().expect("second boot");
+        let second_store = backend.website_data_store_id().expect("fresh store");
+        assert_ne!(first_store, second_store);
+        assert!(!crate::isolated_surface_admission_available());
+    }
+
+    #[cfg(feature = "browser-engine")]
+    #[test]
+    fn contained_browser_engine_refuses_blank_and_host_without_boot() {
+        let mut backend = ContainedBrowserBackend::new();
+        backend
+            .inject_dom_action(
+                GuestLocalAction::ClickGuestButton,
+                FrameKind::BlankTarget,
+                ActionChannel::MainFrameDom,
+            )
+            .expect_err("_blank");
+        backend
+            .inject_dom_action(
+                GuestLocalAction::ClickGuestButton,
+                FrameKind::SecondaryWindow,
+                ActionChannel::MainFrameDom,
+            )
+            .expect_err("secondary");
+        backend
+            .inject_dom_action(
+                GuestLocalAction::ClickGuestButton,
+                FrameKind::MainFrame,
+                ActionChannel::HostKeyboard,
+            )
+            .expect_err("keyboard");
+        backend
+            .inject_dom_action(
+                GuestLocalAction::ClickGuestButton,
+                FrameKind::MainFrame,
+                ActionChannel::HostPointer,
+            )
+            .expect_err("pointer");
+        backend
+            .inject_dom_action(
+                GuestLocalAction::ClickGuestButton,
+                FrameKind::MainFrame,
+                ActionChannel::HostClipboard,
+            )
+            .expect_err("clipboard");
+        assert!(!crate::isolated_surface_admission_available());
     }
 
     #[cfg(feature = "browser-engine")]

@@ -14,9 +14,10 @@ fn main() {
     use grokptah_isolated_surface::{
         canonical_sha256_digest, capture_live_wk_snapshot_through_receipt,
         isolated_surface_admission_available, native_browser_engine_capture_authorized,
-        validate_public_evidence, CapturedFrameMediaKind, CapturedFrameSource,
-        ContainedBrowserBackend, HarnessErrorCode, HostSentinelSnapshot, IsolatedSurfaceBackend,
-        IsolatedSurfaceHarness, SYNTHETIC_FRAME_PAYLOAD_NEEDLE,
+        validate_public_evidence, ActionChannel, CapturedFrameMediaKind, CapturedFrameSource,
+        ContainedBrowserBackend, FrameKind, GuestLocalAction, HarnessErrorCode,
+        HostSentinelSnapshot, IsolatedSurfaceBackend, IsolatedSurfaceHarness, OWNED_PAGE_URL,
+        SYNTHETIC_FRAME_PAYLOAD_NEEDLE,
     };
 
     assert!(
@@ -82,11 +83,68 @@ fn main() {
             observed.captured_frame.as_ref().map(|ev| ev.source),
             Some(CapturedFrameSource::BrowserEngine)
         );
+        assert_eq!(backend.current_page(), Some(OWNED_PAGE_URL));
+        let first_store = backend
+            .website_data_store_id()
+            .expect("nonpersistent store minted")
+            .to_string();
+        backend
+            .navigate("https://evil.example/")
+            .expect_err("off-allowlist navigation denied");
+        backend
+            .navigate("https://grokptah.owned.invalid/other")
+            .expect_err("same-origin other path denied");
+        backend
+            .inject_dom_action(
+                GuestLocalAction::ClickGuestButton,
+                FrameKind::BlankTarget,
+                ActionChannel::MainFrameDom,
+            )
+            .expect_err("_blank refused");
+        backend
+            .inject_dom_action(
+                GuestLocalAction::ClickGuestButton,
+                FrameKind::SecondaryWindow,
+                ActionChannel::MainFrameDom,
+            )
+            .expect_err("secondary window refused");
+        backend
+            .inject_dom_action(
+                GuestLocalAction::ClickGuestButton,
+                FrameKind::MainFrame,
+                ActionChannel::HostKeyboard,
+            )
+            .expect_err("host keyboard refused");
+        backend
+            .inject_dom_action(
+                GuestLocalAction::ClickGuestButton,
+                FrameKind::MainFrame,
+                ActionChannel::HostPointer,
+            )
+            .expect_err("host pointer refused");
+        backend
+            .inject_dom_action(
+                GuestLocalAction::ClickGuestButton,
+                FrameKind::MainFrame,
+                ActionChannel::HostClipboard,
+            )
+            .expect_err("host clipboard refused");
         backend.destroy().expect("destroy");
         assert!(!backend.is_booted());
+        assert!(backend.website_data_store_id().is_none());
         backend
             .observe_frame()
             .expect_err("destroy unboots; observe cannot inherit stored capture");
+
+        let mut second = ContainedBrowserBackend::new();
+        let _ = second
+            .capture_live_wk_snapshot()
+            .expect("second run live WK snapshot");
+        let second_store = second
+            .website_data_store_id()
+            .expect("second run mints a fresh store");
+        assert_ne!(first_store, second_store);
+        second.destroy().expect("destroy second");
 
         let mut harness = IsolatedSurfaceHarness::with_backend(
             HostSentinelSnapshot::synthetic_baseline(),

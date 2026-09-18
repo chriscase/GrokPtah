@@ -16,6 +16,7 @@ use objc2::runtime::{AnyClass, AnyObject};
 use objc2::sel;
 
 use crate::browser_engine_capture::LIVE_WK_FIXTURE_CRIMSON_RGB;
+use crate::cb_containment::owned_page_for_boot;
 use crate::error::{HarnessError, HarnessResult};
 
 pub(crate) struct NativeWkRaster {
@@ -54,6 +55,7 @@ pub(crate) fn rasterize_fixture() -> HarnessResult<NativeWkRaster> {
         ));
     };
     ensure_ns_application()?;
+    let owned_page = owned_page_for_boot()?;
 
     let html = nsstring(FIXTURE_HTML).ok_or_else(|| {
         HarnessError::backend_unavailable("live WK snapshot HTML NSString unavailable")
@@ -61,6 +63,7 @@ pub(crate) fn rasterize_fixture() -> HarnessResult<NativeWkRaster> {
     let config_cls = AnyClass::get(c"WKWebViewConfiguration")
         .ok_or_else(|| HarnessError::backend_unavailable("WKWebViewConfiguration unavailable"))?;
     let config: Retained<AnyObject> = unsafe { objc2::msg_send![config_cls, new] };
+    attach_nonpersistent_website_data_store(&config)?;
 
     let webview_cls = AnyClass::get(c"WKWebView")
         .ok_or_else(|| HarnessError::backend_unavailable("WKWebView unavailable"))?;
@@ -73,8 +76,11 @@ pub(crate) fn rasterize_fixture() -> HarnessResult<NativeWkRaster> {
 
     let _window = attach_offscreen_window(&webview, frame)?;
 
+    let base_url = nsurl(owned_page).ok_or_else(|| {
+        HarnessError::backend_unavailable("owned-page NSURL unavailable for live WK snapshot")
+    })?;
     let _navigation: Option<Retained<AnyObject>> =
-        unsafe { objc2::msg_send![&*webview, loadHTMLString: &*html, baseURL: None::<&AnyObject>] };
+        unsafe { objc2::msg_send![&*webview, loadHTMLString: &*html, baseURL: &*base_url] };
     wait_until_loaded(&webview)?;
 
     let _: () = unsafe { objc2::msg_send![&*webview, layoutSubtreeIfNeeded] };
@@ -370,6 +376,27 @@ fn webkit_loaded() -> bool {
     let path = c"/System/Library/Frameworks/WebKit.framework/WebKit";
     let handle = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_LAZY) };
     !handle.is_null()
+}
+
+fn attach_nonpersistent_website_data_store(config: &AnyObject) -> HarnessResult<()> {
+    let Some(store_cls) = AnyClass::get(c"WKWebsiteDataStore") else {
+        return Err(HarnessError::backend_unavailable(
+            "WKWebsiteDataStore unavailable for nonpersistent store",
+        ));
+    };
+    let store: Option<Retained<AnyObject>> =
+        unsafe { objc2::msg_send![store_cls, nonPersistentDataStore] };
+    let store = store.ok_or_else(|| {
+        HarnessError::backend_unavailable("WKWebsiteDataStore.nonPersistentDataStore unavailable")
+    })?;
+    let _: () = unsafe { objc2::msg_send![config, setWebsiteDataStore: &*store] };
+    Ok(())
+}
+
+fn nsurl(value: &str) -> Option<Retained<AnyObject>> {
+    let cls = AnyClass::get(c"NSURL")?;
+    let string = nsstring(value)?;
+    unsafe { objc2::msg_send![cls, URLWithString: &*string] }
 }
 
 fn nsstring(value: &str) -> Option<Retained<AnyObject>> {

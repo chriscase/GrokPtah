@@ -8,6 +8,7 @@ mod backend;
 #[cfg(feature = "browser-engine")]
 mod browser_engine_capture;
 mod captured_frame;
+mod cb_containment;
 mod channels;
 mod checklist_runner;
 mod clipboard_kill_gate;
@@ -50,6 +51,11 @@ pub use captured_frame::{
     BoundedCapturedFrame, CapturedFrameEvidence, CapturedFrameMediaKind, CapturedFramePair,
     CapturedFrameSource, MAX_CAPTURED_FRAME_BYTES, SYNTHETIC_FRAME_HEIGHT,
     SYNTHETIC_FRAME_PAYLOAD_NEEDLE, SYNTHETIC_FRAME_WIDTH,
+};
+pub use cb_containment::{
+    admit_frame_action, admit_guest_local_action, admit_navigation, owned_page_for_boot,
+    ActionChannel, FrameKind, NonpersistentWebsiteDataStore, OWNED_PAGE_ORIGIN, OWNED_PAGE_PATH,
+    OWNED_PAGE_URL,
 };
 pub use channels::ChannelRegistry;
 pub use checklist_runner::{
