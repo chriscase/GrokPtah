@@ -162,14 +162,15 @@ Bridge admission `isolated_surface_admission_available()` remains **false**.
 
 The first software slice on the ReceiptGated / live-WK substrate admits **one owned
 fixture page** (`https://grokptah.owned.invalid/cb-v0/`). Simulator boot and live WK
-`loadHTMLString` both call the same `owned_page_for_boot()` helper; off-allowlist
-navigation is fail-closed. Guest actions are **main-frame DOM only**. Secondary
-windows, `_blank`, and host keyboard / pointer / clipboard claims are refused.
-Each boot mints a fresh nonpersistent website-data store (live WK attaches
-`WKWebsiteDataStore.nonPersistentDataStore`; the backend token is unique per run
-and cleared on destroy). Stop stays fence-first; `Destroyed` is confirmed-only;
-Uncertain rejects auto-retry. This is **not** isolation PASS, VF PASS, Computer
-Mode, or admission.
+`loadHTMLString` both call the same `owned_page_for_boot()` helper. Live WK keeps a
+session: admitted main-frame inject mutates the owned-page DOM (`evaluateJavaScript`)
+then recaptures at epoch N+1 so digest/`guest_local_change` can move. Off-allowlist
+navigation is fail-closed in WebKit via `WKNavigationDelegate` as well as at the
+Rust allowlist. Guest actions are **main-frame DOM only**. Secondary windows,
+`_blank`, and host keyboard / pointer / clipboard claims are refused. Each boot
+attaches `WKWebsiteDataStore.nonPersistentDataStore` (`isPersistent == false` at
+runtime). Stop stays fence-first; `Destroyed` is confirmed-only; Uncertain rejects
+auto-retry. This is **not** isolation PASS, VF PASS, Computer Mode, or admission.
 
 ### Synthetic guest frame hashes (packet 9 follow-on)
 

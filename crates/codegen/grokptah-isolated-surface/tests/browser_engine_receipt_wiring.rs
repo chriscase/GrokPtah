@@ -190,20 +190,23 @@ fn contained_browser_v0_allowlist_and_main_frame_policy() {
 }
 
 #[test]
-fn live_wk_source_loads_owned_page_with_nonpersistent_store() {
-    let src = include_str!("../src/wk_native_snapshot.rs");
-    assert!(
-        src.contains("owned_page_for_boot"),
-        "live WK raster must arm the shared owned-page allowlist"
-    );
-    assert!(
-        src.contains("nonPersistentDataStore"),
-        "live WK must attach WKWebsiteDataStore.nonPersistentDataStore"
-    );
-    assert!(
-        !src.contains("baseURL: None"),
-        "live WK must not load HTML with unrestricted baseURL None"
-    );
+fn live_wk_navigation_policy_helper_cancels_off_allowlist() {
+    use grokptah_isolated_surface::live_wk_navigation_policy_allows;
+    assert!(live_wk_navigation_policy_allows(
+        OWNED_PAGE_URL,
+        true,
+        false
+    ));
+    assert!(!live_wk_navigation_policy_allows(
+        "https://evil.example/",
+        true,
+        false
+    ));
+    assert!(!live_wk_navigation_policy_allows(
+        OWNED_PAGE_URL,
+        true,
+        true
+    ));
 }
 
 #[cfg(target_os = "macos")]
@@ -238,12 +241,26 @@ fn live_wk_backend_containment_after_capture() {
                 .expect("observe before admitted main-frame DOM inject");
             let original_epoch = before.epoch;
             let original_digest = before.digest.clone();
+            assert!(
+                !backend
+                    .live_website_data_store_is_persistent()
+                    .expect("runtime store persistence"),
+                "live capture must report a nonpersistent store"
+            );
+            backend
+                .live_wk_attempt_navigation("https://evil.example/")
+                .expect_err("WK policy deny");
             match backend.inject_dom_action(
                 GuestLocalAction::ClickGuestButton,
                 FrameKind::MainFrame,
                 ActionChannel::MainFrameDom,
             ) {
-                Ok(_) => {
+                Ok(outcome) => {
+                    let grokptah_isolated_surface::InjectOutcome::Changed(delta) = outcome else {
+                        panic!("admitted inject must be Changed");
+                    };
+                    assert!(delta.guest_local_change);
+                    assert_ne!(delta.before_digest, original_digest);
                     let after = IsolatedSurfaceBackend::observe_frame(&backend)
                         .expect("successful inject must keep observation bound");
                     assert_eq!(after.epoch, original_epoch.saturating_add(1));
@@ -260,6 +277,12 @@ fn live_wk_backend_containment_after_capture() {
                     assert_eq!(still.digest, original_digest);
                 }
             }
+            IsolatedSurfaceBackend::stop_fence_first(&mut backend).expect("fence");
+            IsolatedSurfaceBackend::inject_guest_local(
+                &mut backend,
+                GuestLocalAction::ClickGuestButton,
+            )
+            .expect_err("fenced");
             backend.destroy().expect("destroy");
             assert!(backend.website_data_store_id().is_none());
             match backend.capture_live_wk_snapshot() {

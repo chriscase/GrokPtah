@@ -31,6 +31,8 @@ pub fn native_browser_engine_capture_authorized() -> bool {
 /// CSS `#c41e3a` body background of the live WK fixture. RGBA or BGRA rasters
 /// must contain this crimson; uniform window-white is not engine content.
 pub const LIVE_WK_FIXTURE_CRIMSON_RGB: [u8; 3] = [0xC4, 0x1E, 0x3A];
+/// CSS `#1a6b3c` body background after admitted main-frame click/type.
+pub const LIVE_WK_FIXTURE_CLICKED_RGB: [u8; 3] = [0x1A, 0x6B, 0x3C];
 
 /// Handoff token minted immediately before a native snapshot attempt.
 ///

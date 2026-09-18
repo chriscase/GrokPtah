@@ -67,6 +67,19 @@ pub fn owned_page_for_boot() -> HarnessResult<&'static str> {
     Ok(OWNED_PAGE_URL)
 }
 
+/// Live WK navigation-policy helper used by `WKNavigationDelegate`.
+/// `_blank` / non-main-frame / off-allowlist are cancelled.
+pub fn live_wk_navigation_policy_allows(
+    url: &str,
+    is_main_frame: bool,
+    is_blank_target: bool,
+) -> bool {
+    if is_blank_target || !is_main_frame {
+        return false;
+    }
+    admit_navigation(url).is_ok()
+}
+
 /// Admit only main-frame DOM actions. Secondary windows, `_blank`, and host
 /// keyboard / pointer / clipboard claims are refused.
 pub fn admit_frame_action(frame: FrameKind, channel: ActionChannel) -> HarnessResult<()> {
@@ -129,5 +142,29 @@ mod tests {
         let a = NonpersistentWebsiteDataStore::mint();
         let b = NonpersistentWebsiteDataStore::mint();
         assert_ne!(a.run_id(), b.run_id());
+    }
+
+    #[test]
+    fn contained_browser_live_wk_navigation_policy_cancels_blank_and_off_allowlist() {
+        assert!(live_wk_navigation_policy_allows(
+            OWNED_PAGE_URL,
+            true,
+            false
+        ));
+        assert!(!live_wk_navigation_policy_allows(
+            OWNED_PAGE_URL,
+            true,
+            true
+        ));
+        assert!(!live_wk_navigation_policy_allows(
+            OWNED_PAGE_URL,
+            false,
+            false
+        ));
+        assert!(!live_wk_navigation_policy_allows(
+            "https://evil.example/",
+            true,
+            false
+        ));
     }
 }

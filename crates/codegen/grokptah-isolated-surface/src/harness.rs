@@ -84,8 +84,27 @@ impl IsolatedSurfaceHarness<crate::ContainedBrowserBackend> {
     ///
     /// Does not latch the physical-CLI authorize flag and does not enable admission.
     pub fn capture_and_observe_receipt_gated(&mut self) -> HarnessResult<GuestFrame> {
-        let _capture = self.backend.capture_live_wk_snapshot()?;
-        IsolatedSurfaceBackend::observe_frame(&self.backend)
+        if self.lifecycle.phase == GuestLifecyclePhase::NotStarted {
+            let now = Utc::now();
+            self.probe_host_sentinels()?;
+            self.lifecycle.begin_boot(now)?;
+            self.channels.open_channel("frame")?;
+            self.channels.open_channel("input")?;
+            match self.backend.capture_live_wk_snapshot() {
+                Ok(_) => {
+                    let frame = IsolatedSurfaceBackend::observe_frame(&self.backend)?;
+                    self.lifecycle.frame_epoch = frame.epoch;
+                    self.lifecycle
+                        .complete_boot(now + chrono::Duration::milliseconds(1))?;
+                    self.probe_host_sentinels()?;
+                    Ok(frame)
+                }
+                Err(err) => Err(err),
+            }
+        } else {
+            let _capture = self.backend.capture_live_wk_snapshot()?;
+            IsolatedSurfaceBackend::observe_frame(&self.backend)
+        }
     }
 }
 

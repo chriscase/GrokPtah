@@ -61,6 +61,8 @@ pub struct ContainedBrowserBackend {
     website_data_store: Option<NonpersistentWebsiteDataStore>,
     #[cfg(feature = "browser-engine")]
     receipt_gated_capture: RefCell<Option<BoundedCapturedFrame>>,
+    #[cfg(all(feature = "browser-engine", target_os = "macos"))]
+    live_wk: RefCell<Option<crate::wk_native_snapshot::LiveWkSession>>,
 }
 
 impl ContainedBrowserBackend {
@@ -81,6 +83,8 @@ impl ContainedBrowserBackend {
             website_data_store: None,
             #[cfg(feature = "browser-engine")]
             receipt_gated_capture: RefCell::new(None),
+            #[cfg(all(feature = "browser-engine", target_os = "macos"))]
+            live_wk: RefCell::new(None),
         }
     }
 
@@ -160,6 +164,25 @@ impl ContainedBrowserBackend {
                 return require_engine_frame_observation(self.frame_epoch, stored.as_ref());
             }
         }
+        #[cfg(target_os = "macos")]
+        {
+            let session = self.live_wk.borrow();
+            if let Some(session) = session.as_ref() {
+                let raster = session.snapshot()?;
+                let handoff = crate::browser_engine_capture::begin_browser_engine_frame_capture(
+                    self.frame_epoch,
+                )?;
+                let capture = crate::browser_engine_capture::complete_browser_engine_frame_capture(
+                    handoff,
+                    raster.bytes,
+                    raster.width,
+                    raster.height,
+                )?;
+                let installed = install_receipt_gated_capture(self.frame_epoch, capture)?;
+                *self.receipt_gated_capture.borrow_mut() = Some(installed.clone());
+                return Ok(installed);
+            }
+        }
         let capture = capture_live_wk_snapshot_through_receipt(self.frame_epoch)?;
         let installed = install_receipt_gated_capture(self.frame_epoch, capture)?;
         *self.receipt_gated_capture.borrow_mut() = Some(installed.clone());
@@ -221,18 +244,14 @@ impl ContainedBrowserBackend {
         self.arm_owned_page()?;
         self.booted = true;
         self.frame_epoch = 1;
-        match capture_live_wk_snapshot_through_receipt(self.frame_epoch) {
+        match self.capture_from_live_session(self.frame_epoch) {
             Ok(capture) => {
                 let installed = install_receipt_gated_capture(self.frame_epoch, capture)?;
                 *self.receipt_gated_capture.borrow_mut() = Some(installed);
                 self.current_frame()
             }
             Err(err) => {
-                self.booted = false;
-                self.frame_epoch = 0;
-                self.current_page = None;
-                self.website_data_store = None;
-                *self.receipt_gated_capture.borrow_mut() = None;
+                self.clear_live_session_state();
                 Err(err)
             }
         }
@@ -251,7 +270,7 @@ impl ContainedBrowserBackend {
             self.booted = true;
             self.frame_epoch = 1;
         }
-        match capture_live_wk_snapshot_through_receipt(self.frame_epoch) {
+        match self.capture_from_live_session(self.frame_epoch) {
             Ok(capture) => {
                 let installed = install_receipt_gated_capture(self.frame_epoch, capture)?;
                 *self.receipt_gated_capture.borrow_mut() = Some(installed.clone());
@@ -259,14 +278,61 @@ impl ContainedBrowserBackend {
             }
             Err(err) => {
                 if !started_booted {
-                    self.booted = false;
-                    self.frame_epoch = 0;
-                    self.current_page = None;
-                    self.website_data_store = None;
-                    *self.receipt_gated_capture.borrow_mut() = None;
+                    self.clear_live_session_state();
                 }
                 Err(err)
             }
+        }
+    }
+
+    #[cfg(feature = "browser-engine")]
+    fn capture_from_live_session(&mut self, epoch: u64) -> HarnessResult<BoundedCapturedFrame> {
+        #[cfg(target_os = "macos")]
+        {
+            if self.live_wk.borrow().is_none() {
+                let session = crate::wk_native_snapshot::LiveWkSession::open()?;
+                *self.live_wk.borrow_mut() = Some(session);
+            }
+            let raster = {
+                let session = self.live_wk.borrow();
+                let session = session.as_ref().ok_or_else(|| {
+                    HarnessError::backend_unavailable("live WK session is not open")
+                })?;
+                session.snapshot()?
+            };
+            if raster
+                .bytes
+                .chunks_exact(4)
+                .all(|pixel| pixel[0] == 255 && pixel[1] == 255 && pixel[2] == 255)
+            {
+                return Err(HarnessError::backend_unavailable(
+                    "live WK snapshot is unpainted window-white, not WK-composited fixture pixels",
+                ));
+            }
+            let handoff = crate::browser_engine_capture::begin_browser_engine_frame_capture(epoch)?;
+            crate::browser_engine_capture::complete_browser_engine_frame_capture(
+                handoff,
+                raster.bytes,
+                raster.width,
+                raster.height,
+            )
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            capture_live_wk_snapshot_through_receipt(epoch)
+        }
+    }
+
+    #[cfg(feature = "browser-engine")]
+    fn clear_live_session_state(&mut self) {
+        self.booted = false;
+        self.frame_epoch = 0;
+        self.current_page = None;
+        self.website_data_store = None;
+        *self.receipt_gated_capture.borrow_mut() = None;
+        #[cfg(target_os = "macos")]
+        {
+            *self.live_wk.borrow_mut() = None;
         }
     }
 
@@ -295,7 +361,7 @@ impl ContainedBrowserBackend {
             GuestLocalAction::TypeGuestText => self.guest_link_clicked,
         };
         let next_epoch = self.frame_epoch.saturating_add(1);
-        let after = self.commit_inject_observation(next_epoch, next_clicked)?;
+        let after = self.commit_inject_observation(next_epoch, next_clicked, action)?;
         let guest_local_change = before.digest != after.digest;
         Ok(InjectOutcome::Changed(crate::simulator::FrameDelta {
             before_epoch: before.epoch,
@@ -307,14 +373,17 @@ impl ContainedBrowserBackend {
     }
 
     /// Observe the post-inject frame, then commit epoch/click/capture together.
-    /// ReceiptGated recaptures at the new epoch; failure leaves prior state.
+    /// ReceiptGated mutates the live owned-page DOM, recaptures at N+1, and
+    /// commits store+epoch together. Mutate/recapture failure leaves prior state.
     fn commit_inject_observation(
         &mut self,
         next_epoch: u64,
         next_clicked: bool,
+        action: GuestLocalAction,
     ) -> HarnessResult<GuestFrame> {
         match self.mode {
             SubstrateMode::Simulator => {
+                let _ = action;
                 let capture =
                     BoundedCapturedFrame::admit_simulator_capture(next_epoch, next_clicked)?;
                 let frame = capture.to_guest_frame(next_clicked);
@@ -324,14 +393,112 @@ impl ContainedBrowserBackend {
             }
             #[cfg(feature = "browser-engine")]
             SubstrateMode::ReceiptGated => {
-                let capture = capture_live_wk_snapshot_through_receipt(next_epoch)?;
-                let installed = install_receipt_gated_capture(next_epoch, capture)?;
-                let frame = installed.to_guest_frame(next_clicked);
-                *self.receipt_gated_capture.borrow_mut() = Some(installed);
-                self.guest_link_clicked = next_clicked;
-                self.frame_epoch = next_epoch;
-                Ok(frame)
+                self.commit_receipt_gated_inject(next_epoch, next_clicked, action)
             }
+        }
+    }
+
+    #[cfg(feature = "browser-engine")]
+    fn commit_receipt_gated_inject(
+        &mut self,
+        next_epoch: u64,
+        next_clicked: bool,
+        action: GuestLocalAction,
+    ) -> HarnessResult<GuestFrame> {
+        #[cfg(target_os = "macos")]
+        {
+            {
+                let session = self.live_wk.borrow();
+                let session = session.as_ref().ok_or_else(|| {
+                    HarnessError::backend_unavailable(
+                        "receipt-gated inject requires an open live WK session",
+                    )
+                })?;
+                session.mutate_main_frame_dom(action)?;
+            }
+            let raster = {
+                let session = self.live_wk.borrow();
+                let session = session.as_ref().ok_or_else(|| {
+                    HarnessError::backend_unavailable(
+                        "receipt-gated inject recapture requires an open live WK session",
+                    )
+                })?;
+                session.snapshot()?
+            };
+            if !crate::wk_native_snapshot::raster_contains_clicked_pixels(&raster.bytes) {
+                return Err(HarnessError::backend_unavailable(
+                    "live WK main-frame DOM mutate produced no pixel change",
+                ));
+            }
+            let handoff =
+                crate::browser_engine_capture::begin_browser_engine_frame_capture(next_epoch)?;
+            let capture = crate::browser_engine_capture::complete_browser_engine_frame_capture(
+                handoff,
+                raster.bytes,
+                raster.width,
+                raster.height,
+            )?;
+            let installed = install_receipt_gated_capture(next_epoch, capture)?;
+            let frame = installed.to_guest_frame(next_clicked);
+            *self.receipt_gated_capture.borrow_mut() = Some(installed);
+            self.guest_link_clicked = next_clicked;
+            self.frame_epoch = next_epoch;
+            Ok(frame)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (next_clicked, action);
+            let _ = next_epoch;
+            Err(HarnessError::backend_unavailable(
+                "live WK snapshot is macOS-only; receipt-gated capture stays fail-closed on this platform",
+            ))
+        }
+    }
+
+    #[cfg(feature = "browser-engine")]
+    pub fn live_website_data_store_is_persistent(&self) -> HarnessResult<bool> {
+        #[cfg(target_os = "macos")]
+        {
+            let session = self.live_wk.borrow();
+            let session = session
+                .as_ref()
+                .ok_or_else(|| HarnessError::backend_unavailable("live WK session is not open"))?;
+            session.website_data_store_is_persistent()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(HarnessError::backend_unavailable(
+                "live WK snapshot is macOS-only; receipt-gated capture stays fail-closed on this platform",
+            ))
+        }
+    }
+
+    /// Drive WK navigation. Off-allowlist URLs are cancelled by the live
+    /// `WKNavigationDelegate`, not only by the Rust `admit_navigation` gate.
+    #[cfg(feature = "browser-engine")]
+    pub fn live_wk_attempt_navigation(&mut self, url: &str) -> HarnessResult<()> {
+        if !self.booted {
+            return Err(HarnessError::invalid_state("browser guest is not booted"));
+        }
+        if self.inject_fenced {
+            return Err(HarnessError::inject_fenced(
+                "browser guest navigation is fenced",
+            ));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let session = self.live_wk.borrow();
+            let session = session
+                .as_ref()
+                .ok_or_else(|| HarnessError::backend_unavailable("live WK session is not open"))?;
+            session.attempt_navigation(url)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = url;
+            Err(HarnessError::backend_unavailable(
+                "live WK snapshot is macOS-only; receipt-gated capture stays fail-closed on this platform",
+            ))
         }
     }
 }
@@ -390,6 +557,10 @@ impl IsolatedSurfaceBackend for ContainedBrowserBackend {
         #[cfg(feature = "browser-engine")]
         {
             *self.receipt_gated_capture.borrow_mut() = None;
+        }
+        #[cfg(all(feature = "browser-engine", target_os = "macos"))]
+        {
+            *self.live_wk.borrow_mut() = None;
         }
         Ok(())
     }

@@ -129,7 +129,24 @@ fn main() {
                 ActionChannel::HostClipboard,
             )
             .expect_err("host clipboard refused");
+        assert!(
+            !backend
+                .live_website_data_store_is_persistent()
+                .expect("runtime store persistence"),
+            "live WK must use a nonpersistent website-data store"
+        );
+        backend
+            .live_wk_attempt_navigation("https://evil.example/")
+            .expect_err("WK navigation policy must deny off-allowlist");
+        assert_eq!(backend.current_page(), Some(OWNED_PAGE_URL));
         assert_admitted_main_frame_inject_does_not_desync(&mut backend);
+        backend.stop_fence_first().expect("fence");
+        let fenced = IsolatedSurfaceBackend::inject_guest_local(
+            &mut backend,
+            GuestLocalAction::ClickGuestButton,
+        )
+        .expect_err("inject after fence");
+        assert_eq!(fenced.code, HarnessErrorCode::InjectFenced);
         backend.destroy().expect("destroy");
         assert!(!backend.is_booted());
         assert!(backend.website_data_store_id().is_none());
@@ -172,6 +189,22 @@ fn main() {
             "ok: ReceiptGated backend+harness observe digest={}",
             harness_frame.digest
         );
+
+        harness.schedule_uncertain_on_next_inject();
+        harness
+            .inject_guest_action(GuestLocalAction::ClickGuestButton)
+            .expect_err("uncertain");
+        let retry = harness
+            .retry_inject_after_uncertain(GuestLocalAction::ClickGuestButton)
+            .expect_err("no auto-retry");
+        assert_eq!(retry.code, HarnessErrorCode::AutoRetryForbidden);
+        let evidence = harness.stop().expect("stop after uncertain");
+        assert_eq!(
+            harness.lifecycle().phase,
+            grokptah_isolated_surface::GuestLifecyclePhase::Destroyed
+        );
+        assert!(evidence.destroy_confirmed(harness.lifecycle().phase));
+        println!("ok: browser-engine Stop/Uncertain/Destroyed-after-confirm");
     }
 }
 
@@ -181,7 +214,7 @@ fn assert_admitted_main_frame_inject_does_not_desync(
 ) {
     use grokptah_isolated_surface::{
         ActionChannel, CapturedFrameSource, FrameKind, GuestLocalAction, HarnessErrorCode,
-        IsolatedSurfaceBackend,
+        InjectOutcome, IsolatedSurfaceBackend,
     };
 
     let before = backend
@@ -194,11 +227,22 @@ fn assert_admitted_main_frame_inject_does_not_desync(
         FrameKind::MainFrame,
         ActionChannel::MainFrameDom,
     ) {
-        Ok(_) => {
+        Ok(outcome) => {
+            let delta = match outcome {
+                InjectOutcome::Changed(delta) => delta,
+                other => panic!("admitted live WK inject must be Changed, got {other:?}"),
+            };
+            assert!(
+                delta.guest_local_change,
+                "live WK main-frame DOM inject must change raster bytes"
+            );
+            assert_ne!(delta.before_digest, delta.after_digest);
+            assert_eq!(delta.after_epoch, original_epoch.saturating_add(1));
             let after = backend
                 .observe_frame()
                 .expect("successful inject must keep observation bound to the new epoch");
             assert_eq!(after.epoch, original_epoch.saturating_add(1));
+            assert_ne!(after.digest, original_digest);
             assert_eq!(
                 after.captured_frame.as_ref().map(|ev| ev.source),
                 Some(CapturedFrameSource::BrowserEngine)
