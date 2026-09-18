@@ -21,6 +21,7 @@ surface), [#267](https://github.com/chriscase/GrokPtah/issues/267) (epic).
 | Restart snapshot for recovery tests | `grokptah-coding-worktree/src/store.rs` |
 | Invariant regression suite | `grokptah-coding-worktree/tests/session_invariants.rs` |
 | Bridge fail-closed seam | `grokptah-agent-bridge/src/coding_worktree.rs` |
+| AgentHost disposition surface | `AgentHostHandle::coding_worktree_*` in `grokptah-agent-bridge/src/coding_worktree.rs` |
 | Bridge integration tests | `grokptah-agent-bridge/tests/coding_worktree_session.rs` |
 
 ## Disposition contract
@@ -88,8 +89,23 @@ cargo test --locked --manifest-path crates/codegen/grokptah-coding-worktree/Carg
 
 ## Residuals (honest, post-slice)
 
-- No UI for Accept / Discard / Keep-for-review disposition.
-- No wiring into AgentHost session lifecycle or desktop chrome.
+Closed by the AgentHost disposition surface (`coding_worktree_*` on
+`AgentHostHandle`):
+
+- Host owns/attaches one `CodingWorktreeSession` per explicit handle (optionally
+  bound to an AgentHost session) and exposes Pause, fence-first Stop, Accept
+  (exact `sha256:` digest, never protected main / host project cwd / bound
+  session cwd), Discard, and Keep-for-review.
+- Pause still fences staging/settlement; attach-after-settlement cannot retry;
+  Uncertain rejects auto-retry; Stop remains legal while Paused; `Destroyed` is
+  recorded only on confirmed destroy. Deleting a bound AgentHost session
+  fence-first Stops its coding worktree.
+- Bridge tests in `coding_worktree_session.rs` cover those host paths.
+
+Still open:
+
+- No UI / Tauri command wrappers for Accept / Discard / Keep-for-review /
+  Pause / Stop. Desktop chrome is a follow-up; this slice is host+tests only.
 - No integration with isolated surface / Computer Mode admission.
 - No live provider calls, host CGEvent, or TCC claims.
 - Apply target selection is explicit API only; no automatic promotion to main.

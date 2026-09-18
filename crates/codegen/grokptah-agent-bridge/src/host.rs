@@ -163,7 +163,7 @@ struct SessionComputerQualification {
 
 pub(crate) struct Inner {
     running: bool,
-    project_cwd: Option<PathBuf>,
+    pub(crate) project_cwd: Option<PathBuf>,
     pub(crate) sessions: HashMap<Uuid, Session>,
     active_session: Option<Uuid>,
     /// Tab strip order from the last desktop session (persisted).
@@ -835,6 +835,10 @@ pub struct AgentHostHandle {
     /// through `grokptah_home()`. Shared by all host clones.
     runtime_home: crate::discover::RuntimeHome,
     _runtime_home_context: Arc<crate::discover::RuntimeHomeContext>,
+    /// Windowed Coding Run disposable worktrees owned by this host. One
+    /// [`crate::CodingWorktreeSession`] per explicit handle, optionally bound
+    /// to an AgentHost session. Not Computer Mode / isolated-surface admission.
+    pub(crate) coding_worktrees: Arc<Mutex<crate::coding_worktree::CodingWorktreeRegistry>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1051,6 +1055,9 @@ impl AgentHost {
             lifecycle: lifecycle.clone(),
             runtime_home,
             _runtime_home_context: runtime_home_context,
+            coding_worktrees: Arc::new(Mutex::new(
+                crate::coding_worktree::CodingWorktreeRegistry::default(),
+            )),
         };
         Ok(HostRuntime::new(handle, lifecycle))
     }
@@ -4091,6 +4098,8 @@ impl AgentHostHandle {
     pub fn session_delete(&self, id: Uuid) -> Result<()> {
         let write = self.durable_write("deleting a session")?;
         self.cancel_computer_agent(id);
+        self.coding_worktree_stop_for_agent_session(id)
+            .map_err(|error| anyhow!(error))?;
         {
             let mut g = self.inner.lock();
             if !g.sessions.contains_key(&id) {

@@ -147,11 +147,12 @@ pub use host_helpers::{replay_xai_provider_contract_on_loopback, ProviderContrac
 pub use memory::{MemoryFact, MemoryScope};
 
 pub use coding_worktree::{
-    digest_bytes, digest_path, snapshot_root, AcceptEvidence, CodingWorktreeIdentity,
-    CodingWorktreeSession, DiscardEvidence, KeepForReviewEvidence, PatchArtifact, PauseEvidence,
-    SessionDisposition, SessionError, SessionErrorCode, SessionLifecycle, SessionPhase,
-    SessionResult, SessionSnapshot, StopEvidence, LIFECYCLE_SCHEMA_VERSION, MAX_PATCH_BYTES,
-    MAX_PATCH_PATHS, SNAPSHOT_FILE, SNAPSHOT_SCHEMA_VERSION, SYNTHETIC_SESSION_NONCLAIM,
+    assert_apply_target_allowed, digest_bytes, digest_path, snapshot_root, AcceptEvidence,
+    CodingWorktreeHostView, CodingWorktreeIdentity, CodingWorktreeSession, DiscardEvidence,
+    KeepForReviewEvidence, PatchArtifact, PauseEvidence, SessionDisposition, SessionError,
+    SessionErrorCode, SessionLifecycle, SessionPhase, SessionResult, SessionSnapshot, StopEvidence,
+    LIFECYCLE_SCHEMA_VERSION, MAX_PATCH_BYTES, MAX_PATCH_PATHS, SNAPSHOT_FILE,
+    SNAPSHOT_SCHEMA_VERSION, SYNTHETIC_SESSION_NONCLAIM,
 };
 pub use completion::{
     enrich_terminal_handoff, CompletionClaims, CompletionEvidence, CompletionObservations,
