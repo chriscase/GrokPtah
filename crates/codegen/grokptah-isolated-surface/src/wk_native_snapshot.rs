@@ -5,9 +5,10 @@
 //! pixels, not `NSView` backing-store white). This is not isolation PASS and
 //! never enables admission. Uniform window-white fail-closes.
 
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::sync::mpsc;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use block2::RcBlock;
@@ -193,14 +194,25 @@ impl LiveWkSession {
         })
     }
 
-    /// Load `url` through WK. Off-allowlist / `_blank` are cancelled by the
-    /// navigation delegate; the owned page stays put.
+    fn webview_key(&self) -> usize {
+        (&*self.webview) as *const AnyObject as usize
+    }
+
+    pub(crate) fn last_navigation_decision(&self) -> Option<(String, isize)> {
+        last_recorded_navigation_decision(self.webview_key())
+    }
+
+    /// Load `url` through WK and wait for the navigation-delegate decision.
+    /// Off-allowlist success is: policy cancelled **and** `current_url` still owned.
+    /// Does not re-deny the requested URL in Rust.
     pub(crate) fn attempt_navigation(&self, url: &str) -> HarnessResult<()> {
         if !is_main_thread() {
             return Err(HarnessError::backend_unavailable(
                 "live WK navigation requires the process main thread",
             ));
         }
+        let key = self.webview_key();
+        clear_navigation_decisions(key);
         let request_url = nsurl(url).ok_or_else(|| {
             HarnessError::backend_unavailable("live WK navigation NSURL unavailable")
         })?;
@@ -213,19 +225,16 @@ impl LiveWkSession {
         })?;
         let _nav: Option<Retained<AnyObject>> =
             unsafe { objc2::msg_send![&*self.webview, loadRequest: &*request] };
-        wait_until_loaded(&self.webview)?;
-        for _ in 0..4 {
-            pump_runloop_briefly();
-        }
+        let decision = wait_for_navigation_decision(key, url)?;
         let current = self.current_url()?;
-        if !live_wk_navigation_policy_allows(url, true, false) {
-            if admit_navigation(&current).is_err() {
-                return Err(HarnessError::invalid_state(format!(
-                    "WK navigation policy leaked off-allowlist URL {current}"
-                )));
-            }
+        if decision.1 != 0 {
             return Err(HarnessError::invalid_state(format!(
-                "off-allowlist navigation denied by WK policy: {url}"
+                "WK navigation policy allowed {url} (current={current})"
+            )));
+        }
+        if admit_navigation(&current).is_err() {
+            return Err(HarnessError::invalid_state(format!(
+                "WK navigation policy leaked off-allowlist URL {current}"
             )));
         }
         Ok(())
@@ -618,14 +627,65 @@ fn navigation_delegate_instance() -> HarnessResult<Retained<AnyObject>> {
     obj.ok_or_else(|| HarnessError::backend_unavailable("WKNavigationDelegate alloc failed"))
 }
 
+type NavigationDecisionLog = HashMap<usize, Vec<(String, isize)>>;
+
+fn navigation_decision_log() -> &'static Mutex<NavigationDecisionLog> {
+    static LOG: OnceLock<Mutex<NavigationDecisionLog>> = OnceLock::new();
+    LOG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn record_navigation_decision(key: usize, url: String, policy: isize) {
+    if let Ok(mut guard) = navigation_decision_log().lock() {
+        guard.entry(key).or_default().push((url, policy));
+    }
+}
+
+fn clear_navigation_decisions(key: usize) {
+    if let Ok(mut guard) = navigation_decision_log().lock() {
+        guard.insert(key, Vec::new());
+    }
+}
+
+fn last_recorded_navigation_decision(key: usize) -> Option<(String, isize)> {
+    navigation_decision_log()
+        .lock()
+        .ok()?
+        .get(&key)?
+        .last()
+        .cloned()
+}
+
+fn wait_for_navigation_decision(key: usize, needle: &str) -> HarnessResult<(String, isize)> {
+    let started = Instant::now();
+    loop {
+        if let Ok(guard) = navigation_decision_log().lock() {
+            if let Some(list) = guard.get(&key) {
+                if let Some(hit) = list.iter().rev().find(|(url, _)| {
+                    url == needle || url.starts_with(needle) || needle.starts_with(url)
+                }) {
+                    return Ok(hit.clone());
+                }
+            }
+        }
+        if started.elapsed() > LOAD_TIMEOUT {
+            return Err(HarnessError::backend_unavailable(format!(
+                "WK navigation delegate did not decide for {needle}"
+            )));
+        }
+        pump_runloop_briefly();
+    }
+}
+
 unsafe extern "C-unwind" fn decide_navigation_policy(
     _this: &AnyObject,
     _cmd: Sel,
-    _webview: *mut AnyObject,
+    webview: *mut AnyObject,
     action: &AnyObject,
     decision_handler: *mut std::ffi::c_void,
 ) {
+    let url = navigation_action_url(action).unwrap_or_default();
     let policy = navigation_action_policy(action);
+    record_navigation_decision(webview as usize, url, policy);
     invoke_navigation_decision(decision_handler, policy);
 }
 

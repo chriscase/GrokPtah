@@ -137,9 +137,26 @@ fn main() {
         );
         backend
             .live_wk_attempt_navigation("https://evil.example/")
-            .expect_err("WK navigation policy must deny off-allowlist");
-        assert_eq!(backend.current_page(), Some(OWNED_PAGE_URL));
-        assert_admitted_main_frame_inject_does_not_desync(&mut backend);
+            .expect("WK cancelled off-allowlist; owned page stays");
+        let wk_url = backend
+            .live_wk_current_url()
+            .expect("WK current_url after cancelled navigation");
+        assert!(
+            wk_url.starts_with(OWNED_PAGE_URL) || wk_url == OWNED_PAGE_URL,
+            "WK current_url must remain the owned page, got {wk_url}"
+        );
+        let (decided_url, policy) = backend
+            .last_wk_navigation_decision()
+            .expect("WKNavigationDelegate must fire a decision");
+        assert_eq!(
+            policy, 0,
+            "off-allowlist must be WK policy cancel, got {policy}"
+        );
+        assert!(
+            decided_url.contains("evil.example"),
+            "cancel decision must be for the requested URL, got {decided_url}"
+        );
+        assert_admitted_main_frame_inject_mutates_digest(&mut backend);
         backend.stop_fence_first().expect("fence");
         let fenced = IsolatedSurfaceBackend::inject_guest_local(
             &mut backend,
@@ -209,12 +226,12 @@ fn main() {
 }
 
 #[cfg(feature = "browser-engine")]
-fn assert_admitted_main_frame_inject_does_not_desync(
+fn assert_admitted_main_frame_inject_mutates_digest(
     backend: &mut grokptah_isolated_surface::ContainedBrowserBackend,
 ) {
     use grokptah_isolated_surface::{
-        ActionChannel, CapturedFrameSource, FrameKind, GuestLocalAction, HarnessErrorCode,
-        InjectOutcome, IsolatedSurfaceBackend,
+        ActionChannel, CapturedFrameSource, FrameKind, GuestLocalAction, InjectOutcome,
+        IsolatedSurfaceBackend,
     };
 
     let before = backend
@@ -222,45 +239,36 @@ fn assert_admitted_main_frame_inject_does_not_desync(
         .expect("observe before admitted main-frame DOM inject");
     let original_epoch = before.epoch;
     let original_digest = before.digest.clone();
-    match backend.inject_dom_action(
-        GuestLocalAction::ClickGuestButton,
-        FrameKind::MainFrame,
-        ActionChannel::MainFrameDom,
-    ) {
-        Ok(outcome) => {
-            let delta = match outcome {
-                InjectOutcome::Changed(delta) => delta,
-                other => panic!("admitted live WK inject must be Changed, got {other:?}"),
-            };
-            assert!(
-                delta.guest_local_change,
-                "live WK main-frame DOM inject must change raster bytes"
-            );
-            assert_ne!(delta.before_digest, delta.after_digest);
-            assert_eq!(delta.after_epoch, original_epoch.saturating_add(1));
-            let after = backend
-                .observe_frame()
-                .expect("successful inject must keep observation bound to the new epoch");
-            assert_eq!(after.epoch, original_epoch.saturating_add(1));
-            assert_ne!(after.digest, original_digest);
-            assert_eq!(
-                after.captured_frame.as_ref().map(|ev| ev.source),
-                Some(CapturedFrameSource::BrowserEngine)
-            );
-        }
-        Err(err) => {
-            assert_eq!(
-                err.code,
-                HarnessErrorCode::BackendUnavailable,
-                "fail-closed inject must be BackendUnavailable without dirty epoch, got {err:?}"
-            );
-            let still = backend.observe_frame().expect(
-                "fail-closed inject must not desync stored capture; observe at original epoch",
-            );
-            assert_eq!(still.epoch, original_epoch);
-            assert_eq!(still.digest, original_digest);
-        }
-    }
+    let outcome = backend
+        .inject_dom_action(
+            GuestLocalAction::ClickGuestButton,
+            FrameKind::MainFrame,
+            ActionChannel::MainFrameDom,
+        )
+        .expect("admitted live WK inject after capture must succeed");
+    let delta = match outcome {
+        InjectOutcome::Changed(delta) => delta,
+        other => panic!("admitted live WK inject must be Changed, got {other:?}"),
+    };
+    assert!(
+        delta.guest_local_change,
+        "live WK main-frame DOM inject must change raster bytes"
+    );
+    assert_ne!(delta.before_digest, delta.after_digest);
+    assert_eq!(delta.after_epoch, original_epoch.saturating_add(1));
+    let after = backend
+        .observe_frame()
+        .expect("successful inject must keep observation bound to the new epoch");
+    assert_eq!(after.epoch, original_epoch.saturating_add(1));
+    assert_ne!(after.digest, original_digest);
+    assert_eq!(
+        after.captured_frame.as_ref().map(|ev| ev.source),
+        Some(CapturedFrameSource::BrowserEngine)
+    );
+    println!(
+        "ok: live WK DOM inject guest_local_change={} before={} after={}",
+        delta.guest_local_change, delta.before_digest, delta.after_digest
+    );
 }
 
 #[cfg(feature = "browser-engine")]

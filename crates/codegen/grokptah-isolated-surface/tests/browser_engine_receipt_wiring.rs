@@ -249,34 +249,34 @@ fn live_wk_backend_containment_after_capture() {
             );
             backend
                 .live_wk_attempt_navigation("https://evil.example/")
-                .expect_err("WK policy deny");
-            match backend.inject_dom_action(
-                GuestLocalAction::ClickGuestButton,
-                FrameKind::MainFrame,
-                ActionChannel::MainFrameDom,
-            ) {
-                Ok(outcome) => {
-                    let grokptah_isolated_surface::InjectOutcome::Changed(delta) = outcome else {
-                        panic!("admitted inject must be Changed");
-                    };
-                    assert!(delta.guest_local_change);
-                    assert_ne!(delta.before_digest, original_digest);
-                    let after = IsolatedSurfaceBackend::observe_frame(&backend)
-                        .expect("successful inject must keep observation bound");
-                    assert_eq!(after.epoch, original_epoch.saturating_add(1));
-                }
-                Err(err) => {
-                    assert_eq!(
-                        err.code,
-                        HarnessErrorCode::BackendUnavailable,
-                        "fail-closed inject must not leave a stale epoch: {err:?}"
-                    );
-                    let still = IsolatedSurfaceBackend::observe_frame(&backend)
-                        .expect("fail-closed inject must not desync stored capture epoch");
-                    assert_eq!(still.epoch, original_epoch);
-                    assert_eq!(still.digest, original_digest);
-                }
-            }
+                .expect("WK cancelled off-allowlist");
+            let wk_url = backend
+                .live_wk_current_url()
+                .expect("WK current_url after cancel");
+            assert!(
+                wk_url.starts_with(OWNED_PAGE_URL) || wk_url == OWNED_PAGE_URL,
+                "WK URL must stay owned, got {wk_url}"
+            );
+            let (decided_url, policy) = backend
+                .last_wk_navigation_decision()
+                .expect("WKNavigationDelegate decision");
+            assert_eq!(policy, 0);
+            assert!(decided_url.contains("evil.example"));
+            let outcome = backend
+                .inject_dom_action(
+                    GuestLocalAction::ClickGuestButton,
+                    FrameKind::MainFrame,
+                    ActionChannel::MainFrameDom,
+                )
+                .expect("admitted inject after live capture must succeed");
+            let grokptah_isolated_surface::InjectOutcome::Changed(delta) = outcome else {
+                panic!("admitted inject must be Changed");
+            };
+            assert!(delta.guest_local_change);
+            assert_ne!(delta.before_digest, original_digest);
+            let after = IsolatedSurfaceBackend::observe_frame(&backend)
+                .expect("successful inject must keep observation bound");
+            assert_eq!(after.epoch, original_epoch.saturating_add(1));
             IsolatedSurfaceBackend::stop_fence_first(&mut backend).expect("fence");
             IsolatedSurfaceBackend::inject_guest_local(
                 &mut backend,

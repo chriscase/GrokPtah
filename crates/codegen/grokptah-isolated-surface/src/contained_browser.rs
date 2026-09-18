@@ -501,6 +501,42 @@ impl ContainedBrowserBackend {
             ))
         }
     }
+
+    /// WKWebView.URL after live navigation, not the Rust `current_page` field.
+    #[cfg(feature = "browser-engine")]
+    pub fn live_wk_current_url(&self) -> HarnessResult<String> {
+        #[cfg(target_os = "macos")]
+        {
+            let session = self.live_wk.borrow();
+            let session = session
+                .as_ref()
+                .ok_or_else(|| HarnessError::backend_unavailable("live WK session is not open"))?;
+            session.current_url()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(HarnessError::backend_unavailable(
+                "live WK snapshot is macOS-only; receipt-gated capture stays fail-closed on this platform",
+            ))
+        }
+    }
+
+    /// Last `WKNavigationDelegate` decision: (url, policy) where 0 = cancel, 1 = allow.
+    #[cfg(feature = "browser-engine")]
+    pub fn last_wk_navigation_decision(&self) -> Option<(String, i64)> {
+        #[cfg(target_os = "macos")]
+        {
+            let session = self.live_wk.borrow();
+            session
+                .as_ref()
+                .and_then(|session| session.last_navigation_decision())
+                .map(|(url, policy)| (url, policy as i64))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
+    }
 }
 
 impl Default for ContainedBrowserBackend {
