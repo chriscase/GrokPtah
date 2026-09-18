@@ -355,6 +355,11 @@ fn pause_fences_staging_and_settlement_stop_still_legal() {
     session
         .persist_create_metadata()
         .expect("persist create metadata");
+    session
+        .write_worktree_file("README.md", "pre-pause edit\n")
+        .expect("write before pause");
+    let patch = session.stage_patch().expect("stage before pause");
+    let apply_root = clone_apply_target(dir.path());
 
     let pause = session.pause(Utc::now()).expect("pause");
     assert_eq!(pause.session_id, "test-session");
@@ -367,6 +372,20 @@ fn pause_fences_staging_and_settlement_stop_still_legal() {
     assert_eq!(write_err.code, SessionErrorCode::InvalidState);
     let stage_err = session.stage_patch().expect_err("stage fenced");
     assert_eq!(stage_err.code, SessionErrorCode::InvalidState);
+
+    let accept_err = session
+        .accept(apply_root.path(), &patch.digest, Utc::now())
+        .expect_err("accept fenced while paused");
+    assert_eq!(accept_err.code, SessionErrorCode::InvalidState);
+    let discard_err = session
+        .discard(Utc::now())
+        .expect_err("discard fenced while paused");
+    assert_eq!(discard_err.code, SessionErrorCode::InvalidState);
+    let keep_err = session
+        .keep_for_review(Utc::now())
+        .expect_err("keep_for_review fenced while paused");
+    assert_eq!(keep_err.code, SessionErrorCode::InvalidState);
+    assert_eq!(session.lifecycle().phase, SessionPhase::Paused);
 
     let evidence = session.stop(Utc::now()).expect("stop after pause");
     assert!(evidence.destroy_confirmed);
