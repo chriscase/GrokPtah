@@ -290,17 +290,12 @@ impl ContainedBrowserBackend {
         }
 
         let before = self.current_frame()?;
-        match action {
-            GuestLocalAction::ClickGuestButton => {
-                // Guest-local link click inside contained browser DOM only.
-                self.guest_link_clicked = true;
-            }
-            GuestLocalAction::TypeGuestText => {
-                // Guest-local text field inside browser surface only.
-            }
-        }
-        self.frame_epoch = self.frame_epoch.saturating_add(1);
-        let after = self.current_frame()?;
+        let next_clicked = match action {
+            GuestLocalAction::ClickGuestButton => true,
+            GuestLocalAction::TypeGuestText => self.guest_link_clicked,
+        };
+        let next_epoch = self.frame_epoch.saturating_add(1);
+        let after = self.commit_inject_observation(next_epoch, next_clicked)?;
         let guest_local_change = before.digest != after.digest;
         Ok(InjectOutcome::Changed(crate::simulator::FrameDelta {
             before_epoch: before.epoch,
@@ -309,6 +304,35 @@ impl ContainedBrowserBackend {
             after_digest: after.digest,
             guest_local_change,
         }))
+    }
+
+    /// Observe the post-inject frame, then commit epoch/click/capture together.
+    /// ReceiptGated recaptures at the new epoch; failure leaves prior state.
+    fn commit_inject_observation(
+        &mut self,
+        next_epoch: u64,
+        next_clicked: bool,
+    ) -> HarnessResult<GuestFrame> {
+        match self.mode {
+            SubstrateMode::Simulator => {
+                let capture =
+                    BoundedCapturedFrame::admit_simulator_capture(next_epoch, next_clicked)?;
+                let frame = capture.to_guest_frame(next_clicked);
+                self.guest_link_clicked = next_clicked;
+                self.frame_epoch = next_epoch;
+                Ok(frame)
+            }
+            #[cfg(feature = "browser-engine")]
+            SubstrateMode::ReceiptGated => {
+                let capture = capture_live_wk_snapshot_through_receipt(next_epoch)?;
+                let installed = install_receipt_gated_capture(next_epoch, capture)?;
+                let frame = installed.to_guest_frame(next_clicked);
+                *self.receipt_gated_capture.borrow_mut() = Some(installed);
+                self.guest_link_clicked = next_clicked;
+                self.frame_epoch = next_epoch;
+                Ok(frame)
+            }
+        }
     }
 }
 
@@ -611,6 +635,36 @@ mod tests {
                 .code,
             crate::error::HarnessErrorCode::BackendUnavailable
         );
+
+        let before = backend
+            .observe_frame()
+            .expect("observe before admitted inject");
+        let original_epoch = before.epoch;
+        let original_digest = before.digest.clone();
+        match backend.inject_dom_action(
+            GuestLocalAction::ClickGuestButton,
+            FrameKind::MainFrame,
+            ActionChannel::MainFrameDom,
+        ) {
+            Ok(_) => {
+                let after = backend
+                    .observe_frame()
+                    .expect("successful inject must keep observation bound");
+                assert_eq!(after.epoch, original_epoch.saturating_add(1));
+            }
+            Err(err) => {
+                assert_eq!(
+                    err.code,
+                    crate::error::HarnessErrorCode::BackendUnavailable,
+                    "fail-closed inject must not leave a stale epoch: {err:?}"
+                );
+                let still = backend
+                    .observe_frame()
+                    .expect("fail-closed inject must not desync stored capture epoch");
+                assert_eq!(still.epoch, original_epoch);
+                assert_eq!(still.digest, original_digest);
+            }
+        }
 
         backend.destroy().expect("destroy");
         assert!(!backend.is_booted());

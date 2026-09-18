@@ -234,6 +234,32 @@ fn live_wk_backend_containment_after_capture() {
                     ActionChannel::HostKeyboard,
                 )
                 .expect_err("keyboard");
+            let before = IsolatedSurfaceBackend::observe_frame(&backend)
+                .expect("observe before admitted main-frame DOM inject");
+            let original_epoch = before.epoch;
+            let original_digest = before.digest.clone();
+            match backend.inject_dom_action(
+                GuestLocalAction::ClickGuestButton,
+                FrameKind::MainFrame,
+                ActionChannel::MainFrameDom,
+            ) {
+                Ok(_) => {
+                    let after = IsolatedSurfaceBackend::observe_frame(&backend)
+                        .expect("successful inject must keep observation bound");
+                    assert_eq!(after.epoch, original_epoch.saturating_add(1));
+                }
+                Err(err) => {
+                    assert_eq!(
+                        err.code,
+                        HarnessErrorCode::BackendUnavailable,
+                        "fail-closed inject must not leave a stale epoch: {err:?}"
+                    );
+                    let still = IsolatedSurfaceBackend::observe_frame(&backend)
+                        .expect("fail-closed inject must not desync stored capture epoch");
+                    assert_eq!(still.epoch, original_epoch);
+                    assert_eq!(still.digest, original_digest);
+                }
+            }
             backend.destroy().expect("destroy");
             assert!(backend.website_data_store_id().is_none());
             match backend.capture_live_wk_snapshot() {

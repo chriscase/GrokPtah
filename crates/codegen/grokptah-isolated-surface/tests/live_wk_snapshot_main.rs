@@ -129,6 +129,7 @@ fn main() {
                 ActionChannel::HostClipboard,
             )
             .expect_err("host clipboard refused");
+        assert_admitted_main_frame_inject_does_not_desync(&mut backend);
         backend.destroy().expect("destroy");
         assert!(!backend.is_booted());
         assert!(backend.website_data_store_id().is_none());
@@ -171,6 +172,50 @@ fn main() {
             "ok: ReceiptGated backend+harness observe digest={}",
             harness_frame.digest
         );
+    }
+}
+
+#[cfg(feature = "browser-engine")]
+fn assert_admitted_main_frame_inject_does_not_desync(
+    backend: &mut grokptah_isolated_surface::ContainedBrowserBackend,
+) {
+    use grokptah_isolated_surface::{
+        ActionChannel, CapturedFrameSource, FrameKind, GuestLocalAction, HarnessErrorCode,
+        IsolatedSurfaceBackend,
+    };
+
+    let before = backend
+        .observe_frame()
+        .expect("observe before admitted main-frame DOM inject");
+    let original_epoch = before.epoch;
+    let original_digest = before.digest.clone();
+    match backend.inject_dom_action(
+        GuestLocalAction::ClickGuestButton,
+        FrameKind::MainFrame,
+        ActionChannel::MainFrameDom,
+    ) {
+        Ok(_) => {
+            let after = backend
+                .observe_frame()
+                .expect("successful inject must keep observation bound to the new epoch");
+            assert_eq!(after.epoch, original_epoch.saturating_add(1));
+            assert_eq!(
+                after.captured_frame.as_ref().map(|ev| ev.source),
+                Some(CapturedFrameSource::BrowserEngine)
+            );
+        }
+        Err(err) => {
+            assert_eq!(
+                err.code,
+                HarnessErrorCode::BackendUnavailable,
+                "fail-closed inject must be BackendUnavailable without dirty epoch, got {err:?}"
+            );
+            let still = backend.observe_frame().expect(
+                "fail-closed inject must not desync stored capture; observe at original epoch",
+            );
+            assert_eq!(still.epoch, original_epoch);
+            assert_eq!(still.digest, original_digest);
+        }
     }
 }
 
