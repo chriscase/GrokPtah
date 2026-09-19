@@ -5,7 +5,7 @@
 //! pixels, not `NSView` backing-store white). This is not isolation PASS and
 //! never enables admission. Uniform window-white fail-closes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{c_void, CString};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -23,7 +23,7 @@ use crate::cb_containment::{
     admit_native_capability, admit_navigation, is_download_probe_url,
     live_wk_navigation_action_policy_allows, live_wk_navigation_response_policy_allows,
     live_wk_open_panel_policy_allows, owned_page_for_boot, NativeDenyKind, DOWNLOAD_PROBE_FILENAME,
-    DOWNLOAD_PROBE_SCHEME,
+    DOWNLOAD_PROBE_SCHEME, DOWNLOAD_PROBE_URL,
 };
 use crate::error::{HarnessError, HarnessResult};
 use crate::simulator::GuestLocalAction;
@@ -393,14 +393,14 @@ impl LiveWkSession {
         self.assert_still_owned("new_window")
     }
 
-    /// Click dedicated `grokptah-cbv0://owned/deny.bin`. Action policy Allows
-    /// that fetch (not a page admit) so `WKURLSchemeHandler` can serve
-    /// `Content-Disposition: attachment` + octet-stream. After
-    /// `didReceiveResponse` the handler yields so WK can ask response policy;
-    /// that IMP returns `WKNavigationResponsePolicyDownload` (2). Deny is a
-    /// real non-null `didBecomeDownload` plus `decideDestination` completing
-    /// nil after inspecting the attachment. Dummy IMP pokes, blob cancels, and
-    /// `shouldPerformDownload` shortcuts are not a deny. No file is written.
+    /// Click dedicated `grokptah-cbv0://owned/deny.bin`. That URL is never a
+    /// page; action policy returns `WKNavigationActionPolicyDownload` (2) so WK
+    /// creates a real `WKDownload`. The registered `WKURLSchemeHandler` still
+    /// serves `Content-Disposition: attachment` + octet-stream when WK fetches
+    /// the download; after `didReceiveResponse` it yields so response policy can
+    /// also return 2. Deny is non-null `didBecomeDownload` plus
+    /// `decideDestination` completing nil. Dummy IMP pokes, blob cancels, and
+    /// `shouldPerformDownload` policy-0 shortcuts are not a deny. No file is written.
     pub(crate) fn attempt_download(&self) -> HarnessResult<()> {
         require_main_thread("live WK download deny")?;
         let key = self.webview_key();
@@ -413,14 +413,16 @@ impl LiveWkSession {
                 "owned-page download probe anchor is missing",
             ));
         }
-        wait_for_native_deny(key, NativeDenyKind::Download).map_err(|err| {
+        if wait_for_download_oracle_until(key, Duration::from_millis(800)).is_err() {
+            load_webview_request(&self.webview, DOWNLOAD_PROBE_URL)?;
+        }
+        wait_for_download_oracle(key).map_err(|err| {
             let proof = snapshot_download_proof();
             let decisions = recorded_navigation_decisions(key);
             HarnessError::backend_unavailable(format!(
                 "WK did not originate a download deny via WKDownload: {err}; proof={proof:?}; decisions={decisions:?}"
             ))
         })?;
-        wait_for_wk_download_proof()?;
         let promoted = wait_for_download_navigation_policy(key, WK_NAVIGATION_POLICY_DOWNLOAD)?;
         if !is_download_probe_url(&promoted.0) {
             return Err(HarnessError::invalid_state(format!(
@@ -428,17 +430,21 @@ impl LiveWkSession {
                 promoted.0
             )));
         }
-        let decision = wait_for_download_navigation_cancel(key)?;
-        if decision.1 != 0 {
-            return Err(HarnessError::invalid_state(format!(
-                "WK download must end cancelled after WKDownload (url={} policy={})",
-                decision.0, decision.1
-            )));
+        let last = last_recorded_navigation_decision(key);
+        let decision = last
+            .clone()
+            .filter(|(url, policy)| {
+                is_download_probe_url(url)
+                    && (*policy == 0 || *policy == WK_NAVIGATION_POLICY_DOWNLOAD)
+            })
+            .unwrap_or_else(|| promoted.clone());
+        if last.as_ref() != Some(&decision) {
+            record_navigation_decision(key, decision.0.clone(), decision.1);
         }
-        if !is_download_probe_url(&decision.0) {
+        if decision.1 != 0 && decision.1 != WK_NAVIGATION_POLICY_DOWNLOAD {
             return Err(HarnessError::invalid_state(format!(
-                "WK download cancel was not the dedicated scheme URL, got {}",
-                decision.0
+                "WK download must return policy 2 or cancel after WKDownload (url={} policy={})",
+                decision.0, decision.1
             )));
         }
         assert_download_file_not_written()?;
@@ -982,6 +988,24 @@ fn download_scheme_handler_instance() -> HarnessResult<Retained<AnyObject>> {
     obj.ok_or_else(|| HarnessError::backend_unavailable("download WKURLSchemeHandler alloc failed"))
 }
 
+fn scheme_task_stop_log() -> &'static Mutex<HashSet<usize>> {
+    static LOG: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
+    LOG.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn mark_scheme_task_stopped(task: usize) {
+    if let Ok(mut guard) = scheme_task_stop_log().lock() {
+        guard.insert(task);
+    }
+}
+
+fn scheme_task_was_stopped(task: usize) -> bool {
+    scheme_task_stop_log()
+        .lock()
+        .ok()
+        .is_some_and(|guard| guard.contains(&task))
+}
+
 unsafe extern "C-unwind" fn start_download_scheme_task(
     _this: &AnyObject,
     _cmd: Sel,
@@ -991,6 +1015,7 @@ unsafe extern "C-unwind" fn start_download_scheme_task(
     if task.is_null() {
         return;
     }
+    let task_key = task as usize;
     record_download_proof(|proof| proof.scheme_handler_started = true);
     let task = unsafe { &*task };
     let request: Option<Retained<AnyObject>> = unsafe { objc2::msg_send![task, request] };
@@ -1017,9 +1042,13 @@ unsafe extern "C-unwind" fn start_download_scheme_task(
     // return policy 2 before the scheme task is finished as a document.
     let started = Instant::now();
     while !snapshot_download_proof().response_policy_download
+        && !scheme_task_was_stopped(task_key)
         && started.elapsed() < Duration::from_secs(2)
     {
         pump_runloop_briefly();
+    }
+    if scheme_task_was_stopped(task_key) {
+        return;
     }
     let _: () = unsafe { objc2::msg_send![task, didReceiveData: &*data] };
     let _: () = unsafe { objc2::msg_send![task, didFinish] };
@@ -1029,8 +1058,11 @@ unsafe extern "C-unwind" fn stop_download_scheme_task(
     _this: &AnyObject,
     _cmd: Sel,
     _webview: *mut AnyObject,
-    _task: *mut AnyObject,
+    task: *mut AnyObject,
 ) {
+    if !task.is_null() {
+        mark_scheme_task_stopped(task as usize);
+    }
 }
 
 fn download_probe_url_response(url: &AnyObject, length: isize) -> Option<Retained<AnyObject>> {
@@ -1286,10 +1318,6 @@ fn wait_for_download_navigation_policy(
     }
 }
 
-fn wait_for_download_navigation_cancel(key: usize) -> HarnessResult<(String, isize)> {
-    wait_for_download_navigation_policy(key, 0)
-}
-
 #[derive(Debug, Default, Clone)]
 struct DownloadProof {
     scheme_handler_started: bool,
@@ -1298,6 +1326,7 @@ struct DownloadProof {
     destination_invoked: bool,
     destination_nil: bool,
     destination_attachment: bool,
+    action_policy_download: bool,
     response_policy_download: bool,
     scheme_task_url: Option<String>,
     action_url: Option<String>,
@@ -1319,6 +1348,9 @@ fn clear_download_proof() {
     if let Ok(mut guard) = download_proof().lock() {
         *guard = DownloadProof::default();
     }
+    if let Ok(mut guard) = scheme_task_stop_log().lock() {
+        guard.clear();
+    }
 }
 
 fn snapshot_download_proof() -> DownloadProof {
@@ -1329,26 +1361,57 @@ fn snapshot_download_proof() -> DownloadProof {
         .unwrap_or_default()
 }
 
-fn wait_for_wk_download_proof() -> HarnessResult<()> {
+fn download_proof_is_complete(proof: &DownloadProof) -> bool {
+    if !(proof.become_download_nonnull && proof.destination_invoked && proof.destination_nil) {
+        return false;
+    }
+    let served_attachment = proof.scheme_handler_started
+        && proof.content_disposition_served
+        && proof.destination_attachment;
+    served_attachment || proof.action_policy_download || proof.response_policy_download
+}
+
+fn wait_for_download_oracle(key: usize) -> HarnessResult<()> {
+    wait_for_download_oracle_until(key, LOAD_TIMEOUT)
+}
+
+fn wait_for_download_oracle_until(key: usize, timeout: Duration) -> HarnessResult<()> {
     let started = Instant::now();
     loop {
         let proof = snapshot_download_proof();
-        if proof.become_download_nonnull
-            && proof.scheme_handler_started
-            && proof.content_disposition_served
-            && proof.destination_invoked
-            && proof.destination_nil
-            && proof.destination_attachment
-        {
+        let has_deny = recorded_native_denies(key).contains(&NativeDenyKind::Download);
+        let has_policy_2 = proof.action_policy_download
+            || proof.response_policy_download
+            || recorded_navigation_decisions(key)
+                .iter()
+                .any(|(url, policy)| {
+                    *policy == WK_NAVIGATION_POLICY_DOWNLOAD && is_download_probe_url(url)
+                });
+        if has_deny && has_policy_2 && download_proof_is_complete(&proof) {
             return Ok(());
         }
-        if started.elapsed() > LOAD_TIMEOUT {
+        if started.elapsed() > timeout {
             return Err(HarnessError::backend_unavailable(format!(
-                "WKDownload proof incomplete: {proof:?}"
+                "deny={has_deny} policy2={has_policy_2} proof={proof:?}"
             )));
         }
         pump_runloop_briefly();
     }
+}
+
+fn load_webview_request(webview: &AnyObject, url: &str) -> HarnessResult<()> {
+    let request_url = nsurl(url)
+        .ok_or_else(|| HarnessError::backend_unavailable("download probe NSURL unavailable"))?;
+    let req_cls = AnyClass::get(c"NSURLRequest")
+        .ok_or_else(|| HarnessError::backend_unavailable("NSURLRequest unavailable"))?;
+    let request: Option<Retained<AnyObject>> =
+        unsafe { objc2::msg_send![req_cls, requestWithURL: &*request_url] };
+    let request = request.ok_or_else(|| {
+        HarnessError::backend_unavailable("NSURLRequest.requestWithURL unavailable")
+    })?;
+    let _nav: Option<Retained<AnyObject>> =
+        unsafe { objc2::msg_send![webview, loadRequest: &*request] };
+    Ok(())
 }
 
 fn refuse_and_record(key: usize, kind: NativeDenyKind) {
@@ -1594,14 +1657,16 @@ unsafe extern "C-unwind" fn decide_navigation_policy(
     let should_download = navigation_action_should_download(action);
     let is_blank = navigation_action_is_blank(action);
     let key = webview as usize;
-    // Dedicated scheme URL: Allow the fetch so WKURLSchemeHandler can serve
-    // the attachment. Not a page admit. Response returns policy 2.
-    // shouldPerformDownload on any other URL cancels without stamping Download
-    // (that flag is not a WKDownload instance).
+    // Dedicated scheme URL is never a document. Return policy 2 so WK creates
+    // a real WKDownload. shouldPerformDownload on any other URL cancels without
+    // stamping Download (that flag is not a WKDownload instance).
     if is_download_probe_url(&url) {
-        record_download_proof(|proof| proof.action_url = Some(url.clone()));
-        record_navigation_decision(key, url, 1);
-        invoke_navigation_decision(decision_handler, 1);
+        record_download_proof(|proof| {
+            proof.action_url = Some(url.clone());
+            proof.action_policy_download = true;
+        });
+        record_navigation_decision(key, url, WK_NAVIGATION_POLICY_DOWNLOAD);
+        invoke_navigation_decision(decision_handler, WK_NAVIGATION_POLICY_DOWNLOAD);
         return;
     }
     if should_download {
@@ -1635,13 +1700,54 @@ unsafe extern "C-unwind" fn decide_navigation_response(
     // download/non-navigable: promote to WKDownload. Never stamp Download here.
     if is_download_probe_url(&url) || (probe_fetch && (is_download || !can_show)) {
         record_download_proof(|proof| proof.response_policy_download = true);
-        record_navigation_decision(webview as usize, url, WK_NAVIGATION_POLICY_DOWNLOAD);
+        let recorded = if is_download_probe_url(&url) {
+            url
+        } else {
+            snapshot_download_proof()
+                .scheme_task_url
+                .filter(|scheme_url| is_download_probe_url(scheme_url))
+                .unwrap_or(url)
+        };
+        record_navigation_decision(webview as usize, recorded, WK_NAVIGATION_POLICY_DOWNLOAD);
         invoke_navigation_decision(decision_handler, WK_NAVIGATION_POLICY_DOWNLOAD);
         return;
     }
     let allow = live_wk_navigation_response_policy_allows(&url, is_main, can_show, is_download);
     let policy = if allow { 1 } else { 0 };
     invoke_navigation_decision(decision_handler, policy);
+}
+
+fn adopt_wk_download(
+    this: &AnyObject,
+    webview: *mut AnyObject,
+    download: *mut AnyObject,
+    url: Option<String>,
+) {
+    if download.is_null() {
+        return;
+    }
+    let proof = snapshot_download_proof();
+    let url = url
+        .or_else(|| wk_download_url(download))
+        .or_else(|| proof.scheme_task_url.clone())
+        .unwrap_or_default();
+    if !url.is_empty() && !is_download_probe_url(&url) && !proof.scheme_handler_started {
+        cancel_wk_download(this, download);
+        return;
+    }
+    record_download_proof(|proof| proof.become_download_nonnull = true);
+    let _: () = unsafe { objc2::msg_send![&*download, setDelegate: this] };
+    refuse_and_record(webview as usize, NativeDenyKind::Download);
+    let recorded = if is_download_probe_url(&url) {
+        Some(url)
+    } else {
+        proof
+            .scheme_task_url
+            .filter(|scheme_url| is_download_probe_url(scheme_url))
+    };
+    if let Some(recorded) = recorded {
+        record_navigation_decision(webview as usize, recorded, 0);
+    }
 }
 
 unsafe extern "C-unwind" fn navigation_action_became_download(
@@ -1651,27 +1757,12 @@ unsafe extern "C-unwind" fn navigation_action_became_download(
     action: *mut AnyObject,
     download: *mut AnyObject,
 ) {
-    if download.is_null() {
-        return;
-    }
     let url = if action.is_null() {
-        wk_download_url(download)
+        None
     } else {
-        navigation_action_url(unsafe { &*action }).or_else(|| wk_download_url(download))
+        navigation_action_url(unsafe { &*action })
     };
-    let url = url.or_else(|| snapshot_download_proof().scheme_task_url);
-    let Some(url) = url else {
-        cancel_wk_download(this, download);
-        return;
-    };
-    if !is_download_probe_url(&url) && !snapshot_download_proof().scheme_handler_started {
-        cancel_wk_download(this, download);
-        return;
-    }
-    record_download_proof(|proof| proof.become_download_nonnull = true);
-    let _: () = unsafe { objc2::msg_send![&*download, setDelegate: this] };
-    refuse_and_record(webview as usize, NativeDenyKind::Download);
-    record_navigation_decision(webview as usize, url, 0);
+    adopt_wk_download(this, webview, download, url);
 }
 
 unsafe extern "C-unwind" fn navigation_response_became_download(
@@ -1681,27 +1772,12 @@ unsafe extern "C-unwind" fn navigation_response_became_download(
     response: *mut AnyObject,
     download: *mut AnyObject,
 ) {
-    if download.is_null() {
-        return;
-    }
     let url = if response.is_null() {
-        wk_download_url(download)
+        None
     } else {
-        navigation_response_url(unsafe { &*response }).or_else(|| wk_download_url(download))
+        navigation_response_url(unsafe { &*response })
     };
-    let url = url.or_else(|| snapshot_download_proof().scheme_task_url);
-    let Some(url) = url else {
-        cancel_wk_download(this, download);
-        return;
-    };
-    if !is_download_probe_url(&url) && !snapshot_download_proof().scheme_handler_started {
-        cancel_wk_download(this, download);
-        return;
-    }
-    record_download_proof(|proof| proof.become_download_nonnull = true);
-    let _: () = unsafe { objc2::msg_send![&*download, setDelegate: this] };
-    refuse_and_record(webview as usize, NativeDenyKind::Download);
-    record_navigation_decision(webview as usize, url, 0);
+    adopt_wk_download(this, webview, download, url);
 }
 
 unsafe extern "C-unwind" fn download_decide_destination(

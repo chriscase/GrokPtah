@@ -27,8 +27,12 @@ pub const DOWNLOAD_PROBE_FILENAME: &str = "deny.bin";
 
 /// True when `url` is the dedicated `grokptah-cbv0` download probe.
 /// Not a page admit. Not `blob:`. Not an owned-path `.bin` document.
+/// WK may canonicalize `grokptah-cbv0://owned/deny.bin` with extra slashes.
 pub fn is_download_probe_url(url: &str) -> bool {
-    url == DOWNLOAD_PROBE_URL || url.starts_with("grokptah-cbv0://owned/")
+    let Some(rest) = url.trim().strip_prefix("grokptah-cbv0:") else {
+        return false;
+    };
+    rest.trim_start_matches('/').starts_with("owned/")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,6 +215,8 @@ mod tests {
         admit_navigation(DOWNLOAD_PROBE_URL).expect_err("download probe is not a page");
         assert!(is_download_probe_url(DOWNLOAD_PROBE_URL));
         assert!(is_download_probe_url("grokptah-cbv0://owned/deny.bin"));
+        assert!(is_download_probe_url("grokptah-cbv0:///owned/deny.bin"));
+        assert!(is_download_probe_url("grokptah-cbv0://owned/deny.bin/"));
         assert!(!is_download_probe_url(
             "https://grokptah.owned.invalid/cb-v0/deny.bin"
         ));
