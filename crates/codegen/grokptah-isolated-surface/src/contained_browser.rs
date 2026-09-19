@@ -584,7 +584,7 @@ impl ContainedBrowserBackend {
     pub fn live_wk_attempt_window_open(&mut self) -> HarnessResult<()> {
         #[cfg(target_os = "macos")]
         {
-            return self.live_wk_native_deny_session(|session| session.attempt_window_open());
+            self.live_wk_native_deny_session(|session| session.attempt_window_open())
         }
         #[cfg(not(target_os = "macos"))]
         live_wk_macos_only()
@@ -594,7 +594,7 @@ impl ContainedBrowserBackend {
     pub fn live_wk_attempt_popup(&mut self) -> HarnessResult<()> {
         #[cfg(target_os = "macos")]
         {
-            return self.live_wk_native_deny_session(|session| session.attempt_popup());
+            self.live_wk_native_deny_session(|session| session.attempt_popup())
         }
         #[cfg(not(target_os = "macos"))]
         live_wk_macos_only()
@@ -604,7 +604,7 @@ impl ContainedBrowserBackend {
     pub fn live_wk_attempt_new_window(&mut self) -> HarnessResult<()> {
         #[cfg(target_os = "macos")]
         {
-            return self.live_wk_native_deny_session(|session| session.attempt_blank_target());
+            self.live_wk_native_deny_session(|session| session.attempt_blank_target())
         }
         #[cfg(not(target_os = "macos"))]
         live_wk_macos_only()
@@ -614,7 +614,7 @@ impl ContainedBrowserBackend {
     pub fn live_wk_attempt_download(&mut self) -> HarnessResult<()> {
         #[cfg(target_os = "macos")]
         {
-            return self.live_wk_native_deny_session(|session| session.attempt_download());
+            self.live_wk_native_deny_session(|session| session.attempt_download())
         }
         #[cfg(not(target_os = "macos"))]
         live_wk_macos_only()
@@ -624,7 +624,7 @@ impl ContainedBrowserBackend {
     pub fn live_wk_attempt_file_picker(&mut self) -> HarnessResult<()> {
         #[cfg(target_os = "macos")]
         {
-            return self.live_wk_native_deny_session(|session| session.attempt_file_picker());
+            self.live_wk_native_deny_session(|session| session.attempt_file_picker())
         }
         #[cfg(not(target_os = "macos"))]
         live_wk_macos_only()
@@ -634,7 +634,7 @@ impl ContainedBrowserBackend {
     pub fn live_wk_attempt_directory_picker(&mut self) -> HarnessResult<()> {
         #[cfg(target_os = "macos")]
         {
-            return self.live_wk_native_deny_session(|session| session.attempt_directory_picker());
+            self.live_wk_native_deny_session(|session| session.attempt_directory_picker())
         }
         #[cfg(not(target_os = "macos"))]
         live_wk_macos_only()
@@ -644,8 +644,7 @@ impl ContainedBrowserBackend {
     pub fn live_wk_write_local_storage(&mut self, key: &str, value: &str) -> HarnessResult<()> {
         #[cfg(target_os = "macos")]
         {
-            return self
-                .live_wk_native_deny_session(|session| session.write_local_storage(key, value));
+            self.live_wk_native_deny_session(|session| session.write_local_storage(key, value))
         }
         #[cfg(not(target_os = "macos"))]
         {

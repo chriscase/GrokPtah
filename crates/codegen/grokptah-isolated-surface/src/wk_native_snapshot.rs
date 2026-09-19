@@ -313,7 +313,7 @@ impl LiveWkSession {
 
     /// `<a download>` click. Native download path must cancel, never save.
     pub(crate) fn attempt_download(&self) -> HarnessResult<()> {
-        self.require_main_thread("live WK download deny")?;
+        require_main_thread("live WK download deny")?;
         let key = self.webview_key();
         clear_native_denies(key);
         let result = evaluate_javascript_value(&self.webview, DOWNLOAD_CLICK_JS)?;
@@ -345,7 +345,7 @@ impl LiveWkSession {
     }
 
     pub(crate) fn write_local_storage(&self, key: &str, value: &str) -> HarnessResult<()> {
-        self.require_main_thread("live WK localStorage write")?;
+        require_main_thread("live WK localStorage write")?;
         let js = format!(
             "(function(){{localStorage.setItem({k},{v});return localStorage.getItem({k})||'';}})()",
             k = js_string_literal(key),
@@ -361,23 +361,13 @@ impl LiveWkSession {
     }
 
     pub(crate) fn read_local_storage(&self, key: &str) -> HarnessResult<Option<String>> {
-        self.require_main_thread("live WK localStorage read")?;
+        require_main_thread("live WK localStorage read")?;
         let js = format!(
             "(function(){{var v=localStorage.getItem({k});return v===null?'':v;}})()",
             k = js_string_literal(key),
         );
         let value = evaluate_javascript_value(&self.webview, &js)?;
         Ok(value.filter(|s| !s.is_empty()))
-    }
-
-    fn require_main_thread(&self, what: &str) -> HarnessResult<()> {
-        let _ = self;
-        if !is_main_thread() {
-            return Err(HarnessError::backend_unavailable(format!(
-                "{what} requires the process main thread"
-            )));
-        }
-        Ok(())
     }
 
     fn assert_still_owned(&self, what: &str) -> HarnessResult<()> {
@@ -391,7 +381,7 @@ impl LiveWkSession {
     }
 
     fn attempt_create_webview_js(&self, js: &str, kind: NativeDenyKind) -> HarnessResult<()> {
-        self.require_main_thread("live WK createWebView deny")?;
+        require_main_thread("live WK createWebView deny")?;
         let key = self.webview_key();
         clear_native_denies(key);
         let result = evaluate_javascript_value(&self.webview, js)?;
@@ -464,7 +454,7 @@ impl LiveWkSession {
         &self,
         allows_directories: bool,
     ) -> HarnessResult<()> {
-        self.require_main_thread("live WK open-panel deny")?;
+        require_main_thread("live WK open-panel deny")?;
         let kind = if allows_directories {
             NativeDenyKind::DirectoryPicker
         } else {
@@ -486,7 +476,7 @@ impl LiveWkSession {
             return self.assert_still_owned(kind.as_str());
         }
         let delegate = attached_ui_delegate(&self.webview)?;
-        let params = open_panel_parameters(allows_directories)?;
+        let params = probe_open_panel_parameters(allows_directories)?;
         let (tx, rx) = mpsc::sync_channel::<bool>(1);
         let block = RcBlock::new(move |urls: *mut AnyObject| {
             let _ = tx.send(urls.is_null());
@@ -815,6 +805,15 @@ fn is_main_thread() -> bool {
         return false;
     };
     unsafe { objc2::msg_send![cls, isMainThread] }
+}
+
+fn require_main_thread(what: &str) -> HarnessResult<()> {
+    if !is_main_thread() {
+        return Err(HarnessError::backend_unavailable(format!(
+            "{what} requires the process main thread"
+        )));
+    }
+    Ok(())
 }
 
 fn webkit_loaded() -> bool {
@@ -1290,11 +1289,7 @@ fn navigation_action_policy(action: &AnyObject) -> isize {
     let is_blank = target.is_none();
     let is_main = target
         .as_deref()
-        .map(|frame| {
-            let main: bool = unsafe { objc2::msg_send![frame, isMainFrame] };
-            main
-        })
-        .unwrap_or(false);
+        .is_some_and(|frame| unsafe { objc2::msg_send![frame, isMainFrame] });
     let url = navigation_action_url(action).unwrap_or_default();
     let should_download = navigation_action_should_download(action);
     if live_wk_navigation_action_policy_allows(&url, is_main, is_blank, should_download) {
@@ -1400,10 +1395,6 @@ fn wk_window_features() -> HarnessResult<Retained<AnyObject>> {
     let cls = AnyClass::get(c"WKWindowFeatures").unwrap_or(NSObject::class());
     let obj: Option<Retained<AnyObject>> = unsafe { objc2::msg_send![cls, new] };
     obj.ok_or_else(|| HarnessError::backend_unavailable("WKWindowFeatures alloc failed"))
-}
-
-fn open_panel_parameters(allows_directories: bool) -> HarnessResult<Retained<AnyObject>> {
-    probe_open_panel_parameters(allows_directories)
 }
 
 fn probe_open_panel_parameters(allows_directories: bool) -> HarnessResult<Retained<AnyObject>> {
