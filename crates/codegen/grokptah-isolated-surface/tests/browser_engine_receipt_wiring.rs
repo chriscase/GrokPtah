@@ -444,14 +444,11 @@ fn assert_live_wk_native_denies_and_fresh_store(
     );
     let (dl_url, dl_policy) = backend
         .last_wk_navigation_decision()
-        .expect("WKNavigationDelegate must decide the download probe");
-    assert!(
-        dl_policy == 0 || dl_policy == 2,
-        "download must return WK policy 2 or cancel after WKDownload, got {dl_policy}"
-    );
+        .expect("WKNavigationDelegate must cancel the download probe");
+    assert_eq!(dl_policy, 0);
     assert!(
         grokptah_isolated_surface::is_download_probe_url(&dl_url),
-        "download decision must be the dedicated grokptah-cbv0 URL, got {dl_url}"
+        "download cancel decision must be the dedicated grokptah-cbv0 URL, got {dl_url}"
     );
     backend
         .live_wk_attempt_file_picker()

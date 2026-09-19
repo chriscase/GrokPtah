@@ -179,16 +179,18 @@ a WK-originated createWebView callback (JS `null` without that callback is not a
 missing createWebView IMP fail-closes because unimplemented createWebView is fail-open).
 `target=_blank` is cancelled by `WKNavigationDelegate` (`targetFrame == nil`) and recorded
 as `NewWindow`. Download probes click dedicated `grokptah-cbv0://owned/deny.bin`. Live WK
-registers a `WKURLSchemeHandler` that serves `Content-Disposition: attachment` plus
-octet-stream (`X-Content-Type-Options: nosniff`, ZIP-magic body so WK cannot sniff
-`text/plain`). Action policy returns `WKNavigationActionPolicyDownload` (2) so WK
-creates a `WKDownload` (the URL is never a page). The handler answers on the next
-runloop turn, not reentrantly inside `startURLSchemeTask`. Response policy also
-returns 2 if WK asks after a fetch. Deny is the real non-null `didBecomeDownload`
-callback; `decideDestination` completes nil after inspecting the attachment and
-`deny.bin` is not written. Dummy `didBecomeDownload` IMP pokes, `shouldPerformDownload`
-policy-0 shortcuts, and cancelled `blob:` URLs are not a deny. Native deny IMPs call
-the same `admit_native_capability` gate as Linux tests.
+registers a `WKURLSchemeHandler` for that fetch. Action policy Allows that URL (not a page
+admit) so the handler can answer; it is not cancelled on `shouldPerformDownload` and is not
+short-circuited with action-policy Download (2) before the handler runs. `WKDownload` is
+NetworkProcess-backed and cannot take over a custom-scheme task, so the handler cancels that
+document load and starts loopback HTTP that serves `Content-Disposition: attachment` plus
+octet-stream. Action policy returns `WKNavigationActionPolicyDownload` (2) for the HTTP URL
+so WK creates a `WKDownload`. Deny is the real non-null `didBecomeDownload` callback;
+`decideDestination` completes nil after inspecting the attachment and `deny.bin` is not
+written. Dummy `didBecomeDownload` IMP pokes, timeout→runloop pokes inside the handler,
+`shouldPerformDownload` shortcuts, action-policy-2 on the custom scheme, and cancelled
+`blob:` URLs are not a deny. Native deny IMPs call the same `admit_native_capability` gate
+as Linux tests.
 File and directory pickers require a WK-originated
 `WKUIDelegate.runOpenPanelWithParameters` callback with a real `WKOpenPanelParameters`
 (owned-page `<input type=file>` / `webkitdirectory`); the IMP completes with nil URLs.
