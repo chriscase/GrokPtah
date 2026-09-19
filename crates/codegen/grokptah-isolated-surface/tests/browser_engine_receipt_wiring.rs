@@ -190,6 +190,48 @@ fn contained_browser_v0_allowlist_and_main_frame_policy() {
 }
 
 #[test]
+fn contained_browser_native_deny_policy_fail_closed() {
+    use grokptah_isolated_surface::{
+        admit_native_capability, live_wk_create_webview_policy_allows,
+        live_wk_download_policy_allows, live_wk_navigation_action_policy_allows,
+        live_wk_navigation_response_policy_allows, live_wk_open_panel_policy_allows,
+        NativeDenyKind,
+    };
+
+    assert!(!live_wk_download_policy_allows());
+    assert!(!live_wk_open_panel_policy_allows(false));
+    assert!(!live_wk_open_panel_policy_allows(true));
+    assert!(!live_wk_create_webview_policy_allows());
+    assert!(!live_wk_navigation_action_policy_allows(
+        OWNED_PAGE_URL,
+        true,
+        false,
+        true
+    ));
+    assert!(!live_wk_navigation_response_policy_allows(
+        OWNED_PAGE_URL,
+        true,
+        false,
+        false
+    ));
+    let backend = ContainedBrowserBackend::new();
+    for kind in [
+        NativeDenyKind::Download,
+        NativeDenyKind::FilePicker,
+        NativeDenyKind::DirectoryPicker,
+        NativeDenyKind::WindowOpen,
+        NativeDenyKind::Popup,
+        NativeDenyKind::NewWindow,
+    ] {
+        admit_native_capability(kind).expect_err(kind.as_str());
+        backend
+            .refuse_native_capability(kind)
+            .expect_err(kind.as_str());
+    }
+    assert!(!isolated_surface_admission_available());
+}
+
+#[test]
 fn live_wk_navigation_policy_helper_cancels_off_allowlist() {
     use grokptah_isolated_surface::live_wk_navigation_policy_allows;
     assert!(live_wk_navigation_policy_allows(
@@ -262,6 +304,7 @@ fn live_wk_backend_containment_after_capture() {
                 .expect("WKNavigationDelegate decision");
             assert_eq!(policy, 0);
             assert!(decided_url.contains("evil.example"));
+            assert_live_wk_native_denies_and_fresh_store(&mut backend, &first_store);
             let outcome = backend
                 .inject_dom_action(
                     GuestLocalAction::ClickGuestButton,
@@ -289,6 +332,19 @@ fn live_wk_backend_containment_after_capture() {
                 Ok(_) => {
                     let second = backend.website_data_store_id().expect("fresh store");
                     assert_ne!(first_store, second);
+                    assert!(
+                        !backend
+                            .live_wk_uses_default_website_data_store()
+                            .expect("default store check"),
+                        "second run must not attach the default/profile store"
+                    );
+                    assert!(
+                        backend
+                            .live_wk_read_local_storage("cb-v0-store-probe")
+                            .expect("second-run localStorage")
+                            .is_none(),
+                        "fresh nonpersistent store must not import the previous run's localStorage"
+                    );
                 }
                 Err(err) if err.message.contains("main thread") => {}
                 Err(err) => panic!("second live WK capture: {err:?}"),
@@ -300,4 +356,99 @@ fn live_wk_backend_containment_after_capture() {
         }
         Err(err) => panic!("live WK containment capture: {err:?}"),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn assert_live_wk_native_denies_and_fresh_store(
+    backend: &mut ContainedBrowserBackend,
+    first_store: &str,
+) {
+    use grokptah_isolated_surface::NativeDenyKind;
+
+    let _ = first_store;
+    backend
+        .live_wk_write_local_storage("cb-v0-store-probe", "run-1")
+        .expect("write localStorage into this run's nonpersistent store");
+    assert_eq!(
+        backend
+            .live_wk_read_local_storage("cb-v0-store-probe")
+            .expect("read localStorage"),
+        Some("run-1".into())
+    );
+    assert!(
+        !backend
+            .live_wk_uses_default_website_data_store()
+            .expect("default store check"),
+        "live WK must not use the default/profile website-data store"
+    );
+    let store_key = backend
+        .live_wk_website_data_store_object_key()
+        .expect("store object key");
+    assert_ne!(store_key, 0);
+
+    backend
+        .live_wk_attempt_window_open()
+        .expect("window.open denied");
+    assert_eq!(
+        backend.last_wk_native_deny(),
+        Some(NativeDenyKind::WindowOpen),
+        "window.open must be a WK createWebView WindowOpen deny, not a bundled Popup/NewWindow record"
+    );
+    backend.live_wk_attempt_popup().expect("popup denied");
+    assert_eq!(
+        backend.last_wk_native_deny(),
+        Some(NativeDenyKind::Popup),
+        "popup must be a WK createWebView Popup deny from windowFeatures"
+    );
+    backend
+        .live_wk_attempt_new_window()
+        .expect("_blank/new window denied");
+    assert_eq!(
+        backend.last_wk_native_deny(),
+        Some(NativeDenyKind::NewWindow),
+        "_blank must be a WK navigation-policy NewWindow deny"
+    );
+    let (blank_url, blank_policy) = backend
+        .last_wk_navigation_decision()
+        .expect("WKNavigationDelegate must cancel the _blank probe");
+    assert_eq!(blank_policy, 0);
+    assert!(
+        blank_url.contains("evil.example"),
+        "_blank cancel decision must be for the probe URL, got {blank_url}"
+    );
+    backend.live_wk_attempt_download().expect("download denied");
+    assert_eq!(
+        backend.last_wk_native_deny(),
+        Some(NativeDenyKind::Download)
+    );
+    let (dl_url, dl_policy) = backend
+        .last_wk_navigation_decision()
+        .expect("WKNavigationDelegate must cancel the download probe");
+    assert_eq!(dl_policy, 0);
+    assert!(
+        dl_url.contains("deny.bin"),
+        "download cancel decision must be for deny.bin, got {dl_url}"
+    );
+    backend
+        .live_wk_attempt_file_picker()
+        .expect("file picker denied");
+    assert_eq!(
+        backend.last_wk_native_deny(),
+        Some(NativeDenyKind::FilePicker)
+    );
+    backend
+        .live_wk_attempt_directory_picker()
+        .expect("directory picker denied");
+    assert_eq!(
+        backend.last_wk_native_deny(),
+        Some(NativeDenyKind::DirectoryPicker)
+    );
+    let wk_url = backend
+        .live_wk_current_url()
+        .expect("owned page after native denies");
+    assert!(
+        wk_url.starts_with(OWNED_PAGE_URL) || wk_url == OWNED_PAGE_URL,
+        "native denies must not navigate off the owned page, got {wk_url}"
+    );
+    assert!(!isolated_surface_admission_available());
 }

@@ -183,4 +183,17 @@ fn contained_browser_owned_page_navigation_and_host_input_refused() {
     let second_store = backend.website_data_store_id().expect("fresh store");
     assert_ne!(first_store, second_store);
     assert!(!grokptah_isolated_surface::isolated_surface_admission_available());
+
+    for kind in [
+        grokptah_isolated_surface::NativeDenyKind::Download,
+        grokptah_isolated_surface::NativeDenyKind::FilePicker,
+        grokptah_isolated_surface::NativeDenyKind::DirectoryPicker,
+        grokptah_isolated_surface::NativeDenyKind::WindowOpen,
+        grokptah_isolated_surface::NativeDenyKind::Popup,
+        grokptah_isolated_surface::NativeDenyKind::NewWindow,
+    ] {
+        backend
+            .refuse_native_capability(kind)
+            .expect_err(kind.as_str());
+    }
 }

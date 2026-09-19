@@ -1,8 +1,9 @@
 //! Contained Browser v0 page-containment policy.
 //!
-//! Exact owned-page allowlist, main-frame DOM only, and a fresh nonpersistent
-//! website-data store per run. Shared by the in-process simulator and live WK
-//! so the two paths cannot diverge. Not isolation PASS, not Computer Mode.
+//! Exact owned-page allowlist, main-frame DOM only, a fresh nonpersistent
+//! website-data store per run, and native deny of downloads / file pickers /
+//! popups / new windows. Shared by the in-process simulator and live WK so the
+//! two paths cannot diverge. Not isolation PASS, not Computer Mode.
 
 use uuid::Uuid;
 
@@ -29,6 +30,30 @@ pub enum ActionChannel {
     HostKeyboard,
     HostPointer,
     HostClipboard,
+}
+
+/// Native WK capabilities that Contained Browser v0 always refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeDenyKind {
+    Download,
+    FilePicker,
+    DirectoryPicker,
+    WindowOpen,
+    Popup,
+    NewWindow,
+}
+
+impl NativeDenyKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Download => "download",
+            Self::FilePicker => "file_picker",
+            Self::DirectoryPicker => "directory_picker",
+            Self::WindowOpen => "window_open",
+            Self::Popup => "popup",
+            Self::NewWindow => "new_window",
+        }
+    }
 }
 
 /// Process-local token for a nonpersistent website-data store. A new token is
@@ -68,16 +93,63 @@ pub fn owned_page_for_boot() -> HarnessResult<&'static str> {
 }
 
 /// Live WK navigation-policy helper used by `WKNavigationDelegate`.
-/// `_blank` / non-main-frame / off-allowlist are cancelled.
+/// `_blank` / non-main-frame / off-allowlist / downloads are cancelled.
 pub fn live_wk_navigation_policy_allows(
     url: &str,
     is_main_frame: bool,
     is_blank_target: bool,
 ) -> bool {
-    if is_blank_target || !is_main_frame {
+    live_wk_navigation_action_policy_allows(url, is_main_frame, is_blank_target, false)
+}
+
+/// Same as [`live_wk_navigation_policy_allows`], plus `shouldPerformDownload`.
+pub fn live_wk_navigation_action_policy_allows(
+    url: &str,
+    is_main_frame: bool,
+    is_blank_target: bool,
+    should_perform_download: bool,
+) -> bool {
+    if should_perform_download || is_blank_target || !is_main_frame {
         return false;
     }
     admit_navigation(url).is_ok()
+}
+
+/// `WKNavigationResponse` policy: allow only the owned main-frame document.
+/// Download MIME / attachment / non-main-frame fail closed (cancel, never Download).
+pub fn live_wk_navigation_response_policy_allows(
+    url: &str,
+    is_main_frame: bool,
+    can_show_mime: bool,
+    is_download_response: bool,
+) -> bool {
+    if is_download_response || !can_show_mime || !is_main_frame {
+        return false;
+    }
+    admit_navigation(url).is_ok()
+}
+
+/// Downloads are never admitted. Native `WKDownload` / response-policy deny.
+pub fn live_wk_download_policy_allows() -> bool {
+    false
+}
+
+/// File and directory pickers are never admitted (`runOpenPanel` → nil URLs).
+pub fn live_wk_open_panel_policy_allows(_allows_directories: bool) -> bool {
+    false
+}
+
+/// `window.open` / popups / new windows are never admitted (`createWebView` → nil).
+pub fn live_wk_create_webview_policy_allows() -> bool {
+    false
+}
+
+/// Shared fail-closed gate for native capabilities the live WK delegates deny.
+pub fn admit_native_capability(kind: NativeDenyKind) -> HarnessResult<()> {
+    Err(HarnessError::invalid_state(format!(
+        "contained browser v0 native deny: {} is refused",
+        kind.as_str()
+    )))
 }
 
 /// Admit only main-frame DOM actions. Secondary windows, `_blank`, and host
@@ -166,5 +238,47 @@ mod tests {
             true,
             false
         ));
+        assert!(!live_wk_navigation_action_policy_allows(
+            OWNED_PAGE_URL,
+            true,
+            false,
+            true
+        ));
+        assert!(live_wk_navigation_response_policy_allows(
+            OWNED_PAGE_URL,
+            true,
+            true,
+            false
+        ));
+        assert!(!live_wk_navigation_response_policy_allows(
+            OWNED_PAGE_URL,
+            true,
+            false,
+            false
+        ));
+        assert!(!live_wk_navigation_response_policy_allows(
+            OWNED_PAGE_URL,
+            true,
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn contained_browser_native_deny_delegates_fail_closed() {
+        assert!(!live_wk_download_policy_allows());
+        assert!(!live_wk_open_panel_policy_allows(false));
+        assert!(!live_wk_open_panel_policy_allows(true));
+        assert!(!live_wk_create_webview_policy_allows());
+        for kind in [
+            NativeDenyKind::Download,
+            NativeDenyKind::FilePicker,
+            NativeDenyKind::DirectoryPicker,
+            NativeDenyKind::WindowOpen,
+            NativeDenyKind::Popup,
+            NativeDenyKind::NewWindow,
+        ] {
+            admit_native_capability(kind).expect_err(kind.as_str());
+        }
     }
 }

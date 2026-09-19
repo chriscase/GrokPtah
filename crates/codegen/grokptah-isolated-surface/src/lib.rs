@@ -53,9 +53,12 @@ pub use captured_frame::{
     SYNTHETIC_FRAME_PAYLOAD_NEEDLE, SYNTHETIC_FRAME_WIDTH,
 };
 pub use cb_containment::{
-    admit_frame_action, admit_guest_local_action, admit_navigation,
-    live_wk_navigation_policy_allows, owned_page_for_boot, ActionChannel, FrameKind,
-    NonpersistentWebsiteDataStore, OWNED_PAGE_ORIGIN, OWNED_PAGE_PATH, OWNED_PAGE_URL,
+    admit_frame_action, admit_guest_local_action, admit_native_capability, admit_navigation,
+    live_wk_create_webview_policy_allows, live_wk_download_policy_allows,
+    live_wk_navigation_action_policy_allows, live_wk_navigation_policy_allows,
+    live_wk_navigation_response_policy_allows, live_wk_open_panel_policy_allows,
+    owned_page_for_boot, ActionChannel, FrameKind, NativeDenyKind, NonpersistentWebsiteDataStore,
+    OWNED_PAGE_ORIGIN, OWNED_PAGE_PATH, OWNED_PAGE_URL,
 };
 pub use channels::ChannelRegistry;
 pub use checklist_runner::{
