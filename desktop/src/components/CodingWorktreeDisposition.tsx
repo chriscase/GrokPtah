@@ -46,16 +46,19 @@ export function CodingWorktreeDisposition({ sessionId }: CodingWorktreeDispositi
 
   const run = async (mutation: () => Promise<CodingWorktreeHostView>) => {
     if (!view) return;
+    const epoch = requestEpoch.current;
     setBusy(true);
     setError(null);
     try {
       const next = await mutation();
+      if (requestEpoch.current !== epoch) return;
       setView(next);
       if (!digestTouched && next.patchDigest) setDigest(next.patchDigest);
     } catch (reason) {
+      if (requestEpoch.current !== epoch) return;
       setError(String(reason));
     } finally {
-      setBusy(false);
+      if (requestEpoch.current === epoch) setBusy(false);
     }
   };
 
