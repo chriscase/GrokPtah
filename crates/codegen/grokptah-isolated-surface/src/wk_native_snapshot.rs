@@ -979,14 +979,6 @@ fn download_scheme_handler_class() -> Option<&'static AnyClass> {
                 sel!(webView:stopURLSchemeTask:),
                 stop_download_scheme_task as unsafe extern "C-unwind" fn(_, _, _, _),
             );
-            builder.add_method(
-                sel!(cbV0ServeDownloadTask:),
-                serve_download_scheme_task as unsafe extern "C-unwind" fn(_, _, _),
-            );
-            builder.add_method(
-                sel!(cbV0FinishDownloadTask:),
-                finish_download_scheme_task as unsafe extern "C-unwind" fn(_, _, _),
-            );
         }
         Some(builder.register())
     })
