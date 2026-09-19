@@ -19,7 +19,7 @@ use objc2::{sel, ClassType};
 
 use crate::browser_engine_capture::{LIVE_WK_FIXTURE_CLICKED_RGB, LIVE_WK_FIXTURE_CRIMSON_RGB};
 use crate::cb_containment::{
-    admit_navigation, live_wk_create_webview_policy_allows,
+    admit_navigation, live_wk_create_webview_policy_allows, live_wk_download_policy_allows,
     live_wk_navigation_action_policy_allows, live_wk_navigation_response_policy_allows,
     live_wk_open_panel_policy_allows, owned_page_for_boot, NativeDenyKind,
 };
@@ -37,7 +37,7 @@ const FIXTURE_HTML: &str = concat!(
     "style=\"margin:0;background:#c41e3a;width:100vw;height:100vh\">",
     "<div id=\"cb-v0-probes\" style=\"display:none\">",
     "<a id=\"cb-v0-blank\" href=\"https://evil.example/\" target=\"_blank\" rel=\"noopener\">blank</a>",
-    "<a id=\"cb-v0-download\" href=\"https://grokptah.owned.invalid/cb-v0/\" download=\"deny.bin\">dl</a>",
+    "<a id=\"cb-v0-download\" href=\"https://grokptah.owned.invalid/cb-v0/deny.bin\" download=\"deny.bin\">dl</a>",
     "<input id=\"cb-v0-file\" type=\"file\">",
     "<input id=\"cb-v0-dir\" type=\"file\" webkitdirectory>",
     "<button id=\"cb-v0-popup\" type=\"button\">popup</button>",
@@ -295,46 +295,73 @@ impl LiveWkSession {
         last_recorded_native_deny(self.webview_key())
     }
 
-    /// `window.open(_blank)` through page JS. Fail-closed unless the attached
-    /// `WKUIDelegate.createWebView...` returns nil (missing delegate times out).
+    /// `window.open(_blank)` through page JS. Fail-closed unless WK consults
+    /// `WKUIDelegate.createWebView...` and that IMP returns nil. Popup-blocked
+    /// JS `null` without a createWebView callback is not a deny.
     pub(crate) fn attempt_window_open(&self) -> HarnessResult<()> {
         self.attempt_create_webview_js(WINDOW_OPEN_JS, NativeDenyKind::WindowOpen)
     }
 
-    /// Popup `window.open` with features. Same nil `createWebView` deny.
+    /// Popup `window.open` with features. Same nil `createWebView` deny, recorded
+    /// as `Popup` from `WKWindowFeatures` width/height — not WindowOpen/NewWindow.
     pub(crate) fn attempt_popup(&self) -> HarnessResult<()> {
         self.attempt_create_webview_js(POPUP_OPEN_JS, NativeDenyKind::Popup)
     }
 
-    /// `_blank` anchor click. Navigation policy cancel plus createWebView nil.
+    /// `_blank` anchor click. WK `decidePolicyForNavigationAction` must cancel
+    /// (`targetFrame == nil`) and record `NewWindow`. Not a createWebView poke.
     pub(crate) fn attempt_blank_target(&self) -> HarnessResult<()> {
-        self.attempt_create_webview_js(BLANK_CLICK_JS, NativeDenyKind::NewWindow)
+        require_main_thread("live WK _blank deny")?;
+        let key = self.webview_key();
+        clear_native_denies(key);
+        clear_navigation_decisions(key);
+        let result = evaluate_javascript_value(&self.webview, BLANK_CLICK_JS)?;
+        if result.as_deref() == Some("missing") {
+            return Err(HarnessError::backend_unavailable(
+                "owned-page _blank probe anchor is missing",
+            ));
+        }
+        wait_for_native_deny(key, NativeDenyKind::NewWindow)?;
+        let decision = wait_for_navigation_decision(key, "https://evil.example/")?;
+        if decision.1 != 0 {
+            return Err(HarnessError::invalid_state(format!(
+                "WK _blank navigation policy allowed {} (policy={})",
+                decision.0, decision.1
+            )));
+        }
+        self.assert_still_owned("new_window")
     }
 
-    /// `<a download>` click. Native download path must cancel, never save.
+    /// `<a download href=".../deny.bin">` click. WK must consult navigation
+    /// policy with `shouldPerformDownload` (or a download MIME response) and
+    /// cancel. Dummy `didBecomeDownload` IMP pokes are not a deny.
     pub(crate) fn attempt_download(&self) -> HarnessResult<()> {
         require_main_thread("live WK download deny")?;
         let key = self.webview_key();
         clear_native_denies(key);
+        clear_navigation_decisions(key);
         let result = evaluate_javascript_value(&self.webview, DOWNLOAD_CLICK_JS)?;
         if result.as_deref() == Some("missing") {
             return Err(HarnessError::backend_unavailable(
                 "owned-page download probe anchor is missing",
             ));
         }
-        match wait_for_native_deny(key, NativeDenyKind::Download) {
-            Ok(()) => self.assert_still_owned("download"),
-            Err(_) => {
-                self.invoke_download_became_on_attached_delegate()?;
-                wait_for_native_deny(key, NativeDenyKind::Download)?;
-                self.assert_still_owned("download")
-            }
+        wait_for_native_deny(key, NativeDenyKind::Download)?;
+        let decision =
+            wait_for_navigation_decision(key, "https://grokptah.owned.invalid/cb-v0/deny.bin")?;
+        if decision.1 != 0 {
+            return Err(HarnessError::invalid_state(format!(
+                "WK download navigation policy allowed {} (policy={})",
+                decision.0, decision.1
+            )));
         }
+        self.assert_still_owned("download")
     }
 
     /// File picker: WK does not deliver `runOpenPanel` without a real user
-    /// gesture. Message the attached `WKUIDelegate` (the same object WK holds).
-    /// Missing delegate or non-nil URL array fails closed.
+    /// gesture. This probe messages the attached `WKUIDelegate` (the same
+    /// object WK holds). It is not a WK-originated open-panel oracle.
+    /// Missing delegate or non-nil URLs fail closed.
     pub(crate) fn attempt_file_picker(&self) -> HarnessResult<()> {
         self.invoke_open_panel_on_attached_delegate(false)
     }
@@ -397,57 +424,13 @@ impl LiveWkSession {
                 kind.as_str()
             )));
         }
-        match wait_for_native_deny(key, kind) {
-            Ok(()) => {
-                self.assert_still_owned(kind.as_str())?;
-                Ok(())
-            }
-            Err(_) => {
-                self.invoke_create_webview_on_attached_delegate()?;
-                wait_for_native_deny(key, kind)?;
-                self.assert_still_owned(kind.as_str())?;
-                Ok(())
-            }
-        }
-    }
-
-    fn invoke_create_webview_on_attached_delegate(&self) -> HarnessResult<()> {
-        let delegate = attached_ui_delegate(&self.webview)?;
-        let config: Option<Retained<AnyObject>> =
-            unsafe { objc2::msg_send![&*self.webview, configuration] };
-        let config = config.ok_or_else(|| {
-            HarnessError::backend_unavailable("live WK configuration unavailable")
+        wait_for_native_deny(key, kind).map_err(|err| {
+            HarnessError::backend_unavailable(format!(
+                "WK did not consult createWebView for {} (JS null without UIDelegate is not a deny): {err}",
+                kind.as_str()
+            ))
         })?;
-        let features = wk_window_features()?;
-        let created: *mut AnyObject = unsafe {
-            objc2::msg_send![
-                &*delegate,
-                webView: &*self.webview,
-                createWebViewWithConfiguration: &*config,
-                forNavigationAction: &*self.webview,
-                windowFeatures: &*features
-            ]
-        };
-        if !created.is_null() {
-            return Err(HarnessError::invalid_state(
-                "attached UIDelegate createWebView returned a WKWebView",
-            ));
-        }
-        Ok(())
-    }
-
-    fn invoke_download_became_on_attached_delegate(&self) -> HarnessResult<()> {
-        let delegate = attached_navigation_delegate(&self.webview)?;
-        let dummy = dummy_nsobject()?;
-        let _: () = unsafe {
-            objc2::msg_send![
-                &*delegate,
-                webView: &*self.webview,
-                navigationAction: &*dummy,
-                didBecomeDownload: &*dummy
-            ]
-        };
-        Ok(())
+        self.assert_still_owned(kind.as_str())
     }
 
     fn invoke_open_panel_on_attached_delegate(
@@ -471,7 +454,7 @@ impl LiveWkSession {
                 FILE_CLICK_JS
             },
         )?;
-        if wait_for_native_deny(key, kind).is_ok() {
+        if wait_for_native_deny_until(key, kind, Duration::from_millis(250)).is_ok() {
             wait_for_open_panel_nil(key)?;
             return self.assert_still_owned(kind.as_str());
         }
@@ -863,7 +846,7 @@ fn enable_javascript_window_open_asks_delegate(config: &AnyObject) -> HarnessRes
     })?;
     // Ask the UIDelegate instead of silently returning null without a callback.
     let _: () =
-        unsafe { objc2::msg_send![&*prefs, setJavaScriptCanOpenWindowsAutomatically: true] };
+        unsafe { objc2::msg_send![&*prefs, setJavaScriptCanOpenWindowsAutomatically: Bool::YES] };
     Ok(())
 }
 
@@ -1091,7 +1074,7 @@ fn last_recorded_native_deny(key: usize) -> Option<NativeDenyKind> {
 }
 
 fn wait_for_native_deny(key: usize, kind: NativeDenyKind) -> HarnessResult<()> {
-    wait_for_native_deny_until(key, kind, Duration::from_millis(800))
+    wait_for_native_deny_until(key, kind, LOAD_TIMEOUT)
 }
 
 fn wait_for_native_deny_until(
@@ -1170,9 +1153,14 @@ unsafe extern "C-unwind" fn decide_navigation_policy(
 ) {
     let url = navigation_action_url(action).unwrap_or_default();
     let should_download = navigation_action_should_download(action);
+    let is_blank = navigation_action_is_blank(action);
     let policy = navigation_action_policy(action);
-    if policy == 0 && should_download {
-        record_native_deny(webview as usize, NativeDenyKind::Download);
+    if policy == 0 {
+        if should_download && !live_wk_download_policy_allows() {
+            record_native_deny(webview as usize, NativeDenyKind::Download);
+        } else if is_blank && !live_wk_create_webview_policy_allows() {
+            record_native_deny(webview as usize, NativeDenyKind::NewWindow);
+        }
     }
     record_navigation_decision(webview as usize, url, policy);
     invoke_navigation_decision(decision_handler, policy);
@@ -1191,7 +1179,7 @@ unsafe extern "C-unwind" fn decide_navigation_response(
     let is_download = navigation_response_is_download(response);
     let allow = live_wk_navigation_response_policy_allows(&url, is_main, can_show, is_download);
     let policy = if allow { 1 } else { 0 };
-    if !allow && (is_download || !can_show) {
+    if !allow && (is_download || !can_show) && !live_wk_download_policy_allows() {
         record_native_deny(webview as usize, NativeDenyKind::Download);
     }
     invoke_navigation_decision(decision_handler, policy);
@@ -1203,15 +1191,31 @@ unsafe extern "C-unwind" fn create_webview(
     webview: *mut AnyObject,
     _config: *mut AnyObject,
     _action: *mut AnyObject,
-    _features: *mut AnyObject,
+    features: *mut AnyObject,
 ) -> *mut AnyObject {
     let key = webview as usize;
     if !live_wk_create_webview_policy_allows() {
-        record_native_deny(key, NativeDenyKind::WindowOpen);
-        record_native_deny(key, NativeDenyKind::Popup);
-        record_native_deny(key, NativeDenyKind::NewWindow);
+        record_native_deny(key, create_webview_deny_kind(features));
     }
     std::ptr::null_mut()
+}
+
+fn create_webview_deny_kind(features: *mut AnyObject) -> NativeDenyKind {
+    if window_features_indicate_popup(features) {
+        NativeDenyKind::Popup
+    } else {
+        NativeDenyKind::WindowOpen
+    }
+}
+
+fn window_features_indicate_popup(features: *mut AnyObject) -> bool {
+    if features.is_null() {
+        return false;
+    }
+    let features = unsafe { &*features };
+    let width: Option<Retained<AnyObject>> = unsafe { objc2::msg_send![features, width] };
+    let height: Option<Retained<AnyObject>> = unsafe { objc2::msg_send![features, height] };
+    width.is_some() || height.is_some()
 }
 
 unsafe extern "C-unwind" fn run_open_panel(
@@ -1242,8 +1246,10 @@ unsafe extern "C-unwind" fn navigation_action_became_download(
     _action: *mut AnyObject,
     download: *mut AnyObject,
 ) {
-    record_native_deny(webview as usize, NativeDenyKind::Download);
-    cancel_wk_download(this, download);
+    if !live_wk_download_policy_allows() {
+        record_native_deny(webview as usize, NativeDenyKind::Download);
+        cancel_wk_download(this, download);
+    }
 }
 
 unsafe extern "C-unwind" fn navigation_response_became_download(
@@ -1253,8 +1259,10 @@ unsafe extern "C-unwind" fn navigation_response_became_download(
     _response: *mut AnyObject,
     download: *mut AnyObject,
 ) {
-    record_native_deny(webview as usize, NativeDenyKind::Download);
-    cancel_wk_download(this, download);
+    if !live_wk_download_policy_allows() {
+        record_native_deny(webview as usize, NativeDenyKind::Download);
+        cancel_wk_download(this, download);
+    }
 }
 
 unsafe extern "C-unwind" fn download_decide_destination(
@@ -1265,6 +1273,7 @@ unsafe extern "C-unwind" fn download_decide_destination(
     _filename: *mut AnyObject,
     decision_handler: *mut std::ffi::c_void,
 ) {
+    let _allow = live_wk_download_policy_allows();
     invoke_object_completion(decision_handler, std::ptr::null_mut());
 }
 
@@ -1285,11 +1294,8 @@ fn cancel_wk_download(delegate: &AnyObject, download: *mut AnyObject) {
 }
 
 fn navigation_action_policy(action: &AnyObject) -> isize {
-    let target: Option<Retained<AnyObject>> = unsafe { objc2::msg_send![action, targetFrame] };
-    let is_blank = target.is_none();
-    let is_main = target
-        .as_deref()
-        .is_some_and(|frame| unsafe { objc2::msg_send![frame, isMainFrame] });
+    let is_blank = navigation_action_is_blank(action);
+    let is_main = navigation_action_is_main_frame(action);
     let url = navigation_action_url(action).unwrap_or_default();
     let should_download = navigation_action_should_download(action);
     if live_wk_navigation_action_policy_allows(&url, is_main, is_blank, should_download) {
@@ -1297,6 +1303,18 @@ fn navigation_action_policy(action: &AnyObject) -> isize {
     } else {
         0
     }
+}
+
+fn navigation_action_is_blank(action: &AnyObject) -> bool {
+    let target: Option<Retained<AnyObject>> = unsafe { objc2::msg_send![action, targetFrame] };
+    target.is_none()
+}
+
+fn navigation_action_is_main_frame(action: &AnyObject) -> bool {
+    let target: Option<Retained<AnyObject>> = unsafe { objc2::msg_send![action, targetFrame] };
+    target
+        .as_deref()
+        .is_some_and(|frame| unsafe { objc2::msg_send![frame, isMainFrame] })
 }
 
 fn navigation_action_should_download(action: &AnyObject) -> bool {
@@ -1376,25 +1394,6 @@ fn open_panel_allows_directories(params: *mut AnyObject) -> bool {
 fn attached_ui_delegate(webview: &AnyObject) -> HarnessResult<Retained<AnyObject>> {
     let delegate: Option<Retained<AnyObject>> = unsafe { objc2::msg_send![webview, UIDelegate] };
     delegate.ok_or_else(|| HarnessError::backend_unavailable("live WK UIDelegate is not attached"))
-}
-
-fn attached_navigation_delegate(webview: &AnyObject) -> HarnessResult<Retained<AnyObject>> {
-    let delegate: Option<Retained<AnyObject>> =
-        unsafe { objc2::msg_send![webview, navigationDelegate] };
-    delegate.ok_or_else(|| {
-        HarnessError::backend_unavailable("live WK navigationDelegate is not attached")
-    })
-}
-
-fn dummy_nsobject() -> HarnessResult<Retained<AnyObject>> {
-    let obj: Option<Retained<AnyObject>> = unsafe { objc2::msg_send![NSObject::class(), new] };
-    obj.ok_or_else(|| HarnessError::backend_unavailable("NSObject alloc failed"))
-}
-
-fn wk_window_features() -> HarnessResult<Retained<AnyObject>> {
-    let cls = AnyClass::get(c"WKWindowFeatures").unwrap_or(NSObject::class());
-    let obj: Option<Retained<AnyObject>> = unsafe { objc2::msg_send![cls, new] };
-    obj.ok_or_else(|| HarnessError::backend_unavailable("WKWindowFeatures alloc failed"))
 }
 
 fn probe_open_panel_parameters(allows_directories: bool) -> HarnessResult<Retained<AnyObject>> {

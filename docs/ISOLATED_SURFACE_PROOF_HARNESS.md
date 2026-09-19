@@ -173,12 +173,17 @@ runtime, never the default/profile store). A second run mints a distinct store
 object; guest `localStorage` from the first run is not imported. Stop stays
 fence-first; `Destroyed` is confirmed-only; Uncertain rejects auto-retry.
 
-Live WK also attaches native fail-closed delegates on the owned-page session:
-`WKUIDelegate.createWebView...` returns nil (`window.open`, popups, new windows);
-`runOpenPanelWithParameters` completes with nil URLs (file and directory pickers);
-download navigation/`WKDownload` is cancelled and never given a destination.
-`_blank` / off-allowlist remain cancelled by `WKNavigationDelegate`. This is
-**not** isolation PASS, VF PASS, Computer Mode, or admission.
+Live WK also attaches native fail-closed delegates on the owned-page session.
+`WKUIDelegate.createWebView...` returns nil; live `window.open` / popup probes require
+a WK-originated createWebView callback (JS `null` without that callback is not a deny).
+`target=_blank` is cancelled by `WKNavigationDelegate` (`targetFrame == nil`) and recorded
+as `NewWindow`. Download probes use `<a download href=".../deny.bin">`; WK must cancel
+that navigation (`shouldPerformDownload` or download MIME) — dummy `didBecomeDownload`
+pokes are not a deny. `runOpenPanelWithParameters` completes with nil URLs (file and
+directory pickers); those probes still message the attached UIDelegate because WK does
+not deliver `runOpenPanel` without a real user gesture. `_blank` / off-allowlist remain
+cancelled by `WKNavigationDelegate`. This is **not** isolation PASS, VF PASS, Computer
+Mode, or admission.
 
 ### Synthetic guest frame hashes (packet 9 follow-on)
 

@@ -274,18 +274,45 @@ fn assert_live_wk_native_denies(backend: &mut grokptah_isolated_surface::Contain
     backend
         .live_wk_attempt_window_open()
         .expect("window.open denied");
-    assert!(matches!(
+    assert_eq!(
         backend.last_wk_native_deny(),
-        Some(NativeDenyKind::WindowOpen | NativeDenyKind::Popup | NativeDenyKind::NewWindow)
-    ));
+        Some(NativeDenyKind::WindowOpen),
+        "window.open must be a WK createWebView WindowOpen deny, not a bundled Popup/NewWindow record"
+    );
     backend.live_wk_attempt_popup().expect("popup denied");
+    assert_eq!(
+        backend.last_wk_native_deny(),
+        Some(NativeDenyKind::Popup),
+        "popup must be a WK createWebView Popup deny from windowFeatures"
+    );
     backend
         .live_wk_attempt_new_window()
         .expect("_blank/new window denied");
+    assert_eq!(
+        backend.last_wk_native_deny(),
+        Some(NativeDenyKind::NewWindow),
+        "_blank must be a WK navigation-policy NewWindow deny"
+    );
+    let (blank_url, blank_policy) = backend
+        .last_wk_navigation_decision()
+        .expect("WKNavigationDelegate must cancel the _blank probe");
+    assert_eq!(blank_policy, 0);
+    assert!(
+        blank_url.contains("evil.example"),
+        "_blank cancel decision must be for the probe URL, got {blank_url}"
+    );
     backend.live_wk_attempt_download().expect("download denied");
     assert_eq!(
         backend.last_wk_native_deny(),
         Some(NativeDenyKind::Download)
+    );
+    let (dl_url, dl_policy) = backend
+        .last_wk_navigation_decision()
+        .expect("WKNavigationDelegate must cancel the download probe");
+    assert_eq!(dl_policy, 0);
+    assert!(
+        dl_url.contains("deny.bin"),
+        "download cancel decision must be for deny.bin, got {dl_url}"
     );
     backend
         .live_wk_attempt_file_picker()
