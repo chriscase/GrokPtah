@@ -1268,6 +1268,43 @@ export type {
   RemotePublicRunList,
 } from "./publicRun";
 
+/** Thin desktop projection of AgentHost `CodingWorktreeHostView`. */
+export type CodingWorktreePhase =
+  | "active"
+  | "paused"
+  | "settling"
+  | "settled"
+  | "stopping"
+  | "stopped"
+  | "destroyed";
+
+export type CodingWorktreeDisposition =
+  | "accepted"
+  | "discarded"
+  | "kept_for_review"
+  | "uncertain"
+  | "stopped";
+
+export type CodingWorktreeIdentity = {
+  sessionId: string;
+  baseSha: string;
+  worktreePathDigest: string;
+  branchName: string;
+};
+
+export type CodingWorktreeHostView = {
+  handle: string;
+  agentSessionId: string | null;
+  identity: CodingWorktreeIdentity;
+  phase: CodingWorktreePhase;
+  disposition: CodingWorktreeDisposition | null;
+  pauseFenced: boolean;
+  settlementFenced: boolean;
+  applyUncertain: boolean;
+  worktreePath: string;
+  patchDigest: string | null;
+};
+
 export const SLASH_COMMANDS = [
   { cmd: "/help", desc: "Show commands" },
   { cmd: "/plan", desc: "Propose a plan (accept starts execution)" },

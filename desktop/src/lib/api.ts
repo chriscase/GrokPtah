@@ -34,6 +34,7 @@ import type {
   RemoteWorkSnapshot,
   RemoteRoutineSnapshot,
   DurableActivation,
+  CodingWorktreeHostView,
 } from "./protocol";
 import {
   parseRemotePublicRun,
@@ -772,6 +773,30 @@ export const api = {
   ) => invoke<string>("memory_remember", { sessionId, scope, text }),
   gitStageAll: () => invoke<string>("git_stage_all"),
   gitCommit: (message: string) => invoke<string>("git_commit", { message }),
+  codingWorktreeView: (handle: string) =>
+    invoke<CodingWorktreeHostView>("coding_worktree_view", { handle }),
+  codingWorktreeForSession: (sessionId: string) =>
+    invoke<CodingWorktreeHostView | null>("coding_worktree_for_session", {
+      sessionId,
+    }),
+  codingWorktreePause: (handle: string) =>
+    invoke<CodingWorktreeHostView>("coding_worktree_pause", { handle }),
+  codingWorktreeStop: (handle: string) =>
+    invoke<CodingWorktreeHostView>("coding_worktree_stop", { handle }),
+  codingWorktreeAccept: (
+    handle: string,
+    applyTarget: string,
+    expectedPatchDigest: string,
+  ) =>
+    invoke<CodingWorktreeHostView>("coding_worktree_accept", {
+      handle,
+      applyTarget,
+      expectedPatchDigest,
+    }),
+  codingWorktreeDiscard: (handle: string) =>
+    invoke<CodingWorktreeHostView>("coding_worktree_discard", { handle }),
+  codingWorktreeKeepForReview: (handle: string) =>
+    invoke<CodingWorktreeHostView>("coding_worktree_keep_for_review", { handle }),
   listWorktrees: () => invoke<string>("list_worktrees"),
   createWorktree: (path: string, branch?: string | null) =>
     invoke<string>("create_worktree", { path, branch: branch ?? null }),

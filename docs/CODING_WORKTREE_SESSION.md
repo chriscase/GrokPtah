@@ -23,6 +23,7 @@ surface), [#267](https://github.com/chriscase/GrokPtah/issues/267) (epic).
 | Bridge fail-closed seam | `grokptah-agent-bridge/src/coding_worktree.rs` |
 | AgentHost disposition surface | `AgentHostHandle::coding_worktree_*` in `grokptah-agent-bridge/src/coding_worktree.rs` |
 | Bridge integration tests | `grokptah-agent-bridge/tests/coding_worktree_session.rs` |
+| Desktop/Tauri disposition chrome | `desktop/src-tauri/src/coding_worktree.rs`, `desktop/src/components/CodingWorktreeDisposition.tsx` |
 
 ## Disposition contract
 
@@ -85,6 +86,10 @@ cargo test --locked --manifest-path crates/codegen/grokptah-agent-bridge/Cargo.t
 
 cargo test --locked --manifest-path crates/codegen/grokptah-coding-worktree/Cargo.toml \
   --test session_invariants -- --test-threads=1
+
+# Desktop chrome (command wiring + disabled-state UI)
+cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --lib coding_worktree -- --test-threads=1
+npm test --prefix desktop -- src/lib/codingWorktreeDisposition.test.ts src/components/CodingWorktreeDisposition.test.tsx
 ```
 
 ## Residuals (honest, post-slice)
@@ -107,13 +112,21 @@ Closed by the AgentHost disposition surface (`coding_worktree_*` on
   coding worktrees.
 - Bridge tests in `coding_worktree_session.rs` cover those host paths.
 
+Closed by the desktop/Tauri disposition chrome:
+
+- Pause, fence-first Stop, Accept (explicit `apply_target` + exact `sha256:`
+  digest), Discard, and Keep-for-review commands are bound to AgentHost coding
+  worktree handles. Missing sessions stay disabled/hidden. Host errors surface
+  honestly. Uncertain / Paused / Settled enablement matches host invariants.
+  No auto-Accept.
+
 Still open:
 
-- No UI / Tauri command wrappers for Accept / Discard / Keep-for-review /
-  Pause / Stop. Desktop chrome is a follow-up; this slice is host+tests only.
+- Create / stage remain host API only; this chrome binds to an already-attached
+  AgentHost coding-worktree handle and does not invent a session.
 - No integration with isolated surface / Computer Mode admission.
 - No live provider calls, host CGEvent, or TCC claims.
-- Apply target selection is explicit API only; no automatic promotion to main.
+- Apply target selection is explicit operator input; no automatic promotion to main.
 
 ## Non-claims
 
