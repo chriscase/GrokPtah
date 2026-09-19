@@ -405,12 +405,13 @@ impl LiveWkSession {
     /// `WKDownload` is NetworkProcess-backed and cannot take over a custom-scheme
     /// task, so the handler cancels that document load and starts loopback HTTP
     /// that serves `Content-Disposition: attachment` + octet-stream. Action
-    /// policy returns Download (2) for the HTTP URL so WK originates a
+    /// policy Allows the HTTP URL so NetworkProcess can fetch those headers;
+    /// response policy then returns Download (2) so WK originates a
     /// `WKDownload`. Deny is a real non-null `didBecomeDownload` plus
     /// `decideDestination` completing nil after inspecting the attachment.
     /// Dummy IMP pokes, blob cancels, pumping inside the scheme handler,
-    /// action-policy-2 on the custom scheme, and `shouldPerformDownload`
-    /// shortcuts are not a deny. No file is written.
+    /// action-policy-2 on the custom scheme or the HTTP continuation, and
+    /// `shouldPerformDownload` shortcuts are not a deny. No file is written.
     pub(crate) fn attempt_download(&self) -> HarnessResult<()> {
         require_main_thread("live WK download deny")?;
         let key = self.webview_key();
@@ -1564,6 +1565,7 @@ fn wait_for_wk_download_proof() -> HarnessResult<()> {
             && proof.scheme_handler_started
             && proof.http_load_started
             && proof.content_disposition_served
+            && proof.response_policy_download
             && proof.destination_invoked
             && proof.destination_nil
             && proof.destination_attachment
@@ -1823,9 +1825,11 @@ unsafe extern "C-unwind" fn decide_navigation_policy(
     let is_blank = navigation_action_is_blank(action);
     let key = webview as usize;
     // Dedicated scheme URL: Allow so WKURLSchemeHandler can answer. Not a
-    // page admit. Loopback HTTP continuation: Download (2) so NetworkProcess
-    // originates a WKDownload. shouldPerformDownload on any other URL cancels
-    // without stamping Download (that flag is not a WKDownload instance).
+    // page admit. Loopback HTTP continuation: also Allow so NetworkProcess
+    // fetches Content-Disposition; response policy 2 originates WKDownload.
+    // Action-policy-2 here would short-circuit before those headers exist.
+    // shouldPerformDownload on any other URL cancels without stamping
+    // Download (that flag is not a WKDownload instance).
     if is_download_probe_url(&url) {
         record_download_proof(|proof| proof.action_url = Some(url.clone()));
         record_download_navigation_decision(key, url, 1);
@@ -1834,8 +1838,8 @@ unsafe extern "C-unwind" fn decide_navigation_policy(
     }
     if is_live_download_http_url(&url) {
         record_download_proof(|proof| proof.action_url = Some(url.clone()));
-        record_download_navigation_decision(key, url, WK_NAVIGATION_POLICY_DOWNLOAD);
-        invoke_navigation_decision(decision_handler, WK_NAVIGATION_POLICY_DOWNLOAD);
+        record_download_navigation_decision(key, url, 1);
+        invoke_navigation_decision(decision_handler, 1);
         return;
     }
     if should_download {
@@ -1864,13 +1868,19 @@ unsafe extern "C-unwind" fn decide_navigation_response(
     let can_show: bool = unsafe { objc2::msg_send![response, canShowMIMEType] };
     let is_download = navigation_response_is_download(response);
     record_download_proof(|proof| proof.response_url = Some(url.clone()));
-    // Dedicated attachment resource, including the loopback HTTP continuation
-    // the scheme handler redirected onto so NetworkProcess can start a
-    // WKDownload. Never Allow-as-page, never stamp Download here.
-    if is_wk_download_url(&url) {
+    // Loopback HTTP attachment only: Download (2) after NetworkProcess has
+    // the Content-Disposition / octet-stream response. Never Download on the
+    // custom-scheme URL (WKDownload cannot take over a scheme-handler task).
+    // Never Allow-as-page.
+    if is_live_download_http_url(&url) {
         record_download_proof(|proof| proof.response_policy_download = true);
         record_download_navigation_decision(webview as usize, url, WK_NAVIGATION_POLICY_DOWNLOAD);
         invoke_navigation_decision(decision_handler, WK_NAVIGATION_POLICY_DOWNLOAD);
+        return;
+    }
+    if is_download_probe_url(&url) {
+        record_download_navigation_decision(webview as usize, url, 0);
+        invoke_navigation_decision(decision_handler, 0);
         return;
     }
     let allow = live_wk_navigation_response_policy_allows(&url, is_main, can_show, is_download);

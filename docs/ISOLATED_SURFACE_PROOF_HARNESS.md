@@ -184,12 +184,13 @@ admit) so the handler can answer; it is not cancelled on `shouldPerformDownload`
 short-circuited with action-policy Download (2) before the handler runs. `WKDownload` is
 NetworkProcess-backed and cannot take over a custom-scheme task, so the handler cancels that
 document load and starts loopback HTTP that serves `Content-Disposition: attachment` plus
-octet-stream. Action policy returns `WKNavigationActionPolicyDownload` (2) for the HTTP URL
-so WK creates a `WKDownload`. Deny is the real non-null `didBecomeDownload` callback;
+octet-stream. Action policy Allows that HTTP URL so NetworkProcess can fetch the attachment
+headers; response policy then returns `WKNavigationResponsePolicyDownload` (2) so WK creates
+a `WKDownload`. Deny is the real non-null `didBecomeDownload` callback;
 `decideDestination` completes nil after inspecting the attachment and `deny.bin` is not
 written. Dummy `didBecomeDownload` IMP pokes, timeout→runloop pokes inside the handler,
-`shouldPerformDownload` shortcuts, action-policy-2 on the custom scheme, and cancelled
-`blob:` URLs are not a deny. Native deny IMPs call the same `admit_native_capability` gate
+`shouldPerformDownload` shortcuts, action-policy-2 on the custom scheme or the HTTP
+continuation, and cancelled `blob:` URLs are not a deny. Native deny IMPs call the same `admit_native_capability` gate
 as Linux tests.
 File and directory pickers require a WK-originated
 `WKUIDelegate.runOpenPanelWithParameters` callback with a real `WKOpenPanelParameters`
