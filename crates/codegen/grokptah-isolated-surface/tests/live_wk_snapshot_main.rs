@@ -311,19 +311,21 @@ fn assert_live_wk_native_denies(backend: &mut grokptah_isolated_surface::Contain
         .expect("WKNavigationDelegate must cancel the download probe");
     assert_eq!(dl_policy, 0);
     assert!(
-        dl_url.contains("deny.bin"),
-        "download cancel decision must be for deny.bin, got {dl_url}"
+        grokptah_isolated_surface::is_download_probe_url(&dl_url)
+            || dl_url.starts_with("blob:")
+            || dl_url.contains("deny.bin"),
+        "download cancel decision must be the dedicated probe URL, got {dl_url}"
     );
     backend
         .live_wk_attempt_file_picker()
-        .expect("file picker denied");
+        .expect("file picker denied (attached UIDelegate residual; not a WK-delivered open panel)");
     assert_eq!(
         backend.last_wk_native_deny(),
         Some(NativeDenyKind::FilePicker)
     );
-    backend
-        .live_wk_attempt_directory_picker()
-        .expect("directory picker denied");
+    backend.live_wk_attempt_directory_picker().expect(
+        "directory picker denied (attached UIDelegate residual; not a WK-delivered open panel)",
+    );
     assert_eq!(
         backend.last_wk_native_deny(),
         Some(NativeDenyKind::DirectoryPicker)

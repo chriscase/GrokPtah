@@ -16,6 +16,23 @@ pub const OWNED_PAGE_ORIGIN: &str = "https://grokptah.owned.invalid";
 pub const OWNED_PAGE_PATH: &str = "/cb-v0/";
 /// Exact URL admitted by the v0 allowlist.
 pub const OWNED_PAGE_URL: &str = "https://grokptah.owned.invalid/cb-v0/";
+/// Custom scheme that live WK registers a `WKURLSchemeHandler` for so the
+/// download probe can deliver `Content-Disposition: attachment` + octet-stream.
+/// Not on the page allowlist; never a navigable document.
+pub const DOWNLOAD_PROBE_SCHEME: &str = "grokptah-cbv0";
+/// Dedicated download URL served by the live-WK scheme handler.
+pub const DOWNLOAD_PROBE_URL: &str = "grokptah-cbv0://owned/deny.bin";
+/// Filename the download probe must never write to disk.
+pub const DOWNLOAD_PROBE_FILENAME: &str = "deny.bin";
+
+/// True when `url` is the dedicated download probe (scheme, owned-path `.bin`,
+/// or a same-origin `blob:` created from the owned page). Not a page admit.
+pub fn is_download_probe_url(url: &str) -> bool {
+    url == DOWNLOAD_PROBE_URL
+        || url.starts_with("grokptah-cbv0:")
+        || url.contains("/cb-v0/deny.bin")
+        || (url.starts_with("blob:") && url.contains("grokptah.owned.invalid"))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameKind {
@@ -193,6 +210,15 @@ mod tests {
         admit_navigation("https://grokptah.owned.invalid/other")
             .expect_err("same origin other path");
         admit_navigation("about:blank").expect_err("about:blank");
+        admit_navigation(DOWNLOAD_PROBE_URL).expect_err("download probe is not a page");
+        assert!(is_download_probe_url(DOWNLOAD_PROBE_URL));
+        assert!(is_download_probe_url(
+            "https://grokptah.owned.invalid/cb-v0/deny.bin"
+        ));
+        assert!(is_download_probe_url(
+            "blob:https://grokptah.owned.invalid/cb-v0/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        ));
+        assert!(!is_download_probe_url(OWNED_PAGE_URL));
     }
 
     #[test]
