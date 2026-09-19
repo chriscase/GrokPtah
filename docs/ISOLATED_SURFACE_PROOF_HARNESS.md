@@ -178,11 +178,13 @@ Live WK also attaches native fail-closed delegates on the owned-page session.
 a WK-originated createWebView callback (JS `null` without that callback is not a deny;
 missing createWebView IMP fail-closes because unimplemented createWebView is fail-open).
 `target=_blank` is cancelled by `WKNavigationDelegate` (`targetFrame == nil`) and recorded
-as `NewWindow`. Download probes use a dedicated URL: a same-origin `blob:` of
-`application/octet-stream` and a registered `grokptah-cbv0` `WKURLSchemeHandler` that
-serves `Content-Disposition: attachment` plus octet-stream. WK must cancel that
-navigation (`shouldPerformDownload`, download MIME, or `didBecomeDownload`) and must
-not write `deny.bin`. Dummy `didBecomeDownload` IMP pokes are not a deny. Native
+as `NewWindow`. Download probes click dedicated `grokptah-cbv0://owned/deny.bin`. Live WK
+registers a `WKURLSchemeHandler` that serves `Content-Disposition: attachment` plus
+octet-stream. Action policy Allows that fetch (not a page admit); response policy returns
+`WKNavigationResponsePolicyDownload` (2) so WK creates a `WKDownload`. Deny is the real
+non-null `didBecomeDownload` callback; `decideDestination` completes nil after inspecting
+the attachment and `deny.bin` is not written. Dummy `didBecomeDownload` IMP pokes,
+`shouldPerformDownload` shortcuts, and cancelled `blob:` URLs are not a deny. Native
 deny IMPs call the same `admit_native_capability` gate as Linux tests.
 File and directory pickers require a WK-originated
 `WKUIDelegate.runOpenPanelWithParameters` callback with a real `WKOpenPanelParameters`

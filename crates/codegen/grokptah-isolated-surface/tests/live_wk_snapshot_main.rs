@@ -311,11 +311,10 @@ fn assert_live_wk_native_denies(backend: &mut grokptah_isolated_surface::Contain
         .expect("WKNavigationDelegate must cancel the download probe");
     assert_eq!(dl_policy, 0);
     assert!(
-        grokptah_isolated_surface::is_download_probe_url(&dl_url)
-            || dl_url.starts_with("blob:")
-            || dl_url.contains("deny.bin"),
-        "download cancel decision must be the dedicated probe URL, got {dl_url}"
+        grokptah_isolated_surface::is_download_probe_url(&dl_url),
+        "download cancel decision must be the dedicated grokptah-cbv0 URL, got {dl_url}"
     );
+    println!("ok: live WK download deny url={dl_url} policy={dl_policy}");
     backend
         .live_wk_attempt_file_picker()
         .expect("file picker denied");
