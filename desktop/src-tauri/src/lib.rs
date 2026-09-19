@@ -1,5 +1,6 @@
 //! GrokPtah Tauri backend — thin adapters over grokptah-agent-bridge.
 
+mod coding_worktree;
 mod commands;
 mod computer_use;
 mod event_forward;
@@ -250,6 +251,13 @@ fn run_inner() -> anyhow::Result<()> {
             commands::list_worktrees,
             commands::create_worktree,
             commands::remove_worktree,
+            coding_worktree::coding_worktree_view,
+            coding_worktree::coding_worktree_for_session,
+            coding_worktree::coding_worktree_pause,
+            coding_worktree::coding_worktree_stop,
+            coding_worktree::coding_worktree_accept,
+            coding_worktree::coding_worktree_discard,
+            coding_worktree::coding_worktree_keep_for_review,
             commands::agent_edit_diffs,
             commands::last_edited_path,
             commands::export_transcript,

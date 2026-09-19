@@ -38,7 +38,7 @@ fn desktop_mcp_orchestration(
 }
 
 /// Run a blocking host/FS/git call off the UI thread (#137).
-async fn run_blocking<T, F>(f: F) -> Result<T, String>
+pub(crate) async fn run_blocking<T, F>(f: F) -> Result<T, String>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T, String> + Send + 'static,

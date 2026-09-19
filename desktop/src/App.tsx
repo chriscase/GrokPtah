@@ -29,6 +29,7 @@ import {
   type ContextMenuState,
 } from "./components/ContextMenu";
 import { ComputerCockpit } from "./components/ComputerCockpit";
+import { CodingWorktreeDisposition } from "./components/CodingWorktreeDisposition";
 import { FleetStrip } from "./components/FleetStrip";
 import { HelpCenter } from "./components/HelpCenter";
 import { SearchPanel } from "./components/SearchPanel";
@@ -4314,6 +4315,7 @@ export default function App() {
                   </button>
                 </div>
               </div>
+              <CodingWorktreeDisposition sessionId={activeSessionId} />
             </div>
             <button type="button" onClick={() => void api.gitStageAll()}>
               Stage all
