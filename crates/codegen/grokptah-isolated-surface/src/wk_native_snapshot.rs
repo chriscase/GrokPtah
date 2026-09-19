@@ -6,7 +6,7 @@
 //! never enables admission. Uniform window-white fail-closes.
 
 use std::collections::HashMap;
-use std::ffi::CString;
+use std::ffi::{c_void, CString};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
@@ -1066,7 +1066,9 @@ fn nsmutable_dictionary() -> Option<Retained<AnyObject>> {
 
 fn nsdata(bytes: &[u8]) -> Option<Retained<AnyObject>> {
     let cls = AnyClass::get(c"NSData")?;
-    unsafe { objc2::msg_send![cls, dataWithBytes: bytes.as_ptr(), length: bytes.len()] }
+    // objc2 encodes `*const u8` as '*' (char *); NSData wants '^v' (void *).
+    let ptr: *const c_void = bytes.as_ptr().cast();
+    unsafe { objc2::msg_send![cls, dataWithBytes: ptr, length: bytes.len()] }
 }
 
 fn evaluate_javascript(webview: &AnyObject, js: &str) -> HarnessResult<()> {
