@@ -432,9 +432,9 @@ impl LiveWkSession {
         })?;
         wait_for_wk_download_proof()?;
         let promoted = wait_for_download_navigation_policy(key, WK_NAVIGATION_POLICY_DOWNLOAD)?;
-        if !is_download_probe_url(&promoted.0) {
+        if !is_wk_download_url(&promoted.0) {
             return Err(HarnessError::invalid_state(format!(
-                "WK Download policy 2 was not the dedicated scheme URL, got {}",
+                "WK Download policy 2 was not the dedicated download URL, got {}",
                 promoted.0
             )));
         }
@@ -445,9 +445,9 @@ impl LiveWkSession {
                 decision.0, decision.1
             )));
         }
-        if !is_download_probe_url(&decision.0) {
+        if !is_wk_download_url(&decision.0) {
             return Err(HarnessError::invalid_state(format!(
-                "WK download cancel was not the dedicated scheme URL, got {}",
+                "WK download cancel was not the dedicated download URL, got {}",
                 decision.0
             )));
         }
