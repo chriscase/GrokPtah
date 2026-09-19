@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use block2::RcBlock;
 use objc2::encode::{Encode, Encoding};
 use objc2::rc::{Allocated, Retained};
-use objc2::runtime::{AnyClass, AnyObject, AnyProtocol, ClassBuilder, NSObject, Sel};
+use objc2::runtime::{AnyClass, AnyObject, AnyProtocol, Bool, ClassBuilder, NSObject, Sel};
 use objc2::{sel, ClassType};
 
 use crate::browser_engine_capture::{LIVE_WK_FIXTURE_CLICKED_RGB, LIVE_WK_FIXTURE_CRIMSON_RGB};
@@ -1432,29 +1432,29 @@ fn open_panel_probe_class(allows_directories: bool) -> Option<&'static AnyClass>
             if allows_directories {
                 builder.add_method(
                     sel!(allowsDirectories),
-                    probe_allows_directories_yes as unsafe extern "C-unwind" fn(_, _) -> bool,
+                    probe_allows_directories_yes as unsafe extern "C-unwind" fn(_, _) -> Bool,
                 );
             } else {
                 builder.add_method(
                     sel!(allowsDirectories),
-                    probe_allows_directories_no as unsafe extern "C-unwind" fn(_, _) -> bool,
+                    probe_allows_directories_no as unsafe extern "C-unwind" fn(_, _) -> Bool,
                 );
             }
             builder.add_method(
                 sel!(allowsMultipleSelection),
-                probe_allows_directories_no as unsafe extern "C-unwind" fn(_, _) -> bool,
+                probe_allows_directories_no as unsafe extern "C-unwind" fn(_, _) -> Bool,
             );
         }
         Some(builder.register())
     })
 }
 
-unsafe extern "C-unwind" fn probe_allows_directories_yes(_this: &AnyObject, _cmd: Sel) -> bool {
-    true
+unsafe extern "C-unwind" fn probe_allows_directories_yes(_this: &AnyObject, _cmd: Sel) -> Bool {
+    Bool::YES
 }
 
-unsafe extern "C-unwind" fn probe_allows_directories_no(_this: &AnyObject, _cmd: Sel) -> bool {
-    false
+unsafe extern "C-unwind" fn probe_allows_directories_no(_this: &AnyObject, _cmd: Sel) -> Bool {
+    Bool::NO
 }
 
 #[repr(C)]
