@@ -405,13 +405,15 @@ impl LiveWkSession {
     /// `WKDownload` is NetworkProcess-backed and cannot take over a custom-scheme
     /// task, so the handler cancels that document load and starts loopback HTTP
     /// that serves `Content-Disposition: attachment` + octet-stream. Action
-    /// policy Allows the HTTP URL so NetworkProcess can fetch those headers;
-    /// response policy then returns Download (2) so WK originates a
-    /// `WKDownload`. Deny is a real non-null `didBecomeDownload` plus
-    /// `decideDestination` completing nil after inspecting the attachment.
-    /// Dummy IMP pokes, blob cancels, pumping inside the scheme handler,
-    /// action-policy-2 on the custom scheme or the HTTP continuation, and
-    /// `shouldPerformDownload` shortcuts are not a deny. No file is written.
+    /// policy returns Download (2) for that HTTP URL so WK originates a
+    /// `WKDownload` without committing the main frame off the owned page
+    /// (Allow-as-document leaked `http://127.0.0.1/owned/deny.bin`). If WK
+    /// still consults response policy, that is also Download (2). Deny is a
+    /// real non-null `didBecomeDownload` plus `decideDestination` completing
+    /// nil after inspecting the attachment. Dummy IMP pokes, blob cancels,
+    /// pumping inside the scheme handler, action-policy-2 on the custom
+    /// scheme, and `shouldPerformDownload` shortcuts are not a deny. No file
+    /// is written.
     pub(crate) fn attempt_download(&self) -> HarnessResult<()> {
         require_main_thread("live WK download deny")?;
         let key = self.webview_key();
@@ -1565,7 +1567,6 @@ fn wait_for_wk_download_proof() -> HarnessResult<()> {
             && proof.scheme_handler_started
             && proof.http_load_started
             && proof.content_disposition_served
-            && proof.response_policy_download
             && proof.destination_invoked
             && proof.destination_nil
             && proof.destination_attachment
@@ -1825,9 +1826,9 @@ unsafe extern "C-unwind" fn decide_navigation_policy(
     let is_blank = navigation_action_is_blank(action);
     let key = webview as usize;
     // Dedicated scheme URL: Allow so WKURLSchemeHandler can answer. Not a
-    // page admit. Loopback HTTP continuation: also Allow so NetworkProcess
-    // fetches Content-Disposition; response policy 2 originates WKDownload.
-    // Action-policy-2 here would short-circuit before those headers exist.
+    // page admit. Loopback HTTP continuation: Download (2) so NetworkProcess
+    // originates a WKDownload without committing that URL as a document
+    // (Allow-as-document leaked the loopback URL off the owned page).
     // shouldPerformDownload on any other URL cancels without stamping
     // Download (that flag is not a WKDownload instance).
     if is_download_probe_url(&url) {
@@ -1838,8 +1839,8 @@ unsafe extern "C-unwind" fn decide_navigation_policy(
     }
     if is_live_download_http_url(&url) {
         record_download_proof(|proof| proof.action_url = Some(url.clone()));
-        record_download_navigation_decision(key, url, 1);
-        invoke_navigation_decision(decision_handler, 1);
+        record_download_navigation_decision(key, url, WK_NAVIGATION_POLICY_DOWNLOAD);
+        invoke_navigation_decision(decision_handler, WK_NAVIGATION_POLICY_DOWNLOAD);
         return;
     }
     if should_download {
