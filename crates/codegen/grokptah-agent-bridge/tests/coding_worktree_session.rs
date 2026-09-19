@@ -5,7 +5,7 @@
 //! synthetic temp-dir git fixtures only and never touch the developer's real
 //! GrokPtah checkout.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::MutexGuard;
 
 use chrono::Utc;
@@ -264,6 +264,55 @@ fn host_accept_rejects_host_project_cwd_even_when_not_session_main() {
     assert_eq!(err.code, SessionErrorCode::MainCheckoutProtected);
     assert_eq!(
         std::fs::read_to_string(project.path().join("README.md")).expect("project"),
+        "baseline\n"
+    );
+}
+
+#[test]
+fn host_accept_rejects_bound_session_cwd_distinct_from_project() {
+    let env = HostEnv::new();
+    let worktree_repo = TempDir::new().expect("worktree repo");
+    init_fixture_repo(worktree_repo.path());
+    let project = TempDir::new().expect("project cwd");
+    init_fixture_repo(project.path());
+    let bound_cwd = TempDir::new().expect("bound session cwd");
+    init_fixture_repo(bound_cwd.path());
+
+    env.host
+        .set_project_cwd(project.path())
+        .expect("set project cwd");
+    let bound_session = env.host.session_new().expect("bound session");
+    let _active = env.host.session_new().expect("active other session");
+    env.host
+        .session_set_cwd(bound_session.id, bound_cwd.path())
+        .expect("set inactive session cwd");
+    let reported = PathBuf::from(env.host.status().project_cwd.expect("project cwd"));
+    assert_eq!(
+        dunce::canonicalize(&reported).expect("canon reported"),
+        dunce::canonicalize(project.path()).expect("canon project")
+    );
+
+    stage_on_host(
+        &env,
+        worktree_repo.path(),
+        "host-bound-cwd",
+        Some(bound_session.id),
+    );
+    let patch = env
+        .host
+        .coding_worktree_stage_patch("host-bound-cwd")
+        .expect("stage");
+    let err = env
+        .host
+        .coding_worktree_accept("host-bound-cwd", bound_cwd.path(), &patch.digest)
+        .expect_err("bound session cwd protected");
+    assert_eq!(err.code, SessionErrorCode::MainCheckoutProtected);
+    assert_eq!(
+        std::fs::read_to_string(bound_cwd.path().join("README.md")).expect("bound cwd"),
+        "baseline\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(worktree_repo.path().join("README.md")).expect("main"),
         "baseline\n"
     );
 }
@@ -535,6 +584,21 @@ fn host_uncertain_rejects_auto_retry_stop_remains_legal() {
         .coding_worktree_discard("host-uncertain")
         .expect_err("discard");
     assert_eq!(discard_err.code, SessionErrorCode::UncertainOutcome);
+    let write_err = env
+        .host
+        .coding_worktree_write_file("host-uncertain", "README.md", "retry\n")
+        .expect_err("write");
+    assert_eq!(write_err.code, SessionErrorCode::InvalidState);
+    let stage_err = env
+        .host
+        .coding_worktree_stage_patch("host-uncertain")
+        .expect_err("stage");
+    assert_eq!(stage_err.code, SessionErrorCode::InvalidState);
+    let keep_err = env
+        .host
+        .coding_worktree_keep_for_review("host-uncertain")
+        .expect_err("keep");
+    assert_eq!(keep_err.code, SessionErrorCode::UncertainOutcome);
 
     let stop = env
         .host
@@ -565,6 +629,151 @@ fn host_session_delete_stops_bound_coding_worktree() {
     let view = env.host.coding_worktree_view("host-bound").expect("view");
     assert_eq!(view.phase, SessionPhase::Destroyed);
     assert!(!worktree.exists());
+    assert!(env
+        .host
+        .coding_worktree_handle_for_session(session.id)
+        .is_err());
+}
+
+#[test]
+fn host_session_delete_rejects_unconfirmed_destroy() {
+    let env = HostEnv::new();
+    let dir = TempDir::new().expect("tempdir");
+    init_fixture_repo(dir.path());
+    env.host.set_project_cwd(dir.path()).expect("cwd");
+    let session = env.host.session_new().expect("agent session");
+    env.host
+        .coding_worktree_create(Some(session.id), dir.path(), "HEAD", "host-unc")
+        .expect("create bound");
+    env.host
+        .coding_worktree_fail_next_destroy_for_test("host-unc")
+        .expect("inject");
+    env.host
+        .session_delete(session.id)
+        .expect_err("unconfirmed destroy");
+    let view = env.host.coding_worktree_view("host-unc").expect("view");
+    assert_eq!(view.phase, SessionPhase::Stopped);
+    assert_ne!(view.phase, SessionPhase::Destroyed);
+    assert!(view.worktree_path.exists());
+    env.host.session_load(session.id).expect("session retained");
+}
+
+#[test]
+fn host_session_archive_pauses_bound_coding_worktree() {
+    let env = HostEnv::new();
+    let dir = TempDir::new().expect("tempdir");
+    init_fixture_repo(dir.path());
+    env.host.set_project_cwd(dir.path()).expect("cwd");
+    let session = env.host.session_new().expect("agent session");
+    stage_on_host(&env, dir.path(), "host-archive", Some(session.id));
+    env.host.session_archive(session.id, true).expect("archive");
+    let view = env.host.coding_worktree_view("host-archive").expect("view");
+    assert_eq!(view.phase, SessionPhase::Paused);
+    let write_err = env
+        .host
+        .coding_worktree_write_file("host-archive", "README.md", "archived\n")
+        .expect_err("write fenced");
+    assert_eq!(write_err.code, SessionErrorCode::InvalidState);
+    let evidence = env
+        .host
+        .coding_worktree_stop("host-archive")
+        .expect("stop still legal");
+    assert!(evidence.destroy_confirmed);
+}
+
+#[test]
+fn host_attach_recovers_hostile_active_apply_in_flight() {
+    let env = HostEnv::new();
+    let dir = TempDir::new().expect("tempdir");
+    init_fixture_repo(dir.path());
+    env.host
+        .coding_worktree_create(None, dir.path(), "HEAD", "host-hostile")
+        .expect("create");
+    let snap_base = env.snapshot_base("host-hostile");
+    env.host
+        .coding_worktree_detach_live("host-hostile")
+        .expect("detach");
+
+    let loaded = SessionSnapshot::load(snapshot_root(&snap_base)).expect("load");
+    let mut lifecycle = SessionLifecycle::new(Utc::now());
+    lifecycle.phase = SessionPhase::Active;
+    lifecycle.apply_in_flight = true;
+    lifecycle.disposition = None;
+    lifecycle.settlement_fenced = false;
+    lifecycle.pause_fenced = false;
+    let snapshot = SessionSnapshot::new(
+        loaded.identity,
+        lifecycle,
+        loaded.patch,
+        loaded.main_checkout_digest,
+        loaded.worktree_path,
+        loaded.repo_root,
+    );
+    snapshot
+        .save(snapshot_root(&snap_base))
+        .expect("save hostile");
+
+    env.host
+        .coding_worktree_attach(None, &snap_base)
+        .expect("attach recovers");
+    let view = env.host.coding_worktree_view("host-hostile").expect("view");
+    assert_eq!(view.disposition, Some(SessionDisposition::Uncertain));
+    assert_eq!(view.phase, SessionPhase::Settled);
+    assert!(view.settlement_fenced);
+    assert!(view.pause_fenced);
+
+    let apply_root = clone_apply_target(dir.path());
+    let accept_err = env
+        .host
+        .coding_worktree_accept("host-hostile", apply_root.path(), "sha256:any")
+        .expect_err("no auto-retry");
+    assert_eq!(accept_err.code, SessionErrorCode::UncertainOutcome);
+    let pause_err = env
+        .host
+        .coding_worktree_pause("host-hostile")
+        .expect_err("pause");
+    assert_eq!(pause_err.code, SessionErrorCode::UncertainOutcome);
+    let write_err = env
+        .host
+        .coding_worktree_write_file("host-hostile", "README.md", "retry\n")
+        .expect_err("write");
+    assert_eq!(write_err.code, SessionErrorCode::InvalidState);
+
+    env.host
+        .coding_worktree_create(None, dir.path(), "HEAD", "host-settling")
+        .expect("create settling");
+    let settling_base = env.snapshot_base("host-settling");
+    env.host
+        .coding_worktree_detach_live("host-settling")
+        .expect("detach settling");
+    let loaded = SessionSnapshot::load(snapshot_root(&settling_base)).expect("load settling");
+    let mut lifecycle = SessionLifecycle::new(Utc::now());
+    lifecycle.begin_settlement(Utc::now()).unwrap();
+    lifecycle.mark_apply_in_flight(Utc::now()).unwrap();
+    let snapshot = SessionSnapshot::new(
+        loaded.identity,
+        lifecycle,
+        loaded.patch,
+        loaded.main_checkout_digest,
+        loaded.worktree_path,
+        loaded.repo_root,
+    );
+    snapshot
+        .save(snapshot_root(&settling_base))
+        .expect("save settling");
+    env.host
+        .coding_worktree_attach(None, &settling_base)
+        .expect("attach settling recovers");
+    let view = env
+        .host
+        .coding_worktree_view("host-settling")
+        .expect("view settling");
+    assert_eq!(view.disposition, Some(SessionDisposition::Uncertain));
+    let accept_err = env
+        .host
+        .coding_worktree_accept("host-settling", apply_root.path(), "sha256:any")
+        .expect_err("settling no auto-retry");
+    assert_eq!(accept_err.code, SessionErrorCode::UncertainOutcome);
 }
 
 #[test]

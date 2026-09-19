@@ -65,7 +65,7 @@ impl AgentHostHandle {
         base_sha: &str,
         handle: &str,
     ) -> SessionResult<CodingWorktreeIdentity> {
-        self.ensure_coding_worktree_open("creating a coding worktree session")?;
+        let _write = self.ensure_coding_worktree_write("creating a coding worktree session")?;
         validate_coding_worktree_handle(handle)?;
         self.assert_agent_session_bindable(agent_session_id)?;
         self.assert_coding_worktree_available(handle, agent_session_id)?;
@@ -80,16 +80,23 @@ impl AgentHostHandle {
 
     /// Attach a previously persisted coding worktree from durable snapshot
     /// metadata. Settled and Uncertain restorations stay fenced: Pause and
-    /// settlement cannot be retried.
+    /// settlement cannot be retried. Apply-in-flight (including hostile
+    /// Active+in-flight snapshots) recovers to Uncertain and cannot auto-retry.
     pub fn coding_worktree_attach(
         &self,
         agent_session_id: Option<Uuid>,
         snapshot_base: impl AsRef<Path>,
     ) -> SessionResult<CodingWorktreeIdentity> {
-        self.ensure_coding_worktree_open("attaching a coding worktree session")?;
+        let _write = self.ensure_coding_worktree_write("attaching a coding worktree session")?;
         self.assert_agent_session_bindable(agent_session_id)?;
 
-        let session = CodingWorktreeSession::attach(snapshot_base)?;
+        let mut session = CodingWorktreeSession::attach(snapshot_base)?;
+        if session.lifecycle().apply_in_flight
+            || session.lifecycle().apply_uncertain
+            || session.lifecycle().phase == SessionPhase::Settling
+        {
+            session.recover_after_restart(Utc::now())?;
+        }
         let identity = session.identity().clone();
         validate_coding_worktree_handle(&identity.session_id)?;
         self.assert_coding_worktree_available(&identity.session_id, agent_session_id)?;
@@ -143,27 +150,29 @@ impl AgentHostHandle {
         relative: &str,
         contents: impl AsRef<[u8]>,
     ) -> SessionResult<()> {
-        self.ensure_coding_worktree_open("writing a coding worktree file")?;
+        let _write = self.ensure_coding_worktree_write("writing a coding worktree file")?;
         self.with_coding_worktree_mut(handle, |slot| {
             slot.session.write_worktree_file(relative, contents)
         })
     }
 
     pub fn coding_worktree_stage_patch(&self, handle: &str) -> SessionResult<PatchArtifact> {
-        self.ensure_coding_worktree_open("staging a coding worktree patch")?;
+        let _write = self.ensure_coding_worktree_write("staging a coding worktree patch")?;
         self.with_coding_worktree_mut(handle, |slot| slot.session.stage_patch())
     }
 
     /// Local Pause: fences further staging and settlement. Stop remains legal.
     pub fn coding_worktree_pause(&self, handle: &str) -> SessionResult<PauseEvidence> {
-        self.ensure_coding_worktree_open("pausing a coding worktree session")?;
+        let _write = self.ensure_coding_worktree_write("pausing a coding worktree session")?;
         self.with_coding_worktree_mut(handle, |slot| slot.session.pause(Utc::now()))
     }
 
     /// Fence-first Stop. `Destroyed` is recorded only when worktree destroy is
     /// confirmed; persist/snapshot failure does not skip teardown.
     pub fn coding_worktree_stop(&self, handle: &str) -> SessionResult<StopEvidence> {
-        self.ensure_coding_worktree_open("stopping a coding worktree session")?;
+        let _write = self
+            .durable_write("stopping a coding worktree session")
+            .ok();
         self.with_coding_worktree_mut(handle, |slot| slot.session.stop(Utc::now()))
     }
 
@@ -182,6 +191,56 @@ impl AgentHostHandle {
         }
     }
 
+    /// Pause the coding worktree bound to an AgentHost session, if any.
+    /// Already-fenced / Uncertain sessions stay fenced (not an archive error).
+    pub fn coding_worktree_pause_for_agent_session(
+        &self,
+        agent_session_id: Uuid,
+    ) -> SessionResult<Option<PauseEvidence>> {
+        let handle = {
+            let registry = self.coding_worktrees.lock();
+            registry.by_agent_session.get(&agent_session_id).cloned()
+        };
+        match handle {
+            Some(handle) => match self.coding_worktree_pause(&handle) {
+                Ok(evidence) => Ok(Some(evidence)),
+                Err(error)
+                    if matches!(
+                        error.code,
+                        SessionErrorCode::InvalidState | SessionErrorCode::UncertainOutcome
+                    ) =>
+                {
+                    Ok(None)
+                }
+                Err(error) => Err(error),
+            },
+            None => Ok(None),
+        }
+    }
+
+    /// Drop the AgentHost session binding after a confirmed Stop. The live slot
+    /// remains so Destroyed/Stopped can still be inspected.
+    pub fn coding_worktree_unbind_agent_session(&self, agent_session_id: Uuid) {
+        let mut registry = self.coding_worktrees.lock();
+        if let Some(handle) = registry.by_agent_session.remove(&agent_session_id) {
+            if let Some(slot) = registry.by_handle.get_mut(&handle) {
+                slot.agent_session_id = None;
+            }
+        }
+    }
+
+    /// Fence-first Stop every attached coding worktree. Persist failure does
+    /// not skip teardown. `Destroyed` only if destroy is confirmed per session.
+    pub fn coding_worktree_stop_all(&self) {
+        let handles: Vec<String> = {
+            let registry = self.coding_worktrees.lock();
+            registry.by_handle.keys().cloned().collect()
+        };
+        for handle in handles {
+            let _ = self.coding_worktree_stop(&handle);
+        }
+    }
+
     /// Accept: apply the staged patch to `apply_target` after an exact
     /// `sha256:` digest match. The protected main checkout, host project cwd,
     /// and bound AgentHost session cwd are never apply targets.
@@ -191,21 +250,46 @@ impl AgentHostHandle {
         apply_target: impl AsRef<Path>,
         expected_patch_digest: &str,
     ) -> SessionResult<AcceptEvidence> {
-        self.ensure_coding_worktree_open("accepting a coding worktree session")?;
+        let _write = self.ensure_coding_worktree_write("accepting a coding worktree session")?;
         let apply_target = apply_target.as_ref();
-        let protected = self.coding_worktree_protected_checkouts(handle)?;
-        for root in &protected {
+        let mut registry = self.coding_worktrees.lock();
+        let slot = registry.by_handle.get_mut(handle).ok_or_else(|| {
+            SessionError::invalid_state(format!(
+                "no coding worktree session attached for handle {handle}"
+            ))
+        })?;
+        // Hold Inner for the duration of apply so set_project_cwd /
+        // session_set_cwd cannot swap a host-protected root under Accept.
+        let inner = self.inner.lock();
+        let mut roots = Vec::new();
+        if slot.session.main_checkout().exists() {
+            roots.push(slot.session.main_checkout().to_path_buf());
+        }
+        if let Some(cwd) = inner.project_cwd.as_ref() {
+            if cwd.exists() {
+                roots.push(cwd.clone());
+            }
+        }
+        if let Some(agent_session_id) = slot.agent_session_id {
+            if let Some(session) = inner.sessions.get(&agent_session_id) {
+                if session.cwd.exists() {
+                    roots.push(session.cwd.clone());
+                }
+            }
+        }
+        for root in &roots {
             assert_apply_target_allowed(root, apply_target, "accept")?;
         }
-        self.with_coding_worktree_mut(handle, |slot| {
-            slot.session
-                .accept(apply_target, expected_patch_digest, Utc::now())
-        })
+        let evidence = slot
+            .session
+            .accept(apply_target, expected_patch_digest, Utc::now())?;
+        drop(inner);
+        Ok(evidence)
     }
 
     /// Discard: remove the disposable worktree and clear session records.
     pub fn coding_worktree_discard(&self, handle: &str) -> SessionResult<DiscardEvidence> {
-        self.ensure_coding_worktree_open("discarding a coding worktree session")?;
+        let _write = self.ensure_coding_worktree_write("discarding a coding worktree session")?;
         self.with_coding_worktree_mut(handle, |slot| slot.session.discard(Utc::now()))
     }
 
@@ -214,7 +298,8 @@ impl AgentHostHandle {
         &self,
         handle: &str,
     ) -> SessionResult<KeepForReviewEvidence> {
-        self.ensure_coding_worktree_open("keeping a coding worktree session for review")?;
+        let _write =
+            self.ensure_coding_worktree_write("keeping a coding worktree session for review")?;
         self.with_coding_worktree_mut(handle, |slot| slot.session.keep_for_review(Utc::now()))
     }
 
@@ -256,6 +341,14 @@ impl AgentHostHandle {
 
     fn ensure_coding_worktree_open(&self, operation: &str) -> SessionResult<()> {
         self.ensure_accepting(operation)
+            .map_err(|error| SessionError::invalid_state(error.to_string()))
+    }
+
+    fn ensure_coding_worktree_write(
+        &self,
+        operation: &str,
+    ) -> SessionResult<crate::host_runtime::DurableWriteGuard> {
+        self.durable_write(operation)
             .map_err(|error| SessionError::invalid_state(error.to_string()))
     }
 
@@ -330,33 +423,6 @@ impl AgentHostHandle {
             ))
         })?;
         f(slot)
-    }
-
-    fn coding_worktree_protected_checkouts(&self, handle: &str) -> SessionResult<Vec<PathBuf>> {
-        let (main_checkout, agent_session_id) = self.with_coding_worktree(handle, |slot| {
-            Ok((
-                slot.session.main_checkout().to_path_buf(),
-                slot.agent_session_id,
-            ))
-        })?;
-        let mut roots = Vec::new();
-        if main_checkout.exists() {
-            roots.push(main_checkout);
-        }
-        let inner = self.inner.lock();
-        if let Some(cwd) = inner.project_cwd.as_ref() {
-            if cwd.exists() {
-                roots.push(cwd.clone());
-            }
-        }
-        if let Some(agent_session_id) = agent_session_id {
-            if let Some(session) = inner.sessions.get(&agent_session_id) {
-                if session.cwd.exists() {
-                    roots.push(session.cwd.clone());
-                }
-            }
-        }
-        Ok(roots)
     }
 }
 

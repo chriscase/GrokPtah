@@ -3608,6 +3608,7 @@ impl AgentHostHandle {
 
     pub fn stop(&self) -> Result<()> {
         self.invalidate_computer_agent_authority();
+        self.coding_worktree_stop_all();
         let mut g = self.inner.lock();
         g.turn_generations.clear();
         for (_, c) in g.turn_cancels.drain() {
@@ -4098,8 +4099,15 @@ impl AgentHostHandle {
     pub fn session_delete(&self, id: Uuid) -> Result<()> {
         let write = self.durable_write("deleting a session")?;
         self.cancel_computer_agent(id);
-        self.coding_worktree_stop_for_agent_session(id)
+        let evidence = self
+            .coding_worktree_stop_for_agent_session(id)
             .map_err(|error| anyhow!(error))?;
+        if let Some(evidence) = evidence {
+            if !evidence.destroy_confirmed {
+                bail!("cannot delete a session while coding worktree destroy is unconfirmed");
+            }
+            self.coding_worktree_unbind_agent_session(id);
+        }
         {
             let mut g = self.inner.lock();
             if !g.sessions.contains_key(&id) {
@@ -4126,6 +4134,10 @@ impl AgentHostHandle {
 
     pub fn session_archive(&self, id: Uuid, archived: bool) -> Result<SessionSummary> {
         let _write = self.durable_write("archiving a session")?;
+        if archived {
+            self.coding_worktree_pause_for_agent_session(id)
+                .map_err(|error| anyhow!(error))?;
+        }
         let summary = {
             let mut g = self.inner.lock();
             if archived && g.turn_cancels.contains_key(&id) {

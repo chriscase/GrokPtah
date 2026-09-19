@@ -95,11 +95,15 @@ Closed by the AgentHost disposition surface (`coding_worktree_*` on
 - Host owns/attaches one `CodingWorktreeSession` per explicit handle (optionally
   bound to an AgentHost session) and exposes Pause, fence-first Stop, Accept
   (exact `sha256:` digest, never protected main / host project cwd / bound
-  session cwd), Discard, and Keep-for-review.
+  session cwd), Discard, and Keep-for-review. Mutators take `#455` durable-write
+  authority; Stop still tears down if persist/write authority fails.
 - Pause still fences staging/settlement; attach-after-settlement cannot retry;
-  Uncertain rejects auto-retry; Stop remains legal while Paused; `Destroyed` is
-  recorded only on confirmed destroy. Deleting a bound AgentHost session
-  fence-first Stops its coding worktree.
+  Uncertain rejects auto-retry; attach recovers apply-in-flight (including
+  hostile Active+in-flight) to Uncertain; Stop remains legal while Paused;
+  `Destroyed` is recorded only on confirmed destroy. Deleting a bound AgentHost
+  session fence-first Stops its coding worktree and refuses unconfirmed destroy.
+  Archive Pauses a bound worktree. Host `stop` fence-first Stops attached
+  coding worktrees.
 - Bridge tests in `coding_worktree_session.rs` cover those host paths.
 
 Still open:
