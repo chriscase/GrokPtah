@@ -1246,8 +1246,8 @@ fn clear_stopped_scheme_tasks() {
     }
 }
 
-fn pending_scheme_fail() -> &'static Mutex<Option<Retained<AnyObject>>> {
-    static PENDING: OnceLock<Mutex<Option<Retained<AnyObject>>>> = OnceLock::new();
+fn pending_scheme_fail() -> &'static Mutex<Option<usize>> {
+    static PENDING: OnceLock<Mutex<Option<usize>>> = OnceLock::new();
     PENDING.get_or_init(|| Mutex::new(None))
 }
 
@@ -1255,11 +1255,8 @@ fn queue_scheme_task_fail(task: *mut AnyObject) {
     if task.is_null() {
         return;
     }
-    let Some(task) = (unsafe { Retained::retain(task) }) else {
-        return;
-    };
     if let Ok(mut guard) = pending_scheme_fail().lock() {
-        *guard = Some(task);
+        *guard = Some(task as usize);
     }
 }
 
@@ -1268,13 +1265,14 @@ fn flush_pending_scheme_task_fail() {
         .lock()
         .ok()
         .and_then(|mut guard| guard.take());
-    let Some(task) = pending else {
+    let Some(ptr) = pending else {
         return;
     };
-    if scheme_task_is_stopped(&*task) {
+    let task = ptr as *mut AnyObject;
+    if task.is_null() || scheme_task_is_stopped(task) {
         return;
     }
-    fail_scheme_task_cancelled(&task);
+    fail_scheme_task_cancelled(unsafe { &*task });
 }
 
 fn pending_http_attachment_webview() -> &'static Mutex<Option<usize>> {
