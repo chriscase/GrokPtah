@@ -232,6 +232,27 @@ fn contained_browser_native_deny_policy_fail_closed() {
 }
 
 #[test]
+fn live_wk_open_panel_deny_requires_wk_delivery() {
+    use grokptah_isolated_surface::live_wk_open_panel_policy_allows;
+
+    assert!(!live_wk_open_panel_policy_allows(false));
+    assert!(!live_wk_open_panel_policy_allows(true));
+    let mut backend = ContainedBrowserBackend::new();
+    assert!(
+        backend.last_wk_open_panel_deny().is_none(),
+        "no WKOpenPanelParameters record without a live WK session"
+    );
+    backend
+        .live_wk_attempt_file_picker()
+        .expect_err("file picker without WK-originated runOpenPanel");
+    backend
+        .live_wk_attempt_directory_picker()
+        .expect_err("directory picker without WK-originated runOpenPanel");
+    assert!(backend.last_wk_open_panel_deny().is_none());
+    assert!(!isolated_surface_admission_available());
+}
+
+#[test]
 fn live_wk_navigation_policy_helper_cancels_off_allowlist() {
     use grokptah_isolated_surface::live_wk_navigation_policy_allows;
     assert!(live_wk_navigation_policy_allows(
@@ -436,12 +457,30 @@ fn assert_live_wk_native_denies_and_fresh_store(
         backend.last_wk_native_deny(),
         Some(NativeDenyKind::FilePicker)
     );
+    let (file_dirs, file_urls_null, file_wk) = backend
+        .last_wk_open_panel_deny()
+        .expect("WK runOpenPanel must fire for the file picker");
+    assert!(!file_dirs);
+    assert!(file_urls_null);
+    assert!(
+        file_wk,
+        "file picker must be WK-originated WKOpenPanelParameters, not an attached-UIDelegate IMP poke"
+    );
     backend
         .live_wk_attempt_directory_picker()
         .expect("directory picker denied");
     assert_eq!(
         backend.last_wk_native_deny(),
         Some(NativeDenyKind::DirectoryPicker)
+    );
+    let (dir_dirs, dir_urls_null, dir_wk) = backend
+        .last_wk_open_panel_deny()
+        .expect("WK runOpenPanel must fire for the directory picker");
+    assert!(dir_dirs);
+    assert!(dir_urls_null);
+    assert!(
+        dir_wk,
+        "directory picker must be WK-originated WKOpenPanelParameters, not an attached-UIDelegate IMP poke"
     );
     let wk_url = backend
         .live_wk_current_url()
