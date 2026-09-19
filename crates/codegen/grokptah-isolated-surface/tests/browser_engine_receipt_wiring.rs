@@ -6,11 +6,13 @@
 #![cfg(feature = "browser-engine")]
 
 use grokptah_isolated_surface::{
-    admit_browser_engine_capture, canonical_sha256_digest,
+    admit_browser_engine_capture, admit_frame_action, admit_navigation, canonical_sha256_digest,
     capture_live_wk_snapshot_through_receipt, isolated_surface_admission_available,
-    native_browser_engine_capture_authorized, validate_public_evidence, CapturedFrameSource,
-    ContainedBrowserBackend, HarnessErrorCode, HostSentinelSnapshot, IsolatedSurfaceBackend,
-    IsolatedSurfaceHarness, LIVE_WK_FIXTURE_CRIMSON_RGB, SYNTHETIC_FRAME_PAYLOAD_NEEDLE,
+    native_browser_engine_capture_authorized, owned_page_for_boot, validate_public_evidence,
+    ActionChannel, CapturedFrameSource, ContainedBrowserBackend, FrameKind, GuestLocalAction,
+    HarnessErrorCode, HostSentinelSnapshot, IsolatedSurfaceBackend, IsolatedSurfaceHarness,
+    NonpersistentWebsiteDataStore, LIVE_WK_FIXTURE_CRIMSON_RGB, OWNED_PAGE_URL,
+    SYNTHETIC_FRAME_PAYLOAD_NEEDLE,
 };
 
 #[test]
@@ -150,4 +152,152 @@ fn harness_receipt_gated_observe_never_falls_back_to_simulator() {
     }
     assert!(!native_browser_engine_capture_authorized());
     assert!(!isolated_surface_admission_available());
+}
+
+#[test]
+fn contained_browser_v0_allowlist_and_main_frame_policy() {
+    assert_eq!(owned_page_for_boot().expect("owned page"), OWNED_PAGE_URL);
+    admit_navigation("https://example.com/").expect_err("off-allowlist");
+    admit_navigation("https://grokptah.owned.invalid/other").expect_err("other path");
+    admit_navigation("about:blank").expect_err("about:blank");
+    admit_frame_action(FrameKind::MainFrame, ActionChannel::MainFrameDom).expect("main DOM");
+    admit_frame_action(FrameKind::BlankTarget, ActionChannel::MainFrameDom).expect_err("_blank");
+    admit_frame_action(FrameKind::SecondaryWindow, ActionChannel::MainFrameDom)
+        .expect_err("secondary");
+    admit_frame_action(FrameKind::MainFrame, ActionChannel::HostKeyboard).expect_err("keyboard");
+    admit_frame_action(FrameKind::MainFrame, ActionChannel::HostPointer).expect_err("pointer");
+    admit_frame_action(FrameKind::MainFrame, ActionChannel::HostClipboard).expect_err("clipboard");
+
+    let mut backend = ContainedBrowserBackend::new();
+    backend
+        .inject_dom_action(
+            GuestLocalAction::ClickGuestButton,
+            FrameKind::BlankTarget,
+            ActionChannel::MainFrameDom,
+        )
+        .expect_err("_blank before boot");
+    backend
+        .inject_dom_action(
+            GuestLocalAction::ClickGuestButton,
+            FrameKind::MainFrame,
+            ActionChannel::HostClipboard,
+        )
+        .expect_err("clipboard before boot");
+    let first = NonpersistentWebsiteDataStore::mint();
+    let second = NonpersistentWebsiteDataStore::mint();
+    assert_ne!(first.run_id(), second.run_id());
+    assert!(!isolated_surface_admission_available());
+}
+
+#[test]
+fn live_wk_navigation_policy_helper_cancels_off_allowlist() {
+    use grokptah_isolated_surface::live_wk_navigation_policy_allows;
+    assert!(live_wk_navigation_policy_allows(
+        OWNED_PAGE_URL,
+        true,
+        false
+    ));
+    assert!(!live_wk_navigation_policy_allows(
+        "https://evil.example/",
+        true,
+        false
+    ));
+    assert!(!live_wk_navigation_policy_allows(
+        OWNED_PAGE_URL,
+        true,
+        true
+    ));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn live_wk_backend_containment_after_capture() {
+    let mut backend = ContainedBrowserBackend::new();
+    match backend.capture_live_wk_snapshot() {
+        Ok(_) => {
+            assert_eq!(backend.current_page(), Some(OWNED_PAGE_URL));
+            let first_store = backend
+                .website_data_store_id()
+                .expect("store minted")
+                .to_string();
+            backend
+                .navigate("https://evil.example/")
+                .expect_err("off-allowlist");
+            backend
+                .inject_dom_action(
+                    GuestLocalAction::ClickGuestButton,
+                    FrameKind::BlankTarget,
+                    ActionChannel::MainFrameDom,
+                )
+                .expect_err("_blank");
+            backend
+                .inject_dom_action(
+                    GuestLocalAction::ClickGuestButton,
+                    FrameKind::MainFrame,
+                    ActionChannel::HostKeyboard,
+                )
+                .expect_err("keyboard");
+            let before = IsolatedSurfaceBackend::observe_frame(&backend)
+                .expect("observe before admitted main-frame DOM inject");
+            let original_epoch = before.epoch;
+            let original_digest = before.digest.clone();
+            assert!(
+                !backend
+                    .live_website_data_store_is_persistent()
+                    .expect("runtime store persistence"),
+                "live capture must report a nonpersistent store"
+            );
+            backend
+                .live_wk_attempt_navigation("https://evil.example/")
+                .expect("WK cancelled off-allowlist");
+            let wk_url = backend
+                .live_wk_current_url()
+                .expect("WK current_url after cancel");
+            assert!(
+                wk_url.starts_with(OWNED_PAGE_URL) || wk_url == OWNED_PAGE_URL,
+                "WK URL must stay owned, got {wk_url}"
+            );
+            let (decided_url, policy) = backend
+                .last_wk_navigation_decision()
+                .expect("WKNavigationDelegate decision");
+            assert_eq!(policy, 0);
+            assert!(decided_url.contains("evil.example"));
+            let outcome = backend
+                .inject_dom_action(
+                    GuestLocalAction::ClickGuestButton,
+                    FrameKind::MainFrame,
+                    ActionChannel::MainFrameDom,
+                )
+                .expect("admitted inject after live capture must succeed");
+            let grokptah_isolated_surface::InjectOutcome::Changed(delta) = outcome else {
+                panic!("admitted inject must be Changed");
+            };
+            assert!(delta.guest_local_change);
+            assert_ne!(delta.before_digest, original_digest);
+            let after = IsolatedSurfaceBackend::observe_frame(&backend)
+                .expect("successful inject must keep observation bound");
+            assert_eq!(after.epoch, original_epoch.saturating_add(1));
+            IsolatedSurfaceBackend::stop_fence_first(&mut backend).expect("fence");
+            IsolatedSurfaceBackend::inject_guest_local(
+                &mut backend,
+                GuestLocalAction::ClickGuestButton,
+            )
+            .expect_err("fenced");
+            backend.destroy().expect("destroy");
+            assert!(backend.website_data_store_id().is_none());
+            match backend.capture_live_wk_snapshot() {
+                Ok(_) => {
+                    let second = backend.website_data_store_id().expect("fresh store");
+                    assert_ne!(first_store, second);
+                }
+                Err(err) if err.message.contains("main thread") => {}
+                Err(err) => panic!("second live WK capture: {err:?}"),
+            }
+            assert!(!isolated_surface_admission_available());
+        }
+        Err(err) if err.message.contains("main thread") => {
+            assert_eq!(err.code, HarnessErrorCode::BackendUnavailable);
+        }
+        Err(err) => panic!("live WK containment capture: {err:?}"),
+    }
 }

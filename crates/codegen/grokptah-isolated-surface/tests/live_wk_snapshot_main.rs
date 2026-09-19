@@ -14,9 +14,10 @@ fn main() {
     use grokptah_isolated_surface::{
         canonical_sha256_digest, capture_live_wk_snapshot_through_receipt,
         isolated_surface_admission_available, native_browser_engine_capture_authorized,
-        validate_public_evidence, CapturedFrameMediaKind, CapturedFrameSource,
-        ContainedBrowserBackend, HarnessErrorCode, HostSentinelSnapshot, IsolatedSurfaceBackend,
-        IsolatedSurfaceHarness, SYNTHETIC_FRAME_PAYLOAD_NEEDLE,
+        validate_public_evidence, ActionChannel, CapturedFrameMediaKind, CapturedFrameSource,
+        ContainedBrowserBackend, FrameKind, GuestLocalAction, HarnessErrorCode,
+        HostSentinelSnapshot, IsolatedSurfaceBackend, IsolatedSurfaceHarness, OWNED_PAGE_URL,
+        SYNTHETIC_FRAME_PAYLOAD_NEEDLE,
     };
 
     assert!(
@@ -82,11 +83,103 @@ fn main() {
             observed.captured_frame.as_ref().map(|ev| ev.source),
             Some(CapturedFrameSource::BrowserEngine)
         );
+        assert_eq!(backend.current_page(), Some(OWNED_PAGE_URL));
+        let first_store = backend
+            .website_data_store_id()
+            .expect("nonpersistent store minted")
+            .to_string();
+        backend
+            .navigate("https://evil.example/")
+            .expect_err("off-allowlist navigation denied");
+        backend
+            .navigate("https://grokptah.owned.invalid/other")
+            .expect_err("same-origin other path denied");
+        backend
+            .inject_dom_action(
+                GuestLocalAction::ClickGuestButton,
+                FrameKind::BlankTarget,
+                ActionChannel::MainFrameDom,
+            )
+            .expect_err("_blank refused");
+        backend
+            .inject_dom_action(
+                GuestLocalAction::ClickGuestButton,
+                FrameKind::SecondaryWindow,
+                ActionChannel::MainFrameDom,
+            )
+            .expect_err("secondary window refused");
+        backend
+            .inject_dom_action(
+                GuestLocalAction::ClickGuestButton,
+                FrameKind::MainFrame,
+                ActionChannel::HostKeyboard,
+            )
+            .expect_err("host keyboard refused");
+        backend
+            .inject_dom_action(
+                GuestLocalAction::ClickGuestButton,
+                FrameKind::MainFrame,
+                ActionChannel::HostPointer,
+            )
+            .expect_err("host pointer refused");
+        backend
+            .inject_dom_action(
+                GuestLocalAction::ClickGuestButton,
+                FrameKind::MainFrame,
+                ActionChannel::HostClipboard,
+            )
+            .expect_err("host clipboard refused");
+        assert!(
+            !backend
+                .live_website_data_store_is_persistent()
+                .expect("runtime store persistence"),
+            "live WK must use a nonpersistent website-data store"
+        );
+        backend
+            .live_wk_attempt_navigation("https://evil.example/")
+            .expect("WK cancelled off-allowlist; owned page stays");
+        let wk_url = backend
+            .live_wk_current_url()
+            .expect("WK current_url after cancelled navigation");
+        assert!(
+            wk_url.starts_with(OWNED_PAGE_URL) || wk_url == OWNED_PAGE_URL,
+            "WK current_url must remain the owned page, got {wk_url}"
+        );
+        let (decided_url, policy) = backend
+            .last_wk_navigation_decision()
+            .expect("WKNavigationDelegate must fire a decision");
+        assert_eq!(
+            policy, 0,
+            "off-allowlist must be WK policy cancel, got {policy}"
+        );
+        assert!(
+            decided_url.contains("evil.example"),
+            "cancel decision must be for the requested URL, got {decided_url}"
+        );
+        assert_admitted_main_frame_inject_mutates_digest(&mut backend);
+        backend.stop_fence_first().expect("fence");
+        let fenced = IsolatedSurfaceBackend::inject_guest_local(
+            &mut backend,
+            GuestLocalAction::ClickGuestButton,
+        )
+        .expect_err("inject after fence");
+        assert_eq!(fenced.code, HarnessErrorCode::InjectFenced);
         backend.destroy().expect("destroy");
         assert!(!backend.is_booted());
+        assert!(backend.website_data_store_id().is_none());
         backend
             .observe_frame()
             .expect_err("destroy unboots; observe cannot inherit stored capture");
+
+        let mut second = ContainedBrowserBackend::new();
+        let _ = second
+            .capture_live_wk_snapshot()
+            .expect("second run live WK snapshot");
+        let second_store = second
+            .website_data_store_id()
+            .expect("second run mints a fresh store");
+        assert_ne!(first_store, second_store);
+        second.destroy().expect("destroy second");
 
         let mut harness = IsolatedSurfaceHarness::with_backend(
             HostSentinelSnapshot::synthetic_baseline(),
@@ -113,7 +206,69 @@ fn main() {
             "ok: ReceiptGated backend+harness observe digest={}",
             harness_frame.digest
         );
+
+        harness.schedule_uncertain_on_next_inject();
+        harness
+            .inject_guest_action(GuestLocalAction::ClickGuestButton)
+            .expect_err("uncertain");
+        let retry = harness
+            .retry_inject_after_uncertain(GuestLocalAction::ClickGuestButton)
+            .expect_err("no auto-retry");
+        assert_eq!(retry.code, HarnessErrorCode::AutoRetryForbidden);
+        let evidence = harness.stop().expect("stop after uncertain");
+        assert_eq!(
+            harness.lifecycle().phase,
+            grokptah_isolated_surface::GuestLifecyclePhase::Destroyed
+        );
+        assert!(evidence.destroy_confirmed(harness.lifecycle().phase));
+        println!("ok: browser-engine Stop/Uncertain/Destroyed-after-confirm");
     }
+}
+
+#[cfg(feature = "browser-engine")]
+fn assert_admitted_main_frame_inject_mutates_digest(
+    backend: &mut grokptah_isolated_surface::ContainedBrowserBackend,
+) {
+    use grokptah_isolated_surface::{
+        ActionChannel, CapturedFrameSource, FrameKind, GuestLocalAction, InjectOutcome,
+        IsolatedSurfaceBackend,
+    };
+
+    let before = backend
+        .observe_frame()
+        .expect("observe before admitted main-frame DOM inject");
+    let original_epoch = before.epoch;
+    let original_digest = before.digest.clone();
+    let outcome = backend
+        .inject_dom_action(
+            GuestLocalAction::ClickGuestButton,
+            FrameKind::MainFrame,
+            ActionChannel::MainFrameDom,
+        )
+        .expect("admitted live WK inject after capture must succeed");
+    let delta = match outcome {
+        InjectOutcome::Changed(delta) => delta,
+        other => panic!("admitted live WK inject must be Changed, got {other:?}"),
+    };
+    assert!(
+        delta.guest_local_change,
+        "live WK main-frame DOM inject must change raster bytes"
+    );
+    assert_ne!(delta.before_digest, delta.after_digest);
+    assert_eq!(delta.after_epoch, original_epoch.saturating_add(1));
+    let after = backend
+        .observe_frame()
+        .expect("successful inject must keep observation bound to the new epoch");
+    assert_eq!(after.epoch, original_epoch.saturating_add(1));
+    assert_ne!(after.digest, original_digest);
+    assert_eq!(
+        after.captured_frame.as_ref().map(|ev| ev.source),
+        Some(CapturedFrameSource::BrowserEngine)
+    );
+    println!(
+        "ok: live WK DOM inject guest_local_change={} before={} after={}",
+        delta.guest_local_change, delta.before_digest, delta.after_digest
+    );
 }
 
 #[cfg(feature = "browser-engine")]

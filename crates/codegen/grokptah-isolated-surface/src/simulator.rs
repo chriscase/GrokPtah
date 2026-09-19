@@ -15,7 +15,7 @@ use crate::error::{HarnessError, HarnessResult};
 use crate::lifecycle::ProofEvidenceClass;
 
 /// Guest-local action dispatched through the backend SPI (never host paths).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GuestLocalAction {
     ClickGuestButton,

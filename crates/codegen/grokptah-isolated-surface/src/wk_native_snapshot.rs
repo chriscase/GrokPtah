@@ -5,18 +5,24 @@
 //! pixels, not `NSView` backing-store white). This is not isolation PASS and
 //! never enables admission. Uniform window-white fail-closes.
 
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::sync::mpsc;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use block2::RcBlock;
 use objc2::encode::{Encode, Encoding};
 use objc2::rc::{Allocated, Retained};
-use objc2::runtime::{AnyClass, AnyObject};
-use objc2::sel;
+use objc2::runtime::{AnyClass, AnyObject, AnyProtocol, ClassBuilder, NSObject, Sel};
+use objc2::{sel, ClassType};
 
-use crate::browser_engine_capture::LIVE_WK_FIXTURE_CRIMSON_RGB;
+use crate::browser_engine_capture::{LIVE_WK_FIXTURE_CLICKED_RGB, LIVE_WK_FIXTURE_CRIMSON_RGB};
+use crate::cb_containment::{
+    admit_navigation, live_wk_navigation_policy_allows, owned_page_for_boot,
+};
 use crate::error::{HarnessError, HarnessResult};
+use crate::simulator::GuestLocalAction;
 
 pub(crate) struct NativeWkRaster {
     pub bytes: Vec<u8>,
@@ -24,8 +30,43 @@ pub(crate) struct NativeWkRaster {
     pub height: u32,
 }
 
-const FIXTURE_HTML: &str =
-    "<!doctype html><html><body style=\"margin:0;background:#c41e3a\"></body></html>";
+const FIXTURE_HTML: &str = concat!(
+    "<!doctype html><html><body id=\"cb-v0-root\" ",
+    "style=\"margin:0;background:#c41e3a;width:100vw;height:100vh\">",
+    "<script>",
+    "document.getElementById('cb-v0-root').addEventListener('click',function(){",
+    "this.style.background='#1a6b3c';",
+    "this.setAttribute('data-grokptah-clicked','1');",
+    "});",
+    "</script></body></html>"
+);
+
+const CLICK_JS: &str = concat!(
+    "(function(){var el=document.getElementById('cb-v0-root')||document.body;",
+    "el.dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true,view:window}));",
+    "return el.getAttribute('data-grokptah-clicked')||'';})()"
+);
+
+const TYPE_JS: &str = concat!(
+    "(function(){var el=document.getElementById('cb-v0-root')||document.body;",
+    "el.style.background='#1a6b3c';",
+    "el.setAttribute('data-grokptah-typed','1');",
+    "return el.getAttribute('data-grokptah-typed')||'';})()"
+);
+
+/// Process-local live WK session: one owned page, main-frame DOM mutate, then snapshot.
+pub(crate) struct LiveWkSession {
+    webview: Retained<AnyObject>,
+    _window: Option<Retained<AnyObject>>,
+    _delegate: Retained<AnyObject>,
+    store: Retained<AnyObject>,
+}
+
+impl std::fmt::Debug for LiveWkSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveWkSession").finish_non_exhaustive()
+    }
+}
 const LOGICAL_WIDTH: f64 = 16.0;
 const LOGICAL_HEIGHT: f64 = 16.0;
 const MAX_PIXEL_EDGE: u32 = 64;
@@ -33,67 +74,189 @@ const LOAD_TIMEOUT: Duration = Duration::from_secs(5);
 const FIXTURE_CHANNEL_TOLERANCE: u16 = 40;
 
 pub(crate) fn rasterize_fixture() -> HarnessResult<NativeWkRaster> {
-    if !is_main_thread() {
-        return Err(HarnessError::backend_unavailable(
-            "live WK snapshot requires the process main thread",
-        ));
-    }
-    if !webkit_loaded() {
-        return Err(HarnessError::backend_unavailable(
-            "WebKit.framework is unavailable for live WK snapshot",
-        ));
-    }
-    let Some(_) = AnyClass::get(c"WKWebView") else {
-        return Err(HarnessError::backend_unavailable(
-            "WKWebView class unavailable",
-        ));
-    };
-    let Some(_) = AnyClass::get(c"WKWebViewConfiguration") else {
-        return Err(HarnessError::backend_unavailable(
-            "WKWebViewConfiguration class unavailable",
-        ));
-    };
-    ensure_ns_application()?;
-
-    let html = nsstring(FIXTURE_HTML).ok_or_else(|| {
-        HarnessError::backend_unavailable("live WK snapshot HTML NSString unavailable")
-    })?;
-    let config_cls = AnyClass::get(c"WKWebViewConfiguration")
-        .ok_or_else(|| HarnessError::backend_unavailable("WKWebViewConfiguration unavailable"))?;
-    let config: Retained<AnyObject> = unsafe { objc2::msg_send![config_cls, new] };
-
-    let webview_cls = AnyClass::get(c"WKWebView")
-        .ok_or_else(|| HarnessError::backend_unavailable("WKWebView unavailable"))?;
-    let frame = cg_rect(0.0, 0.0, LOGICAL_WIDTH, LOGICAL_HEIGHT);
-    let webview_alloc: Allocated<AnyObject> = unsafe { objc2::msg_send![webview_cls, alloc] };
-    let webview: Option<Retained<AnyObject>> =
-        unsafe { objc2::msg_send![webview_alloc, initWithFrame: frame, configuration: &*config] };
-    let webview = webview
-        .ok_or_else(|| HarnessError::backend_unavailable("WKWebView initWithFrame unavailable"))?;
-
-    let _window = attach_offscreen_window(&webview, frame)?;
-
-    let _navigation: Option<Retained<AnyObject>> =
-        unsafe { objc2::msg_send![&*webview, loadHTMLString: &*html, baseURL: None::<&AnyObject>] };
-    wait_until_loaded(&webview)?;
-
-    let _: () = unsafe { objc2::msg_send![&*webview, layoutSubtreeIfNeeded] };
-    for _ in 0..8 {
-        pump_runloop_briefly();
-    }
-
-    let raster = take_wk_snapshot(&webview, frame)?;
-    if raster_is_unpainted_white(&raster.bytes) {
-        return Err(HarnessError::backend_unavailable(
-            "live WK snapshot is unpainted window-white, not WK-composited fixture pixels",
-        ));
-    }
+    let session = LiveWkSession::open()?;
+    let raster = session.snapshot()?;
     if !raster_contains_fixture_crimson(&raster.bytes) {
         return Err(HarnessError::backend_unavailable(
             "live WK snapshot does not contain fixture #c41e3a pixels",
         ));
     }
     Ok(raster)
+}
+
+impl LiveWkSession {
+    pub(crate) fn open() -> HarnessResult<Self> {
+        if !is_main_thread() {
+            return Err(HarnessError::backend_unavailable(
+                "live WK snapshot requires the process main thread",
+            ));
+        }
+        if !webkit_loaded() {
+            return Err(HarnessError::backend_unavailable(
+                "WebKit.framework is unavailable for live WK snapshot",
+            ));
+        }
+        ensure_ns_application()?;
+        let owned_page = owned_page_for_boot()?;
+
+        let html = nsstring(FIXTURE_HTML).ok_or_else(|| {
+            HarnessError::backend_unavailable("live WK snapshot HTML NSString unavailable")
+        })?;
+        let config_cls = AnyClass::get(c"WKWebViewConfiguration").ok_or_else(|| {
+            HarnessError::backend_unavailable("WKWebViewConfiguration unavailable")
+        })?;
+        let config: Retained<AnyObject> = unsafe { objc2::msg_send![config_cls, new] };
+        let store = attach_nonpersistent_website_data_store(&config)?;
+
+        let webview_cls = AnyClass::get(c"WKWebView")
+            .ok_or_else(|| HarnessError::backend_unavailable("WKWebView unavailable"))?;
+        let frame = cg_rect(0.0, 0.0, LOGICAL_WIDTH, LOGICAL_HEIGHT);
+        let webview_alloc: Allocated<AnyObject> = unsafe { objc2::msg_send![webview_cls, alloc] };
+        let webview: Option<Retained<AnyObject>> = unsafe {
+            objc2::msg_send![webview_alloc, initWithFrame: frame, configuration: &*config]
+        };
+        let webview = webview.ok_or_else(|| {
+            HarnessError::backend_unavailable("WKWebView initWithFrame unavailable")
+        })?;
+
+        let delegate = navigation_delegate_instance()?;
+        let _: () = unsafe { objc2::msg_send![&*webview, setNavigationDelegate: &*delegate] };
+
+        let window = attach_offscreen_window(&webview, frame)?;
+        let base_url = nsurl(owned_page).ok_or_else(|| {
+            HarnessError::backend_unavailable("owned-page NSURL unavailable for live WK snapshot")
+        })?;
+        let _navigation: Option<Retained<AnyObject>> =
+            unsafe { objc2::msg_send![&*webview, loadHTMLString: &*html, baseURL: &*base_url] };
+        wait_until_loaded(&webview)?;
+        let _: () = unsafe { objc2::msg_send![&*webview, layoutSubtreeIfNeeded] };
+        for _ in 0..8 {
+            pump_runloop_briefly();
+        }
+        Ok(Self {
+            webview,
+            _window: window,
+            _delegate: delegate,
+            store,
+        })
+    }
+
+    pub(crate) fn snapshot(&self) -> HarnessResult<NativeWkRaster> {
+        if !is_main_thread() {
+            return Err(HarnessError::backend_unavailable(
+                "live WK snapshot requires the process main thread",
+            ));
+        }
+        let frame = cg_rect(0.0, 0.0, LOGICAL_WIDTH, LOGICAL_HEIGHT);
+        let _: () = unsafe { objc2::msg_send![&*self.webview, layoutSubtreeIfNeeded] };
+        for _ in 0..4 {
+            pump_runloop_briefly();
+        }
+        let raster = take_wk_snapshot(&self.webview, frame)?;
+        if raster_is_unpainted_white(&raster.bytes) {
+            return Err(HarnessError::backend_unavailable(
+                "live WK snapshot is unpainted window-white, not WK-composited fixture pixels",
+            ));
+        }
+        Ok(raster)
+    }
+
+    pub(crate) fn mutate_main_frame_dom(&self, action: GuestLocalAction) -> HarnessResult<()> {
+        if !is_main_thread() {
+            return Err(HarnessError::backend_unavailable(
+                "live WK DOM mutate requires the process main thread",
+            ));
+        }
+        let js = match action {
+            GuestLocalAction::ClickGuestButton => CLICK_JS,
+            GuestLocalAction::TypeGuestText => TYPE_JS,
+        };
+        evaluate_javascript(&self.webview, js)?;
+        let _: () = unsafe { objc2::msg_send![&*self.webview, layoutSubtreeIfNeeded] };
+        for _ in 0..8 {
+            pump_runloop_briefly();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn website_data_store_is_persistent(&self) -> HarnessResult<bool> {
+        let persistent: bool = unsafe { objc2::msg_send![&*self.store, isPersistent] };
+        Ok(persistent)
+    }
+
+    pub(crate) fn current_url(&self) -> HarnessResult<String> {
+        let url: Option<Retained<AnyObject>> = unsafe { objc2::msg_send![&*self.webview, URL] };
+        let url = url
+            .ok_or_else(|| HarnessError::backend_unavailable("live WK webview URL unavailable"))?;
+        let abs: Option<Retained<AnyObject>> = unsafe { objc2::msg_send![&*url, absoluteString] };
+        nsstring_to_string(abs.as_deref()).ok_or_else(|| {
+            HarnessError::backend_unavailable("live WK webview URL string unavailable")
+        })
+    }
+
+    fn webview_key(&self) -> usize {
+        (&*self.webview) as *const AnyObject as usize
+    }
+
+    pub(crate) fn last_navigation_decision(&self) -> Option<(String, isize)> {
+        last_recorded_navigation_decision(self.webview_key())
+    }
+
+    /// Load `url` through WK and wait for the navigation-delegate decision.
+    /// Off-allowlist success is: policy cancelled **and** `current_url` still owned.
+    /// Does not re-deny the requested URL in Rust.
+    pub(crate) fn attempt_navigation(&self, url: &str) -> HarnessResult<()> {
+        if !is_main_thread() {
+            return Err(HarnessError::backend_unavailable(
+                "live WK navigation requires the process main thread",
+            ));
+        }
+        let key = self.webview_key();
+        clear_navigation_decisions(key);
+        let request_url = nsurl(url).ok_or_else(|| {
+            HarnessError::backend_unavailable("live WK navigation NSURL unavailable")
+        })?;
+        let req_cls = AnyClass::get(c"NSURLRequest")
+            .ok_or_else(|| HarnessError::backend_unavailable("NSURLRequest unavailable"))?;
+        let request: Option<Retained<AnyObject>> =
+            unsafe { objc2::msg_send![req_cls, requestWithURL: &*request_url] };
+        let request = request.ok_or_else(|| {
+            HarnessError::backend_unavailable("NSURLRequest.requestWithURL unavailable")
+        })?;
+        let _nav: Option<Retained<AnyObject>> =
+            unsafe { objc2::msg_send![&*self.webview, loadRequest: &*request] };
+        let decision = wait_for_navigation_decision(key, url)?;
+        let current = self.current_url()?;
+        if decision.1 != 0 {
+            return Err(HarnessError::invalid_state(format!(
+                "WK navigation policy allowed {url} (current={current})"
+            )));
+        }
+        if admit_navigation(&current).is_err() {
+            return Err(HarnessError::invalid_state(format!(
+                "WK navigation policy leaked off-allowlist URL {current}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn raster_contains_fixture_clicked(bytes: &[u8]) -> bool {
+    bytes.chunks_exact(4).any(pixel_near_fixture_clicked)
+}
+
+fn pixel_near_fixture_clicked(pixel: &[u8]) -> bool {
+    let [target_r, target_g, target_b] = LIVE_WK_FIXTURE_CLICKED_RGB;
+    channel_near(pixel[0], target_r)
+        && channel_near(pixel[1], target_g)
+        && channel_near(pixel[2], target_b)
+        || channel_near(pixel[0], target_b)
+            && channel_near(pixel[1], target_g)
+            && channel_near(pixel[2], target_r)
+}
+
+pub(crate) fn raster_contains_clicked_pixels(bytes: &[u8]) -> bool {
+    raster_contains_fixture_clicked(bytes)
 }
 
 pub(crate) fn raster_is_unpainted_white(bytes: &[u8]) -> bool {
@@ -370,6 +533,213 @@ fn webkit_loaded() -> bool {
     let path = c"/System/Library/Frameworks/WebKit.framework/WebKit";
     let handle = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_LAZY) };
     !handle.is_null()
+}
+
+fn attach_nonpersistent_website_data_store(
+    config: &AnyObject,
+) -> HarnessResult<Retained<AnyObject>> {
+    let Some(store_cls) = AnyClass::get(c"WKWebsiteDataStore") else {
+        return Err(HarnessError::backend_unavailable(
+            "WKWebsiteDataStore unavailable for nonpersistent store",
+        ));
+    };
+    let store: Option<Retained<AnyObject>> =
+        unsafe { objc2::msg_send![store_cls, nonPersistentDataStore] };
+    let store = store.ok_or_else(|| {
+        HarnessError::backend_unavailable("WKWebsiteDataStore.nonPersistentDataStore unavailable")
+    })?;
+    let _: () = unsafe { objc2::msg_send![config, setWebsiteDataStore: &*store] };
+    Ok(store)
+}
+
+fn evaluate_javascript(webview: &AnyObject, js: &str) -> HarnessResult<()> {
+    let script = nsstring(js).ok_or_else(|| {
+        HarnessError::backend_unavailable("live WK evaluateJavaScript NSString unavailable")
+    })?;
+    let (tx, rx) = mpsc::sync_channel::<Result<(), String>>(1);
+    let block = RcBlock::new(move |_value: *mut AnyObject, error: *mut AnyObject| {
+        if !error.is_null() {
+            let message = nserror_message(error)
+                .unwrap_or_else(|| "evaluateJavaScript returned an error".into());
+            let _ = tx.send(Err(message));
+            return;
+        }
+        let _ = tx.send(Ok(()));
+    });
+    let _: () = unsafe {
+        objc2::msg_send![
+            webview,
+            evaluateJavaScript: &*script,
+            completionHandler: &*block
+        ]
+    };
+    let started = Instant::now();
+    loop {
+        match rx.try_recv() {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(message)) => {
+                return Err(HarnessError::backend_unavailable(format!(
+                    "live WK main-frame DOM mutate failed: {message}"
+                )));
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                if started.elapsed() > LOAD_TIMEOUT {
+                    return Err(HarnessError::backend_unavailable(
+                        "live WK evaluateJavaScript timed out",
+                    ));
+                }
+                pump_runloop_briefly();
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err(HarnessError::backend_unavailable(
+                    "live WK evaluateJavaScript completion dropped",
+                ));
+            }
+        }
+    }
+}
+
+fn navigation_delegate_class() -> Option<&'static AnyClass> {
+    static CLASS: OnceLock<Option<&'static AnyClass>> = OnceLock::new();
+    *CLASS.get_or_init(|| {
+        if let Some(existing) = AnyClass::get(c"GrokptahCbV0NavigationDelegate") {
+            return Some(existing);
+        }
+        let mut builder = ClassBuilder::new(c"GrokptahCbV0NavigationDelegate", NSObject::class())?;
+        if let Some(protocol) = AnyProtocol::get(c"WKNavigationDelegate") {
+            let _ = builder.add_protocol(protocol);
+        }
+        unsafe {
+            builder.add_method(
+                sel!(webView:decidePolicyForNavigationAction:decisionHandler:),
+                decide_navigation_policy as unsafe extern "C-unwind" fn(_, _, _, _, _),
+            );
+        }
+        Some(builder.register())
+    })
+}
+
+fn navigation_delegate_instance() -> HarnessResult<Retained<AnyObject>> {
+    let cls = navigation_delegate_class().ok_or_else(|| {
+        HarnessError::backend_unavailable("WKNavigationDelegate class unavailable")
+    })?;
+    let obj: Option<Retained<AnyObject>> = unsafe { objc2::msg_send![cls, new] };
+    obj.ok_or_else(|| HarnessError::backend_unavailable("WKNavigationDelegate alloc failed"))
+}
+
+type NavigationDecisionLog = HashMap<usize, Vec<(String, isize)>>;
+
+fn navigation_decision_log() -> &'static Mutex<NavigationDecisionLog> {
+    static LOG: OnceLock<Mutex<NavigationDecisionLog>> = OnceLock::new();
+    LOG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn record_navigation_decision(key: usize, url: String, policy: isize) {
+    if let Ok(mut guard) = navigation_decision_log().lock() {
+        guard.entry(key).or_default().push((url, policy));
+    }
+}
+
+fn clear_navigation_decisions(key: usize) {
+    if let Ok(mut guard) = navigation_decision_log().lock() {
+        guard.insert(key, Vec::new());
+    }
+}
+
+fn last_recorded_navigation_decision(key: usize) -> Option<(String, isize)> {
+    navigation_decision_log()
+        .lock()
+        .ok()?
+        .get(&key)?
+        .last()
+        .cloned()
+}
+
+fn wait_for_navigation_decision(key: usize, needle: &str) -> HarnessResult<(String, isize)> {
+    let started = Instant::now();
+    loop {
+        if let Ok(guard) = navigation_decision_log().lock() {
+            if let Some(list) = guard.get(&key) {
+                if let Some(hit) = list.iter().rev().find(|(url, _)| {
+                    url == needle || url.starts_with(needle) || needle.starts_with(url)
+                }) {
+                    return Ok(hit.clone());
+                }
+            }
+        }
+        if started.elapsed() > LOAD_TIMEOUT {
+            return Err(HarnessError::backend_unavailable(format!(
+                "WK navigation delegate did not decide for {needle}"
+            )));
+        }
+        pump_runloop_briefly();
+    }
+}
+
+unsafe extern "C-unwind" fn decide_navigation_policy(
+    _this: &AnyObject,
+    _cmd: Sel,
+    webview: *mut AnyObject,
+    action: &AnyObject,
+    decision_handler: *mut std::ffi::c_void,
+) {
+    let url = navigation_action_url(action).unwrap_or_default();
+    let policy = navigation_action_policy(action);
+    record_navigation_decision(webview as usize, url, policy);
+    invoke_navigation_decision(decision_handler, policy);
+}
+
+fn navigation_action_policy(action: &AnyObject) -> isize {
+    let target: Option<Retained<AnyObject>> = unsafe { objc2::msg_send![action, targetFrame] };
+    let is_blank = target.is_none();
+    let is_main = target
+        .as_deref()
+        .map(|frame| {
+            let main: bool = unsafe { objc2::msg_send![frame, isMainFrame] };
+            main
+        })
+        .unwrap_or(false);
+    let url = navigation_action_url(action).unwrap_or_default();
+    if live_wk_navigation_policy_allows(&url, is_main, is_blank) {
+        1
+    } else {
+        0
+    }
+}
+
+fn navigation_action_url(action: &AnyObject) -> Option<String> {
+    let request: Option<Retained<AnyObject>> = unsafe { objc2::msg_send![action, request] };
+    let request = request?;
+    let url: Option<Retained<AnyObject>> = unsafe { objc2::msg_send![&*request, URL] };
+    let url = url?;
+    let abs: Option<Retained<AnyObject>> = unsafe { objc2::msg_send![&*url, absoluteString] };
+    nsstring_to_string(abs.as_deref())
+}
+
+#[repr(C)]
+struct NavigationDecisionBlock {
+    isa: *const std::ffi::c_void,
+    flags: i32,
+    reserved: i32,
+    invoke: unsafe extern "C" fn(*mut NavigationDecisionBlock, isize),
+}
+
+fn invoke_navigation_decision(handler: *mut std::ffi::c_void, policy: isize) {
+    if handler.is_null() {
+        return;
+    }
+    unsafe {
+        let block = handler as *mut NavigationDecisionBlock;
+        if (*block).invoke as usize != 0 {
+            ((*block).invoke)(block, policy);
+        }
+    }
+}
+
+fn nsurl(value: &str) -> Option<Retained<AnyObject>> {
+    let cls = AnyClass::get(c"NSURL")?;
+    let string = nsstring(value)?;
+    unsafe { objc2::msg_send![cls, URLWithString: &*string] }
 }
 
 fn nsstring(value: &str) -> Option<Retained<AnyObject>> {
