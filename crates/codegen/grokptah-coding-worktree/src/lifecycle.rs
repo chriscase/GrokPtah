@@ -257,6 +257,7 @@ impl SessionLifecycle {
         }
         if self.apply_in_flight || self.apply_uncertain {
             self.disposition = Some(SessionDisposition::Uncertain);
+            self.apply_uncertain = true;
         }
         self.settlement_fenced = true;
         self.pause_fenced = true;

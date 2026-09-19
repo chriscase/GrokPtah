@@ -332,6 +332,55 @@ fn restart_with_apply_in_flight_becomes_uncertain_no_auto_accept() {
 }
 
 #[test]
+fn attach_recovers_hostile_active_apply_in_flight_without_retry() {
+    let dir = TempDir::new().expect("tempdir");
+    init_fixture_repo(dir.path());
+    let snap_root = dir.path().join("snapshots");
+    let mut session =
+        CodingWorktreeSession::create(dir.path(), "HEAD", "hostile-attach", Utc::now())
+            .expect("create")
+            .with_snapshot_root(&snap_root);
+    session
+        .write_worktree_file("README.md", "agent edit\n")
+        .expect("write");
+    let patch = session.stage_patch().expect("stage");
+    drop(session);
+
+    let loaded = SessionSnapshot::load(snapshot_root(&snap_root)).expect("load");
+    let mut lifecycle = SessionLifecycle::new(Utc::now());
+    lifecycle.apply_in_flight = true;
+    lifecycle.phase = SessionPhase::Active;
+    let snapshot = SessionSnapshot::new(
+        loaded.identity,
+        lifecycle,
+        loaded.patch,
+        loaded.main_checkout_digest,
+        loaded.worktree_path,
+        loaded.repo_root,
+    );
+    snapshot
+        .save(snapshot_root(&snap_root))
+        .expect("save hostile");
+
+    let mut restored = CodingWorktreeSession::attach(&snap_root).expect("attach recovers");
+    assert_eq!(
+        restored.lifecycle().disposition,
+        Some(SessionDisposition::Uncertain)
+    );
+    assert!(!restored.lifecycle().apply_in_flight);
+    assert!(restored.lifecycle().settlement_fenced);
+    let apply_root = clone_apply_target(dir.path());
+    let retry_err = restored
+        .accept(apply_root.path(), &patch.digest, Utc::now())
+        .expect_err("no auto-retry after hostile attach");
+    assert_eq!(retry_err.code, SessionErrorCode::UncertainOutcome);
+    assert_eq!(
+        std::fs::read_to_string(apply_root.path().join("README.md")).expect("target"),
+        "baseline\n"
+    );
+}
+
+#[test]
 fn write_worktree_file_rejects_absolute_main_path() {
     let dir = TempDir::new().expect("tempdir");
     init_fixture_repo(dir.path());

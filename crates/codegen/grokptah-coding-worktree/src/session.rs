@@ -122,13 +122,19 @@ impl CodingWorktreeSession {
     /// Attach a previously persisted session from durable snapshot metadata.
     ///
     /// Restored settled/Uncertain dispositions stay fenced: settlement and Pause
-    /// cannot be retried. Local authority only; not admission.
+    /// cannot be retried. A snapshot with `apply_in_flight` (honest crash persist
+    /// in Settling, or a hostile Active restore) runs [`Self::recover_after_restart`]
+    /// so Accept cannot auto-retry `git apply`. Local authority only; not admission.
     pub fn attach(snapshot_base: impl AsRef<Path>) -> SessionResult<Self> {
         let base = snapshot_base.as_ref().to_path_buf();
         let snapshot = SessionSnapshot::load(snapshot_root(&base))?;
         let mut session = Self::restore_from_snapshot(snapshot)?;
         session.snapshot_root = Some(base);
-        session.persist_snapshot()?;
+        if session.lifecycle.apply_in_flight || session.lifecycle.phase == SessionPhase::Settling {
+            session.recover_after_restart(Utc::now())?;
+        } else {
+            session.persist_snapshot()?;
+        }
         Ok(session)
     }
 

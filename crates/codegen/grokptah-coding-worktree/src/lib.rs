@@ -21,6 +21,7 @@ pub use error::{SessionError, SessionErrorCode, SessionResult};
 pub use identity::CodingWorktreeIdentity;
 pub use lifecycle::{SessionDisposition, SessionLifecycle, SessionPhase, LIFECYCLE_SCHEMA_VERSION};
 pub use patch::{digest_bytes, digest_path, PatchArtifact, MAX_PATCH_BYTES, MAX_PATCH_PATHS};
+pub use paths::assert_apply_target_allowed;
 pub use session::{
     AcceptEvidence, CodingWorktreeSession, DiscardEvidence, KeepForReviewEvidence, PauseEvidence,
     StopEvidence, SYNTHETIC_SESSION_NONCLAIM,
