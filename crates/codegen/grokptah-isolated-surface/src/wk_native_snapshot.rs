@@ -72,14 +72,52 @@ const BLANK_CLICK_JS: &str = concat!(
     "if(!el){return 'missing';}el.click();return 'clicked';})()"
 );
 
-const FILE_CLICK_JS: &str = concat!(
-    "(function(){var el=document.getElementById('cb-v0-file');",
-    "if(!el){return 'missing';}el.click();return 'clicked';})()"
+const FILE_ARM_JS: &str = concat!(
+    "(function(){var wrap=document.getElementById('cb-v0-probes');",
+    "var el=document.getElementById('cb-v0-file');",
+    "var other=document.getElementById('cb-v0-dir');",
+    "if(!el){return 'missing';}",
+    "if(wrap){wrap.style.cssText='display:block;position:fixed;inset:0;z-index:9999;';}",
+    "if(other){other.style.display='none';}",
+    "el.style.cssText='position:fixed;left:0;top:0;width:16px;height:16px;opacity:0.2;margin:0;padding:0;border:0;display:block;';",
+    "window.__cbV0OpenPanel='armed';",
+    "document.addEventListener('click',function(){",
+    "try{if(el.showPicker){el.showPicker();window.__cbV0OpenPanel='showPicker';}",
+    "else{el.click();window.__cbV0OpenPanel='click';}}",
+    "catch(e){window.__cbV0OpenPanel='err:'+(e&&e.name||'x');}",
+    "},{once:true,capture:true});",
+    "return 'armed';})()"
 );
 
-const DIR_CLICK_JS: &str = concat!(
+const DIR_ARM_JS: &str = concat!(
+    "(function(){var wrap=document.getElementById('cb-v0-probes');",
+    "var el=document.getElementById('cb-v0-dir');",
+    "var other=document.getElementById('cb-v0-file');",
+    "if(!el){return 'missing';}",
+    "if(wrap){wrap.style.cssText='display:block;position:fixed;inset:0;z-index:9999;';}",
+    "if(other){other.style.display='none';}",
+    "el.style.cssText='position:fixed;left:0;top:0;width:16px;height:16px;opacity:0.2;margin:0;padding:0;border:0;display:block;';",
+    "window.__cbV0OpenPanel='armed';",
+    "document.addEventListener('click',function(){",
+    "try{if(el.showPicker){el.showPicker();window.__cbV0OpenPanel='showPicker';}",
+    "else{el.click();window.__cbV0OpenPanel='click';}}",
+    "catch(e){window.__cbV0OpenPanel='err:'+(e&&e.name||'x');}",
+    "},{once:true,capture:true});",
+    "return 'armed';})()"
+);
+
+const FILE_ACTIVATE_JS: &str = concat!(
+    "(function(){var el=document.getElementById('cb-v0-file');",
+    "if(!el){return 'missing';}",
+    "try{if(el.showPicker){el.showPicker();return 'showPicker';}}catch(e){}",
+    "el.click();return 'clicked';})()"
+);
+
+const DIR_ACTIVATE_JS: &str = concat!(
     "(function(){var el=document.getElementById('cb-v0-dir');",
-    "if(!el){return 'missing';}el.click();return 'clicked';})()"
+    "if(!el){return 'missing';}",
+    "try{if(el.showPicker){el.showPicker();return 'showPicker';}}catch(e){}",
+    "el.click();return 'clicked';})()"
 );
 
 const CLICK_JS: &str = concat!(
@@ -98,7 +136,7 @@ const TYPE_JS: &str = concat!(
 /// Process-local live WK session: one owned page, main-frame DOM mutate, then snapshot.
 pub(crate) struct LiveWkSession {
     webview: Retained<AnyObject>,
-    _window: Option<Retained<AnyObject>>,
+    window: Option<Retained<AnyObject>>,
     _delegate: Retained<AnyObject>,
     store: Retained<AnyObject>,
 }
@@ -178,7 +216,7 @@ impl LiveWkSession {
         }
         Ok(Self {
             webview,
-            _window: window,
+            window,
             _delegate: delegate,
             store,
         })
@@ -295,6 +333,19 @@ impl LiveWkSession {
         last_recorded_native_deny(self.webview_key())
     }
 
+    /// Last `runOpenPanel` completion: (allows_directories, urls_null, wk_originated).
+    /// `wk_originated` is true only when WK delivered `WKOpenPanelParameters`
+    /// (not a probe NSObject poke of the attached UIDelegate IMP).
+    pub(crate) fn last_open_panel_deny(&self) -> Option<(bool, bool, bool)> {
+        last_recorded_open_panel(self.webview_key()).map(|record| {
+            (
+                record.allows_directories,
+                record.urls_null,
+                record.wk_originated,
+            )
+        })
+    }
+
     /// `window.open(_blank)` through page JS. Fail-closed unless WK consults
     /// `WKUIDelegate.createWebView...` and that IMP returns nil. Popup-blocked
     /// JS `null` without a createWebView callback is not a deny.
@@ -358,17 +409,18 @@ impl LiveWkSession {
         self.assert_still_owned("download")
     }
 
-    /// File picker: WK does not deliver `runOpenPanel` without a real user
-    /// gesture. This probe messages the attached `WKUIDelegate` (the same
-    /// object WK holds). It is not a WK-originated open-panel oracle.
-    /// Missing delegate or non-nil URLs fail closed.
+    /// File picker: owned-page `<input type=file>` must make WK consult
+    /// `WKUIDelegate.runOpenPanelWithParameters` with a real
+    /// `WKOpenPanelParameters`. The IMP fail-closes with nil URLs.
+    /// Timeout → self `objc_msgSend` of `runOpenPanel` is not a deny.
     pub(crate) fn attempt_file_picker(&self) -> HarnessResult<()> {
-        self.invoke_open_panel_on_attached_delegate(false)
+        self.attempt_open_panel_from_owned_page(false)
     }
 
-    /// Directory picker: same `runOpenPanel` deny with `allowsDirectories`.
+    /// Directory picker: owned-page `<input webkitdirectory>` must make WK
+    /// consult `runOpenPanel` with `allowsDirectories`. Same nil-URL deny.
     pub(crate) fn attempt_directory_picker(&self) -> HarnessResult<()> {
-        self.invoke_open_panel_on_attached_delegate(true)
+        self.attempt_open_panel_from_owned_page(true)
     }
 
     pub(crate) fn write_local_storage(&self, key: &str, value: &str) -> HarnessResult<()> {
@@ -433,10 +485,7 @@ impl LiveWkSession {
         self.assert_still_owned(kind.as_str())
     }
 
-    fn invoke_open_panel_on_attached_delegate(
-        &self,
-        allows_directories: bool,
-    ) -> HarnessResult<()> {
+    fn attempt_open_panel_from_owned_page(&self, allows_directories: bool) -> HarnessResult<()> {
         require_main_thread("live WK open-panel deny")?;
         let kind = if allows_directories {
             NativeDenyKind::DirectoryPicker
@@ -446,58 +495,50 @@ impl LiveWkSession {
         let key = self.webview_key();
         clear_native_denies(key);
         clear_open_panel_completions(key);
-        let _ = evaluate_javascript_value(
+        require_ui_delegate_would_receive_open_panel(&self.webview)?;
+        let armed = evaluate_javascript_value(
             &self.webview,
             if allows_directories {
-                DIR_CLICK_JS
+                DIR_ARM_JS
             } else {
-                FILE_CLICK_JS
+                FILE_ARM_JS
             },
         )?;
-        if wait_for_native_deny_until(key, kind, Duration::from_millis(250)).is_ok() {
-            wait_for_open_panel_nil(key)?;
-            return self.assert_still_owned(kind.as_str());
+        if armed.as_deref() == Some("missing") {
+            return Err(HarnessError::backend_unavailable(format!(
+                "owned-page {} probe input is missing",
+                kind.as_str()
+            )));
         }
-        let delegate = attached_ui_delegate(&self.webview)?;
-        let params = probe_open_panel_parameters(allows_directories)?;
-        let (tx, rx) = mpsc::sync_channel::<bool>(1);
-        let block = RcBlock::new(move |urls: *mut AnyObject| {
-            let _ = tx.send(urls.is_null());
-        });
-        let _: () = unsafe {
-            objc2::msg_send![
-                &*delegate,
-                webView: &*self.webview,
-                runOpenPanelWithParameters: &*params,
-                initiatedByFrame: &*self.webview,
-                completionHandler: &*block
-            ]
-        };
-        let started = Instant::now();
-        let urls_null = loop {
-            match rx.try_recv() {
-                Ok(urls_null) => break urls_null,
-                Err(mpsc::TryRecvError::Empty) => {
-                    if started.elapsed() > LOAD_TIMEOUT {
-                        return Err(HarnessError::backend_unavailable(
-                            "attached UIDelegate runOpenPanel did not invoke completionHandler",
-                        ));
-                    }
-                    pump_runloop_briefly();
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    return Err(HarnessError::backend_unavailable(
-                        "attached UIDelegate runOpenPanel completion dropped",
-                    ));
-                }
-            }
-        };
-        if !urls_null {
-            return Err(HarnessError::invalid_state(
-                "runOpenPanel completionHandler received URLs; file/directory picker must deny with nil",
-            ));
+        let _: () = unsafe { objc2::msg_send![&*self.webview, layoutSubtreeIfNeeded] };
+        for _ in 0..4 {
+            pump_runloop_briefly();
         }
-        wait_for_native_deny(key, kind)?;
+        deliver_webview_mouse_click(self.window.as_deref(), &self.webview)?;
+        let activated = evaluate_javascript_value(
+            &self.webview,
+            if allows_directories {
+                DIR_ACTIVATE_JS
+            } else {
+                FILE_ACTIVATE_JS
+            },
+        )?;
+        if activated.as_deref() == Some("missing") {
+            return Err(HarnessError::backend_unavailable(format!(
+                "owned-page {} probe input disappeared",
+                kind.as_str()
+            )));
+        }
+        wait_for_native_deny(key, kind).map_err(|err| {
+            HarnessError::backend_unavailable(format!(
+                "WK did not consult runOpenPanel for {} (JS/gesture click without UIDelegate is not a deny): {err}",
+                kind.as_str()
+            ))
+        })?;
+        wait_for_wk_open_panel_deny(key, allows_directories)?;
+        if let Some(window) = self.window.as_deref() {
+            let _: () = unsafe { objc2::msg_send![window, orderBack: None::<&AnyObject>] };
+        }
         self.assert_still_owned(kind.as_str())
     }
 }
@@ -1097,16 +1138,23 @@ fn wait_for_native_deny_until(
     }
 }
 
-type OpenPanelCompletionLog = HashMap<usize, Vec<bool>>;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OpenPanelDenyRecord {
+    allows_directories: bool,
+    urls_null: bool,
+    wk_originated: bool,
+}
+
+type OpenPanelCompletionLog = HashMap<usize, Vec<OpenPanelDenyRecord>>;
 
 fn open_panel_completion_log() -> &'static Mutex<OpenPanelCompletionLog> {
     static LOG: OnceLock<Mutex<OpenPanelCompletionLog>> = OnceLock::new();
     LOG.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn record_open_panel_completion(key: usize, urls_null: bool) {
+fn record_open_panel_completion(key: usize, record: OpenPanelDenyRecord) {
     if let Ok(mut guard) = open_panel_completion_log().lock() {
-        guard.entry(key).or_default().push(urls_null);
+        guard.entry(key).or_default().push(record);
     }
 }
 
@@ -1116,23 +1164,45 @@ fn clear_open_panel_completions(key: usize) {
     }
 }
 
-fn wait_for_open_panel_nil(key: usize) -> HarnessResult<()> {
+fn last_recorded_open_panel(key: usize) -> Option<OpenPanelDenyRecord> {
+    open_panel_completion_log()
+        .lock()
+        .ok()?
+        .get(&key)?
+        .last()
+        .copied()
+}
+
+fn wait_for_wk_open_panel_deny(
+    key: usize,
+    allows_directories: bool,
+) -> HarnessResult<OpenPanelDenyRecord> {
     let started = Instant::now();
     loop {
         if let Ok(guard) = open_panel_completion_log().lock() {
-            if guard
-                .get(&key)
-                .is_some_and(|list| list.iter().any(|nil| *nil))
-            {
-                return Ok(());
-            }
-            if guard
-                .get(&key)
-                .is_some_and(|list| list.iter().any(|nil| !*nil))
-            {
-                return Err(HarnessError::invalid_state(
-                    "runOpenPanel completionHandler received URLs; picker must deny with nil",
-                ));
+            if let Some(list) = guard.get(&key) {
+                if let Some(hit) = list
+                    .iter()
+                    .rev()
+                    .find(|record| record.allows_directories == allows_directories)
+                {
+                    if !hit.urls_null {
+                        return Err(HarnessError::invalid_state(
+                            "runOpenPanel completionHandler received URLs; picker must deny with nil",
+                        ));
+                    }
+                    if !hit.wk_originated {
+                        return Err(HarnessError::backend_unavailable(
+                            "runOpenPanel was not WK-originated (WKOpenPanelParameters required; IMP poke is not a deny)",
+                        ));
+                    }
+                    return Ok(*hit);
+                }
+                if list.iter().any(|record| !record.urls_null) {
+                    return Err(HarnessError::invalid_state(
+                        "runOpenPanel completionHandler received URLs; picker must deny with nil",
+                    ));
+                }
             }
         }
         if started.elapsed() > LOAD_TIMEOUT {
@@ -1223,7 +1293,7 @@ unsafe extern "C-unwind" fn run_open_panel(
     _cmd: Sel,
     webview: *mut AnyObject,
     params: *mut AnyObject,
-    _frame: *mut AnyObject,
+    frame: *mut AnyObject,
     decision_handler: *mut std::ffi::c_void,
 ) {
     let allows_directories = open_panel_allows_directories(params);
@@ -1232,9 +1302,22 @@ unsafe extern "C-unwind" fn run_open_panel(
     } else {
         NativeDenyKind::FilePicker
     };
+    let wk_originated = open_panel_is_wk_originated(params, frame);
     if !live_wk_open_panel_policy_allows(allows_directories) {
-        record_native_deny(webview as usize, kind);
-        record_open_panel_completion(webview as usize, true);
+        record_open_panel_completion(
+            webview as usize,
+            OpenPanelDenyRecord {
+                allows_directories,
+                urls_null: true,
+                wk_originated,
+            },
+        );
+        // Only a WK-delivered WKOpenPanelParameters call records FilePicker /
+        // DirectoryPicker. Probe NSObject / WKWebView-as-frame pokes fail closed
+        // (nil URLs) without counting as a deny.
+        if wk_originated {
+            record_native_deny(webview as usize, kind);
+        }
     }
     invoke_object_completion(decision_handler, std::ptr::null_mut());
 }
@@ -1396,55 +1479,149 @@ fn attached_ui_delegate(webview: &AnyObject) -> HarnessResult<Retained<AnyObject
     delegate.ok_or_else(|| HarnessError::backend_unavailable("live WK UIDelegate is not attached"))
 }
 
-fn probe_open_panel_parameters(allows_directories: bool) -> HarnessResult<Retained<AnyObject>> {
-    let cls = open_panel_probe_class(allows_directories).ok_or_else(|| {
-        HarnessError::backend_unavailable("open-panel probe parameters class unavailable")
+/// WK's chrome client calls `runOpenPanel` only when the UIDelegate responds
+/// to the selector. Missing IMP would also complete with nil URLs, so this
+/// proves our deny IMP is the one WK would deliver to.
+fn require_ui_delegate_would_receive_open_panel(webview: &AnyObject) -> HarnessResult<()> {
+    let delegate = attached_ui_delegate(webview)?;
+    let responds: bool = unsafe {
+        objc2::msg_send![
+            &*delegate,
+            respondsToSelector: sel!(webView:runOpenPanelWithParameters:initiatedByFrame:completionHandler:)
+        ]
+    };
+    if !responds {
+        return Err(HarnessError::backend_unavailable(
+            "attached UIDelegate does not implement runOpenPanel; WK would not deliver the file chooser to our deny IMP",
+        ));
+    }
+    Ok(())
+}
+
+fn open_panel_is_wk_originated(params: *mut AnyObject, frame: *mut AnyObject) -> bool {
+    if !params_are_wk_open_panel_parameters(params) {
+        return false;
+    }
+    if frame.is_null() {
+        return true;
+    }
+    let frame = unsafe { &*frame };
+    if let Some(webview_cls) = AnyClass::get(c"WKWebView") {
+        let is_webview: bool = unsafe { objc2::msg_send![frame, isKindOfClass: webview_cls] };
+        if is_webview {
+            // #576 poke passed the WKWebView as initiatedByFrame.
+            return false;
+        }
+    }
+    true
+}
+
+fn params_are_wk_open_panel_parameters(params: *mut AnyObject) -> bool {
+    if params.is_null() {
+        return false;
+    }
+    let Some(cls) = AnyClass::get(c"WKOpenPanelParameters") else {
+        return false;
+    };
+    let params = unsafe { &*params };
+    unsafe { objc2::msg_send![params, isKindOfClass: cls] }
+}
+
+const NS_EVENT_LEFT_MOUSE_DOWN: usize = 1;
+const NS_EVENT_LEFT_MOUSE_UP: usize = 2;
+
+fn deliver_webview_mouse_click(
+    window: Option<&AnyObject>,
+    webview: &AnyObject,
+) -> HarnessResult<()> {
+    let location = CGPoint {
+        x: LOGICAL_WIDTH / 2.0,
+        y: LOGICAL_HEIGHT / 2.0,
+    };
+    let timestamp = process_uptime();
+    let window_number: isize = if let Some(window) = window {
+        let _: () = unsafe { objc2::msg_send![window, orderFrontRegardless] };
+        let _: () = unsafe { objc2::msg_send![window, makeKeyAndOrderFront: None::<&AnyObject>] };
+        let _: bool = unsafe { objc2::msg_send![window, makeFirstResponder: webview] };
+        unsafe { objc2::msg_send![window, windowNumber] }
+    } else {
+        0
+    };
+    post_mouse_event(
+        window,
+        webview,
+        NS_EVENT_LEFT_MOUSE_DOWN,
+        location,
+        window_number,
+        timestamp,
+    )?;
+    pump_runloop_briefly();
+    post_mouse_event(
+        window,
+        webview,
+        NS_EVENT_LEFT_MOUSE_UP,
+        location,
+        window_number,
+        timestamp,
+    )?;
+    for _ in 0..4 {
+        pump_runloop_briefly();
+    }
+    Ok(())
+}
+
+fn post_mouse_event(
+    window: Option<&AnyObject>,
+    webview: &AnyObject,
+    event_type: usize,
+    location: CGPoint,
+    window_number: isize,
+    timestamp: f64,
+) -> HarnessResult<()> {
+    let event_cls = AnyClass::get(c"NSEvent").ok_or_else(|| {
+        HarnessError::backend_unavailable("NSEvent unavailable for open-panel gesture")
     })?;
-    let obj: Option<Retained<AnyObject>> = unsafe { objc2::msg_send![cls, new] };
-    obj.ok_or_else(|| HarnessError::backend_unavailable("open-panel probe parameters alloc failed"))
-}
-
-fn open_panel_probe_class(allows_directories: bool) -> Option<&'static AnyClass> {
-    static YES: OnceLock<Option<&'static AnyClass>> = OnceLock::new();
-    static NO: OnceLock<Option<&'static AnyClass>> = OnceLock::new();
-    let slot = if allows_directories { &YES } else { &NO };
-    *slot.get_or_init(|| {
-        let name = if allows_directories {
-            c"GrokptahCbV0OpenPanelParamsDir"
-        } else {
-            c"GrokptahCbV0OpenPanelParamsFile"
-        };
-        if let Some(existing) = AnyClass::get(name) {
-            return Some(existing);
+    let event: Option<Retained<AnyObject>> = unsafe {
+        objc2::msg_send![
+            event_cls,
+            mouseEventWithType: event_type,
+            location: location,
+            modifierFlags: 0usize,
+            timestamp: timestamp,
+            windowNumber: window_number,
+            context: None::<&AnyObject>,
+            eventNumber: 0isize,
+            clickCount: 1isize,
+            pressure: 1.0f32
+        ]
+    };
+    let event = event.ok_or_else(|| {
+        HarnessError::backend_unavailable("NSEvent mouse event alloc failed for open-panel gesture")
+    })?;
+    if let Some(window) = window {
+        let _: () = unsafe { objc2::msg_send![window, sendEvent: &*event] };
+    }
+    match event_type {
+        NS_EVENT_LEFT_MOUSE_DOWN => {
+            let _: () = unsafe { objc2::msg_send![webview, mouseDown: &*event] };
         }
-        let mut builder = ClassBuilder::new(name, NSObject::class())?;
-        unsafe {
-            if allows_directories {
-                builder.add_method(
-                    sel!(allowsDirectories),
-                    probe_allows_directories_yes as unsafe extern "C-unwind" fn(_, _) -> Bool,
-                );
-            } else {
-                builder.add_method(
-                    sel!(allowsDirectories),
-                    probe_allows_directories_no as unsafe extern "C-unwind" fn(_, _) -> Bool,
-                );
-            }
-            builder.add_method(
-                sel!(allowsMultipleSelection),
-                probe_allows_directories_no as unsafe extern "C-unwind" fn(_, _) -> Bool,
-            );
+        NS_EVENT_LEFT_MOUSE_UP => {
+            let _: () = unsafe { objc2::msg_send![webview, mouseUp: &*event] };
         }
-        Some(builder.register())
-    })
+        _ => {}
+    }
+    Ok(())
 }
 
-unsafe extern "C-unwind" fn probe_allows_directories_yes(_this: &AnyObject, _cmd: Sel) -> Bool {
-    Bool::YES
-}
-
-unsafe extern "C-unwind" fn probe_allows_directories_no(_this: &AnyObject, _cmd: Sel) -> Bool {
-    Bool::NO
+fn process_uptime() -> f64 {
+    let Some(cls) = AnyClass::get(c"NSProcessInfo") else {
+        return 0.0;
+    };
+    let info: Option<Retained<AnyObject>> = unsafe { objc2::msg_send![cls, processInfo] };
+    let Some(info) = info else {
+        return 0.0;
+    };
+    unsafe { objc2::msg_send![&*info, systemUptime] }
 }
 
 #[repr(C)]

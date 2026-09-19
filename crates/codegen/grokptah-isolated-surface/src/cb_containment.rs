@@ -135,6 +135,7 @@ pub fn live_wk_download_policy_allows() -> bool {
 }
 
 /// File and directory pickers are never admitted (`runOpenPanel` → nil URLs).
+/// Live WK must deliver `WKOpenPanelParameters`; IMP pokes are not a deny.
 pub fn live_wk_open_panel_policy_allows(_allows_directories: bool) -> bool {
     false
 }

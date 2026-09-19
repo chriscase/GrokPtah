@@ -179,9 +179,10 @@ a WK-originated createWebView callback (JS `null` without that callback is not a
 `target=_blank` is cancelled by `WKNavigationDelegate` (`targetFrame == nil`) and recorded
 as `NewWindow`. Download probes use `<a download href=".../deny.bin">`; WK must cancel
 that navigation (`shouldPerformDownload` or download MIME) — dummy `didBecomeDownload`
-pokes are not a deny. `runOpenPanelWithParameters` completes with nil URLs (file and
-directory pickers); those probes still message the attached UIDelegate because WK does
-not deliver `runOpenPanel` without a real user gesture. `_blank` / off-allowlist remain
+pokes are not a deny. File and directory pickers require a WK-originated
+`WKUIDelegate.runOpenPanelWithParameters` callback with a real `WKOpenPanelParameters`
+(owned-page `<input type=file>` / `webkitdirectory`); the IMP completes with nil URLs.
+Timeout → self `objc_msgSend` of `runOpenPanel` is not a deny. `_blank` / off-allowlist remain
 cancelled by `WKNavigationDelegate`. This is **not** isolation PASS, VF PASS, Computer
 Mode, or admission.
 

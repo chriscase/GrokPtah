@@ -685,6 +685,23 @@ impl ContainedBrowserBackend {
         }
     }
 
+    /// Last live `runOpenPanel` deny: `(allows_directories, urls_null, wk_originated)`.
+    /// `wk_originated` is true only when WK delivered `WKOpenPanelParameters`.
+    #[cfg(feature = "browser-engine")]
+    pub fn last_wk_open_panel_deny(&self) -> Option<(bool, bool, bool)> {
+        #[cfg(target_os = "macos")]
+        {
+            let session = self.live_wk.borrow();
+            session
+                .as_ref()
+                .and_then(|session| session.last_open_panel_deny())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
+    }
+
     #[cfg(all(feature = "browser-engine", target_os = "macos"))]
     fn live_wk_native_deny_session<T>(
         &self,
