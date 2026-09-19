@@ -447,8 +447,9 @@ fn assert_live_wk_native_denies_and_fresh_store(
         .expect("WKNavigationDelegate must cancel the download probe");
     assert_eq!(dl_policy, 0);
     assert!(
-        dl_url.contains("deny.bin"),
-        "download cancel decision must be for deny.bin, got {dl_url}"
+        grokptah_isolated_surface::is_download_probe_url(&dl_url)
+            || (dl_url.contains("127.0.0.1") && dl_url.contains("deny.bin")),
+        "download cancel decision must be the dedicated download URL, got {dl_url}"
     );
     backend
         .live_wk_attempt_file_picker()

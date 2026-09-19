@@ -521,7 +521,7 @@ impl ContainedBrowserBackend {
         }
     }
 
-    /// Last `WKNavigationDelegate` decision: (url, policy) where 0 = cancel, 1 = allow.
+    /// Last `WKNavigationDelegate` decision: (url, policy) where 0 = cancel, 1 = allow, 2 = download.
     #[cfg(feature = "browser-engine")]
     pub fn last_wk_navigation_decision(&self) -> Option<(String, i64)> {
         #[cfg(target_os = "macos")]
