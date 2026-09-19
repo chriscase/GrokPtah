@@ -162,8 +162,6 @@ const LOGICAL_HEIGHT: f64 = 16.0;
 const MAX_PIXEL_EDGE: u32 = 64;
 const LOAD_TIMEOUT: Duration = Duration::from_secs(5);
 const FIXTURE_CHANNEL_TOLERANCE: u16 = 40;
-/// `WKNavigationActionPolicyDownload` / `WKNavigationResponsePolicyDownload`.
-const WK_NAVIGATION_POLICY_DOWNLOAD: isize = 2;
 
 pub(crate) fn rasterize_fixture() -> HarnessResult<NativeWkRaster> {
     let session = LiveWkSession::open()?;
@@ -417,17 +415,15 @@ impl LiveWkSession {
     /// Click dedicated `grokptah-cbv0://owned/deny.bin`. Action policy Allows
     /// that fetch (not a page admit) so `WKURLSchemeHandler` can answer.
     /// `WKDownload` is NetworkProcess-backed and cannot take over a custom-scheme
-    /// task, so the handler cancels that document load and starts loopback HTTP
-    /// that serves `Content-Disposition: attachment` + octet-stream. Action
-    /// policy returns Download (2) for that HTTP URL so WK originates a
-    /// `WKDownload` without committing the main frame off the owned page
-    /// (Allow-as-document leaked `http://127.0.0.1/owned/deny.bin`). If WK
-    /// still consults response policy, that is also Download (2). Deny is a
-    /// real non-null `didBecomeDownload` plus `decideDestination` completing
-    /// nil after inspecting the attachment. Dummy IMP pokes, blob cancels,
-    /// pumping inside the scheme handler, action-policy-2 on the custom
-    /// scheme, and `shouldPerformDownload` shortcuts are not a deny. No file
-    /// is written.
+    /// task, so the handler cancels that document load and starts a loopback HTTP
+    /// attachment via `startDownloadUsingRequest` (not `loadRequest`: even
+    /// action policy 2 still leaked `http://127.0.0.1/owned/deny.bin` as
+    /// `WKWebView.URL`). That HTTP URL serves `Content-Disposition: attachment`
+    /// and octet-stream. Deny is a real non-null `WKDownload` plus
+    /// `decideDestination` completing nil after inspecting the attachment.
+    /// Dummy IMP pokes, blob cancels, pumping inside the scheme handler,
+    /// `loadRequest` of the HTTP URL, and `shouldPerformDownload` shortcuts
+    /// are not a deny. No file is written.
     pub(crate) fn attempt_download(&self) -> HarnessResult<()> {
         require_main_thread("live WK download deny")?;
         let key = self.webview_key();
@@ -448,38 +444,17 @@ impl LiveWkSession {
             ))
         })?;
         wait_for_wk_download_proof()?;
-        let promoted = wait_for_download_navigation_policy(key, WK_NAVIGATION_POLICY_DOWNLOAD)?;
-        if !is_wk_download_url(&promoted.0) {
-            return Err(HarnessError::invalid_state(format!(
-                "WK Download policy 2 was not the dedicated download URL, got {}",
-                promoted.0
-            )));
-        }
-        let decision = wait_for_download_navigation_cancel(key)?;
-        if decision.1 != 0 {
-            return Err(HarnessError::invalid_state(format!(
-                "WK download must end cancelled after WKDownload (url={} policy={})",
-                decision.0, decision.1
-            )));
-        }
-        if !is_wk_download_url(&decision.0) {
-            return Err(HarnessError::invalid_state(format!(
-                "WK download cancel was not the dedicated download URL, got {}",
-                decision.0
-            )));
-        }
         assert_download_file_not_written()?;
-        // Hosted Desktop: WKWebView.URL follows a main-frame download request
-        // even when action/response policy is Download (2). Restore the owned
-        // fixture so later probes still have the owned DOM, then re-stamp the
-        // WKDownload cancel as the last decision the tests read.
+        // `startDownloadUsingRequest` should keep the owned document. If
+        // location.href is still off-allowlist, restore the owned fixture so
+        // later pickers have the owned DOM, then re-stamp the download cancel.
         if self
             .current_url()
             .ok()
             .is_none_or(|url| admit_navigation(&url).is_err())
         {
             self.restore_owned_fixture()?;
-            record_download_navigation_decision(key, decision.0.clone(), 0);
+            record_download_navigation_decision(key, DOWNLOAD_PROBE_URL.to_string(), 0);
         }
         self.assert_still_owned("download")
     }
@@ -1262,10 +1237,46 @@ fn load_loopback_attachment_from_webview(webview: *mut AnyObject) {
     let Some(request) = nsurl_request(&http_url) else {
         return;
     };
-    record_download_proof(|proof| proof.http_load_started = true);
     let webview = unsafe { &*webview };
-    let _: Option<Retained<AnyObject>> =
-        unsafe { objc2::msg_send![webview, loadRequest: &*request] };
+    let responds: bool = unsafe {
+        objc2::msg_send![
+            webview,
+            respondsToSelector: sel!(startDownloadUsingRequest:completionHandler:)
+        ]
+    };
+    if !responds {
+        return;
+    }
+    record_download_proof(|proof| proof.http_load_started = true);
+    let webview_key = webview as *const AnyObject as usize;
+    let block = RcBlock::new(move |download: *mut AnyObject| {
+        if download.is_null() {
+            return;
+        }
+        let wv = webview_key as *mut AnyObject;
+        if wv.is_null() {
+            return;
+        }
+        let webview = unsafe { &*wv };
+        let delegate: Option<Retained<AnyObject>> =
+            unsafe { objc2::msg_send![webview, navigationDelegate] };
+        let Some(delegate) = delegate else {
+            return;
+        };
+        adopt_wk_download(
+            &delegate,
+            wv,
+            download,
+            live_download_http_url().or_else(|| Some(http_url.clone())),
+        );
+    });
+    let _: () = unsafe {
+        objc2::msg_send![
+            webview,
+            startDownloadUsingRequest: &*request,
+            completionHandler: &*block
+        ]
+    };
 }
 
 fn stopped_scheme_tasks() -> &'static Mutex<HashSet<usize>> {
@@ -1523,41 +1534,6 @@ fn recorded_navigation_decisions(key: usize) -> Vec<(String, isize)> {
         .unwrap_or_default()
 }
 
-fn wait_for_download_navigation_policy(
-    key: usize,
-    want_policy: isize,
-) -> HarnessResult<(String, isize)> {
-    let started = Instant::now();
-    loop {
-        if let Ok(guard) = navigation_decision_log().lock() {
-            if let Some(list) = guard.get(&key) {
-                if let Some(hit) = list
-                    .iter()
-                    .rev()
-                    .find(|(url, policy)| *policy == want_policy && is_download_probe_url(url))
-                    .or_else(|| {
-                        list.iter()
-                            .rev()
-                            .find(|(url, policy)| *policy == want_policy && is_wk_download_url(url))
-                    })
-                {
-                    return Ok(hit.clone());
-                }
-            }
-        }
-        if started.elapsed() > LOAD_TIMEOUT {
-            return Err(HarnessError::backend_unavailable(format!(
-                "WK did not return navigation policy {want_policy} for the dedicated grokptah-cbv0 download URL"
-            )));
-        }
-        pump_runloop_briefly();
-    }
-}
-
-fn wait_for_download_navigation_cancel(key: usize) -> HarnessResult<(String, isize)> {
-    wait_for_download_navigation_policy(key, 0)
-}
-
 #[derive(Debug, Default, Clone)]
 struct DownloadProof {
     scheme_handler_started: bool,
@@ -1566,7 +1542,6 @@ struct DownloadProof {
     destination_invoked: bool,
     destination_nil: bool,
     destination_attachment: bool,
-    response_policy_download: bool,
     http_load_started: bool,
     scheme_task_url: Option<String>,
     action_url: Option<String>,
@@ -1872,11 +1847,10 @@ unsafe extern "C-unwind" fn decide_navigation_policy(
     let is_blank = navigation_action_is_blank(action);
     let key = webview as usize;
     // Dedicated scheme URL: Allow so WKURLSchemeHandler can answer. Not a
-    // page admit. Loopback HTTP continuation: Download (2) so NetworkProcess
-    // originates a WKDownload without committing that URL as a document
-    // (Allow-as-document leaked the loopback URL off the owned page).
-    // shouldPerformDownload on any other URL cancels without stamping
-    // Download (that flag is not a WKDownload instance).
+    // page admit. Loopback HTTP must never load as a document — even policy 2
+    // on loadRequest leaked WKWebView.URL. Downloads use
+    // startDownloadUsingRequest. shouldPerformDownload on any other URL
+    // cancels without stamping Download (that flag is not a WKDownload).
     if is_download_probe_url(&url) {
         record_download_proof(|proof| proof.action_url = Some(url.clone()));
         record_download_navigation_decision(key, url, 1);
@@ -1885,8 +1859,8 @@ unsafe extern "C-unwind" fn decide_navigation_policy(
     }
     if is_live_download_http_url(&url) {
         record_download_proof(|proof| proof.action_url = Some(url.clone()));
-        record_download_navigation_decision(key, url, WK_NAVIGATION_POLICY_DOWNLOAD);
-        invoke_navigation_decision(decision_handler, WK_NAVIGATION_POLICY_DOWNLOAD);
+        record_download_navigation_decision(key, url, 0);
+        invoke_navigation_decision(decision_handler, 0);
         return;
     }
     if should_download {
@@ -1915,17 +1889,9 @@ unsafe extern "C-unwind" fn decide_navigation_response(
     let can_show: bool = unsafe { objc2::msg_send![response, canShowMIMEType] };
     let is_download = navigation_response_is_download(response);
     record_download_proof(|proof| proof.response_url = Some(url.clone()));
-    // Loopback HTTP attachment only: Download (2) after NetworkProcess has
-    // the Content-Disposition / octet-stream response. Never Download on the
-    // custom-scheme URL (WKDownload cannot take over a scheme-handler task).
-    // Never Allow-as-page.
-    if is_live_download_http_url(&url) {
-        record_download_proof(|proof| proof.response_policy_download = true);
-        record_download_navigation_decision(webview as usize, url, WK_NAVIGATION_POLICY_DOWNLOAD);
-        invoke_navigation_decision(decision_handler, WK_NAVIGATION_POLICY_DOWNLOAD);
-        return;
-    }
-    if is_download_probe_url(&url) {
+    // Loopback HTTP / custom-scheme attachment as a document is cancelled.
+    // WKDownload for the HTTP URL is started with startDownloadUsingRequest.
+    if is_live_download_http_url(&url) || is_download_probe_url(&url) {
         record_download_navigation_decision(webview as usize, url, 0);
         invoke_navigation_decision(decision_handler, 0);
         return;

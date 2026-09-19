@@ -183,18 +183,18 @@ registers a `WKURLSchemeHandler` for that fetch. Action policy Allows that URL (
 admit) so the handler can answer; it is not cancelled on `shouldPerformDownload` and is not
 short-circuited with action-policy Download (2) before the handler runs. `WKDownload` is
 NetworkProcess-backed and cannot take over a custom-scheme task, so the handler cancels that
-document load and starts loopback HTTP that serves `Content-Disposition: attachment` plus
-octet-stream. Action policy returns `WKNavigationActionPolicyDownload` (2) for that HTTP URL
-so WK creates a `WKDownload`. `WKWebView.URL` may still report the download request; the
-owned document is the committed `location.href`. Custom-scheme response is Cancel, never
-Download. Deny is the real non-null `didBecomeDownload` callback;
-`decideDestination` completes nil after inspecting the attachment and `deny.bin` is not
-written. Hosted Desktop still reports the loopback URL as `WKWebView.URL` after a
-main-frame Download policy, so the probe restores the owned fixture before later
-pickers. Dummy `didBecomeDownload` IMP pokes, timeout→runloop pokes inside the handler,
-`shouldPerformDownload` shortcuts, action-policy-2 on the custom scheme, and cancelled
-`blob:` URLs are not a deny. Native deny IMPs call the same `admit_native_capability` gate
-as Linux tests.
+document load and starts loopback HTTP via `WKWebView.startDownloadUsingRequest` that serves
+`Content-Disposition: attachment` plus octet-stream. `loadRequest` of that HTTP URL is not
+used: even action policy Download (2) still leaked `http://127.0.0.1/owned/deny.bin` as
+`WKWebView.URL`. Any HTTP document navigation is Cancel. Page identity is the committed
+`location.href`. Custom-scheme response is Cancel, never Download. Deny is a real non-null
+`WKDownload` (completion handler and/or `didBecomeDownload`) plus `decideDestination`
+completing nil after inspecting the attachment; `deny.bin` is not written. If the committed
+document is still off-allowlist after that oracle, the probe restores the owned fixture
+before later pickers. Dummy `didBecomeDownload` IMP pokes, timeout→runloop pokes inside the
+handler, `shouldPerformDownload` shortcuts, `loadRequest` of the HTTP URL, action-policy-2
+on the custom scheme, and cancelled `blob:` URLs are not a deny. Native deny IMPs call the
+same `admit_native_capability` gate as Linux tests.
 File and directory pickers require a WK-originated
 `WKUIDelegate.runOpenPanelWithParameters` callback with a real `WKOpenPanelParameters`
 (owned-page `<input type=file>` / `webkitdirectory`); the IMP completes with nil URLs.
