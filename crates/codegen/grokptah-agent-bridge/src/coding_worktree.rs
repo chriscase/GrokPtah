@@ -91,6 +91,9 @@ impl AgentHostHandle {
         self.assert_agent_session_bindable(agent_session_id)?;
 
         let mut session = CodingWorktreeSession::attach(snapshot_base)?;
+        // `CodingWorktreeSession::attach` already recovers apply-in-flight.
+        // Re-run here so a host attach of a pre-recovery snapshot cannot skip
+        // the fence if crate attach is ever split from recover.
         if session.lifecycle().apply_in_flight
             || session.lifecycle().apply_uncertain
             || session.lifecycle().phase == SessionPhase::Settling
@@ -177,6 +180,8 @@ impl AgentHostHandle {
     }
 
     /// Stop the coding worktree bound to an AgentHost session, if any.
+    /// Already-`Destroyed` worktrees are treated as confirmed so a later
+    /// `session_delete` does not fail closed on a completed Stop.
     pub fn coding_worktree_stop_for_agent_session(
         &self,
         agent_session_id: Uuid,
@@ -185,10 +190,25 @@ impl AgentHostHandle {
             let registry = self.coding_worktrees.lock();
             registry.by_agent_session.get(&agent_session_id).cloned()
         };
-        match handle {
-            Some(handle) => self.coding_worktree_stop(&handle).map(Some),
-            None => Ok(None),
+        let Some(handle) = handle else {
+            return Ok(None);
+        };
+        let phase =
+            self.with_coding_worktree(&handle, |slot| Ok(slot.session.lifecycle().phase))?;
+        if phase == SessionPhase::Destroyed {
+            return self.with_coding_worktree(&handle, |slot| {
+                let lifecycle = slot.session.lifecycle();
+                Ok(Some(StopEvidence {
+                    session_id: slot.session.identity().session_id.clone(),
+                    worktree_removed: !slot.session.worktree_path().exists(),
+                    destroy_confirmed: true,
+                    persist_snapshot_error: None,
+                    disposition: lifecycle.disposition,
+                    phase: lifecycle.phase,
+                }))
+            });
         }
+        self.coding_worktree_stop(&handle).map(Some)
     }
 
     /// Pause the coding worktree bound to an AgentHost session, if any.

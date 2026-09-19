@@ -58,7 +58,7 @@ Active | Paused → Stop (fence-first teardown)
 | Accept requires exact patch digest of bytes applied | `PatchArtifact::verify_digest` hashes `bytes`; `apply_patch` re-hashes before `git apply` |
 | Discard cannot leave active worktree | `git worktree remove` + `prune` + `git worktree list` must not list session path |
 | Staging includes untracked files | `git add -N` intent-to-add before diff capture; fail-closed if untracked present but diff empty |
-| Restart/reload cannot auto-Accept | `recover_after_restart` → `Uncertain` when `apply_in_flight` |
+| Restart/reload cannot auto-Accept | `recover_after_restart` → `Uncertain` when `apply_in_flight`; crate `attach` and host `coding_worktree_attach` invoke it |
 | Uncertain apply → no auto-retry | `enforce_no_auto_retry` on settlement ops and Pause |
 | Attach after settlement cannot retry | `reconcile_invariants` fences Accepted/Discarded/KeptForReview; Pause and settlement stay closed |
 | Pause fences further work | `begin_pause` sets `pause_fenced`; staging/settlement reject |
@@ -98,8 +98,9 @@ Closed by the AgentHost disposition surface (`coding_worktree_*` on
   session cwd), Discard, and Keep-for-review. Mutators take `#455` durable-write
   authority; Stop still tears down if persist/write authority fails.
 - Pause still fences staging/settlement; attach-after-settlement cannot retry;
-  Uncertain rejects auto-retry; attach recovers apply-in-flight (including
-  hostile Active+in-flight) to Uncertain; Stop remains legal while Paused;
+  Uncertain rejects auto-retry; crate `attach` and host `coding_worktree_attach`
+  recover apply-in-flight (including hostile Active+in-flight) to Uncertain;
+  Stop remains legal while Paused;
   `Destroyed` is recorded only on confirmed destroy. Deleting a bound AgentHost
   session fence-first Stops its coding worktree and refuses unconfirmed destroy.
   Archive Pauses a bound worktree. Host `stop` fence-first Stops attached

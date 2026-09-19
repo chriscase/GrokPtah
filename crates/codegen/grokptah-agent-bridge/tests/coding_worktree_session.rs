@@ -636,6 +636,27 @@ fn host_session_delete_stops_bound_coding_worktree() {
 }
 
 #[test]
+fn host_session_delete_after_confirmed_stop_still_succeeds() {
+    let env = HostEnv::new();
+    let dir = TempDir::new().expect("tempdir");
+    init_fixture_repo(dir.path());
+    env.host.set_project_cwd(dir.path()).expect("cwd");
+    let session = env.host.session_new().expect("agent session");
+    env.host
+        .coding_worktree_create(Some(session.id), dir.path(), "HEAD", "host-stopped")
+        .expect("create bound");
+    let evidence = env.host.coding_worktree_stop("host-stopped").expect("stop");
+    assert!(evidence.destroy_confirmed);
+    env.host
+        .session_delete(session.id)
+        .expect("delete after confirmed stop");
+    assert!(env
+        .host
+        .coding_worktree_handle_for_session(session.id)
+        .is_err());
+}
+
+#[test]
 fn host_session_delete_rejects_unconfirmed_destroy() {
     let env = HostEnv::new();
     let dir = TempDir::new().expect("tempdir");
@@ -774,6 +795,28 @@ fn host_attach_recovers_hostile_active_apply_in_flight() {
         .coding_worktree_accept("host-settling", apply_root.path(), "sha256:any")
         .expect_err("settling no auto-retry");
     assert_eq!(accept_err.code, SessionErrorCode::UncertainOutcome);
+}
+
+#[test]
+fn host_stop_stops_attached_coding_worktrees() {
+    let env = HostEnv::new();
+    let dir = TempDir::new().expect("tempdir");
+    init_fixture_repo(dir.path());
+    env.host
+        .coding_worktree_create(None, dir.path(), "HEAD", "host-teardown")
+        .expect("create");
+    let worktree = env
+        .host
+        .coding_worktree_view("host-teardown")
+        .expect("view")
+        .worktree_path;
+    env.host.stop().expect("host stop");
+    let view = env
+        .host
+        .coding_worktree_view("host-teardown")
+        .expect("tombstone");
+    assert_eq!(view.phase, SessionPhase::Destroyed);
+    assert!(!worktree.exists());
 }
 
 #[test]
