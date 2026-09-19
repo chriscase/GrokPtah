@@ -169,8 +169,16 @@ navigation is fail-closed in WebKit via `WKNavigationDelegate` as well as at the
 Rust allowlist. Guest actions are **main-frame DOM only**. Secondary windows,
 `_blank`, and host keyboard / pointer / clipboard claims are refused. Each boot
 attaches `WKWebsiteDataStore.nonPersistentDataStore` (`isPersistent == false` at
-runtime). Stop stays fence-first; `Destroyed` is confirmed-only; Uncertain rejects
-auto-retry. This is **not** isolation PASS, VF PASS, Computer Mode, or admission.
+runtime, never the default/profile store). A second run mints a distinct store
+object; guest `localStorage` from the first run is not imported. Stop stays
+fence-first; `Destroyed` is confirmed-only; Uncertain rejects auto-retry.
+
+Live WK also attaches native fail-closed delegates on the owned-page session:
+`WKUIDelegate.createWebView...` returns nil (`window.open`, popups, new windows);
+`runOpenPanelWithParameters` completes with nil URLs (file and directory pickers);
+download navigation/`WKDownload` is cancelled and never given a destination.
+`_blank` / off-allowlist remain cancelled by `WKNavigationDelegate`. This is
+**not** isolation PASS, VF PASS, Computer Mode, or admission.
 
 ### Synthetic guest frame hashes (packet 9 follow-on)
 
