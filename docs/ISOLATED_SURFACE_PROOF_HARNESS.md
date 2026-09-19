@@ -189,7 +189,9 @@ so WK creates a `WKDownload` without committing the main frame off the owned pag
 (Allow-as-document leaked the loopback URL). Custom-scheme response is Cancel, never
 Download. Deny is the real non-null `didBecomeDownload` callback;
 `decideDestination` completes nil after inspecting the attachment and `deny.bin` is not
-written. Dummy `didBecomeDownload` IMP pokes, timeout→runloop pokes inside the handler,
+written. Hosted Desktop still reports the loopback URL as `WKWebView.URL` after a
+main-frame Download policy, so the probe restores the owned fixture before later
+pickers. Dummy `didBecomeDownload` IMP pokes, timeout→runloop pokes inside the handler,
 `shouldPerformDownload` shortcuts, action-policy-2 on the custom scheme, and cancelled
 `blob:` URLs are not a deny. Native deny IMPs call the same `admit_native_capability` gate
 as Linux tests.

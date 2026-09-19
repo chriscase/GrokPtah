@@ -455,6 +455,18 @@ impl LiveWkSession {
             )));
         }
         assert_download_file_not_written()?;
+        // Hosted Desktop: WKWebView.URL follows a main-frame download request
+        // even when action/response policy is Download (2). Restore the owned
+        // fixture so later probes still have the owned DOM, then re-stamp the
+        // WKDownload cancel as the last decision the tests read.
+        if self
+            .current_url()
+            .ok()
+            .is_none_or(|url| admit_navigation(&url).is_err())
+        {
+            self.restore_owned_fixture()?;
+            record_download_navigation_decision(key, decision.0.clone(), 0);
+        }
         self.assert_still_owned("download")
     }
 
@@ -504,6 +516,24 @@ impl LiveWkSession {
             return Err(HarnessError::invalid_state(format!(
                 "{what} leaked off-allowlist URL {current}"
             )));
+        }
+        Ok(())
+    }
+
+    fn restore_owned_fixture(&self) -> HarnessResult<()> {
+        let owned_page = owned_page_for_boot()?;
+        let html = nsstring(FIXTURE_HTML).ok_or_else(|| {
+            HarnessError::backend_unavailable("owned fixture HTML NSString unavailable")
+        })?;
+        let base_url = nsurl(owned_page).ok_or_else(|| {
+            HarnessError::backend_unavailable("owned-page NSURL unavailable to restore fixture")
+        })?;
+        let _navigation: Option<Retained<AnyObject>> =
+            unsafe { objc2::msg_send![&*self.webview, loadHTMLString: &*html, baseURL: &*base_url] };
+        wait_until_loaded(&self.webview)?;
+        let _: () = unsafe { objc2::msg_send![&*self.webview, layoutSubtreeIfNeeded] };
+        for _ in 0..4 {
+            pump_runloop_briefly();
         }
         Ok(())
     }
