@@ -283,6 +283,20 @@ impl LiveWkSession {
     }
 
     pub(crate) fn current_url(&self) -> HarnessResult<String> {
+        // WKWebView.URL tracks the last download request even when policy 2
+        // keeps the owned document. Page identity is the committed document.
+        if let Ok(Some(href)) =
+            evaluate_javascript_value(&self.webview, "String(location.href||'')")
+        {
+            let href = href.trim().to_string();
+            if !href.is_empty() && href != "undefined" && href != "null" && href != "about:blank" {
+                return Ok(href);
+            }
+        }
+        self.webview_url()
+    }
+
+    fn webview_url(&self) -> HarnessResult<String> {
         let url: Option<Retained<AnyObject>> = unsafe { objc2::msg_send![&*self.webview, URL] };
         let url = url
             .ok_or_else(|| HarnessError::backend_unavailable("live WK webview URL unavailable"))?;
@@ -513,8 +527,9 @@ impl LiveWkSession {
     fn assert_still_owned(&self, what: &str) -> HarnessResult<()> {
         let current = self.current_url()?;
         if admit_navigation(&current).is_err() {
+            let wk = self.webview_url().unwrap_or_default();
             return Err(HarnessError::invalid_state(format!(
-                "{what} leaked off-allowlist URL {current}"
+                "{what} leaked off-allowlist URL {current} (WK URL {wk})"
             )));
         }
         Ok(())
@@ -528,8 +543,9 @@ impl LiveWkSession {
         let base_url = nsurl(owned_page).ok_or_else(|| {
             HarnessError::backend_unavailable("owned-page NSURL unavailable to restore fixture")
         })?;
-        let _navigation: Option<Retained<AnyObject>> =
-            unsafe { objc2::msg_send![&*self.webview, loadHTMLString: &*html, baseURL: &*base_url] };
+        let _navigation: Option<Retained<AnyObject>> = unsafe {
+            objc2::msg_send![&*self.webview, loadHTMLString: &*html, baseURL: &*base_url]
+        };
         wait_until_loaded(&self.webview)?;
         let _: () = unsafe { objc2::msg_send![&*self.webview, layoutSubtreeIfNeeded] };
         for _ in 0..4 {

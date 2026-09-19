@@ -185,8 +185,8 @@ short-circuited with action-policy Download (2) before the handler runs. `WKDown
 NetworkProcess-backed and cannot take over a custom-scheme task, so the handler cancels that
 document load and starts loopback HTTP that serves `Content-Disposition: attachment` plus
 octet-stream. Action policy returns `WKNavigationActionPolicyDownload` (2) for that HTTP URL
-so WK creates a `WKDownload` without committing the main frame off the owned page
-(Allow-as-document leaked the loopback URL). Custom-scheme response is Cancel, never
+so WK creates a `WKDownload`. `WKWebView.URL` may still report the download request; the
+owned document is the committed `location.href`. Custom-scheme response is Cancel, never
 Download. Deny is the real non-null `didBecomeDownload` callback;
 `decideDestination` completes nil after inspecting the attachment and `deny.bin` is not
 written. Hosted Desktop still reports the loopback URL as `WKWebView.URL` after a
