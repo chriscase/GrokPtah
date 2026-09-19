@@ -14,8 +14,8 @@
 use crate::backend::IsolatedSurfaceBackend;
 use crate::captured_frame::BoundedCapturedFrame;
 use crate::cb_containment::{
-    admit_frame_action, admit_guest_local_action, admit_navigation, owned_page_for_boot,
-    ActionChannel, FrameKind, NonpersistentWebsiteDataStore,
+    admit_frame_action, admit_guest_local_action, admit_native_capability, admit_navigation,
+    owned_page_for_boot, ActionChannel, FrameKind, NativeDenyKind, NonpersistentWebsiteDataStore,
 };
 use crate::error::{HarnessError, HarnessResult};
 use crate::lifecycle::ProofEvidenceClass;
@@ -537,6 +537,173 @@ impl ContainedBrowserBackend {
             None
         }
     }
+
+    #[cfg(feature = "browser-engine")]
+    pub fn live_wk_website_data_store_object_key(&self) -> HarnessResult<usize> {
+        #[cfg(target_os = "macos")]
+        {
+            let session = self.live_wk.borrow();
+            let session = session
+                .as_ref()
+                .ok_or_else(|| HarnessError::backend_unavailable("live WK session is not open"))?;
+            Ok(session.website_data_store_object_key())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(HarnessError::backend_unavailable(
+                "live WK snapshot is macOS-only; receipt-gated capture stays fail-closed on this platform",
+            ))
+        }
+    }
+
+    #[cfg(feature = "browser-engine")]
+    pub fn live_wk_uses_default_website_data_store(&self) -> HarnessResult<bool> {
+        #[cfg(target_os = "macos")]
+        {
+            let session = self.live_wk.borrow();
+            let session = session
+                .as_ref()
+                .ok_or_else(|| HarnessError::backend_unavailable("live WK session is not open"))?;
+            Ok(session.uses_default_website_data_store())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(HarnessError::backend_unavailable(
+                "live WK snapshot is macOS-only; receipt-gated capture stays fail-closed on this platform",
+            ))
+        }
+    }
+
+    /// Native deny for downloads / pickers / window.open / popups / new windows.
+    /// Simulator and live WK share [`admit_native_capability`].
+    pub fn refuse_native_capability(&self, kind: NativeDenyKind) -> HarnessResult<()> {
+        admit_native_capability(kind)
+    }
+
+    #[cfg(feature = "browser-engine")]
+    pub fn live_wk_attempt_window_open(&mut self) -> HarnessResult<()> {
+        #[cfg(target_os = "macos")]
+        {
+            self.live_wk_native_deny_session(|session| session.attempt_window_open())
+        }
+        #[cfg(not(target_os = "macos"))]
+        live_wk_macos_only()
+    }
+
+    #[cfg(feature = "browser-engine")]
+    pub fn live_wk_attempt_popup(&mut self) -> HarnessResult<()> {
+        #[cfg(target_os = "macos")]
+        {
+            self.live_wk_native_deny_session(|session| session.attempt_popup())
+        }
+        #[cfg(not(target_os = "macos"))]
+        live_wk_macos_only()
+    }
+
+    #[cfg(feature = "browser-engine")]
+    pub fn live_wk_attempt_new_window(&mut self) -> HarnessResult<()> {
+        #[cfg(target_os = "macos")]
+        {
+            self.live_wk_native_deny_session(|session| session.attempt_blank_target())
+        }
+        #[cfg(not(target_os = "macos"))]
+        live_wk_macos_only()
+    }
+
+    #[cfg(feature = "browser-engine")]
+    pub fn live_wk_attempt_download(&mut self) -> HarnessResult<()> {
+        #[cfg(target_os = "macos")]
+        {
+            self.live_wk_native_deny_session(|session| session.attempt_download())
+        }
+        #[cfg(not(target_os = "macos"))]
+        live_wk_macos_only()
+    }
+
+    #[cfg(feature = "browser-engine")]
+    pub fn live_wk_attempt_file_picker(&mut self) -> HarnessResult<()> {
+        #[cfg(target_os = "macos")]
+        {
+            self.live_wk_native_deny_session(|session| session.attempt_file_picker())
+        }
+        #[cfg(not(target_os = "macos"))]
+        live_wk_macos_only()
+    }
+
+    #[cfg(feature = "browser-engine")]
+    pub fn live_wk_attempt_directory_picker(&mut self) -> HarnessResult<()> {
+        #[cfg(target_os = "macos")]
+        {
+            self.live_wk_native_deny_session(|session| session.attempt_directory_picker())
+        }
+        #[cfg(not(target_os = "macos"))]
+        live_wk_macos_only()
+    }
+
+    #[cfg(feature = "browser-engine")]
+    pub fn live_wk_write_local_storage(&mut self, key: &str, value: &str) -> HarnessResult<()> {
+        #[cfg(target_os = "macos")]
+        {
+            self.live_wk_native_deny_session(|session| session.write_local_storage(key, value))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (key, value);
+            live_wk_macos_only()
+        }
+    }
+
+    #[cfg(feature = "browser-engine")]
+    pub fn live_wk_read_local_storage(&self, key: &str) -> HarnessResult<Option<String>> {
+        #[cfg(target_os = "macos")]
+        {
+            let session = self.live_wk.borrow();
+            let session = session
+                .as_ref()
+                .ok_or_else(|| HarnessError::backend_unavailable("live WK session is not open"))?;
+            session.read_local_storage(key)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = key;
+            live_wk_macos_only()
+        }
+    }
+
+    #[cfg(feature = "browser-engine")]
+    pub fn last_wk_native_deny(&self) -> Option<NativeDenyKind> {
+        #[cfg(target_os = "macos")]
+        {
+            let session = self.live_wk.borrow();
+            session
+                .as_ref()
+                .and_then(|session| session.last_native_deny())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
+    }
+
+    #[cfg(all(feature = "browser-engine", target_os = "macos"))]
+    fn live_wk_native_deny_session<T>(
+        &self,
+        op: impl FnOnce(&crate::wk_native_snapshot::LiveWkSession) -> HarnessResult<T>,
+    ) -> HarnessResult<T> {
+        if !self.booted {
+            return Err(HarnessError::invalid_state("browser guest is not booted"));
+        }
+        if self.inject_fenced {
+            return Err(HarnessError::inject_fenced(
+                "browser guest native deny probe is fenced",
+            ));
+        }
+        let session = self.live_wk.borrow();
+        let session = session
+            .as_ref()
+            .ok_or_else(|| HarnessError::backend_unavailable("live WK session is not open"))?;
+        op(session)
+    }
 }
 
 impl Default for ContainedBrowserBackend {
@@ -554,6 +721,13 @@ fn default_substrate_mode() -> SubstrateMode {
     {
         SubstrateMode::Simulator
     }
+}
+
+#[cfg(all(feature = "browser-engine", not(target_os = "macos")))]
+fn live_wk_macos_only<T>() -> HarnessResult<T> {
+    Err(HarnessError::backend_unavailable(
+        "live WK snapshot is macOS-only; receipt-gated capture stays fail-closed on this platform",
+    ))
 }
 
 impl IsolatedSurfaceBackend for ContainedBrowserBackend {
@@ -654,6 +828,24 @@ mod tests {
     fn contained_browser_never_vf_eligible() {
         let backend = ContainedBrowserBackend::new();
         assert!(!backend.evidence_class().is_vf_qualification_eligible());
+        assert!(!crate::isolated_surface_admission_available());
+    }
+
+    #[test]
+    fn contained_browser_native_capabilities_are_refused() {
+        let backend = ContainedBrowserBackend::new();
+        for kind in [
+            NativeDenyKind::Download,
+            NativeDenyKind::FilePicker,
+            NativeDenyKind::DirectoryPicker,
+            NativeDenyKind::WindowOpen,
+            NativeDenyKind::Popup,
+            NativeDenyKind::NewWindow,
+        ] {
+            backend
+                .refuse_native_capability(kind)
+                .expect_err(kind.as_str());
+        }
         assert!(!crate::isolated_surface_admission_available());
     }
 
