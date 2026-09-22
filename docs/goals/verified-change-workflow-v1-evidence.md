@@ -52,11 +52,17 @@ Result: after approval the source pair is still the pre-repair text. Apply then 
 
 ## G6
 
-Restart reopens the same orchestration store. The reviewed work stays `AwaitingApproval` with the same attempt count and an unapplied source. Cancellation of an in-flight hold, followed by the child's late completion, stays `cancelled` and does not change the source.
+Restart reopens the same orchestration store in a new host process. `restart_at_admission_approval_and_apply_names_a_safe_action` cuts that store three times:
+
+- In-flight admission (`Dispatching`, work leased or running): recovery records `grok_dispatch_uncertain_after_restart`, leaves the source unchanged, and the safe action says not to dispatch another attempt or treat the result as verified success.
+- After approval and before apply: the work stays `AwaitingApproval`, the source stays unchanged, and the safe action says application is separate.
+- After apply: the work stays `Succeeded`, the repaired source remains, and the safe action says no further application is safe.
+
+Each reopen keeps the same attempt count. Repeating the original start request does not add an attempt. Cancellation of an in-flight hold, followed by the child's late completion, stays `cancelled` and does not change the source.
 
 Issue #521 is already repaired on the base by `WorkMutationIntent` in `store.rs`. The assignment path used here goes through that mutation. Regressions on the base, re-run in spirit by the store tests present on main: `work_mutation_intent_recovers_after_decision_only_crash` and the sibling intent tests, 4 passed at freeze. This goal did not add a second decision ledger.
 
-Result: `cancel_and_restart_do_not_dispatch_or_apply` passed on two consecutive runs.
+Result: `cancel_and_restart_do_not_dispatch_or_apply` and `restart_at_admission_approval_and_apply_names_a_safe_action` passed. The restart test was run twice, then again inside the full locked suite.
 
 ## G7
 
@@ -67,7 +73,7 @@ Result: `cancel_and_restart_do_not_dispatch_or_apply` passed on two consecutive 
 | 3 | Post-verification mutation | pass, tamper then approve fails |
 | 4 | Out-of-scope and symlink | pass, escape and symlink tests plus identity unit test |
 | 5 | Cancel plus late completion | pass |
-| 6 | Restart | pass for candidate persistence and verification. Admission without a live task remains the existing uncertain review path. |
+| 6 | Restart at admission, approval, and apply | pass, `restart_at_admission_approval_and_apply_names_a_safe_action` on two runs |
 | 7 | Duplicate start | pass, one attempt |
 | 8 | Unsupported readiness | pass, zero intents |
 | 9 | Exact candidate apply and discard | pass |
@@ -81,9 +87,10 @@ The same suite against the operator's existing `~/.grokptah` failed three `provi
 
 ## Identity
 
-- Tested functional SHA: `aed1248fbdbebca002b4bfb43d24fbc2653587e0`
-- Tested functional tree: `53d01d981e7b6822944a43a10c437c0a5e4efbc2`
-- Earlier functional commit `ab2f86ea5cadd89321794a7ca50609c11ed171d9` (tree `f113106787c39bd16e7d6901a8f49d4cb70e1de2`) is the candidate-verification slice. The SHA above adds the operator control-plane entry and the truthful status projection. The workflow, adapter, managed-executor, clippy, and full bridge suite results in this file apply to that later SHA.
+- Tested functional SHA: `9b02ecc986c77e6872ec22ae6beb6377075e9493`
+- Tested functional tree: `550d81116bc0c7bb064ac3e814fe4272836c0a48`
+- `aed1248fbdbebca002b4bfb43d24fbc2653587e0` (tree `53d01d981e7b6822944a43a10c437c0a5e4efbc2`) added the operator control-plane entry. The SHA above adds the admission, approval, and apply restart cuts and the uncertain-dispatch safe action. Clippy and the full locked bridge suite were run on that tree.
+- Earlier functional commit `ab2f86ea5cadd89321794a7ca50609c11ed171d9` (tree `f113106787c39bd16e7d6901a8f49d4cb70e1de2`) is the candidate-verification slice.
 - The commit that updates this identity section is evidence-only. It does not change executable code. Any later executable change requires the applicable tests again.
 
 ## G8
