@@ -1144,6 +1144,239 @@ async fn restart_at_admission_approval_and_apply_names_a_safe_action() {
     set_grokptah_home_override(None);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_after_candidate_persistence_and_verification() {
+    let harness = Harness::open(ManagedExecutionBudgetProfile::Economy);
+    let workspace = harness.workspace.path().to_path_buf();
+    let fake = harness.fake_dir.path().join("grok");
+    let isolate = harness.isolate.path().to_path_buf();
+    let identity = harness.identity.clone();
+    let lease = harness.fake_dir.path().join("lease.json");
+    let behavior = harness.fake_dir.path().join("behavior");
+    let lane = harness.lane;
+    let persist_request = harness.request("persist-cut", "isolated_review", "macos");
+    let verify_request = harness.request("verify-cut", "isolated_review", "macos");
+
+    harness.set_behavior("ledger-only");
+    let persisted = harness
+        .orch
+        .start_verified_change(&auth(), &persist_request)
+        .await
+        .unwrap_or_else(|error| panic!("persist start: {error}"));
+    let persist_id = persisted["workId"].as_str().unwrap().to_string();
+    let settled = settle(&harness.orch, &persist_id).await;
+    assert_eq!(settled["state"], "review");
+    let persisted_work = harness
+        .orch
+        .store()
+        .load_work_item(&persist_id)
+        .unwrap()
+        .unwrap();
+    let persisted_verification = persisted_work
+        .result
+        .as_ref()
+        .and_then(|result| result.candidate_verification.as_ref())
+        .expect("candidate verification");
+    assert!(persisted_verification.change_proposed);
+    assert!(!persisted_verification.checks_passed);
+    assert!(!persisted_verification.applied);
+    let persisted_digest = persisted_verification.content_digest.clone();
+    assert_eq!(
+        harness
+            .orch
+            .store()
+            .list_work_attempts(Some(&persist_id))
+            .unwrap()
+            .len(),
+        1
+    );
+    let snapshot = harness
+        .orch
+        .store()
+        .candidate_snapshot_dir(&persist_id)
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(snapshot.join("src/ledger.rs")).unwrap(),
+        LEDGER_AFTER
+    );
+    assert_eq!(
+        harness.source_pair(),
+        (LEDGER_BEFORE.to_string(), REPORT_BEFORE.to_string())
+    );
+
+    let mut live = reopen_production_store(
+        harness.host,
+        harness.orch,
+        &workspace,
+        &fake,
+        &isolate,
+        &identity,
+        &lease,
+    )
+    .await;
+    let persisted_again = live
+        .orch
+        .store()
+        .load_work_item(&persist_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted_again.state, WorkState::Review);
+    assert_eq!(
+        persisted_again
+            .result
+            .as_ref()
+            .and_then(|result| result.candidate_verification.as_ref())
+            .map(|verification| verification.content_digest.clone()),
+        Some(persisted_digest.clone())
+    );
+    assert_eq!(
+        live.orch
+            .store()
+            .list_work_attempts(Some(&persist_id))
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        fs::read_to_string(
+            live.orch
+                .store()
+                .candidate_snapshot_dir(&persist_id)
+                .unwrap()
+                .join("src/ledger.rs")
+        )
+        .unwrap(),
+        LEDGER_AFTER
+    );
+    let persist_status = live
+        .orch
+        .verified_change_status(&auth(), lane, &workspace, &persist_id)
+        .unwrap();
+    assert_eq!(persist_status["phases"]["workerStopped"], true);
+    assert_eq!(persist_status["phases"]["changeProposed"], true);
+    assert_eq!(persist_status["phases"]["checksPassed"], false);
+    assert_eq!(persist_status["phases"]["humanApproved"], false);
+    assert_eq!(persist_status["phases"]["applied"], false);
+    assert_eq!(persist_status["attemptCount"], 1);
+    assert_eq!(
+        persist_status["safeAction"],
+        "The worker stopped without verified checks. Do not treat the model verdict as success."
+    );
+    assert_secret_free(&persist_status);
+    assert_eq!(
+        fs::read_to_string(workspace.join("src/ledger.rs")).unwrap(),
+        LEDGER_BEFORE
+    );
+    let persist_again = live
+        .orch
+        .start_verified_change(&auth(), &persist_request)
+        .await
+        .unwrap_or_else(|error| panic!("persist reconnect: {error}"));
+    assert_eq!(persist_again["workId"], persist_id);
+    assert_eq!(persist_again["attemptCount"], 1);
+
+    restore_lease(&lease);
+    fs::write(&behavior, "repair").unwrap();
+    let verified = live
+        .orch
+        .start_verified_change(&auth(), &verify_request)
+        .await
+        .unwrap_or_else(|error| panic!("verify start: {error}"));
+    let verify_id = verified["workId"].as_str().unwrap().to_string();
+    let awaiting = settle(&live.orch, &verify_id).await;
+    assert_eq!(awaiting["state"], "awaiting_approval");
+    let verified_work = live
+        .orch
+        .store()
+        .load_work_item(&verify_id)
+        .unwrap()
+        .unwrap();
+    let verified_verification = verified_work
+        .result
+        .as_ref()
+        .and_then(|result| result.candidate_verification.as_ref())
+        .expect("verified candidate");
+    assert!(verified_verification.checks_passed);
+    assert!(verified_work.approval.is_none());
+    let verified_digest = verified_verification.content_digest.clone();
+    assert_eq!(
+        live.orch
+            .store()
+            .list_work_attempts(Some(&verify_id))
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.join("src/ledger.rs")).unwrap(),
+        LEDGER_BEFORE
+    );
+
+    live = reopen_production_store(
+        live.host, live.orch, &workspace, &fake, &isolate, &identity, &lease,
+    )
+    .await;
+    let verified_again = live
+        .orch
+        .store()
+        .load_work_item(&verify_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(verified_again.state, WorkState::AwaitingApproval);
+    assert!(verified_again.approval.is_none());
+    assert_eq!(
+        verified_again
+            .result
+            .as_ref()
+            .and_then(|result| result.candidate_verification.as_ref())
+            .map(|verification| verification.content_digest.clone()),
+        Some(verified_digest)
+    );
+    assert_eq!(
+        live.orch
+            .store()
+            .list_work_attempts(Some(&verify_id))
+            .unwrap()
+            .len(),
+        1
+    );
+    let verify_status = live
+        .orch
+        .verified_change_status(&auth(), lane, &workspace, &verify_id)
+        .unwrap();
+    assert_eq!(verify_status["phases"]["workerStopped"], true);
+    assert_eq!(verify_status["phases"]["changeProposed"], true);
+    assert_eq!(verify_status["phases"]["checksPassed"], true);
+    assert_eq!(verify_status["phases"]["humanApproved"], false);
+    assert_eq!(verify_status["phases"]["applied"], false);
+    assert_eq!(verify_status["attemptCount"], 1);
+    assert_eq!(
+        verify_status["safeAction"],
+        "Review the candidate diff and required checks. Approval does not apply the change."
+    );
+    assert_secret_free(&verify_status);
+    assert_eq!(
+        (
+            fs::read_to_string(workspace.join("src/ledger.rs")).unwrap(),
+            fs::read_to_string(workspace.join("src/report.rs")).unwrap(),
+        ),
+        (LEDGER_BEFORE.to_string(), REPORT_BEFORE.to_string())
+    );
+    let verify_again = live
+        .orch
+        .start_verified_change(&auth(), &verify_request)
+        .await
+        .unwrap_or_else(|error| panic!("verify reconnect: {error}"));
+    assert_eq!(verify_again["workId"], verify_id);
+    assert_eq!(verify_again["attemptCount"], 1);
+    assert_eq!(verify_again["phases"]["checksPassed"], true);
+    assert_eq!(verify_again["phases"]["humanApproved"], false);
+
+    live.orch.stop_background_tasks().await;
+    live.host.shutdown().await;
+    set_grokptah_home_override(None);
+}
+
 const FAKE_GROK: &str = r#"#!/bin/sh
 printf '%s\n' "$*" >> "$(dirname "$0")/grok.argv"
 if [ "$1" = "inspect" ] && [ "$2" = "--json" ]; then
@@ -1173,6 +1406,13 @@ fi
 if [ "$behavior" = "symlink" ]; then
   rm -f src/ledger.rs
   ln -s /etc/passwd src/ledger.rs
+fi
+if [ "$behavior" = "ledger-only" ]; then
+  mkdir -p src
+  printf '%s' 'pub fn balance(cents: &[i32]) -> i32 {
+    cents.iter().sum()
+}
+' > src/ledger.rs
 fi
 if [ "$behavior" = "repair" ] || [ "$behavior" = "hold" ] || [ "$behavior" = "escape" ]; then
   mkdir -p src
