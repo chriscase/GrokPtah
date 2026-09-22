@@ -1703,6 +1703,19 @@ fn default_verified_host() -> String {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct VerifiedChangeReviewArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    work_id: String,
+    #[serde(default)]
+    candidate_digest: String,
+    #[serde(default)]
+    expected_revision: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AssignWorkArgs {
     request_id: String,
     session_id: Uuid,
@@ -3151,7 +3164,7 @@ fn tool_input_schema(name: &str) -> Value {
                 "request_id": req_id,
                 "session_id": session,
                 "workspace": workspace,
-                "agent_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                "agent_id": {"type": "string", "minLength": 0, "maxLength": 256},
                 "objective": {"type": "string", "minLength": 1, "maxLength": 32768},
                 "allowed_files": {"type": "array", "minItems": 1, "maxItems": 64, "items": {"type": "string", "minLength": 1}},
                 "check_id": {"type": "string", "minLength": 1, "maxLength": 64},
@@ -3161,6 +3174,30 @@ fn tool_input_schema(name: &str) -> Value {
                 "mutation_mode": {"type": "string"},
                 "platform": {"type": "string"},
                 "execution_host": {"type": "string"}
+            }
+        }),
+        "ptah_verified_change_status" => json!({
+            "type": "object",
+            "required": ["request_id", "session_id", "workspace", "work_id"],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "work_id": {"type": "string", "minLength": 1, "maxLength": 256}
+            }
+        }),
+        "ptah_apply_verified_change" | "ptah_discard_verified_change" => json!({
+            "type": "object",
+            "required": ["request_id", "session_id", "workspace", "work_id", "candidate_digest"],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "work_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                "candidate_digest": {"type": "string", "minLength": 1, "maxLength": 128},
+                "expected_revision": {"type": "integer", "minimum": 0}
             }
         }),
         "ptah_cancel" => json!({
@@ -4178,7 +4215,6 @@ async fn dispatch_tool(
         "ptah_prepare_verified_change" | "ptah_start_verified_change" => {
             let tool_args: VerifiedChangeToolArgs = parse_value(args)?;
             require_nonempty(&tool_args.request_id, "request_id")?;
-            require_nonempty(&tool_args.agent_id, "agent_id")?;
             require_nonempty(&tool_args.objective, "objective")?;
             require_nonempty(&tool_args.check_id, "check_id")?;
             require_nonempty(&tool_args.check_executable, "check_executable")?;
@@ -4222,6 +4258,52 @@ async fn dispatch_tool(
             } else {
                 orch.prepare_verified_change(auth, &request)
             }
+        }
+        "ptah_verified_change_status" => {
+            let tool_args: VerifiedChangeReviewArgs = parse_value(args)?;
+            require_nonempty(&tool_args.request_id, "request_id")?;
+            require_nonempty(&tool_args.work_id, "work_id")?;
+            orch.verified_change_status(
+                auth,
+                tool_args.session_id,
+                &tool_args.workspace,
+                &tool_args.work_id,
+            )
+        }
+        "ptah_apply_verified_change" | "ptah_discard_verified_change" => {
+            let tool_args: VerifiedChangeReviewArgs = parse_value(args)?;
+            require_nonempty(&tool_args.request_id, "request_id")?;
+            require_nonempty(&tool_args.work_id, "work_id")?;
+            require_nonempty(&tool_args.candidate_digest, "candidate_digest")?;
+            if name == "ptah_apply_verified_change" {
+                orch.apply_verified_change(
+                    auth,
+                    &tool_args.request_id,
+                    tool_args.session_id,
+                    &tool_args.workspace,
+                    &tool_args.work_id,
+                    &tool_args.candidate_digest,
+                    tool_args.expected_revision,
+                )
+                .await?;
+            } else {
+                orch.discard_verified_change(
+                    auth,
+                    &tool_args.request_id,
+                    tool_args.session_id,
+                    &tool_args.workspace,
+                    &tool_args.work_id,
+                    &tool_args.candidate_digest,
+                    tool_args.expected_revision,
+                )
+                .await?;
+            }
+            orch.verified_change_status(
+                auth,
+                tool_args.session_id,
+                &tool_args.workspace,
+                &tool_args.work_id,
+            )
         }
         "ptah_cancel" => {
             let args: CancelArgs = parse_value(args)?;

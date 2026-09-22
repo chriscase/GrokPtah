@@ -16,9 +16,9 @@ use grokptah_agent_bridge::orchestration::{
     WorkState, WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
-    execute_required_checks, set_grokptah_home_override, AgentHost, CredentialLeaseHandle,
-    CredentialLeaseResolver, GrokBuildAdapterError, HostConfig, HostRuntime, RequiredCheckCwd,
-    RequiredCheckSpec, SessionKind,
+    execute_required_checks, set_grokptah_home_override, start_control_server, AgentHost,
+    CredentialLeaseHandle, CredentialLeaseResolver, GrokBuildAdapterError, HostConfig, HostRuntime,
+    RequiredCheckCwd, RequiredCheckSpec, SessionKind,
 };
 use grokptah_agent_sdk::GrokBuildGitIdentity;
 use tempfile::tempdir;
@@ -1375,6 +1375,225 @@ async fn restart_after_candidate_persistence_and_verification() {
     live.orch.stop_background_tasks().await;
     live.host.shutdown().await;
     set_grokptah_home_override(None);
+}
+
+async fn mcp_tool(
+    addr: std::net::SocketAddr,
+    token: &str,
+    id: u64,
+    name: &str,
+    arguments: serde_json::Value,
+) -> serde_json::Value {
+    reqwest::Client::new()
+        .post(format!("http://{addr}/mcp"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/json")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments}
+        }))
+        .send()
+        .await
+        .expect("mcp post")
+        .json()
+        .await
+        .expect("mcp json")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn operator_status_apply_and_discard_bind_the_exact_digest() {
+    let harness = Harness::open(ManagedExecutionBudgetProfile::Economy);
+    harness.set_behavior("repair");
+    let server = start_control_server(harness.orch.clone(), 0).await.unwrap();
+    let session_id = harness.lane.to_string();
+    let started = harness
+        .orch
+        .start_verified_change(
+            &auth(),
+            &harness.request("operator-review", "isolated_review", "macos"),
+        )
+        .await
+        .unwrap();
+    let work_id = started["workId"].as_str().unwrap().to_string();
+    let settled = settle(&harness.orch, &work_id).await;
+    assert_eq!(settled["state"], "awaiting_approval");
+    let workspace = settled["workspace"].as_str().unwrap().to_string();
+
+    let status = mcp_tool(
+        server.addr,
+        "verified-change-token",
+        1,
+        "ptah_verified_change_status",
+        serde_json::json!({
+            "request_id": "status-1",
+            "session_id": session_id,
+            "workspace": workspace,
+            "work_id": work_id,
+        }),
+    )
+    .await;
+    let view = &status["result"]["structuredContent"];
+    assert_eq!(view["phases"]["checksPassed"], true, "{status}");
+    assert_eq!(view["phases"]["humanApproved"], false);
+    assert_eq!(view["phases"]["applied"], false);
+    assert_eq!(view["workState"], "awaiting_approval");
+    assert!(view["boundedDiff"].as_str().unwrap().contains("ledger"));
+    let digest = view["candidateDigest"].as_str().unwrap().to_string();
+    assert!(digest.starts_with("sha256:"));
+    assert_eq!(
+        harness.source_pair(),
+        (LEDGER_BEFORE.to_string(), REPORT_BEFORE.to_string())
+    );
+
+    let premature = mcp_tool(
+        server.addr,
+        "verified-change-token",
+        2,
+        "ptah_apply_verified_change",
+        serde_json::json!({
+            "request_id": "apply-early",
+            "session_id": session_id,
+            "workspace": workspace,
+            "work_id": work_id,
+            "candidate_digest": digest,
+        }),
+    )
+    .await;
+    assert!(premature.get("error").is_some(), "{premature}");
+    assert_eq!(
+        harness.source_pair(),
+        (LEDGER_BEFORE.to_string(), REPORT_BEFORE.to_string())
+    );
+    let wrong = mcp_tool(
+        server.addr,
+        "verified-change-token",
+        3,
+        "ptah_discard_verified_change",
+        serde_json::json!({
+            "request_id": "discard-wrong",
+            "session_id": session_id,
+            "workspace": workspace,
+            "work_id": work_id,
+            "candidate_digest": "sha256:not-the-candidate",
+        }),
+    )
+    .await;
+    assert!(wrong.get("error").is_some(), "{wrong}");
+    assert_eq!(
+        harness.source_pair(),
+        (LEDGER_BEFORE.to_string(), REPORT_BEFORE.to_string())
+    );
+
+    let discarded = mcp_tool(
+        server.addr,
+        "verified-change-token",
+        4,
+        "ptah_discard_verified_change",
+        serde_json::json!({
+            "request_id": "discard-exact",
+            "session_id": session_id,
+            "workspace": workspace,
+            "work_id": work_id,
+            "candidate_digest": digest,
+        }),
+    )
+    .await;
+    let discarded_view = &discarded["result"]["structuredContent"];
+    assert!(discarded.get("error").is_none(), "{discarded}");
+    assert_eq!(discarded_view["phases"]["applied"], false);
+    assert_eq!(discarded_view["workState"], "cancelled");
+    assert_eq!(
+        harness.source_pair(),
+        (LEDGER_BEFORE.to_string(), REPORT_BEFORE.to_string())
+    );
+
+    restore_lease(&harness.fake_dir.path().join("lease.json"));
+    let second = harness
+        .orch
+        .start_verified_change(
+            &auth(),
+            &harness.request("operator-apply", "isolated_review", "macos"),
+        )
+        .await
+        .unwrap();
+    let apply_id = second["workId"].as_str().unwrap().to_string();
+    let awaiting = settle(&harness.orch, &apply_id).await;
+    assert_eq!(awaiting["state"], "awaiting_approval");
+    let apply_status = mcp_tool(
+        server.addr,
+        "verified-change-token",
+        5,
+        "ptah_verified_change_status",
+        serde_json::json!({
+            "request_id": "status-2",
+            "session_id": session_id,
+            "workspace": workspace,
+            "work_id": apply_id,
+        }),
+    )
+    .await;
+    let apply_view = &apply_status["result"]["structuredContent"];
+    let apply_digest = apply_view["candidateDigest"].as_str().unwrap().to_string();
+    let revision = apply_view["workRevision"].as_u64();
+    harness
+        .orch
+        .approve_work(
+            &auth(),
+            "operator-approve",
+            harness.lane,
+            harness.workspace.path(),
+            &apply_id,
+            Some("approve the exact candidate".into()),
+            revision,
+        )
+        .await
+        .unwrap();
+    let applied = mcp_tool(
+        server.addr,
+        "verified-change-token",
+        6,
+        "ptah_apply_verified_change",
+        serde_json::json!({
+            "request_id": "apply-exact",
+            "session_id": session_id,
+            "workspace": workspace,
+            "work_id": apply_id,
+            "candidate_digest": apply_digest,
+        }),
+    )
+    .await;
+    let applied_view = &applied["result"]["structuredContent"];
+    assert!(applied.get("error").is_none(), "{applied}");
+    assert_eq!(applied_view["phases"]["applied"], true);
+    assert_eq!(applied_view["candidateDigest"], apply_digest);
+    assert_eq!(
+        harness.source_pair(),
+        (LEDGER_AFTER.to_string(), REPORT_AFTER.to_string())
+    );
+    let stale = mcp_tool(
+        server.addr,
+        "verified-change-token",
+        7,
+        "ptah_apply_verified_change",
+        serde_json::json!({
+            "request_id": "apply-wrong",
+            "session_id": session_id,
+            "workspace": workspace,
+            "work_id": apply_id,
+            "candidate_digest": "sha256:not-the-candidate",
+        }),
+    )
+    .await;
+    assert!(stale.get("error").is_some(), "{stale}");
+    assert_eq!(
+        harness.source_pair(),
+        (LEDGER_AFTER.to_string(), REPORT_AFTER.to_string())
+    );
+
+    let _ = server.stop_and_wait().await;
+    harness.close().await;
 }
 
 const FAKE_GROK: &str = r#"#!/bin/sh

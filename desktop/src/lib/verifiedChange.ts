@@ -32,6 +32,9 @@ export interface VerifiedChangeView {
     applied?: boolean;
   };
   safeAction?: string;
+  workId?: string | null;
+  workRevision?: number | null;
+  candidateDigest?: string | null;
   workState?: string;
   changedPaths?: string[];
   boundedDiff?: string;

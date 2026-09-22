@@ -157,6 +157,23 @@ export const api = {
       checkExecutable,
       oracleRoot,
     }),
+  verifiedChangeStatus: (sessionId: string, workId: string) =>
+    invoke<import("./verifiedChange").VerifiedChangeView>("verified_change_status", {
+      sessionId,
+      workId,
+    }),
+  verifiedChangeApply: (sessionId: string, workId: string, candidateDigest: string) =>
+    invoke<import("./verifiedChange").VerifiedChangeView>("verified_change_apply", {
+      sessionId,
+      workId,
+      candidateDigest,
+    }),
+  verifiedChangeDiscard: (sessionId: string, workId: string, candidateDigest: string) =>
+    invoke<import("./verifiedChange").VerifiedChangeView>("verified_change_discard", {
+      sessionId,
+      workId,
+      candidateDigest,
+    }),
   workCreate: (
     sessionId: string,
     kind: string,

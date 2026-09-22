@@ -86,6 +86,14 @@ export function VerifiedChangePanel({
             </dd>
           </div>
           <div>
+            <dt>Work</dt>
+            <dd>{view.workId || "not started"}</dd>
+          </div>
+          <div>
+            <dt>Candidate</dt>
+            <dd>{view.candidateDigest || "none"}</dd>
+          </div>
+          <div>
             <dt>Next action</dt>
             <dd>{view.safeAction}</dd>
           </div>

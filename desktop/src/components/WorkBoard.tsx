@@ -32,7 +32,7 @@ export type WorkBoardProps = {
   onOpenRun?: (runId: string) => void;
   verifiedChange?: VerifiedChangeView | null;
   onVerifiedChange?: (
-    action: "prepare" | "start",
+    action: "prepare" | "start" | "status" | "apply" | "discard",
     input: {
       agentId: string;
       objective: string;
@@ -40,6 +40,8 @@ export type WorkBoardProps = {
       checkId: string;
       checkExecutable: string;
       oracleRoot: string;
+      workId?: string;
+      candidateDigest?: string;
     },
   ) => Promise<VerifiedChangeView>;
 };
@@ -150,24 +152,41 @@ export function WorkBoard({
     setVerifiedView(verifiedChange);
   }, [verifiedChange]);
 
-  async function submitVerified(action: "prepare" | "start") {
-    if (!onVerifiedChange) return;
+  function verifiedInput(view?: VerifiedChangeView | null) {
     const allowedFiles = verifiedFiles
       .split(",")
       .map((path) => path.trim())
       .filter(Boolean);
+    return {
+      agentId: agentId.trim(),
+      objective: verifiedObjective.trim(),
+      allowedFiles,
+      checkId: verifiedCheckId.trim(),
+      checkExecutable: verifiedExecutable.trim(),
+      oracleRoot: verifiedOracle.trim(),
+      workId: view?.workId ?? verifiedView?.workId ?? undefined,
+      candidateDigest: view?.candidateDigest ?? verifiedView?.candidateDigest ?? undefined,
+    };
+  }
+
+  async function submitVerified(action: "prepare" | "start" | "status" | "apply" | "discard") {
+    if (!onVerifiedChange) return;
     setActionBusy(true);
     setVerifiedError(null);
     try {
-      const view = await onVerifiedChange(action, {
-        agentId: agentId.trim(),
-        objective: verifiedObjective.trim(),
-        allowedFiles,
-        checkId: verifiedCheckId.trim(),
-        checkExecutable: verifiedExecutable.trim(),
-        oracleRoot: verifiedOracle.trim(),
-      });
+      let view = await onVerifiedChange(action, verifiedInput());
       setVerifiedView(view);
+      if (action === "start" && view.workId) {
+        const deadline = Date.now() + 15_000;
+        while (
+          (view.workState === "running" || view.workState === "leased") &&
+          Date.now() < deadline
+        ) {
+          await new Promise((resolve) => setTimeout(resolve, 400));
+          view = await onVerifiedChange("status", verifiedInput(view));
+          setVerifiedView(view);
+        }
+      }
     } catch (error) {
       setVerifiedError(String(error));
     } finally {
@@ -258,7 +277,7 @@ export function WorkBoard({
             Oracle directory
             <input value={verifiedOracle} onChange={(event) => setVerifiedOracle(event.target.value)} />
           </label>
-          <button type="submit" disabled={actionBusy || !agentId.trim() || !verifiedObjective.trim()}>
+          <button type="submit" disabled={actionBusy || !verifiedObjective.trim()}>
             Prepare
           </button>
           <button
@@ -267,6 +286,38 @@ export function WorkBoard({
             onClick={() => void submitVerified("start")}
           >
             Start one attempt
+          </button>
+          <button
+            type="button"
+            disabled={actionBusy || !verifiedView?.workId}
+            onClick={() => void submitVerified("status")}
+          >
+            Refresh review
+          </button>
+          <button
+            type="button"
+            disabled={
+              actionBusy ||
+              !verifiedView?.workId ||
+              !verifiedView.candidateDigest ||
+              verifiedView.phases?.humanApproved !== true ||
+              verifiedView.phases?.applied === true
+            }
+            onClick={() => void submitVerified("apply")}
+          >
+            Apply exact candidate
+          </button>
+          <button
+            type="button"
+            disabled={
+              actionBusy ||
+              !verifiedView?.workId ||
+              !verifiedView.candidateDigest ||
+              verifiedView.phases?.applied === true
+            }
+            onClick={() => void submitVerified("discard")}
+          >
+            Discard exact candidate
           </button>
           <VerifiedChangePanel view={verifiedView} error={verifiedError} />
         </form>

@@ -235,6 +235,8 @@ fn verified_change_projection(
             "humanApproved": work.is_some_and(|work| work.approval.as_ref().is_some_and(|approval| approval.candidate_digest.is_some())),
             "applied": verification.is_some_and(|verification| verification.applied),
         },
+        "candidateDigest": verification.map(|verification| verification.content_digest.clone()),
+        "workRevision": work.map(|work| work.revision),
         "diffDigest": verification.and_then(|verification| verification.diff_digest.clone()),
         "changedPaths": verification.map(|verification| verification.changed_paths.clone()).unwrap_or_default(),
         "boundedDiff": verification.map(|verification| verification.bounded_diff.clone()).unwrap_or_default(),
