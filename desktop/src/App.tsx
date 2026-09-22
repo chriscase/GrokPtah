@@ -4514,9 +4514,7 @@ export default function App() {
                 input.agentId,
                 input.objective,
                 input.allowedFiles,
-                input.checkId,
-                input.checkExecutable,
-                input.oracleRoot,
+                input.checkProfileId,
               );
             }}
           />

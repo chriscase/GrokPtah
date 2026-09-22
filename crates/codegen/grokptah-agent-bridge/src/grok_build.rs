@@ -234,9 +234,17 @@ pub trait CredentialLeaseResolver: Send + Sync {
     fn resolve(&self, lease_id: &str) -> Result<CredentialLeaseHandle, GrokBuildAdapterError>;
 
     fn revoke(&self, lease_id: &str) -> Result<(), GrokBuildAdapterError>;
+
+    /// True only when `revoke` invalidates the credential a child already read.
+    /// Deleting a local file is not enough.
+    fn revokes_upstream(&self) -> bool {
+        false
+    }
 }
 
-/// Host-owned lease file. The path is never included in `Debug`.
+/// Test-only file handle. `revoke` deletes the file and does not invalidate a
+/// credential the child has already read. Production operator setup must not
+/// install this as containment for a live provider child.
 pub struct FileCredentialLease {
     lease_id: String,
     path: PathBuf,
@@ -281,6 +289,105 @@ impl CredentialLeaseResolver for FileCredentialLease {
             fs::remove_file(&self.path).map_err(|_| GrokBuildAdapterError::CredentialRevocation)?;
         }
         Ok(())
+    }
+}
+
+/// Host registry whose `revoke` rejects a token the caller already holds.
+///
+/// The file written for the child is only a transport. Acceptance is decided
+/// by this registry, so truncating that file does not revoke a token the
+/// child has already read.
+pub struct HostLeaseAuthority {
+    dir: PathBuf,
+    scope: String,
+    inner: std::sync::Mutex<std::collections::BTreeMap<String, (u64, String, bool, u128)>>,
+}
+
+impl HostLeaseAuthority {
+    pub fn new(dir: PathBuf) -> Self {
+        Self::scoped(dir, "host")
+    }
+
+    pub fn scoped(dir: PathBuf, scope: impl Into<String>) -> Self {
+        Self {
+            dir,
+            scope: scope.into(),
+            inner: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+        }
+    }
+
+    pub fn scope(&self) -> &str {
+        &self.scope
+    }
+
+    pub fn provider_accepts(&self, presented: &str) -> bool {
+        let Ok(inner) = self.inner.lock() else {
+            return false;
+        };
+        let now = host_lease_now_ms();
+        inner
+            .values()
+            .any(|(_, token, revoked, expires)| !revoked && *expires > now && token == presented)
+    }
+}
+
+fn host_lease_now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
+}
+
+impl CredentialLeaseResolver for HostLeaseAuthority {
+    fn resolve(&self, lease_id: &str) -> Result<CredentialLeaseHandle, GrokBuildAdapterError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| GrokBuildAdapterError::CredentialLease)?;
+        let now = host_lease_now_ms();
+        let entry = inner.entry(lease_id.to_string()).or_insert_with(|| {
+            (
+                1,
+                format!("lease:{lease_id}:generation:1"),
+                false,
+                now.saturating_add(3_600_000),
+            )
+        });
+        if entry.2 || entry.3 <= now {
+            if entry.3 <= now {
+                entry.0 = entry.0.saturating_add(1);
+                entry.1 = format!("lease:{lease_id}:generation:{}", entry.0);
+            }
+            entry.2 = false;
+            entry.3 = now.saturating_add(3_600_000);
+        }
+        let token = entry.1.clone();
+        drop(inner);
+        let path = self.dir.join(format!("lease-{lease_id}"));
+        if path.exists() {
+            fs::remove_file(&path).map_err(|_| GrokBuildAdapterError::CredentialLease)?;
+        }
+        write_private_file(&path, token.as_bytes())?;
+        Ok(CredentialLeaseHandle::from_host_path(path))
+    }
+
+    fn revoke(&self, lease_id: &str) -> Result<(), GrokBuildAdapterError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| GrokBuildAdapterError::CredentialRevocation)?;
+        let Some(entry) = inner.get_mut(lease_id) else {
+            return Err(GrokBuildAdapterError::CredentialRevocation);
+        };
+        entry.2 = true;
+        entry.0 = entry.0.saturating_add(1);
+        entry.1 = format!("lease:{lease_id}:generation:{}", entry.0);
+        entry.3 = host_lease_now_ms().saturating_add(3_600_000);
+        Ok(())
+    }
+
+    fn revokes_upstream(&self) -> bool {
+        true
     }
 }
 
@@ -1788,6 +1895,7 @@ async fn execute_allowlisted(
                         if let Err(error) = crate::verified_change::retain_candidate_snapshot(
                             &execution_host.cwd,
                             retention,
+                            &launch.identity.head_sha,
                         ) {
                             let _ = checkout.cleanup().await;
                             let _ = std::fs::remove_dir_all(retention);
@@ -2940,6 +3048,34 @@ mod tests {
                 Ok(())
             }
         }
+    }
+
+    #[test]
+    fn file_truncation_does_not_revoke_an_already_read_lease() {
+        let dir = tempfile::tempdir().expect("dir");
+        let authority = HostLeaseAuthority::scoped(dir.path().to_path_buf(), "workspace-a");
+        authority.resolve("lease-1").expect("resolve");
+        let lease_path = dir.path().join("lease-lease-1");
+        let token = std::fs::read_to_string(&lease_path).expect("child read");
+        assert!(authority.provider_accepts(&token));
+        std::fs::write(&lease_path, []).unwrap();
+        std::fs::remove_file(&lease_path).unwrap();
+        assert!(
+            authority.provider_accepts(&token),
+            "deleting the lease file must not revoke a token the child already read"
+        );
+        let opaque = dir.path().join("opaque");
+        std::fs::write(&opaque, token.as_bytes()).unwrap();
+        FileCredentialLease::new("lease-1", opaque.clone())
+            .revoke("lease-1")
+            .unwrap();
+        assert!(!opaque.exists());
+        assert!(
+            authority.provider_accepts(&token),
+            "FileCredentialLease revoke does not invalidate the token the child read"
+        );
+        authority.revoke("lease-1").expect("revoke");
+        assert!(!authority.provider_accepts(&token));
     }
 
     #[test]

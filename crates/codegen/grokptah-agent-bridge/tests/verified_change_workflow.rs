@@ -8,7 +8,7 @@ mod common;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use grokptah_agent_bridge::orchestration::{
     AuthContext, ManagedExecutionBudgetProfile, ManagedGrokExecutorConfig, ManagedIntentState,
@@ -16,9 +16,10 @@ use grokptah_agent_bridge::orchestration::{
     WorkState, WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
-    execute_required_checks, set_grokptah_home_override, start_control_server, AgentHost,
-    CredentialLeaseHandle, CredentialLeaseResolver, GrokBuildAdapterError, HostConfig, HostRuntime,
-    RequiredCheckCwd, RequiredCheckSpec, SessionKind,
+    directory_digest, execute_required_checks, file_digest, set_grokptah_home_override,
+    start_control_server, AgentHost, CredentialLeaseHandle, CredentialLeaseResolver,
+    GrokBuildAdapterError, HostConfig, HostLeaseAuthority, HostRuntime, RequiredCheckCwd,
+    RequiredCheckSpec, SessionKind, APPLY_FAULT, BEFORE_CANDIDATE_BIND,
 };
 use grokptah_agent_sdk::GrokBuildGitIdentity;
 use tempfile::tempdir;
@@ -33,25 +34,20 @@ const LEDGER_AFTER: &str = "pub fn balance(cents: &[i32]) -> i32 {\n    cents.it
 const REPORT_AFTER: &str = "pub fn render(cents: &[i32]) -> String {\n    // COORDINATED_REPORT=1\n    format!(\"balance:{}\", crate::ledger::balance(cents))\n}\n";
 
 struct FileLeaseResolver {
-    path: PathBuf,
+    authority: HostLeaseAuthority,
 }
 
 impl CredentialLeaseResolver for FileLeaseResolver {
     fn resolve(&self, lease_id: &str) -> Result<CredentialLeaseHandle, GrokBuildAdapterError> {
-        if lease_id != "verified-change-lease" {
-            return Err(GrokBuildAdapterError::CredentialLease);
-        }
-        Ok(CredentialLeaseHandle::from_host_path(self.path.clone()))
+        self.authority.resolve(lease_id)
     }
 
     fn revoke(&self, lease_id: &str) -> Result<(), GrokBuildAdapterError> {
-        if lease_id != "verified-change-lease" {
-            return Err(GrokBuildAdapterError::CredentialRevocation);
-        }
-        if self.path.exists() {
-            fs::remove_file(&self.path).map_err(|_| GrokBuildAdapterError::CredentialRevocation)?;
-        }
-        Ok(())
+        self.authority.revoke(lease_id)
+    }
+
+    fn revokes_upstream(&self) -> bool {
+        true
     }
 }
 
@@ -111,6 +107,32 @@ fn install_fake(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
     fs::write(path, FAKE_GROK).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn install_profile(store: &Path, executable: &str, oracle: &Path, revision: u64) {
+    let executable_path = Path::new(executable);
+    let body = serde_json::json!({
+        "profileId": "balance-regression",
+        "profileRevision": revision,
+        "executable": executable,
+        "executableDigest": file_digest(executable_path).expect("executable digest"),
+        "args": [],
+        "cwd": "oracle",
+        "oracleRoot": oracle,
+        "oracleDigest": directory_digest(oracle).expect("oracle digest"),
+        "env": [],
+        "timeoutMs": 2000,
+        "maxOutputBytes": 1024,
+        "network": "none",
+        "maxOutputDirBytes": 65536,
+    });
+    let dir = store.join("check-profiles");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("balance-regression.json"),
+        serde_json::to_vec(&body).unwrap(),
+    )
+    .unwrap();
 }
 
 fn auth() -> AuthContext {
@@ -187,9 +209,12 @@ impl Harness {
                 identity: identity.clone(),
                 credential_lease_id: "verified-change-lease".into(),
             },
-            Arc::new(FileLeaseResolver { path: lease }),
+            Arc::new(FileLeaseResolver {
+                authority: HostLeaseAuthority::new(fake_dir.path().to_path_buf()),
+            }),
         )
         .unwrap();
+        install_profile(orch.store().root(), &check.executable, oracle.path(), 1);
         let _ = profile;
         Self {
             home,
@@ -216,7 +241,8 @@ impl Harness {
             objective: "Repair the balance so the report and ledger agree without the extra cent."
                 .into(),
             allowed_files: vec!["src/ledger.rs".into(), "src/report.rs".into()],
-            required_checks: vec![self.check.clone()],
+            check_profile_id: "balance-regression".into(),
+            required_checks: Vec::new(),
             oracle_root: self.oracle.path().to_path_buf(),
             budget_profile: ManagedExecutionBudgetProfile::Economy,
             mutation_mode: mode.into(),
@@ -302,7 +328,7 @@ async fn reopen_production_store(
             credential_lease_id: "verified-change-lease".into(),
         },
         Arc::new(FileLeaseResolver {
-            path: lease.to_path_buf(),
+            authority: HostLeaseAuthority::new(lease.parent().unwrap().to_path_buf()),
         }),
     )
     .unwrap();
@@ -364,28 +390,19 @@ async fn multi_file_repair_is_red_then_green_and_apply_is_separate() {
             &harness.request("linux", "isolated_review", "linux"),
         )
         .unwrap();
-    assert_eq!(blocked["readiness"]["ready"], false);
+    assert_eq!(blocked["readiness"]["platform"], "macos");
+    assert_eq!(blocked["executionHost"], "service");
     assert_eq!(blocked["readiness"]["workersDispatched"], 0);
     assert_eq!(blocked["readiness"]["providerInvocations"], 0);
     assert!(blocked["readiness"]["reasons"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|reason| reason.as_str().unwrap().contains("Non-macOS")));
-    let work_before = harness.orch.store().list_work_items().unwrap_or_default();
-    let start_blocked = harness
-        .orch
-        .start_verified_change(
-            &auth(),
-            &harness.request("linux", "isolated_review", "linux"),
-        )
-        .await;
-    assert!(start_blocked.is_err());
+        .all(|reason| !reason.as_str().unwrap_or("").contains("linux")));
     assert_eq!(
         harness.orch.store().list_managed_intents().unwrap().len(),
         0
     );
-    let _ = work_before;
 
     let readonly = harness
         .orch
@@ -566,7 +583,10 @@ async fn multi_file_repair_is_red_then_green_and_apply_is_separate() {
         .orch
         .verified_change_status(&auth(), harness.lane, harness.workspace.path(), &apply_id)
         .unwrap();
-    assert_eq!(apply_status["phases"]["checksPassed"], true);
+    assert_eq!(
+        apply_status["phases"]["checksPassed"], true,
+        "{apply_status}"
+    );
     let apply_work = harness
         .orch
         .store()
@@ -771,7 +791,11 @@ async fn cancel_and_restart_do_not_dispatch_or_apply() {
         .await
         .unwrap();
     let review_id = review["workId"].as_str().unwrap().to_string();
-    let _ = settle(&harness.orch, &review_id).await;
+    let settled_review = settle(&harness.orch, &review_id).await;
+    assert_eq!(
+        settled_review["state"], "awaiting_approval",
+        "{settled_review}"
+    );
     let before_attempts = harness
         .orch
         .store()
@@ -820,7 +844,9 @@ async fn cancel_and_restart_do_not_dispatch_or_apply() {
             identity,
             credential_lease_id: "verified-change-lease".into(),
         },
-        Arc::new(FileLeaseResolver { path: lease }),
+        Arc::new(FileLeaseResolver {
+            authority: HostLeaseAuthority::new(lease.parent().unwrap().to_path_buf()),
+        }),
     )
     .unwrap();
     for _ in 0..4 {
@@ -1649,3 +1675,731 @@ printf '{"method":"session/update","params":{"_meta":{},"sessionId":"%s","update
 printf '{"method":"_x.ai/session/update","params":{"_meta":{},"sessionId":"%s","update":{"sessionUpdate":"turn_completed","stop_reason":"end_turn"}},"timestamp":"2026-08-31T00:00:01Z"}\n' "$session_id" >> "$GROK_HOME/sessions/workspace/$session_id/updates.jsonl"
 printf '{"text":"repaired the balance pair\\nGROK_BUILD_VERDICT=clean","stopReason":"end_turn","sessionId":"%s","requestId":"11111111-1111-4111-8111-111111111111","thought":"","usage":{},"num_turns":1,"total_cost_usd":0.0,"total_cost_usd_ticks":0,"modelUsage":{}}\n' "$session_id"
 "#;
+
+struct ResetFault;
+impl Drop for ResetFault {
+    fn drop(&mut self) {
+        APPLY_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+async fn approved_repair(label: &str) -> (Harness, String, String, u64) {
+    let harness = Harness::open(ManagedExecutionBudgetProfile::Economy);
+    harness.set_behavior("repair");
+    let started = harness
+        .orch
+        .start_verified_change(&auth(), &harness.request(label, "isolated_review", "macos"))
+        .await
+        .unwrap_or_else(|error| panic!("start {label}: {error}"));
+    let work_id = started["workId"].as_str().unwrap().to_string();
+    let _ = settle(&harness.orch, &work_id).await;
+    let work = harness
+        .orch
+        .store()
+        .load_work_item(&work_id)
+        .unwrap()
+        .unwrap();
+    let digest = work
+        .result
+        .as_ref()
+        .unwrap()
+        .candidate_verification
+        .as_ref()
+        .unwrap()
+        .content_digest
+        .clone();
+    harness
+        .orch
+        .approve_work(
+            &auth(),
+            "approve-repair",
+            harness.lane,
+            harness.workspace.path(),
+            &work_id,
+            Some("approve".into()),
+            Some(work.revision),
+        )
+        .await
+        .unwrap();
+    let revision = harness
+        .orch
+        .store()
+        .load_work_item(&work_id)
+        .unwrap()
+        .unwrap()
+        .revision;
+    (harness, work_id, digest, revision)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn second_path_failure_rolls_back_and_a_crash_is_not_a_clean_noop() {
+    let _reset = ResetFault;
+    let (harness, work_id, digest, revision) = approved_repair("rollback").await;
+    APPLY_FAULT.store(9, std::sync::atomic::Ordering::SeqCst);
+    let rolled = harness
+        .orch
+        .apply_verified_change(
+            &auth(),
+            "apply-rollback",
+            harness.lane,
+            harness.workspace.path(),
+            &work_id,
+            &digest,
+            Some(revision),
+        )
+        .await
+        .unwrap_err();
+    assert!(rolled.to_string().contains("rolled back"), "{rolled}");
+    assert_eq!(
+        harness.source_pair(),
+        (LEDGER_BEFORE.into(), REPORT_BEFORE.into())
+    );
+    APPLY_FAULT.store(3, std::sync::atomic::Ordering::SeqCst);
+    let current = harness
+        .orch
+        .store()
+        .load_work_item(&work_id)
+        .unwrap()
+        .unwrap();
+    let crashed = harness
+        .orch
+        .apply_verified_change(
+            &auth(),
+            "apply-crash",
+            harness.lane,
+            harness.workspace.path(),
+            &work_id,
+            &digest,
+            Some(current.revision),
+        )
+        .await
+        .unwrap_err();
+    assert!(crashed.to_string().contains("reconciliation"), "{crashed}");
+    let partial = harness.source_pair();
+    assert_ne!(partial, (LEDGER_AFTER.into(), REPORT_AFTER.into()));
+    APPLY_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+    let again = harness
+        .orch
+        .store()
+        .load_work_item(&work_id)
+        .unwrap()
+        .unwrap();
+    let replay = harness
+        .orch
+        .apply_verified_change(
+            &auth(),
+            "apply-replay",
+            harness.lane,
+            harness.workspace.path(),
+            &work_id,
+            &digest,
+            Some(again.revision),
+        )
+        .await
+        .unwrap_err();
+    assert!(replay.to_string().contains("reconciliation"), "{replay}");
+    assert_eq!(harness.source_pair(), partial);
+    harness.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn foreign_status_does_not_reveal_or_mutate_the_candidate() {
+    let (harness, work_id, _digest, _revision) = approved_repair("scope").await;
+    let before = fs::read_dir(harness.orch.store().root().join("work-items"))
+        .unwrap()
+        .map(|entry| fs::read(entry.unwrap().path()).unwrap())
+        .collect::<Vec<_>>();
+    let other = harness.host.session_new_kind(SessionKind::Build).unwrap();
+    harness
+        .host
+        .session_set_cwd(other.id, harness.workspace.path())
+        .unwrap();
+    let foreign =
+        harness
+            .orch
+            .verified_change_status(&auth(), other.id, harness.workspace.path(), &work_id);
+    let unknown = harness.orch.verified_change_status(
+        &auth(),
+        harness.lane,
+        harness.workspace.path(),
+        "missing-work",
+    );
+    let foreign_error = foreign.unwrap_err().to_string();
+    let unknown_error = unknown.unwrap_err().to_string();
+    assert_eq!(foreign_error, unknown_error);
+    assert!(!foreign_error.contains("COORDINATED_REPORT"));
+    assert!(!foreign_error.contains("iter().sum()"));
+    let other_approve = harness
+        .orch
+        .approve_work(
+            &auth(),
+            "approve-foreign",
+            other.id,
+            harness.workspace.path(),
+            &work_id,
+            Some("clear".into()),
+            Some(0),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    let missing_approve = harness
+        .orch
+        .approve_work(
+            &auth(),
+            "approve-missing",
+            harness.lane,
+            harness.workspace.path(),
+            "missing-work",
+            Some("clear".into()),
+            Some(0),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(other_approve, missing_approve);
+    assert!(!other_approve.contains("COORDINATED_REPORT"));
+    let malformed = harness
+        .orch
+        .verified_change_status(&auth(), harness.lane, harness.workspace.path(), "../secret")
+        .unwrap_err()
+        .to_string();
+    assert!(!malformed.contains("COORDINATED_REPORT"));
+    assert!(!malformed.contains("iter().sum()"));
+    let after = fs::read_dir(harness.orch.store().root().join("work-items"))
+        .unwrap()
+        .map(|entry| fs::read(entry.unwrap().path()).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(before, after);
+    let still = harness
+        .orch
+        .store()
+        .load_work_item(&work_id)
+        .unwrap()
+        .unwrap();
+    assert!(still.approval.as_ref().is_some_and(|approval| {
+        approval.candidate_digest.is_some() && approval.reviewer_id == "operator"
+    }));
+    harness.close().await;
+}
+
+static BARRIER_REPO: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+fn commit_barrier_b() {
+    let Some(repo) = BARRIER_REPO.lock().unwrap().clone() else {
+        return;
+    };
+    fs::write(repo.join("src/ledger.rs"), "COMMIT_B_MARKER\n").unwrap();
+    let _ = Command::new("/usr/bin/git")
+        .args(["add", "src/ledger.rs"])
+        .current_dir(&repo)
+        .status();
+    let _ = Command::new("/usr/bin/git")
+        .args(["commit", "-m", "barrier B"])
+        .current_dir(&repo)
+        .env("GIT_AUTHOR_NAME", "barrier")
+        .env("GIT_AUTHOR_EMAIL", "barrier@grokptah.invalid")
+        .env("GIT_COMMITTER_NAME", "barrier")
+        .env("GIT_COMMITTER_EMAIL", "barrier@grokptah.invalid")
+        .status();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verification_stays_bound_to_the_launch_sha() {
+    let harness = Harness::open(ManagedExecutionBudgetProfile::Economy);
+    let launch = harness.identity.head_sha.clone();
+    *BARRIER_REPO.lock().unwrap() = Some(harness.workspace.path().to_path_buf());
+    *BEFORE_CANDIDATE_BIND.lock().unwrap() = Some(commit_barrier_b);
+    harness.set_behavior("repair");
+    let started = harness
+        .orch
+        .start_verified_change(
+            &auth(),
+            &harness.request("barrier", "isolated_review", "macos"),
+        )
+        .await
+        .unwrap();
+    let work_id = started["workId"].as_str().unwrap().to_string();
+    let _ = settle(&harness.orch, &work_id).await;
+    *BEFORE_CANDIDATE_BIND.lock().unwrap() = None;
+    let work = harness
+        .orch
+        .store()
+        .load_work_item(&work_id)
+        .unwrap()
+        .unwrap();
+    let verification = work
+        .result
+        .as_ref()
+        .unwrap()
+        .candidate_verification
+        .as_ref()
+        .unwrap();
+    assert_eq!(verification.source_revision, launch);
+    let head = git(harness.workspace.path(), &["rev-parse", "HEAD"]);
+    assert_ne!(head, launch);
+    let approved = harness
+        .orch
+        .approve_work(
+            &auth(),
+            "approve-b",
+            harness.lane,
+            harness.workspace.path(),
+            &work_id,
+            None,
+            Some(work.revision),
+        )
+        .await;
+    assert!(approved.is_err(), "{approved:?}");
+    assert_eq!(
+        fs::read_to_string(harness.workspace.path().join("src/ledger.rs")).unwrap(),
+        "COMMIT_B_MARKER\n"
+    );
+    harness.close().await;
+}
+
+fn directory_bytes(root: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut files = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if let Ok(bytes) = fs::read(&path) {
+                files.push((
+                    path.strip_prefix(root).unwrap().display().to_string(),
+                    bytes,
+                ));
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn same_request_with_a_changed_profile_conflicts() {
+    let harness = Harness::open(ManagedExecutionBudgetProfile::Economy);
+    harness.set_behavior("repair");
+    let request = harness.request("same-profile", "isolated_review", "macos");
+    harness
+        .orch
+        .start_verified_change(&auth(), &request)
+        .await
+        .unwrap();
+    let agents = directory_bytes(&harness.orch.store().root().join("agents"));
+    let specs = directory_bytes(&harness.orch.store().root().join("agent-specs"));
+    install_profile(
+        harness.orch.store().root(),
+        &harness.check.executable,
+        harness.oracle.path(),
+        2,
+    );
+    let conflict = harness
+        .orch
+        .start_verified_change(&auth(), &request)
+        .await
+        .unwrap_err();
+    assert!(
+        conflict.to_string().contains("different payload"),
+        "{conflict}"
+    );
+    assert_eq!(
+        agents,
+        directory_bytes(&harness.orch.store().root().join("agents"))
+    );
+    assert_eq!(
+        specs,
+        directory_bytes(&harness.orch.store().root().join("agent-specs"))
+    );
+    harness.close().await;
+}
+
+fn intent_files(root: &Path) -> Vec<String> {
+    let dir = root.join("apply-source-intents");
+    let mut names = Vec::new();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry.path().extension().and_then(|value| value.to_str()) == Some("json") {
+                names.push(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+    }
+    names.sort();
+    names
+}
+
+async fn apply_at(
+    harness: &Harness,
+    request_id: &str,
+    work_id: &str,
+    digest: &str,
+    revision: u64,
+) -> Result<serde_json::Value, grokptah_agent_bridge::orchestration::OrchError> {
+    harness
+        .orch
+        .apply_verified_change(
+            &auth(),
+            request_id,
+            harness.lane,
+            harness.workspace.path(),
+            work_id,
+            digest,
+            Some(revision),
+        )
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn apply_faults_before_effect_retry_once_and_a_failed_command_changes_nothing() {
+    let _reset = ResetFault;
+    let (harness, work_id, digest, revision) = approved_repair("fault-before").await;
+    let before = harness.source_pair();
+    APPLY_FAULT.store(1, std::sync::atomic::Ordering::SeqCst);
+    let early = apply_at(&harness, "apply-fault-1", &work_id, &digest, revision)
+        .await
+        .unwrap_err();
+    assert!(early.to_string().contains("before the intent"), "{early}");
+    assert!(intent_files(harness.orch.store().root()).is_empty());
+    assert_eq!(harness.source_pair(), before);
+    APPLY_FAULT.store(2, std::sync::atomic::Ordering::SeqCst);
+    let armed = apply_at(&harness, "apply-fault-2", &work_id, &digest, revision)
+        .await
+        .unwrap_err();
+    assert!(
+        armed.to_string().contains("before any source effect"),
+        "{armed}"
+    );
+    assert_eq!(intent_files(harness.orch.store().root()).len(), 1);
+    assert_eq!(harness.source_pair(), before);
+    APPLY_FAULT.store(6, std::sync::atomic::Ordering::SeqCst);
+    let failed = apply_at(&harness, "apply-fault-6", &work_id, &digest, revision)
+        .await
+        .unwrap_err();
+    assert!(failed.to_string().contains("not changed"), "{failed}");
+    assert!(!failed.to_string().contains("reconciliation"), "{failed}");
+    assert_eq!(harness.source_pair(), before);
+    let work = harness
+        .orch
+        .store()
+        .load_work_item(&work_id)
+        .unwrap()
+        .unwrap();
+    assert!(work.state != WorkState::Succeeded);
+    assert!(
+        !work
+            .result
+            .as_ref()
+            .unwrap()
+            .candidate_verification
+            .as_ref()
+            .unwrap()
+            .reconciliation_required
+    );
+    APPLY_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+    let applied = apply_at(&harness, "apply-fault-retry", &work_id, &digest, revision)
+        .await
+        .unwrap();
+    assert_eq!(applied["work"]["state"], "succeeded");
+    assert_eq!(
+        harness.source_pair(),
+        (LEDGER_AFTER.to_string(), REPORT_AFTER.to_string())
+    );
+    harness.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rollback_failure_blocks_automatic_continuation() {
+    let _reset = ResetFault;
+    let (harness, work_id, digest, revision) = approved_repair("fault-rollback").await;
+    APPLY_FAULT.store(7, std::sync::atomic::Ordering::SeqCst);
+    let failed = apply_at(&harness, "apply-fault-7", &work_id, &digest, revision)
+        .await
+        .unwrap_err();
+    assert!(
+        failed.to_string().contains("rollback also failed"),
+        "{failed}"
+    );
+    let poisoned = harness.source_pair();
+    assert_ne!(poisoned, (LEDGER_BEFORE.into(), REPORT_BEFORE.into()));
+    assert_ne!(poisoned, (LEDGER_AFTER.into(), REPORT_AFTER.into()));
+    assert!(poisoned.0.contains("rollback-poison") || poisoned.1.contains("rollback-poison"));
+    APPLY_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+    let current = harness
+        .orch
+        .store()
+        .load_work_item(&work_id)
+        .unwrap()
+        .unwrap();
+    assert!(
+        current
+            .result
+            .as_ref()
+            .unwrap()
+            .candidate_verification
+            .as_ref()
+            .unwrap()
+            .reconciliation_required
+    );
+    let replay = apply_at(
+        &harness,
+        "apply-fault-7-replay",
+        &work_id,
+        &digest,
+        current.revision,
+    )
+    .await
+    .unwrap_err();
+    assert!(replay.to_string().contains("reconciliation"), "{replay}");
+    assert_eq!(harness.source_pair(), poisoned);
+    harness.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_after_source_effect_commits_without_applying_again() {
+    let _reset = ResetFault;
+    let (harness, work_id, digest, revision) = approved_repair("fault-restart").await;
+    let workspace = harness.workspace.path().to_path_buf();
+    let fake = harness.fake_dir.path().join("grok");
+    let isolate = harness.isolate.path().to_path_buf();
+    let identity = harness.identity.clone();
+    let lease = harness.fake_dir.path().join("lease.json");
+    let lane = harness.lane;
+    APPLY_FAULT.store(4, std::sync::atomic::Ordering::SeqCst);
+    let interrupted = apply_at(&harness, "apply-fault-4", &work_id, &digest, revision)
+        .await
+        .unwrap_err();
+    assert!(
+        interrupted.to_string().contains("before the work commit"),
+        "{interrupted}"
+    );
+    let applied_bytes = (
+        fs::read(workspace.join("src/ledger.rs")).unwrap(),
+        fs::read(workspace.join("src/report.rs")).unwrap(),
+    );
+    assert_eq!(applied_bytes.0, LEDGER_AFTER.as_bytes());
+    assert_eq!(applied_bytes.1, REPORT_AFTER.as_bytes());
+    assert_ne!(
+        harness
+            .orch
+            .store()
+            .load_work_item(&work_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        WorkState::Succeeded
+    );
+    APPLY_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+    let live = reopen_production_store(
+        harness.host,
+        harness.orch,
+        &workspace,
+        &fake,
+        &isolate,
+        &identity,
+        &lease,
+    )
+    .await;
+    let recovered = live.orch.store().load_work_item(&work_id).unwrap().unwrap();
+    assert_eq!(recovered.state, WorkState::Succeeded);
+    assert!(
+        recovered
+            .result
+            .as_ref()
+            .unwrap()
+            .candidate_verification
+            .as_ref()
+            .unwrap()
+            .applied
+    );
+    assert_eq!(
+        fs::read(workspace.join("src/ledger.rs")).unwrap(),
+        applied_bytes.0
+    );
+    assert_eq!(
+        fs::read(workspace.join("src/report.rs")).unwrap(),
+        applied_bytes.1
+    );
+    let replay = live
+        .orch
+        .apply_verified_change(
+            &auth(),
+            "apply-fault-4-replay",
+            lane,
+            &workspace,
+            &work_id,
+            &digest,
+            Some(recovered.revision),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay["work"]["state"], "succeeded");
+    assert_eq!(
+        fs::read(workspace.join("src/ledger.rs")).unwrap(),
+        applied_bytes.0
+    );
+    assert_eq!(
+        fs::read(workspace.join("src/report.rs")).unwrap(),
+        applied_bytes.1
+    );
+    live.orch.stop_background_tasks().await;
+    live.host.shutdown().await;
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_after_work_commit_finishes_the_idempotency_response() {
+    let _reset = ResetFault;
+    let (harness, work_id, digest, revision) = approved_repair("fault-response").await;
+    let workspace = harness.workspace.path().to_path_buf();
+    let fake = harness.fake_dir.path().join("grok");
+    let isolate = harness.isolate.path().to_path_buf();
+    let identity = harness.identity.clone();
+    let lease = harness.fake_dir.path().join("lease.json");
+    let lane = harness.lane;
+    APPLY_FAULT.store(5, std::sync::atomic::Ordering::SeqCst);
+    let interrupted = apply_at(&harness, "apply-fault-5", &work_id, &digest, revision)
+        .await
+        .unwrap_err();
+    assert!(
+        interrupted
+            .to_string()
+            .contains("before the idempotency response"),
+        "{interrupted}"
+    );
+    let applied_bytes = (
+        fs::read(workspace.join("src/ledger.rs")).unwrap(),
+        fs::read(workspace.join("src/report.rs")).unwrap(),
+    );
+    assert_eq!(
+        harness
+            .orch
+            .store()
+            .load_work_item(&work_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        WorkState::Succeeded
+    );
+    APPLY_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+    let live = reopen_production_store(
+        harness.host,
+        harness.orch,
+        &workspace,
+        &fake,
+        &isolate,
+        &identity,
+        &lease,
+    )
+    .await;
+    let replay = live
+        .orch
+        .apply_verified_change(
+            &auth(),
+            "apply-fault-5",
+            lane,
+            &workspace,
+            &work_id,
+            &digest,
+            Some(revision),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay["work"]["state"], "succeeded");
+    assert_eq!(
+        fs::read(workspace.join("src/ledger.rs")).unwrap(),
+        applied_bytes.0
+    );
+    assert_eq!(
+        fs::read(workspace.join("src/report.rs")).unwrap(),
+        applied_bytes.1
+    );
+    live.orch.stop_background_tasks().await;
+    live.host.shutdown().await;
+    set_grokptah_home_override(None);
+}
+
+struct ClearImmutable(PathBuf);
+impl Drop for ClearImmutable {
+    fn drop(&mut self) {
+        let _ = Command::new("/usr/bin/chflags")
+            .args(["-R", "nouchg"])
+            .arg(&self.0)
+            .status();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn discard_cleanup_failure_is_not_a_completed_discard() {
+    let harness = Harness::open(ManagedExecutionBudgetProfile::Economy);
+    let agents = directory_bytes(&harness.orch.store().root().join("agents"));
+    let specs = directory_bytes(&harness.orch.store().root().join("agent-specs"));
+    let works_before = directory_bytes(&harness.orch.store().root().join("work-items"));
+    let mut foreign = harness.request("unauth-prepare", "isolated_review", "macos");
+    foreign.workspace = std::env::temp_dir();
+    foreign.session_id = Uuid::nil();
+    let refused = harness
+        .orch
+        .prepare_verified_change(&auth(), &foreign)
+        .unwrap_err();
+    assert!(refused.to_string().contains("unknown session"), "{refused}");
+    assert_eq!(
+        agents,
+        directory_bytes(&harness.orch.store().root().join("agents"))
+    );
+    assert_eq!(
+        specs,
+        directory_bytes(&harness.orch.store().root().join("agent-specs"))
+    );
+    assert_eq!(
+        works_before,
+        directory_bytes(&harness.orch.store().root().join("work-items"))
+    );
+    harness.close().await;
+
+    let (harness, work_id, digest, revision) = approved_repair("discard-cleanup").await;
+    let private = harness
+        .orch
+        .store()
+        .verified_change_private_dir(&work_id)
+        .unwrap();
+    let _clear = ClearImmutable(private.clone());
+    let flagged = Command::new("/usr/bin/chflags")
+        .args(["-R", "uchg"])
+        .arg(&private)
+        .status()
+        .unwrap();
+    assert!(flagged.success(), "chflags could not pin the candidate");
+    let failed = harness
+        .orch
+        .discard_verified_change(
+            &auth(),
+            "discard-pinned",
+            harness.lane,
+            harness.workspace.path(),
+            &work_id,
+            &digest,
+            Some(revision),
+        )
+        .await
+        .unwrap_err();
+    assert!(failed.to_string().contains("cleanup failed"), "{failed}");
+    let work = harness
+        .orch
+        .store()
+        .load_work_item(&work_id)
+        .unwrap()
+        .unwrap();
+    assert_ne!(work.state, WorkState::Cancelled);
+    assert!(work.approval.is_some());
+    assert_eq!(
+        harness.source_pair(),
+        (LEDGER_BEFORE.to_string(), REPORT_BEFORE.to_string())
+    );
+    drop(_clear);
+    harness.close().await;
+}

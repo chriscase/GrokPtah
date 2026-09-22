@@ -238,9 +238,7 @@ pub async fn verified_change_prepare(
     agent_id: String,
     objective: String,
     allowed_files: Vec<String>,
-    check_id: String,
-    check_executable: String,
-    oracle_root: String,
+    check_profile_id: String,
 ) -> Result<serde_json::Value, String> {
     verified_change_call(
         &state,
@@ -248,9 +246,7 @@ pub async fn verified_change_prepare(
         agent_id,
         objective,
         allowed_files,
-        check_id,
-        check_executable,
-        oracle_root,
+        check_profile_id,
         false,
     )
     .await
@@ -263,9 +259,7 @@ pub async fn verified_change_start(
     agent_id: String,
     objective: String,
     allowed_files: Vec<String>,
-    check_id: String,
-    check_executable: String,
-    oracle_root: String,
+    check_profile_id: String,
 ) -> Result<serde_json::Value, String> {
     verified_change_call(
         &state,
@@ -273,9 +267,7 @@ pub async fn verified_change_start(
         agent_id,
         objective,
         allowed_files,
-        check_id,
-        check_executable,
-        oracle_root,
+        check_profile_id,
         true,
     )
     .await
@@ -287,9 +279,7 @@ async fn verified_change_call(
     agent_id: String,
     objective: String,
     allowed_files: Vec<String>,
-    check_id: String,
-    check_executable: String,
-    oracle_root: String,
+    check_profile_id: String,
     start: bool,
 ) -> Result<serde_json::Value, String> {
     let (orch, _) = desktop_mcp_orchestration(state)?;
@@ -302,20 +292,13 @@ async fn verified_change_call(
         agent_id,
         objective,
         allowed_files,
-        required_checks: vec![grokptah_agent_bridge::RequiredCheckSpec {
-            check_id,
-            executable: check_executable,
-            args: Vec::new(),
-            cwd: grokptah_agent_bridge::RequiredCheckCwd::Oracle,
-            env: Vec::new(),
-            timeout_ms: 30_000,
-            max_output_bytes: 8 * 1024,
-        }],
-        oracle_root: std::path::PathBuf::from(oracle_root),
+        check_profile_id,
+        required_checks: Vec::new(),
+        oracle_root: std::path::PathBuf::new(),
         budget_profile: grokptah_agent_bridge::ManagedExecutionBudgetProfile::Economy,
         mutation_mode: "isolated_review".into(),
-        platform: std::env::consts::OS.into(),
-        execution_host: "desktop".into(),
+        platform: String::new(),
+        execution_host: String::new(),
     };
     let auth = grokptah_agent_bridge::AuthContext {
         token_id: "desktop".into(),

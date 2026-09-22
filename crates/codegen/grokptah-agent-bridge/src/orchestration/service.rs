@@ -108,6 +108,7 @@ pub struct VerifiedChangeRequest {
     pub agent_id: String,
     pub objective: String,
     pub allowed_files: Vec<String>,
+    pub check_profile_id: String,
     pub required_checks: Vec<crate::verified_change::RequiredCheckSpec>,
     pub oracle_root: PathBuf,
     pub budget_profile: ManagedExecutionBudgetProfile,
@@ -236,6 +237,13 @@ fn verified_change_projection(
             "applied": verification.is_some_and(|verification| verification.applied),
         },
         "candidateDigest": verification.map(|verification| verification.content_digest.clone()),
+        "checkProfileId": verification
+            .map(|verification| verification.check_profile_id.clone())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| request.check_profile_id.clone()),
+        "checkProfileRevision": verification
+            .map(|verification| verification.check_profile_revision)
+            .unwrap_or(0),
         "workRevision": work.map(|work| work.revision),
         "diffDigest": verification.and_then(|verification| verification.diff_digest.clone()),
         "changedPaths": verification.map(|verification| verification.changed_paths.clone()).unwrap_or_default(),
@@ -302,6 +310,8 @@ pub struct OrchestrationService {
     managed_grok_tasks: Mutex<HashMap<String, ManagedGrokTask>>,
     /// Join handles for in-flight runs (prevents forget + unbounded leaks).
     join_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Host binary surface. Public requests cannot select this.
+    execution_surface: Mutex<String>,
 }
 
 /// Authorized bounds for a live run event stream.
@@ -413,6 +423,13 @@ impl IdempotencyLease {
             Err(store_error) => store_error,
         }
     }
+
+    /// The Work commit landed and the process died before the receipt. Leave
+    /// the claim pending so restart can finish that response. Drop must not
+    /// record the committed apply as a failed mutation.
+    fn leave_pending(&mut self) {
+        self.settled = true;
+    }
 }
 
 impl Drop for IdempotencyLease {
@@ -493,6 +510,7 @@ impl OrchestrationService {
             managed_grok_runtime: Mutex::new(None),
             managed_grok_tasks: Mutex::new(HashMap::new()),
             join_handles: Mutex::new(Vec::new()),
+            execution_surface: Mutex::new("service".into()),
         });
         service.start_scheduler_watcher();
         service.start_native_executor();
@@ -1350,14 +1368,22 @@ impl OrchestrationService {
         let private_dir = self.store.verified_change_private_dir(&work.work_id)?;
         let retained = self.store.candidate_snapshot_dir(&work.work_id)?;
         let oracle = crate::verified_change::read_oracle_pointer(&private_dir).ok();
-        let source_revision = crate::verified_change::source_revision(
-            Path::new("/usr/bin/git"),
-            Path::new(&work.workspace),
-        )
-        .unwrap_or_else(|_| "0".repeat(40));
+        crate::verified_change::run_before_candidate_bind_hook();
         let grok = intent.grok.as_ref();
-        let change_proposed = grok.is_some_and(|invocation| !invocation.changed_paths.is_empty());
+        let source_revision = grok
+            .map(|invocation| invocation.identity.head_sha.clone())
+            .filter(|revision| revision.len() == 40)
+            .unwrap_or_else(|| "0".repeat(40));
+        let source_fingerprint = grok
+            .and_then(|invocation| invocation.source_fingerprint.clone())
+            .unwrap_or_default();
+        let manifest_proposed = crate::verified_change::read_promotion_record(&retained)
+            .map(|record| !record.manifest.is_empty())
+            .unwrap_or(false);
+        let change_proposed = manifest_proposed
+            || grok.is_some_and(|invocation| !invocation.changed_paths.is_empty());
         let diff_digest = grok.and_then(|invocation| invocation.diff_digest.clone());
+        let authority = self.store.verified_check_authority(&work.work_id);
         let verification = crate::verified_change::assemble_candidate_verification(
             &work.work_id,
             intent.run_id.clone(),
@@ -1367,10 +1393,12 @@ impl OrchestrationService {
             Path::new(&work.workspace),
             oracle.as_deref(),
             &source_revision,
+            &source_fingerprint,
             &work.policy.allowed_files,
             worker_stopped,
             change_proposed,
             diff_digest,
+            authority.as_ref(),
         );
         evidence.push(format!("candidate_digest:{}", verification.content_digest));
         evidence.push(format!("checks_passed:{}", verification.checks_passed));
@@ -1797,10 +1825,28 @@ impl OrchestrationService {
                 self.native_executor.lock().skipped_ineligible += 1;
                 continue;
             };
-            let Ok(spec) = agent.current_spec().cloned() else {
+            let Ok(mut spec) = agent.current_spec().cloned() else {
                 self.native_executor.lock().skipped_ineligible += 1;
                 continue;
             };
+            let envelope = self.store.verified_execution_envelope(&work.work_id);
+            if let Some(envelope) = envelope.as_ref() {
+                spec.managed_execution.enabled = true;
+                spec.managed_execution.executor = ManagedExecutorKind::GrokBuildIsolatedReview;
+                spec.managed_execution.retry_eligible = false;
+                spec.managed_execution.requires_approval_before_execution = true;
+                spec.authority.bypass_permissions = false;
+                spec.managed_execution.budget_profile = Some(
+                    match envelope.get("budget").and_then(|value| value.as_str()) {
+                        Some("balanced") => ManagedExecutionBudgetProfile::Balanced,
+                        Some("high_assurance") => ManagedExecutionBudgetProfile::HighAssurance,
+                        _ => ManagedExecutionBudgetProfile::Economy,
+                    },
+                );
+                if let Some(limits) = envelope.get("maxRounds").and_then(|value| value.as_u64()) {
+                    spec.managed_execution.bounds.max_rounds = limits as u32;
+                }
+            }
             if !spec.managed_execution.enabled {
                 self.native_executor.lock().skipped_manual += 1;
                 continue;
@@ -1819,7 +1865,7 @@ impl OrchestrationService {
                 &work, &agent, &spec, &decisions, live, &ceiling,
             ) {
                 Ok(bounds) => bounds,
-                Err(_) => {
+                Err(_error) => {
                     self.native_executor.lock().skipped_ineligible += 1;
                     continue;
                 }
@@ -2050,6 +2096,11 @@ impl OrchestrationService {
             &allowed_files,
             prompt_bound,
         )?;
+        let source_fingerprint = crate::run_promotion::fingerprint_at(
+            &runtime.config.cwd,
+            &runtime.config.identity.head_sha,
+        )
+        .map_err(|error| OrchError::new(OrchErrorCode::Conflict, error.to_string()))?;
         let invocation = ManagedGrokInvocation {
             schema_version: MANAGED_GROK_INVOCATION_SCHEMA_VERSION,
             profile,
@@ -2069,6 +2120,7 @@ impl OrchestrationService {
             evidence_refs: Vec::new(),
             changed_paths: Vec::new(),
             diff_digest: None,
+            source_fingerprint: Some(source_fingerprint),
         };
         let mut intent = ManagedExecutionIntent {
             schema_version: MANAGED_EXECUTION_SCHEMA_VERSION,
@@ -2334,6 +2386,14 @@ impl OrchestrationService {
         &self.store
     }
 
+    /// Record whether this process is the desktop host or the headless service.
+    /// Caller-supplied request strings are not an input.
+    pub fn set_execution_surface(&self, surface: &str) {
+        if matches!(surface, "desktop" | "service") {
+            *self.execution_surface.lock() = surface.to_string();
+        }
+    }
+
     /// Install the host-owned Grok Build dispatch capability. The durable
     /// policy still defaults to native execution and must opt in explicitly;
     /// installing this runtime alone cannot make queued Work eligible.
@@ -2368,41 +2428,22 @@ impl OrchestrationService {
     }
 
     pub fn configure_managed_grok_from_operator_env(&self) -> Result<bool, OrchError> {
-        let Some(executable) = operator_env("GROKPTAH_MANAGED_GROK_EXECUTABLE") else {
+        let Some(_executable) = operator_env("GROKPTAH_MANAGED_GROK_EXECUTABLE") else {
             return Ok(false);
         };
-        let workspace = require_operator_env("GROKPTAH_MANAGED_GROK_WORKSPACE")?;
-        let isolate = require_operator_env("GROKPTAH_MANAGED_GROK_ISOLATE")?;
-        let repository_id = require_operator_env("GROKPTAH_MANAGED_GROK_REPOSITORY_ID")?;
-        let git_ref = require_operator_env("GROKPTAH_MANAGED_GROK_REF")?;
-        let sha = require_operator_env("GROKPTAH_MANAGED_GROK_SHA")?;
-        let lease_id = require_operator_env("GROKPTAH_MANAGED_GROK_LEASE_ID")?;
-        let lease_file = require_operator_env("GROKPTAH_MANAGED_GROK_LEASE_FILE")?;
-        let git_executable =
-            operator_env("GROKPTAH_MANAGED_GROK_GIT").unwrap_or_else(|| "/usr/bin/git".to_string());
-        let identity = GrokBuildGitIdentity {
-            repository_id,
-            git_ref,
-            base_sha: sha.clone(),
-            head_sha: sha,
-        };
-        self.configure_managed_grok_executor(
-            ManagedGrokExecutorConfig {
-                executable: PathBuf::from(executable),
-                git_executable: PathBuf::from(git_executable),
-                cwd: PathBuf::from(workspace),
-                isolate_parent: PathBuf::from(isolate),
-                repository_id: identity.repository_id.clone(),
-                base_ref: identity.git_ref.clone(),
-                identity,
-                credential_lease_id: lease_id.clone(),
-            },
-            Arc::new(crate::FileCredentialLease::new(
-                lease_id,
-                PathBuf::from(lease_file),
-            )),
-        )?;
-        Ok(true)
+        let _ = (
+            require_operator_env("GROKPTAH_MANAGED_GROK_WORKSPACE")?,
+            require_operator_env("GROKPTAH_MANAGED_GROK_ISOLATE")?,
+            require_operator_env("GROKPTAH_MANAGED_GROK_REPOSITORY_ID")?,
+            require_operator_env("GROKPTAH_MANAGED_GROK_REF")?,
+            require_operator_env("GROKPTAH_MANAGED_GROK_SHA")?,
+            require_operator_env("GROKPTAH_MANAGED_GROK_LEASE_ID")?,
+            require_operator_env("GROKPTAH_MANAGED_GROK_LEASE_FILE")?,
+        );
+        Err(OrchError::new(
+            OrchErrorCode::InvalidRequest,
+            "a file-backed credential lease does not revoke upstream provider authority; readiness stays unavailable and no worker is dispatched",
+        ))
     }
 
     fn resolve_verified_agent(&self, request: &mut VerifiedChangeRequest) -> Result<(), OrchError> {
@@ -2416,23 +2457,117 @@ impl OrchestrationService {
         Ok(())
     }
 
-    pub fn prepare_verified_change(
+    fn existing_verified_work(
         &self,
         auth: &AuthContext,
         request: &VerifiedChangeRequest,
-    ) -> Result<serde_json::Value, OrchError> {
-        let mut request = request.clone();
-        self.resolve_verified_agent(&mut request)?;
+    ) -> Option<String> {
+        let workspace = dunce::canonicalize(&request.workspace).ok()?;
+        let scope = IdempotencyScope::new(&auth.owner_id, request.session_id, &workspace).ok()?;
+        let receipt = self
+            .store
+            .load_idempotency(&scope, &format!("{}:advance", request.request_id))
+            .ok()
+            .flatten()?;
+        receipt.response.get("createdWork")?;
+        if receipt.status != "complete" {
+            return None;
+        }
+        receipt.response["createdWork"][0]["workId"]
+            .as_str()
+            .map(str::to_string)
+    }
+
+    fn assess_verified_change(
+        &self,
+        request: &VerifiedChangeRequest,
+    ) -> Result<
+        (
+            VerifiedChangeRequest,
+            crate::verified_change::VerifiedChangeReadiness,
+            Option<crate::verified_change::CheckAuthority>,
+            String,
+        ),
+        OrchError,
+    > {
         let _claimed = self.authorize_work_read_scope(request.session_id, &request.workspace)?;
-        let agent = self.store.require_agent_in_scope(
-            &request.agent_id,
-            request.session_id,
-            &request.workspace.display().to_string(),
-        )?;
-        let spec = agent
-            .current_spec()
-            .map_err(|error| OrchError::new(OrchErrorCode::Conflict, error.to_string()))?;
+        let mut request = request.clone();
+        request.platform = std::env::consts::OS.to_string();
+        request.execution_host = self.execution_surface.lock().clone();
         let runtime = self.managed_grok_runtime.lock().clone();
+        let mut reasons = Vec::new();
+        let repository_id = runtime
+            .as_ref()
+            .map(|runtime| runtime.config.repository_id.clone())
+            .unwrap_or_else(|| "unconfigured".into());
+        let head = runtime.as_ref().and_then(|runtime| {
+            crate::verified_change::source_revision(
+                &runtime.config.git_executable,
+                &request.workspace,
+            )
+            .ok()
+        });
+        if let Some(runtime) = &runtime {
+            let configured = dunce::canonicalize(&runtime.config.cwd).ok();
+            let requested = dunce::canonicalize(&request.workspace).ok();
+            if configured.is_none() || configured != requested {
+                reasons.push(
+                    "the requested workspace is not the configured managed-executor workspace"
+                        .into(),
+                );
+            }
+            if head.as_deref() != Some(runtime.config.identity.head_sha.as_str())
+                || runtime.config.repository_id != runtime.config.identity.repository_id
+                || runtime.config.base_ref != runtime.config.identity.git_ref
+            {
+                reasons.push(
+                    "the configured repository id, ref, or head does not match the exact source"
+                        .into(),
+                );
+            }
+            if !runtime.credentials.revokes_upstream() {
+                reasons.push(
+                    "the configured credential lease does not revoke upstream provider authority"
+                        .into(),
+                );
+            }
+        } else {
+            reasons.push("Managed Grok executor authority is not installed on this host.".into());
+        }
+        let authority = match crate::verified_change::resolve_check_profile(
+            self.store.root(),
+            &request.check_profile_id,
+        ) {
+            Ok((spec, mut authority, oracle)) => {
+                authority.source_root = request.workspace.clone();
+                request.required_checks = vec![spec];
+                request.oracle_root = oracle;
+                Some(authority)
+            }
+            Err(error) => {
+                reasons.push(error.message);
+                request.required_checks.clear();
+                request.oracle_root = PathBuf::new();
+                None
+            }
+        };
+        let identity_unsupported = match head.as_deref() {
+            Some(revision) => {
+                crate::run_promotion::fingerprint_at(&request.workspace, revision).is_err()
+                    || !crate::verified_change::worktree_is_clean(
+                        Path::new("/usr/bin/git"),
+                        &request.workspace,
+                    )
+                    .unwrap_or(false)
+            }
+            None => true,
+        };
+        if identity_unsupported {
+            reasons.push(
+                "candidate identity requires a git base SHA plus a changed-path manifest; unchanged files are not hashed, and a change above 2000 paths or 32 MiB is unsupported"
+                    .into(),
+            );
+        }
         let executable = runtime
             .as_ref()
             .map(|runtime| runtime.config.executable.clone())
@@ -2447,31 +2582,51 @@ impl OrchestrationService {
                 workspace: &request.workspace,
             },
         );
-        if runtime.is_none() {
-            readiness.ready = false;
-            readiness
-                .reasons
-                .push("Managed Grok executor authority is not installed on this host.".into());
-        }
-        if !matches!(request.execution_host.as_str(), "desktop" | "service") {
-            readiness.ready = false;
-            readiness
-                .reasons
-                .push("Execution host must be desktop or service.".into());
-        }
+        readiness.reasons.extend(reasons);
         readiness.reasons.sort();
         readiness.reasons.dedup();
+        readiness.ready = readiness.reasons.is_empty();
+        readiness.workers_dispatched = 0;
+        readiness.provider_invocations = 0;
+        Ok((request, readiness, authority, repository_id))
+    }
+
+    pub fn prepare_verified_change(
+        &self,
+        auth: &AuthContext,
+        request: &VerifiedChangeRequest,
+    ) -> Result<serde_json::Value, OrchError> {
         let _ = auth;
-        let revision =
-            crate::verified_change::source_revision(Path::new("/usr/bin/git"), &request.workspace)
-                .unwrap_or_else(|_| "unavailable".into());
+        let (request, readiness, _authority, repository_id) =
+            self.assess_verified_change(request)?;
+        let model = if request.agent_id.is_empty() {
+            String::new()
+        } else {
+            self.store
+                .require_agent_in_scope(
+                    &request.agent_id,
+                    request.session_id,
+                    &request.workspace.display().to_string(),
+                )
+                .ok()
+                .and_then(|agent| {
+                    agent
+                        .current_spec()
+                        .ok()
+                        .map(|spec| spec.model.selection_key.clone())
+                })
+                .unwrap_or_default()
+        };
+        let revision = self
+            .managed_grok_runtime
+            .lock()
+            .as_ref()
+            .map(|runtime| runtime.config.identity.head_sha.clone())
+            .unwrap_or_else(|| "unavailable".into());
         Ok(verified_change_projection(
             &request,
-            &spec.model.selection_key,
-            runtime
-                .as_ref()
-                .map(|runtime| runtime.config.repository_id.as_str())
-                .unwrap_or("unconfigured"),
+            &model,
+            &repository_id,
             &revision,
             &readiness,
             None,
@@ -2485,51 +2640,30 @@ impl OrchestrationService {
         auth: &AuthContext,
         request: &VerifiedChangeRequest,
     ) -> Result<serde_json::Value, OrchError> {
-        let mut request = request.clone();
-        self.resolve_verified_agent(&mut request)?;
-        let prepared = self.prepare_verified_change(auth, &request)?;
-        if prepared["readiness"]["ready"] != true {
+        let (mut request, readiness, authority, _repository_id) =
+            self.assess_verified_change(request)?;
+        if !readiness.ready {
+            if let Some(work_id) = self.existing_verified_work(auth, &request) {
+                return self.verified_change_status(
+                    auth,
+                    request.session_id,
+                    &request.workspace,
+                    &work_id,
+                );
+            }
             return Err(OrchError::new(
                 OrchErrorCode::Conflict,
                 "verified change is not ready; no worker was dispatched",
             ));
         }
+        let authority = authority.ok_or_else(|| {
+            OrchError::new(
+                OrchErrorCode::Conflict,
+                "verified change is not ready; no worker was dispatched",
+            )
+        })?;
+        self.resolve_verified_agent(&mut request)?;
         let limits = request.budget_profile.limits();
-        let policy = ManagedExecutionPolicy {
-            enabled: true,
-            allowed_work_kinds: vec!["isolated-review".into()],
-            max_concurrent_runs: 1,
-            bounds: RunBounds {
-                max_prompt_bytes: limits.max_prompt_bytes,
-                max_rounds: limits.max_turns,
-                max_duration_ms: limits.max_duration_ms,
-                max_total_tokens: Some(16_000),
-            },
-            retry_eligible: false,
-            requires_approval_before_execution: true,
-            executor: ManagedExecutorKind::GrokBuildIsolatedReview,
-            budget_profile: Some(request.budget_profile),
-            ..ManagedExecutionPolicy::default()
-        };
-        let current = self.store.require_agent_in_scope(
-            &request.agent_id,
-            request.session_id,
-            &request.workspace.display().to_string(),
-        )?;
-        let current_policy = current
-            .current_spec()
-            .map_err(|error| OrchError::new(OrchErrorCode::Conflict, error.to_string()))?
-            .managed_execution
-            .clone();
-        if current_policy != policy {
-            self.set_managed_execution(
-                auth,
-                request.session_id,
-                &request.workspace,
-                &request.agent_id,
-                policy.clone(),
-            )?;
-        }
         let work_policy = WorkPolicy {
             requires_approval: true,
             allowed_files: request.allowed_files.clone(),
@@ -2549,11 +2683,17 @@ impl OrchestrationService {
                 request.session_id,
                 &request.workspace,
                 request.agent_id.clone(),
-                request.objective.clone(),
+                format!(
+                    "{} [profile {}@{}]",
+                    request.objective, authority.profile_id, authority.profile_revision
+                ),
                 vec![ManagerStepSpec {
                     step_id: "verified-change".into(),
                     kind: "isolated-review".into(),
-                    objective: request.objective.clone(),
+                    objective: format!(
+                        "{} [profile {}@{}]",
+                        request.objective, authority.profile_id, authority.profile_revision
+                    ),
                     priority: 0,
                     dependencies: Vec::new(),
                     assigned_agent_id: Some(request.agent_id.clone()),
@@ -2594,6 +2734,48 @@ impl OrchestrationService {
             &request.mutation_mode,
         )
         .map_err(|error| OrchError::new(OrchErrorCode::InvalidRequest, error.message))?;
+        let envelope = serde_json::json!({
+            "executor": "grok_build_isolated_review",
+            "budget": request.budget_profile.as_str(),
+            "platform": request.platform,
+            "executionHost": request.execution_host,
+            "checkProfileId": authority.profile_id,
+            "checkProfileRevision": authority.profile_revision,
+            "executableDigest": authority.executable_digest,
+            "oracleDigest": authority.oracle_digest,
+            "maxPromptBytes": limits.max_prompt_bytes,
+            "maxRounds": limits.max_turns,
+            "maxDurationMs": limits.max_duration_ms,
+        });
+        std::fs::write(
+            private_dir.join("execution-envelope.json"),
+            envelope.to_string(),
+        )
+        .map_err(|_| {
+            OrchError::new(
+                OrchErrorCode::Internal,
+                "the verified-change execution envelope could not be stored",
+            )
+        })?;
+        std::fs::write(
+            private_dir.join("check-authority.json"),
+            serde_json::json!({
+                "profileId": authority.profile_id,
+                "profileRevision": authority.profile_revision,
+                "executableDigest": authority.executable_digest,
+                "oracleDigest": authority.oracle_digest,
+                "network": authority.network,
+                "sourceRoot": authority.source_root,
+                "maxOutputDirBytes": authority.output_limit_bytes,
+            })
+            .to_string(),
+        )
+        .map_err(|_| {
+            OrchError::new(
+                OrchErrorCode::Internal,
+                "the verified-change check authority could not be stored",
+            )
+        })?;
         let _authorized = self
             .authorize_work_execution(
                 auth,
@@ -2608,7 +2790,6 @@ impl OrchestrationService {
         self.drive_native_executor_once().await;
         self.verified_change_status(auth, request.session_id, &request.workspace, &work_id)
     }
-
     pub fn verified_change_status(
         &self,
         _auth: &AuthContext,
@@ -2616,34 +2797,34 @@ impl OrchestrationService {
         workspace: &Path,
         work_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        let _claimed = self.authorize_work_read_scope(session_id, workspace)?;
-        let _ = self.store.revalidate_verified_candidate(work_id)?;
+        let claimed = self.authorize_work_read_scope(session_id, workspace)?;
         let work = self
             .store
-            .load_work_item(work_id)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
-            .ok_or_else(|| OrchError::new(OrchErrorCode::InvalidRequest, "unknown work"))?;
-        if work.session_id != session_id {
-            return Err(OrchError::new(
-                OrchErrorCode::ForbiddenScope,
-                "work is outside the requested lane",
-            ));
-        }
+            .revalidate_verified_candidate_in_scope(work_id, session_id, &claimed)?;
         let agent_id = work.assigned_agent_id.clone().unwrap_or_default();
-        let (model, budget_profile) = self
+        let model = self
             .store
             .require_agent_in_scope(&agent_id, session_id, &work.workspace)
             .ok()
             .and_then(|agent| {
-                agent.current_spec().ok().map(|spec| {
-                    (
-                        spec.model.selection_key.clone(),
-                        spec.managed_execution.budget_profile,
-                    )
-                })
+                agent
+                    .current_spec()
+                    .ok()
+                    .map(|spec| spec.model.selection_key.clone())
             })
-            .unwrap_or((String::new(), None));
-        let budget_profile = budget_profile.unwrap_or(ManagedExecutionBudgetProfile::Economy);
+            .unwrap_or_default();
+        let envelope = self.store.verified_execution_envelope(work_id);
+        let budget_profile = envelope
+            .as_ref()
+            .and_then(|value| value.get("budget"))
+            .and_then(|value| value.as_str())
+            .and_then(|value| match value {
+                "economy" => Some(ManagedExecutionBudgetProfile::Economy),
+                "balanced" => Some(ManagedExecutionBudgetProfile::Balanced),
+                "high_assurance" => Some(ManagedExecutionBudgetProfile::HighAssurance),
+                _ => None,
+            })
+            .unwrap_or(ManagedExecutionBudgetProfile::Economy);
         let runtime = self.managed_grok_runtime.lock().clone();
         let repository = runtime
             .as_ref()
@@ -2700,6 +2881,15 @@ impl OrchestrationService {
             readiness
                 .reasons
                 .push("Managed Grok executor authority is not installed on this host.".into());
+        } else if !runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.credentials.revokes_upstream())
+        {
+            readiness.ready = false;
+            readiness.reasons.push(
+                "the configured credential lease does not revoke upstream provider authority"
+                    .into(),
+            );
         }
         if readiness.ready && readiness.cli_version.as_deref().unwrap_or("").is_empty() {
             readiness.ready = false;
@@ -2736,6 +2926,12 @@ impl OrchestrationService {
             agent_id,
             objective: work.objective.clone(),
             allowed_files: work.policy.allowed_files.clone(),
+            check_profile_id: envelope
+                .as_ref()
+                .and_then(|value| value.get("checkProfileId"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .to_string(),
             required_checks: work.policy.required_checks.clone(),
             oracle_root: PathBuf::new(),
             budget_profile,
@@ -2767,6 +2963,8 @@ impl OrchestrationService {
         expected_revision: Option<u64>,
     ) -> Result<serde_json::Value, OrchError> {
         let digest = expected_digest.to_string();
+        let principal = auth.token_id.clone();
+        let request = request_id.to_string();
         self.work_item_mutation(
             auth,
             "ptah_apply_verified_change",
@@ -2778,7 +2976,15 @@ impl OrchestrationService {
                 "expectedDigest": digest,
                 "expectedRevision": expected_revision,
             }),
-            move |store| store.apply_verified_candidate(work_id, &digest, expected_revision),
+            move |store| {
+                store.apply_verified_candidate(
+                    work_id,
+                    &digest,
+                    expected_revision,
+                    &principal,
+                    &request,
+                )
+            },
         )
         .await
     }
@@ -6062,7 +6268,14 @@ impl OrchestrationService {
         let item = match operation(&self.store) {
             Ok(item) => item,
             Err(error) => {
-                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
+                if error
+                    .message
+                    .contains("apply committed before the idempotency response")
+                {
+                    lease.leave_pending();
+                    return Err(error);
+                }
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
             }
         };
         let response = json!({

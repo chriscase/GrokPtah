@@ -11,6 +11,7 @@ use anyhow::Context;
 use chrono::{Duration, Utc};
 use fs2::FileExt;
 use parking_lot::{Condvar, Mutex};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::managed::{
@@ -202,6 +203,28 @@ struct WorkLifecycleIntent {
 }
 
 const WORK_LIFECYCLE_INTENT_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApplySourceIntent {
+    schema_version: u32,
+    intent_id: String,
+    principal_id: String,
+    policy_revision: Option<u64>,
+    session_id: Uuid,
+    workspace: String,
+    work_id: String,
+    attempt_id: String,
+    work_revision: u64,
+    candidate_digest: String,
+    source_base_sha: String,
+    source_fingerprint: String,
+    patch_digest: String,
+    final_fingerprint: String,
+    approval_reviewer: String,
+    approval_revision: u64,
+    request_id: String,
+}
 
 impl WorkLifecycleIntent {
     fn new(
@@ -569,6 +592,7 @@ impl OrchStore {
         fs::create_dir_all(root.join("manager-intents"))?;
         fs::create_dir_all(root.join("work-intents"))?;
         fs::create_dir_all(root.join("work-lifecycle-intents"))?;
+        fs::create_dir_all(root.join("apply-source-intents"))?;
         let root = dunce::canonicalize(root)?;
         let lock_path = root.join(".store.lock");
         let store_lock = OpenOptions::new()
@@ -634,6 +658,7 @@ impl OrchStore {
         store.recover_manager_creation_intents()?;
         store.recover_work_mutation_intents()?;
         store.recover_work_lifecycle_intents()?;
+        store.recover_apply_source_intents()?;
         store.recover_managed_finalization_intents()?;
         store.mark_unfinished_interrupted()?;
         store.fail_orphaned_idempotency_claims()?;
@@ -651,6 +676,37 @@ impl OrchStore {
     pub fn verified_change_private_dir(&self, work_id: &str) -> Result<PathBuf, OrchError> {
         let safe = safe_id_filename(work_id)?;
         Ok(self.inner.root.join("verified-changes").join(safe))
+    }
+
+    pub fn verified_check_authority(
+        &self,
+        work_id: &str,
+    ) -> Option<crate::verified_change::CheckAuthority> {
+        let dir = self.verified_change_private_dir(work_id).ok()?;
+        let raw = std::fs::read_to_string(dir.join("check-authority.json")).ok()?;
+        let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+        Some(crate::verified_change::CheckAuthority {
+            profile_id: value.get("profileId")?.as_str()?.to_string(),
+            profile_revision: value.get("profileRevision")?.as_u64()?,
+            executable_digest: value.get("executableDigest")?.as_str()?.to_string(),
+            oracle_digest: value.get("oracleDigest")?.as_str()?.to_string(),
+            network: value
+                .get("network")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("none")
+                .to_string(),
+            source_root: PathBuf::from(value.get("sourceRoot")?.as_str()?),
+            output_limit_bytes: value
+                .get("maxOutputDirBytes")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(65_536),
+        })
+    }
+
+    pub fn verified_execution_envelope(&self, work_id: &str) -> Option<serde_json::Value> {
+        let dir = self.verified_change_private_dir(work_id).ok()?;
+        let raw = std::fs::read_to_string(dir.join("execution-envelope.json")).ok()?;
+        serde_json::from_str(&raw).ok()
     }
 
     pub fn candidate_snapshot_dir(&self, work_id: &str) -> Result<PathBuf, OrchError> {
@@ -5729,12 +5785,13 @@ impl OrchStore {
                 ));
             }
             let retained = self.candidate_snapshot_dir(&item.work_id)?;
-            let identity = crate::verified_change::candidate_content_identity(
+            let matches = crate::verified_change::retained_matches(
                 &retained,
-                &verification.source_revision,
+                &verification.content_digest,
+                &verification.files,
             )
             .map_err(|error| OrchError::new(OrchErrorCode::Conflict, error.message))?;
-            if identity.content_digest != verification.content_digest {
+            if !matches {
                 return Err(OrchError::new(
                     OrchErrorCode::Conflict,
                     "candidate content changed after verification",
@@ -5773,11 +5830,236 @@ impl OrchStore {
         Ok((item, approved_attempt))
     }
 
+    fn apply_source_intent_path(&self, work_id: &str) -> Result<PathBuf, OrchError> {
+        let safe = safe_id_filename(work_id)?;
+        Ok(self
+            .inner
+            .root
+            .join("apply-source-intents")
+            .join(format!("{safe}.json")))
+    }
+
+    fn persist_apply_source_intent_unlocked(
+        &self,
+        intent: &ApplySourceIntent,
+    ) -> Result<(), OrchError> {
+        let path = self.apply_source_intent_path(&intent.work_id)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        }
+        atomic_write_json(&self.lease(), &path, intent)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+    }
+
+    fn read_apply_source_intent_unlocked(
+        &self,
+        work_id: &str,
+    ) -> Result<Option<ApplySourceIntent>, OrchError> {
+        let path = self.apply_source_intent_path(work_id)?;
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let raw = fs::read_to_string(&path)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        serde_json::from_str(&raw)
+            .map(Some)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+    }
+
+    fn clear_apply_source_intent_unlocked(&self, work_id: &str) -> Result<(), OrchError> {
+        let path = self.apply_source_intent_path(work_id)?;
+        if path.exists() {
+            remove_file_durable(&self.lease(), &path)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn finish_applied_candidate_unlocked(
+        &self,
+        mut item: WorkItem,
+        prior_item: WorkItem,
+        verification: crate::verified_change::CandidateVerification,
+    ) -> Result<(), OrchError> {
+        let work_id = item.work_id.clone();
+        if let Some(result) = item.result.as_mut() {
+            result.candidate_verification = Some(verification);
+            result.failure = None;
+        }
+        let mut attempts = self
+            .list_work_attempts_unlocked(Some(&work_id))
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let prior_attempts = attempts.clone();
+        let attempt = attempts.iter_mut().rev().find(|attempt| {
+            attempt.state == AttemptState::AwaitingApproval
+                || attempt.state == AttemptState::Succeeded
+        });
+        self.assign_work_succeeded_unlocked(&mut item, attempt, None)?;
+        let attempts_now = attempts.clone();
+        item.bump();
+        self.commit_work_lifecycle_snapshots_unlocked(
+            "apply-candidate",
+            prior_item,
+            item,
+            prior_attempts,
+            attempts_now,
+        )
+    }
+
+    fn complete_pending_apply_receipt_unlocked(
+        &self,
+        intent: &ApplySourceIntent,
+        item: &WorkItem,
+    ) -> Result<(), OrchError> {
+        let mut report = RetentionReport::default();
+        let paths = match self.idempotency_receipt_paths_unlocked(&mut report) {
+            Ok(paths) => paths,
+            Err(_) => return Ok(()),
+        };
+        for path in paths {
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(mut receipt) = serde_json::from_str::<IdempotencyReceipt>(&text) else {
+                continue;
+            };
+            if receipt.status != "pending"
+                || receipt.tool != "ptah_apply_verified_change"
+                || receipt.request_id != intent.request_id
+                || receipt.session_id != intent.session_id
+            {
+                continue;
+            }
+            receipt.status = "complete".into();
+            receipt.error = None;
+            receipt.response = serde_json::json!({
+                "work": item,
+                "sessionId": intent.session_id,
+                "workspace": item.workspace,
+            });
+            atomic_write_json(&self.lease(), &path, &receipt)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn recover_apply_source_intents(&self) -> Result<(), OrchError> {
+        let _guard = self.inner.lock.lock();
+        let dir = self.inner.root.join("apply-source-intents");
+        if !dir.exists() {
+            return Ok(());
+        }
+        let entries = fs::read_dir(&dir)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        for entry in entries {
+            let path = entry
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+                .path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let raw = fs::read_to_string(&path)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            let intent: ApplySourceIntent = serde_json::from_str(&raw)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            self.recover_one_apply_intent_unlocked(&intent)?;
+        }
+        Ok(())
+    }
+
+    fn recover_one_apply_intent_unlocked(
+        &self,
+        intent: &ApplySourceIntent,
+    ) -> Result<(), OrchError> {
+        let Some(mut item) = self
+            .load_work_item_unlocked(&intent.work_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+        else {
+            return Ok(());
+        };
+        let applied = item.state == WorkState::Succeeded
+            && item
+                .result
+                .as_ref()
+                .and_then(|result| result.candidate_verification.as_ref())
+                .is_some_and(|verification| verification.applied);
+        if applied {
+            self.complete_pending_apply_receipt_unlocked(intent, &item)?;
+            return self.clear_apply_source_intent_unlocked(&intent.work_id);
+        }
+        let class = crate::run_promotion::classify_source(
+            Path::new(&intent.workspace),
+            &intent.source_base_sha,
+            &intent.source_fingerprint,
+            &intent.final_fingerprint,
+        )
+        .map_err(|error| OrchError::new(OrchErrorCode::Conflict, error.to_string()))?;
+        match class {
+            crate::run_promotion::SourceClassification::AlreadyApplied => {
+                let Some(mut verification) = item
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.candidate_verification.clone())
+                else {
+                    return Ok(());
+                };
+                verification.applied = true;
+                verification.reconciliation_required = false;
+                let prior = item.clone();
+                self.finish_applied_candidate_unlocked(item, prior, verification)?;
+                let finished = self
+                    .load_work_item_unlocked(&intent.work_id)
+                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+                    .ok_or_else(|| {
+                        OrchError::new(OrchErrorCode::Conflict, "work item not found")
+                    })?;
+                self.complete_pending_apply_receipt_unlocked(intent, &finished)?;
+                self.clear_apply_source_intent_unlocked(&intent.work_id)
+            }
+            crate::run_promotion::SourceClassification::NotApplied => Ok(()),
+            crate::run_promotion::SourceClassification::Poisoned => {
+                if item
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.candidate_verification.as_ref())
+                    .is_some_and(|verification| verification.reconciliation_required)
+                {
+                    return Ok(());
+                }
+                let prior = item.clone();
+                if let Some(result) = item.result.as_mut() {
+                    if let Some(verification) = result.candidate_verification.as_mut() {
+                        verification.reconciliation_required = true;
+                        verification.checks_passed = false;
+                    }
+                    result.failure = Some(
+                        "source is neither the verified base nor the final candidate; reconciliation is required"
+                            .into(),
+                    );
+                }
+                let attempts = self
+                    .list_work_attempts_unlocked(Some(&item.work_id))
+                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+                item.bump();
+                self.commit_work_lifecycle_snapshots_unlocked(
+                    "apply-reconciliation",
+                    prior,
+                    item,
+                    attempts.clone(),
+                    attempts,
+                )
+            }
+        }
+    }
+
     pub fn apply_verified_candidate(
         &self,
         work_id: &str,
         expected_digest: &str,
         expected_revision: Option<u64>,
+        principal_id: &str,
+        request_id: &str,
     ) -> Result<WorkItem, OrchError> {
         let _guard = self.inner.lock.lock();
         let mut item = self
@@ -5830,42 +6112,152 @@ impl OrchStore {
             ));
         }
         let retained = self.candidate_snapshot_dir(work_id)?;
+        let record = crate::verified_change::read_promotion_record(&retained)
+            .map_err(|error| OrchError::new(OrchErrorCode::Conflict, error.message))?;
+        let attempt_id = self
+            .list_work_attempts_unlocked(Some(work_id))
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .iter()
+            .rev()
+            .find(|attempt| {
+                attempt.state == AttemptState::AwaitingApproval
+                    || attempt.state == AttemptState::Succeeded
+            })
+            .map(|attempt| attempt.attempt_id.clone())
+            .unwrap_or_default();
+        let policy_revision =
+            self.list_work_decisions_unlocked(work_id)
+                .ok()
+                .and_then(|decisions| {
+                    decisions
+                        .into_iter()
+                        .rev()
+                        .find(|decision| decision.policy_revision.is_some())
+                        .and_then(|decision| decision.policy_revision)
+                });
+        let intent = ApplySourceIntent {
+            schema_version: 1,
+            intent_id: Uuid::new_v4().to_string(),
+            principal_id: principal_id.to_string(),
+            policy_revision,
+            session_id: item.session_id,
+            workspace: item.workspace.clone(),
+            work_id: item.work_id.clone(),
+            attempt_id,
+            work_revision: item.revision,
+            candidate_digest: verification.content_digest.clone(),
+            source_base_sha: verification.source_revision.clone(),
+            source_fingerprint: verification.source_fingerprint.clone(),
+            patch_digest: format!("{:x}", Sha256::digest(&record.patch)),
+            final_fingerprint: record.final_fingerprint.clone(),
+            approval_reviewer: approval.reviewer_id.clone(),
+            approval_revision: item.revision,
+            request_id: request_id.to_string(),
+        };
+        if verification.reconciliation_required {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "source is neither the verified base nor the final candidate; reconciliation is required",
+            ));
+        }
+        if let Some(existing) = self.read_apply_source_intent_unlocked(work_id)? {
+            match crate::run_promotion::classify_source(
+                Path::new(&item.workspace),
+                &existing.source_base_sha,
+                &existing.source_fingerprint,
+                &existing.final_fingerprint,
+            ) {
+                Ok(crate::run_promotion::SourceClassification::AlreadyApplied) => {
+                    verification.applied = true;
+                    self.finish_applied_candidate_unlocked(item, prior_item, verification)?;
+                    let _ = self.clear_apply_source_intent_unlocked(work_id);
+                    return self
+                        .load_work_item_unlocked(work_id)
+                        .map_err(|error| {
+                            OrchError::new(OrchErrorCode::Internal, error.to_string())
+                        })?
+                        .ok_or_else(|| {
+                            OrchError::new(OrchErrorCode::Conflict, "work item not found")
+                        });
+                }
+                Ok(crate::run_promotion::SourceClassification::Poisoned) => {
+                    return Err(OrchError::new(
+                        OrchErrorCode::Conflict,
+                        "source is neither the verified base nor the final candidate; reconciliation is required",
+                    ));
+                }
+                _ => {}
+            }
+        }
+        if crate::verified_change::apply_fault() == 1 {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "apply interrupted before the intent was stored",
+            ));
+        }
+        self.persist_apply_source_intent_unlocked(&intent)?;
+        if crate::verified_change::apply_fault() == 2 {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "apply interrupted after the intent and before any source effect",
+            ));
+        }
         let identity = crate::verified_change::CandidateContentIdentity {
             source_revision: verification.source_revision.clone(),
             content_digest: verification.content_digest.clone(),
             files: verification.files.clone(),
         };
-        crate::verified_change::apply_candidate_tree(
+        let applied = crate::verified_change::apply_candidate_tree(
             Path::new("/usr/bin/git"),
             Path::new(&item.workspace),
             &retained,
             &identity,
+            &verification.source_fingerprint,
             &item.policy.allowed_files,
-        )
-        .map_err(|error| OrchError::new(OrchErrorCode::Conflict, error.message))?;
-        verification.applied = true;
-        if let Some(result) = item.result.as_mut() {
-            result.candidate_verification = Some(verification);
+        );
+        if let Err(error) = applied {
+            let poisoned = error.message.contains("reconciliation")
+                || error.message.contains("rollback also failed")
+                || error.message.contains("partial");
+            if poisoned {
+                verification.reconciliation_required = true;
+                if let Some(result) = item.result.as_mut() {
+                    result.candidate_verification = Some(verification);
+                    result.failure = Some(error.message.clone());
+                }
+                let attempts = self
+                    .list_work_attempts_unlocked(Some(work_id))
+                    .map_err(|err| OrchError::new(OrchErrorCode::Internal, err.to_string()))?;
+                let prior_attempts = attempts.clone();
+                item.bump();
+                let _ = self.commit_work_lifecycle_snapshots_unlocked(
+                    "apply-reconciliation",
+                    prior_item,
+                    item,
+                    prior_attempts.clone(),
+                    prior_attempts,
+                );
+            }
+            return Err(OrchError::new(OrchErrorCode::Conflict, error.message));
         }
-        let mut attempts = self
-            .list_work_attempts_unlocked(Some(work_id))
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-        let prior_attempts = attempts.clone();
-        let attempt = attempts.iter_mut().rev().find(|attempt| {
-            attempt.state == AttemptState::AwaitingApproval
-                || attempt.state == AttemptState::Succeeded
-        });
-        self.assign_work_succeeded_unlocked(&mut item, attempt, None)?;
-        let attempts_now = attempts.clone();
-        item.bump();
-        self.commit_work_lifecycle_snapshots_unlocked(
-            "apply-candidate",
-            prior_item,
-            item.clone(),
-            prior_attempts,
-            attempts_now,
-        )?;
-        Ok(item)
+        if crate::verified_change::apply_fault() == 4 {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "apply interrupted after the source matched the candidate and before the work commit",
+            ));
+        }
+        verification.applied = true;
+        self.finish_applied_candidate_unlocked(item, prior_item, verification)?;
+        if crate::verified_change::apply_fault() == 5 {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "apply committed before the idempotency response",
+            ));
+        }
+        let _ = self.clear_apply_source_intent_unlocked(work_id);
+        self.load_work_item_unlocked(work_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))
     }
 
     pub fn discard_verified_candidate(
@@ -5908,7 +6300,20 @@ impl OrchStore {
             ));
         }
         if let Ok(dir) = self.verified_change_private_dir(work_id) {
-            let _ = fs::remove_dir_all(dir);
+            if dir.exists() {
+                fs::remove_dir_all(&dir).map_err(|_| {
+                    OrchError::new(
+                        OrchErrorCode::Conflict,
+                        "candidate cleanup failed; discard is not complete",
+                    )
+                })?;
+                if dir.exists() {
+                    return Err(OrchError::new(
+                        OrchErrorCode::Conflict,
+                        "candidate cleanup failed; discard is not complete",
+                    ));
+                }
+            }
         }
         let mut attempts = self
             .list_work_attempts_unlocked(Some(work_id))
@@ -5942,12 +6347,33 @@ impl OrchStore {
         Ok(item)
     }
 
-    pub fn revalidate_verified_candidate(&self, work_id: &str) -> Result<WorkItem, OrchError> {
+    pub fn revalidate_verified_candidate_in_scope(
+        &self,
+        work_id: &str,
+        session_id: uuid::Uuid,
+        workspace: &Path,
+    ) -> Result<WorkItem, OrchError> {
         let _guard = self.inner.lock.lock();
-        let mut item = self
+        let item = self
             .load_work_item_unlocked(work_id)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
-            .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
+            .ok_or_else(|| OrchError::new(OrchErrorCode::InvalidRequest, "unknown work_id"))?;
+        if item.session_id != session_id
+            || !workspaces_match(&item.workspace, &workspace.display().to_string())
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "unknown work_id",
+            ));
+        }
+        self.revalidate_loaded_candidate_unlocked(item)
+    }
+
+    fn revalidate_loaded_candidate_unlocked(
+        &self,
+        mut item: WorkItem,
+    ) -> Result<WorkItem, OrchError> {
+        let work_id = item.work_id.clone();
         let Some(verification) = item
             .result
             .as_ref()
@@ -5955,24 +6381,28 @@ impl OrchStore {
         else {
             return Ok(item);
         };
-        if verification.applied || item.state == WorkState::Succeeded {
+        if verification.applied
+            || item.state == WorkState::Succeeded
+            || verification.content_digest.is_empty()
+            || verification.content_digest == "sha256:missing"
+        {
             return Ok(item);
         }
-        let retained = self.candidate_snapshot_dir(work_id)?;
-        let identity = crate::verified_change::candidate_content_identity(
-            &retained,
-            &verification.source_revision,
+        let retained = self.candidate_snapshot_dir(&work_id)?;
+        let changed = matches!(
+            crate::verified_change::retained_matches(
+                &retained,
+                &verification.content_digest,
+                &verification.files,
+            ),
+            Ok(false)
         );
-        let changed = match identity {
-            Ok(identity) => identity.content_digest != verification.content_digest,
-            Err(_) => true,
-        };
         if !changed {
             return Ok(item);
         }
         let prior_item = item.clone();
         let prior_attempts = self
-            .list_work_attempts_unlocked(Some(work_id))
+            .list_work_attempts_unlocked(Some(&work_id))
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         if let Some(result) = item.result.as_mut() {
             if let Some(current) = result.candidate_verification.as_mut() {

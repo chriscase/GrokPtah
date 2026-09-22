@@ -126,36 +126,28 @@ export const api = {
     agentId: string,
     objective: string,
     allowedFiles: string[],
-    checkId: string,
-    checkExecutable: string,
-    oracleRoot: string,
+    checkProfileId: string,
   ) =>
     invoke<import("./verifiedChange").VerifiedChangeView>("verified_change_prepare", {
       sessionId,
       agentId,
       objective,
       allowedFiles,
-      checkId,
-      checkExecutable,
-      oracleRoot,
+      checkProfileId,
     }),
   verifiedChangeStart: (
     sessionId: string,
     agentId: string,
     objective: string,
     allowedFiles: string[],
-    checkId: string,
-    checkExecutable: string,
-    oracleRoot: string,
+    checkProfileId: string,
   ) =>
     invoke<import("./verifiedChange").VerifiedChangeView>("verified_change_start", {
       sessionId,
       agentId,
       objective,
       allowedFiles,
-      checkId,
-      checkExecutable,
-      oracleRoot,
+      checkProfileId,
     }),
   verifiedChangeStatus: (sessionId: string, workId: string) =>
     invoke<import("./verifiedChange").VerifiedChangeView>("verified_change_status", {

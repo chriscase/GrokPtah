@@ -37,9 +37,7 @@ export type WorkBoardProps = {
       agentId: string;
       objective: string;
       allowedFiles: string[];
-      checkId: string;
-      checkExecutable: string;
-      oracleRoot: string;
+      checkProfileId: string;
       workId?: string;
       candidateDigest?: string;
     },
@@ -121,9 +119,7 @@ export function WorkBoard({
   const [approvalNote, setApprovalNote] = useState("");
   const [verifiedObjective, setVerifiedObjective] = useState("");
   const [verifiedFiles, setVerifiedFiles] = useState("src/ledger.rs, src/report.rs");
-  const [verifiedCheckId, setVerifiedCheckId] = useState("balance-regression");
-  const [verifiedExecutable, setVerifiedExecutable] = useState("");
-  const [verifiedOracle, setVerifiedOracle] = useState("");
+  const [verifiedProfileId, setVerifiedProfileId] = useState("balance-regression");
   const [verifiedView, setVerifiedView] = useState<VerifiedChangeView | null>(verifiedChange);
   const [verifiedError, setVerifiedError] = useState<string | null>(null);
   const [actionBusy, setActionBusy] = useState(false);
@@ -161,9 +157,7 @@ export function WorkBoard({
       agentId: agentId.trim(),
       objective: verifiedObjective.trim(),
       allowedFiles,
-      checkId: verifiedCheckId.trim(),
-      checkExecutable: verifiedExecutable.trim(),
-      oracleRoot: verifiedOracle.trim(),
+      checkProfileId: verifiedProfileId.trim(),
       workId: view?.workId ?? verifiedView?.workId ?? undefined,
       candidateDigest: view?.candidateDigest ?? verifiedView?.candidateDigest ?? undefined,
     };
@@ -266,16 +260,8 @@ export function WorkBoard({
             <input value={verifiedFiles} onChange={(event) => setVerifiedFiles(event.target.value)} />
           </label>
           <label>
-            Check id
-            <input value={verifiedCheckId} onChange={(event) => setVerifiedCheckId(event.target.value)} />
-          </label>
-          <label>
-            Check executable
-            <input value={verifiedExecutable} onChange={(event) => setVerifiedExecutable(event.target.value)} />
-          </label>
-          <label>
-            Oracle directory
-            <input value={verifiedOracle} onChange={(event) => setVerifiedOracle(event.target.value)} />
+            Check profile
+            <input value={verifiedProfileId} onChange={(event) => setVerifiedProfileId(event.target.value)} />
           </label>
           <button type="submit" disabled={actionBusy || !verifiedObjective.trim()}>
             Prepare

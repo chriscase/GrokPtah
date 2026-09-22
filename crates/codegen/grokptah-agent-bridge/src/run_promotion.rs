@@ -7,6 +7,7 @@
 
 use std::fs;
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
@@ -339,11 +340,405 @@ fn diff_bytes(worktree: &Path, base_revision: &str) -> Result<Vec<u8>> {
 pub(crate) fn fingerprint_at(root: &Path, base_revision: &str) -> Result<String> {
     let head = git_stdout(root, &["rev-parse", "HEAD"])?;
     let patch = diff_bytes(root, base_revision)?;
+    Ok(fingerprint_bytes(&head, &patch))
+}
+
+pub(crate) fn fingerprint_bytes(head: &str, patch: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(head.as_bytes());
     hasher.update([0]);
     hasher.update(patch);
-    Ok(format!("{:x}", hasher.finalize()))
+    format!("{:x}", hasher.finalize())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PathManifestEntry {
+    pub path: String,
+    pub before_mode: String,
+    pub after_mode: String,
+    pub before_blob: String,
+    pub after_blob: String,
+    pub state: String,
+    pub symlink: bool,
+    pub untracked: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CapturedWorktreeChanges {
+    pub patch: Vec<u8>,
+    pub final_fingerprint: String,
+    pub manifest: Vec<PathManifestEntry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourceClassification {
+    NotApplied,
+    AlreadyApplied,
+    Poisoned,
+}
+
+/// Changed-path identity for one worktree. Unchanged files are not read.
+pub(crate) fn capture_worktree_changes(
+    worktree: &Path,
+    base_revision: &str,
+) -> Result<CapturedWorktreeChanges> {
+    ensure_intent_to_add(worktree)?;
+    let patch = diff_bytes(worktree, base_revision)?;
+    let manifest = path_manifest(worktree, base_revision)?;
+    validate_isolated_links(
+        worktree,
+        &manifest
+            .iter()
+            .map(|entry| ChangeRecord {
+                path: entry.path.clone(),
+                summary: entry.state.clone(),
+            })
+            .collect::<Vec<_>>(),
+    )?;
+    let final_fingerprint = fingerprint_at(worktree, base_revision)?;
+    Ok(CapturedWorktreeChanges {
+        patch,
+        final_fingerprint,
+        manifest,
+    })
+}
+
+pub(crate) fn classify_source(
+    source: &Path,
+    base_revision: &str,
+    source_fingerprint: &str,
+    final_fingerprint: &str,
+) -> Result<SourceClassification> {
+    let current = fingerprint_at(source, base_revision)?;
+    if current == final_fingerprint {
+        Ok(SourceClassification::AlreadyApplied)
+    } else if current == source_fingerprint {
+        Ok(SourceClassification::NotApplied)
+    } else {
+        Ok(SourceClassification::Poisoned)
+    }
+}
+
+/// Apply one recorded promotion patch with the same preflight, fingerprint,
+/// and rollback contract as [`promote`]. A later file failure rolls back
+/// earlier files before returning. Fault 3 leaves the first effect in place
+/// so a crashed process is classified as poisoned rather than as a no-op.
+pub(crate) fn apply_recorded_patch(
+    source: &Path,
+    base_revision: &str,
+    source_fingerprint: &str,
+    patch: &[u8],
+    final_fingerprint: &str,
+    fault: u8,
+) -> Result<PromotionOutcome> {
+    match classify_source(source, base_revision, source_fingerprint, final_fingerprint)? {
+        SourceClassification::AlreadyApplied => return Ok(PromotionOutcome::AlreadyApplied),
+        SourceClassification::Poisoned => {
+            bail!(
+                "source is neither the verified base nor the final candidate; reconciliation is required"
+            );
+        }
+        SourceClassification::NotApplied => {}
+    }
+    if patch.is_empty() {
+        if source_fingerprint == final_fingerprint {
+            return Ok(PromotionOutcome::Applied);
+        }
+        bail!("the candidate change is missing from the promotion patch");
+    }
+    let parts = split_patch(patch);
+    if parts.is_empty() {
+        bail!("the promotion patch could not be read");
+    }
+    for part in &parts {
+        let check = git_command(
+            source,
+            &["apply", "--check", "--binary", "--whitespace=nowarn"],
+            &[],
+            Some(part),
+        )?;
+        if !check.status.success() {
+            bail!("promotion preflight failed: {}", command_error(&check));
+        }
+    }
+    if fault == 6 {
+        let failed = git_command(source, &["apply", "--binary"], &[], Some(b"not a patch\n"))?;
+        if failed.status.success() {
+            bail!("promotion apply command failed and the source was not changed");
+        }
+        match classify_source(source, base_revision, source_fingerprint, final_fingerprint)? {
+            SourceClassification::NotApplied => {
+                bail!("promotion apply command failed and the source was not changed");
+            }
+            _ => bail!("source effect is partial; reconciliation is required"),
+        }
+    }
+    let mut applied: Vec<Vec<u8>> = Vec::new();
+    for (index, part) in parts.iter().enumerate() {
+        if fault == 9 && index + 1 == parts.len() && parts.len() >= 2 {
+            let failed = git_command(source, &["apply", "--binary"], &[], Some(b"not a patch\n"))?;
+            if failed.status.success() {
+                bail!("promotion apply command failed and the source was not changed");
+            }
+            if !rollback_parts(source, &applied) {
+                bail!("promotion verification failed and rollback also failed");
+            }
+            match classify_source(source, base_revision, source_fingerprint, final_fingerprint)? {
+                SourceClassification::NotApplied => {
+                    bail!("promotion apply command failed and the source was rolled back");
+                }
+                _ => bail!("promotion verification failed and rollback also failed"),
+            }
+        }
+        let applied_now = git_command(
+            source,
+            &["apply", "--binary", "--whitespace=nowarn"],
+            &[],
+            Some(part),
+        )?;
+        if !applied_now.status.success() {
+            if !rollback_parts(source, &applied) {
+                bail!("promotion verification failed and rollback also failed");
+            }
+            match classify_source(source, base_revision, source_fingerprint, final_fingerprint)? {
+                SourceClassification::NotApplied => {
+                    bail!("promotion apply command failed and the source was rolled back");
+                }
+                _ => bail!("promotion verification failed and rollback also failed"),
+            }
+        }
+        applied.push(part.clone());
+        if fault == 3 && index == 0 && parts.len() >= 2 {
+            bail!("source effect is partial; reconciliation is required");
+        }
+        if fault == 7 && index == 0 {
+            if let Some(path) = first_patch_path(part) {
+                let _ = fs::write(source.join(&path), b"rollback-poison\n");
+            }
+            if rollback_parts(source, &applied) {
+                bail!("rollback fault injection did not stick");
+            }
+            bail!("promotion verification failed and rollback also failed");
+        }
+    }
+    ensure_intent_to_add(source)?;
+    let after = fingerprint_at(source, base_revision)?;
+    if after != final_fingerprint {
+        if !rollback_parts(source, &applied) {
+            bail!("promotion verification failed and rollback also failed");
+        }
+        bail!("promotion verification failed; the source workspace was rolled back");
+    }
+    Ok(PromotionOutcome::Applied)
+}
+
+pub(crate) fn manifest_digest(base_revision: &str, entries: &[PathManifestEntry]) -> String {
+    let mut ordered = entries.to_vec();
+    ordered.sort_by(|left, right| left.path.cmp(&right.path));
+    let mut hasher = Sha256::new();
+    hasher.update(b"grokptah-changed-path-v1\0");
+    hasher.update(base_revision.as_bytes());
+    hasher.update([0]);
+    for entry in &ordered {
+        hasher.update(entry.path.as_bytes());
+        hasher.update([0]);
+        hasher.update(entry.before_mode.as_bytes());
+        hasher.update([0]);
+        hasher.update(entry.after_mode.as_bytes());
+        hasher.update([0]);
+        hasher.update(entry.before_blob.as_bytes());
+        hasher.update([0]);
+        hasher.update(entry.after_blob.as_bytes());
+        hasher.update([0]);
+        hasher.update(entry.state.as_bytes());
+        hasher.update([0]);
+        hasher.update([u8::from(entry.symlink), u8::from(entry.untracked), b'\n']);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+pub(crate) fn materialize_manifest(
+    worktree: &Path,
+    dest: &Path,
+    entries: &[PathManifestEntry],
+) -> Result<()> {
+    if dest.exists() {
+        fs::remove_dir_all(dest).context("replace candidate snapshot")?;
+    }
+    fs::create_dir_all(dest).context("create candidate snapshot")?;
+    for entry in entries {
+        if entry.state == "delete" {
+            continue;
+        }
+        let from = worktree.join(&entry.path);
+        let to = dest.join(&entry.path);
+        if let Some(parent) = to.parent() {
+            fs::create_dir_all(parent).context("create candidate snapshot directory")?;
+        }
+        let meta = fs::symlink_metadata(&from)
+            .with_context(|| format!("read candidate {}", entry.path))?;
+        if meta.file_type().is_symlink() {
+            let target = fs::read_link(&from).context("read candidate symlink")?;
+            if target.is_absolute() {
+                bail!("promotion refuses absolute symlinks: {}", entry.path);
+            }
+            let resolved = dunce::canonicalize(from.parent().unwrap_or(worktree).join(&target))
+                .with_context(|| format!("resolve candidate symlink {}", entry.path))?;
+            let root = dunce::canonicalize(worktree).context("canonicalize candidate worktree")?;
+            if !resolved.starts_with(&root) {
+                bail!("promotion refuses symlink escape: {}", entry.path);
+            }
+            std::os::unix::fs::symlink(&target, &to).context("retain candidate symlink")?;
+            continue;
+        }
+        if !meta.is_file() {
+            bail!("the candidate contains a non-regular source file");
+        }
+        fs::copy(&from, &to).with_context(|| format!("retain {}", entry.path))?;
+        if let Ok(mode) = u32::from_str_radix(&entry.after_mode, 8) {
+            fs::set_permissions(&to, fs::Permissions::from_mode(mode & 0o777))
+                .with_context(|| format!("retain mode {}", entry.path))?;
+        }
+    }
+    Ok(())
+}
+
+fn path_manifest(worktree: &Path, base_revision: &str) -> Result<Vec<PathManifestEntry>> {
+    let output = git_command(
+        worktree,
+        &["diff", "--raw", "--no-renames", "-z", "--no-ext-diff"],
+        &[
+            std::ffi::OsStr::new(base_revision),
+            std::ffi::OsStr::new("--"),
+        ],
+        None,
+    )?;
+    if !output.status.success() {
+        bail!("list isolated changes failed: {}", command_error(&output));
+    }
+    let mut entries = Vec::new();
+    let fields: Vec<&[u8]> = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|field| !field.is_empty())
+        .collect();
+    let mut index = 0;
+    while index + 1 < fields.len() {
+        let header = std::str::from_utf8(fields[index]).context("git returned a non-UTF-8 diff")?;
+        let path =
+            std::str::from_utf8(fields[index + 1]).context("git returned a non-UTF-8 path")?;
+        index += 2;
+        validate_relative_path(Path::new(path))?;
+        // `git diff --raw -z` emits ":oldmode newmode oldsha newsha status\0path\0".
+        let header_parts: Vec<&str> = header.split_whitespace().collect();
+        if header_parts.len() < 5 {
+            bail!("isolated change header is incomplete");
+        }
+        let before_mode = header_parts[0].trim_start_matches(':').to_string();
+        let after_mode = header_parts[1].to_string();
+        let before_blob = header_parts[2].to_string();
+        let after_blob = header_parts[3].to_string();
+        let status = header_parts[4];
+        let state = if status.starts_with('A') {
+            "add"
+        } else if status.starts_with('D') {
+            "delete"
+        } else if before_mode != after_mode
+            && (before_blob == after_blob || after_blob == "0000000")
+        {
+            "mode"
+        } else {
+            "modify"
+        };
+        let tracked = git_command(
+            worktree,
+            &["ls-files", "--error-unmatch", "--"],
+            &[std::ffi::OsStr::new(path)],
+            None,
+        )
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+        entries.push(PathManifestEntry {
+            path: path.to_string(),
+            before_mode: before_mode.clone(),
+            after_mode: after_mode.clone(),
+            before_blob,
+            after_blob,
+            state: state.to_string(),
+            symlink: before_mode == "120000" || after_mode == "120000",
+            untracked: status.starts_with('A') && !tracked,
+        });
+    }
+    if entries.len() > MAX_CHANGED_FILES {
+        bail!(
+            "the candidate changes more files than the host changed-path bound of {MAX_CHANGED_FILES}"
+        );
+    }
+    Ok(entries)
+}
+
+fn split_patch(patch: &[u8]) -> Vec<Vec<u8>> {
+    if patch.is_empty() {
+        return Vec::new();
+    }
+    let marker = b"\ndiff --git ";
+    let mut starts = vec![0usize];
+    let mut search = 0usize;
+    while search + marker.len() <= patch.len() {
+        if let Some(found) = patch[search..]
+            .windows(marker.len())
+            .position(|window| window == marker)
+        {
+            let at = search + found + 1;
+            starts.push(at);
+            search = at + 1;
+        } else {
+            break;
+        }
+    }
+    let mut parts = Vec::new();
+    for (index, start) in starts.iter().copied().enumerate() {
+        let end = starts.get(index + 1).copied().unwrap_or(patch.len());
+        if end > start {
+            parts.push(patch[start..end].to_vec());
+        }
+    }
+    parts
+}
+
+fn rollback_parts(source: &Path, parts: &[Vec<u8>]) -> bool {
+    for part in parts.iter().rev() {
+        let reversed = git_command(
+            source,
+            &["apply", "--reverse", "--binary", "--whitespace=nowarn"],
+            &[],
+            Some(part),
+        );
+        if reversed
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        return false;
+    }
+    true
+}
+
+fn first_patch_path(part: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(part);
+    let line = text.lines().find(|line| line.starts_with("diff --git "))?;
+    let mut pieces = line.split_whitespace();
+    let _ = pieces.next();
+    let _ = pieces.next();
+    let path = pieces.next()?;
+    let relative = path.strip_prefix("a/").unwrap_or(path);
+    if relative.is_empty() || relative.contains('\0') {
+        None
+    } else {
+        Some(relative.to_string())
+    }
 }
 
 fn parse_paths(bytes: &[u8]) -> Result<Vec<String>> {
@@ -515,6 +910,7 @@ fn command_error(output: &Output) -> String {
 mod tests {
     use super::*;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
 
     fn git(root: &Path, args: &[&str]) {
@@ -667,5 +1063,81 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("outside the source workspace"), "{error}");
+    }
+
+    #[test]
+    fn mode_only_change_applies_exactly() {
+        let dir = repository();
+        let base = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let base = String::from_utf8(base.stdout).unwrap().trim().to_string();
+        let source_fingerprint = fingerprint_at(dir.path(), &base).unwrap();
+        let readme = dir.path().join("README.md");
+        fs::set_permissions(&readme, fs::Permissions::from_mode(0o755)).unwrap();
+        let captured = capture_worktree_changes(dir.path(), &base).unwrap();
+        assert!(
+            captured
+                .manifest
+                .iter()
+                .any(|entry| entry.before_mode != entry.after_mode),
+            "{:?}",
+            captured.manifest
+        );
+        fs::set_permissions(&readme, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            fingerprint_at(dir.path(), &base).unwrap(),
+            source_fingerprint
+        );
+        apply_recorded_patch(
+            dir.path(),
+            &base,
+            &source_fingerprint,
+            &captured.patch,
+            &captured.final_fingerprint,
+            0,
+        )
+        .unwrap();
+        let mode = fs::symlink_metadata(&readme).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
+        assert_eq!(fs::read(&readme).unwrap(), b"base\n");
+    }
+
+    #[test]
+    fn changed_path_identity_does_not_hash_unchanged_files() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        for index in 0..300 {
+            fs::write(
+                dir.path().join(format!("src/file-{index}.rs")),
+                format!("fn value_{index}() {{}}\n"),
+            )
+            .unwrap();
+        }
+        git(dir.path(), &["init", "-b", "main"]);
+        git(
+            dir.path(),
+            &["config", "user.email", "tests@grokptah.invalid"],
+        );
+        git(dir.path(), &["config", "user.name", "GrokPtah tests"]);
+        git(dir.path(), &["add", "."]);
+        git(dir.path(), &["commit", "-m", "base"]);
+        let base = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let base = String::from_utf8(base.stdout).unwrap().trim().to_string();
+        fs::write(
+            dir.path().join("src/file-0.rs"),
+            "fn value_0() { changed }\n",
+        )
+        .unwrap();
+        let captured = capture_worktree_changes(dir.path(), &base).unwrap();
+        assert_eq!(captured.manifest.len(), 1);
+        assert_eq!(captured.manifest[0].path, "src/file-0.rs");
+        assert!(captured.patch.len() < 32 * 1024 * 1024);
     }
 }

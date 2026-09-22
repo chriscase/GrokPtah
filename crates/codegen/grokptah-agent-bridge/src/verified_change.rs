@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -22,6 +23,7 @@ const MAX_CHECKS: usize = 8;
 const MAX_ARGS: usize = 16;
 const MAX_ARG_BYTES: usize = 512;
 const MAX_ENV: usize = 8;
+#[cfg(test)]
 const MAX_FILES: usize = 256;
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_TREE_BYTES: u64 = 8 * 1024 * 1024;
@@ -381,6 +383,8 @@ pub struct CandidateVerification {
     pub run_id: Option<String>,
     pub attempt_id: Option<String>,
     pub source_revision: String,
+    #[serde(default)]
+    pub source_fingerprint: String,
     pub content_digest: String,
     pub spec_digest: String,
     pub files: Vec<CandidateFileRecord>,
@@ -394,6 +398,12 @@ pub struct CandidateVerification {
     pub changed_paths: Vec<String>,
     pub bounded_diff: String,
     pub diff_truncated: bool,
+    #[serde(default)]
+    pub reconciliation_required: bool,
+    #[serde(default)]
+    pub check_profile_id: String,
+    #[serde(default)]
+    pub check_profile_revision: u64,
 }
 
 impl CandidateVerification {
@@ -412,6 +422,7 @@ impl CandidateVerification {
             && target_revision == Some(self.source_revision.as_str())
             && self.checks.iter().all(|check| check.outcome == "passed")
             && !self.checks.is_empty()
+            && !self.reconciliation_required
     }
 }
 
@@ -438,6 +449,7 @@ pub fn worktree_is_clean(git: &Path, repo: &Path) -> Result<bool, VerifiedChange
     Ok(output.iter().all(u8::is_ascii_whitespace) || output.is_empty())
 }
 
+#[cfg(test)]
 pub fn candidate_content_identity(
     root: &Path,
     source_revision: &str,
@@ -471,27 +483,80 @@ pub fn candidate_content_identity(
     })
 }
 
-pub fn retain_candidate_snapshot(source: &Path, dest: &Path) -> Result<(), VerifiedChangeError> {
-    let source = canonical_dir(source)?;
-    if dest.exists() {
-        fs::remove_dir_all(dest).map_err(|_| {
-            VerifiedChangeError::new("an older candidate snapshot could not be replaced")
-        })?;
-    }
-    fs::create_dir_all(dest).map_err(|_| {
+pub fn retain_candidate_snapshot(
+    source: &Path,
+    dest: &Path,
+    base_revision: &str,
+) -> Result<(), VerifiedChangeError> {
+    let captured = crate::run_promotion::capture_worktree_changes(source, base_revision)
+        .map_err(|error| VerifiedChangeError::new(error.to_string()))?;
+    let parent = dest.parent().ok_or_else(|| {
         VerifiedChangeError::new("the candidate snapshot directory could not be created")
     })?;
-    let copied = copy_tree(&source, &source, dest);
-    if copied.is_err() {
-        let _ = fs::remove_dir_all(dest);
+    fs::create_dir_all(parent).map_err(|_| {
+        VerifiedChangeError::new("the candidate snapshot directory could not be created")
+    })?;
+    let digest = crate::run_promotion::manifest_digest(base_revision, &captured.manifest);
+    let mut files = Vec::new();
+    for entry in &captured.manifest {
+        if entry.state == "delete" {
+            files.push(CandidateFileRecord {
+                path: entry.path.clone(),
+                digest: "absent".into(),
+                kind: format!("delete:{}", entry.before_mode),
+            });
+            continue;
+        }
+        let bytes = fs::read(source.join(&entry.path)).unwrap_or_default();
+        files.push(CandidateFileRecord {
+            path: entry.path.clone(),
+            digest: digest_bytes(&bytes),
+            kind: entry.after_mode.clone(),
+        });
     }
-    copied
+    let record = json!({
+        "baseRevision": base_revision,
+        "finalFingerprint": captured.final_fingerprint,
+        "contentDigest": format!("sha256:{digest}"),
+        "manifest": captured.manifest,
+        "files": files,
+    });
+    fs::write(parent.join("promotion.patch"), &captured.patch)
+        .map_err(|_| VerifiedChangeError::new("the promotion patch could not be stored"))?;
+    fs::write(
+        parent.join("manifest.json"),
+        serde_json::to_vec(&record)
+            .map_err(|_| VerifiedChangeError::new("the candidate manifest could not be stored"))?,
+    )
+    .map_err(|_| VerifiedChangeError::new("the candidate manifest could not be stored"))?;
+    crate::run_promotion::materialize_manifest(source, dest, &captured.manifest)
+        .map_err(|error| VerifiedChangeError::new(error.to_string()))
+}
+
+#[derive(Debug, Clone)]
+pub struct CheckAuthority {
+    pub profile_id: String,
+    pub profile_revision: u64,
+    pub executable_digest: String,
+    pub oracle_digest: String,
+    pub network: String,
+    pub source_root: PathBuf,
+    pub output_limit_bytes: u64,
 }
 
 pub fn execute_required_checks(
     checks: &[RequiredCheckSpec],
     candidate_root: &Path,
     oracle_root: &Path,
+) -> Result<Vec<RequiredCheckExecution>, VerifiedChangeError> {
+    execute_required_checks_with_authority(checks, candidate_root, oracle_root, None)
+}
+
+pub fn execute_required_checks_with_authority(
+    checks: &[RequiredCheckSpec],
+    candidate_root: &Path,
+    oracle_root: &Path,
+    authority: Option<&CheckAuthority>,
 ) -> Result<Vec<RequiredCheckExecution>, VerifiedChangeError> {
     validate_required_checks(checks)?;
     if oracle_inside_workspace(oracle_root, candidate_root) {
@@ -500,14 +565,41 @@ pub fn execute_required_checks(
         ));
     }
     let spec_digest = RequiredCheckSpec::spec_digest(checks)?;
+    let before = snapshot_identity(candidate_root);
     let mut results = Vec::with_capacity(checks.len());
     for check in checks {
+        if let Some(authority) = authority {
+            if file_digest(Path::new(&check.executable)).as_deref()
+                != Some(authority.executable_digest.as_str())
+                || directory_digest(oracle_root).as_deref()
+                    != Some(authority.oracle_digest.as_str())
+            {
+                results.push(RequiredCheckExecution {
+                    check_id: check.check_id.clone(),
+                    outcome: "invalidated".into(),
+                    exit_code: None,
+                    output_digest: digest_bytes(b""),
+                    output_truncated: false,
+                    duration_ms: 0,
+                    spec_digest: spec_digest.clone(),
+                });
+                continue;
+            }
+        }
         results.push(run_one_check(
             check,
             candidate_root,
             oracle_root,
             &spec_digest,
+            authority,
         ));
+    }
+    if snapshot_identity(candidate_root) != before {
+        for result in &mut results {
+            if result.outcome == "passed" {
+                result.outcome = "failed".into();
+            }
+        }
     }
     Ok(results)
 }
@@ -523,32 +615,88 @@ pub fn checks_passed(checks: &[RequiredCheckSpec], results: &[RequiredCheckExecu
         })
 }
 
-pub fn bounded_source_diff(
-    before: &Path,
-    after: &Path,
-    allowed: &[String],
-) -> Result<(String, bool, Vec<String>), VerifiedChangeError> {
-    let mut changed = Vec::new();
-    let mut body = String::new();
-    for path in allowed {
-        let left = fs::read(before.join(path)).unwrap_or_default();
-        let right = fs::read(after.join(path)).unwrap_or_default();
-        if left != right {
-            changed.push(path.clone());
-            body.push_str(&format!("--- a/{path}\n+++ b/{path}\n"));
-            push_text_diff(&mut body, &left, &right);
+pub fn retained_matches(
+    retained: &Path,
+    digest: &str,
+    files: &[CandidateFileRecord],
+) -> Result<bool, VerifiedChangeError> {
+    let record = read_promotion_record(retained)?;
+    if record.content_digest != digest || record.files != files {
+        return Ok(false);
+    }
+    for file in &record.files {
+        let path = retained.join(&file.path);
+        if file.digest == "absent" {
+            if path.exists() {
+                return Ok(false);
+            }
+            continue;
+        }
+        let bytes = fs::read(&path).unwrap_or_default();
+        if digest_bytes(&bytes) != file.digest {
+            return Ok(false);
+        }
+        if let Ok(mode) = u32::from_str_radix(&file.kind, 8) {
+            let actual = fs::symlink_metadata(&path)
+                .map(|meta| meta.permissions().mode() & 0o777)
+                .unwrap_or(0);
+            if actual != (mode & 0o777) {
+                return Ok(false);
+            }
         }
     }
-    let truncated = body.len() > MAX_DIFF_BYTES;
-    if truncated {
-        let mut end = MAX_DIFF_BYTES;
-        while !body.is_char_boundary(end) {
-            end -= 1;
-        }
-        body.truncate(end);
-        body.push_str("\n...[diff truncated]\n");
-    }
-    Ok((body, truncated, changed))
+    Ok(true)
+}
+
+pub fn apply_fault() -> u8 {
+    APPLY_FAULT.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+pub static APPLY_FAULT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub(crate) struct PromotionRecord {
+    pub base_revision: String,
+    pub final_fingerprint: String,
+    pub content_digest: String,
+    pub manifest: Vec<crate::run_promotion::PathManifestEntry>,
+    pub files: Vec<CandidateFileRecord>,
+    pub patch: Vec<u8>,
+}
+
+pub(crate) fn read_promotion_record(
+    retained: &Path,
+) -> Result<PromotionRecord, VerifiedChangeError> {
+    let parent = retained.parent().unwrap_or(retained);
+    let raw = fs::read_to_string(parent.join("manifest.json"))
+        .map_err(|_| VerifiedChangeError::new("the candidate manifest is missing"))?;
+    let value: Value = serde_json::from_str(&raw)
+        .map_err(|_| VerifiedChangeError::new("the candidate manifest is unreadable"))?;
+    let manifest = serde_json::from_value(value.get("manifest").cloned().unwrap_or(Value::Null))
+        .map_err(|_| VerifiedChangeError::new("the candidate manifest is unreadable"))?;
+    let files = serde_json::from_value(value.get("files").cloned().unwrap_or(Value::Null))
+        .unwrap_or_default();
+    let patch = fs::read(parent.join("promotion.patch"))
+        .map_err(|_| VerifiedChangeError::new("the promotion patch is missing"))?;
+    Ok(PromotionRecord {
+        base_revision: value
+            .get("baseRevision")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        final_fingerprint: value
+            .get("finalFingerprint")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        content_digest: value
+            .get("contentDigest")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        manifest,
+        files,
+        patch,
+    })
 }
 
 pub fn apply_candidate_tree(
@@ -556,6 +704,7 @@ pub fn apply_candidate_tree(
     source: &Path,
     retained: &Path,
     expected: &CandidateContentIdentity,
+    source_fingerprint: &str,
     allowed: &[String],
 ) -> Result<(), VerifiedChangeError> {
     let observed = source_revision(git, source)?;
@@ -569,76 +718,230 @@ pub fn apply_candidate_tree(
             "the target workspace is not clean at the verified revision",
         ));
     }
-    let retained_identity = candidate_content_identity(retained, &expected.source_revision)?;
-    if retained_identity.content_digest != expected.content_digest
-        || retained_identity.files != expected.files
+    let record = read_promotion_record(retained)?;
+    if record.base_revision != expected.source_revision
+        || record.content_digest != expected.content_digest
+        || record.files != expected.files
     {
         return Err(VerifiedChangeError::new(
             "the retained candidate no longer matches the verified content identity",
         ));
     }
-    let source_identity = candidate_content_identity(source, &expected.source_revision)?;
-    let mut differing = Vec::new();
-    let source_map: BTreeMap<_, _> = source_identity
-        .files
+    if record
+        .manifest
         .iter()
-        .map(|file| (file.path.clone(), file.clone()))
-        .collect();
-    let retained_map: BTreeMap<_, _> = retained_identity
-        .files
-        .iter()
-        .map(|file| (file.path.clone(), file.clone()))
-        .collect();
-    for path in source_map.keys().chain(retained_map.keys()) {
-        if source_map.get(path) != retained_map.get(path) && !differing.contains(path) {
-            differing.push(path.clone());
-        }
-    }
-    if differing
-        .iter()
-        .any(|path| !allowed.iter().any(|allowed| allowed == path))
+        .any(|entry| !allowed.iter().any(|allowed| allowed == &entry.path))
     {
         return Err(VerifiedChangeError::new(
             "the candidate changes a path outside the allowed file scope",
         ));
     }
-    for path in &differing {
-        let from = retained.join(path);
-        let to = source.join(path);
-        if !retained_map.contains_key(path) {
-            if to.exists() {
-                fs::remove_file(&to).map_err(|_| {
-                    VerifiedChangeError::new("an allowed candidate deletion could not be applied")
-                })?;
-            }
-            continue;
-        }
-        if let Some(parent) = to.parent() {
-            fs::create_dir_all(parent).map_err(|_| {
-                VerifiedChangeError::new("the candidate destination directory could not be created")
-            })?;
-        }
-        fs::copy(&from, &to)
-            .map_err(|_| VerifiedChangeError::new("the candidate file could not be applied"))?;
-    }
-    let applied = candidate_content_identity(source, &expected.source_revision)?;
-    if applied.content_digest != expected.content_digest {
-        restore_clean_worktree(git, source, &expected.source_revision)?;
+    if source_fingerprint.is_empty() || record.final_fingerprint.is_empty() {
         return Err(VerifiedChangeError::new(
-            "applying the candidate did not reproduce its verified content identity",
+            "the launch source fingerprint was not retained",
         ));
     }
-    Ok(())
+    crate::run_promotion::apply_recorded_patch(
+        source,
+        &expected.source_revision,
+        source_fingerprint,
+        &record.patch,
+        &record.final_fingerprint,
+        apply_fault(),
+    )
+    .map(|_| ())
+    .map_err(|error| VerifiedChangeError::new(error.to_string()))
 }
 
-pub fn restore_clean_worktree(
-    git: &Path,
-    source: &Path,
-    revision: &str,
-) -> Result<(), VerifiedChangeError> {
-    git_status(git, source, &["reset", "--hard", revision])?;
-    git_status(git, source, &["clean", "-ffdx", "--"])?;
-    Ok(())
+fn check_sandbox_profile(
+    candidate: &Path,
+    oracle: &Path,
+    output: &Path,
+    source: Option<&Path>,
+) -> String {
+    let profile = format!(
+        "(version 1)\n(deny default)\n(allow process*)\n(allow signal)\n(allow sysctl-read)\n(allow file-read*)\n(allow file-ioctl (literal \"/dev/null\"))\n(allow file-write* (subpath \"{}\"))\n(deny network*)\n",
+        output.display()
+    );
+    let _ = (candidate, oracle, source);
+    profile
+}
+
+pub fn file_digest(path: &Path) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    Some(digest_bytes(&bytes))
+}
+
+pub fn directory_digest(root: &Path) -> Option<String> {
+    let mut files = Vec::new();
+    let mut total = 0u64;
+    walk_identity(root, root, &mut files, &mut total).ok()?;
+    let mut hasher = Sha256::new();
+    for file in &files {
+        hasher.update(file.path.as_bytes());
+        hasher.update([0]);
+        hasher.update(file.kind.as_bytes());
+        hasher.update([0]);
+        hasher.update(file.digest.as_bytes());
+        hasher.update(b"\n");
+    }
+    Some(digest_bytes(&hasher.finalize()))
+}
+
+fn directory_size(root: &Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.is_dir() {
+                stack.push(path);
+            } else {
+                total = total.saturating_add(meta.len());
+            }
+        }
+    }
+    total
+}
+
+fn snapshot_identity(root: &Path) -> String {
+    directory_digest(root).unwrap_or_else(|| "missing".into())
+}
+
+pub fn resolve_check_profile(
+    home: &Path,
+    profile_id: &str,
+) -> Result<(RequiredCheckSpec, CheckAuthority, PathBuf), VerifiedChangeError> {
+    if !valid_check_id(profile_id) {
+        return Err(VerifiedChangeError::new(
+            "the check profile id is not a host token",
+        ));
+    }
+    let path = home
+        .join("check-profiles")
+        .join(format!("{profile_id}.json"));
+    let raw = fs::read_to_string(&path)
+        .map_err(|_| VerifiedChangeError::new("the check profile is not installed on this host"))?;
+    let value: Value = serde_json::from_str(&raw)
+        .map_err(|_| VerifiedChangeError::new("the check profile is unreadable"))?;
+    let executable = value
+        .get("executable")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let oracle_root = PathBuf::from(
+        value
+            .get("oracleRoot")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    );
+    let executable_digest = file_digest(Path::new(&executable)).ok_or_else(|| {
+        VerifiedChangeError::new("the check profile executable could not be sealed")
+    })?;
+    let expected_executable = value
+        .get("executableDigest")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if expected_executable != executable_digest {
+        return Err(VerifiedChangeError::new(
+            "the check profile executable no longer matches its sealed digest",
+        ));
+    }
+    let oracle_digest = directory_digest(&oracle_root)
+        .ok_or_else(|| VerifiedChangeError::new("the check profile oracle could not be sealed"))?;
+    let expected_oracle = value
+        .get("oracleDigest")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if expected_oracle != oracle_digest {
+        return Err(VerifiedChangeError::new(
+            "the check profile oracle no longer matches its sealed digest",
+        ));
+    }
+    let cwd = match value.get("cwd").and_then(Value::as_str).unwrap_or("oracle") {
+        "candidate" => RequiredCheckCwd::Candidate,
+        "oracle" => RequiredCheckCwd::Oracle,
+        _ => {
+            return Err(VerifiedChangeError::new(
+                "the check profile cwd policy is not supported",
+            ))
+        }
+    };
+    let args = value
+        .get("args")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let env = value
+        .get("env")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    Some(RequiredCheckEnv {
+                        key: item.get("key")?.as_str()?.to_string(),
+                        value: item.get("value")?.as_str()?.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let spec = RequiredCheckSpec {
+        check_id: profile_id.to_string(),
+        executable,
+        args,
+        cwd,
+        env,
+        timeout_ms: value.get("timeoutMs").and_then(Value::as_u64).unwrap_or(0),
+        max_output_bytes: value
+            .get("maxOutputBytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as u32,
+    };
+    validate_required_checks(std::slice::from_ref(&spec))?;
+    let authority = CheckAuthority {
+        profile_id: profile_id.to_string(),
+        profile_revision: value
+            .get("profileRevision")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        executable_digest,
+        oracle_digest,
+        network: value
+            .get("network")
+            .and_then(Value::as_str)
+            .unwrap_or("none")
+            .to_string(),
+        source_root: PathBuf::new(),
+        output_limit_bytes: value
+            .get("maxOutputDirBytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(65_536),
+    };
+    if authority.profile_revision == 0 {
+        return Err(VerifiedChangeError::new(
+            "the check profile revision is missing",
+        ));
+    }
+    if authority.network != "none" && authority.network != "qualified" {
+        return Err(VerifiedChangeError::new(
+            "the check profile network policy is not supported",
+        ));
+    }
+    Ok((spec, authority, oracle_root))
 }
 
 fn run_one_check(
@@ -646,6 +949,7 @@ fn run_one_check(
     candidate_root: &Path,
     oracle_root: &Path,
     spec_digest: &str,
+    authority: Option<&CheckAuthority>,
 ) -> RequiredCheckExecution {
     let started = Instant::now();
     let base = |outcome: &str, exit_code: Option<i32>, truncated: bool| RequiredCheckExecution {
@@ -672,16 +976,52 @@ fn run_one_check(
         Ok(path) => path,
         Err(_) => return base("incomplete", None, false),
     };
-    let mut command = Command::new(&check.executable);
+    let output_dir = std::env::temp_dir().join(format!(
+        "grokptah-check-{}-{}",
+        check.check_id,
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&output_dir);
+    if fs::create_dir_all(&output_dir).is_err() {
+        return base("incomplete", None, false);
+    }
+    let network = authority
+        .map(|item| item.network.as_str())
+        .unwrap_or("none");
+    let mut command = if network == "none" && Path::new("/usr/bin/sandbox-exec").is_file() {
+        let mut sandboxed = Command::new("/usr/bin/sandbox-exec");
+        sandboxed.arg("-p").arg(check_sandbox_profile(
+            &candidate,
+            &oracle,
+            &output_dir,
+            authority.map(|item| item.source_root.as_path()),
+        ));
+        sandboxed.arg(&check.executable);
+        sandboxed
+    } else {
+        Command::new(&check.executable)
+    };
     command
         .args(&check.args)
         .current_dir(cwd)
         .env_clear()
         .env("CANDIDATE_ROOT", candidate.to_string_lossy().as_ref())
         .env("ORACLE_ROOT", oracle.to_string_lossy().as_ref())
+        .env("CHECK_OUTPUT", output_dir.to_string_lossy().as_ref())
+        .env(
+            "SOURCE_ROOT",
+            authority
+                .map(|item| item.source_root.to_string_lossy().to_string())
+                .unwrap_or_default(),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     for entry in &check.env {
         command.env(&entry.key, &entry.value);
     }
@@ -699,8 +1039,7 @@ fn run_one_check(
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
             Ok(None) if started.elapsed() >= timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate_check_tree(&mut child);
                 break None;
             }
             Ok(None) => thread::sleep(Duration::from_millis(15)),
@@ -719,9 +1058,13 @@ fn run_one_check(
     let mut output = stdout.bytes;
     output.extend(stderr.bytes);
     let digest = digest_bytes(&output);
+    terminate_check_tree(&mut child);
+    let output_too_large =
+        authority.is_some_and(|item| directory_size(&output_dir) > item.output_limit_bytes);
+    let _ = fs::remove_dir_all(&output_dir);
     let (outcome, exit_code) = match waited {
         None => ("timed_out", None),
-        Some(status) if truncated => ("truncated", status.code()),
+        Some(status) if truncated || output_too_large => ("truncated", status.code()),
         Some(status) if status.success() => ("passed", status.code()),
         Some(status) => ("failed", status.code()),
     };
@@ -735,6 +1078,36 @@ fn run_one_check(
         spec_digest: spec_digest.into(),
     }
 }
+
+fn terminate_check_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pid = child.id() as i32;
+        if pid > 0 {
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+    }
+    let _ = child.kill();
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_millis(200) {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            _ => thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
+
+pub fn run_before_candidate_bind_hook() {
+    if let Ok(guard) = BEFORE_CANDIDATE_BIND.lock() {
+        if let Some(hook) = guard.as_ref() {
+            hook();
+        }
+    }
+}
+
+pub static BEFORE_CANDIDATE_BIND: std::sync::Mutex<Option<fn()>> = std::sync::Mutex::new(None);
 
 struct CappedRead {
     bytes: Vec<u8>,
@@ -837,50 +1210,6 @@ fn walk_identity(
     Ok(())
 }
 
-fn copy_tree(root: &Path, dir: &Path, dest_root: &Path) -> Result<(), VerifiedChangeError> {
-    let entries = fs::read_dir(dir)
-        .map_err(|_| VerifiedChangeError::new("the candidate checkout could not be read"))?;
-    for entry in entries {
-        let entry =
-            entry.map_err(|_| VerifiedChangeError::new("a candidate entry could not be read"))?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if dir == root && SKIP_DIRS.contains(&name.as_ref()) {
-            continue;
-        }
-        let path = entry.path();
-        let relative = relative_path(root, &path)?;
-        let dest = dest_root.join(&relative);
-        let meta = fs::symlink_metadata(&path)
-            .map_err(|_| VerifiedChangeError::new("candidate metadata could not be read"))?;
-        if meta.file_type().is_symlink() {
-            return Err(VerifiedChangeError::new(
-                "a candidate symlink is not part of the retained source snapshot",
-            ));
-        }
-        if meta.is_dir() {
-            fs::create_dir_all(&dest).map_err(|_| {
-                VerifiedChangeError::new("the candidate snapshot directory could not be created")
-            })?;
-            copy_tree(root, &path, dest_root)?;
-            continue;
-        }
-        if !meta.is_file() {
-            return Err(VerifiedChangeError::new(
-                "the candidate contains a non-regular source file",
-            ));
-        }
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent).map_err(|_| {
-                VerifiedChangeError::new("the candidate snapshot directory could not be created")
-            })?;
-        }
-        fs::copy(&path, &dest)
-            .map_err(|_| VerifiedChangeError::new("a candidate file could not be retained"))?;
-    }
-    Ok(())
-}
-
 fn reject_symlink_escape(root: &Path, link: &Path) -> Result<(), VerifiedChangeError> {
     let target = fs::read_link(link)
         .map_err(|_| VerifiedChangeError::new("a candidate symlink could not be read"))?;
@@ -949,26 +1278,6 @@ fn git_output(git: &Path, repo: &Path, args: &[&str]) -> Result<Vec<u8>, Verifie
         ));
     }
     Ok(output.stdout)
-}
-
-fn git_status(git: &Path, repo: &Path, args: &[&str]) -> Result<(), VerifiedChangeError> {
-    let _ = git_output(git, repo, args)?;
-    Ok(())
-}
-
-fn push_text_diff(body: &mut String, left: &[u8], right: &[u8]) {
-    let left = String::from_utf8_lossy(left);
-    let right = String::from_utf8_lossy(right);
-    for line in left.lines() {
-        body.push('-');
-        body.push_str(line);
-        body.push('\n');
-    }
-    for line in right.lines() {
-        body.push('+');
-        body.push_str(line);
-        body.push('\n');
-    }
 }
 
 fn digest_bytes(bytes: &[u8]) -> String {
@@ -1140,24 +1449,48 @@ pub fn assemble_candidate_verification(
     source: &Path,
     oracle: Option<&Path>,
     source_revision: &str,
+    source_fingerprint: &str,
     allowed: &[String],
     worker_stopped: bool,
     change_proposed: bool,
     diff_digest: Option<String>,
+    authority: Option<&CheckAuthority>,
 ) -> CandidateVerification {
     let spec_digest =
         RequiredCheckSpec::spec_digest(checks).unwrap_or_else(|_| "sha256:invalid".into());
-    let identity = candidate_content_identity(retained, source_revision).ok();
-    let (bounded_diff, diff_truncated, changed_paths) = if change_proposed {
-        bounded_source_diff(source, retained, allowed)
-            .unwrap_or_else(|_| (String::new(), true, Vec::new()))
-    } else {
-        (String::new(), false, Vec::new())
-    };
+    let record = read_promotion_record(retained).ok();
+    let changed_paths = record
+        .as_ref()
+        .map(|record| {
+            record
+                .manifest
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let out_of_scope = changed_paths
         .iter()
         .any(|path| !allowed.iter().any(|allowed| allowed == path));
-    let results = if !worker_stopped || !change_proposed || identity.is_none() || out_of_scope {
+    let patch_text = record
+        .as_ref()
+        .map(|record| String::from_utf8_lossy(&record.patch).into_owned())
+        .unwrap_or_default();
+    let diff_truncated = patch_text.len() > MAX_DIFF_BYTES;
+    let mut bounded_diff = patch_text;
+    if diff_truncated {
+        let mut end = MAX_DIFF_BYTES;
+        while !bounded_diff.is_char_boundary(end) && end > 0 {
+            end -= 1;
+        }
+        bounded_diff.truncate(end);
+        bounded_diff.push_str("\n...[diff truncated]\n");
+    }
+    let identity_ok = record.as_ref().is_some_and(|record| {
+        record.base_revision == source_revision && !record.content_digest.is_empty()
+    });
+    let _ = source;
+    let results = if !worker_stopped || !change_proposed || !identity_ok || out_of_scope {
         checks
             .iter()
             .map(|check| RequiredCheckExecution {
@@ -1176,20 +1509,22 @@ pub fn assemble_candidate_verification(
             })
             .collect()
     } else if let Some(oracle) = oracle {
-        execute_required_checks(checks, retained, oracle).unwrap_or_else(|_| {
-            checks
-                .iter()
-                .map(|check| RequiredCheckExecution {
-                    check_id: check.check_id.clone(),
-                    outcome: "incomplete".into(),
-                    exit_code: None,
-                    output_digest: digest_bytes(b""),
-                    output_truncated: false,
-                    duration_ms: 0,
-                    spec_digest: spec_digest.clone(),
-                })
-                .collect()
-        })
+        execute_required_checks_with_authority(checks, retained, oracle, authority).unwrap_or_else(
+            |_| {
+                checks
+                    .iter()
+                    .map(|check| RequiredCheckExecution {
+                        check_id: check.check_id.clone(),
+                        outcome: "incomplete".into(),
+                        exit_code: None,
+                        output_digest: digest_bytes(b""),
+                        output_truncated: false,
+                        duration_ms: 0,
+                        spec_digest: spec_digest.clone(),
+                    })
+                    .collect()
+            },
+        )
     } else {
         checks
             .iter()
@@ -1204,25 +1539,23 @@ pub fn assemble_candidate_verification(
             })
             .collect()
     };
-    let passed =
-        identity.is_some() && !out_of_scope && !diff_truncated && checks_passed(checks, &results);
-    let identity = identity.unwrap_or(CandidateContentIdentity {
-        source_revision: source_revision.to_string(),
-        content_digest: "sha256:missing".into(),
-        files: Vec::new(),
-    });
+    let passed = identity_ok && !out_of_scope && !diff_truncated && checks_passed(checks, &results);
+    let (content_digest, files) = record
+        .map(|record| (record.content_digest, record.files))
+        .unwrap_or_else(|| ("sha256:missing".into(), Vec::new()));
     CandidateVerification {
         schema_version: CANDIDATE_VERIFICATION_SCHEMA,
         work_id: work_id.to_string(),
         run_id,
         attempt_id,
-        source_revision: identity.source_revision,
-        content_digest: identity.content_digest,
+        source_revision: source_revision.to_string(),
+        source_fingerprint: source_fingerprint.to_string(),
+        content_digest,
         spec_digest,
-        files: identity.files,
+        files,
         checks: results,
         worker_stopped,
-        change_proposed: change_proposed && !out_of_scope,
+        change_proposed: change_proposed && !out_of_scope && identity_ok,
         checks_passed: passed,
         invalidated: false,
         applied: false,
@@ -1230,6 +1563,11 @@ pub fn assemble_candidate_verification(
         changed_paths,
         bounded_diff,
         diff_truncated,
+        reconciliation_required: false,
+        check_profile_id: authority
+            .map(|item| item.profile_id.clone())
+            .unwrap_or_default(),
+        check_profile_revision: authority.map(|item| item.profile_revision).unwrap_or(0),
     }
 }
 
@@ -1240,6 +1578,88 @@ mod tests {
 
     fn temp() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    struct OperatorEnvGuard {
+        home: Option<std::ffi::OsString>,
+        path: Option<std::ffi::OsString>,
+        token: Option<std::ffi::OsString>,
+    }
+
+    impl OperatorEnvGuard {
+        fn install() -> Self {
+            let guard = Self {
+                home: std::env::var_os("HOME"),
+                path: std::env::var_os("PATH"),
+                token: std::env::var_os("GITHUB_TOKEN"),
+            };
+            std::env::set_var("HOME", "/operator/home-leak");
+            std::env::set_var("PATH", "/leak-path-marker");
+            std::env::set_var("GITHUB_TOKEN", "leak-token-marker");
+            guard
+        }
+    }
+
+    impl Drop for OperatorEnvGuard {
+        fn drop(&mut self) {
+            restore_env("HOME", &self.home);
+            restore_env("PATH", &self.path);
+            restore_env("GITHUB_TOKEN", &self.token);
+        }
+    }
+
+    fn restore_env(key: &str, value: &Option<std::ffi::OsString>) {
+        match value {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    struct ReapSleep(&'static str);
+    impl Drop for ReapSleep {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("/usr/bin/pkill")
+                .args(["-f", self.0])
+                .status();
+        }
+    }
+
+    fn pgrep_empty(pattern: &str) -> bool {
+        let listed = std::process::Command::new("/usr/bin/pgrep")
+            .args(["-f", pattern])
+            .output()
+            .unwrap();
+        listed.stdout.is_empty()
+    }
+
+    fn check_spec(check_id: &str, executable: &Path, timeout_ms: u64) -> RequiredCheckSpec {
+        RequiredCheckSpec {
+            check_id: check_id.into(),
+            executable: executable.display().to_string(),
+            args: Vec::new(),
+            cwd: RequiredCheckCwd::Oracle,
+            env: Vec::new(),
+            timeout_ms,
+            max_output_bytes: 256,
+        }
+    }
+
+    fn sealed_authority(
+        profile: &str,
+        executable: &Path,
+        oracle: &Path,
+        source: &Path,
+        network: &str,
+    ) -> CheckAuthority {
+        CheckAuthority {
+            profile_id: profile.into(),
+            profile_revision: 1,
+            executable_digest: file_digest(executable).unwrap(),
+            oracle_digest: directory_digest(oracle).unwrap(),
+            network: network.into(),
+            source_root: source.to_path_buf(),
+            output_limit_bytes: 4096,
+        }
     }
 
     #[test]
@@ -1331,6 +1751,167 @@ mod tests {
         }
         let argv = fs::read_to_string(oracle.path().join("grok.argv")).unwrap_or_default();
         assert!(!argv.contains("prompt-file"), "{argv}");
+    }
+
+    #[test]
+    fn timed_out_check_kills_the_background_process_group() {
+        let _reap = ReapSleep("sleep 47");
+        let oracle = temp();
+        let candidate = temp();
+        let source = temp();
+        let script = oracle.path().join("linger.sh");
+        fs::write(&script, "#!/bin/sh\nsleep 47 &\nsleep 47\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let check = RequiredCheckSpec {
+            check_id: "linger".into(),
+            executable: script.display().to_string(),
+            args: Vec::new(),
+            cwd: RequiredCheckCwd::Oracle,
+            env: Vec::new(),
+            timeout_ms: 500,
+            max_output_bytes: 256,
+        };
+        let authority = sealed_authority("linger", &script, oracle.path(), source.path(), "none");
+        let started = Instant::now();
+        let results = execute_required_checks_with_authority(
+            &[check],
+            candidate.path(),
+            oracle.path(),
+            Some(&authority),
+        )
+        .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the check waited for the background sleep"
+        );
+        assert_eq!(results[0].outcome, "timed_out");
+        assert!(
+            pgrep_empty("sleep 47"),
+            "background sleep survived the timed-out check"
+        );
+    }
+
+    #[test]
+    fn replaced_executable_or_oracle_invalidates_without_running() {
+        let oracle = temp();
+        let bin = temp();
+        let candidate = temp();
+        let source = temp();
+        fs::write(oracle.path().join("fixture.txt"), b"oracle-v1\n").unwrap();
+        let script = bin.path().join("check.sh");
+        fs::write(&script, "#!/bin/sh\nexit 7\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let check = check_spec("swapbin", &script, 1000);
+        let mut authority =
+            sealed_authority("swapbin", &script, oracle.path(), source.path(), "none");
+        fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        let replaced = execute_required_checks_with_authority(
+            std::slice::from_ref(&check),
+            candidate.path(),
+            oracle.path(),
+            Some(&authority),
+        )
+        .unwrap();
+        assert_eq!(replaced[0].outcome, "invalidated");
+        assert_eq!(replaced[0].exit_code, None);
+
+        authority.executable_digest = file_digest(&script).unwrap();
+        fs::write(oracle.path().join("fixture.txt"), b"oracle-v2\n").unwrap();
+        let oracle_replaced = execute_required_checks_with_authority(
+            std::slice::from_ref(&check),
+            candidate.path(),
+            oracle.path(),
+            Some(&authority),
+        )
+        .unwrap();
+        assert_eq!(oracle_replaced[0].outcome, "invalidated");
+        assert_eq!(oracle_replaced[0].exit_code, None);
+    }
+
+    #[test]
+    fn check_cannot_write_source_or_candidate_or_inherit_operator_env() {
+        let _env = OperatorEnvGuard::install();
+        let oracle = temp();
+        let candidate = temp();
+        let source = temp();
+        fs::write(candidate.path().join("kept.txt"), b"kept\n").unwrap();
+        fs::write(source.path().join("kept.txt"), b"kept\n").unwrap();
+        let script = oracle.path().join("write.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\nif [ \"$HOME\" = \"/operator/home-leak\" ]; then exit 4; fi\nif [ \"$GITHUB_TOKEN\" = \"leak-token-marker\" ]; then exit 4; fi\ncase \"$PATH\" in *leak-path-marker*) exit 4;; esac\nif printf poisoned > \"$SOURCE_ROOT/poisoned.txt\" 2>/dev/null; then exit 3; fi\nif printf poisoned > \"$CANDIDATE_ROOT/poisoned.txt\" 2>/dev/null; then exit 3; fi\nexit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut check = check_spec("contain", &script, 2000);
+        check.max_output_bytes = 4096;
+        let authority = sealed_authority("contain", &script, oracle.path(), source.path(), "none");
+        let results = execute_required_checks_with_authority(
+            std::slice::from_ref(&check),
+            candidate.path(),
+            oracle.path(),
+            Some(&authority),
+        )
+        .unwrap();
+        assert_eq!(results[0].outcome, "passed", "{results:?}");
+        assert!(!source.path().join("poisoned.txt").exists());
+        assert!(!candidate.path().join("poisoned.txt").exists());
+        assert_eq!(fs::read(source.path().join("kept.txt")).unwrap(), b"kept\n");
+        assert_eq!(
+            fs::read(candidate.path().join("kept.txt")).unwrap(),
+            b"kept\n"
+        );
+    }
+
+    #[test]
+    fn forbidden_network_is_denied_and_qualified_network_can_connect() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let oracle = temp();
+        let candidate = temp();
+        let source = temp();
+        let script = oracle.path().join("net.sh");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n/usr/bin/nc -z -G 2 127.0.0.1 {port}\nif [ $? -eq 0 ]; then exit 2; fi\nexit 0\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let check = check_spec("netdeny", &script, 3000);
+        let denied = sealed_authority("netdeny", &script, oracle.path(), source.path(), "none");
+        let blocked = execute_required_checks_with_authority(
+            std::slice::from_ref(&check),
+            candidate.path(),
+            oracle.path(),
+            Some(&denied),
+        )
+        .unwrap();
+        assert_eq!(
+            blocked[0].outcome, "passed",
+            "sandbox allowed the connection"
+        );
+        let allowed = sealed_authority(
+            "netdeny",
+            &script,
+            oracle.path(),
+            source.path(),
+            "qualified",
+        );
+        let opened = execute_required_checks_with_authority(
+            std::slice::from_ref(&check),
+            candidate.path(),
+            oracle.path(),
+            Some(&allowed),
+        )
+        .unwrap();
+        assert_eq!(
+            opened[0].outcome, "failed",
+            "qualified network could not connect"
+        );
+        assert_eq!(opened[0].exit_code, Some(2));
+        drop(listener);
     }
 
     #[test]

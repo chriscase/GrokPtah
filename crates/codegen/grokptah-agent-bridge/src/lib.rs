@@ -182,7 +182,7 @@ pub use events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 pub use grok_build::{
     launch_grok_build, CredentialLeaseHandle, CredentialLeaseResolver, FileCredentialLease,
     GrokBuildAdapterError, GrokBuildAdapterOutcome, GrokBuildAdvisoryEvidence,
-    GrokBuildHostLaunchConfig, GrokBuildMutationEvidence,
+    GrokBuildHostLaunchConfig, GrokBuildMutationEvidence, HostLeaseAuthority,
 };
 pub use host::{AgentHost, AgentHostHandle, AgentStatus, HostConfig, WorkspaceUiState};
 pub use host_runtime::{
@@ -237,9 +237,9 @@ pub use types::{
     SkillInfo, SubagentExecutionMode, SubagentInfo, SubagentIsolationPreference,
 };
 pub use verified_change::{
-    execute_required_checks, inspect_assignment_readiness, CandidateVerification, ReadinessInput,
-    RequiredCheckCwd, RequiredCheckEnv, RequiredCheckSpec, VerifiedChangeError,
-    VerifiedChangeReadiness,
+    directory_digest, execute_required_checks, file_digest, inspect_assignment_readiness,
+    CandidateVerification, ReadinessInput, RequiredCheckCwd, RequiredCheckEnv, RequiredCheckSpec,
+    VerifiedChangeError, VerifiedChangeReadiness, APPLY_FAULT, BEFORE_CANDIDATE_BIND,
 };
 
 /// Crate version string for about / diagnostics.

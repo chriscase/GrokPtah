@@ -363,6 +363,7 @@ pub async fn start_service(config: ServiceConfig) -> Result<ServiceHandle> {
             bounds: Default::default(),
         },
     );
+    orch.set_execution_surface("service");
     orch.set_auth_credentials(config.client_credentials.clone())
         .map_err(|error| anyhow::anyhow!(error.message))?;
     orch.set_agent_owner_id(config.agent_owner_id.clone())

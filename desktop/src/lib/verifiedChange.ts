@@ -15,6 +15,8 @@ export interface VerifiedChangeView {
     maxTotalTokens?: number;
   };
   requiredChecks?: Array<{ checkId: string; cwd: string; timeoutMs: number }>;
+  checkProfileId?: string;
+  checkProfileRevision?: number;
   approvalRequired?: boolean;
   readiness?: {
     ready?: boolean;

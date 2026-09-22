@@ -517,6 +517,7 @@ pub async fn start_control_from_env(host: AgentHostHandle) -> Option<ControlServ
             bounds: Default::default(),
         },
     );
+    orch.set_execution_surface("desktop");
     let mut limits = ControlServerLimits::default();
     if let Ok(n) = std::env::var("GROKPTAH_CONTROL_MAX_CONCURRENT") {
         if let Ok(v) = n.parse::<usize>() {
@@ -1672,17 +1673,11 @@ struct VerifiedChangeToolArgs {
     agent_id: String,
     objective: String,
     allowed_files: Vec<String>,
-    check_id: String,
-    check_executable: String,
-    oracle_root: PathBuf,
+    check_profile_id: String,
     #[serde(default = "default_verified_budget")]
     budget_profile: String,
     #[serde(default = "default_verified_mode")]
     mutation_mode: String,
-    #[serde(default = "default_verified_platform")]
-    platform: String,
-    #[serde(default = "default_verified_host")]
-    execution_host: String,
 }
 
 fn default_verified_budget() -> String {
@@ -1691,14 +1686,6 @@ fn default_verified_budget() -> String {
 
 fn default_verified_mode() -> String {
     "isolated_review".into()
-}
-
-fn default_verified_platform() -> String {
-    std::env::consts::OS.into()
-}
-
-fn default_verified_host() -> String {
-    "service".into()
 }
 
 #[derive(Debug, Deserialize)]
@@ -3158,7 +3145,7 @@ fn tool_input_schema(name: &str) -> Value {
         }),
         "ptah_prepare_verified_change" | "ptah_start_verified_change" => json!({
             "type": "object",
-            "required": ["request_id", "session_id", "workspace", "agent_id", "objective", "allowed_files", "check_id", "check_executable", "oracle_root"],
+            "required": ["request_id", "session_id", "workspace", "agent_id", "objective", "allowed_files", "check_profile_id"],
             "additionalProperties": false,
             "properties": {
                 "request_id": req_id,
@@ -3167,13 +3154,9 @@ fn tool_input_schema(name: &str) -> Value {
                 "agent_id": {"type": "string", "minLength": 0, "maxLength": 256},
                 "objective": {"type": "string", "minLength": 1, "maxLength": 32768},
                 "allowed_files": {"type": "array", "minItems": 1, "maxItems": 64, "items": {"type": "string", "minLength": 1}},
-                "check_id": {"type": "string", "minLength": 1, "maxLength": 64},
-                "check_executable": {"type": "string", "minLength": 1, "maxLength": 1024},
-                "oracle_root": {"type": "string", "minLength": 1, "maxLength": 1024},
+                "check_profile_id": {"type": "string", "minLength": 1, "maxLength": 64},
                 "budget_profile": {"type": "string"},
-                "mutation_mode": {"type": "string"},
-                "platform": {"type": "string"},
-                "execution_host": {"type": "string"}
+                "mutation_mode": {"type": "string"}
             }
         }),
         "ptah_verified_change_status" => json!({
@@ -4216,8 +4199,7 @@ async fn dispatch_tool(
             let tool_args: VerifiedChangeToolArgs = parse_value(args)?;
             require_nonempty(&tool_args.request_id, "request_id")?;
             require_nonempty(&tool_args.objective, "objective")?;
-            require_nonempty(&tool_args.check_id, "check_id")?;
-            require_nonempty(&tool_args.check_executable, "check_executable")?;
+            require_nonempty(&tool_args.check_profile_id, "check_profile_id")?;
             let budget = match tool_args.budget_profile.as_str() {
                 "economy" => crate::orchestration::ManagedExecutionBudgetProfile::Economy,
                 "balanced" => crate::orchestration::ManagedExecutionBudgetProfile::Balanced,
@@ -4238,20 +4220,13 @@ async fn dispatch_tool(
                 agent_id: tool_args.agent_id,
                 objective: tool_args.objective,
                 allowed_files: tool_args.allowed_files,
-                required_checks: vec![crate::RequiredCheckSpec {
-                    check_id: tool_args.check_id,
-                    executable: tool_args.check_executable,
-                    args: Vec::new(),
-                    cwd: crate::RequiredCheckCwd::Oracle,
-                    env: Vec::new(),
-                    timeout_ms: 5_000,
-                    max_output_bytes: 4_096,
-                }],
-                oracle_root: tool_args.oracle_root,
+                check_profile_id: tool_args.check_profile_id,
+                required_checks: Vec::new(),
+                oracle_root: PathBuf::new(),
                 budget_profile: budget,
                 mutation_mode: tool_args.mutation_mode,
-                platform: tool_args.platform,
-                execution_host: tool_args.execution_host,
+                platform: String::new(),
+                execution_host: String::new(),
             };
             if name == "ptah_start_verified_change" {
                 orch.start_verified_change(auth, &request).await
