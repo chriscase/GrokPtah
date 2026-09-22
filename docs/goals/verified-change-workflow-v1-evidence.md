@@ -12,7 +12,7 @@ Operator prepare and start are `OrchestrationService::prepare_verified_change` a
 
 Paths: `crates/codegen/grokptah-agent-bridge/src/orchestration/service.rs`, `crates/codegen/grokptah-agent-bridge/src/mcp_control.rs`, `desktop/src-tauri/src/commands.rs`, `desktop/src/components/VerifiedChangePanel.tsx`, `desktop/src/components/WorkBoard.tsx`.
 
-The operator entry used here is the desktop binary's existing MCP control plane. Tools `ptah_prepare_verified_change` and `ptah_start_verified_change` call the same service methods. The managed executor is installed only when `GROKPTAH_MANAGED_GROK_EXECUTABLE` and its sibling settings are present. The child still receives no GitHub push credential.
+The operator entry is the desktop Work board and the same methods on the MCP control plane: `ptah_prepare_verified_change`, `ptah_start_verified_change`, `ptah_verified_change_status`, `ptah_apply_verified_change`, and `ptah_discard_verified_change`. Desktop commands are `verified_change_prepare`, `verified_change_start`, `verified_change_status`, `verified_change_apply`, and `verified_change_discard`. An empty agent id resolves to the session agent, so Prepare is available before any work item is selected. After start, the board refreshes status until the worker leaves `running` or `leased`, and Refresh review loads the settled diff and check results. Apply and discard require the exact `candidateDigest`. The managed executor is installed only when `GROKPTAH_MANAGED_GROK_EXECUTABLE` and its sibling settings are present. The child still receives no GitHub push credential.
 
 Command: `cargo test --locked --manifest-path crates/codegen/grokptah-agent-bridge/Cargo.toml --test verified_change_workflow -- --test-threads=1`
 
@@ -20,7 +20,7 @@ Result: `multi_file_repair_is_red_then_green_and_apply_is_separate` passed. Prep
 
 Desktop process: the debug `grokptah-desktop` binary was started twice. Each process listened on its MCP control plane. Prepare and start were called over that plane against a fake CLI and a disposable two-file repository. Both runs returned the same outcome: readiness ready, CLI `1.0.5` with contract `inspect-json-v1`, model key `grok-4.6`, workers dispatched 0, provider invocations 0, execution host `desktop`, allowed files `src/ledger.rs` and `src/report.rs`, required check `balance-regression`, max rounds 8, approval required, and exactly one admitted attempt in state `running`. The admission snapshot's `checksPassed` is false because the worker had not settled yet. The workflow test shows the same path reaches `checksPassed` after settle. The projection did not contain the fixture credential or the control-plane token.
 
-Desktop UI tests from the prior functional commit still apply to the unchanged panel: `npm test` passed (5), `npm run typecheck` passed, and `desktop/src-tauri` `cargo test --locked --lib -- --test-threads=1` passed 50.
+Desktop, from `desktop/`: `npm run typecheck` exited 0. `npm test` exited 0 (58 files, 428 tests). `desktop/src-tauri` `cargo test --locked --lib -- --test-threads=1` exited 0 (50 passed). The Work board test prepares with an empty agent id, refreshes a settled diff, and applies the displayed candidate digest.
 
 ## G2
 
@@ -48,7 +48,7 @@ Result: skipped noop, escape, and symlink cases stay unverified. A tampered reta
 
 Approval records the candidate digest and does not apply. Apply writes only that digest and then uses the existing success writer. Discard of a different or already-applied candidate is rejected. The disposable source is the only tree applied.
 
-Result: after approval the source pair is still the pre-repair text. Apply then matches the repaired pair. Discard of the applied digest errors and leaves the repaired pair in place. The earlier unapplied candidate is not applied by that call.
+Result: after approval the source pair is still the pre-repair text. Apply then matches the repaired pair. Discard of the applied digest errors and leaves the repaired pair in place. `operator_status_apply_and_discard_bind_the_exact_digest` drives status, apply, and discard through the MCP control plane. Status after settle shows the diff and `checksPassed`. Apply before approval fails. Discard of a different digest fails. Discard of the exact digest cancels without changing the source. Apply of the exact digest after approval changes the source, and a later wrong digest does not.
 
 ## G6
 
@@ -89,9 +89,10 @@ The same suite against the operator's existing `~/.grokptah` failed three `provi
 
 ## Identity
 
-- Tested functional SHA: `7f9ba9dc1c23cfc3052680b7f6736638d041cfa9`
-- Tested functional tree: `905375f539ac08b1a845cc3646207a14894367a2`
-- `9b02ecc986c77e6872ec22ae6beb6377075e9493` (tree `550d81116bc0c7bb064ac3e814fe4272836c0a48`) added the admission, approval, and apply restart cuts. The SHA above adds the candidate-persistence and checks-passed restart cuts. Clippy and the full locked bridge suite were run on that tree.
+- Tested functional SHA: `32268e89f52776704d7a4729c2bd3581310ceeb7`
+- Tested functional tree: `74727df90e187f906b1bdd912742073444978166`
+- `7f9ba9dc1c23cfc3052680b7f6736638d041cfa9` (tree `905375f539ac08b1a845cc3646207a14894367a2`) added the candidate-persistence and checks-passed restart cuts. The SHA above adds settled status, apply, and discard on the desktop and MCP operator entries. Clippy, the full locked bridge suite, desktop typecheck, and desktop npm test were run on that tree.
+- `9b02ecc986c77e6872ec22ae6beb6377075e9493` (tree `550d81116bc0c7bb064ac3e814fe4272836c0a48`) added the admission, approval, and apply restart cuts.
 - `aed1248fbdbebca002b4bfb43d24fbc2653587e0` (tree `53d01d981e7b6822944a43a10c437c0a5e4efbc2`) added the operator control-plane entry.
 - Earlier functional commit `ab2f86ea5cadd89321794a7ca50609c11ed171d9` (tree `f113106787c39bd16e7d6901a8f49d4cb70e1de2`) is the candidate-verification slice.
 - The commit that updates this identity section is evidence-only. It does not change executable code. Any later executable change requires the applicable tests again.
@@ -105,6 +106,6 @@ The functional SHA above is the tested executable tree. This evidence commit is 
 ## Limitations
 
 - No live Grok Build provider call. The ignored live managed-executor test was not run.
-- The desktop binary was driven through its MCP control plane, not by clicking the Work board form. The panel tests cover that form's render.
+- The earlier desktop process drive used prepare and start. Settled review, apply, and discard are now on that same control plane and on the Work board. The Work board test exercises prepare without a selected agent, refresh of a settled diff, and apply of the displayed digest. The window itself was not clicked.
 - At admission time the worker is still `running`, so the live start projection does not yet show `checksPassed`. The workflow test covers the settled candidate.
 - Non-macOS mutation remains refused. This run is macOS.
