@@ -148,6 +148,14 @@ fn safe_verified_action(work: &WorkItem) -> &'static str {
     {
         return "The exact candidate was applied. No further application is safe.";
     }
+    if work.result.as_ref().is_some_and(|result| {
+        result
+            .failure
+            .as_deref()
+            .is_some_and(|failure| failure.starts_with("grok_dispatch_"))
+    }) {
+        return "Execution was admitted, but the supervised task did not survive restart. Do not dispatch another attempt or treat this as verified success.";
+    }
     if work
         .approval
         .as_ref()

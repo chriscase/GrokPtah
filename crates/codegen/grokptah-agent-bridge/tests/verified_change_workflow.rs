@@ -11,9 +11,9 @@ use std::process::Command;
 use std::sync::Arc;
 
 use grokptah_agent_bridge::orchestration::{
-    AuthContext, ManagedExecutionBudgetProfile, ManagedGrokExecutorConfig, OrchStore,
-    OrchestrationConfig, OrchestrationService, RunBounds, VerifiedChangeRequest, WorkState,
-    WorkspaceAllowlist,
+    AuthContext, ManagedExecutionBudgetProfile, ManagedGrokExecutorConfig, ManagedIntentState,
+    OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, VerifiedChangeRequest,
+    WorkState, WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
     execute_required_checks, set_grokptah_home_override, AgentHost, CredentialLeaseHandle,
@@ -251,6 +251,74 @@ fn assert_secret_free(value: &serde_json::Value) {
     assert!(!rendered.contains("GITHUB_TOKEN"), "{rendered}");
     assert!(!rendered.contains("/operator/home"), "{rendered}");
     assert!(!rendered.contains("verified-change-token"), "{rendered}");
+}
+
+struct LiveRuntime {
+    host: HostRuntime,
+    orch: Arc<OrchestrationService>,
+}
+
+async fn reopen_production_store(
+    host: HostRuntime,
+    orch: Arc<OrchestrationService>,
+    workspace: &Path,
+    fake: &Path,
+    isolate: &Path,
+    identity: &GrokBuildGitIdentity,
+    lease: &Path,
+) -> LiveRuntime {
+    let store_root = orch.store().root().to_path_buf();
+    let attempts_before = orch.store().list_work_attempts(None).unwrap().len();
+    orch.stop_background_tasks().await;
+    host.shutdown().await;
+    drop(orch);
+    drop(host);
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    })
+    .unwrap();
+    host.start().unwrap();
+    let orch = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        OrchStore::open(&store_root).unwrap(),
+        OrchestrationConfig {
+            bearer_token: "verified-change-token".into(),
+            allowlist: WorkspaceAllowlist::new([workspace.to_path_buf()]),
+            max_concurrent_runs: 1,
+            bounds: RunBounds::default(),
+        },
+    );
+    orch.configure_managed_grok_executor(
+        ManagedGrokExecutorConfig {
+            executable: fake.to_path_buf(),
+            git_executable: PathBuf::from("/usr/bin/git"),
+            cwd: workspace.to_path_buf(),
+            isolate_parent: isolate.to_path_buf(),
+            repository_id: identity.repository_id.clone(),
+            base_ref: identity.git_ref.clone(),
+            identity: identity.clone(),
+            credential_lease_id: "verified-change-lease".into(),
+        },
+        Arc::new(FileLeaseResolver {
+            path: lease.to_path_buf(),
+        }),
+    )
+    .unwrap();
+    for _ in 0..4 {
+        orch.drive_native_executor_once().await;
+    }
+    assert_eq!(
+        orch.store().list_work_attempts(None).unwrap().len(),
+        attempts_before,
+        "restart dispatched additional work attempts"
+    );
+    LiveRuntime { host, orch }
+}
+
+fn restore_lease(path: &Path) {
+    fs::write(path, b"opaque-test-credential\n").unwrap();
 }
 
 async fn settle(orch: &OrchestrationService, work_id: &str) -> serde_json::Value {
@@ -785,6 +853,294 @@ async fn cancel_and_restart_do_not_dispatch_or_apply() {
     let _ = agent_id;
     orch.stop_background_tasks().await;
     host.shutdown().await;
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_at_admission_approval_and_apply_names_a_safe_action() {
+    let harness = Harness::open(ManagedExecutionBudgetProfile::Economy);
+    let workspace = harness.workspace.path().to_path_buf();
+    let fake = harness.fake_dir.path().join("grok");
+    let isolate = harness.isolate.path().to_path_buf();
+    let identity = harness.identity.clone();
+    let lease = harness.fake_dir.path().join("lease.json");
+    let behavior = harness.fake_dir.path().join("behavior");
+    let lane = harness.lane;
+    let admit_request = harness.request("admit-cut", "isolated_review", "macos");
+    let approve_request = harness.request("approve-cut", "isolated_review", "macos");
+
+    harness.set_behavior("hold");
+    let admitted = harness
+        .orch
+        .start_verified_change(&auth(), &admit_request)
+        .await
+        .unwrap_or_else(|error| panic!("admit start: {error}"));
+    let admit_id = admitted["workId"].as_str().unwrap().to_string();
+    let running = harness
+        .orch
+        .store()
+        .load_work_item(&admit_id)
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(running.state, WorkState::Leased | WorkState::Running),
+        "admission cut missed the in-flight state: {:?}",
+        running.state
+    );
+    assert_eq!(
+        harness
+            .orch
+            .store()
+            .list_work_attempts(Some(&admit_id))
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(harness
+        .orch
+        .store()
+        .list_managed_intents()
+        .unwrap()
+        .iter()
+        .any(|intent| {
+            intent.work_id == admit_id && intent.state == ManagedIntentState::Dispatching
+        }));
+    assert_eq!(
+        harness.source_pair(),
+        (LEDGER_BEFORE.to_string(), REPORT_BEFORE.to_string())
+    );
+
+    let mut live = reopen_production_store(
+        harness.host,
+        harness.orch,
+        &workspace,
+        &fake,
+        &isolate,
+        &identity,
+        &lease,
+    )
+    .await;
+    let uncertain = live
+        .orch
+        .store()
+        .load_work_item(&admit_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(uncertain.state, WorkState::Review);
+    assert_eq!(
+        uncertain
+            .result
+            .as_ref()
+            .and_then(|result| result.failure.as_deref()),
+        Some("grok_dispatch_uncertain_after_restart")
+    );
+    assert_eq!(
+        live.orch
+            .store()
+            .list_work_attempts(Some(&admit_id))
+            .unwrap()
+            .len(),
+        1
+    );
+    let admit_status = live
+        .orch
+        .verified_change_status(&auth(), lane, &workspace, &admit_id)
+        .unwrap();
+    assert_eq!(admit_status["phases"]["checksPassed"], false);
+    assert_eq!(admit_status["phases"]["humanApproved"], false);
+    assert_eq!(admit_status["phases"]["applied"], false);
+    assert_eq!(admit_status["attemptCount"], 1);
+    assert!(admit_status["safeAction"]
+        .as_str()
+        .unwrap()
+        .contains("Do not dispatch another attempt"));
+    assert!(admit_status["safeAction"]
+        .as_str()
+        .unwrap()
+        .contains("verified success"));
+    assert_secret_free(&admit_status);
+    assert_eq!(
+        fs::read_to_string(workspace.join("src/ledger.rs")).unwrap(),
+        LEDGER_BEFORE
+    );
+    let admit_again = live
+        .orch
+        .start_verified_change(&auth(), &admit_request)
+        .await
+        .unwrap_or_else(|error| panic!("admit reconnect: {error}"));
+    assert_eq!(admit_again["workId"], admit_id);
+    assert_eq!(admit_again["attemptCount"], 1);
+
+    restore_lease(&lease);
+    fs::write(&behavior, "repair").unwrap();
+    let approved_start = live
+        .orch
+        .start_verified_change(&auth(), &approve_request)
+        .await
+        .unwrap_or_else(|error| panic!("approve start: {error}"));
+    let approve_id = approved_start["workId"].as_str().unwrap().to_string();
+    let awaiting = settle(&live.orch, &approve_id).await;
+    assert_eq!(awaiting["state"], "awaiting_approval");
+    let approve_work = live
+        .orch
+        .store()
+        .load_work_item(&approve_id)
+        .unwrap()
+        .unwrap();
+    live.orch
+        .approve_work(
+            &auth(),
+            "approve-cut-decision",
+            lane,
+            &workspace,
+            &approve_id,
+            Some("approve the exact candidate".into()),
+            Some(approve_work.revision),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("approve: {error}"));
+    assert_eq!(
+        fs::read_to_string(workspace.join("src/ledger.rs")).unwrap(),
+        LEDGER_BEFORE
+    );
+    let approved_attempts = live
+        .orch
+        .store()
+        .list_work_attempts(Some(&approve_id))
+        .unwrap()
+        .len();
+    assert_eq!(approved_attempts, 1);
+
+    live = reopen_production_store(
+        live.host, live.orch, &workspace, &fake, &isolate, &identity, &lease,
+    )
+    .await;
+    let approved = live
+        .orch
+        .store()
+        .load_work_item(&approve_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(approved.state, WorkState::AwaitingApproval);
+    assert!(approved
+        .approval
+        .as_ref()
+        .is_some_and(|approval| approval.candidate_digest.is_some()));
+    assert_eq!(
+        live.orch
+            .store()
+            .list_work_attempts(Some(&approve_id))
+            .unwrap()
+            .len(),
+        approved_attempts
+    );
+    let approve_status = live
+        .orch
+        .verified_change_status(&auth(), lane, &workspace, &approve_id)
+        .unwrap();
+    assert_eq!(approve_status["phases"]["checksPassed"], true);
+    assert_eq!(approve_status["phases"]["humanApproved"], true);
+    assert_eq!(approve_status["phases"]["applied"], false);
+    assert_eq!(
+        approve_status["safeAction"],
+        "Approval is recorded. Application is a separate action."
+    );
+    assert_secret_free(&approve_status);
+    assert_eq!(
+        fs::read_to_string(workspace.join("src/ledger.rs")).unwrap(),
+        LEDGER_BEFORE
+    );
+    let approve_again = live
+        .orch
+        .start_verified_change(&auth(), &approve_request)
+        .await
+        .unwrap_or_else(|error| panic!("approve reconnect: {error}"));
+    assert_eq!(approve_again["workId"], approve_id);
+    assert_eq!(approve_again["attemptCount"], approved_attempts);
+
+    let digest = approved
+        .result
+        .as_ref()
+        .and_then(|result| result.candidate_verification.as_ref())
+        .unwrap()
+        .content_digest
+        .clone();
+    let applied = live
+        .orch
+        .apply_verified_change(
+            &auth(),
+            "apply-cut",
+            lane,
+            &workspace,
+            &approve_id,
+            &digest,
+            Some(approved.revision),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("apply: {error}"));
+    assert_eq!(applied["work"]["state"], "succeeded");
+    assert_eq!(
+        fs::read_to_string(workspace.join("src/ledger.rs")).unwrap(),
+        LEDGER_AFTER
+    );
+    let applied_attempts = live
+        .orch
+        .store()
+        .list_work_attempts(Some(&approve_id))
+        .unwrap()
+        .len();
+
+    live = reopen_production_store(
+        live.host, live.orch, &workspace, &fake, &isolate, &identity, &lease,
+    )
+    .await;
+    let succeeded = live
+        .orch
+        .store()
+        .load_work_item(&approve_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(succeeded.state, WorkState::Succeeded);
+    assert_eq!(
+        live.orch
+            .store()
+            .list_work_attempts(Some(&approve_id))
+            .unwrap()
+            .len(),
+        applied_attempts
+    );
+    let apply_status = live
+        .orch
+        .verified_change_status(&auth(), lane, &workspace, &approve_id)
+        .unwrap();
+    assert_eq!(apply_status["phases"]["applied"], true);
+    assert_eq!(apply_status["phases"]["humanApproved"], true);
+    assert_eq!(
+        apply_status["safeAction"],
+        "The exact candidate was applied. No further application is safe."
+    );
+    assert_secret_free(&apply_status);
+    assert_eq!(
+        (
+            fs::read_to_string(workspace.join("src/ledger.rs")).unwrap(),
+            fs::read_to_string(workspace.join("src/report.rs")).unwrap(),
+        ),
+        (LEDGER_AFTER.to_string(), REPORT_AFTER.to_string())
+    );
+    let apply_again = live
+        .orch
+        .start_verified_change(&auth(), &approve_request)
+        .await
+        .unwrap_or_else(|error| panic!("apply reconnect: {error}"));
+    assert_eq!(apply_again["workId"], approve_id);
+    assert_eq!(apply_again["attemptCount"], applied_attempts);
+    assert_eq!(
+        fs::read_to_string(workspace.join("src/ledger.rs")).unwrap(),
+        LEDGER_AFTER
+    );
+
+    live.orch.stop_background_tasks().await;
+    live.host.shutdown().await;
     set_grokptah_home_override(None);
 }
 
