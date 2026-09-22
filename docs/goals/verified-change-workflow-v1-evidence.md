@@ -10,13 +10,17 @@ The live exit gate was not run. No explicit live-use grant was present. The igno
 
 Operator prepare and start are `OrchestrationService::prepare_verified_change` and `start_verified_change`. They create one manager plan and one Work item on the existing ledger, assign the existing agent, and authorize execution. Desktop commands `verified_change_prepare` and `verified_change_start` call those methods. The Work board form renders repository, revision, agent, host, scope, executor, model, CLI version, limits, required checks, approval, readiness reasons, and phases.
 
-Paths: `crates/codegen/grokptah-agent-bridge/src/orchestration/service.rs`, `desktop/src-tauri/src/commands.rs`, `desktop/src/components/VerifiedChangePanel.tsx`, `desktop/src/components/WorkBoard.tsx`.
+Paths: `crates/codegen/grokptah-agent-bridge/src/orchestration/service.rs`, `crates/codegen/grokptah-agent-bridge/src/mcp_control.rs`, `desktop/src-tauri/src/commands.rs`, `desktop/src/components/VerifiedChangePanel.tsx`, `desktop/src/components/WorkBoard.tsx`.
+
+The operator entry used here is the desktop binary's existing MCP control plane. Tools `ptah_prepare_verified_change` and `ptah_start_verified_change` call the same service methods. The managed executor is installed only when `GROKPTAH_MANAGED_GROK_EXECUTABLE` and its sibling settings are present. The child still receives no GitHub push credential.
 
 Command: `cargo test --locked --manifest-path crates/codegen/grokptah-agent-bridge/Cargo.toml --test verified_change_workflow -- --test-threads=1`
 
-Result: `multi_file_repair_is_red_then_green_and_apply_is_separate` passed. The projection asserts repository id, source revision, agent id, execution host, both allowed files, executor, distinct model key and CLI version `1.0.5`, limits, and approval required.
+Result: `multi_file_repair_is_red_then_green_and_apply_is_separate` passed. Prepare and the immediate start projection both assert repository id, the full source revision, agent id, execution host, both allowed files, executor, distinct model key and CLI version `1.0.5`, limits, approval required, and zero workers dispatched by readiness.
 
-Desktop: `npm test -- --run src/components/VerifiedChangePanel.test.tsx src/components/WorkBoard.test.tsx` passed (5). `npm run typecheck` passed. `desktop/src-tauri` `cargo test --locked --lib -- --test-threads=1` passed 50.
+Desktop process: the debug `grokptah-desktop` binary was started twice. Each process listened on its MCP control plane. Prepare and start were called over that plane against a fake CLI and a disposable two-file repository. Both runs returned the same outcome: readiness ready, CLI `1.0.5` with contract `inspect-json-v1`, model key `grok-4.6`, workers dispatched 0, provider invocations 0, execution host `desktop`, allowed files `src/ledger.rs` and `src/report.rs`, required check `balance-regression`, max rounds 8, approval required, and exactly one admitted attempt in state `running`. The admission snapshot's `checksPassed` is false because the worker had not settled yet. The workflow test shows the same path reaches `checksPassed` after settle. The projection did not contain the fixture credential or the control-plane token.
+
+Desktop UI tests from the prior functional commit still apply to the unchanged panel: `npm test` passed (5), `npm run typecheck` passed, and `desktop/src-tauri` `cargo test --locked --lib -- --test-threads=1` passed 50.
 
 ## G2
 
@@ -69,24 +73,28 @@ Result: `cancel_and_restart_do_not_dispatch_or_apply` passed on two consecutive 
 | 9 | Exact candidate apply and discard | pass |
 | 10 | No credentials in the projection | pass, `assert_secret_free` |
 
-Bridge clippy `--locked --all-targets -- -D warnings`: exit 0. `cargo fmt --all`: exit 0.
+Bridge clippy `--locked --all-targets -- -D warnings`: exit 0 on the functional commit below. `cargo fmt --all -- --check`: exit 0 after the one formatting wrap included in that commit.
 
-Regression: adapter 27 passed. Managed executor non-live test 1 passed. Live test ignored, not counted as a pass.
+Regression: `cargo test --locked -- --test-threads=1` from `crates/codegen/grokptah-agent-bridge` exited 0. Lib tests: 653 passed. Adapter 27 passed. Managed executor non-live test 1 passed. Live test ignored, not counted as a pass. `grokptah-service` `cargo check --locked --all-targets` exited 0.
+
+The same suite against the operator's existing `~/.grokptah` failed three `provider_qualification` tests because that authority file cannot be opened (`missing field policy_revision`). Those three tests passed on a fresh `GROKPTAH_HOME`. This branch does not modify that store. The passing suite used a fresh home.
 
 ## Identity
 
-- Tested functional SHA: `ab2f86ea5cadd89321794a7ca50609c11ed171d9`
-- Tested functional tree: `f113106787c39bd16e7d6901a8f49d4cb70e1de2`
-- The commit that adds this identity section is evidence-only. It does not change executable code. Re-run the workflow tests only if a later commit changes Rust or desktop behavior.
+- Tested functional SHA: `aed1248fbdbebca002b4bfb43d24fbc2653587e0`
+- Tested functional tree: `53d01d981e7b6822944a43a10c437c0a5e4efbc2`
+- Earlier functional commit `ab2f86ea5cadd89321794a7ca50609c11ed171d9` (tree `f113106787c39bd16e7d6901a8f49d4cb70e1de2`) is the candidate-verification slice. The SHA above adds the operator control-plane entry and the truthful status projection. The workflow, adapter, managed-executor, clippy, and full bridge suite results in this file apply to that later SHA.
+- The commit that updates this identity section is evidence-only. It does not change executable code. Any later executable change requires the applicable tests again.
 
 ## G8
 
 Draft PR: https://github.com/chriscase/GrokPtah/pull/579
 Remote branch: `grok/verified-change-workflow-v1`
-The functional commit above was pushed and matched `git ls-remote` before this evidence-only note.
+The functional SHA above is the tested executable tree. This evidence commit is documentation only and is the published tip once `git ls-remote` matches it.
 
 ## Limitations
 
-- No live Grok Build provider call.
-- Desktop GUI process starts, then was stopped before an operator clicked Prepare or Start. Panel tests and the service tests cover the projection and the assignment entry. The desktop lib suite passed (50).
+- No live Grok Build provider call. The ignored live managed-executor test was not run.
+- The desktop binary was driven through its MCP control plane, not by clicking the Work board form. The panel tests cover that form's render.
+- At admission time the worker is still `running`, so the live start projection does not yet show `checksPassed`. The workflow test covers the settled candidate.
 - Non-macOS mutation remains refused. This run is macOS.
