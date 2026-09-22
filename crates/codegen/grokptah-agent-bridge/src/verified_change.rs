@@ -1057,6 +1057,79 @@ pub fn read_oracle_pointer(dir: &Path) -> Result<PathBuf, VerifiedChangeError> {
     canonical_dir(Path::new(raw.trim()))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssignmentContext {
+    pub execution_host: String,
+    pub platform: String,
+    pub mutation_mode: String,
+}
+
+fn assignment_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 32
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'-'
+        })
+}
+
+pub fn write_assignment_context(
+    dir: &Path,
+    execution_host: &str,
+    platform: &str,
+    mutation_mode: &str,
+) -> Result<(), VerifiedChangeError> {
+    if !matches!(execution_host, "desktop" | "service")
+        || !matches!(mutation_mode, "isolated_review" | "read_only")
+        || !assignment_token(platform)
+    {
+        return Err(VerifiedChangeError::new(
+            "assignment context is not a supported host, platform, or mode",
+        ));
+    }
+    fs::create_dir_all(dir)
+        .map_err(|_| VerifiedChangeError::new("the candidate directory could not be created"))?;
+    let body = json!({
+        "executionHost": execution_host,
+        "platform": platform,
+        "mutationMode": mutation_mode,
+    });
+    fs::write(
+        dir.join("assignment.json"),
+        serde_json::to_vec(&body)
+            .map_err(|_| VerifiedChangeError::new("the assignment context could not be stored"))?,
+    )
+    .map_err(|_| VerifiedChangeError::new("the assignment context could not be stored"))
+}
+
+pub fn read_assignment_context(dir: &Path) -> Result<AssignmentContext, VerifiedChangeError> {
+    let raw = fs::read_to_string(dir.join("assignment.json"))
+        .map_err(|_| VerifiedChangeError::new("the assignment context was not recorded"))?;
+    let value: Value = serde_json::from_str(&raw)
+        .map_err(|_| VerifiedChangeError::new("the assignment context is unreadable"))?;
+    let execution_host = value
+        .get("executionHost")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let platform = value.get("platform").and_then(Value::as_str).unwrap_or("");
+    let mutation_mode = value
+        .get("mutationMode")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if !matches!(execution_host, "desktop" | "service")
+        || !matches!(mutation_mode, "isolated_review" | "read_only")
+        || !assignment_token(platform)
+    {
+        return Err(VerifiedChangeError::new(
+            "the assignment context is not a supported host, platform, or mode",
+        ));
+    }
+    Ok(AssignmentContext {
+        execution_host: execution_host.to_string(),
+        platform: platform.to_string(),
+        mutation_mode: mutation_mode.to_string(),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn assemble_candidate_verification(
     work_id: &str,

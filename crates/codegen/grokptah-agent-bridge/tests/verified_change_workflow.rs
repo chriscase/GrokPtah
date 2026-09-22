@@ -367,6 +367,15 @@ async fn multi_file_repair_is_red_then_green_and_apply_is_separate() {
         .await
         .unwrap_or_else(|error| panic!("start: {error}"));
     let work_id = started["workId"].as_str().unwrap().to_string();
+    assert_eq!(started["attemptCount"], 1);
+    assert_eq!(started["cliVersion"], "1.0.5");
+    assert_eq!(started["cliContract"], "inspect-json-v1");
+    assert_eq!(started["executionHost"], "service");
+    assert_eq!(started["sourceRevision"], harness.identity.head_sha);
+    assert_eq!(started["readiness"]["ready"], true);
+    assert_eq!(started["readiness"]["workersDispatched"], 0);
+    assert_eq!(started["readiness"]["providerInvocations"], 0);
+    assert_secret_free(&started);
     let settled = settle(&harness.orch, &work_id).await;
     assert_eq!(
         settled["state"].as_str().unwrap_or(""),
@@ -385,6 +394,10 @@ async fn multi_file_repair_is_red_then_green_and_apply_is_separate() {
     assert_eq!(status["phases"]["workerStopped"], true);
     assert_eq!(status["phases"]["changeProposed"], true);
     assert_eq!(status["phases"]["checksPassed"], true);
+    assert_eq!(status["cliVersion"], "1.0.5");
+    assert_eq!(status["executionHost"], "service");
+    assert_eq!(status["sourceRevision"], harness.identity.head_sha);
+    assert_eq!(status["readiness"]["workersDispatched"], 0);
     assert_eq!(status["phases"]["humanApproved"], false);
     assert_eq!(status["phases"]["applied"], false);
     assert_eq!(status["checkResults"][0]["outcome"], "passed");
@@ -704,6 +717,7 @@ async fn cancel_and_restart_do_not_dispatch_or_apply() {
     let fake = harness.fake_dir.path().join("grok");
     let isolate = harness.isolate.path().to_path_buf();
     let identity = harness.identity.clone();
+    let head_sha = identity.head_sha.clone();
     let lease = harness.fake_dir.path().join("lease.json");
     harness.orch.stop_background_tasks().await;
     harness.host.shutdown().await;
@@ -762,6 +776,11 @@ async fn cancel_and_restart_do_not_dispatch_or_apply() {
         .unwrap();
     assert_eq!(status["phases"]["checksPassed"], true);
     assert_eq!(status["phases"]["applied"], false);
+    assert_eq!(status["cliVersion"], "1.0.5");
+    assert_eq!(status["executionHost"], "service");
+    assert_eq!(status["sourceRevision"], head_sha);
+    assert_eq!(status["readiness"]["workersDispatched"], 0);
+    assert_eq!(status["attemptCount"], before_attempts);
     assert_secret_free(&status);
     let _ = agent_id;
     orch.stop_background_tasks().await;

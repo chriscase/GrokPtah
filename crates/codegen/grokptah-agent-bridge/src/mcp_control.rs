@@ -535,6 +535,12 @@ pub async fn start_control_from_env(host: AgentHostHandle) -> Option<ControlServ
             }
         }
     }
+    if let Err(error) = orch.configure_managed_grok_from_operator_env() {
+        eprintln!(
+            "[grokptah] managed Grok executor was not installed: {}",
+            error.message
+        );
+    }
     match start_control_server_with(orch, port, limits).await {
         Ok(mut h) => {
             h.token = token;
@@ -1655,6 +1661,44 @@ struct CancelWorkArgs {
     reason: String,
     #[serde(default)]
     expected_revision: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerifiedChangeToolArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    agent_id: String,
+    objective: String,
+    allowed_files: Vec<String>,
+    check_id: String,
+    check_executable: String,
+    oracle_root: PathBuf,
+    #[serde(default = "default_verified_budget")]
+    budget_profile: String,
+    #[serde(default = "default_verified_mode")]
+    mutation_mode: String,
+    #[serde(default = "default_verified_platform")]
+    platform: String,
+    #[serde(default = "default_verified_host")]
+    execution_host: String,
+}
+
+fn default_verified_budget() -> String {
+    "economy".into()
+}
+
+fn default_verified_mode() -> String {
+    "isolated_review".into()
+}
+
+fn default_verified_platform() -> String {
+    std::env::consts::OS.into()
+}
+
+fn default_verified_host() -> String {
+    "service".into()
 }
 
 #[derive(Debug, Deserialize)]
@@ -3099,6 +3143,26 @@ fn tool_input_schema(name: &str) -> Value {
                 "text": {"type": "string", "minLength": 1}
             }
         }),
+        "ptah_prepare_verified_change" | "ptah_start_verified_change" => json!({
+            "type": "object",
+            "required": ["request_id", "session_id", "workspace", "agent_id", "objective", "allowed_files", "check_id", "check_executable", "oracle_root"],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "agent_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                "objective": {"type": "string", "minLength": 1, "maxLength": 32768},
+                "allowed_files": {"type": "array", "minItems": 1, "maxItems": 64, "items": {"type": "string", "minLength": 1}},
+                "check_id": {"type": "string", "minLength": 1, "maxLength": 64},
+                "check_executable": {"type": "string", "minLength": 1, "maxLength": 1024},
+                "oracle_root": {"type": "string", "minLength": 1, "maxLength": 1024},
+                "budget_profile": {"type": "string"},
+                "mutation_mode": {"type": "string"},
+                "platform": {"type": "string"},
+                "execution_host": {"type": "string"}
+            }
+        }),
         "ptah_cancel" => json!({
             "type": "object",
             "required": ["request_id", "session_id", "workspace", "run_id"],
@@ -4110,6 +4174,54 @@ async fn dispatch_tool(
                 args.text,
             )
             .await
+        }
+        "ptah_prepare_verified_change" | "ptah_start_verified_change" => {
+            let tool_args: VerifiedChangeToolArgs = parse_value(args)?;
+            require_nonempty(&tool_args.request_id, "request_id")?;
+            require_nonempty(&tool_args.agent_id, "agent_id")?;
+            require_nonempty(&tool_args.objective, "objective")?;
+            require_nonempty(&tool_args.check_id, "check_id")?;
+            require_nonempty(&tool_args.check_executable, "check_executable")?;
+            let budget = match tool_args.budget_profile.as_str() {
+                "economy" => crate::orchestration::ManagedExecutionBudgetProfile::Economy,
+                "balanced" => crate::orchestration::ManagedExecutionBudgetProfile::Balanced,
+                "high_assurance" => {
+                    crate::orchestration::ManagedExecutionBudgetProfile::HighAssurance
+                }
+                _ => {
+                    return Err(OrchError::new(
+                        OrchErrorCode::InvalidRequest,
+                        "budget_profile must be economy, balanced, or high_assurance",
+                    ))
+                }
+            };
+            let request = crate::orchestration::VerifiedChangeRequest {
+                request_id: tool_args.request_id,
+                session_id: tool_args.session_id,
+                workspace: tool_args.workspace,
+                agent_id: tool_args.agent_id,
+                objective: tool_args.objective,
+                allowed_files: tool_args.allowed_files,
+                required_checks: vec![crate::RequiredCheckSpec {
+                    check_id: tool_args.check_id,
+                    executable: tool_args.check_executable,
+                    args: Vec::new(),
+                    cwd: crate::RequiredCheckCwd::Oracle,
+                    env: Vec::new(),
+                    timeout_ms: 5_000,
+                    max_output_bytes: 4_096,
+                }],
+                oracle_root: tool_args.oracle_root,
+                budget_profile: budget,
+                mutation_mode: tool_args.mutation_mode,
+                platform: tool_args.platform,
+                execution_host: tool_args.execution_host,
+            };
+            if name == "ptah_start_verified_change" {
+                orch.start_verified_change(auth, &request).await
+            } else {
+                orch.prepare_verified_change(auth, &request)
+            }
         }
         "ptah_cancel" => {
             let args: CancelArgs = parse_value(args)?;

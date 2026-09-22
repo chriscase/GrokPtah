@@ -116,6 +116,22 @@ pub struct VerifiedChangeRequest {
     pub execution_host: String,
 }
 
+fn operator_env(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn require_operator_env(key: &str) -> Result<String, OrchError> {
+    operator_env(key).ok_or_else(|| {
+        OrchError::new(
+            OrchErrorCode::InvalidRequest,
+            format!("{key} is required to install the managed Grok executor"),
+        )
+    })
+}
+
 fn safe_verified_action(work: &WorkItem) -> &'static str {
     let verification = work
         .result
@@ -2341,11 +2357,62 @@ impl OrchestrationService {
         Ok(())
     }
 
+    pub fn configure_managed_grok_from_operator_env(&self) -> Result<bool, OrchError> {
+        let Some(executable) = operator_env("GROKPTAH_MANAGED_GROK_EXECUTABLE") else {
+            return Ok(false);
+        };
+        let workspace = require_operator_env("GROKPTAH_MANAGED_GROK_WORKSPACE")?;
+        let isolate = require_operator_env("GROKPTAH_MANAGED_GROK_ISOLATE")?;
+        let repository_id = require_operator_env("GROKPTAH_MANAGED_GROK_REPOSITORY_ID")?;
+        let git_ref = require_operator_env("GROKPTAH_MANAGED_GROK_REF")?;
+        let sha = require_operator_env("GROKPTAH_MANAGED_GROK_SHA")?;
+        let lease_id = require_operator_env("GROKPTAH_MANAGED_GROK_LEASE_ID")?;
+        let lease_file = require_operator_env("GROKPTAH_MANAGED_GROK_LEASE_FILE")?;
+        let git_executable =
+            operator_env("GROKPTAH_MANAGED_GROK_GIT").unwrap_or_else(|| "/usr/bin/git".to_string());
+        let identity = GrokBuildGitIdentity {
+            repository_id,
+            git_ref,
+            base_sha: sha.clone(),
+            head_sha: sha,
+        };
+        self.configure_managed_grok_executor(
+            ManagedGrokExecutorConfig {
+                executable: PathBuf::from(executable),
+                git_executable: PathBuf::from(git_executable),
+                cwd: PathBuf::from(workspace),
+                isolate_parent: PathBuf::from(isolate),
+                repository_id: identity.repository_id.clone(),
+                base_ref: identity.git_ref.clone(),
+                identity,
+                credential_lease_id: lease_id.clone(),
+            },
+            Arc::new(crate::FileCredentialLease::new(
+                lease_id,
+                PathBuf::from(lease_file),
+            )),
+        )?;
+        Ok(true)
+    }
+
+    fn resolve_verified_agent(&self, request: &mut VerifiedChangeRequest) -> Result<(), OrchError> {
+        let agent = self
+            .host
+            .ensure_session_agent(request.session_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        if request.agent_id.is_empty() || request.agent_id == "session-agent" {
+            request.agent_id = agent.agent_id;
+        }
+        Ok(())
+    }
+
     pub fn prepare_verified_change(
         &self,
         auth: &AuthContext,
         request: &VerifiedChangeRequest,
     ) -> Result<serde_json::Value, OrchError> {
+        let mut request = request.clone();
+        self.resolve_verified_agent(&mut request)?;
         let _claimed = self.authorize_work_read_scope(request.session_id, &request.workspace)?;
         let agent = self.store.require_agent_in_scope(
             &request.agent_id,
@@ -2389,7 +2456,7 @@ impl OrchestrationService {
             crate::verified_change::source_revision(Path::new("/usr/bin/git"), &request.workspace)
                 .unwrap_or_else(|_| "unavailable".into());
         Ok(verified_change_projection(
-            request,
+            &request,
             &spec.model.selection_key,
             runtime
                 .as_ref()
@@ -2408,7 +2475,9 @@ impl OrchestrationService {
         auth: &AuthContext,
         request: &VerifiedChangeRequest,
     ) -> Result<serde_json::Value, OrchError> {
-        let prepared = self.prepare_verified_change(auth, request)?;
+        let mut request = request.clone();
+        self.resolve_verified_agent(&mut request)?;
+        let prepared = self.prepare_verified_change(auth, &request)?;
         if prepared["readiness"]["ready"] != true {
             return Err(OrchError::new(
                 OrchErrorCode::Conflict,
@@ -2508,6 +2577,13 @@ impl OrchestrationService {
         let private_dir = self.store.verified_change_private_dir(&work_id)?;
         crate::verified_change::write_oracle_pointer(&private_dir, &request.oracle_root)
             .map_err(|error| OrchError::new(OrchErrorCode::InvalidRequest, error.message))?;
+        crate::verified_change::write_assignment_context(
+            &private_dir,
+            &request.execution_host,
+            &request.platform,
+            &request.mutation_mode,
+        )
+        .map_err(|error| OrchError::new(OrchErrorCode::InvalidRequest, error.message))?;
         let _authorized = self
             .authorize_work_execution(
                 auth,
@@ -2544,29 +2620,99 @@ impl OrchestrationService {
             ));
         }
         let agent_id = work.assigned_agent_id.clone().unwrap_or_default();
-        let model = self
+        let (model, budget_profile) = self
             .store
             .require_agent_in_scope(&agent_id, session_id, &work.workspace)
             .ok()
             .and_then(|agent| {
-                agent
-                    .current_spec()
-                    .ok()
-                    .map(|spec| spec.model.selection_key.clone())
+                agent.current_spec().ok().map(|spec| {
+                    (
+                        spec.model.selection_key.clone(),
+                        spec.managed_execution.budget_profile,
+                    )
+                })
             })
-            .unwrap_or_default();
-        let repository = self
-            .managed_grok_runtime
-            .lock()
+            .unwrap_or((String::new(), None));
+        let budget_profile = budget_profile.unwrap_or(ManagedExecutionBudgetProfile::Economy);
+        let runtime = self.managed_grok_runtime.lock().clone();
+        let repository = runtime
             .as_ref()
             .map(|runtime| runtime.config.repository_id.clone())
             .unwrap_or_else(|| "unconfigured".into());
-        let revision = work
+        let private_dir = self.store.verified_change_private_dir(work_id)?;
+        let context = crate::verified_change::read_assignment_context(&private_dir);
+        let oracle = crate::verified_change::read_oracle_pointer(&private_dir);
+        let (execution_host, platform, mutation_mode) = match &context {
+            Ok(context) => (
+                context.execution_host.clone(),
+                context.platform.clone(),
+                context.mutation_mode.clone(),
+            ),
+            Err(_) => (
+                "unrecorded".into(),
+                std::env::consts::OS.into(),
+                "isolated_review".into(),
+            ),
+        };
+        let executable = runtime
+            .as_ref()
+            .map(|runtime| runtime.config.executable.clone())
+            .unwrap_or_else(|| PathBuf::from("/missing/grok"));
+        let mut readiness = match &oracle {
+            Ok(oracle) => crate::verified_change::inspect_assignment_readiness(
+                &crate::verified_change::ReadinessInput {
+                    executable: &executable,
+                    mutation_mode: &mutation_mode,
+                    platform: &platform,
+                    checks: &work.policy.required_checks,
+                    oracle_root: oracle,
+                    workspace,
+                },
+            ),
+            Err(error) => crate::verified_change::VerifiedChangeReadiness {
+                ready: false,
+                reasons: vec![error.message.clone()],
+                cli_version: None,
+                cli_contract: None,
+                platform: platform.clone(),
+                mutation_mode: mutation_mode.clone(),
+                toolchain: Vec::new(),
+                workers_dispatched: 0,
+                provider_invocations: 0,
+            },
+        };
+        if let Err(error) = &context {
+            readiness.ready = false;
+            readiness.reasons.push(error.message.clone());
+        }
+        if runtime.is_none() {
+            readiness.ready = false;
+            readiness
+                .reasons
+                .push("Managed Grok executor authority is not installed on this host.".into());
+        }
+        if readiness.ready && readiness.cli_version.as_deref().unwrap_or("").is_empty() {
+            readiness.ready = false;
+            readiness
+                .reasons
+                .push("The installed CLI did not report a version.".into());
+        }
+        readiness.reasons.sort();
+        readiness.reasons.dedup();
+        let recorded_revision = work
             .result
             .as_ref()
             .and_then(|result| result.candidate_verification.as_ref())
             .map(|verification| verification.source_revision.clone())
-            .unwrap_or_else(|| "pending".into());
+            .filter(|revision| revision.len() == 40);
+        let git = runtime
+            .as_ref()
+            .map(|runtime| runtime.config.git_executable.clone())
+            .unwrap_or_else(|| PathBuf::from("/usr/bin/git"));
+        let revision = recorded_revision.unwrap_or_else(|| {
+            crate::verified_change::source_revision(&git, workspace)
+                .unwrap_or_else(|_| "unavailable".into())
+        });
         let attempts = self
             .store
             .list_work_attempts(Some(work_id))
@@ -2582,21 +2728,10 @@ impl OrchestrationService {
             allowed_files: work.policy.allowed_files.clone(),
             required_checks: work.policy.required_checks.clone(),
             oracle_root: PathBuf::new(),
-            budget_profile: ManagedExecutionBudgetProfile::Economy,
-            mutation_mode: "isolated_review".into(),
-            platform: std::env::consts::OS.into(),
-            execution_host: "service".into(),
-        };
-        let readiness = crate::verified_change::VerifiedChangeReadiness {
-            ready: work.state != WorkState::Failed,
-            reasons: Vec::new(),
-            cli_version: None,
-            cli_contract: None,
-            platform: request.platform.clone(),
-            mutation_mode: request.mutation_mode.clone(),
-            toolchain: Vec::new(),
-            workers_dispatched: 0,
-            provider_invocations: 0,
+            budget_profile,
+            mutation_mode,
+            platform,
+            execution_host,
         };
         Ok(verified_change_projection(
             &request,

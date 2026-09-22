@@ -180,9 +180,9 @@ pub use discover::{
 pub use event_bus::{EventBus, EventReceiver, JournalEntry, JournalPage};
 pub use events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 pub use grok_build::{
-    launch_grok_build, CredentialLeaseHandle, CredentialLeaseResolver, GrokBuildAdapterError,
-    GrokBuildAdapterOutcome, GrokBuildAdvisoryEvidence, GrokBuildHostLaunchConfig,
-    GrokBuildMutationEvidence,
+    launch_grok_build, CredentialLeaseHandle, CredentialLeaseResolver, FileCredentialLease,
+    GrokBuildAdapterError, GrokBuildAdapterOutcome, GrokBuildAdvisoryEvidence,
+    GrokBuildHostLaunchConfig, GrokBuildMutationEvidence,
 };
 pub use host::{AgentHost, AgentHostHandle, AgentStatus, HostConfig, WorkspaceUiState};
 pub use host_runtime::{

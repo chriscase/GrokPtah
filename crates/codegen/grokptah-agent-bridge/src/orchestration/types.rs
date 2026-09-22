@@ -1844,6 +1844,8 @@ pub const CONTROL_TOOLS: &[&str] = &[
     "ptah_set_managed_execution",
     "ptah_get_managed_execution",
     "ptah_authorize_work_execution",
+    "ptah_prepare_verified_change",
+    "ptah_start_verified_change",
     "ptah_resolve_work_input",
     "ptah_list_execution_intents",
     "ptah_retry_run",

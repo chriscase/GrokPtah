@@ -15,7 +15,7 @@
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fmt;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -234,6 +234,54 @@ pub trait CredentialLeaseResolver: Send + Sync {
     fn resolve(&self, lease_id: &str) -> Result<CredentialLeaseHandle, GrokBuildAdapterError>;
 
     fn revoke(&self, lease_id: &str) -> Result<(), GrokBuildAdapterError>;
+}
+
+/// Host-owned lease file. The path is never included in `Debug`.
+pub struct FileCredentialLease {
+    lease_id: String,
+    path: PathBuf,
+}
+
+impl FileCredentialLease {
+    pub fn new(lease_id: impl Into<String>, path: PathBuf) -> Self {
+        Self {
+            lease_id: lease_id.into(),
+            path,
+        }
+    }
+}
+
+impl fmt::Debug for FileCredentialLease {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FileCredentialLease")
+            .field("lease_id_present", &!self.lease_id.is_empty())
+            .finish()
+    }
+}
+
+impl CredentialLeaseResolver for FileCredentialLease {
+    fn resolve(&self, lease_id: &str) -> Result<CredentialLeaseHandle, GrokBuildAdapterError> {
+        if lease_id != self.lease_id {
+            return Err(GrokBuildAdapterError::CredentialLease);
+        }
+        Ok(CredentialLeaseHandle::from_host_path(self.path.clone()))
+    }
+
+    fn revoke(&self, lease_id: &str) -> Result<(), GrokBuildAdapterError> {
+        if lease_id != self.lease_id {
+            return Err(GrokBuildAdapterError::CredentialRevocation);
+        }
+        if self.path.exists() {
+            fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&self.path)
+                .and_then(|file| file.sync_all())
+                .map_err(|_| GrokBuildAdapterError::CredentialRevocation)?;
+            fs::remove_file(&self.path).map_err(|_| GrokBuildAdapterError::CredentialRevocation)?;
+        }
+        Ok(())
+    }
 }
 
 /// Bounded host-only evidence captured before the disposable Grok home is
