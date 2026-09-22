@@ -648,6 +648,15 @@ impl OrchStore {
         &self.inner.root
     }
 
+    pub fn verified_change_private_dir(&self, work_id: &str) -> Result<PathBuf, OrchError> {
+        let safe = safe_id_filename(work_id)?;
+        Ok(self.inner.root.join("verified-changes").join(safe))
+    }
+
+    pub fn candidate_snapshot_dir(&self, work_id: &str) -> Result<PathBuf, OrchError> {
+        Ok(self.verified_change_private_dir(work_id)?.join("tree"))
+    }
+
     fn run_path(&self, run_id: &str) -> Result<PathBuf, OrchError> {
         let safe = safe_id_filename(run_id)?;
         Ok(self.inner.root.join("runs").join(format!("{safe}.json")))
@@ -2951,6 +2960,7 @@ impl OrchStore {
             cancellation_reason: None,
             completed_at: now,
             verification: None,
+            candidate_verification: None,
         }
     }
 
@@ -3004,6 +3014,23 @@ impl OrchStore {
         result: Option<&WorkResult>,
         extra_run_id: Option<&str>,
     ) -> Result<bool, OrchError> {
+        if !item.policy.required_checks.is_empty() {
+            let approved_digest = item
+                .approval
+                .as_ref()
+                .and_then(|approval| approval.candidate_digest.as_deref());
+            let target_revision = item
+                .approval
+                .as_ref()
+                .and_then(|approval| approval.target_revision.as_deref());
+            return Ok(item
+                .result
+                .as_ref()
+                .and_then(|result| result.candidate_verification.as_ref())
+                .is_some_and(|verification| {
+                    verification.authorizes_applied_success(approved_digest, target_revision)
+                }));
+        }
         if item.approval.is_some() {
             return Ok(true);
         }
@@ -3122,6 +3149,7 @@ impl OrchStore {
             && stored.failure == incoming.failure
             && stored.cancellation_reason == incoming.cancellation_reason
             && stored.verification == incoming.verification
+            && stored.candidate_verification == incoming.candidate_verification
     }
 
     /// The only production writer of `WorkState::Succeeded`.
@@ -5599,6 +5627,8 @@ impl OrchStore {
             reviewer_id: reviewer_id.to_string(),
             note,
             approved_at: Utc::now(),
+            candidate_digest: None,
+            target_revision: None,
         };
         approval.validate()?;
         let _guard = self.inner.lock.lock();
@@ -5664,6 +5694,71 @@ impl OrchStore {
             })?;
         attempt.terminal_reason = Some(format!("approved by {}", reviewer_id));
         attempt.updated_at = approval.approved_at;
+        if !item.policy.required_checks.is_empty() {
+            if item.approval.as_ref().is_some_and(|existing| {
+                existing.reviewer_id == reviewer_id && existing.candidate_digest.is_some()
+            }) {
+                let approved_attempt = attempt.clone();
+                return Ok((item, approved_attempt));
+            }
+            let verification = item
+                .result
+                .as_ref()
+                .and_then(|result| result.candidate_verification.clone())
+                .ok_or_else(|| {
+                    OrchError::new(
+                        OrchErrorCode::Conflict,
+                        "required checks have no candidate verification to approve",
+                    )
+                })?;
+            if !verification.checks_passed || verification.invalidated || verification.applied {
+                return Err(OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "candidate verification is not eligible for approval",
+                ));
+            }
+            let revision = crate::verified_change::source_revision(
+                Path::new("/usr/bin/git"),
+                Path::new(&item.workspace),
+            )
+            .map_err(|error| OrchError::new(OrchErrorCode::Conflict, error.message))?;
+            if revision != verification.source_revision {
+                return Err(OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "target revision changed after verification",
+                ));
+            }
+            let retained = self.candidate_snapshot_dir(&item.work_id)?;
+            let identity = crate::verified_change::candidate_content_identity(
+                &retained,
+                &verification.source_revision,
+            )
+            .map_err(|error| OrchError::new(OrchErrorCode::Conflict, error.message))?;
+            if identity.content_digest != verification.content_digest {
+                return Err(OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "candidate content changed after verification",
+                ));
+            }
+            let mut bound = approval;
+            bound.candidate_digest = Some(verification.content_digest);
+            bound.target_revision = Some(revision);
+            attempt.terminal_reason = Some(format!(
+                "approved candidate {} by {reviewer_id}",
+                bound.candidate_digest.as_deref().unwrap_or_default()
+            ));
+            item.approval = Some(bound);
+            let approved_attempt = attempt.clone();
+            item.bump();
+            self.commit_work_lifecycle_snapshots_unlocked(
+                "approve-candidate",
+                prior_item,
+                item.clone(),
+                prior_attempts,
+                attempts.clone(),
+            )?;
+            return Ok((item, approved_attempt));
+        }
         item.approval = Some(approval);
         self.assign_work_succeeded_unlocked(&mut item, Some(attempt), None)?;
         let approved_attempt = attempt.clone();
@@ -5676,6 +5771,229 @@ impl OrchStore {
             attempts.clone(),
         )?;
         Ok((item, approved_attempt))
+    }
+
+    pub fn apply_verified_candidate(
+        &self,
+        work_id: &str,
+        expected_digest: &str,
+        expected_revision: Option<u64>,
+    ) -> Result<WorkItem, OrchError> {
+        let _guard = self.inner.lock.lock();
+        let mut item = self
+            .load_work_item_unlocked(work_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
+        let prior_item = item.clone();
+        Self::require_work_revision(&item, expected_revision)?;
+        if item.state == WorkState::Succeeded
+            && item
+                .result
+                .as_ref()
+                .and_then(|result| result.candidate_verification.as_ref())
+                .is_some_and(|verification| {
+                    verification.applied && verification.content_digest == expected_digest
+                })
+        {
+            return Ok(item);
+        }
+        let approval = item.approval.clone().ok_or_else(|| {
+            OrchError::new(
+                OrchErrorCode::Conflict,
+                "application requires a separate approval of this candidate",
+            )
+        })?;
+        if approval.candidate_digest.as_deref() != Some(expected_digest) {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "approval does not match the requested candidate",
+            ));
+        }
+        let mut verification = item
+            .result
+            .as_ref()
+            .and_then(|result| result.candidate_verification.clone())
+            .ok_or_else(|| {
+                OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "application requires candidate verification",
+                )
+            })?;
+        if verification.content_digest != expected_digest
+            || !verification.checks_passed
+            || verification.invalidated
+            || approval.target_revision.as_deref() != Some(verification.source_revision.as_str())
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "stale approval cannot apply this candidate",
+            ));
+        }
+        let retained = self.candidate_snapshot_dir(work_id)?;
+        let identity = crate::verified_change::CandidateContentIdentity {
+            source_revision: verification.source_revision.clone(),
+            content_digest: verification.content_digest.clone(),
+            files: verification.files.clone(),
+        };
+        crate::verified_change::apply_candidate_tree(
+            Path::new("/usr/bin/git"),
+            Path::new(&item.workspace),
+            &retained,
+            &identity,
+            &item.policy.allowed_files,
+        )
+        .map_err(|error| OrchError::new(OrchErrorCode::Conflict, error.message))?;
+        verification.applied = true;
+        if let Some(result) = item.result.as_mut() {
+            result.candidate_verification = Some(verification);
+        }
+        let mut attempts = self
+            .list_work_attempts_unlocked(Some(work_id))
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let prior_attempts = attempts.clone();
+        let attempt = attempts.iter_mut().rev().find(|attempt| {
+            attempt.state == AttemptState::AwaitingApproval
+                || attempt.state == AttemptState::Succeeded
+        });
+        self.assign_work_succeeded_unlocked(&mut item, attempt, None)?;
+        let attempts_now = attempts.clone();
+        item.bump();
+        self.commit_work_lifecycle_snapshots_unlocked(
+            "apply-candidate",
+            prior_item,
+            item.clone(),
+            prior_attempts,
+            attempts_now,
+        )?;
+        Ok(item)
+    }
+
+    pub fn discard_verified_candidate(
+        &self,
+        work_id: &str,
+        expected_digest: &str,
+        expected_revision: Option<u64>,
+    ) -> Result<WorkItem, OrchError> {
+        let _guard = self.inner.lock.lock();
+        let mut item = self
+            .load_work_item_unlocked(work_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
+        if item.state == WorkState::Cancelled {
+            return Ok(item);
+        }
+        let prior_item = item.clone();
+        Self::require_work_revision(&item, expected_revision)?;
+        let digest = item
+            .result
+            .as_ref()
+            .and_then(|result| result.candidate_verification.as_ref())
+            .map(|verification| verification.content_digest.clone());
+        if digest.as_deref() != Some(expected_digest) {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "discard does not match the requested candidate",
+            ));
+        }
+        if item
+            .result
+            .as_ref()
+            .and_then(|result| result.candidate_verification.as_ref())
+            .is_some_and(|verification| verification.applied)
+            || item.state == WorkState::Succeeded
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "an applied candidate cannot be discarded through this action",
+            ));
+        }
+        if let Ok(dir) = self.verified_change_private_dir(work_id) {
+            let _ = fs::remove_dir_all(dir);
+        }
+        let mut attempts = self
+            .list_work_attempts_unlocked(Some(work_id))
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let prior_attempts = attempts.clone();
+        if let Some(attempt) = attempts
+            .iter_mut()
+            .rev()
+            .find(|attempt| attempt.state.is_active())
+        {
+            attempt.state = AttemptState::Cancelled;
+            attempt.terminal_reason = Some("candidate discarded before application".into());
+            attempt.updated_at = Utc::now();
+        }
+        item.state = WorkState::Cancelled;
+        if let Some(result) = item.result.as_mut() {
+            result.cancellation_reason = Some("candidate discarded before application".into());
+            if let Some(verification) = result.candidate_verification.as_mut() {
+                verification.applied = false;
+                verification.checks_passed = false;
+            }
+        }
+        item.bump();
+        self.commit_work_lifecycle_snapshots_unlocked(
+            "discard-candidate",
+            prior_item,
+            item.clone(),
+            prior_attempts,
+            attempts,
+        )?;
+        Ok(item)
+    }
+
+    pub fn revalidate_verified_candidate(&self, work_id: &str) -> Result<WorkItem, OrchError> {
+        let _guard = self.inner.lock.lock();
+        let mut item = self
+            .load_work_item_unlocked(work_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
+        let Some(verification) = item
+            .result
+            .as_ref()
+            .and_then(|result| result.candidate_verification.clone())
+        else {
+            return Ok(item);
+        };
+        if verification.applied || item.state == WorkState::Succeeded {
+            return Ok(item);
+        }
+        let retained = self.candidate_snapshot_dir(work_id)?;
+        let identity = crate::verified_change::candidate_content_identity(
+            &retained,
+            &verification.source_revision,
+        );
+        let changed = match identity {
+            Ok(identity) => identity.content_digest != verification.content_digest,
+            Err(_) => true,
+        };
+        if !changed {
+            return Ok(item);
+        }
+        let prior_item = item.clone();
+        let prior_attempts = self
+            .list_work_attempts_unlocked(Some(work_id))
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        if let Some(result) = item.result.as_mut() {
+            if let Some(current) = result.candidate_verification.as_mut() {
+                current.invalidated = true;
+                current.checks_passed = false;
+                current.applied = false;
+            }
+        }
+        item.approval = None;
+        if item.state == WorkState::AwaitingApproval {
+            item.state = WorkState::Review;
+        }
+        item.bump();
+        self.commit_work_lifecycle_snapshots_unlocked(
+            "invalidate-candidate",
+            prior_item,
+            item.clone(),
+            prior_attempts.clone(),
+            prior_attempts,
+        )?;
+        Ok(item)
     }
 
     fn require_managed_grok_claim_fence_unlocked(
@@ -6284,6 +6602,7 @@ impl OrchStore {
             cancellation_reason: Some(reason.to_string()),
             completed_at: now,
             verification: None,
+            candidate_verification: None,
         });
         item.bump();
         self.commit_work_lifecycle_snapshots_unlocked(
@@ -10225,6 +10544,7 @@ mod tests {
                 cancellation_reason: None,
                 completed_at: now,
                 verification: None,
+                candidate_verification: None,
             });
             failed.bump_at(now + chrono::Duration::seconds(2));
             let record = ManagedFinalizationRecord {

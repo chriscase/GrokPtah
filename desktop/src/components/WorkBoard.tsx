@@ -7,6 +7,8 @@ import type {
 import type { LaneScope } from "./LaneScopeLine";
 import { LaneScopeLine } from "./LaneScopeLine";
 import { StateCard } from "./StateCard";
+import { VerifiedChangePanel } from "./VerifiedChangePanel";
+import type { VerifiedChangeView } from "../lib/verifiedChange";
 
 type WorkFilter = "all" | "active" | "attention" | "completed";
 
@@ -28,6 +30,18 @@ export type WorkBoardProps = {
   onCancel?: (workId: string, reason: string, expectedRevision: number) => Promise<void>;
   onOpenLane?: (sessionId: string) => void;
   onOpenRun?: (runId: string) => void;
+  verifiedChange?: VerifiedChangeView | null;
+  onVerifiedChange?: (
+    action: "prepare" | "start",
+    input: {
+      agentId: string;
+      objective: string;
+      allowedFiles: string[];
+      checkId: string;
+      checkExecutable: string;
+      oracleRoot: string;
+    },
+  ) => Promise<VerifiedChangeView>;
 };
 
 function stateLabel(value: string): string {
@@ -92,6 +106,8 @@ export function WorkBoard({
   onCancel,
   onOpenLane,
   onOpenRun,
+  verifiedChange = null,
+  onVerifiedChange,
 }: WorkBoardProps) {
   const [filter, setFilter] = useState<WorkFilter>("all");
   const [createOpen, setCreateOpen] = useState(false);
@@ -101,6 +117,13 @@ export function WorkBoard({
   const [createRequiresApproval, setCreateRequiresApproval] = useState(false);
   const [agentId, setAgentId] = useState("");
   const [approvalNote, setApprovalNote] = useState("");
+  const [verifiedObjective, setVerifiedObjective] = useState("");
+  const [verifiedFiles, setVerifiedFiles] = useState("src/ledger.rs, src/report.rs");
+  const [verifiedCheckId, setVerifiedCheckId] = useState("balance-regression");
+  const [verifiedExecutable, setVerifiedExecutable] = useState("");
+  const [verifiedOracle, setVerifiedOracle] = useState("");
+  const [verifiedView, setVerifiedView] = useState<VerifiedChangeView | null>(verifiedChange);
+  const [verifiedError, setVerifiedError] = useState<string | null>(null);
   const [actionBusy, setActionBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const visibleItems = useMemo(
@@ -122,6 +145,35 @@ export function WorkBoard({
     setAgentId(selected?.assignedAgentId ?? "");
     setApprovalNote("");
   }, [selected?.assignedAgentId, selected?.workId]);
+
+  useEffect(() => {
+    setVerifiedView(verifiedChange);
+  }, [verifiedChange]);
+
+  async function submitVerified(action: "prepare" | "start") {
+    if (!onVerifiedChange) return;
+    const allowedFiles = verifiedFiles
+      .split(",")
+      .map((path) => path.trim())
+      .filter(Boolean);
+    setActionBusy(true);
+    setVerifiedError(null);
+    try {
+      const view = await onVerifiedChange(action, {
+        agentId: agentId.trim(),
+        objective: verifiedObjective.trim(),
+        allowedFiles,
+        checkId: verifiedCheckId.trim(),
+        checkExecutable: verifiedExecutable.trim(),
+        oracleRoot: verifiedOracle.trim(),
+      });
+      setVerifiedView(view);
+    } catch (error) {
+      setVerifiedError(String(error));
+    } finally {
+      setActionBusy(false);
+    }
+  }
 
   async function perform(action: () => Promise<void>) {
     setActionBusy(true);
@@ -177,6 +229,48 @@ export function WorkBoard({
           <LaneScopeLine scope={scope} compact />
         </div>
       </div>
+
+      {onVerifiedChange && (
+        <form
+          className="verified-change-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void submitVerified("prepare");
+          }}
+        >
+          <label>
+            Objective
+            <input value={verifiedObjective} onChange={(event) => setVerifiedObjective(event.target.value)} />
+          </label>
+          <label>
+            Allowed files
+            <input value={verifiedFiles} onChange={(event) => setVerifiedFiles(event.target.value)} />
+          </label>
+          <label>
+            Check id
+            <input value={verifiedCheckId} onChange={(event) => setVerifiedCheckId(event.target.value)} />
+          </label>
+          <label>
+            Check executable
+            <input value={verifiedExecutable} onChange={(event) => setVerifiedExecutable(event.target.value)} />
+          </label>
+          <label>
+            Oracle directory
+            <input value={verifiedOracle} onChange={(event) => setVerifiedOracle(event.target.value)} />
+          </label>
+          <button type="submit" disabled={actionBusy || !agentId.trim() || !verifiedObjective.trim()}>
+            Prepare
+          </button>
+          <button
+            type="button"
+            disabled={actionBusy || verifiedView?.readiness?.ready !== true}
+            onClick={() => void submitVerified("start")}
+          >
+            Start one attempt
+          </button>
+          <VerifiedChangePanel view={verifiedView} error={verifiedError} />
+        </form>
+      )}
 
       <div className="work-board-summary" aria-label="Work summary">
         <span>{items.length} total</span>

@@ -4489,6 +4489,25 @@ export default function App() {
               setRightTab("tasks");
               void loadRight("tasks");
             }}
+            onVerifiedChange={async (action, input) => {
+              const lane =
+                executionTarget === "remote" && selectedRemoteLane ? selectedRemoteLane : activeLane;
+              const sessionId = lane?.session_id ?? activeSessionId;
+              if (!sessionId) throw new Error("Select a Build Lane first");
+              if (executionTarget === "remote") {
+                throw new Error("Verified change assignment starts on the local host");
+              }
+              const call = action === "start" ? api.verifiedChangeStart : api.verifiedChangePrepare;
+              return call(
+                sessionId,
+                input.agentId,
+                input.objective,
+                input.allowedFiles,
+                input.checkId,
+                input.checkExecutable,
+                input.oracleRoot,
+              );
+            }}
           />
         )}
         {rightTab === "work" && (

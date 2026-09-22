@@ -142,6 +142,7 @@ fn complete_with_verified_evidence(
                 cancellation_reason: None,
                 completed_at,
                 verification: Some(evidence),
+                candidate_verification: None,
             },
         )
         .unwrap();

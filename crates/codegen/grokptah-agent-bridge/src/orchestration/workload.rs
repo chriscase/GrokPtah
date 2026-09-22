@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use super::types::{hash_payload, OrchError, OrchErrorCode, RunBounds};
 use crate::completion::CompletionEvidence;
+use crate::verified_change::{validate_required_checks, CandidateVerification, RequiredCheckSpec};
 
 pub const WORKLOAD_SCHEMA_VERSION: u32 = 1;
 pub const MAX_WORK_KIND_BYTES: usize = 96;
@@ -268,6 +269,10 @@ pub struct WorkPolicy {
     /// is denied rather than parsed.
     #[serde(default)]
     pub allowed_files: Vec<String>,
+    /// Host-owned argv checks. Empty preserves legacy completion authority.
+    /// A non-empty list binds success to exact candidate verification.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_checks: Vec<RequiredCheckSpec>,
 }
 
 impl Default for WorkPolicy {
@@ -279,6 +284,7 @@ impl Default for WorkPolicy {
             max_concurrent_attempts: 1,
             managed_execution: super::managed::ManagedWorkMode::Inherit,
             allowed_files: Vec::new(),
+            required_checks: Vec::new(),
         }
     }
 }
@@ -298,6 +304,7 @@ impl WorkPolicy {
                 "allowed_files must be stored as normalized relative workspace paths",
             ));
         }
+        validate_required_checks(&self.required_checks).map_err(|error| invalid(error.message))?;
         Ok(())
     }
 
@@ -461,6 +468,10 @@ pub struct WorkResult {
     /// Absent on historical records; never carries lease secrets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification: Option<CompletionEvidence>,
+    /// Host-controlled candidate identity and required-check results.
+    /// Absent on historical records. Never carries credentials or absolute paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_verification: Option<CandidateVerification>,
 }
 
 /// Durable attribution for the human decision that releases an approval-gated
@@ -472,6 +483,13 @@ pub struct WorkApproval {
     pub reviewer_id: String,
     pub note: Option<String>,
     pub approved_at: DateTime<Utc>,
+    /// Exact candidate content digest this approval releases. Required when
+    /// the work declares required checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_digest: Option<String>,
+    /// Source revision observed when the approval was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_revision: Option<String>,
 }
 
 impl WorkApproval {
@@ -538,6 +556,21 @@ impl WorkResult {
                 if let Some(id) = value {
                     validate_id(id, field)?;
                 }
+            }
+        }
+        if let Some(candidate) = &self.candidate_verification {
+            if candidate.bounded_diff.len() > 16 * 1024
+                || candidate.files.len() > 256
+                || candidate.checks.len() > 8
+                || candidate
+                    .changed_paths
+                    .iter()
+                    .chain(candidate.files.iter().map(|file| &file.path))
+                    .any(|path| path.starts_with('/') || path.contains("..") || path.contains('\0'))
+            {
+                return Err(invalid(
+                    "candidate verification is outside the host evidence bound",
+                ));
             }
         }
         Ok(())

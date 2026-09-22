@@ -232,6 +232,106 @@ pub async fn work_get(
 }
 
 #[tauri::command]
+pub async fn verified_change_prepare(
+    state: State<'_, AppState>,
+    session_id: String,
+    agent_id: String,
+    objective: String,
+    allowed_files: Vec<String>,
+    check_id: String,
+    check_executable: String,
+    oracle_root: String,
+) -> Result<serde_json::Value, String> {
+    verified_change_call(
+        &state,
+        session_id,
+        agent_id,
+        objective,
+        allowed_files,
+        check_id,
+        check_executable,
+        oracle_root,
+        false,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn verified_change_start(
+    state: State<'_, AppState>,
+    session_id: String,
+    agent_id: String,
+    objective: String,
+    allowed_files: Vec<String>,
+    check_id: String,
+    check_executable: String,
+    oracle_root: String,
+) -> Result<serde_json::Value, String> {
+    verified_change_call(
+        &state,
+        session_id,
+        agent_id,
+        objective,
+        allowed_files,
+        check_id,
+        check_executable,
+        oracle_root,
+        true,
+    )
+    .await
+}
+
+async fn verified_change_call(
+    state: &AppState,
+    session_id: String,
+    agent_id: String,
+    objective: String,
+    allowed_files: Vec<String>,
+    check_id: String,
+    check_executable: String,
+    oracle_root: String,
+    start: bool,
+) -> Result<serde_json::Value, String> {
+    let (orch, _) = desktop_mcp_orchestration(state)?;
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    let session = state.host.session_inspect(session_id).map_err(map_err)?;
+    let request = grokptah_agent_bridge::VerifiedChangeRequest {
+        request_id: format!("desktop-{session_id}"),
+        session_id,
+        workspace: std::path::PathBuf::from(session.cwd),
+        agent_id,
+        objective,
+        allowed_files,
+        required_checks: vec![grokptah_agent_bridge::RequiredCheckSpec {
+            check_id,
+            executable: check_executable,
+            args: Vec::new(),
+            cwd: grokptah_agent_bridge::RequiredCheckCwd::Oracle,
+            env: Vec::new(),
+            timeout_ms: 30_000,
+            max_output_bytes: 8 * 1024,
+        }],
+        oracle_root: std::path::PathBuf::from(oracle_root),
+        budget_profile: grokptah_agent_bridge::ManagedExecutionBudgetProfile::Economy,
+        mutation_mode: "isolated_review".into(),
+        platform: std::env::consts::OS.into(),
+        execution_host: "desktop".into(),
+    };
+    let auth = grokptah_agent_bridge::AuthContext {
+        token_id: "desktop".into(),
+        owner_id: "primary".into(),
+    };
+    if start {
+        orch.start_verified_change(&auth, &request)
+            .await
+            .map_err(map_err)
+    } else {
+        orch.prepare_verified_change(&auth, &request)
+            .map_err(map_err)
+    }
+}
+
+#[tauri::command]
 pub async fn work_create(
     state: State<'_, AppState>,
     session_id: String,

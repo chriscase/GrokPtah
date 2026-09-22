@@ -133,6 +133,8 @@ fn run_inner() -> anyhow::Result<()> {
             commands::remote_service_work_cancel,
             commands::work_list,
             commands::work_get,
+            commands::verified_change_prepare,
+            commands::verified_change_start,
             commands::work_create,
             commands::work_assign,
             commands::work_retry,

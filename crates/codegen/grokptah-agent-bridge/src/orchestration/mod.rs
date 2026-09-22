@@ -78,7 +78,9 @@ pub use routine::{
     ROUTINE_SCHEMA_VERSION,
 };
 pub(crate) use service::apply_run_aggregate;
-pub use service::{ManagedGrokExecutorConfig, OrchestrationConfig, OrchestrationService};
+pub use service::{
+    ManagedGrokExecutorConfig, OrchestrationConfig, OrchestrationService, VerifiedChangeRequest,
+};
 pub(crate) use store::workspaces_match;
 pub(crate) use store::AuditWriterStopReport;
 pub use store::{IdempotencyClaim, OrchStore, RetentionPolicy, RetentionReport};

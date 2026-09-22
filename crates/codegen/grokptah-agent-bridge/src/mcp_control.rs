@@ -3508,6 +3508,7 @@ async fn dispatch_tool(
                 cancellation_reason: args.cancellation_reason,
                 completed_at: chrono::Utc::now(),
                 verification: None,
+                candidate_verification: None,
             };
             if name == "ptah_complete_work" {
                 orch.complete_work(

@@ -121,6 +121,42 @@ export const api = {
     invoke<DurableWorkItem[]>("work_list", { sessionId }),
   workGet: (sessionId: string, workId: string) =>
     invoke<RemoteWorkSnapshot | null>("work_get", { sessionId, workId }),
+  verifiedChangePrepare: (
+    sessionId: string,
+    agentId: string,
+    objective: string,
+    allowedFiles: string[],
+    checkId: string,
+    checkExecutable: string,
+    oracleRoot: string,
+  ) =>
+    invoke<import("./verifiedChange").VerifiedChangeView>("verified_change_prepare", {
+      sessionId,
+      agentId,
+      objective,
+      allowedFiles,
+      checkId,
+      checkExecutable,
+      oracleRoot,
+    }),
+  verifiedChangeStart: (
+    sessionId: string,
+    agentId: string,
+    objective: string,
+    allowedFiles: string[],
+    checkId: string,
+    checkExecutable: string,
+    oracleRoot: string,
+  ) =>
+    invoke<import("./verifiedChange").VerifiedChangeView>("verified_change_start", {
+      sessionId,
+      agentId,
+      objective,
+      allowedFiles,
+      checkId,
+      checkExecutable,
+      oracleRoot,
+    }),
   workCreate: (
     sessionId: string,
     kind: string,

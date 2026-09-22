@@ -124,6 +124,12 @@ pub struct GrokBuildHostLaunchConfig {
     pub git_timeout: Duration,
     /// Parent directory for the task-scoped isolated `GROK_HOME`.
     pub isolate_parent: PathBuf,
+    /// When true, a verified isolated mutation is retained for operator
+    /// review and is not written into the source workspace.
+    pub defer_source_apply: bool,
+    /// Host-private directory that receives the candidate snapshot when
+    /// `defer_source_apply` is set. Never forwarded to the child.
+    pub candidate_retention_dir: Option<PathBuf>,
 }
 
 impl fmt::Debug for GrokBuildHostLaunchConfig {
@@ -139,6 +145,11 @@ impl fmt::Debug for GrokBuildHostLaunchConfig {
             .field("allowed_file_count", &self.allowed_files.len())
             .field("execution_approved", &self.execution_approved)
             .field("max_stdout_bytes", &self.max_stdout_bytes)
+            .field("defer_source_apply", &self.defer_source_apply)
+            .field(
+                "candidate_retained",
+                &self.candidate_retention_dir.is_some(),
+            )
             .field("max_stderr_bytes", &self.max_stderr_bytes)
             .finish_non_exhaustive()
     }
@@ -179,6 +190,14 @@ impl GrokBuildHostLaunchConfig {
         }
         if self.git_timeout.is_zero() {
             return Err(GrokBuildAdapterError::InvalidRequest);
+        }
+        if self.defer_source_apply {
+            let Some(retention) = &self.candidate_retention_dir else {
+                return Err(GrokBuildAdapterError::InvalidRequest);
+            };
+            if !retention.is_absolute() {
+                return Err(GrokBuildAdapterError::InvalidRequest);
+            }
         }
         Ok(())
     }
@@ -1711,14 +1730,42 @@ async fn execute_allowlisted(
         && cleaned;
     let mutation_evidence =
         if launch.mutation_mode == GrokBuildMutationMode::IsolatedReview && promote_mutation {
-            match promote_verified_isolated_review_mutation(
-                launch,
-                source_host,
-                execution_host,
-                source_fingerprint,
-            )
-            .await
-            {
+            let captured = if source_host.defer_source_apply {
+                let Some(retention) = source_host.candidate_retention_dir.as_ref() else {
+                    let _ = checkout.cleanup().await;
+                    return Err(GrokBuildAdapterError::InvalidRequest);
+                };
+                match capture_isolated_review_mutation(launch, execution_host, true).await {
+                    Ok(evidence) => {
+                        if let Err(error) = crate::verified_change::retain_candidate_snapshot(
+                            &execution_host.cwd,
+                            retention,
+                        ) {
+                            let _ = checkout.cleanup().await;
+                            let _ = std::fs::remove_dir_all(retention);
+                            return Err(
+                                match error.message.contains("symlink")
+                                    || error.message.contains("escape")
+                                {
+                                    true => GrokBuildAdapterError::ReadOnlyMutation,
+                                    false => GrokBuildAdapterError::IsolationFailed,
+                                },
+                            );
+                        }
+                        Ok(evidence)
+                    }
+                    Err(error) => Err(error),
+                }
+            } else {
+                promote_verified_isolated_review_mutation(
+                    launch,
+                    source_host,
+                    execution_host,
+                    source_fingerprint,
+                )
+                .await
+            };
+            match captured {
                 Ok(evidence) => Some(evidence),
                 Err(error) => {
                     let _ = checkout.cleanup().await;
@@ -2965,6 +3012,8 @@ mod tests {
             max_stderr_bytes: 32,
             git_timeout: Duration::from_secs(1),
             isolate_parent: PathBuf::from("/tmp/iso"),
+            defer_source_apply: false,
+            candidate_retention_dir: None,
         };
         let rendered = format!("{host:?}");
         assert!(!rendered.contains("sk-"));
