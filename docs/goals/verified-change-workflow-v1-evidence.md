@@ -73,9 +73,17 @@ Bridge clippy `--locked --all-targets -- -D warnings`: exit 0. `cargo fmt --all`
 
 Regression: adapter 27 passed. Managed executor non-live test 1 passed. Live test ignored, not counted as a pass.
 
+## Identity
+
+- Tested functional SHA: `ab2f86ea5cadd89321794a7ca50609c11ed171d9`
+- Tested functional tree: `f113106787c39bd16e7d6901a8f49d4cb70e1de2`
+- The commit that adds this identity section is evidence-only. It does not change executable code. Re-run the workflow tests only if a later commit changes Rust or desktop behavior.
+
 ## G8
 
-See the draft PR and this file. Tested functional tree is the commit that contains the executable changes. A following commit that only updates this evidence file does not change behavior.
+Draft PR: https://github.com/chriscase/GrokPtah/pull/579
+Remote branch: `grok/verified-change-workflow-v1`
+The functional commit above was pushed and matched `git ls-remote` before this evidence-only note.
 
 ## Limitations
 
