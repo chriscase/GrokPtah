@@ -103,9 +103,51 @@ Draft PR: https://github.com/chriscase/GrokPtah/pull/579
 Remote branch: `grok/verified-change-workflow-v1`
 The functional SHA above is the tested executable tree. This evidence commit is documentation only and is the published tip once `git ls-remote` matches it.
 
+## Repair after independent review
+
+Independent exact-source review of `32268e89f52776704d7a4729c2bd3581310ceeb7` returned HOLD / REWRITE. The green fixture suite on that SHA is not treated as a disproof. The repair is `bd4476cfd89b1e24f279d8883f01cfe4e74201a4` (tree `c1e1024a2908491f28023fe9c52a78eac93aa20c`).
+
+| Finding | Disposition | Named regression |
+| --- | --- | --- |
+| P0: source application is not crash/restart/partial-failure recoverable | Repaired. Apply persists `ApplySourceIntent` before any git effect and classifies restart as not applied, already applied, or poisoned. A second-path failure rolls back. A crash after the first effect is reconciliation, not a clean no-op. Discard cleanup failure does not mark the work cancelled. | `apply_faults_before_effect_retry_once_and_a_failed_command_changes_nothing` (cuts 1, 2, 6); `second_path_failure_rolls_back_and_a_crash_is_not_a_clean_noop` (cuts 3 and 9); `restart_after_source_effect_commits_without_applying_again` (cuts 4 and 8); `restart_after_work_commit_finishes_the_idempotency_response` (cut 5); `rollback_failure_blocks_automatic_continuation` (cut 7); `discard_cleanup_failure_is_not_a_completed_discard` |
+| P0: production `FileCredentialLease` does not revoke upstream authority | Repaired by removal from the operator path. `configure_managed_grok_from_operator_env` returns an error when `GROKPTAH_MANAGED_GROK_EXECUTABLE` is set and does not install a file lease. Readiness stays unavailable and dispatches nothing unless the resolver reports `revokes_upstream`. File truncation is not revocation. | `file_truncation_does_not_revoke_an_already_read_lease` |
+| P1: candidate source revision is re-read from mutable HEAD | Repaired. Verification copies the launch SHA and source fingerprint from `ManagedGrokInvocation`. | `verification_stays_bound_to_the_launch_sha` |
+| P1: required checks are caller-selected executables | Repaired. Public prepare/start take an opaque `check_profile_id`. The runtime home resolves the executable, digests, argv, cwd, oracle, environment, limits, and network policy. Replacement of the executable or oracle invalidates the check. Timeout kills the process group. Checks do not inherit operator `HOME`, `PATH`, or `GITHUB_TOKEN`, cannot write the source or candidate, and cannot use the network unless the profile says `qualified`. | `replaced_executable_or_oracle_invalidates_without_running`; `timed_out_check_kills_the_background_process_group`; `check_cannot_write_source_or_candidate_or_inherit_operator_env`; `forbidden_network_is_denied_and_qualified_network_can_connect` |
+| P1: status revalidates before the Work is in scope | Repaired. Status authorizes the session and workspace, then revalidates under that scope. Foreign, unknown, and malformed ids do not reveal the diff or clear approval. | `foreign_status_does_not_reveal_or_mutate_the_candidate` |
+| P1: readiness trusts caller platform/host and start rewrites Agent policy | Repaired. Platform is the host OS and the execution host is the process surface. A failed readiness check creates no admission. Executor budget and one-attempt authority travel in a Work-scoped envelope. The persistent Agent `managed_execution` policy is not rewritten. Retrying the same request id with a changed profile conflicts and leaves agent bytes unchanged. | `same_request_with_a_changed_profile_conflicts`; `multi_file_repair_is_red_then_green_and_apply_is_separate` (caller platform `linux` is ignored) |
+| P1: candidate identity omits modes and hashes the whole tree | Repaired. Identity is the launch base SHA plus a changed-path manifest and binary patch. Each path records mode, blob, add/modify/delete/mode, symlink, and untracked. A mode-only change applies the mode and keeps the bytes. Unchanged files are not hashed. Remaining bounds are 2000 paths and 32 MiB; readiness names that limit before dispatch. | `mode_only_change_applies_exactly`; `changed_path_identity_does_not_hash_unchanged_files` |
+
+Local validation on this functional tree, before this evidence text:
+
+- `cargo test --locked --test verified_change_workflow -- --test-threads=1`: 15 passed.
+- `cargo test --locked --lib -- timed_out_check_kills replaced_executable check_cannot_write forbidden_network`: 4 passed. The timeout test finished in the same second as the other three and found no surviving `sleep 47`.
+- `cargo test --locked -- --test-threads=1` from `crates/codegen/grokptah-agent-bridge` with a fresh `GROKPTAH_HOME`: exit 0. Lib tests 660 passed. `grok_build_adapter` 27 passed. `grok_build_managed_executor` 1 passed and `live_grok_build_dogfood_runs_both_profiles_under_one_authority` ignored. `reliability_eval` 1 passed. `verified_change_workflow` 15 passed inside that suite.
+- `cargo fmt --all -- --check` and `cargo clippy --locked --all-targets -- -D warnings` in the bridge: exit 0. The test-gateway fmt check exited 0.
+- `grokptah-service`: `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked -- --test-threads=1`, and `cargo check --locked --all-targets` exited 0.
+- Desktop `npm run typecheck` exited 0. `npm test` exited 0 (58 files, 428 tests). `desktop/src-tauri` `cargo test --locked` exited 0 (50 lib tests passed).
+- `cargo test -p xai-host-authority --locked -- --test-threads=1` from the repository root exited 0.
+
+Hosted Desktop workflow for `bd4476cfd89b1e24f279d8883f01cfe4e74201a4`: GitHub Actions run `35794089280` (https://github.com/chriscase/GrokPtah/actions/runs/35794089280) completed with conclusion `success`. The run event was `pull_request`, `head_sha` was that functional SHA, and the `desktop` job succeeded with no failed steps. It started `2026-09-22T22:45:55Z` and finished `2026-09-22T23:21:22Z`. A later docs-only commit matches `.github/workflows/desktop.yml`'s `docs/**` path filter, so it can start another run. That later run is not the result for the repaired functional head.
+
+The live-provider test was not run.
+
+## Repair identity
+
+- Prior reviewed functional SHA: `32268e89f52776704d7a4729c2bd3581310ceeb7`
+- Prior reviewed functional tree: `74727df90e187f906b1bdd912742073444978166`
+- Repaired functional SHA: `bd4476cfd89b1e24f279d8883f01cfe4e74201a4`
+- Repaired functional tree: `c1e1024a2908491f28023fe9c52a78eac93aa20c`
+- This evidence section is documentation only once committed. It does not change executable code.
+
 ## Limitations
 
-- No live Grok Build provider call. The ignored live managed-executor test was not run.
+- No live Grok Build provider call. The ignored live managed-executor test was not run. `FileCredentialLease` remains test-only and does not revoke an already-read token. No production xAI lease authority is installed; an operator environment that names `GROKPTAH_MANAGED_GROK_EXECUTABLE` fails closed and dispatches no worker.
+- `HostLeaseAuthority` is an in-process fake used by tests. Revocation rejects the already-read token at that fake provider. It is not a live provider proof.
+- A mode-only change is applied and checked by `mode_only_change_applies_exactly`. The fake worker journey does not emit a mode-only edit.
+- Check confinement uses macOS `sandbox-exec`. Non-macOS mutation remains refused.
+- Application reuses `run_promotion` fingerprint, patch, and rollback helpers through `apply_recorded_patch`. It does not call `promote()` on a registered isolated worktree. The apply intent is a separate JSON record recovered on store open, not a second `WorkMutationIntent` decision ledger.
+- A not-ready start of an already-admitted request id returns that work's status so a dirty post-apply tree can reconnect. A new not-ready request with no admission receipt still creates nothing.
+- This file is not an independent acceptance of the frozen goal.
 - The earlier desktop process drive used prepare and start. Settled review, apply, and discard are now on that same control plane and on the Work board. The Work board test exercises prepare without a selected agent, refresh of a settled diff, and apply of the displayed digest. The window itself was not clicked.
 - At admission time the worker is still `running`, so the live start projection does not yet show `checksPassed`. The workflow test covers the settled candidate.
 - Non-macOS mutation remains refused. This run is macOS.
