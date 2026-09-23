@@ -185,6 +185,33 @@ The commit that adds this section is documentation only. Its SHA is not `e14ac60
 
 The live-provider test was not run. No production revocable xAI lease was implemented. `FileCredentialLease` stays test-only. `HostLeaseAuthority` stays an in-process fake.
 
+## Publication record for the authority seals
+
+- Prior functional SHA: `872707b6006d9b9f6c2fe94a09e57d2093973fbb`
+- Prior functional tree: `450ff6e55d52800729ec1d43e4fb4cdb285d027b`
+- Repaired functional SHA: `e14ac60458bd7d29aa7562e03575f439ad494e56`
+- Repaired functional tree: `91faf17b9a91520781f4ab65d4b2f4664c76e042`
+- Evidence tip that first recorded run `35898331687`: `fee6a5c4433d5907b89a1c1b223ec662c354eb1b`
+- Evidence tip tree: `03428e51ba243bdf1bb9f380aa9530b5b6715d95`
+- When `fee6a5c44` was pushed, `git ls-remote origin refs/heads/grok/verified-change-workflow-v1` equaled `fee6a5c4433d5907b89a1c1b223ec662c354eb1b`, and `origin/main` stayed `0dbe51c8aa94e3f26543be7a90e0085029487de7`.
+- Executable changes after tested revision `e14ac60458bd7d29aa7562e03575f439ad494e56`: none. The diff through `fee6a5c44` is only `docs/goals/verified-change-workflow-v1-evidence.md`.
+
+| Check | Result on `e14ac6045` |
+| --- | --- |
+| C1 sealed check authority | pass, named regressions in the table above |
+| C2 candidate apply bundle | pass, named regressions in the table above |
+| C3 apply-intent validation | pass, named regressions in the table above |
+| C4 discard serialized with apply recovery | pass, named regressions in the table above |
+| C5 check confinement fails closed | pass, named regressions in the table above |
+| C6 typed execution envelope | pass, named regressions in the table above |
+| C7 local suites and hosted Desktop | pass. Local suites listed above. Hosted run `35898331687` has `head_sha` `e14ac60458bd7d29aa7562e03575f439ad494e56` |
+
+Live-provider test: NOT RUN.
+
+Production revocable xAI lease: STILL UNAVAILABLE.
+
+Desktop run `35902522879` has `head_sha` `fee6a5c4433d5907b89a1c1b223ec662c354eb1b`. It is not a result for `e14ac60458bd7d29aa7562e03575f439ad494e56`. This paragraph is a later docs-only commit. A Desktop run whose `head_sha` is not `e14ac60458bd7d29aa7562e03575f439ad494e56` is not claimed.
+
 ## Repair identity
 
 - Prior reviewed functional SHA: `32268e89f52776704d7a4729c2bd3581310ceeb7`
