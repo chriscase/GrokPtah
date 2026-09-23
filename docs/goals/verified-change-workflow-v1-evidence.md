@@ -149,7 +149,11 @@ Local proof for this follow-up, measured on functional SHA `872707b6006d9b9f6c2f
 
 Hosted Desktop for functional SHA `872707b6006d9b9f6c2fe94a09e57d2093973fbb`: GitHub Actions run `35804342846` (https://github.com/chriscase/GrokPtah/actions/runs/35804342846) completed with conclusion `success`. The run event was `pull_request`, `head_sha` was that functional SHA, and the `desktop` job succeeded with no failed steps. It started `2026-09-23T00:58:29Z` and finished `2026-09-23T01:29:33Z`.
 
-The commit that adds this paragraph is evidence-only. It does not change executable code. Its SHA is not `872707b60`. A Desktop run for that later docs tip, if the path filter starts one, is not the result for the functional head.
+The commit that first added the suite paragraph is evidence-only SHA `5cb0ee3e42619c0cb8d1b8f17bf91bc48a7eab11` (tree `67eceedff884bbd754dabf552b8957ff4374645e`). It does not change executable code. Its SHA is not `872707b60`.
+
+Hosted Desktop for that published evidence tip `5cb0ee3e42619c0cb8d1b8f17bf91bc48a7eab11`, recorded separately from the functional-head run: GitHub Actions run `35807355869` (https://github.com/chriscase/GrokPtah/actions/runs/35807355869) completed with conclusion `success`. The run event was `pull_request`, `head_sha` was `5cb0ee3e42619c0cb8d1b8f17bf91bc48a7eab11`, and the `desktop` job succeeded with no failed steps. It started `2026-09-23T01:41:49Z` and finished `2026-09-23T02:02:01Z`. Run `35804342846` remains the result for functional SHA `872707b60` only. It is not the result for `5cb0ee3e`.
+
+This sentence is a later docs-only change. A Desktop run started by publishing it is not the result for `5cb0ee3e` or for `872707b60`.
 
 
 ## Repair identity
