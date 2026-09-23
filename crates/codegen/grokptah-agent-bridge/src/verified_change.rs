@@ -404,6 +404,12 @@ pub struct CandidateVerification {
     pub check_profile_id: String,
     #[serde(default)]
     pub check_profile_revision: u64,
+    #[serde(default)]
+    pub check_authority_digest: String,
+    #[serde(default)]
+    pub apply_bundle_digest: String,
+    #[serde(default)]
+    pub execution_envelope_digest: String,
 }
 
 impl CandidateVerification {
@@ -411,6 +417,9 @@ impl CandidateVerification {
         &self,
         approved_digest: Option<&str>,
         target_revision: Option<&str>,
+        profile_id: &str,
+        profile_revision: u64,
+        authority_digest: &str,
     ) -> bool {
         self.schema_version == CANDIDATE_VERIFICATION_SCHEMA
             && self.applied
@@ -423,6 +432,12 @@ impl CandidateVerification {
             && self.checks.iter().all(|check| check.outcome == "passed")
             && !self.checks.is_empty()
             && !self.reconciliation_required
+            && !profile_id.is_empty()
+            && self.check_profile_id == profile_id
+            && self.check_profile_revision == profile_revision
+            && self.check_profile_revision > 0
+            && !authority_digest.is_empty()
+            && self.check_authority_digest == authority_digest
     }
 }
 
@@ -533,7 +548,31 @@ pub fn retain_candidate_snapshot(
         .map_err(|error| VerifiedChangeError::new(error.to_string()))
 }
 
-#[derive(Debug, Clone)]
+pub const CHECK_CONFINEMENT_BACKEND: &str = "macos-sandbox-exec";
+pub const CHECK_CONFINEMENT_REVISION: u64 = 1;
+
+pub static CHECK_CONFINEMENT_EXECUTABLE: std::sync::Mutex<Option<PathBuf>> =
+    std::sync::Mutex::new(None);
+pub static SKIP_VERIFIED_DRIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn skip_verified_drive() -> bool {
+    SKIP_VERIFIED_DRIVE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+pub fn confinement_executable() -> PathBuf {
+    CHECK_CONFINEMENT_EXECUTABLE
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+        .unwrap_or_else(|| PathBuf::from("/usr/bin/sandbox-exec"))
+}
+
+pub fn confinement_available() -> bool {
+    confinement_executable().is_file()
+}
+
+#[derive(Clone)]
 pub struct CheckAuthority {
     pub profile_id: String,
     pub profile_revision: u64,
@@ -542,6 +581,271 @@ pub struct CheckAuthority {
     pub network: String,
     pub source_root: PathBuf,
     pub output_limit_bytes: u64,
+    pub confinement_backend: String,
+    pub confinement_revision: u64,
+    pub work_id: String,
+    pub session_id: String,
+    pub workspace: String,
+    pub authority_digest: String,
+}
+
+impl CheckAuthority {
+    pub fn canonical_digest(&self) -> String {
+        digest_bytes(
+            format!(
+                "grokptah-check-authority-v1\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+                self.profile_id,
+                self.profile_revision,
+                self.executable_digest,
+                self.oracle_digest,
+                self.network,
+                self.confinement_backend,
+                self.confinement_revision,
+                self.output_limit_bytes,
+                self.work_id,
+                self.session_id,
+                self.workspace
+            )
+            .as_bytes(),
+        )
+    }
+
+    pub fn seal(mut self) -> Self {
+        self.confinement_backend = CHECK_CONFINEMENT_BACKEND.into();
+        self.confinement_revision = CHECK_CONFINEMENT_REVISION;
+        self.authority_digest = self.canonical_digest();
+        self
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifiedExecutionEnvelopeV1 {
+    pub schema_version: u32,
+    pub work_id: String,
+    pub session_id: String,
+    pub workspace: String,
+    pub agent_id: String,
+    pub agent_revision: u64,
+    pub executor: String,
+    pub budget: String,
+    pub platform: String,
+    pub execution_host: String,
+    pub check_profile_id: String,
+    pub check_profile_revision: u64,
+    pub executable_digest: String,
+    pub oracle_digest: String,
+    pub max_prompt_bytes: u64,
+    pub max_rounds: u64,
+    pub max_duration_ms: u64,
+    pub envelope_digest: String,
+}
+
+impl VerifiedExecutionEnvelopeV1 {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        work_id: &str,
+        session_id: &str,
+        workspace: &str,
+        agent_id: &str,
+        agent_revision: u64,
+        budget: &str,
+        platform: &str,
+        execution_host: &str,
+        check_profile_id: &str,
+        check_profile_revision: u64,
+        executable_digest: &str,
+        oracle_digest: &str,
+        max_prompt_bytes: u64,
+        max_rounds: u64,
+        max_duration_ms: u64,
+    ) -> Self {
+        let mut envelope = Self {
+            schema_version: 1,
+            work_id: work_id.into(),
+            session_id: session_id.into(),
+            workspace: workspace.into(),
+            agent_id: agent_id.into(),
+            agent_revision,
+            executor: "grok_build_isolated_review".into(),
+            budget: budget.into(),
+            platform: platform.into(),
+            execution_host: execution_host.into(),
+            check_profile_id: check_profile_id.into(),
+            check_profile_revision,
+            executable_digest: executable_digest.into(),
+            oracle_digest: oracle_digest.into(),
+            max_prompt_bytes,
+            max_rounds,
+            max_duration_ms,
+            envelope_digest: String::new(),
+        };
+        envelope.envelope_digest = envelope.canonical_digest();
+        envelope
+    }
+
+    pub fn canonical_digest(&self) -> String {
+        digest_bytes(
+            format!(
+                "grokptah-execution-envelope-v1\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+                self.schema_version,
+                self.work_id,
+                self.session_id,
+                self.workspace,
+                self.agent_id,
+                self.agent_revision,
+                self.executor,
+                self.budget,
+                self.platform,
+                self.execution_host,
+                self.check_profile_id,
+                self.check_profile_revision,
+                self.executable_digest,
+                self.oracle_digest,
+                self.max_prompt_bytes,
+                self.max_rounds,
+                self.max_duration_ms
+            )
+            .as_bytes(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn permits(
+        &self,
+        work_id: &str,
+        session_id: &str,
+        workspace: &str,
+        agent_id: &str,
+        agent_revision: u64,
+        decision_digest: &str,
+        kind: &str,
+    ) -> bool {
+        self.schema_version == 1
+            && kind == "isolated-review"
+            && self.work_id == work_id
+            && self.session_id == session_id
+            && self.workspace == workspace
+            && self.agent_id == agent_id
+            && self.agent_revision == agent_revision
+            && self.envelope_digest == self.canonical_digest()
+            && self.envelope_digest == decision_digest
+    }
+}
+
+pub fn write_check_authority(
+    dir: &Path,
+    authority: &CheckAuthority,
+) -> Result<(), VerifiedChangeError> {
+    if authority.authority_digest != authority.canonical_digest() {
+        return Err(VerifiedChangeError::new(
+            "the check authority digest does not match its fields",
+        ));
+    }
+    let body = json!({
+        "schemaVersion": 1,
+        "profileId": authority.profile_id,
+        "profileRevision": authority.profile_revision,
+        "executableDigest": authority.executable_digest,
+        "oracleDigest": authority.oracle_digest,
+        "network": authority.network,
+        "sourceRoot": authority.source_root,
+        "outputLimitBytes": authority.output_limit_bytes,
+        "confinementBackend": authority.confinement_backend,
+        "confinementRevision": authority.confinement_revision,
+        "workId": authority.work_id,
+        "sessionId": authority.session_id,
+        "workspace": authority.workspace,
+        "authorityDigest": authority.authority_digest,
+    });
+    fs::create_dir_all(dir)
+        .and_then(|_| fs::write(dir.join("check-authority.json"), body.to_string()))
+        .map_err(|_| VerifiedChangeError::new("the check authority could not be stored"))
+}
+
+pub fn read_check_authority(dir: &Path) -> Result<CheckAuthority, VerifiedChangeError> {
+    let raw = fs::read_to_string(dir.join("check-authority.json"))
+        .map_err(|_| VerifiedChangeError::new("the check authority is missing"))?;
+    let value: Value = serde_json::from_str(&raw)
+        .map_err(|_| VerifiedChangeError::new("the check authority is malformed"))?;
+    if value.get("schemaVersion").and_then(Value::as_u64) != Some(1) {
+        return Err(VerifiedChangeError::new(
+            "the check authority schema is unsupported",
+        ));
+    }
+    let authority = CheckAuthority {
+        profile_id: value
+            .get("profileId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        profile_revision: value
+            .get("profileRevision")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        executable_digest: value
+            .get("executableDigest")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        oracle_digest: value
+            .get("oracleDigest")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        network: value
+            .get("network")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        source_root: PathBuf::from(
+            value
+                .get("sourceRoot")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        ),
+        output_limit_bytes: value
+            .get("outputLimitBytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        confinement_backend: value
+            .get("confinementBackend")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        confinement_revision: value
+            .get("confinementRevision")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        work_id: value
+            .get("workId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        session_id: value
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        workspace: value
+            .get("workspace")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        authority_digest: value
+            .get("authorityDigest")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+    };
+    if authority.authority_digest != authority.canonical_digest()
+        || authority.confinement_backend != CHECK_CONFINEMENT_BACKEND
+    {
+        return Err(VerifiedChangeError::new(
+            "the check authority digest does not match its fields",
+        ));
+    }
+    Ok(authority)
 }
 
 pub fn execute_required_checks(
@@ -549,7 +853,26 @@ pub fn execute_required_checks(
     candidate_root: &Path,
     oracle_root: &Path,
 ) -> Result<Vec<RequiredCheckExecution>, VerifiedChangeError> {
-    execute_required_checks_with_authority(checks, candidate_root, oracle_root, None)
+    let authority = CheckAuthority {
+        profile_id: "direct".into(),
+        profile_revision: 1,
+        executable_digest: checks
+            .first()
+            .and_then(|check| file_digest(Path::new(&check.executable)))
+            .unwrap_or_else(|| "sha256:missing".into()),
+        oracle_digest: directory_digest(oracle_root).unwrap_or_else(|| "sha256:missing".into()),
+        network: "none".into(),
+        source_root: candidate_root.to_path_buf(),
+        output_limit_bytes: 65_536,
+        confinement_backend: String::new(),
+        confinement_revision: 0,
+        work_id: "direct".into(),
+        session_id: "direct".into(),
+        workspace: candidate_root.display().to_string(),
+        authority_digest: String::new(),
+    }
+    .seal();
+    execute_required_checks_with_authority(checks, candidate_root, oracle_root, Some(&authority))
 }
 
 pub fn execute_required_checks_with_authority(
@@ -565,27 +888,55 @@ pub fn execute_required_checks_with_authority(
         ));
     }
     let spec_digest = RequiredCheckSpec::spec_digest(checks)?;
+    let Some(authority) = authority else {
+        return Ok(checks
+            .iter()
+            .map(|check| RequiredCheckExecution {
+                check_id: check.check_id.clone(),
+                outcome: "invalidated".into(),
+                exit_code: None,
+                output_digest: digest_bytes(b""),
+                output_truncated: false,
+                duration_ms: 0,
+                spec_digest: spec_digest.clone(),
+            })
+            .collect());
+    };
+    if authority.authority_digest != authority.canonical_digest()
+        || authority.confinement_backend != CHECK_CONFINEMENT_BACKEND
+        || !confinement_available()
+    {
+        return Ok(checks
+            .iter()
+            .map(|check| RequiredCheckExecution {
+                check_id: check.check_id.clone(),
+                outcome: "incomplete".into(),
+                exit_code: None,
+                output_digest: digest_bytes(b""),
+                output_truncated: false,
+                duration_ms: 0,
+                spec_digest: spec_digest.clone(),
+            })
+            .collect());
+    }
     let before = snapshot_identity(candidate_root);
-    let source_before = authority.and_then(|item| sealed_tree_token(&item.source_root));
+    let source_before = sealed_tree_token(&authority.source_root);
     let mut results = Vec::with_capacity(checks.len());
     for check in checks {
-        if let Some(authority) = authority {
-            if file_digest(Path::new(&check.executable)).as_deref()
-                != Some(authority.executable_digest.as_str())
-                || directory_digest(oracle_root).as_deref()
-                    != Some(authority.oracle_digest.as_str())
-            {
-                results.push(RequiredCheckExecution {
-                    check_id: check.check_id.clone(),
-                    outcome: "invalidated".into(),
-                    exit_code: None,
-                    output_digest: digest_bytes(b""),
-                    output_truncated: false,
-                    duration_ms: 0,
-                    spec_digest: spec_digest.clone(),
-                });
-                continue;
-            }
+        if file_digest(Path::new(&check.executable)).as_deref()
+            != Some(authority.executable_digest.as_str())
+            || directory_digest(oracle_root).as_deref() != Some(authority.oracle_digest.as_str())
+        {
+            results.push(RequiredCheckExecution {
+                check_id: check.check_id.clone(),
+                outcome: "invalidated".into(),
+                exit_code: None,
+                output_digest: digest_bytes(b""),
+                output_truncated: false,
+                duration_ms: 0,
+                spec_digest: spec_digest.clone(),
+            });
+            continue;
         }
         results.push(run_one_check(
             check,
@@ -596,9 +947,7 @@ pub fn execute_required_checks_with_authority(
         ));
     }
     let source_changed = source_before.is_some_and(|before| {
-        authority.is_some_and(|item| {
-            sealed_tree_token(&item.source_root).as_deref() != Some(before.as_str())
-        })
+        sealed_tree_token(&authority.source_root).as_deref() != Some(before.as_str())
     });
     if snapshot_identity(candidate_root) != before || source_changed {
         for result in &mut results {
@@ -956,6 +1305,12 @@ pub fn resolve_check_profile(
             .get("maxOutputDirBytes")
             .and_then(Value::as_u64)
             .unwrap_or(65_536),
+        confinement_backend: String::new(),
+        confinement_revision: 0,
+        work_id: String::new(),
+        session_id: String::new(),
+        workspace: String::new(),
+        authority_digest: String::new(),
     };
     if authority.profile_revision == 0 {
         return Err(VerifiedChangeError::new(
@@ -975,7 +1330,7 @@ fn run_one_check(
     candidate_root: &Path,
     oracle_root: &Path,
     spec_digest: &str,
-    authority: Option<&CheckAuthority>,
+    authority: &CheckAuthority,
 ) -> RequiredCheckExecution {
     let started = Instant::now();
     let base = |outcome: &str, exit_code: Option<i32>, truncated: bool| RequiredCheckExecution {
@@ -1011,19 +1366,12 @@ fn run_one_check(
     if fs::create_dir_all(&output_dir).is_err() {
         return base("incomplete", None, false);
     }
-    let network = authority
-        .map(|item| item.network.as_str())
-        .unwrap_or("none");
-    let mut command = if Path::new("/usr/bin/sandbox-exec").is_file() {
-        let mut sandboxed = Command::new("/usr/bin/sandbox-exec");
-        sandboxed
-            .arg("-p")
-            .arg(check_sandbox_profile(&output_dir, network));
-        sandboxed.arg(&check.executable);
-        sandboxed
-    } else {
-        Command::new(&check.executable)
-    };
+    let network = authority.network.as_str();
+    let mut command = Command::new(confinement_executable());
+    command
+        .arg("-p")
+        .arg(check_sandbox_profile(&output_dir, network))
+        .arg(&check.executable);
     command
         .args(&check.args)
         .current_dir(cwd)
@@ -1033,9 +1381,7 @@ fn run_one_check(
         .env("CHECK_OUTPUT", output_dir.to_string_lossy().as_ref())
         .env(
             "SOURCE_ROOT",
-            authority
-                .map(|item| item.source_root.to_string_lossy().to_string())
-                .unwrap_or_default(),
+            authority.source_root.to_string_lossy().as_ref(),
         )
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1050,7 +1396,7 @@ fn run_one_check(
     }
     let mut child = match command.spawn() {
         Ok(child) => child,
-        Err(_) => return base("missing", None, false),
+        Err(_) => return base("incomplete", None, false),
     };
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -1082,8 +1428,7 @@ fn run_one_check(
     output.extend(stderr.bytes);
     let digest = digest_bytes(&output);
     terminate_check_tree(&mut child);
-    let output_too_large =
-        authority.is_some_and(|item| directory_size(&output_dir) > item.output_limit_bytes);
+    let output_too_large = directory_size(&output_dir) > authority.output_limit_bytes;
     let _ = fs::remove_dir_all(&output_dir);
     let (outcome, exit_code) = match waited {
         None => ("timed_out", None),
@@ -1562,7 +1907,31 @@ pub fn assemble_candidate_verification(
             })
             .collect()
     };
-    let passed = identity_ok && !out_of_scope && !diff_truncated && checks_passed(checks, &results);
+    let apply_bundle_digest = record
+        .as_ref()
+        .and_then(|record| {
+            apply_bundle_digest(
+                record,
+                work_id,
+                attempt_id.as_deref().unwrap_or(""),
+                source_fingerprint,
+                allowed,
+                authority
+                    .map(|item| item.authority_digest.as_str())
+                    .unwrap_or(""),
+                &spec_digest,
+                diff_digest.as_deref().unwrap_or(""),
+                run_id.as_deref().unwrap_or(""),
+            )
+            .ok()
+        })
+        .unwrap_or_default();
+    let passed = identity_ok
+        && !out_of_scope
+        && !diff_truncated
+        && authority.is_some()
+        && !apply_bundle_digest.is_empty()
+        && checks_passed(checks, &results);
     let (content_digest, files) = record
         .map(|record| (record.content_digest, record.files))
         .unwrap_or_else(|| ("sha256:missing".into(), Vec::new()));
@@ -1591,7 +1960,93 @@ pub fn assemble_candidate_verification(
             .map(|item| item.profile_id.clone())
             .unwrap_or_default(),
         check_profile_revision: authority.map(|item| item.profile_revision).unwrap_or(0),
+        check_authority_digest: authority
+            .map(|item| item.authority_digest.clone())
+            .unwrap_or_default(),
+        apply_bundle_digest,
+        execution_envelope_digest: String::new(),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn apply_bundle_digest(
+    record: &PromotionRecord,
+    work_id: &str,
+    attempt_id: &str,
+    source_fingerprint: &str,
+    allowed: &[String],
+    authority_digest: &str,
+    spec_digest: &str,
+    diff_digest: &str,
+    run_id: &str,
+) -> Result<String, VerifiedChangeError> {
+    let derived = crate::run_promotion::fingerprint_bytes(&record.base_revision, &record.patch);
+    if derived != record.final_fingerprint {
+        return Err(VerifiedChangeError::new(
+            "the final fingerprint does not match the base and patch",
+        ));
+    }
+    let manifest = crate::run_promotion::manifest_digest(&record.base_revision, &record.manifest);
+    if record.content_digest != format!("sha256:{manifest}") {
+        return Err(VerifiedChangeError::new(
+            "the manifest digest does not match the candidate bundle",
+        ));
+    }
+    let patch_sha = format!("{:x}", Sha256::digest(&record.patch));
+    let mut allowed_files = allowed.to_vec();
+    allowed_files.sort();
+    let mut hasher = Sha256::new();
+    hasher.update(b"grokptah-apply-bundle-v1\0");
+    hasher.update(record.base_revision.as_bytes());
+    hasher.update([0]);
+    hasher.update(source_fingerprint.as_bytes());
+    hasher.update([0]);
+    hasher.update(work_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(attempt_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(authority_digest.as_bytes());
+    hasher.update([0]);
+    hasher.update(spec_digest.as_bytes());
+    hasher.update([0]);
+    hasher.update(diff_digest.as_bytes());
+    hasher.update([0]);
+    hasher.update(run_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(patch_sha.as_bytes());
+    hasher.update([0]);
+    hasher.update(derived.as_bytes());
+    hasher.update([0]);
+    hasher.update(manifest.as_bytes());
+    for path in &allowed_files {
+        hasher.update(path.as_bytes());
+        hasher.update([0]);
+    }
+    for entry in &record.manifest {
+        hasher.update(entry.path.as_bytes());
+        hasher.update([0]);
+        hasher.update(entry.before_mode.as_bytes());
+        hasher.update([0]);
+        hasher.update(entry.after_mode.as_bytes());
+        hasher.update([0]);
+        hasher.update(entry.before_blob.as_bytes());
+        hasher.update([0]);
+        hasher.update(entry.after_blob.as_bytes());
+        hasher.update([0]);
+        hasher.update(entry.state.as_bytes());
+        hasher.update([0]);
+        hasher.update([u8::from(entry.symlink)]);
+        hasher.update([u8::from(entry.untracked)]);
+    }
+    for file in &record.files {
+        hasher.update(file.path.as_bytes());
+        hasher.update([0]);
+        hasher.update(file.digest.as_bytes());
+        hasher.update([0]);
+        hasher.update(file.kind.as_bytes());
+        hasher.update([0]);
+    }
+    Ok(digest_bytes(&hasher.finalize()))
 }
 
 #[cfg(test)]
@@ -1682,7 +2137,14 @@ mod tests {
             network: network.into(),
             source_root: source.to_path_buf(),
             output_limit_bytes: 4096,
+            confinement_backend: String::new(),
+            confinement_revision: 0,
+            work_id: "unit".into(),
+            session_id: "unit".into(),
+            workspace: source.display().to_string(),
+            authority_digest: String::new(),
         }
+        .seal()
     }
 
     #[test]
@@ -1815,6 +2277,11 @@ mod tests {
     }
 
     #[test]
+    fn replaced_executable_or_oracle_invalidates_without_execution() {
+        replaced_executable_or_oracle_invalidates_without_running();
+    }
+
+    #[test]
     fn replaced_executable_or_oracle_invalidates_without_running() {
         let oracle = temp();
         let bin = temp();
@@ -1839,6 +2306,7 @@ mod tests {
         assert_eq!(replaced[0].exit_code, None);
 
         authority.executable_digest = file_digest(&script).unwrap();
+        authority = authority.seal();
         fs::write(oracle.path().join("fixture.txt"), b"oracle-v2\n").unwrap();
         let oracle_replaced = execute_required_checks_with_authority(
             std::slice::from_ref(&check),
@@ -1980,6 +2448,212 @@ mod tests {
             0o644
         );
         assert_eq!(fs::read(&kept).unwrap(), b"kept\n");
+    }
+
+    struct ConfinementGuard;
+    impl Drop for ConfinementGuard {
+        fn drop(&mut self) {
+            *CHECK_CONFINEMENT_EXECUTABLE.lock().unwrap() = None;
+        }
+    }
+
+    #[test]
+    fn missing_check_authority_runs_no_check_and_cannot_verify() {
+        let oracle = temp();
+        let candidate = temp();
+        let marker = candidate.path().join("ran.txt");
+        let script = oracle.path().join("run.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\nprintf ran > \"$CANDIDATE_ROOT/ran.txt\"\nexit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let check = check_spec("missing-auth", &script, 2000);
+        let results = execute_required_checks_with_authority(
+            std::slice::from_ref(&check),
+            candidate.path(),
+            oracle.path(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(results[0].outcome, "invalidated");
+        assert!(results[0].exit_code.is_none());
+        assert!(!marker.exists());
+        let verification = CandidateVerification {
+            schema_version: 1,
+            work_id: "work".into(),
+            run_id: None,
+            attempt_id: None,
+            source_revision: "a".repeat(40),
+            source_fingerprint: "fp".into(),
+            content_digest: "sha256:abc".into(),
+            spec_digest: "sha256:spec".into(),
+            files: Vec::new(),
+            checks: results,
+            worker_stopped: true,
+            change_proposed: true,
+            checks_passed: false,
+            invalidated: true,
+            applied: true,
+            diff_digest: None,
+            changed_paths: Vec::new(),
+            bounded_diff: String::new(),
+            diff_truncated: false,
+            reconciliation_required: false,
+            check_profile_id: String::new(),
+            check_profile_revision: 0,
+            check_authority_digest: String::new(),
+            apply_bundle_digest: String::new(),
+            execution_envelope_digest: String::new(),
+        };
+        assert!(!verification.authorizes_applied_success(
+            Some("sha256:abc"),
+            Some(&"a".repeat(40)),
+            "balance",
+            1,
+            "sha256:missing"
+        ));
+    }
+
+    #[test]
+    fn malformed_check_authority_runs_no_check_and_cannot_verify() {
+        let dir = temp();
+        fs::write(dir.path().join("check-authority.json"), b"{not json").unwrap();
+        assert!(read_check_authority(dir.path()).is_err());
+        let oracle = temp();
+        let candidate = temp();
+        let script = oracle.path().join("run.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\nprintf ran > \"$CANDIDATE_ROOT/ran.txt\"\nexit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut authority =
+            sealed_authority("bad", &script, oracle.path(), candidate.path(), "none");
+        authority.authority_digest = "sha256:tampered".into();
+        let check = check_spec("bad", &script, 2000);
+        let results = execute_required_checks_with_authority(
+            std::slice::from_ref(&check),
+            candidate.path(),
+            oracle.path(),
+            Some(&authority),
+        )
+        .unwrap();
+        assert_eq!(results[0].outcome, "incomplete");
+        assert!(!candidate.path().join("ran.txt").exists());
+    }
+
+    #[test]
+    fn tampered_profile_revision_or_network_policy_cannot_verify() {
+        let oracle = temp();
+        let candidate = temp();
+        let script = oracle.path().join("run.sh");
+        fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut authority =
+            sealed_authority("rev", &script, oracle.path(), candidate.path(), "none");
+        authority.profile_revision = 9;
+        authority.network = "qualified".into();
+        let check = check_spec("rev", &script, 2000);
+        let results = execute_required_checks_with_authority(
+            std::slice::from_ref(&check),
+            candidate.path(),
+            oracle.path(),
+            Some(&authority),
+        )
+        .unwrap();
+        assert_eq!(results[0].outcome, "incomplete");
+        assert!(results[0].exit_code.is_none());
+        let verification = CandidateVerification {
+            schema_version: 1,
+            work_id: "work".into(),
+            run_id: None,
+            attempt_id: None,
+            source_revision: "b".repeat(40),
+            source_fingerprint: "fp".into(),
+            content_digest: "sha256:abc".into(),
+            spec_digest: "sha256:spec".into(),
+            files: Vec::new(),
+            checks: results,
+            worker_stopped: true,
+            change_proposed: true,
+            checks_passed: true,
+            invalidated: false,
+            applied: true,
+            diff_digest: None,
+            changed_paths: Vec::new(),
+            bounded_diff: String::new(),
+            diff_truncated: false,
+            reconciliation_required: false,
+            check_profile_id: "rev".into(),
+            check_profile_revision: 1,
+            check_authority_digest: authority.canonical_digest(),
+            apply_bundle_digest: "sha256:bundle".into(),
+            execution_envelope_digest: String::new(),
+        };
+        assert!(!verification.authorizes_applied_success(
+            Some("sha256:abc"),
+            Some(&"b".repeat(40)),
+            "rev",
+            9,
+            &authority.canonical_digest()
+        ));
+    }
+
+    #[test]
+    fn missing_check_sandbox_runs_no_process() {
+        let _guard = ConfinementGuard;
+        *CHECK_CONFINEMENT_EXECUTABLE.lock().unwrap() =
+            Some(PathBuf::from("/no/such/sandbox-exec"));
+        let oracle = temp();
+        let candidate = temp();
+        let script = oracle.path().join("run.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\nprintf ran > \"$CANDIDATE_ROOT/ran.txt\"\nexit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let authority = sealed_authority("box", &script, oracle.path(), candidate.path(), "none");
+        let check = check_spec("box", &script, 2000);
+        let results = execute_required_checks_with_authority(
+            std::slice::from_ref(&check),
+            candidate.path(),
+            oracle.path(),
+            Some(&authority),
+        )
+        .unwrap();
+        assert_eq!(results[0].outcome, "incomplete");
+        assert!(!candidate.path().join("ran.txt").exists());
+    }
+
+    #[test]
+    fn sandbox_launch_failure_cannot_fall_back_unsandboxed() {
+        let _guard = ConfinementGuard;
+        *CHECK_CONFINEMENT_EXECUTABLE.lock().unwrap() = Some(PathBuf::from("/dev/null"));
+        let oracle = temp();
+        let candidate = temp();
+        let script = oracle.path().join("run.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\nprintf ran > \"$CANDIDATE_ROOT/ran.txt\"\nexit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let authority =
+            sealed_authority("launch", &script, oracle.path(), candidate.path(), "none");
+        let check = check_spec("launch", &script, 2000);
+        let results = execute_required_checks_with_authority(
+            std::slice::from_ref(&check),
+            candidate.path(),
+            oracle.path(),
+            Some(&authority),
+        )
+        .unwrap();
+        assert_ne!(results[0].outcome, "passed");
+        assert!(!candidate.path().join("ran.txt").exists());
     }
 
     #[test]

@@ -1830,22 +1830,54 @@ impl OrchestrationService {
                 continue;
             };
             let envelope = self.store.verified_execution_envelope(&work.work_id);
-            if let Some(envelope) = envelope.as_ref() {
+            if !work.policy.required_checks.is_empty() {
+                let Some(raw) = envelope.as_ref() else {
+                    self.native_executor.lock().skipped_ineligible += 1;
+                    continue;
+                };
+                let Ok(parsed) = serde_json::from_value::<
+                    crate::verified_change::VerifiedExecutionEnvelopeV1,
+                >(raw.clone()) else {
+                    self.native_executor.lock().skipped_ineligible += 1;
+                    continue;
+                };
+                let decisions = self
+                    .store
+                    .list_work_decisions(&work.work_id)
+                    .unwrap_or_default();
+                let decision_digest = decisions
+                    .iter()
+                    .rev()
+                    .find(|decision| decision.reason.contains("envelope:"))
+                    .and_then(|decision| decision.reason.split("envelope:").nth(1))
+                    .unwrap_or("")
+                    .trim();
+                if !parsed.permits(
+                    &work.work_id,
+                    &work.session_id.to_string(),
+                    &work.workspace,
+                    &agent_id,
+                    spec.revision,
+                    decision_digest,
+                    &work.kind,
+                ) {
+                    self.native_executor.lock().skipped_ineligible += 1;
+                    continue;
+                }
                 spec.managed_execution.enabled = true;
                 spec.managed_execution.executor = ManagedExecutorKind::GrokBuildIsolatedReview;
                 spec.managed_execution.retry_eligible = false;
                 spec.managed_execution.requires_approval_before_execution = true;
                 spec.authority.bypass_permissions = false;
-                spec.managed_execution.budget_profile = Some(
-                    match envelope.get("budget").and_then(|value| value.as_str()) {
-                        Some("balanced") => ManagedExecutionBudgetProfile::Balanced,
-                        Some("high_assurance") => ManagedExecutionBudgetProfile::HighAssurance,
-                        _ => ManagedExecutionBudgetProfile::Economy,
-                    },
-                );
-                if let Some(limits) = envelope.get("maxRounds").and_then(|value| value.as_u64()) {
-                    spec.managed_execution.bounds.max_rounds = limits as u32;
-                }
+                spec.managed_execution.budget_profile = Some(match parsed.budget.as_str() {
+                    "balanced" => ManagedExecutionBudgetProfile::Balanced,
+                    "high_assurance" => ManagedExecutionBudgetProfile::HighAssurance,
+                    _ => ManagedExecutionBudgetProfile::Economy,
+                });
+                spec.managed_execution.bounds.max_rounds = parsed.max_rounds as u32;
+            } else if envelope.is_some() {
+                self.native_executor.lock().skipped_ineligible += 1;
+                continue;
             }
             if !spec.managed_execution.enabled {
                 self.native_executor.lock().skipped_manual += 1;
@@ -2551,6 +2583,9 @@ impl OrchestrationService {
                 None
             }
         };
+        if !crate::verified_change::confinement_available() {
+            reasons.push("the check confinement backend macos-sandbox-exec is unavailable".into());
+        }
         match head.as_deref() {
             Some(revision) => {
                 let git = runtime
@@ -2742,22 +2777,39 @@ impl OrchestrationService {
             &request.mutation_mode,
         )
         .map_err(|error| OrchError::new(OrchErrorCode::InvalidRequest, error.message))?;
-        let envelope = serde_json::json!({
-            "executor": "grok_build_isolated_review",
-            "budget": request.budget_profile.as_str(),
-            "platform": request.platform,
-            "executionHost": request.execution_host,
-            "checkProfileId": authority.profile_id,
-            "checkProfileRevision": authority.profile_revision,
-            "executableDigest": authority.executable_digest,
-            "oracleDigest": authority.oracle_digest,
-            "maxPromptBytes": limits.max_prompt_bytes,
-            "maxRounds": limits.max_turns,
-            "maxDurationMs": limits.max_duration_ms,
-        });
+        let stored_work = self
+            .store
+            .load_work_item(&work_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .ok_or_else(|| OrchError::new(OrchErrorCode::Internal, "managed work disappeared"))?;
+        let agent_revision = self
+            .store
+            .load_agent(&request.agent_id)
+            .ok()
+            .flatten()
+            .and_then(|agent| agent.current_spec().ok().map(|spec| spec.revision))
+            .unwrap_or(0);
+        let envelope = crate::verified_change::VerifiedExecutionEnvelopeV1::new(
+            &work_id,
+            &stored_work.session_id.to_string(),
+            &stored_work.workspace,
+            &request.agent_id,
+            agent_revision,
+            request.budget_profile.as_str(),
+            &request.platform,
+            &request.execution_host,
+            &authority.profile_id,
+            authority.profile_revision,
+            &authority.executable_digest,
+            &authority.oracle_digest,
+            limits.max_prompt_bytes as u64,
+            u64::from(limits.max_turns),
+            limits.max_duration_ms,
+        );
         std::fs::write(
             private_dir.join("execution-envelope.json"),
-            envelope.to_string(),
+            serde_json::to_string(&envelope)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
         )
         .map_err(|_| {
             OrchError::new(
@@ -2765,25 +2817,14 @@ impl OrchestrationService {
                 "the verified-change execution envelope could not be stored",
             )
         })?;
-        std::fs::write(
-            private_dir.join("check-authority.json"),
-            serde_json::json!({
-                "profileId": authority.profile_id,
-                "profileRevision": authority.profile_revision,
-                "executableDigest": authority.executable_digest,
-                "oracleDigest": authority.oracle_digest,
-                "network": authority.network,
-                "sourceRoot": authority.source_root,
-                "maxOutputDirBytes": authority.output_limit_bytes,
-            })
-            .to_string(),
-        )
-        .map_err(|_| {
-            OrchError::new(
-                OrchErrorCode::Internal,
-                "the verified-change check authority could not be stored",
-            )
-        })?;
+        let mut sealed = authority.clone();
+        sealed.work_id = work_id.clone();
+        sealed.session_id = request.session_id.to_string();
+        sealed.workspace = request.workspace.display().to_string();
+        sealed.source_root = request.workspace.clone();
+        let sealed = sealed.seal();
+        crate::verified_change::write_check_authority(&private_dir, &sealed)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.message))?;
         let _authorized = self
             .authorize_work_execution(
                 auth,
@@ -2791,11 +2832,16 @@ impl OrchestrationService {
                 request.session_id,
                 &request.workspace,
                 &work_id,
-                "authorize one supervised verified-change attempt".into(),
+                format!(
+                    "authorize one supervised verified-change attempt envelope:{}",
+                    envelope.envelope_digest
+                ),
                 assigned_revision,
             )
             .await?;
-        self.drive_native_executor_once().await;
+        if !crate::verified_change::skip_verified_drive() {
+            self.drive_native_executor_once().await;
+        }
         self.verified_change_status(auth, request.session_id, &request.workspace, &work_id)
     }
     pub fn verified_change_status(
@@ -2972,7 +3018,9 @@ impl OrchestrationService {
     ) -> Result<serde_json::Value, OrchError> {
         let digest = expected_digest.to_string();
         let principal = auth.token_id.clone();
+        let owner = auth.owner_id.clone();
         let request = request_id.to_string();
+        let payload_workspace = workspace.display().to_string();
         self.work_item_mutation(
             auth,
             "ptah_apply_verified_change",
@@ -2983,6 +3031,7 @@ impl OrchestrationService {
             json!({
                 "expectedDigest": digest,
                 "expectedRevision": expected_revision,
+                "principalId": principal,
             }),
             move |store| {
                 store.apply_verified_candidate(
@@ -2991,6 +3040,8 @@ impl OrchestrationService {
                     expected_revision,
                     &principal,
                     &request,
+                    &owner,
+                    &payload_workspace,
                 )
             },
         )

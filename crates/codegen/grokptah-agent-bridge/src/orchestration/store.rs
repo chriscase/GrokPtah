@@ -224,6 +224,155 @@ struct ApplySourceIntent {
     approval_reviewer: String,
     approval_revision: u64,
     request_id: String,
+    #[serde(default)]
+    apply_bundle_digest: String,
+    /// Authenticated account that claimed the apply receipt.
+    #[serde(default)]
+    owner_id: String,
+    /// Exact workspace string inside the idempotency payload.
+    #[serde(default)]
+    payload_workspace: String,
+    /// `expectedRevision` as the caller supplied it. Absent is JSON null.
+    #[serde(default)]
+    payload_expected_revision: Option<u64>,
+}
+
+impl ApplySourceIntent {
+    fn validate_against(
+        &self,
+        item: &WorkItem,
+        attempts: &[WorkAttempt],
+        record: &crate::verified_change::PromotionRecord,
+        decisions: &[WorkDecision],
+        receipt: &IdempotencyReceipt,
+    ) -> Result<(), OrchError> {
+        let mismatch = || {
+            OrchError::new(
+                OrchErrorCode::Conflict,
+                "the apply intent does not match the sealed candidate",
+            )
+        };
+        if self.schema_version != 1 {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "the apply intent schema is unsupported",
+            ));
+        }
+        if self.approval_revision != self.work_revision
+            || self.principal_id.is_empty()
+            || self.owner_id.is_empty()
+            || self.payload_workspace.is_empty()
+        {
+            return Err(mismatch());
+        }
+        if !decisions.iter().any(|decision| {
+            decision.action == WorkDecisionAction::AuthorizeExecution
+                && decision.work_id == self.work_id
+                && !decision.actor_id.is_empty()
+        }) {
+            return Err(mismatch());
+        }
+        let observed_policy = decisions
+            .iter()
+            .rev()
+            .find_map(|decision| decision.policy_revision);
+        if self.policy_revision != observed_policy {
+            return Err(mismatch());
+        }
+        if self.work_id != item.work_id
+            || self.session_id != item.session_id
+            || self.workspace != item.workspace
+        {
+            return Err(mismatch());
+        }
+        let verification = item
+            .result
+            .as_ref()
+            .and_then(|result| result.candidate_verification.as_ref())
+            .ok_or_else(mismatch)?;
+        if item.state != WorkState::Succeeded && self.work_revision != item.revision {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "the apply intent is stale for this work revision",
+            ));
+        }
+        if self.candidate_digest != verification.content_digest
+            || self.apply_bundle_digest != verification.apply_bundle_digest
+            || self.apply_bundle_digest.is_empty()
+            || self.source_base_sha != verification.source_revision
+            || self.source_fingerprint != verification.source_fingerprint
+        {
+            return Err(mismatch());
+        }
+        let approval = item.approval.as_ref().ok_or_else(mismatch)?;
+        if approval.candidate_digest.as_deref() != Some(self.candidate_digest.as_str())
+            || approval.reviewer_id != self.approval_reviewer
+        {
+            return Err(mismatch());
+        }
+        if !attempts
+            .iter()
+            .any(|attempt| attempt.work_id == self.work_id && attempt.attempt_id == self.attempt_id)
+        {
+            return Err(mismatch());
+        }
+        let derived = crate::run_promotion::fingerprint_bytes(&record.base_revision, &record.patch);
+        let patch_digest = format!("{:x}", Sha256::digest(&record.patch));
+        if self.patch_digest != patch_digest
+            || self.final_fingerprint != derived
+            || record.final_fingerprint != derived
+            || record.base_revision != self.source_base_sha
+        {
+            return Err(mismatch());
+        }
+        let recomputed = crate::verified_change::apply_bundle_digest(
+            record,
+            &self.work_id,
+            verification
+                .attempt_id
+                .as_deref()
+                .unwrap_or(&self.attempt_id),
+            &self.source_fingerprint,
+            &item.policy.allowed_files,
+            &verification.check_authority_digest,
+            &verification.spec_digest,
+            verification.diff_digest.as_deref().unwrap_or(""),
+            verification.run_id.as_deref().unwrap_or(""),
+        )
+        .map_err(|_| mismatch())?;
+        if recomputed != self.apply_bundle_digest {
+            return Err(mismatch());
+        }
+        if receipt.schema_version != IDEMPOTENCY_RECEIPT_SCHEMA_VERSION
+            || receipt.tool != "ptah_apply_verified_change"
+            || receipt.request_id != self.request_id
+            || receipt.session_id != self.session_id
+            || receipt.owner_id != self.owner_id
+            || !matches!(receipt.status.as_str(), "pending" | "complete" | "failed")
+        {
+            return Err(mismatch());
+        }
+        let scope =
+            IdempotencyScope::new(&self.owner_id, self.session_id, Path::new(&item.workspace))
+                .map_err(|_| mismatch())?;
+        if receipt.workspace_digest != scope.workspace_digest {
+            return Err(mismatch());
+        }
+        let payload_hash = super::hash_payload(&serde_json::json!({
+            "sessionId": self.session_id,
+            "workspace": self.payload_workspace,
+            "workId": item.work_id,
+            "details": {
+                "expectedDigest": self.candidate_digest,
+                "expectedRevision": self.payload_expected_revision,
+                "principalId": self.principal_id,
+            },
+        }));
+        if receipt.payload_hash != payload_hash {
+            return Err(mismatch());
+        }
+        Ok(())
+    }
 }
 
 impl WorkLifecycleIntent {
@@ -683,24 +832,7 @@ impl OrchStore {
         work_id: &str,
     ) -> Option<crate::verified_change::CheckAuthority> {
         let dir = self.verified_change_private_dir(work_id).ok()?;
-        let raw = std::fs::read_to_string(dir.join("check-authority.json")).ok()?;
-        let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
-        Some(crate::verified_change::CheckAuthority {
-            profile_id: value.get("profileId")?.as_str()?.to_string(),
-            profile_revision: value.get("profileRevision")?.as_u64()?,
-            executable_digest: value.get("executableDigest")?.as_str()?.to_string(),
-            oracle_digest: value.get("oracleDigest")?.as_str()?.to_string(),
-            network: value
-                .get("network")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("none")
-                .to_string(),
-            source_root: PathBuf::from(value.get("sourceRoot")?.as_str()?),
-            output_limit_bytes: value
-                .get("maxOutputDirBytes")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(65_536),
-        })
+        crate::verified_change::read_check_authority(&dir).ok()
     }
 
     pub fn verified_execution_envelope(&self, work_id: &str) -> Option<serde_json::Value> {
@@ -3079,12 +3211,28 @@ impl OrchStore {
                 .approval
                 .as_ref()
                 .and_then(|approval| approval.target_revision.as_deref());
+            let authority = self.verified_check_authority(&item.work_id);
             return Ok(item
                 .result
                 .as_ref()
                 .and_then(|result| result.candidate_verification.as_ref())
                 .is_some_and(|verification| {
-                    verification.authorizes_applied_success(approved_digest, target_revision)
+                    verification.authorizes_applied_success(
+                        approved_digest,
+                        target_revision,
+                        authority
+                            .as_ref()
+                            .map(|item| item.profile_id.as_str())
+                            .unwrap_or(""),
+                        authority
+                            .as_ref()
+                            .map(|item| item.profile_revision)
+                            .unwrap_or(0),
+                        authority
+                            .as_ref()
+                            .map(|item| item.authority_digest.as_str())
+                            .unwrap_or(""),
+                    )
                 }));
         }
         if item.approval.is_some() {
@@ -5944,6 +6092,82 @@ impl OrchStore {
         Ok(())
     }
 
+    fn quarantine_apply_intent_unlocked(
+        &self,
+        mut item: WorkItem,
+        message: &str,
+    ) -> Result<(), OrchError> {
+        if item.state == WorkState::Succeeded {
+            return Ok(());
+        }
+        let prior = item.clone();
+        if let Some(result) = item.result.as_mut() {
+            if let Some(verification) = result.candidate_verification.as_mut() {
+                verification.reconciliation_required = true;
+                verification.checks_passed = false;
+            }
+            result.failure = Some(message.to_string());
+        }
+        let attempts = self
+            .list_work_attempts_unlocked(Some(&item.work_id))
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        item.bump();
+        self.commit_work_lifecycle_snapshots_unlocked(
+            "apply-reconciliation",
+            prior,
+            item,
+            attempts.clone(),
+            attempts,
+        )
+    }
+
+    fn prove_apply_intent_unlocked(
+        &self,
+        intent: &ApplySourceIntent,
+        item: &WorkItem,
+        attempts: &[WorkAttempt],
+        record: &crate::verified_change::PromotionRecord,
+    ) -> Result<(), OrchError> {
+        let decisions = self.list_work_decisions_unlocked(&item.work_id)?;
+        let receipt = self.matching_apply_receipt_unlocked(intent)?;
+        intent.validate_against(item, attempts, record, &decisions, &receipt)
+    }
+
+    fn matching_apply_receipt_unlocked(
+        &self,
+        intent: &ApplySourceIntent,
+    ) -> Result<IdempotencyReceipt, OrchError> {
+        let mismatch = || {
+            OrchError::new(
+                OrchErrorCode::Conflict,
+                "the apply intent does not match the sealed candidate",
+            )
+        };
+        let mut report = RetentionReport::default();
+        let paths = self
+            .idempotency_receipt_paths_unlocked(&mut report)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let mut found = None;
+        for path in paths {
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(receipt) = serde_json::from_str::<IdempotencyReceipt>(&text) else {
+                continue;
+            };
+            if receipt.tool == "ptah_apply_verified_change"
+                && receipt.request_id == intent.request_id
+                && receipt.session_id == intent.session_id
+            {
+                if found.is_some() {
+                    return Err(mismatch());
+                }
+                found = Some(receipt);
+            }
+        }
+        found.ok_or_else(mismatch)
+    }
+
     fn recover_apply_source_intents(&self) -> Result<(), OrchError> {
         let _guard = self.inner.lock.lock();
         let dir = self.inner.root.join("apply-source-intents");
@@ -5978,6 +6202,21 @@ impl OrchStore {
         else {
             return Ok(());
         };
+        let attempts = self
+            .list_work_attempts_unlocked(Some(&intent.work_id))
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let record = self
+            .candidate_snapshot_dir(&intent.work_id)
+            .ok()
+            .and_then(|path| crate::verified_change::read_promotion_record(&path).ok());
+        let Some(record) = record else {
+            return self
+                .quarantine_apply_intent_unlocked(item, "the apply intent bundle is missing");
+        };
+        if let Err(error) = self.prove_apply_intent_unlocked(intent, &item, &attempts, &record) {
+            return self.quarantine_apply_intent_unlocked(item, &error.message);
+        }
+        let derived = crate::run_promotion::fingerprint_bytes(&record.base_revision, &record.patch);
         let applied = item.state == WorkState::Succeeded
             && item
                 .result
@@ -5992,7 +6231,7 @@ impl OrchStore {
             Path::new(&intent.workspace),
             &intent.source_base_sha,
             &intent.source_fingerprint,
-            &intent.final_fingerprint,
+            &derived,
         )
         .map_err(|error| OrchError::new(OrchErrorCode::Conflict, error.to_string()))?;
         match class {
@@ -6053,6 +6292,7 @@ impl OrchStore {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn apply_verified_candidate(
         &self,
         work_id: &str,
@@ -6060,6 +6300,8 @@ impl OrchStore {
         expected_revision: Option<u64>,
         principal_id: &str,
         request_id: &str,
+        owner_id: &str,
+        payload_workspace: &str,
     ) -> Result<WorkItem, OrchError> {
         let _guard = self.inner.lock.lock();
         let mut item = self
@@ -6153,7 +6395,32 @@ impl OrchStore {
             approval_reviewer: approval.reviewer_id.clone(),
             approval_revision: item.revision,
             request_id: request_id.to_string(),
+            apply_bundle_digest: verification.apply_bundle_digest.clone(),
+            owner_id: owner_id.to_string(),
+            payload_workspace: payload_workspace.to_string(),
+            payload_expected_revision: expected_revision,
         };
+        if verification.apply_bundle_digest.is_empty()
+            || crate::verified_change::apply_bundle_digest(
+                &record,
+                work_id,
+                verification.attempt_id.as_deref().unwrap_or(""),
+                &verification.source_fingerprint,
+                &item.policy.allowed_files,
+                &verification.check_authority_digest,
+                &verification.spec_digest,
+                verification.diff_digest.as_deref().unwrap_or(""),
+                verification.run_id.as_deref().unwrap_or(""),
+            )
+            .ok()
+            .as_deref()
+                != Some(verification.apply_bundle_digest.as_str())
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "the candidate bundle does not match the approved digest",
+            ));
+        }
         if verification.reconciliation_required {
             return Err(OrchError::new(
                 OrchErrorCode::Conflict,
@@ -6161,11 +6428,17 @@ impl OrchStore {
             ));
         }
         if let Some(existing) = self.read_apply_source_intent_unlocked(work_id)? {
+            let attempts = self
+                .list_work_attempts_unlocked(Some(work_id))
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            self.prove_apply_intent_unlocked(&existing, &item, &attempts, &record)?;
+            let derived =
+                crate::run_promotion::fingerprint_bytes(&record.base_revision, &record.patch);
             match crate::run_promotion::classify_source(
                 Path::new(&item.workspace),
                 &existing.source_base_sha,
                 &existing.source_fingerprint,
-                &existing.final_fingerprint,
+                &derived,
             ) {
                 Ok(crate::run_promotion::SourceClassification::AlreadyApplied) => {
                     verification.applied = true;
@@ -6195,6 +6468,10 @@ impl OrchStore {
                 "apply interrupted before the intent was stored",
             ));
         }
+        let attempts = self
+            .list_work_attempts_unlocked(Some(work_id))
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        self.prove_apply_intent_unlocked(&intent, &item, &attempts, &record)?;
         self.persist_apply_source_intent_unlocked(&intent)?;
         if crate::verified_change::apply_fault() == 2 {
             return Err(OrchError::new(
@@ -6286,6 +6563,82 @@ impl OrchStore {
                 OrchErrorCode::Conflict,
                 "discard does not match the requested candidate",
             ));
+        }
+        if let Some(intent) = self.read_apply_source_intent_unlocked(work_id)? {
+            let attempts = self
+                .list_work_attempts_unlocked(Some(work_id))
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            let record = crate::verified_change::read_promotion_record(
+                &self.candidate_snapshot_dir(work_id)?,
+            )
+            .map_err(|error| OrchError::new(OrchErrorCode::Conflict, error.message))?;
+            let derived =
+                crate::run_promotion::fingerprint_bytes(&record.base_revision, &record.patch);
+            if let Err(error) = self.prove_apply_intent_unlocked(&intent, &item, &attempts, &record)
+            {
+                if error.message.contains("stale")
+                    && crate::run_promotion::classify_source(
+                        Path::new(&item.workspace),
+                        &intent.source_base_sha,
+                        &intent.source_fingerprint,
+                        &derived,
+                    )
+                    .ok()
+                        == Some(crate::run_promotion::SourceClassification::Poisoned)
+                {
+                    return Err(OrchError::new(
+                        OrchErrorCode::Conflict,
+                        "discard refused because the source needs reconciliation",
+                    ));
+                }
+                return Err(error);
+            }
+            match crate::run_promotion::classify_source(
+                Path::new(&item.workspace),
+                &intent.source_base_sha,
+                &intent.source_fingerprint,
+                &derived,
+            )
+            .map_err(|error| OrchError::new(OrchErrorCode::Conflict, error.to_string()))?
+            {
+                crate::run_promotion::SourceClassification::AlreadyApplied => {
+                    let mut verification = item
+                        .result
+                        .as_ref()
+                        .and_then(|result| result.candidate_verification.clone())
+                        .ok_or_else(|| {
+                            OrchError::new(
+                                OrchErrorCode::Conflict,
+                                "candidate verification is missing",
+                            )
+                        })?;
+                    verification.applied = true;
+                    self.finish_applied_candidate_unlocked(item, prior_item, verification)?;
+                    let finished = self
+                        .load_work_item_unlocked(work_id)
+                        .map_err(|error| {
+                            OrchError::new(OrchErrorCode::Internal, error.to_string())
+                        })?
+                        .ok_or_else(|| {
+                            OrchError::new(OrchErrorCode::Conflict, "work item not found")
+                        })?;
+                    self.complete_pending_apply_receipt_unlocked(&intent, &finished)?;
+                    let _ = self.clear_apply_source_intent_unlocked(work_id);
+                    return Err(OrchError::new(
+                        OrchErrorCode::Conflict,
+                        "discard refused because the candidate was already applied",
+                    ));
+                }
+                crate::run_promotion::SourceClassification::Poisoned => {
+                    return Err(OrchError::new(
+                        OrchErrorCode::Conflict,
+                        "discard refused because the source needs reconciliation",
+                    ));
+                }
+                crate::run_promotion::SourceClassification::NotApplied => {
+                    self.clear_apply_source_intent_unlocked(work_id)?;
+                }
+            }
         }
         if item
             .result
@@ -6389,14 +6742,32 @@ impl OrchStore {
             return Ok(item);
         }
         let retained = self.candidate_snapshot_dir(&work_id)?;
-        let changed = matches!(
-            crate::verified_change::retained_matches(
-                &retained,
-                &verification.content_digest,
-                &verification.files,
-            ),
-            Ok(false)
-        );
+        let bundle_changed = crate::verified_change::read_promotion_record(&retained)
+            .ok()
+            .and_then(|record| {
+                crate::verified_change::apply_bundle_digest(
+                    &record,
+                    &work_id,
+                    verification.attempt_id.as_deref().unwrap_or(""),
+                    &verification.source_fingerprint,
+                    &item.policy.allowed_files,
+                    &verification.check_authority_digest,
+                    &verification.spec_digest,
+                    verification.diff_digest.as_deref().unwrap_or(""),
+                    verification.run_id.as_deref().unwrap_or(""),
+                )
+                .ok()
+            })
+            .is_none_or(|digest| digest != verification.apply_bundle_digest);
+        let changed = bundle_changed
+            || matches!(
+                crate::verified_change::retained_matches(
+                    &retained,
+                    &verification.content_digest,
+                    &verification.files,
+                ),
+                Ok(false)
+            );
         if !changed {
             return Ok(item);
         }

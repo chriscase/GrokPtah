@@ -13,13 +13,14 @@ use std::sync::{Arc, Mutex};
 use grokptah_agent_bridge::orchestration::{
     AuthContext, ManagedExecutionBudgetProfile, ManagedGrokExecutorConfig, ManagedIntentState,
     OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, VerifiedChangeRequest,
-    WorkState, WorkspaceAllowlist,
+    WorkPolicy, WorkState, WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
     directory_digest, execute_required_checks, file_digest, set_grokptah_home_override,
     start_control_server, AgentHost, CredentialLeaseHandle, CredentialLeaseResolver,
     GrokBuildAdapterError, HostConfig, HostLeaseAuthority, HostRuntime, RequiredCheckCwd,
     RequiredCheckSpec, SessionKind, APPLY_FAULT, BEFORE_CANDIDATE_BIND,
+    CHECK_CONFINEMENT_EXECUTABLE, SKIP_VERIFIED_DRIVE,
 };
 use grokptah_agent_sdk::GrokBuildGitIdentity;
 use tempfile::tempdir;
@@ -2484,5 +2485,768 @@ async fn over_bound_source_names_the_path_ceiling_before_dispatch() {
         .list_managed_intents()
         .unwrap()
         .is_empty());
+    harness.close().await;
+}
+
+fn candidate_dir(harness: &Harness, work_id: &str) -> PathBuf {
+    harness
+        .orch
+        .store()
+        .verified_change_private_dir(work_id)
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_check_sandbox_is_not_ready() {
+    *CHECK_CONFINEMENT_EXECUTABLE.lock().unwrap() = Some(PathBuf::from("/no/such/sandbox-exec"));
+    let harness = Harness::open(ManagedExecutionBudgetProfile::Economy);
+    let prepared = harness
+        .orch
+        .prepare_verified_change(
+            &auth(),
+            &harness.request("no-sandbox", "isolated_review", "macos"),
+        )
+        .unwrap();
+    let reasons = prepared["readiness"]["reasons"].to_string();
+    assert!(reasons.contains("sandbox-exec"), "{prepared}");
+    assert_eq!(prepared["readiness"]["workersDispatched"], 0);
+    let started = harness
+        .orch
+        .start_verified_change(
+            &auth(),
+            &harness.request("no-sandbox", "isolated_review", "macos"),
+        )
+        .await
+        .unwrap_err();
+    assert!(started.to_string().contains("not ready"), "{started}");
+    assert!(harness
+        .orch
+        .store()
+        .list_managed_intents()
+        .unwrap()
+        .is_empty());
+    *CHECK_CONFINEMENT_EXECUTABLE.lock().unwrap() = None;
+    harness.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tampered_patch_cannot_apply() {
+    let (harness, work_id, digest, revision) = approved_repair("tamper-patch").await;
+    let before = harness.source_pair();
+    fs::write(
+        candidate_dir(&harness, &work_id).join("promotion.patch"),
+        b"not a patch\n",
+    )
+    .unwrap();
+    let error = harness
+        .orch
+        .apply_verified_change(
+            &auth(),
+            "apply-tamper-patch",
+            harness.lane,
+            harness.workspace.path(),
+            &work_id,
+            &digest,
+            Some(revision),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("bundle"), "{error}");
+    assert_eq!(harness.source_pair(), before);
+    harness.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tampered_final_fingerprint_cannot_apply() {
+    let (harness, work_id, digest, revision) = approved_repair("tamper-fp").await;
+    let before = harness.source_pair();
+    let manifest = candidate_dir(&harness, &work_id).join("manifest.json");
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+    value["finalFingerprint"] = serde_json::json!("deadbeef");
+    fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+    let error = harness
+        .orch
+        .apply_verified_change(
+            &auth(),
+            "apply-tamper-fp",
+            harness.lane,
+            harness.workspace.path(),
+            &work_id,
+            &digest,
+            Some(revision),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("bundle"), "{error}");
+    assert_eq!(harness.source_pair(), before);
+    harness.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tampered_manifest_path_mode_or_blob_cannot_apply() {
+    let (harness, work_id, digest, revision) = approved_repair("tamper-manifest").await;
+    let before = harness.source_pair();
+    let manifest = candidate_dir(&harness, &work_id).join("manifest.json");
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+    value["manifest"][0]["afterMode"] = serde_json::json!("100755");
+    fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+    let error = harness
+        .orch
+        .apply_verified_change(
+            &auth(),
+            "apply-tamper-mode",
+            harness.lane,
+            harness.workspace.path(),
+            &work_id,
+            &digest,
+            Some(revision),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("bundle"), "{error}");
+    assert_eq!(harness.source_pair(), before);
+    harness.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unchanged_materialized_tree_does_not_hide_a_replaced_patch() {
+    let (harness, work_id, digest, revision) = approved_repair("hide-patch").await;
+    let before = harness.source_pair();
+    let dir = candidate_dir(&harness, &work_id);
+    let tree = fs::read(dir.join("tree/src/ledger.rs")).unwrap();
+    fs::write(dir.join("promotion.patch"), b"replaced patch\n").unwrap();
+    assert_eq!(fs::read(dir.join("tree/src/ledger.rs")).unwrap(), tree);
+    let error = harness
+        .orch
+        .apply_verified_change(
+            &auth(),
+            "apply-hide-patch",
+            harness.lane,
+            harness.workspace.path(),
+            &work_id,
+            &digest,
+            Some(revision),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("bundle"), "{error}");
+    assert_eq!(harness.source_pair(), before);
+    harness.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_bundle_tamper_clears_approval_and_changes_no_source() {
+    let (harness, work_id, _digest, _revision) = approved_repair("clear-approval").await;
+    let before = harness.source_pair();
+    fs::write(
+        candidate_dir(&harness, &work_id).join("promotion.patch"),
+        b"tampered\n",
+    )
+    .unwrap();
+    harness
+        .orch
+        .verified_change_status(&auth(), harness.lane, harness.workspace.path(), &work_id)
+        .unwrap();
+    let work = harness
+        .orch
+        .store()
+        .load_work_item(&work_id)
+        .unwrap()
+        .unwrap();
+    assert!(
+        work.approval.is_none(),
+        "approval remained after the bundle changed"
+    );
+    assert_eq!(harness.source_pair(), before);
+    harness.close().await;
+}
+
+fn rewrite_only_intent(root: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
+    let dir = root.join("apply-source-intents");
+    let path = fs::read_dir(&dir).unwrap().flatten().next().unwrap().path();
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    edit(&mut value);
+    fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tampered_apply_intent_final_fingerprint_cannot_fabricate_success() {
+    let _reset = ResetFault;
+    let (harness, work_id, digest, revision) = approved_repair("intent-fp").await;
+    APPLY_FAULT.store(4, std::sync::atomic::Ordering::SeqCst);
+    let _ = harness
+        .orch
+        .apply_verified_change(
+            &auth(),
+            "apply-intent-fp",
+            harness.lane,
+            harness.workspace.path(),
+            &work_id,
+            &digest,
+            Some(revision),
+        )
+        .await
+        .unwrap_err();
+    APPLY_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+    rewrite_only_intent(harness.orch.store().root(), |value| {
+        value["finalFingerprint"] = serde_json::json!("fabricated");
+    });
+    let workspace = harness.workspace.path().to_path_buf();
+    let fake = harness.fake_dir.path().join("grok");
+    let isolate = harness.isolate.path().to_path_buf();
+    let identity = harness.identity.clone();
+    let lease = harness.fake_dir.path().join("lease.json");
+    let live = reopen_production_store(
+        harness.host,
+        harness.orch,
+        &workspace,
+        &fake,
+        &isolate,
+        &identity,
+        &lease,
+    )
+    .await;
+    let recovered = live.orch.store().load_work_item(&work_id).unwrap().unwrap();
+    assert_ne!(recovered.state, WorkState::Succeeded);
+    live.orch.stop_background_tasks().await;
+    live.host.shutdown().await;
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn discard_after_source_effect_before_work_commit_finishes_apply() {
+    let _reset = ResetFault;
+    let (harness, work_id, digest, revision) = approved_repair("discard-applied").await;
+    APPLY_FAULT.store(4, std::sync::atomic::Ordering::SeqCst);
+    let _ = harness
+        .orch
+        .apply_verified_change(
+            &auth(),
+            "apply-discard-4",
+            harness.lane,
+            harness.workspace.path(),
+            &work_id,
+            &digest,
+            Some(revision),
+        )
+        .await
+        .unwrap_err();
+    APPLY_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+    let error = harness
+        .orch
+        .discard_verified_change(
+            &auth(),
+            "discard-applied",
+            harness.lane,
+            harness.workspace.path(),
+            &work_id,
+            &digest,
+            Some(revision),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("already applied"), "{error}");
+    let work = harness
+        .orch
+        .store()
+        .load_work_item(&work_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(work.state, WorkState::Succeeded);
+    assert_eq!(
+        harness.source_pair(),
+        (LEDGER_AFTER.to_string(), REPORT_AFTER.to_string())
+    );
+    harness.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn discard_after_intent_before_effect_retires_intent_then_cancels() {
+    let _reset = ResetFault;
+    let (harness, work_id, digest, revision) = approved_repair("discard-intent").await;
+    let before = harness.source_pair();
+    APPLY_FAULT.store(2, std::sync::atomic::Ordering::SeqCst);
+    let _ = harness
+        .orch
+        .apply_verified_change(
+            &auth(),
+            "apply-discard-2",
+            harness.lane,
+            harness.workspace.path(),
+            &work_id,
+            &digest,
+            Some(revision),
+        )
+        .await
+        .unwrap_err();
+    APPLY_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+    harness
+        .orch
+        .discard_verified_change(
+            &auth(),
+            "discard-intent",
+            harness.lane,
+            harness.workspace.path(),
+            &work_id,
+            &digest,
+            Some(revision),
+        )
+        .await
+        .unwrap();
+    let work = harness
+        .orch
+        .store()
+        .load_work_item(&work_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(work.state, WorkState::Cancelled);
+    assert_eq!(harness.source_pair(), before);
+    let intents = harness.orch.store().root().join("apply-source-intents");
+    assert!(
+        fs::read_dir(&intents)
+            .map(|entries| entries.flatten().count())
+            .unwrap_or(0)
+            == 0
+    );
+    harness.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn discard_refuses_poisoned_apply() {
+    let _reset = ResetFault;
+    let (harness, work_id, digest, revision) = approved_repair("discard-poison").await;
+    APPLY_FAULT.store(7, std::sync::atomic::Ordering::SeqCst);
+    let _ = harness
+        .orch
+        .apply_verified_change(
+            &auth(),
+            "apply-discard-7",
+            harness.lane,
+            harness.workspace.path(),
+            &work_id,
+            &digest,
+            Some(revision),
+        )
+        .await
+        .unwrap_err();
+    APPLY_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+    let current = harness
+        .orch
+        .store()
+        .load_work_item(&work_id)
+        .unwrap()
+        .unwrap();
+    let error = harness
+        .orch
+        .discard_verified_change(
+            &auth(),
+            "discard-poison",
+            harness.lane,
+            harness.workspace.path(),
+            &work_id,
+            &digest,
+            Some(current.revision),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("reconciliation"), "{error}");
+    let work = harness
+        .orch
+        .store()
+        .load_work_item(&work_id)
+        .unwrap()
+        .unwrap();
+    assert_ne!(work.state, WorkState::Cancelled);
+    assert!(
+        harness.source_pair().0.contains("rollback-poison")
+            || harness.source_pair().1.contains("rollback-poison")
+    );
+    harness.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_execution_envelope_is_ineligible_without_side_effects() {
+    SKIP_VERIFIED_DRIVE.store(true, std::sync::atomic::Ordering::SeqCst);
+    let harness = Harness::open(ManagedExecutionBudgetProfile::Economy);
+    let started = harness
+        .orch
+        .start_verified_change(
+            &auth(),
+            &harness.request("no-envelope", "isolated_review", "macos"),
+        )
+        .await
+        .unwrap();
+    let work_id = started["workId"].as_str().unwrap().to_string();
+    let specs = directory_bytes(&harness.orch.store().root().join("agent-specs"));
+    fs::remove_file(candidate_dir(&harness, &work_id).join("execution-envelope.json")).unwrap();
+    SKIP_VERIFIED_DRIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+    harness.orch.drive_native_executor_once().await;
+    assert!(harness
+        .orch
+        .store()
+        .list_managed_intents()
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        specs,
+        directory_bytes(&harness.orch.store().root().join("agent-specs"))
+    );
+    harness.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tampered_execution_budget_or_profile_cannot_dispatch() {
+    SKIP_VERIFIED_DRIVE.store(true, std::sync::atomic::Ordering::SeqCst);
+    let harness = Harness::open(ManagedExecutionBudgetProfile::Economy);
+    let started = harness
+        .orch
+        .start_verified_change(
+            &auth(),
+            &harness.request("tamper-budget", "isolated_review", "macos"),
+        )
+        .await
+        .unwrap();
+    let work_id = started["workId"].as_str().unwrap().to_string();
+    let path = candidate_dir(&harness, &work_id).join("execution-envelope.json");
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    value["budget"] = serde_json::json!("high_assurance");
+    fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    SKIP_VERIFIED_DRIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+    harness.orch.drive_native_executor_once().await;
+    assert!(harness
+        .orch
+        .store()
+        .list_managed_intents()
+        .unwrap()
+        .is_empty());
+    harness.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn injected_execution_envelope_cannot_enable_grok_for_unrelated_work() {
+    let harness = Harness::open(ManagedExecutionBudgetProfile::Economy);
+    let specs = directory_bytes(&harness.orch.store().root().join("agent-specs"));
+    let created = harness
+        .orch
+        .create_work(
+            &auth(),
+            "unrelated-work",
+            harness.lane,
+            harness.workspace.path(),
+            "task".into(),
+            "unrelated".into(),
+            0,
+            None,
+            None,
+            Vec::new(),
+            WorkPolicy::default(),
+        )
+        .await
+        .unwrap();
+    let work_id = created["work"]["workId"].as_str().unwrap().to_string();
+    let revision = created["work"]["revision"].as_u64();
+    harness
+        .orch
+        .assign_work(
+            &auth(),
+            "assign-unrelated",
+            harness.lane,
+            harness.workspace.path(),
+            &work_id,
+            Some(harness.agent_id.clone()),
+            revision,
+        )
+        .await
+        .unwrap();
+    let dir = candidate_dir(&harness, &work_id);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("execution-envelope.json"), br#"{"schemaVersion":1,"workId":"foreign","budget":"economy","envelopeDigest":"sha256:nope"}"#).unwrap();
+    harness.orch.drive_native_executor_once().await;
+    assert!(harness
+        .orch
+        .store()
+        .live_managed_intent_for_work(&work_id)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        specs,
+        directory_bytes(&harness.orch.store().root().join("agent-specs"))
+    );
+    harness.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unsupported_apply_intent_schema_fails_closed() {
+    let _reset = ResetFault;
+    let (harness, work_id, digest, revision) = approved_repair("intent-schema").await;
+    APPLY_FAULT.store(2, std::sync::atomic::Ordering::SeqCst);
+    let _ = harness
+        .orch
+        .apply_verified_change(
+            &auth(),
+            "apply-schema",
+            harness.lane,
+            harness.workspace.path(),
+            &work_id,
+            &digest,
+            Some(revision),
+        )
+        .await
+        .unwrap_err();
+    APPLY_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+    rewrite_only_intent(harness.orch.store().root(), |value| {
+        value["schemaVersion"] = serde_json::json!(99);
+    });
+    let workspace = harness.workspace.path().to_path_buf();
+    let fake = harness.fake_dir.path().join("grok");
+    let isolate = harness.isolate.path().to_path_buf();
+    let identity = harness.identity.clone();
+    let lease = harness.fake_dir.path().join("lease.json");
+    let live = reopen_production_store(
+        harness.host,
+        harness.orch,
+        &workspace,
+        &fake,
+        &isolate,
+        &identity,
+        &lease,
+    )
+    .await;
+    assert_ne!(
+        live.orch
+            .store()
+            .load_work_item(&work_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        WorkState::Succeeded
+    );
+    live.orch.stop_background_tasks().await;
+    live.host.shutdown().await;
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_apply_intent_cannot_finish_a_newer_work_revision() {
+    let _reset = ResetFault;
+    let (harness, work_id, digest, revision) = approved_repair("intent-stale").await;
+    APPLY_FAULT.store(2, std::sync::atomic::Ordering::SeqCst);
+    let _ = harness
+        .orch
+        .apply_verified_change(
+            &auth(),
+            "apply-stale",
+            harness.lane,
+            harness.workspace.path(),
+            &work_id,
+            &digest,
+            Some(revision),
+        )
+        .await
+        .unwrap_err();
+    APPLY_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+    rewrite_only_intent(harness.orch.store().root(), |value| {
+        value["workRevision"] = serde_json::json!(9_999);
+    });
+    let workspace = harness.workspace.path().to_path_buf();
+    let fake = harness.fake_dir.path().join("grok");
+    let isolate = harness.isolate.path().to_path_buf();
+    let identity = harness.identity.clone();
+    let lease = harness.fake_dir.path().join("lease.json");
+    let live = reopen_production_store(
+        harness.host,
+        harness.orch,
+        &workspace,
+        &fake,
+        &isolate,
+        &identity,
+        &lease,
+    )
+    .await;
+    assert_ne!(
+        live.orch
+            .store()
+            .load_work_item(&work_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        WorkState::Succeeded
+    );
+    live.orch.stop_background_tasks().await;
+    live.host.shutdown().await;
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tampered_apply_intent_patch_or_candidate_digest_cannot_recover() {
+    let _reset = ResetFault;
+    let (harness, work_id, digest, revision) = approved_repair("intent-patch").await;
+    APPLY_FAULT.store(2, std::sync::atomic::Ordering::SeqCst);
+    let _ = harness
+        .orch
+        .apply_verified_change(
+            &auth(),
+            "apply-patch-digest",
+            harness.lane,
+            harness.workspace.path(),
+            &work_id,
+            &digest,
+            Some(revision),
+        )
+        .await
+        .unwrap_err();
+    APPLY_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+    rewrite_only_intent(harness.orch.store().root(), |value| {
+        value["patchDigest"] = serde_json::json!("0000");
+        value["candidateDigest"] = serde_json::json!("sha256:other");
+    });
+    let workspace = harness.workspace.path().to_path_buf();
+    let fake = harness.fake_dir.path().join("grok");
+    let isolate = harness.isolate.path().to_path_buf();
+    let identity = harness.identity.clone();
+    let lease = harness.fake_dir.path().join("lease.json");
+    let live = reopen_production_store(
+        harness.host,
+        harness.orch,
+        &workspace,
+        &fake,
+        &isolate,
+        &identity,
+        &lease,
+    )
+    .await;
+    assert_ne!(
+        live.orch
+            .store()
+            .load_work_item(&work_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        WorkState::Succeeded
+    );
+    assert_eq!(
+        (
+            fs::read_to_string(workspace.join("src/ledger.rs")).unwrap(),
+            fs::read_to_string(workspace.join("src/report.rs")).unwrap()
+        ),
+        (LEDGER_BEFORE.to_string(), REPORT_BEFORE.to_string())
+    );
+    live.orch.stop_background_tasks().await;
+    live.host.shutdown().await;
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn foreign_apply_intent_cannot_complete_another_receipt() {
+    let _reset = ResetFault;
+    let (harness, work_id, digest, revision) = approved_repair("intent-foreign").await;
+    APPLY_FAULT.store(2, std::sync::atomic::Ordering::SeqCst);
+    let _ = harness
+        .orch
+        .apply_verified_change(
+            &auth(),
+            "apply-foreign",
+            harness.lane,
+            harness.workspace.path(),
+            &work_id,
+            &digest,
+            Some(revision),
+        )
+        .await
+        .unwrap_err();
+    APPLY_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+    rewrite_only_intent(harness.orch.store().root(), |value| {
+        value["requestId"] = serde_json::json!("someone-else");
+        value["sessionId"] = serde_json::json!("00000000-0000-0000-0000-000000000000");
+    });
+    let workspace = harness.workspace.path().to_path_buf();
+    let fake = harness.fake_dir.path().join("grok");
+    let isolate = harness.isolate.path().to_path_buf();
+    let identity = harness.identity.clone();
+    let lease = harness.fake_dir.path().join("lease.json");
+    let live = reopen_production_store(
+        harness.host,
+        harness.orch,
+        &workspace,
+        &fake,
+        &isolate,
+        &identity,
+        &lease,
+    )
+    .await;
+    assert_ne!(
+        live.orch
+            .store()
+            .load_work_item(&work_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        WorkState::Succeeded
+    );
+    live.orch.stop_background_tasks().await;
+    live.host.shutdown().await;
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_apply_and_discard_converge_to_one_truthful_result() {
+    let (harness, work_id, digest, revision) = approved_repair("converge").await;
+    let orch = harness.orch.clone();
+    let lane = harness.lane;
+    let workspace = harness.workspace.path().to_path_buf();
+    let apply_id = work_id.clone();
+    let discard_id = work_id.clone();
+    let apply_digest = digest.clone();
+    let discard_digest = digest.clone();
+    let apply = {
+        let orch = orch.clone();
+        let workspace = workspace.clone();
+        tokio::spawn(async move {
+            orch.apply_verified_change(
+                &auth(),
+                "apply-converge",
+                lane,
+                &workspace,
+                &apply_id,
+                &apply_digest,
+                Some(revision),
+            )
+            .await
+        })
+    };
+    let discard = {
+        let orch = orch.clone();
+        let workspace = workspace.clone();
+        tokio::spawn(async move {
+            orch.discard_verified_change(
+                &auth(),
+                "discard-converge",
+                lane,
+                &workspace,
+                &discard_id,
+                &discard_digest,
+                Some(revision),
+            )
+            .await
+        })
+    };
+    let _ = apply.await.unwrap();
+    let _ = discard.await.unwrap();
+    let work = harness
+        .orch
+        .store()
+        .load_work_item(&work_id)
+        .unwrap()
+        .unwrap();
+    let source = harness.source_pair();
+    let before = (LEDGER_BEFORE.to_string(), REPORT_BEFORE.to_string());
+    let after = (LEDGER_AFTER.to_string(), REPORT_AFTER.to_string());
+    match work.state {
+        WorkState::Succeeded => assert_eq!(source, after),
+        WorkState::Cancelled => assert_eq!(source, before),
+        other => panic!("converged to {other:?} with source {source:?}"),
+    }
     harness.close().await;
 }
