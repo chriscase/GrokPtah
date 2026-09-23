@@ -158,6 +158,33 @@ Hosted Desktop for published tip `a1d65361fcb120e975740963cc571eedc8cffc48` (tre
 The commit that adds this paragraph is a later docs-only change. Its Desktop run, if one starts, is not finished here and is not claimed.
 
 
+## Durable authority seals
+
+Independent review of published tip `7443e0b1130161460aa17bf2701129ad8ab54005` returned HOLD. The executable tree under review was still functional SHA `872707b6006d9b9f6c2fe94a09e57d2093973fbb` (tree `450ff6e55d52800729ec1d43e4fb4cdb285d027b`). This repair is functional SHA `e14ac60458bd7d29aa7562e03575f439ad494e56` (tree `91faf17b9a91520781f4ab65d4b2f4664c76e042`). It is not an independent acceptance of the frozen goal.
+
+| Finding | Disposition | Named regression |
+| --- | --- | --- |
+| P0: missing or corrupt check authority still executes and can pass | Repaired. A verified-change Work seals a schema-versioned check authority into `CandidateVerification`. Missing, unreadable, malformed, stale, or mismatched authority launches no check, cannot reach `AwaitingApproval`, and cannot authorize success. `authorizes_applied_success` requires the profile id, profile revision, and authority digest. | `missing_check_authority_runs_no_check_and_cannot_verify`; `malformed_check_authority_runs_no_check_and_cannot_verify`; `replaced_executable_or_oracle_invalidates_without_execution`; `replaced_executable_or_oracle_invalidates_without_running`; `tampered_profile_revision_or_network_policy_cannot_verify` |
+| P0: patch, manifest, and final fingerprint are not sealed to the approved digest | Repaired. Finalization stores a `CandidateApplyBundle` digest on `CandidateVerification`. Approval, revalidation, apply, and recovery reread the artifacts, recompute the digest, derive `finalFingerprint` from base plus patch, and check patch SHA-256, manifest digest, and materialized bytes and modes. | `tampered_patch_cannot_apply`; `tampered_final_fingerprint_cannot_apply`; `tampered_manifest_path_mode_or_blob_cannot_apply`; `unchanged_materialized_tree_does_not_hide_a_replaced_patch`; `candidate_bundle_tamper_clears_approval_and_changes_no_source` |
+| P1: discard ignores a pending apply intent after source effects | Repaired. Discard inspects any `ApplySourceIntent` under the store lock before it removes artifacts. Already applied finishes success, completes the pending receipt, and refuses discard. Not applied retires the intent, then discards. Poisoned evidence is retained and discard is refused. | `discard_after_source_effect_before_work_commit_finishes_apply`; `discard_after_intent_before_effect_retires_intent_then_cancels`; `discard_refuses_poisoned_apply`; `concurrent_apply_and_discard_converge_to_one_truthful_result` |
+| P1: apply-intent fields are not validated on recovery | Repaired. `ApplySourceIntent::validate_against` runs before source classification or receipt completion. A mismatched schema, Work, revision, candidate, bundle, attempt, approval, patch, derived fingerprint, principal, policy revision, or idempotency receipt is quarantine, not success. The recorded `finalFingerprint` is not success authority. | `tampered_apply_intent_final_fingerprint_cannot_fabricate_success`; `tampered_apply_intent_patch_or_candidate_digest_cannot_recover`; `stale_apply_intent_cannot_finish_a_newer_work_revision`; `foreign_apply_intent_cannot_complete_another_receipt`; `unsupported_apply_intent_schema_fails_closed` |
+| P1: required checks run unsandboxed when `sandbox-exec` is absent | Repaired. Readiness and the sealed authority require the macOS `sandbox-exec` backend. A missing backend or a failed sandbox launch runs no check process and does not fall back to the executable. | `missing_check_sandbox_is_not_ready`; `missing_check_sandbox_runs_no_process`; `sandbox_launch_failure_cannot_fall_back_unsandboxed` |
+| P1: the execution envelope is an untyped mutable sidecar | Repaired. `VerifiedExecutionEnvelopeV1` replaces arbitrary JSON parsing. Its canonical digest is bound into the Work authorization decision. A missing, malformed, tampered, foreign, or mismatched envelope does not dispatch. | `injected_execution_envelope_cannot_enable_grok_for_unrelated_work`; `tampered_execution_budget_or_profile_cannot_dispatch`; `missing_execution_envelope_is_ineligible_without_side_effects` |
+
+Local validation on functional SHA `e14ac60458bd7d29aa7562e03575f439ad494e56`, before this evidence text:
+
+- `cargo test --locked -- --test-threads=1` in `crates/codegen/grokptah-agent-bridge` with a fresh `GROKPTAH_HOME`: exit 0. Lib tests 670 passed, including the run-promotion tests and `work_lifecycle_reopen_is_deterministic_at_each_crash_cut`. `grok_build_adapter` 27 passed. `grok_build_managed_executor` 1 passed and `live_grok_build_dogfood_runs_both_profiles_under_one_authority` ignored. `reliability_eval` 1 passed. `verified_change_workflow` 35 passed.
+- `cargo fmt --all -- --check` and `cargo clippy --locked --all-targets -- -D warnings` in the bridge: exit 0.
+- `cargo test -p xai-host-authority --locked -- --test-threads=1` from the repository root: exit 0.
+- Headless `grokptah-service` on a fresh `GROKPTAH_HOME`, not overlapping the bridge suite: `cargo test --locked -- --test-threads=1` exit 0 (lib 4, `service_conformance` 11, `service_smoke` 5) and `cargo check --locked --all-targets` exit 0.
+- Desktop `npm run typecheck` exit 0. `npm test` exit 0 (58 files, 428 tests). `desktop/src-tauri` `cargo test --locked` exit 0 (50 lib tests).
+
+Hosted Desktop for functional SHA `e14ac60458bd7d29aa7562e03575f439ad494e56`: GitHub Actions run `35898331687` (https://github.com/chriscase/GrokPtah/actions/runs/35898331687) completed with conclusion `success`. The run event was `pull_request`, `head_sha` was that functional SHA, and the `desktop` job succeeded with no failed steps. It started `2026-09-23T17:50:12Z` and the job finished `2026-09-23T18:24:56Z`.
+
+The commit that adds this section is documentation only. Its SHA is not `e14ac60458bd7d29aa7562e03575f439ad494e56`. A Desktop run for that docs tip, if one starts, is not the functional result above.
+
+The live-provider test was not run. No production revocable xAI lease was implemented. `FileCredentialLease` stays test-only. `HostLeaseAuthority` stays an in-process fake.
+
 ## Repair identity
 
 - Prior reviewed functional SHA: `32268e89f52776704d7a4729c2bd3581310ceeb7`
