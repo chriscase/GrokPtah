@@ -127,7 +127,9 @@ Local validation on this functional tree, before this evidence text:
 - Desktop `npm run typecheck` exited 0. `npm test` exited 0 (58 files, 428 tests). `desktop/src-tauri` `cargo test --locked` exited 0 (50 lib tests passed).
 - `cargo test -p xai-host-authority --locked -- --test-threads=1` from the repository root exited 0.
 
-Hosted Desktop workflow for `bd4476cfd89b1e24f279d8883f01cfe4e74201a4`: GitHub Actions run `35794089280` (https://github.com/chriscase/GrokPtah/actions/runs/35794089280) completed with conclusion `success`. The run event was `pull_request`, `head_sha` was that functional SHA, and the `desktop` job succeeded with no failed steps. It started `2026-09-22T22:45:55Z` and finished `2026-09-22T23:21:22Z`. A later docs-only commit matches `.github/workflows/desktop.yml`'s `docs/**` path filter, so it can start another run. That later run is not the result for the repaired functional head.
+Hosted Desktop workflow for the repaired functional SHA `bd4476cfd89b1e24f279d8883f01cfe4e74201a4`: GitHub Actions run `35794089280` (https://github.com/chriscase/GrokPtah/actions/runs/35794089280) completed with conclusion `success`. The run event was `pull_request`, `head_sha` was that functional SHA, and the `desktop` job succeeded with no failed steps. It started `2026-09-22T22:45:55Z` and finished `2026-09-22T23:21:22Z`.
+
+Hosted Desktop workflow for the evidence tip `2ddc65577b7716c448c10e071231846cc094a8ca`, recorded separately: GitHub Actions run `35797121302` (https://github.com/chriscase/GrokPtah/actions/runs/35797121302) also completed with conclusion `success`. Its `head_sha` was that evidence tip, not the functional SHA. It started `2026-09-22T23:22:46Z` and finished `2026-09-23T00:01:26Z`. The `desktop` job succeeded with no failed steps. That run does not replace the functional-head result above. This sentence is itself a docs-only change, so publishing it can queue another Desktop run for a newer tip. That later run is not a new functional result.
 
 The live-provider test was not run.
 
