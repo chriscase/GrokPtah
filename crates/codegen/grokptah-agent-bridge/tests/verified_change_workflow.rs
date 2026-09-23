@@ -16,11 +16,11 @@ use grokptah_agent_bridge::orchestration::{
     WorkPolicy, WorkState, WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
-    directory_digest, execute_required_checks, file_digest, set_grokptah_home_override,
-    start_control_server, AgentHost, CredentialLeaseHandle, CredentialLeaseResolver,
-    GrokBuildAdapterError, HostConfig, HostLeaseAuthority, HostRuntime, RequiredCheckCwd,
-    RequiredCheckSpec, SessionKind, APPLY_FAULT, BEFORE_CANDIDATE_BIND,
-    CHECK_CONFINEMENT_EXECUTABLE, SKIP_VERIFIED_DRIVE,
+    derived_snapshot_fingerprint, directory_digest, execute_required_checks, file_digest,
+    recompute_candidate_apply_bundle, set_grokptah_home_override, start_control_server, AgentHost,
+    CredentialLeaseHandle, CredentialLeaseResolver, GrokBuildAdapterError, HostConfig,
+    HostLeaseAuthority, HostRuntime, RequiredCheckCwd, RequiredCheckSpec, SessionKind, APPLY_FAULT,
+    BEFORE_CANDIDATE_BIND, CHECK_CONFINEMENT_EXECUTABLE, SKIP_VERIFIED_DRIVE,
 };
 use grokptah_agent_sdk::GrokBuildGitIdentity;
 use tempfile::tempdir;
@@ -2552,6 +2552,75 @@ async fn tampered_patch_cannot_apply() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("bundle"), "{error}");
+    assert_eq!(harness.source_pair(), before);
+    harness.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resealed_patch_after_approval_cannot_apply() {
+    let (harness, work_id, digest, revision) = approved_repair("reseal-patch").await;
+    let before = harness.source_pair();
+    let private_dir = candidate_dir(&harness, &work_id);
+    fs::write(
+        private_dir.join("promotion.patch"),
+        b"tampered patch bytes\n",
+    )
+    .unwrap();
+    let snapshot = private_dir.join("tree");
+    let derived = derived_snapshot_fingerprint(&snapshot).unwrap();
+    let manifest_path = private_dir.join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["finalFingerprint"] = serde_json::json!(derived);
+    fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let work = harness
+        .orch
+        .store()
+        .load_work_item(&work_id)
+        .unwrap()
+        .unwrap();
+    let verification = work
+        .result
+        .as_ref()
+        .unwrap()
+        .candidate_verification
+        .as_ref()
+        .unwrap();
+    let bundle =
+        recompute_candidate_apply_bundle(&snapshot, verification, &work.policy.allowed_files)
+            .unwrap();
+    let item_path = fs::read_dir(harness.orch.store().root().join("work-items"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            serde_json::from_slice::<serde_json::Value>(&fs::read(path).unwrap_or_default())
+                .ok()
+                .is_some_and(|value| {
+                    value.get("workId").and_then(|id| id.as_str()) == Some(work_id.as_str())
+                })
+        })
+        .expect("work item file");
+    let mut item: serde_json::Value =
+        serde_json::from_slice(&fs::read(&item_path).unwrap()).unwrap();
+    item["result"]["candidateVerification"]["applyBundleDigest"] = serde_json::json!(bundle);
+    fs::write(&item_path, serde_json::to_vec(&item).unwrap()).unwrap();
+    let error = harness
+        .orch
+        .apply_verified_change(
+            &auth(),
+            "apply-resealed-patch",
+            harness.lane,
+            harness.workspace.path(),
+            &work_id,
+            &digest,
+            Some(revision),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("bundle") || error.to_string().contains("approval"),
+        "{error}"
+    );
     assert_eq!(harness.source_pair(), before);
     harness.close().await;
 }

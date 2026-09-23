@@ -490,6 +490,9 @@ pub struct WorkApproval {
     /// Source revision observed when the approval was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_revision: Option<String>,
+    /// Exact candidate apply-bundle digest this approval releases.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apply_bundle_digest: Option<String>,
 }
 
 impl WorkApproval {

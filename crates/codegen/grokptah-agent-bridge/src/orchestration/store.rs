@@ -245,6 +245,7 @@ impl ApplySourceIntent {
         record: &crate::verified_change::PromotionRecord,
         decisions: &[WorkDecision],
         receipt: &IdempotencyReceipt,
+        retained: &Path,
     ) -> Result<(), OrchError> {
         let mismatch = || {
             OrchError::new(
@@ -306,6 +307,7 @@ impl ApplySourceIntent {
         }
         let approval = item.approval.as_ref().ok_or_else(mismatch)?;
         if approval.candidate_digest.as_deref() != Some(self.candidate_digest.as_str())
+            || approval.apply_bundle_digest.as_deref() != Some(self.apply_bundle_digest.as_str())
             || approval.reviewer_id != self.approval_reviewer
         {
             return Err(mismatch());
@@ -325,19 +327,10 @@ impl ApplySourceIntent {
         {
             return Err(mismatch());
         }
-        let recomputed = crate::verified_change::apply_bundle_digest(
-            record,
-            &self.work_id,
-            verification
-                .attempt_id
-                .as_deref()
-                .unwrap_or(&self.attempt_id),
-            &self.source_fingerprint,
+        let recomputed = crate::verified_change::recompute_candidate_apply_bundle(
+            retained,
+            verification,
             &item.policy.allowed_files,
-            &verification.check_authority_digest,
-            &verification.spec_digest,
-            verification.diff_digest.as_deref().unwrap_or(""),
-            verification.run_id.as_deref().unwrap_or(""),
         )
         .map_err(|_| mismatch())?;
         if recomputed != self.apply_bundle_digest {
@@ -3232,6 +3225,9 @@ impl OrchStore {
                             .as_ref()
                             .map(|item| item.authority_digest.as_str())
                             .unwrap_or(""),
+                        item.approval
+                            .as_ref()
+                            .and_then(|approval| approval.apply_bundle_digest.as_deref()),
                     )
                 }));
         }
@@ -5833,6 +5829,7 @@ impl OrchStore {
             approved_at: Utc::now(),
             candidate_digest: None,
             target_revision: None,
+            apply_bundle_digest: None,
         };
         approval.validate()?;
         let _guard = self.inner.lock.lock();
@@ -5945,8 +5942,23 @@ impl OrchStore {
                     "candidate content changed after verification",
                 ));
             }
+            let bundle = crate::verified_change::recompute_candidate_apply_bundle(
+                &retained,
+                &verification,
+                &item.policy.allowed_files,
+            )
+            .map_err(|error| OrchError::new(OrchErrorCode::Conflict, error.message))?;
+            if verification.apply_bundle_digest.is_empty()
+                || bundle != verification.apply_bundle_digest
+            {
+                return Err(OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "the candidate bundle changed after verification",
+                ));
+            }
             let mut bound = approval;
             bound.candidate_digest = Some(verification.content_digest);
+            bound.apply_bundle_digest = Some(bundle);
             bound.target_revision = Some(revision);
             attempt.terminal_reason = Some(format!(
                 "approved candidate {} by {reviewer_id}",
@@ -6130,7 +6142,8 @@ impl OrchStore {
     ) -> Result<(), OrchError> {
         let decisions = self.list_work_decisions_unlocked(&item.work_id)?;
         let receipt = self.matching_apply_receipt_unlocked(intent)?;
-        intent.validate_against(item, attempts, record, &decisions, &receipt)
+        let retained = self.candidate_snapshot_dir(&item.work_id)?;
+        intent.validate_against(item, attempts, record, &decisions, &receipt, &retained)
     }
 
     fn matching_apply_receipt_unlocked(
@@ -6400,21 +6413,18 @@ impl OrchStore {
             payload_workspace: payload_workspace.to_string(),
             payload_expected_revision: expected_revision,
         };
+        let approved_bundle = approval.apply_bundle_digest.clone().unwrap_or_default();
         if verification.apply_bundle_digest.is_empty()
-            || crate::verified_change::apply_bundle_digest(
-                &record,
-                work_id,
-                verification.attempt_id.as_deref().unwrap_or(""),
-                &verification.source_fingerprint,
+            || approved_bundle.is_empty()
+            || crate::verified_change::recompute_candidate_apply_bundle(
+                &retained,
+                &verification,
                 &item.policy.allowed_files,
-                &verification.check_authority_digest,
-                &verification.spec_digest,
-                verification.diff_digest.as_deref().unwrap_or(""),
-                verification.run_id.as_deref().unwrap_or(""),
             )
             .ok()
             .as_deref()
-                != Some(verification.apply_bundle_digest.as_str())
+                != Some(approved_bundle.as_str())
+            || approved_bundle != verification.apply_bundle_digest
         {
             return Err(OrchError::new(
                 OrchErrorCode::Conflict,
@@ -6742,23 +6752,22 @@ impl OrchStore {
             return Ok(item);
         }
         let retained = self.candidate_snapshot_dir(&work_id)?;
-        let bundle_changed = crate::verified_change::read_promotion_record(&retained)
-            .ok()
-            .and_then(|record| {
-                crate::verified_change::apply_bundle_digest(
-                    &record,
-                    &work_id,
-                    verification.attempt_id.as_deref().unwrap_or(""),
-                    &verification.source_fingerprint,
-                    &item.policy.allowed_files,
-                    &verification.check_authority_digest,
-                    &verification.spec_digest,
-                    verification.diff_digest.as_deref().unwrap_or(""),
-                    verification.run_id.as_deref().unwrap_or(""),
-                )
-                .ok()
-            })
-            .is_none_or(|digest| digest != verification.apply_bundle_digest);
+        let approved_bundle = item
+            .approval
+            .as_ref()
+            .and_then(|approval| approval.apply_bundle_digest.clone());
+        let bundle_changed = crate::verified_change::recompute_candidate_apply_bundle(
+            &retained,
+            &verification,
+            &item.policy.allowed_files,
+        )
+        .ok()
+        .is_none_or(|digest| {
+            digest != verification.apply_bundle_digest
+                || approved_bundle
+                    .as_deref()
+                    .is_some_and(|approved| approved != digest)
+        });
         let changed = bundle_changed
             || matches!(
                 crate::verified_change::retained_matches(
