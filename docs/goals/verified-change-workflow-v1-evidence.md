@@ -212,6 +212,31 @@ Production revocable xAI lease: STILL UNAVAILABLE.
 
 Desktop run `35902522879` has `head_sha` `fee6a5c4433d5907b89a1c1b223ec662c354eb1b`. It is not a result for `e14ac60458bd7d29aa7562e03575f439ad494e56`. This paragraph is a later docs-only commit. A Desktop run whose `head_sha` is not `e14ac60458bd7d29aa7562e03575f439ad494e56` is not claimed.
 
+## Invocation and approval-bundle seals
+
+A follow-up review of functional SHA `e14ac60458bd7d29aa7562e03575f439ad494e56` (tree `91faf17b9a91520781f4ab65d4b2f4664c76e042`) found two remaining holes. This repair is functional SHA `2240ed985dc3f7ade21cfd1ddfaa9f366df21486` (tree `eb73caffb771928dba9f59f75cb8a4087e4f4671`). It is not an independent acceptance of the frozen goal.
+
+| Finding | Disposition | Named regression |
+| --- | --- | --- |
+| Check authority digest omitted the executable path, oracle root, argv, cwd, env, timeout, process limit, write policy, and source root, so a rewritten check spec still launched | Repaired. Those fields are part of the canonical authority digest. A spec that does not match the sealed invocation launches no process. | `rewritten_check_argv_cwd_env_or_timeout_runs_no_process` |
+| Approval stored only the manifest digest. Replacing `promotion.patch`, aligning `finalFingerprint`, and rewriting `applyBundleDigest` applied the unapproved patch. Check outcomes and materialized bytes were not bundle inputs. | Repaired. Approval stores the recomputed apply-bundle digest. Apply and success authorization require that pin. The bundle hashes check outcomes and the on-disk candidate bytes and modes. | `resealed_patch_after_approval_cannot_apply` |
+
+Local validation on `2240ed985dc3f7ade21cfd1ddfaa9f366df21486`, before this evidence text:
+
+- `cargo test --locked -- --test-threads=1` in `crates/codegen/grokptah-agent-bridge` with a fresh `GROKPTAH_HOME`: exit 0. The suite includes lib tests, `verified_change_workflow` (36 passed, including the two regressions above), adapter 27, managed-executor non-live with the live test ignored, `reliability_eval`, and the run-promotion and lifecycle recovery tests.
+- Bridge `cargo fmt --all -- --check` and `cargo clippy --locked --all-targets -- -D warnings`: exit 0.
+- `cargo test -p xai-host-authority --locked -- --test-threads=1`: exit 0.
+- Isolated headless service `cargo test --locked -- --test-threads=1` and `cargo check --locked --all-targets`: exit 0.
+- Desktop `npm run typecheck`, `npm test`, and `desktop/src-tauri` `cargo test --locked`: exit 0.
+
+Hosted Desktop for functional SHA `2240ed985dc3f7ade21cfd1ddfaa9f366df21486`: GitHub Actions run `35907264876` (https://github.com/chriscase/GrokPtah/actions/runs/35907264876) completed with conclusion `success`. The event was `pull_request`, `head_sha` was that functional SHA, and the `desktop` job succeeded with no failed steps. The run started `2026-09-23T19:08:05Z` and the job finished `2026-09-23T19:51:43Z`.
+
+The commit that adds this section is documentation only. Its SHA is not `2240ed985dc3f7ade21cfd1ddfaa9f366df21486`. A Desktop run for that docs tip is not this result.
+
+Live-provider test: NOT RUN.
+
+Production revocable xAI lease: STILL UNAVAILABLE.
+
 ## Repair identity
 
 - Prior reviewed functional SHA: `32268e89f52776704d7a4729c2bd3581310ceeb7`
