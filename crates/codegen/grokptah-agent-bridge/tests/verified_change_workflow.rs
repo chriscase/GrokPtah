@@ -2403,3 +2403,86 @@ async fn discard_cleanup_failure_is_not_a_completed_discard() {
     drop(_clear);
     harness.close().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dirty_source_names_the_worktree_and_does_not_dispatch() {
+    let harness = Harness::open(ManagedExecutionBudgetProfile::Economy);
+    let ledger = harness.workspace.path().join("src/ledger.rs");
+    let mut bytes = fs::read(&ledger).unwrap();
+    bytes.push(b'x');
+    fs::write(&ledger, bytes).unwrap();
+    let prepared = harness
+        .orch
+        .prepare_verified_change(
+            &auth(),
+            &harness.request("dirty-byte", "isolated_review", "macos"),
+        )
+        .unwrap();
+    let reasons = prepared["readiness"]["reasons"].to_string();
+    assert!(reasons.contains("dirty"), "{prepared}");
+    assert!(!reasons.contains("2000"), "{prepared}");
+    assert!(!reasons.contains("32 MiB"), "{prepared}");
+    assert_eq!(prepared["readiness"]["workersDispatched"], 0);
+    assert_eq!(prepared["readiness"]["providerInvocations"], 0);
+    assert!(harness
+        .orch
+        .store()
+        .list_managed_intents()
+        .unwrap()
+        .is_empty());
+    let started = harness
+        .orch
+        .start_verified_change(
+            &auth(),
+            &harness.request("dirty-byte", "isolated_review", "macos"),
+        )
+        .await
+        .unwrap_err();
+    assert!(started.to_string().contains("not ready"), "{started}");
+    assert!(harness
+        .orch
+        .store()
+        .list_managed_intents()
+        .unwrap()
+        .is_empty());
+    harness.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn over_bound_source_names_the_path_ceiling_before_dispatch() {
+    let harness = Harness::open(ManagedExecutionBudgetProfile::Economy);
+    for index in 0..=2000 {
+        fs::write(
+            harness.workspace.path().join(format!("extra-{index}.txt")),
+            b"x",
+        )
+        .unwrap();
+    }
+    let prepared = harness
+        .orch
+        .prepare_verified_change(
+            &auth(),
+            &harness.request("too-many-paths", "isolated_review", "macos"),
+        )
+        .unwrap();
+    let reasons = prepared["readiness"]["reasons"].to_string();
+    assert!(reasons.contains("2000"), "{prepared}");
+    assert_eq!(prepared["readiness"]["workersDispatched"], 0);
+    assert_eq!(prepared["readiness"]["providerInvocations"], 0);
+    let started = harness
+        .orch
+        .start_verified_change(
+            &auth(),
+            &harness.request("too-many-paths", "isolated_review", "macos"),
+        )
+        .await
+        .unwrap_err();
+    assert!(started.to_string().contains("not ready"), "{started}");
+    assert!(harness
+        .orch
+        .store()
+        .list_managed_intents()
+        .unwrap()
+        .is_empty());
+    harness.close().await;
+}

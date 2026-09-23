@@ -566,6 +566,7 @@ pub fn execute_required_checks_with_authority(
     }
     let spec_digest = RequiredCheckSpec::spec_digest(checks)?;
     let before = snapshot_identity(candidate_root);
+    let source_before = authority.and_then(|item| sealed_tree_token(&item.source_root));
     let mut results = Vec::with_capacity(checks.len());
     for check in checks {
         if let Some(authority) = authority {
@@ -594,7 +595,12 @@ pub fn execute_required_checks_with_authority(
             authority,
         ));
     }
-    if snapshot_identity(candidate_root) != before {
+    let source_changed = source_before.is_some_and(|before| {
+        authority.is_some_and(|item| {
+            sealed_tree_token(&item.source_root).as_deref() != Some(before.as_str())
+        })
+    });
+    if snapshot_identity(candidate_root) != before || source_changed {
         for result in &mut results {
             if result.outcome == "passed" {
                 result.outcome = "failed".into();
@@ -753,18 +759,16 @@ pub fn apply_candidate_tree(
     .map_err(|error| VerifiedChangeError::new(error.to_string()))
 }
 
-fn check_sandbox_profile(
-    candidate: &Path,
-    oracle: &Path,
-    output: &Path,
-    source: Option<&Path>,
-) -> String {
-    let profile = format!(
-        "(version 1)\n(deny default)\n(allow process*)\n(allow signal)\n(allow sysctl-read)\n(allow file-read*)\n(allow file-ioctl (literal \"/dev/null\"))\n(allow file-write* (subpath \"{}\"))\n(deny network*)\n",
+fn check_sandbox_profile(output: &Path, network: &str) -> String {
+    let network_rule = if network == "qualified" {
+        "(allow network*)"
+    } else {
+        "(deny network*)"
+    };
+    format!(
+        "(version 1)\n(deny default)\n(allow process*)\n(allow signal)\n(allow sysctl-read)\n(allow file-read*)\n(allow file-ioctl (literal \"/dev/null\"))\n(allow file-write* (subpath \"{}\"))\n{network_rule}\n",
         output.display()
-    );
-    let _ = (candidate, oracle, source);
-    profile
+    )
 }
 
 pub fn file_digest(path: &Path) -> Option<String> {
@@ -812,6 +816,28 @@ fn directory_size(root: &Path) -> u64 {
 
 fn snapshot_identity(root: &Path) -> String {
     directory_digest(root).unwrap_or_else(|| "missing".into())
+}
+
+fn sealed_tree_token(root: &Path) -> Option<String> {
+    if root.as_os_str().is_empty() || !root.is_dir() {
+        return None;
+    }
+    let status = Command::new("/usr/bin/git")
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .current_dir(root)
+        .output();
+    let diff = Command::new("/usr/bin/git")
+        .args(["diff", "--raw", "-z", "--no-ext-diff"])
+        .current_dir(root)
+        .output();
+    if let (Ok(status), Ok(diff)) = (status, diff) {
+        if status.status.success() && diff.status.success() {
+            let mut bytes = status.stdout;
+            bytes.extend(diff.stdout);
+            return Some(digest_bytes(&bytes));
+        }
+    }
+    Some(snapshot_identity(root))
 }
 
 pub fn resolve_check_profile(
@@ -988,14 +1014,11 @@ fn run_one_check(
     let network = authority
         .map(|item| item.network.as_str())
         .unwrap_or("none");
-    let mut command = if network == "none" && Path::new("/usr/bin/sandbox-exec").is_file() {
+    let mut command = if Path::new("/usr/bin/sandbox-exec").is_file() {
         let mut sandboxed = Command::new("/usr/bin/sandbox-exec");
-        sandboxed.arg("-p").arg(check_sandbox_profile(
-            &candidate,
-            &oracle,
-            &output_dir,
-            authority.map(|item| item.source_root.as_path()),
-        ));
+        sandboxed
+            .arg("-p")
+            .arg(check_sandbox_profile(&output_dir, network));
         sandboxed.arg(&check.executable);
         sandboxed
     } else {
@@ -1204,7 +1227,7 @@ fn walk_identity(
         files.push(CandidateFileRecord {
             path: relative,
             digest: digest_bytes(&bytes),
-            kind: "file".into(),
+            kind: format!("file:{:o}", meta.permissions().mode() & 0o777),
         });
     }
     Ok(())
@@ -1912,6 +1935,51 @@ mod tests {
         );
         assert_eq!(opened[0].exit_code, Some(2));
         drop(listener);
+    }
+
+    #[test]
+    fn qualified_network_cannot_change_source_bytes_or_candidate_mode() {
+        let oracle = temp();
+        let candidate = temp();
+        let source = temp();
+        let kept = candidate.path().join("kept.txt");
+        fs::write(&kept, b"kept\n").unwrap();
+        fs::set_permissions(&kept, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::write(source.path().join("kept.txt"), b"source\n").unwrap();
+        let script = oracle.path().join("mutate.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\nprintf poisoned > \"$SOURCE_ROOT/poisoned.txt\" 2>/dev/null\nchmod 755 \"$CANDIDATE_ROOT/kept.txt\" 2>/dev/null\nexit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut check = check_spec("qualified", &script, 2000);
+        check.max_output_bytes = 4096;
+        let authority = sealed_authority(
+            "qualified",
+            &script,
+            oracle.path(),
+            source.path(),
+            "qualified",
+        );
+        let results = execute_required_checks_with_authority(
+            std::slice::from_ref(&check),
+            candidate.path(),
+            oracle.path(),
+            Some(&authority),
+        )
+        .unwrap();
+        assert_eq!(results[0].outcome, "passed", "{results:?}");
+        assert!(!source.path().join("poisoned.txt").exists());
+        assert_eq!(
+            fs::read(source.path().join("kept.txt")).unwrap(),
+            b"source\n"
+        );
+        assert_eq!(
+            fs::symlink_metadata(&kept).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        assert_eq!(fs::read(&kept).unwrap(), b"kept\n");
     }
 
     #[test]

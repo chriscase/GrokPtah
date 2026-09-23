@@ -2551,22 +2551,30 @@ impl OrchestrationService {
                 None
             }
         };
-        let identity_unsupported = match head.as_deref() {
+        match head.as_deref() {
             Some(revision) => {
-                crate::run_promotion::fingerprint_at(&request.workspace, revision).is_err()
-                    || !crate::verified_change::worktree_is_clean(
-                        Path::new("/usr/bin/git"),
-                        &request.workspace,
-                    )
+                let git = runtime
+                    .as_ref()
+                    .map(|runtime| runtime.config.git_executable.as_path())
+                    .unwrap_or(Path::new("/usr/bin/git"));
+                if !crate::verified_change::worktree_is_clean(git, &request.workspace)
                     .unwrap_or(false)
+                {
+                    reasons.push(
+                        "the source worktree is dirty; candidate identity is not taken from uncommitted source edits"
+                            .into(),
+                    );
+                }
+                if let Err(error) = crate::run_promotion::preflight_changed_path_bounds(
+                    &request.workspace,
+                    revision,
+                ) {
+                    reasons.push(error.to_string());
+                }
             }
-            None => true,
-        };
-        if identity_unsupported {
-            reasons.push(
-                "candidate identity requires a git base SHA plus a changed-path manifest; unchanged files are not hashed, and a change above 2000 paths or 32 MiB is unsupported"
-                    .into(),
-            );
+            None => {
+                reasons.push("the source revision could not be read".into());
+            }
         }
         let executable = runtime
             .as_ref()

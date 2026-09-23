@@ -133,6 +133,17 @@ Hosted Desktop workflow for the evidence tip `2ddc65577b7716c448c10e071231846cc0
 
 The live-provider test was not run.
 
+## Follow-up after hosted review
+
+Three gaps remained after `2216b8e18`:
+
+- A check profile with network `qualified` skipped `sandbox-exec`, so the check could write the source workspace. Candidate identity also ignored file mode, so a mode-only candidate edit could still pass. Qualified checks now use the same write sandbox as offline checks, with network allowed only for that policy. After the check, source status and candidate bytes and modes are compared. Regression: `qualified_network_cannot_change_source_bytes_or_candidate_mode`.
+- `grokptah-service` aborted startup when `GROKPTAH_MANAGED_GROK_EXECUTABLE` was set, because a file lease cannot revoke upstream authority. Startup now logs that error and keeps serving, with readiness unavailable and no worker dispatched. Regression: `unavailable_operator_lease_does_not_abort_service_startup`.
+- Readiness described every dirty tree or fingerprint error as the 2000-path / 32 MiB ceiling, and did not measure the bound before dispatch. A dirty tree now says the worktree is dirty. An over-bound diff says the 2000-path or 32 MiB limit. Both refuse dispatch. Regressions: `dirty_source_names_the_worktree_and_does_not_dispatch`, `over_bound_source_names_the_path_ceiling_before_dispatch`, `one_byte_edit_is_inside_the_changed_path_bound`, `too_many_untracked_paths_name_the_file_bound`, `oversized_patch_names_the_byte_bound`.
+
+Local proof for this follow-up: verified-change workflow 17 passed; the new lib tests above passed; bridge and service fmt and Clippy `-D warnings` exited 0; the service startup regression passed. The hosted Desktop result for this follow-up commit is not claimed in this file. Recording it with another docs commit would queue another Desktop run. The draft PR body is the place that result is recorded after the run for this commit's SHA.
+
+
 ## Repair identity
 
 - Prior reviewed functional SHA: `32268e89f52776704d7a4729c2bd3581310ceeb7`

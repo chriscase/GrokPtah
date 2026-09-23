@@ -337,6 +337,68 @@ fn diff_bytes(worktree: &Path, base_revision: &str) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
+/// Count changed and untracked paths and the binary patch size. Unchanged
+/// file contents are not read. Readiness uses this before any provider spawn.
+pub(crate) fn preflight_changed_path_bounds(worktree: &Path, base_revision: &str) -> Result<()> {
+    let names = git_command(
+        worktree,
+        &["diff", "--name-only", "-z", "--no-ext-diff"],
+        &[
+            std::ffi::OsStr::new(base_revision),
+            std::ffi::OsStr::new("--"),
+        ],
+        None,
+    )?;
+    if !names.status.success() {
+        bail!("list candidate changes failed: {}", command_error(&names));
+    }
+    let untracked = git_command(
+        worktree,
+        &["ls-files", "--others", "-z", "--exclude-standard"],
+        &[],
+        None,
+    )?;
+    if !untracked.status.success() {
+        bail!(
+            "list untracked candidate paths failed: {}",
+            command_error(&untracked)
+        );
+    }
+    let mut paths = std::collections::BTreeSet::new();
+    for raw in names
+        .stdout
+        .split(|byte| *byte == 0)
+        .chain(untracked.stdout.split(|byte| *byte == 0))
+    {
+        if raw.is_empty() {
+            continue;
+        }
+        let path = std::str::from_utf8(raw).context("Git returned a non-UTF-8 path")?;
+        paths.insert(path.to_string());
+    }
+    if paths.len() > MAX_CHANGED_FILES {
+        bail!(
+            "the candidate changes more files than the host changed-path bound of {MAX_CHANGED_FILES}"
+        );
+    }
+    let patch = git_command(
+        worktree,
+        &["diff", "--binary", "--no-ext-diff", "--no-textconv"],
+        &[
+            std::ffi::OsStr::new(base_revision),
+            std::ffi::OsStr::new("--"),
+        ],
+        None,
+    )?;
+    if !patch.status.success() {
+        bail!("read candidate patch failed: {}", command_error(&patch));
+    }
+    if patch.stdout.len() > MAX_PATCH_BYTES {
+        bail!("the candidate patch exceeds the host bound of 32 MiB");
+    }
+    Ok(())
+}
+
 pub(crate) fn fingerprint_at(root: &Path, base_revision: &str) -> Result<String> {
     let head = git_stdout(root, &["rev-parse", "HEAD"])?;
     let patch = diff_bytes(root, base_revision)?;
@@ -1139,5 +1201,56 @@ mod tests {
         assert_eq!(captured.manifest.len(), 1);
         assert_eq!(captured.manifest[0].path, "src/file-0.rs");
         assert!(captured.patch.len() < 32 * 1024 * 1024);
+    }
+
+    #[test]
+    fn one_byte_edit_is_inside_the_changed_path_bound() {
+        let dir = repository();
+        let base = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let base = String::from_utf8(base.stdout).unwrap().trim().to_string();
+        let readme = dir.path().join("README.md");
+        let mut bytes = fs::read(&readme).unwrap();
+        bytes.push(b'x');
+        fs::write(&readme, bytes).unwrap();
+        preflight_changed_path_bounds(dir.path(), &base).unwrap();
+    }
+
+    #[test]
+    fn too_many_untracked_paths_name_the_file_bound() {
+        let dir = repository();
+        let base = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let base = String::from_utf8(base.stdout).unwrap().trim().to_string();
+        for index in 0..=2000 {
+            fs::write(dir.path().join(format!("extra-{index}.txt")), b"x").unwrap();
+        }
+        let error = preflight_changed_path_bounds(dir.path(), &base)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("2000"), "{error}");
+        assert!(!error.contains("32 MiB"), "{error}");
+    }
+
+    #[test]
+    fn oversized_patch_names_the_byte_bound() {
+        let dir = repository();
+        let base = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let base = String::from_utf8(base.stdout).unwrap().trim().to_string();
+        fs::write(dir.path().join("README.md"), vec![b'a'; 33 * 1024 * 1024]).unwrap();
+        let error = preflight_changed_path_bounds(dir.path(), &base)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("32 MiB"), "{error}");
     }
 }
