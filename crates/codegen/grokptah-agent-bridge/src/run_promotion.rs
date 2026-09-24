@@ -1369,13 +1369,18 @@ fn symlink_target_escapes(root: &Path, link_path: &Path, target: &Path) -> bool 
     resolve_contained(&root, &start, target, 0).is_none()
 }
 
+fn is_protected_metadata_name(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy();
+    name.eq_ignore_ascii_case(".git") || name.eq_ignore_ascii_case(".grokptah")
+}
+
 fn enters_metadata(root: &Path, path: &Path) -> bool {
     let Ok(relative) = path.strip_prefix(root) else {
         return true;
     };
-    relative.components().any(|component| {
-        matches!(component, Component::Normal(name) if name == ".git" || name == ".grokptah")
-    })
+    relative
+        .components()
+        .any(|component| matches!(component, Component::Normal(name) if is_protected_metadata_name(name)))
 }
 
 fn resolve_contained(root: &Path, start: &Path, target: &Path, depth: u32) -> Option<PathBuf> {
@@ -1405,7 +1410,7 @@ fn resolve_contained(root: &Path, start: &Path, target: &Path, depth: u32) -> Op
                 }
             }
             Component::Normal(name) => {
-                if name == ".git" || name == ".grokptah" {
+                if is_protected_metadata_name(name) {
                     return None;
                 }
                 let next = current.join(name);
@@ -2058,6 +2063,24 @@ mod tests {
         assert!(error.contains("symlink"), "{error}");
         fs::remove_file(dir.path().join("link")).unwrap();
         symlink(".grokptah/secret", dir.path().join("link")).unwrap();
+        let error = capture_worktree_changes(dir.path(), &base)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("symlink"), "{error}");
+    }
+
+    #[test]
+    fn case_variant_metadata_symlink_target_is_rejected() {
+        use std::os::unix::fs::symlink;
+        let dir = repository();
+        let base = head_of(dir.path());
+        symlink(".Grokptah/secret", dir.path().join("link")).unwrap();
+        let error = capture_worktree_changes(dir.path(), &base)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("symlink"), "{error}");
+        fs::remove_file(dir.path().join("link")).unwrap();
+        symlink(".GIT/config", dir.path().join("link")).unwrap();
         let error = capture_worktree_changes(dir.path(), &base)
             .unwrap_err()
             .to_string();
