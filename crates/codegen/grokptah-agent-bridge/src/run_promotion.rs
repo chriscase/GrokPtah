@@ -666,6 +666,8 @@ fn sealed_identity_matches(
         }
         let target = fs::read_link(path).with_context(|| format!("read symlink {}", entry.path))?;
         git_hash_bytes(source, target.as_os_str().as_encoded_bytes())?
+    } else if !meta.is_file() {
+        return Ok(false);
     } else {
         if entry.symlink || recorded_mode.contains("120000") {
             return Ok(false);
@@ -835,10 +837,12 @@ fn git_hash_bytes(worktree: &Path, bytes: &[u8]) -> Result<String> {
 fn mode_matches_meta(meta: &std::fs::Metadata, recorded: &str) -> bool {
     let observed = if meta.file_type().is_symlink() {
         "120000"
-    } else if meta.permissions().mode() & 0o111 != 0 {
+    } else if meta.is_file() && meta.permissions().mode() & 0o111 != 0 {
         "100755"
-    } else {
+    } else if meta.is_file() {
         "100644"
+    } else {
+        return false;
     };
     recorded.ends_with(observed) || observed.ends_with(recorded.trim_start_matches(':'))
 }
@@ -1756,6 +1760,90 @@ mod tests {
             fs::read_link(retained.path().join("tree").join("link")).unwrap(),
             Path::new("renamed-target")
         );
+        let parent = tempfile::tempdir().unwrap();
+        let tree = parent.path().join("candidate");
+        crate::verified_change::retain_candidate_snapshot(dir.path(), &tree, &base).unwrap();
+        assert_eq!(
+            fs::read_link(tree.join("link")).unwrap(),
+            Path::new("renamed-target")
+        );
+        let stored: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(parent.path().join("manifest.json")).unwrap())
+                .unwrap();
+        let link_file = stored["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|file| file["path"] == "link")
+            .unwrap();
+        use sha2::Digest;
+        let expected = format!("sha256:{:x}", sha2::Sha256::digest(b"renamed-target"));
+        let empty = format!("sha256:{:x}", sha2::Sha256::digest(b""));
+        assert_eq!(link_file["digest"].as_str().unwrap(), expected);
+        assert_ne!(link_file["digest"].as_str().unwrap(), empty);
+        let record = crate::verified_change::read_promotion_record(&tree).unwrap();
+        assert!(crate::verified_change::retained_matches(
+            &tree,
+            &record.content_digest,
+            &record.files
+        )
+        .unwrap());
+        let bundle = crate::verified_change::apply_bundle_digest(
+            &record,
+            "work",
+            "attempt",
+            "source-fingerprint",
+            &["link".to_string()],
+            "authority",
+            "spec",
+            "diff",
+            "run",
+            &[],
+            false,
+            &tree,
+        )
+        .unwrap();
+        assert!(bundle.starts_with("sha256:"));
+        assert_eq!(bundle.len(), "sha256:".len() + 64);
+        let bound = crate::verified_change::bind_retained_candidate(dir.path(), &tree).unwrap();
+        assert!(bound.changed_paths.iter().any(|path| path == "link"));
+    }
+
+    #[test]
+    fn executable_add_replaced_by_a_directory_is_foreign_not_an_error() {
+        let dir = repository();
+        let base = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let base = String::from_utf8(base.stdout).unwrap().trim().to_string();
+        let tool = dir.path().join("tool");
+        fs::write(&tool, b"#!/bin/sh\n").unwrap();
+        let mut permissions = fs::metadata(&tool).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tool, permissions).unwrap();
+        let captured = capture_worktree_changes(dir.path(), &base).unwrap();
+        let entry = captured
+            .manifest
+            .iter()
+            .find(|entry| entry.path == "tool")
+            .unwrap();
+        assert_eq!(entry.state, "add");
+        assert_eq!(entry.after_mode, "100755");
+        git(dir.path(), &["reset", "-q"]);
+        fs::remove_file(&tool).unwrap();
+        fs::create_dir(&tool).unwrap();
+        assert_eq!(
+            classify_source(dir.path(), &base, &captured.manifest).unwrap(),
+            SourceClassification::Poisoned
+        );
+        assert_eq!(
+            rollback_exact_candidate_additions(dir.path(), &base, &captured.manifest, &[]).unwrap(),
+            SourceClassification::Poisoned
+        );
+        assert!(tool.is_dir());
+        assert!(fs::read_dir(&tool).unwrap().next().is_none());
     }
 
     #[test]

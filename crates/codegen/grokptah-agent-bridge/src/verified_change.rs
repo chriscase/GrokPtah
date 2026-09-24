@@ -556,7 +556,7 @@ pub fn retain_candidate_snapshot(
             });
             continue;
         }
-        let bytes = fs::read(staging.join("tree").join(&entry.path)).unwrap_or_default();
+        let (_symlink, bytes, _mode) = candidate_identity(&staging.join("tree").join(&entry.path))?;
         files.push(CandidateFileRecord {
             path: entry.path.clone(),
             digest: digest_bytes(&bytes),
@@ -724,7 +724,7 @@ fn prove_patch_reproduces_checked_tree(
         let checked = materialized.join(&entry.path);
         let reproduced = checkout.join(&entry.path);
         if entry.state == "delete" {
-            if checked.exists() || reproduced.exists() {
+            if fs::symlink_metadata(&checked).is_ok() || fs::symlink_metadata(&reproduced).is_ok() {
                 let _ = std::process::Command::new("git")
                     .args(["worktree", "remove", "--force"])
                     .arg(&checkout)
@@ -737,26 +737,13 @@ fn prove_patch_reproduces_checked_tree(
             }
             continue;
         }
-        let checked_bytes = fs::read(&checked).unwrap_or_default();
-        let reproduced_bytes = fs::read(&reproduced).unwrap_or_default();
-        if checked_bytes != reproduced_bytes {
-            let _ = std::process::Command::new("git")
-                .args(["worktree", "remove", "--force"])
-                .arg(&checkout)
-                .current_dir(source)
-                .status();
-            let _ = fs::remove_dir_all(&scratch);
-            return Err(VerifiedChangeError::new(
-                "the retained patch does not reproduce the checked tree",
-            ));
-        }
-        let checked_mode = fs::symlink_metadata(&checked)
-            .map(|meta| meta.permissions().mode() & 0o777)
-            .unwrap_or(0);
-        let reproduced_mode = fs::symlink_metadata(&reproduced)
-            .map(|meta| meta.permissions().mode() & 0o777)
-            .unwrap_or(0);
-        if checked_mode != reproduced_mode {
+        let checked_identity = candidate_identity(&checked).map_err(|_| {
+            VerifiedChangeError::new("the retained patch does not reproduce the checked tree")
+        })?;
+        let reproduced_identity = candidate_identity(&reproduced).map_err(|_| {
+            VerifiedChangeError::new("the retained patch does not reproduce the checked tree")
+        })?;
+        if checked_identity != reproduced_identity {
             let _ = std::process::Command::new("git")
                 .args(["worktree", "remove", "--force"])
                 .arg(&checkout)
@@ -1317,20 +1304,23 @@ pub fn retained_matches(
     for file in &record.files {
         let path = retained.join(&file.path);
         if file.digest == "absent" {
-            if path.exists() {
+            if fs::symlink_metadata(&path).is_ok() {
                 return Ok(false);
             }
             continue;
         }
-        let bytes = fs::read(&path).unwrap_or_default();
+        let Ok((symlink, bytes, mode)) = candidate_identity(&path) else {
+            return Ok(false);
+        };
         if digest_bytes(&bytes) != file.digest {
             return Ok(false);
         }
-        if let Ok(mode) = u32::from_str_radix(&file.kind, 8) {
-            let actual = fs::symlink_metadata(&path)
-                .map(|meta| meta.permissions().mode() & 0o777)
-                .unwrap_or(0);
-            if actual != (mode & 0o777) {
+        if symlink {
+            if !file.kind.contains("120000") {
+                return Ok(false);
+            }
+        } else if let Ok(recorded) = u32::from_str_radix(&file.kind, 8) {
+            if mode != (recorded & 0o777) {
                 return Ok(false);
             }
         }
@@ -1416,9 +1406,10 @@ fn digest_retained_candidate(
             hasher.update([0]);
             continue;
         }
-        let bytes = fs::read(tree.join(&entry.path)).map_err(|_| {
-            VerifiedChangeError::new("the retained candidate file could not be read")
-        })?;
+        let (_symlink, bytes, _mode) =
+            candidate_identity(&tree.join(&entry.path)).map_err(|_| {
+                VerifiedChangeError::new("the retained candidate file could not be read")
+            })?;
         hasher.update(&bytes);
         hasher.update([0]);
     }
@@ -1446,32 +1437,40 @@ fn retained_tree_matches_checkout(
     Ok(true)
 }
 
-fn snapshot_entry(path: &Path) -> Result<Option<(Vec<u8>, u32)>, VerifiedChangeError> {
-    let meta = match fs::symlink_metadata(path) {
-        Ok(meta) => meta,
+fn snapshot_entry(path: &Path) -> Result<Option<(Vec<u8>, u32, bool)>, VerifiedChangeError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => {
             return Err(VerifiedChangeError::new(
                 "the candidate file could not be read",
             ))
         }
-    };
+    }
+    let (symlink, bytes, mode) = candidate_identity(path)?;
+    Ok(Some((bytes, mode, symlink)))
+}
+
+/// Bytes that identify one materialized path. A symlink contributes its
+/// target text, the same bytes Git hashes for a 120000 blob. The link is
+/// never followed.
+fn candidate_identity(path: &Path) -> Result<(bool, Vec<u8>, u32), VerifiedChangeError> {
+    let meta = fs::symlink_metadata(path)
+        .map_err(|_| VerifiedChangeError::new("materialized candidate bytes are missing"))?;
     let mode = meta.permissions().mode() & 0o777;
-    let bytes = if meta.file_type().is_symlink() {
-        fs::read_link(path)
-            .map_err(|_| VerifiedChangeError::new("a candidate symlink could not be read"))?
-            .to_string_lossy()
-            .into_owned()
-            .into_bytes()
-    } else if meta.is_file() {
-        fs::read(path)
-            .map_err(|_| VerifiedChangeError::new("the candidate file could not be read"))?
-    } else {
-        return Err(VerifiedChangeError::new(
-            "the candidate contains a non-regular source file",
-        ));
-    };
-    Ok(Some((bytes, mode)))
+    if meta.file_type().is_symlink() {
+        let target = fs::read_link(path)
+            .map_err(|_| VerifiedChangeError::new("a candidate symlink could not be read"))?;
+        return Ok((true, target.as_os_str().as_encoded_bytes().to_vec(), mode));
+    }
+    if meta.is_file() {
+        let bytes = fs::read(path)
+            .map_err(|_| VerifiedChangeError::new("the candidate file could not be read"))?;
+        return Ok((false, bytes, mode));
+    }
+    Err(VerifiedChangeError::new(
+        "the candidate contains a non-regular source file",
+    ))
 }
 
 pub fn apply_fault() -> u8 {
@@ -2664,7 +2663,7 @@ pub fn apply_bundle_digest(
     for file in &record.files {
         let path = retained.join(&file.path);
         if file.digest == "absent" {
-            if path.exists() {
+            if fs::symlink_metadata(&path).is_ok() {
                 return Err(VerifiedChangeError::new(
                     "a deleted candidate path is still materialized",
                 ));
@@ -2673,17 +2672,13 @@ pub fn apply_bundle_digest(
             hasher.update([0]);
             continue;
         }
-        let bytes = fs::read(&path)
-            .map_err(|_| VerifiedChangeError::new("materialized candidate bytes are missing"))?;
+        let (_symlink, bytes, mode) = candidate_identity(&path)?;
         let actual = digest_bytes(&bytes);
         if actual != file.digest {
             return Err(VerifiedChangeError::new(
                 "materialized candidate bytes do not match the manifest",
             ));
         }
-        let mode = fs::symlink_metadata(&path)
-            .map(|meta| meta.permissions().mode() & 0o777)
-            .unwrap_or(0);
         hasher.update(file.path.as_bytes());
         hasher.update([0]);
         hasher.update(actual.as_bytes());
