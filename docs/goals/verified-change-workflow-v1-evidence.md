@@ -391,6 +391,40 @@ Live-provider test: NOT RUN.
 
 Production revocable xAI lease: STILL UNAVAILABLE.
 
+## Stale cleanup and symlink containment
+
+Prior functional SHA: `2b987192a22f921cef4fd0f0eb3774508c0bbe8c` (tree `43776b3f57c170d511dfcf9788218c6fe5a63b40`). This repair is functional SHA `112b0032d306015c412d2ebf8931fba1ca677e55` (tree `a8e9238438bd4e7cc1e111963dd97d59cab8acea`). It is not an independent acceptance of the frozen goal.
+
+Stale cleanup runs only after schema and bounds, Work identity, candidate and apply-bundle digests, approval and attempt, patch, manifest, materialized tree, final fingerprint, exact base SHA, allowed-file scope, idempotency receipt and payload, and the source-cleanup plan digest have been checked. The stale result is a typed verdict. Directory provenance is `grokptah-source-cleanup-plan-v1`, stored on the apply intent and the apply receipt. Rollback refuses a manifest path outside the Work allowed files. An all-Before file set still removes directories created only for candidate additions. Cleanup has six fault cuts. Symlink containment resolves each existing ancestor, rejects absolute targets and targets that enter `.git` or `.grokptah`, and allows a dangling target only when its longest existing ancestor stays inside the workspace. A regular-to-symlink or symlink-to-regular change is refused before verification.
+
+Local validation on the working tree committed as `112b0032d306015c412d2ebf8931fba1ca677e55` (tree `a8e9238438bd4e7cc1e111963dd97d59cab8acea`), before that commit at `2026-09-24T14:05:39-05:00`. No executable diff exists after that commit. Each named regression below was `ok`. The live managed-executor test stayed ignored.
+
+- Bridge `cargo fmt --all -- --check`: exit 0 (`FMT:0`).
+- Bridge `cargo clippy --locked --all-targets -- -D warnings`: exit 0 (`CLIPPY:0`).
+- Bridge `cargo test --locked -- --test-threads=1` on a fresh `GROKPTAH_HOME`: exit 0 (`SUITE:0`). `verified_change_workflow` passed 66 tests. `live_grok_build_dogfood_runs_both_profiles_under_one_authority` stayed ignored.
+- `cargo test -p xai-host-authority --locked -- --test-threads=1`: exit 0 (`AUTH:0`).
+- Isolated service `cargo test --locked -- --test-threads=1`: exit 0 (`SERVICE:0`).
+- Isolated service `cargo check --locked --all-targets`: exit 0 (`CHECK:0`).
+- Desktop `npm run typecheck`: exit 0 (`TC:0`).
+- Desktop `npm test`: exit 0 (`NPM:0`, 58 files, 428 tests).
+- `desktop/src-tauri` `cargo test --locked`: exit 0 (`DESKLIB:0`).
+
+| Gap | Result on `112b0032d` / `a8e92384` | Named regression |
+| --- | --- | --- |
+| F1 stale cleanup | A tampered manifest, an expanded path, a tampered directory-provenance seal, or an unapproved bundle performs no cleanup. An ordinary stale partial addition is still discarded. | `stale_intent_with_tampered_manifest_performs_zero_cleanup`; `stale_intent_cannot_expand_cleanup_beyond_allowed_files`; `tampered_preexisting_directory_provenance_is_quarantined`; `stale_cleanup_requires_the_approved_apply_bundle`; `ordinary_stale_partial_addition_can_still_be_safely_discarded` |
+| F2 directory durability | A crash after file removal and before directory removal is recovered. All-Before paths still remove candidate-created directories. A preexisting empty directory survives every cleanup cut. The discard receipt completes only after restoration. | `crash_after_file_cleanup_before_directory_cleanup_recovers`; `all_before_paths_still_reconcile_candidate_created_directories`; `preexisting_empty_directory_survives_every_cleanup_cut`; `discard_receipt_completes_only_after_full_source_restoration` |
+| F3 symlink containment | A dangling target through an escaping ancestor, a `..` after a symlink, and a target into `.git` or `.grokptah` are rejected. A safe dangling internal target is retained exactly. | `dangling_target_through_escaping_symlink_ancestor_is_rejected`; `parent_component_after_symlink_cannot_escape`; `symlink_target_into_git_metadata_is_rejected`; `safe_dangling_internal_target_is_retained_exactly` |
+| F4 type transitions | A regular/symlink transition is refused before verification. An unchanged source is NotApplied and does not require reconciliation. | `regular_to_symlink_applies_exactly_or_is_refused_before_review`; `symlink_to_regular_applies_exactly_or_is_refused_before_review`; `type_transition_with_unchanged_source_never_sets_reconciliation_required` |
+| Accepted repairs | Retained symlink identity, foreign-path preservation, changed HEAD, an unchanged operator index, patch reproduction, check authority, and the approval-bound bundle stayed green. | `symlink_target_change_is_exactly_verified_or_explicitly_refused`; `foreign_file_at_candidate_add_path_is_preserved_and_discard_refuses`; `changed_head_after_source_effect_cannot_recover_success`; `successful_added_file_application_leaves_index_unchanged`; `applied_patch_must_reproduce_the_checked_materialized_tree`; `rewritten_check_argv_cwd_env_or_timeout_runs_no_process`; `resealed_patch_after_approval_cannot_apply` |
+
+Hosted Desktop for repaired functional SHA `112b0032d306015c412d2ebf8931fba1ca677e55` only: GitHub Actions run `36045789618` attempt 1 (https://github.com/chriscase/GrokPtah/actions/runs/36045789618) concluded `success`. The event was `pull_request`. `head_sha` was `112b0032d306015c412d2ebf8931fba1ca677e55`. The `desktop` job had no failed steps (`2026-09-24T19:15:08Z` to `2026-09-24T19:51:11Z`).
+
+The commit that adds this section is documentation only. Its tree is not `a8e9238438bd4e7cc1e111963dd97d59cab8acea`. A Desktop run for that docs tip is not the result above.
+
+Live-provider test: NOT RUN.
+
+Production revocable xAI lease: STILL UNAVAILABLE.
+
 ## Repair identity
 
 - Prior reviewed functional SHA: `32268e89f52776704d7a4729c2bd3581310ceeb7`
