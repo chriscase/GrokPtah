@@ -326,6 +326,39 @@ Live-provider test: NOT RUN.
 
 Production revocable xAI lease: STILL UNAVAILABLE.
 
+## Source-state recovery
+
+Prior functional SHA: `cf9d03a1a114e79805797b1df8429dd9182dd445` (tree `1e6b830b0726545f5654b330b0cd937034ca5d8f`). This repair is functional SHA `642dee819d4d3ebb895703a37f1c27a158bdb6b9` (tree `46e6c299c857bd2097f742d1aea8a5a48210a1c5`). It is not an independent acceptance of the frozen goal.
+
+Discard no longer removes every manifest addition after a poisoned classification. Each path is Before, After, Absent, Foreign, or Unknown. An add is Before only when absent, After only when the sealed after bytes, type, and mode match, and Foreign when anything else is at that path. All Before with the sealed base is NotApplied. All After with that base is AlreadyApplied. A mixture of Before and exact After may remove only exact candidate additions. Any Foreign or Unknown path requires reconciliation and performs no cleanup. Pre-application directory identity keeps a pre-existing directory and removes a directory created only by a partial candidate. NotApplied and AlreadyApplied require the current HEAD to equal the sealed base SHA, a clean index, and every worktree change accounted for by the manifest. A staged change on a manifest path is reconciliation. Applying a candidate does not intent-to-add the operator index. Symlink identity is the Git blob of the exact link target. A path is not accepted as that symlink merely because its mode is `120000`.
+
+Local validation on the working tree committed as `642dee819d4d3ebb895703a37f1c27a158bdb6b9` (tree `46e6c299c857bd2097f742d1aea8a5a48210a1c5`), before that commit at `2026-09-24T10:29:43-05:00`. No executable diff exists after that commit. Each named regression below was `ok`. The live managed-executor test stayed ignored.
+
+- Bridge `cargo fmt --all -- --check`: exit 0 (`FMT:0`).
+- Bridge `cargo clippy --locked --all-targets -- -D warnings`: exit 0 (`CLIPPY:0`).
+- Bridge `cargo test --locked -- --test-threads=1` on a fresh `GROKPTAH_HOME`: exit 0 (`SUITE:0`). `verified_change_workflow` passed 57 tests. `live_grok_build_dogfood_runs_both_profiles_under_one_authority` stayed ignored.
+- `cargo test -p xai-host-authority --locked -- --test-threads=1`: exit 0 (`AUTH:0`).
+- Isolated service `cargo test --locked -- --test-threads=1`: exit 0 (`SERVICE:0`).
+- Isolated service `cargo check --locked --all-targets`: exit 0 (`CHECK:0`).
+- Desktop `npm run typecheck`: exit 0 (`TC:0`).
+- Desktop `npm test`: exit 0 (`NPM:0`, 58 files, 428 tests).
+- `desktop/src-tauri` `cargo test --locked`: exit 0 (`DESKLIB:0`, 50 lib tests).
+
+| Gap | Result on `642dee819` / `46e6c299` | Named regression |
+| --- | --- | --- |
+| E1 foreign same-path file | Discard does not delete a foreign file or symlink at an add path. Exact After additions can be removed. Cleanup keeps a pre-existing empty directory and removes a directory created only by the partial candidate. | `foreign_file_at_candidate_add_path_is_preserved_and_discard_refuses`; `foreign_symlink_at_candidate_add_path_is_preserved`; `exact_partial_candidate_addition_can_be_removed`; `partial_add_cleanup_does_not_remove_a_preexisting_empty_directory`; `partial_add_cleanup_does_not_leave_a_candidate_created_directory` |
+| E2 base head and index | A changed HEAD is not recovered as success, including when the candidate bytes were committed on that new HEAD. A staged foreign change on a manifest path blocks apply and recovery. A successful add leaves the operator index unchanged. | `changed_head_after_source_effect_cannot_recover_success`; `changed_head_with_candidate_bytes_and_foreign_commit_is_poisoned`; `staged_foreign_change_on_manifest_path_blocks_apply`; `staged_foreign_change_on_manifest_path_blocks_recovery`; `successful_added_file_application_leaves_index_unchanged` |
+| E3 symlink identity | A different link target is Foreign, not AlreadyApplied. The retained and materialized target matches the Git blob of the link text. An escaping symlink is still rejected. | `different_symlink_target_is_foreign_not_already_applied`; `symlink_target_change_is_exactly_verified_or_explicitly_refused`; `symlink_escape_remains_rejected` |
+| E4 validation | Bridge suite, fmt, and strict Clippy passed, as did host-authority, isolated service tests and check, desktop typecheck, npm tests, and Tauri tests. Accepted D1–D5 repairs stayed green. Hosted Desktop success for this functional SHA is only run `36020642386` attempt 1. | `rewritten_check_argv_cwd_env_or_timeout_runs_no_process`; `resealed_patch_after_approval_cannot_apply` |
+
+Hosted Desktop for repaired functional SHA `642dee819d4d3ebb895703a37f1c27a158bdb6b9` only: GitHub Actions run `36020642386` attempt 1 (https://github.com/chriscase/GrokPtah/actions/runs/36020642386) concluded `success`. The event was `pull_request`. `head_sha` was `642dee819d4d3ebb895703a37f1c27a158bdb6b9`. The `desktop` job had no failed steps (`2026-09-24T15:30:15Z` to `2026-09-24T16:05:02Z`).
+
+The commit that adds this section is documentation only. Its tree is not `46e6c299c857bd2097f742d1aea8a5a48210a1c5`. A Desktop run for that docs tip is not the result above.
+
+Live-provider test: NOT RUN.
+
+Production revocable xAI lease: STILL UNAVAILABLE.
+
 ## Repair identity
 
 - Prior reviewed functional SHA: `32268e89f52776704d7a4729c2bd3581310ceeb7`
