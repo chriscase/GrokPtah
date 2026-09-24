@@ -21,7 +21,7 @@ use grokptah_agent_bridge::{
     set_grokptah_home_override, start_control_server, write_check_authority, AgentHost,
     CredentialLeaseHandle, CredentialLeaseResolver, GrokBuildAdapterError, HostConfig,
     HostLeaseAuthority, HostRuntime, RequiredCheckCwd, RequiredCheckSpec, SessionKind, APPLY_FAULT,
-    BEFORE_CANDIDATE_BIND, CHECK_CONFINEMENT_EXECUTABLE, SKIP_VERIFIED_DRIVE,
+    BEFORE_CANDIDATE_BIND, CHECK_CONFINEMENT_EXECUTABLE, CLEANUP_FAULT, SKIP_VERIFIED_DRIVE,
 };
 use grokptah_agent_sdk::GrokBuildGitIdentity;
 use tempfile::tempdir;
@@ -1668,7 +1668,7 @@ if [ "$behavior" = "ledger-only" ]; then
 }
 ' > src/ledger.rs
 fi
-if [ "$behavior" = "repair" ] || [ "$behavior" = "hold" ] || [ "$behavior" = "escape" ] || [ "$behavior" = "survive" ] || [ "$behavior" = "add-files" ] || [ "$behavior" = "extra" ] || [ "$behavior" = "add-kept" ] || [ "$behavior" = "add-fresh" ]; then
+if [ "$behavior" = "repair" ] || [ "$behavior" = "hold" ] || [ "$behavior" = "escape" ] || [ "$behavior" = "survive" ] || [ "$behavior" = "add-files" ] || [ "$behavior" = "extra" ] || [ "$behavior" = "add-kept" ] || [ "$behavior" = "add-fresh" ] || [ "$behavior" = "add-pair" ]; then
   mkdir -p src
   printf '%s' 'pub fn balance(cents: &[i32]) -> i32 {
     cents.iter().sum()
@@ -1694,6 +1694,15 @@ if [ "$behavior" = "add-fresh" ]; then
   printf '%s' 'pub fn note() -> i32 { 1 }
 ' > fresh/note.rs
 fi
+if [ "$behavior" = "add-pair" ]; then
+  mkdir -p kept fresh/nested
+  printf '%s' 'pub fn note() -> i32 { 1 }
+' > kept/note.rs
+  printf '%s' 'pub fn note() -> i32 { 1 }
+' > fresh/a.rs
+  printf '%s' 'pub fn note() -> i32 { 1 }
+' > fresh/nested/b.rs
+fi
 if [ "$behavior" = "extra" ]; then
   printf '%s' 'pub fn extra() {}
 ' > src/notes.rs
@@ -1711,6 +1720,7 @@ struct ResetFault;
 impl Drop for ResetFault {
     fn drop(&mut self) {
         APPLY_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+        CLEANUP_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -4574,6 +4584,492 @@ async fn successful_added_file_application_leaves_index_unchanged() {
     assert_eq!(
         fs::read_to_string(workspace.join("src/aaa_note.rs")).unwrap(),
         NOTE_AFTER
+    );
+    harness.close().await;
+}
+
+fn bump_work_revision(root: &Path, work_id: &str) -> u64 {
+    for entry in fs::read_dir(root.join("work-items")).unwrap().flatten() {
+        let path = entry.path();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        if value["workId"] != work_id {
+            continue;
+        }
+        let revision = value["revision"].as_u64().unwrap() + 7;
+        value["revision"] = serde_json::json!(revision);
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        return revision;
+    }
+    panic!("work item {work_id} was not stored");
+}
+
+fn receipt_status(root: &Path, request_id: &str) -> Option<String> {
+    let dir = root.join("idempotency").join("v2");
+    let owners = fs::read_dir(dir).ok()?;
+    for owner in owners.flatten() {
+        let files = fs::read_dir(owner.path()).ok()?;
+        for file in files.flatten() {
+            let Ok(text) = fs::read_to_string(file.path()) else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                continue;
+            };
+            if value["requestId"] == request_id {
+                return value["status"].as_str().map(str::to_string);
+            }
+        }
+    }
+    None
+}
+
+fn reconciliation_required(harness: &Harness, work_id: &str) -> bool {
+    harness
+        .orch
+        .store()
+        .load_work_item(work_id)
+        .unwrap()
+        .unwrap()
+        .result
+        .unwrap()
+        .candidate_verification
+        .unwrap()
+        .reconciliation_required
+}
+
+async fn partial_add(label: &str, behavior: &str, files: Vec<String>) -> (Harness, String, String) {
+    let (harness, work_id, digest, revision) = approved_files(label, behavior, files).await;
+    APPLY_FAULT.store(3, std::sync::atomic::Ordering::SeqCst);
+    let crashed = apply_at(
+        &harness,
+        &format!("apply-{label}"),
+        &work_id,
+        &digest,
+        revision,
+    )
+    .await
+    .unwrap_err();
+    assert!(crashed.to_string().contains("reconciliation"), "{crashed}");
+    APPLY_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+    (harness, work_id, digest)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_intent_with_tampered_manifest_performs_zero_cleanup() {
+    let _reset = ResetFault;
+    let (harness, work_id, digest) =
+        partial_add("stale-manifest", "add-files", adding_files()).await;
+    let note = harness.workspace.path().join("src/aaa_note.rs");
+    assert_eq!(fs::read_to_string(&note).unwrap(), NOTE_AFTER);
+    let mut manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(candidate_dir(&harness, &work_id).join("manifest.json")).unwrap(),
+    )
+    .unwrap();
+    manifest["manifest"][0]["afterBlob"] =
+        serde_json::json!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    fs::write(
+        candidate_dir(&harness, &work_id).join("manifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    let revision = bump_work_revision(harness.orch.store().root(), &work_id);
+    let error = harness
+        .orch
+        .discard_verified_change(
+            &auth(),
+            "discard-stale-manifest",
+            harness.lane,
+            harness.workspace.path(),
+            &work_id,
+            &digest,
+            Some(revision),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        !error.to_string().contains("cleanup interrupted"),
+        "{error}"
+    );
+    assert_eq!(fs::read_to_string(&note).unwrap(), NOTE_AFTER);
+    harness.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_intent_cannot_expand_cleanup_beyond_allowed_files() {
+    let _reset = ResetFault;
+    let (harness, work_id, digest) = partial_add("stale-expand", "add-files", adding_files()).await;
+    let note = harness.workspace.path().join("src/aaa_note.rs");
+    let evil = harness.workspace.path().join("src/evil.rs");
+    fs::write(&evil, b"do not delete\n").unwrap();
+    let mut manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(candidate_dir(&harness, &work_id).join("manifest.json")).unwrap(),
+    )
+    .unwrap();
+    let mut extra = manifest["manifest"][0].clone();
+    extra["path"] = serde_json::json!("src/evil.rs");
+    manifest["manifest"].as_array_mut().unwrap().push(extra);
+    fs::write(
+        candidate_dir(&harness, &work_id).join("manifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    let revision = bump_work_revision(harness.orch.store().root(), &work_id);
+    let _ = harness
+        .orch
+        .discard_verified_change(
+            &auth(),
+            "discard-stale-expand",
+            harness.lane,
+            harness.workspace.path(),
+            &work_id,
+            &digest,
+            Some(revision),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(fs::read_to_string(&note).unwrap(), NOTE_AFTER);
+    assert_eq!(fs::read_to_string(&evil).unwrap(), "do not delete\n");
+    harness.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tampered_preexisting_directory_provenance_is_quarantined() {
+    let _reset = ResetFault;
+    let files = vec![
+        "kept/note.rs".into(),
+        "src/ledger.rs".into(),
+        "src/report.rs".into(),
+    ];
+    let (harness, work_id, digest, revision) =
+        approved_files("provenance", "add-kept", files).await;
+    fs::create_dir(harness.workspace.path().join("kept")).unwrap();
+    APPLY_FAULT.store(3, std::sync::atomic::Ordering::SeqCst);
+    let _ = apply_at(&harness, "apply-provenance", &work_id, &digest, revision)
+        .await
+        .unwrap_err();
+    APPLY_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+    let note = harness.workspace.path().join("kept/note.rs");
+    assert!(note.is_file());
+    rewrite_only_intent(harness.orch.store().root(), |value| {
+        value["preexistingDirectories"] = serde_json::json!([]);
+    });
+    let current = bump_work_revision(harness.orch.store().root(), &work_id);
+    let error = harness
+        .orch
+        .discard_verified_change(
+            &auth(),
+            "discard-provenance",
+            harness.lane,
+            harness.workspace.path(),
+            &work_id,
+            &digest,
+            Some(current),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("directory provenance"),
+        "{error}"
+    );
+    assert!(note.is_file());
+    assert!(harness.workspace.path().join("kept").is_dir());
+    assert!(reconciliation_required(&harness, &work_id));
+    harness.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_cleanup_requires_the_approved_apply_bundle() {
+    let _reset = ResetFault;
+    let (harness, work_id, digest) = partial_add("stale-bundle", "add-files", adding_files()).await;
+    let note = harness.workspace.path().join("src/aaa_note.rs");
+    rewrite_only_intent(harness.orch.store().root(), |value| {
+        value["applyBundleDigest"] = serde_json::json!("sha256:not-the-approved-bundle");
+    });
+    let revision = bump_work_revision(harness.orch.store().root(), &work_id);
+    let _ = harness
+        .orch
+        .discard_verified_change(
+            &auth(),
+            "discard-stale-bundle",
+            harness.lane,
+            harness.workspace.path(),
+            &work_id,
+            &digest,
+            Some(revision),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(fs::read_to_string(&note).unwrap(), NOTE_AFTER);
+    harness.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ordinary_stale_partial_addition_can_still_be_safely_discarded() {
+    let _reset = ResetFault;
+    let (harness, work_id, digest) =
+        partial_add("stale-ordinary", "add-files", adding_files()).await;
+    let note = harness.workspace.path().join("src/aaa_note.rs");
+    assert_eq!(fs::read_to_string(&note).unwrap(), NOTE_AFTER);
+    let revision = bump_work_revision(harness.orch.store().root(), &work_id);
+    harness
+        .orch
+        .discard_verified_change(
+            &auth(),
+            "discard-stale-ordinary",
+            harness.lane,
+            harness.workspace.path(),
+            &work_id,
+            &digest,
+            Some(revision),
+        )
+        .await
+        .unwrap();
+    assert!(!note.exists());
+    assert_eq!(harness.source_pair().0, LEDGER_BEFORE);
+    assert_eq!(
+        harness
+            .orch
+            .store()
+            .load_work_item(&work_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        WorkState::Cancelled
+    );
+    harness.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn crash_after_file_cleanup_before_directory_cleanup_recovers() {
+    let _reset = ResetFault;
+    let files = vec![
+        "fresh/note.rs".into(),
+        "src/ledger.rs".into(),
+        "src/report.rs".into(),
+    ];
+    let (harness, work_id, digest) = partial_add("dir-cut", "add-fresh", files).await;
+    let fresh = harness.workspace.path().join("fresh");
+    assert!(fresh.join("note.rs").is_file());
+    CLEANUP_FAULT.store(3, std::sync::atomic::Ordering::SeqCst);
+    let current = harness
+        .orch
+        .store()
+        .load_work_item(&work_id)
+        .unwrap()
+        .unwrap()
+        .revision;
+    let error = harness
+        .orch
+        .discard_verified_change(
+            &auth(),
+            "discard-dir-cut",
+            harness.lane,
+            harness.workspace.path(),
+            &work_id,
+            &digest,
+            Some(current),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("cut 3"), "{error}");
+    assert!(!fresh.join("note.rs").exists());
+    assert!(fresh.is_dir());
+    CLEANUP_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+    let workspace = harness.workspace.path().to_path_buf();
+    let fake = harness.fake_dir.path().join("grok");
+    let isolate = harness.isolate.path().to_path_buf();
+    let identity = harness.identity.clone();
+    let lease = harness.fake_dir.path().join("lease.json");
+    let live = reopen_production_store(
+        harness.host,
+        harness.orch,
+        &workspace,
+        &fake,
+        &isolate,
+        &identity,
+        &lease,
+    )
+    .await;
+    assert!(!workspace.join("fresh").exists());
+    live.orch.stop_background_tasks().await;
+    live.host.shutdown().await;
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn all_before_paths_still_reconcile_candidate_created_directories() {
+    let _reset = ResetFault;
+    let files = vec![
+        "fresh/note.rs".into(),
+        "src/ledger.rs".into(),
+        "src/report.rs".into(),
+    ];
+    let (harness, work_id, digest) = partial_add("all-before-dir", "add-fresh", files).await;
+    let fresh = harness.workspace.path().join("fresh");
+    fs::remove_file(fresh.join("note.rs")).unwrap();
+    assert!(fresh.is_dir());
+    let current = harness
+        .orch
+        .store()
+        .load_work_item(&work_id)
+        .unwrap()
+        .unwrap()
+        .revision;
+    harness
+        .orch
+        .discard_verified_change(
+            &auth(),
+            "discard-all-before-dir",
+            harness.lane,
+            harness.workspace.path(),
+            &work_id,
+            &digest,
+            Some(current),
+        )
+        .await
+        .unwrap();
+    assert!(!fresh.exists());
+    assert!(!reconciliation_required(&harness, &work_id));
+    harness.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn preexisting_empty_directory_survives_every_cleanup_cut() {
+    let _reset = ResetFault;
+    let files = vec![
+        "kept/note.rs".into(),
+        "fresh/a.rs".into(),
+        "fresh/nested/b.rs".into(),
+        "src/ledger.rs".into(),
+        "src/report.rs".into(),
+    ];
+    for cut in 1..=6 {
+        let (harness, work_id, digest, revision) =
+            approved_files(&format!("cut-{cut}"), "add-pair", files.clone()).await;
+        fs::create_dir(harness.workspace.path().join("kept")).unwrap();
+        APPLY_FAULT.store(3, std::sync::atomic::Ordering::SeqCst);
+        let _ = apply_at(
+            &harness,
+            &format!("apply-cut-{cut}"),
+            &work_id,
+            &digest,
+            revision,
+        )
+        .await
+        .unwrap_err();
+        APPLY_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+        for path in ["kept/note.rs", "fresh/a.rs", "fresh/nested/b.rs"] {
+            let full = harness.workspace.path().join(path);
+            if let Some(parent) = full.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(&full, NOTE_AFTER).unwrap();
+        }
+        CLEANUP_FAULT.store(cut, std::sync::atomic::Ordering::SeqCst);
+        let current = harness
+            .orch
+            .store()
+            .load_work_item(&work_id)
+            .unwrap()
+            .unwrap()
+            .revision;
+        let error = harness
+            .orch
+            .discard_verified_change(
+                &auth(),
+                &format!("discard-cut-{cut}"),
+                harness.lane,
+                harness.workspace.path(),
+                &work_id,
+                &digest,
+                Some(current),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains(&format!("cut {cut}")),
+            "cut {cut}: {error}"
+        );
+        assert!(
+            harness.workspace.path().join("kept").is_dir(),
+            "cut {cut} removed the preexisting directory"
+        );
+        CLEANUP_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+        harness.close().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn discard_receipt_completes_only_after_full_source_restoration() {
+    let _reset = ResetFault;
+    let files = vec![
+        "fresh/note.rs".into(),
+        "src/ledger.rs".into(),
+        "src/report.rs".into(),
+    ];
+    let (harness, work_id, digest) = partial_add("receipt-cut", "add-fresh", files).await;
+    CLEANUP_FAULT.store(5, std::sync::atomic::Ordering::SeqCst);
+    let current = harness
+        .orch
+        .store()
+        .load_work_item(&work_id)
+        .unwrap()
+        .unwrap()
+        .revision;
+    let error = harness
+        .orch
+        .discard_verified_change(
+            &auth(),
+            "discard-receipt-cut",
+            harness.lane,
+            harness.workspace.path(),
+            &work_id,
+            &digest,
+            Some(current),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("cut 5"), "{error}");
+    assert!(!harness.workspace.path().join("fresh").exists());
+    assert_ne!(
+        receipt_status(harness.orch.store().root(), "discard-receipt-cut").as_deref(),
+        Some("complete")
+    );
+    CLEANUP_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+    let revision = harness
+        .orch
+        .store()
+        .load_work_item(&work_id)
+        .unwrap()
+        .unwrap()
+        .revision;
+    harness
+        .orch
+        .discard_verified_change(
+            &auth(),
+            "discard-receipt-done",
+            harness.lane,
+            harness.workspace.path(),
+            &work_id,
+            &digest,
+            Some(revision),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        receipt_status(harness.orch.store().root(), "discard-receipt-done").as_deref(),
+        Some("complete")
+    );
+    assert_eq!(
+        harness
+            .orch
+            .store()
+            .load_work_item(&work_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        WorkState::Cancelled
     );
     harness.close().await;
 }

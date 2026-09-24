@@ -1479,6 +1479,17 @@ pub fn apply_fault() -> u8 {
 
 pub static APPLY_FAULT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
+pub fn cleanup_fault() -> u8 {
+    CLEANUP_FAULT.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Discard/recovery cuts. 1 before the first addition removal, 2 between two
+/// addition removals, 3 after the last file removal and before directory
+/// removal, 4 between nested directory removals, 5 after cleanup and before
+/// the intent is cleared, 6 after the intent is cleared and before the Work
+/// cancellation commit.
+pub static CLEANUP_FAULT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
 pub(crate) struct PromotionRecord {
     pub base_revision: String,
     pub final_fingerprint: String,

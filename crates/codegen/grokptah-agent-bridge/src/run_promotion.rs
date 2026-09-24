@@ -458,6 +458,19 @@ pub(crate) fn capture_worktree_changes(
             })
             .collect::<Vec<_>>(),
     )?;
+    for entry in &manifest {
+        let before_link = entry.before_mode.contains("120000");
+        let after_link = entry.after_mode.contains("120000");
+        let before_file =
+            entry.before_mode.contains("100644") || entry.before_mode.contains("100755");
+        let after_file = entry.after_mode.contains("100644") || entry.after_mode.contains("100755");
+        if (before_link && after_file) || (before_file && after_link) {
+            bail!(
+                "promotion refuses a regular/symlink type transition before verification: {}",
+                entry.path
+            );
+        }
+    }
     let final_fingerprint = fingerprint_at(worktree, base_revision)?;
     Ok(CapturedWorktreeChanges {
         patch,
@@ -513,7 +526,14 @@ pub(crate) fn rollback_exact_candidate_additions(
     base_revision: &str,
     manifest: &[PathManifestEntry],
     preexisting_directories: &[String],
+    allowed_files: &[String],
 ) -> Result<SourceClassification> {
+    if manifest
+        .iter()
+        .any(|entry| !allowed_files.iter().any(|allowed| allowed == &entry.path))
+    {
+        return Ok(SourceClassification::Poisoned);
+    }
     if !head_matches_base(source, base_revision)? || !index_matches_head(source)? {
         return Ok(SourceClassification::Poisoned);
     }
@@ -536,14 +556,8 @@ pub(crate) fn rollback_exact_candidate_additions(
         && identities
             .iter()
             .all(|identity| *identity == PathIdentity::After);
-    let all_before = identities
-        .iter()
-        .all(|identity| *identity == PathIdentity::Before);
     if all_after {
         return Ok(SourceClassification::AlreadyApplied);
-    }
-    if all_before {
-        return Ok(SourceClassification::NotApplied);
     }
     let removable: Vec<_> = manifest
         .iter()
@@ -553,7 +567,10 @@ pub(crate) fn rollback_exact_candidate_additions(
         })
         .map(|(entry, _)| entry)
         .collect();
-    for entry in removable {
+    if !removable.is_empty() && crate::verified_change::cleanup_fault() == 1 {
+        bail!("cleanup interrupted at cut 1");
+    }
+    for (index, entry) in removable.iter().enumerate() {
         if path_identity(source, entry)? != PathIdentity::After {
             continue;
         }
@@ -561,9 +578,60 @@ pub(crate) fn rollback_exact_candidate_additions(
         if path.symlink_metadata().is_ok() {
             fs::remove_file(&path).with_context(|| format!("remove candidate {}", entry.path))?;
         }
+        if crate::verified_change::cleanup_fault() == 2 && index + 1 < removable.len() {
+            bail!("cleanup interrupted at cut 2");
+        }
+    }
+    if crate::verified_change::cleanup_fault() == 3 {
+        bail!("cleanup interrupted at cut 3");
     }
     remove_candidate_created_directories(source, manifest, preexisting_directories)?;
     classify_source(source, base_revision, manifest)
+}
+
+pub(crate) struct SourceCleanupPlan<'a> {
+    pub work_id: &'a str,
+    pub attempt_id: &'a str,
+    pub base_sha: &'a str,
+    pub candidate_digest: &'a str,
+    pub apply_bundle_digest: &'a str,
+    pub allowed_files: &'a [String],
+    pub manifest_paths: &'a [String],
+    pub preexisting_directories: &'a [String],
+}
+
+pub(crate) fn source_cleanup_plan_digest(plan: &SourceCleanupPlan<'_>) -> String {
+    let mut allowed = plan.allowed_files.to_vec();
+    allowed.sort();
+    let mut paths = plan.manifest_paths.to_vec();
+    paths.sort();
+    let mut directories = plan.preexisting_directories.to_vec();
+    directories.sort();
+    let mut hasher = Sha256::new();
+    hasher.update(b"grokptah-source-cleanup-plan-v1\0");
+    for part in [
+        plan.work_id,
+        plan.attempt_id,
+        plan.base_sha,
+        plan.candidate_digest,
+        plan.apply_bundle_digest,
+    ] {
+        hasher.update(part.as_bytes());
+        hasher.update([0]);
+    }
+    for path in allowed.iter().chain(paths.iter()).chain(directories.iter()) {
+        hasher.update(path.as_bytes());
+        hasher.update([0]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+pub(crate) fn reconcile_candidate_directories(
+    source: &Path,
+    manifest: &[PathManifestEntry],
+    preexisting_directories: &[String],
+) -> Result<()> {
+    remove_candidate_created_directories(source, manifest, preexisting_directories)
 }
 
 pub(crate) fn preexisting_add_directories(
@@ -660,19 +728,19 @@ fn sealed_identity_matches(
     if !mode_matches_meta(meta, recorded_mode) {
         return Ok(false);
     }
-    let object = if meta.file_type().is_symlink() {
-        if !entry.symlink && !recorded_mode.contains("120000") {
+    let object = if recorded_mode.contains("120000") {
+        if !meta.file_type().is_symlink() {
             return Ok(false);
         }
         let target = fs::read_link(path).with_context(|| format!("read symlink {}", entry.path))?;
         git_hash_bytes(source, target.as_os_str().as_encoded_bytes())?
-    } else if !meta.is_file() {
-        return Ok(false);
-    } else {
-        if entry.symlink || recorded_mode.contains("120000") {
+    } else if recorded_mode.contains("100644") || recorded_mode.contains("100755") {
+        if !meta.is_file() {
             return Ok(false);
         }
         git_stdout(source, &["hash-object", "--", &entry.path])?
+    } else {
+        return Ok(false);
     };
     Ok(object == recorded_blob)
 }
@@ -796,6 +864,7 @@ fn remove_candidate_created_directories(
     }
     let mut parents: Vec<_> = parents.into_iter().collect();
     parents.sort_by_key(|path| std::cmp::Reverse(path.matches('/').count()));
+    let mut removed = false;
     for parent in parents {
         if preexisting.contains(parent.as_str()) {
             continue;
@@ -809,8 +878,12 @@ fn remove_candidate_created_directories(
         if contents.next().is_some() {
             continue;
         }
+        if removed && crate::verified_change::cleanup_fault() == 4 {
+            bail!("cleanup interrupted at cut 4");
+        }
         fs::remove_dir(&directory)
             .with_context(|| format!("remove candidate directory {parent}"))?;
+        removed = true;
     }
     Ok(())
 }
@@ -1281,28 +1354,115 @@ fn symlink_target_escapes(root: &Path, link_path: &Path, target: &Path) -> bool 
     if target.is_absolute() {
         return true;
     }
-    let root = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    let start = link_path.parent().unwrap_or(&root);
-    let mut current = dunce::canonicalize(start).unwrap_or_else(|_| start.to_path_buf());
-    for component in target.components() {
-        match component {
-            Component::ParentDir => {
-                if !current.pop() {
-                    return true;
-                }
-            }
-            Component::Normal(part) => current.push(part),
-            Component::CurDir => {}
-            Component::RootDir | Component::Prefix(_) => return true,
-        }
-    }
-    if !current.starts_with(&root) {
+    let Ok(root) = dunce::canonicalize(root) else {
+        return true;
+    };
+    let Some(parent) = link_path.parent() else {
+        return true;
+    };
+    let Ok(start) = dunce::canonicalize(parent) else {
+        return true;
+    };
+    if !start.starts_with(&root) || enters_metadata(&root, &start) {
         return true;
     }
-    if let Ok(resolved) = dunce::canonicalize(&current) {
-        return !resolved.starts_with(&root);
+    resolve_contained(&root, &start, target, 0).is_none()
+}
+
+fn enters_metadata(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return true;
+    };
+    relative.components().any(|component| {
+        matches!(component, Component::Normal(name) if name == ".git" || name == ".grokptah")
+    })
+}
+
+fn resolve_contained(root: &Path, start: &Path, target: &Path, depth: u32) -> Option<PathBuf> {
+    if depth > 16 {
+        return None;
     }
-    false
+    let mut current = start.to_path_buf();
+    let mut dangling = false;
+    for component in target.components() {
+        match component {
+            Component::CurDir => {}
+            Component::RootDir | Component::Prefix(_) => return None,
+            Component::ParentDir => {
+                if !current.pop() {
+                    return None;
+                }
+                if !dangling {
+                    if !current.starts_with(root) || enters_metadata(root, &current) {
+                        return None;
+                    }
+                } else if current.exists() {
+                    current = dunce::canonicalize(&current).ok()?;
+                    dangling = false;
+                    if !current.starts_with(root) || enters_metadata(root, &current) {
+                        return None;
+                    }
+                }
+            }
+            Component::Normal(name) => {
+                if name == ".git" || name == ".grokptah" {
+                    return None;
+                }
+                let next = current.join(name);
+                if dangling {
+                    current = next;
+                    continue;
+                }
+                match fs::symlink_metadata(&next) {
+                    Ok(meta) if meta.file_type().is_symlink() => {
+                        let link_target = fs::read_link(&next).ok()?;
+                        if link_target.is_absolute() {
+                            return None;
+                        }
+                        let link_parent = dunce::canonicalize(next.parent()?).ok()?;
+                        if !link_parent.starts_with(root) || enters_metadata(root, &link_parent) {
+                            return None;
+                        }
+                        current = resolve_contained(root, &link_parent, &link_target, depth + 1)?;
+                        if current.is_dir() {
+                            current = dunce::canonicalize(&current).ok()?;
+                            if !current.starts_with(root) || enters_metadata(root, &current) {
+                                return None;
+                            }
+                        } else {
+                            dangling = true;
+                        }
+                    }
+                    Ok(meta) if meta.is_dir() => {
+                        current = dunce::canonicalize(&next).ok()?;
+                        if !current.starts_with(root) || enters_metadata(root, &current) {
+                            return None;
+                        }
+                    }
+                    Ok(_) => {
+                        current = next;
+                        dangling = true;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        current = next;
+                        dangling = true;
+                    }
+                    Err(_) => return None,
+                }
+            }
+        }
+    }
+    if !current.starts_with(root) || enters_metadata(root, &current) {
+        return None;
+    }
+    if !dangling {
+        if let Ok(resolved) = dunce::canonicalize(&current) {
+            if !resolved.starts_with(root) || enters_metadata(root, &resolved) {
+                return None;
+            }
+        }
+    }
+    Some(current)
 }
 
 fn bounded_text(bytes: &[u8], limit: usize) -> (String, bool) {
@@ -1839,11 +1999,186 @@ mod tests {
             SourceClassification::Poisoned
         );
         assert_eq!(
-            rollback_exact_candidate_additions(dir.path(), &base, &captured.manifest, &[]).unwrap(),
+            rollback_exact_candidate_additions(
+                dir.path(),
+                &base,
+                &captured.manifest,
+                &[],
+                &["tool".into()]
+            )
+            .unwrap(),
             SourceClassification::Poisoned
         );
         assert!(tool.is_dir());
         assert!(fs::read_dir(&tool).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn dangling_target_through_escaping_symlink_ancestor_is_rejected() {
+        use std::os::unix::fs::symlink;
+        let dir = repository();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), dir.path().join("door")).unwrap();
+        git(dir.path(), &["add", "door"]);
+        git(dir.path(), &["commit", "-qm", "door"]);
+        let base = head_of(dir.path());
+        symlink("door/missing", dir.path().join("link")).unwrap();
+        let error = capture_worktree_changes(dir.path(), &base)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("symlink"), "{error}");
+        assert!(dir.path().join("link").is_symlink());
+    }
+
+    #[test]
+    fn parent_component_after_symlink_cannot_escape() {
+        use std::os::unix::fs::symlink;
+        let dir = repository();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), dir.path().join("jump")).unwrap();
+        git(dir.path(), &["add", "jump"]);
+        git(dir.path(), &["commit", "-qm", "jump"]);
+        let base = head_of(dir.path());
+        symlink("jump/../escaped", dir.path().join("link")).unwrap();
+        let error = capture_worktree_changes(dir.path(), &base)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("symlink"), "{error}");
+    }
+
+    #[test]
+    fn symlink_target_into_git_metadata_is_rejected() {
+        use std::os::unix::fs::symlink;
+        let dir = repository();
+        let base = head_of(dir.path());
+        symlink(".git/config", dir.path().join("link")).unwrap();
+        let error = capture_worktree_changes(dir.path(), &base)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("symlink"), "{error}");
+        fs::remove_file(dir.path().join("link")).unwrap();
+        symlink(".grokptah/secret", dir.path().join("link")).unwrap();
+        let error = capture_worktree_changes(dir.path(), &base)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("symlink"), "{error}");
+    }
+
+    #[test]
+    fn safe_dangling_internal_target_is_retained_exactly() {
+        use std::os::unix::fs::symlink;
+        let dir = repository();
+        fs::create_dir(dir.path().join("inside")).unwrap();
+        let base = head_of(dir.path());
+        symlink("inside/missing", dir.path().join("link")).unwrap();
+        let captured = capture_worktree_changes(dir.path(), &base).unwrap();
+        let tree = tempfile::tempdir().unwrap();
+        crate::verified_change::retain_candidate_snapshot(
+            dir.path(),
+            &tree.path().join("candidate"),
+            &base,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_link(tree.path().join("candidate").join("link")).unwrap(),
+            Path::new("inside/missing")
+        );
+        let link = captured
+            .manifest
+            .iter()
+            .find(|entry| entry.path == "link")
+            .unwrap();
+        assert_eq!(link.after_mode, "120000");
+        assert_eq!(link.after_blob.len(), 40);
+    }
+
+    #[test]
+    fn regular_to_symlink_applies_exactly_or_is_refused_before_review() {
+        use std::os::unix::fs::symlink;
+        let dir = repository();
+        fs::write(dir.path().join("note.txt"), b"one\n").unwrap();
+        git(dir.path(), &["add", "note.txt"]);
+        git(dir.path(), &["commit", "-qm", "note"]);
+        let base = head_of(dir.path());
+        fs::remove_file(dir.path().join("note.txt")).unwrap();
+        symlink("renamed-target", dir.path().join("note.txt")).unwrap();
+        let error = capture_worktree_changes(dir.path(), &base)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("type transition before verification"),
+            "{error}"
+        );
+        fs::remove_file(dir.path().join("note.txt")).unwrap();
+        fs::write(dir.path().join("note.txt"), b"one\n").unwrap();
+        git(dir.path(), &["reset", "-q"]);
+        assert!(capture_worktree_changes(dir.path(), &base)
+            .unwrap()
+            .manifest
+            .is_empty());
+    }
+
+    #[test]
+    fn symlink_to_regular_applies_exactly_or_is_refused_before_review() {
+        use std::os::unix::fs::symlink;
+        let dir = repository();
+        symlink("old-target", dir.path().join("note.txt")).unwrap();
+        git(dir.path(), &["add", "note.txt"]);
+        git(dir.path(), &["commit", "-qm", "link"]);
+        let base = head_of(dir.path());
+        fs::remove_file(dir.path().join("note.txt")).unwrap();
+        fs::write(dir.path().join("note.txt"), b"regular\n").unwrap();
+        let error = capture_worktree_changes(dir.path(), &base)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("type transition before verification"),
+            "{error}"
+        );
+        fs::remove_file(dir.path().join("note.txt")).unwrap();
+        symlink("old-target", dir.path().join("note.txt")).unwrap();
+        git(dir.path(), &["reset", "-q"]);
+        assert!(capture_worktree_changes(dir.path(), &base)
+            .unwrap()
+            .manifest
+            .is_empty());
+    }
+
+    #[test]
+    fn type_transition_with_unchanged_source_never_sets_reconciliation_required() {
+        use std::os::unix::fs::symlink;
+        let dir = repository();
+        fs::write(dir.path().join("note.txt"), b"one\n").unwrap();
+        git(dir.path(), &["add", "note.txt"]);
+        git(dir.path(), &["commit", "-qm", "note"]);
+        let base = head_of(dir.path());
+        fs::remove_file(dir.path().join("note.txt")).unwrap();
+        symlink("renamed-target", dir.path().join("note.txt")).unwrap();
+        let error = capture_worktree_changes(dir.path(), &base)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("type transition before verification"),
+            "{error}"
+        );
+        fs::remove_file(dir.path().join("note.txt")).unwrap();
+        fs::write(dir.path().join("note.txt"), b"one\n").unwrap();
+        git(dir.path(), &["reset", "-q"]);
+        let restored = capture_worktree_changes(dir.path(), &base).unwrap();
+        assert!(restored.manifest.is_empty());
+        assert_eq!(
+            classify_source(dir.path(), &base, &restored.manifest).unwrap(),
+            SourceClassification::NotApplied
+        );
+    }
+
+    fn head_of(root: &Path) -> String {
+        let base = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        String::from_utf8(base.stdout).unwrap().trim().to_string()
     }
 
     #[test]

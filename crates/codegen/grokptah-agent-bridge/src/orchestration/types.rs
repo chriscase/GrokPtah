@@ -1545,6 +1545,9 @@ pub struct IdempotencyReceipt {
     /// pending | complete | failed
     #[serde(default = "default_receipt_status")]
     pub status: String,
+    /// Digest of the sealed source-cleanup plan. Empty until apply stores one.
+    #[serde(default)]
+    pub cleanup_plan_digest: String,
 }
 
 impl IdempotencyReceipt {

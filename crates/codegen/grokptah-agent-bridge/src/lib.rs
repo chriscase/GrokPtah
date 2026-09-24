@@ -243,7 +243,8 @@ pub use verified_change::{
     retained_candidate_diff_digest, skip_verified_drive, write_check_authority,
     CandidateVerification, CheckAuthority, ReadinessInput, RequiredCheckCwd, RequiredCheckEnv,
     RequiredCheckSpec, VerifiedChangeError, VerifiedChangeReadiness, VerifiedExecutionEnvelopeV1,
-    APPLY_FAULT, BEFORE_CANDIDATE_BIND, CHECK_CONFINEMENT_EXECUTABLE, SKIP_VERIFIED_DRIVE,
+    APPLY_FAULT, BEFORE_CANDIDATE_BIND, CHECK_CONFINEMENT_EXECUTABLE, CLEANUP_FAULT,
+    SKIP_VERIFIED_DRIVE,
 };
 
 /// Crate version string for about / diagnostics.
