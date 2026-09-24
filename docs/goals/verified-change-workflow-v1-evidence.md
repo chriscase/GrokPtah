@@ -359,6 +359,38 @@ Live-provider test: NOT RUN.
 
 Production revocable xAI lease: STILL UNAVAILABLE.
 
+## Symlink candidate identity and foreign directories
+
+A review of functional SHA `642dee819d4d3ebb895703a37f1c27a158bdb6b9` (tree `46e6c299c857bd2097f742d1aea8a5a48210a1c5`) found two remaining holes. Retain, patch reproduction, the retained-candidate digest, and the apply bundle read a symlink by following it. A directory at an add path whose sealed mode is `100755` made classification return an error instead of Foreign. This repair is functional SHA `2b987192a22f921cef4fd0f0eb3774508c0bbe8c` (tree `43776b3f57c170d511dfcf9788218c6fe5a63b40`). It is not an independent acceptance of the frozen goal.
+
+Symlink identity on the candidate path is the link target text, the same bytes Git hashes for a `120000` blob. Those bytes are what retain stores, what patch reproduction compares, what the retained digest and checkout bind use, and what the apply bundle checks. The link is not followed. A path that is neither a regular file nor a symlink is Foreign before any object hash, so store-open recovery reconciles and performs no cleanup.
+
+Local validation on the working tree committed as `2b987192a22f921cef4fd0f0eb3774508c0bbe8c` (tree `43776b3f57c170d511dfcf9788218c6fe5a63b40`), before that commit at `2026-09-24T11:40:32-05:00`. No executable diff exists after that commit. Each named regression below was `ok`. The live managed-executor test stayed ignored.
+
+- Bridge `cargo fmt --all -- --check`: exit 0 (`FMT:0`).
+- Bridge `cargo clippy --locked --all-targets -- -D warnings`: exit 0 (`CLIPPY:0`).
+- Bridge `cargo test --locked -- --test-threads=1` on a fresh `GROKPTAH_HOME`: exit 0 (`SUITE:0`). `live_grok_build_dogfood_runs_both_profiles_under_one_authority` stayed ignored.
+- `cargo test -p xai-host-authority --locked -- --test-threads=1`: exit 0 (`AUTH:0`).
+- Isolated service `cargo test --locked -- --test-threads=1`: exit 0 (`SERVICE:0`). An earlier attempt run beside other suites failed `disconnect_reconnect_restart_and_cursor_expiry_are_durable`; the isolated rerun passed and is this result.
+- Isolated service `cargo check --locked --all-targets`: exit 0 (`CHECK:0`).
+- Desktop `npm run typecheck`: exit 0 (`TC:0`).
+- Desktop `npm test`: exit 0 (`NPM:0`, 58 files, 428 tests).
+- `desktop/src-tauri` `cargo test --locked`: exit 0 (`DESKLIB:0`, 50 lib tests).
+
+| Gap | Result on `2b987192a` / `43776b3f` | Named regression |
+| --- | --- | --- |
+| Symlink candidate path | A dangling link target is retained, reproduced, bound, and included in the apply bundle as the Git blob of the link text. An escaping symlink stays rejected. A different target stays Foreign. | `symlink_target_change_is_exactly_verified_or_explicitly_refused`; `different_symlink_target_is_foreign_not_already_applied`; `symlink_escape_remains_rejected` |
+| Directory at an executable add | Classification and rollback return reconciliation, not an error, and the directory remains. | `executable_add_replaced_by_a_directory_is_foreign_not_an_error` |
+| Accepted repairs | Retained-candidate mismatch still refuses the bind. The check-authority and approval-bundle repairs stayed green inside the locked suite. | `retained_tree_byte_mismatch_cannot_bind_adapter_evidence`; `rewritten_check_argv_cwd_env_or_timeout_runs_no_process`; `resealed_patch_after_approval_cannot_apply` |
+
+Hosted Desktop for repaired functional SHA `2b987192a22f921cef4fd0f0eb3774508c0bbe8c` only: GitHub Actions run `36029026678` attempt 1 (https://github.com/chriscase/GrokPtah/actions/runs/36029026678) concluded `success`. The event was `pull_request`. `head_sha` was `2b987192a22f921cef4fd0f0eb3774508c0bbe8c`. The `desktop` job had no failed steps (`2026-09-24T16:40:51Z` to `2026-09-24T17:15:20Z`).
+
+The commit that adds this section is documentation only. Its tree is not `43776b3f57c170d511dfcf9788218c6fe5a63b40`. A Desktop run for that docs tip is not the result above.
+
+Live-provider test: NOT RUN.
+
+Production revocable xAI lease: STILL UNAVAILABLE.
+
 ## Repair identity
 
 - Prior reviewed functional SHA: `32268e89f52776704d7a4729c2bd3581310ceeb7`
