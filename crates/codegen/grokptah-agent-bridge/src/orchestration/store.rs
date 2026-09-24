@@ -235,6 +235,9 @@ struct ApplySourceIntent {
     /// `expectedRevision` as the caller supplied it. Absent is JSON null.
     #[serde(default)]
     payload_expected_revision: Option<u64>,
+    /// Directories that already existed before this apply created candidate files.
+    #[serde(default)]
+    preexisting_directories: Vec<String>,
 }
 
 impl ApplySourceIntent {
@@ -6239,9 +6242,12 @@ impl OrchStore {
             self.complete_pending_apply_receipt_unlocked(intent, &item)?;
             return self.clear_apply_source_intent_unlocked(&intent.work_id);
         }
-        let class =
-            crate::run_promotion::classify_source(Path::new(&intent.workspace), &record.manifest)
-                .map_err(|error| OrchError::new(OrchErrorCode::Conflict, error.to_string()))?;
+        let class = crate::run_promotion::classify_source(
+            Path::new(&intent.workspace),
+            &record.base_revision,
+            &record.manifest,
+        )
+        .map_err(|error| OrchError::new(OrchErrorCode::Conflict, error.to_string()))?;
         match class {
             crate::run_promotion::SourceClassification::AlreadyApplied => {
                 let Some(mut verification) = item
@@ -6407,6 +6413,10 @@ impl OrchStore {
             owner_id: owner_id.to_string(),
             payload_workspace: payload_workspace.to_string(),
             payload_expected_revision: expected_revision,
+            preexisting_directories: crate::run_promotion::preexisting_add_directories(
+                Path::new(&item.workspace),
+                &record.manifest,
+            ),
         };
         let approved_bundle = approval.apply_bundle_digest.clone().unwrap_or_default();
         if verification.apply_bundle_digest.is_empty()
@@ -6439,6 +6449,7 @@ impl OrchStore {
             self.prove_apply_intent_unlocked(&existing, &item, &attempts, &record)?;
             match crate::run_promotion::classify_source(
                 Path::new(&item.workspace),
+                &record.base_revision,
                 &record.manifest,
             ) {
                 Ok(crate::run_promotion::SourceClassification::AlreadyApplied) => {
@@ -6578,23 +6589,13 @@ impl OrchStore {
                 if !error.message.contains("stale") {
                     return Err(error);
                 }
-                let mut class = crate::run_promotion::classify_source(
+                let class = crate::run_promotion::rollback_exact_candidate_additions(
                     Path::new(&item.workspace),
+                    &record.base_revision,
                     &record.manifest,
+                    &intent.preexisting_directories,
                 )
                 .map_err(|error| OrchError::new(OrchErrorCode::Conflict, error.to_string()))?;
-                if class == crate::run_promotion::SourceClassification::Poisoned {
-                    crate::run_promotion::remove_manifest_additions(
-                        Path::new(&item.workspace),
-                        &record.manifest,
-                    )
-                    .map_err(|error| OrchError::new(OrchErrorCode::Conflict, error.to_string()))?;
-                    class = crate::run_promotion::classify_source(
-                        Path::new(&item.workspace),
-                        &record.manifest,
-                    )
-                    .map_err(|error| OrchError::new(OrchErrorCode::Conflict, error.to_string()))?;
-                }
                 if class != crate::run_promotion::SourceClassification::NotApplied {
                     return Err(OrchError::new(
                         OrchErrorCode::Conflict,
@@ -6603,23 +6604,13 @@ impl OrchStore {
                 }
                 self.clear_apply_source_intent_unlocked(work_id)?;
             } else {
-                let mut class = crate::run_promotion::classify_source(
+                let class = crate::run_promotion::rollback_exact_candidate_additions(
                     Path::new(&item.workspace),
+                    &record.base_revision,
                     &record.manifest,
+                    &intent.preexisting_directories,
                 )
                 .map_err(|error| OrchError::new(OrchErrorCode::Conflict, error.to_string()))?;
-                if class == crate::run_promotion::SourceClassification::Poisoned {
-                    crate::run_promotion::remove_manifest_additions(
-                        Path::new(&item.workspace),
-                        &record.manifest,
-                    )
-                    .map_err(|error| OrchError::new(OrchErrorCode::Conflict, error.to_string()))?;
-                    class = crate::run_promotion::classify_source(
-                        Path::new(&item.workspace),
-                        &record.manifest,
-                    )
-                    .map_err(|error| OrchError::new(OrchErrorCode::Conflict, error.to_string()))?;
-                }
                 match class {
                     crate::run_promotion::SourceClassification::AlreadyApplied => {
                         let mut verification = item
@@ -6656,13 +6647,6 @@ impl OrchStore {
                         ));
                     }
                     crate::run_promotion::SourceClassification::NotApplied => {
-                        crate::run_promotion::remove_manifest_additions(
-                            Path::new(&item.workspace),
-                            &record.manifest,
-                        )
-                        .map_err(|error| {
-                            OrchError::new(OrchErrorCode::Conflict, error.to_string())
-                        })?;
                         self.clear_apply_source_intent_unlocked(work_id)?;
                     }
                 }

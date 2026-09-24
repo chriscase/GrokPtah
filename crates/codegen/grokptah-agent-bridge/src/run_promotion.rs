@@ -466,103 +466,184 @@ pub(crate) fn capture_worktree_changes(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PathIdentity {
+    Before,
+    After,
+    Absent,
+    Foreign,
+    Unknown,
+}
+
 pub(crate) fn classify_source(
     source: &Path,
+    base_revision: &str,
     manifest: &[PathManifestEntry],
 ) -> Result<SourceClassification> {
-    let mut foreign = worktree_change_paths(source)?;
-    for entry in manifest {
-        foreign.remove(&entry.path);
-    }
-    if !foreign.is_empty() {
+    if !head_matches_base(source, base_revision)? || !index_matches_head(source)? {
         return Ok(SourceClassification::Poisoned);
     }
-    let mut all_before = true;
-    let mut all_after = true;
+    if unaccounted_or_staged_changes(source, manifest)? {
+        return Ok(SourceClassification::Poisoned);
+    }
+    let mut saw_before = false;
+    let mut saw_after = false;
     for entry in manifest {
-        let before = path_has_manifest_identity(source, entry, false)?;
-        let after = path_has_manifest_identity(source, entry, true)?;
-        if !before {
-            all_before = false;
-        }
-        if !after {
-            all_after = false;
-        }
-        if !before && !after {
-            return Ok(SourceClassification::Poisoned);
+        match path_identity(source, entry)? {
+            PathIdentity::Before => saw_before = true,
+            PathIdentity::After => saw_after = true,
+            PathIdentity::Absent | PathIdentity::Foreign | PathIdentity::Unknown => {
+                return Ok(SourceClassification::Poisoned);
+            }
         }
     }
-    if all_after && !manifest.is_empty() {
+    if manifest.is_empty() || (saw_before && !saw_after) {
+        return Ok(SourceClassification::NotApplied);
+    }
+    if saw_after && !saw_before {
+        return Ok(SourceClassification::AlreadyApplied);
+    }
+    Ok(SourceClassification::Poisoned)
+}
+
+/// Remove only added paths whose current bytes, type, and mode are the sealed
+/// after identity. A Foreign or Unknown path produces no cleanup.
+pub(crate) fn rollback_exact_candidate_additions(
+    source: &Path,
+    base_revision: &str,
+    manifest: &[PathManifestEntry],
+    preexisting_directories: &[String],
+) -> Result<SourceClassification> {
+    if !head_matches_base(source, base_revision)? || !index_matches_head(source)? {
+        return Ok(SourceClassification::Poisoned);
+    }
+    if unaccounted_or_staged_changes(source, manifest)? {
+        return Ok(SourceClassification::Poisoned);
+    }
+    let mut identities = Vec::with_capacity(manifest.len());
+    for entry in manifest {
+        identities.push(path_identity(source, entry)?);
+    }
+    if identities.iter().any(|identity| {
+        matches!(
+            identity,
+            PathIdentity::Foreign | PathIdentity::Unknown | PathIdentity::Absent
+        )
+    }) {
+        return Ok(SourceClassification::Poisoned);
+    }
+    let all_after = !manifest.is_empty()
+        && identities
+            .iter()
+            .all(|identity| *identity == PathIdentity::After);
+    let all_before = identities
+        .iter()
+        .all(|identity| *identity == PathIdentity::Before);
+    if all_after {
         return Ok(SourceClassification::AlreadyApplied);
     }
     if all_before {
         return Ok(SourceClassification::NotApplied);
     }
-    Ok(SourceClassification::Poisoned)
-}
-
-fn worktree_change_paths(source: &Path) -> Result<std::collections::BTreeSet<String>> {
-    let output = git_command(
-        source,
-        &[
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--untracked-files=all",
-            "--ignored=no",
-        ],
-        &[],
-        None,
-    )?;
-    if !output.status.success() {
-        bail!("list worktree changes failed: {}", command_error(&output));
-    }
-    let mut paths = std::collections::BTreeSet::new();
-    let bytes = &output.stdout;
-    let mut index = 0usize;
-    while index + 3 < bytes.len() {
-        let status = &bytes[index..index + 2];
-        let start = index + 3;
-        let Some(end_offset) = bytes[start..].iter().position(|byte| *byte == 0) else {
-            break;
-        };
-        let end = start + end_offset;
-        let path =
-            std::str::from_utf8(&bytes[start..end]).context("git returned a non-UTF-8 path")?;
-        paths.insert(path.to_string());
-        index = end + 1;
-        if matches!(status.first(), Some(b'R' | b'C')) {
-            let Some(next_offset) = bytes[index..].iter().position(|byte| *byte == 0) else {
-                break;
-            };
-            let next_end = index + next_offset;
-            let renamed = std::str::from_utf8(&bytes[index..next_end])
-                .context("git returned a non-UTF-8 path")?;
-            paths.insert(renamed.to_string());
-            index = next_end + 1;
+    let removable: Vec<_> = manifest
+        .iter()
+        .zip(identities.iter())
+        .filter(|(entry, identity)| {
+            **identity == PathIdentity::After && (entry.state == "add" || entry.untracked)
+        })
+        .map(|(entry, _)| entry)
+        .collect();
+    for entry in removable {
+        if path_identity(source, entry)? != PathIdentity::After {
+            continue;
+        }
+        let path = source.join(&entry.path);
+        if path.symlink_metadata().is_ok() {
+            fs::remove_file(&path).with_context(|| format!("remove candidate {}", entry.path))?;
         }
     }
-    Ok(paths)
+    remove_candidate_created_directories(source, manifest, preexisting_directories)?;
+    classify_source(source, base_revision, manifest)
 }
 
-fn path_has_manifest_identity(
+pub(crate) fn preexisting_add_directories(
+    source: &Path,
+    manifest: &[PathManifestEntry],
+) -> Vec<String> {
+    let mut found = std::collections::BTreeSet::new();
+    for entry in manifest {
+        if entry.state != "add" && !entry.untracked {
+            continue;
+        }
+        let mut relative = Path::new(&entry.path);
+        while let Some(parent) = relative.parent() {
+            if parent.as_os_str().is_empty() {
+                break;
+            }
+            if source.join(parent).is_dir() {
+                found.insert(parent.to_string_lossy().replace('\\', "/"));
+            }
+            relative = parent;
+        }
+    }
+    found.into_iter().collect()
+}
+
+fn path_identity(source: &Path, entry: &PathManifestEntry) -> Result<PathIdentity> {
+    let path = source.join(&entry.path);
+    let meta = match path.symlink_metadata() {
+        Ok(meta) => Some(meta),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => bail!("read candidate path {}: {error}", entry.path),
+    };
+    if entry.state == "add" || entry.untracked {
+        let Some(meta) = meta else {
+            return Ok(PathIdentity::Before);
+        };
+        return Ok(
+            if sealed_identity_matches(source, entry, &path, &meta, true)? {
+                PathIdentity::After
+            } else {
+                PathIdentity::Foreign
+            },
+        );
+    }
+    if entry.state == "delete" {
+        let Some(meta) = meta else {
+            return Ok(PathIdentity::After);
+        };
+        return Ok(
+            if sealed_identity_matches(source, entry, &path, &meta, false)? {
+                PathIdentity::Before
+            } else {
+                PathIdentity::Foreign
+            },
+        );
+    }
+    let Some(meta) = meta else {
+        return Ok(PathIdentity::Absent);
+    };
+    let before = sealed_identity_matches(source, entry, &path, &meta, false)?;
+    let after = sealed_identity_matches(source, entry, &path, &meta, true)?;
+    if before && after {
+        return Ok(PathIdentity::Unknown);
+    }
+    if after {
+        return Ok(PathIdentity::After);
+    }
+    if before {
+        return Ok(PathIdentity::Before);
+    }
+    Ok(PathIdentity::Foreign)
+}
+
+fn sealed_identity_matches(
     source: &Path,
     entry: &PathManifestEntry,
+    path: &Path,
+    meta: &std::fs::Metadata,
     after: bool,
 ) -> Result<bool> {
-    let path = source.join(&entry.path);
-    let exists = path.symlink_metadata().is_ok();
-    let state_delete = if after {
-        entry.state == "delete"
-    } else {
-        entry.state == "add"
-    };
-    if state_delete {
-        return Ok(!exists);
-    }
-    if !exists {
-        return Ok(false);
-    }
     let recorded_mode = if after {
         entry.after_mode.as_str()
     } else {
@@ -573,23 +654,25 @@ fn path_has_manifest_identity(
     } else {
         entry.before_blob.as_str()
     };
-    let content_blob = if !is_full_object_id(recorded_blob) {
+    if !is_full_object_id(recorded_blob) || recorded_blob.chars().all(|ch| ch == '0') {
         return Ok(false);
+    }
+    if !mode_matches_meta(meta, recorded_mode) {
+        return Ok(false);
+    }
+    let object = if meta.file_type().is_symlink() {
+        if !entry.symlink && !recorded_mode.contains("120000") {
+            return Ok(false);
+        }
+        let target = fs::read_link(path).with_context(|| format!("read symlink {}", entry.path))?;
+        git_hash_bytes(source, target.as_os_str().as_encoded_bytes())?
     } else {
-        recorded_blob
+        if entry.symlink || recorded_mode.contains("120000") {
+            return Ok(false);
+        }
+        git_stdout(source, &["hash-object", "--", &entry.path])?
     };
-    if !mode_matches(&path, recorded_mode) {
-        return Ok(false);
-    }
-    if path
-        .symlink_metadata()
-        .map(|meta| meta.file_type().is_symlink())
-        .unwrap_or(false)
-    {
-        return Ok(entry.symlink);
-    }
-    let object = git_stdout(source, &["hash-object", "--", &entry.path])?;
-    Ok(object == content_blob)
+    Ok(object == recorded_blob)
 }
 
 fn is_full_object_id(blob: &str) -> bool {
@@ -605,7 +688,7 @@ fn canonical_object_id(
 ) -> Result<String> {
     if blob.chars().all(|ch| ch == '0') {
         if after && !status.starts_with('D') {
-            return git_stdout(worktree, &["hash-object", "--", path]);
+            return hash_worktree_object(worktree, path);
         }
         return Ok("0".repeat(40));
     }
@@ -618,10 +701,138 @@ fn canonical_object_id(
     )
 }
 
-fn mode_matches(path: &Path, recorded: &str) -> bool {
-    let Ok(meta) = path.symlink_metadata() else {
-        return false;
-    };
+fn head_matches_base(source: &Path, base_revision: &str) -> Result<bool> {
+    if !is_full_object_id(base_revision) {
+        return Ok(false);
+    }
+    Ok(git_stdout(source, &["rev-parse", "HEAD"])? == base_revision)
+}
+
+fn index_matches_head(source: &Path) -> Result<bool> {
+    let output = git_command(source, &["diff", "--cached", "--quiet", "HEAD"], &[], None)?;
+    Ok(output.status.success())
+}
+
+fn unaccounted_or_staged_changes(source: &Path, manifest: &[PathManifestEntry]) -> Result<bool> {
+    let manifest_paths: std::collections::BTreeSet<&str> =
+        manifest.iter().map(|entry| entry.path.as_str()).collect();
+    for (index_status, path) in worktree_status_entries(source)? {
+        if !manifest_paths.contains(path.as_str()) {
+            return Ok(true);
+        }
+        if index_status != b' ' && index_status != b'?' {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn worktree_status_entries(source: &Path) -> Result<Vec<(u8, String)>> {
+    let output = git_command(
+        source,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignored=no",
+        ],
+        &[],
+        None,
+    )?;
+    if !output.status.success() {
+        bail!("list worktree changes failed: {}", command_error(&output));
+    }
+    let bytes = &output.stdout;
+    let mut entries = Vec::new();
+    let mut index = 0usize;
+    while index + 3 < bytes.len() {
+        let status = bytes[index];
+        let start = index + 3;
+        let Some(end_offset) = bytes[start..].iter().position(|byte| *byte == 0) else {
+            break;
+        };
+        let end = start + end_offset;
+        let path =
+            std::str::from_utf8(&bytes[start..end]).context("git returned a non-UTF-8 path")?;
+        entries.push((status, path.to_string()));
+        index = end + 1;
+        if matches!(status, b'R' | b'C') {
+            let Some(next_offset) = bytes[index..].iter().position(|byte| *byte == 0) else {
+                break;
+            };
+            let next_end = index + next_offset;
+            let renamed = std::str::from_utf8(&bytes[index..next_end])
+                .context("git returned a non-UTF-8 path")?;
+            entries.push((status, renamed.to_string()));
+            index = next_end + 1;
+        }
+    }
+    Ok(entries)
+}
+
+fn remove_candidate_created_directories(
+    source: &Path,
+    manifest: &[PathManifestEntry],
+    preexisting_directories: &[String],
+) -> Result<()> {
+    let preexisting: std::collections::BTreeSet<&str> =
+        preexisting_directories.iter().map(String::as_str).collect();
+    let mut parents = std::collections::BTreeSet::new();
+    for entry in manifest {
+        if entry.state != "add" && !entry.untracked {
+            continue;
+        }
+        let mut relative = Path::new(&entry.path);
+        while let Some(parent) = relative.parent() {
+            if parent.as_os_str().is_empty() {
+                break;
+            }
+            parents.insert(parent.to_string_lossy().replace('\\', "/"));
+            relative = parent;
+        }
+    }
+    let mut parents: Vec<_> = parents.into_iter().collect();
+    parents.sort_by_key(|path| std::cmp::Reverse(path.matches('/').count()));
+    for parent in parents {
+        if preexisting.contains(parent.as_str()) {
+            continue;
+        }
+        let directory = source.join(&parent);
+        if !directory.is_dir() {
+            continue;
+        }
+        let mut contents = fs::read_dir(&directory)
+            .with_context(|| format!("read candidate directory {parent}"))?;
+        if contents.next().is_some() {
+            continue;
+        }
+        fs::remove_dir(&directory)
+            .with_context(|| format!("remove candidate directory {parent}"))?;
+    }
+    Ok(())
+}
+
+fn hash_worktree_object(worktree: &Path, path: &str) -> Result<String> {
+    let full = worktree.join(path);
+    let meta =
+        fs::symlink_metadata(&full).with_context(|| format!("read candidate object {path}"))?;
+    if meta.file_type().is_symlink() {
+        let target = fs::read_link(&full).with_context(|| format!("read symlink {path}"))?;
+        return git_hash_bytes(worktree, target.as_os_str().as_encoded_bytes());
+    }
+    git_stdout(worktree, &["hash-object", "--", path])
+}
+
+fn git_hash_bytes(worktree: &Path, bytes: &[u8]) -> Result<String> {
+    let output = git_command(worktree, &["hash-object", "--stdin"], &[], Some(bytes))?;
+    if !output.status.success() {
+        bail!("hash candidate bytes failed: {}", command_error(&output));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn mode_matches_meta(meta: &std::fs::Metadata, recorded: &str) -> bool {
     let observed = if meta.file_type().is_symlink() {
         "120000"
     } else if meta.permissions().mode() & 0o111 != 0 {
@@ -630,22 +841,6 @@ fn mode_matches(path: &Path, recorded: &str) -> bool {
         "100644"
     };
     recorded.ends_with(observed) || observed.ends_with(recorded.trim_start_matches(':'))
-}
-
-pub(crate) fn remove_manifest_additions(
-    source: &Path,
-    manifest: &[PathManifestEntry],
-) -> Result<()> {
-    for entry in manifest {
-        if entry.state != "add" && !entry.untracked {
-            continue;
-        }
-        let path = source.join(&entry.path);
-        if path.is_file() || path.symlink_metadata().is_ok() {
-            let _ = fs::remove_file(&path);
-        }
-    }
-    Ok(())
 }
 
 /// Apply one recorded promotion patch with the same preflight, fingerprint,
@@ -661,7 +856,7 @@ pub(crate) fn apply_recorded_patch(
     manifest: &[PathManifestEntry],
     fault: u8,
 ) -> Result<PromotionOutcome> {
-    match classify_source(source, manifest)? {
+    match classify_source(source, base_revision, manifest)? {
         SourceClassification::AlreadyApplied => return Ok(PromotionOutcome::AlreadyApplied),
         SourceClassification::Poisoned => {
             bail!(
@@ -696,7 +891,7 @@ pub(crate) fn apply_recorded_patch(
         if failed.status.success() {
             bail!("promotion apply command failed and the source was not changed");
         }
-        match classify_source(source, manifest)? {
+        match classify_source(source, base_revision, manifest)? {
             SourceClassification::NotApplied => {
                 bail!("promotion apply command failed and the source was not changed");
             }
@@ -713,7 +908,7 @@ pub(crate) fn apply_recorded_patch(
             if !rollback_parts(source, &applied) {
                 bail!("promotion verification failed and rollback also failed");
             }
-            match classify_source(source, manifest)? {
+            match classify_source(source, base_revision, manifest)? {
                 SourceClassification::NotApplied => {
                     bail!("promotion apply command failed and the source was rolled back");
                 }
@@ -730,7 +925,7 @@ pub(crate) fn apply_recorded_patch(
             if !rollback_parts(source, &applied) {
                 bail!("promotion verification failed and rollback also failed");
             }
-            match classify_source(source, manifest)? {
+            match classify_source(source, base_revision, manifest)? {
                 SourceClassification::NotApplied => {
                     bail!("promotion apply command failed and the source was rolled back");
                 }
@@ -739,7 +934,7 @@ pub(crate) fn apply_recorded_patch(
         }
         applied.push(part.clone());
         if fault == 3 && index == 0 && parts.len() >= 2 {
-            match classify_source(source, manifest)? {
+            match classify_source(source, base_revision, manifest)? {
                 SourceClassification::NotApplied => {
                     bail!("promotion apply command failed and the source was not changed");
                 }
@@ -756,9 +951,8 @@ pub(crate) fn apply_recorded_patch(
             bail!("promotion verification failed and rollback also failed");
         }
     }
-    ensure_intent_to_add(source)?;
-    let _ = (base_revision, final_fingerprint, source_fingerprint);
-    if classify_source(source, manifest)? != SourceClassification::AlreadyApplied {
+    let _ = (final_fingerprint, source_fingerprint);
+    if classify_source(source, base_revision, manifest)? != SourceClassification::AlreadyApplied {
         if !rollback_parts(source, &applied) {
             bail!("promotion verification failed and rollback also failed");
         }
@@ -814,13 +1008,8 @@ pub(crate) fn materialize_manifest(
             .with_context(|| format!("read candidate {}", entry.path))?;
         if meta.file_type().is_symlink() {
             let target = fs::read_link(&from).context("read candidate symlink")?;
-            if target.is_absolute() {
-                bail!("promotion refuses absolute symlinks: {}", entry.path);
-            }
-            let resolved = dunce::canonicalize(from.parent().unwrap_or(worktree).join(&target))
-                .with_context(|| format!("resolve candidate symlink {}", entry.path))?;
             let root = dunce::canonicalize(worktree).context("canonicalize candidate worktree")?;
-            if !resolved.starts_with(&root) {
+            if symlink_target_escapes(&root, &from, &target) {
                 bail!("promotion refuses symlink escape: {}", entry.path);
             }
             std::os::unix::fs::symlink(&target, &to).context("retain candidate symlink")?;
@@ -1077,16 +1266,39 @@ fn validate_isolated_links(worktree: &Path, changed: &[ChangeRecord]) -> Result<
             continue;
         }
         let target = fs::read_link(&path).context("read isolated symlink")?;
-        if target.is_absolute() {
-            bail!("promotion refuses absolute symlinks: {}", change.path);
-        }
-        let resolved = dunce::canonicalize(path.parent().unwrap_or(&root).join(target))
-            .with_context(|| format!("resolve isolated symlink {}", change.path))?;
-        if !resolved.starts_with(&root) {
+        if symlink_target_escapes(&root, &path, &target) {
             bail!("promotion refuses symlink escape: {}", change.path);
         }
     }
     Ok(())
+}
+
+fn symlink_target_escapes(root: &Path, link_path: &Path, target: &Path) -> bool {
+    if target.is_absolute() {
+        return true;
+    }
+    let root = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let start = link_path.parent().unwrap_or(&root);
+    let mut current = dunce::canonicalize(start).unwrap_or_else(|_| start.to_path_buf());
+    for component in target.components() {
+        match component {
+            Component::ParentDir => {
+                if !current.pop() {
+                    return true;
+                }
+            }
+            Component::Normal(part) => current.push(part),
+            Component::CurDir => {}
+            Component::RootDir | Component::Prefix(_) => return true,
+        }
+    }
+    if !current.starts_with(&root) {
+        return true;
+    }
+    if let Ok(resolved) = dunce::canonicalize(&current) {
+        return !resolved.starts_with(&root);
+    }
+    false
 }
 
 fn bounded_text(bytes: &[u8], limit: usize) -> (String, bool) {
@@ -1458,7 +1670,104 @@ mod tests {
         let mut tampered = captured.manifest.clone();
         let full = tampered[0].after_blob.clone();
         tampered[0].after_blob = full[..7].to_string();
-        let class = classify_source(dir.path(), &tampered).unwrap();
+        let class = classify_source(dir.path(), &base, &tampered).unwrap();
         assert_eq!(class, SourceClassification::Poisoned);
+    }
+
+    #[test]
+    fn different_symlink_target_is_foreign_not_already_applied() {
+        use std::os::unix::fs::symlink;
+        let dir = repository();
+        fs::write(dir.path().join("target.txt"), b"one\n").unwrap();
+        symlink("target.txt", dir.path().join("link")).unwrap();
+        git(dir.path(), &["add", "target.txt", "link"]);
+        git(dir.path(), &["commit", "-qm", "link"]);
+        let base = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let base = String::from_utf8(base.stdout).unwrap().trim().to_string();
+        fs::remove_file(dir.path().join("link")).unwrap();
+        symlink("other-target", dir.path().join("link")).unwrap();
+        let captured = capture_worktree_changes(dir.path(), &base).unwrap();
+        let link = captured
+            .manifest
+            .iter()
+            .find(|entry| entry.path == "link")
+            .unwrap();
+        assert!(link.symlink);
+        assert_eq!(link.after_blob.len(), 40);
+        assert_eq!(
+            classify_source(dir.path(), &base, &captured.manifest).unwrap(),
+            SourceClassification::AlreadyApplied
+        );
+        fs::remove_file(dir.path().join("link")).unwrap();
+        symlink("third-target", dir.path().join("link")).unwrap();
+        assert_eq!(
+            classify_source(dir.path(), &base, &captured.manifest).unwrap(),
+            SourceClassification::Poisoned
+        );
+    }
+
+    #[test]
+    fn symlink_target_change_is_exactly_verified_or_explicitly_refused() {
+        use std::os::unix::fs::symlink;
+        let dir = repository();
+        fs::write(dir.path().join("target.txt"), b"one\n").unwrap();
+        symlink("target.txt", dir.path().join("link")).unwrap();
+        git(dir.path(), &["add", "target.txt", "link"]);
+        git(dir.path(), &["commit", "-qm", "link"]);
+        let base = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let base = String::from_utf8(base.stdout).unwrap().trim().to_string();
+        fs::remove_file(dir.path().join("link")).unwrap();
+        symlink("renamed-target", dir.path().join("link")).unwrap();
+        let captured = capture_worktree_changes(dir.path(), &base).unwrap();
+        let mut child = Command::new("git")
+            .args(["hash-object", "--stdin"])
+            .current_dir(dir.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::io::Write::write_all(child.stdin.as_mut().unwrap(), b"renamed-target").unwrap();
+        drop(child.stdin.take());
+        let hashed = child.wait_with_output().unwrap();
+        assert!(hashed.status.success());
+        let object = String::from_utf8(hashed.stdout).unwrap();
+        let link = captured
+            .manifest
+            .iter()
+            .find(|entry| entry.path == "link")
+            .unwrap();
+        assert_eq!(link.after_blob, object.trim());
+        let retained = tempfile::tempdir().unwrap();
+        materialize_manifest(
+            dir.path(),
+            &retained.path().join("tree"),
+            &captured.manifest,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_link(retained.path().join("tree").join("link")).unwrap(),
+            Path::new("renamed-target")
+        );
+    }
+
+    #[test]
+    fn symlink_escape_remains_rejected() {
+        use std::os::unix::fs::symlink;
+        let dir = repository();
+        let prepared = prepare(dir.path(), "escape-link").unwrap();
+        symlink("/etc/passwd", prepared.cwd.join("escape")).unwrap();
+        let base = prepared.base_revision;
+        let error = capture_worktree_changes(&prepared.cwd, &base)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("symlink"), "{error}");
     }
 }

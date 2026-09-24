@@ -1668,7 +1668,7 @@ if [ "$behavior" = "ledger-only" ]; then
 }
 ' > src/ledger.rs
 fi
-if [ "$behavior" = "repair" ] || [ "$behavior" = "hold" ] || [ "$behavior" = "escape" ] || [ "$behavior" = "survive" ] || [ "$behavior" = "add-files" ] || [ "$behavior" = "extra" ]; then
+if [ "$behavior" = "repair" ] || [ "$behavior" = "hold" ] || [ "$behavior" = "escape" ] || [ "$behavior" = "survive" ] || [ "$behavior" = "add-files" ] || [ "$behavior" = "extra" ] || [ "$behavior" = "add-kept" ] || [ "$behavior" = "add-fresh" ]; then
   mkdir -p src
   printf '%s' 'pub fn balance(cents: &[i32]) -> i32 {
     cents.iter().sum()
@@ -1683,6 +1683,16 @@ fi
 if [ "$behavior" = "add-files" ]; then
   printf '%s' 'pub fn note() -> i32 { 1 }
 ' > src/aaa_note.rs
+fi
+if [ "$behavior" = "add-kept" ]; then
+  mkdir -p kept
+  printf '%s' 'pub fn note() -> i32 { 1 }
+' > kept/note.rs
+fi
+if [ "$behavior" = "add-fresh" ]; then
+  mkdir -p fresh
+  printf '%s' 'pub fn note() -> i32 { 1 }
+' > fresh/note.rs
 fi
 if [ "$behavior" = "extra" ]; then
   printf '%s' 'pub fn extra() {}
@@ -4183,6 +4193,387 @@ async fn authority_identity_mismatch_runs_no_check() {
     assert_eq!(
         harness.source_pair(),
         (LEDGER_BEFORE.to_string(), REPORT_BEFORE.to_string())
+    );
+    harness.close().await;
+}
+
+fn git_ok(repo: &Path, args: &[&str]) -> bool {
+    Command::new("/usr/bin/git")
+        .current_dir(repo)
+        .args(args)
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn foreign_file_at_candidate_add_path_is_preserved_and_discard_refuses() {
+    let _reset = ResetFault;
+    let (harness, work_id, digest, revision) =
+        approved_files("foreign-add-path", "add-files", adding_files()).await;
+    APPLY_FAULT.store(3, std::sync::atomic::Ordering::SeqCst);
+    let _ = apply_at(&harness, "apply-foreign-path", &work_id, &digest, revision)
+        .await
+        .unwrap_err();
+    let note = harness.workspace.path().join("src/aaa_note.rs");
+    fs::write(&note, b"foreign-bytes\n").unwrap();
+    APPLY_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+    let current = harness
+        .orch
+        .store()
+        .load_work_item(&work_id)
+        .unwrap()
+        .unwrap();
+    let error = harness
+        .orch
+        .discard_verified_change(
+            &auth(),
+            "discard-foreign-path",
+            harness.lane,
+            harness.workspace.path(),
+            &work_id,
+            &digest,
+            Some(current.revision),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("reconciliation"), "{error}");
+    assert_eq!(fs::read(&note).unwrap(), b"foreign-bytes\n");
+    harness.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn foreign_symlink_at_candidate_add_path_is_preserved() {
+    let _reset = ResetFault;
+    let (harness, work_id, digest, revision) =
+        approved_files("foreign-link", "add-files", adding_files()).await;
+    APPLY_FAULT.store(3, std::sync::atomic::Ordering::SeqCst);
+    let _ = apply_at(&harness, "apply-foreign-link", &work_id, &digest, revision)
+        .await
+        .unwrap_err();
+    let note = harness.workspace.path().join("src/aaa_note.rs");
+    fs::remove_file(&note).unwrap();
+    std::os::unix::fs::symlink("ledger.rs", &note).unwrap();
+    APPLY_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+    let current = harness
+        .orch
+        .store()
+        .load_work_item(&work_id)
+        .unwrap()
+        .unwrap();
+    let error = harness
+        .orch
+        .discard_verified_change(
+            &auth(),
+            "discard-foreign-link",
+            harness.lane,
+            harness.workspace.path(),
+            &work_id,
+            &digest,
+            Some(current.revision),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("reconciliation"), "{error}");
+    assert!(note.symlink_metadata().unwrap().file_type().is_symlink());
+    assert_eq!(fs::read_link(&note).unwrap(), Path::new("ledger.rs"));
+    harness.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exact_partial_candidate_addition_can_be_removed() {
+    let _reset = ResetFault;
+    let (harness, work_id, digest, revision) =
+        approved_files("exact-partial", "add-files", adding_files()).await;
+    APPLY_FAULT.store(3, std::sync::atomic::Ordering::SeqCst);
+    let _ = apply_at(&harness, "apply-exact-partial", &work_id, &digest, revision)
+        .await
+        .unwrap_err();
+    let note = harness.workspace.path().join("src/aaa_note.rs");
+    assert_eq!(fs::read_to_string(&note).unwrap(), NOTE_AFTER);
+    APPLY_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+    let current = harness
+        .orch
+        .store()
+        .load_work_item(&work_id)
+        .unwrap()
+        .unwrap();
+    harness
+        .orch
+        .discard_verified_change(
+            &auth(),
+            "discard-exact-partial",
+            harness.lane,
+            harness.workspace.path(),
+            &work_id,
+            &digest,
+            Some(current.revision),
+        )
+        .await
+        .unwrap();
+    assert!(!note.exists());
+    harness.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn partial_add_cleanup_does_not_remove_a_preexisting_empty_directory() {
+    let _reset = ResetFault;
+    let files = vec![
+        "kept/note.rs".into(),
+        "src/ledger.rs".into(),
+        "src/report.rs".into(),
+    ];
+    let (harness, work_id, digest, revision) =
+        approved_files("preexisting-dir", "add-kept", files).await;
+    fs::create_dir(harness.workspace.path().join("kept")).unwrap();
+    APPLY_FAULT.store(3, std::sync::atomic::Ordering::SeqCst);
+    let _ = apply_at(&harness, "apply-kept", &work_id, &digest, revision)
+        .await
+        .unwrap_err();
+    assert!(harness.workspace.path().join("kept/note.rs").is_file());
+    APPLY_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+    let current = harness
+        .orch
+        .store()
+        .load_work_item(&work_id)
+        .unwrap()
+        .unwrap();
+    harness
+        .orch
+        .discard_verified_change(
+            &auth(),
+            "discard-kept",
+            harness.lane,
+            harness.workspace.path(),
+            &work_id,
+            &digest,
+            Some(current.revision),
+        )
+        .await
+        .unwrap();
+    assert!(!harness.workspace.path().join("kept/note.rs").exists());
+    assert!(harness.workspace.path().join("kept").is_dir());
+    harness.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn partial_add_cleanup_does_not_leave_a_candidate_created_directory() {
+    let _reset = ResetFault;
+    let files = vec![
+        "fresh/note.rs".into(),
+        "src/ledger.rs".into(),
+        "src/report.rs".into(),
+    ];
+    let (harness, work_id, digest, revision) =
+        approved_files("created-dir", "add-fresh", files).await;
+    APPLY_FAULT.store(3, std::sync::atomic::Ordering::SeqCst);
+    let _ = apply_at(&harness, "apply-fresh", &work_id, &digest, revision)
+        .await
+        .unwrap_err();
+    assert!(harness.workspace.path().join("fresh/note.rs").is_file());
+    APPLY_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+    let current = harness
+        .orch
+        .store()
+        .load_work_item(&work_id)
+        .unwrap()
+        .unwrap();
+    harness
+        .orch
+        .discard_verified_change(
+            &auth(),
+            "discard-fresh",
+            harness.lane,
+            harness.workspace.path(),
+            &work_id,
+            &digest,
+            Some(current.revision),
+        )
+        .await
+        .unwrap();
+    assert!(!harness.workspace.path().join("fresh").exists());
+    harness.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn changed_head_after_source_effect_cannot_recover_success() {
+    let _reset = ResetFault;
+    let (harness, work_id, digest, revision) = approved_repair("head-after").await;
+    let workspace = harness.workspace.path().to_path_buf();
+    let fake = harness.fake_dir.path().join("grok");
+    let isolate = harness.isolate.path().to_path_buf();
+    let identity = harness.identity.clone();
+    let lease = harness.fake_dir.path().join("lease.json");
+    APPLY_FAULT.store(4, std::sync::atomic::Ordering::SeqCst);
+    let _ = apply_at(&harness, "apply-head-after", &work_id, &digest, revision)
+        .await
+        .unwrap_err();
+    git(
+        &workspace,
+        &["commit", "--allow-empty", "-m", "foreign head"],
+    );
+    APPLY_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+    let live = reopen_production_store(
+        harness.host,
+        harness.orch,
+        &workspace,
+        &fake,
+        &isolate,
+        &identity,
+        &lease,
+    )
+    .await;
+    let recovered = live.orch.store().load_work_item(&work_id).unwrap().unwrap();
+    assert_ne!(recovered.state, WorkState::Succeeded);
+    assert!(
+        recovered
+            .result
+            .as_ref()
+            .unwrap()
+            .candidate_verification
+            .as_ref()
+            .unwrap()
+            .reconciliation_required
+    );
+    live.orch.stop_background_tasks().await;
+    live.host.shutdown().await;
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn changed_head_with_candidate_bytes_and_foreign_commit_is_poisoned() {
+    let _reset = ResetFault;
+    let (harness, work_id, digest, revision) = approved_repair("foreign-commit").await;
+    let workspace = harness.workspace.path().to_path_buf();
+    let fake = harness.fake_dir.path().join("grok");
+    let isolate = harness.isolate.path().to_path_buf();
+    let identity = harness.identity.clone();
+    let lease = harness.fake_dir.path().join("lease.json");
+    APPLY_FAULT.store(4, std::sync::atomic::Ordering::SeqCst);
+    let _ = apply_at(
+        &harness,
+        "apply-foreign-commit",
+        &work_id,
+        &digest,
+        revision,
+    )
+    .await
+    .unwrap_err();
+    git(&workspace, &["add", "src/ledger.rs", "src/report.rs"]);
+    git(&workspace, &["commit", "-m", "foreign tree"]);
+    APPLY_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+    let live = reopen_production_store(
+        harness.host,
+        harness.orch,
+        &workspace,
+        &fake,
+        &isolate,
+        &identity,
+        &lease,
+    )
+    .await;
+    let recovered = live.orch.store().load_work_item(&work_id).unwrap().unwrap();
+    assert_ne!(recovered.state, WorkState::Succeeded);
+    assert!(
+        recovered
+            .result
+            .as_ref()
+            .unwrap()
+            .candidate_verification
+            .as_ref()
+            .unwrap()
+            .reconciliation_required
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.join("src/ledger.rs")).unwrap(),
+        LEDGER_AFTER
+    );
+    live.orch.stop_background_tasks().await;
+    live.host.shutdown().await;
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn staged_foreign_change_on_manifest_path_blocks_apply() {
+    let (harness, work_id, digest, revision) = approved_repair("staged-apply").await;
+    let ledger = harness.workspace.path().join("src/ledger.rs");
+    fs::write(&ledger, b"fn foreign() {}\n").unwrap();
+    git(harness.workspace.path(), &["add", "src/ledger.rs"]);
+    let error = apply_at(&harness, "apply-staged", &work_id, &digest, revision)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("reconciliation"), "{error}");
+    assert_eq!(fs::read(&ledger).unwrap(), b"fn foreign() {}\n");
+    harness.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn staged_foreign_change_on_manifest_path_blocks_recovery() {
+    let _reset = ResetFault;
+    let (harness, work_id, digest, revision) = approved_repair("staged-recover").await;
+    let workspace = harness.workspace.path().to_path_buf();
+    let fake = harness.fake_dir.path().join("grok");
+    let isolate = harness.isolate.path().to_path_buf();
+    let identity = harness.identity.clone();
+    let lease = harness.fake_dir.path().join("lease.json");
+    APPLY_FAULT.store(4, std::sync::atomic::Ordering::SeqCst);
+    let _ = apply_at(
+        &harness,
+        "apply-staged-recover",
+        &work_id,
+        &digest,
+        revision,
+    )
+    .await
+    .unwrap_err();
+    fs::write(workspace.join("src/ledger.rs"), b"fn staged() {}\n").unwrap();
+    git(&workspace, &["add", "src/ledger.rs"]);
+    APPLY_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+    let live = reopen_production_store(
+        harness.host,
+        harness.orch,
+        &workspace,
+        &fake,
+        &isolate,
+        &identity,
+        &lease,
+    )
+    .await;
+    let recovered = live.orch.store().load_work_item(&work_id).unwrap().unwrap();
+    assert_ne!(recovered.state, WorkState::Succeeded);
+    assert!(
+        recovered
+            .result
+            .as_ref()
+            .unwrap()
+            .candidate_verification
+            .as_ref()
+            .unwrap()
+            .reconciliation_required
+    );
+    live.orch.stop_background_tasks().await;
+    live.host.shutdown().await;
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn successful_added_file_application_leaves_index_unchanged() {
+    let (harness, work_id, digest, revision) =
+        approved_files("index-clean", "add-files", adding_files()).await;
+    let applied = apply_at(&harness, "apply-index", &work_id, &digest, revision)
+        .await
+        .unwrap();
+    assert_eq!(applied["work"]["state"], "succeeded");
+    let workspace = harness.workspace.path();
+    assert!(git_ok(workspace, &["diff", "--cached", "--quiet", "HEAD"]));
+    assert!(!git_ok(
+        workspace,
+        &["ls-files", "--error-unmatch", "--", "src/aaa_note.rs"]
+    ));
+    assert_eq!(
+        fs::read_to_string(workspace.join("src/aaa_note.rs")).unwrap(),
+        NOTE_AFTER
     );
     harness.close().await;
 }
