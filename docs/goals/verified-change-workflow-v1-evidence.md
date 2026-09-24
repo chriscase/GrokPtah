@@ -265,6 +265,31 @@ Live-provider test: NOT RUN.
 
 Production revocable xAI lease: STILL UNAVAILABLE.
 
+## Retained-byte evidence and full object ids
+
+A review of functional SHA `c33593bede2263b96849ec7e98f9beb92352be28` (tree `41063bc923618069159c3bd856c1b54021447fb2`) found two remaining holes. This repair is functional SHA `cf9d03a1a114e79805797b1df8429dd9182dd445` (tree `1e6b830b0726545f5654b330b0cd937034ca5d8f`). It is not an independent acceptance of the frozen goal.
+
+| Finding | Disposition | Named regression |
+| --- | --- | --- |
+| Adapter mutation evidence was an independent status and file hash taken before retention. Only path sets were compared, and that earlier digest was what the work stored. | Repaired. Changed paths and the evidence digest are derived from the retained patch, manifest, and materialized bytes. A checkout whose bytes differ is refused. | `retained_tree_byte_mismatch_cannot_bind_adapter_evidence`. `applied_patch_must_reproduce_the_checked_materialized_tree` also checks that the stored digest equals `retained_candidate_diff_digest`. |
+| Manifest identity accepted a `git diff --raw` abbreviation as a prefix of `git hash-object`. A different file sharing that prefix could be classified AlreadyApplied. | Repaired. Capture stores full 40-character object ids. Identity requires exact equality. | `abbreviated_blob_prefix_is_not_already_applied` |
+
+Local validation on `cf9d03a1a114e79805797b1df8429dd9182dd445`, before this evidence text:
+
+- Locked bridge suite on a fresh `GROKPTAH_HOME`: exit 0. The live managed-executor test stayed ignored.
+- Bridge fmt and strict all-target Clippy: exit 0.
+- Host-authority suite: exit 0.
+- Isolated headless service tests and `cargo check --locked --all-targets`: exit 0.
+- Desktop typecheck, npm test, and Tauri tests: exit 0.
+
+Hosted Desktop for functional SHA `cf9d03a1a114e79805797b1df8429dd9182dd445`: GitHub Actions run `35942601248` attempt 3 (https://github.com/chriscase/GrokPtah/actions/runs/35942601248) completed with conclusion `success`. The event was `pull_request`, `head_sha` was that functional SHA, and the `desktop` job succeeded with no failed steps. The successful job started `2026-09-24T02:08:30Z` and finished `2026-09-24T02:36:34Z`. Attempts 1 and 2 of the same run failed in unrelated journal-lock and continuity-probe tests and are not this result.
+
+The commit that adds this section is documentation only. A Desktop run for that docs tip is not this result.
+
+Live-provider test: NOT RUN.
+
+Production revocable xAI lease: STILL UNAVAILABLE.
+
 ## Repair identity
 
 - Prior reviewed functional SHA: `32268e89f52776704d7a4729c2bd3581310ceeb7`
