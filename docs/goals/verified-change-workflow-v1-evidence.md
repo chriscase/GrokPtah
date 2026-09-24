@@ -298,7 +298,17 @@ Prior functional tree: `eb73caffb771928dba9f59f75cb8a4087e4f4671`
 Repaired functional SHA: `cf9d03a1a114e79805797b1df8429dd9182dd445`
 Repaired functional tree: `1e6b830b0726545f5654b330b0cd937034ca5d8f`
 
-The locked bridge suite that recorded the rows below ran on that repaired functional tree, before this documentation commit. `SUITE:0`. Each named regression below was `ok`. The live managed-executor test stayed ignored. This is not an independent acceptance of the frozen goal.
+The commands below ran on the working tree committed as `cf9d03a1a114e79805797b1df8429dd9182dd445` (tree `1e6b830b0726545f5654b330b0cd937034ca5d8f`), before that commit at `2026-09-23T20:21:59-05:00`. No executable diff exists after that commit. Each named regression below was `ok`. The live managed-executor test stayed ignored. This is not an independent acceptance of the frozen goal.
+
+- Bridge `cargo fmt --all -- --check`: exit 0 (`FMT:0`).
+- Bridge `cargo clippy --locked --all-targets -- -D warnings`: exit 0 (`CLIPPY:0`).
+- Bridge `cargo test --locked -- --test-threads=1` on a fresh `GROKPTAH_HOME`: exit 0 (`SUITE:0`).
+- `cargo test -p xai-host-authority --locked -- --test-threads=1`: exit 0 (`AUTH:0`).
+- Isolated service `cargo test --locked -- --test-threads=1`: exit 0 (`SERVICE:0`).
+- Isolated service `cargo check --locked --all-targets`: exit 0 (`CHECK:0`).
+- Desktop `npm run typecheck`: exit 0 (`TC:0`).
+- Desktop `npm test`: exit 0 (`NPM:0`).
+- `desktop/src-tauri` `cargo test --locked`: exit 0 (`DESKLIB:0`).
 
 | Gap | Result on `cf9d03a1a` / `1e6b830b` | Named regression |
 | --- | --- | --- |
