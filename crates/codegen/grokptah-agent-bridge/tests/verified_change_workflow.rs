@@ -17,10 +17,11 @@ use grokptah_agent_bridge::orchestration::{
 };
 use grokptah_agent_bridge::{
     derived_snapshot_fingerprint, directory_digest, execute_required_checks, file_digest,
-    recompute_candidate_apply_bundle, set_grokptah_home_override, start_control_server, AgentHost,
-    CredentialLeaseHandle, CredentialLeaseResolver, GrokBuildAdapterError, HostConfig,
-    HostLeaseAuthority, HostRuntime, RequiredCheckCwd, RequiredCheckSpec, SessionKind, APPLY_FAULT,
-    BEFORE_CANDIDATE_BIND, CHECK_CONFINEMENT_EXECUTABLE, SKIP_VERIFIED_DRIVE,
+    read_check_authority, recompute_candidate_apply_bundle, set_grokptah_home_override,
+    start_control_server, write_check_authority, AgentHost, CredentialLeaseHandle,
+    CredentialLeaseResolver, GrokBuildAdapterError, HostConfig, HostLeaseAuthority, HostRuntime,
+    RequiredCheckCwd, RequiredCheckSpec, SessionKind, APPLY_FAULT, BEFORE_CANDIDATE_BIND,
+    CHECK_CONFINEMENT_EXECUTABLE, SKIP_VERIFIED_DRIVE,
 };
 use grokptah_agent_sdk::GrokBuildGitIdentity;
 use tempfile::tempdir;
@@ -33,6 +34,7 @@ const LEDGER_BEFORE: &str =
 const REPORT_BEFORE: &str = "pub fn render(cents: &[i32]) -> String {\n    format!(\"balance:{}\", crate::ledger::balance(cents))\n}\n";
 const LEDGER_AFTER: &str = "pub fn balance(cents: &[i32]) -> i32 {\n    cents.iter().sum()\n}\n";
 const REPORT_AFTER: &str = "pub fn render(cents: &[i32]) -> String {\n    // COORDINATED_REPORT=1\n    format!(\"balance:{}\", crate::ledger::balance(cents))\n}\n";
+const NOTE_AFTER: &str = "pub fn note() -> i32 { 1 }\n";
 
 struct FileLeaseResolver {
     authority: HostLeaseAuthority,
@@ -231,6 +233,12 @@ impl Harness {
             orch,
             _env: env,
         }
+    }
+
+    fn request_files(&self, request_id: &str, files: Vec<String>) -> VerifiedChangeRequest {
+        let mut request = self.request(request_id, "isolated_review", "macos");
+        request.allowed_files = files;
+        request
     }
 
     fn request(&self, request_id: &str, mode: &str, platform: &str) -> VerifiedChangeRequest {
@@ -1660,7 +1668,7 @@ if [ "$behavior" = "ledger-only" ]; then
 }
 ' > src/ledger.rs
 fi
-if [ "$behavior" = "repair" ] || [ "$behavior" = "hold" ] || [ "$behavior" = "escape" ]; then
+if [ "$behavior" = "repair" ] || [ "$behavior" = "hold" ] || [ "$behavior" = "escape" ] || [ "$behavior" = "survive" ] || [ "$behavior" = "add-files" ] || [ "$behavior" = "extra" ]; then
   mkdir -p src
   printf '%s' 'pub fn balance(cents: &[i32]) -> i32 {
     cents.iter().sum()
@@ -1671,6 +1679,18 @@ if [ "$behavior" = "repair" ] || [ "$behavior" = "hold" ] || [ "$behavior" = "es
     format!("balance:{}", crate::ledger::balance(cents))
 }
 ' > src/report.rs
+fi
+if [ "$behavior" = "add-files" ]; then
+  printf '%s' 'pub fn note() -> i32 { 1 }
+' > src/aaa_note.rs
+fi
+if [ "$behavior" = "extra" ]; then
+  printf '%s' 'pub fn extra() {}
+' > src/notes.rs
+fi
+if [ "$behavior" = "survive" ]; then
+  ( sleep 2; printf 'SURVIVOR\n' >> src/ledger.rs ) >/dev/null 2>&1 &
+  sleep 61 >/dev/null 2>&1 &
 fi
 printf '{"method":"session/update","params":{"_meta":{},"sessionId":"%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"repaired the balance pair\\nGROK_BUILD_VERDICT=clean"}}},"timestamp":"2026-08-31T00:00:00Z"}\n' "$session_id" > "$GROK_HOME/sessions/workspace/$session_id/updates.jsonl"
 printf '{"method":"_x.ai/session/update","params":{"_meta":{},"sessionId":"%s","update":{"sessionUpdate":"turn_completed","stop_reason":"end_turn"}},"timestamp":"2026-08-31T00:00:01Z"}\n' "$session_id" >> "$GROK_HOME/sessions/workspace/$session_id/updates.jsonl"
@@ -1703,10 +1723,16 @@ async fn approved_repair(label: &str) -> (Harness, String, String, u64) {
     let digest = work
         .result
         .as_ref()
-        .unwrap()
-        .candidate_verification
-        .as_ref()
-        .unwrap()
+        .and_then(|result| result.candidate_verification.as_ref())
+        .unwrap_or_else(|| {
+            panic!(
+                "no verification for {label}: state {:?} failure {:?}",
+                work.state,
+                work.result
+                    .as_ref()
+                    .and_then(|result| result.failure.clone())
+            )
+        })
         .content_digest
         .clone();
     harness
@@ -1730,6 +1756,72 @@ async fn approved_repair(label: &str) -> (Harness, String, String, u64) {
         .unwrap()
         .revision;
     (harness, work_id, digest, revision)
+}
+
+async fn approved_files(
+    label: &str,
+    behavior: &str,
+    files: Vec<String>,
+) -> (Harness, String, String, u64) {
+    let harness = Harness::open(ManagedExecutionBudgetProfile::Economy);
+    harness.set_behavior(behavior);
+    let started = harness
+        .orch
+        .start_verified_change(&auth(), &harness.request_files(label, files))
+        .await
+        .unwrap_or_else(|error| panic!("start {label}: {error}"));
+    let work_id = started["workId"].as_str().unwrap().to_string();
+    let _ = settle(&harness.orch, &work_id).await;
+    let work = harness
+        .orch
+        .store()
+        .load_work_item(&work_id)
+        .unwrap()
+        .unwrap();
+    let digest = work
+        .result
+        .as_ref()
+        .and_then(|result| result.candidate_verification.as_ref())
+        .unwrap_or_else(|| {
+            panic!(
+                "no verification for {label}: state {:?} failure {:?}",
+                work.state,
+                work.result
+                    .as_ref()
+                    .and_then(|result| result.failure.clone())
+            )
+        })
+        .content_digest
+        .clone();
+    harness
+        .orch
+        .approve_work(
+            &auth(),
+            "approve-files",
+            harness.lane,
+            harness.workspace.path(),
+            &work_id,
+            Some("approve".into()),
+            Some(work.revision),
+        )
+        .await
+        .unwrap();
+    let revision = harness
+        .orch
+        .store()
+        .load_work_item(&work_id)
+        .unwrap()
+        .unwrap()
+        .revision;
+    (harness, work_id, digest, revision)
+}
+
+fn adding_files() -> Vec<String> {
+    vec![
+        "src/aaa_note.rs".into(),
+        "src/ledger.rs".into(),
+        "src/report.rs".into(),
+    ]
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1885,6 +1977,82 @@ async fn foreign_status_does_not_reveal_or_mutate_the_candidate() {
 }
 
 static BARRIER_REPO: Mutex<Option<PathBuf>> = Mutex::new(None);
+static HOOK_STORE: Mutex<Option<PathBuf>> = Mutex::new(None);
+static FOREIGN_AUTHORITY: Mutex<Option<(PathBuf, Vec<u8>)>> = Mutex::new(None);
+
+fn append_tree_mismatch() {
+    let Some(root) = HOOK_STORE.lock().unwrap().clone() else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(root.join("verified-changes")) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let ledger = entry.path().join("tree").join("src").join("ledger.rs");
+        if !ledger.is_file() {
+            continue;
+        }
+        let mut bytes = fs::read(&ledger).unwrap();
+        bytes.extend(b"\n// tree-mismatch\n");
+        fs::write(&ledger, bytes).unwrap();
+    }
+}
+
+fn reseal_network_and_output() {
+    let Some(root) = HOOK_STORE.lock().unwrap().clone() else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(root.join("verified-changes")) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(mut authority) = read_check_authority(&entry.path()) else {
+            continue;
+        };
+        authority.network = "qualified".into();
+        authority.output_limit_bytes = 1;
+        let _ = write_check_authority(&entry.path(), &authority.seal());
+    }
+}
+
+fn copy_foreign_authority() {
+    let Some((source, bytes)) = FOREIGN_AUTHORITY.lock().unwrap().clone() else {
+        return;
+    };
+    let Some(root) = HOOK_STORE.lock().unwrap().clone() else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(root.join("verified-changes")) else {
+        return;
+    };
+    let source = dunce::canonicalize(&source).ok();
+    for entry in entries.flatten() {
+        let path = entry.path().join("check-authority.json");
+        if !path.is_file() {
+            continue;
+        }
+        if dunce::canonicalize(&path).ok() == source {
+            continue;
+        }
+        let _ = fs::write(path, &bytes);
+    }
+}
+
+struct ClearBindHook;
+impl Drop for ClearBindHook {
+    fn drop(&mut self) {
+        *BEFORE_CANDIDATE_BIND.lock().unwrap() = None;
+        *HOOK_STORE.lock().unwrap() = None;
+        *FOREIGN_AUTHORITY.lock().unwrap() = None;
+    }
+}
+
+struct EnableDrive;
+impl Drop for EnableDrive {
+    fn drop(&mut self) {
+        SKIP_VERIFIED_DRIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
 
 fn commit_barrier_b() {
     let Some(repo) = BARRIER_REPO.lock().unwrap().clone() else {
@@ -3317,5 +3485,689 @@ async fn concurrent_apply_and_discard_converge_to_one_truthful_result() {
         WorkState::Cancelled => assert_eq!(source, before),
         other => panic!("converged to {other:?} with source {source:?}"),
     }
+    harness.close().await;
+}
+
+fn diff_paths(patch: &[u8]) -> Vec<String> {
+    let mut paths = Vec::new();
+    for line in String::from_utf8_lossy(patch).lines() {
+        let Some(rest) = line.strip_prefix("diff --git ") else {
+            continue;
+        };
+        let mut parts = rest.split_whitespace();
+        let Some(a) = parts.next() else { continue };
+        let Some(b) = parts.next() else { continue };
+        let path = b
+            .strip_prefix("b/")
+            .or_else(|| a.strip_prefix("a/"))
+            .unwrap_or(b);
+        paths.push(path.to_string());
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn manifest_paths(private_dir: &Path) -> Vec<String> {
+    let value: serde_json::Value =
+        serde_json::from_slice(&fs::read(private_dir.join("manifest.json")).unwrap()).unwrap();
+    let mut paths = value["manifest"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["path"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn normal_exit_with_surviving_mutator_cannot_retain_a_candidate() {
+    let harness = Harness::open(ManagedExecutionBudgetProfile::Economy);
+    harness.set_behavior("survive");
+    let started = harness
+        .orch
+        .start_verified_change(
+            &auth(),
+            &harness.request("survive", "isolated_review", "macos"),
+        )
+        .await
+        .unwrap();
+    let work_id = started["workId"].as_str().unwrap().to_string();
+    let settled = settle(&harness.orch, &work_id).await;
+    let _ = Command::new("/usr/bin/pkill")
+        .args(["-f", "sleep 61"])
+        .status();
+    assert_ne!(settled["state"], "awaiting_approval", "{settled}");
+    assert!(!candidate_dir(&harness, &work_id)
+        .join("promotion.patch")
+        .exists());
+    assert!(!candidate_dir(&harness, &work_id).join("tree").exists());
+    assert_eq!(
+        harness.source_pair(),
+        (LEDGER_BEFORE.to_string(), REPORT_BEFORE.to_string())
+    );
+    let listed = Command::new("/usr/bin/pgrep")
+        .args(["-f", "sleep 61"])
+        .output()
+        .unwrap();
+    assert!(
+        listed.stdout.is_empty(),
+        "the surviving mutator was left running"
+    );
+    harness.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn preverification_patch_tree_mismatch_cannot_verify() {
+    let _clear = ClearBindHook;
+    let harness = Harness::open(ManagedExecutionBudgetProfile::Economy);
+    *HOOK_STORE.lock().unwrap() = Some(harness.orch.store().root().to_path_buf());
+    *BEFORE_CANDIDATE_BIND.lock().unwrap() = Some(append_tree_mismatch);
+    harness.set_behavior("repair");
+    let started = harness
+        .orch
+        .start_verified_change(
+            &auth(),
+            &harness.request("mismatch", "isolated_review", "macos"),
+        )
+        .await
+        .unwrap();
+    let work_id = started["workId"].as_str().unwrap().to_string();
+    let settled = settle(&harness.orch, &work_id).await;
+    assert_ne!(settled["state"], "awaiting_approval", "{settled}");
+    let work = harness
+        .orch
+        .store()
+        .load_work_item(&work_id)
+        .unwrap()
+        .unwrap();
+    let verification = work
+        .result
+        .as_ref()
+        .unwrap()
+        .candidate_verification
+        .as_ref()
+        .unwrap();
+    assert!(!verification.checks_passed);
+    assert!(verification
+        .checks
+        .iter()
+        .all(|check| check.outcome != "passed" && check.exit_code.is_none()));
+    let tree = fs::read_to_string(
+        candidate_dir(&harness, &work_id)
+            .join("tree")
+            .join("src")
+            .join("ledger.rs"),
+    )
+    .unwrap();
+    assert!(tree.contains("tree-mismatch"));
+    assert!(tree.contains("iter().sum()"));
+    assert_eq!(
+        harness.source_pair(),
+        (LEDGER_BEFORE.to_string(), REPORT_BEFORE.to_string())
+    );
+    harness.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn applied_patch_must_reproduce_the_checked_materialized_tree() {
+    let harness = Harness::open(ManagedExecutionBudgetProfile::Economy);
+    harness.set_behavior("repair");
+    let started = harness
+        .orch
+        .start_verified_change(
+            &auth(),
+            &harness.request("reproduce", "isolated_review", "macos"),
+        )
+        .await
+        .unwrap();
+    let work_id = started["workId"].as_str().unwrap().to_string();
+    let settled = settle(&harness.orch, &work_id).await;
+    assert_eq!(settled["state"], "awaiting_approval", "{settled}");
+    let private_dir = candidate_dir(&harness, &work_id);
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(private_dir.join("manifest.json")).unwrap()).unwrap();
+    let patch = fs::read(private_dir.join("promotion.patch")).unwrap();
+    let base = manifest["baseRevision"].as_str().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let checkout = scratch.path().join("checkout");
+    let added = Command::new("/usr/bin/git")
+        .args(["worktree", "add", "--detach", "--force"])
+        .arg(&checkout)
+        .arg(base)
+        .current_dir(harness.workspace.path())
+        .status()
+        .unwrap();
+    assert!(added.success());
+    let mut child = Command::new("/usr/bin/git")
+        .args(["apply", "--binary", "--whitespace=nowarn"])
+        .current_dir(&checkout)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write;
+    child.stdin.as_mut().unwrap().write_all(&patch).unwrap();
+    drop(child.stdin.take());
+    assert!(child.wait().unwrap().success());
+    for entry in manifest["manifest"].as_array().unwrap() {
+        let path = entry["path"].as_str().unwrap();
+        let checked = private_dir.join("tree").join(path);
+        let reproduced = checkout.join(path);
+        if entry["state"] == "delete" {
+            assert!(!checked.exists());
+            assert!(!reproduced.exists());
+            continue;
+        }
+        assert_eq!(fs::read(&checked).unwrap(), fs::read(&reproduced).unwrap());
+        use std::os::unix::fs::PermissionsExt;
+        let checked_mode = fs::symlink_metadata(&checked).unwrap().permissions().mode() & 0o777;
+        let reproduced_mode = fs::symlink_metadata(&reproduced)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(checked_mode, reproduced_mode, "{path}");
+    }
+    let _ = Command::new("/usr/bin/git")
+        .args(["worktree", "remove", "--force"])
+        .arg(&checkout)
+        .current_dir(harness.workspace.path())
+        .status();
+    harness.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn patch_paths_must_equal_manifest_and_allowed_scope() {
+    let harness = Harness::open(ManagedExecutionBudgetProfile::Economy);
+    harness.set_behavior("repair");
+    let started = harness
+        .orch
+        .start_verified_change(
+            &auth(),
+            &harness.request("paths", "isolated_review", "macos"),
+        )
+        .await
+        .unwrap();
+    let work_id = started["workId"].as_str().unwrap().to_string();
+    let settled = settle(&harness.orch, &work_id).await;
+    assert_eq!(settled["state"], "awaiting_approval", "{settled}");
+    let private_dir = candidate_dir(&harness, &work_id);
+    let patch = diff_paths(&fs::read(private_dir.join("promotion.patch")).unwrap());
+    let manifest = manifest_paths(&private_dir);
+    let mut allowed = harness
+        .orch
+        .store()
+        .load_work_item(&work_id)
+        .unwrap()
+        .unwrap()
+        .policy
+        .allowed_files;
+    allowed.sort();
+    assert_eq!(patch, manifest);
+    assert_eq!(patch, allowed);
+    harness.close().await;
+
+    let harness = Harness::open(ManagedExecutionBudgetProfile::Economy);
+    harness.set_behavior("extra");
+    let started = harness
+        .orch
+        .start_verified_change(
+            &auth(),
+            &harness.request("extra", "isolated_review", "macos"),
+        )
+        .await
+        .unwrap();
+    let work_id = started["workId"].as_str().unwrap().to_string();
+    let settled = settle(&harness.orch, &work_id).await;
+    assert_ne!(settled["state"], "awaiting_approval", "{settled}");
+    assert!(!candidate_dir(&harness, &work_id)
+        .join("promotion.patch")
+        .exists());
+    assert_eq!(
+        harness.source_pair(),
+        (LEDGER_BEFORE.to_string(), REPORT_BEFORE.to_string())
+    );
+    harness.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn crash_after_first_untracked_add_is_not_classified_not_applied() {
+    let _reset = ResetFault;
+    let (harness, work_id, digest, revision) =
+        approved_files("first-add", "add-files", adding_files()).await;
+    APPLY_FAULT.store(3, std::sync::atomic::Ordering::SeqCst);
+    let crashed = apply_at(&harness, "apply-first-add", &work_id, &digest, revision)
+        .await
+        .unwrap_err();
+    assert!(crashed.to_string().contains("reconciliation"), "{crashed}");
+    assert!(
+        !crashed.to_string().contains("was not changed"),
+        "{crashed}"
+    );
+    let note = harness.workspace.path().join("src/aaa_note.rs");
+    assert_eq!(fs::read_to_string(&note).unwrap(), NOTE_AFTER);
+    assert_eq!(harness.source_pair().0, LEDGER_BEFORE);
+    let work = harness
+        .orch
+        .store()
+        .load_work_item(&work_id)
+        .unwrap()
+        .unwrap();
+    assert!(
+        work.result
+            .as_ref()
+            .unwrap()
+            .candidate_verification
+            .as_ref()
+            .unwrap()
+            .reconciliation_required
+    );
+    assert_ne!(work.state, WorkState::Succeeded);
+    APPLY_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+    let workspace = harness.workspace.path().to_path_buf();
+    let fake = harness.fake_dir.path().join("grok");
+    let isolate = harness.isolate.path().to_path_buf();
+    let identity = harness.identity.clone();
+    let lease = harness.fake_dir.path().join("lease.json");
+    let live = reopen_production_store(
+        harness.host,
+        harness.orch,
+        &workspace,
+        &fake,
+        &isolate,
+        &identity,
+        &lease,
+    )
+    .await;
+    let recovered = live.orch.store().load_work_item(&work_id).unwrap().unwrap();
+    assert_ne!(recovered.state, WorkState::Succeeded);
+    assert!(
+        recovered
+            .result
+            .as_ref()
+            .unwrap()
+            .candidate_verification
+            .as_ref()
+            .unwrap()
+            .reconciliation_required
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.join("src/aaa_note.rs")).unwrap(),
+        NOTE_AFTER
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.join("src/ledger.rs")).unwrap(),
+        LEDGER_BEFORE
+    );
+    live.orch.stop_background_tasks().await;
+    live.host.shutdown().await;
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn crash_after_all_new_files_before_index_update_recovers_applied() {
+    let _reset = ResetFault;
+    let (harness, work_id, digest, revision) =
+        approved_files("all-new", "add-files", adding_files()).await;
+    let workspace = harness.workspace.path().to_path_buf();
+    let fake = harness.fake_dir.path().join("grok");
+    let isolate = harness.isolate.path().to_path_buf();
+    let identity = harness.identity.clone();
+    let lease = harness.fake_dir.path().join("lease.json");
+    APPLY_FAULT.store(4, std::sync::atomic::Ordering::SeqCst);
+    let interrupted = apply_at(&harness, "apply-all-new", &work_id, &digest, revision)
+        .await
+        .unwrap_err();
+    assert!(
+        interrupted.to_string().contains("before the work commit"),
+        "{interrupted}"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.join("src/aaa_note.rs")).unwrap(),
+        NOTE_AFTER
+    );
+    let removed = Command::new("/usr/bin/git")
+        .args(["update-index", "--force-remove", "--", "src/aaa_note.rs"])
+        .current_dir(&workspace)
+        .status()
+        .unwrap();
+    assert!(removed.success());
+    let indexed = Command::new("/usr/bin/git")
+        .args(["ls-files", "--error-unmatch", "--", "src/aaa_note.rs"])
+        .current_dir(&workspace)
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(!indexed.success(), "the new file was still in the index");
+    assert_ne!(
+        harness
+            .orch
+            .store()
+            .load_work_item(&work_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        WorkState::Succeeded
+    );
+    APPLY_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+    let live = reopen_production_store(
+        harness.host,
+        harness.orch,
+        &workspace,
+        &fake,
+        &isolate,
+        &identity,
+        &lease,
+    )
+    .await;
+    let recovered = live.orch.store().load_work_item(&work_id).unwrap().unwrap();
+    assert_eq!(recovered.state, WorkState::Succeeded);
+    assert!(
+        recovered
+            .result
+            .as_ref()
+            .unwrap()
+            .candidate_verification
+            .as_ref()
+            .unwrap()
+            .applied
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.join("src/aaa_note.rs")).unwrap(),
+        NOTE_AFTER
+    );
+    let still_unindexed = Command::new("/usr/bin/git")
+        .args(["ls-files", "--error-unmatch", "--", "src/aaa_note.rs"])
+        .current_dir(&workspace)
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(!still_unindexed.success());
+    live.orch.stop_background_tasks().await;
+    live.host.shutdown().await;
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn discard_never_leaves_an_untracked_candidate_file() {
+    let _reset = ResetFault;
+    let (harness, work_id, digest, revision) =
+        approved_files("discard-add", "add-files", adding_files()).await;
+    APPLY_FAULT.store(3, std::sync::atomic::Ordering::SeqCst);
+    let crashed = apply_at(&harness, "apply-discard-add", &work_id, &digest, revision)
+        .await
+        .unwrap_err();
+    assert!(crashed.to_string().contains("reconciliation"), "{crashed}");
+    let note = harness.workspace.path().join("src/aaa_note.rs");
+    assert!(note.is_file());
+    APPLY_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+    let current = harness
+        .orch
+        .store()
+        .load_work_item(&work_id)
+        .unwrap()
+        .unwrap();
+    harness
+        .orch
+        .discard_verified_change(
+            &auth(),
+            "discard-untracked",
+            harness.lane,
+            harness.workspace.path(),
+            &work_id,
+            &digest,
+            Some(current.revision),
+        )
+        .await
+        .unwrap();
+    assert!(!note.exists(), "discard left the untracked candidate file");
+    assert_eq!(harness.source_pair().0, LEDGER_BEFORE);
+    let work = harness
+        .orch
+        .store()
+        .load_work_item(&work_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(work.state, WorkState::Cancelled);
+    harness.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn foreign_untracked_file_during_apply_requires_reconciliation() {
+    let (harness, work_id, digest, revision) =
+        approved_files("foreign-file", "add-files", adding_files()).await;
+    fs::write(harness.workspace.path().join("FOREIGN.txt"), b"foreign\n").unwrap();
+    let error = apply_at(&harness, "apply-foreign", &work_id, &digest, revision)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("reconciliation"), "{error}");
+    assert!(!harness.workspace.path().join("src/aaa_note.rs").exists());
+    assert_eq!(
+        harness.source_pair(),
+        (LEDGER_BEFORE.to_string(), REPORT_BEFORE.to_string())
+    );
+    assert!(harness.workspace.path().join("FOREIGN.txt").is_file());
+    let work = harness
+        .orch
+        .store()
+        .load_work_item(&work_id)
+        .unwrap()
+        .unwrap();
+    assert!(
+        work.result
+            .as_ref()
+            .unwrap()
+            .candidate_verification
+            .as_ref()
+            .unwrap()
+            .reconciliation_required
+    );
+    assert_ne!(work.state, WorkState::Succeeded);
+    harness.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resealed_check_authority_cannot_upgrade_network_or_resource_policy() {
+    let _clear = ClearBindHook;
+    let harness = Harness::open(ManagedExecutionBudgetProfile::Economy);
+    *HOOK_STORE.lock().unwrap() = Some(harness.orch.store().root().to_path_buf());
+    *BEFORE_CANDIDATE_BIND.lock().unwrap() = Some(reseal_network_and_output);
+    harness.set_behavior("repair");
+    let started = harness
+        .orch
+        .start_verified_change(
+            &auth(),
+            &harness.request("reseal-net", "isolated_review", "macos"),
+        )
+        .await
+        .unwrap();
+    let work_id = started["workId"].as_str().unwrap().to_string();
+    let settled = settle(&harness.orch, &work_id).await;
+    assert_ne!(settled["state"], "awaiting_approval", "{settled}");
+    let private_dir = candidate_dir(&harness, &work_id);
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&fs::read(private_dir.join("execution-envelope.json")).unwrap())
+            .unwrap();
+    let original = envelope["checkAuthorityDigest"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let resealed = read_check_authority(&private_dir).unwrap();
+    assert_eq!(resealed.network, "qualified");
+    assert_eq!(resealed.output_limit_bytes, 1);
+    assert_ne!(resealed.authority_digest, original);
+    let work = harness
+        .orch
+        .store()
+        .load_work_item(&work_id)
+        .unwrap()
+        .unwrap();
+    let verification = work
+        .result
+        .as_ref()
+        .unwrap()
+        .candidate_verification
+        .as_ref()
+        .unwrap();
+    assert_eq!(verification.check_authority_digest, original);
+    assert_ne!(
+        verification.check_authority_digest,
+        resealed.authority_digest
+    );
+    assert!(!verification.checks_passed);
+    assert!(verification
+        .checks
+        .iter()
+        .all(|check| check.outcome != "passed" && check.exit_code.is_none()));
+    assert!(!verification.apply_bundle_digest.is_empty());
+    harness.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn foreign_check_authority_cannot_be_copied_to_another_work() {
+    let _clear = ClearBindHook;
+    let harness = Harness::open(ManagedExecutionBudgetProfile::Economy);
+    harness.set_behavior("repair");
+    let first = harness
+        .orch
+        .start_verified_change(
+            &auth(),
+            &harness.request("foreign-a", "isolated_review", "macos"),
+        )
+        .await
+        .unwrap();
+    let first_id = first["workId"].as_str().unwrap().to_string();
+    let first_settled = settle(&harness.orch, &first_id).await;
+    assert_eq!(
+        first_settled["state"], "awaiting_approval",
+        "{first_settled}"
+    );
+    let first_dir = candidate_dir(&harness, &first_id);
+    let first_authority = fs::read(first_dir.join("check-authority.json")).unwrap();
+    let first_digest = read_check_authority(&first_dir).unwrap().authority_digest;
+    *FOREIGN_AUTHORITY.lock().unwrap() = Some((
+        first_dir.join("check-authority.json"),
+        first_authority.clone(),
+    ));
+    *HOOK_STORE.lock().unwrap() = Some(harness.orch.store().root().to_path_buf());
+    *BEFORE_CANDIDATE_BIND.lock().unwrap() = Some(copy_foreign_authority);
+    let second = harness
+        .orch
+        .start_verified_change(
+            &auth(),
+            &harness.request("foreign-b", "isolated_review", "macos"),
+        )
+        .await
+        .unwrap();
+    let second_id = second["workId"].as_str().unwrap().to_string();
+    let second_settled = settle(&harness.orch, &second_id).await;
+    assert_ne!(
+        second_settled["state"], "awaiting_approval",
+        "{second_settled}"
+    );
+    let second_dir = candidate_dir(&harness, &second_id);
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&fs::read(second_dir.join("execution-envelope.json")).unwrap())
+            .unwrap();
+    let original = envelope["checkAuthorityDigest"].as_str().unwrap();
+    assert_ne!(original, first_digest);
+    let copied = read_check_authority(&second_dir).unwrap();
+    assert_eq!(copied.authority_digest, first_digest);
+    assert_ne!(copied.work_id, second_id);
+    let work = harness
+        .orch
+        .store()
+        .load_work_item(&second_id)
+        .unwrap()
+        .unwrap();
+    let verification = work
+        .result
+        .as_ref()
+        .unwrap()
+        .candidate_verification
+        .as_ref()
+        .unwrap();
+    assert_eq!(verification.check_authority_digest, original);
+    assert_ne!(verification.check_authority_digest, first_digest);
+    assert!(!verification.checks_passed);
+    assert!(verification
+        .checks
+        .iter()
+        .all(|check| check.exit_code.is_none() && check.outcome != "passed"));
+    assert_eq!(
+        fs::read(first_dir.join("check-authority.json")).unwrap(),
+        first_authority
+    );
+    assert_eq!(
+        harness
+            .orch
+            .store()
+            .load_work_item(&first_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        WorkState::AwaitingApproval
+    );
+    harness.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authority_identity_mismatch_runs_no_check() {
+    let _drive = EnableDrive;
+    SKIP_VERIFIED_DRIVE.store(true, std::sync::atomic::Ordering::SeqCst);
+    let harness = Harness::open(ManagedExecutionBudgetProfile::Economy);
+    let started = harness
+        .orch
+        .start_verified_change(
+            &auth(),
+            &harness.request("identity", "isolated_review", "macos"),
+        )
+        .await
+        .unwrap();
+    let work_id = started["workId"].as_str().unwrap().to_string();
+    let private_dir = candidate_dir(&harness, &work_id);
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&fs::read(private_dir.join("execution-envelope.json")).unwrap())
+            .unwrap();
+    let original = envelope["checkAuthorityDigest"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut authority = read_check_authority(&private_dir).unwrap();
+    authority.work_id = "other-work".into();
+    write_check_authority(&private_dir, &authority.seal()).unwrap();
+    assert_ne!(
+        read_check_authority(&private_dir).unwrap().authority_digest,
+        original
+    );
+    SKIP_VERIFIED_DRIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+    harness.orch.drive_native_executor_once().await;
+    assert!(harness
+        .orch
+        .store()
+        .list_managed_intents()
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        harness
+            .orch
+            .store()
+            .load_work_item(&work_id)
+            .unwrap()
+            .unwrap()
+            .attempt_count,
+        0
+    );
+    let argv = fs::read_to_string(harness.fake_dir.path().join("grok.argv")).unwrap_or_default();
+    assert!(
+        !argv.contains("--session-id"),
+        "identity mismatch dispatched a worker: {argv}"
+    );
+    assert!(!private_dir.join("tree").exists());
+    assert_eq!(
+        harness.source_pair(),
+        (LEDGER_BEFORE.to_string(), REPORT_BEFORE.to_string())
+    );
     harness.close().await;
 }

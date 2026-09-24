@@ -468,18 +468,165 @@ pub(crate) fn capture_worktree_changes(
 
 pub(crate) fn classify_source(
     source: &Path,
-    base_revision: &str,
-    source_fingerprint: &str,
-    final_fingerprint: &str,
+    manifest: &[PathManifestEntry],
 ) -> Result<SourceClassification> {
-    let current = fingerprint_at(source, base_revision)?;
-    if current == final_fingerprint {
-        Ok(SourceClassification::AlreadyApplied)
-    } else if current == source_fingerprint {
-        Ok(SourceClassification::NotApplied)
-    } else {
-        Ok(SourceClassification::Poisoned)
+    let mut foreign = worktree_change_paths(source)?;
+    for entry in manifest {
+        foreign.remove(&entry.path);
     }
+    if !foreign.is_empty() {
+        return Ok(SourceClassification::Poisoned);
+    }
+    let mut all_before = true;
+    let mut all_after = true;
+    for entry in manifest {
+        let before = path_has_manifest_identity(source, entry, false)?;
+        let after = path_has_manifest_identity(source, entry, true)?;
+        if !before {
+            all_before = false;
+        }
+        if !after {
+            all_after = false;
+        }
+        if !before && !after {
+            return Ok(SourceClassification::Poisoned);
+        }
+    }
+    if all_after && !manifest.is_empty() {
+        return Ok(SourceClassification::AlreadyApplied);
+    }
+    if all_before {
+        return Ok(SourceClassification::NotApplied);
+    }
+    Ok(SourceClassification::Poisoned)
+}
+
+fn worktree_change_paths(source: &Path) -> Result<std::collections::BTreeSet<String>> {
+    let output = git_command(
+        source,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignored=no",
+        ],
+        &[],
+        None,
+    )?;
+    if !output.status.success() {
+        bail!("list worktree changes failed: {}", command_error(&output));
+    }
+    let mut paths = std::collections::BTreeSet::new();
+    let bytes = &output.stdout;
+    let mut index = 0usize;
+    while index + 3 < bytes.len() {
+        let status = &bytes[index..index + 2];
+        let start = index + 3;
+        let Some(end_offset) = bytes[start..].iter().position(|byte| *byte == 0) else {
+            break;
+        };
+        let end = start + end_offset;
+        let path =
+            std::str::from_utf8(&bytes[start..end]).context("git returned a non-UTF-8 path")?;
+        paths.insert(path.to_string());
+        index = end + 1;
+        if matches!(status.first(), Some(b'R' | b'C')) {
+            let Some(next_offset) = bytes[index..].iter().position(|byte| *byte == 0) else {
+                break;
+            };
+            let next_end = index + next_offset;
+            let renamed = std::str::from_utf8(&bytes[index..next_end])
+                .context("git returned a non-UTF-8 path")?;
+            paths.insert(renamed.to_string());
+            index = next_end + 1;
+        }
+    }
+    Ok(paths)
+}
+
+fn path_has_manifest_identity(
+    source: &Path,
+    entry: &PathManifestEntry,
+    after: bool,
+) -> Result<bool> {
+    let path = source.join(&entry.path);
+    let exists = path.symlink_metadata().is_ok();
+    let state_delete = if after {
+        entry.state == "delete"
+    } else {
+        entry.state == "add"
+    };
+    if state_delete {
+        return Ok(!exists);
+    }
+    if !exists {
+        return Ok(false);
+    }
+    let recorded_mode = if after {
+        entry.after_mode.as_str()
+    } else {
+        entry.before_mode.as_str()
+    };
+    let recorded_blob = if after {
+        entry.after_blob.as_str()
+    } else {
+        entry.before_blob.as_str()
+    };
+    let content_blob = if recorded_blob.chars().all(|ch| ch == '0') {
+        if after {
+            entry.before_blob.as_str()
+        } else {
+            return Ok(false);
+        }
+    } else {
+        recorded_blob
+    };
+    if content_blob.chars().all(|ch| ch == '0') {
+        return Ok(false);
+    }
+    if !mode_matches(&path, recorded_mode) {
+        return Ok(false);
+    }
+    if path
+        .symlink_metadata()
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Ok(entry.symlink);
+    }
+    let object = git_stdout(source, &["hash-object", "--", &entry.path])?;
+    Ok(object.starts_with(content_blob) || content_blob.starts_with(object.as_str()))
+}
+
+fn mode_matches(path: &Path, recorded: &str) -> bool {
+    let Ok(meta) = path.symlink_metadata() else {
+        return false;
+    };
+    let observed = if meta.file_type().is_symlink() {
+        "120000"
+    } else if meta.permissions().mode() & 0o111 != 0 {
+        "100755"
+    } else {
+        "100644"
+    };
+    recorded.ends_with(observed) || observed.ends_with(recorded.trim_start_matches(':'))
+}
+
+pub(crate) fn remove_manifest_additions(
+    source: &Path,
+    manifest: &[PathManifestEntry],
+) -> Result<()> {
+    for entry in manifest {
+        if entry.state != "add" && !entry.untracked {
+            continue;
+        }
+        let path = source.join(&entry.path);
+        if path.is_file() || path.symlink_metadata().is_ok() {
+            let _ = fs::remove_file(&path);
+        }
+    }
+    Ok(())
 }
 
 /// Apply one recorded promotion patch with the same preflight, fingerprint,
@@ -492,9 +639,10 @@ pub(crate) fn apply_recorded_patch(
     source_fingerprint: &str,
     patch: &[u8],
     final_fingerprint: &str,
+    manifest: &[PathManifestEntry],
     fault: u8,
 ) -> Result<PromotionOutcome> {
-    match classify_source(source, base_revision, source_fingerprint, final_fingerprint)? {
+    match classify_source(source, manifest)? {
         SourceClassification::AlreadyApplied => return Ok(PromotionOutcome::AlreadyApplied),
         SourceClassification::Poisoned => {
             bail!(
@@ -529,7 +677,7 @@ pub(crate) fn apply_recorded_patch(
         if failed.status.success() {
             bail!("promotion apply command failed and the source was not changed");
         }
-        match classify_source(source, base_revision, source_fingerprint, final_fingerprint)? {
+        match classify_source(source, manifest)? {
             SourceClassification::NotApplied => {
                 bail!("promotion apply command failed and the source was not changed");
             }
@@ -546,7 +694,7 @@ pub(crate) fn apply_recorded_patch(
             if !rollback_parts(source, &applied) {
                 bail!("promotion verification failed and rollback also failed");
             }
-            match classify_source(source, base_revision, source_fingerprint, final_fingerprint)? {
+            match classify_source(source, manifest)? {
                 SourceClassification::NotApplied => {
                     bail!("promotion apply command failed and the source was rolled back");
                 }
@@ -563,7 +711,7 @@ pub(crate) fn apply_recorded_patch(
             if !rollback_parts(source, &applied) {
                 bail!("promotion verification failed and rollback also failed");
             }
-            match classify_source(source, base_revision, source_fingerprint, final_fingerprint)? {
+            match classify_source(source, manifest)? {
                 SourceClassification::NotApplied => {
                     bail!("promotion apply command failed and the source was rolled back");
                 }
@@ -572,7 +720,12 @@ pub(crate) fn apply_recorded_patch(
         }
         applied.push(part.clone());
         if fault == 3 && index == 0 && parts.len() >= 2 {
-            bail!("source effect is partial; reconciliation is required");
+            match classify_source(source, manifest)? {
+                SourceClassification::NotApplied => {
+                    bail!("promotion apply command failed and the source was not changed");
+                }
+                _ => bail!("source effect is partial; reconciliation is required"),
+            }
         }
         if fault == 7 && index == 0 {
             if let Some(path) = first_patch_path(part) {
@@ -585,8 +738,8 @@ pub(crate) fn apply_recorded_patch(
         }
     }
     ensure_intent_to_add(source)?;
-    let after = fingerprint_at(source, base_revision)?;
-    if after != final_fingerprint {
+    let _ = (base_revision, final_fingerprint, source_fingerprint);
+    if classify_source(source, manifest)? != SourceClassification::AlreadyApplied {
         if !rollback_parts(source, &applied) {
             bail!("promotion verification failed and rollback also failed");
         }
@@ -713,6 +866,12 @@ fn path_manifest(worktree: &Path, base_revision: &str) -> Result<Vec<PathManifes
         } else {
             "modify"
         };
+        let mut after_blob = after_blob;
+        if after_blob.chars().all(|ch| ch == '0') && !status.starts_with('D') {
+            if let Ok(object) = git_stdout(worktree, &["hash-object", "--", path]) {
+                after_blob = object;
+            }
+        }
         let tracked = git_command(
             worktree,
             &["ls-files", "--error-unmatch", "--"],
@@ -1159,6 +1318,7 @@ mod tests {
             &source_fingerprint,
             &captured.patch,
             &captured.final_fingerprint,
+            &captured.manifest,
             0,
         )
         .unwrap();

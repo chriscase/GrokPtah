@@ -1883,54 +1883,70 @@ async fn execute_allowlisted(
             Some(GrokBuildVerdict::Clean | GrokBuildVerdict::Findings)
         )
         && cleaned;
-    let mutation_evidence =
-        if launch.mutation_mode == GrokBuildMutationMode::IsolatedReview && promote_mutation {
-            let captured = if source_host.defer_source_apply {
-                let Some(retention) = source_host.candidate_retention_dir.as_ref() else {
-                    let _ = checkout.cleanup().await;
-                    return Err(GrokBuildAdapterError::InvalidRequest);
-                };
-                match capture_isolated_review_mutation(launch, execution_host, true).await {
-                    Ok(evidence) => {
-                        if let Err(error) = crate::verified_change::retain_candidate_snapshot(
-                            &execution_host.cwd,
-                            retention,
-                            &launch.identity.head_sha,
-                        ) {
+    let mutation_evidence = if launch.mutation_mode == GrokBuildMutationMode::IsolatedReview
+        && promote_mutation
+    {
+        let captured = if source_host.defer_source_apply {
+            let Some(retention) = source_host.candidate_retention_dir.as_ref() else {
+                let _ = checkout.cleanup().await;
+                return Err(GrokBuildAdapterError::InvalidRequest);
+            };
+            match capture_isolated_review_mutation(launch, execution_host, true).await {
+                Ok(evidence) => {
+                    if let Err(error) = crate::verified_change::retain_candidate_snapshot(
+                        &execution_host.cwd,
+                        retention,
+                        &launch.identity.head_sha,
+                    ) {
+                        let _ = checkout.cleanup().await;
+                        let _ = std::fs::remove_dir_all(retention);
+                        return Err(
+                            match error.message.contains("symlink")
+                                || error.message.contains("escape")
+                            {
+                                true => GrokBuildAdapterError::ReadOnlyMutation,
+                                false => GrokBuildAdapterError::IsolationFailed,
+                            },
+                        );
+                    }
+                    if let Ok(record) = crate::verified_change::read_promotion_record(retention) {
+                        let mut manifest_paths: Vec<String> = record
+                            .manifest
+                            .iter()
+                            .map(|entry| entry.path.clone())
+                            .collect();
+                        manifest_paths.sort();
+                        let mut adapter_paths = evidence.changed_paths().to_vec();
+                        adapter_paths.sort();
+                        if manifest_paths != adapter_paths {
                             let _ = checkout.cleanup().await;
                             let _ = std::fs::remove_dir_all(retention);
-                            return Err(
-                                match error.message.contains("symlink")
-                                    || error.message.contains("escape")
-                                {
-                                    true => GrokBuildAdapterError::ReadOnlyMutation,
-                                    false => GrokBuildAdapterError::IsolationFailed,
-                                },
-                            );
+                            return Err(GrokBuildAdapterError::IsolationFailed);
                         }
-                        Ok(evidence)
                     }
-                    Err(error) => Err(error),
+                    Ok(evidence)
                 }
-            } else {
-                promote_verified_isolated_review_mutation(
-                    launch,
-                    source_host,
-                    execution_host,
-                    source_fingerprint,
-                )
-                .await
-            };
-            match captured {
-                Ok(evidence) => Some(evidence),
-                Err(error) => {
-                    let _ = checkout.cleanup().await;
-                    return Err(error);
-                }
+                Err(error) => Err(error),
             }
         } else {
-            None
+            promote_verified_isolated_review_mutation(
+                launch,
+                source_host,
+                execution_host,
+                source_fingerprint,
+            )
+            .await
         };
+        match captured {
+            Ok(evidence) => Some(evidence),
+            Err(error) => {
+                let _ = checkout.cleanup().await;
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
     let checkout_cleaned = checkout.cleanup().await;
     if !checkout_cleaned {
         if mutation_evidence.is_some() {
@@ -2563,10 +2579,18 @@ async fn harvest_child(
     let mut stdout_done = false;
     let mut stderr_done = false;
     let mut status: Option<i32> = None;
+    let process_group = child.id();
     let deadline = Instant::now() + limit;
 
     let kind = loop {
         if status.is_some() && stdout_done && stderr_done {
+            #[cfg(unix)]
+            if let Some(pid) = process_group {
+                if !process_group_gone(pid) {
+                    let _ = terminate_and_confirm(child).await;
+                    break HarvestKind::TerminationUnproven;
+                }
+            }
             break HarvestKind::Exited(status.unwrap_or(1));
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -2645,6 +2669,12 @@ async fn harvest_child(
         stdout: out,
         stderr: err,
     }
+}
+
+#[cfg(unix)]
+fn process_group_gone(pid: u32) -> bool {
+    let status = unsafe { libc::kill(-(pid as i32), 0) };
+    status != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
 async fn terminate_and_confirm(child: &mut tokio::process::Child) -> bool {

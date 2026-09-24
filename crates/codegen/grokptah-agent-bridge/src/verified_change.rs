@@ -5,7 +5,7 @@
 //! argv against the retained candidate, never as a frontend shell, and never
 //! with the operator environment.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
@@ -506,17 +506,48 @@ pub fn retain_candidate_snapshot(
     dest: &Path,
     base_revision: &str,
 ) -> Result<(), VerifiedChangeError> {
-    let captured = crate::run_promotion::capture_worktree_changes(source, base_revision)
-        .map_err(|error| VerifiedChangeError::new(error.to_string()))?;
     let parent = dest.parent().ok_or_else(|| {
         VerifiedChangeError::new("the candidate snapshot directory could not be created")
     })?;
     fs::create_dir_all(parent).map_err(|_| {
         VerifiedChangeError::new("the candidate snapshot directory could not be created")
     })?;
-    let digest = crate::run_promotion::manifest_digest(base_revision, &captured.manifest);
+    let before = capture_identity(source, base_revision)?;
+    let patch_paths = patch_path_set(&before.patch)?;
+    let manifest_paths: BTreeSet<String> = before
+        .manifest
+        .iter()
+        .map(|entry| entry.path.clone())
+        .collect();
+    if patch_paths != manifest_paths {
+        return Err(VerifiedChangeError::new(
+            "the candidate patch paths do not equal the manifest",
+        ));
+    }
+    let staging = parent.join(format!(".capture-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&staging);
+    fs::create_dir_all(staging.join("tree")).map_err(|_| {
+        VerifiedChangeError::new("the candidate snapshot directory could not be created")
+    })?;
+    crate::run_promotion::materialize_manifest(source, &staging.join("tree"), &before.manifest)
+        .map_err(|error| VerifiedChangeError::new(error.to_string()))?;
+    let after = capture_identity(source, base_revision)?;
+    if before != after {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(VerifiedChangeError::new(
+            "the candidate changed while it was being captured",
+        ));
+    }
+    prove_patch_reproduces_checked_tree(
+        source,
+        base_revision,
+        &before.patch,
+        &before.manifest,
+        &staging.join("tree"),
+    )?;
+    let digest = crate::run_promotion::manifest_digest(base_revision, &before.manifest);
     let mut files = Vec::new();
-    for entry in &captured.manifest {
+    for entry in &before.manifest {
         if entry.state == "delete" {
             files.push(CandidateFileRecord {
                 path: entry.path.clone(),
@@ -525,7 +556,7 @@ pub fn retain_candidate_snapshot(
             });
             continue;
         }
-        let bytes = fs::read(source.join(&entry.path)).unwrap_or_default();
+        let bytes = fs::read(staging.join("tree").join(&entry.path)).unwrap_or_default();
         files.push(CandidateFileRecord {
             path: entry.path.clone(),
             digest: digest_bytes(&bytes),
@@ -534,26 +565,231 @@ pub fn retain_candidate_snapshot(
     }
     let record = json!({
         "baseRevision": base_revision,
-        "finalFingerprint": captured.final_fingerprint,
+        "head": before.head,
+        "gitRef": before.git_ref,
+        "status": before.status,
+        "finalFingerprint": before.final_fingerprint,
         "contentDigest": format!("sha256:{digest}"),
-        "manifest": captured.manifest,
+        "manifest": before.manifest,
         "files": files,
     });
-    fs::write(parent.join("promotion.patch"), &captured.patch)
-        .map_err(|_| VerifiedChangeError::new("the promotion patch could not be stored"))?;
-    fs::write(
-        parent.join("manifest.json"),
-        serde_json::to_vec(&record)
-            .map_err(|_| VerifiedChangeError::new("the candidate manifest could not be stored"))?,
-    )
-    .map_err(|_| VerifiedChangeError::new("the candidate manifest could not be stored"))?;
-    crate::run_promotion::materialize_manifest(source, dest, &captured.manifest)
-        .map_err(|error| VerifiedChangeError::new(error.to_string()))
+    let manifest_bytes = serde_json::to_vec(&record)
+        .map_err(|_| VerifiedChangeError::new("the candidate manifest could not be stored"))?;
+    atomic_publish(
+        &staging.join("promotion.patch"),
+        &parent.join("promotion.patch"),
+        &before.patch,
+    )?;
+    atomic_publish(
+        &staging.join("manifest.json"),
+        &parent.join("manifest.json"),
+        &manifest_bytes,
+    )?;
+    if dest.exists() {
+        fs::remove_dir_all(dest).map_err(|_| {
+            VerifiedChangeError::new("the candidate snapshot directory could not be created")
+        })?;
+    }
+    fs::rename(staging.join("tree"), dest).map_err(|_| {
+        VerifiedChangeError::new("the candidate snapshot directory could not be created")
+    })?;
+    let _ = fs::remove_dir_all(&staging);
+    Ok(())
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct CaptureIdentity {
+    head: String,
+    git_ref: String,
+    status: String,
+    patch: Vec<u8>,
+    manifest: Vec<crate::run_promotion::PathManifestEntry>,
+    final_fingerprint: String,
+}
+
+fn capture_identity(
+    source: &Path,
+    base_revision: &str,
+) -> Result<CaptureIdentity, VerifiedChangeError> {
+    let captured = crate::run_promotion::capture_worktree_changes(source, base_revision)
+        .map_err(|error| VerifiedChangeError::new(error.to_string()))?;
+    let head = git_text(source, &["rev-parse", "HEAD"])?;
+    let git_ref =
+        git_text(source, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_else(|_| "HEAD".into());
+    let status = git_text(
+        source,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    )?;
+    Ok(CaptureIdentity {
+        head,
+        git_ref,
+        status,
+        patch: captured.patch,
+        manifest: captured.manifest,
+        final_fingerprint: captured.final_fingerprint,
+    })
+}
+
+fn atomic_publish(temp: &Path, dest: &Path, bytes: &[u8]) -> Result<(), VerifiedChangeError> {
+    fs::write(temp, bytes)
+        .map_err(|_| VerifiedChangeError::new("the candidate artifact could not be stored"))?;
+    fs::rename(temp, dest)
+        .map_err(|_| VerifiedChangeError::new("the candidate artifact could not be stored"))
+}
+
+fn patch_path_set(patch: &[u8]) -> Result<BTreeSet<String>, VerifiedChangeError> {
+    let mut paths = BTreeSet::new();
+    let text = String::from_utf8_lossy(patch);
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix("diff --git ") else {
+            continue;
+        };
+        let mut parts = rest.split_whitespace();
+        let Some(a) = parts.next() else { continue };
+        let Some(b) = parts.next() else { continue };
+        let path = b
+            .strip_prefix("b/")
+            .or_else(|| a.strip_prefix("a/"))
+            .unwrap_or(b);
+        paths.insert(path.to_string());
+    }
+    Ok(paths)
+}
+
+fn prove_patch_reproduces_checked_tree(
+    source: &Path,
+    base_revision: &str,
+    patch: &[u8],
+    manifest: &[crate::run_promotion::PathManifestEntry],
+    materialized: &Path,
+) -> Result<(), VerifiedChangeError> {
+    let scratch = std::env::temp_dir().join(format!(
+        "grokptah-reproduce-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0)
+    ));
+    fs::create_dir_all(&scratch).map_err(|_| {
+        VerifiedChangeError::new("the candidate reproduction checkout could not be created")
+    })?;
+    let checkout = scratch.join("checkout");
+    let added = std::process::Command::new("git")
+        .args(["worktree", "add", "--detach", "--force"])
+        .arg(&checkout)
+        .arg(base_revision)
+        .current_dir(source)
+        .output()
+        .map_err(|_| {
+            VerifiedChangeError::new("the candidate reproduction checkout could not be created")
+        })?;
+    if !added.status.success() {
+        let _ = fs::remove_dir_all(&scratch);
+        return Err(VerifiedChangeError::new(
+            "the candidate reproduction checkout could not be created",
+        ));
+    }
+    if !patch.is_empty() {
+        let applied = std::process::Command::new("git")
+            .args(["apply", "--binary", "--whitespace=nowarn"])
+            .current_dir(&checkout)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write;
+                if let Some(stdin) = child.stdin.as_mut() {
+                    stdin.write_all(patch)?;
+                }
+                child.wait()
+            })
+            .map_err(|_| VerifiedChangeError::new("the retained patch could not be reproduced"))?;
+        if !applied.success() {
+            let _ = std::process::Command::new("git")
+                .args(["worktree", "remove", "--force"])
+                .arg(&checkout)
+                .current_dir(source)
+                .status();
+            let _ = fs::remove_dir_all(&scratch);
+            return Err(VerifiedChangeError::new(
+                "the retained patch does not reproduce the checked tree",
+            ));
+        }
+    }
+    for entry in manifest {
+        let checked = materialized.join(&entry.path);
+        let reproduced = checkout.join(&entry.path);
+        if entry.state == "delete" {
+            if checked.exists() || reproduced.exists() {
+                let _ = std::process::Command::new("git")
+                    .args(["worktree", "remove", "--force"])
+                    .arg(&checkout)
+                    .current_dir(source)
+                    .status();
+                let _ = fs::remove_dir_all(&scratch);
+                return Err(VerifiedChangeError::new(
+                    "the retained patch does not reproduce the checked tree",
+                ));
+            }
+            continue;
+        }
+        let checked_bytes = fs::read(&checked).unwrap_or_default();
+        let reproduced_bytes = fs::read(&reproduced).unwrap_or_default();
+        if checked_bytes != reproduced_bytes {
+            let _ = std::process::Command::new("git")
+                .args(["worktree", "remove", "--force"])
+                .arg(&checkout)
+                .current_dir(source)
+                .status();
+            let _ = fs::remove_dir_all(&scratch);
+            return Err(VerifiedChangeError::new(
+                "the retained patch does not reproduce the checked tree",
+            ));
+        }
+        let checked_mode = fs::symlink_metadata(&checked)
+            .map(|meta| meta.permissions().mode() & 0o777)
+            .unwrap_or(0);
+        let reproduced_mode = fs::symlink_metadata(&reproduced)
+            .map(|meta| meta.permissions().mode() & 0o777)
+            .unwrap_or(0);
+        if checked_mode != reproduced_mode {
+            let _ = std::process::Command::new("git")
+                .args(["worktree", "remove", "--force"])
+                .arg(&checkout)
+                .current_dir(source)
+                .status();
+            let _ = fs::remove_dir_all(&scratch);
+            return Err(VerifiedChangeError::new(
+                "the retained patch does not reproduce the checked tree",
+            ));
+        }
+    }
+    let _ = std::process::Command::new("git")
+        .args(["worktree", "remove", "--force"])
+        .arg(&checkout)
+        .current_dir(source)
+        .status();
+    let _ = fs::remove_dir_all(&scratch);
+    Ok(())
+}
+
+fn git_text(source: &Path, args: &[&str]) -> Result<String, VerifiedChangeError> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(source)
+        .output()
+        .map_err(|_| VerifiedChangeError::new("git identity could not be read"))?;
+    if !output.status.success() {
+        return Err(VerifiedChangeError::new("git identity could not be read"));
+    }
+    String::from_utf8(output.stdout)
+        .map_err(|_| VerifiedChangeError::new("git identity could not be read"))
 }
 
 pub const CHECK_CONFINEMENT_BACKEND: &str = "macos-sandbox-exec";
 pub const CHECK_CONFINEMENT_REVISION: u64 = 1;
-pub const CHECK_PROCESS_LIMIT: u64 = 1;
 pub const CHECK_WRITE_POLICY: &str = "deny-source-and-candidate";
 
 pub static CHECK_CONFINEMENT_EXECUTABLE: std::sync::Mutex<Option<PathBuf>> =
@@ -590,7 +826,6 @@ pub struct CheckAuthority {
     pub env: Vec<RequiredCheckEnv>,
     pub timeout_ms: u64,
     pub max_output_bytes: u64,
-    pub process_limit: u64,
     pub write_policy: String,
     pub network: String,
     pub source_root: PathBuf,
@@ -626,7 +861,6 @@ impl CheckAuthority {
         self.env = check.env.clone();
         self.timeout_ms = check.timeout_ms;
         self.max_output_bytes = u64::from(check.max_output_bytes);
-        self.process_limit = CHECK_PROCESS_LIMIT;
         self.write_policy = CHECK_WRITE_POLICY.into();
     }
 
@@ -638,7 +872,6 @@ impl CheckAuthority {
             && self.env == check.env
             && self.timeout_ms == check.timeout_ms
             && self.max_output_bytes == u64::from(check.max_output_bytes)
-            && self.process_limit == CHECK_PROCESS_LIMIT
             && self.write_policy == CHECK_WRITE_POLICY
     }
 
@@ -667,7 +900,6 @@ impl CheckAuthority {
         hasher.update([1]);
         push(&mut hasher, self.timeout_ms.to_string().as_bytes());
         push(&mut hasher, self.max_output_bytes.to_string().as_bytes());
-        push(&mut hasher, self.process_limit.to_string().as_bytes());
         push(&mut hasher, self.output_limit_bytes.to_string().as_bytes());
         push(&mut hasher, self.write_policy.as_bytes());
         push(&mut hasher, self.network.as_bytes());
@@ -686,7 +918,6 @@ impl CheckAuthority {
     pub fn seal(mut self) -> Self {
         self.confinement_backend = CHECK_CONFINEMENT_BACKEND.into();
         self.confinement_revision = CHECK_CONFINEMENT_REVISION;
-        self.process_limit = CHECK_PROCESS_LIMIT;
         self.write_policy = CHECK_WRITE_POLICY.into();
         self.authority_digest = self.canonical_digest();
         self
@@ -710,6 +941,7 @@ pub struct VerifiedExecutionEnvelopeV1 {
     pub check_profile_revision: u64,
     pub executable_digest: String,
     pub oracle_digest: String,
+    pub check_authority_digest: String,
     pub max_prompt_bytes: u64,
     pub max_rounds: u64,
     pub max_duration_ms: u64,
@@ -731,6 +963,7 @@ impl VerifiedExecutionEnvelopeV1 {
         check_profile_revision: u64,
         executable_digest: &str,
         oracle_digest: &str,
+        check_authority_digest: &str,
         max_prompt_bytes: u64,
         max_rounds: u64,
         max_duration_ms: u64,
@@ -750,6 +983,7 @@ impl VerifiedExecutionEnvelopeV1 {
             check_profile_revision,
             executable_digest: executable_digest.into(),
             oracle_digest: oracle_digest.into(),
+            check_authority_digest: check_authority_digest.into(),
             max_prompt_bytes,
             max_rounds,
             max_duration_ms,
@@ -762,7 +996,7 @@ impl VerifiedExecutionEnvelopeV1 {
     pub fn canonical_digest(&self) -> String {
         digest_bytes(
             format!(
-                "grokptah-execution-envelope-v1\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+                "grokptah-execution-envelope-v1\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
                 self.schema_version,
                 self.work_id,
                 self.session_id,
@@ -777,6 +1011,7 @@ impl VerifiedExecutionEnvelopeV1 {
                 self.check_profile_revision,
                 self.executable_digest,
                 self.oracle_digest,
+                self.check_authority_digest,
                 self.max_prompt_bytes,
                 self.max_rounds,
                 self.max_duration_ms
@@ -830,7 +1065,6 @@ pub fn write_check_authority(
         "env": authority.env,
         "timeoutMs": authority.timeout_ms,
         "maxOutputBytes": authority.max_output_bytes,
-        "processLimit": authority.process_limit,
         "writePolicy": authority.write_policy,
         "network": authority.network,
         "sourceRoot": authority.source_root,
@@ -891,7 +1125,6 @@ pub fn read_check_authority(dir: &Path) -> Result<CheckAuthority, VerifiedChange
             .map_err(|_| VerifiedChangeError::new("the check authority is malformed"))?,
         timeout_ms: required("timeoutMs")?.as_u64().unwrap_or(0),
         max_output_bytes: required("maxOutputBytes")?.as_u64().unwrap_or(0),
-        process_limit: required("processLimit")?.as_u64().unwrap_or(0),
         write_policy: required("writePolicy")?
             .as_str()
             .unwrap_or_default()
@@ -923,7 +1156,6 @@ pub fn read_check_authority(dir: &Path) -> Result<CheckAuthority, VerifiedChange
     };
     if authority.authority_digest != authority.canonical_digest()
         || authority.confinement_backend != CHECK_CONFINEMENT_BACKEND
-        || authority.process_limit != CHECK_PROCESS_LIMIT
         || authority.write_policy != CHECK_WRITE_POLICY
     {
         return Err(VerifiedChangeError::new(
@@ -953,7 +1185,6 @@ pub fn execute_required_checks(
         env: Vec::new(),
         timeout_ms: 0,
         max_output_bytes: 0,
-        process_limit: CHECK_PROCESS_LIMIT,
         write_policy: CHECK_WRITE_POLICY.into(),
         network: "none".into(),
         source_root: candidate_root.to_path_buf(),
@@ -1170,11 +1401,6 @@ pub fn apply_candidate_tree(
             "the target revision changed after verification",
         ));
     }
-    if !worktree_is_clean(git, source)? {
-        return Err(VerifiedChangeError::new(
-            "the target workspace is not clean at the verified revision",
-        ));
-    }
     let record = read_promotion_record(retained)?;
     if record.base_revision != expected.source_revision
         || record.content_digest != expected.content_digest
@@ -1204,6 +1430,7 @@ pub fn apply_candidate_tree(
         source_fingerprint,
         &record.patch,
         &record.final_fingerprint,
+        &record.manifest,
         apply_fault(),
     )
     .map(|_| ())
@@ -1405,7 +1632,6 @@ pub fn resolve_check_profile(
         env: Vec::new(),
         timeout_ms: 0,
         max_output_bytes: 0,
-        process_limit: CHECK_PROCESS_LIMIT,
         write_policy: CHECK_WRITE_POLICY.into(),
         network: value
             .get("network")
@@ -1471,14 +1697,23 @@ fn run_one_check(
         Err(_) => return base("incomplete", None, false),
     };
     let output_dir = std::env::temp_dir().join(format!(
-        "grokptah-check-{}-{}",
+        "grokptah-check-{}-{}-{}-{}",
+        authority.work_id,
         check.check_id,
-        std::process::id()
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0)
     ));
-    let _ = fs::remove_dir_all(&output_dir);
-    if fs::create_dir_all(&output_dir).is_err() {
+    if fs::create_dir(&output_dir).is_err() {
         return base("incomplete", None, false);
     }
+    // sandbox-exec matches the resolved directory. dunce keeps the symlink path,
+    // and that path does not authorize writes into the private output directory.
+    #[allow(clippy::disallowed_methods)]
+    let output_dir = fs::canonicalize(&output_dir).unwrap_or(output_dir);
+    let _ = fs::set_permissions(&output_dir, fs::Permissions::from_mode(0o700));
     let network = authority.network.as_str();
     let mut command = Command::new(confinement_executable());
     command
@@ -1511,23 +1746,42 @@ fn run_one_check(
         Ok(child) => child,
         Err(_) => return base("incomplete", None, false),
     };
+    let group_pid = child.id();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let cap = check.max_output_bytes as usize;
-    let stdout_thread = thread::spawn(move || read_capped(stdout, cap));
-    let stderr_thread = thread::spawn(move || read_capped(stderr, cap));
-    let timeout = Duration::from_millis(check.timeout_ms);
+    let deadline = started + Duration::from_millis(check.timeout_ms);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stdout_stop = stop.clone();
+    let stderr_stop = stop.clone();
+    let stdout_thread =
+        thread::spawn(move || read_capped_until(stdout, cap, deadline, stdout_stop));
+    let stderr_thread =
+        thread::spawn(move || read_capped_until(stderr, cap, deadline, stderr_stop));
+    let mut output_limited = false;
     let waited = loop {
+        if directory_size(&output_dir) > authority.output_limit_bytes {
+            output_limited = true;
+            terminate_check_tree(&mut child);
+            break None;
+        }
         match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) if started.elapsed() >= timeout => {
+            Ok(Some(status)) => {
+                terminate_check_tree(&mut child);
+                break Some(status);
+            }
+            Ok(None) if Instant::now() >= deadline => {
                 terminate_check_tree(&mut child);
                 break None;
             }
             Ok(None) => thread::sleep(Duration::from_millis(15)),
-            Err(_) => break None,
+            Err(_) => {
+                terminate_check_tree(&mut child);
+                break None;
+            }
         }
     };
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
     let stdout = stdout_thread.join().unwrap_or(CappedRead {
         bytes: Vec::new(),
         truncated: true,
@@ -1536,18 +1790,22 @@ fn run_one_check(
         bytes: Vec::new(),
         truncated: true,
     });
-    let truncated = stdout.truncated || stderr.truncated;
+    let truncated = stdout.truncated || stderr.truncated || output_limited;
     let mut output = stdout.bytes;
     output.extend(stderr.bytes);
     let digest = digest_bytes(&output);
-    terminate_check_tree(&mut child);
+    let group_gone = check_group_gone(group_pid);
     let output_too_large = directory_size(&output_dir) > authority.output_limit_bytes;
     let _ = fs::remove_dir_all(&output_dir);
-    let (outcome, exit_code) = match waited {
-        None => ("timed_out", None),
-        Some(status) if truncated || output_too_large => ("truncated", status.code()),
-        Some(status) if status.success() => ("passed", status.code()),
-        Some(status) => ("failed", status.code()),
+    let (outcome, exit_code) = if !group_gone {
+        ("unterminated", None)
+    } else {
+        match waited {
+            None => ("timed_out", None),
+            Some(status) if truncated || output_too_large => ("truncated", status.code()),
+            Some(status) if status.success() => ("passed", status.code()),
+            Some(status) => ("failed", status.code()),
+        }
     };
     RequiredCheckExecution {
         check_id: check.check_id.clone(),
@@ -1595,14 +1853,60 @@ struct CappedRead {
     truncated: bool,
 }
 
-fn read_capped(pipe: Option<impl Read>, cap: usize) -> CappedRead {
+fn check_group_gone(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_millis(200) {
+            let status = unsafe { libc::kill(-(pid as i32), 0) };
+            if status != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+fn read_capped_until(
+    pipe: Option<impl Read + std::os::unix::io::AsRawFd>,
+    cap: usize,
+    deadline: Instant,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> CappedRead {
+    let Some(pipe) = pipe else {
+        return CappedRead {
+            bytes: Vec::new(),
+            truncated: false,
+        };
+    };
+    #[cfg(unix)]
+    {
+        let fd = pipe.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags >= 0 {
+            unsafe {
+                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+        }
+    }
     let mut bytes = Vec::new();
     let mut truncated = false;
-    let Some(mut pipe) = pipe else {
-        return CappedRead { bytes, truncated };
-    };
+    let mut pipe = pipe;
     let mut buf = [0u8; 1024];
     loop {
+        let stopped = stop.load(std::sync::atomic::Ordering::SeqCst);
+        if Instant::now() >= deadline || (stopped && bytes.len() >= cap) {
+            if Instant::now() >= deadline {
+                truncated = true;
+            }
+            break;
+        }
         match pipe.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
@@ -1616,6 +1920,12 @@ fn read_capped(pipe: Option<impl Read>, cap: usize) -> CappedRead {
                 } else {
                     truncated = true;
                 }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline || stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
             }
             Err(_) => {
                 truncated = true;
@@ -1936,6 +2246,7 @@ pub fn assemble_candidate_verification(
     change_proposed: bool,
     diff_digest: Option<String>,
     authority: Option<&CheckAuthority>,
+    bound_authority_digest: &str,
 ) -> CandidateVerification {
     let spec_digest =
         RequiredCheckSpec::spec_digest(checks).unwrap_or_else(|_| "sha256:invalid".into());
@@ -1970,56 +2281,91 @@ pub fn assemble_candidate_verification(
     let identity_ok = record.as_ref().is_some_and(|record| {
         record.base_revision == source_revision && !record.content_digest.is_empty()
     });
-    let _ = source;
-    let results = if !worker_stopped || !change_proposed || !identity_ok || out_of_scope {
-        checks
-            .iter()
-            .map(|check| RequiredCheckExecution {
-                check_id: check.check_id.clone(),
-                outcome: if worker_stopped {
-                    "skipped"
-                } else {
-                    "incomplete"
-                }
-                .into(),
-                exit_code: None,
-                output_digest: digest_bytes(b""),
-                output_truncated: false,
-                duration_ms: 0,
-                spec_digest: spec_digest.clone(),
-            })
-            .collect()
-    } else if let Some(oracle) = oracle {
-        execute_required_checks_with_authority(checks, retained, oracle, authority).unwrap_or_else(
-            |_| {
-                checks
-                    .iter()
-                    .map(|check| RequiredCheckExecution {
-                        check_id: check.check_id.clone(),
-                        outcome: "incomplete".into(),
-                        exit_code: None,
-                        output_digest: digest_bytes(b""),
-                        output_truncated: false,
-                        duration_ms: 0,
-                        spec_digest: spec_digest.clone(),
-                    })
-                    .collect()
-            },
+    let manifest_paths: BTreeSet<String> = record
+        .as_ref()
+        .map(|record| {
+            record
+                .manifest
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    let patch_paths_match = record
+        .as_ref()
+        .is_some_and(|record| patch_path_set(&record.patch).ok().as_ref() == Some(&manifest_paths));
+    let tree_matches = record.as_ref().is_some_and(|record| {
+        prove_patch_reproduces_checked_tree(
+            source,
+            &record.base_revision,
+            &record.patch,
+            &record.manifest,
+            retained,
         )
+        .is_ok()
+    });
+    let authority_matches = authority.is_some_and(|item| {
+        bound_authority_digest.is_empty() || item.authority_digest == bound_authority_digest
+    });
+    let recorded_authority_digest = if !bound_authority_digest.is_empty() {
+        bound_authority_digest.to_string()
     } else {
-        checks
-            .iter()
-            .map(|check| RequiredCheckExecution {
-                check_id: check.check_id.clone(),
-                outcome: "missing".into(),
-                exit_code: None,
-                output_digest: digest_bytes(b""),
-                output_truncated: false,
-                duration_ms: 0,
-                spec_digest: spec_digest.clone(),
-            })
-            .collect()
+        authority
+            .map(|item| item.authority_digest.clone())
+            .unwrap_or_default()
     };
+    let blocked = !patch_paths_match || !tree_matches || !authority_matches;
+    let results =
+        if !worker_stopped || !change_proposed || !identity_ok || out_of_scope || blocked {
+            checks
+                .iter()
+                .map(|check| RequiredCheckExecution {
+                    check_id: check.check_id.clone(),
+                    outcome: if !worker_stopped {
+                        "incomplete"
+                    } else if blocked {
+                        "invalidated"
+                    } else {
+                        "skipped"
+                    }
+                    .into(),
+                    exit_code: None,
+                    output_digest: digest_bytes(b""),
+                    output_truncated: false,
+                    duration_ms: 0,
+                    spec_digest: spec_digest.clone(),
+                })
+                .collect()
+        } else if let Some(oracle) = oracle {
+            execute_required_checks_with_authority(checks, retained, oracle, authority)
+                .unwrap_or_else(|_| {
+                    checks
+                        .iter()
+                        .map(|check| RequiredCheckExecution {
+                            check_id: check.check_id.clone(),
+                            outcome: "incomplete".into(),
+                            exit_code: None,
+                            output_digest: digest_bytes(b""),
+                            output_truncated: false,
+                            duration_ms: 0,
+                            spec_digest: spec_digest.clone(),
+                        })
+                        .collect()
+                })
+        } else {
+            checks
+                .iter()
+                .map(|check| RequiredCheckExecution {
+                    check_id: check.check_id.clone(),
+                    outcome: "missing".into(),
+                    exit_code: None,
+                    output_digest: digest_bytes(b""),
+                    output_truncated: false,
+                    duration_ms: 0,
+                    spec_digest: spec_digest.clone(),
+                })
+                .collect()
+        };
     let checks_ok = checks_passed(checks, &results);
     let apply_bundle_digest = record
         .as_ref()
@@ -2030,9 +2376,7 @@ pub fn assemble_candidate_verification(
                 attempt_id.as_deref().unwrap_or(""),
                 source_fingerprint,
                 allowed,
-                authority
-                    .map(|item| item.authority_digest.as_str())
-                    .unwrap_or(""),
+                &recorded_authority_digest,
                 &spec_digest,
                 diff_digest.as_deref().unwrap_or(""),
                 run_id.as_deref().unwrap_or(""),
@@ -2045,8 +2389,10 @@ pub fn assemble_candidate_verification(
         .unwrap_or_default();
     let passed = identity_ok
         && !out_of_scope
+        && patch_paths_match
+        && tree_matches
         && !diff_truncated
-        && authority.is_some()
+        && authority_matches
         && !apply_bundle_digest.is_empty()
         && checks_passed(checks, &results);
     let (content_digest, files) = record
@@ -2077,9 +2423,7 @@ pub fn assemble_candidate_verification(
             .map(|item| item.profile_id.clone())
             .unwrap_or_default(),
         check_profile_revision: authority.map(|item| item.profile_revision).unwrap_or(0),
-        check_authority_digest: authority
-            .map(|item| item.authority_digest.clone())
-            .unwrap_or_default(),
+        check_authority_digest: recorded_authority_digest,
         apply_bundle_digest,
         execution_envelope_digest: String::new(),
     }
@@ -2334,7 +2678,6 @@ mod tests {
             env: Vec::new(),
             timeout_ms: 0,
             max_output_bytes: 0,
-            process_limit: CHECK_PROCESS_LIMIT,
             write_policy: CHECK_WRITE_POLICY.into(),
             network: network.into(),
             source_root: source.to_path_buf(),
@@ -2948,5 +3291,221 @@ mod tests {
             value: "nope".into(),
         }];
         assert!(validate_required_checks(&[secret]).is_err());
+    }
+
+    fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, body).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn reseal_work(authority: CheckAuthority, work_id: &str) -> CheckAuthority {
+        let mut authority = authority;
+        authority.work_id = work_id.into();
+        authority.seal()
+    }
+
+    #[test]
+    fn successful_parent_with_background_pipe_holder_obeys_timeout() {
+        let _reap = ReapSleep("sleep 39");
+        let oracle = temp();
+        let candidate = temp();
+        let source = temp();
+        let executable = script(
+            oracle.path(),
+            "pipe.sh",
+            "#!/bin/sh\nsleep 39 >&1 &\nexit 0\n",
+        );
+        let check = check_spec("pipe-holder", &executable, 5_000);
+        let authority = sealed_authority("pipe", &check, oracle.path(), source.path(), "none");
+        let started = Instant::now();
+        let results = execute_required_checks_with_authority(
+            std::slice::from_ref(&check),
+            candidate.path(),
+            oracle.path(),
+            Some(&authority),
+        )
+        .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(2500),
+            "a pipe-holding descendant blocked the check past its deadline"
+        );
+        assert_ne!(results[0].outcome, "timed_out");
+        assert!(
+            results[0].outcome == "passed" || results[0].outcome == "unterminated",
+            "{results:?}"
+        );
+        if results[0].outcome == "passed" {
+            assert!(
+                pgrep_empty("sleep 39"),
+                "passed while the pipe holder lived"
+            );
+        }
+        assert!(pgrep_empty("sleep 39"));
+    }
+
+    #[test]
+    fn normal_check_exit_requires_process_group_quiescence() {
+        let _reap = ReapSleep("sleep 41");
+        let oracle = temp();
+        let candidate = temp();
+        let source = temp();
+        let executable = script(
+            oracle.path(),
+            "quiet.sh",
+            "#!/bin/sh\nsleep 41 >/dev/null 2>&1 &\nexit 0\n",
+        );
+        let check = check_spec("quiesce", &executable, 4_000);
+        let authority = sealed_authority("quiesce", &check, oracle.path(), source.path(), "none");
+        let started = Instant::now();
+        let results = execute_required_checks_with_authority(
+            std::slice::from_ref(&check),
+            candidate.path(),
+            oracle.path(),
+            Some(&authority),
+        )
+        .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "normal exit waited for a surviving descendant"
+        );
+        assert!(
+            results[0].outcome == "passed" || results[0].outcome == "unterminated",
+            "{results:?}"
+        );
+        assert!(
+            pgrep_empty("sleep 41"),
+            "the check returned while its process group was still alive"
+        );
+        if results[0].outcome == "passed" {
+            assert_eq!(results[0].exit_code, Some(0));
+        } else {
+            assert!(results[0].exit_code.is_none());
+        }
+    }
+
+    #[test]
+    fn concurrent_checks_have_distinct_private_output_directories() {
+        let oracle = temp();
+        let candidate = temp();
+        let source = temp();
+        let executable = script(
+            oracle.path(),
+            "wait.sh",
+            "#!/bin/sh\nprintf '%s\\n' \"$CHECK_OUTPUT\" > \"$CHECK_OUTPUT/path\"\ni=0\nwhile [ ! -f \"$CHECK_OUTPUT/go\" ]; do\n  i=$((i+1))\n  if [ \"$i\" -gt 300 ]; then exit 2; fi\n  sleep 0.05\ndone\nexit 0\n",
+        );
+        let left_check = check_spec("left-check", &executable, 8_000);
+        let right_check = check_spec("right-check", &executable, 8_000);
+        let left = reseal_work(
+            sealed_authority("dirs", &left_check, oracle.path(), source.path(), "none"),
+            "work-left",
+        );
+        let right = reseal_work(
+            sealed_authority("dirs", &right_check, oracle.path(), source.path(), "none"),
+            "work-right",
+        );
+        let left_root = candidate.path().to_path_buf();
+        let right_root = candidate.path().to_path_buf();
+        let oracle_root = oracle.path().to_path_buf();
+        let left_thread = thread::spawn(move || {
+            execute_required_checks_with_authority(
+                std::slice::from_ref(&left_check),
+                &left_root,
+                &oracle_root,
+                Some(&left),
+            )
+            .unwrap()
+        });
+        let oracle_root = oracle.path().to_path_buf();
+        let right_thread = thread::spawn(move || {
+            execute_required_checks_with_authority(
+                std::slice::from_ref(&right_check),
+                &right_root,
+                &oracle_root,
+                Some(&right),
+            )
+            .unwrap()
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut found = Vec::new();
+        while Instant::now() < deadline && found.len() < 2 {
+            found = fs::read_dir(std::env::temp_dir())
+                .unwrap()
+                .flatten()
+                .filter_map(|entry| {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if (name.starts_with("grokptah-check-work-left")
+                        || name.starts_with("grokptah-check-work-right"))
+                        && entry.path().join("path").is_file()
+                    {
+                        Some(entry.path())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            found.len(),
+            2,
+            "expected two private check directories: {found:?}"
+        );
+        assert_ne!(found[0], found[1]);
+        for dir in &found {
+            let mode = fs::metadata(dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{dir:?}");
+            let written = fs::read_to_string(dir.join("path")).unwrap();
+            let name = dir.file_name().unwrap().to_string_lossy();
+            assert!(
+                written.trim().ends_with(name.as_ref()),
+                "the check did not receive its private output directory: {written}"
+            );
+            fs::write(dir.join("go"), b"1").unwrap();
+        }
+        let left_results = left_thread.join().unwrap();
+        let right_results = right_thread.join().unwrap();
+        assert_eq!(left_results[0].outcome, "passed");
+        assert_eq!(right_results[0].outcome, "passed");
+        for dir in &found {
+            assert!(!dir.exists(), "check output directory was reused or leaked");
+        }
+    }
+
+    #[test]
+    fn output_directory_limit_terminates_the_check_tree() {
+        let _reap = ReapSleep("sleep 44");
+        let oracle = temp();
+        let candidate = temp();
+        let source = temp();
+        let executable = script(
+            oracle.path(),
+            "grow.sh",
+            "#!/bin/sh\nsleep 44 >/dev/null 2>&1 &\nwhile true; do printf '%s' '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' >> \"$CHECK_OUTPUT/blob\" || exit 1; done\n",
+        );
+        let check = check_spec("grow", &executable, 8_000);
+        let mut authority = sealed_authority("grow", &check, oracle.path(), source.path(), "none");
+        authority.output_limit_bytes = 1024;
+        let authority = authority.seal();
+        let started = Instant::now();
+        let results = execute_required_checks_with_authority(
+            std::slice::from_ref(&check),
+            candidate.path(),
+            oracle.path(),
+            Some(&authority),
+        )
+        .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "the output-directory limit did not stop the check"
+        );
+        assert_ne!(results[0].outcome, "passed", "{results:?}");
+        assert!(
+            results[0].outcome == "timed_out" || results[0].outcome == "truncated",
+            "{results:?}"
+        );
+        assert!(results[0].output_truncated);
+        assert!(pgrep_empty("sleep 44"));
     }
 }

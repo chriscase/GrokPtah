@@ -6229,7 +6229,6 @@ impl OrchStore {
         if let Err(error) = self.prove_apply_intent_unlocked(intent, &item, &attempts, &record) {
             return self.quarantine_apply_intent_unlocked(item, &error.message);
         }
-        let derived = crate::run_promotion::fingerprint_bytes(&record.base_revision, &record.patch);
         let applied = item.state == WorkState::Succeeded
             && item
                 .result
@@ -6240,13 +6239,9 @@ impl OrchStore {
             self.complete_pending_apply_receipt_unlocked(intent, &item)?;
             return self.clear_apply_source_intent_unlocked(&intent.work_id);
         }
-        let class = crate::run_promotion::classify_source(
-            Path::new(&intent.workspace),
-            &intent.source_base_sha,
-            &intent.source_fingerprint,
-            &derived,
-        )
-        .map_err(|error| OrchError::new(OrchErrorCode::Conflict, error.to_string()))?;
+        let class =
+            crate::run_promotion::classify_source(Path::new(&intent.workspace), &record.manifest)
+                .map_err(|error| OrchError::new(OrchErrorCode::Conflict, error.to_string()))?;
         match class {
             crate::run_promotion::SourceClassification::AlreadyApplied => {
                 let Some(mut verification) = item
@@ -6442,13 +6437,9 @@ impl OrchStore {
                 .list_work_attempts_unlocked(Some(work_id))
                 .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
             self.prove_apply_intent_unlocked(&existing, &item, &attempts, &record)?;
-            let derived =
-                crate::run_promotion::fingerprint_bytes(&record.base_revision, &record.patch);
             match crate::run_promotion::classify_source(
                 Path::new(&item.workspace),
-                &existing.source_base_sha,
-                &existing.source_fingerprint,
-                &derived,
+                &record.manifest,
             ) {
                 Ok(crate::run_promotion::SourceClassification::AlreadyApplied) => {
                     verification.applied = true;
@@ -6582,71 +6573,98 @@ impl OrchStore {
                 &self.candidate_snapshot_dir(work_id)?,
             )
             .map_err(|error| OrchError::new(OrchErrorCode::Conflict, error.message))?;
-            let derived =
-                crate::run_promotion::fingerprint_bytes(&record.base_revision, &record.patch);
             if let Err(error) = self.prove_apply_intent_unlocked(&intent, &item, &attempts, &record)
             {
-                if error.message.contains("stale")
-                    && crate::run_promotion::classify_source(
+                if !error.message.contains("stale") {
+                    return Err(error);
+                }
+                let mut class = crate::run_promotion::classify_source(
+                    Path::new(&item.workspace),
+                    &record.manifest,
+                )
+                .map_err(|error| OrchError::new(OrchErrorCode::Conflict, error.to_string()))?;
+                if class == crate::run_promotion::SourceClassification::Poisoned {
+                    crate::run_promotion::remove_manifest_additions(
                         Path::new(&item.workspace),
-                        &intent.source_base_sha,
-                        &intent.source_fingerprint,
-                        &derived,
+                        &record.manifest,
                     )
-                    .ok()
-                        == Some(crate::run_promotion::SourceClassification::Poisoned)
-                {
+                    .map_err(|error| OrchError::new(OrchErrorCode::Conflict, error.to_string()))?;
+                    class = crate::run_promotion::classify_source(
+                        Path::new(&item.workspace),
+                        &record.manifest,
+                    )
+                    .map_err(|error| OrchError::new(OrchErrorCode::Conflict, error.to_string()))?;
+                }
+                if class != crate::run_promotion::SourceClassification::NotApplied {
                     return Err(OrchError::new(
                         OrchErrorCode::Conflict,
                         "discard refused because the source needs reconciliation",
                     ));
                 }
-                return Err(error);
-            }
-            match crate::run_promotion::classify_source(
-                Path::new(&item.workspace),
-                &intent.source_base_sha,
-                &intent.source_fingerprint,
-                &derived,
-            )
-            .map_err(|error| OrchError::new(OrchErrorCode::Conflict, error.to_string()))?
-            {
-                crate::run_promotion::SourceClassification::AlreadyApplied => {
-                    let mut verification = item
-                        .result
-                        .as_ref()
-                        .and_then(|result| result.candidate_verification.clone())
-                        .ok_or_else(|| {
-                            OrchError::new(
-                                OrchErrorCode::Conflict,
-                                "candidate verification is missing",
-                            )
-                        })?;
-                    verification.applied = true;
-                    self.finish_applied_candidate_unlocked(item, prior_item, verification)?;
-                    let finished = self
-                        .load_work_item_unlocked(work_id)
+                self.clear_apply_source_intent_unlocked(work_id)?;
+            } else {
+                let mut class = crate::run_promotion::classify_source(
+                    Path::new(&item.workspace),
+                    &record.manifest,
+                )
+                .map_err(|error| OrchError::new(OrchErrorCode::Conflict, error.to_string()))?;
+                if class == crate::run_promotion::SourceClassification::Poisoned {
+                    crate::run_promotion::remove_manifest_additions(
+                        Path::new(&item.workspace),
+                        &record.manifest,
+                    )
+                    .map_err(|error| OrchError::new(OrchErrorCode::Conflict, error.to_string()))?;
+                    class = crate::run_promotion::classify_source(
+                        Path::new(&item.workspace),
+                        &record.manifest,
+                    )
+                    .map_err(|error| OrchError::new(OrchErrorCode::Conflict, error.to_string()))?;
+                }
+                match class {
+                    crate::run_promotion::SourceClassification::AlreadyApplied => {
+                        let mut verification = item
+                            .result
+                            .as_ref()
+                            .and_then(|result| result.candidate_verification.clone())
+                            .ok_or_else(|| {
+                                OrchError::new(
+                                    OrchErrorCode::Conflict,
+                                    "candidate verification is missing",
+                                )
+                            })?;
+                        verification.applied = true;
+                        self.finish_applied_candidate_unlocked(item, prior_item, verification)?;
+                        let finished = self
+                            .load_work_item_unlocked(work_id)
+                            .map_err(|error| {
+                                OrchError::new(OrchErrorCode::Internal, error.to_string())
+                            })?
+                            .ok_or_else(|| {
+                                OrchError::new(OrchErrorCode::Conflict, "work item not found")
+                            })?;
+                        self.complete_pending_apply_receipt_unlocked(&intent, &finished)?;
+                        let _ = self.clear_apply_source_intent_unlocked(work_id);
+                        return Err(OrchError::new(
+                            OrchErrorCode::Conflict,
+                            "discard refused because the candidate was already applied",
+                        ));
+                    }
+                    crate::run_promotion::SourceClassification::Poisoned => {
+                        return Err(OrchError::new(
+                            OrchErrorCode::Conflict,
+                            "discard refused because the source needs reconciliation",
+                        ));
+                    }
+                    crate::run_promotion::SourceClassification::NotApplied => {
+                        crate::run_promotion::remove_manifest_additions(
+                            Path::new(&item.workspace),
+                            &record.manifest,
+                        )
                         .map_err(|error| {
-                            OrchError::new(OrchErrorCode::Internal, error.to_string())
-                        })?
-                        .ok_or_else(|| {
-                            OrchError::new(OrchErrorCode::Conflict, "work item not found")
+                            OrchError::new(OrchErrorCode::Conflict, error.to_string())
                         })?;
-                    self.complete_pending_apply_receipt_unlocked(&intent, &finished)?;
-                    let _ = self.clear_apply_source_intent_unlocked(work_id);
-                    return Err(OrchError::new(
-                        OrchErrorCode::Conflict,
-                        "discard refused because the candidate was already applied",
-                    ));
-                }
-                crate::run_promotion::SourceClassification::Poisoned => {
-                    return Err(OrchError::new(
-                        OrchErrorCode::Conflict,
-                        "discard refused because the source needs reconciliation",
-                    ));
-                }
-                crate::run_promotion::SourceClassification::NotApplied => {
-                    self.clear_apply_source_intent_unlocked(work_id)?;
+                        self.clear_apply_source_intent_unlocked(work_id)?;
+                    }
                 }
             }
         }

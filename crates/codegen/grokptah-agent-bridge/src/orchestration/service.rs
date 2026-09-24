@@ -1383,7 +1383,30 @@ impl OrchestrationService {
         let change_proposed = manifest_proposed
             || grok.is_some_and(|invocation| !invocation.changed_paths.is_empty());
         let diff_digest = grok.and_then(|invocation| invocation.diff_digest.clone());
-        let authority = self.store.verified_check_authority(&work.work_id);
+        let envelope = self
+            .store
+            .verified_execution_envelope(&work.work_id)
+            .and_then(|raw| {
+                serde_json::from_value::<crate::verified_change::VerifiedExecutionEnvelopeV1>(raw)
+                    .ok()
+            });
+        let bound_authority_digest = envelope
+            .as_ref()
+            .map(|envelope| envelope.check_authority_digest.clone())
+            .unwrap_or_default();
+        let authority = self
+            .store
+            .verified_check_authority(&work.work_id)
+            .filter(|authority| {
+                envelope.as_ref().is_some_and(|envelope| {
+                    authority.authority_digest == envelope.check_authority_digest
+                        && authority.work_id == envelope.work_id
+                        && authority.session_id == envelope.session_id
+                        && authority.workspace == envelope.workspace
+                        && authority.profile_id == envelope.check_profile_id
+                        && authority.profile_revision == envelope.check_profile_revision
+                })
+            });
         let verification = crate::verified_change::assemble_candidate_verification(
             &work.work_id,
             intent.run_id.clone(),
@@ -1399,6 +1422,7 @@ impl OrchestrationService {
             change_proposed,
             diff_digest,
             authority.as_ref(),
+            &bound_authority_digest,
         );
         evidence.push(format!("candidate_digest:{}", verification.content_digest));
         evidence.push(format!("checks_passed:{}", verification.checks_passed));
@@ -1852,15 +1876,26 @@ impl OrchestrationService {
                     .and_then(|decision| decision.reason.split("envelope:").nth(1))
                     .unwrap_or("")
                     .trim();
-                if !parsed.permits(
-                    &work.work_id,
-                    &work.session_id.to_string(),
-                    &work.workspace,
-                    &agent_id,
-                    spec.revision,
-                    decision_digest,
-                    &work.kind,
-                ) {
+                let authority_bound = self
+                    .store
+                    .verified_check_authority(&work.work_id)
+                    .is_some_and(|authority| {
+                        authority.authority_digest == parsed.check_authority_digest
+                            && authority.work_id == parsed.work_id
+                            && authority.session_id == parsed.session_id
+                            && authority.workspace == parsed.workspace
+                    });
+                if !authority_bound
+                    || !parsed.permits(
+                        &work.work_id,
+                        &work.session_id.to_string(),
+                        &work.workspace,
+                        &agent_id,
+                        spec.revision,
+                        decision_digest,
+                        &work.kind,
+                    )
+                {
                     self.native_executor.lock().skipped_ineligible += 1;
                     continue;
                 }
@@ -2789,6 +2824,12 @@ impl OrchestrationService {
             .flatten()
             .and_then(|agent| agent.current_spec().ok().map(|spec| spec.revision))
             .unwrap_or(0);
+        let mut sealed = authority.clone();
+        sealed.work_id = work_id.clone();
+        sealed.session_id = stored_work.session_id.to_string();
+        sealed.workspace = stored_work.workspace.clone();
+        sealed.source_root = request.workspace.clone();
+        let sealed = sealed.seal();
         let envelope = crate::verified_change::VerifiedExecutionEnvelopeV1::new(
             &work_id,
             &stored_work.session_id.to_string(),
@@ -2802,6 +2843,7 @@ impl OrchestrationService {
             authority.profile_revision,
             &authority.executable_digest,
             &authority.oracle_digest,
+            &sealed.authority_digest,
             limits.max_prompt_bytes as u64,
             u64::from(limits.max_turns),
             limits.max_duration_ms,
@@ -2817,12 +2859,6 @@ impl OrchestrationService {
                 "the verified-change execution envelope could not be stored",
             )
         })?;
-        let mut sealed = authority.clone();
-        sealed.work_id = work_id.clone();
-        sealed.session_id = request.session_id.to_string();
-        sealed.workspace = request.workspace.display().to_string();
-        sealed.source_root = request.workspace.clone();
-        let sealed = sealed.seal();
         crate::verified_change::write_check_authority(&private_dir, &sealed)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.message))?;
         let _authorized = self
