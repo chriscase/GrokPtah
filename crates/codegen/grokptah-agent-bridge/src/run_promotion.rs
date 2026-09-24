@@ -573,18 +573,11 @@ fn path_has_manifest_identity(
     } else {
         entry.before_blob.as_str()
     };
-    let content_blob = if recorded_blob.chars().all(|ch| ch == '0') {
-        if after {
-            entry.before_blob.as_str()
-        } else {
-            return Ok(false);
-        }
+    let content_blob = if !is_full_object_id(recorded_blob) {
+        return Ok(false);
     } else {
         recorded_blob
     };
-    if content_blob.chars().all(|ch| ch == '0') {
-        return Ok(false);
-    }
     if !mode_matches(&path, recorded_mode) {
         return Ok(false);
     }
@@ -596,7 +589,33 @@ fn path_has_manifest_identity(
         return Ok(entry.symlink);
     }
     let object = git_stdout(source, &["hash-object", "--", &entry.path])?;
-    Ok(object.starts_with(content_blob) || content_blob.starts_with(object.as_str()))
+    Ok(object == content_blob)
+}
+
+fn is_full_object_id(blob: &str) -> bool {
+    blob.len() == 40 && blob.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn canonical_object_id(
+    worktree: &Path,
+    blob: &str,
+    path: &str,
+    after: bool,
+    status: &str,
+) -> Result<String> {
+    if blob.chars().all(|ch| ch == '0') {
+        if after && !status.starts_with('D') {
+            return git_stdout(worktree, &["hash-object", "--", path]);
+        }
+        return Ok("0".repeat(40));
+    }
+    if is_full_object_id(blob) {
+        return Ok(blob.to_string());
+    }
+    git_stdout(
+        worktree,
+        &["rev-parse", "--verify", &format!("{blob}^{{blob}}")],
+    )
 }
 
 fn mode_matches(path: &Path, recorded: &str) -> bool {
@@ -822,7 +841,14 @@ pub(crate) fn materialize_manifest(
 fn path_manifest(worktree: &Path, base_revision: &str) -> Result<Vec<PathManifestEntry>> {
     let output = git_command(
         worktree,
-        &["diff", "--raw", "--no-renames", "-z", "--no-ext-diff"],
+        &[
+            "diff",
+            "--raw",
+            "--abbrev=40",
+            "--no-renames",
+            "-z",
+            "--no-ext-diff",
+        ],
         &[
             std::ffi::OsStr::new(base_revision),
             std::ffi::OsStr::new("--"),
@@ -866,12 +892,8 @@ fn path_manifest(worktree: &Path, base_revision: &str) -> Result<Vec<PathManifes
         } else {
             "modify"
         };
-        let mut after_blob = after_blob;
-        if after_blob.chars().all(|ch| ch == '0') && !status.starts_with('D') {
-            if let Ok(object) = git_stdout(worktree, &["hash-object", "--", path]) {
-                after_blob = object;
-            }
-        }
+        let before_blob = canonical_object_id(worktree, &before_blob, path, false, status)?;
+        let after_blob = canonical_object_id(worktree, &after_blob, path, true, status)?;
         let tracked = git_command(
             worktree,
             &["ls-files", "--error-unmatch", "--"],
@@ -1412,5 +1434,31 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("32 MiB"), "{error}");
+    }
+
+    #[test]
+    fn abbreviated_blob_prefix_is_not_already_applied() {
+        let dir = repository();
+        let base = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let base = String::from_utf8(base.stdout).unwrap().trim().to_string();
+        fs::write(dir.path().join("README.md"), "staged\n").unwrap();
+        git(dir.path(), &["add", "README.md"]);
+        let captured = capture_worktree_changes(dir.path(), &base).unwrap();
+        assert!(!captured.manifest.is_empty());
+        for entry in &captured.manifest {
+            for blob in [&entry.before_blob, &entry.after_blob] {
+                assert_eq!(blob.len(), 40, "{blob}");
+                assert!(blob.chars().all(|ch| ch.is_ascii_hexdigit()), "{blob}");
+            }
+        }
+        let mut tampered = captured.manifest.clone();
+        let full = tampered[0].after_blob.clone();
+        tampered[0].after_blob = full[..7].to_string();
+        let class = classify_source(dir.path(), &tampered).unwrap();
+        assert_eq!(class, SourceClassification::Poisoned);
     }
 }

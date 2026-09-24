@@ -1909,22 +1909,33 @@ async fn execute_allowlisted(
                             },
                         );
                     }
-                    if let Ok(record) = crate::verified_change::read_promotion_record(retention) {
-                        let mut manifest_paths: Vec<String> = record
-                            .manifest
-                            .iter()
-                            .map(|entry| entry.path.clone())
-                            .collect();
-                        manifest_paths.sort();
-                        let mut adapter_paths = evidence.changed_paths().to_vec();
-                        adapter_paths.sort();
-                        if manifest_paths != adapter_paths {
+                    let binding = match crate::verified_change::bind_retained_candidate(
+                        &execution_host.cwd,
+                        retention,
+                    ) {
+                        Ok(binding) => binding,
+                        Err(_) => {
                             let _ = checkout.cleanup().await;
                             let _ = std::fs::remove_dir_all(retention);
                             return Err(GrokBuildAdapterError::IsolationFailed);
                         }
+                    };
+                    let mut live_paths = evidence.changed_paths().to_vec();
+                    live_paths.sort();
+                    if binding.head != launch.identity.head_sha
+                        || live_paths != binding.changed_paths
+                        || (binding.git_ref != "HEAD" && binding.git_ref != launch.identity.git_ref)
+                    {
+                        let _ = checkout.cleanup().await;
+                        let _ = std::fs::remove_dir_all(retention);
+                        return Err(GrokBuildAdapterError::IsolationFailed);
                     }
-                    Ok(evidence)
+                    Ok(GrokBuildMutationEvidence {
+                        final_head_sha: binding.head,
+                        final_ref: launch.identity.git_ref.clone(),
+                        changed_paths: binding.changed_paths,
+                        diff_digest: binding.diff_digest,
+                    })
                 }
                 Err(error) => Err(error),
             }

@@ -17,11 +17,11 @@ use grokptah_agent_bridge::orchestration::{
 };
 use grokptah_agent_bridge::{
     derived_snapshot_fingerprint, directory_digest, execute_required_checks, file_digest,
-    read_check_authority, recompute_candidate_apply_bundle, set_grokptah_home_override,
-    start_control_server, write_check_authority, AgentHost, CredentialLeaseHandle,
-    CredentialLeaseResolver, GrokBuildAdapterError, HostConfig, HostLeaseAuthority, HostRuntime,
-    RequiredCheckCwd, RequiredCheckSpec, SessionKind, APPLY_FAULT, BEFORE_CANDIDATE_BIND,
-    CHECK_CONFINEMENT_EXECUTABLE, SKIP_VERIFIED_DRIVE,
+    read_check_authority, recompute_candidate_apply_bundle, retained_candidate_diff_digest,
+    set_grokptah_home_override, start_control_server, write_check_authority, AgentHost,
+    CredentialLeaseHandle, CredentialLeaseResolver, GrokBuildAdapterError, HostConfig,
+    HostLeaseAuthority, HostRuntime, RequiredCheckCwd, RequiredCheckSpec, SessionKind, APPLY_FAULT,
+    BEFORE_CANDIDATE_BIND, CHECK_CONFINEMENT_EXECUTABLE, SKIP_VERIFIED_DRIVE,
 };
 use grokptah_agent_sdk::GrokBuildGitIdentity;
 use tempfile::tempdir;
@@ -3674,6 +3674,21 @@ async fn applied_patch_must_reproduce_the_checked_materialized_tree() {
         .arg(&checkout)
         .current_dir(harness.workspace.path())
         .status();
+    let stored = harness
+        .orch
+        .store()
+        .list_managed_intents()
+        .unwrap()
+        .into_iter()
+        .find(|intent| intent.work_id == work_id)
+        .and_then(|intent| intent.grok)
+        .unwrap();
+    let tree = private_dir.join("tree");
+    assert_eq!(
+        stored.diff_digest.as_deref(),
+        Some(retained_candidate_diff_digest(&tree).unwrap().as_str())
+    );
+    assert_eq!(stored.changed_paths, manifest_paths(&private_dir));
     harness.close().await;
 }
 

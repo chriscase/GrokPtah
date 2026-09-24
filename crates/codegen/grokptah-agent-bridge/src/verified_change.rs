@@ -613,9 +613,11 @@ fn capture_identity(
 ) -> Result<CaptureIdentity, VerifiedChangeError> {
     let captured = crate::run_promotion::capture_worktree_changes(source, base_revision)
         .map_err(|error| VerifiedChangeError::new(error.to_string()))?;
-    let head = git_text(source, &["rev-parse", "HEAD"])?;
-    let git_ref =
-        git_text(source, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_else(|_| "HEAD".into());
+    let head = git_text(source, &["rev-parse", "HEAD"])?.trim().to_string();
+    let git_ref = git_text(source, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .unwrap_or_else(|_| "HEAD".into())
+        .trim()
+        .to_string();
     let status = git_text(
         source,
         &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
@@ -1334,6 +1336,142 @@ pub fn retained_matches(
         }
     }
     Ok(true)
+}
+
+#[derive(Debug)]
+pub struct RetainedCandidateBinding {
+    pub head: String,
+    pub git_ref: String,
+    pub changed_paths: Vec<String>,
+    pub diff_digest: String,
+}
+
+/// Digest and changed paths of the single retained patch, manifest, and tree.
+/// The checkout must still contain those same bytes or the bind is refused.
+pub fn bind_retained_candidate(
+    checkout: &Path,
+    retained_tree: &Path,
+) -> Result<RetainedCandidateBinding, VerifiedChangeError> {
+    let record = read_promotion_record(retained_tree)?;
+    let parent = retained_tree.parent().unwrap_or(retained_tree);
+    let raw = fs::read_to_string(parent.join("manifest.json"))
+        .map_err(|_| VerifiedChangeError::new("the candidate manifest is missing"))?;
+    let value: Value = serde_json::from_str(&raw)
+        .map_err(|_| VerifiedChangeError::new("the candidate manifest is unreadable"))?;
+    let head = value
+        .get("head")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let git_ref = value
+        .get("gitRef")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if !retained_tree_matches_checkout(checkout, retained_tree, &record.manifest)? {
+        return Err(VerifiedChangeError::new(
+            "the retained candidate bytes do not match the checked tree",
+        ));
+    }
+    let mut changed_paths: Vec<String> = record
+        .manifest
+        .iter()
+        .map(|entry| entry.path.clone())
+        .collect();
+    changed_paths.sort();
+    let diff_digest = digest_retained_candidate(&record.patch, &record.manifest, retained_tree)?;
+    Ok(RetainedCandidateBinding {
+        head,
+        git_ref,
+        changed_paths,
+        diff_digest,
+    })
+}
+
+pub fn retained_candidate_diff_digest(retained_tree: &Path) -> Result<String, VerifiedChangeError> {
+    let record = read_promotion_record(retained_tree)?;
+    digest_retained_candidate(&record.patch, &record.manifest, retained_tree)
+}
+
+fn digest_retained_candidate(
+    patch: &[u8],
+    manifest: &[crate::run_promotion::PathManifestEntry],
+    tree: &Path,
+) -> Result<String, VerifiedChangeError> {
+    let mut entries = manifest.to_vec();
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    let mut hasher = Sha256::new();
+    hasher.update(b"grokptah-retained-candidate-v1\0");
+    hasher.update(patch);
+    hasher.update([0]);
+    for entry in &entries {
+        hasher.update(entry.path.as_bytes());
+        hasher.update([0]);
+        hasher.update(entry.state.as_bytes());
+        hasher.update([0]);
+        if entry.state == "delete" {
+            hasher.update(b"deleted");
+            hasher.update([0]);
+            continue;
+        }
+        let bytes = fs::read(tree.join(&entry.path)).map_err(|_| {
+            VerifiedChangeError::new("the retained candidate file could not be read")
+        })?;
+        hasher.update(&bytes);
+        hasher.update([0]);
+    }
+    Ok(format!("sha256:{}", hex_bytes(&hasher.finalize())))
+}
+
+fn retained_tree_matches_checkout(
+    checkout: &Path,
+    retained_tree: &Path,
+    manifest: &[crate::run_promotion::PathManifestEntry],
+) -> Result<bool, VerifiedChangeError> {
+    for entry in manifest {
+        let live = snapshot_entry(&checkout.join(&entry.path))?;
+        let kept = snapshot_entry(&retained_tree.join(&entry.path))?;
+        if entry.state == "delete" {
+            if live.is_some() || kept.is_some() {
+                return Ok(false);
+            }
+            continue;
+        }
+        if live != kept {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn snapshot_entry(path: &Path) -> Result<Option<(Vec<u8>, u32)>, VerifiedChangeError> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => {
+            return Err(VerifiedChangeError::new(
+                "the candidate file could not be read",
+            ))
+        }
+    };
+    let mode = meta.permissions().mode() & 0o777;
+    let bytes = if meta.file_type().is_symlink() {
+        fs::read_link(path)
+            .map_err(|_| VerifiedChangeError::new("a candidate symlink could not be read"))?
+            .to_string_lossy()
+            .into_owned()
+            .into_bytes()
+    } else if meta.is_file() {
+        fs::read(path)
+            .map_err(|_| VerifiedChangeError::new("the candidate file could not be read"))?
+    } else {
+        return Err(VerifiedChangeError::new(
+            "the candidate contains a non-regular source file",
+        ));
+    };
+    Ok(Some((bytes, mode)))
 }
 
 pub fn apply_fault() -> u8 {
@@ -3291,6 +3429,52 @@ mod tests {
             value: "nope".into(),
         }];
         assert!(validate_required_checks(&[secret]).is_err());
+    }
+
+    #[test]
+    fn retained_tree_byte_mismatch_cannot_bind_adapter_evidence() {
+        let dir = temp();
+        fs::write(dir.path().join("README.md"), b"before\n").unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("/usr/bin/git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{args:?}");
+        };
+        git(&["init", "-q", "-b", "topic"]);
+        git(&["config", "user.email", "test@grokptah.invalid"]);
+        git(&["config", "user.name", "GrokPtah test"]);
+        git(&["add", "README.md"]);
+        git(&["commit", "-qm", "base"]);
+        let base = Command::new("/usr/bin/git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let base = String::from_utf8(base.stdout).unwrap().trim().to_string();
+        fs::write(dir.path().join("README.md"), b"after\n").unwrap();
+        let retained = temp();
+        let tree = retained.path().join("tree");
+        retain_candidate_snapshot(dir.path(), &tree, &base).unwrap();
+        fs::write(dir.path().join("README.md"), b"after-mutated\n").unwrap();
+        let error = bind_retained_candidate(dir.path(), &tree).unwrap_err();
+        assert!(error.message.contains("bytes"), "{error:?}");
+        fs::write(dir.path().join("README.md"), b"after\n").unwrap();
+        let binding = bind_retained_candidate(dir.path(), &tree).unwrap();
+        assert_eq!(
+            binding.diff_digest,
+            retained_candidate_diff_digest(&tree).unwrap()
+        );
+        assert_eq!(binding.changed_paths, vec!["README.md".to_string()]);
+        let mut kept = fs::read(tree.join("README.md")).unwrap();
+        kept.push(b'z');
+        fs::write(tree.join("README.md"), &kept).unwrap();
+        assert_ne!(
+            retained_candidate_diff_digest(&tree).unwrap(),
+            binding.diff_digest
+        );
     }
 
     fn script(dir: &Path, name: &str, body: &str) -> PathBuf {

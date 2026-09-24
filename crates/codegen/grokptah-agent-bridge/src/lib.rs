@@ -237,13 +237,13 @@ pub use types::{
     SkillInfo, SubagentExecutionMode, SubagentInfo, SubagentIsolationPreference,
 };
 pub use verified_change::{
-    confinement_available, derived_snapshot_fingerprint, directory_digest, execute_required_checks,
-    execute_required_checks_with_authority, file_digest, inspect_assignment_readiness,
-    read_check_authority, recompute_candidate_apply_bundle, skip_verified_drive,
-    write_check_authority, CandidateVerification, CheckAuthority, ReadinessInput, RequiredCheckCwd,
-    RequiredCheckEnv, RequiredCheckSpec, VerifiedChangeError, VerifiedChangeReadiness,
-    VerifiedExecutionEnvelopeV1, APPLY_FAULT, BEFORE_CANDIDATE_BIND, CHECK_CONFINEMENT_EXECUTABLE,
-    SKIP_VERIFIED_DRIVE,
+    bind_retained_candidate, confinement_available, derived_snapshot_fingerprint, directory_digest,
+    execute_required_checks, execute_required_checks_with_authority, file_digest,
+    inspect_assignment_readiness, read_check_authority, recompute_candidate_apply_bundle,
+    retained_candidate_diff_digest, skip_verified_drive, write_check_authority,
+    CandidateVerification, CheckAuthority, ReadinessInput, RequiredCheckCwd, RequiredCheckEnv,
+    RequiredCheckSpec, VerifiedChangeError, VerifiedChangeReadiness, VerifiedExecutionEnvelopeV1,
+    APPLY_FAULT, BEFORE_CANDIDATE_BIND, CHECK_CONFINEMENT_EXECUTABLE, SKIP_VERIFIED_DRIVE,
 };
 
 /// Crate version string for about / diagnostics.
