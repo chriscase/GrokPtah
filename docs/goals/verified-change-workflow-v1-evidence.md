@@ -425,6 +425,37 @@ Live-provider test: NOT RUN.
 
 Production revocable xAI lease: STILL UNAVAILABLE.
 
+## Case-variant metadata symlink targets
+
+Prior functional SHA: `112b0032d306015c412d2ebf8931fba1ca677e55` (tree `a8e9238438bd4e7cc1e111963dd97d59cab8acea`). This repair is functional SHA `d7306c1e7d346d1ee9ed6f36e06e457d5a65c6c6` (tree `a121de35fe498bc9fb147f53ccfa5f034949d95f`). It is not an independent acceptance of the frozen goal.
+
+Symlink containment compares `.git` and `.grokptah` with the same ASCII case-insensitive rule as relative-path validation. A dangling target `.Grokptah/secret` or `.GIT/config` is rejected at capture. The exact lowercase forms stay rejected, and a safe dangling internal target stays retained.
+
+Local validation on the working tree committed as `d7306c1e7d346d1ee9ed6f36e06e457d5a65c6c6` (tree `a121de35fe498bc9fb147f53ccfa5f034949d95f`), before that commit at `2026-09-24T15:36:06-05:00`. No executable diff exists after that commit. The named regression below was `ok`. The live managed-executor test stayed ignored.
+
+- Bridge `cargo fmt --all -- --check`: exit 0 (`FMT:0`).
+- Bridge `cargo clippy --locked --all-targets -- -D warnings`: exit 0 (`CLIPPY:0`).
+- Bridge `cargo test --locked -- --test-threads=1` on a fresh `GROKPTAH_HOME`: exit 0 (`SUITE:0`). `live_grok_build_dogfood_runs_both_profiles_under_one_authority` stayed ignored.
+- `cargo test -p xai-host-authority --locked -- --test-threads=1`: exit 0 (`AUTH:0`).
+- Isolated service `cargo test --locked -- --test-threads=1`: exit 0 (`SERVICE:0`).
+- Isolated service `cargo check --locked --all-targets`: exit 0 (`CHECK:0`).
+- Desktop `npm run typecheck`: exit 0 (`TC:0`).
+- Desktop `npm test`: exit 0 (`NPM:0`, 58 files, 428 tests).
+- `desktop/src-tauri` `cargo test --locked`: exit 0 (`DESKLIB:0`).
+
+| Gap | Result on `d7306c1e7` / `a121de35` | Named regression |
+| --- | --- | --- |
+| Case-variant metadata | Capture rejects `.Grokptah/secret` and `.GIT/config`. | `case_variant_metadata_symlink_target_is_rejected` |
+| Exact metadata and safe links | Exact `.git` and `.grokptah` targets stay rejected. A safe dangling internal target is retained. | `symlink_target_into_git_metadata_is_rejected`; `safe_dangling_internal_target_is_retained_exactly` |
+
+Hosted Desktop for repaired functional SHA `d7306c1e7d346d1ee9ed6f36e06e457d5a65c6c6` only: GitHub Actions run `36055983316` attempt 1 (https://github.com/chriscase/GrokPtah/actions/runs/36055983316) concluded `success`. The event was `pull_request`. `head_sha` was `d7306c1e7d346d1ee9ed6f36e06e457d5a65c6c6`. The `desktop` job had no failed steps (`2026-09-24T20:36:19Z` to `2026-09-24T21:06:50Z`).
+
+The commit that adds this section is documentation only. Its tree is not `a121de35fe498bc9fb147f53ccfa5f034949d95f`. A Desktop run for that docs tip is not the result above.
+
+Live-provider test: NOT RUN.
+
+Production revocable xAI lease: STILL UNAVAILABLE.
+
 ## Repair identity
 
 - Prior reviewed functional SHA: `32268e89f52776704d7a4729c2bd3581310ceeb7`
