@@ -290,6 +290,32 @@ Live-provider test: NOT RUN.
 
 Production revocable xAI lease: STILL UNAVAILABLE.
 
+## Publication record for the exact-candidate repair
+
+Prior functional SHA: `2240ed985dc3f7ade21cfd1ddfaa9f366df21486`
+Prior functional tree: `eb73caffb771928dba9f59f75cb8a4087e4f4671`
+
+Repaired functional SHA: `cf9d03a1a114e79805797b1df8429dd9182dd445`
+Repaired functional tree: `1e6b830b0726545f5654b330b0cd937034ca5d8f`
+
+The locked bridge suite that recorded the rows below ran on that repaired functional tree, before this documentation commit. `SUITE:0`. Each named regression below was `ok`. The live managed-executor test stayed ignored. This is not an independent acceptance of the frozen goal.
+
+| Gap | Result on `cf9d03a1a` / `1e6b830b` | Named regression |
+| --- | --- | --- |
+| D1 one candidate | One capture records HEAD, ref, status, patch, manifest, bytes, modes, deletions, and symlinks, then recaptures and refuses a mismatch. A surviving process-group member blocks retention. The retained patch reproduces the checked tree. Patch paths equal the manifest, adapter paths, and `allowed_files`. Adapter evidence is that retained patch and materialized tree; differing checkout bytes are refused. | `normal_exit_with_surviving_mutator_cannot_retain_a_candidate`; `preverification_patch_tree_mismatch_cannot_verify`; `applied_patch_must_reproduce_the_checked_materialized_tree`; `patch_paths_must_equal_manifest_and_allowed_scope`; `retained_tree_byte_mismatch_cannot_bind_adapter_evidence` |
+| D2 classification | Replay, store-open recovery, discard, receipt completion, and reconciliation use the sealed manifest and the full worktree, including untracked files. Full object ids are required; a short blob prefix is not AlreadyApplied. | `crash_after_first_untracked_add_is_not_classified_not_applied`; `crash_after_all_new_files_before_index_update_recovers_applied`; `discard_never_leaves_an_untracked_candidate_file`; `foreign_untracked_file_during_apply_requires_reconciliation`; `abbreviated_blob_prefix_is_not_already_applied` |
+| D3 supervision | One deadline covers the leader, descendants, pipes, and output-directory growth. Each check gets a distinct mode-0700 directory with a byte limit. After every outcome the process group is proved gone or the check fails closed. `processLimit` is removed from the authority contract. | `successful_parent_with_background_pipe_holder_obeys_timeout`; `normal_check_exit_requires_process_group_quiescence`; `concurrent_checks_have_distinct_private_output_directories`; `output_directory_limit_terminates_the_check_tree` |
+| D4 decision bind | The check authority is sealed before the envelope. Its digest is inside the envelope bound to the authorization decision. Dispatch and finalization reject a different digest or identity. Verification and the apply bundle keep the original digest. | `resealed_check_authority_cannot_upgrade_network_or_resource_policy`; `foreign_check_authority_cannot_be_copied_to_another_work`; `authority_identity_mismatch_runs_no_check` |
+| D5 validation | Bridge suite, fmt, and strict Clippy passed on the repaired functional tree, as did host-authority, isolated service tests and check, desktop typecheck, npm tests, and Tauri tests. Hosted Desktop success for this functional SHA is only run `35942601248` attempt 3. | `rewritten_check_argv_cwd_env_or_timeout_runs_no_process`; `resealed_patch_after_approval_cannot_apply` |
+
+Hosted Desktop for repaired functional SHA `cf9d03a1a114e79805797b1df8429dd9182dd445` only: GitHub Actions run `35942601248` attempt 3 (https://github.com/chriscase/GrokPtah/actions/runs/35942601248) concluded `success`. The event was `pull_request`. `head_sha` was `cf9d03a1a114e79805797b1df8429dd9182dd445`. The `desktop` job had no failed steps (`2026-09-24T02:08:30Z` to `2026-09-24T02:36:34Z`).
+
+The commit that adds this section is documentation only. Its tree is not `1e6b830b0726545f5654b330b0cd937034ca5d8f`. A Desktop run for that docs tip is not the result above.
+
+Live-provider test: NOT RUN.
+
+Production revocable xAI lease: STILL UNAVAILABLE.
+
 ## Repair identity
 
 - Prior reviewed functional SHA: `32268e89f52776704d7a4729c2bd3581310ceeb7`
