@@ -237,6 +237,34 @@ Live-provider test: NOT RUN.
 
 Production revocable xAI lease: STILL UNAVAILABLE.
 
+## Exact candidate, crash classification, and process-tree authority
+
+Prior functional SHA: `2240ed985dc3f7ade21cfd1ddfaa9f366df21486` (tree `eb73caffb771928dba9f59f75cb8a4087e4f4671`). This repair is functional SHA `c33593bede2263b96849ec7e98f9beb92352be28` (tree `41063bc923618069159c3bd856c1b54021447fb2`). It is not an independent acceptance of the frozen goal.
+
+| Gap | Disposition | Named regression |
+| --- | --- | --- |
+| One stable candidate | Repaired. Normal Grok Build completion proves the worker process group is gone before capture. One capture records HEAD, ref, status, the canonical patch, the changed-path manifest, and file bytes, modes, deletions, and symlinks; materializes that tree; recaptures; and refuses a mismatch. Applying the retained patch to a fresh detached checkout at the base SHA reproduces the checked tree. Patch paths equal the manifest, the adapter changed paths, and Work `allowed_files`. | `normal_exit_with_surviving_mutator_cannot_retain_a_candidate`; `preverification_patch_tree_mismatch_cannot_verify`; `applied_patch_must_reproduce_the_checked_materialized_tree`; `patch_paths_must_equal_manifest_and_allowed_scope` |
+| Apply recovery classification | Repaired. Replay, store-open recovery, discard, receipt completion, and reconciliation classify the sealed manifest against the complete worktree, including untracked additions, without depending on intent-to-add. Before-identity with no foreign changes is NotApplied. After-identity with no foreign changes is AlreadyApplied. Mixed, unknown, or foreign changes are Poisoned. | `crash_after_first_untracked_add_is_not_classified_not_applied`; `crash_after_all_new_files_before_index_update_recovers_applied`; `discard_never_leaves_an_untracked_candidate_file`; `foreign_untracked_file_during_apply_requires_reconciliation` |
+| Check process tree | Repaired. One wall-clock deadline covers the leader, descendants, stdout, stderr, and output-directory growth. A leader that exits while a descendant holds a pipe does not block past that deadline. Every outcome proves the process group is gone or returns an unproved-termination failure. Each invocation uses a distinct mode-0700 output directory whose byte limit is enforced during the run. `processLimit` is removed from the authority contract and from public claims; a sealed limit of 1 cannot mean one OS process under `sandbox-exec` plus the check script. | `successful_parent_with_background_pipe_holder_obeys_timeout`; `normal_check_exit_requires_process_group_quiescence`; `concurrent_checks_have_distinct_private_output_directories`; `output_directory_limit_terminates_the_check_tree` |
+| Check authority bound to the work decision | Repaired. The complete check authority is sealed before `VerifiedExecutionEnvelopeV1` is built, and that digest is inside the envelope bound to the authorization decision. Dispatch and finalization reject an authority whose digest or work, session, or workspace identity differs. Candidate verification and the apply bundle carry the original digest. | `resealed_check_authority_cannot_upgrade_network_or_resource_policy`; `foreign_check_authority_cannot_be_copied_to_another_work`; `authority_identity_mismatch_runs_no_check` |
+| Accepted repairs | Kept. A rewritten check argv, cwd, env, or timeout still launches no process. Approval still pins the apply-bundle digest. | `rewritten_check_argv_cwd_env_or_timeout_runs_no_process`; `resealed_patch_after_approval_cannot_apply` |
+
+Local validation on `c33593bede2263b96849ec7e98f9beb92352be28`, before this evidence text:
+
+- `cargo test --locked -- --test-threads=1` in `crates/codegen/grokptah-agent-bridge` with a fresh `GROKPTAH_HOME`: exit 0. `verified_change_workflow` passed 47 tests. The live managed-executor test stayed ignored.
+- Bridge `cargo fmt --all -- --check` and `cargo clippy --locked --all-targets -- -D warnings`: exit 0.
+- `cargo test -p xai-host-authority --locked -- --test-threads=1`: exit 0.
+- Isolated headless service `cargo test --locked -- --test-threads=1` and `cargo check --locked --all-targets`: exit 0.
+- Desktop `npm run typecheck`, `npm test`, and `desktop/src-tauri` `cargo test --locked`: exit 0.
+
+Hosted Desktop for functional SHA `c33593bede2263b96849ec7e98f9beb92352be28`: GitHub Actions run `35937962980` (https://github.com/chriscase/GrokPtah/actions/runs/35937962980) completed with conclusion `success`. The event was `pull_request`, `head_sha` was that functional SHA, and the `desktop` job succeeded with no failed steps. The run started `2026-09-24T00:20:21Z` and the job finished `2026-09-24T00:48:01Z`.
+
+The commit that adds this section is documentation only. Its SHA is not `c33593bede2263b96849ec7e98f9beb92352be28`. A Desktop run for that docs tip is not this result.
+
+Live-provider test: NOT RUN.
+
+Production revocable xAI lease: STILL UNAVAILABLE.
+
 ## Repair identity
 
 - Prior reviewed functional SHA: `32268e89f52776704d7a4729c2bd3581310ceeb7`
@@ -257,3 +285,4 @@ Production revocable xAI lease: STILL UNAVAILABLE.
 - The earlier desktop process drive used prepare and start. Settled review, apply, and discard are now on that same control plane and on the Work board. The Work board test exercises prepare without a selected agent, refresh of a settled diff, and apply of the displayed digest. The window itself was not clicked.
 - At admission time the worker is still `running`, so the live start projection does not yet show `checksPassed`. The workflow test covers the settled candidate.
 - Non-macOS mutation remains refused. This run is macOS.
+- `processLimit` is not an enforced descendant cap. It is absent from the check-authority contract. The check supervisor proves the process group is gone or fails closed, and it enforces the output-directory byte limit during the run.
