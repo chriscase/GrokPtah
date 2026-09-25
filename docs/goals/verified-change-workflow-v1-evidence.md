@@ -466,15 +466,15 @@ Apply cleanup sealing, receipt matching, and receipt completion resolve one rece
 
 Local validation on the working tree committed as `8cecd488ebb3f5b34692e70f09bb89cc2c8ec3ad` (tree `2ade073c8ac6496c46d428a1b16993bc6d33b079`), before that commit. No executable diff exists after that commit. The named regressions below were `ok`. The live managed-executor test stayed ignored.
 
-- Bridge `cargo fmt --all -- --check`: exit 0 (`FMT:0`).
-- Bridge `cargo clippy --locked --all-targets -- -D warnings`: exit 0 (`CLIPPY:0`).
-- Bridge `cargo test --locked -- --test-threads=1` on a fresh `GROKPTAH_HOME`: exit 0 (`SUITE:0`). `verified_change_workflow` includes the workspace collision regression. `live_grok_build_dogfood_runs_both_profiles_under_one_authority` stayed ignored.
+- Bridge `cargo fmt --all -- --check`: exit 0 (`FMT:0`), re-run for tree `2ade073c8ac6496c46d428a1b16993bc6d33b079` / SHA `8cecd488ebb3f5b34692e70f09bb89cc2c8ec3ad`.
+- Bridge `cargo clippy --locked --all-targets -- -D warnings`: exit 0 (`CLIPPY:0`) on that same tree.
+- Bridge `cargo test --locked -- --test-threads=1` on a fresh `GROKPTAH_HOME`: exit 0 (`SUITE:0`) on that same tree. Every required R1–R4 regression was `ok`: `foreign_owner_receipt_collision_is_ignored_and_unchanged`, `foreign_workspace_receipt_collision_is_ignored_and_unchanged`, `apply_recovery_completes_only_the_exact_scoped_receipt`, `receipt_lookup_does_not_scan_unrelated_owner_shards`, `admission_fault_cuts_reopen_without_a_permanent_in_progress_receipt`, `fault4_original_request_replays_recovered_success`, `fault5_original_request_replays_recovered_success`, `crash_after_intent_before_source_effect_resolves_original_request`, `not_applied_recovery_does_not_leave_a_permanent_pending_receipt`, `poisoned_recovery_never_replays_success_or_no_effect`, `repeated_store_reopen_is_idempotent_for_receipt_work_and_source`, `receipt_completion_precedes_intent_removal`. `live_grok_build_dogfood_runs_both_profiles_under_one_authority` stayed ignored.
 - `cargo test -p xai-host-authority --locked -- --test-threads=1`: exit 0 (`AUTHORITY:0`), re-run on the checked-out functional SHA `8cecd488ebb3f5b34692e70f09bb89cc2c8ec3ad`.
 - Isolated service `cargo test --locked -- --test-threads=1`: exit 0 (`SERVICE_TEST:0`).
 - Isolated service `cargo check --locked --all-targets`: exit 0 (`SERVICE_CHECK:0`).
 - Desktop `npm run typecheck`: exit 0 (`TC:0`), re-run on the checked-out functional SHA `8cecd488ebb3f5b34692e70f09bb89cc2c8ec3ad`.
 - Desktop `npm test`: exit 0 (`NPM:0`, 58 files, 428 tests), re-run on the checked-out functional SHA `8cecd488ebb3f5b34692e70f09bb89cc2c8ec3ad`. These three results are for `8cecd488ebb3f5b34692e70f09bb89cc2c8ec3ad`, not for `ccf776393988f2452b610a8aed77abbe66423076`.
-- `desktop/src-tauri` `cargo test --locked`: exit 0 (`TAURI:0`, 50 lib tests). One earlier parallel run failed `public_run_list_and_get_do_not_register_raw_run_watchers` with instance-lock os error 17. The isolated rerun exited 0.
+- `desktop/src-tauri` `cargo test --locked`: exit 0 (`TAURI:0`, 50 lib tests), re-run for tree `2ade073c8ac6496c46d428a1b16993bc6d33b079` / SHA `8cecd488ebb3f5b34692e70f09bb89cc2c8ec3ad`.
 
 | Gap | Result on `8cecd488` / `2ade073c` | Named regression |
 | --- | --- | --- |
