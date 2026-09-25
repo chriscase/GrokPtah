@@ -458,33 +458,35 @@ Production revocable xAI lease: STILL UNAVAILABLE.
 
 ## Scoped apply receipt transaction
 
-Prior functional SHA: `d7306c1e7d346d1ee9ed6f36e06e457d5a65c6c6` (tree `a121de35fe498bc9fb147f53ccfa5f034949d95f`). This repair is functional SHA `ccf776393988f2452b610a8aed77abbe66423076` (tree `01ad9cfcdcdb4d0c30ac3cce3384be77340bad33`). It is not an independent acceptance of the frozen goal.
+Prior functional SHA: `d7306c1e7d346d1ee9ed6f36e06e457d5a65c6c6` (tree `a121de35fe498bc9fb147f53ccfa5f034949d95f`). This repair is functional SHA `8cecd488ebb3f5b34692e70f09bb89cc2c8ec3ad` (tree `2ade073c8ac6496c46d428a1b16993bc6d33b079`). It is not an independent acceptance of the frozen goal.
 
-Apply cleanup sealing, receipt matching, and receipt completion resolve one owner-sharded receipt from the authenticated owner, session, and canonical workspace. They validate schema, owner, session, workspace digest, request ID, tool, payload hash, and expected status, and they do not scan the receipt tree. A same request ID and session UUID under another owner or workspace stays byte-identical. An admission envelope is stored before either the pending receipt or the ApplySourceIntent changes, and it is removed only after both records match. A typed apply phase leaves the exact receipt recoverable once a source effect is possible. Store-open recovery completes that original receipt from AlreadyApplied, NotApplied, or Poisoned source classification before it clears the intent. Poisoned source keeps the intent and does not claim success or no effect.
+Apply cleanup sealing, receipt matching, and receipt completion resolve one receipt from the authenticated owner, session, and canonical workspace. The durable path is `idempotency/v2/{owner-digest}/{workspace-digest}/{request}.json`. They validate schema, owner, session, workspace digest, request ID, tool, payload hash, and expected status, and they do not scan the receipt tree. The same owner, session, and request ID in another workspace is a different file and stays byte-identical. The same workspace with another session still conflicts. An admission envelope is stored before either the pending receipt or the ApplySourceIntent changes, and it is removed only after both records match. A typed apply phase leaves the exact receipt recoverable once a source effect is possible. Store-open recovery completes that original receipt from AlreadyApplied, NotApplied, or Poisoned source classification before it clears the intent. Poisoned source keeps the intent and does not claim success or no effect.
 
-Local validation on the working tree committed as `ccf776393988f2452b610a8aed77abbe66423076` (tree `01ad9cfcdcdb4d0c30ac3cce3384be77340bad33`), before that commit. No executable diff exists after that commit. The named regressions below were `ok`. The live managed-executor test stayed ignored.
+`ccf776393988f2452b610a8aed77abbe66423076` (tree `01ad9cfcdcdb4d0c30ac3cce3384be77340bad33`) is an earlier publication of this repair. Its receipt path was only the owner shard and request ID, so another workspace with the same owner, session, and request ID occupied that file. Hosted Desktop run `36078044062` is the result for that SHA only. It is not the result for `8cecd488ebb3f5b34692e70f09bb89cc2c8ec3ad`.
+
+Local validation on the working tree committed as `8cecd488ebb3f5b34692e70f09bb89cc2c8ec3ad` (tree `2ade073c8ac6496c46d428a1b16993bc6d33b079`), before that commit. No executable diff exists after that commit. The named regressions below were `ok`. The live managed-executor test stayed ignored.
 
 - Bridge `cargo fmt --all -- --check`: exit 0 (`FMT:0`).
 - Bridge `cargo clippy --locked --all-targets -- -D warnings`: exit 0 (`CLIPPY:0`).
-- Bridge `cargo test --locked -- --test-threads=1` on a fresh `GROKPTAH_HOME`: exit 0 (`SUITE:0`). `verified_change_workflow` passed 78 tests. `live_grok_build_dogfood_runs_both_profiles_under_one_authority` stayed ignored.
+- Bridge `cargo test --locked -- --test-threads=1` on a fresh `GROKPTAH_HOME`: exit 0 (`SUITE:0`). `verified_change_workflow` includes the workspace collision regression. `live_grok_build_dogfood_runs_both_profiles_under_one_authority` stayed ignored.
 - `cargo test -p xai-host-authority --locked -- --test-threads=1`: exit 0 (`AUTHORITY:0`).
+- Isolated service `cargo test --locked -- --test-threads=1`: exit 0 (`SERVICE_TEST:0`).
 - Isolated service `cargo check --locked --all-targets`: exit 0 (`SERVICE_CHECK:0`).
-- Isolated service `cargo test --locked -- --test-threads=1`: the other conformance tests passed. `disconnect_reconnect_restart_and_cursor_expiry_are_durable` failed once with journal lock os error 35. An isolated rerun of that test exited 0 (`SERVICE_DISCONNECT_FINAL:0`).
 - Desktop `npm run typecheck`: exit 0 (`TC:0`).
 - Desktop `npm test`: exit 0 (`NPM:0`, 58 files, 428 tests).
-- `desktop/src-tauri` `cargo test --locked`: exit 0 (`TAURI:0`, 50 lib tests).
+- `desktop/src-tauri` `cargo test --locked`: exit 0 (`TAURI:0`, 50 lib tests). One earlier parallel run failed `public_run_list_and_get_do_not_register_raw_run_watchers` with instance-lock os error 17. The isolated rerun exited 0.
 
-| Gap | Result on `ccf776393` / `01ad9cfc` | Named regression |
+| Gap | Result on `8cecd488` / `2ade073c` | Named regression |
 | --- | --- | --- |
-| R1 exact receipt | Seal, match, and complete one owner-scoped receipt. A foreign owner or workspace collision stays unchanged. | `foreign_owner_receipt_collision_is_ignored_and_unchanged`; `foreign_workspace_receipt_collision_is_ignored_and_unchanged`; `apply_recovery_completes_only_the_exact_scoped_receipt`; `receipt_lookup_does_not_scan_unrelated_owner_shards` |
+| R1 exact receipt | Seal, match, and complete one workspace-scoped receipt. A foreign owner or workspace collision stays unchanged and does not block the authorized apply. | `foreign_owner_receipt_collision_is_ignored_and_unchanged`; `foreign_workspace_receipt_collision_is_ignored_and_unchanged`; `apply_recovery_completes_only_the_exact_scoped_receipt`; `receipt_lookup_does_not_scan_unrelated_owner_shards` |
 | R2 admission | Five cuts reopen to a terminal not-admitted receipt or a recoverable admitted pair. None stay permanently in progress. | `admission_fault_cuts_reopen_without_a_permanent_in_progress_receipt` |
 | R3 original request | AlreadyApplied replays the original success. NotApplied is terminal. Poisoned does not replay success or no effect. | `fault4_original_request_replays_recovered_success`; `fault5_original_request_replays_recovered_success`; `crash_after_intent_before_source_effect_resolves_original_request`; `not_applied_recovery_does_not_leave_a_permanent_pending_receipt`; `poisoned_recovery_never_replays_success_or_no_effect`; `repeated_store_reopen_is_idempotent_for_receipt_work_and_source` |
 | R4 intent retirement | The receipt is complete before the intent is removed. Replay converges. | `receipt_completion_precedes_intent_removal` |
 | Accepted seals | Stale cleanup, foreign-path preservation, symlink containment, metadata case, and the approval-bound bundle stayed green. | `stale_cleanup_requires_the_approved_apply_bundle`; `foreign_file_at_candidate_add_path_is_preserved_and_discard_refuses`; `parent_component_after_symlink_cannot_escape`; `case_variant_metadata_symlink_target_is_rejected`; `resealed_patch_after_approval_cannot_apply` |
 
-Hosted Desktop for repaired functional SHA `ccf776393988f2452b610a8aed77abbe66423076` only: GitHub Actions run `36078044062` attempt 1 (https://github.com/chriscase/GrokPtah/actions/runs/36078044062) concluded `success`. The event was `pull_request`. `head_sha` was `ccf776393988f2452b610a8aed77abbe66423076`. The `desktop` job had no failed steps (`2026-09-25T00:34:49Z` to `2026-09-25T01:02:40Z`).
+Hosted Desktop for repaired functional SHA `8cecd488ebb3f5b34692e70f09bb89cc2c8ec3ad` only: GitHub Actions run `36083488303` attempt 1 (https://github.com/chriscase/GrokPtah/actions/runs/36083488303) concluded `success`. The event was `pull_request`. `head_sha` was `8cecd488ebb3f5b34692e70f09bb89cc2c8ec3ad`. The `desktop` job had no failed steps (`2026-09-25T01:46:55Z` to `2026-09-25T02:13:58Z`).
 
-The commit that adds this section is documentation only. Its tree is not `01ad9cfcdcdb4d0c30ac3cce3384be77340bad33`. A Desktop run for that docs tip is not the result above.
+The commit that adds this correction is documentation only. Its tree is not `2ade073c8ac6496c46d428a1b16993bc6d33b079`. A Desktop run for that docs tip is not the result above.
 
 Live-provider test: NOT RUN.
 
