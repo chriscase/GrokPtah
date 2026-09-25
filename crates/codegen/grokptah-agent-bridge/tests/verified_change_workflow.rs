@@ -11,17 +11,19 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use grokptah_agent_bridge::orchestration::{
-    AuthContext, ManagedExecutionBudgetProfile, ManagedGrokExecutorConfig, ManagedIntentState,
-    OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, VerifiedChangeRequest,
-    WorkPolicy, WorkState, WorkspaceAllowlist,
+    ApplyPhase, AuthContext, IdempotencyScope, ManagedExecutionBudgetProfile,
+    ManagedGrokExecutorConfig, ManagedIntentState, OrchStore, OrchestrationConfig,
+    OrchestrationService, RunBounds, VerifiedChangeRequest, WorkPolicy, WorkState,
+    WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
     derived_snapshot_fingerprint, directory_digest, execute_required_checks, file_digest,
     read_check_authority, recompute_candidate_apply_bundle, retained_candidate_diff_digest,
     set_grokptah_home_override, start_control_server, write_check_authority, AgentHost,
     CredentialLeaseHandle, CredentialLeaseResolver, GrokBuildAdapterError, HostConfig,
-    HostLeaseAuthority, HostRuntime, RequiredCheckCwd, RequiredCheckSpec, SessionKind, APPLY_FAULT,
-    BEFORE_CANDIDATE_BIND, CHECK_CONFINEMENT_EXECUTABLE, CLEANUP_FAULT, SKIP_VERIFIED_DRIVE,
+    HostLeaseAuthority, HostRuntime, RequiredCheckCwd, RequiredCheckSpec, SessionKind,
+    ADMISSION_FAULT, APPLY_FAULT, BEFORE_CANDIDATE_BIND, CHECK_CONFINEMENT_EXECUTABLE,
+    CLEANUP_FAULT, RECEIPT_TREE_SCANS, SKIP_VERIFIED_DRIVE,
 };
 use grokptah_agent_sdk::GrokBuildGitIdentity;
 use tempfile::tempdir;
@@ -1720,6 +1722,7 @@ struct ResetFault;
 impl Drop for ResetFault {
     fn drop(&mut self) {
         APPLY_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+        ADMISSION_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
         CLEANUP_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
     }
 }
@@ -5072,4 +5075,1052 @@ async fn discard_receipt_completes_only_after_full_source_restoration() {
         WorkState::Cancelled
     );
     harness.close().await;
+}
+
+fn source_at(workspace: &Path) -> (String, String) {
+    (
+        fs::read_to_string(workspace.join("src/ledger.rs")).unwrap(),
+        fs::read_to_string(workspace.join("src/report.rs")).unwrap(),
+    )
+}
+
+fn idempotency_files(root: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let Ok(owners) = fs::read_dir(root.join("idempotency").join("v2")) else {
+        return paths;
+    };
+    for owner in owners.flatten() {
+        let Ok(files) = fs::read_dir(owner.path()) else {
+            continue;
+        };
+        for file in files.flatten() {
+            if file.path().extension().and_then(|value| value.to_str()) == Some("json") {
+                paths.push(file.path());
+            }
+        }
+    }
+    paths.sort();
+    paths
+}
+
+fn admission_files(root: &Path) -> Vec<String> {
+    let mut names = Vec::new();
+    if let Ok(entries) = fs::read_dir(root.join("apply-admissions")) {
+        for entry in entries.flatten() {
+            if entry.path().extension().and_then(|value| value.to_str()) == Some("json") {
+                names.push(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+    }
+    names.sort();
+    names
+}
+
+fn primary_receipt(root: &Path, request_id: &str) -> (PathBuf, serde_json::Value, Vec<u8>) {
+    for path in idempotency_files(root) {
+        if path.file_name().and_then(|name| name.to_str())
+            == Some("foreign-workspace-collision.json")
+        {
+            continue;
+        }
+        let bytes = fs::read(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        if value["ownerId"] == "primary" && value["requestId"] == request_id {
+            return (path, value, bytes);
+        }
+    }
+    panic!("missing primary receipt for {request_id}");
+}
+
+fn plant_owner_collision(store: &OrchStore, session: Uuid, request_id: &str) -> PathBuf {
+    let scope =
+        IdempotencyScope::new("intruder", session, Path::new("/foreign/workspace")).unwrap();
+    let before = idempotency_files(store.root());
+    store
+        .claim_idempotency(
+            &scope,
+            "ptah_apply_verified_change",
+            request_id,
+            "foreign-owner-payload",
+        )
+        .unwrap();
+    idempotency_files(store.root())
+        .into_iter()
+        .find(|path| !before.contains(path))
+        .expect("foreign owner receipt")
+}
+
+fn plant_workspace_collision(root: &Path, session: Uuid, request_id: &str) -> PathBuf {
+    let dir = primary_receipt(root, "approve-repair")
+        .0
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let path = dir.join("foreign-workspace-collision.json");
+    let body = serde_json::json!({
+        "schemaVersion": 2,
+        "ownerId": "primary",
+        "sessionId": session,
+        "workspaceDigest": "ab".repeat(32),
+        "requestId": request_id,
+        "payloadHash": "foreign-workspace-payload",
+        "runId": null,
+        "tool": "ptah_apply_verified_change",
+        "response": {"marker": "foreign-workspace"},
+        "error": null,
+        "createdAt": "2026-09-24T00:00:00Z",
+        "status": "pending",
+        "cleanupPlanDigest": ""
+    });
+    fs::write(&path, serde_json::to_vec_pretty(&body).unwrap()).unwrap();
+    path
+}
+
+fn freeze_foreign(path: &Path) -> Vec<u8> {
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    value["status"] = serde_json::json!("complete");
+    value["response"] = serde_json::json!({"marker": "foreign-frozen"});
+    value["cleanupPlanDigest"] = serde_json::json!("");
+    let bytes = serde_json::to_vec_pretty(&value).unwrap();
+    fs::write(path, &bytes).unwrap();
+    fs::read(path).unwrap()
+}
+
+async fn stop_live(live: LiveRuntime) {
+    live.orch.stop_background_tasks().await;
+    live.host.shutdown().await;
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn foreign_owner_receipt_collision_is_ignored_and_unchanged() {
+    let _reset = ResetFault;
+    let (harness, work_id, digest, revision) = approved_repair("foreign-owner").await;
+    let request_id = "foreign-owner-apply";
+    let foreign = plant_owner_collision(harness.orch.store(), harness.lane, request_id);
+    let before = fs::read(&foreign).unwrap();
+    let applied = apply_at(&harness, request_id, &work_id, &digest, revision)
+        .await
+        .unwrap();
+    assert_eq!(applied["work"]["state"], "succeeded");
+    assert_eq!(fs::read(&foreign).unwrap(), before);
+    let (_, receipt, _) = primary_receipt(harness.orch.store().root(), request_id);
+    assert_eq!(receipt["status"], "complete");
+    assert_eq!(receipt["response"]["work"]["state"], "succeeded");
+    assert!(!receipt["cleanupPlanDigest"].as_str().unwrap().is_empty());
+    let foreign_body: serde_json::Value = serde_json::from_slice(&before).unwrap();
+    assert_eq!(foreign_body["ownerId"], "intruder");
+    assert_eq!(foreign_body["cleanupPlanDigest"], "");
+    assert!(foreign_body["response"].is_null());
+    harness.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn foreign_workspace_receipt_collision_is_ignored_and_unchanged() {
+    let _reset = ResetFault;
+    let (harness, work_id, digest, revision) = approved_repair("foreign-workspace").await;
+    let request_id = "foreign-workspace-apply";
+    let foreign = plant_workspace_collision(harness.orch.store().root(), harness.lane, request_id);
+    let before = fs::read(&foreign).unwrap();
+    let applied = apply_at(&harness, request_id, &work_id, &digest, revision)
+        .await
+        .unwrap();
+    assert_eq!(applied["work"]["state"], "succeeded");
+    assert_eq!(fs::read(&foreign).unwrap(), before);
+    let (authorized, receipt, _) = primary_receipt(harness.orch.store().root(), request_id);
+    assert_ne!(authorized, foreign);
+    assert_eq!(receipt["status"], "complete");
+    assert_eq!(receipt["response"]["work"]["state"], "succeeded");
+    assert!(!receipt["cleanupPlanDigest"].as_str().unwrap().is_empty());
+    let foreign_body: serde_json::Value = serde_json::from_slice(&before).unwrap();
+    assert_eq!(foreign_body["requestId"], request_id);
+    assert_eq!(foreign_body["sessionId"], harness.lane.to_string());
+    assert_eq!(foreign_body["cleanupPlanDigest"], "");
+    assert_eq!(foreign_body["response"]["marker"], "foreign-workspace");
+    harness.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn apply_recovery_completes_only_the_exact_scoped_receipt() {
+    let _reset = ResetFault;
+    let (harness, work_id, digest, revision) = approved_repair("scoped-recovery").await;
+    let request_id = "scoped-recovery-apply";
+    let workspace = harness.workspace.path().to_path_buf();
+    let fake = harness.fake_dir.path().join("grok");
+    let isolate = harness.isolate.path().to_path_buf();
+    let identity = harness.identity.clone();
+    let lease = harness.fake_dir.path().join("lease.json");
+    let lane = harness.lane;
+    let owner_path = plant_owner_collision(harness.orch.store(), lane, request_id);
+    let workspace_path = plant_workspace_collision(harness.orch.store().root(), lane, request_id);
+    let owner_bytes = freeze_foreign(&owner_path);
+    let workspace_bytes = freeze_foreign(&workspace_path);
+    APPLY_FAULT.store(4, std::sync::atomic::Ordering::SeqCst);
+    let interrupted = apply_at(&harness, request_id, &work_id, &digest, revision)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        interrupted.apply_phase(),
+        Some(ApplyPhase::SourceEffectCompleteBeforeWorkCommit)
+    );
+    APPLY_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+    let live = reopen_production_store(
+        harness.host,
+        harness.orch,
+        &workspace,
+        &fake,
+        &isolate,
+        &identity,
+        &lease,
+    )
+    .await;
+    assert_eq!(fs::read(&owner_path).unwrap(), owner_bytes);
+    assert_eq!(fs::read(&workspace_path).unwrap(), workspace_bytes);
+    let (_, receipt, _) = primary_receipt(live.orch.store().root(), request_id);
+    assert_eq!(receipt["status"], "complete");
+    assert_eq!(receipt["response"]["work"]["state"], "succeeded");
+    assert!(!receipt["cleanupPlanDigest"].as_str().unwrap().is_empty());
+    let owner_body: serde_json::Value = serde_json::from_slice(&owner_bytes).unwrap();
+    let workspace_body: serde_json::Value = serde_json::from_slice(&workspace_bytes).unwrap();
+    assert_eq!(owner_body["response"]["marker"], "foreign-frozen");
+    assert_eq!(workspace_body["response"]["marker"], "foreign-frozen");
+    assert_eq!(owner_body["cleanupPlanDigest"], "");
+    assert_eq!(workspace_body["cleanupPlanDigest"], "");
+    let replay = live
+        .orch
+        .apply_verified_change(
+            &auth(),
+            request_id,
+            lane,
+            &workspace,
+            &work_id,
+            &digest,
+            Some(revision),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay["work"]["state"], "succeeded");
+    assert_eq!(fs::read(&owner_path).unwrap(), owner_bytes);
+    assert_eq!(fs::read(&workspace_path).unwrap(), workspace_bytes);
+    stop_live(live).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn receipt_lookup_does_not_scan_unrelated_owner_shards() {
+    let _reset = ResetFault;
+    let (harness, work_id, digest, revision) = approved_repair("receipt-scan").await;
+    let request_id = "receipt-scan-apply";
+    let foreign = plant_owner_collision(harness.orch.store(), harness.lane, request_id);
+    let decoy = plant_workspace_collision(harness.orch.store().root(), harness.lane, request_id);
+    let foreign_before = fs::read(&foreign).unwrap();
+    let decoy_before = fs::read(&decoy).unwrap();
+    RECEIPT_TREE_SCANS.store(0, std::sync::atomic::Ordering::SeqCst);
+    let applied = apply_at(&harness, request_id, &work_id, &digest, revision)
+        .await
+        .unwrap();
+    assert_eq!(applied["work"]["state"], "succeeded");
+    assert_eq!(
+        RECEIPT_TREE_SCANS.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert_eq!(fs::read(&foreign).unwrap(), foreign_before);
+    assert_eq!(fs::read(&decoy).unwrap(), decoy_before);
+    harness.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admission_fault_cuts_reopen_without_a_permanent_in_progress_receipt() {
+    let _reset = ResetFault;
+    for cut in 1..=5 {
+        let (harness, work_id, digest, revision) =
+            approved_repair(&format!("admission-{cut}")).await;
+        let request_id = format!("admission-cut-{cut}");
+        let workspace = harness.workspace.path().to_path_buf();
+        let source_before = harness.source_pair();
+        let fake = harness.fake_dir.path().join("grok");
+        let isolate = harness.isolate.path().to_path_buf();
+        let identity = harness.identity.clone();
+        let lease = harness.fake_dir.path().join("lease.json");
+        let lane = harness.lane;
+        let root = harness.orch.store().root().to_path_buf();
+        ADMISSION_FAULT.store(cut, std::sync::atomic::Ordering::SeqCst);
+        let error = apply_at(&harness, &request_id, &work_id, &digest, revision)
+            .await
+            .unwrap_err();
+        ADMISSION_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            harness.source_pair(),
+            source_before,
+            "cut {cut} touched source"
+        );
+        if cut == 1 {
+            assert_eq!(error.apply_phase(), Some(ApplyPhase::NoSourceEffect));
+            assert!(intent_files(&root).is_empty(), "cut {cut}");
+            assert!(admission_files(&root).is_empty(), "cut {cut}");
+            assert_eq!(
+                receipt_status(&root, &request_id).as_deref(),
+                Some("failed"),
+                "cut {cut}"
+            );
+        } else {
+            assert_eq!(
+                error.apply_phase(),
+                Some(ApplyPhase::SourceEffectPossible),
+                "cut {cut}"
+            );
+            assert_eq!(
+                receipt_status(&root, &request_id).as_deref(),
+                Some("pending"),
+                "cut {cut}"
+            );
+            let (_, receipt, _) = primary_receipt(&root, &request_id);
+            match cut {
+                2 => {
+                    assert!(intent_files(&root).is_empty(), "cut {cut}");
+                    assert_eq!(admission_files(&root).len(), 1, "cut {cut}");
+                    assert_eq!(receipt["cleanupPlanDigest"], "", "cut {cut}");
+                }
+                3 => {
+                    assert!(intent_files(&root).is_empty(), "cut {cut}");
+                    assert_eq!(admission_files(&root).len(), 1, "cut {cut}");
+                    assert!(!receipt["cleanupPlanDigest"].as_str().unwrap().is_empty());
+                }
+                4 => {
+                    assert_eq!(intent_files(&root).len(), 1, "cut {cut}");
+                    assert_eq!(admission_files(&root).len(), 1, "cut {cut}");
+                    assert!(!receipt["cleanupPlanDigest"].as_str().unwrap().is_empty());
+                }
+                5 => {
+                    assert_eq!(intent_files(&root).len(), 1, "cut {cut}");
+                    assert!(admission_files(&root).is_empty(), "cut {cut}");
+                    assert!(!receipt["cleanupPlanDigest"].as_str().unwrap().is_empty());
+                }
+                _ => unreachable!(),
+            }
+            if matches!(cut, 2..=4) {
+                let names = admission_files(&root);
+                let envelope: serde_json::Value = serde_json::from_slice(
+                    &fs::read(root.join("apply-admissions").join(&names[0])).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(envelope["schemaVersion"], 1);
+                assert_eq!(envelope["workId"], work_id);
+                for key in [
+                    "sessionId",
+                    "workspace",
+                    "ownerId",
+                    "requestId",
+                    "candidateDigest",
+                    "cleanupPlanDigest",
+                    "receiptPath",
+                    "intentPath",
+                    "receiptPriorDigest",
+                    "receiptNextDigest",
+                    "intentNextDigest",
+                    "receiptNextText",
+                    "intentNextText",
+                ] {
+                    assert!(
+                        envelope[key]
+                            .as_str()
+                            .is_some_and(|value| !value.is_empty()),
+                        "cut {cut} envelope missing {key}"
+                    );
+                }
+            }
+        }
+        let live = reopen_production_store(
+            harness.host,
+            harness.orch,
+            &workspace,
+            &fake,
+            &isolate,
+            &identity,
+            &lease,
+        )
+        .await;
+        let replay = live
+            .orch
+            .apply_verified_change(
+                &auth(),
+                &request_id,
+                lane,
+                &workspace,
+                &work_id,
+                &digest,
+                Some(revision),
+            )
+            .await
+            .unwrap_err();
+        let rendered = replay.to_string();
+        assert!(
+            !rendered.contains("still in progress"),
+            "cut {cut}: {rendered}"
+        );
+        assert_ne!(
+            receipt_status(live.orch.store().root(), &request_id).as_deref(),
+            Some("pending"),
+            "cut {cut}"
+        );
+        assert_eq!(
+            (
+                fs::read_to_string(workspace.join("src/ledger.rs")).unwrap(),
+                fs::read_to_string(workspace.join("src/report.rs")).unwrap()
+            ),
+            source_before,
+            "cut {cut}"
+        );
+        assert_ne!(
+            live.orch
+                .store()
+                .load_work_item(&work_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            WorkState::Succeeded,
+            "cut {cut}"
+        );
+        if cut == 1 {
+            assert!(
+                rendered.contains("before the intent"),
+                "cut {cut}: {rendered}"
+            );
+            assert!(intent_files(live.orch.store().root()).is_empty());
+        } else {
+            assert!(
+                rendered.contains("definitely not applied"),
+                "cut {cut}: {rendered}"
+            );
+            assert!(
+                intent_files(live.orch.store().root()).is_empty(),
+                "cut {cut}"
+            );
+            assert!(
+                admission_files(live.orch.store().root()).is_empty(),
+                "cut {cut}"
+            );
+        }
+        stop_live(live).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fault4_original_request_replays_recovered_success() {
+    let _reset = ResetFault;
+    let (harness, work_id, digest, revision) = approved_repair("fault4-original").await;
+    let workspace = harness.workspace.path().to_path_buf();
+    let fake = harness.fake_dir.path().join("grok");
+    let isolate = harness.isolate.path().to_path_buf();
+    let identity = harness.identity.clone();
+    let lease = harness.fake_dir.path().join("lease.json");
+    let lane = harness.lane;
+    let request_id = "fault4-original-request";
+    APPLY_FAULT.store(4, std::sync::atomic::Ordering::SeqCst);
+    let interrupted = apply_at(&harness, request_id, &work_id, &digest, revision)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        interrupted.apply_phase(),
+        Some(ApplyPhase::SourceEffectCompleteBeforeWorkCommit)
+    );
+    assert_eq!(
+        receipt_status(harness.orch.store().root(), request_id).as_deref(),
+        Some("pending")
+    );
+    assert_ne!(
+        harness
+            .orch
+            .store()
+            .load_work_item(&work_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        WorkState::Succeeded
+    );
+    APPLY_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+    let source = (
+        fs::read(workspace.join("src/ledger.rs")).unwrap(),
+        fs::read(workspace.join("src/report.rs")).unwrap(),
+    );
+    assert_eq!(source.0, LEDGER_AFTER.as_bytes());
+    let live = reopen_production_store(
+        harness.host,
+        harness.orch,
+        &workspace,
+        &fake,
+        &isolate,
+        &identity,
+        &lease,
+    )
+    .await;
+    let recovered = live.orch.store().load_work_item(&work_id).unwrap().unwrap();
+    assert_eq!(recovered.state, WorkState::Succeeded);
+    assert!(
+        recovered
+            .result
+            .as_ref()
+            .unwrap()
+            .candidate_verification
+            .as_ref()
+            .unwrap()
+            .applied
+    );
+    assert!(intent_files(live.orch.store().root()).is_empty());
+    assert_eq!(
+        receipt_status(live.orch.store().root(), request_id).as_deref(),
+        Some("complete")
+    );
+    let replay = live
+        .orch
+        .apply_verified_change(
+            &auth(),
+            request_id,
+            lane,
+            &workspace,
+            &work_id,
+            &digest,
+            Some(revision),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay["work"]["state"], "succeeded");
+    assert_eq!(fs::read(workspace.join("src/ledger.rs")).unwrap(), source.0);
+    assert_eq!(fs::read(workspace.join("src/report.rs")).unwrap(), source.1);
+    let again = live
+        .orch
+        .apply_verified_change(
+            &auth(),
+            request_id,
+            lane,
+            &workspace,
+            &work_id,
+            &digest,
+            Some(revision),
+        )
+        .await
+        .unwrap();
+    assert_eq!(again, replay);
+    stop_live(live).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fault5_original_request_replays_recovered_success() {
+    let _reset = ResetFault;
+    let (harness, work_id, digest, revision) = approved_repair("fault5-original").await;
+    let workspace = harness.workspace.path().to_path_buf();
+    let fake = harness.fake_dir.path().join("grok");
+    let isolate = harness.isolate.path().to_path_buf();
+    let identity = harness.identity.clone();
+    let lease = harness.fake_dir.path().join("lease.json");
+    let lane = harness.lane;
+    let request_id = "fault5-original-request";
+    APPLY_FAULT.store(5, std::sync::atomic::Ordering::SeqCst);
+    let interrupted = apply_at(&harness, request_id, &work_id, &digest, revision)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        interrupted.apply_phase(),
+        Some(ApplyPhase::WorkCommittedBeforeReceipt)
+    );
+    assert!(
+        interrupted
+            .to_string()
+            .contains("before the idempotency response"),
+        "{interrupted}"
+    );
+    assert_eq!(
+        harness
+            .orch
+            .store()
+            .load_work_item(&work_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        WorkState::Succeeded
+    );
+    assert_eq!(
+        receipt_status(harness.orch.store().root(), request_id).as_deref(),
+        Some("pending")
+    );
+    assert_eq!(intent_files(harness.orch.store().root()).len(), 1);
+    APPLY_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+    let source = fs::read(workspace.join("src/ledger.rs")).unwrap();
+    let live = reopen_production_store(
+        harness.host,
+        harness.orch,
+        &workspace,
+        &fake,
+        &isolate,
+        &identity,
+        &lease,
+    )
+    .await;
+    assert!(intent_files(live.orch.store().root()).is_empty());
+    let replay = live
+        .orch
+        .apply_verified_change(
+            &auth(),
+            request_id,
+            lane,
+            &workspace,
+            &work_id,
+            &digest,
+            Some(revision),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay["work"]["state"], "succeeded");
+    assert_eq!(fs::read(workspace.join("src/ledger.rs")).unwrap(), source);
+    assert_eq!(
+        receipt_status(live.orch.store().root(), request_id).as_deref(),
+        Some("complete")
+    );
+    stop_live(live).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn crash_after_intent_before_source_effect_resolves_original_request() {
+    let _reset = ResetFault;
+    let (harness, work_id, digest, revision) = approved_repair("crash-before-effect").await;
+    let workspace = harness.workspace.path().to_path_buf();
+    let fake = harness.fake_dir.path().join("grok");
+    let isolate = harness.isolate.path().to_path_buf();
+    let identity = harness.identity.clone();
+    let lease = harness.fake_dir.path().join("lease.json");
+    let lane = harness.lane;
+    let request_id = "crash-before-effect-request";
+    let source_before = harness.source_pair();
+    APPLY_FAULT.store(2, std::sync::atomic::Ordering::SeqCst);
+    let interrupted = apply_at(&harness, request_id, &work_id, &digest, revision)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        interrupted.apply_phase(),
+        Some(ApplyPhase::SourceEffectPossible)
+    );
+    assert_eq!(intent_files(harness.orch.store().root()).len(), 1);
+    assert_eq!(
+        receipt_status(harness.orch.store().root(), request_id).as_deref(),
+        Some("pending")
+    );
+    APPLY_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+    let live = reopen_production_store(
+        harness.host,
+        harness.orch,
+        &workspace,
+        &fake,
+        &isolate,
+        &identity,
+        &lease,
+    )
+    .await;
+    let replay = live
+        .orch
+        .apply_verified_change(
+            &auth(),
+            request_id,
+            lane,
+            &workspace,
+            &work_id,
+            &digest,
+            Some(revision),
+        )
+        .await
+        .unwrap_err();
+    let rendered = replay.to_string();
+    assert!(rendered.contains("definitely not applied"), "{rendered}");
+    assert!(!rendered.contains("still in progress"), "{rendered}");
+    assert_eq!(
+        (
+            fs::read_to_string(workspace.join("src/ledger.rs")).unwrap(),
+            fs::read_to_string(workspace.join("src/report.rs")).unwrap()
+        ),
+        source_before
+    );
+    assert_ne!(
+        live.orch
+            .store()
+            .load_work_item(&work_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        WorkState::Succeeded
+    );
+    assert_eq!(
+        receipt_status(live.orch.store().root(), request_id).as_deref(),
+        Some("failed")
+    );
+    stop_live(live).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn not_applied_recovery_does_not_leave_a_permanent_pending_receipt() {
+    let _reset = ResetFault;
+    let (harness, work_id, digest, revision) = approved_repair("not-applied-receipt").await;
+    let workspace = harness.workspace.path().to_path_buf();
+    let fake = harness.fake_dir.path().join("grok");
+    let isolate = harness.isolate.path().to_path_buf();
+    let identity = harness.identity.clone();
+    let lease = harness.fake_dir.path().join("lease.json");
+    let lane = harness.lane;
+    let request_id = "not-applied-receipt-request";
+    ADMISSION_FAULT.store(5, std::sync::atomic::Ordering::SeqCst);
+    let interrupted = apply_at(&harness, request_id, &work_id, &digest, revision)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        interrupted.apply_phase(),
+        Some(ApplyPhase::SourceEffectPossible)
+    );
+    assert_eq!(
+        receipt_status(harness.orch.store().root(), request_id).as_deref(),
+        Some("pending")
+    );
+    ADMISSION_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+    let live = reopen_production_store(
+        harness.host,
+        harness.orch,
+        &workspace,
+        &fake,
+        &isolate,
+        &identity,
+        &lease,
+    )
+    .await;
+    assert_eq!(
+        receipt_status(live.orch.store().root(), request_id).as_deref(),
+        Some("failed")
+    );
+    let (_, receipt, _) = primary_receipt(live.orch.store().root(), request_id);
+    assert!(receipt["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("definitely not applied"));
+    assert!(intent_files(live.orch.store().root()).is_empty());
+    let replay = live
+        .orch
+        .apply_verified_change(
+            &auth(),
+            request_id,
+            lane,
+            &workspace,
+            &work_id,
+            &digest,
+            Some(revision),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        !replay.to_string().contains("still in progress"),
+        "{replay}"
+    );
+    assert!(
+        replay.to_string().contains("definitely not applied"),
+        "{replay}"
+    );
+    assert_eq!(
+        receipt_status(live.orch.store().root(), request_id).as_deref(),
+        Some("failed")
+    );
+    stop_live(live).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn poisoned_recovery_never_replays_success_or_no_effect() {
+    let _reset = ResetFault;
+    let (harness, work_id, digest, revision) = approved_repair("poison-original").await;
+    let workspace = harness.workspace.path().to_path_buf();
+    let fake = harness.fake_dir.path().join("grok");
+    let isolate = harness.isolate.path().to_path_buf();
+    let identity = harness.identity.clone();
+    let lease = harness.fake_dir.path().join("lease.json");
+    let lane = harness.lane;
+    let request_id = "poison-original-request";
+    APPLY_FAULT.store(7, std::sync::atomic::Ordering::SeqCst);
+    let failed = apply_at(&harness, request_id, &work_id, &digest, revision)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        failed.apply_phase(),
+        Some(ApplyPhase::ReconciliationRequired)
+    );
+    let poisoned = harness.source_pair();
+    assert!(
+        poisoned.0.contains("rollback-poison") || poisoned.1.contains("rollback-poison"),
+        "{poisoned:?}"
+    );
+    assert_eq!(
+        receipt_status(harness.orch.store().root(), request_id).as_deref(),
+        Some("pending")
+    );
+    assert_eq!(intent_files(harness.orch.store().root()).len(), 1);
+    APPLY_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+    let live = reopen_production_store(
+        harness.host,
+        harness.orch,
+        &workspace,
+        &fake,
+        &isolate,
+        &identity,
+        &lease,
+    )
+    .await;
+    assert_eq!(intent_files(live.orch.store().root()).len(), 1);
+    let work = live.orch.store().load_work_item(&work_id).unwrap().unwrap();
+    assert_ne!(work.state, WorkState::Succeeded);
+    assert!(
+        work.result
+            .as_ref()
+            .unwrap()
+            .candidate_verification
+            .as_ref()
+            .unwrap()
+            .reconciliation_required
+    );
+    assert_eq!(
+        receipt_status(live.orch.store().root(), request_id).as_deref(),
+        Some("failed")
+    );
+    let receipt_bytes = primary_receipt(live.orch.store().root(), request_id).2;
+    let replay = live
+        .orch
+        .apply_verified_change(
+            &auth(),
+            request_id,
+            lane,
+            &workspace,
+            &work_id,
+            &digest,
+            Some(revision),
+        )
+        .await
+        .unwrap_err();
+    let rendered = replay.to_string();
+    assert!(rendered.contains("reconciliation"), "{rendered}");
+    assert!(!rendered.contains("definitely not applied"), "{rendered}");
+    assert!(!rendered.contains("still in progress"), "{rendered}");
+    assert_eq!(source_at(&workspace), poisoned);
+    let again = live
+        .orch
+        .apply_verified_change(
+            &auth(),
+            request_id,
+            lane,
+            &workspace,
+            &work_id,
+            &digest,
+            Some(revision),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(again.to_string(), rendered);
+    let reopened = reopen_production_store(
+        live.host, live.orch, &workspace, &fake, &isolate, &identity, &lease,
+    )
+    .await;
+    assert_eq!(
+        primary_receipt(reopened.orch.store().root(), request_id).2,
+        receipt_bytes
+    );
+    assert_eq!(source_at(&workspace), poisoned);
+    assert_eq!(intent_files(reopened.orch.store().root()).len(), 1);
+    assert_ne!(
+        reopened
+            .orch
+            .store()
+            .load_work_item(&work_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        WorkState::Succeeded
+    );
+    stop_live(reopened).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_store_reopen_is_idempotent_for_receipt_work_and_source() {
+    let _reset = ResetFault;
+    let (harness, work_id, digest, revision) = approved_repair("reopen-idempotent").await;
+    let workspace = harness.workspace.path().to_path_buf();
+    let fake = harness.fake_dir.path().join("grok");
+    let isolate = harness.isolate.path().to_path_buf();
+    let identity = harness.identity.clone();
+    let lease = harness.fake_dir.path().join("lease.json");
+    let lane = harness.lane;
+    let request_id = "reopen-idempotent-request";
+    APPLY_FAULT.store(4, std::sync::atomic::Ordering::SeqCst);
+    let interrupted = apply_at(&harness, request_id, &work_id, &digest, revision)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        interrupted.apply_phase(),
+        Some(ApplyPhase::SourceEffectCompleteBeforeWorkCommit)
+    );
+    APPLY_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+    let source = source_at(&workspace);
+    let live = reopen_production_store(
+        harness.host,
+        harness.orch,
+        &workspace,
+        &fake,
+        &isolate,
+        &identity,
+        &lease,
+    )
+    .await;
+    let first = live
+        .orch
+        .apply_verified_change(
+            &auth(),
+            request_id,
+            lane,
+            &workspace,
+            &work_id,
+            &digest,
+            Some(revision),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first["work"]["state"], "succeeded");
+    let receipt_bytes = primary_receipt(live.orch.store().root(), request_id).2;
+    let work_state = live
+        .orch
+        .store()
+        .load_work_item(&work_id)
+        .unwrap()
+        .unwrap()
+        .state;
+    assert!(intent_files(live.orch.store().root()).is_empty());
+    let again = reopen_production_store(
+        live.host, live.orch, &workspace, &fake, &isolate, &identity, &lease,
+    )
+    .await;
+    assert_eq!(
+        primary_receipt(again.orch.store().root(), request_id).2,
+        receipt_bytes
+    );
+    assert_eq!(source_at(&workspace), source);
+    assert_eq!(
+        again
+            .orch
+            .store()
+            .load_work_item(&work_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        work_state
+    );
+    assert!(intent_files(again.orch.store().root()).is_empty());
+    let replay = again
+        .orch
+        .apply_verified_change(
+            &auth(),
+            request_id,
+            lane,
+            &workspace,
+            &work_id,
+            &digest,
+            Some(revision),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay, first);
+    assert_eq!(source_at(&workspace), source);
+    assert_eq!(
+        primary_receipt(again.orch.store().root(), request_id).2,
+        receipt_bytes
+    );
+    stop_live(again).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn receipt_completion_precedes_intent_removal() {
+    let _reset = ResetFault;
+    let (harness, work_id, digest, revision) = approved_repair("receipt-before-intent").await;
+    let workspace = harness.workspace.path().to_path_buf();
+    let fake = harness.fake_dir.path().join("grok");
+    let isolate = harness.isolate.path().to_path_buf();
+    let identity = harness.identity.clone();
+    let lease = harness.fake_dir.path().join("lease.json");
+    let lane = harness.lane;
+    let request_id = "receipt-before-intent-request";
+    APPLY_FAULT.store(8, std::sync::atomic::Ordering::SeqCst);
+    let interrupted = apply_at(&harness, request_id, &work_id, &digest, revision)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        interrupted.apply_phase(),
+        Some(ApplyPhase::WorkCommittedBeforeReceipt)
+    );
+    assert!(
+        interrupted
+            .to_string()
+            .contains("before the intent was removed"),
+        "{interrupted}"
+    );
+    assert_eq!(
+        harness
+            .orch
+            .store()
+            .load_work_item(&work_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        WorkState::Succeeded
+    );
+    assert_eq!(intent_files(harness.orch.store().root()).len(), 1);
+    assert_eq!(
+        receipt_status(harness.orch.store().root(), request_id).as_deref(),
+        Some("complete")
+    );
+    let receipt_bytes = primary_receipt(harness.orch.store().root(), request_id).2;
+    let source = harness.source_pair();
+    APPLY_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+    let live = reopen_production_store(
+        harness.host,
+        harness.orch,
+        &workspace,
+        &fake,
+        &isolate,
+        &identity,
+        &lease,
+    )
+    .await;
+    assert!(intent_files(live.orch.store().root()).is_empty());
+    assert_eq!(
+        primary_receipt(live.orch.store().root(), request_id).2,
+        receipt_bytes
+    );
+    assert_eq!(source_at(&workspace), source);
+    let replay = live
+        .orch
+        .apply_verified_change(
+            &auth(),
+            request_id,
+            lane,
+            &workspace,
+            &work_id,
+            &digest,
+            Some(revision),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay["work"]["state"], "succeeded");
+    let settled = live
+        .orch
+        .apply_verified_change(
+            &auth(),
+            request_id,
+            lane,
+            &workspace,
+            &work_id,
+            &digest,
+            Some(revision),
+        )
+        .await
+        .unwrap();
+    assert_eq!(settled, replay);
+    assert_eq!(source_at(&workspace), source);
+    assert!(intent_files(live.orch.store().root()).is_empty());
+    stop_live(live).await;
 }

@@ -6364,8 +6364,8 @@ impl OrchestrationService {
             Ok(item) => item,
             Err(error) => {
                 if error
-                    .message
-                    .contains("apply committed before the idempotency response")
+                    .apply_phase()
+                    .is_some_and(crate::orchestration::ApplyPhase::leaves_receipt_recoverable)
                 {
                     lease.leave_pending();
                     return Err(error);

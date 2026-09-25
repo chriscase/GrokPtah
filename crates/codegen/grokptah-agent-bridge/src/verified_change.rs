@@ -1490,6 +1490,19 @@ pub fn cleanup_fault() -> u8 {
 /// cancellation commit.
 pub static CLEANUP_FAULT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
+pub fn admission_fault() -> u8 {
+    ADMISSION_FAULT.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Admission cuts. 1 before the recovery envelope, 2 after the envelope and
+/// before the receipt seal, 3 after the seal and before the apply intent, 4
+/// after the intent and before envelope removal, 5 after envelope removal and
+/// before any source effect.
+pub static ADMISSION_FAULT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub static RECEIPT_TREE_SCANS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 pub(crate) struct PromotionRecord {
     pub base_revision: String,
     pub final_fingerprint: String,
