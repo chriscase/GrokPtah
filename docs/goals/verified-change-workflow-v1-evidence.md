@@ -533,6 +533,36 @@ Production revocable xAI lease: STILL UNAVAILABLE.
 
 Independent acceptance: NOT CLAIMED.
 
+## Pending old-layout receipts stay recoverable
+
+Prior functional SHA for this correction: `f77a3222126b053365c035ca344b2fee62ea9709` (tree `3b238644107c5c9ddb0b6e36d6d2c6f8726d2c69`). Reviewed functional SHA remains `8cecd488ebb3f5b34692e70f09bb89cc2c8ec3ad` (tree `2ade073c8ac6496c46d428a1b16993bc6d33b079`). This correction is functional SHA `6316a051c0fe978ac62ebc4f8d9630c68600d1f6` (tree `1178af80ff6521231bd24eeebbacd2057be8468b`). It is not an independent acceptance of the frozen goal.
+
+`fail_orphaned_idempotency_claims` walks flat `idempotency/v2/<owner>/<request>.json` files. On `f77a32221` a pending owner-scoped v2 receipt was rewritten to failed with `use a new request_id` during store open, before claim could adopt it. A pending receipt whose path is that owner-scoped layout and whose identity matches the file is now left pending. Claim still adopts it into the workspace path and returns `Pending`. A new-layout pending receipt is still failed on open.
+
+Before the correction, `old_v2_pending_receipt_is_not_reexecuted` with the fixture planted before `OrchStore::open` exited failed (`LIB:101`): reopen replaced the pending bytes with status `failed` and the message `mutation was interrupted before its durable receipt completed; use a new request_id`. After the correction that test, the other four old-layout regressions, and the locked bridge suite were `ok`.
+
+Local validation on the working tree committed as `6316a051c0fe978ac62ebc4f8d9630c68600d1f6` (tree `1178af80ff6521231bd24eeebbacd2057be8468b`), before that commit. No executable diff exists after that commit. The live managed-executor test stayed ignored.
+
+- Bridge `cargo fmt --all -- --check`: exit 0 (`FMT:0`).
+- Bridge `cargo clippy --locked --all-targets -- -D warnings`: exit 0 (`CLIPPY:0`).
+- Bridge `cargo test --locked -- --test-threads=1` on a fresh `GROKPTAH_HOME`: exit 0 (`SUITE:0`). `old_v2_pending_receipt_is_not_reexecuted` was `ok`. `live_grok_build_dogfood_runs_both_profiles_under_one_authority` stayed ignored.
+- `cargo test -p xai-host-authority --locked`: one parallel run hit `review_does_not_mutate_and_grant_expires` with `Expired` (`AUTHORITY:101`). An isolated rerun exited 0 (`AUTHORITY:0`), including that test.
+- Isolated service `cargo test --locked -- --test-threads=1` on a fresh `GROKPTAH_HOME`: exit 0 (`SERVICE_TEST:0`, 5 passed).
+- Isolated service `cargo check --locked --all-targets`: exit 0 (`SERVICE_CHECK:0`).
+- Desktop `npm run typecheck`: exit 0 (`TC:0`).
+- Desktop `npm test`: exit 0 (`NPM:0`, 58 files, 428 tests).
+- `desktop/src-tauri` `cargo test --locked`: exit 0 (`TAURI:0`, 50 lib tests).
+
+Hosted Desktop for repaired functional SHA `6316a051c0fe978ac62ebc4f8d9630c68600d1f6` only: GitHub Actions run `36192098418` attempt 1 (https://github.com/chriscase/GrokPtah/actions/runs/36192098418) concluded `success`. The event was `pull_request`. `headSha` was `6316a051c0fe978ac62ebc4f8d9630c68600d1f6`. The `desktop` job had no failed steps (`2026-09-25T21:33:41Z` to `2026-09-25T22:09:42Z`).
+
+The commit that adds this section is documentation only. Its tree is not `1178af80ff6521231bd24eeebbacd2057be8468b`. A Desktop run for that docs tip is not the result above.
+
+Live-provider test: NOT RUN.
+
+Production revocable xAI lease: STILL UNAVAILABLE.
+
+Independent acceptance: NOT CLAIMED.
+
 ## Repair identity
 
 - Prior reviewed functional SHA: `32268e89f52776704d7a4729c2bd3581310ceeb7`
