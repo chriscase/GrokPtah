@@ -4608,20 +4608,29 @@ fn bump_work_revision(root: &Path, work_id: &str) -> u64 {
 }
 
 fn receipt_status(root: &Path, request_id: &str) -> Option<String> {
-    let dir = root.join("idempotency").join("v2");
-    let owners = fs::read_dir(dir).ok()?;
-    for owner in owners.flatten() {
-        let files = fs::read_dir(owner.path()).ok()?;
-        for file in files.flatten() {
-            let Ok(text) = fs::read_to_string(file.path()) else {
-                continue;
-            };
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
-                continue;
-            };
-            if value["requestId"] == request_id {
-                return value["status"].as_str().map(str::to_string);
-            }
+    for path in idempotency_files(root) {
+        let Ok(bytes) = fs::read(&path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            continue;
+        };
+        if value["requestId"] == request_id
+            && value["ownerId"] == "primary"
+            && value["response"]["work"]["state"] == "succeeded"
+        {
+            return value["status"].as_str().map(str::to_string);
+        }
+    }
+    for path in idempotency_files(root) {
+        let Ok(bytes) = fs::read(&path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            continue;
+        };
+        if value["requestId"] == request_id && value["ownerId"] == "primary" {
+            return value["status"].as_str().map(str::to_string);
         }
     }
     None
@@ -5085,20 +5094,21 @@ fn source_at(workspace: &Path) -> (String, String) {
 }
 
 fn idempotency_files(root: &Path) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    let Ok(owners) = fs::read_dir(root.join("idempotency").join("v2")) else {
-        return paths;
-    };
-    for owner in owners.flatten() {
-        let Ok(files) = fs::read_dir(owner.path()) else {
-            continue;
+    fn walk(dir: &Path, paths: &mut Vec<PathBuf>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
         };
-        for file in files.flatten() {
-            if file.path().extension().and_then(|value| value.to_str()) == Some("json") {
-                paths.push(file.path());
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, paths);
+            } else if path.extension().and_then(|value| value.to_str()) == Some("json") {
+                paths.push(path);
             }
         }
     }
+    let mut paths = Vec::new();
+    walk(&root.join("idempotency").join("v2"), &mut paths);
     paths.sort();
     paths
 }
@@ -5117,19 +5127,29 @@ fn admission_files(root: &Path) -> Vec<String> {
 }
 
 fn primary_receipt(root: &Path, request_id: &str) -> (PathBuf, serde_json::Value, Vec<u8>) {
+    let mut found = Vec::new();
     for path in idempotency_files(root) {
-        if path.file_name().and_then(|name| name.to_str())
-            == Some("foreign-workspace-collision.json")
-        {
-            continue;
-        }
         let bytes = fs::read(&path).unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            continue;
+        };
         if value["ownerId"] == "primary" && value["requestId"] == request_id {
-            return (path, value, bytes);
+            found.push((path, value, bytes));
         }
     }
-    panic!("missing primary receipt for {request_id}");
+    if let Some(index) = found
+        .iter()
+        .position(|(_, value, _)| value["response"]["work"]["state"] == "succeeded")
+    {
+        return found.swap_remove(index);
+    }
+    if found.len() == 1 {
+        return found.pop().unwrap();
+    }
+    panic!(
+        "missing unambiguous primary receipt for {request_id} ({} candidates)",
+        found.len()
+    );
 }
 
 fn plant_owner_collision(store: &OrchStore, session: Uuid, request_id: &str) -> PathBuf {
@@ -5150,30 +5170,21 @@ fn plant_owner_collision(store: &OrchStore, session: Uuid, request_id: &str) -> 
         .expect("foreign owner receipt")
 }
 
-fn plant_workspace_collision(root: &Path, session: Uuid, request_id: &str) -> PathBuf {
-    let dir = primary_receipt(root, "approve-repair")
-        .0
-        .parent()
-        .unwrap()
-        .to_path_buf();
-    let path = dir.join("foreign-workspace-collision.json");
-    let body = serde_json::json!({
-        "schemaVersion": 2,
-        "ownerId": "primary",
-        "sessionId": session,
-        "workspaceDigest": "ab".repeat(32),
-        "requestId": request_id,
-        "payloadHash": "foreign-workspace-payload",
-        "runId": null,
-        "tool": "ptah_apply_verified_change",
-        "response": {"marker": "foreign-workspace"},
-        "error": null,
-        "createdAt": "2026-09-24T00:00:00Z",
-        "status": "pending",
-        "cleanupPlanDigest": ""
-    });
-    fs::write(&path, serde_json::to_vec_pretty(&body).unwrap()).unwrap();
-    path
+fn plant_workspace_collision(store: &OrchStore, session: Uuid, request_id: &str) -> PathBuf {
+    let scope = IdempotencyScope::new("primary", session, Path::new("/foreign/workspace")).unwrap();
+    let before = idempotency_files(store.root());
+    store
+        .claim_idempotency(
+            &scope,
+            "ptah_apply_verified_change",
+            request_id,
+            "foreign-workspace-payload",
+        )
+        .unwrap();
+    idempotency_files(store.root())
+        .into_iter()
+        .find(|path| !before.contains(path))
+        .expect("foreign workspace receipt")
 }
 
 fn freeze_foreign(path: &Path) -> Vec<u8> {
@@ -5220,7 +5231,7 @@ async fn foreign_workspace_receipt_collision_is_ignored_and_unchanged() {
     let _reset = ResetFault;
     let (harness, work_id, digest, revision) = approved_repair("foreign-workspace").await;
     let request_id = "foreign-workspace-apply";
-    let foreign = plant_workspace_collision(harness.orch.store().root(), harness.lane, request_id);
+    let foreign = plant_workspace_collision(harness.orch.store(), harness.lane, request_id);
     let before = fs::read(&foreign).unwrap();
     let applied = apply_at(&harness, request_id, &work_id, &digest, revision)
         .await
@@ -5229,14 +5240,16 @@ async fn foreign_workspace_receipt_collision_is_ignored_and_unchanged() {
     assert_eq!(fs::read(&foreign).unwrap(), before);
     let (authorized, receipt, _) = primary_receipt(harness.orch.store().root(), request_id);
     assert_ne!(authorized, foreign);
+    assert_ne!(authorized.parent(), foreign.parent());
     assert_eq!(receipt["status"], "complete");
     assert_eq!(receipt["response"]["work"]["state"], "succeeded");
     assert!(!receipt["cleanupPlanDigest"].as_str().unwrap().is_empty());
     let foreign_body: serde_json::Value = serde_json::from_slice(&before).unwrap();
+    assert_eq!(foreign_body["ownerId"], "primary");
     assert_eq!(foreign_body["requestId"], request_id);
     assert_eq!(foreign_body["sessionId"], harness.lane.to_string());
     assert_eq!(foreign_body["cleanupPlanDigest"], "");
-    assert_eq!(foreign_body["response"]["marker"], "foreign-workspace");
+    assert!(foreign_body["response"].is_null());
     harness.close().await;
 }
 
@@ -5252,7 +5265,7 @@ async fn apply_recovery_completes_only_the_exact_scoped_receipt() {
     let lease = harness.fake_dir.path().join("lease.json");
     let lane = harness.lane;
     let owner_path = plant_owner_collision(harness.orch.store(), lane, request_id);
-    let workspace_path = plant_workspace_collision(harness.orch.store().root(), lane, request_id);
+    let workspace_path = plant_workspace_collision(harness.orch.store(), lane, request_id);
     let owner_bytes = freeze_foreign(&owner_path);
     let workspace_bytes = freeze_foreign(&workspace_path);
     APPLY_FAULT.store(4, std::sync::atomic::Ordering::SeqCst);
@@ -5311,7 +5324,7 @@ async fn receipt_lookup_does_not_scan_unrelated_owner_shards() {
     let (harness, work_id, digest, revision) = approved_repair("receipt-scan").await;
     let request_id = "receipt-scan-apply";
     let foreign = plant_owner_collision(harness.orch.store(), harness.lane, request_id);
-    let decoy = plant_workspace_collision(harness.orch.store().root(), harness.lane, request_id);
+    let decoy = plant_workspace_collision(harness.orch.store(), harness.lane, request_id);
     let foreign_before = fs::read(&foreign).unwrap();
     let decoy_before = fs::read(&decoy).unwrap();
     RECEIPT_TREE_SCANS.store(0, std::sync::atomic::Ordering::SeqCst);

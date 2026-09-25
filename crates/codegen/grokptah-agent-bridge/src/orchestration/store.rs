@@ -936,12 +936,20 @@ impl OrchStore {
 
     fn idemp_path(&self, scope: &IdempotencyScope, request_id: &str) -> Result<PathBuf, OrchError> {
         let safe = safe_id_filename(request_id)?;
+        let workspace = scope.workspace_digest.as_str();
+        if workspace.len() != 64 || !workspace.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(OrchError::new(
+                OrchErrorCode::Internal,
+                "idempotency workspace scope is invalid",
+            ));
+        }
         Ok(self
             .inner
             .root
             .join("idempotency")
             .join("v2")
             .join(scope.owner_path_digest())
+            .join(workspace)
             .join(format!("{safe}.json")))
     }
 
@@ -966,10 +974,10 @@ impl OrchStore {
             .join("idempotency")
             .join("v2")
             .join(scope.owner_path_digest());
-        if !owner_dir.is_dir() {
-            return Ok(0);
-        }
-        Ok(fs::read_dir(owner_dir)?.take(stop_at).count())
+        Ok(owner_receipt_files(&owner_dir)?
+            .into_iter()
+            .take(stop_at)
+            .count())
     }
 
     #[cfg(test)]
@@ -1004,20 +1012,9 @@ impl OrchStore {
             .join("v2")
             .join(scope.owner_path_digest());
         let mut eligible = Vec::new();
-        for entry in fs::read_dir(&owner_dir)
+        for path in owner_receipt_files(&owner_dir)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
         {
-            let entry = entry
-                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-            let path = entry.path();
-            if !entry
-                .file_type()
-                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
-                .is_file()
-                || path.extension().and_then(|value| value.to_str()) != Some("json")
-            {
-                continue;
-            }
             let Ok(text) = fs::read_to_string(&path) else {
                 continue;
             };
@@ -1029,8 +1026,7 @@ impl OrchStore {
             };
             if receipt.owner_id != scope.owner_id
                 || receipt_scope.owner_path_digest() != scope.owner_path_digest()
-                || path.file_stem().and_then(|value| value.to_str())
-                    != safe_id_filename(&receipt.request_id).ok().as_deref()
+                || !receipt_path_matches_identity(&path, &receipt)
                 || !matches!(receipt.status.as_str(), "complete" | "failed")
             {
                 continue;
@@ -8392,18 +8388,7 @@ impl OrchStore {
                 continue;
             };
             report.idempotency_files_scanned += 1;
-            let Ok(scope) = receipt.scope() else {
-                report.skipped_files += 1;
-                continue;
-            };
-            let path_owner = path
-                .parent()
-                .and_then(Path::file_name)
-                .and_then(|value| value.to_str());
-            let path_request = path.file_stem().and_then(|value| value.to_str());
-            if path_owner != Some(scope.owner_path_digest().as_str())
-                || path_request != safe_id_filename(&receipt.request_id).ok().as_deref()
-            {
+            if receipt.scope().is_err() || !receipt_path_matches_identity(&path, &receipt) {
                 report.skipped_files += 1;
                 continue;
             }
@@ -8467,15 +8452,7 @@ impl OrchStore {
                 report.skipped_files += 1;
                 continue;
             }
-            for receipt_entry in fs::read_dir(owner_entry.path())? {
-                let receipt_entry = receipt_entry?;
-                let path = receipt_entry.path();
-                if !receipt_entry.file_type()?.is_file()
-                    || path.extension().and_then(|value| value.to_str()) != Some("json")
-                {
-                    report.skipped_files += 1;
-                    continue;
-                }
+            for path in owner_receipt_files(&owner_entry.path())? {
                 paths.push(path);
             }
         }
@@ -8647,19 +8624,20 @@ impl OrchStore {
         if let Some(after) = after_request_id {
             safe_id_filename(after).map_err(|error| anyhow::anyhow!(error.to_string()))?;
         }
-        let owner_dir = self
+        let workspace_dir = self
             .inner
             .root
             .join("idempotency")
             .join("v2")
-            .join(scope.owner_path_digest());
-        if !owner_dir.is_dir() {
+            .join(scope.owner_path_digest())
+            .join(&scope.workspace_digest);
+        if !workspace_dir.is_dir() {
             return Ok(Vec::new());
         }
 
         let mut receipts = Vec::new();
         let mut scanned = 0usize;
-        for entry in fs::read_dir(owner_dir)? {
+        for entry in fs::read_dir(workspace_dir)? {
             scanned += 1;
             anyhow::ensure!(
                 scanned <= MAX_IDEMPOTENCY_RECEIPTS_PER_OWNER,
@@ -8676,13 +8654,7 @@ impl OrchStore {
             else {
                 continue;
             };
-            let Ok(receipt_scope) = receipt.scope() else {
-                continue;
-            };
-            if receipt_scope.owner_path_digest() != scope.owner_path_digest()
-                || path.file_stem().and_then(|value| value.to_str())
-                    != safe_id_filename(&receipt.request_id).ok().as_deref()
-            {
+            if !receipt_path_matches_identity(&path, &receipt) {
                 continue;
             }
             if receipt.is_in_scope(scope)
@@ -8754,11 +8726,11 @@ impl OrchStore {
             };
         }
 
-        let owner_dir = path
+        let shard_dir = path
             .parent()
-            .expect("idempotency path has an owner directory");
-        if owner_dir.is_dir()
-            && fs::read_dir(owner_dir)
+            .expect("idempotency path has a workspace directory");
+        if shard_dir.is_dir()
+            && fs::read_dir(shard_dir)
                 .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
                 .take(MAX_IDEMPOTENCY_RECEIPTS_PER_OWNER)
                 .count()
@@ -9325,6 +9297,63 @@ pub(crate) fn workspaces_match(left: &str, right: &str) -> bool {
         (Ok(left), Ok(right)) => left == right,
         _ => false,
     }
+}
+
+fn owner_receipt_files(owner_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    if !owner_dir.is_dir() {
+        return Ok(paths);
+    }
+    for entry in fs::read_dir(owner_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            for child in fs::read_dir(&path)? {
+                let child = child?;
+                let child_path = child.path();
+                if child.file_type()?.is_file()
+                    && child_path.extension().and_then(|value| value.to_str()) == Some("json")
+                {
+                    paths.push(child_path);
+                }
+            }
+        } else if file_type.is_file()
+            && path.extension().and_then(|value| value.to_str()) == Some("json")
+        {
+            paths.push(path);
+        }
+    }
+    Ok(paths)
+}
+
+fn receipt_path_matches_identity(path: &Path, receipt: &IdempotencyReceipt) -> bool {
+    let Ok(scope) = receipt.scope() else {
+        return false;
+    };
+    let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    let Ok(expected) = safe_id_filename(&receipt.request_id) else {
+        return false;
+    };
+    if stem != expected {
+        return false;
+    }
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let Some(parent_name) = parent.file_name().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    if parent_name == scope.workspace_digest {
+        return parent
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|value| value.to_str())
+            == Some(scope.owner_path_digest().as_str());
+    }
+    parent_name == scope.owner_path_digest()
 }
 
 /// Every durable effect in this store funnels through here, so the authority
@@ -10601,6 +10630,29 @@ mod tests {
             ),
             Err(error) if error.code == OrchErrorCode::Conflict
         ));
+        let other_workspace =
+            IdempotencyScope::new("owner-a", Uuid::nil(), Path::new("/workspace/other")).unwrap();
+        let foreign_path = store
+            .idemp_path(&other_workspace, "shared-request")
+            .unwrap();
+        assert!(matches!(
+            store
+                .claim_idempotency(&other_workspace, "tool", "shared-request", "foreign-hash")
+                .unwrap(),
+            IdempotencyClaim::Perform
+        ));
+        let foreign_bytes = fs::read(&foreign_path).unwrap();
+        assert!(matches!(
+            store
+                .claim_idempotency(&owner_a, "tool", "shared-request", "hash-a")
+                .unwrap(),
+            IdempotencyClaim::Replay(Ok(value)) if value["owner"] == "a"
+        ));
+        assert_eq!(fs::read(&foreign_path).unwrap(), foreign_bytes);
+        assert_ne!(
+            store.idemp_path(&owner_a, "shared-request").unwrap(),
+            foreign_path
+        );
 
         let corrupt_id = "cross-session-corrupt";
         let corrupt_path = store.idemp_path(&other_session, corrupt_id).unwrap();
