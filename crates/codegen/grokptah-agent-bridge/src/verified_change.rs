@@ -1503,6 +1503,35 @@ pub static ADMISSION_FAULT: std::sync::atomic::AtomicU8 = std::sync::atomic::Ato
 pub static RECEIPT_TREE_SCANS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Fail one durable ledger write whose path contains `needle`, after skipping
+/// `skips_remaining` matching writes. Tests use this at the I/O helper, not as
+/// a pre-classified apply fault.
+pub struct DurableWriteFault {
+    pub needle: &'static str,
+    pub skips_remaining: u32,
+}
+
+pub static DURABLE_WRITE_FAULT: std::sync::Mutex<Option<DurableWriteFault>> =
+    std::sync::Mutex::new(None);
+
+pub(crate) fn fail_durable_write_if_armed(path: &std::path::Path) -> anyhow::Result<()> {
+    let mut guard = DURABLE_WRITE_FAULT
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let Some(fault) = guard.as_mut() else {
+        return Ok(());
+    };
+    if !path.to_string_lossy().contains(fault.needle) {
+        return Ok(());
+    }
+    if fault.skips_remaining > 0 {
+        fault.skips_remaining -= 1;
+        return Ok(());
+    }
+    *guard = None;
+    anyhow::bail!("injected durable write failure");
+}
+
 pub(crate) struct PromotionRecord {
     pub base_revision: String,
     pub final_fingerprint: String,

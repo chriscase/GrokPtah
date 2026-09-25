@@ -205,6 +205,28 @@ struct WorkLifecycleIntent {
 
 const WORK_LIFECYCLE_INTENT_SCHEMA_VERSION: u32 = 1;
 
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ApplyAdmissionEnvelopeV1 {
+    schema_version: u32,
+    work_id: String,
+    session_id: Uuid,
+    workspace: String,
+    owner_id: String,
+    request_id: String,
+    candidate_digest: String,
+    cleanup_plan_digest: String,
+    receipt_path: String,
+    intent_path: String,
+    receipt_prior_digest: String,
+    #[serde(default)]
+    intent_prior_digest: String,
+    receipt_next_digest: String,
+    intent_next_digest: String,
+    receipt_next_text: String,
+    intent_next_text: String,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ApplySourceIntent {
@@ -932,6 +954,21 @@ impl OrchStore {
     fn run_path(&self, run_id: &str) -> Result<PathBuf, OrchError> {
         let safe = safe_id_filename(run_id)?;
         Ok(self.inner.root.join("runs").join(format!("{safe}.json")))
+    }
+
+    fn legacy_owner_v2_path(
+        &self,
+        scope: &IdempotencyScope,
+        request_id: &str,
+    ) -> Result<PathBuf, OrchError> {
+        let safe = safe_id_filename(request_id)?;
+        Ok(self
+            .inner
+            .root
+            .join("idempotency")
+            .join("v2")
+            .join(scope.owner_path_digest())
+            .join(format!("{safe}.json")))
     }
 
     fn idemp_path(&self, scope: &IdempotencyScope, request_id: &str) -> Result<PathBuf, OrchError> {
@@ -5159,7 +5196,7 @@ impl OrchStore {
                 super::authz::canonical_workspace(Path::new(&intent.workspace))?;
             let scope = IdempotencyScope::new(owner_id, intent.session_id, &canonical_workspace)?;
             let receipt = self
-                .load_idempotency(&scope, &intent.intent_id)
+                .load_idempotency_unlocked(&scope, &intent.intent_id)
                 .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
             match receipt {
                 Some(receipt) if receipt.tool != "ptah_native_execute" => {
@@ -6158,6 +6195,14 @@ impl OrchStore {
         OrchError::new(OrchErrorCode::Conflict, message).with_apply_phase(phase)
     }
 
+    fn phase_error(phase: ApplyPhase, error: OrchError) -> OrchError {
+        if error.apply_phase().is_some() {
+            error
+        } else {
+            error.with_apply_phase(phase)
+        }
+    }
+
     fn record_digest(bytes: &[u8]) -> String {
         format!("{:x}", Sha256::digest(bytes))
     }
@@ -6377,6 +6422,13 @@ impl OrchStore {
             ));
         }
         let intent_path = self.apply_source_intent_path(&intent.work_id)?;
+        let intent_prior_digest = if intent_path.is_file() {
+            let current = fs::read(&intent_path)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            Self::record_digest(&current)
+        } else {
+            String::new()
+        };
         let envelope = serde_json::json!({
             "schemaVersion": 1,
             "workId": intent.work_id,
@@ -6386,9 +6438,10 @@ impl OrchStore {
             "requestId": intent.request_id,
             "candidateDigest": intent.candidate_digest,
             "cleanupPlanDigest": intent.cleanup_plan_digest,
-            "receiptPath": receipt_path.strip_prefix(&self.inner.root).unwrap_or(&receipt_path).to_string_lossy(),
-            "intentPath": intent_path.strip_prefix(&self.inner.root).unwrap_or(&intent_path).to_string_lossy(),
+            "receiptPath": self.relative_to_store(&receipt_path),
+            "intentPath": self.relative_to_store(&intent_path),
             "receiptPriorDigest": Self::record_digest(&prior_bytes),
+            "intentPriorDigest": intent_prior_digest,
             "receiptNextDigest": Self::record_digest(&receipt_next),
             "intentNextDigest": Self::record_digest(&intent_next),
             "receiptNextText": String::from_utf8(receipt_next).map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
@@ -6399,43 +6452,195 @@ impl OrchStore {
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
     }
 
-    fn write_enveloped_record(
-        &self,
-        relative: &Path,
-        pretty: &str,
-        digest: &str,
-    ) -> Result<(), OrchError> {
-        if relative.is_absolute()
-            || relative
-                .components()
-                .any(|component| matches!(component, std::path::Component::ParentDir))
+    fn relative_to_store(&self, path: &Path) -> String {
+        path.strip_prefix(&self.inner.root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/")
+    }
+
+    fn optional_record_digest(path: &Path) -> Result<Option<String>, OrchError> {
+        match fs::read(path) {
+            Ok(bytes) => Ok(Some(Self::record_digest(&bytes))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(OrchError::new(OrchErrorCode::Internal, error.to_string())),
+        }
+    }
+
+    /// A destination may be the recorded prior bytes, absent when that was the
+    /// recorded prior, or already the exact next bytes. Any other occupant is
+    /// left untouched.
+    fn admission_destination_allowed(current: Option<&str>, prior: &str, next: &str) -> bool {
+        match current {
+            None => prior.is_empty(),
+            Some(digest) => digest == prior || digest == next,
+        }
+    }
+
+    fn install_validated_admission_unlocked(&self, path: &Path) -> Result<(), OrchError> {
+        let raw = fs::read_to_string(path)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let Ok(envelope) = serde_json::from_str::<ApplyAdmissionEnvelopeV1>(&raw) else {
+            return Ok(());
+        };
+        if !self.admission_envelope_is_installable(&envelope, path)? {
+            return Ok(());
+        }
+        if serde_json::from_str::<IdempotencyReceipt>(&envelope.receipt_next_text).is_err() {
+            return Ok(());
+        }
+        let Ok(intent) = serde_json::from_str::<ApplySourceIntent>(&envelope.intent_next_text)
+        else {
+            return Ok(());
+        };
+        let receipt_path =
+            self.idemp_path(&Self::apply_receipt_scope(&intent)?, &intent.request_id)?;
+        let intent_path = self.apply_source_intent_path(&intent.work_id)?;
+        let current_receipt = Self::optional_record_digest(&receipt_path)?;
+        let current_intent = Self::optional_record_digest(&intent_path)?;
+        if !Self::admission_destination_allowed(
+            current_receipt.as_deref(),
+            &envelope.receipt_prior_digest,
+            &envelope.receipt_next_digest,
+        ) || !Self::admission_destination_allowed(
+            current_intent.as_deref(),
+            &envelope.intent_prior_digest,
+            &envelope.intent_next_digest,
+        ) {
+            return Ok(());
+        }
+        if current_receipt.as_deref() != Some(envelope.receipt_next_digest.as_str()) {
+            atomic_write_bytes(
+                &self.lease(),
+                &receipt_path,
+                envelope.receipt_next_text.as_bytes(),
+            )
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        }
+        if current_intent.as_deref() != Some(envelope.intent_next_digest.as_str()) {
+            atomic_write_bytes(
+                &self.lease(),
+                &intent_path,
+                envelope.intent_next_text.as_bytes(),
+            )
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        }
+        let installed_receipt = Self::optional_record_digest(&receipt_path)?;
+        let installed_intent = Self::optional_record_digest(&intent_path)?;
+        if installed_receipt.as_deref() == Some(envelope.receipt_next_digest.as_str())
+            && installed_intent.as_deref() == Some(envelope.intent_next_digest.as_str())
         {
-            return Err(OrchError::new(
-                OrchErrorCode::Conflict,
-                "the apply admission path escapes the store",
-            ));
-        }
-        let path = self.inner.root.join(relative);
-        let bytes = pretty.as_bytes();
-        if Self::record_digest(bytes) != digest {
-            return Err(OrchError::new(
-                OrchErrorCode::Conflict,
-                "the apply admission envelope digest does not match",
-            ));
-        }
-        if path.is_file() {
-            let current = fs::read(&path)
-                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-            if Self::record_digest(&current) == digest {
-                return Ok(());
-            }
-        }
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
+            remove_file_durable(&self.lease(), path)
                 .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         }
-        atomic_write_bytes(&self.lease(), &path, bytes)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+        Ok(())
+    }
+
+    fn admission_envelope_is_installable(
+        &self,
+        envelope: &ApplyAdmissionEnvelopeV1,
+        path: &Path,
+    ) -> Result<bool, OrchError> {
+        if envelope.schema_version != 1
+            || !bounded_intent_text(&envelope.work_id, 128)
+            || !bounded_intent_text(&envelope.owner_id, 256)
+            || !bounded_intent_text(&envelope.workspace, 4096)
+            || !bounded_intent_text(&envelope.request_id, 256)
+            || !bounded_intent_text(&envelope.candidate_digest, 256)
+            || !bounded_intent_text(&envelope.cleanup_plan_digest, 64)
+            || envelope.receipt_next_text.len() > 1_048_576
+            || envelope.intent_next_text.len() > 1_048_576
+            || envelope.receipt_next_text.is_empty()
+            || envelope.intent_next_text.is_empty()
+            || !Self::admission_digest_token(&envelope.receipt_next_digest)
+            || !Self::admission_digest_token(&envelope.intent_next_digest)
+            || !Self::admission_prior_token(&envelope.receipt_prior_digest)
+            || !Self::admission_prior_token(&envelope.intent_prior_digest)
+        {
+            return Ok(false);
+        }
+        let Ok(expected_name) = safe_id_filename(&envelope.work_id) else {
+            return Ok(false);
+        };
+        if path.file_name().and_then(|value| value.to_str())
+            != Some(format!("{expected_name}.json").as_str())
+        {
+            return Ok(false);
+        }
+        if Self::record_digest(envelope.receipt_next_text.as_bytes())
+            != envelope.receipt_next_digest
+            || Self::record_digest(envelope.intent_next_text.as_bytes())
+                != envelope.intent_next_digest
+        {
+            return Ok(false);
+        }
+        let Ok(receipt) = serde_json::from_str::<IdempotencyReceipt>(&envelope.receipt_next_text)
+        else {
+            return Ok(false);
+        };
+        let Ok(intent) = serde_json::from_str::<ApplySourceIntent>(&envelope.intent_next_text)
+        else {
+            return Ok(false);
+        };
+        if envelope.work_id != intent.work_id
+            || envelope.session_id != intent.session_id
+            || envelope.session_id != receipt.session_id
+            || envelope.workspace != intent.workspace
+            || envelope.owner_id != intent.owner_id
+            || envelope.owner_id != receipt.owner_id
+            || envelope.request_id != intent.request_id
+            || envelope.request_id != receipt.request_id
+            || envelope.candidate_digest != intent.candidate_digest
+            || envelope.cleanup_plan_digest != intent.cleanup_plan_digest
+            || envelope.cleanup_plan_digest != receipt.cleanup_plan_digest
+            || receipt.tool != "ptah_apply_verified_change"
+        {
+            return Ok(false);
+        }
+        let Ok(scope) = Self::apply_receipt_scope(&intent) else {
+            return Ok(false);
+        };
+        let Ok(receipt_path) = self.idemp_path(&scope, &intent.request_id) else {
+            return Ok(false);
+        };
+        let Ok(intent_path) = self.apply_source_intent_path(&intent.work_id) else {
+            return Ok(false);
+        };
+        if self.relative_to_store(&receipt_path) != envelope.receipt_path.replace('\\', "/")
+            || self.relative_to_store(&intent_path) != envelope.intent_path.replace('\\', "/")
+        {
+            return Ok(false);
+        }
+        let Some(item) = self
+            .load_work_item_unlocked(&intent.work_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+        else {
+            return Ok(false);
+        };
+        let attempts = self
+            .list_work_attempts_unlocked(Some(&intent.work_id))
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let decisions = self
+            .list_work_decisions_unlocked(&intent.work_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let retained = match self.candidate_snapshot_dir(&intent.work_id) {
+            Ok(path) => path,
+            Err(_) => return Ok(false),
+        };
+        let Ok(record) = crate::verified_change::read_promotion_record(&retained) else {
+            return Ok(false);
+        };
+        Ok(intent
+            .validate_against(&item, &attempts, &record, &decisions, &receipt, &retained)
+            .is_ok())
+    }
+
+    fn admission_digest_token(value: &str) -> bool {
+        value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }
+
+    fn admission_prior_token(value: &str) -> bool {
+        value.is_empty() || Self::admission_digest_token(value)
     }
 
     fn recover_apply_admissions(&self) -> Result<(), OrchError> {
@@ -6453,39 +6658,47 @@ impl OrchStore {
             if path.extension().and_then(|value| value.to_str()) != Some("json") {
                 continue;
             }
-            let raw = fs::read_to_string(&path)
-                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-            let envelope: serde_json::Value = serde_json::from_str(&raw)
-                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-            if envelope["schemaVersion"] != 1 {
-                continue;
-            }
-            let receipt_path = PathBuf::from(envelope["receiptPath"].as_str().unwrap_or_default());
-            let intent_path = PathBuf::from(envelope["intentPath"].as_str().unwrap_or_default());
-            self.write_enveloped_record(
-                &receipt_path,
-                envelope["receiptNextText"].as_str().unwrap_or_default(),
-                envelope["receiptNextDigest"].as_str().unwrap_or_default(),
-            )?;
-            self.write_enveloped_record(
-                &intent_path,
-                envelope["intentNextText"].as_str().unwrap_or_default(),
-                envelope["intentNextDigest"].as_str().unwrap_or_default(),
-            )?;
-            let receipt_bytes = fs::read(self.inner.root.join(&receipt_path))
-                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-            let intent_bytes = fs::read(self.inner.root.join(&intent_path))
-                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-            if Self::record_digest(&receipt_bytes)
-                == envelope["receiptNextDigest"].as_str().unwrap_or_default()
-                && Self::record_digest(&intent_bytes)
-                    == envelope["intentNextDigest"].as_str().unwrap_or_default()
-            {
-                remove_file_durable(&self.lease(), &path)
-                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-            }
+            self.install_validated_admission_unlocked(&path)?;
         }
         Ok(())
+    }
+
+    fn admission_guarded_receipt_paths(&self) -> Vec<PathBuf> {
+        let mut guarded = Vec::new();
+        let Ok(entries) = fs::read_dir(self.inner.root.join("apply-admissions")) else {
+            return guarded;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(raw) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(envelope) = serde_json::from_str::<ApplyAdmissionEnvelopeV1>(&raw) else {
+                continue;
+            };
+            let Ok(expected_name) = safe_id_filename(&envelope.work_id) else {
+                continue;
+            };
+            if path.file_name().and_then(|value| value.to_str())
+                != Some(format!("{expected_name}.json").as_str())
+            {
+                continue;
+            }
+            let Ok(scope) = IdempotencyScope::new(
+                &envelope.owner_id,
+                envelope.session_id,
+                Path::new(&envelope.workspace),
+            ) else {
+                continue;
+            };
+            if let Ok(receipt_path) = self.idemp_path(&scope, &envelope.request_id) {
+                guarded.push(receipt_path);
+            }
+        }
+        guarded
     }
 
     fn recover_apply_source_intents(&self) -> Result<(), OrchError> {
@@ -6505,8 +6718,9 @@ impl OrchStore {
             }
             let raw = fs::read_to_string(&path)
                 .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-            let intent: ApplySourceIntent = serde_json::from_str(&raw)
-                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            let Ok(intent) = serde_json::from_str::<ApplySourceIntent>(&raw) else {
+                continue;
+            };
             self.recover_one_apply_intent_unlocked(&intent)?;
         }
         Ok(())
@@ -6810,17 +7024,30 @@ impl OrchStore {
                 "source is neither the verified base nor the final candidate; reconciliation is required",
             ));
         }
-        if let Some(existing) = self.read_apply_source_intent_unlocked(work_id)? {
+        if let Some(existing) = self
+            .read_apply_source_intent_unlocked(work_id)
+            .map_err(|error| Self::phase_error(ApplyPhase::SourceEffectPossible, error))?
+        {
             let attempts = self
                 .list_work_attempts_unlocked(Some(work_id))
-                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+                .map_err(|error| {
+                    Self::phase_error(
+                        ApplyPhase::SourceEffectPossible,
+                        OrchError::new(OrchErrorCode::Internal, error.to_string()),
+                    )
+                })?;
             let verdict = self
                 .prove_apply_intent_unlocked(&existing, &item, &attempts, &record)
-                .map_err(IntentFault::into_error)?;
+                .map_err(|fault| {
+                    Self::phase_error(ApplyPhase::SourceEffectPossible, fault.into_error())
+                })?;
             if verdict == ApplyIntentVerdict::StaleWorkRevision {
-                return Err(OrchError::new(
-                    OrchErrorCode::Conflict,
-                    "the apply intent is for an older work revision",
+                return Err(Self::phase_error(
+                    ApplyPhase::SourceEffectPossible,
+                    OrchError::new(
+                        OrchErrorCode::Conflict,
+                        "the apply intent is for an older work revision",
+                    ),
                 ));
             }
             match crate::run_promotion::classify_source(
@@ -6830,23 +7057,41 @@ impl OrchStore {
             ) {
                 Ok(crate::run_promotion::SourceClassification::AlreadyApplied) => {
                     verification.applied = true;
-                    self.finish_applied_candidate_unlocked(item, prior_item, verification)?;
+                    self.finish_applied_candidate_unlocked(item, prior_item, verification)
+                        .map_err(|error| {
+                            Self::phase_error(
+                                ApplyPhase::SourceEffectCompleteBeforeWorkCommit,
+                                error,
+                            )
+                        })?;
                     let finished = self
                         .load_work_item_unlocked(work_id)
                         .map_err(|error| {
-                            OrchError::new(OrchErrorCode::Internal, error.to_string())
+                            Self::phase_error(
+                                ApplyPhase::WorkCommittedBeforeReceipt,
+                                OrchError::new(OrchErrorCode::Internal, error.to_string()),
+                            )
                         })?
                         .ok_or_else(|| {
-                            OrchError::new(OrchErrorCode::Conflict, "work item not found")
+                            Self::phase_error(
+                                ApplyPhase::WorkCommittedBeforeReceipt,
+                                OrchError::new(OrchErrorCode::Conflict, "work item not found"),
+                            )
                         })?;
-                    self.complete_pending_apply_receipt_unlocked(&existing, &finished)?;
+                    self.complete_pending_apply_receipt_unlocked(&existing, &finished)
+                        .map_err(|error| {
+                            Self::phase_error(ApplyPhase::WorkCommittedBeforeReceipt, error)
+                        })?;
                     let _ = self.clear_apply_source_intent_unlocked(work_id);
                     return Ok(finished);
                 }
                 Ok(crate::run_promotion::SourceClassification::Poisoned) => {
-                    return Err(OrchError::new(
-                        OrchErrorCode::Conflict,
-                        "source is neither the verified base nor the final candidate; reconciliation is required",
+                    return Err(Self::phase_error(
+                        ApplyPhase::ReconciliationRequired,
+                        OrchError::new(
+                            OrchErrorCode::Conflict,
+                            "source is neither the verified base nor the final candidate; reconciliation is required",
+                        ),
                     ));
                 }
                 _ => {}
@@ -6863,14 +7108,16 @@ impl OrchStore {
         let attempts = self
             .list_work_attempts_unlocked(Some(work_id))
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-        self.persist_apply_admission_unlocked(&intent)?;
+        self.persist_apply_admission_unlocked(&intent)
+            .map_err(|error| Self::phase_error(ApplyPhase::NoSourceEffect, error))?;
         if crate::verified_change::admission_fault() == 2 {
             return Err(Self::apply_stop(
                 ApplyPhase::SourceEffectPossible,
                 "apply interrupted after the admission envelope and before the receipt seal",
             ));
         }
-        self.seal_cleanup_plan_on_receipt_unlocked(&intent)?;
+        self.seal_cleanup_plan_on_receipt_unlocked(&intent)
+            .map_err(|error| Self::phase_error(ApplyPhase::SourceEffectPossible, error))?;
         if crate::verified_change::admission_fault() == 3 {
             return Err(Self::apply_stop(
                 ApplyPhase::SourceEffectPossible,
@@ -6878,16 +7125,25 @@ impl OrchStore {
             ));
         }
         self.prove_apply_intent_unlocked(&intent, &item, &attempts, &record)
-            .map_err(IntentFault::into_error)?;
-        self.persist_apply_source_intent_unlocked(&intent)?;
+            .map_err(|fault| {
+                Self::phase_error(ApplyPhase::SourceEffectPossible, fault.into_error())
+            })?;
+        self.persist_apply_source_intent_unlocked(&intent)
+            .map_err(|error| Self::phase_error(ApplyPhase::SourceEffectPossible, error))?;
         if crate::verified_change::admission_fault() == 4 {
             return Err(Self::apply_stop(
                 ApplyPhase::SourceEffectPossible,
                 "apply interrupted after the apply intent and before admission envelope removal",
             ));
         }
-        remove_file_durable(&self.lease(), &self.admission_envelope_path(work_id)?)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        remove_file_durable(&self.lease(), &self.admission_envelope_path(work_id)?).map_err(
+            |error| {
+                Self::phase_error(
+                    ApplyPhase::SourceEffectPossible,
+                    OrchError::new(OrchErrorCode::Internal, error.to_string()),
+                )
+            },
+        )?;
         if crate::verified_change::apply_fault() == 2
             || crate::verified_change::admission_fault() == 5
         {
@@ -6921,7 +7177,12 @@ impl OrchStore {
                 }
                 let attempts = self
                     .list_work_attempts_unlocked(Some(work_id))
-                    .map_err(|err| OrchError::new(OrchErrorCode::Internal, err.to_string()))?;
+                    .map_err(|err| {
+                        Self::phase_error(
+                            ApplyPhase::ReconciliationRequired,
+                            OrchError::new(OrchErrorCode::Internal, err.to_string()),
+                        )
+                    })?;
                 let prior_attempts = attempts.clone();
                 item.bump();
                 let _ = self.commit_work_lifecycle_snapshots_unlocked(
@@ -6946,7 +7207,10 @@ impl OrchStore {
             ));
         }
         verification.applied = true;
-        self.finish_applied_candidate_unlocked(item, prior_item, verification)?;
+        self.finish_applied_candidate_unlocked(item, prior_item, verification)
+            .map_err(|error| {
+                Self::phase_error(ApplyPhase::SourceEffectCompleteBeforeWorkCommit, error)
+            })?;
         if crate::verified_change::apply_fault() == 5 {
             return Err(Self::apply_stop(
                 ApplyPhase::WorkCommittedBeforeReceipt,
@@ -6955,9 +7219,20 @@ impl OrchStore {
         }
         let finished = self
             .load_work_item_unlocked(work_id)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
-            .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
-        self.complete_pending_apply_receipt_unlocked(&intent, &finished)?;
+            .map_err(|error| {
+                Self::phase_error(
+                    ApplyPhase::WorkCommittedBeforeReceipt,
+                    OrchError::new(OrchErrorCode::Internal, error.to_string()),
+                )
+            })?
+            .ok_or_else(|| {
+                Self::phase_error(
+                    ApplyPhase::WorkCommittedBeforeReceipt,
+                    OrchError::new(OrchErrorCode::Conflict, "work item not found"),
+                )
+            })?;
+        self.complete_pending_apply_receipt_unlocked(&intent, &finished)
+            .map_err(|error| Self::phase_error(ApplyPhase::WorkCommittedBeforeReceipt, error))?;
         if crate::verified_change::apply_fault() == 8 {
             return Err(Self::apply_stop(
                 ApplyPhase::WorkCommittedBeforeReceipt,
@@ -8566,6 +8841,17 @@ impl OrchStore {
         scope: &IdempotencyScope,
         request_id: &str,
     ) -> anyhow::Result<Option<IdempotencyReceipt>> {
+        let _guard = self.inner.lock.lock();
+        self.load_idempotency_unlocked(scope, request_id)
+    }
+
+    fn load_idempotency_unlocked(
+        &self,
+        scope: &IdempotencyScope,
+        request_id: &str,
+    ) -> anyhow::Result<Option<IdempotencyReceipt>> {
+        self.adopt_legacy_owner_receipt_unlocked(scope, request_id, None)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         let path = match self.idemp_path(scope, request_id) {
             Ok(p) => p,
             Err(_) => return Ok(None),
@@ -8582,6 +8868,127 @@ impl OrchStore {
         Ok(Some(receipt))
     }
 
+    fn receipts_outcomes_compatible(left: &IdempotencyReceipt, right: &IdempotencyReceipt) -> bool {
+        left.schema_version == right.schema_version
+            && left.owner_id == right.owner_id
+            && left.session_id == right.session_id
+            && left.workspace_digest == right.workspace_digest
+            && left.request_id == right.request_id
+            && left.tool == right.tool
+            && left.payload_hash == right.payload_hash
+            && left.run_id == right.run_id
+            && left.status == right.status
+            && left.response == right.response
+            && left.cleanup_plan_digest == right.cleanup_plan_digest
+            && match (&left.error, &right.error) {
+                (None, None) => true,
+                (Some(left_error), Some(right_error)) => {
+                    left_error.code == right_error.code && left_error.message == right_error.message
+                }
+                _ => false,
+            }
+    }
+
+    /// Install one pre-workspace v2 receipt at its workspace path, or refuse
+    /// with both records intact. Exact lookup opens only this owner/request file.
+    fn adopt_legacy_owner_receipt_unlocked(
+        &self,
+        scope: &IdempotencyScope,
+        request_id: &str,
+        claim: Option<(&str, &str)>,
+    ) -> Result<(), OrchError> {
+        let legacy_path = self.legacy_owner_v2_path(scope, request_id)?;
+        if !legacy_path.is_file() {
+            return Ok(());
+        }
+        let legacy_bytes = fs::read(&legacy_path)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let legacy = serde_json::from_slice::<IdempotencyReceipt>(&legacy_bytes).map_err(|_| {
+            OrchError::new(
+                OrchErrorCode::Conflict,
+                "legacy idempotency receipt cannot be reused",
+            )
+        })?;
+        if legacy.request_id != request_id
+            || legacy.owner_id != scope.owner_id
+            || legacy.schema_version != IDEMPOTENCY_RECEIPT_SCHEMA_VERSION
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "legacy idempotency receipt cannot be reused",
+            ));
+        }
+        if legacy.workspace_digest != scope.workspace_digest {
+            return Ok(());
+        }
+        if let Some((tool, payload_hash)) = claim {
+            if legacy.session_id != scope.session_id
+                || legacy.tool != tool
+                || legacy.payload_hash != payload_hash
+            {
+                return Err(OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "request_id reused with different payload",
+                ));
+            }
+        } else if legacy.session_id != scope.session_id {
+            let new_path = self.idemp_path(scope, request_id)?;
+            if new_path.is_file() {
+                return self.converge_legacy_owner_receipt_unlocked(
+                    &legacy_path,
+                    &new_path,
+                    &legacy_bytes,
+                    &legacy,
+                );
+            }
+            return Ok(());
+        }
+        let new_path = self.idemp_path(scope, request_id)?;
+        self.converge_legacy_owner_receipt_unlocked(&legacy_path, &new_path, &legacy_bytes, &legacy)
+    }
+
+    fn converge_legacy_owner_receipt_unlocked(
+        &self,
+        legacy_path: &Path,
+        new_path: &Path,
+        legacy_bytes: &[u8],
+        legacy: &IdempotencyReceipt,
+    ) -> Result<(), OrchError> {
+        if new_path.is_file() {
+            let current_bytes = fs::read(new_path)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            if current_bytes.as_slice() != legacy_bytes {
+                let current = serde_json::from_slice::<IdempotencyReceipt>(&current_bytes)
+                    .map_err(|_| {
+                        OrchError::new(
+                            OrchErrorCode::Conflict,
+                            "idempotency receipt evidence conflicts; both records were preserved",
+                        )
+                    })?;
+                if !Self::receipts_outcomes_compatible(legacy, &current) {
+                    return Err(OrchError::new(
+                        OrchErrorCode::Conflict,
+                        "idempotency receipt evidence conflicts; both records were preserved",
+                    ));
+                }
+            }
+            let _ = remove_file_durable(&self.lease(), legacy_path);
+            return Ok(());
+        }
+        atomic_write_bytes(&self.lease(), new_path, legacy_bytes)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let written = fs::read(new_path)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        if written.as_slice() != legacy_bytes {
+            return Err(OrchError::new(
+                OrchErrorCode::Internal,
+                "legacy idempotency receipt was not installed",
+            ));
+        }
+        let _ = remove_file_durable(&self.lease(), legacy_path);
+        Ok(())
+    }
+
     /// Read one receipt for an operator-facing lookup. A receipt owned by the
     /// same principal but bound to another session/workspace is deliberately
     /// indistinguishable from an unknown request ID.
@@ -8590,6 +8997,9 @@ impl OrchStore {
         scope: &IdempotencyScope,
         request_id: &str,
     ) -> anyhow::Result<Option<IdempotencyReceipt>> {
+        let _guard = self.inner.lock.lock();
+        self.adopt_legacy_owner_receipt_unlocked(scope, request_id, None)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         let path = match self.idemp_path(scope, request_id) {
             Ok(path) => path,
             Err(_) => return Ok(None),
@@ -8624,44 +9034,60 @@ impl OrchStore {
         if let Some(after) = after_request_id {
             safe_id_filename(after).map_err(|error| anyhow::anyhow!(error.to_string()))?;
         }
-        let workspace_dir = self
+        let owner_dir = self
             .inner
             .root
             .join("idempotency")
             .join("v2")
-            .join(scope.owner_path_digest())
-            .join(&scope.workspace_digest);
-        if !workspace_dir.is_dir() {
+            .join(scope.owner_path_digest());
+        if !owner_dir.is_dir() {
             return Ok(Vec::new());
         }
+        let workspace_dir = owner_dir.join(&scope.workspace_digest);
 
         let mut receipts = Vec::new();
         let mut scanned = 0usize;
-        for entry in fs::read_dir(workspace_dir)? {
-            scanned += 1;
+        let consider = |path: PathBuf,
+                        receipts: &mut Vec<IdempotencyReceipt>,
+                        scanned: &mut usize|
+         -> anyhow::Result<()> {
+            *scanned += 1;
             anyhow::ensure!(
-                scanned <= MAX_IDEMPOTENCY_RECEIPTS_PER_OWNER,
+                *scanned <= MAX_IDEMPOTENCY_RECEIPTS_PER_OWNER,
                 "operation receipt owner shard exceeds its hard bound"
             );
-            let entry = entry?;
-            let path = entry.path();
-            if !entry.file_type()?.is_file()
-                || path.extension().and_then(|value| value.to_str()) != Some("json")
-            {
-                continue;
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                return Ok(());
             }
             let Ok(receipt) = serde_json::from_slice::<IdempotencyReceipt>(&fs::read(&path)?)
             else {
-                continue;
+                return Ok(());
             };
             if !receipt_path_matches_identity(&path, &receipt) {
-                continue;
+                return Ok(());
             }
             if receipt.is_in_scope(scope)
                 && after_request_id.is_none_or(|after| receipt.request_id.as_str() > after)
             {
                 receipts.push(receipt);
             }
+            Ok(())
+        };
+        if workspace_dir.is_dir() {
+            for entry in fs::read_dir(&workspace_dir)? {
+                let entry = entry?;
+                if !entry.file_type()?.is_file() {
+                    continue;
+                }
+                consider(entry.path(), &mut receipts, &mut scanned)?;
+            }
+        }
+        for entry in fs::read_dir(&owner_dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            consider(entry.path(), &mut receipts, &mut scanned)?;
         }
         receipts.sort_by(|left, right| left.request_id.cmp(&right.request_id));
         receipts.truncate(limit);
@@ -8682,6 +9108,7 @@ impl OrchStore {
     ) -> Result<IdempotencyClaim, OrchError> {
         let path = self.idemp_path(scope, request_id)?;
         let _g = self.inner.lock.lock();
+        self.adopt_legacy_owner_receipt_unlocked(scope, request_id, Some((tool, payload_hash)))?;
         // Count, compact, and claim under one critical section so concurrent
         // callers cannot discard more terminal evidence than the one slot
         // needed for the winning claim.
@@ -8693,9 +9120,10 @@ impl OrchStore {
         {
             self.prune_one_owner_receipt_unlocked(scope)?;
         }
-        if self
-            .legacy_idempotency_tombstone_path(request_id)?
-            .is_file()
+        if !path.is_file()
+            && self
+                .legacy_idempotency_tombstone_path(request_id)?
+                .is_file()
         {
             return Err(OrchError::new(
                 OrchErrorCode::Conflict,
@@ -9126,8 +9554,12 @@ impl OrchStore {
     fn fail_orphaned_idempotency_claims(&self) -> anyhow::Result<usize> {
         let mut report = RetentionReport::default();
         let paths = self.idempotency_receipt_paths_unlocked(&mut report)?;
+        let guarded = self.admission_guarded_receipt_paths();
         let mut changed = 0;
         for path in paths {
+            if guarded.iter().any(|guarded_path| guarded_path == &path) {
+                continue;
+            }
             let Ok(text) = fs::read_to_string(&path) else {
                 continue;
             };
@@ -9271,6 +9703,7 @@ fn append_audit_entry(
     Ok(())
 }
 
+#[derive(Debug)]
 pub enum IdempotencyClaim {
     Perform,
     Pending,
@@ -9363,6 +9796,7 @@ fn atomic_write_bytes(
     path: &Path,
     bytes: &[u8],
 ) -> anyhow::Result<()> {
+    crate::verified_change::fail_durable_write_if_armed(path)?;
     let _write = lease.begin("writing the durable orchestration ledger")?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -9385,6 +9819,7 @@ fn atomic_write_json<T: serde::Serialize>(
     path: &Path,
     value: &T,
 ) -> anyhow::Result<()> {
+    crate::verified_change::fail_durable_write_if_armed(path)?;
     let _write = lease.begin("writing the durable orchestration ledger")?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -12256,5 +12691,226 @@ mod tests {
             .unwrap();
         assert_eq!(recovered.state, ManagedIntentState::Admitted);
         assert_eq!(recovered.run_id.as_deref(), Some(run_id));
+    }
+
+    fn legacy_owner_v2_file(root: &Path, scope: &IdempotencyScope, request_id: &str) -> PathBuf {
+        let safe = safe_id_filename(request_id).unwrap();
+        root.join("idempotency")
+            .join("v2")
+            .join(scope.owner_path_digest())
+            .join(format!("{safe}.json"))
+    }
+
+    fn planted_receipt(
+        scope: &IdempotencyScope,
+        request_id: &str,
+        tool: &str,
+        status: &str,
+        response: serde_json::Value,
+        error: Option<OrchError>,
+    ) -> IdempotencyReceipt {
+        IdempotencyReceipt {
+            schema_version: IDEMPOTENCY_RECEIPT_SCHEMA_VERSION,
+            owner_id: scope.owner_id.clone(),
+            session_id: scope.session_id,
+            workspace_digest: scope.workspace_digest.clone(),
+            request_id: request_id.into(),
+            payload_hash: "shared-ledger-hash".into(),
+            run_id: None,
+            tool: tool.into(),
+            response,
+            error,
+            created_at: Utc::now(),
+            status: status.into(),
+            cleanup_plan_digest: String::new(),
+        }
+    }
+
+    fn write_legacy_v2(
+        root: &Path,
+        scope: &IdempotencyScope,
+        receipt: &IdempotencyReceipt,
+    ) -> PathBuf {
+        let path = legacy_owner_v2_file(root, scope, &receipt.request_id);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, serde_json::to_vec_pretty(receipt).unwrap()).unwrap();
+        path
+    }
+
+    #[test]
+    fn old_v2_complete_receipt_replays_after_upgrade() {
+        let dir = tempdir().unwrap();
+        let store = OrchStore::open(dir.path()).unwrap();
+        let scope = receipt_scope(dir.path());
+        let request_id = "legacy-complete";
+        let response =
+            serde_json::json!({"work": {"state": "succeeded"}, "tool": "ptah_claim_work"});
+        let receipt = planted_receipt(
+            &scope,
+            request_id,
+            "ptah_claim_work",
+            "complete",
+            response.clone(),
+            None,
+        );
+        let legacy = write_legacy_v2(dir.path(), &scope, &receipt);
+        let before = fs::read(&legacy).unwrap();
+        let claim = store
+            .claim_idempotency(&scope, "ptah_claim_work", request_id, "shared-ledger-hash")
+            .unwrap();
+        match claim {
+            IdempotencyClaim::Replay(Ok(value)) => assert_eq!(value, response),
+            other => panic!("expected replay, got {other:?}"),
+        }
+        assert!(
+            fs::read(&legacy).unwrap_or(before.clone()) == before || !legacy.exists(),
+            "legacy evidence was rewritten"
+        );
+    }
+
+    #[test]
+    fn old_v2_failed_receipt_replays_after_upgrade() {
+        let dir = tempdir().unwrap();
+        let store = OrchStore::open(dir.path()).unwrap();
+        let scope = receipt_scope(dir.path());
+        let error = OrchError::new(OrchErrorCode::Conflict, "the original mutation failed");
+        let receipt = planted_receipt(
+            &scope,
+            "legacy-failed",
+            "ptah_discard_verified_change",
+            "failed",
+            serde_json::Value::Null,
+            Some(error.clone()),
+        );
+        write_legacy_v2(dir.path(), &scope, &receipt);
+        let claim = store
+            .claim_idempotency(
+                &scope,
+                "ptah_discard_verified_change",
+                "legacy-failed",
+                "shared-ledger-hash",
+            )
+            .unwrap();
+        match claim {
+            IdempotencyClaim::Replay(Err(replayed)) => {
+                assert_eq!(replayed.message, error.message);
+            }
+            other => panic!("expected failed replay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn old_v2_pending_receipt_is_not_reexecuted() {
+        let dir = tempdir().unwrap();
+        let store = OrchStore::open(dir.path()).unwrap();
+        let scope = receipt_scope(dir.path());
+        let receipt = planted_receipt(
+            &scope,
+            "legacy-pending",
+            "ptah_claim_work",
+            "pending",
+            serde_json::Value::Null,
+            None,
+        );
+        let legacy = write_legacy_v2(dir.path(), &scope, &receipt);
+        let before = fs::read(&legacy).unwrap();
+        let claim = store
+            .claim_idempotency(
+                &scope,
+                "ptah_claim_work",
+                "legacy-pending",
+                "shared-ledger-hash",
+            )
+            .unwrap();
+        assert!(
+            matches!(claim, IdempotencyClaim::Pending),
+            "pending legacy receipt was re-executed: {claim:?}"
+        );
+        let new_path = store.idemp_path(&scope, "legacy-pending").unwrap();
+        if new_path.is_file() {
+            let migrated: IdempotencyReceipt =
+                serde_json::from_slice(&fs::read(&new_path).unwrap()).unwrap();
+            assert_eq!(migrated.status, "pending");
+            assert_eq!(migrated.response, serde_json::Value::Null);
+        }
+        if legacy.is_file() {
+            assert_eq!(fs::read(&legacy).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn conflicting_old_and_new_receipts_preserve_evidence() {
+        let dir = tempdir().unwrap();
+        let store = OrchStore::open(dir.path()).unwrap();
+        let scope = receipt_scope(dir.path());
+        let old = planted_receipt(
+            &scope,
+            "legacy-conflict",
+            "ptah_claim_work",
+            "complete",
+            serde_json::json!({"marker": "old"}),
+            None,
+        );
+        let mut newer = old.clone();
+        newer.response = serde_json::json!({"marker": "new"});
+        let legacy = write_legacy_v2(dir.path(), &scope, &old);
+        let current = store.idemp_path(&scope, "legacy-conflict").unwrap();
+        fs::create_dir_all(current.parent().unwrap()).unwrap();
+        fs::write(&current, serde_json::to_vec_pretty(&newer).unwrap()).unwrap();
+        let legacy_before = fs::read(&legacy).unwrap();
+        let current_before = fs::read(&current).unwrap();
+        let error = store
+            .claim_idempotency(
+                &scope,
+                "ptah_claim_work",
+                "legacy-conflict",
+                "shared-ledger-hash",
+            )
+            .unwrap_err();
+        assert_eq!(error.code, OrchErrorCode::Conflict);
+        assert_eq!(fs::read(&legacy).unwrap(), legacy_before);
+        assert_eq!(fs::read(&current).unwrap(), current_before);
+    }
+
+    #[test]
+    fn receipt_migration_restart_preserves_exact_request_outcome() {
+        let dir = tempdir().unwrap();
+        let scope = receipt_scope(dir.path());
+        let response = serde_json::json!({"runId": "kept"});
+        let receipt = planted_receipt(
+            &scope,
+            "legacy-restart",
+            "ptah_claim_work",
+            "complete",
+            response.clone(),
+            None,
+        );
+        write_legacy_v2(dir.path(), &scope, &receipt);
+        let store = OrchStore::open(dir.path()).unwrap();
+        let first = store
+            .claim_idempotency(
+                &scope,
+                "ptah_claim_work",
+                "legacy-restart",
+                "shared-ledger-hash",
+            )
+            .unwrap();
+        drop(store);
+        let store = OrchStore::open(dir.path()).unwrap();
+        let second = store
+            .claim_idempotency(
+                &scope,
+                "ptah_claim_work",
+                "legacy-restart",
+                "shared-ledger-hash",
+            )
+            .unwrap();
+        match (first, second) {
+            (IdempotencyClaim::Replay(Ok(left)), IdempotencyClaim::Replay(Ok(right))) => {
+                assert_eq!(left, response);
+                assert_eq!(right, response);
+            }
+            other => panic!("restart changed the request outcome: {other:?}"),
+        }
     }
 }
