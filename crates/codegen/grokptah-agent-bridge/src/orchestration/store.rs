@@ -9566,7 +9566,7 @@ impl OrchStore {
             let Ok(mut receipt) = serde_json::from_str::<IdempotencyReceipt>(&text) else {
                 continue;
             };
-            if receipt.status != "pending" {
+            if receipt.status != "pending" || pending_legacy_owner_v2_receipt(&path, &receipt) {
                 continue;
             }
             receipt.status = "failed".into();
@@ -9758,6 +9758,24 @@ fn owner_receipt_files(owner_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
         }
     }
     Ok(paths)
+}
+
+/// A pending owner-scoped v2 receipt still lives at
+/// `idempotency/v2/<owner>/<request>.json`. Store open must leave it pending
+/// so a later claim can adopt it. Rewriting it as a failed "use a new
+/// request_id" outcome destroys that recovery.
+fn pending_legacy_owner_v2_receipt(path: &Path, receipt: &IdempotencyReceipt) -> bool {
+    if receipt.status != "pending" || !receipt_path_matches_identity(path, receipt) {
+        return false;
+    }
+    let Ok(scope) = receipt.scope() else {
+        return false;
+    };
+    let owner = scope.owner_path_digest();
+    path.parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        == Some(owner.as_str())
 }
 
 fn receipt_path_matches_identity(path: &Path, receipt: &IdempotencyReceipt) -> bool {
@@ -12802,7 +12820,6 @@ mod tests {
     #[test]
     fn old_v2_pending_receipt_is_not_reexecuted() {
         let dir = tempdir().unwrap();
-        let store = OrchStore::open(dir.path()).unwrap();
         let scope = receipt_scope(dir.path());
         let receipt = planted_receipt(
             &scope,
@@ -12814,6 +12831,26 @@ mod tests {
         );
         let legacy = write_legacy_v2(dir.path(), &scope, &receipt);
         let before = fs::read(&legacy).unwrap();
+        let store = OrchStore::open(dir.path()).unwrap();
+        drop(store);
+        let store = OrchStore::open(dir.path()).unwrap();
+        let reopened = fs::read(&legacy).unwrap();
+        assert_eq!(
+            reopened, before,
+            "store open rewrote the pending legacy receipt"
+        );
+        let stored: IdempotencyReceipt = serde_json::from_slice(&reopened).unwrap();
+        assert_eq!(stored.status, "pending");
+        assert_eq!(stored.payload_hash, "shared-ledger-hash");
+        assert_eq!(stored.response, serde_json::Value::Null);
+        assert!(
+            stored
+                .error
+                .as_ref()
+                .is_none_or(|error| !error.message.contains("use a new request_id")),
+            "reopen advised a new request id: {:?}",
+            stored.error
+        );
         let claim = store
             .claim_idempotency(
                 &scope,
@@ -12831,7 +12868,16 @@ mod tests {
             let migrated: IdempotencyReceipt =
                 serde_json::from_slice(&fs::read(&new_path).unwrap()).unwrap();
             assert_eq!(migrated.status, "pending");
+            assert_eq!(migrated.payload_hash, "shared-ledger-hash");
             assert_eq!(migrated.response, serde_json::Value::Null);
+            assert!(
+                migrated
+                    .error
+                    .as_ref()
+                    .is_none_or(|error| !error.message.contains("use a new request_id")),
+                "migrated receipt advised a new request id: {:?}",
+                migrated.error
+            );
         }
         if legacy.is_file() {
             assert_eq!(fs::read(&legacy).unwrap(), before);
