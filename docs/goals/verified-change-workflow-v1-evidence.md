@@ -493,6 +493,46 @@ Live-provider test: NOT RUN.
 
 Production revocable xAI lease: STILL UNAVAILABLE.
 
+## Receipt transaction repairs RC1–RC3
+
+Prior functional SHA: `8cecd488ebb3f5b34692e70f09bb89cc2c8ec3ad` (tree `2ade073c8ac6496c46d428a1b16993bc6d33b079`). Published tip at the start of this repair: `e1b52401f0d7108c232610a8014cc6be826413ce` (tree `6cfbe63c62c6a7f5d08c36d83f0cbc645e4eeda1`). This repair is functional SHA `f77a3222126b053365c035ca344b2fee62ea9709` (tree `3b238644107c5c9ddb0b6e36d6d2c6f8726d2c69`). It is not an independent acceptance of the frozen goal.
+
+Admission recovery parses one typed envelope. Before either destination changes, it checks the next receipt and ApplySourceIntent, the Work, session, workspace, owner, and request identities, and the candidate, approval, payload, and cleanup-plan bindings. The receipt and intent paths are derived from those identities. A substituted path, a foreign Work id, or a destination that is not the recorded prior, a permitted absence, or the exact next bytes is left untouched and the envelope stays. An already-installed pair removes the envelope without rewriting either record.
+
+Owner-scoped v2 receipts at `idempotency/v2/{owner}/{request}.json` are adopted into `idempotency/v2/{owner}/{workspace}/{request}.json` only when the recorded owner, session, workspace, tool, request, and payload match. A complete receipt replays its response. A failed receipt replays its error. A pending receipt stays pending. A different workspace does not block. The same workspace with another session conflicts. Incompatible old and new copies are kept and the claim fails closed. Exact lookup opens that one legacy file and does not scan other owner shards.
+
+Apply errors keep the phase of the boundary they crossed. A write that fails before the admission envelope is durable may be no-effect. After the source is applied, a lifecycle write failure stays `SourceEffectCompleteBeforeWorkCommit`. After the Work commit, a receipt write failure stays `WorkCommittedBeforeReceipt`. The intent is cleared only after the exact scoped receipt has the matching terminal outcome. Reopening the original request finishes that outcome and does not apply the source again.
+
+Before the repair, on reviewed implementation `8cecd488` as published at `e1b52401f`, the workflow regressions exited `WORKFLOW:101` (9 failed). `lifecycle_write_failure_after_apply_keeps_original_request_recoverable` and `receipt_write_failure_after_work_commit_recovers_original_success` observed `apply_phase` `None`. The five old-layout lib regressions exited `LIB:101`: complete, failed, and pending receipts were claimed as `Perform`, the conflicting pair replayed `{"marker":"new"}`, and restart replayed `mutation was interrupted before its durable receipt completed; use a new request_id`. After the repair those 14 regressions were `ok` (`LIB:0`, `WORKFLOW:0`).
+
+Local validation on the working tree committed as `f77a3222126b053365c035ca344b2fee62ea9709` (tree `3b238644107c5c9ddb0b6e36d6d2c6f8726d2c69`), before that commit. No executable diff exists after that commit. The live managed-executor test stayed ignored.
+
+- Bridge `cargo fmt --all -- --check`: exit 0 (`FMT:0`).
+- Bridge `cargo clippy --locked --all-targets -- -D warnings`: exit 0 (`CLIPPY:0`), including a rebuild of `grokptah-agent-bridge` on SHA `f77a3222126b053365c035ca344b2fee62ea9709`.
+- Bridge `cargo test --locked -- --test-threads=1` on a fresh `GROKPTAH_HOME`: exit 0 (`SUITE:0`). The R1–R5 regressions and the RC1–RC3 regressions were `ok`. `live_grok_build_dogfood_runs_both_profiles_under_one_authority` stayed ignored.
+- `cargo test -p xai-host-authority --locked`: exit 0 (`AUTHORITY:0`).
+- Isolated service `cargo test --locked -- --test-threads=1` on a fresh `GROKPTAH_HOME`: exit 0 (`SERVICE_TEST:0`, 5 passed).
+- Isolated service `cargo check --locked` and `cargo check --locked --all-targets`: exit 0 (`SERVICE_CHECK:0`, `SERVICE_CHECK_ALL:0`).
+- Desktop `npm run typecheck`: exit 0 (`TC:0`).
+- Desktop `npm test`: exit 0 (`NPM:0`, 58 files, 428 tests).
+- `desktop/src-tauri` `cargo test --locked`: exit 0 (`TAURI:0`, 50 lib tests).
+
+| Gap | Result on `f77a32221` / `3b238644`. Prior functional SHA/tree: `8cecd488ebb3f5b34692e70f09bb89cc2c8ec3ad` / `2ade073c8ac6496c46d428a1b16993bc6d33b079`. | Named regression |
+| --- | --- | --- |
+| RC1 admission pair | A substituted path, a prior-byte mismatch, a foreign or newer intent, or an identity mismatch changes no store record. An already-installed pair is stable across reopen. | `admission_path_substitution_changes_no_store_records`; `admission_prior_receipt_mismatch_preserves_both_destinations`; `admission_foreign_or_newer_intent_is_not_overwritten`; `admission_pair_identity_mismatch_performs_zero_writes`; `admission_already_installed_pair_is_idempotent` |
+| RC2 old v2 receipts | Complete, failed, and pending owner-scoped v2 receipts survive the workspace path, including `ptah_claim_work` and `ptah_discard_verified_change`. Conflicting copies are preserved. Restart replays the same response. | `old_v2_complete_receipt_replays_after_upgrade`; `old_v2_failed_receipt_replays_after_upgrade`; `old_v2_pending_receipt_is_not_reexecuted`; `conflicting_old_and_new_receipts_preserve_evidence`; `receipt_migration_restart_preserves_exact_request_outcome` |
+| RC3 write failures | A lifecycle write after apply, a receipt write after the Work commit, and an admission write before durability keep the original request recoverable or honestly failed. Repeated reopen converges without a second source application. | `lifecycle_write_failure_after_apply_keeps_original_request_recoverable`; `receipt_write_failure_after_work_commit_recovers_original_success`; `admission_record_write_failure_resolves_without_false_reexecution`; `repeated_reopen_after_real_write_failure_converges` |
+
+Hosted Desktop for repaired functional SHA `f77a3222126b053365c035ca344b2fee62ea9709` only: GitHub Actions run `36186211071` attempt 1 (https://github.com/chriscase/GrokPtah/actions/runs/36186211071) concluded `success`. The event was `pull_request`. `headSha` was `f77a3222126b053365c035ca344b2fee62ea9709`. The `desktop` job had no failed steps (`2026-09-25T20:30:53Z` to `2026-09-25T21:02:29Z`).
+
+The commit that adds this section is documentation only. Its tree is not `3b238644107c5c9ddb0b6e36d6d2c6f8726d2c69`. A Desktop run for that docs tip is not the result above.
+
+Live-provider test: NOT RUN.
+
+Production revocable xAI lease: STILL UNAVAILABLE.
+
+Independent acceptance: NOT CLAIMED.
+
 ## Repair identity
 
 - Prior reviewed functional SHA: `32268e89f52776704d7a4729c2bd3581310ceeb7`
