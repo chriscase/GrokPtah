@@ -469,11 +469,11 @@ Local validation on the working tree committed as `8cecd488ebb3f5b34692e70f09bb8
 - Bridge `cargo fmt --all -- --check`: exit 0 (`FMT:0`).
 - Bridge `cargo clippy --locked --all-targets -- -D warnings`: exit 0 (`CLIPPY:0`).
 - Bridge `cargo test --locked -- --test-threads=1` on a fresh `GROKPTAH_HOME`: exit 0 (`SUITE:0`). `verified_change_workflow` includes the workspace collision regression. `live_grok_build_dogfood_runs_both_profiles_under_one_authority` stayed ignored.
-- `cargo test -p xai-host-authority --locked -- --test-threads=1`: exit 0 (`AUTHORITY:0`).
+- `cargo test -p xai-host-authority --locked -- --test-threads=1`: exit 0 (`AUTHORITY:0`), re-run on the checked-out functional SHA `8cecd488ebb3f5b34692e70f09bb89cc2c8ec3ad`.
 - Isolated service `cargo test --locked -- --test-threads=1`: exit 0 (`SERVICE_TEST:0`).
 - Isolated service `cargo check --locked --all-targets`: exit 0 (`SERVICE_CHECK:0`).
-- Desktop `npm run typecheck`: exit 0 (`TC:0`).
-- Desktop `npm test`: exit 0 (`NPM:0`, 58 files, 428 tests).
+- Desktop `npm run typecheck`: exit 0 (`TC:0`), re-run on the checked-out functional SHA `8cecd488ebb3f5b34692e70f09bb89cc2c8ec3ad`.
+- Desktop `npm test`: exit 0 (`NPM:0`, 58 files, 428 tests), re-run on the checked-out functional SHA `8cecd488ebb3f5b34692e70f09bb89cc2c8ec3ad`. These three results are for `8cecd488ebb3f5b34692e70f09bb89cc2c8ec3ad`, not for `ccf776393988f2452b610a8aed77abbe66423076`.
 - `desktop/src-tauri` `cargo test --locked`: exit 0 (`TAURI:0`, 50 lib tests). One earlier parallel run failed `public_run_list_and_get_do_not_register_raw_run_watchers` with instance-lock os error 17. The isolated rerun exited 0.
 
 | Gap | Result on `8cecd488` / `2ade073c` | Named regression |
