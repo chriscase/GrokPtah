@@ -219,6 +219,9 @@ struct ApplyAdmissionEnvelopeV1 {
     receipt_path: String,
     intent_path: String,
     receipt_prior_digest: String,
+    /// Original claim bytes keep transition authority provable after either write.
+    #[serde(default)]
+    receipt_prior_text: String,
     #[serde(default)]
     intent_prior_digest: String,
     receipt_next_digest: String,
@@ -6335,6 +6338,14 @@ impl OrchStore {
         if item.state == WorkState::Succeeded {
             return Ok(());
         }
+        if item.result.as_ref().is_some_and(|result| {
+            result
+                .candidate_verification
+                .as_ref()
+                .is_some_and(|verification| verification.reconciliation_required)
+        }) {
+            return Ok(());
+        }
         let prior = item.clone();
         if let Some(result) = item.result.as_mut() {
             if let Some(verification) = result.candidate_verification.as_mut() {
@@ -6366,11 +6377,27 @@ impl OrchStore {
         let decisions = self
             .list_work_decisions_unlocked(&item.work_id)
             .map_err(IntentFault::Reject)?;
-        let receipt = self
-            .matching_apply_receipt_unlocked(intent)
-            .map_err(IntentFault::Reject)?;
         let retained = self
             .candidate_snapshot_dir(&item.work_id)
+            .map_err(IntentFault::Reject)?;
+        let scope = Self::apply_receipt_scope(intent).map_err(IntentFault::Reject)?;
+        let legacy_path = self
+            .legacy_owner_v2_path(&scope, &intent.request_id)
+            .map_err(IntentFault::Reject)?;
+        if legacy_path.is_file() {
+            let bytes = fs::read(&legacy_path).map_err(|_| intent_mismatch())?;
+            let legacy: IdempotencyReceipt =
+                serde_json::from_slice(&bytes).map_err(|_| intent_mismatch())?;
+            intent.validate_against(item, attempts, record, &decisions, &legacy, &retained)?;
+            self.adopt_legacy_owner_receipt_unlocked(
+                &scope,
+                &intent.request_id,
+                Some(("ptah_apply_verified_change", &legacy.payload_hash)),
+            )
+            .map_err(IntentFault::Reject)?;
+        }
+        let receipt = self
+            .matching_apply_receipt_unlocked(intent)
             .map_err(IntentFault::Reject)?;
         intent.validate_against(item, attempts, record, &decisions, &receipt, &retained)
     }
@@ -6409,8 +6436,18 @@ impl OrchStore {
         let (receipt_path, prior) = self.read_exact_apply_receipt_unlocked(intent, &["pending"])?;
         let prior_bytes = fs::read(&receipt_path)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-        let mut next_receipt = prior;
+        let mut next_receipt = prior.clone();
         next_receipt.cleanup_plan_digest = intent.cleanup_plan_digest.clone();
+        if !Self::validate_admission_receipt_transition(
+            &prior,
+            &next_receipt,
+            &intent.cleanup_plan_digest,
+        ) {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "invalid apply admission receipt transition",
+            ));
+        }
         let receipt_next = serde_json::to_vec_pretty(&next_receipt)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         let intent_next = serde_json::to_vec_pretty(intent)
@@ -6441,6 +6478,7 @@ impl OrchStore {
             "receiptPath": self.relative_to_store(&receipt_path),
             "intentPath": self.relative_to_store(&intent_path),
             "receiptPriorDigest": Self::record_digest(&prior_bytes),
+            "receiptPriorText": String::from_utf8(prior_bytes.clone()).map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
             "intentPriorDigest": intent_prior_digest,
             "receiptNextDigest": Self::record_digest(&receipt_next),
             "intentNextDigest": Self::record_digest(&intent_next),
@@ -6496,7 +6534,11 @@ impl OrchStore {
         let receipt_path =
             self.idemp_path(&Self::apply_receipt_scope(&intent)?, &intent.request_id)?;
         let intent_path = self.apply_source_intent_path(&intent.work_id)?;
-        let current_receipt = Self::optional_record_digest(&receipt_path)?;
+        let scope = Self::apply_receipt_scope(&intent)?;
+        let legacy_path = self.legacy_owner_v2_path(&scope, &intent.request_id)?;
+        let modern_receipt = Self::optional_record_digest(&receipt_path)?;
+        let legacy_receipt = Self::optional_record_digest(&legacy_path)?;
+        let current_receipt = modern_receipt.clone().or(legacy_receipt.clone());
         let current_intent = Self::optional_record_digest(&intent_path)?;
         if !Self::admission_destination_allowed(
             current_receipt.as_deref(),
@@ -6508,6 +6550,45 @@ impl OrchStore {
             &envelope.intent_next_digest,
         ) {
             return Ok(());
+        }
+        if legacy_receipt.is_some() {
+            let bytes = fs::read(&legacy_path)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            let Ok(legacy) = serde_json::from_slice::<IdempotencyReceipt>(&bytes) else {
+                return Ok(());
+            };
+            let Ok(next) = serde_json::from_str::<IdempotencyReceipt>(&envelope.receipt_next_text)
+            else {
+                return Ok(());
+            };
+            if !Self::admission_destination_allowed(
+                legacy_receipt.as_deref(),
+                &envelope.receipt_prior_digest,
+                &envelope.receipt_next_digest,
+            ) || !Self::validate_admission_receipt_transition(
+                &legacy,
+                &next,
+                &intent.cleanup_plan_digest,
+            ) {
+                return Ok(());
+            }
+            // Existing old/new conflict evidence is never resolved by guessing.
+            if modern_receipt.is_some() {
+                let current_bytes = fs::read(&receipt_path)
+                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+                let Ok(current) = serde_json::from_slice::<IdempotencyReceipt>(&current_bytes)
+                else {
+                    return Ok(());
+                };
+                if !Self::receipts_outcomes_compatible(&legacy, &current) {
+                    return Ok(());
+                }
+            }
+            self.adopt_legacy_owner_receipt_unlocked(
+                &scope,
+                &intent.request_id,
+                Some(("ptah_apply_verified_change", &legacy.payload_hash)),
+            )?;
         }
         if current_receipt.as_deref() != Some(envelope.receipt_next_digest.as_str()) {
             atomic_write_bytes(
@@ -6536,6 +6617,76 @@ impl OrchStore {
         Ok(())
     }
 
+    /// Admission can seal cleanup authority on the existing pending claim. It
+    /// cannot resolve that claim or replace any of its immutable fields.
+    fn validate_admission_receipt_transition(
+        prior: &IdempotencyReceipt,
+        next: &IdempotencyReceipt,
+        expected_cleanup_digest: &str,
+    ) -> bool {
+        if prior.status != "pending"
+            || next.status != "pending"
+            || !prior.response.is_null()
+            || !next.response.is_null()
+            || prior.error.is_some()
+            || next.error.is_some()
+            || next.cleanup_plan_digest != expected_cleanup_digest
+            || (!prior.cleanup_plan_digest.is_empty()
+                && prior.cleanup_plan_digest != expected_cleanup_digest)
+        {
+            return false;
+        }
+        let mut authorized = prior.clone();
+        authorized.cleanup_plan_digest = expected_cleanup_digest.to_owned();
+        // Compare every serialized field, including claim fields added later.
+        match (
+            serde_json::to_value(&authorized),
+            serde_json::to_value(next),
+        ) {
+            (Ok(left), Ok(right)) => left == right,
+            _ => false,
+        }
+    }
+
+    fn admission_prior_receipt(
+        &self,
+        envelope: &ApplyAdmissionEnvelopeV1,
+        next: &IdempotencyReceipt,
+        scope: &IdempotencyScope,
+    ) -> Option<IdempotencyReceipt> {
+        let decode = |bytes: &[u8]| {
+            if Self::record_digest(bytes) != envelope.receipt_prior_digest {
+                return None;
+            }
+            serde_json::from_slice::<IdempotencyReceipt>(bytes).ok()
+        };
+        if !envelope.receipt_prior_text.is_empty() {
+            return decode(envelope.receipt_prior_text.as_bytes());
+        }
+        // Journals written before prior bytes were embedded still have a
+        // provable transition when the exact prior claim survives in either layout.
+        for path in [
+            self.idemp_path(scope, &envelope.request_id).ok(),
+            self.legacy_owner_v2_path(scope, &envelope.request_id).ok(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Ok(bytes) = fs::read(path) {
+                if let Some(prior) = decode(&bytes) {
+                    return Some(prior);
+                }
+            }
+        }
+        // Old journals whose next receipt is already installed can reconstruct
+        // the original unsealed claim, but only if its exact recorded digest agrees.
+        let mut prior = next.clone();
+        prior.cleanup_plan_digest.clear();
+        serde_json::to_vec_pretty(&prior)
+            .ok()
+            .and_then(|bytes| decode(&bytes))
+    }
+
     fn admission_envelope_is_installable(
         &self,
         envelope: &ApplyAdmissionEnvelopeV1,
@@ -6548,6 +6699,7 @@ impl OrchStore {
             || !bounded_intent_text(&envelope.request_id, 256)
             || !bounded_intent_text(&envelope.candidate_digest, 256)
             || !bounded_intent_text(&envelope.cleanup_plan_digest, 64)
+            || envelope.receipt_prior_text.len() > 1_048_576
             || envelope.receipt_next_text.len() > 1_048_576
             || envelope.intent_next_text.len() > 1_048_576
             || envelope.receipt_next_text.is_empty()
@@ -6606,6 +6758,17 @@ impl OrchStore {
         let Ok(intent_path) = self.apply_source_intent_path(&intent.work_id) else {
             return Ok(false);
         };
+        let Some(prior) = self.admission_prior_receipt(envelope, &receipt, &scope) else {
+            return Ok(false);
+        };
+        if !Self::validate_admission_receipt_transition(
+            &prior,
+            &receipt,
+            &intent.cleanup_plan_digest,
+        ) {
+            return Ok(false);
+        }
+
         if self.relative_to_store(&receipt_path) != envelope.receipt_path.replace('\\', "/")
             || self.relative_to_store(&intent_path) != envelope.intent_path.replace('\\', "/")
         {
@@ -6747,6 +6910,25 @@ impl OrchStore {
             return self
                 .quarantine_apply_intent_unlocked(item, "the apply intent bundle is missing");
         };
+        // A resolved reconciliation failure has no remaining source authority.
+        // Preserve that stable outcome and its intent evidence on later opens;
+        // quarantine may have cleared the public checks-passed projection.
+        if let Ok(receipt) = self.matching_apply_receipt_unlocked(intent) {
+            if receipt.status == "failed"
+                && receipt.cleanup_plan_digest == intent.cleanup_plan_digest
+                && receipt.error.as_ref().is_some_and(|error| {
+                    error.code == OrchErrorCode::Conflict
+                        && item.result.as_ref().is_some_and(|result| {
+                            result.failure.as_deref() == Some(error.message.as_str())
+                                && result.candidate_verification.as_ref().is_some_and(
+                                    |verification| verification.reconciliation_required,
+                                )
+                        })
+                })
+            {
+                return Ok(());
+            }
+        }
         let verdict = match self.prove_apply_intent_unlocked(intent, &item, &attempts, &record) {
             Ok(verdict) => verdict,
             Err(error) => {
@@ -9554,7 +9736,24 @@ impl OrchStore {
     fn fail_orphaned_idempotency_claims(&self) -> anyhow::Result<usize> {
         let mut report = RetentionReport::default();
         let paths = self.idempotency_receipt_paths_unlocked(&mut report)?;
-        let guarded = self.admission_guarded_receipt_paths();
+        let mut guarded = self.admission_guarded_receipt_paths();
+        // Unresolved apply intents own their receipt evidence. Orphan cleanup
+        // must not rewrite a conflicting pending claim after recovery refused it.
+        if let Ok(entries) = fs::read_dir(self.inner.root.join("apply-source-intents")) {
+            for entry in entries.flatten() {
+                let Ok(bytes) = fs::read(entry.path()) else {
+                    continue;
+                };
+                let Ok(intent) = serde_json::from_slice::<ApplySourceIntent>(&bytes) else {
+                    continue;
+                };
+                if let Ok(scope) = Self::apply_receipt_scope(&intent) {
+                    if let Ok(path) = self.idemp_path(&scope, &intent.request_id) {
+                        guarded.push(path);
+                    }
+                }
+            }
+        }
         let mut changed = 0;
         for path in paths {
             if guarded.iter().any(|guarded_path| guarded_path == &path) {

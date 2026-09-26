@@ -6569,3 +6569,367 @@ async fn repeated_reopen_after_real_write_failure_converges() {
     assert_eq!(source_at(&kept.workspace), applied);
     stop_live(again).await;
 }
+
+fn reseal_admission_receipt(envelope: &mut serde_json::Value, receipt: &serde_json::Value) {
+    use sha2::{Digest, Sha256};
+    // Recompute integrity so rejection must come from transition authority.
+    let text = serde_json::to_string_pretty(receipt).unwrap();
+    envelope["receiptNextDigest"] =
+        serde_json::json!(format!("{:x}", Sha256::digest(text.as_bytes())));
+    envelope["receiptNextText"] = serde_json::json!(text);
+}
+
+async fn rejected_admission_successor(label: &str, field: &str, value: serde_json::Value) {
+    let _reset = ResetFault;
+    let (harness, work_id, digest, revision) = approved_repair(label).await;
+    let kept = keep_runtime(&harness);
+    let request_id = format!("{label}-request");
+    ADMISSION_FAULT.store(2, std::sync::atomic::Ordering::SeqCst);
+    apply_at(&harness, &request_id, &work_id, &digest, revision)
+        .await
+        .unwrap_err();
+    ADMISSION_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+    let root = harness.orch.store().root().to_path_buf();
+    let envelope_path = only_json(&root.join("apply-admissions"));
+    let mut envelope: serde_json::Value =
+        serde_json::from_slice(&fs::read(&envelope_path).unwrap()).unwrap();
+    let mut receipt: serde_json::Value =
+        serde_json::from_str(envelope["receiptNextText"].as_str().unwrap()).unwrap();
+    receipt[field] = value;
+    reseal_admission_receipt(&mut envelope, &receipt);
+    fs::write(
+        &envelope_path,
+        serde_json::to_vec_pretty(&envelope).unwrap(),
+    )
+    .unwrap();
+    let receipt_before = primary_receipt(&root, &request_id).2;
+    let source_before = source_at(&kept.workspace);
+    let (live, _parked) = reopen_kept(harness, &kept).await;
+    assert_eq!(
+        primary_receipt(&root, &request_id).2,
+        receipt_before,
+        "receipt destination changed for {field}"
+    );
+    assert!(
+        intent_files(&root).is_empty(),
+        "intent destination changed for {field}"
+    );
+    assert_eq!(source_at(&kept.workspace), source_before);
+    assert!(
+        envelope_path.is_file(),
+        "invalid journal evidence must remain"
+    );
+    stop_live(live).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admission_resealed_complete_successor_performs_zero_writes() {
+    rejected_admission_successor("admit-complete", "status", serde_json::json!("complete")).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admission_resealed_failed_successor_performs_zero_writes() {
+    rejected_admission_successor("admit-failed", "status", serde_json::json!("failed")).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admission_pending_successor_cannot_inject_response_or_error() {
+    rejected_admission_successor(
+        "admit-response",
+        "response",
+        serde_json::json!({"fabricated": true}),
+    )
+    .await;
+    rejected_admission_successor(
+        "admit-error",
+        "error",
+        serde_json::json!({"code": "conflict", "message": "fabricated"}),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admission_successor_changes_only_the_authorized_cleanup_binding() {
+    for (field, value) in [
+        ("runId", serde_json::json!("fabricated-run")),
+        ("createdAt", serde_json::json!("2020-01-01T00:00:00Z")),
+        ("ownerId", serde_json::json!("foreign-owner")),
+        ("sessionId", serde_json::json!(Uuid::new_v4())),
+        ("workspaceDigest", serde_json::json!("0".repeat(64))),
+        ("requestId", serde_json::json!("foreign-request")),
+        ("tool", serde_json::json!("foreign-tool")),
+        ("payloadHash", serde_json::json!("foreign-payload")),
+    ] {
+        rejected_admission_successor(&format!("admit-{field}"), field, value).await;
+    }
+}
+
+fn move_pending_receipt_to_legacy(root: &Path, request_id: &str) -> (PathBuf, PathBuf, Vec<u8>) {
+    let (modern, receipt, bytes) = primary_receipt(root, request_id);
+    assert_eq!(receipt["status"], "pending");
+    let legacy = modern
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join(modern.file_name().unwrap());
+    fs::rename(&modern, &legacy).unwrap();
+    (modern, legacy, bytes)
+}
+
+async fn legacy_interrupted_apply(
+    label: &str,
+    cut: u8,
+    poison: bool,
+    conflict: bool,
+    admission: bool,
+) {
+    let _reset = ResetFault;
+    let (harness, work_id, digest, revision) = approved_repair(label).await;
+    let kept = keep_runtime(&harness);
+    let request_id = format!("{label}-request");
+    if admission {
+        ADMISSION_FAULT.store(2, std::sync::atomic::Ordering::SeqCst);
+    } else {
+        APPLY_FAULT.store(cut, std::sync::atomic::Ordering::SeqCst);
+    }
+    apply_at(&harness, &request_id, &work_id, &digest, revision)
+        .await
+        .unwrap_err();
+    APPLY_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+    ADMISSION_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+    let root = harness.orch.store().root().to_path_buf();
+    let (modern, legacy, legacy_bytes) = move_pending_receipt_to_legacy(&root, &request_id);
+    if poison {
+        fs::write(kept.workspace.join("src/ledger.rs"), "foreign source\n").unwrap();
+    }
+    let modern_before = if conflict {
+        let mut receipt: serde_json::Value = serde_json::from_slice(&legacy_bytes).unwrap();
+        receipt["payloadHash"] = serde_json::json!("foreign-payload");
+        let bytes = serde_json::to_vec_pretty(&receipt).unwrap();
+        fs::write(&modern, &bytes).unwrap();
+        Some(bytes)
+    } else {
+        None
+    };
+    let source = source_at(&kept.workspace);
+    let (live, _parked) = reopen_kept(harness, &kept).await;
+    let work = live.orch.store().load_work_item(&work_id).unwrap().unwrap();
+    let verification = work
+        .result
+        .as_ref()
+        .unwrap()
+        .candidate_verification
+        .as_ref()
+        .unwrap();
+    assert_eq!(verification.reconciliation_required, poison || conflict);
+    if conflict {
+        assert_eq!(fs::read(&legacy).unwrap(), legacy_bytes);
+        assert_eq!(fs::read(&modern).unwrap(), modern_before.unwrap());
+        assert_eq!(intent_files(&root).len(), 1);
+    } else {
+        assert!(
+            !legacy.exists(),
+            "exact legacy claim must be adopted before recovery"
+        );
+        assert_eq!(
+            receipt_status(&root, &request_id).as_deref(),
+            Some(if cut == 4 && !poison {
+                "complete"
+            } else {
+                "failed"
+            })
+        );
+    }
+    let replay = live
+        .orch
+        .apply_verified_change(
+            &auth(),
+            &request_id,
+            kept.lane,
+            &kept.workspace,
+            &work_id,
+            &digest,
+            Some(revision),
+        )
+        .await;
+    if cut == 4 && !poison && !conflict {
+        assert_eq!(work.state, WorkState::Succeeded);
+        assert_eq!(replay.as_ref().unwrap()["work"]["state"], "succeeded");
+    } else {
+        let message = replay.as_ref().unwrap_err().to_string();
+        assert!(
+            message.contains(if conflict {
+                "conflict"
+            } else if poison {
+                "reconciliation"
+            } else {
+                "definitely not applied"
+            }),
+            "{message}"
+        );
+    }
+    assert_eq!(source_at(&kept.workspace), source);
+    let receipt_once = fs::read(&modern).unwrap();
+    let work_once = serde_json::to_value(&work).unwrap();
+    let again = reopen_production_store(
+        live.host,
+        live.orch,
+        &kept.workspace,
+        &kept.fake,
+        &kept.isolate,
+        &kept.identity,
+        &kept.lease,
+    )
+    .await;
+    assert_eq!(fs::read(&modern).unwrap(), receipt_once);
+    assert_eq!(
+        serde_json::to_value(
+            again
+                .orch
+                .store()
+                .load_work_item(&work_id)
+                .unwrap()
+                .unwrap()
+        )
+        .unwrap(),
+        work_once
+    );
+    let repeated = again
+        .orch
+        .apply_verified_change(
+            &auth(),
+            &request_id,
+            kept.lane,
+            &kept.workspace,
+            &work_id,
+            &digest,
+            Some(revision),
+        )
+        .await;
+    assert_eq!(format!("{repeated:?}"), format!("{replay:?}"));
+    assert_eq!(source_at(&kept.workspace), source);
+    stop_live(again).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_pending_applied_intent_recovers_original_request_success() {
+    legacy_interrupted_apply("legacy-applied", 4, false, false, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_pending_unapplied_intent_resolves_original_request_no_effect() {
+    legacy_interrupted_apply("legacy-unapplied", 2, false, false, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_pending_poisoned_intent_reports_reconciliation() {
+    legacy_interrupted_apply("legacy-poisoned", 2, true, false, false).await;
+    legacy_interrupted_apply("legacy-conflicting", 2, false, true, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_receipt_adoption_precedes_work_quarantine() {
+    legacy_interrupted_apply("legacy-admission", 2, false, false, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_reopen_after_legacy_apply_recovery_is_idempotent() {
+    legacy_interrupted_apply("legacy-repeated", 4, false, false, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admission_old_journal_and_partial_pair_recover_idempotently() {
+    for cut in [2, 3, 4] {
+        let _reset = ResetFault;
+        let (harness, work_id, digest, revision) =
+            approved_repair(&format!("admit-old-{cut}")).await;
+        let kept = keep_runtime(&harness);
+        let request_id = format!("admit-old-{cut}-request");
+        ADMISSION_FAULT.store(cut, std::sync::atomic::Ordering::SeqCst);
+        apply_at(&harness, &request_id, &work_id, &digest, revision)
+            .await
+            .unwrap_err();
+        ADMISSION_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+        let root = harness.orch.store().root().to_path_buf();
+        let path = only_json(&root.join("apply-admissions"));
+        let mut envelope: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        envelope.as_object_mut().unwrap().remove("receiptPriorText");
+        fs::write(&path, serde_json::to_vec_pretty(&envelope).unwrap()).unwrap();
+        let source = source_at(&kept.workspace);
+        let (live, _parked) = reopen_kept(harness, &kept).await;
+        assert!(!path.exists(), "old journal cut {cut} did not converge");
+        assert!(intent_files(&root).is_empty());
+        let receipt = primary_receipt(&root, &request_id).2;
+        let replay = live
+            .orch
+            .apply_verified_change(
+                &auth(),
+                &request_id,
+                kept.lane,
+                &kept.workspace,
+                &work_id,
+                &digest,
+                Some(revision),
+            )
+            .await
+            .unwrap_err();
+        assert!(replay.to_string().contains("definitely not applied"));
+        assert_eq!(source_at(&kept.workspace), source);
+        let again = reopen_production_store(
+            live.host,
+            live.orch,
+            &kept.workspace,
+            &kept.fake,
+            &kept.isolate,
+            &kept.identity,
+            &kept.lease,
+        )
+        .await;
+        assert_eq!(primary_receipt(&root, &request_id).2, receipt);
+        stop_live(again).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admission_installed_intent_with_prior_receipt_recovers() {
+    let _reset = ResetFault;
+    let (harness, work_id, digest, revision) = approved_repair("admit-intent-first").await;
+    let kept = keep_runtime(&harness);
+    let request_id = "admit-intent-first-request";
+    ADMISSION_FAULT.store(4, std::sync::atomic::Ordering::SeqCst);
+    apply_at(&harness, request_id, &work_id, &digest, revision)
+        .await
+        .unwrap_err();
+    ADMISSION_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+    let root = harness.orch.store().root().to_path_buf();
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&fs::read(only_json(&root.join("apply-admissions"))).unwrap())
+            .unwrap();
+    let receipt_path = primary_receipt(&root, request_id).0;
+    fs::write(
+        &receipt_path,
+        envelope["receiptPriorText"].as_str().unwrap(),
+    )
+    .unwrap();
+    let (live, _parked) = reopen_kept(harness, &kept).await;
+    assert!(admission_files(&root).is_empty());
+    assert!(intent_files(&root).is_empty());
+    assert_eq!(receipt_status(&root, request_id).as_deref(), Some("failed"));
+    let replay = live
+        .orch
+        .apply_verified_change(
+            &auth(),
+            request_id,
+            kept.lane,
+            &kept.workspace,
+            &work_id,
+            &digest,
+            Some(revision),
+        )
+        .await
+        .unwrap_err();
+    assert!(replay.to_string().contains("definitely not applied"));
+    stop_live(live).await;
+}
