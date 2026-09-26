@@ -517,6 +517,7 @@ pub async fn start_control_from_env(host: AgentHostHandle) -> Option<ControlServ
             bounds: Default::default(),
         },
     );
+    orch.set_execution_surface("desktop");
     let mut limits = ControlServerLimits::default();
     if let Ok(n) = std::env::var("GROKPTAH_CONTROL_MAX_CONCURRENT") {
         if let Ok(v) = n.parse::<usize>() {
@@ -534,6 +535,12 @@ pub async fn start_control_from_env(host: AgentHostHandle) -> Option<ControlServ
                 limits.inject_work_delay = Some(Duration::from_millis(v));
             }
         }
+    }
+    if let Err(error) = orch.configure_managed_grok_from_operator_env() {
+        eprintln!(
+            "[grokptah] managed Grok executor was not installed: {}",
+            error.message
+        );
     }
     match start_control_server_with(orch, port, limits).await {
         Ok(mut h) => {
@@ -1653,6 +1660,43 @@ struct CancelWorkArgs {
     workspace: PathBuf,
     work_id: String,
     reason: String,
+    #[serde(default)]
+    expected_revision: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerifiedChangeToolArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    agent_id: String,
+    objective: String,
+    allowed_files: Vec<String>,
+    check_profile_id: String,
+    #[serde(default = "default_verified_budget")]
+    budget_profile: String,
+    #[serde(default = "default_verified_mode")]
+    mutation_mode: String,
+}
+
+fn default_verified_budget() -> String {
+    "economy".into()
+}
+
+fn default_verified_mode() -> String {
+    "isolated_review".into()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerifiedChangeReviewArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    work_id: String,
+    #[serde(default)]
+    candidate_digest: String,
     #[serde(default)]
     expected_revision: Option<u64>,
 }
@@ -3099,6 +3143,46 @@ fn tool_input_schema(name: &str) -> Value {
                 "text": {"type": "string", "minLength": 1}
             }
         }),
+        "ptah_prepare_verified_change" | "ptah_start_verified_change" => json!({
+            "type": "object",
+            "required": ["request_id", "session_id", "workspace", "agent_id", "objective", "allowed_files", "check_profile_id"],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "agent_id": {"type": "string", "minLength": 0, "maxLength": 256},
+                "objective": {"type": "string", "minLength": 1, "maxLength": 32768},
+                "allowed_files": {"type": "array", "minItems": 1, "maxItems": 64, "items": {"type": "string", "minLength": 1}},
+                "check_profile_id": {"type": "string", "minLength": 1, "maxLength": 64},
+                "budget_profile": {"type": "string"},
+                "mutation_mode": {"type": "string"}
+            }
+        }),
+        "ptah_verified_change_status" => json!({
+            "type": "object",
+            "required": ["request_id", "session_id", "workspace", "work_id"],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "work_id": {"type": "string", "minLength": 1, "maxLength": 256}
+            }
+        }),
+        "ptah_apply_verified_change" | "ptah_discard_verified_change" => json!({
+            "type": "object",
+            "required": ["request_id", "session_id", "workspace", "work_id", "candidate_digest"],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "work_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                "candidate_digest": {"type": "string", "minLength": 1, "maxLength": 128},
+                "expected_revision": {"type": "integer", "minimum": 0}
+            }
+        }),
         "ptah_cancel" => json!({
             "type": "object",
             "required": ["request_id", "session_id", "workspace", "run_id"],
@@ -3508,6 +3592,7 @@ async fn dispatch_tool(
                 cancellation_reason: args.cancellation_reason,
                 completed_at: chrono::Utc::now(),
                 verification: None,
+                candidate_verification: None,
             };
             if name == "ptah_complete_work" {
                 orch.complete_work(
@@ -4109,6 +4194,91 @@ async fn dispatch_tool(
                 args.text,
             )
             .await
+        }
+        "ptah_prepare_verified_change" | "ptah_start_verified_change" => {
+            let tool_args: VerifiedChangeToolArgs = parse_value(args)?;
+            require_nonempty(&tool_args.request_id, "request_id")?;
+            require_nonempty(&tool_args.objective, "objective")?;
+            require_nonempty(&tool_args.check_profile_id, "check_profile_id")?;
+            let budget = match tool_args.budget_profile.as_str() {
+                "economy" => crate::orchestration::ManagedExecutionBudgetProfile::Economy,
+                "balanced" => crate::orchestration::ManagedExecutionBudgetProfile::Balanced,
+                "high_assurance" => {
+                    crate::orchestration::ManagedExecutionBudgetProfile::HighAssurance
+                }
+                _ => {
+                    return Err(OrchError::new(
+                        OrchErrorCode::InvalidRequest,
+                        "budget_profile must be economy, balanced, or high_assurance",
+                    ))
+                }
+            };
+            let request = crate::orchestration::VerifiedChangeRequest {
+                request_id: tool_args.request_id,
+                session_id: tool_args.session_id,
+                workspace: tool_args.workspace,
+                agent_id: tool_args.agent_id,
+                objective: tool_args.objective,
+                allowed_files: tool_args.allowed_files,
+                check_profile_id: tool_args.check_profile_id,
+                required_checks: Vec::new(),
+                oracle_root: PathBuf::new(),
+                budget_profile: budget,
+                mutation_mode: tool_args.mutation_mode,
+                platform: String::new(),
+                execution_host: String::new(),
+            };
+            if name == "ptah_start_verified_change" {
+                orch.start_verified_change(auth, &request).await
+            } else {
+                orch.prepare_verified_change(auth, &request)
+            }
+        }
+        "ptah_verified_change_status" => {
+            let tool_args: VerifiedChangeReviewArgs = parse_value(args)?;
+            require_nonempty(&tool_args.request_id, "request_id")?;
+            require_nonempty(&tool_args.work_id, "work_id")?;
+            orch.verified_change_status(
+                auth,
+                tool_args.session_id,
+                &tool_args.workspace,
+                &tool_args.work_id,
+            )
+        }
+        "ptah_apply_verified_change" | "ptah_discard_verified_change" => {
+            let tool_args: VerifiedChangeReviewArgs = parse_value(args)?;
+            require_nonempty(&tool_args.request_id, "request_id")?;
+            require_nonempty(&tool_args.work_id, "work_id")?;
+            require_nonempty(&tool_args.candidate_digest, "candidate_digest")?;
+            if name == "ptah_apply_verified_change" {
+                orch.apply_verified_change(
+                    auth,
+                    &tool_args.request_id,
+                    tool_args.session_id,
+                    &tool_args.workspace,
+                    &tool_args.work_id,
+                    &tool_args.candidate_digest,
+                    tool_args.expected_revision,
+                )
+                .await?;
+            } else {
+                orch.discard_verified_change(
+                    auth,
+                    &tool_args.request_id,
+                    tool_args.session_id,
+                    &tool_args.workspace,
+                    &tool_args.work_id,
+                    &tool_args.candidate_digest,
+                    tool_args.expected_revision,
+                )
+                .await?;
+            }
+            orch.verified_change_status(
+                auth,
+                tool_args.session_id,
+                &tool_args.workspace,
+                &tool_args.work_id,
+            )
         }
         "ptah_cancel" => {
             let args: CancelArgs = parse_value(args)?;

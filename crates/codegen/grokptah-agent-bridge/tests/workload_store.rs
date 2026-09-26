@@ -38,6 +38,7 @@ fn success_result(summary: &str) -> WorkResult {
         cancellation_reason: None,
         completed_at: Utc::now(),
         verification: None,
+        candidate_verification: None,
     }
 }
 
@@ -91,6 +92,7 @@ fn result_with(summary: &str, evidence: CompletionEvidence) -> WorkResult {
         cancellation_reason: None,
         completed_at: Utc::now(),
         verification: Some(evidence),
+        candidate_verification: None,
     }
 }
 
@@ -430,6 +432,7 @@ fn assignment_and_manual_retry_use_revision_fences_and_preserve_history() {
                 cancellation_reason: None,
                 completed_at: Utc::now(),
                 verification: None,
+                candidate_verification: None,
             },
         )
         .unwrap();

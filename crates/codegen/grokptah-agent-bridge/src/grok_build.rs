@@ -15,7 +15,7 @@
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fmt;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -124,6 +124,12 @@ pub struct GrokBuildHostLaunchConfig {
     pub git_timeout: Duration,
     /// Parent directory for the task-scoped isolated `GROK_HOME`.
     pub isolate_parent: PathBuf,
+    /// When true, a verified isolated mutation is retained for operator
+    /// review and is not written into the source workspace.
+    pub defer_source_apply: bool,
+    /// Host-private directory that receives the candidate snapshot when
+    /// `defer_source_apply` is set. Never forwarded to the child.
+    pub candidate_retention_dir: Option<PathBuf>,
 }
 
 impl fmt::Debug for GrokBuildHostLaunchConfig {
@@ -139,6 +145,11 @@ impl fmt::Debug for GrokBuildHostLaunchConfig {
             .field("allowed_file_count", &self.allowed_files.len())
             .field("execution_approved", &self.execution_approved)
             .field("max_stdout_bytes", &self.max_stdout_bytes)
+            .field("defer_source_apply", &self.defer_source_apply)
+            .field(
+                "candidate_retained",
+                &self.candidate_retention_dir.is_some(),
+            )
             .field("max_stderr_bytes", &self.max_stderr_bytes)
             .finish_non_exhaustive()
     }
@@ -180,6 +191,14 @@ impl GrokBuildHostLaunchConfig {
         if self.git_timeout.is_zero() {
             return Err(GrokBuildAdapterError::InvalidRequest);
         }
+        if self.defer_source_apply {
+            let Some(retention) = &self.candidate_retention_dir else {
+                return Err(GrokBuildAdapterError::InvalidRequest);
+            };
+            if !retention.is_absolute() {
+                return Err(GrokBuildAdapterError::InvalidRequest);
+            }
+        }
         Ok(())
     }
 }
@@ -215,6 +234,161 @@ pub trait CredentialLeaseResolver: Send + Sync {
     fn resolve(&self, lease_id: &str) -> Result<CredentialLeaseHandle, GrokBuildAdapterError>;
 
     fn revoke(&self, lease_id: &str) -> Result<(), GrokBuildAdapterError>;
+
+    /// True only when `revoke` invalidates the credential a child already read.
+    /// Deleting a local file is not enough.
+    fn revokes_upstream(&self) -> bool {
+        false
+    }
+}
+
+/// Test-only file handle. `revoke` deletes the file and does not invalidate a
+/// credential the child has already read. Production operator setup must not
+/// install this as containment for a live provider child.
+pub struct FileCredentialLease {
+    lease_id: String,
+    path: PathBuf,
+}
+
+impl FileCredentialLease {
+    pub fn new(lease_id: impl Into<String>, path: PathBuf) -> Self {
+        Self {
+            lease_id: lease_id.into(),
+            path,
+        }
+    }
+}
+
+impl fmt::Debug for FileCredentialLease {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FileCredentialLease")
+            .field("lease_id_present", &!self.lease_id.is_empty())
+            .finish()
+    }
+}
+
+impl CredentialLeaseResolver for FileCredentialLease {
+    fn resolve(&self, lease_id: &str) -> Result<CredentialLeaseHandle, GrokBuildAdapterError> {
+        if lease_id != self.lease_id {
+            return Err(GrokBuildAdapterError::CredentialLease);
+        }
+        Ok(CredentialLeaseHandle::from_host_path(self.path.clone()))
+    }
+
+    fn revoke(&self, lease_id: &str) -> Result<(), GrokBuildAdapterError> {
+        if lease_id != self.lease_id {
+            return Err(GrokBuildAdapterError::CredentialRevocation);
+        }
+        if self.path.exists() {
+            fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&self.path)
+                .and_then(|file| file.sync_all())
+                .map_err(|_| GrokBuildAdapterError::CredentialRevocation)?;
+            fs::remove_file(&self.path).map_err(|_| GrokBuildAdapterError::CredentialRevocation)?;
+        }
+        Ok(())
+    }
+}
+
+/// Host registry whose `revoke` rejects a token the caller already holds.
+///
+/// The file written for the child is only a transport. Acceptance is decided
+/// by this registry, so truncating that file does not revoke a token the
+/// child has already read.
+pub struct HostLeaseAuthority {
+    dir: PathBuf,
+    scope: String,
+    inner: std::sync::Mutex<std::collections::BTreeMap<String, (u64, String, bool, u128)>>,
+}
+
+impl HostLeaseAuthority {
+    pub fn new(dir: PathBuf) -> Self {
+        Self::scoped(dir, "host")
+    }
+
+    pub fn scoped(dir: PathBuf, scope: impl Into<String>) -> Self {
+        Self {
+            dir,
+            scope: scope.into(),
+            inner: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+        }
+    }
+
+    pub fn scope(&self) -> &str {
+        &self.scope
+    }
+
+    pub fn provider_accepts(&self, presented: &str) -> bool {
+        let Ok(inner) = self.inner.lock() else {
+            return false;
+        };
+        let now = host_lease_now_ms();
+        inner
+            .values()
+            .any(|(_, token, revoked, expires)| !revoked && *expires > now && token == presented)
+    }
+}
+
+fn host_lease_now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
+}
+
+impl CredentialLeaseResolver for HostLeaseAuthority {
+    fn resolve(&self, lease_id: &str) -> Result<CredentialLeaseHandle, GrokBuildAdapterError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| GrokBuildAdapterError::CredentialLease)?;
+        let now = host_lease_now_ms();
+        let entry = inner.entry(lease_id.to_string()).or_insert_with(|| {
+            (
+                1,
+                format!("lease:{lease_id}:generation:1"),
+                false,
+                now.saturating_add(3_600_000),
+            )
+        });
+        if entry.2 || entry.3 <= now {
+            if entry.3 <= now {
+                entry.0 = entry.0.saturating_add(1);
+                entry.1 = format!("lease:{lease_id}:generation:{}", entry.0);
+            }
+            entry.2 = false;
+            entry.3 = now.saturating_add(3_600_000);
+        }
+        let token = entry.1.clone();
+        drop(inner);
+        let path = self.dir.join(format!("lease-{lease_id}"));
+        if path.exists() {
+            fs::remove_file(&path).map_err(|_| GrokBuildAdapterError::CredentialLease)?;
+        }
+        write_private_file(&path, token.as_bytes())?;
+        Ok(CredentialLeaseHandle::from_host_path(path))
+    }
+
+    fn revoke(&self, lease_id: &str) -> Result<(), GrokBuildAdapterError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| GrokBuildAdapterError::CredentialRevocation)?;
+        let Some(entry) = inner.get_mut(lease_id) else {
+            return Err(GrokBuildAdapterError::CredentialRevocation);
+        };
+        entry.2 = true;
+        entry.0 = entry.0.saturating_add(1);
+        entry.1 = format!("lease:{lease_id}:generation:{}", entry.0);
+        entry.3 = host_lease_now_ms().saturating_add(3_600_000);
+        Ok(())
+    }
+
+    fn revokes_upstream(&self) -> bool {
+        true
+    }
 }
 
 /// Bounded host-only evidence captured before the disposable Grok home is
@@ -1709,25 +1883,81 @@ async fn execute_allowlisted(
             Some(GrokBuildVerdict::Clean | GrokBuildVerdict::Findings)
         )
         && cleaned;
-    let mutation_evidence =
-        if launch.mutation_mode == GrokBuildMutationMode::IsolatedReview && promote_mutation {
-            match promote_verified_isolated_review_mutation(
+    let mutation_evidence = if launch.mutation_mode == GrokBuildMutationMode::IsolatedReview
+        && promote_mutation
+    {
+        let captured = if source_host.defer_source_apply {
+            let Some(retention) = source_host.candidate_retention_dir.as_ref() else {
+                let _ = checkout.cleanup().await;
+                return Err(GrokBuildAdapterError::InvalidRequest);
+            };
+            match capture_isolated_review_mutation(launch, execution_host, true).await {
+                Ok(evidence) => {
+                    if let Err(error) = crate::verified_change::retain_candidate_snapshot(
+                        &execution_host.cwd,
+                        retention,
+                        &launch.identity.head_sha,
+                    ) {
+                        let _ = checkout.cleanup().await;
+                        let _ = std::fs::remove_dir_all(retention);
+                        return Err(
+                            match error.message.contains("symlink")
+                                || error.message.contains("escape")
+                            {
+                                true => GrokBuildAdapterError::ReadOnlyMutation,
+                                false => GrokBuildAdapterError::IsolationFailed,
+                            },
+                        );
+                    }
+                    let binding = match crate::verified_change::bind_retained_candidate(
+                        &execution_host.cwd,
+                        retention,
+                    ) {
+                        Ok(binding) => binding,
+                        Err(_) => {
+                            let _ = checkout.cleanup().await;
+                            let _ = std::fs::remove_dir_all(retention);
+                            return Err(GrokBuildAdapterError::IsolationFailed);
+                        }
+                    };
+                    let mut live_paths = evidence.changed_paths().to_vec();
+                    live_paths.sort();
+                    if binding.head != launch.identity.head_sha
+                        || live_paths != binding.changed_paths
+                        || (binding.git_ref != "HEAD" && binding.git_ref != launch.identity.git_ref)
+                    {
+                        let _ = checkout.cleanup().await;
+                        let _ = std::fs::remove_dir_all(retention);
+                        return Err(GrokBuildAdapterError::IsolationFailed);
+                    }
+                    Ok(GrokBuildMutationEvidence {
+                        final_head_sha: binding.head,
+                        final_ref: launch.identity.git_ref.clone(),
+                        changed_paths: binding.changed_paths,
+                        diff_digest: binding.diff_digest,
+                    })
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            promote_verified_isolated_review_mutation(
                 launch,
                 source_host,
                 execution_host,
                 source_fingerprint,
             )
             .await
-            {
-                Ok(evidence) => Some(evidence),
-                Err(error) => {
-                    let _ = checkout.cleanup().await;
-                    return Err(error);
-                }
-            }
-        } else {
-            None
         };
+        match captured {
+            Ok(evidence) => Some(evidence),
+            Err(error) => {
+                let _ = checkout.cleanup().await;
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
     let checkout_cleaned = checkout.cleanup().await;
     if !checkout_cleaned {
         if mutation_evidence.is_some() {
@@ -2360,10 +2590,18 @@ async fn harvest_child(
     let mut stdout_done = false;
     let mut stderr_done = false;
     let mut status: Option<i32> = None;
+    let process_group = child.id();
     let deadline = Instant::now() + limit;
 
     let kind = loop {
         if status.is_some() && stdout_done && stderr_done {
+            #[cfg(unix)]
+            if let Some(pid) = process_group {
+                if !process_group_gone(pid) {
+                    let _ = terminate_and_confirm(child).await;
+                    break HarvestKind::TerminationUnproven;
+                }
+            }
             break HarvestKind::Exited(status.unwrap_or(1));
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -2442,6 +2680,12 @@ async fn harvest_child(
         stdout: out,
         stderr: err,
     }
+}
+
+#[cfg(unix)]
+fn process_group_gone(pid: u32) -> bool {
+    let status = unsafe { libc::kill(-(pid as i32), 0) };
+    status != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
 async fn terminate_and_confirm(child: &mut tokio::process::Child) -> bool {
@@ -2848,6 +3092,34 @@ mod tests {
     }
 
     #[test]
+    fn file_truncation_does_not_revoke_an_already_read_lease() {
+        let dir = tempfile::tempdir().expect("dir");
+        let authority = HostLeaseAuthority::scoped(dir.path().to_path_buf(), "workspace-a");
+        authority.resolve("lease-1").expect("resolve");
+        let lease_path = dir.path().join("lease-lease-1");
+        let token = std::fs::read_to_string(&lease_path).expect("child read");
+        assert!(authority.provider_accepts(&token));
+        std::fs::write(&lease_path, []).unwrap();
+        std::fs::remove_file(&lease_path).unwrap();
+        assert!(
+            authority.provider_accepts(&token),
+            "deleting the lease file must not revoke a token the child already read"
+        );
+        let opaque = dir.path().join("opaque");
+        std::fs::write(&opaque, token.as_bytes()).unwrap();
+        FileCredentialLease::new("lease-1", opaque.clone())
+            .revoke("lease-1")
+            .unwrap();
+        assert!(!opaque.exists());
+        assert!(
+            authority.provider_accepts(&token),
+            "FileCredentialLease revoke does not invalidate the token the child read"
+        );
+        authority.revoke("lease-1").expect("revoke");
+        assert!(!authority.provider_accepts(&token));
+    }
+
+    #[test]
     fn uncertain_termination_revokes_upstream_and_local_authority() {
         let parent = tempfile::tempdir().expect("parent");
         let isolated = IsolatedHome::create(parent.path()).expect("home");
@@ -2965,6 +3237,8 @@ mod tests {
             max_stderr_bytes: 32,
             git_timeout: Duration::from_secs(1),
             isolate_parent: PathBuf::from("/tmp/iso"),
+            defer_source_apply: false,
+            candidate_retention_dir: None,
         };
         let rendered = format!("{host:?}");
         assert!(!rendered.contains("sk-"));

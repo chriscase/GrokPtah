@@ -128,6 +128,8 @@ impl Fixture {
             max_stderr_bytes: 8_192,
             git_timeout: Duration::from_secs(5),
             isolate_parent: self.isolate.path().to_path_buf(),
+            defer_source_apply: false,
+            candidate_retention_dir: None,
         }
     }
 

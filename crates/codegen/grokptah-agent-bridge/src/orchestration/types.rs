@@ -1545,6 +1545,9 @@ pub struct IdempotencyReceipt {
     /// pending | complete | failed
     #[serde(default = "default_receipt_status")]
     pub status: String,
+    /// Digest of the sealed source-cleanup plan. Empty until apply stores one.
+    #[serde(default)]
+    pub cleanup_plan_digest: String,
 }
 
 impl IdempotencyReceipt {
@@ -1636,6 +1639,24 @@ impl OrchErrorCode {
     }
 }
 
+/// Where an apply call stopped, so the caller can leave the exact receipt
+/// recoverable without matching error prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ApplyPhase {
+    NoSourceEffect,
+    SourceEffectPossible,
+    SourceEffectCompleteBeforeWorkCommit,
+    WorkCommittedBeforeReceipt,
+    ReconciliationRequired,
+}
+
+impl ApplyPhase {
+    pub fn leaves_receipt_recoverable(self) -> bool {
+        !matches!(self, Self::NoSourceEffect)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OrchError {
@@ -1645,6 +1666,8 @@ pub struct OrchError {
     /// 410 `cursor_expired` can carry `eventRange` without a second read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apply_phase: Option<ApplyPhase>,
 }
 
 impl OrchError {
@@ -1653,6 +1676,7 @@ impl OrchError {
             code,
             message: message.into(),
             data: None,
+            apply_phase: None,
         }
     }
 
@@ -1665,7 +1689,17 @@ impl OrchError {
             code,
             message: message.into(),
             data: Some(data),
+            apply_phase: None,
         }
+    }
+
+    pub fn with_apply_phase(mut self, phase: ApplyPhase) -> Self {
+        self.apply_phase = Some(phase);
+        self
+    }
+
+    pub fn apply_phase(&self) -> Option<ApplyPhase> {
+        self.apply_phase
     }
 }
 
@@ -1844,6 +1878,11 @@ pub const CONTROL_TOOLS: &[&str] = &[
     "ptah_set_managed_execution",
     "ptah_get_managed_execution",
     "ptah_authorize_work_execution",
+    "ptah_prepare_verified_change",
+    "ptah_start_verified_change",
+    "ptah_verified_change_status",
+    "ptah_apply_verified_change",
+    "ptah_discard_verified_change",
     "ptah_resolve_work_input",
     "ptah_list_execution_intents",
     "ptah_retry_run",

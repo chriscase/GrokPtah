@@ -121,6 +121,51 @@ export const api = {
     invoke<DurableWorkItem[]>("work_list", { sessionId }),
   workGet: (sessionId: string, workId: string) =>
     invoke<RemoteWorkSnapshot | null>("work_get", { sessionId, workId }),
+  verifiedChangePrepare: (
+    sessionId: string,
+    agentId: string,
+    objective: string,
+    allowedFiles: string[],
+    checkProfileId: string,
+  ) =>
+    invoke<import("./verifiedChange").VerifiedChangeView>("verified_change_prepare", {
+      sessionId,
+      agentId,
+      objective,
+      allowedFiles,
+      checkProfileId,
+    }),
+  verifiedChangeStart: (
+    sessionId: string,
+    agentId: string,
+    objective: string,
+    allowedFiles: string[],
+    checkProfileId: string,
+  ) =>
+    invoke<import("./verifiedChange").VerifiedChangeView>("verified_change_start", {
+      sessionId,
+      agentId,
+      objective,
+      allowedFiles,
+      checkProfileId,
+    }),
+  verifiedChangeStatus: (sessionId: string, workId: string) =>
+    invoke<import("./verifiedChange").VerifiedChangeView>("verified_change_status", {
+      sessionId,
+      workId,
+    }),
+  verifiedChangeApply: (sessionId: string, workId: string, candidateDigest: string) =>
+    invoke<import("./verifiedChange").VerifiedChangeView>("verified_change_apply", {
+      sessionId,
+      workId,
+      candidateDigest,
+    }),
+  verifiedChangeDiscard: (sessionId: string, workId: string, candidateDigest: string) =>
+    invoke<import("./verifiedChange").VerifiedChangeView>("verified_change_discard", {
+      sessionId,
+      workId,
+      candidateDigest,
+    }),
   workCreate: (
     sessionId: string,
     kind: string,

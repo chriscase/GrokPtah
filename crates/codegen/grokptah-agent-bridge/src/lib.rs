@@ -23,6 +23,7 @@ mod host;
 mod host_helpers;
 mod host_runtime;
 mod instance_lock;
+mod verified_change;
 pub use instance_lock::{instance_lock_is_held, InstanceLock};
 mod isolation;
 mod lane;
@@ -179,9 +180,9 @@ pub use discover::{
 pub use event_bus::{EventBus, EventReceiver, JournalEntry, JournalPage};
 pub use events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 pub use grok_build::{
-    launch_grok_build, CredentialLeaseHandle, CredentialLeaseResolver, GrokBuildAdapterError,
-    GrokBuildAdapterOutcome, GrokBuildAdvisoryEvidence, GrokBuildHostLaunchConfig,
-    GrokBuildMutationEvidence,
+    launch_grok_build, CredentialLeaseHandle, CredentialLeaseResolver, FileCredentialLease,
+    GrokBuildAdapterError, GrokBuildAdapterOutcome, GrokBuildAdvisoryEvidence,
+    GrokBuildHostLaunchConfig, GrokBuildMutationEvidence, HostLeaseAuthority,
 };
 pub use host::{AgentHost, AgentHostHandle, AgentStatus, HostConfig, WorkspaceUiState};
 pub use host_runtime::{
@@ -216,8 +217,8 @@ pub use orchestration::{
     PublicEventPageV1, PublicEventV1, RetentionPolicy, RetentionReport, RoutineConcurrencyPolicy,
     RoutineLifecycle, RoutineRecord, RoutineRetryPolicy, RoutineSnapshot, RoutineTrigger,
     RunApproval, RunBounds, RunExecution, RunExecutionMode, RunRecord, RunState, RunStopCause,
-    WorkAttemptView, WorkDecision, WorkItem, WorkItemSnapshot, WorkMessage, WorkPolicy,
-    WorkTemplate, WorkerProjection, WorkloadReconciliationReport, WorkloadSupervisor,
+    VerifiedChangeRequest, WorkAttemptView, WorkDecision, WorkItem, WorkItemSnapshot, WorkMessage,
+    WorkPolicy, WorkTemplate, WorkerProjection, WorkloadReconciliationReport, WorkloadSupervisor,
     WorkloadSupervisorStatus, WorkspaceAllowlist, AGENT_SPEC_SCHEMA_VERSION,
     CONTINUATION_ASSEMBLER_VERSION, CONTINUATION_SCHEMA_VERSION, CONTROL_TOOLS,
     DEFAULT_AGENT_TOOL_IDS, DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS,
@@ -234,6 +235,17 @@ pub use spawn_env::{scrub_std_command, scrub_tokio_command, CONTROL_SECRET_ENV_K
 pub use types::{
     AuthState, BackgroundTask, EffortLevel, McpProjectTrust, McpServerInfo, ModelInfo, PluginInfo,
     SkillInfo, SubagentExecutionMode, SubagentInfo, SubagentIsolationPreference,
+};
+pub use verified_change::{
+    bind_retained_candidate, confinement_available, derived_snapshot_fingerprint, directory_digest,
+    execute_required_checks, execute_required_checks_with_authority, file_digest,
+    inspect_assignment_readiness, read_check_authority, recompute_candidate_apply_bundle,
+    retained_candidate_diff_digest, skip_verified_drive, write_check_authority,
+    CandidateVerification, CheckAuthority, DurableWriteFault, ReadinessInput, RequiredCheckCwd,
+    RequiredCheckEnv, RequiredCheckSpec, VerifiedChangeError, VerifiedChangeReadiness,
+    VerifiedExecutionEnvelopeV1, ADMISSION_FAULT, APPLY_FAULT, BEFORE_CANDIDATE_BIND,
+    CHECK_CONFINEMENT_EXECUTABLE, CLEANUP_FAULT, DURABLE_WRITE_FAULT, RECEIPT_TREE_SCANS,
+    SKIP_VERIFIED_DRIVE,
 };
 
 /// Crate version string for about / diagnostics.

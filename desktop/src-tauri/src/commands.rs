@@ -232,6 +232,187 @@ pub async fn work_get(
 }
 
 #[tauri::command]
+pub async fn verified_change_prepare(
+    state: State<'_, AppState>,
+    session_id: String,
+    agent_id: String,
+    objective: String,
+    allowed_files: Vec<String>,
+    check_profile_id: String,
+) -> Result<serde_json::Value, String> {
+    verified_change_call(
+        &state,
+        session_id,
+        agent_id,
+        objective,
+        allowed_files,
+        check_profile_id,
+        false,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn verified_change_start(
+    state: State<'_, AppState>,
+    session_id: String,
+    agent_id: String,
+    objective: String,
+    allowed_files: Vec<String>,
+    check_profile_id: String,
+) -> Result<serde_json::Value, String> {
+    verified_change_call(
+        &state,
+        session_id,
+        agent_id,
+        objective,
+        allowed_files,
+        check_profile_id,
+        true,
+    )
+    .await
+}
+
+async fn verified_change_call(
+    state: &AppState,
+    session_id: String,
+    agent_id: String,
+    objective: String,
+    allowed_files: Vec<String>,
+    check_profile_id: String,
+    start: bool,
+) -> Result<serde_json::Value, String> {
+    let (orch, _) = desktop_mcp_orchestration(state)?;
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    let session = state.host.session_inspect(session_id).map_err(map_err)?;
+    let request = grokptah_agent_bridge::VerifiedChangeRequest {
+        request_id: format!("desktop-{session_id}"),
+        session_id,
+        workspace: std::path::PathBuf::from(session.cwd),
+        agent_id,
+        objective,
+        allowed_files,
+        check_profile_id,
+        required_checks: Vec::new(),
+        oracle_root: std::path::PathBuf::new(),
+        budget_profile: grokptah_agent_bridge::ManagedExecutionBudgetProfile::Economy,
+        mutation_mode: "isolated_review".into(),
+        platform: String::new(),
+        execution_host: String::new(),
+    };
+    let auth = grokptah_agent_bridge::AuthContext {
+        token_id: "desktop".into(),
+        owner_id: "primary".into(),
+    };
+    if start {
+        orch.start_verified_change(&auth, &request)
+            .await
+            .map_err(map_err)
+    } else {
+        orch.prepare_verified_change(&auth, &request)
+            .map_err(map_err)
+    }
+}
+
+fn verified_change_auth() -> grokptah_agent_bridge::AuthContext {
+    grokptah_agent_bridge::AuthContext {
+        token_id: "desktop".into(),
+        owner_id: "primary".into(),
+    }
+}
+
+fn verified_change_scope(
+    state: &AppState,
+    session_id: &str,
+) -> Result<(std::sync::Arc<grokptah_agent_bridge::OrchestrationService>, uuid::Uuid, std::path::PathBuf), String> {
+    let (orch, _) = desktop_mcp_orchestration(state)?;
+    let session_id = Uuid::parse_str(session_id).map_err(map_err)?;
+    let session = state.host.session_inspect(session_id).map_err(map_err)?;
+    Ok((orch, session_id, std::path::PathBuf::from(session.cwd)))
+}
+
+#[tauri::command]
+pub async fn verified_change_status(
+    state: State<'_, AppState>,
+    session_id: String,
+    work_id: String,
+) -> Result<serde_json::Value, String> {
+    let (orch, session_id, workspace) = verified_change_scope(&state, &session_id)?;
+    orch.verified_change_status(&verified_change_auth(), session_id, &workspace, &work_id)
+        .map_err(map_err)
+}
+
+#[tauri::command]
+pub async fn verified_change_apply(
+    state: State<'_, AppState>,
+    session_id: String,
+    work_id: String,
+    candidate_digest: String,
+) -> Result<serde_json::Value, String> {
+    verified_change_review(&state, session_id, work_id, candidate_digest, true).await
+}
+
+#[tauri::command]
+pub async fn verified_change_discard(
+    state: State<'_, AppState>,
+    session_id: String,
+    work_id: String,
+    candidate_digest: String,
+) -> Result<serde_json::Value, String> {
+    verified_change_review(&state, session_id, work_id, candidate_digest, false).await
+}
+
+async fn verified_change_review(
+    state: &AppState,
+    session_id: String,
+    work_id: String,
+    candidate_digest: String,
+    apply: bool,
+) -> Result<serde_json::Value, String> {
+    if candidate_digest.trim().is_empty() {
+        return Err("candidate digest is required".into());
+    }
+    let (orch, session_id, workspace) = verified_change_scope(state, &session_id)?;
+    let suffix = candidate_digest
+        .get(candidate_digest.len().saturating_sub(16)..)
+        .unwrap_or("digest");
+    let request_id = format!(
+        "desktop-{}-{}-{}",
+        if apply { "apply" } else { "discard" },
+        work_id,
+        suffix
+    );
+    let auth = verified_change_auth();
+    if apply {
+        orch.apply_verified_change(
+            &auth,
+            &request_id,
+            session_id,
+            &workspace,
+            &work_id,
+            &candidate_digest,
+            None,
+        )
+        .await
+        .map_err(map_err)?;
+    } else {
+        orch.discard_verified_change(
+            &auth,
+            &request_id,
+            session_id,
+            &workspace,
+            &work_id,
+            &candidate_digest,
+            None,
+        )
+        .await
+        .map_err(map_err)?;
+    }
+    orch.verified_change_status(&auth, session_id, &workspace, &work_id)
+        .map_err(map_err)
+}
+
+#[tauri::command]
 pub async fn work_create(
     state: State<'_, AppState>,
     session_id: String,

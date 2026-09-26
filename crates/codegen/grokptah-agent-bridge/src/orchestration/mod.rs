@@ -78,7 +78,9 @@ pub use routine::{
     ROUTINE_SCHEMA_VERSION,
 };
 pub(crate) use service::apply_run_aggregate;
-pub use service::{ManagedGrokExecutorConfig, OrchestrationConfig, OrchestrationService};
+pub use service::{
+    ManagedGrokExecutorConfig, OrchestrationConfig, OrchestrationService, VerifiedChangeRequest,
+};
 pub(crate) use store::workspaces_match;
 pub(crate) use store::AuditWriterStopReport;
 pub use store::{IdempotencyClaim, OrchStore, RetentionPolicy, RetentionReport};
@@ -93,12 +95,13 @@ pub use types::{
     hash_payload, is_recognized_test_command, merge_bounds, prompt_preview, reject_control_prompt,
     safe_id_filename, AgentAuthorityPolicy, AgentLaneAssociation, AgentMemoryPolicy,
     AgentModelSpec, AgentRecord, AgentResumePlan, AgentRuntimeState, AgentSpec, AgentState,
-    AuditEntry, ChangeRecord, ContinuationCheckpoint, ContinuationReason, CoordinatorAgentView,
-    CoordinatorCheckpointView, CoordinatorResumePlanView, OrchError, OrchErrorCode, PromotionState,
-    RunAggregates, RunApproval, RunBounds, RunExecution, RunExecutionMode, RunProgress, RunPurpose,
-    RunRecord, RunState, RunStopCause, TestObservation, AGENT_SPEC_SCHEMA_VERSION, CONTROL_TOOLS,
-    DEFAULT_AGENT_TOOL_IDS, DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS, FORBIDDEN_TOOLS,
-    LEGACY_DESKTOP_CLIENT_ID, LOCAL_DESKTOP_ORIGIN_ID, MAX_AGENT_CONTEXT_BYTES,
+    ApplyPhase, AuditEntry, ChangeRecord, ContinuationCheckpoint, ContinuationReason,
+    CoordinatorAgentView, CoordinatorCheckpointView, CoordinatorResumePlanView, OrchError,
+    OrchErrorCode, PromotionState, RunAggregates, RunApproval, RunBounds, RunExecution,
+    RunExecutionMode, RunProgress, RunPurpose, RunRecord, RunState, RunStopCause, TestObservation,
+    AGENT_SPEC_SCHEMA_VERSION, CONTROL_TOOLS, DEFAULT_AGENT_TOOL_IDS,
+    DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS, FORBIDDEN_TOOLS, LEGACY_DESKTOP_CLIENT_ID,
+    LOCAL_DESKTOP_ORIGIN_ID, MAX_AGENT_CONTEXT_BYTES,
 };
 pub use worker::{
     reject_privilege_amplification, MeasuredCapability, WorkerHostKind, WorkerLivenessState,

@@ -7,6 +7,8 @@ import type {
 import type { LaneScope } from "./LaneScopeLine";
 import { LaneScopeLine } from "./LaneScopeLine";
 import { StateCard } from "./StateCard";
+import { VerifiedChangePanel } from "./VerifiedChangePanel";
+import type { VerifiedChangeView } from "../lib/verifiedChange";
 
 type WorkFilter = "all" | "active" | "attention" | "completed";
 
@@ -28,6 +30,18 @@ export type WorkBoardProps = {
   onCancel?: (workId: string, reason: string, expectedRevision: number) => Promise<void>;
   onOpenLane?: (sessionId: string) => void;
   onOpenRun?: (runId: string) => void;
+  verifiedChange?: VerifiedChangeView | null;
+  onVerifiedChange?: (
+    action: "prepare" | "start" | "status" | "apply" | "discard",
+    input: {
+      agentId: string;
+      objective: string;
+      allowedFiles: string[];
+      checkProfileId: string;
+      workId?: string;
+      candidateDigest?: string;
+    },
+  ) => Promise<VerifiedChangeView>;
 };
 
 function stateLabel(value: string): string {
@@ -92,6 +106,8 @@ export function WorkBoard({
   onCancel,
   onOpenLane,
   onOpenRun,
+  verifiedChange = null,
+  onVerifiedChange,
 }: WorkBoardProps) {
   const [filter, setFilter] = useState<WorkFilter>("all");
   const [createOpen, setCreateOpen] = useState(false);
@@ -101,6 +117,11 @@ export function WorkBoard({
   const [createRequiresApproval, setCreateRequiresApproval] = useState(false);
   const [agentId, setAgentId] = useState("");
   const [approvalNote, setApprovalNote] = useState("");
+  const [verifiedObjective, setVerifiedObjective] = useState("");
+  const [verifiedFiles, setVerifiedFiles] = useState("src/ledger.rs, src/report.rs");
+  const [verifiedProfileId, setVerifiedProfileId] = useState("balance-regression");
+  const [verifiedView, setVerifiedView] = useState<VerifiedChangeView | null>(verifiedChange);
+  const [verifiedError, setVerifiedError] = useState<string | null>(null);
   const [actionBusy, setActionBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const visibleItems = useMemo(
@@ -122,6 +143,50 @@ export function WorkBoard({
     setAgentId(selected?.assignedAgentId ?? "");
     setApprovalNote("");
   }, [selected?.assignedAgentId, selected?.workId]);
+
+  useEffect(() => {
+    setVerifiedView(verifiedChange);
+  }, [verifiedChange]);
+
+  function verifiedInput(view?: VerifiedChangeView | null) {
+    const allowedFiles = verifiedFiles
+      .split(",")
+      .map((path) => path.trim())
+      .filter(Boolean);
+    return {
+      agentId: agentId.trim(),
+      objective: verifiedObjective.trim(),
+      allowedFiles,
+      checkProfileId: verifiedProfileId.trim(),
+      workId: view?.workId ?? verifiedView?.workId ?? undefined,
+      candidateDigest: view?.candidateDigest ?? verifiedView?.candidateDigest ?? undefined,
+    };
+  }
+
+  async function submitVerified(action: "prepare" | "start" | "status" | "apply" | "discard") {
+    if (!onVerifiedChange) return;
+    setActionBusy(true);
+    setVerifiedError(null);
+    try {
+      let view = await onVerifiedChange(action, verifiedInput());
+      setVerifiedView(view);
+      if (action === "start" && view.workId) {
+        const deadline = Date.now() + 15_000;
+        while (
+          (view.workState === "running" || view.workState === "leased") &&
+          Date.now() < deadline
+        ) {
+          await new Promise((resolve) => setTimeout(resolve, 400));
+          view = await onVerifiedChange("status", verifiedInput(view));
+          setVerifiedView(view);
+        }
+      }
+    } catch (error) {
+      setVerifiedError(String(error));
+    } finally {
+      setActionBusy(false);
+    }
+  }
 
   async function perform(action: () => Promise<void>) {
     setActionBusy(true);
@@ -177,6 +242,72 @@ export function WorkBoard({
           <LaneScopeLine scope={scope} compact />
         </div>
       </div>
+
+      {onVerifiedChange && (
+        <form
+          className="verified-change-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void submitVerified("prepare");
+          }}
+        >
+          <label>
+            Objective
+            <input value={verifiedObjective} onChange={(event) => setVerifiedObjective(event.target.value)} />
+          </label>
+          <label>
+            Allowed files
+            <input value={verifiedFiles} onChange={(event) => setVerifiedFiles(event.target.value)} />
+          </label>
+          <label>
+            Check profile
+            <input value={verifiedProfileId} onChange={(event) => setVerifiedProfileId(event.target.value)} />
+          </label>
+          <button type="submit" disabled={actionBusy || !verifiedObjective.trim()}>
+            Prepare
+          </button>
+          <button
+            type="button"
+            disabled={actionBusy || verifiedView?.readiness?.ready !== true}
+            onClick={() => void submitVerified("start")}
+          >
+            Start one attempt
+          </button>
+          <button
+            type="button"
+            disabled={actionBusy || !verifiedView?.workId}
+            onClick={() => void submitVerified("status")}
+          >
+            Refresh review
+          </button>
+          <button
+            type="button"
+            disabled={
+              actionBusy ||
+              !verifiedView?.workId ||
+              !verifiedView.candidateDigest ||
+              verifiedView.phases?.humanApproved !== true ||
+              verifiedView.phases?.applied === true
+            }
+            onClick={() => void submitVerified("apply")}
+          >
+            Apply exact candidate
+          </button>
+          <button
+            type="button"
+            disabled={
+              actionBusy ||
+              !verifiedView?.workId ||
+              !verifiedView.candidateDigest ||
+              verifiedView.phases?.applied === true
+            }
+            onClick={() => void submitVerified("discard")}
+          >
+            Discard exact candidate
+          </button>
+          <VerifiedChangePanel view={verifiedView} error={verifiedError} />
+        </form>
+      )}
 
       <div className="work-board-summary" aria-label="Work summary">
         <span>{items.length} total</span>

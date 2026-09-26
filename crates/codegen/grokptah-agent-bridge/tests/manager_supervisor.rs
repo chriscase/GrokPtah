@@ -120,6 +120,7 @@ async fn autonomous_manager_replans_once_and_reaches_success() {
         cancellation_reason: None,
         completed_at: Utc::now(),
         verification: None,
+        candidate_verification: None,
     });
     original.bump_at(Utc::now());
     fixture_store.save_work_item(&original).unwrap();
@@ -164,6 +165,7 @@ async fn autonomous_manager_replans_once_and_reaches_success() {
         cancellation_reason: None,
         completed_at: Utc::now(),
         verification: None,
+        candidate_verification: None,
     });
     decision_work.bump_at(Utc::now());
     fixture_store.save_work_item(&decision_work).unwrap();
@@ -195,6 +197,7 @@ async fn autonomous_manager_replans_once_and_reaches_success() {
         cancellation_reason: None,
         completed_at: Utc::now(),
         verification: None,
+        candidate_verification: None,
     });
     replacement.bump_at(Utc::now());
     fixture_store.save_work_item(&replacement).unwrap();
