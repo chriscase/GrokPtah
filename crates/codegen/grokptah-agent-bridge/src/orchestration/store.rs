@@ -6551,6 +6551,9 @@ impl OrchStore {
         ) {
             return Ok(());
         }
+        let recorded_legacy_prior_with_installed_next = legacy_receipt.as_deref()
+            == Some(envelope.receipt_prior_digest.as_str())
+            && modern_receipt.as_deref() == Some(envelope.receipt_next_digest.as_str());
         if legacy_receipt.is_some() {
             let bytes = fs::read(&legacy_path)
                 .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
@@ -6580,15 +6583,22 @@ impl OrchStore {
                 else {
                     return Ok(());
                 };
-                if !Self::receipts_outcomes_compatible(&legacy, &current) {
+                if !Self::receipts_outcomes_compatible(&legacy, &current)
+                    && !recorded_legacy_prior_with_installed_next
+                {
                     return Ok(());
                 }
             }
-            self.adopt_legacy_owner_receipt_unlocked(
-                &scope,
-                &intent.request_id,
-                Some(("ptah_apply_verified_change", &legacy.payload_hash)),
-            )?;
+            // The journal proves an exact legacy prior beside its installed
+            // modern successor. Retire that prior only after both next records
+            // are durable, instead of treating the authorized seal as a conflict.
+            if !recorded_legacy_prior_with_installed_next {
+                self.adopt_legacy_owner_receipt_unlocked(
+                    &scope,
+                    &intent.request_id,
+                    Some(("ptah_apply_verified_change", &legacy.payload_hash)),
+                )?;
+            }
         }
         if current_receipt.as_deref() != Some(envelope.receipt_next_digest.as_str()) {
             atomic_write_bytes(
@@ -6611,6 +6621,17 @@ impl OrchStore {
         if installed_receipt.as_deref() == Some(envelope.receipt_next_digest.as_str())
             && installed_intent.as_deref() == Some(envelope.intent_next_digest.as_str())
         {
+            if let Some(legacy_digest) = Self::optional_record_digest(&legacy_path)? {
+                if !Self::admission_destination_allowed(
+                    Some(&legacy_digest),
+                    &envelope.receipt_prior_digest,
+                    &envelope.receipt_next_digest,
+                ) {
+                    return Err(OrchError::new(OrchErrorCode::Conflict, "legacy receipt evidence changed during admission; reconciliation is required"));
+                }
+                remove_file_durable(&self.lease(), &legacy_path)
+                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            }
             remove_file_durable(&self.lease(), path)
                 .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         }

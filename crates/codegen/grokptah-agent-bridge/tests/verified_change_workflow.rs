@@ -7064,3 +7064,83 @@ async fn legacy_binding_scope_and_cleanup_conflicts_reconcile_original_request()
         legacy_binding_conflict(&format!("legacy-{field}-conflict"), field, value).await;
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_admission_recorded_prior_beside_installed_next_recovers() {
+    for cut in [3, 4] {
+        let _reset = ResetFault;
+        let (harness, work_id, digest, revision) =
+            approved_repair(&format!("legacy-partial-{cut}")).await;
+        let kept = keep_runtime(&harness);
+        let request_id = format!("legacy-partial-{cut}-request");
+        ADMISSION_FAULT.store(cut, std::sync::atomic::Ordering::SeqCst);
+        apply_at(&harness, &request_id, &work_id, &digest, revision)
+            .await
+            .unwrap_err();
+        ADMISSION_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+        let root = harness.orch.store().root().to_path_buf();
+        let journal_path = only_json(&root.join("apply-admissions"));
+        let journal: serde_json::Value =
+            serde_json::from_slice(&fs::read(&journal_path).unwrap()).unwrap();
+        let modern = primary_receipt(&root, &request_id).0;
+        let legacy = modern
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(modern.file_name().unwrap());
+        // Migration may leave its exact prior copy after the modern seal write.
+        // The durable journal authenticates that one cleanup-only transition.
+        fs::write(&legacy, journal["receiptPriorText"].as_str().unwrap()).unwrap();
+        let source = source_at(&kept.workspace);
+        let (live, _parked) = reopen_kept(harness, &kept).await;
+        assert!(
+            !legacy.exists(),
+            "cut {cut}: recorded prior copy did not converge"
+        );
+        assert!(!journal_path.exists());
+        assert!(intent_files(&root).is_empty());
+        let work = live.orch.store().load_work_item(&work_id).unwrap().unwrap();
+        assert!(
+            !work
+                .result
+                .as_ref()
+                .unwrap()
+                .candidate_verification
+                .as_ref()
+                .unwrap()
+                .reconciliation_required
+        );
+        let replay = live
+            .orch
+            .apply_verified_change(
+                &auth(),
+                &request_id,
+                kept.lane,
+                &kept.workspace,
+                &work_id,
+                &digest,
+                Some(revision),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            replay.to_string().contains("definitely not applied"),
+            "{replay}"
+        );
+        let bytes = fs::read(&modern).unwrap();
+        let again = reopen_production_store(
+            live.host,
+            live.orch,
+            &kept.workspace,
+            &kept.fake,
+            &kept.isolate,
+            &kept.identity,
+            &kept.lease,
+        )
+        .await;
+        assert_eq!(fs::read(&modern).unwrap(), bytes);
+        assert_eq!(source_at(&kept.workspace), source);
+        stop_live(again).await;
+    }
+}
