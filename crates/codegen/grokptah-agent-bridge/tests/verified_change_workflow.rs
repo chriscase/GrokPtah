@@ -6933,3 +6933,134 @@ async fn admission_installed_intent_with_prior_receipt_recovers() {
     assert!(replay.to_string().contains("definitely not applied"));
     stop_live(live).await;
 }
+
+async fn legacy_binding_conflict(label: &str, field: &str, value: serde_json::Value) {
+    let _reset = ResetFault;
+    let (harness, work_id, digest, revision) = approved_repair(label).await;
+    let kept = keep_runtime(&harness);
+    let request_id = format!("{label}-request");
+    APPLY_FAULT.store(2, std::sync::atomic::Ordering::SeqCst);
+    apply_at(&harness, &request_id, &work_id, &digest, revision)
+        .await
+        .unwrap_err();
+    APPLY_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+    let root = harness.orch.store().root().to_path_buf();
+    let (modern, legacy, bytes) = move_pending_receipt_to_legacy(&root, &request_id);
+    let mut receipt: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    receipt[field] = value;
+    let evidence = serde_json::to_vec_pretty(&receipt).unwrap();
+    fs::write(&legacy, &evidence).unwrap();
+    let source = source_at(&kept.workspace);
+    let (live, _parked) = reopen_kept(harness, &kept).await;
+    assert_eq!(
+        fs::read(&legacy).unwrap(),
+        evidence,
+        "legacy evidence changed for {field}"
+    );
+    assert!(
+        !modern.exists(),
+        "invalid legacy evidence was adopted for {field}"
+    );
+    let work = live.orch.store().load_work_item(&work_id).unwrap().unwrap();
+    assert!(
+        work.result
+            .as_ref()
+            .unwrap()
+            .candidate_verification
+            .as_ref()
+            .unwrap()
+            .reconciliation_required
+    );
+    let replay = live
+        .orch
+        .apply_verified_change(
+            &auth(),
+            &request_id,
+            kept.lane,
+            &kept.workspace,
+            &work_id,
+            &digest,
+            Some(revision),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        replay.to_string().contains("reconciliation"),
+        "{field}: {replay}"
+    );
+    assert!(
+        !modern.exists(),
+        "original known request became a fresh claim for {field}"
+    );
+    assert_eq!(fs::read(&legacy).unwrap(), evidence);
+    let work_once = serde_json::to_value(work).unwrap();
+    let again = reopen_production_store(
+        live.host,
+        live.orch,
+        &kept.workspace,
+        &kept.fake,
+        &kept.isolate,
+        &kept.identity,
+        &kept.lease,
+    )
+    .await;
+    assert_eq!(fs::read(&legacy).unwrap(), evidence);
+    assert!(!modern.exists());
+    assert_eq!(
+        serde_json::to_value(
+            again
+                .orch
+                .store()
+                .load_work_item(&work_id)
+                .unwrap()
+                .unwrap()
+        )
+        .unwrap(),
+        work_once
+    );
+    let repeated = again
+        .orch
+        .apply_verified_change(
+            &auth(),
+            &request_id,
+            kept.lane,
+            &kept.workspace,
+            &work_id,
+            &digest,
+            Some(revision),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(repeated.to_string(), replay.to_string());
+    assert_eq!(source_at(&kept.workspace), source);
+    stop_live(again).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_binding_owner_and_request_conflicts_preserve_evidence() {
+    legacy_binding_conflict(
+        "legacy-owner-conflict",
+        "ownerId",
+        serde_json::json!("foreign-owner"),
+    )
+    .await;
+    legacy_binding_conflict(
+        "legacy-request-conflict",
+        "requestId",
+        serde_json::json!("foreign-request"),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_binding_scope_and_cleanup_conflicts_reconcile_original_request() {
+    for (field, value) in [
+        ("cleanupPlanDigest", serde_json::json!("0".repeat(64))),
+        ("sessionId", serde_json::json!(Uuid::new_v4())),
+        ("workspaceDigest", serde_json::json!("0".repeat(64))),
+        ("tool", serde_json::json!("foreign-tool")),
+        ("payloadHash", serde_json::json!("foreign-payload")),
+    ] {
+        legacy_binding_conflict(&format!("legacy-{field}-conflict"), field, value).await;
+    }
+}

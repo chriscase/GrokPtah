@@ -6860,8 +6860,55 @@ impl OrchStore {
             if let Ok(receipt_path) = self.idemp_path(&scope, &envelope.request_id) {
                 guarded.push(receipt_path);
             }
+            if let Ok(legacy_path) = self.legacy_owner_v2_path(&scope, &envelope.request_id) {
+                guarded.push(legacy_path);
+            }
         }
         guarded
+    }
+
+    /// A refused original apply must not fall through ordinary legacy adoption
+    /// into a pending claim or a fresh Perform. Terminal resolved claims replay
+    /// normally; unresolved conflicting evidence stays in its original paths.
+    pub(crate) fn require_resolved_apply_replay(
+        &self,
+        work_id: &str,
+        scope: &IdempotencyScope,
+        request_id: &str,
+    ) -> Result<(), OrchError> {
+        let _guard = self.inner.lock.lock();
+        let Some(intent) = self.read_apply_source_intent_unlocked(work_id)? else {
+            return Ok(());
+        };
+        let intent_scope = Self::apply_receipt_scope(&intent)?;
+        if intent.request_id != request_id
+            || intent_scope.owner_id != scope.owner_id
+            || intent_scope.session_id != scope.session_id
+            || intent_scope.workspace_digest != scope.workspace_digest
+        {
+            return Ok(());
+        }
+        let item = self
+            .load_work_item_unlocked(work_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        if !item
+            .as_ref()
+            .and_then(|item| item.result.as_ref())
+            .and_then(|result| result.candidate_verification.as_ref())
+            .is_some_and(|verification| verification.reconciliation_required)
+        {
+            return Ok(());
+        }
+        if self
+            .read_exact_apply_receipt_unlocked(&intent, &["complete", "failed"])
+            .is_ok_and(|(_, receipt)| receipt.cleanup_plan_digest == intent.cleanup_plan_digest)
+        {
+            return Ok(());
+        }
+        Err(OrchError::new(
+            OrchErrorCode::Conflict,
+            "apply receipt evidence conflicts; reconciliation is required",
+        ))
     }
 
     fn recover_apply_source_intents(&self) -> Result<(), OrchError> {
@@ -9749,6 +9796,9 @@ impl OrchStore {
                 };
                 if let Ok(scope) = Self::apply_receipt_scope(&intent) {
                     if let Ok(path) = self.idemp_path(&scope, &intent.request_id) {
+                        guarded.push(path);
+                    }
+                    if let Ok(path) = self.legacy_owner_v2_path(&scope, &intent.request_id) {
                         guarded.push(path);
                     }
                 }

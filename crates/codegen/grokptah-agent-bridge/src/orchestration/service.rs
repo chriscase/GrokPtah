@@ -3824,6 +3824,13 @@ impl OrchestrationService {
             }
         };
         let payload_hash = hash_payload(payload);
+        if tool == "ptah_apply_verified_change" {
+            if let Some(work_id) = payload.get("workId").and_then(serde_json::Value::as_str) {
+                let scope = IdempotencyScope::new(&auth.owner_id, session_id, &claimed)?;
+                self.store
+                    .require_resolved_apply_replay(work_id, &scope, request_id)?;
+            }
+        }
         let start = self
             .begin_idempotency(auth, tool, request_id, &payload_hash, session_id, &claimed)
             .await?;
