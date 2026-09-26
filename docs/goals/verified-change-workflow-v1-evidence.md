@@ -584,3 +584,74 @@ Independent acceptance: NOT CLAIMED.
 - At admission time the worker is still `running`, so the live start projection does not yet show `checksPassed`. The workflow test covers the settled candidate.
 - Non-macOS mutation remains refused. This run is macOS.
 - `processLimit` is not an enforced descendant cap. It is absent from the check-authority contract. The check supervisor proves the process group is gone or fails closed, and it enforces the output-directory byte limit during the run.
+
+## P1 follow-through: admission transition and legacy apply recovery
+
+This bounded continuation repairs the two remaining reviewed P1 findings. The frozen goal is unchanged. Qualification remains fixture and local CI; independent acceptance is not claimed.
+
+Starting branch tip: `948333321c3ce922e673a6831f3ee97afd42c4be`, tree `884dd927926f3faea45a8f6a67f9980d663e10d2`. Starting functional revision: `6316a051c0fe978ac62ebc4f8d9630c68600d1f6`, tree `1178af80ff6521231bd24eeebbacd2057be8468b`. The only intervening diff was this evidence document. Remote PR #579 was open and draft; remote branch and local worktree matched. `origin/main` remained `0dbe51c8aa94e3f26543be7a90e0085029487de7`.
+
+Repaired functional revision: `56757475fdfeba18247e936e16f240ecfa9f7f8f`, tree `341591e61ab0f51bac0d4fc89e364fc4460088d5`. This section is a subsequent documentation-only commit. The final published identity and exact hosted CI observation are recorded in PR #579 and the implementation handoff, avoiding a chain of evidence-only commits.
+
+### Finding 1
+
+Reproduction used a real approved two-file repair, interrupted at admission fault cut 2 after the admission journal was durable and before either destination changed. Each adversarial fixture changed the embedded successor receipt and recomputed `receiptNextDigest` from the actual successor bytes. Checksums were internally consistent. On the starting implementation, `admission_resealed_complete_successor_performs_zero_writes` failed during reopen with `a completed apply receipt cannot be failed`, after the forged complete receipt was installed. `admission_resealed_failed_successor_performs_zero_writes` failed because the destination receipt bytes changed. The focused pre-fix command exited 101 (0 passed, 2 failed).
+
+`validate_admission_receipt_transition` now requires prior and next to be pending with null response and no error. It compares the entire serialized prior claim with the successor after changing only the approved cleanup-plan digest. This preserves owner, session, workspace, request, tool, payload, run identity, creation time, schema, and future serialized claim fields. The general apply-intent validator continues to accept legitimate terminal states. New admission journals embed the original claim bytes, bound to the prior digest, so transition proof survives either durable destination write. Older journals use surviving exact prior bytes or reconstruct the unsealed prior only when its exact recorded digest agrees. Existing destination, path, candidate, and approval checks remain in place before installation or legacy adoption.
+
+Post-fix tests passed: `admission_resealed_complete_successor_performs_zero_writes`, `admission_resealed_failed_successor_performs_zero_writes`, `admission_pending_successor_cannot_inject_response_or_error`, and `admission_successor_changes_only_the_authorized_cleanup_binding`. Invalid envelopes retain their evidence and change neither receipt nor intent; the source stays unchanged. Positive coverage includes existing admission fault cuts, installed-pair idempotence, old-journal cuts 2/3/4, and an installed intent with the recorded prior receipt. Path substitution, prior-state conflict, and foreign/newer intent tests also pass.
+
+### Finding 2
+
+Integrated fixtures create real Work, an approved candidate, an actual interrupted apply intent, and the original pending receipt. They move that receipt to its actual owner-scoped v2 path, shut down the host/store, reopen production recovery, and replay the exact original service request ID, payload, and expected revision.
+
+On the starting implementation, `legacy_pending_applied_intent_recovers_original_request_success` and `legacy_pending_unapplied_intent_resolves_original_request_no_effect` incorrectly observed reconciliation required. `legacy_pending_poisoned_intent_reports_reconciliation` left the original pending legacy receipt unadopted. The focused pre-fix command exited 101 (0 passed, 3 failed).
+
+Apply-intent proof now resolves only the intent's exact legacy owner/request path. Before adoption it validates that receipt against the full intent, Work, candidate bundle, approval, session/workspace/owner, tool, payload, request, and cleanup plan. It then uses the existing durable adoption/convergence machinery before the modern receipt lookup. Admission recovery likewise validates its prior-to-next transition and both destination occupants before adopting an exact legacy prior. There is no global migration.
+
+A final conflict follow-through on the initial repair `a1555ca27471dc4a7266e90e44fcce182d3e9d57` (tree `f42fa89f4b11d801a499b675a3893cccc2188432`) reproduced two additional Finding 2 cases. `legacy_binding_owner_and_request_conflicts_preserve_evidence` observed orphan cleanup rewriting an owner-mismatched legacy record. `legacy_binding_scope_and_cleanup_conflicts_reconcile_original_request` observed an invalid cleanup claim being adopted later and replaying `still in progress`. The focused command `cargo test --locked --manifest-path crates/codegen/grokptah-agent-bridge/Cargo.toml --test verified_change_workflow legacy_binding_ -- --test-threads=1` exited 101 (0 passed, 2 failed).
+
+Both exact receipt layouts are now guarded during orphan cleanup. Before ordinary idempotency claim/adoption, the authenticated apply service checks only its exact owner/session/workspace/request intent. If that Work requires reconciliation and the intent has no matching resolved terminal receipt, the original request returns reconciliation directly. Conflicting evidence is neither adopted nor turned into a fresh Perform. Terminal outcomes retain normal replay.
+
+The expanded integrated regressions vary owner, request, session, workspace, tool, payload, and cleanup bindings. All eight focused legacy test names pass; malformed-bound records stay byte-identical, the modern receipt remains absent through original service replay, and a second reopen preserves Work/source/error/evidence.
+
+The required legitimate partial pair was also reproduced on `e074b947eb728d8290bc7f2d7a1858fd4af2b5c8` (tree `90f4aa412ebd92eab2e19cec471e64c0295bd3df`): the exact recorded legacy prior remained beside the installed modern successor, and the original admission stalled. `legacy_admission_recorded_prior_beside_installed_next_recovers` exited 101 (0 passed, 1 failed), with `cut 3: recorded prior copy did not converge`. Recovery now recognizes only that digest-exact, semantic-validated cleanup transition. It retires the old copy durably after both next records are installed and before removing the journal. A removal failure keeps the journal recoverable. Other differing old/new records remain conflicts. Both receipt-only and fully installed pair cuts converge, replay the original no-effect result, and stay stable after another reopen.
+
+Post-fix integrated outcomes:
+
+| Source/evidence | Original service request after reopen | Repeated reopen |
+| --- | --- | --- |
+| Exact candidate already applied | Success; Work succeeded; pending receipt completed; intent removed | Same response, receipt bytes, and Work snapshot; no further source change |
+| Valid original pre-apply source | Stable `definitely not applied` failure; no second apply; intent removed | Same failure, receipt bytes, and Work snapshot |
+| Poisoned source | Stable reconciliation failure; intent evidence retained | Same receipt, Work, error, and source |
+| Conflicting legacy/modern receipts | Conflict and reconciliation; both original records and intent retained | Same records and Work; no guessed adoption |
+| Interrupted admission with only legacy prior | Adopted before apply recovery; stable no-effect failure; valid Work not quarantined | Stable result |
+
+The five requested integrated test names and two expanded conflict tests all pass, including `legacy_receipt_adoption_precedes_work_quarantine` and `repeated_reopen_after_legacy_apply_recovery_is_idempotent`. The reopen helper also asserts that no extra Work attempt is dispatched. Orphan cleanup now guards receipts owned by unresolved apply intents, preserving conflicting evidence. Quarantine and already-resolved reconciliation failures remain stable across reopen. This is necessary recovery follow-through; candidate verification and source authority are otherwise unchanged.
+
+### Final local validation
+
+Rust commands below used `CARGO_INCREMENTAL=0` and no `RUSTC_WRAPPER`. Test suites used a fresh disposable `GROKPTAH_HOME` for each gate. No live provider test was run.
+
+| Gate / working directory | Exact command | Final result |
+| --- | --- | --- |
+| Bridge formatting / `crates/codegen/grokptah-agent-bridge` | `cargo fmt --check` | Exit 0 |
+| Strict bridge Clippy / bridge | `cargo clippy --locked --all-targets -- -D warnings` | Exit 0 |
+| Full locked bridge suite / bridge | `cargo test --locked -- --test-threads=1 --skip live_grok_build_dogfood` | Exit 0; 1,223 passed across test targets, including 694 unit and 101 workflow tests; 2 integration tests and 1 doctest ignored; live dogfood filtered, not run |
+| Host-authority / repository root | `cargo test -p xai-host-authority --locked -- --test-threads=1` | Exit 0; 119 passed including 21 doctests |
+| Service tests / `crates/codegen/grokptah-service` | `cargo test --locked -- --test-threads=1` | Exit 0; 20 passed (4 unit, 11 conformance, 5 smoke) |
+| Service all-target check / service | `cargo check --locked --all-targets` | Exit 0 |
+| Strict service Clippy / repository root | `cargo clippy --manifest-path crates/codegen/grokptah-service/Cargo.toml --locked --all-targets -- -D warnings` | Exit 0 |
+| Desktop TypeScript / `desktop` | `npm run typecheck` | Exit 0 |
+| Complete desktop npm suite / desktop | `npm test` | Exit 0; 58 files, 428 tests |
+| Tauri Rust / `desktop/src-tauri` | `cargo test --locked -- --test-threads=1` | Exit 0; all 50 lib tests passed; isolated remote-service rerun also passed |
+
+A focused legacy poisoned/conflict rerun during concurrent compilation encountered the existing fixture's approval-state failure (`work item is not awaiting approval`), before apply recovery. The isolated rerun passed. Tauri's initial default-parallel run failed `remote_service::tests::public_run_list_and_get_do_not_register_raw_run_watchers` with an MCP internal/reconnect error (49 passed, 1 failed); the isolated test passed, and the complete serial rerun passed all 50 tests. No unrelated test or product code was changed.
+
+Hosted Desktop: workflow `Desktop`, run [36258025951](https://github.com/chriscase/GrokPtah/actions/runs/36258025951), attempt 1, event `pull_request`, exact head SHA `56757475fdfeba18247e936e16f240ecfa9f7f8f`, status `completed`, conclusion `success`, failed steps: none. The exact functional SHA result is recorded in PR #579 and the implementation handoff; a later documentation SHA must not be substituted for that result.
+
+Live provider: NOT RUN.
+
+Production revocable xAI lease: STILL UNAVAILABLE.
+
+Independent acceptance: NOT CLAIMED.
