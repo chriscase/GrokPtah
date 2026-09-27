@@ -1,4 +1,13 @@
 {
+  "completed-forward-hosted-desktop.json": "sha256:2053e679a55622cc634dd2fa7e21a920a4bf94f533be99cc98d73f670cdcd12b",
+  "completed-forward-offline-http-rejected.json": "sha256:552ec370f220e48a2c4de33cf874f34d4df34421634ae116e1f899f7ee84abd2",
+  "completed-forward-offline-interrupted.json": "sha256:b40877240a47900c3bf2b35a8338549f32257ec6998c466ea9d5c71cc6e05bc2",
+  "completed-forward-offline-malformed.json": "sha256:b9b9568202177d711c2c1a635afdcad3f3db3cc46e9eaa0fe28c7fd34deaf5e5",
+  "completed-forward-offline-missing-usage.json": "sha256:f3afb30f4f432a7839e8a82fb03c8b4fd2ab382eb630811aadae3968fe5fe663",
+  "completed-forward-offline-success.json": "sha256:222488d92796779f17d2215f6fe7aaeb1feee646b4fdd23cf303749713222ec2",
+  "completed-forward-preservation.json": "sha256:b4fbfc3b5559828443a231583adf3483770fb4b80135126440d316eedc074f55",
+  "completed-forward-reproduction.json": "sha256:7e19e0212cf0716944032ff212ed320095831907e4eea78f21736bf6f51d925e",
+  "completed-forward-validation.json": "sha256:fc433073edb105c9b792bb8101b2c6a34b76c81136754b80bb41a2aca93de5da",
   "continuation-abandoned-forward.json": "sha256:d61a808c3ef39a96765b7e91c488c9b613ff1f2bdb02fa3103c6919f947684f4",
   "continuation-hosted-desktop.json": "sha256:90b96871c104a9e4fb9e3fe227cefc829d37d4913fc43c23944c553dbcc4111e",
   "continuation-offline-http-rejected.json": "sha256:67fbbd8d567fdb004961e8e0ea18b6497da033a84f2df44130e05fd6a4cd797a",

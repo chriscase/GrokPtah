@@ -345,3 +345,74 @@ Hosted Desktop [36337674750](https://github.com/chriscase/GrokPtah/actions/runs/
 Historical live Work `c724d7eb-d321-4159-af79-7861ad0bb10b`, Run `681606e4-b8a6-469f-ab80-ab246b861af7`, Attempt `752e00ee-5b62-4038-bbbc-3fd40a016878` is unchanged and cancelled. Its one failed live attempt/send and unknown/incomplete usage remain recorded; no retry, verified candidate or application has been invented. The earlier zero-wire isolation-failed Work is also not rearmed. Additional live inference/entitlement/paid diagnostic/cancellation requests in this pass: **0**.
 
 [The next-live proposal](real-managed-assignment-v1-next-live-spec.md) is **NOT EXECUTED**. It pins CLI/model/OIDC proxy authentication/route, reproducible new red base and two allowed files, private external oracle, one worker attempt, no retry/application, 180-second lifetime, six maximum admissions, 16,000 aggregate tokens, 1,024 output tokens per call and current byte/tool ceilings. No new live qualification repository/Work/request ID exists. Independent review, complete accounting compatibility and separate precise owner authorization remain prerequisites. The frozen original goal stays PARTIAL. Stop after this publication for independent review; no merge, undraft, release, deployment or new goal is authorized.
+
+
+## Completed-forward ownership continuation — READY FOR INDEPENDENT REVIEW
+
+This bounded pass repairs the single completed-forward handoff finding. Additional live requests: **0**. The original live G1–G10 goal remains **PARTIAL**; independent acceptance is **NOT CLAIMED**. PR #580 remains draft and unmerged. The accepted abandonment, diagnostics and actual-CLI offline journeys are preserved within their stated fixture scope.
+
+### Exact revision boundary
+
+| Identity | SHA | Tree |
+| --- | --- | --- |
+| Integrated main / #579 base, unchanged | `9e2660ff1a50edb7af1b81a4232d7fe23a37de0d` | `f524b705a3b88cb895309506bf726e76c91874bf` |
+| Starting reviewed functional | `fd8a7873468d7b416a53fc23b089b0cc4b589e2d` | `94d275b23090e873378e4690107a7d3abbba9061` |
+| Actual starting published tip | `80c8db55c8aeec39b2d5fbf49c92b42cf59f866e` | `b8d65b4409107bc86d8226b505c3324b84476f34` |
+| Repaired/tested functional | `e70c5609628ef76847d9eceb02b0523a8980409d` | `d36d0f3b081a1b9e7448d27bf2a12b1f282c183b` |
+
+Git/PR metadata was refreshed before implementation. Local and remote starting tips agreed; there was no intervening or unrelated local work. The repaired commit directly descends from the starting tip on `grok/real-managed-assignment-v1`. Its only changed file is `crates/codegen/grokptah-agent-bridge/src/managed_provider.rs`. The production repair is an early return in completed guard cleanup; other additions are test-only instrumentation and regressions. No ledger, generation subsystem, scheduler, credentials, isolation, accounting parser, budget or #579 machinery changed.
+
+The final publication SHA/tree and independently checked remote head are recorded in the PR body/final handoff. One subsequent commit contains this evidence and sanitized JSON only. **Executable changes after the tested functional revision: NONE.** No reset, rebase, force push, main mutation, replacement PR, merge, undraft, release or deployment occurred.
+
+### Meaningful before/after production-boundary reproduction
+
+Four deterministic cases use a two-worker-thread runtime, the actual production relay/forward code and canonical transport, and a local upstream fixture. A one-use `cfg(test)` barrier pauses A after durable successful settlement and successful shared-state publication, after releasing the lease mutex and before its settlement guard drops. No lease/hook mutex is held at the barrier; no timing sleep establishes ordering. B must physically reach the fixture and remain before response headers/usage before A is released. Channel/notification waits use bounded three-second test deadlines. A uses the authenticated HTTP relay; uninterrupted B/C cases also use that relay. The successor-abort variant directly owns the same production forward future so task abortion deterministically drops B's guard; it does not equate client disconnect with Hyper handler destruction.
+
+Before the production repair, the original Drop implementation was byte-identical to the starting code. A had one durably settled receipt (canonical pending count 0). B was then observed with two total reservations/admissions/fixture calls, one completed response and one pending canonical attempt. After A returned HTTP 200 and its completed guard dropped, B's active marker was **false** and `provider_quiescent` was **true**, despite that outstanding B attempt. A distinct valid C returned **200**, taking all three counts to **3**. The meaningful failures were the active-marker assertion, false-quiescence assertion, successor-ownership assertion and third-count assertion `(3,3,3) == (2,2,2)`: **13 passed, 4 failed, 1 ignored**, not a setup/permission panic. This demonstrates lost serialization within the existing finite request cap; it does not imply unlimited spending.
+
+After repair, completed `ForwardSettlement::drop` returns before locking or mutating shared lease state. Its successful transition has already released that forward's ownership. The existing incomplete cleanup remains unchanged: interruption/uncertainty, revocation and token cancellation precede releasing in-flight admission under the same mutex. The canonical transport remains the only send authority.
+
+| Assertion | Before | After |
+| --- | --- | --- |
+| A durably settled before B admission | 1; pending 0 | 1; pending 0 |
+| B physically observed and canonical pending | 1 pending B | 1 pending B |
+| B active after completed A cleanup | false | **true** |
+| Quiescence while B remains outstanding | true | **false** |
+| Entire B evidence unchanged by A cleanup | yes; active marker was lost | **yes, with active ownership retained** |
+| Distinct C status while B is active | 200 | **502 prewire refusal** |
+| Total reservations / canonical admissions / fixture sends after C | 3 / 3 / 3 | **2 / 2 / 2** |
+| Uninterrupted A/B completion | ownership assertion failed | **2 settled turns; 200 input / 20 output; accounting complete; quiescent; not revoked** |
+| Aborting actually active B after A completes | ownership assertion failed | **revoked; abandoned_forward; one pending canonical B; usage incomplete** |
+
+The C-denial variant preserves the current policy: refusal revokes/cancels B. It joins B's resulting failure while the upstream fixture remains running, so fixture shutdown cannot substitute for cancellation. The uninterrupted success variant is separate. After explicit B task abortion, only A's settled 100-input/10-output totals remain; B's usage stays unknown, not zero-cost. Changed-body HTTP C returns 401, another direct changed-body admission is refused, and all counts stay 2. Local quiescence after B cleanup does not undo the remote request.
+
+Focused final relay result: **17 passed, 0 failed, 1 ignored**. All four new regressions pass: `completed_forward_drop_cannot_clear_successor_inflight`, `completed_guard_drop_does_not_publish_false_quiescence`, `successor_inflight_prevents_a_third_forward_after_predecessor_drop`, and `completed_predecessor_preserves_successor_abandonment_revocation`. Existing header-wait/body-drain abandonment, socket-disconnect, cancellation/expiry, bounds, safe diagnostics, unknown usage and two-settled-turn tests also pass unchanged. [Observed events, commands, source/log digests and exact assertions](real-managed-assignment-v1-artifacts/completed-forward-reproduction.json).
+
+### Final validation and preserved offline qualification
+
+All local native campaigns ran serially, with `CARGO_INCREMENTAL=0`, a normal stack and disposable host homes. The final locked bridge suite used a fresh `GROKPTAH_HOME` and the established `--test-threads=1` command. No timeout, confinement, usage expectation or limit was widened.
+
+| Campaign on the functional tree above | Passed | Failed | Ignored / qualification |
+| --- | ---: | ---: | --- |
+| Bridge full locked suite | 1,247 | 0 | 10; 717 library and 102 Verified Change tests included; 39 top-level suites |
+| Bridge fmt / strict all-target Clippy | PASS | 0 | Normal stack |
+| Service fmt / all-target check / strict Clippy / isolated tests | 20 | 0 | 0 |
+| Host authority fmt / strict Clippy / locked suite | 119 | 0 | 0 |
+| Frontend typecheck / complete tests | 428 | 0 | 58 files |
+| Tauri Rust tests | 50 | 0 | 0 |
+| Actual installed-CLI managed/diagnostic cases, separately OFFLINE | 5 | 0 | 0 |
+| Existing installed-CLI protocol/cancellation/no-retry fixture, OFFLINE | 1 | 0 | 0 |
+
+The deliberate four pre-fix failures above are retained as reproduction evidence. No unexpected setup/baseline/transient validation failures occurred in this repair campaign. Earlier seven timing/output/deadline failures, their unchanged 23-check rerun and the prior passing serial campaign remain in the unchanged predecessor validation receipt/section; their cause is not retroactively reclassified. [Exact commands, per-suite counts and failure qualifications](real-managed-assignment-v1-artifacts/completed-forward-validation.json).
+
+Installed CLI 1.0.41 digest remains `sha256:9c844eb13365180787d9ad22b2b3748a024be8e1ed845253cc114781b31c591d`. All five managed journey/diagnostic cases and the separate existing protocol fixture were rerun against local upstreams, with accepted private confinement, production relay/canonical authority, Work/Run/Attempt stores, retained candidate and host-owned oracle. The positive red-to-green journey still requires explicit application on disposable source; failure cases remain discardable without source mutation. Three reopens preserve evidence, one Work/Run/Attempt and unchanged fixture counts. The fixture responses are not proof that a live model solved the assignment. [Positive rerun](real-managed-assignment-v1-artifacts/completed-forward-offline-success.json), [HTTP rejection](real-managed-assignment-v1-artifacts/completed-forward-offline-http-rejected.json), [interruption](real-managed-assignment-v1-artifacts/completed-forward-offline-interrupted.json), [protocol](real-managed-assignment-v1-artifacts/completed-forward-offline-malformed.json), [missing usage](real-managed-assignment-v1-artifacts/completed-forward-offline-missing-usage.json).
+
+Hosted Desktop [36343929733](https://github.com/chriscase/GrokPtah/actions/runs/36343929733), attempt **1**, `pull_request`, exact head `e70c5609628ef76847d9eceb02b0523a8980409d`: **completed/success**, failed steps **0**. [Exact-functional hosted metadata](real-managed-assignment-v1-artifacts/completed-forward-hosted-desktop.json). The later evidence-tip run is separate; any later CI metadata belongs in the PR body rather than another documentation commit.
+
+### Historical preservation and stop
+
+All **20** starting receipt files remain byte-identical, including the original **11** historical artifacts and all nine accepted continuation records. The digest manifest only adds this pass's records. Frozen goal SHA-256 remains `50edf789c5acc46a0f349a81ca12b53ce155adfc860ff084537e0aba33f578f8`. The next-live specification is also byte-identical, SHA-256 `d731eb90e391047826dfe1e14d4d0600e338308a635bf94fab9bb8a1d6121e41`. Canary/credential-shape scans and preservation results are in [the bounded preservation record](real-managed-assignment-v1-artifacts/completed-forward-preservation.json).
+
+Historical live Work `c724d7eb-d321-4159-af79-7861ad0bb10b`, Run `681606e4-b8a6-469f-ab80-ab246b861af7`, Attempt `752e00ee-5b62-4038-bbbc-3fd40a016878` is not rearmed or modified. Its one failed child/recorded live send, unknown/incomplete usage and **UNKNOWN** cause remain preserved. Preflight dispatch count remains **0**. Additional inference, entitlement, paid diagnostic, live cancellation or auth-route/model fallback requests in this pass: **0**. No new live qualification root/Work/request ID was created.
+
+The [next-live specification](real-managed-assignment-v1-next-live-spec.md) remains **NOT EXECUTED**. Nonzero reasoning/cache/additional-cost accounting compatibility and separate precise owner authorization remain gates. This repair neither broadens accounting nor completes original live G4/G5/G8. Stop after this single publication for independent review. Independent acceptance is **NOT CLAIMED**; no merge, undraft, release, deployment, unrelated hardening or new goal is authorized.
