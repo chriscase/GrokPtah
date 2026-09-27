@@ -1312,6 +1312,7 @@ mod tests {
             cancellation_reason: None,
             completed_at: now,
             verification: None,
+            candidate_verification: None,
         });
         failed.bump_at(now + chrono::Duration::seconds(2));
         plan.advance(&[failed.clone()], "operator", now).unwrap();
@@ -1366,6 +1367,7 @@ mod tests {
             cancellation_reason: None,
             completed_at: now,
             verification: None,
+            candidate_verification: None,
         });
         original.bump_at(now);
         plan.advance(&[original.clone()], "operator", now).unwrap();

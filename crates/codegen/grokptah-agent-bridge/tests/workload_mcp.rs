@@ -21,7 +21,16 @@ fn read_owner_sharded_receipt(root: &std::path::Path, receipt_name: &str) -> Opt
         if !owner.file_type().ok()?.is_dir() {
             return None;
         }
-        std::fs::read_to_string(owner.path().join(receipt_name)).ok()
+        if let Ok(text) = std::fs::read_to_string(owner.path().join(receipt_name)) {
+            return Some(text);
+        }
+        std::fs::read_dir(owner.path()).ok()?.find_map(|workspace| {
+            let workspace = workspace.ok()?;
+            if !workspace.file_type().ok()?.is_dir() {
+                return None;
+            }
+            std::fs::read_to_string(workspace.path().join(receipt_name)).ok()
+        })
     })
 }
 

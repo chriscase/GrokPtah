@@ -49,6 +49,40 @@ async fn a_second_service_on_the_same_home_returns_a_startup_error() {
 
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
+async fn unavailable_operator_lease_does_not_abort_service_startup() {
+    let _serial = home_override_serial();
+    let home = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    set_grokptah_home_override(Some(home.path().to_path_buf()));
+    let previous = std::env::var_os("GROKPTAH_MANAGED_GROK_EXECUTABLE");
+    std::env::set_var("GROKPTAH_MANAGED_GROK_EXECUTABLE", "/usr/bin/true");
+    let config = ServiceConfig::new(
+        "127.0.0.1:0".parse().unwrap(),
+        "lease-unavailable-token",
+        vec![workspace.path().to_path_buf()],
+        false,
+        1,
+        Duration::from_secs(5),
+    )
+    .unwrap()
+    .with_runtime_home(home.path())
+    .unwrap();
+    let handle = start_service(config).await.unwrap();
+    match previous {
+        Some(value) => std::env::set_var("GROKPTAH_MANAGED_GROK_EXECUTABLE", value),
+        None => std::env::remove_var("GROKPTAH_MANAGED_GROK_EXECUTABLE"),
+    }
+    let base = format!("http://{}", handle.addr);
+    let readiness = reqwest::get(format!("{base}/ready")).await.unwrap();
+    assert_eq!(readiness.status(), reqwest::StatusCode::OK);
+    let store = handle.host().orchestration_store().expect("store");
+    assert!(store.list_managed_intents().unwrap().is_empty());
+    assert!(handle.stop_and_wait().await.is_clean());
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn standalone_service_exposes_authenticated_mcp_and_readiness() {
     let _serial = home_override_serial();
     let home = tempdir().unwrap();

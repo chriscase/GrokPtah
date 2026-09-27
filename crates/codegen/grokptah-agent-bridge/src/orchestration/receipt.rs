@@ -72,6 +72,8 @@ mod tests {
             error: Some(OrchError::new(OrchErrorCode::Conflict, "error-secret")),
             created_at: Utc::now(),
             status: "failed".into(),
+
+            cleanup_plan_digest: String::new(),
         };
 
         let value = serde_json::to_value(OperationReceiptV1::from(&receipt)).unwrap();

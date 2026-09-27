@@ -352,6 +352,9 @@ pub struct ManagedGrokInvocation {
     pub changed_paths: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff_digest: Option<String>,
+    /// Launch-time source fingerprint. Later HEAD movement must not replace it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_fingerprint: Option<String>,
 }
 
 impl ManagedGrokInvocation {

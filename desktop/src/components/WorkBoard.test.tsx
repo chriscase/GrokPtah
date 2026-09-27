@@ -144,4 +144,68 @@ describe("WorkBoard", () => {
     await user.click(screen.getByRole("button", { name: "Approve completion" }));
     expect(onApprove).toHaveBeenCalledWith(item.workId, undefined, item.revision);
   });
+
+  it("prepares without a selected agent and refreshes the settled review", async () => {
+    const user = userEvent.setup();
+    const onVerifiedChange = vi.fn(async (action: string) => {
+      if (action === "prepare") {
+        return {
+          readiness: { ready: true, workersDispatched: 0, providerInvocations: 0 },
+          safeAction: "Resolve readiness, then start one supervised attempt.",
+        };
+      }
+      if (action === "start") {
+        return {
+          workId: "work-verified",
+          workState: "running",
+          readiness: { ready: true, workersDispatched: 0, providerInvocations: 0 },
+          phases: { checksPassed: false, applied: false },
+          boundedDiff: "",
+        };
+      }
+      return {
+        workId: "work-verified",
+        workState: "awaiting_approval",
+        candidateDigest: "sha256:candidate",
+        boundedDiff: "src/ledger.rs repaired",
+        phases: {
+          workerStopped: true,
+          changeProposed: true,
+          checksPassed: true,
+          humanApproved: true,
+          applied: false,
+        },
+        checkResults: [{ checkId: "balance-regression", outcome: "passed" }],
+        safeAction: "Approval is recorded. Application is a separate action.",
+      };
+    });
+    render(
+      <WorkBoard
+        items={[]}
+        selectedWorkId={null}
+        snapshot={null}
+        scope={scope}
+        onRefresh={vi.fn()}
+        onSelect={vi.fn()}
+        onVerifiedChange={onVerifiedChange}
+      />,
+    );
+    const prepare = screen.getByRole("button", { name: "Prepare" });
+    expect(prepare).toBeDisabled();
+    await user.type(screen.getByLabelText("Objective"), "Repair the balance pair");
+    expect(prepare).toBeEnabled();
+    await user.click(prepare);
+    expect(onVerifiedChange).toHaveBeenCalledWith(
+      "prepare",
+      expect.objectContaining({ agentId: "", objective: "Repair the balance pair" }),
+    );
+    await user.click(screen.getByRole("button", { name: "Start one attempt" }));
+    expect(await screen.findByText("src/ledger.rs repaired")).toBeTruthy();
+    expect(screen.getByText(/balance-regression: passed/)).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Apply exact candidate" }));
+    expect(onVerifiedChange).toHaveBeenCalledWith(
+      "apply",
+      expect.objectContaining({ workId: "work-verified", candidateDigest: "sha256:candidate" }),
+    );
+  });
 });

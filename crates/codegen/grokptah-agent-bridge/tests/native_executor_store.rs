@@ -476,6 +476,7 @@ fn expired_attempt_rejects_late_managed_completion() {
         cancellation_reason: None,
         completed_at: Utc::now(),
         verification: None,
+        candidate_verification: None,
     };
     assert!(store
         .complete_work(
@@ -831,6 +832,7 @@ fn dispatching_intent_cannot_be_abandoned_or_requeued_after_possible_send() {
                 cancellation_reason: None,
                 completed_at: Utc::now(),
                 verification: None,
+                candidate_verification: None,
             }),
             Utc::now(),
         )
@@ -1069,6 +1071,7 @@ fn managed_close_preserves_review_gate_even_when_retry_is_requested() {
                 cancellation_reason: None,
                 completed_at: Utc::now(),
                 verification: None,
+                candidate_verification: None,
             },
         )
         .unwrap();
@@ -1101,6 +1104,7 @@ fn managed_close_preserves_review_gate_even_when_retry_is_requested() {
                 cancellation_reason: None,
                 completed_at: Utc::now(),
                 verification: None,
+                candidate_verification: None,
             }),
             Utc::now(),
             ManagedFinalizationStage::Complete,
@@ -1871,6 +1875,7 @@ fn completed_finalization_converges_after_partial_writes() {
             cancellation_reason: None,
             completed_at: Utc::now(),
             verification: None,
+            candidate_verification: None,
         };
         store
             .finalize_managed_intent_until(

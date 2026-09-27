@@ -28,10 +28,11 @@ use super::authz::{
 use super::graph::{validate_scoped_dependency_graph, GraphScope};
 use super::managed::{
     assemble_managed_run_input, managed_execution_eligible, seal_managed_grok_prompt,
-    select_relevant_managed_messages, truncate_utf8_to_bytes, ManagedExecutionIntent,
-    ManagedExecutionPolicy, ManagedExecutorKind, ManagedFinalizationOutcome,
-    ManagedGrokCliPermissionMode, ManagedGrokInvocation, ManagedIntentState, ManagedRetryCause,
-    NativeExecutorStatus, DEFAULT_NATIVE_EXECUTOR_INTERVAL_MS, MANAGED_EXECUTION_SCHEMA_VERSION,
+    select_relevant_managed_messages, truncate_utf8_to_bytes, ManagedExecutionBudgetProfile,
+    ManagedExecutionIntent, ManagedExecutionPolicy, ManagedExecutorKind,
+    ManagedFinalizationOutcome, ManagedGrokCliPermissionMode, ManagedGrokInvocation,
+    ManagedIntentState, ManagedRetryCause, NativeExecutorStatus,
+    DEFAULT_NATIVE_EXECUTOR_INTERVAL_MS, MANAGED_EXECUTION_SCHEMA_VERSION,
     MANAGED_GROK_INVOCATION_SCHEMA_VERSION, MAX_MANAGED_MESSAGES,
 };
 use super::manager::{
@@ -61,7 +62,7 @@ use super::types::*;
 use super::worker::{reject_privilege_amplification, WorkerHostKind, WorkerObservatoryProjection};
 use super::workload::{
     WorkAttempt, WorkAttemptView, WorkDecision, WorkDependency, WorkItem, WorkPolicy, WorkProgress,
-    WorkResult, WorkState,
+    WorkResult, WorkRetryPolicy, WorkState,
 };
 
 /// Admission is deliberately bounded so an untrusted coordinator cannot turn
@@ -100,6 +101,159 @@ pub struct OrchestrationConfig {
 /// checkout. Credential material is never accepted here; only an opaque lease
 /// alias understood by the injected resolver is retained.
 #[derive(Clone)]
+pub struct VerifiedChangeRequest {
+    pub request_id: String,
+    pub session_id: Uuid,
+    pub workspace: PathBuf,
+    pub agent_id: String,
+    pub objective: String,
+    pub allowed_files: Vec<String>,
+    pub check_profile_id: String,
+    pub required_checks: Vec<crate::verified_change::RequiredCheckSpec>,
+    pub oracle_root: PathBuf,
+    pub budget_profile: ManagedExecutionBudgetProfile,
+    pub mutation_mode: String,
+    pub platform: String,
+    pub execution_host: String,
+}
+
+fn operator_env(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn require_operator_env(key: &str) -> Result<String, OrchError> {
+    operator_env(key).ok_or_else(|| {
+        OrchError::new(
+            OrchErrorCode::InvalidRequest,
+            format!("{key} is required to install the managed Grok executor"),
+        )
+    })
+}
+
+fn safe_verified_action(work: &WorkItem) -> &'static str {
+    let verification = work
+        .result
+        .as_ref()
+        .and_then(|result| result.candidate_verification.as_ref());
+    if work.state == WorkState::Cancelled {
+        return "The candidate was discarded or cancelled. Do not promote it.";
+    }
+    if verification.is_some_and(|verification| verification.invalidated) {
+        return "The candidate changed after verification. Approval is not usable.";
+    }
+    if verification.is_some_and(|verification| verification.applied)
+        || work.state == WorkState::Succeeded
+    {
+        return "The exact candidate was applied. No further application is safe.";
+    }
+    if work.result.as_ref().is_some_and(|result| {
+        result
+            .failure
+            .as_deref()
+            .is_some_and(|failure| failure.starts_with("grok_dispatch_"))
+    }) {
+        return "Execution was admitted, but the supervised task did not survive restart. Do not dispatch another attempt or treat this as verified success.";
+    }
+    if work
+        .approval
+        .as_ref()
+        .is_some_and(|approval| approval.candidate_digest.is_some())
+    {
+        return "Approval is recorded. Application is a separate action.";
+    }
+    if verification.is_some_and(|verification| verification.checks_passed) {
+        return "Review the candidate diff and required checks. Approval does not apply the change.";
+    }
+    if verification.is_some_and(|verification| verification.worker_stopped) {
+        return "The worker stopped without verified checks. Do not treat the model verdict as success.";
+    }
+    match work.state {
+        WorkState::Queued => {
+            "Execution is authorized and has not been admitted. One attempt can start."
+        }
+        WorkState::Leased | WorkState::Running => {
+            "Execution was admitted. Reconnect must not dispatch another attempt."
+        }
+        WorkState::Review => {
+            "The candidate is not verified. Inspect the check results before any approval."
+        }
+        WorkState::Failed => "Execution failed closed. No promotion is available.",
+        _ => "Inspect the durable work record before taking another action.",
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verified_change_projection(
+    request: &VerifiedChangeRequest,
+    model_selection_key: &str,
+    repository_id: &str,
+    source_revision: &str,
+    readiness: &crate::verified_change::VerifiedChangeReadiness,
+    work: Option<&WorkItem>,
+    attempt_count: usize,
+    safe_action: &str,
+) -> serde_json::Value {
+    let verification = work.and_then(|work| {
+        work.result
+            .as_ref()
+            .and_then(|result| result.candidate_verification.as_ref())
+    });
+    let limits = request.budget_profile.limits();
+    json!({
+        "repositoryId": repository_id,
+        "sourceRevision": source_revision,
+        "agentId": request.agent_id,
+        "executionHost": request.execution_host,
+        "allowedFiles": request.allowed_files,
+        "executor": "grok_build_isolated_review",
+        "modelSelectionKey": model_selection_key,
+        "cliVersion": readiness.cli_version,
+        "cliContract": readiness.cli_contract,
+        "limits": {
+            "maxPromptBytes": limits.max_prompt_bytes,
+            "maxRounds": limits.max_turns,
+            "maxDurationMs": limits.max_duration_ms,
+            "maxTotalTokens": 16000,
+        },
+        "requiredChecks": request.required_checks.iter().map(|check| json!({
+            "checkId": check.check_id,
+            "cwd": check.cwd,
+            "timeoutMs": check.timeout_ms,
+            "maxOutputBytes": check.max_output_bytes,
+        })).collect::<Vec<_>>(),
+        "approvalRequired": true,
+        "readiness": readiness,
+        "attemptCount": attempt_count,
+        "workId": work.map(|work| work.work_id.clone()),
+        "workState": work.map(|work| serde_json::to_value(work.state).unwrap_or(json!(null))),
+        "phases": {
+            "workerStopped": verification.is_some_and(|verification| verification.worker_stopped),
+            "changeProposed": verification.is_some_and(|verification| verification.change_proposed),
+            "checksPassed": verification.is_some_and(|verification| verification.checks_passed && !verification.invalidated),
+            "humanApproved": work.is_some_and(|work| work.approval.as_ref().is_some_and(|approval| approval.candidate_digest.is_some())),
+            "applied": verification.is_some_and(|verification| verification.applied),
+        },
+        "candidateDigest": verification.map(|verification| verification.content_digest.clone()),
+        "checkProfileId": verification
+            .map(|verification| verification.check_profile_id.clone())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| request.check_profile_id.clone()),
+        "checkProfileRevision": verification
+            .map(|verification| verification.check_profile_revision)
+            .unwrap_or(0),
+        "workRevision": work.map(|work| work.revision),
+        "diffDigest": verification.and_then(|verification| verification.diff_digest.clone()),
+        "changedPaths": verification.map(|verification| verification.changed_paths.clone()).unwrap_or_default(),
+        "boundedDiff": verification.map(|verification| verification.bounded_diff.clone()).unwrap_or_default(),
+        "checkResults": verification.map(|verification| verification.checks.clone()).unwrap_or_default(),
+        "safeAction": safe_action,
+    })
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct ManagedGrokExecutorConfig {
     pub executable: PathBuf,
     pub git_executable: PathBuf,
@@ -156,6 +310,8 @@ pub struct OrchestrationService {
     managed_grok_tasks: Mutex<HashMap<String, ManagedGrokTask>>,
     /// Join handles for in-flight runs (prevents forget + unbounded leaks).
     join_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Host binary surface. Public requests cannot select this.
+    execution_surface: Mutex<String>,
 }
 
 /// Authorized bounds for a live run event stream.
@@ -267,6 +423,13 @@ impl IdempotencyLease {
             Err(store_error) => store_error,
         }
     }
+
+    /// The Work commit landed and the process died before the receipt. Leave
+    /// the claim pending so restart can finish that response. Drop must not
+    /// record the committed apply as a failed mutation.
+    fn leave_pending(&mut self) {
+        self.settled = true;
+    }
 }
 
 impl Drop for IdempotencyLease {
@@ -347,6 +510,7 @@ impl OrchestrationService {
             managed_grok_runtime: Mutex::new(None),
             managed_grok_tasks: Mutex::new(HashMap::new()),
             join_handles: Mutex::new(Vec::new()),
+            execution_surface: Mutex::new("service".into()),
         });
         service.start_scheduler_watcher();
         service.start_native_executor();
@@ -1151,6 +1315,16 @@ impl OrchestrationService {
         intent.grok = Some(invocation);
         intent.updated_at = Utc::now();
         self.store.save_managed_intent(&intent)?;
+        let mut evidence = evidence;
+        let mut reason = reason.to_string();
+        let mut finalization = finalization;
+        let candidate_verification = self.bind_required_candidate_verification(
+            &intent,
+            &mut evidence,
+            &mut reason,
+            &mut finalization,
+            failure.is_none(),
+        )?;
         let result = WorkResult {
             summary,
             evidence,
@@ -1159,9 +1333,10 @@ impl OrchestrationService {
             cancellation_reason: None,
             completed_at: Utc::now(),
             verification: None,
+            candidate_verification,
         };
         self.store
-            .finalize_managed_intent(intent_id, finalization, reason, Some(result), Utc::now())?
+            .finalize_managed_intent(intent_id, finalization, &reason, Some(result), Utc::now())?
             .ok_or_else(|| {
                 OrchError::new(
                     OrchErrorCode::Internal,
@@ -1170,6 +1345,100 @@ impl OrchestrationService {
             })?;
         self.native_executor.lock().finalized += 1;
         Ok(())
+    }
+
+    fn bind_required_candidate_verification(
+        &self,
+        intent: &ManagedExecutionIntent,
+        evidence: &mut Vec<String>,
+        reason: &mut String,
+        finalization: &mut ManagedFinalizationOutcome,
+        worker_stopped: bool,
+    ) -> Result<Option<crate::verified_change::CandidateVerification>, OrchError> {
+        let Some(work) = self
+            .store
+            .load_work_item(&intent.work_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+        else {
+            return Ok(None);
+        };
+        if work.policy.required_checks.is_empty() {
+            return Ok(None);
+        }
+        let private_dir = self.store.verified_change_private_dir(&work.work_id)?;
+        let retained = self.store.candidate_snapshot_dir(&work.work_id)?;
+        let oracle = crate::verified_change::read_oracle_pointer(&private_dir).ok();
+        crate::verified_change::run_before_candidate_bind_hook();
+        let grok = intent.grok.as_ref();
+        let source_revision = grok
+            .map(|invocation| invocation.identity.head_sha.clone())
+            .filter(|revision| revision.len() == 40)
+            .unwrap_or_else(|| "0".repeat(40));
+        let source_fingerprint = grok
+            .and_then(|invocation| invocation.source_fingerprint.clone())
+            .unwrap_or_default();
+        let manifest_proposed = crate::verified_change::read_promotion_record(&retained)
+            .map(|record| !record.manifest.is_empty())
+            .unwrap_or(false);
+        let change_proposed = manifest_proposed
+            || grok.is_some_and(|invocation| !invocation.changed_paths.is_empty());
+        let diff_digest = grok.and_then(|invocation| invocation.diff_digest.clone());
+        let envelope = self
+            .store
+            .verified_execution_envelope(&work.work_id)
+            .and_then(|raw| {
+                serde_json::from_value::<crate::verified_change::VerifiedExecutionEnvelopeV1>(raw)
+                    .ok()
+            });
+        let bound_authority_digest = envelope
+            .as_ref()
+            .map(|envelope| envelope.check_authority_digest.clone())
+            .unwrap_or_default();
+        let authority = self
+            .store
+            .verified_check_authority(&work.work_id)
+            .filter(|authority| {
+                envelope.as_ref().is_some_and(|envelope| {
+                    authority.authority_digest == envelope.check_authority_digest
+                        && authority.work_id == envelope.work_id
+                        && authority.session_id == envelope.session_id
+                        && authority.workspace == envelope.workspace
+                        && authority.profile_id == envelope.check_profile_id
+                        && authority.profile_revision == envelope.check_profile_revision
+                })
+            });
+        let verification = crate::verified_change::assemble_candidate_verification(
+            &work.work_id,
+            intent.run_id.clone(),
+            intent.attempt_id.clone(),
+            &work.policy.required_checks,
+            &retained,
+            Path::new(&work.workspace),
+            oracle.as_deref(),
+            &source_revision,
+            &source_fingerprint,
+            &work.policy.allowed_files,
+            worker_stopped,
+            change_proposed,
+            diff_digest,
+            authority.as_ref(),
+            &bound_authority_digest,
+        );
+        evidence.push(format!("candidate_digest:{}", verification.content_digest));
+        evidence.push(format!("checks_passed:{}", verification.checks_passed));
+        evidence.push(format!("worker_stopped:{}", verification.worker_stopped));
+        evidence.push(format!("change_proposed:{}", verification.change_proposed));
+        for check in &verification.checks {
+            evidence.push(format!("check:{}:{}", check.check_id, check.outcome));
+        }
+        if verification.checks_passed {
+            *reason = "required checks passed for the retained candidate; approval and application remain separate".into();
+            *finalization = ManagedFinalizationOutcome::AwaitingApproval;
+        } else {
+            *reason = "required checks did not verify this candidate".into();
+            *finalization = ManagedFinalizationOutcome::Review;
+        }
+        Ok(Some(verification))
     }
 
     fn finalize_managed_grok_review(
@@ -1186,6 +1455,7 @@ impl OrchestrationService {
             cancellation_reason: None,
             completed_at: Utc::now(),
             verification: None,
+            candidate_verification: None,
         };
         self.store.finalize_managed_intent(
             &intent.intent_id,
@@ -1483,6 +1753,7 @@ impl OrchestrationService {
             cancellation_reason: None,
             completed_at: Utc::now(),
             verification: None,
+            candidate_verification: None,
         };
         if let Some(mut evidence) = run.aggregates.verification.clone() {
             evidence.work_id = Some(intent.work_id.clone());
@@ -1578,10 +1849,71 @@ impl OrchestrationService {
                 self.native_executor.lock().skipped_ineligible += 1;
                 continue;
             };
-            let Ok(spec) = agent.current_spec().cloned() else {
+            let Ok(mut spec) = agent.current_spec().cloned() else {
                 self.native_executor.lock().skipped_ineligible += 1;
                 continue;
             };
+            let envelope = self.store.verified_execution_envelope(&work.work_id);
+            if !work.policy.required_checks.is_empty() {
+                let Some(raw) = envelope.as_ref() else {
+                    self.native_executor.lock().skipped_ineligible += 1;
+                    continue;
+                };
+                let Ok(parsed) = serde_json::from_value::<
+                    crate::verified_change::VerifiedExecutionEnvelopeV1,
+                >(raw.clone()) else {
+                    self.native_executor.lock().skipped_ineligible += 1;
+                    continue;
+                };
+                let decisions = self
+                    .store
+                    .list_work_decisions(&work.work_id)
+                    .unwrap_or_default();
+                let decision_digest = decisions
+                    .iter()
+                    .rev()
+                    .find(|decision| decision.reason.contains("envelope:"))
+                    .and_then(|decision| decision.reason.split("envelope:").nth(1))
+                    .unwrap_or("")
+                    .trim();
+                let authority_bound = self
+                    .store
+                    .verified_check_authority(&work.work_id)
+                    .is_some_and(|authority| {
+                        authority.authority_digest == parsed.check_authority_digest
+                            && authority.work_id == parsed.work_id
+                            && authority.session_id == parsed.session_id
+                            && authority.workspace == parsed.workspace
+                    });
+                if !authority_bound
+                    || !parsed.permits(
+                        &work.work_id,
+                        &work.session_id.to_string(),
+                        &work.workspace,
+                        &agent_id,
+                        spec.revision,
+                        decision_digest,
+                        &work.kind,
+                    )
+                {
+                    self.native_executor.lock().skipped_ineligible += 1;
+                    continue;
+                }
+                spec.managed_execution.enabled = true;
+                spec.managed_execution.executor = ManagedExecutorKind::GrokBuildIsolatedReview;
+                spec.managed_execution.retry_eligible = false;
+                spec.managed_execution.requires_approval_before_execution = true;
+                spec.authority.bypass_permissions = false;
+                spec.managed_execution.budget_profile = Some(match parsed.budget.as_str() {
+                    "balanced" => ManagedExecutionBudgetProfile::Balanced,
+                    "high_assurance" => ManagedExecutionBudgetProfile::HighAssurance,
+                    _ => ManagedExecutionBudgetProfile::Economy,
+                });
+                spec.managed_execution.bounds.max_rounds = parsed.max_rounds as u32;
+            } else if envelope.is_some() {
+                self.native_executor.lock().skipped_ineligible += 1;
+                continue;
+            }
             if !spec.managed_execution.enabled {
                 self.native_executor.lock().skipped_manual += 1;
                 continue;
@@ -1600,7 +1932,7 @@ impl OrchestrationService {
                 &work, &agent, &spec, &decisions, live, &ceiling,
             ) {
                 Ok(bounds) => bounds,
-                Err(_) => {
+                Err(_error) => {
                     self.native_executor.lock().skipped_ineligible += 1;
                     continue;
                 }
@@ -1831,6 +2163,11 @@ impl OrchestrationService {
             &allowed_files,
             prompt_bound,
         )?;
+        let source_fingerprint = crate::run_promotion::fingerprint_at(
+            &runtime.config.cwd,
+            &runtime.config.identity.head_sha,
+        )
+        .map_err(|error| OrchError::new(OrchErrorCode::Conflict, error.to_string()))?;
         let invocation = ManagedGrokInvocation {
             schema_version: MANAGED_GROK_INVOCATION_SCHEMA_VERSION,
             profile,
@@ -1850,6 +2187,7 @@ impl OrchestrationService {
             evidence_refs: Vec::new(),
             changed_paths: Vec::new(),
             diff_digest: None,
+            source_fingerprint: Some(source_fingerprint),
         };
         let mut intent = ManagedExecutionIntent {
             schema_version: MANAGED_EXECUTION_SCHEMA_VERSION,
@@ -1939,6 +2277,18 @@ impl OrchestrationService {
             max_stderr_bytes: limits.max_output_bytes,
             git_timeout: Duration::from_secs(10),
             isolate_parent: runtime.config.isolate_parent.clone(),
+            defer_source_apply: !work.policy.required_checks.is_empty(),
+            candidate_retention_dir: if work.policy.required_checks.is_empty() {
+                None
+            } else {
+                Some(
+                    self.store
+                        .candidate_snapshot_dir(&work.work_id)
+                        .map_err(|error| {
+                            OrchError::new(OrchErrorCode::Internal, error.to_string())
+                        })?,
+                )
+            },
         };
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
@@ -2103,6 +2453,14 @@ impl OrchestrationService {
         &self.store
     }
 
+    /// Record whether this process is the desktop host or the headless service.
+    /// Caller-supplied request strings are not an input.
+    pub fn set_execution_surface(&self, surface: &str) {
+        if matches!(surface, "desktop" | "service") {
+            *self.execution_surface.lock() = surface.to_string();
+        }
+    }
+
     /// Install the host-owned Grok Build dispatch capability. The durable
     /// policy still defaults to native execution and must opt in explicitly;
     /// installing this runtime alone cannot make queued Work eligible.
@@ -2134,6 +2492,624 @@ impl OrchestrationService {
             credentials,
         });
         Ok(())
+    }
+
+    pub fn configure_managed_grok_from_operator_env(&self) -> Result<bool, OrchError> {
+        let Some(_executable) = operator_env("GROKPTAH_MANAGED_GROK_EXECUTABLE") else {
+            return Ok(false);
+        };
+        let _ = (
+            require_operator_env("GROKPTAH_MANAGED_GROK_WORKSPACE")?,
+            require_operator_env("GROKPTAH_MANAGED_GROK_ISOLATE")?,
+            require_operator_env("GROKPTAH_MANAGED_GROK_REPOSITORY_ID")?,
+            require_operator_env("GROKPTAH_MANAGED_GROK_REF")?,
+            require_operator_env("GROKPTAH_MANAGED_GROK_SHA")?,
+            require_operator_env("GROKPTAH_MANAGED_GROK_LEASE_ID")?,
+            require_operator_env("GROKPTAH_MANAGED_GROK_LEASE_FILE")?,
+        );
+        Err(OrchError::new(
+            OrchErrorCode::InvalidRequest,
+            "a file-backed credential lease does not revoke upstream provider authority; readiness stays unavailable and no worker is dispatched",
+        ))
+    }
+
+    fn resolve_verified_agent(&self, request: &mut VerifiedChangeRequest) -> Result<(), OrchError> {
+        let agent = self
+            .host
+            .ensure_session_agent(request.session_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        if request.agent_id.is_empty() || request.agent_id == "session-agent" {
+            request.agent_id = agent.agent_id;
+        }
+        Ok(())
+    }
+
+    fn existing_verified_work(
+        &self,
+        auth: &AuthContext,
+        request: &VerifiedChangeRequest,
+    ) -> Option<String> {
+        let workspace = dunce::canonicalize(&request.workspace).ok()?;
+        let scope = IdempotencyScope::new(&auth.owner_id, request.session_id, &workspace).ok()?;
+        let receipt = self
+            .store
+            .load_idempotency(&scope, &format!("{}:advance", request.request_id))
+            .ok()
+            .flatten()?;
+        receipt.response.get("createdWork")?;
+        if receipt.status != "complete" {
+            return None;
+        }
+        receipt.response["createdWork"][0]["workId"]
+            .as_str()
+            .map(str::to_string)
+    }
+
+    fn assess_verified_change(
+        &self,
+        request: &VerifiedChangeRequest,
+    ) -> Result<
+        (
+            VerifiedChangeRequest,
+            crate::verified_change::VerifiedChangeReadiness,
+            Option<crate::verified_change::CheckAuthority>,
+            String,
+        ),
+        OrchError,
+    > {
+        let _claimed = self.authorize_work_read_scope(request.session_id, &request.workspace)?;
+        let mut request = request.clone();
+        request.platform = std::env::consts::OS.to_string();
+        request.execution_host = self.execution_surface.lock().clone();
+        let runtime = self.managed_grok_runtime.lock().clone();
+        let mut reasons = Vec::new();
+        let repository_id = runtime
+            .as_ref()
+            .map(|runtime| runtime.config.repository_id.clone())
+            .unwrap_or_else(|| "unconfigured".into());
+        let head = runtime.as_ref().and_then(|runtime| {
+            crate::verified_change::source_revision(
+                &runtime.config.git_executable,
+                &request.workspace,
+            )
+            .ok()
+        });
+        if let Some(runtime) = &runtime {
+            let configured = dunce::canonicalize(&runtime.config.cwd).ok();
+            let requested = dunce::canonicalize(&request.workspace).ok();
+            if configured.is_none() || configured != requested {
+                reasons.push(
+                    "the requested workspace is not the configured managed-executor workspace"
+                        .into(),
+                );
+            }
+            if head.as_deref() != Some(runtime.config.identity.head_sha.as_str())
+                || runtime.config.repository_id != runtime.config.identity.repository_id
+                || runtime.config.base_ref != runtime.config.identity.git_ref
+            {
+                reasons.push(
+                    "the configured repository id, ref, or head does not match the exact source"
+                        .into(),
+                );
+            }
+            if !runtime.credentials.revokes_upstream() {
+                reasons.push(
+                    "the configured credential lease does not revoke upstream provider authority"
+                        .into(),
+                );
+            }
+        } else {
+            reasons.push("Managed Grok executor authority is not installed on this host.".into());
+        }
+        let authority = match crate::verified_change::resolve_check_profile(
+            self.store.root(),
+            &request.check_profile_id,
+        ) {
+            Ok((spec, mut authority, oracle)) => {
+                authority.source_root = request.workspace.clone();
+                request.required_checks = vec![spec];
+                request.oracle_root = oracle;
+                Some(authority)
+            }
+            Err(error) => {
+                reasons.push(error.message);
+                request.required_checks.clear();
+                request.oracle_root = PathBuf::new();
+                None
+            }
+        };
+        if !crate::verified_change::confinement_available() {
+            reasons.push("the check confinement backend macos-sandbox-exec is unavailable".into());
+        }
+        match head.as_deref() {
+            Some(revision) => {
+                let git = runtime
+                    .as_ref()
+                    .map(|runtime| runtime.config.git_executable.as_path())
+                    .unwrap_or(Path::new("/usr/bin/git"));
+                if !crate::verified_change::worktree_is_clean(git, &request.workspace)
+                    .unwrap_or(false)
+                {
+                    reasons.push(
+                        "the source worktree is dirty; candidate identity is not taken from uncommitted source edits"
+                            .into(),
+                    );
+                }
+                if let Err(error) = crate::run_promotion::preflight_changed_path_bounds(
+                    &request.workspace,
+                    revision,
+                ) {
+                    reasons.push(error.to_string());
+                }
+            }
+            None => {
+                reasons.push("the source revision could not be read".into());
+            }
+        }
+        let executable = runtime
+            .as_ref()
+            .map(|runtime| runtime.config.executable.clone())
+            .unwrap_or_else(|| PathBuf::from("/missing/grok"));
+        let mut readiness = crate::verified_change::inspect_assignment_readiness(
+            &crate::verified_change::ReadinessInput {
+                executable: &executable,
+                mutation_mode: &request.mutation_mode,
+                platform: &request.platform,
+                checks: &request.required_checks,
+                oracle_root: &request.oracle_root,
+                workspace: &request.workspace,
+            },
+        );
+        readiness.reasons.extend(reasons);
+        readiness.reasons.sort();
+        readiness.reasons.dedup();
+        readiness.ready = readiness.reasons.is_empty();
+        readiness.workers_dispatched = 0;
+        readiness.provider_invocations = 0;
+        Ok((request, readiness, authority, repository_id))
+    }
+
+    pub fn prepare_verified_change(
+        &self,
+        auth: &AuthContext,
+        request: &VerifiedChangeRequest,
+    ) -> Result<serde_json::Value, OrchError> {
+        let _ = auth;
+        let (request, readiness, _authority, repository_id) =
+            self.assess_verified_change(request)?;
+        let model = if request.agent_id.is_empty() {
+            String::new()
+        } else {
+            self.store
+                .require_agent_in_scope(
+                    &request.agent_id,
+                    request.session_id,
+                    &request.workspace.display().to_string(),
+                )
+                .ok()
+                .and_then(|agent| {
+                    agent
+                        .current_spec()
+                        .ok()
+                        .map(|spec| spec.model.selection_key.clone())
+                })
+                .unwrap_or_default()
+        };
+        let revision = self
+            .managed_grok_runtime
+            .lock()
+            .as_ref()
+            .map(|runtime| runtime.config.identity.head_sha.clone())
+            .unwrap_or_else(|| "unavailable".into());
+        Ok(verified_change_projection(
+            &request,
+            &model,
+            &repository_id,
+            &revision,
+            &readiness,
+            None,
+            0,
+            "Resolve readiness, then start one supervised attempt.",
+        ))
+    }
+
+    pub async fn start_verified_change(
+        &self,
+        auth: &AuthContext,
+        request: &VerifiedChangeRequest,
+    ) -> Result<serde_json::Value, OrchError> {
+        let (mut request, readiness, authority, _repository_id) =
+            self.assess_verified_change(request)?;
+        if !readiness.ready {
+            if let Some(work_id) = self.existing_verified_work(auth, &request) {
+                return self.verified_change_status(
+                    auth,
+                    request.session_id,
+                    &request.workspace,
+                    &work_id,
+                );
+            }
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "verified change is not ready; no worker was dispatched",
+            ));
+        }
+        let authority = authority.ok_or_else(|| {
+            OrchError::new(
+                OrchErrorCode::Conflict,
+                "verified change is not ready; no worker was dispatched",
+            )
+        })?;
+        self.resolve_verified_agent(&mut request)?;
+        let limits = request.budget_profile.limits();
+        let work_policy = WorkPolicy {
+            requires_approval: true,
+            allowed_files: request.allowed_files.clone(),
+            required_checks: request.required_checks.clone(),
+            retry: WorkRetryPolicy {
+                max_attempts: 1,
+                retry_failed: false,
+                retry_expired: false,
+                backoff_ms: 0,
+            },
+            ..WorkPolicy::default()
+        };
+        let created = self
+            .create_manager_plan(
+                auth,
+                &format!("{}:plan", request.request_id),
+                request.session_id,
+                &request.workspace,
+                request.agent_id.clone(),
+                format!(
+                    "{} [profile {}@{}]",
+                    request.objective, authority.profile_id, authority.profile_revision
+                ),
+                vec![ManagerStepSpec {
+                    step_id: "verified-change".into(),
+                    kind: "isolated-review".into(),
+                    objective: format!(
+                        "{} [profile {}@{}]",
+                        request.objective, authority.profile_id, authority.profile_revision
+                    ),
+                    priority: 0,
+                    dependencies: Vec::new(),
+                    assigned_agent_id: Some(request.agent_id.clone()),
+                    policy: work_policy,
+                }],
+                1,
+                1,
+                false,
+            )
+            .await?;
+        let plan_id = created["plan"]["planId"]
+            .as_str()
+            .ok_or_else(|| OrchError::new(OrchErrorCode::Internal, "manager plan has no id"))?
+            .to_string();
+        let plan_revision = created["plan"]["revision"].as_u64();
+        let advanced = self
+            .advance_manager_plan(
+                auth,
+                &format!("{}:advance", request.request_id),
+                request.session_id,
+                &request.workspace,
+                &plan_id,
+                plan_revision,
+            )
+            .await?;
+        let work_id = advanced["createdWork"][0]["workId"]
+            .as_str()
+            .ok_or_else(|| OrchError::new(OrchErrorCode::Internal, "managed work has no id"))?
+            .to_string();
+        let assigned_revision = advanced["createdWork"][0]["revision"].as_u64();
+        let private_dir = self.store.verified_change_private_dir(&work_id)?;
+        crate::verified_change::write_oracle_pointer(&private_dir, &request.oracle_root)
+            .map_err(|error| OrchError::new(OrchErrorCode::InvalidRequest, error.message))?;
+        crate::verified_change::write_assignment_context(
+            &private_dir,
+            &request.execution_host,
+            &request.platform,
+            &request.mutation_mode,
+        )
+        .map_err(|error| OrchError::new(OrchErrorCode::InvalidRequest, error.message))?;
+        let stored_work = self
+            .store
+            .load_work_item(&work_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .ok_or_else(|| OrchError::new(OrchErrorCode::Internal, "managed work disappeared"))?;
+        let agent_revision = self
+            .store
+            .load_agent(&request.agent_id)
+            .ok()
+            .flatten()
+            .and_then(|agent| agent.current_spec().ok().map(|spec| spec.revision))
+            .unwrap_or(0);
+        let mut sealed = authority.clone();
+        sealed.work_id = work_id.clone();
+        sealed.session_id = stored_work.session_id.to_string();
+        sealed.workspace = stored_work.workspace.clone();
+        sealed.source_root = request.workspace.clone();
+        let sealed = sealed.seal();
+        let envelope = crate::verified_change::VerifiedExecutionEnvelopeV1::new(
+            &work_id,
+            &stored_work.session_id.to_string(),
+            &stored_work.workspace,
+            &request.agent_id,
+            agent_revision,
+            request.budget_profile.as_str(),
+            &request.platform,
+            &request.execution_host,
+            &authority.profile_id,
+            authority.profile_revision,
+            &authority.executable_digest,
+            &authority.oracle_digest,
+            &sealed.authority_digest,
+            limits.max_prompt_bytes as u64,
+            u64::from(limits.max_turns),
+            limits.max_duration_ms,
+        );
+        std::fs::write(
+            private_dir.join("execution-envelope.json"),
+            serde_json::to_string(&envelope)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+        )
+        .map_err(|_| {
+            OrchError::new(
+                OrchErrorCode::Internal,
+                "the verified-change execution envelope could not be stored",
+            )
+        })?;
+        crate::verified_change::write_check_authority(&private_dir, &sealed)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.message))?;
+        let _authorized = self
+            .authorize_work_execution(
+                auth,
+                &format!("{}:authorize", request.request_id),
+                request.session_id,
+                &request.workspace,
+                &work_id,
+                format!(
+                    "authorize one supervised verified-change attempt envelope:{}",
+                    envelope.envelope_digest
+                ),
+                assigned_revision,
+            )
+            .await?;
+        if !crate::verified_change::skip_verified_drive() {
+            self.drive_native_executor_once().await;
+        }
+        self.verified_change_status(auth, request.session_id, &request.workspace, &work_id)
+    }
+    pub fn verified_change_status(
+        &self,
+        _auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        work_id: &str,
+    ) -> Result<serde_json::Value, OrchError> {
+        let claimed = self.authorize_work_read_scope(session_id, workspace)?;
+        let work = self
+            .store
+            .revalidate_verified_candidate_in_scope(work_id, session_id, &claimed)?;
+        let agent_id = work.assigned_agent_id.clone().unwrap_or_default();
+        let model = self
+            .store
+            .require_agent_in_scope(&agent_id, session_id, &work.workspace)
+            .ok()
+            .and_then(|agent| {
+                agent
+                    .current_spec()
+                    .ok()
+                    .map(|spec| spec.model.selection_key.clone())
+            })
+            .unwrap_or_default();
+        let envelope = self.store.verified_execution_envelope(work_id);
+        let budget_profile = envelope
+            .as_ref()
+            .and_then(|value| value.get("budget"))
+            .and_then(|value| value.as_str())
+            .and_then(|value| match value {
+                "economy" => Some(ManagedExecutionBudgetProfile::Economy),
+                "balanced" => Some(ManagedExecutionBudgetProfile::Balanced),
+                "high_assurance" => Some(ManagedExecutionBudgetProfile::HighAssurance),
+                _ => None,
+            })
+            .unwrap_or(ManagedExecutionBudgetProfile::Economy);
+        let runtime = self.managed_grok_runtime.lock().clone();
+        let repository = runtime
+            .as_ref()
+            .map(|runtime| runtime.config.repository_id.clone())
+            .unwrap_or_else(|| "unconfigured".into());
+        let private_dir = self.store.verified_change_private_dir(work_id)?;
+        let context = crate::verified_change::read_assignment_context(&private_dir);
+        let oracle = crate::verified_change::read_oracle_pointer(&private_dir);
+        let (execution_host, platform, mutation_mode) = match &context {
+            Ok(context) => (
+                context.execution_host.clone(),
+                context.platform.clone(),
+                context.mutation_mode.clone(),
+            ),
+            Err(_) => (
+                "unrecorded".into(),
+                std::env::consts::OS.into(),
+                "isolated_review".into(),
+            ),
+        };
+        let executable = runtime
+            .as_ref()
+            .map(|runtime| runtime.config.executable.clone())
+            .unwrap_or_else(|| PathBuf::from("/missing/grok"));
+        let mut readiness = match &oracle {
+            Ok(oracle) => crate::verified_change::inspect_assignment_readiness(
+                &crate::verified_change::ReadinessInput {
+                    executable: &executable,
+                    mutation_mode: &mutation_mode,
+                    platform: &platform,
+                    checks: &work.policy.required_checks,
+                    oracle_root: oracle,
+                    workspace,
+                },
+            ),
+            Err(error) => crate::verified_change::VerifiedChangeReadiness {
+                ready: false,
+                reasons: vec![error.message.clone()],
+                cli_version: None,
+                cli_contract: None,
+                platform: platform.clone(),
+                mutation_mode: mutation_mode.clone(),
+                toolchain: Vec::new(),
+                workers_dispatched: 0,
+                provider_invocations: 0,
+            },
+        };
+        if let Err(error) = &context {
+            readiness.ready = false;
+            readiness.reasons.push(error.message.clone());
+        }
+        if runtime.is_none() {
+            readiness.ready = false;
+            readiness
+                .reasons
+                .push("Managed Grok executor authority is not installed on this host.".into());
+        } else if !runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.credentials.revokes_upstream())
+        {
+            readiness.ready = false;
+            readiness.reasons.push(
+                "the configured credential lease does not revoke upstream provider authority"
+                    .into(),
+            );
+        }
+        if readiness.ready && readiness.cli_version.as_deref().unwrap_or("").is_empty() {
+            readiness.ready = false;
+            readiness
+                .reasons
+                .push("The installed CLI did not report a version.".into());
+        }
+        readiness.reasons.sort();
+        readiness.reasons.dedup();
+        let recorded_revision = work
+            .result
+            .as_ref()
+            .and_then(|result| result.candidate_verification.as_ref())
+            .map(|verification| verification.source_revision.clone())
+            .filter(|revision| revision.len() == 40);
+        let git = runtime
+            .as_ref()
+            .map(|runtime| runtime.config.git_executable.clone())
+            .unwrap_or_else(|| PathBuf::from("/usr/bin/git"));
+        let revision = recorded_revision.unwrap_or_else(|| {
+            crate::verified_change::source_revision(&git, workspace)
+                .unwrap_or_else(|_| "unavailable".into())
+        });
+        let attempts = self
+            .store
+            .list_work_attempts(Some(work_id))
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .len();
+        let action = safe_verified_action(&work);
+        let request = VerifiedChangeRequest {
+            request_id: String::new(),
+            session_id,
+            workspace: workspace.to_path_buf(),
+            agent_id,
+            objective: work.objective.clone(),
+            allowed_files: work.policy.allowed_files.clone(),
+            check_profile_id: envelope
+                .as_ref()
+                .and_then(|value| value.get("checkProfileId"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .to_string(),
+            required_checks: work.policy.required_checks.clone(),
+            oracle_root: PathBuf::new(),
+            budget_profile,
+            mutation_mode,
+            platform,
+            execution_host,
+        };
+        Ok(verified_change_projection(
+            &request,
+            &model,
+            &repository,
+            &revision,
+            &readiness,
+            Some(&work),
+            attempts,
+            action,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn apply_verified_change(
+        &self,
+        auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        work_id: &str,
+        expected_digest: &str,
+        expected_revision: Option<u64>,
+    ) -> Result<serde_json::Value, OrchError> {
+        let digest = expected_digest.to_string();
+        let principal = auth.token_id.clone();
+        let owner = auth.owner_id.clone();
+        let request = request_id.to_string();
+        let payload_workspace = workspace.display().to_string();
+        self.work_item_mutation(
+            auth,
+            "ptah_apply_verified_change",
+            request_id,
+            session_id,
+            workspace,
+            work_id,
+            json!({
+                "expectedDigest": digest,
+                "expectedRevision": expected_revision,
+                "principalId": principal,
+            }),
+            move |store| {
+                store.apply_verified_candidate(
+                    work_id,
+                    &digest,
+                    expected_revision,
+                    &principal,
+                    &request,
+                    &owner,
+                    &payload_workspace,
+                )
+            },
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn discard_verified_change(
+        &self,
+        auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        work_id: &str,
+        expected_digest: &str,
+        expected_revision: Option<u64>,
+    ) -> Result<serde_json::Value, OrchError> {
+        let digest = expected_digest.to_string();
+        self.work_item_mutation(
+            auth,
+            "ptah_discard_verified_change",
+            request_id,
+            session_id,
+            workspace,
+            work_id,
+            json!({
+                "expectedDigest": digest,
+                "expectedRevision": expected_revision,
+            }),
+            move |store| store.discard_verified_candidate(work_id, &digest, expected_revision),
+        )
+        .await
     }
 
     pub fn set_token(&self, token: String) {
@@ -2848,6 +3824,13 @@ impl OrchestrationService {
             }
         };
         let payload_hash = hash_payload(payload);
+        if tool == "ptah_apply_verified_change" {
+            if let Some(work_id) = payload.get("workId").and_then(serde_json::Value::as_str) {
+                let scope = IdempotencyScope::new(&auth.owner_id, session_id, &claimed)?;
+                self.store
+                    .require_resolved_apply_replay(work_id, &scope, request_id)?;
+            }
+        }
         let start = self
             .begin_idempotency(auth, tool, request_id, &payload_hash, session_id, &claimed)
             .await?;
@@ -5387,7 +6370,14 @@ impl OrchestrationService {
         let item = match operation(&self.store) {
             Ok(item) => item,
             Err(error) => {
-                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
+                if error
+                    .apply_phase()
+                    .is_some_and(crate::orchestration::ApplyPhase::leaves_receipt_recoverable)
+                {
+                    lease.leave_pending();
+                    return Err(error);
+                }
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
             }
         };
         let response = json!({

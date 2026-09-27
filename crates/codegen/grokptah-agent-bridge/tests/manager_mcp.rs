@@ -102,6 +102,7 @@ fn complete_work_with_verified_evidence(
                 cancellation_reason: None,
                 completed_at: now,
                 verification: Some(evidence),
+                candidate_verification: None,
             },
         )
         .unwrap();
@@ -488,6 +489,7 @@ async fn hosted_manager_tick_routes_attention_and_terminal_outcomes() {
         cancellation_reason: None,
         completed_at: now,
         verification: None,
+        candidate_verification: None,
     });
     work.bump_at(now);
     store_for_fixture.save_work_item(&work).unwrap();

@@ -1083,6 +1083,7 @@ async fn run_profile(
                 cancellation_reason: None,
                 completed_at: Utc::now(),
                 verification: None,
+                candidate_verification: None,
             },
         )
         .await
@@ -1580,6 +1581,7 @@ async fn run_profile(
                     cancellation_reason: None,
                     completed_at: Utc::now(),
                     verification: None,
+                    candidate_verification: None,
                 },
             )
             .await

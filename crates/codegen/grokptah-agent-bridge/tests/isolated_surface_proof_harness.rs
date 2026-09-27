@@ -7,10 +7,10 @@
 use grokptah_agent_bridge::computer_use::{
     computer_use_isolated_surface_admission, ContainedBrowserBackend,
     ContainedBrowserDryRunOutcome, ContainedBrowserDryRunPlatform, GuestLifecyclePhase,
-    HostSentinelSnapshot, IsolatedSurfaceBackend, IsolatedSurfaceHarness, ProofEvidenceClass,
-    Sep18NoModelProofSequencer, SyntheticGuestAction, VfDryRunOutcome, VfDryRunPlatform,
-    VfLaunchReceipt, CONTAINED_BROWSER_DRY_RUN_NONCLAIM, NATIVE_HOST_SENTINEL_NONCLAIM,
-    SYNTHETIC_HARNESS_NONCLAIM, VF_DRY_RUN_NONCLAIM,
+    HostSentinelSnapshot, IsolatedHarnessErrorCode, IsolatedSurfaceBackend, IsolatedSurfaceHarness,
+    ProofEvidenceClass, Sep18NoModelProofSequencer, SyntheticGuestAction, VfDryRunOutcome,
+    VfDryRunPlatform, VfLaunchReceipt, CONTAINED_BROWSER_DRY_RUN_NONCLAIM,
+    NATIVE_HOST_SENTINEL_NONCLAIM, SYNTHETIC_HARNESS_NONCLAIM, VF_DRY_RUN_NONCLAIM,
 };
 
 #[test]
@@ -105,14 +105,29 @@ fn bridge_vf_dry_run_honest_nonclaim() {
 
 #[test]
 fn bridge_native_host_sentinel_runner_fail_closed() {
-    let sequencer = Sep18NoModelProofSequencer::new(HostSentinelSnapshot::synthetic_baseline());
-    let evidence = sequencer
-        .run_native_host_sentinel(".")
-        .expect("native runner artifact");
-    assert!(!evidence.synthetic_fallback_used);
-    assert!(!evidence.physical_pass_claimed);
-    assert!(!evidence.isolation_pass_claimed);
-    assert!(!evidence.vf_pass_claimed);
-    assert_eq!(evidence.nonclaim, NATIVE_HOST_SENTINEL_NONCLAIM);
-    assert!(!computer_use_isolated_surface_admission());
+    // The runner fail-closes when the live pointer moves between probes. Sample
+    // until one collection is stable; a drift result is never treated as a pass.
+    let mut last_error = None;
+    for _ in 0..12 {
+        let sequencer = Sep18NoModelProofSequencer::new(HostSentinelSnapshot::synthetic_baseline());
+        match sequencer.run_native_host_sentinel(".") {
+            Ok(evidence) => {
+                assert!(!evidence.synthetic_fallback_used);
+                assert!(!evidence.physical_pass_claimed);
+                assert!(!evidence.isolation_pass_claimed);
+                assert!(!evidence.vf_pass_claimed);
+                assert_eq!(evidence.nonclaim, NATIVE_HOST_SENTINEL_NONCLAIM);
+                assert!(!computer_use_isolated_surface_admission());
+                return;
+            }
+            Err(error)
+                if error.code == IsolatedHarnessErrorCode::HostSentinelViolation
+                    && error.message.contains("drift") =>
+            {
+                last_error = Some(error);
+            }
+            Err(error) => panic!("native runner artifact: {error:?}"),
+        }
+    }
+    panic!("native runner artifact: {last_error:?}");
 }
