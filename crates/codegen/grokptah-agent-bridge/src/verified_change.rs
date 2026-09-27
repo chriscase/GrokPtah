@@ -2070,6 +2070,16 @@ fn run_one_check(
     let truncated = stdout.truncated || stderr.truncated || output_limited;
     let mut output = stdout.bytes;
     output.extend(stderr.bytes);
+    #[cfg(test)]
+    if check.check_id == "private" && !waited.is_some_and(|status| status.success()) {
+        // This fixed unit fixture has only synthetic canaries and a public
+        // Python invocation. Never emit candidate output in production.
+        eprintln!(
+            "private fixture public Xcode: {}; bounded loader diagnostic: {}",
+            public_xcode_root().display(),
+            String::from_utf8_lossy(&output)
+        );
+    }
     let digest = digest_bytes(&output);
     let group_gone = check_group_gone(group_pid);
     let output_too_large = directory_size(&output_dir) > authority.output_limit_bytes;
