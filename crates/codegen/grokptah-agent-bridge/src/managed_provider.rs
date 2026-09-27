@@ -759,13 +759,19 @@ fn validate_completion(
             return Err("managed stream contains a provider error");
         }
         if let Some(u) = value.get("usage").filter(|u| !u.is_null()) {
+            if usage.is_some() {
+                return Err("managed stream repeated its usage receipt");
+            }
             let input = u["prompt_tokens"]
                 .as_u64()
                 .ok_or("managed usage is malformed")?;
             let output = u["completion_tokens"]
                 .as_u64()
                 .ok_or("managed usage is malformed")?;
-            if output > u64::from(MAX_OUTPUT_TOKENS) || input > MAX_REQUEST_BYTES as u64 {
+            if output > u64::from(MAX_OUTPUT_TOKENS)
+                || input > MAX_REQUEST_BYTES as u64
+                || u["total_tokens"].as_u64() != Some(input.saturating_add(output))
+            {
                 return Err("managed output exceeded its token budget");
             }
             usage = Some((input, output));
@@ -810,7 +816,7 @@ fn validate_completion(
             }
         }
     }
-    if !finished || !done {
+    if !finished || !done || usage.is_none() {
         return Err("managed stream did not prove a completed response");
     }
     for (name, arguments) in tools.values() {
@@ -1137,6 +1143,9 @@ mod tests {
             good.replace("[DONE]", ""),
             good.replace("\"stop\"", "\"length\""),
             good.replace("\"completion_tokens\":10", "\"completion_tokens\":99999"),
+            good.replace("\"usage\":", "\"missing_usage\":"),
+            good.replace("\"total_tokens\":110", "\"total_tokens\":111"),
+            good.replace("data: [DONE]", "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":10,\"total_tokens\":110}}\n\ndata: [DONE]"),
             stream("child-secret"),
             stream("parent-secret"),
             format!("{good}data: {{}}\n\n"),
