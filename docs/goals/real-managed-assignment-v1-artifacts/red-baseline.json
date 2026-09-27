@@ -1,0 +1,15 @@
+{
+  "baseSha": "1f0120725be891b4ba165aca226e9cd34b27360d",
+  "checkResults": [
+    {
+      "checkId": "utf8-frame",
+      "durationMs": 132,
+      "exitCode": 1,
+      "outcome": "failed",
+      "outputDigest": "sha256:619de14b58e3763db01b37148ae9342bc31bb7f39de5dbc9f74512277b4dca57",
+      "outputTruncated": false,
+      "specDigest": "sha256:662a864af79d45ace1bab977e1280c772aad280bb0b4848bcd1f2d82bff0976c"
+    }
+  ],
+  "confinementRevision": 2
+}

@@ -1,0 +1,516 @@
+{
+  "attempts": [
+    {
+      "acquiredAt": "2026-09-27T06:56:30.105477Z",
+      "attemptId": "752e00ee-5b62-4038-bbbc-3fd40a016878",
+      "attemptNumber": 1,
+      "claimantId": "agent-8478d315-239c-41d5-ab67-5c265a30d2d7",
+      "createdAt": "2026-09-27T06:56:30.105520Z",
+      "lastHeartbeatAt": "2026-09-27T06:56:33.913986Z",
+      "leaseExpiresAt": "2026-09-27T07:01:33.913986Z",
+      "leaseTokenHash": "e4dbfe12ffcd02cc1f19a359b34de7f3fcdeb1bfa8265e17528083b107c71578",
+      "linkedRunIds": [
+        "681606e4-b8a6-469f-ab80-ab246b861af7"
+      ],
+      "progress": {
+        "percent": 1,
+        "summary": "Grok Build dispatch recorded and supervised",
+        "updatedAt": "2026-09-27T06:56:30.201088Z"
+      },
+      "result": {
+        "artifacts": [],
+        "cancellationReason": null,
+        "candidateVerification": {
+          "applied": false,
+          "applyBundleDigest": "",
+          "attemptId": "752e00ee-5b62-4038-bbbc-3fd40a016878",
+          "boundedDiff": "",
+          "changeProposed": false,
+          "changedPaths": [],
+          "checkAuthorityDigest": "sha256:49d7a548f01c397a7ee42d706f0fbb0ca161425f661451fd99a0143709f21ee6",
+          "checkProfileId": "utf8-frame",
+          "checkProfileRevision": 1,
+          "checks": [
+            {
+              "checkId": "utf8-frame",
+              "durationMs": 0,
+              "exitCode": null,
+              "outcome": "invalidated",
+              "outputDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "outputTruncated": false,
+              "specDigest": "sha256:662a864af79d45ace1bab977e1280c772aad280bb0b4848bcd1f2d82bff0976c"
+            }
+          ],
+          "checksPassed": false,
+          "contentDigest": "sha256:missing",
+          "diffDigest": null,
+          "diffTruncated": false,
+          "executionEnvelopeDigest": "",
+          "files": [],
+          "invalidated": false,
+          "reconciliationRequired": false,
+          "runId": "681606e4-b8a6-469f-ab80-ab246b861af7",
+          "schemaVersion": 1,
+          "sourceFingerprint": "a8e29cd3da4000f9b7a7f94ae11f87aa7ab5637920043fd88b261d868fb6f61e",
+          "sourceRevision": "1f0120725be891b4ba165aca226e9cd34b27360d",
+          "specDigest": "sha256:662a864af79d45ace1bab977e1280c772aad280bb0b4848bcd1f2d82bff0976c",
+          "workId": "c724d7eb-d321-4159-af79-7861ad0bb10b",
+          "workerStopped": true
+        },
+        "completedAt": "2026-09-27T06:56:34.050903Z",
+        "evidence": [
+          "executor:grok_build_isolated_review",
+          "profile:economy",
+          "state:failedclosed",
+          "cli_permission_mode:host_mapped_bypass_permissions",
+          "host_execution_approved:true",
+          "evidence_ref:closed-run:managed-worker-did-not-exit-cleanly",
+          "candidate_digest:sha256:missing",
+          "checks_passed:false",
+          "worker_stopped:true",
+          "change_proposed:false",
+          "check:utf8-frame:invalidated"
+        ],
+        "failure": null,
+        "summary": "Grok Build returned no persistable advisory summary"
+      },
+      "schemaVersion": 1,
+      "state": "review",
+      "terminalReason": "required checks did not verify this candidate",
+      "updatedAt": "2026-09-27T06:56:34.050903Z",
+      "workId": "c724d7eb-d321-4159-af79-7861ad0bb10b"
+    }
+  ],
+  "baseSha": "1f0120725be891b4ba165aca226e9cd34b27360d",
+  "baseTree": "1ef9c0872b4eadfaae5f75bbf2933c062cce67ec",
+  "cliDigest": "sha256:9c844eb13365180787d9ad22b2b3748a024be8e1ed845253cc114781b31c591d",
+  "mode": "execute",
+  "operatorEntry": "production loopback MCP",
+  "readiness": {
+    "agentId": "agent-8478d315-239c-41d5-ab67-5c265a30d2d7",
+    "allowedFiles": [
+      "src/framing.py",
+      "src/decoder.py"
+    ],
+    "approvalRequired": true,
+    "attemptCount": 0,
+    "boundedDiff": "",
+    "candidateDigest": null,
+    "changedPaths": [],
+    "checkProfileId": "utf8-frame",
+    "checkProfileRevision": 0,
+    "checkResults": [],
+    "cliContract": "inspect-json-v1",
+    "cliVersion": "1.0.41",
+    "diffDigest": null,
+    "executionHost": "service",
+    "executor": "grok_build_isolated_review",
+    "limits": {
+      "maxDurationMs": 180000,
+      "maxOutputTokensPerRequest": 1024,
+      "maxPromptBytes": 16384,
+      "maxRounds": 6,
+      "maxTotalTokens": 16000
+    },
+    "modelSelectionKey": "grok-build-0.1",
+    "phases": {
+      "applied": false,
+      "changeProposed": false,
+      "checksPassed": false,
+      "humanApproved": false,
+      "workerStopped": false
+    },
+    "readiness": {
+      "cliContract": "inspect-json-v1",
+      "cliVersion": "1.0.41",
+      "mutationMode": "isolated_review",
+      "platform": "macos",
+      "providerInvocations": 0,
+      "ready": true,
+      "reasons": [],
+      "toolchain": [
+        {
+          "checkId": "utf8-frame",
+          "present": true
+        }
+      ],
+      "workersDispatched": 0
+    },
+    "repositoryId": "qualification:utf8-frame-v1",
+    "requiredChecks": [
+      {
+        "checkId": "utf8-frame",
+        "cwd": "oracle",
+        "maxOutputBytes": 16384,
+        "timeoutMs": 5000
+      }
+    ],
+    "safeAction": "Resolve readiness, then start one supervised attempt.",
+    "sourceRevision": "1f0120725be891b4ba165aca226e9cd34b27360d",
+    "workId": null,
+    "workRevision": null,
+    "workState": null
+  },
+  "runs": [
+    {
+      "agentId": "agent-8478d315-239c-41d5-ab67-5c265a30d2d7",
+      "agentSpecRevision": 1,
+      "aggregates": {
+        "changes": [],
+        "permissionsDenied": 0,
+        "permissionsGranted": 0,
+        "permissionsRequested": 0,
+        "tests": [],
+        "usage": {
+          "completionTokens": 0,
+          "promptTokens": 0,
+          "requests": 1,
+          "totalTokens": 0
+        },
+        "usageComplete": false,
+        "usagePendingRequests": 1,
+        "verification": null
+      },
+      "approval": null,
+      "bounds": {
+        "maxDurationMs": 180000,
+        "maxPromptBytes": 16000,
+        "maxRounds": 6,
+        "maxTotalTokens": 16000
+      },
+      "checkpointId": null,
+      "clientId": "managed-grok",
+      "continuationContextHash": null,
+      "continuationContextId": null,
+      "continuationFidelity": null,
+      "createdAt": "2026-09-27T06:56:30.076666Z",
+      "endSeq": null,
+      "errorCode": null,
+      "execution": null,
+      "finalResponse": null,
+      "parentRunId": null,
+      "progress": null,
+      "promptPreview": "Host-approved bounded Grok Build assignment",
+      "purpose": "execution",
+      "queuePosition": null,
+      "requestId": "3579478f-63e3-4c1d-8b31-06e4456cbe58",
+      "retryOf": null,
+      "runId": "681606e4-b8a6-469f-ab80-ab246b861af7",
+      "sessionId": "8478d315-239c-41d5-ab67-5c265a30d2d7",
+      "startSeq": 1000001,
+      "state": "interrupted",
+      "stopCause": "interrupted",
+      "terminalResult": "managed_execution_uncertain_or_failed",
+      "updatedAt": "2026-09-27T06:56:34.050903Z",
+      "workspace": "/private/tmp/rma-provider-qualification-v1-final/source"
+    }
+  ],
+  "setupError": null,
+  "sourceDecoderDigest": "sha256:4affad25745d7962b4ef474c59d3564d0634fef0a9e1987c9dfd30ada8962cb9",
+  "sourceDiff": "",
+  "sourceFramingDigest": "sha256:7f0ed4cf86fca40e73d7a8c22d436f074b20a94c47e9a1aa7bed605720a6c71d",
+  "started": {
+    "agentId": "agent-8478d315-239c-41d5-ab67-5c265a30d2d7",
+    "allowedFiles": [
+      "src/framing.py",
+      "src/decoder.py"
+    ],
+    "approvalRequired": true,
+    "attemptCount": 1,
+    "attemptId": "752e00ee-5b62-4038-bbbc-3fd40a016878",
+    "boundedDiff": "",
+    "candidateDigest": null,
+    "changedPaths": [],
+    "checkProfileId": "utf8-frame",
+    "checkProfileRevision": 0,
+    "checkResults": [],
+    "cliContract": "inspect-json-v1",
+    "cliVersion": "1.0.41",
+    "diffDigest": null,
+    "executionHost": "service",
+    "executor": "grok_build_isolated_review",
+    "limits": {
+      "maxDurationMs": 180000,
+      "maxOutputTokensPerRequest": 1024,
+      "maxPromptBytes": 16384,
+      "maxRounds": 6,
+      "maxTotalTokens": 16000
+    },
+    "modelSelectionKey": "grok-build-0.1",
+    "phases": {
+      "applied": false,
+      "changeProposed": false,
+      "checksPassed": false,
+      "humanApproved": false,
+      "workerStopped": false
+    },
+    "providerEvidence": {
+      "accountingComplete": true,
+      "authorityAttempts": [],
+      "deniedRequests": 0,
+      "inputTokens": 0,
+      "mechanism": "host_relay_v1",
+      "model": "grok-build-0.1",
+      "outputTokens": 0,
+      "requestsReserved": 0,
+      "responsesCompleted": 0,
+      "revoked": false,
+      "toolCalls": 0,
+      "uncertain": false,
+      "usageObserved": false,
+      "wireAttempts": 0
+    },
+    "readiness": {
+      "cliContract": "inspect-json-v1",
+      "cliVersion": "1.0.41",
+      "mutationMode": "isolated_review",
+      "platform": "macos",
+      "providerInvocations": 0,
+      "ready": true,
+      "reasons": [],
+      "toolchain": [
+        {
+          "checkId": "utf8-frame",
+          "present": true
+        }
+      ],
+      "workersDispatched": 0
+    },
+    "repositoryId": "qualification:utf8-frame-v1",
+    "requiredChecks": [
+      {
+        "checkId": "utf8-frame",
+        "cwd": "oracle",
+        "maxOutputBytes": 16384,
+        "timeoutMs": 5000
+      }
+    ],
+    "runId": "681606e4-b8a6-469f-ab80-ab246b861af7",
+    "safeAction": "Execution was admitted. Reconnect must not dispatch another attempt.",
+    "sourceRevision": "1f0120725be891b4ba165aca226e9cd34b27360d",
+    "stopReason": null,
+    "workId": "c724d7eb-d321-4159-af79-7861ad0bb10b",
+    "workRevision": 4,
+    "workState": "running"
+  },
+  "status": {
+    "agentId": "agent-8478d315-239c-41d5-ab67-5c265a30d2d7",
+    "allowedFiles": [
+      "src/framing.py",
+      "src/decoder.py"
+    ],
+    "approvalRequired": true,
+    "attemptCount": 1,
+    "attemptId": "752e00ee-5b62-4038-bbbc-3fd40a016878",
+    "boundedDiff": "",
+    "candidateDigest": "sha256:missing",
+    "changedPaths": [],
+    "checkProfileId": "utf8-frame",
+    "checkProfileRevision": 1,
+    "checkResults": [
+      {
+        "checkId": "utf8-frame",
+        "durationMs": 0,
+        "exitCode": null,
+        "outcome": "invalidated",
+        "outputDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outputTruncated": false,
+        "specDigest": "sha256:662a864af79d45ace1bab977e1280c772aad280bb0b4848bcd1f2d82bff0976c"
+      }
+    ],
+    "cliContract": "inspect-json-v1",
+    "cliVersion": "1.0.41",
+    "diffDigest": null,
+    "executionHost": "service",
+    "executor": "grok_build_isolated_review",
+    "limits": {
+      "maxDurationMs": 180000,
+      "maxOutputTokensPerRequest": 1024,
+      "maxPromptBytes": 16384,
+      "maxRounds": 6,
+      "maxTotalTokens": 16000
+    },
+    "modelSelectionKey": "grok-build-0.1",
+    "phases": {
+      "applied": false,
+      "changeProposed": false,
+      "checksPassed": false,
+      "humanApproved": false,
+      "workerStopped": true
+    },
+    "providerEvidence": {
+      "accountingComplete": false,
+      "authorityAttempts": [
+        "att_2ccf6034ee8b0389"
+      ],
+      "deniedRequests": 0,
+      "inputTokens": 0,
+      "mechanism": "host_relay_v1",
+      "model": "grok-build-0.1",
+      "outputTokens": 0,
+      "requestsReserved": 1,
+      "responsesCompleted": 0,
+      "revoked": true,
+      "toolCalls": 0,
+      "uncertain": true,
+      "usageObserved": false,
+      "wireAttempts": 1
+    },
+    "readiness": {
+      "cliContract": "inspect-json-v1",
+      "cliVersion": "1.0.41",
+      "mutationMode": "isolated_review",
+      "platform": "macos",
+      "providerInvocations": 0,
+      "ready": true,
+      "reasons": [],
+      "toolchain": [
+        {
+          "checkId": "utf8-frame",
+          "present": true
+        }
+      ],
+      "workersDispatched": 0
+    },
+    "repositoryId": "qualification:utf8-frame-v1",
+    "requiredChecks": [
+      {
+        "checkId": "utf8-frame",
+        "cwd": "oracle",
+        "maxOutputBytes": 16384,
+        "timeoutMs": 5000
+      }
+    ],
+    "runId": "681606e4-b8a6-469f-ab80-ab246b861af7",
+    "safeAction": "The worker stopped without verified checks. Do not treat the model verdict as success.",
+    "sourceRevision": "1f0120725be891b4ba165aca226e9cd34b27360d",
+    "stopReason": "managed_execution_uncertain_or_failed",
+    "workId": "c724d7eb-d321-4159-af79-7861ad0bb10b",
+    "workRevision": 5,
+    "workState": "review"
+  },
+  "work": {
+    "approval": null,
+    "assignedAgentId": "agent-8478d315-239c-41d5-ab67-5c265a30d2d7",
+    "assignmentStatus": "accepted",
+    "attemptCount": 1,
+    "createdAt": "2026-09-27T06:56:29.928979Z",
+    "createdBy": "primary",
+    "deadline": null,
+    "dependencies": [],
+    "isContainer": false,
+    "kind": "isolated-review",
+    "lastDecisionId": "54f6b64e-e9f7-4154-be71-7d71d1a727fe",
+    "objective": "Inspect src/framing.py and src/decoder.py and repair both functions. encode(str) must emit the UTF-8 BYTE length as canonical unsigned ASCII decimal followed by a colon and the payload. decode(bytes) must accept exactly one frame, require header 0 or a nonzero decimal without leading zeros, require the exact payload byte length, and reject malformed headers, truncated/excess payloads, and invalid UTF-8 with ValueError. Preserve valid empty, ASCII, Unicode and embedded-colon messages. Modify exactly these two files. Use file tools only; do not run commands or change any oracle. Finish with a brief description of both changes and a final line GROK_BUILD_VERDICT=clean, or GROK_BUILD_VERDICT=not_complete if unfinished. [profile utf8-frame@1]",
+    "parentWorkId": "87d7cc77-c90b-4b69-93cf-9d3c2e60f991",
+    "policy": {
+      "allowedFiles": [
+        "src/framing.py",
+        "src/decoder.py"
+      ],
+      "bounds": {
+        "maxDurationMs": 180000,
+        "maxPromptBytes": 16000,
+        "maxRounds": 6,
+        "maxTotalTokens": 16000
+      },
+      "managedExecution": "inherit",
+      "maxConcurrentAttempts": 1,
+      "requiredChecks": [
+        {
+          "args": [],
+          "checkId": "utf8-frame",
+          "cwd": "oracle",
+          "env": [
+            {
+              "key": "QUALIFICATION_PYTHON",
+              "value": "/Applications/Xcode.app/Contents/Developer/usr/bin/python3"
+            }
+          ],
+          "executable": "/private/tmp/rma-provider-qualification-v1-final/oracle/check.sh",
+          "maxOutputBytes": 16384,
+          "timeoutMs": 5000
+        }
+      ],
+      "requiresApproval": true,
+      "retry": {
+        "backoffMs": 0,
+        "maxAttempts": 1,
+        "retryExpired": false,
+        "retryFailed": false
+      }
+    },
+    "priority": 0,
+    "progress": {
+      "percent": 1,
+      "summary": "Grok Build dispatch recorded and supervised",
+      "updatedAt": "2026-09-27T06:56:30.201088Z"
+    },
+    "result": {
+      "artifacts": [],
+      "cancellationReason": null,
+      "candidateVerification": {
+        "applied": false,
+        "applyBundleDigest": "",
+        "attemptId": "752e00ee-5b62-4038-bbbc-3fd40a016878",
+        "boundedDiff": "",
+        "changeProposed": false,
+        "changedPaths": [],
+        "checkAuthorityDigest": "sha256:49d7a548f01c397a7ee42d706f0fbb0ca161425f661451fd99a0143709f21ee6",
+        "checkProfileId": "utf8-frame",
+        "checkProfileRevision": 1,
+        "checks": [
+          {
+            "checkId": "utf8-frame",
+            "durationMs": 0,
+            "exitCode": null,
+            "outcome": "invalidated",
+            "outputDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "outputTruncated": false,
+            "specDigest": "sha256:662a864af79d45ace1bab977e1280c772aad280bb0b4848bcd1f2d82bff0976c"
+          }
+        ],
+        "checksPassed": false,
+        "contentDigest": "sha256:missing",
+        "diffDigest": null,
+        "diffTruncated": false,
+        "executionEnvelopeDigest": "",
+        "files": [],
+        "invalidated": false,
+        "reconciliationRequired": false,
+        "runId": "681606e4-b8a6-469f-ab80-ab246b861af7",
+        "schemaVersion": 1,
+        "sourceFingerprint": "a8e29cd3da4000f9b7a7f94ae11f87aa7ab5637920043fd88b261d868fb6f61e",
+        "sourceRevision": "1f0120725be891b4ba165aca226e9cd34b27360d",
+        "specDigest": "sha256:662a864af79d45ace1bab977e1280c772aad280bb0b4848bcd1f2d82bff0976c",
+        "workId": "c724d7eb-d321-4159-af79-7861ad0bb10b",
+        "workerStopped": true
+      },
+      "completedAt": "2026-09-27T06:56:34.050903Z",
+      "evidence": [
+        "executor:grok_build_isolated_review",
+        "profile:economy",
+        "state:failedclosed",
+        "cli_permission_mode:host_mapped_bypass_permissions",
+        "host_execution_approved:true",
+        "evidence_ref:closed-run:managed-worker-did-not-exit-cleanly",
+        "candidate_digest:sha256:missing",
+        "checks_passed:false",
+        "worker_stopped:true",
+        "change_proposed:false",
+        "check:utf8-frame:invalidated"
+      ],
+      "failure": null,
+      "summary": "Grok Build returned no persistable advisory summary"
+    },
+    "revision": 5,
+    "schemaVersion": 1,
+    "sessionId": "8478d315-239c-41d5-ab67-5c265a30d2d7",
+    "sourceManagerPlanId": "ca85de76-a8ce-476f-a0da-b22509160e0b",
+    "sourceManagerStepId": "verified-change",
+    "state": "review",
+    "updatedAt": "2026-09-27T06:56:34.050903Z",
+    "workId": "c724d7eb-d321-4159-af79-7861ad0bb10b",
+    "workspace": "/private/tmp/rma-provider-qualification-v1-final/source"
+  }
+}

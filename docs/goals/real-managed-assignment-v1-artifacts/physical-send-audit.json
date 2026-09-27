@@ -1,0 +1,98 @@
+[
+  {
+    "sequence": 1,
+    "recorded_at_ms": 1790492191212,
+    "control_epoch": 2,
+    "previous_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+    "event": {
+      "kind": "authenticated",
+      "principal": "prn_ecfdd3d634399ccd"
+    }
+  },
+  {
+    "sequence": 2,
+    "recorded_at_ms": 1790492191247,
+    "control_epoch": 2,
+    "previous_digest": "ea848ad9aed1b48b092d83775b4d65c6f197a4931af399f304b488982c298f44",
+    "event": {
+      "kind": "resource_issued",
+      "resource": "res_bca3b177100fea66",
+      "principal": "prn_ecfdd3d634399ccd",
+      "session": "ses_eb8cae23443363a4",
+      "workspace": "wsp_abe6c41d6dd9dd69"
+    }
+  },
+  {
+    "sequence": 3,
+    "recorded_at_ms": 1790492191279,
+    "control_epoch": 2,
+    "previous_digest": "d4b0234ce324aab5eebdeaf913c0535a32e06b0b3e7d5af80bef2889f11a68a9",
+    "event": {
+      "kind": "capability_sealed",
+      "capability": "cap_0a638faac817a5b3",
+      "principal": "prn_ecfdd3d634399ccd",
+      "actor": "verified_model",
+      "effect": "provider_send"
+    }
+  },
+  {
+    "sequence": 4,
+    "recorded_at_ms": 1790492191299,
+    "control_epoch": 2,
+    "previous_digest": "20ac5a3c31aee794b82939895157ae1a505e849290e8f053cf76852b35c4cdfe",
+    "event": {
+      "kind": "lease_minted",
+      "lease": "lea_9f211ffefc860a59",
+      "capability": "cap_0a638faac817a5b3",
+      "action_digest": "dig_c9ab1acd38ab5d3d",
+      "observation_revision": 1
+    }
+  },
+  {
+    "sequence": 5,
+    "recorded_at_ms": 1790492191324,
+    "control_epoch": 2,
+    "previous_digest": "68dc27f9492220cbc3594e8a1361860d4b41645e859f88e47ec8c619c3e7e390",
+    "event": {
+      "kind": "send_intent",
+      "attempt": "att_2ccf6034ee8b0389",
+      "lease": "lea_9f211ffefc860a59",
+      "principal": "prn_ecfdd3d634399ccd",
+      "auth_generation": 1,
+      "capability_generation": 1,
+      "policy_revision": 1,
+      "session": "ses_eb8cae23443363a4",
+      "workspace": "wsp_abe6c41d6dd9dd69",
+      "resource": "res_bca3b177100fea66",
+      "actor": "verified_model",
+      "ordinal": 1,
+      "dialect": "xai_chat_completions",
+      "route_digest": "dig_3ab55a28ad294aa9",
+      "request_digest": "dig_c9ab1acd38ab5d3d",
+      "body_digest": "dig_081832e17e43c653",
+      "wire_idempotency_digest": "dig_e59bbc1abc8d72e3"
+    }
+  },
+  {
+    "sequence": 6,
+    "recorded_at_ms": 1790492191347,
+    "control_epoch": 2,
+    "previous_digest": "a2512a9f65b0a634ccd3f743154cd573cc50363183265ce9b442e088dabeec28",
+    "event": {
+      "kind": "send_wire_admission",
+      "attempt": "att_2ccf6034ee8b0389"
+    }
+  },
+  {
+    "sequence": 7,
+    "recorded_at_ms": 1790492191629,
+    "control_epoch": 2,
+    "previous_digest": "0f4aa2c86f669ddff55544bf9e6ca479e95d196f693ebceadab88d2f0cb9e7a4",
+    "event": {
+      "kind": "send_outcome",
+      "attempt": "att_2ccf6034ee8b0389",
+      "outcome": "settled",
+      "detail": "response observed"
+    }
+  }
+]

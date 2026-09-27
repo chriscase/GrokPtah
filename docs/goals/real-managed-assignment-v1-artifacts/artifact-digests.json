@@ -1,0 +1,13 @@
+{
+  "hosted-desktop-final.json": "sha256:5573e71e91c1511cdbbef376cc052d94a88956b2eef545da9a13cbf3bc049cca",
+  "live-discard.json": "sha256:5c0d512190211a229ecb5f42f0553b31cafd17949df69c3ec51402545957a3b0",
+  "live-execute.json": "sha256:7b1b3eb2e5c34766122b283a74172d7208bfff7092cb6ce27f2d94f25497185b",
+  "live-reopened-discard.json": "sha256:c5701e736a6c306c506d277fbbda12ad2dd35e717bcb88d0e5415c977656a864",
+  "live-review-before-discard.json": "sha256:539e2b66839dc01855087656861555ad46ee977f8139c01b2e1760bb2a20c124",
+  "physical-send-audit.json": "sha256:02111bade507157a1de6575dc1b77ebdfea81f1faf02c8a728245427549656cf",
+  "predecessor-integration.json": "sha256:0d3bcc8db80bbcf858f3aede34048f03118b6a89b6032f16b8547c907750e91e",
+  "readiness-before-live.json": "sha256:f47e895ccc5eb5dc8c300c008330cfaa40087abd42da6ffc0ecedb93de8ee4d9",
+  "red-baseline.json": "sha256:2c1203a8656e846fe7322d222ef51787496cd797526242db13a41f5fcfba2316",
+  "secret-retention-check.json": "sha256:43edd045594409ec7cb7aa08cc8fde26809b610ef524ceb9b7a3d06e71629c88",
+  "zero-wire-isolation-failure.json": "sha256:7466913d35f57dc200c3ca9bd6b4b0e17e03426c7a72ca3f7980008461e4abca"
+}

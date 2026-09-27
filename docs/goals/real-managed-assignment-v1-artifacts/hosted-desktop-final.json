@@ -1,0 +1,1095 @@
+{
+  "schemaVersion": 1,
+  "receipt": {
+    "attempt": 1,
+    "conclusion": "success",
+    "createdAt": "2026-09-27T08:04:12Z",
+    "databaseId": 36305039955,
+    "event": "pull_request",
+    "headBranch": "grok/real-managed-assignment-v1",
+    "headSha": "97bf4d5a639650d68e45eaf68f52d66c17b22688",
+    "jobs": [
+      {
+        "completedAt": "2026-09-27T08:32:58Z",
+        "conclusion": "success",
+        "databaseId": 108579913387,
+        "name": "desktop",
+        "startedAt": "2026-09-27T08:04:35Z",
+        "status": "completed",
+        "steps": [
+          {
+            "completedAt": "2026-09-27T08:04:37Z",
+            "conclusion": "success",
+            "name": "Set up job",
+            "number": 1,
+            "startedAt": "2026-09-27T08:04:36Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-27T08:04:41Z",
+            "conclusion": "success",
+            "name": "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+            "number": 2,
+            "startedAt": "2026-09-27T08:04:37Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-27T08:04:47Z",
+            "conclusion": "success",
+            "name": "Run actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
+            "number": 3,
+            "startedAt": "2026-09-27T08:04:41Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-27T08:04:54Z",
+            "conclusion": "success",
+            "name": "Run dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4",
+            "number": 4,
+            "startedAt": "2026-09-27T08:04:47Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-27T08:04:55Z",
+            "conclusion": "success",
+            "name": "Configure compiler-cache namespace",
+            "number": 5,
+            "startedAt": "2026-09-27T08:04:54Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-27T08:04:56Z",
+            "conclusion": "success",
+            "name": "Install compiler cache",
+            "number": 6,
+            "startedAt": "2026-09-27T08:04:55Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-27T08:05:48Z",
+            "conclusion": "success",
+            "name": "Install hermetic protobuf compiler",
+            "number": 7,
+            "startedAt": "2026-09-27T08:04:56Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-27T08:05:50Z",
+            "conclusion": "success",
+            "name": "Install frontend deps",
+            "number": 8,
+            "startedAt": "2026-09-27T08:05:48Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-27T08:06:06Z",
+            "conclusion": "success",
+            "name": "Semantic Help contract and generated-artifact gates",
+            "number": 9,
+            "startedAt": "2026-09-27T08:05:50Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-27T08:06:27Z",
+            "conclusion": "success",
+            "name": "Typecheck + unit tests",
+            "number": 10,
+            "startedAt": "2026-09-27T08:06:06Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-27T08:06:47Z",
+            "conclusion": "success",
+            "name": "Semantic Help public bundle and provenance gates",
+            "number": 11,
+            "startedAt": "2026-09-27T08:06:27Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-27T08:06:49Z",
+            "conclusion": "success",
+            "name": "Upload Semantic Help provenance manifest",
+            "number": 12,
+            "startedAt": "2026-09-27T08:06:47Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-27T08:08:10Z",
+            "conclusion": "success",
+            "name": "Cargo tests (desktop)",
+            "number": 13,
+            "startedAt": "2026-09-27T08:06:49Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-27T08:08:33Z",
+            "conclusion": "success",
+            "name": "Establish private-check public toolchain ownership",
+            "number": 14,
+            "startedAt": "2026-09-27T08:08:10Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-27T08:20:12Z",
+            "conclusion": "success",
+            "name": "Bridge fmt + clippy + tests",
+            "number": 15,
+            "startedAt": "2026-09-27T08:08:33Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-27T08:21:46Z",
+            "conclusion": "success",
+            "name": "Headless service fmt + clippy + tests",
+            "number": 16,
+            "startedAt": "2026-09-27T08:20:12Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-27T08:25:11Z",
+            "conclusion": "success",
+            "name": "Shell provider helper compile",
+            "number": 17,
+            "startedAt": "2026-09-27T08:21:46Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-27T08:28:51Z",
+            "conclusion": "success",
+            "name": "Pager fmt + production composition checks",
+            "number": 18,
+            "startedAt": "2026-09-27T08:25:11Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-27T08:29:07Z",
+            "conclusion": "success",
+            "name": "Host authority spine (fmt + clippy + tests)",
+            "number": 19,
+            "startedAt": "2026-09-27T08:28:51Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-27T08:29:09Z",
+            "conclusion": "success",
+            "name": "Offline parity oracles (no network)",
+            "number": 20,
+            "startedAt": "2026-09-27T08:29:07Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-27T08:30:55Z",
+            "conclusion": "success",
+            "name": "Persistent-Agent certification lab (offline only)",
+            "number": 21,
+            "startedAt": "2026-09-27T08:29:09Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-27T08:32:15Z",
+            "conclusion": "success",
+            "name": "Adaptive Computer Use evaluator (synthetic authority)",
+            "number": 22,
+            "startedAt": "2026-09-27T08:30:55Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-27T08:32:15Z",
+            "conclusion": "success",
+            "name": "Offline oracle suite shape (repo root)",
+            "number": 23,
+            "startedAt": "2026-09-27T08:32:15Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-27T08:32:27Z",
+            "conclusion": "success",
+            "name": "Coding-worktree fmt + clippy + tests",
+            "number": 24,
+            "startedAt": "2026-09-27T08:32:15Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-27T08:32:52Z",
+            "conclusion": "success",
+            "name": "Isolated-surface fmt + clippy + focused tests",
+            "number": 25,
+            "startedAt": "2026-09-27T08:32:27Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-27T08:32:52Z",
+            "conclusion": "success",
+            "name": "Post Install compiler cache",
+            "number": 48,
+            "startedAt": "2026-09-27T08:32:52Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-27T08:32:53Z",
+            "conclusion": "success",
+            "name": "Post Run actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
+            "number": 49,
+            "startedAt": "2026-09-27T08:32:52Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-27T08:32:53Z",
+            "conclusion": "success",
+            "name": "Post Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+            "number": 50,
+            "startedAt": "2026-09-27T08:32:53Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-27T08:32:55Z",
+            "conclusion": "success",
+            "name": "Complete job",
+            "number": 51,
+            "startedAt": "2026-09-27T08:32:53Z",
+            "status": "completed"
+          }
+        ],
+        "url": "https://github.com/chriscase/GrokPtah/actions/runs/36305039955/job/108579913387"
+      }
+    ],
+    "status": "completed",
+    "updatedAt": "2026-09-27T08:32:58Z",
+    "url": "https://github.com/chriscase/GrokPtah/actions/runs/36305039955"
+  },
+  "rustTestSummariesByStep": {
+    "Semantic Help contract and generated-artifact gates": [
+      {
+        "passed": 31,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 50,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 31,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      }
+    ],
+    "Cargo tests (desktop)": [
+      {
+        "passed": 50,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      }
+    ],
+    "Bridge fmt + clippy + tests": [
+      {
+        "passed": 704,
+        "failed": 0,
+        "ignored": 1,
+        "filtered": 0
+      },
+      {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 41,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 19,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 15,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 6,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 5,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 12,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 27,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 1,
+        "filtered": 0
+      },
+      {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 41
+      },
+      {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 41
+      },
+      {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 41
+      },
+      {
+        "passed": 41,
+        "failed": 0,
+        "ignored": 1,
+        "filtered": 0
+      },
+      {
+        "passed": 8,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 5,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 2,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 6,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 3,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 5,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 29,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 5,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 16,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 38,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 20,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 40,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 9,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 4,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 10,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 1,
+        "filtered": 0
+      },
+      {
+        "passed": 5,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 102,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 25,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 3,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 20,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 1,
+        "filtered": 0
+      },
+      {
+        "passed": 5,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 11,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      }
+    ],
+    "Headless service fmt + clippy + tests": [
+      {
+        "passed": 4,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 11,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 5,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      }
+    ],
+    "Pager fmt + production composition checks": [
+      {
+        "passed": 81,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 969,
+        "failed": 0,
+        "ignored": 2,
+        "filtered": 0
+      }
+    ],
+    "Host authority spine (fmt + clippy + tests)": [
+      {
+        "passed": 4,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 47,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 3,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 15,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 8,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 11,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 7,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 3,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 21,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      }
+    ],
+    "Offline parity oracles (no network)": [
+      {
+        "passed": 7,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 698
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 1
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 41
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 19
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 15
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 6
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 5
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 12
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 27
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 2
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 42
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 8
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 5
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 2
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 6
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 1
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 1
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 1
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 3
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 5
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 29
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 5
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 16
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 38
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 20
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 40
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 9
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 4
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 1
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 1
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 10
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 2
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 5
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 102
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 25
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 3
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 1
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 20
+      }
+    ],
+    "Persistent-Agent certification lab (offline only)": [
+      {
+        "passed": 84,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      }
+    ],
+    "Adaptive Computer Use evaluator (synthetic authority)": [
+      {
+        "passed": 23,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 5,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 9,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 6,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 34,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      }
+    ],
+    "Coding-worktree fmt + clippy + tests": [
+      {
+        "passed": 5,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 22,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      }
+    ],
+    "Isolated-surface fmt + clippy + focused tests": [
+      {
+        "passed": 9,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 24,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 6,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 38,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 22,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 14,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 5,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 5,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 12,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 0
+      },
+      {
+        "passed": 18,
+        "failed": 0,
+        "ignored": 0,
+        "filtered": 57
+      }
+    ]
+  },
+  "desktopFrontend": {
+    "filesPassed": 58,
+    "testsPassed": 428
+  },
+  "publicToolchainOwnership": {
+    "path": "/Applications/Xcode_26.6.app",
+    "beforeUid": 501,
+    "beforeGid": 20,
+    "afterUid": 0,
+    "afterGid": 0
+  },
+  "failedSteps": 0,
+  "countingNote": "Filtered lock-holder child invocations and focused reruns are not counted as additional unique tests."
+}
