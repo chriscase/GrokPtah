@@ -44,6 +44,70 @@ pub struct ManagedChildPolicy {
     pub(crate) max_output_tokens: u32,
 }
 
+/// Stable categories contain no upstream prose, request bodies or credentials.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedProviderDiagnosticKind {
+    BeforeWireRejected,
+    TransportUncertain,
+    HttpResponseObserved,
+    HttpRejected,
+    ProtocolFailure,
+    UsageMissing,
+    UsageInconsistent,
+    ChildExit,
+    ChildEvidenceMismatch,
+    Cancelled,
+    Expired,
+    AbandonedForward,
+    Completed,
+    BudgetExceeded,
+    SettlementFailure,
+    RecoveryUncertain,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderMachineError {
+    InvalidRequestError,
+    AuthenticationError,
+    PermissionDenied,
+    RateLimitExceeded,
+    InsufficientQuota,
+    InvalidApiKey,
+    ModelNotFound,
+    ContextLengthExceeded,
+    ServerError,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedAdmissionDenial {
+    Revoked,
+    Uncertain,
+    InFlight,
+    Expired,
+    RequestLimit,
+    TokenReserve,
+    DuplicateRequest,
+    CredentialEcho,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedProviderDiagnostic {
+    pub kind: ManagedProviderDiagnosticKind,
+    pub admission: u32,
+    pub http_status: Option<u16>,
+    pub provider_request_id: Option<String>,
+    pub provider_error_type: Option<ProviderMachineError>,
+    pub provider_error_code: Option<ProviderMachineError>,
+    #[serde(default)]
+    pub admission_denial: Option<ManagedAdmissionDenial>,
+    #[serde(default)]
+    pub request_bytes: Option<u32>,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ManagedProviderEvidence {
@@ -61,6 +125,16 @@ pub struct ManagedProviderEvidence {
     pub uncertain: bool,
     pub revoked: bool,
     pub authority_attempts: Vec<String>,
+    #[serde(default)]
+    pub http_responses_observed: u32,
+    // None means the older receipt (or lost relay) did not establish this
+    // fact. Deserializing historical uncertainty must not invent false.
+    #[serde(default)]
+    pub remote_effect_uncertain: Option<bool>,
+    #[serde(default)]
+    pub interruption: Option<ManagedProviderDiagnosticKind>,
+    #[serde(default)]
+    pub diagnostics: Vec<ManagedProviderDiagnostic>,
 }
 
 struct Lease {
@@ -276,6 +350,7 @@ impl CredentialLeaseResolver for ManagedProviderRelay {
                 evidence: ManagedProviderEvidence {
                     mechanism: "host_relay_v1".into(),
                     model: self.policy.model.clone(),
+                    remote_effect_uncertain: Some(false),
                     ..Default::default()
                 },
             },
@@ -338,7 +413,9 @@ impl CredentialLeaseResolver for ManagedProviderRelay {
                     if let Some(state) = state.upgrade() {
                         if let Ok(mut leases) = state.leases.lock() {
                             if let Some(lease) = leases.get_mut(&id) {
+                                record_diagnostic(lease, ManagedProviderDiagnosticKind::Expired);
                                 lease.evidence.uncertain |= lease.in_flight;
+                                lease.evidence.remote_effect_uncertain = Some(lease.evidence.remote_effect_uncertain.unwrap_or(true) || lease.in_flight);
                                 lease.evidence.revoked = true;
                                 lease.cancelled.cancel();
                             }
@@ -381,8 +458,13 @@ impl CredentialLeaseResolver for ManagedProviderRelay {
         let lease = leases
             .get_mut(lease_id)
             .ok_or(GrokBuildAdapterError::CredentialRevocation)?;
+        if lease.in_flight {
+            record_diagnostic(lease, ManagedProviderDiagnosticKind::Cancelled);
+        }
         lease.cancelled.cancel();
         lease.evidence.uncertain |= lease.in_flight;
+        lease.evidence.remote_effect_uncertain =
+            Some(lease.evidence.remote_effect_uncertain.unwrap_or(true) || lease.in_flight);
         lease.evidence.revoked = true;
         let path = self.credential_dir.join(lease_id);
         if path.exists() {
@@ -399,6 +481,9 @@ impl CredentialLeaseResolver for ManagedProviderRelay {
     }
     fn provider_evidence(&self, id: &str) -> Option<ManagedProviderEvidence> {
         self.evidence(id)
+    }
+    fn note_child_failure(&self, id: &str, kind: ManagedProviderDiagnosticKind) {
+        note_diagnostic(&self.state, id, kind);
     }
     fn readiness_error(&self) -> Option<&'static str> {
         if self.server.is_finished() || self.state.stopped.is_cancelled() {
@@ -418,6 +503,9 @@ impl CredentialLeaseResolver for ManagedProviderRelay {
         self.state.stopped.cancel();
         if let Ok(mut leases) = self.state.leases.lock() {
             for lease in leases.values_mut() {
+                if lease.in_flight {
+                    record_diagnostic(lease, ManagedProviderDiagnosticKind::Cancelled);
+                }
                 lease.evidence.revoked = true;
                 lease.cancelled.cancel();
             }
@@ -441,6 +529,7 @@ fn authorized_lease(state: &RelayState, headers: &HeaderMap) -> Option<String> {
             .issued
             .is_some_and(|issued| issued.elapsed() < Duration::from_millis(lease.max_duration_ms))
             && !lease.cancelled.is_cancelled();
+        let active = active && !lease.evidence.revoked && !lease.evidence.uncertain;
         (active && token_equal(bearer.as_bytes(), lease.secret.as_bytes())).then(|| id.clone())
     })
 }
@@ -485,6 +574,24 @@ async fn completion(
 }
 
 async fn forward(state: &RelayState, id: &str, bytes: &[u8]) -> Result<Vec<u8>, &'static str> {
+    let result = forward_inner(state, id, bytes).await;
+    if result.is_err() {
+        if let Ok(mut leases) = state.leases.lock() {
+            if let Some(lease) = leases.get_mut(id) {
+                if lease.evidence.interruption.is_none() {
+                    record_diagnostic(lease, ManagedProviderDiagnosticKind::BeforeWireRejected);
+                }
+            }
+        }
+    }
+    result
+}
+
+async fn forward_inner(
+    state: &RelayState,
+    id: &str,
+    bytes: &[u8],
+) -> Result<Vec<u8>, &'static str> {
     if bytes.len() > MAX_REQUEST_BYTES {
         return Err("managed request exceeds byte budget");
     }
@@ -549,33 +656,62 @@ async fn forward(state: &RelayState, id: &str, bytes: &[u8]) -> Result<Vec<u8>, 
             .map_err(|_| "managed lease state unavailable")?;
         let lease = leases.get_mut(id).ok_or("managed lease unavailable")?;
         let digest = format!("{:x}", Sha256::digest(bytes));
-        if lease.cancelled.is_cancelled()
-            || lease.in_flight
-            || lease
-                .issued
-                .is_none_or(|issued| issued.elapsed() >= Duration::from_millis(lease.max_duration_ms))
-            || lease.evidence.requests_reserved >= lease.max_requests
-            // Reserve a conservative byte-sized prompt allowance plus the
-            // enforced output ceiling before each send, using settled totals
-            // for earlier calls. A provider-side overrun still stays uncertain.
-            || lease.evidence.input_tokens.saturating_add(lease.evidence.output_tokens)
-                .saturating_add(bytes.len() as u64).saturating_add(u64::from(MAX_OUTPUT_TOKENS)) > lease.max_total_tokens
-            || !lease.requests.insert(digest)
-            || bytes
-                .windows(lease.secret.len())
-                .any(|part| part == lease.secret.as_bytes())
+        let denial = if lease.cancelled.is_cancelled() || lease.evidence.revoked {
+            Some(ManagedAdmissionDenial::Revoked)
+        } else if lease.evidence.uncertain {
+            Some(ManagedAdmissionDenial::Uncertain)
+        } else if lease.in_flight {
+            Some(ManagedAdmissionDenial::InFlight)
+        } else if lease
+            .issued
+            .is_none_or(|issued| issued.elapsed() >= Duration::from_millis(lease.max_duration_ms))
+        {
+            Some(ManagedAdmissionDenial::Expired)
+        } else if lease.evidence.requests_reserved >= lease.max_requests {
+            Some(ManagedAdmissionDenial::RequestLimit)
+        } else if lease
+            .evidence
+            .input_tokens
+            .saturating_add(lease.evidence.output_tokens)
+            .saturating_add(bytes.len() as u64)
+            .saturating_add(u64::from(MAX_OUTPUT_TOKENS))
+            > lease.max_total_tokens
+        {
+            // Reserve a conservative byte-sized prompt allowance and output
+            // ceiling; no unknown turn is reusable as settled zero usage.
+            Some(ManagedAdmissionDenial::TokenReserve)
+        } else if lease.requests.contains(&digest) {
+            Some(ManagedAdmissionDenial::DuplicateRequest)
+        } else if bytes
+            .windows(lease.secret.len())
+            .any(|part| part == lease.secret.as_bytes())
             || bytes
                 .windows(state.credentials.bearer.len())
                 .any(|part| part == state.credentials.bearer.as_bytes())
         {
-            lease.evidence.denied_requests += 1;
+            Some(ManagedAdmissionDenial::CredentialEcho)
+        } else {
+            None
+        };
+        if let Some(denial) = denial {
+            lease.evidence.denied_requests = lease.evidence.denied_requests.saturating_add(1);
+            record_diagnostic(lease, ManagedProviderDiagnosticKind::BeforeWireRejected);
+            if let Some(last) = lease.evidence.diagnostics.last_mut() {
+                last.admission_denial = Some(denial);
+                last.request_bytes = Some(bytes.len() as u32);
+            }
             return Err("managed lease expired, repeated, or exceeded its budget");
         }
+        lease.requests.insert(digest);
         lease.evidence.requests_reserved += 1;
         lease.in_flight = true;
         (lease.cancelled.clone(), lease.secret.clone())
     };
-    let _settlement = ForwardSettlement { state, id };
+    let mut settlement = ForwardSettlement {
+        state,
+        id,
+        completed: false,
+    };
     let base = &state.target.base_url;
     let request = crate::auth_store::apply_auth_headers(
         state
@@ -598,6 +734,7 @@ async fn forward(state: &RelayState, id: &str, bytes: &[u8]) -> Result<Vec<u8>, 
             .get_mut(id)
             .ok_or_else(|| anyhow::anyhow!("managed lease unavailable"))?;
         lease.evidence.wire_attempts += 1;
+        lease.evidence.remote_effect_uncertain = Some(true);
         lease.evidence.authority_attempts.push(attempt.to_owned());
         Ok(())
     };
@@ -616,13 +753,78 @@ async fn forward(state: &RelayState, id: &str, bytes: &[u8]) -> Result<Vec<u8>, 
     .await;
     let mut response = match response {
         Ok(response) => response,
-        Err(_) => {
+        Err(error) => {
+            if !error.is_uncertain() {
+                if let Ok(mut leases) = state.leases.lock() {
+                    if let Some(lease) = leases.get_mut(id) {
+                        // Canonical transport proved this request did not
+                        // reach the wire. Admission is still counted.
+                        lease.evidence.remote_effect_uncertain = Some(false);
+                    }
+                }
+            }
+            note_diagnostic(
+                state,
+                id,
+                if error.is_uncertain() {
+                    ManagedProviderDiagnosticKind::TransportUncertain
+                } else {
+                    ManagedProviderDiagnosticKind::BeforeWireRejected
+                },
+            );
             invalidate(state, id);
             return Err("managed provider send failed; no automatic retry");
         }
     };
+    let status = response.status().as_u16();
+    let request_id = safe_request_id(response.headers(), &secret, &state.credentials.bearer);
+    if let Ok(mut leases) = state.leases.lock() {
+        if let Some(lease) = leases.get_mut(id) {
+            lease.evidence.http_responses_observed += 1;
+            record_diagnostic(lease, ManagedProviderDiagnosticKind::HttpResponseObserved);
+            if let Some(last) = lease.evidence.diagnostics.last_mut() {
+                last.http_status = Some(status);
+                last.provider_request_id = request_id;
+            }
+        }
+    }
     if !response.status().is_success() {
-        let _ = response.settle_http_failure("managed provider returned a non-success status");
+        // Parse only a small complete JSON error envelope. Free-form messages,
+        // arbitrary headers and unknown codes are discarded, never retained.
+        let mut error_body = Vec::new();
+        let mut complete = false;
+        loop {
+            match response.next_chunk(Some(&cancel)).await {
+                Ok(Some(chunk)) if error_body.len() + chunk.len() <= 4096 => {
+                    error_body.extend_from_slice(&chunk)
+                }
+                Ok(None) => {
+                    complete = true;
+                    break;
+                }
+                _ => break,
+            }
+        }
+        let codes = if complete {
+            safe_error_codes(&error_body, &secret, &state.credentials.bearer)
+        } else {
+            (None, None)
+        };
+        if let Ok(mut leases) = state.leases.lock() {
+            if let Some(lease) = leases.get_mut(id) {
+                record_diagnostic(lease, ManagedProviderDiagnosticKind::HttpRejected);
+                if let Some(last) = lease.evidence.diagnostics.last_mut() {
+                    last.http_status = Some(status);
+                    last.provider_error_type = codes.0;
+                    last.provider_error_code = codes.1;
+                }
+            }
+        }
+        if complete {
+            let _ = response.settle_http_failure("managed provider HTTP rejection");
+        } else {
+            let _ = response.settle_protocol_error("managed provider error envelope incomplete");
+        }
         invalidate(state, id);
         return Err("managed provider rejected the request; no automatic retry");
     }
@@ -632,7 +834,13 @@ async fn forward(state: &RelayState, id: &str, bytes: &[u8]) -> Result<Vec<u8>, 
             Ok(Some(chunk)) if output.len() + chunk.len() <= MAX_RESPONSE_BYTES => {
                 output.extend_from_slice(&chunk)
             }
-            Ok(Some(_)) | Err(_) => {
+            Ok(Some(_)) => {
+                note_diagnostic(state, id, ManagedProviderDiagnosticKind::ProtocolFailure);
+                invalidate(state, id);
+                return Err("managed provider response exceeded bounds or became uncertain");
+            }
+            Err(_) => {
+                note_diagnostic(state, id, ManagedProviderDiagnosticKind::TransportUncertain);
                 invalidate(state, id);
                 return Err("managed provider response exceeded bounds or became uncertain");
             }
@@ -642,6 +850,17 @@ async fn forward(state: &RelayState, id: &str, bytes: &[u8]) -> Result<Vec<u8>, 
     let summary = match validate_completion(&output, &secret, &state.credentials.bearer) {
         Ok(summary) => summary,
         Err(reason) => {
+            note_diagnostic(
+                state,
+                id,
+                if reason == "managed stream usage is missing" {
+                    ManagedProviderDiagnosticKind::UsageMissing
+                } else if reason.contains("usage") {
+                    ManagedProviderDiagnosticKind::UsageInconsistent
+                } else {
+                    ManagedProviderDiagnosticKind::ProtocolFailure
+                },
+            );
             let _ = response.settle_protocol_error(reason);
             invalidate(state, id);
             return Err(reason);
@@ -686,6 +905,7 @@ async fn forward(state: &RelayState, id: &str, bytes: &[u8]) -> Result<Vec<u8>, 
         }
     }
     if response.settle_success().is_err() {
+        note_diagnostic(state, id, ManagedProviderDiagnosticKind::SettlementFailure);
         invalidate(state, id);
         return Err("managed provider settlement is not durable");
     }
@@ -695,7 +915,10 @@ async fn forward(state: &RelayState, id: &str, bytes: &[u8]) -> Result<Vec<u8>, 
                 return Err("managed lease was revoked before response delivery");
             }
             lease.evidence.responses_completed += 1;
+            lease.evidence.remote_effect_uncertain = Some(false);
+            record_diagnostic(lease, ManagedProviderDiagnosticKind::Completed);
             lease.in_flight = false;
+            settlement.completed = true;
         }
     }
     Ok(output)
@@ -706,23 +929,128 @@ async fn forward(state: &RelayState, id: &str, bytes: &[u8]) -> Result<Vec<u8>, 
 struct ForwardSettlement<'a> {
     state: &'a RelayState,
     id: &'a str,
+    completed: bool,
 }
 impl Drop for ForwardSettlement<'_> {
     fn drop(&mut self) {
         if let Ok(mut leases) = self.state.leases.lock() {
             if let Some(lease) = leases.get_mut(self.id) {
-                lease.evidence.uncertain |=
-                    lease.evidence.responses_completed < lease.evidence.wire_attempts;
+                if !self.completed {
+                    if lease.evidence.interruption.is_none() {
+                        record_diagnostic(lease, ManagedProviderDiagnosticKind::AbandonedForward);
+                    }
+                    // The send observer marks remote uncertainty; a proven
+                    // before-wire failure may clear it without refunding the
+                    // admission or restoring this capability.
+                    // Clearing local in-flight state cannot restore authority
+                    // or reclaim unknown usage after an abandoned forward.
+                    lease.evidence.uncertain |=
+                        lease.evidence.responses_completed < lease.evidence.wire_attempts;
+                    lease.evidence.revoked = true;
+                    lease.cancelled.cancel();
+                }
                 lease.in_flight = false;
             }
         }
     }
 }
 
+fn record_diagnostic(lease: &mut Lease, kind: ManagedProviderDiagnosticKind) {
+    lease.evidence.record_diagnostic(kind);
+}
+
+impl ManagedProviderEvidence {
+    pub(crate) fn record_diagnostic(&mut self, kind: ManagedProviderDiagnosticKind) {
+        if !matches!(
+            kind,
+            ManagedProviderDiagnosticKind::HttpResponseObserved
+                | ManagedProviderDiagnosticKind::Completed
+        ) && self.interruption.is_none()
+        {
+            self.interruption = Some(kind);
+        }
+        let diagnostic = ManagedProviderDiagnostic {
+            kind,
+            admission: self.wire_attempts,
+            http_status: None,
+            provider_request_id: None,
+            provider_error_type: None,
+            provider_error_code: None,
+            admission_denial: None,
+            request_bytes: None,
+        };
+        if self.diagnostics.len() < 32 {
+            self.diagnostics.push(diagnostic);
+        } else if let Some(last) = self.diagnostics.last_mut() {
+            *last = diagnostic;
+        }
+    }
+}
+fn note_diagnostic(state: &RelayState, id: &str, kind: ManagedProviderDiagnosticKind) {
+    if let Ok(mut leases) = state.leases.lock() {
+        if let Some(lease) = leases.get_mut(id) {
+            record_diagnostic(lease, kind);
+        }
+    }
+}
+
+fn safe_request_id(headers: &HeaderMap, child: &str, upstream: &str) -> Option<String> {
+    let value = headers
+        .get("x-request-id")
+        .or_else(|| headers.get("request-id"))?
+        .to_str()
+        .ok()?;
+    if value.len() > 64 || value.contains(child) || value.contains(upstream) {
+        return None;
+    }
+    if uuid::Uuid::parse_str(value).is_ok()
+        || value
+            .strip_prefix("req_")
+            .is_some_and(|id| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        Some(value.to_owned())
+    } else {
+        None
+    }
+}
+
+fn safe_error_codes(
+    body: &[u8],
+    child: &str,
+    upstream: &str,
+) -> (Option<ProviderMachineError>, Option<ProviderMachineError>) {
+    fn code(value: &Value, child: &str, upstream: &str) -> Option<ProviderMachineError> {
+        let text = value.as_str()?;
+        if text.contains(child) || text.contains(upstream) {
+            return None;
+        }
+        Some(match text {
+            "invalid_request_error" => ProviderMachineError::InvalidRequestError,
+            "authentication_error" => ProviderMachineError::AuthenticationError,
+            "permission_denied" => ProviderMachineError::PermissionDenied,
+            "rate_limit_exceeded" | "rate_limit_error" => ProviderMachineError::RateLimitExceeded,
+            "insufficient_quota" => ProviderMachineError::InsufficientQuota,
+            "invalid_api_key" => ProviderMachineError::InvalidApiKey,
+            "model_not_found" => ProviderMachineError::ModelNotFound,
+            "context_length_exceeded" => ProviderMachineError::ContextLengthExceeded,
+            "server_error" => ProviderMachineError::ServerError,
+            _ => return None,
+        })
+    }
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return (None, None);
+    };
+    (
+        code(&value["error"]["type"], child, upstream),
+        code(&value["error"]["code"], child, upstream),
+    )
+}
+
 fn invalidate(state: &RelayState, id: &str) {
     if let Ok(mut leases) = state.leases.lock() {
         if let Some(lease) = leases.get_mut(id) {
-            lease.evidence.uncertain = true;
+            lease.evidence.uncertain |=
+                lease.evidence.responses_completed < lease.evidence.wire_attempts;
             lease.evidence.revoked = true;
             lease.cancelled.cancel();
         }
@@ -772,7 +1100,7 @@ fn validate_completion(
                 || input > MAX_REQUEST_BYTES as u64
                 || u["total_tokens"].as_u64() != Some(input.saturating_add(output))
             {
-                return Err("managed output exceeded its token budget");
+                return Err("managed usage is inconsistent or exceeds token bounds");
             }
             usage = Some((input, output));
         }
@@ -816,8 +1144,11 @@ fn validate_completion(
             }
         }
     }
-    if !finished || !done || usage.is_none() {
+    if !finished || !done {
         return Err("managed stream did not prove a completed response");
+    }
+    if usage.is_none() {
+        return Err("managed stream usage is missing");
     }
     for (name, arguments) in tools.values() {
         if !matches!(
@@ -839,6 +1170,10 @@ fn validate_completion(
     Ok((tools.len() as u32, usage))
 }
 
+#[cfg(all(test, target_os = "macos"))]
+#[path = "managed_provider_offline_tests.rs"]
+mod offline_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -851,7 +1186,7 @@ mod tests {
         }
     }
 
-    fn credentials() -> crate::auth_store::WireCredentials {
+    pub(super) fn credentials() -> crate::auth_store::WireCredentials {
         crate::auth_store::WireCredentials {
             provider_id: "xai".into(),
             bearer: "upstream-test-secret-never-child".into(),
@@ -938,6 +1273,155 @@ mod tests {
         )
     }
 
+    pub(super) async fn local_fixture(
+        dir: PathBuf,
+        router: Router,
+    ) -> (Arc<ManagedProviderRelay>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let target = crate::host_helpers::ResolvedModelTarget {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            wire_model: "grok-build-0.1".into(),
+            dialect: crate::gateway_config::ProviderDialect::XaiChatCompletions,
+            capabilities: crate::gateway_config::ModelCapabilities {
+                tools: true,
+                stream: true,
+                ..Default::default()
+            },
+            deadline_class: crate::gateway_config::ProviderDeadlineClass::Standard,
+        };
+        (
+            ManagedProviderRelay::with_target(credentials(), target, dir)
+                .await
+                .unwrap(),
+            server,
+        )
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn typed_http_and_protocol_diagnostics_are_bounded_and_secret_free() {
+        let _serial = crate::home_override_serial();
+        let root = tempfile::tempdir().unwrap();
+        crate::set_grokptah_home_override(Some(root.path().join("host")));
+        let _home = Home;
+        for (index, status, body, expected) in [
+            (0, StatusCode::BAD_REQUEST, json!({"error":{"type":"invalid_request_error","code":"invalid_request_error","message":"SECRET_RESPONSE_CANARY"}}).to_string(), ManagedProviderDiagnosticKind::HttpRejected),
+            (1, StatusCode::UNAUTHORIZED, json!({"error":{"type":"authentication_error","code":"invalid_api_key","message":"SECRET_RESPONSE_CANARY"}}).to_string(), ManagedProviderDiagnosticKind::HttpRejected),
+            (2, StatusCode::FORBIDDEN, json!({"error":{"code":"permission_denied","message":"SECRET_RESPONSE_CANARY"}}).to_string(), ManagedProviderDiagnosticKind::HttpRejected),
+            (3, StatusCode::TOO_MANY_REQUESTS, json!({"error":{"code":"rate_limit_exceeded","message":"SECRET_RESPONSE_CANARY"}}).to_string(), ManagedProviderDiagnosticKind::HttpRejected),
+            (4, StatusCode::SERVICE_UNAVAILABLE, json!({"error":{"code":"server_error","message":"SECRET_RESPONSE_CANARY"}}).to_string(), ManagedProviderDiagnosticKind::HttpRejected),
+            (5, StatusCode::OK, "data: SECRET_RESPONSE_CANARY\n\ndata: [DONE]\n\n".into(), ManagedProviderDiagnosticKind::ProtocolFailure),
+            (6, StatusCode::OK, stream("ok").replace("\"usage\":", "\"missing_usage\":"), ManagedProviderDiagnosticKind::UsageMissing),
+            (7, StatusCode::OK, stream("ok").replace("\"total_tokens\":110", "\"total_tokens\":111"), ManagedProviderDiagnosticKind::UsageInconsistent),
+            (8, StatusCode::OK, stream("ok"), ManagedProviderDiagnosticKind::Completed),
+            (9, StatusCode::BAD_REQUEST, json!({"error":{"type":"SECRET_RESPONSE_CANARY","code":"SECRET_RESPONSE_CANARY"}}).to_string(), ManagedProviderDiagnosticKind::HttpRejected),
+        ] {
+            let calls = Arc::new(AtomicU32::new(0));
+            let count = calls.clone();
+            let router = Router::new().route("/v1/chat/completions", post(move || {
+                let count = count.clone(); let body = body.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    (status, [("content-type", "text/event-stream"), ("x-request-id", "12345678-1234-4234-8234-123456789abc"), ("set-cookie", "COOKIE_CANARY")], body)
+                }
+            }));
+            let (relay, server) = local_fixture(root.path().join(format!("leases-{index}")), router).await;
+            let (id, secret) = issue(&relay, "diagnostics");
+            let response = send(&relay, &secret, &request(index)).await;
+            assert_eq!(response.status(), if expected == ManagedProviderDiagnosticKind::Completed { StatusCode::OK } else { StatusCode::BAD_GATEWAY });
+            let e = relay.evidence(&id).unwrap();
+            assert_eq!((e.wire_attempts, e.http_responses_observed), (1, 1));
+            assert!(e.diagnostics.iter().any(|d| d.kind == expected), "{e:?}");
+            assert!(e.diagnostics.iter().any(|d| d.http_status == Some(status.as_u16())));
+            assert_eq!(e.responses_completed, u32::from(expected == ManagedProviderDiagnosticKind::Completed));
+            let encoded = serde_json::to_string(&e).unwrap();
+            for canary in ["SECRET_RESPONSE_CANARY", "COOKIE_CANARY", &secret, &credentials().bearer] { assert!(!encoded.contains(canary)); }
+            if index == 1 { assert!(e.diagnostics.iter().any(|d| d.provider_error_code == Some(ProviderMachineError::InvalidApiKey))); }
+            if index == 9 { assert!(e.diagnostics.iter().all(|d| d.provider_error_code.is_none() && d.provider_error_type.is_none())); }
+            if expected != ManagedProviderDiagnosticKind::Completed {
+                assert!(e.revoked && e.uncertain && !e.accounting_complete);
+                assert_eq!(send(&relay, &secret, &request(100)).await.status(), StatusCode::UNAUTHORIZED);
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            server.abort();
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", "SECRET_HEADER_CANARY".parse().unwrap());
+        assert!(safe_request_id(&headers, "child", "upstream").is_none());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn relay_connection_disconnect_never_permits_an_additional_forward() {
+        use tokio::io::AsyncWriteExt;
+        let _serial = crate::home_override_serial();
+        let root = tempfile::tempdir().unwrap();
+        crate::set_grokptah_home_override(Some(root.path().join("host")));
+        let _home = Home;
+        let calls = Arc::new(AtomicU32::new(0));
+        let count = calls.clone();
+        let observed = Arc::new(tokio::sync::Notify::new());
+        let barrier = observed.clone();
+        let router = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let count = count.clone();
+                let barrier = barrier.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    barrier.notify_one();
+                    std::future::pending::<Response>().await
+                }
+            }),
+        );
+        let (relay, server) = local_fixture(root.path().join("leases"), router).await;
+        let (id, secret) = issue(&relay, "disconnect");
+        let body = serde_json::to_vec(&request(0)).unwrap();
+        let mut connection = tokio::net::TcpStream::connect(("127.0.0.1", relay.policy.port))
+            .await
+            .unwrap();
+        let prefix = format!("POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {secret}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n", body.len());
+        connection.write_all(prefix.as_bytes()).await.unwrap();
+        connection.write_all(&body).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), observed.notified())
+            .await
+            .unwrap();
+        drop(connection);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let before = relay.evidence(&id).unwrap();
+        let status = send(&relay, &secret, &request(1)).await.status();
+        assert!(matches!(
+            status,
+            StatusCode::UNAUTHORIZED | StatusCode::BAD_GATEWAY
+        ));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !relay.provider_quiescent(&id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let after = relay.evidence(&id).unwrap();
+        assert!(after.revoked && after.uncertain && !after.accounting_complete);
+        assert_eq!(
+            (
+                after.requests_reserved,
+                after.wire_attempts,
+                calls.load(Ordering::SeqCst)
+            ),
+            (1, 1, 1)
+        );
+        // Hyper may retain a handler after disconnect; while retained, admission
+        // remains locked out. If it drops the handler, the settlement guard
+        // revokes immediately. Neither path can spend a changed request.
+        assert!(before.revoked || before.responses_completed == 0);
+        server.abort();
+    }
+
     fn issue(relay: &ManagedProviderRelay, request: &str) -> (String, String) {
         let id = relay.lease_id_for_request("assignment", request).unwrap();
         let handle = relay.resolve(&id).unwrap();
@@ -963,6 +1447,198 @@ mod tests {
             .send()
             .await
             .unwrap()
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    async fn assert_abandoned_forward(draining: bool) {
+        let _serial = crate::home_override_serial();
+        let root = tempfile::tempdir().unwrap();
+        crate::set_grokptah_home_override(Some(root.path().join("host")));
+        let _home = Home;
+        let calls = Arc::new(AtomicU32::new(0));
+        let observed = Arc::new(tokio::sync::Notify::new());
+        let count = calls.clone();
+        let barrier = observed.clone();
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let count = count.clone();
+                let barrier = barrier.clone();
+                async move {
+                    if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                        if draining {
+                            use futures::StreamExt;
+                            let partial = futures::stream::once(async {
+                                Ok::<_, std::io::Error>(Bytes::from_static(
+                                    b"data: {\"choices\":[]}",
+                                ))
+                            });
+                            let held = futures::stream::once(async move {
+                                barrier.notify_one();
+                                std::future::pending::<Result<Bytes, std::io::Error>>().await
+                            });
+                            return (
+                                [("content-type", "text/event-stream")],
+                                axum::body::Body::from_stream(partial.chain(held)),
+                            )
+                                .into_response();
+                        }
+                        barrier.notify_one();
+                        std::future::pending::<()>().await;
+                    }
+                    (
+                        [("content-type", "text/event-stream")],
+                        stream("settled turn"),
+                    )
+                        .into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+        let target = crate::host_helpers::ResolvedModelTarget {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            wire_model: "grok-build-0.1".into(),
+            dialect: crate::gateway_config::ProviderDialect::XaiChatCompletions,
+            capabilities: crate::gateway_config::ModelCapabilities {
+                tools: true,
+                stream: true,
+                ..Default::default()
+            },
+            deadline_class: crate::gateway_config::ProviderDeadlineClass::Standard,
+        };
+        let relay =
+            ManagedProviderRelay::with_target(credentials(), target, root.path().join("leases"))
+                .await
+                .unwrap();
+        let (id, secret) = issue(&relay, "abandoned-forward");
+        let state = relay.state.clone();
+        let forwarding_id = id.clone();
+        let task = tokio::spawn(async move {
+            forward(
+                &state,
+                &forwarding_id,
+                &serde_json::to_vec(&request(0)).unwrap(),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(3), observed.notified())
+            .await
+            .unwrap();
+        if draining {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while relay.evidence(&id).unwrap().http_responses_observed == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let abandoned = relay.evidence(&id).unwrap();
+        assert_eq!(abandoned.wire_attempts, 1);
+        assert!(abandoned.uncertain);
+        assert_eq!(abandoned.http_responses_observed, u32::from(draining));
+        assert!(!abandoned.usage_observed && !abandoned.accounting_complete);
+        assert_eq!((abandoned.input_tokens, abandoned.output_tokens), (0, 0));
+        let custody =
+            fs::read_to_string(root.path().join("host/authority/provider-send-v1.key")).unwrap();
+        let operator =
+            crate::provider_transport::authenticate_provider_reconciliation(&custody).unwrap();
+        assert_eq!(
+            crate::provider_transport::provider_attempts_requiring_reconciliation(&operator)
+                .unwrap()
+                .len(),
+            1
+        );
+        let changed_status = send(&relay, &secret, &request(1)).await.status();
+        let after = relay.evidence(&id).unwrap();
+        server.abort();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "abandoned={abandoned:?}, after={after:?}, changed_status={changed_status}"
+        );
+        assert_eq!(changed_status, StatusCode::UNAUTHORIZED);
+        assert!(abandoned.revoked);
+        assert_eq!(
+            abandoned.interruption,
+            Some(ManagedProviderDiagnosticKind::AbandonedForward)
+        );
+        assert_eq!(after.requests_reserved, 1);
+        assert!(
+            forward(&relay.state, &id, &serde_json::to_vec(&request(2)).unwrap())
+                .await
+                .is_err()
+        );
+        assert_eq!(relay.evidence(&id).unwrap().requests_reserved, 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn dropped_forward_after_upstream_admission_revokes_capability() {
+        assert_abandoned_forward(false).await;
+        assert_abandoned_forward(true).await;
+    }
+
+    #[tokio::test]
+    async fn changed_request_after_abandoned_forward_causes_zero_additional_sends() {
+        assert_abandoned_forward(false).await;
+        assert_abandoned_forward(true).await;
+    }
+
+    #[tokio::test]
+    async fn unknown_usage_cannot_be_reused_as_free_budget() {
+        assert_abandoned_forward(false).await;
+        assert_abandoned_forward(true).await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn successful_settled_turn_preserves_bounded_multiturn_execution() {
+        let _serial = crate::home_override_serial();
+        let root = tempfile::tempdir().unwrap();
+        crate::set_grokptah_home_override(Some(root.path().join("host")));
+        let _home = Home;
+        let (relay, calls, server) = relay(root.path().join("leases"), StatusCode::OK).await;
+        let id = relay
+            .lease_id_for_request("assignment", "multiturn")
+            .unwrap();
+        relay
+            .bind_lease_bounds(&id, 2, LEASE_LIFETIME_MS, MAX_TOTAL_TOKENS)
+            .unwrap();
+        relay.resolve(&id).unwrap();
+        let secret = relay.state.leases.lock().unwrap()[&id].secret.clone();
+        for index in 0..2 {
+            assert_eq!(
+                send(&relay, &secret, &request(index)).await.status(),
+                StatusCode::OK
+            );
+        }
+        let evidence = relay.evidence(&id).unwrap();
+        assert_eq!(
+            (
+                evidence.wire_attempts,
+                evidence.http_responses_observed,
+                evidence.responses_completed
+            ),
+            (2, 2, 2)
+        );
+        assert_eq!((evidence.input_tokens, evidence.output_tokens), (200, 20));
+        assert!(evidence.accounting_complete && !evidence.uncertain && !evidence.revoked);
+        assert_eq!(evidence.remote_effect_uncertain, Some(false));
+        assert!(evidence.interruption.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            send(&relay, &secret, &request(2)).await.status(),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        server.abort();
     }
 
     #[tokio::test]
@@ -1130,6 +1806,64 @@ mod tests {
         assert!(authorized_lease(&relay.state, &headers).is_none());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         server.abort();
+    }
+
+    #[test]
+    fn legacy_evidence_retains_unknown_remote_outcome_and_diagnostics_stay_bounded() {
+        let mut value = serde_json::to_value(ManagedProviderEvidence {
+            uncertain: true,
+            wire_attempts: 1,
+            ..Default::default()
+        })
+        .unwrap();
+        for key in [
+            "remoteEffectUncertain",
+            "interruption",
+            "diagnostics",
+            "httpResponsesObserved",
+        ] {
+            value.as_object_mut().unwrap().remove(key);
+        }
+        let mut evidence: ManagedProviderEvidence = serde_json::from_value(value).unwrap();
+        assert!(evidence.uncertain);
+        assert_eq!(evidence.remote_effect_uncertain, None);
+        for _ in 0..100 {
+            evidence.record_diagnostic(ManagedProviderDiagnosticKind::RecoveryUncertain);
+        }
+        assert_eq!(evidence.diagnostics.len(), 32);
+        assert_eq!(
+            evidence.interruption,
+            Some(ManagedProviderDiagnosticKind::RecoveryUncertain)
+        );
+    }
+
+    #[test]
+    fn diagnostic_identifiers_never_retain_known_secrets_or_arbitrary_content() {
+        let body = br#"{"error":{"type":"authentication_error","code":"invalid_api_key","message":"SECRET_RESPONSE_CANARY"}}"#;
+        assert_eq!(
+            safe_error_codes(body, "child-secret", "invalid_api_key").1,
+            None
+        );
+        assert_eq!(
+            safe_error_codes(b"SECRET_RESPONSE_CANARY", "child-secret", "upstream-secret"),
+            (None, None)
+        );
+        let mut headers = HeaderMap::new();
+        for unsafe_id in [
+            "https://host.invalid/?secret=CANARY",
+            "COOKIE_CANARY",
+            "12345678-1234-4234-8234-123456789abc",
+        ] {
+            headers.insert("x-request-id", unsafe_id.parse().unwrap());
+            assert_eq!(
+                safe_request_id(
+                    &headers,
+                    "child-secret",
+                    "12345678-1234-4234-8234-123456789abc"
+                ),
+                None
+            );
+        }
     }
 
     #[test]

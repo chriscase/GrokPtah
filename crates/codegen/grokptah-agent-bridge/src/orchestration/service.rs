@@ -1467,10 +1467,19 @@ impl OrchestrationService {
                     .as_ref()
                     .and_then(|runtime| runtime.credentials.provider_evidence(id))
             });
+            let relay_observed = observed.is_some();
             let mut evidence = observed
                 .or_else(|| grok.provider_evidence.clone())
                 .unwrap_or_default();
             evidence.uncertain = true;
+            if !relay_observed {
+                // A persisted earlier counter cannot prove what a lost relay
+                // subsequently admitted. Keep this fact unknown on recovery.
+                evidence.remote_effect_uncertain = None;
+            }
+            evidence.record_diagnostic(
+                crate::managed_provider::ManagedProviderDiagnosticKind::RecoveryUncertain,
+            );
             evidence.accounting_complete = false;
             evidence.revoked = true;
             grok.provider_evidence = Some(evidence);

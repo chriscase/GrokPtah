@@ -309,6 +309,12 @@ pub trait CredentialLeaseResolver: Send + Sync {
     ) -> Option<crate::managed_provider::ManagedProviderEvidence> {
         None
     }
+    fn note_child_failure(
+        &self,
+        _id: &str,
+        _kind: crate::managed_provider::ManagedProviderDiagnosticKind,
+    ) {
+    }
     fn readiness_error(&self) -> Option<&'static str> {
         None
     }
@@ -2550,6 +2556,18 @@ fn classify_managed_harvest(
     credentials: &dyn CredentialLeaseResolver,
 ) -> ClassifiedRun {
     if harvest.kind != HarvestKind::Exited(0) {
+        credentials.note_child_failure(
+            &launch.credential_lease_id,
+            match harvest.kind {
+                HarvestKind::Cancelled => {
+                    crate::managed_provider::ManagedProviderDiagnosticKind::Cancelled
+                }
+                HarvestKind::Timeout => {
+                    crate::managed_provider::ManagedProviderDiagnosticKind::Expired
+                }
+                _ => crate::managed_provider::ManagedProviderDiagnosticKind::ChildExit,
+            },
+        );
         return failed_closed_classification("managed-worker-did-not-exit-cleanly");
     }
     let result = (|| {
@@ -2640,17 +2658,7 @@ fn classify_managed_harvest(
         }
         let usage: serde_json::Value =
             serde_json::from_slice(&bytes).map_err(|_| "managed-usage-json")?;
-        let stats = &usage["session"];
-        if usage["sessionId"].as_str() != Some(session)
-            || stats["modelCalls"].as_u64() != Some(u64::from(provider.wire_attempts))
-            || stats["totalTokens"].as_u64()
-                != Some(provider.input_tokens.saturating_add(provider.output_tokens))
-            || stats["turnCount"]
-                .as_u64()
-                .is_none_or(|turns| turns == 0 || turns > u64::from(launch.max_turns))
-            || stats["turnCount"] != value["num_turns"]
-            || usage["turns"].as_array().is_none_or(Vec::is_empty)
-        {
+        if !managed_session_usage_matches(&usage, session, &provider) {
             return Err("managed-usage-does-not-match-host-sends");
         }
         let summary_ref = sha256_evidence_ref("summary", text.as_bytes());
@@ -2675,8 +2683,38 @@ fn classify_managed_harvest(
             ],
             advisory_evidence: Some(evidence),
         },
-        Err(reason) => failed_closed_classification(reason),
+        Err(reason) => {
+            credentials.note_child_failure(
+                &launch.credential_lease_id,
+                crate::managed_provider::ManagedProviderDiagnosticKind::ChildEvidenceMismatch,
+            );
+            failed_closed_classification(reason)
+        }
     }
+}
+
+// CLI 1.0.41 records one user prompt in usage.json, while headless
+// num_turns counts model rounds inside that prompt. Validate each ledger at
+// its own granularity, retaining exact host send/token reconciliation.
+fn managed_session_usage_matches(
+    usage: &serde_json::Value,
+    session: &str,
+    provider: &crate::managed_provider::ManagedProviderEvidence,
+) -> bool {
+    let Some(turns) = usage["turns"].as_array() else {
+        return false;
+    };
+    if usage["sessionId"].as_str() != Some(session) || turns.len() != 1 {
+        return false;
+    }
+    [&usage["session"], &turns[0]].into_iter().all(|stats| {
+        stats["turnCount"].as_u64() == Some(1)
+            && stats["modelCalls"].as_u64() == Some(u64::from(provider.wire_attempts))
+            && stats["totalTokens"].as_u64()
+                == Some(provider.input_tokens.saturating_add(provider.output_tokens))
+            && stats["inputTokens"].as_u64() == Some(provider.input_tokens)
+            && stats["outputTokens"].as_u64() == Some(provider.output_tokens)
+    })
 }
 
 fn managed_stdout_usage_matches(
@@ -2705,7 +2743,7 @@ fn managed_stdout_usage_matches(
             != Some(provider.input_tokens.saturating_add(provider.output_tokens))
         || value["num_turns"]
             .as_u64()
-            .is_none_or(|turns| turns == 0 || turns > u64::from(provider.wire_attempts))
+            .is_none_or(|turns| turns == 0 || turns != u64::from(provider.wire_attempts))
     {
         return false;
     }
@@ -4013,6 +4051,43 @@ printf 'candidate' > source
         assert!(managed_offline_readiness(&executable, root.path())
             .unwrap_err()
             .contains("requires Grok 1.0.41"));
+    }
+
+    #[test]
+    fn managed_session_usage_binds_one_prompt_and_every_settled_model_round() {
+        let provider = crate::managed_provider::ManagedProviderEvidence {
+            wire_attempts: 2,
+            input_tokens: 200,
+            output_tokens: 20,
+            ..Default::default()
+        };
+        let stats = serde_json::json!({"turnCount":1,"modelCalls":2,"inputTokens":200,"outputTokens":20,"totalTokens":220});
+        let good = serde_json::json!({"sessionId":"session","session":stats,"turns":[stats]});
+        assert!(managed_session_usage_matches(&good, "session", &provider));
+        for path in [
+            "/session/turnCount",
+            "/session/modelCalls",
+            "/session/inputTokens",
+            "/session/outputTokens",
+            "/session/totalTokens",
+            "/turns/0/turnCount",
+            "/turns/0/modelCalls",
+            "/turns/0/inputTokens",
+            "/turns/0/outputTokens",
+            "/turns/0/totalTokens",
+        ] {
+            let mut bad = good.clone();
+            *bad.pointer_mut(path).unwrap() = serde_json::json!(0);
+            assert!(!managed_session_usage_matches(&bad, "session", &provider));
+        }
+        let mut extra = good.clone();
+        extra["turns"].as_array_mut().unwrap().push(stats);
+        assert!(!managed_session_usage_matches(&extra, "session", &provider));
+        assert!(!managed_session_usage_matches(
+            &good,
+            "other-session",
+            &provider
+        ));
     }
 
     #[test]
