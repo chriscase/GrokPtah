@@ -154,6 +154,22 @@ jobs:
         working-directory: desktop/src-tauri
         # cargo test compiles the library, binary, and test targets.
         run: cargo test --locked
+      - name: Establish private-check public toolchain ownership
+        # Revision 2 admits only a root-owned physical Xcode bundle. Hosted
+        # image toolchains may belong to the image-builder user. Normalize
+        # this disposable runner's public bundle, never the production rule.
+        working-directory: .
+        run: |
+          xcode_root="$(cd /Applications/Xcode.app && pwd -P)"
+          case "$xcode_root" in
+            /Applications/Xcode.app|/Applications/Xcode_*.app) ;;
+            *) echo "Unexpected public Xcode location" >&2; exit 1 ;;
+          esac
+          /usr/bin/stat -f 'Public toolchain before: uid=%u gid=%g path=%N' "$xcode_root"
+          sudo /usr/sbin/chown -R root:wheel "$xcode_root"
+          sudo /bin/chmod -R go-w "$xcode_root"
+          test "$(/usr/bin/stat -f '%u' "$xcode_root")" = 0
+          /usr/bin/stat -f 'Public toolchain after: uid=%u gid=%g path=%N' "$xcode_root"
       - name: Bridge fmt + clippy + tests
         # Bridge is its own Cargo workspace root (path dep of desktop).
         working-directory: crates/codegen/grokptah-agent-bridge
