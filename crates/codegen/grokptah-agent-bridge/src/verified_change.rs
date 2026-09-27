@@ -1671,12 +1671,34 @@ const PRIVATE_CHECK_SANDBOX: &str = r#"(version 1)
   (subpath (param "OUTPUT")) (literal (param "EXECUTABLE"))
   (subpath "/System/Library") (subpath "/System/Cryptexes")
   (subpath "/usr/lib") (subpath "/usr/share") (subpath "/usr/bin") (subpath "/bin")
-  (subpath "/Applications/Xcode.app") (subpath "/Library/Developer/CommandLineTools")
+  (subpath (param "PUBLIC_XCODE")) (subpath "/Library/Developer/CommandLineTools")
   (literal "/dev/null") (literal "/dev/urandom") (literal "/dev/random")
   (literal "/private/etc/localtime") (literal "/private/var/db/timezone/localtime"))
 (allow file-write* (subpath (param "OUTPUT")) (literal "/dev/null"))
 (allow file-ioctl (literal "/dev/null"))
 "#;
+
+/// macOS runners select versioned Xcode bundles through Xcode.app. Sandbox
+/// path filters observe the physical bundle, not necessarily that alias.
+/// Admit only an installed root-owned Xcode bundle directly in Applications.
+fn public_xcode_root() -> PathBuf {
+    use std::os::unix::fs::MetadataExt;
+    let unavailable = || PathBuf::from("/__grokptah_missing_public_xcode__");
+    let Ok(root) = dunce::canonicalize("/Applications/Xcode.app") else {
+        return unavailable();
+    };
+    let name = root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+    if root.parent() != Some(Path::new("/Applications"))
+        || !(name == "Xcode.app" || (name.starts_with("Xcode_") && name.ends_with(".app")))
+        || !fs::metadata(&root).is_ok_and(|metadata| metadata.is_dir() && metadata.uid() == 0)
+    {
+        return unavailable();
+    }
+    root
+}
 
 pub fn file_digest(path: &Path) -> Option<String> {
     let bytes = fs::read(path).ok()?;
@@ -1968,6 +1990,9 @@ fn run_one_check(
             .arg(format!("OUTPUT={}", output_dir.display()))
             .arg("-D")
             .arg(format!("EXECUTABLE={}", check.executable));
+        command
+            .arg("-D")
+            .arg(format!("PUBLIC_XCODE={}", public_xcode_root().display()));
     } else {
         command.arg(check_sandbox_profile(&output_dir, network));
     }
