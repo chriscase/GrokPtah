@@ -165,6 +165,7 @@ jobs:
             /Applications/Xcode.app|/Applications/Xcode_*.app) ;;
             *) echo "Unexpected public Xcode location" >&2; exit 1 ;;
           esac
+          test "$(dirname "$xcode_root")" = /Applications
           /usr/bin/stat -f 'Public toolchain before: uid=%u gid=%g path=%N' "$xcode_root"
           sudo /usr/sbin/chown -R root:wheel "$xcode_root"
           sudo /bin/chmod -R go-w "$xcode_root"
