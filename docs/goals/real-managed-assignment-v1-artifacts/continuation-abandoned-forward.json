@@ -1,0 +1,66 @@
+{
+  "schemaVersion": 1,
+  "qualification": "OFFLINE; actual relay and canonical authority; no live provider request",
+  "startingFunctionalSha": "97bf4d5a639650d68e45eaf68f52d66c17b22688",
+  "startingFunctionalTree": "f42634387bd2fe7073feee002d3f9353dce41559",
+  "startingPublishedSha": "e8d841ce1dc287c1ccf03ad8b4b852a13a5cb7a3",
+  "beforeLogDigest": "sha256:446ba5ce52e1bbbec828a40ec3c7a671730a3ebb70e6c8bdee3f4a23cdcf4549",
+  "before": {
+    "testsPassed": 0,
+    "testsFailed": 1,
+    "upstreamObservedBeforeAbort": true,
+    "explicitRevokeBeforeAbort": false,
+    "canonicalUncertainAttempts": 1,
+    "abandoned": {
+      "admissions": 1,
+      "responsesCompleted": 0,
+      "usageObserved": false,
+      "accountingComplete": false,
+      "uncertain": true,
+      "revoked": false
+    },
+    "differentBodyStatus": 200,
+    "physicalFixtureCallsAfterDifferentBody": 2,
+    "authorityAdmissionsAfterDifferentBody": 2
+  },
+  "afterAssertions": {
+    "phases": [
+      "waiting_for_headers",
+      "draining_response"
+    ],
+    "explicitRevokeBeforeAbort": false,
+    "canonicalUncertainAttempts": 1,
+    "revoked": true,
+    "interruption": "abandoned_forward",
+    "usageObserved": false,
+    "accountingComplete": false,
+    "storedInputTokens": 0,
+    "storedOutputTokens": 0,
+    "zeroTokensAreNotZeroCost": true,
+    "differentBodyStatus": 401,
+    "fixtureCalls": 1,
+    "admissions": 1,
+    "requestsReserved": 1,
+    "anotherDirectDifferentBodyAdmission": "denied; reservation and fixture count remain 1"
+  },
+  "normalSettlementAssertions": {
+    "distinctSuccessfulTurns": 2,
+    "fixtureCalls": 2,
+    "completedResponses": 2,
+    "inputTokens": 200,
+    "outputTokens": 20,
+    "accountingComplete": true,
+    "uncertain": false,
+    "revoked": false,
+    "thirdCallBeyondBound": "denied; no additional fixture call"
+  },
+  "disconnectQualification": "Actual relay socket drop: handler may be dropped immediately or remain pending; both prevent a changed body from creating another send. No remote undo is claimed.",
+  "settlementQualification": "Durable settle_success and completed-marker update have no intervening await. Completed turns and cancellation/expiry boundaries are covered; no artificial transport authority bypass is used.",
+  "requiredTests": [
+    "dropped_forward_after_upstream_admission_revokes_capability",
+    "changed_request_after_abandoned_forward_causes_zero_additional_sends",
+    "unknown_usage_cannot_be_reused_as_free_budget",
+    "successful_settled_turn_preserves_bounded_multiturn_execution",
+    "interrupted_forward_recovery_never_creates_another_paid_attempt"
+  ]
+}

@@ -1,4 +1,13 @@
 {
+  "continuation-abandoned-forward.json": "sha256:d61a808c3ef39a96765b7e91c488c9b613ff1f2bdb02fa3103c6919f947684f4",
+  "continuation-hosted-desktop.json": "sha256:90b96871c104a9e4fb9e3fe227cefc829d37d4913fc43c23944c553dbcc4111e",
+  "continuation-offline-http-rejected.json": "sha256:67fbbd8d567fdb004961e8e0ea18b6497da033a84f2df44130e05fd6a4cd797a",
+  "continuation-offline-interrupted.json": "sha256:a46246fd34d1e7b07b54d1133a6efdc6e8ace081fdfffbb4dbb3eb213fda7d8e",
+  "continuation-offline-malformed.json": "sha256:cf66321ee5453d51403052643747bfd9489aa84f45a570b7060f40f2456f02bf",
+  "continuation-offline-missing-usage.json": "sha256:c0efc6ad41b49e88d22e503a61b61abf380a89746029af765cf56db72d85a9ee",
+  "continuation-offline-success.json": "sha256:3273245846f3f3ab7d1d29219ea6e4c328fca6557c8ae500087df4746318ceb4",
+  "continuation-secret-retention.json": "sha256:543eb4b526d19f7aee2e5965fdacb612ed43c8f0e85c852ef3303a4fb4b21c3b",
+  "continuation-validation.json": "sha256:721f3c931c628cd46c60e05aeeec68dcebba80e64e586b9987e531418ed3fa30",
   "hosted-desktop-final.json": "sha256:5573e71e91c1511cdbbef376cc052d94a88956b2eef545da9a13cbf3bc049cca",
   "live-discard.json": "sha256:5c0d512190211a229ecb5f42f0553b31cafd17949df69c3ec51402545957a3b0",
   "live-execute.json": "sha256:7b1b3eb2e5c34766122b283a74172d7208bfff7092cb6ce27f2d94f25497185b",

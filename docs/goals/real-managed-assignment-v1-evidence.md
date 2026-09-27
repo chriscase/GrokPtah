@@ -271,3 +271,77 @@ Predecessor ancestry and preflight dispatch 0 are preserved. New branch/worktree
 This goal's safety gates were not weakened. Its requested successful live software change was not achieved. Remaining work requires diagnosing upstream acceptance with sanitized error evidence, then a **separately authorized new bounded qualification**, since this goal's paid attempt is spent. A new attempt must retain the same readiness/containment/isolation/check/publication gates. The CLI is deliberately supported only at the observed 1.0.41 contract on macOS; other versions/platforms fail closed. No dollar budget or usage completion is promised after an unaccounted request.
 
 Independent review should focus on relay revocation/in-flight settlement, observer-before-wire accounting, exact Work/Run/Attempt recovery, hostile candidate execution under check revision 2, no source/secret leakage, and whether the qualification evidence supports the narrowly stated claims. The lack of a verified live candidate is the reason the overall result is partial. Do not merge PR #580, release, deploy or begin a follow-up goal from this handoff.
+
+
+## Bounded abandoned-forward/diagnostics continuation — READY FOR INDEPENDENT REVIEW
+
+This continuation implements Tasks A–C from the owner-supplied PR #580 assignment. Additional live inference requests: **0**. The original frozen G1–G10 goal remains **PARTIAL**; offline integration does not complete live G4/G5/G8. Independent acceptance is **NOT CLAIMED**. PR #580 remains draft and unmerged; no release or deployment occurred.
+
+### Revision and publication boundary
+
+| Identity | SHA | Tree |
+| --- | --- | --- |
+| Integrated #579/main base (unchanged) | `9e2660ff1a50edb7af1b81a4232d7fe23a37de0d` | `f524b705a3b88cb895309506bf726e76c91874bf` |
+| Previously reviewed functional | `97bf4d5a639650d68e45eaf68f52d66c17b22688` | `f42634387bd2fe7073feee002d3f9353dce41559` |
+| Starting published evidence tip | `e8d841ce1dc287c1ccf03ad8b4b852a13a5cb7a3` | `193f1a6b988acae6c0868e1395739c2b11132269` |
+| Repaired/tested functional | `fd8a7873468d7b416a53fc23b089b0cc4b589e2d` | `94d275b23090e873378e4690107a7d3abbba9061` |
+
+The repaired commit is a normal descendant of the starting tip on the same `grok/real-managed-assignment-v1` branch. No reset, rebase, force push, main mutation or new PR was used. Its changes are restricted to `managed_provider.rs`, `grok_build.rs`, `orchestration/service.rs` and the new offline test module. All subsequent committed files are evidence/specification records under docs. **Executable changes after the tested functional revision: NONE.** The final publication SHA/tree and independently verified remote head are recorded in the PR body/handoff, avoiding a self-referential documentation commit.
+
+Frozen goal content SHA-256 remains `50edf789c5acc46a0f349a81ca12b53ce155adfc860ff084537e0aba33f578f8`. All eleven historical artifact file digests match the starting manifest; the manifest only adds continuation records. The prerequisite preflight dispatch count remains **0**.
+
+### A — Meaningful red reproduction and terminal repair
+
+Before implementation, the actual production relay/canonical transport observed the first loopback upstream request, then the forward task was aborted before headers without calling revoke. Canonical authenticated reconciliation reported one uncertain attempt. Relay evidence had one admission, no completed response/usage, incomplete accounting and uncertainty, but `revoked=false`. A **different valid body using the same capability** then returned HTTP 200 and reached the fixture: two physical fixture calls/two authority admissions. The regression failed its assertion `2 == 1`: **0 passed, 1 failed**, not a setup panic. The private meaningful-red log digest is retained in [the reproduction record](real-managed-assignment-v1-artifacts/continuation-abandoned-forward.json). Earlier compile/setup failures are not substituted for this reproduction.
+
+After repair, authorization and serialized admission both reject uncertain/revoked leases. The forward guard becomes completed only after durable canonical success settlement and the successful evidence transition. Every incomplete guard drop cancels/revokes the lease before clearing in-flight state. Both header-wait and response-drain barriers prove one uncertain canonical attempt, one admission/reservation, missing/incomplete usage, changed-body HTTP 401 and zero additional fixture calls. Another direct different-body admission also fails without reserving again. Stored token totals of zero mean unobserved usage; terminal authority makes them unusable as free budget.
+
+Two distinct completely settled turns remain usable under a two-call bound, preserve exact 200-input/20-output accounting and do not revoke between turns. A third call is denied without another send. Actual relay socket disconnect is also covered: Hyper may drop the handler or retain it pending, but serialized admission prevents another send in either case. Quiescence/revocation does not undo a remote request. Durable settlement and the completed-marker update have no intervening await; the completed-turn and cancellation/expiry regressions cover this boundary without injecting a transport bypass.
+
+All required names are present and executed: `dropped_forward_after_upstream_admission_revokes_capability`, `changed_request_after_abandoned_forward_causes_zero_additional_sends`, `unknown_usage_cannot_be_reused_as_free_budget`, `successful_settled_turn_preserves_bounded_multiturn_execution`, and the separately run installed-CLI `interrupted_forward_recovery_never_creates_another_paid_attempt`.
+
+### B — Safe evidence, persistence and demonstrated protocol findings
+
+The existing ManagedProviderEvidence/managed-intent/Work–Run projections now carry distinct reserved/admitted, HTTP-observed and usage-completed counts; numeric HTTP status; bounded request identifiers; allowlisted machine error enums; first interruption; and at most 32 typed diagnostics. Categories distinguish prewire denial, uncertain transport, observed HTTP/rejection, SSE/protocol failure, missing/inconsistent usage, child exit/metadata mismatch, cancellation, expiry, abandonment, settlement and uncertain recovery. Prewire denial retains a typed reason and bounded request-byte count. A proven before-wire transport failure may clear remote uncertainty without restoring authority. Legacy/lost-relay remote outcomes remain **unknown**, not invented false; canonical transport remains the sole send ledger.
+
+Loopback fixtures cover 400/401/403/429/503, malformed SSE, missing and inconsistent usage, transport interruption and successful settlement. For example, the offline 401 retains `httpStatus=401`, `http_rejected`, validated UUID request ID and allowlisted `authentication_error`/`invalid_api_key`; its message, cookie and body are absent. Unknown/malformed machine codes and arbitrary request IDs are discarded. An HTTP rejection still has incomplete usage and remote uncertainty; it does not prove zero billing. Canary tests also reject a known credential masquerading as an otherwise allowlisted code/identifier.
+
+Actual installed-CLI HTTP, stream, missing-usage and transport diagnostics survive finalization, explicit discard and three reopens with the same evidence and exactly one Work/Run/Attempt. Recursive scans of each owned fixture's retained files and public report found no injected response/transport/cookie/credential canary. Public reports omit prompt previews and free-form Run responses. See [HTTP fixture](real-managed-assignment-v1-artifacts/continuation-offline-http-rejected.json), [protocol fixture](real-managed-assignment-v1-artifacts/continuation-offline-malformed.json), [usage fixture](real-managed-assignment-v1-artifacts/continuation-offline-missing-usage.json) and [interrupted fixture](real-managed-assignment-v1-artifacts/continuation-offline-interrupted.json).
+
+Installed CLI 1.0.41 request shapes are retained only as field/tool/parameter names, numeric byte lengths and output ceilings. The positive fixture sends the standard messages/model/tools/stream fields, a forced 1,024-token ceiling and usage-enabled SSE. A concrete installed-CLI mismatch was reproduced: two settled model calls and 220 tokens appear as headless `num_turns=2`, while `usage.json` records one user prompt (`turnCount=1`) containing both calls. The old equality falsely rejected it. The repaired validator requires exactly one prompt/usage row, exact host call/input/output/total counts in both session and prompt aggregates, exact headless model-round/call reconciliation and the existing journal/session/request binding. Validation was strengthened; token accounting was not replaced with a worker verdict.
+
+[The primary Chat Completions reference](https://docs.x.ai/developers/rest-api-reference/inference/chat-completions) demonstrates an additional reasoning-token contribution to total usage. The pinned Grok headless guide documents cached versus uncached input and optional cost fields. Those nonzero reasoning/cache/additional-cost forms remain **unqualified** by the present fixtures; no parser broadening or live diagnostic request was used. [The coding model documentation](https://docs.x.ai/developers/models/grok-build-0.1) is capability context, not entitlement proof. These findings do **not** establish the historical failed request's cause, which stays **UNKNOWN**.
+
+### C — Actual-CLI production-path OFFLINE qualification
+
+The external model is a cost-isolating loopback fixture; the installed CLI, private child confinement, production relay, canonical transport, managed service/MCP, Work/Run/Attempt stores, retained candidate, registered private host oracle and explicit disposition/recovery are real. CLI 1.0.41 digest: `sha256:9c844eb13365180787d9ad22b2b3748a024be8e1ed845253cc114781b31c591d`.
+
+Successful offline Work `b5eff315-201e-4a76-92e2-b634a68d25ab`, Run `f36dae6c-3051-4435-aba5-33c54fd14bde`, Attempt `3bc59042-4a51-4ec1-a585-eba2ac6f9e2f` (number 1), base `d10ec97b05d6b5f1643840b2233ad90c51ce74da`, tree `1ef9c0872b4eadfaae5f75bbf2933c062cce67ec`. Two actual CLI file-tool writes repair UTF-8 byte-length framing and canonical exact-length/strict-UTF-8 decoding in the two allowed source files. Two settled fixture calls total synthetic 200-input/20-output usage, within existing limits. Request sizes were 13,289 and 14,519 bytes. Earlier longer scripted transcripts correctly hit the existing token reserve and were shortened; no budget or confinement was enlarged.
+
+Host oracle profile `offline-utf8`, revision 1, private confinement revision 2; sealed check specification `sha256:55d8ae3e2b6378a68634b1722509c3667a1a0d4ebcc59f18fdfaf085ca42478b`. Original registered check fails (exit 1), the retained candidate passes (exit 0). Candidate digest `sha256:53274f59ebf1ac3b4db81ec6c46f2d22c3e23359fc963183febb03c498775356`; diff bundle `sha256:22571f59ec41e6cfaae9d5ac29f0b4d0cc0fb3131164844e422941dd82312aa9`. Source remains clean at its base through review. A reopened host explicitly approves/applies that candidate on disposable source; two further reopens preserve applied/succeeded state, exact repaired bytes and one Work/Run/Attempt, with no further fixture calls and an empty worker root. [Complete sanitized positive record](real-managed-assignment-v1-artifacts/continuation-offline-success.json).
+
+Interrupted offline Work `3e41b4a1-8c7c-4140-b9fe-4bfec183f9ee`, Run `96a28743-957b-49a1-9dbe-931d5e651200`, Attempt `90afbaae-578e-40e1-9840-268b292c637a` stays one attempt/one local fixture request through finalization, discard and three reopens; source remains unchanged and usage incomplete. This and the positive journey are **OFFLINE integration**, not live G4/G5/G8 completion.
+
+### Validation and exact-functional Hosted Desktop
+
+| Final campaign | Passed | Failed | Ignored / qualification |
+| --- | ---: | ---: | --- |
+| Locked bridge, fresh disposable home, default stack | 1,243 | 0 | 10; 713 library and 102 Verified Change recovery tests included |
+| Bridge fmt / strict all-target Clippy | PASS | 0 | CARGO_INCREMENTAL=0; no stack override |
+| Service fmt / strict Clippy / locked suites | 20 | 0 | 0 |
+| Host authority fmt / strict Clippy / suites | 119 | 0 | 0 |
+| Frontend typecheck / full tests | 428 | 0 | 58 files |
+| Tauri native desktop | 50 | 0 | 0 |
+| Installed-CLI managed journey/diagnostics, explicitly offline | 5 | 0 | 0; run separately from the normal campaign |
+| Existing installed-CLI protocol/failure/no-retry fixture, offline | 1 | 0 | 0 |
+| Affected check regressions rerun separately | 23 | 0 | 0 |
+
+The first full bridge campaign (overlapping native qualification) had 706 passed, 7 timing/output/deadline failures and 6 ignored. Those failures are retained, not hidden. All 23 affected check regressions then passed unchanged, followed by the complete serial campaign above. No timeout, sandbox rule or test expectation was weakened. Intermediate development setup/transcript/metadata failures are qualified separately from the meaningful authority reproduction. [Exact commands and per-suite counts](real-managed-assignment-v1-artifacts/continuation-validation.json).
+
+Hosted Desktop [36337674750](https://github.com/chriscase/GrokPtah/actions/runs/36337674750), attempt **1**, `pull_request`, exact functional head `fd8a7873468d7b416a53fc23b089b0cc4b589e2d`: **completed/success**, failed steps **0**. Its full workflow includes bridge/service/host-authority, Tauri, frontend, coding-worktree/isolated-surface, certification and provenance gates. [Bounded hosted metadata](real-managed-assignment-v1-artifacts/continuation-hosted-desktop.json). The subsequent single publication commit contains evidence/specification only; later CI metadata belongs in the PR body, not another docs commit.
+
+### Historical preservation, next-live proposal and stop
+
+Historical live Work `c724d7eb-d321-4159-af79-7861ad0bb10b`, Run `681606e4-b8a6-469f-ab80-ab246b861af7`, Attempt `752e00ee-5b62-4038-bbbc-3fd40a016878` is unchanged and cancelled. Its one failed live attempt/send and unknown/incomplete usage remain recorded; no retry, verified candidate or application has been invented. The earlier zero-wire isolation-failed Work is also not rearmed. Additional live inference/entitlement/paid diagnostic/cancellation requests in this pass: **0**.
+
+[The next-live proposal](real-managed-assignment-v1-next-live-spec.md) is **NOT EXECUTED**. It pins CLI/model/OIDC proxy authentication/route, reproducible new red base and two allowed files, private external oracle, one worker attempt, no retry/application, 180-second lifetime, six maximum admissions, 16,000 aggregate tokens, 1,024 output tokens per call and current byte/tool ceilings. No new live qualification repository/Work/request ID exists. Independent review, complete accounting compatibility and separate precise owner authorization remain prerequisites. The frozen original goal stays PARTIAL. Stop after this publication for independent review; no merge, undraft, release, deployment or new goal is authorized.
