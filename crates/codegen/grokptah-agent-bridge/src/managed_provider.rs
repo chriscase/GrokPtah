@@ -155,6 +155,14 @@ struct RelayState {
     client: reqwest::Client,
     leases: Mutex<BTreeMap<String, Lease>>,
     stopped: CancellationToken,
+    #[cfg(test)]
+    completed_forward_handoff: Mutex<Option<CompletedForwardHandoff>>,
+}
+
+#[cfg(test)]
+struct CompletedForwardHandoff {
+    published: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
 }
 
 pub struct ManagedProviderRelay {
@@ -249,6 +257,8 @@ impl ManagedProviderRelay {
             client,
             leases: Mutex::new(BTreeMap::new()),
             stopped: CancellationToken::new(),
+            #[cfg(test)]
+            completed_forward_handoff: Mutex::new(None),
         });
         let router = Router::new()
             .route("/v1/models", get(models))
@@ -921,6 +931,15 @@ async fn forward_inner(
             settlement.completed = true;
         }
     }
+    // Only tests pause at this actual post-publication/pre-Drop boundary.
+    // Neither the lease mutex nor the hook mutex is held across the barrier.
+    #[cfg(test)]
+    let handoff = state.completed_forward_handoff.lock().unwrap().take();
+    #[cfg(test)]
+    if let Some(handoff) = handoff {
+        let _ = handoff.published.send(());
+        let _ = handoff.release.await;
+    }
     Ok(output)
 }
 
@@ -933,6 +952,11 @@ struct ForwardSettlement<'a> {
 }
 impl Drop for ForwardSettlement<'_> {
     fn drop(&mut self) {
+        // Successful publication already released this forward's ownership.
+        // A successor may now be active; completed cleanup must not touch it.
+        if self.completed {
+            return;
+        }
         if let Ok(mut leases) = self.state.leases.lock() {
             if let Some(lease) = leases.get_mut(self.id) {
                 if !self.completed {
@@ -1447,6 +1471,298 @@ mod tests {
             .send()
             .await
             .unwrap()
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum HandoffCase {
+        Ownership,
+        Quiescence,
+        ThirdRequest,
+        SuccessorAbandonment,
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    async fn assert_completed_forward_handoff(case: HandoffCase) {
+        let _serial = crate::home_override_serial();
+        let root = tempfile::tempdir().unwrap();
+        crate::set_grokptah_home_override(Some(root.path().join("host")));
+        let _home = Home;
+        let calls = Arc::new(AtomicU32::new(0));
+        let b_observed = Arc::new(tokio::sync::Notify::new());
+        let release_b = Arc::new(tokio::sync::Notify::new());
+        let count = calls.clone();
+        let observed = b_observed.clone();
+        let release = release_b.clone();
+        let router = Router::new().route(
+            "/v1/chat/completions",
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let count = count.clone();
+                let observed = observed.clone();
+                let release = release.clone();
+                async move {
+                    assert_eq!(
+                        headers["authorization"],
+                        "Bearer upstream-test-secret-never-child"
+                    );
+                    assert!(headers.contains_key("idempotency-key"));
+                    assert_eq!(body["max_tokens"], MAX_OUTPUT_TOKENS);
+                    if count.fetch_add(1, Ordering::SeqCst) == 1 {
+                        // B is physically observed, but has received neither
+                        // headers nor usage. C (if admitted) would finish.
+                        observed.notify_one();
+                        release.notified().await;
+                    }
+                    (
+                        [("content-type", "text/event-stream")],
+                        stream("settled handoff turn"),
+                    )
+                }
+            }),
+        );
+        let (relay, server) = local_fixture(root.path().join("leases"), router).await;
+        let (id, secret) = issue(&relay, "completed-forward-handoff");
+        let (published_tx, published_rx) = tokio::sync::oneshot::channel();
+        let (release_a, release_rx) = tokio::sync::oneshot::channel();
+        *relay.state.completed_forward_handoff.lock().unwrap() = Some(CompletedForwardHandoff {
+            published: published_tx,
+            release: release_rx,
+        });
+        let a_relay = relay.clone();
+        let a_secret = secret.clone();
+        let a = tokio::spawn(async move { send(&a_relay, &a_secret, &request(0)).await.status() });
+        tokio::time::timeout(Duration::from_secs(3), published_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let settled_a = relay.evidence(&id).unwrap();
+        assert_eq!(
+            (
+                settled_a.requests_reserved,
+                settled_a.wire_attempts,
+                settled_a.responses_completed
+            ),
+            (1, 1, 1)
+        );
+        assert!(settled_a.accounting_complete && !settled_a.revoked && !settled_a.uncertain);
+        let custody =
+            fs::read_to_string(root.path().join("host/authority/provider-send-v1.key")).unwrap();
+        let operator =
+            crate::provider_transport::authenticate_provider_reconciliation(&custody).unwrap();
+        let pending = || {
+            crate::provider_transport::provider_attempts_requiring_reconciliation(&operator)
+                .unwrap()
+                .len()
+        };
+        assert_eq!(pending(), 0, "A must be durably settled before the handoff");
+        let b_relay = relay.clone();
+        let b_secret = secret.clone();
+        let b_id = id.clone();
+        let b = tokio::spawn(async move {
+            if case == HandoffCase::SuccessorAbandonment {
+                // Directly own the same production forward future for a
+                // deterministic task abort. HTTP disconnect is separately
+                // covered; it need not drop Hyper's request handler.
+                match forward(
+                    &b_relay.state,
+                    &b_id,
+                    &serde_json::to_vec(&request(1)).unwrap(),
+                )
+                .await
+                {
+                    Ok(_) => StatusCode::OK,
+                    Err(_) => StatusCode::BAD_GATEWAY,
+                }
+            } else {
+                send(&b_relay, &b_secret, &request(1)).await.status()
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(3), b_observed.notified())
+            .await
+            .unwrap();
+        let active_b = relay.evidence(&id).unwrap();
+        assert_eq!(
+            (
+                active_b.requests_reserved,
+                active_b.wire_attempts,
+                active_b.responses_completed
+            ),
+            (2, 2, 1)
+        );
+        assert_eq!(
+            pending(),
+            1,
+            "B must have a real outstanding canonical attempt"
+        );
+        assert!(relay.state.leases.lock().unwrap()[&id].in_flight);
+        assert!(!relay.provider_quiescent(&id));
+        release_a.send(()).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), a)
+                .await
+                .unwrap()
+                .unwrap(),
+            StatusCode::OK
+        );
+        let after_a_drop = relay.evidence(&id).unwrap();
+        let b_still_active = relay.state.leases.lock().unwrap()[&id].in_flight;
+        let quiescent = relay.provider_quiescent(&id);
+        eprintln!(
+            "completed-forward-handoff {}",
+            json!({"case":format!("{case:?}"),"aSettled":1,"bObservedBeforeADrop":true,"bActiveAfterADrop":b_still_active,"providerQuiescentAfterADrop":quiescent,"canonicalPending":pending(),"reserved":after_a_drop.requests_reserved,"admissions":after_a_drop.wire_attempts,"fixtureCalls":calls.load(Ordering::SeqCst),"completed":after_a_drop.responses_completed,"inputTokens":after_a_drop.input_tokens,"outputTokens":after_a_drop.output_tokens})
+        );
+        assert_eq!(
+            after_a_drop, active_b,
+            "A cleanup cannot change B's evidence"
+        );
+        match case {
+            HandoffCase::ThirdRequest => {
+                let c = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    send(&relay, &secret, &request(2)),
+                )
+                .await
+                .unwrap();
+                let after_c = relay.evidence(&id).unwrap();
+                let counts = (
+                    after_c.requests_reserved,
+                    after_c.wire_attempts,
+                    calls.load(Ordering::SeqCst),
+                );
+                eprintln!(
+                    "completed-forward-third {}",
+                    json!({"httpStatus":c.status().as_u16(),"reserved":counts.0,"admissions":counts.1,"fixtureCalls":counts.2})
+                );
+                assert_eq!(
+                    counts,
+                    (2, 2, 2),
+                    "C cannot reserve or send while B owns admission"
+                );
+                assert_eq!(c.status(), StatusCode::BAD_GATEWAY);
+                assert!(b_still_active && !quiescent);
+                assert!(after_c.revoked && after_c.uncertain && !after_c.accounting_complete);
+                assert!(relay.state.leases.lock().unwrap()[&id]
+                    .cancelled
+                    .is_cancelled());
+                assert!(after_c
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.admission_denial == Some(ManagedAdmissionDenial::InFlight)));
+                // Preserve refusal policy: denying C cancels B, rather than
+                // weakening revocation to make the adversarial case succeed.
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(3), b)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    StatusCode::BAD_GATEWAY
+                );
+                assert_eq!(pending(), 1);
+                server.abort();
+            }
+            HandoffCase::SuccessorAbandonment => {
+                assert!(b_still_active && !quiescent);
+                b.abort();
+                assert!(b.await.unwrap_err().is_cancelled());
+                let abandoned = relay.evidence(&id).unwrap();
+                assert!(abandoned.revoked && abandoned.uncertain && !abandoned.accounting_complete);
+                assert_eq!(
+                    abandoned.interruption,
+                    Some(ManagedProviderDiagnosticKind::AbandonedForward)
+                );
+                assert_eq!((abandoned.input_tokens, abandoned.output_tokens), (100, 10));
+                assert_eq!(pending(), 1);
+                assert!(relay.provider_quiescent(&id));
+                assert_eq!(
+                    tokio::time::timeout(
+                        Duration::from_secs(3),
+                        send(&relay, &secret, &request(2))
+                    )
+                    .await
+                    .unwrap()
+                    .status(),
+                    StatusCode::UNAUTHORIZED
+                );
+                assert!(
+                    forward(&relay.state, &id, &serde_json::to_vec(&request(3)).unwrap())
+                        .await
+                        .is_err()
+                );
+                let after = relay.evidence(&id).unwrap();
+                assert_eq!(
+                    (
+                        after.requests_reserved,
+                        after.wire_attempts,
+                        calls.load(Ordering::SeqCst)
+                    ),
+                    (2, 2, 2)
+                );
+                eprintln!(
+                    "completed-forward-successor-abandoned {}",
+                    json!({"revoked":after.revoked,"uncertain":after.uncertain,"interruption":after.interruption,"providerQuiescent":relay.provider_quiescent(&id),"canonicalPending":pending(),"reserved":after.requests_reserved,"admissions":after.wire_attempts,"fixtureCalls":calls.load(Ordering::SeqCst),"inputTokens":after.input_tokens,"outputTokens":after.output_tokens,"accountingComplete":after.accounting_complete})
+                );
+                server.abort();
+            }
+            HandoffCase::Ownership | HandoffCase::Quiescence => {
+                if case == HandoffCase::Quiescence {
+                    assert!(
+                        !quiescent,
+                        "completed A cleanup cannot publish quiescence while B is outstanding"
+                    );
+                }
+                assert!(
+                    b_still_active,
+                    "completed A cleanup cannot clear B's active marker"
+                );
+                assert!(!quiescent);
+                release_b.notify_one();
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(3), b)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    StatusCode::OK
+                );
+                let complete = relay.evidence(&id).unwrap();
+                assert_eq!(
+                    (
+                        complete.requests_reserved,
+                        complete.wire_attempts,
+                        complete.responses_completed,
+                        calls.load(Ordering::SeqCst)
+                    ),
+                    (2, 2, 2, 2)
+                );
+                assert_eq!((complete.input_tokens, complete.output_tokens), (200, 20));
+                assert!(complete.accounting_complete && !complete.uncertain && !complete.revoked);
+                assert_eq!(pending(), 0);
+                assert!(relay.provider_quiescent(&id));
+                eprintln!(
+                    "completed-forward-normal {}",
+                    json!({"revoked":complete.revoked,"uncertain":complete.uncertain,"providerQuiescent":relay.provider_quiescent(&id),"canonicalPending":pending(),"reserved":complete.requests_reserved,"admissions":complete.wire_attempts,"completed":complete.responses_completed,"fixtureCalls":calls.load(Ordering::SeqCst),"inputTokens":complete.input_tokens,"outputTokens":complete.output_tokens,"accountingComplete":complete.accounting_complete})
+                );
+                server.abort();
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completed_forward_drop_cannot_clear_successor_inflight() {
+        assert_completed_forward_handoff(HandoffCase::Ownership).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn successor_inflight_prevents_a_third_forward_after_predecessor_drop() {
+        assert_completed_forward_handoff(HandoffCase::ThirdRequest).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completed_guard_drop_does_not_publish_false_quiescence() {
+        assert_completed_forward_handoff(HandoffCase::Quiescence).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completed_predecessor_preserves_successor_abandonment_revocation() {
+        assert_completed_forward_handoff(HandoffCase::SuccessorAbandonment).await;
     }
 
     #[allow(clippy::await_holding_lock)]
