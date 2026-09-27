@@ -201,6 +201,15 @@ pub struct ReadinessInput<'a> {
 /// Inspect the installed CLI and declared validators. This never sends a
 /// prompt and never records a dispatched worker.
 pub fn inspect_assignment_readiness(input: &ReadinessInput<'_>) -> VerifiedChangeReadiness {
+    inspect_assignment_readiness_with_cli(input, None)
+}
+
+/// A production caller supplies only a host-confined CLI observation. Request
+/// fields cannot select this observation or cause an unconfined fallback.
+pub(crate) fn inspect_assignment_readiness_with_cli(
+    input: &ReadinessInput<'_>,
+    confined_cli: Option<Result<String, &'static str>>,
+) -> VerifiedChangeReadiness {
     let mut reasons = Vec::new();
     let mut cli_version = None;
     let mut cli_contract = None;
@@ -252,7 +261,11 @@ pub fn inspect_assignment_readiness(input: &ReadinessInput<'_>) -> VerifiedChang
                 .into(),
         );
     } else {
-        match inspect_cli(input.executable) {
+        let observed = match confined_cli {
+            Some(result) => result.map_err(VerifiedChangeError::new),
+            None => inspect_cli(input.executable),
+        };
+        match observed {
             Ok(version) => {
                 cli_version = Some(version);
                 cli_contract = Some("inspect-json-v1".into());
@@ -779,6 +792,7 @@ fn git_text(source: &Path, args: &[&str]) -> Result<String, VerifiedChangeError>
 
 pub const CHECK_CONFINEMENT_BACKEND: &str = "macos-sandbox-exec";
 pub const CHECK_CONFINEMENT_REVISION: u64 = 1;
+pub const PRIVATE_CHECK_CONFINEMENT_REVISION: u64 = 2;
 pub const CHECK_WRITE_POLICY: &str = "deny-source-and-candidate";
 
 pub static CHECK_CONFINEMENT_EXECUTABLE: std::sync::Mutex<Option<PathBuf>> =
@@ -906,7 +920,9 @@ impl CheckAuthority {
 
     pub fn seal(mut self) -> Self {
         self.confinement_backend = CHECK_CONFINEMENT_BACKEND.into();
-        self.confinement_revision = CHECK_CONFINEMENT_REVISION;
+        if self.confinement_revision == 0 {
+            self.confinement_revision = CHECK_CONFINEMENT_REVISION;
+        }
         self.write_policy = CHECK_WRITE_POLICY.into();
         self.authority_digest = self.canonical_digest();
         self
@@ -1146,6 +1162,7 @@ pub fn read_check_authority(dir: &Path) -> Result<CheckAuthority, VerifiedChange
     if authority.authority_digest != authority.canonical_digest()
         || authority.confinement_backend != CHECK_CONFINEMENT_BACKEND
         || authority.write_policy != CHECK_WRITE_POLICY
+        || !matches!(authority.confinement_revision, 1 | 2)
     {
         return Err(VerifiedChangeError::new(
             "the check authority digest does not match its fields",
@@ -1225,6 +1242,7 @@ pub fn execute_required_checks_with_authority(
     };
     if authority.authority_digest != authority.canonical_digest()
         || authority.confinement_backend != CHECK_CONFINEMENT_BACKEND
+        || !matches!(authority.confinement_revision, 1 | 2)
         || !confinement_available()
     {
         return Ok(checks
@@ -1639,6 +1657,27 @@ fn check_sandbox_profile(output: &Path, network: &str) -> String {
     )
 }
 
+/// Revision 2 executes untrusted candidate code with access only to the
+/// candidate, the sealed oracle, its output, and public system toolchains.
+const PRIVATE_CHECK_SANDBOX: &str = r#"(version 1)
+(deny default)
+(import "dyld-support.sb")
+(allow process-exec process-fork)
+(allow signal (target self))
+(allow sysctl-read)
+(deny sysctl-read (sysctl-name-regex #"^kern\.proc"))
+(allow file-read-metadata)
+(allow file-read* (subpath (param "CANDIDATE")) (subpath (param "ORACLE"))
+  (subpath (param "OUTPUT")) (literal (param "EXECUTABLE"))
+  (subpath "/System/Library") (subpath "/System/Cryptexes")
+  (subpath "/usr/lib") (subpath "/usr/share") (subpath "/usr/bin") (subpath "/bin")
+  (subpath "/Applications/Xcode.app") (subpath "/Library/Developer/CommandLineTools")
+  (literal "/dev/null") (literal "/dev/urandom") (literal "/dev/random")
+  (literal "/private/etc/localtime") (literal "/private/var/db/timezone/localtime"))
+(allow file-write* (subpath (param "OUTPUT")) (literal "/dev/null"))
+(allow file-ioctl (literal "/dev/null"))
+"#;
+
 pub fn file_digest(path: &Path) -> Option<String> {
     let bytes = fs::read(path).ok()?;
     Some(digest_bytes(&bytes))
@@ -1834,13 +1873,24 @@ pub fn resolve_check_profile(
             .and_then(Value::as_u64)
             .unwrap_or(65_536),
         confinement_backend: String::new(),
-        confinement_revision: 0,
+        confinement_revision: value
+            .get("confinementRevision")
+            .and_then(Value::as_u64)
+            .unwrap_or(1),
         work_id: String::new(),
         session_id: String::new(),
         workspace: String::new(),
         authority_digest: String::new(),
     };
     authority.bind_invocation(&spec, &oracle_canon);
+    if !matches!(authority.confinement_revision, 1 | 2)
+        || (authority.confinement_revision == PRIVATE_CHECK_CONFINEMENT_REVISION
+            && authority.network != "none")
+    {
+        return Err(VerifiedChangeError::new(
+            "the check confinement revision or network policy is unsupported",
+        ));
+    }
     if authority.profile_revision == 0 {
         return Err(VerifiedChangeError::new(
             "the check profile revision is missing",
@@ -1906,10 +1956,22 @@ fn run_one_check(
     let _ = fs::set_permissions(&output_dir, fs::Permissions::from_mode(0o700));
     let network = authority.network.as_str();
     let mut command = Command::new(confinement_executable());
-    command
-        .arg("-p")
-        .arg(check_sandbox_profile(&output_dir, network))
-        .arg(&check.executable);
+    command.arg("-p");
+    if authority.confinement_revision == PRIVATE_CHECK_CONFINEMENT_REVISION {
+        command
+            .arg(PRIVATE_CHECK_SANDBOX)
+            .arg("-D")
+            .arg(format!("CANDIDATE={}", candidate.display()))
+            .arg("-D")
+            .arg(format!("ORACLE={}", oracle.display()))
+            .arg("-D")
+            .arg(format!("OUTPUT={}", output_dir.display()))
+            .arg("-D")
+            .arg(format!("EXECUTABLE={}", check.executable));
+    } else {
+        command.arg(check_sandbox_profile(&output_dir, network));
+    }
+    command.arg(&check.executable);
     command
         .args(&check.args)
         .current_dir(cwd)
@@ -3739,5 +3801,39 @@ mod tests {
         );
         assert!(results[0].output_truncated);
         assert!(pgrep_empty("sleep 44"));
+    }
+
+    #[test]
+    fn private_check_revision_blocks_operator_data_and_data_volume_alias() {
+        let oracle = temp();
+        let candidate = temp();
+        let source = temp();
+        let host = temp();
+        let secret = host.path().join("credential-canary");
+        fs::write(&secret, b"private operator bytes").unwrap();
+        let script = oracle.path().join("check.sh");
+        fs::write(&script, "#!/bin/sh\ncat \"$1\" >/dev/null 2>&1 && exit 11\ncat \"$2\" >/dev/null 2>&1 && exit 12\n(echo bad > \"$CANDIDATE_ROOT/mutated\") 2>/dev/null && exit 13\n/Applications/Xcode.app/Contents/Developer/usr/bin/python3 -B -c 'print(2 + 2)'\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut check = check_spec("private", &script, 5000);
+        let canonical = dunce::canonicalize(&secret).unwrap();
+        check.args = vec![
+            canonical.display().to_string(),
+            format!("/System/Volumes/Data{}", canonical.display()),
+        ];
+        let mut authority =
+            sealed_authority("private", &check, oracle.path(), source.path(), "none");
+        authority.confinement_revision = PRIVATE_CHECK_CONFINEMENT_REVISION;
+        authority = authority.seal();
+        assert_eq!(authority.confinement_revision, 2);
+        let results = execute_required_checks_with_authority(
+            &[check],
+            candidate.path(),
+            oracle.path(),
+            Some(&authority),
+        )
+        .unwrap();
+        assert_eq!(results[0].outcome, "passed", "{results:?}");
+        assert!(!candidate.path().join("mutated").exists());
+        assert_eq!(fs::read(&secret).unwrap(), b"private operator bytes");
     }
 }

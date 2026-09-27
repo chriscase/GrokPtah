@@ -316,15 +316,60 @@ pub(crate) async fn send_provider_request(
     scope: ProviderRequestScope<'_>,
     cancel: Option<&CancellationToken>,
 ) -> Result<ProviderResponse, ProviderTransportError> {
-    send_provider_request_with(client, request, scope, cancel, &ReqwestWireDispatch).await
+    Box::pin(send_provider_request_observed_with(
+        client,
+        request,
+        scope,
+        cancel,
+        &ReqwestWireDispatch,
+        None,
+    ))
+    .await
 }
 
+#[cfg(test)]
 async fn send_provider_request_with(
     client: &reqwest::Client,
     request: reqwest::RequestBuilder,
     scope: ProviderRequestScope<'_>,
     cancel: Option<&CancellationToken>,
     dispatch: &dyn WireDispatch,
+) -> Result<ProviderResponse, ProviderTransportError> {
+    Box::pin(send_provider_request_observed_with(
+        client, request, scope, cancel, dispatch, None,
+    ))
+    .await
+}
+
+/// Observe the already-durable physical permit before any wire dispatch.
+/// A disconnected child can then never erase the parent's admitted-send count.
+type SendObserver<'a> = dyn Fn(&str) -> anyhow::Result<()> + Send + Sync + 'a;
+
+pub(crate) async fn send_provider_request_observed(
+    client: &reqwest::Client,
+    request: reqwest::RequestBuilder,
+    scope: ProviderRequestScope<'_>,
+    cancel: Option<&CancellationToken>,
+    observer: &SendObserver<'_>,
+) -> Result<ProviderResponse, ProviderTransportError> {
+    Box::pin(send_provider_request_observed_with(
+        client,
+        request,
+        scope,
+        cancel,
+        &ReqwestWireDispatch,
+        Some(observer),
+    ))
+    .await
+}
+
+async fn send_provider_request_observed_with(
+    client: &reqwest::Client,
+    request: reqwest::RequestBuilder,
+    scope: ProviderRequestScope<'_>,
+    cancel: Option<&CancellationToken>,
+    dispatch: &dyn WireDispatch,
+    observer: Option<&SendObserver<'_>>,
 ) -> Result<ProviderResponse, ProviderTransportError> {
     let mut request = request
         .build()
@@ -355,6 +400,15 @@ async fn send_provider_request_with(
         .authority
         .admit_sending(&auth, permit)
         .map_err(ProviderTransportError::before_dispatch)?;
+
+    if let Some(observer) = observer {
+        if let Err(error) = observer(&permit.attempt().public_handle()) {
+            let outcome = runtime
+                .authority
+                .settle_failed_before_write(permit, FailedReason::DeniedBeforeDispatch);
+            return Err(ProviderTransportError::settled(error.to_string(), outcome));
+        }
+    }
 
     let result = if let Some(cancel) = cancel {
         tokio::select! {

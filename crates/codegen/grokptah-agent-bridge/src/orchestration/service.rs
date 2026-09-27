@@ -333,6 +333,12 @@ pub struct BackgroundStopReport {
 
 impl Drop for OrchestrationService {
     fn drop(&mut self) {
+        for task in self.managed_grok_tasks.get_mut().values() {
+            task.cancel.cancel();
+        }
+        if let Some(runtime) = self.managed_grok_runtime.get_mut().as_ref() {
+            runtime.credentials.stop_authority();
+        }
         if let Some(watcher) = self.scheduler_watcher.get_mut().take() {
             watcher.abort();
         }
@@ -1312,6 +1318,12 @@ impl OrchestrationService {
                 ManagedFinalizationOutcome::Review,
             ),
         };
+        invocation.provider_evidence = invocation.credential_lease_id.as_deref().and_then(|id| {
+            self.managed_grok_runtime
+                .lock()
+                .as_ref()
+                .and_then(|runtime| runtime.credentials.provider_evidence(id))
+        });
         intent.grok = Some(invocation);
         intent.updated_at = Utc::now();
         self.store.save_managed_intent(&intent)?;
@@ -1447,6 +1459,23 @@ impl OrchestrationService {
         summary: &str,
         failure: &str,
     ) -> Result<(), OrchError> {
+        let mut intent = intent.clone();
+        if let Some(grok) = intent.grok.as_mut() {
+            let observed = grok.credential_lease_id.as_deref().and_then(|id| {
+                self.managed_grok_runtime
+                    .lock()
+                    .as_ref()
+                    .and_then(|runtime| runtime.credentials.provider_evidence(id))
+            });
+            let mut evidence = observed
+                .or_else(|| grok.provider_evidence.clone())
+                .unwrap_or_default();
+            evidence.uncertain = true;
+            evidence.accounting_complete = false;
+            evidence.revoked = true;
+            grok.provider_evidence = Some(evidence);
+            self.store.save_managed_intent(&intent)?;
+        }
         let result = WorkResult {
             summary: summary.into(),
             evidence: vec!["executor:grok_build_isolated_review".into()],
@@ -1575,6 +1604,14 @@ impl OrchestrationService {
                     )?;
                     if let Some(recovered) = recovered {
                         if recovered.state == ManagedIntentState::Admitted {
+                            if recovered.grok.is_some() {
+                                self.finalize_managed_grok_review(
+                                    &recovered,
+                                    "managed admission interrupted before supervised dispatch",
+                                    "grok_admission_interrupted_no_redispatch",
+                                )?;
+                                continue;
+                            }
                             self.finalize_or_heartbeat_intent(&recovered, &secret)
                                 .await?;
                         }
@@ -1638,9 +1675,7 @@ impl OrchestrationService {
             .renew_work_lease(&intent.work_id, attempt_id, &token, None)
             .is_err()
         {
-            if let Some(task) = self.managed_grok_tasks.lock().get(&intent.intent_id) {
-                task.cancel.cancel();
-            }
+            self.cancel_managed_grok_authority(intent)?;
         }
         Ok(())
     }
@@ -1993,9 +2028,10 @@ impl OrchestrationService {
             None,
         )?;
         if spec.managed_execution.executor == ManagedExecutorKind::GrokBuildIsolatedReview {
-            return self
-                .admit_one_managed_grok_work(work, agent, spec, bounds, prompt, input_hash, secret)
-                .await;
+            return Box::pin(self.admit_one_managed_grok_work(
+                work, agent, spec, bounds, prompt, input_hash, secret,
+            ))
+            .await;
         }
         let mut intent = ManagedExecutionIntent {
             schema_version: MANAGED_EXECUTION_SCHEMA_VERSION,
@@ -2150,9 +2186,72 @@ impl OrchestrationService {
             )
         })?;
         let limits = profile.limits();
+        let mut bounds = bounds;
+        if let Some(policy) = runtime.credentials.managed_child_policy() {
+            if work.policy.required_checks.is_empty() || !work.policy.requires_approval {
+                return Err(OrchError::new(OrchErrorCode::Conflict, "production managed execution requires host checks and explicit candidate disposition"));
+            }
+            if self
+                .store
+                .verified_check_authority(&work.work_id)
+                .is_none_or(|authority| {
+                    authority.confinement_revision
+                        != crate::verified_change::PRIVATE_CHECK_CONFINEMENT_REVISION
+                        || authority.network != "none"
+                })
+            {
+                return Err(OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "production execution requires sealed private host-check confinement",
+                ));
+            }
+            if let Some(reason) = runtime.credentials.readiness_error() {
+                return Err(OrchError::new(OrchErrorCode::Conflict, reason));
+            }
+            crate::grok_build::managed_offline_readiness(
+                &runtime.config.executable,
+                &runtime.config.isolate_parent,
+            )
+            .map_err(|reason| OrchError::new(OrchErrorCode::Conflict, reason))?;
+            bounds.max_rounds = bounds.max_rounds.min(policy.max_turns);
+            bounds.max_duration_ms = bounds.max_duration_ms.min(policy.max_duration_ms);
+            bounds.max_total_tokens = Some(
+                bounds
+                    .max_total_tokens
+                    .unwrap_or(u64::MAX)
+                    .min(crate::managed_provider::MAX_TOTAL_TOKENS),
+            );
+        }
         let now = Utc::now();
         let intent_id = Uuid::new_v4().to_string();
         let request_id = intent_id.clone();
+        let credential_lease_id = runtime
+            .credentials
+            .lease_id_for_request(&runtime.config.credential_lease_id, &request_id)
+            .map_err(|_| {
+                OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "request-specific provider capability is unavailable",
+                )
+            })?;
+        if runtime.credentials.managed_child_policy().is_some() {
+            runtime
+                .credentials
+                .bind_lease_bounds(
+                    &credential_lease_id,
+                    bounds.max_rounds,
+                    bounds.max_duration_ms,
+                    bounds
+                        .max_total_tokens
+                        .unwrap_or(crate::managed_provider::MAX_TOTAL_TOKENS),
+                )
+                .map_err(|_| {
+                    OrchError::new(
+                        OrchErrorCode::Conflict,
+                        "request-specific provider budget could not be bound",
+                    )
+                })?;
+        }
         let prompt_bound = limits.max_prompt_bytes.min(bounds.max_prompt_bytes);
         let allowed_files = super::workload::normalize_allowed_files(&work.policy.allowed_files)?;
         let (prompt, prompt_hash) = seal_managed_grok_prompt(
@@ -2188,6 +2287,8 @@ impl OrchestrationService {
             changed_paths: Vec::new(),
             diff_digest: None,
             source_fingerprint: Some(source_fingerprint),
+            credential_lease_id: Some(credential_lease_id.clone()),
+            provider_evidence: runtime.credentials.provider_evidence(&credential_lease_id),
         };
         let mut intent = ManagedExecutionIntent {
             schema_version: MANAGED_EXECUTION_SCHEMA_VERSION,
@@ -2241,6 +2342,53 @@ impl OrchestrationService {
             }
         };
         intent.attempt_id = Some(claim.attempt.attempt_id.clone());
+        let run_id = Uuid::new_v4().to_string();
+        self.store.save_managed_intent(&intent)?;
+        let run = RunRecord {
+            run_id: run_id.clone(),
+            session_id: work.session_id,
+            workspace: work.workspace.clone(),
+            request_id: intent.intent_id.clone(),
+            client_id: Some("managed-grok".into()),
+            state: RunState::Running,
+            purpose: RunPurpose::Execution,
+            agent_id: Some(agent.agent_id.clone()),
+            retry_of: None,
+            parent_run_id: None,
+            agent_spec_revision: Some(spec.revision),
+            checkpoint_id: None,
+            continuation_context_id: None,
+            continuation_context_hash: None,
+            continuation_fidelity: None,
+            queue_position: None,
+            bounds: bounds.clone(),
+            prompt_preview: "Host-approved bounded Grok Build assignment".into(),
+            start_seq: Some(self.bus.next_seq()),
+            end_seq: None,
+            created_at: now,
+            updated_at: now,
+            terminal_result: None,
+            final_response: None,
+            error_code: None,
+            stop_cause: None,
+            aggregates: RunAggregates {
+                usage_complete: false,
+                ..Default::default()
+            },
+            progress: None,
+            execution: None,
+            approval: None,
+        };
+        self.store
+            .save_run_and_activate_agent(&run, &agent.agent_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        self.store.link_work_run(
+            &work.work_id,
+            &claim.attempt.attempt_id,
+            &claim.lease_token,
+            &run_id,
+        )?;
+        intent.run_id = Some(run_id);
         intent.state = ManagedIntentState::Dispatching;
         intent.updated_at = Utc::now();
         self.store.save_managed_intent(&intent)?;
@@ -2252,7 +2400,7 @@ impl OrchestrationService {
             max_prompt_bytes: prompt_bound as u64,
             max_turns: limits.max_turns.min(bounds.max_rounds),
             max_duration_ms: limits.max_duration_ms.min(bounds.max_duration_ms),
-            credential_lease_id: runtime.config.credential_lease_id.clone(),
+            credential_lease_id,
         };
         launch.validate().map_err(|_| {
             OrchError::new(
@@ -2351,6 +2499,9 @@ impl OrchestrationService {
         &self,
         timeout: std::time::Duration,
     ) -> BackgroundStopReport {
+        if let Some(runtime) = self.managed_grok_runtime.lock().as_ref() {
+            runtime.credentials.stop_authority();
+        }
         let deadline = tokio::time::Instant::now() + timeout;
         let mut report = BackgroundStopReport {
             fully_stopped: true,
@@ -2469,6 +2620,12 @@ impl OrchestrationService {
         config: ManagedGrokExecutorConfig,
         credentials: Arc<dyn CredentialLeaseResolver>,
     ) -> Result<(), OrchError> {
+        if !self.managed_grok_tasks.lock().is_empty() {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "managed executor authority cannot be replaced while a child is supervised",
+            ));
+        }
         config
             .identity
             .validate()
@@ -2494,23 +2651,46 @@ impl OrchestrationService {
         Ok(())
     }
 
-    pub fn configure_managed_grok_from_operator_env(&self) -> Result<bool, OrchError> {
-        let Some(_executable) = operator_env("GROKPTAH_MANAGED_GROK_EXECUTABLE") else {
+    pub async fn configure_managed_grok_from_operator_env(&self) -> Result<bool, OrchError> {
+        let Some(executable) = operator_env("GROKPTAH_MANAGED_GROK_EXECUTABLE") else {
             return Ok(false);
         };
-        let _ = (
-            require_operator_env("GROKPTAH_MANAGED_GROK_WORKSPACE")?,
-            require_operator_env("GROKPTAH_MANAGED_GROK_ISOLATE")?,
-            require_operator_env("GROKPTAH_MANAGED_GROK_REPOSITORY_ID")?,
-            require_operator_env("GROKPTAH_MANAGED_GROK_REF")?,
-            require_operator_env("GROKPTAH_MANAGED_GROK_SHA")?,
-            require_operator_env("GROKPTAH_MANAGED_GROK_LEASE_ID")?,
-            require_operator_env("GROKPTAH_MANAGED_GROK_LEASE_FILE")?,
-        );
-        Err(OrchError::new(
-            OrchErrorCode::InvalidRequest,
-            "a file-backed credential lease does not revoke upstream provider authority; readiness stays unavailable and no worker is dispatched",
-        ))
+        if operator_env("GROKPTAH_MANAGED_GROK_LEASE_FILE").is_some() {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "file-backed credential containment is unsupported",
+            ));
+        }
+        let cwd = PathBuf::from(require_operator_env("GROKPTAH_MANAGED_GROK_WORKSPACE")?);
+        let isolate_parent = PathBuf::from(require_operator_env("GROKPTAH_MANAGED_GROK_ISOLATE")?);
+        let repository_id = require_operator_env("GROKPTAH_MANAGED_GROK_REPOSITORY_ID")?;
+        let base_ref = require_operator_env("GROKPTAH_MANAGED_GROK_REF")?;
+        let head_sha = require_operator_env("GROKPTAH_MANAGED_GROK_SHA")?;
+        let relay = crate::managed_provider::ManagedProviderRelay::start(
+            "grok-build-0.1",
+            self.store.root().join("managed-provider-leases"),
+        )
+        .await
+        .map_err(|reason| OrchError::new(OrchErrorCode::Conflict, reason))?;
+        self.configure_managed_grok_executor(
+            ManagedGrokExecutorConfig {
+                executable: PathBuf::from(executable),
+                git_executable: PathBuf::from("/usr/bin/git"),
+                cwd,
+                isolate_parent,
+                repository_id: repository_id.clone(),
+                base_ref: base_ref.clone(),
+                identity: GrokBuildGitIdentity {
+                    repository_id,
+                    git_ref: base_ref,
+                    base_sha: head_sha.clone(),
+                    head_sha,
+                },
+                credential_lease_id: "real-managed-assignment-v1".into(),
+            },
+            relay,
+        )?;
+        Ok(true)
     }
 
     fn resolve_verified_agent(&self, request: &mut VerifiedChangeRequest) -> Result<(), OrchError> {
@@ -2598,6 +2778,9 @@ impl OrchestrationService {
                         .into(),
                 );
             }
+            if let Some(reason) = runtime.credentials.readiness_error() {
+                reasons.push(reason.into());
+            }
         } else {
             reasons.push("Managed Grok executor authority is not installed on this host.".into());
         }
@@ -2606,6 +2789,16 @@ impl OrchestrationService {
             &request.check_profile_id,
         ) {
             Ok((spec, mut authority, oracle)) => {
+                if runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.credentials.managed_child_policy().is_some())
+                    && authority.confinement_revision
+                        != crate::verified_change::PRIVATE_CHECK_CONFINEMENT_REVISION
+                {
+                    reasons.push(
+                        "production candidate checks require private confinement revision 2".into(),
+                    );
+                }
                 authority.source_root = request.workspace.clone();
                 request.required_checks = vec![spec];
                 request.oracle_root = oracle;
@@ -2650,7 +2843,16 @@ impl OrchestrationService {
             .as_ref()
             .map(|runtime| runtime.config.executable.clone())
             .unwrap_or_else(|| PathBuf::from("/missing/grok"));
-        let mut readiness = crate::verified_change::inspect_assignment_readiness(
+        let confined_cli = runtime
+            .as_ref()
+            .filter(|runtime| runtime.credentials.managed_child_policy().is_some())
+            .map(|runtime| {
+                crate::grok_build::managed_offline_readiness(
+                    &runtime.config.executable,
+                    &runtime.config.isolate_parent,
+                )
+            });
+        let mut readiness = crate::verified_change::inspect_assignment_readiness_with_cli(
             &crate::verified_change::ReadinessInput {
                 executable: &executable,
                 mutation_mode: &request.mutation_mode,
@@ -2659,6 +2861,7 @@ impl OrchestrationService {
                 oracle_root: &request.oracle_root,
                 workspace: &request.workspace,
             },
+            confined_cli,
         );
         readiness.reasons.extend(reasons);
         readiness.reasons.sort();
@@ -2669,14 +2872,49 @@ impl OrchestrationService {
         Ok((request, readiness, authority, repository_id))
     }
 
+    fn record_managed_readiness(
+        &self,
+        auth: &AuthContext,
+        request: &VerifiedChangeRequest,
+        readiness: &crate::verified_change::VerifiedChangeReadiness,
+    ) -> Result<(), OrchError> {
+        let detail = if readiness.ready {
+            "readiness complete; no worker or provider dispatched".into()
+        } else {
+            format!(
+                "no worker or provider dispatched: {}",
+                readiness.reasons.join("; ")
+            )
+        };
+        self.store
+            .append_audit(&AuditEntry {
+                ts: Utc::now(),
+                tool: "ptah_verified_change_readiness".into(),
+                request_id: Some(self.bus.redact_text(&request.request_id, 256)),
+                session_id: Some(request.session_id),
+                workspace: Some(request.workspace.display().to_string()),
+                outcome: if readiness.ready { "ready" } else { "denied" }.into(),
+                error_code: (!readiness.ready).then(|| "readiness_unavailable".into()),
+                detail: self
+                    .bus
+                    .redact_text(&format!("principal {}; {detail}", auth.token_id), 4096),
+            })
+            .map_err(|_| {
+                OrchError::new(
+                    OrchErrorCode::Internal,
+                    "readiness evidence could not be durably recorded; dispatch remains closed",
+                )
+            })
+    }
+
     pub fn prepare_verified_change(
         &self,
         auth: &AuthContext,
         request: &VerifiedChangeRequest,
     ) -> Result<serde_json::Value, OrchError> {
-        let _ = auth;
         let (request, readiness, _authority, repository_id) =
             self.assess_verified_change(request)?;
+        self.record_managed_readiness(auth, &request, &readiness)?;
         let model = if request.agent_id.is_empty() {
             String::new()
         } else {
@@ -2701,7 +2939,14 @@ impl OrchestrationService {
             .as_ref()
             .map(|runtime| runtime.config.identity.head_sha.clone())
             .unwrap_or_else(|| "unavailable".into());
-        Ok(verified_change_projection(
+        let model = self
+            .managed_grok_runtime
+            .lock()
+            .as_ref()
+            .and_then(|runtime| runtime.credentials.managed_child_policy())
+            .map(|policy| policy.model)
+            .unwrap_or(model);
+        let mut projection = verified_change_projection(
             &request,
             &model,
             &repository_id,
@@ -2710,7 +2955,71 @@ impl OrchestrationService {
             None,
             0,
             "Resolve readiness, then start one supervised attempt.",
-        ))
+        );
+        let mut bounds = self.config.lock().bounds.clone();
+        if let Ok(agent) = self.store.require_agent_in_scope(
+            &request.agent_id,
+            request.session_id,
+            &request.workspace.display().to_string(),
+        ) {
+            if let Ok(spec) = agent.current_spec() {
+                bounds.max_prompt_bytes = bounds
+                    .max_prompt_bytes
+                    .min(spec.default_run_bounds.max_prompt_bytes);
+                bounds.max_rounds = bounds.max_rounds.min(spec.default_run_bounds.max_rounds);
+                bounds.max_duration_ms = bounds
+                    .max_duration_ms
+                    .min(spec.default_run_bounds.max_duration_ms);
+                bounds.max_total_tokens = match (
+                    bounds.max_total_tokens,
+                    spec.default_run_bounds.max_total_tokens,
+                ) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
+            }
+        }
+        self.bind_managed_projection_limits(&mut projection, &bounds);
+        Ok(projection)
+    }
+
+    fn bind_managed_projection_limits(
+        &self,
+        projection: &mut serde_json::Value,
+        bounds: &RunBounds,
+    ) {
+        for (field, bound) in [
+            ("maxPromptBytes", bounds.max_prompt_bytes as u64),
+            ("maxRounds", u64::from(bounds.max_rounds)),
+            ("maxDurationMs", bounds.max_duration_ms),
+        ] {
+            if let Some(value) = projection["limits"][field].as_u64() {
+                projection["limits"][field] = json!(value.min(bound));
+            }
+        }
+        if let Some(bound) = bounds.max_total_tokens {
+            projection["limits"]["maxTotalTokens"] = json!(bound);
+        }
+        if let Some(policy) = self
+            .managed_grok_runtime
+            .lock()
+            .as_ref()
+            .and_then(|runtime| runtime.credentials.managed_child_policy())
+        {
+            projection["limits"]["maxRounds"] = json!(projection["limits"]["maxRounds"]
+                .as_u64()
+                .unwrap_or(0)
+                .min(u64::from(policy.max_turns)));
+            projection["limits"]["maxDurationMs"] = json!(projection["limits"]["maxDurationMs"]
+                .as_u64()
+                .unwrap_or(0)
+                .min(policy.max_duration_ms));
+            projection["limits"]["maxTotalTokens"] = json!(bounds
+                .max_total_tokens
+                .unwrap_or(u64::MAX)
+                .min(crate::managed_provider::MAX_TOTAL_TOKENS));
+            projection["limits"]["maxOutputTokensPerRequest"] = json!(policy.max_output_tokens);
+        }
     }
 
     pub async fn start_verified_change(
@@ -2720,6 +3029,7 @@ impl OrchestrationService {
     ) -> Result<serde_json::Value, OrchError> {
         let (mut request, readiness, authority, _repository_id) =
             self.assess_verified_change(request)?;
+        self.record_managed_readiness(auth, &request, &readiness)?;
         if !readiness.ready {
             if let Some(work_id) = self.existing_verified_work(auth, &request) {
                 return self.verified_change_status(
@@ -2742,7 +3052,56 @@ impl OrchestrationService {
         })?;
         self.resolve_verified_agent(&mut request)?;
         let limits = request.budget_profile.limits();
+        let server_bounds = self.config.lock().bounds.clone();
+        let agent_bounds = self
+            .store
+            .require_agent_in_scope(
+                &request.agent_id,
+                request.session_id,
+                &request.workspace.display().to_string(),
+            )?
+            .current_spec()?
+            .default_run_bounds
+            .clone();
+        let managed_policy = self
+            .managed_grok_runtime
+            .lock()
+            .as_ref()
+            .and_then(|runtime| runtime.credentials.managed_child_policy());
+        let assignment_bounds = RunBounds {
+            max_prompt_bytes: limits
+                .max_prompt_bytes
+                .min(server_bounds.max_prompt_bytes)
+                .min(agent_bounds.max_prompt_bytes),
+            max_rounds: limits
+                .max_turns
+                .min(server_bounds.max_rounds)
+                .min(agent_bounds.max_rounds)
+                .min(
+                    managed_policy
+                        .as_ref()
+                        .map_or(u32::MAX, |policy| policy.max_turns),
+                ),
+            max_duration_ms: limits
+                .max_duration_ms
+                .min(server_bounds.max_duration_ms)
+                .min(agent_bounds.max_duration_ms)
+                .min(
+                    managed_policy
+                        .as_ref()
+                        .map_or(u64::MAX, |policy| policy.max_duration_ms),
+                ),
+            max_total_tokens: [
+                Some(crate::managed_provider::MAX_TOTAL_TOKENS),
+                server_bounds.max_total_tokens,
+                agent_bounds.max_total_tokens,
+            ]
+            .into_iter()
+            .flatten()
+            .min(),
+        };
         let work_policy = WorkPolicy {
+            bounds: assignment_bounds,
             requires_approval: true,
             allowed_files: request.allowed_files.clone(),
             required_checks: request.required_checks.clone(),
@@ -2939,8 +3298,17 @@ impl OrchestrationService {
             .as_ref()
             .map(|runtime| runtime.config.executable.clone())
             .unwrap_or_else(|| PathBuf::from("/missing/grok"));
+        let confined_cli = runtime
+            .as_ref()
+            .filter(|runtime| runtime.credentials.managed_child_policy().is_some())
+            .map(|runtime| {
+                crate::grok_build::managed_offline_readiness(
+                    &runtime.config.executable,
+                    &runtime.config.isolate_parent,
+                )
+            });
         let mut readiness = match &oracle {
-            Ok(oracle) => crate::verified_change::inspect_assignment_readiness(
+            Ok(oracle) => crate::verified_change::inspect_assignment_readiness_with_cli(
                 &crate::verified_change::ReadinessInput {
                     executable: &executable,
                     mutation_mode: &mutation_mode,
@@ -2949,6 +3317,7 @@ impl OrchestrationService {
                     oracle_root: oracle,
                     workspace,
                 },
+                confined_cli,
             ),
             Err(error) => crate::verified_change::VerifiedChangeReadiness {
                 ready: false,
@@ -2965,6 +3334,28 @@ impl OrchestrationService {
         if let Err(error) = &context {
             readiness.ready = false;
             readiness.reasons.push(error.message.clone());
+        }
+        if let Some(runtime) = &runtime {
+            if let Some(reason) = runtime.credentials.readiness_error() {
+                readiness.ready = false;
+                readiness.reasons.push(reason.into());
+            }
+            if runtime.credentials.managed_child_policy().is_some()
+                && self
+                    .store
+                    .verified_check_authority(work_id)
+                    .is_none_or(|authority| {
+                        authority.confinement_revision
+                            != crate::verified_change::PRIVATE_CHECK_CONFINEMENT_REVISION
+                            || authority.network != "none"
+                    })
+            {
+                readiness.ready = false;
+                readiness.reasons.push(
+                    "production candidate checks require sealed private confinement revision 2"
+                        .into(),
+                );
+            }
         }
         if runtime.is_none() {
             readiness.ready = false;
@@ -3029,7 +3420,19 @@ impl OrchestrationService {
             platform,
             execution_host,
         };
-        Ok(verified_change_projection(
+        let invocation = self
+            .store
+            .list_managed_intents()?
+            .into_iter()
+            .find(|intent| intent.work_id == work_id && intent.grok.is_some());
+        let model = invocation
+            .as_ref()
+            .and_then(|intent| intent.grok.as_ref())
+            .and_then(|grok| grok.provider_evidence.as_ref())
+            .map(|evidence| evidence.model.clone())
+            .filter(|model| !model.is_empty())
+            .unwrap_or(model);
+        let mut projection = verified_change_projection(
             &request,
             &model,
             &repository,
@@ -3038,7 +3441,22 @@ impl OrchestrationService {
             Some(&work),
             attempts,
             action,
-        ))
+        );
+        if let Some(intent) = invocation {
+            projection["runId"] = json!(intent.run_id);
+            projection["attemptId"] = json!(intent.attempt_id);
+            projection["providerEvidence"] =
+                json!(intent.grok.and_then(|grok| grok.provider_evidence));
+            projection["stopReason"] = intent
+                .run_id
+                .as_deref()
+                .and_then(|id| self.store.load_run(id).ok().flatten())
+                .and_then(|run| run.terminal_result)
+                .map(serde_json::Value::String)
+                .unwrap_or(serde_json::Value::Null);
+        }
+        self.bind_managed_projection_limits(&mut projection, &work.policy.bounds);
+        Ok(projection)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5118,6 +5536,14 @@ impl OrchestrationService {
                     return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
                 }
             };
+        for intent in self
+            .store
+            .list_managed_intents()?
+            .into_iter()
+            .filter(|intent| intent.work_id == work_id && intent.grok.is_some())
+        {
+            self.cancel_managed_grok_authority(&intent)?;
+        }
         let attempts = attempts
             .iter()
             .map(WorkAttemptView::from)
@@ -5135,6 +5561,34 @@ impl OrchestrationService {
                 )
             })?;
         Ok(response)
+    }
+
+    fn cancel_managed_grok_authority(
+        &self,
+        intent: &ManagedExecutionIntent,
+    ) -> Result<(), OrchError> {
+        if let Some(task) = self.managed_grok_tasks.lock().get(&intent.intent_id) {
+            task.cancel.cancel();
+        }
+        if let Some(id) = intent
+            .grok
+            .as_ref()
+            .and_then(|grok| grok.credential_lease_id.as_deref())
+        {
+            if let Some(runtime) = self.managed_grok_runtime.lock().as_ref() {
+                // A fresh relay after restart has no old capabilities. Never
+                // mint one here or infer that an old upstream action stopped.
+                if runtime.credentials.provider_evidence(id).is_some() {
+                    runtime.credentials.revoke(id).map_err(|_| {
+                        OrchError::new(
+                            OrchErrorCode::Conflict,
+                            "managed provider capability could not be revoked",
+                        )
+                    })?;
+                }
+            }
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]

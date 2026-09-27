@@ -59,6 +59,28 @@ const MACOS_MUTATION_SANDBOX: &str = r#"(version 1)
   (literal "/dev/null"))
 "#;
 
+/// Production children have no operator-home or external network authority.
+/// Apple's minimal dyld bootstrap is needed on current macOS snapshot boots.
+#[cfg(target_os = "macos")]
+const MACOS_MANAGED_SANDBOX: &str = r#"(version 1)
+(deny default)
+(import "dyld-support.sb")
+(allow process-exec process-fork)
+(allow signal (target self))
+(allow sysctl-read)
+(deny sysctl-read (sysctl-name-regex #"^kern\.proc"))
+(allow file-read-metadata)
+(allow file-read*
+  (subpath (param "CANDIDATE")) (subpath (param "CHILD_HOME")) (literal (param "CLI"))
+  (subpath "/System/Library") (subpath "/System/Cryptexes") (subpath "/usr/lib") (subpath "/usr/share")
+  (subpath "/usr/bin") (subpath "/bin")
+  (literal "/dev/null") (literal "/dev/urandom") (literal "/dev/random")
+  (literal "/private/etc/localtime") (literal "/private/var/db/timezone/localtime"))
+ (allow file-read* (literal "/private/etc/ssl/openssl.cnf"))
+(allow file-write* (subpath (param "CANDIDATE")) (subpath (param "CHILD_HOME")) (literal "/dev/null"))
+(allow network-outbound (remote ip (param "RELAY")))
+"#;
+
 const VERDICT_CLEAN: &[u8] = b"GROK_BUILD_VERDICT=clean";
 const VERDICT_FINDINGS: &[u8] = b"GROK_BUILD_VERDICT=findings";
 const VERDICT_NOT_COMPLETE: &[u8] = b"GROK_BUILD_VERDICT=not_complete";
@@ -206,12 +228,27 @@ impl GrokBuildHostLaunchConfig {
 /// Opaque lease handle. The contained location is never shown in Debug.
 pub struct CredentialLeaseHandle {
     location: PathBuf,
+    managed: Option<(crate::managed_provider::ManagedChildPolicy, String)>,
 }
 
 impl CredentialLeaseHandle {
     /// Host-only constructor. The adapter copies but never interprets contents.
     pub fn from_host_path(path: PathBuf) -> Self {
-        Self { location: path }
+        Self {
+            location: path,
+            managed: None,
+        }
+    }
+
+    pub(crate) fn from_managed_relay(
+        path: PathBuf,
+        policy: crate::managed_provider::ManagedChildPolicy,
+        capability: String,
+    ) -> Self {
+        Self {
+            location: path,
+            managed: Some((policy, capability)),
+        }
     }
 }
 
@@ -239,6 +276,45 @@ pub trait CredentialLeaseResolver: Send + Sync {
     /// Deleting a local file is not enough.
     fn revokes_upstream(&self) -> bool {
         false
+    }
+
+    /// Allocate a request-specific capability before durable dispatch admission.
+    fn lease_id_for_request(
+        &self,
+        alias: &str,
+        _request: &str,
+    ) -> Result<String, GrokBuildAdapterError> {
+        Ok(alias.to_owned())
+    }
+
+    fn managed_child_policy(&self) -> Option<crate::managed_provider::ManagedChildPolicy> {
+        None
+    }
+    fn bind_lease_bounds(
+        &self,
+        _id: &str,
+        _max_requests: u32,
+        _max_duration_ms: u64,
+        _max_total_tokens: u64,
+    ) -> Result<(), GrokBuildAdapterError> {
+        if self.managed_child_policy().is_some() {
+            Err(GrokBuildAdapterError::CredentialLease)
+        } else {
+            Ok(())
+        }
+    }
+    fn provider_evidence(
+        &self,
+        _id: &str,
+    ) -> Option<crate::managed_provider::ManagedProviderEvidence> {
+        None
+    }
+    fn readiness_error(&self) -> Option<&'static str> {
+        None
+    }
+    fn stop_authority(&self) {}
+    fn provider_quiescent(&self, _id: &str) -> bool {
+        true
     }
 }
 
@@ -525,6 +601,30 @@ pub async fn launch_grok_build(
     credentials: &dyn CredentialLeaseResolver,
     cancel: CancellationToken,
 ) -> Result<GrokBuildAdapterOutcome, GrokBuildAdapterError> {
+    let managed = credentials.managed_child_policy().is_some();
+    let result = launch_grok_build_inner(launch, host, credentials, cancel).await;
+    // Includes readiness/inspect/spawn errors, cancellation and normal exits.
+    if managed && credentials.revoke(&launch.credential_lease_id).is_err() {
+        return Err(GrokBuildAdapterError::CredentialRevocation);
+    }
+    if managed {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !credentials.provider_quiescent(&launch.credential_lease_id) {
+            if Instant::now() >= deadline {
+                return Err(GrokBuildAdapterError::TerminationUnproven);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    result
+}
+
+async fn launch_grok_build_inner(
+    launch: &GrokBuildLaunchRequest,
+    host: &GrokBuildHostLaunchConfig,
+    credentials: &dyn CredentialLeaseResolver,
+    cancel: CancellationToken,
+) -> Result<GrokBuildAdapterOutcome, GrokBuildAdapterError> {
     launch.validate().map_err(map_contract)?;
     host.validate()?;
     // Grok 1.0.x accepts named sandbox profiles but `grok inspect --json`
@@ -564,6 +664,12 @@ pub async fn launch_grok_build(
     validate_credential_boundary(&lease.location, &host.isolate_parent)?;
     let isolated = IsolatedHome::create(&host.isolate_parent)?;
     isolated.write_minimal_config()?;
+    if let Some((policy, _)) = &lease.managed {
+        if launch.max_duration_ms > policy.max_duration_ms || launch.max_turns > policy.max_turns {
+            return Err(GrokBuildAdapterError::InvalidRequest);
+        }
+        isolated.configure_managed_provider(policy)?;
+    }
     isolated.install_prompt(&host.prompt)?;
     isolated.install_lease(&lease)?;
 
@@ -572,6 +678,7 @@ pub async fn launch_grok_build(
         &isolated,
         credentials,
         &launch.credential_lease_id,
+        lease.managed.as_ref(),
         cancel.clone(),
     )
     .await?;
@@ -602,11 +709,47 @@ pub async fn launch_grok_build(
         source_control_fingerprint: &source_control_fingerprint,
         isolated: &isolated,
         credentials,
+        managed: lease.managed.as_ref(),
         session_id: &session_id,
     };
     let outcome = execute_allowlisted(launch, execution, cancel).await;
     drop(isolation_scope);
     outcome
+}
+
+fn managed_material_leaked(root: &Path, capability: &str) -> bool {
+    let mut total = 0u64;
+    for entry in walkdir::WalkDir::new(root).follow_links(false) {
+        let Ok(entry) = entry else {
+            return true;
+        };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let Ok(file) = std::fs::File::open(entry.path()) else {
+            return true;
+        };
+        let Ok(meta) = file.metadata() else {
+            return true;
+        };
+        total = total.saturating_add(meta.len());
+        if meta.len() > SESSION_EVIDENCE_MAX || total > 4 * SESSION_EVIDENCE_MAX {
+            return true;
+        }
+        let mut bytes = Vec::new();
+        if file
+            .take(SESSION_EVIDENCE_MAX + 1)
+            .read_to_end(&mut bytes)
+            .is_err()
+            || bytes.len() as u64 > SESSION_EVIDENCE_MAX
+            || bytes
+                .windows(capability.len())
+                .any(|part| part == capability.as_bytes())
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn map_contract(err: GrokBuildContractError) -> GrokBuildAdapterError {
@@ -702,6 +845,170 @@ fn mutation_sandbox_command(
         .arg(&host.executable)
         .args(args);
     Ok(command)
+}
+
+#[cfg(target_os = "macos")]
+fn managed_sandbox_command(
+    host: &GrokBuildHostLaunchConfig,
+    args: &[String],
+    policy: &crate::managed_provider::ManagedChildPolicy,
+    home: &Path,
+) -> Result<Command, GrokBuildAdapterError> {
+    require_absolute_file_path(Path::new("/usr/bin/sandbox-exec"))?;
+    let candidate =
+        dunce::canonicalize(&host.cwd).map_err(|_| GrokBuildAdapterError::IsolationFailed)?;
+    let home = dunce::canonicalize(home).map_err(|_| GrokBuildAdapterError::IsolationFailed)?;
+    let cli = dunce::canonicalize(&host.executable)
+        .map_err(|_| GrokBuildAdapterError::IsolationFailed)?;
+    let mut command = Command::new("/usr/bin/sandbox-exec");
+    command
+        .arg("-p")
+        .arg(MACOS_MANAGED_SANDBOX)
+        .arg("-D")
+        .arg(format!("CANDIDATE={}", candidate.display()))
+        .arg("-D")
+        .arg(format!("CHILD_HOME={}", home.display()))
+        .arg("-D")
+        .arg(format!("CLI={}", cli.display()))
+        .arg("-D")
+        .arg(format!("RELAY=localhost:{}", policy.port))
+        .arg(cli)
+        .args(args);
+    Ok(command)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn managed_sandbox_command(
+    _host: &GrokBuildHostLaunchConfig,
+    _args: &[String],
+    _policy: &crate::managed_provider::ManagedChildPolicy,
+    _home: &Path,
+) -> Result<Command, GrokBuildAdapterError> {
+    Err(GrokBuildAdapterError::IsolationFailed)
+}
+
+/// No credential is resolved and no inference endpoint is reachable in this
+/// probe. The actual isolated inspect contract is checked again before launch.
+pub(crate) fn managed_offline_readiness(
+    executable: &Path,
+    isolate_parent: &Path,
+) -> Result<String, &'static str> {
+    validate_isolate_parent(isolate_parent).map_err(|_| "private worker root is unavailable")?;
+    // Status/readiness may run while admission acquires its empty worker root.
+    // Never create probe files in that root or expose them to the child.
+    let probe_root = IsolatedHome::create(&std::env::temp_dir())
+        .map_err(|_| "private CLI readiness directory unavailable")?;
+    let isolated = IsolatedHome::create(&probe_root.path)
+        .map_err(|_| "private CLI readiness directory is not writable")?;
+    isolated
+        .write_minimal_config()
+        .map_err(|_| "private CLI configuration is unavailable")?;
+    let git = std::process::Command::new("/usr/bin/git")
+        .args(["init", "--quiet"])
+        .current_dir(&isolated.path)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|_| "private CLI inspection repository is unavailable")?;
+    if !git.success() {
+        return Err("private CLI inspection repository is unavailable");
+    }
+    let host = GrokBuildHostLaunchConfig {
+        executable: executable.into(),
+        git_executable: "/usr/bin/git".into(),
+        cwd: isolated.path.clone(),
+        repository_id: "offline-probe".into(),
+        base_ref: "refs/heads/probe".into(),
+        prompt: "offline".into(),
+        allowed_files: vec!["probe".into()],
+        execution_approved: false,
+        max_stdout_bytes: 1024,
+        max_stderr_bytes: 1024,
+        git_timeout: Duration::from_secs(3),
+        isolate_parent: probe_root.path.clone(),
+        defer_source_apply: false,
+        candidate_retention_dir: None,
+    };
+    let policy = crate::managed_provider::ManagedChildPolicy {
+        endpoint: "http://127.0.0.1:1/v1".into(),
+        port: 1,
+        model: "grok-build-0.1".into(),
+        max_duration_ms: 1,
+        max_turns: 1,
+        max_output_tokens: 1,
+    };
+    let probe = |args: &[String], limit: usize| -> Result<Vec<u8>, &'static str> {
+        let mut cmd = managed_sandbox_command(&host, args, &policy, &isolated.path)
+            .map_err(|_| "managed worker confinement is unsupported")?;
+        cmd.env_clear()
+            .envs(
+                allowlisted_env(&isolated.path)
+                    .map_err(|_| "private CLI environment unavailable")?,
+            )
+            .current_dir(&isolated.path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        crate::process_tree::configure(&mut cmd);
+        let mut child = cmd
+            .into_std()
+            .spawn()
+            .map_err(|_| "managed CLI cannot start inside confinement")?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or("managed CLI version unavailable")?;
+        let reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stdout
+                .take(limit as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map(|_| bytes)
+        });
+        let started = Instant::now();
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) if started.elapsed() < Duration::from_secs(3) => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                _ => break None,
+            }
+        };
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(-(child.id() as i32), libc::SIGKILL);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        let bytes = reader
+            .join()
+            .ok()
+            .and_then(Result::ok)
+            .ok_or("managed CLI version unavailable")?;
+        if !status.is_some_and(|status| status.success()) || bytes.len() > limit {
+            return Err("managed CLI confined inspection is unsupported");
+        }
+        Ok(bytes)
+    };
+    let version = probe(&["--version".into()], 1024)?;
+    if !String::from_utf8_lossy(&version).starts_with("grok 1.0.41 ") {
+        return Err("managed CLI version or confined startup is unsupported; requires Grok 1.0.41");
+    }
+    let report = probe(&["inspect".into(), "--json".into()], INSPECT_OUTPUT_MAX)?;
+    let value: serde_json::Value = serde_json::from_slice(&report)
+        .map_err(|_| "managed CLI inspect contract is unsupported")?;
+    if value["grokVersion"].as_str() != Some("1.0.41") {
+        return Err("managed CLI inspect version is unsupported");
+    }
+    verify_inspect_report(&host, &isolated, &value)
+        .map_err(|_| "managed CLI private inspect contract is unsupported")?;
+    Ok("1.0.41".into())
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -910,6 +1217,17 @@ impl IsolatedHome {
         write_private_file(&self.path.join(PROMPT_FILE_NAME), prompt.as_bytes())
     }
 
+    fn configure_managed_provider(
+        &self,
+        policy: &crate::managed_provider::ManagedChildPolicy,
+    ) -> Result<(), GrokBuildAdapterError> {
+        // The config contains a local address and an env variable NAME only.
+        // The local capability is injected into the cleared child environment.
+        let config = format!("{ISOLATED_CONFIG}\n[models]\ndefault = \"managed-assignment\"\nmax_retries = 0\nmax_completion_tokens = {}\n\n[model.managed-assignment]\nbase_url = \"{}\"\nmodel = \"{}\"\nenv_key = \"GROKPTAH_MANAGED_CAPABILITY\"\n\n[endpoints]\nmodels_base_url = \"{}\"\n[cli]\nauto_update = false\n[features]\ntelemetry = false\ntitle_refresh = false\nturn_summary = false\n[workflows]\nenabled = false\n", policy.max_output_tokens, policy.endpoint, policy.model, policy.endpoint);
+        std::fs::write(self.path.join(CONFIG_FILE_NAME), config)
+            .map_err(|_| GrokBuildAdapterError::IsolationFailed)
+    }
+
     fn prompt_path(&self) -> PathBuf {
         self.path.join(PROMPT_FILE_NAME)
     }
@@ -1088,11 +1406,22 @@ async fn verify_isolation(
     isolated: &IsolatedHome,
     credentials: &dyn CredentialLeaseResolver,
     credential_lease_id: &str,
+    managed: Option<&(crate::managed_provider::ManagedChildPolicy, String)>,
     cancel: CancellationToken,
 ) -> Result<(), GrokBuildAdapterError> {
     let env = allowlisted_env(&isolated.path)?;
-    let mut cmd = Command::new(&host.executable);
-    cmd.args(["inspect", "--json"]);
+    let mut cmd = if let Some((policy, _)) = managed {
+        managed_sandbox_command(
+            host,
+            &["inspect".into(), "--json".into()],
+            policy,
+            &isolated.path,
+        )?
+    } else {
+        let mut cmd = Command::new(&host.executable);
+        cmd.args(["inspect", "--json"]);
+        cmd
+    };
     cmd.current_dir(&host.cwd);
     cmd.env_clear();
     cmd.envs(env);
@@ -1125,6 +1454,9 @@ async fn verify_isolation(
     }
     let value: serde_json::Value = serde_json::from_slice(&harvest.stdout)
         .map_err(|_| GrokBuildAdapterError::IsolationFailed)?;
+    if managed.is_some() && value["grokVersion"].as_str() != Some("1.0.41") {
+        return Err(GrokBuildAdapterError::IsolationFailed);
+    }
     verify_inspect_report(host, isolated, &value)
 }
 
@@ -1793,6 +2125,7 @@ struct AllowlistedExecution<'a> {
     source_control_fingerprint: &'a str,
     isolated: &'a IsolatedHome,
     credentials: &'a dyn CredentialLeaseResolver,
+    managed: Option<&'a (crate::managed_provider::ManagedChildPolicy, String)>,
     session_id: &'a str,
 }
 
@@ -1809,16 +2142,26 @@ async fn execute_allowlisted(
         source_control_fingerprint,
         isolated,
         credentials,
+        managed,
         session_id,
     } = execution;
-    let args = allowlisted_args(
+    let mut args = allowlisted_args(
         &isolated.prompt_path(),
         launch.mutation_mode,
         launch.max_turns,
         session_id,
     )?;
-    let env = allowlisted_env(&isolated.path)?;
-    let mut cmd = mutation_sandbox_command(execution_host, &args)?;
+    let mut env = allowlisted_env(&isolated.path)?;
+    let mut cmd = if let Some((policy, capability)) = managed {
+        args.extend(["--model".into(), "managed-assignment".into(), "--tools".into(), "read_file,write,search_replace,list_dir,grep".into(), "--system-prompt-override".into(), "Inspect the source and implement the requested bounded change. Use only the provided file tools. Do not inspect credentials or execute commands. End with GROK_BUILD_VERDICT=clean when done, otherwise GROK_BUILD_VERDICT=not_complete.".into()]);
+        env.push(("GROKPTAH_MANAGED_CAPABILITY".into(), capability.clone()));
+        // Grok's startup auth gate requires this even for per-model env_key.
+        // It is the same relay-only bearer, never an upstream xAI credential.
+        env.push(("XAI_API_KEY".into(), capability.clone()));
+        managed_sandbox_command(execution_host, &args, policy, &isolated.path)?
+    } else {
+        mutation_sandbox_command(execution_host, &args)?
+    };
     cmd.current_dir(&execution_host.cwd);
     cmd.env_clear();
     cmd.envs(env);
@@ -1853,6 +2196,20 @@ async fn execute_allowlisted(
         ));
     }
 
+    if let Some((_, capability)) = managed {
+        let leaked = [&harvest.stdout, &harvest.stderr].iter().any(|bytes| {
+            bytes
+                .windows(capability.len())
+                .any(|part| part == capability.as_bytes())
+        }) || managed_material_leaked(&checkout.path, capability)
+            || managed_material_leaked(&isolated.path, capability);
+        if leaked {
+            let _ = isolated.cleanup();
+            let _ = checkout.cleanup().await;
+            return Err(GrokBuildAdapterError::CredentialLease);
+        }
+    }
+
     if checkout.verify_control_state(execution_host).await.is_err()
         || verify_source_repository_unchanged(
             source_host,
@@ -1875,7 +2232,15 @@ async fn execute_allowlisted(
     } else {
         false
     };
-    let classified = classify_harvest(&harvest, readonly_violation, isolated, session_id);
+    // A current production CLI omits accounting from stdout. Preserve the
+    // legacy parser unchanged; production completion instead requires BOTH
+    // its durable usage/turn journal and independently settled host sends.
+    let classified = if managed.is_some() {
+        credentials.revoke(&launch.credential_lease_id)?;
+        classify_managed_harvest(&harvest, isolated, session_id, launch, credentials)
+    } else {
+        classify_harvest(&harvest, readonly_violation, isolated, session_id)
+    };
     let cleaned = isolated.cleanup();
     let promote_mutation = classified.state == GrokBuildRunState::CompleteAdvisory
         && matches!(
@@ -2175,6 +2540,204 @@ struct ClassifiedRun {
     verdict: Option<GrokBuildVerdict>,
     evidence_refs: Vec<String>,
     advisory_evidence: Option<GrokBuildAdvisoryEvidence>,
+}
+
+fn classify_managed_harvest(
+    harvest: &Harvest,
+    isolated: &IsolatedHome,
+    session: &str,
+    launch: &GrokBuildLaunchRequest,
+    credentials: &dyn CredentialLeaseResolver,
+) -> ClassifiedRun {
+    if harvest.kind != HarvestKind::Exited(0) {
+        return failed_closed_classification("managed-worker-did-not-exit-cleanly");
+    }
+    let result = (|| {
+        let provider = credentials
+            .provider_evidence(&launch.credential_lease_id)
+            .ok_or("managed-sends-missing")?;
+        if !provider.accounting_complete
+            || !provider.usage_observed
+            || provider.uncertain
+            || !provider.revoked
+            || provider.wire_attempts == 0
+            || provider.wire_attempts > launch.max_turns
+            || provider.authority_attempts.len() != provider.wire_attempts as usize
+        {
+            return Err("managed-sends-unsettled");
+        }
+        let value: serde_json::Value =
+            serde_json::from_slice(&harvest.stdout).map_err(|_| "managed-stdout-json")?;
+        let object = value.as_object().ok_or("managed-stdout-shape")?;
+        require_exact_keys(
+            object,
+            &[
+                "text",
+                "stopReason",
+                "sessionId",
+                "requestId",
+                "usage",
+                "modelUsage",
+                "num_turns",
+            ],
+        )
+        .map_err(|_| "managed-stdout-shape")?;
+        if !managed_stdout_usage_matches(&value, &provider) {
+            return Err("managed-stdout-usage-mismatch");
+        }
+        if value["stopReason"] != "end_turn" || value["sessionId"].as_str() != Some(session) {
+            return Err("managed-terminal-identity");
+        }
+        let request = value["requestId"]
+            .as_str()
+            .ok_or("managed-request-identity")?;
+        Uuid::parse_str(request).map_err(|_| "managed-request-identity")?;
+        let text = value["text"]
+            .as_str()
+            .filter(|text| !text.is_empty() && text.len() <= ADVISORY_SUMMARY_MAX)
+            .ok_or("managed-summary")?;
+        let verdict = explicit_verdict(text.as_bytes(), &[]).ok_or("managed-verdict")?;
+        if text
+            .lines()
+            .filter(|line| {
+                !line.trim().is_empty() && !line.trim().starts_with("GROK_BUILD_VERDICT=")
+            })
+            .count()
+            == 0
+        {
+            return Err("managed-summary");
+        }
+        let updates =
+            retained_session_evidence(isolated, session, text).ok_or("managed-session-evidence")?;
+        let terminal = updates
+            .split(|byte| *byte == b'\n')
+            .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
+            .find(|event| event["params"]["update"]["sessionUpdate"] == "turn_completed")
+            .ok_or("managed-terminal-journal")?;
+        if terminal["params"]["update"]["prompt_id"].as_str() != Some(request) {
+            return Err("managed-terminal-request-binding");
+        }
+        let mut usage_paths = Vec::new();
+        for workspace in
+            fs::read_dir(isolated.path.join("sessions")).map_err(|_| "managed-usage-missing")?
+        {
+            let workspace = workspace.map_err(|_| "managed-usage-missing")?;
+            let path = workspace.path().join(session).join("usage.json");
+            if path.is_file() {
+                usage_paths.push(path);
+            }
+        }
+        if usage_paths.len() != 1 {
+            return Err("managed-usage-identity");
+        }
+        let file = open_credential_source(&usage_paths[0]).map_err(|_| "managed-usage-missing")?;
+        let mut bytes = Vec::new();
+        file.take(INSPECT_OUTPUT_MAX as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "managed-usage-missing")?;
+        if bytes.len() > INSPECT_OUTPUT_MAX {
+            return Err("managed-usage-overflow");
+        }
+        let usage: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|_| "managed-usage-json")?;
+        let stats = &usage["session"];
+        if usage["sessionId"].as_str() != Some(session)
+            || stats["modelCalls"].as_u64() != Some(u64::from(provider.wire_attempts))
+            || stats["totalTokens"].as_u64()
+                != Some(provider.input_tokens.saturating_add(provider.output_tokens))
+            || stats["turnCount"]
+                .as_u64()
+                .is_none_or(|turns| turns == 0 || turns > u64::from(launch.max_turns))
+            || stats["turnCount"] != value["num_turns"]
+            || usage["turns"].as_array().is_none_or(Vec::is_empty)
+        {
+            return Err("managed-usage-does-not-match-host-sends");
+        }
+        let summary_ref = sha256_evidence_ref("summary", text.as_bytes());
+        let session_ref = sha256_evidence_ref("session", &updates);
+        let evidence = GrokBuildAdvisoryEvidence {
+            cli_request_id: request.into(),
+            summary: text.into(),
+            session_updates: updates,
+            summary_ref,
+            session_ref,
+        };
+        Ok((verdict, evidence, sha256_evidence_ref("usage", &bytes)))
+    })();
+    match result {
+        Ok((verdict, evidence, usage_ref)) => ClassifiedRun {
+            state: GrokBuildRunState::CompleteAdvisory,
+            verdict: Some(verdict),
+            evidence_refs: vec![
+                evidence.summary_ref.clone(),
+                evidence.session_ref.clone(),
+                usage_ref,
+            ],
+            advisory_evidence: Some(evidence),
+        },
+        Err(reason) => failed_closed_classification(reason),
+    }
+}
+
+fn managed_stdout_usage_matches(
+    value: &serde_json::Value,
+    provider: &crate::managed_provider::ManagedProviderEvidence,
+) -> bool {
+    let Some(usage) = value["usage"].as_object() else {
+        return false;
+    };
+    if require_exact_keys(
+        usage,
+        &[
+            "input_tokens",
+            "output_tokens",
+            "total_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+            "reasoning_tokens",
+        ],
+    )
+    .is_err()
+        || usage.values().any(|value| value.as_u64().is_none())
+        || value["usage"]["input_tokens"].as_u64() != Some(provider.input_tokens)
+        || value["usage"]["output_tokens"].as_u64() != Some(provider.output_tokens)
+        || value["usage"]["total_tokens"].as_u64()
+            != Some(provider.input_tokens.saturating_add(provider.output_tokens))
+        || value["num_turns"]
+            .as_u64()
+            .is_none_or(|turns| turns == 0 || turns > u64::from(provider.wire_attempts))
+    {
+        return false;
+    }
+    let Some(models) = value["modelUsage"].as_object() else {
+        return false;
+    };
+    if models.len() != 1 {
+        return false;
+    }
+    let Some(model) = models
+        .get(&provider.model)
+        .and_then(serde_json::Value::as_object)
+    else {
+        return false;
+    };
+    require_exact_keys(
+        model,
+        &[
+            "inputTokens",
+            "outputTokens",
+            "modelCalls",
+            "cacheCreationInputTokens",
+            "cacheReadInputTokens",
+        ],
+    )
+    .is_ok()
+        && model.values().all(|value| value.as_u64().is_some())
+        && model["inputTokens"].as_u64() == Some(provider.input_tokens)
+        && model["outputTokens"].as_u64() == Some(provider.output_tokens)
+        && model["modelCalls"].as_u64() == Some(u64::from(provider.wire_attempts))
+        && model["cacheReadInputTokens"] == usage["cache_read_input_tokens"]
+        && model["cacheCreationInputTokens"] == usage["cache_creation_input_tokens"]
 }
 
 fn classify_harvest(
@@ -3334,5 +3897,170 @@ mod tests {
             remaining.is_empty(),
             "open auth descriptor was not truncated"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn managed_os_confinement_blocks_host_data_oracle_writes_and_other_ports() {
+        use axum::{routing::get, Router};
+        let root = tempfile::tempdir().unwrap();
+        let candidate = root.path().join("candidate");
+        let home = root.path().join("child-home");
+        fs::create_dir(&candidate).unwrap();
+        fs::create_dir(&home).unwrap();
+        let secret = root.path().join("operator-credential-canary");
+        let oracle = root.path().join("host-oracle");
+        fs::write(&secret, "must-not-be-readable").unwrap();
+        fs::write(&oracle, "host-authority").unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let other = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let other_port = other.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/", get(|| async { "local relay" })),
+            )
+            .await
+            .unwrap();
+        });
+        let other_server = tokio::spawn(async move {
+            axum::serve(
+                other,
+                Router::new().route("/", get(|| async { "outside relay" })),
+            )
+            .await
+            .unwrap();
+        });
+        let policy = crate::managed_provider::ManagedChildPolicy {
+            endpoint: format!("http://127.0.0.1:{port}/v1"),
+            port,
+            model: "grok-build-0.1".into(),
+            max_duration_ms: 3000,
+            max_turns: 1,
+            max_output_tokens: 1,
+        };
+        let host = GrokBuildHostLaunchConfig {
+            executable: "/bin/sh".into(),
+            git_executable: "/usr/bin/git".into(),
+            cwd: candidate.clone(),
+            repository_id: "test".into(),
+            base_ref: "refs/heads/test".into(),
+            prompt: "test".into(),
+            allowed_files: vec!["source".into()],
+            execution_approved: true,
+            max_stdout_bytes: 1024,
+            max_stderr_bytes: 1024,
+            git_timeout: Duration::from_secs(2),
+            isolate_parent: root.path().into(),
+            defer_source_apply: true,
+            candidate_retention_dir: Some(root.path().join("retained")),
+        };
+        let script = r#"cat "$1" >/dev/null 2>&1 && exit 11
+(echo bad > "$2") 2>/dev/null && exit 12
+/usr/bin/curl --silent --max-time 1 "$3" >/dev/null 2>&1 && exit 13
+/usr/bin/curl --silent --max-time 1 "$4" || exit 14
+printf 'candidate' > source
+"#;
+        let args = vec![
+            "-c".into(),
+            script.into(),
+            "probe".into(),
+            secret.display().to_string(),
+            oracle.display().to_string(),
+            format!("http://127.0.0.1:{other_port}/"),
+            format!("http://127.0.0.1:{port}/"),
+        ];
+        let mut command = managed_sandbox_command(&host, &args, &policy, &home).unwrap();
+        command
+            .env_clear()
+            .envs(allowlisted_env(&home).unwrap())
+            .current_dir(&candidate)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = tokio::time::timeout(Duration::from_secs(5), command.output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "local relay");
+        assert_eq!(fs::read_to_string(&oracle).unwrap(), "host-authority");
+        assert_eq!(
+            fs::read_to_string(candidate.join("source")).unwrap(),
+            "candidate"
+        );
+        server.abort();
+        other_server.abort();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unsupported_cli_version_is_denied_before_a_provider_capability_is_issued() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("unsupported-cli");
+        fs::write(
+            &executable,
+            "#!/bin/sh\nprintf 'grok 9.0.0 unsupported\\n'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(managed_offline_readiness(&executable, root.path())
+            .unwrap_err()
+            .contains("requires Grok 1.0.41"));
+    }
+
+    #[test]
+    fn managed_stdout_requires_matching_host_usage_model_and_turns() {
+        let provider = crate::managed_provider::ManagedProviderEvidence {
+            model: "grok-build-0.1".into(),
+            wire_attempts: 1,
+            input_tokens: 100,
+            output_tokens: 10,
+            ..Default::default()
+        };
+        let good = serde_json::json!({"usage":{"input_tokens":100,"output_tokens":10,"total_tokens":110,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"reasoning_tokens":0},"num_turns":1,"modelUsage":{"grok-build-0.1":{"inputTokens":100,"outputTokens":10,"modelCalls":1,"cacheCreationInputTokens":0,"cacheReadInputTokens":0}}});
+        assert!(managed_stdout_usage_matches(&good, &provider));
+        for pointer in [
+            "/usage/input_tokens",
+            "/usage/output_tokens",
+            "/usage/total_tokens",
+            "/num_turns",
+            "/modelUsage/grok-build-0.1/modelCalls",
+        ] {
+            let mut bad = good.clone();
+            *bad.pointer_mut(pointer).unwrap() = serde_json::json!(999);
+            assert!(!managed_stdout_usage_matches(&bad, &provider));
+        }
+        let mut bad = good.clone();
+        bad.as_object_mut().unwrap().remove("usage");
+        assert!(!managed_stdout_usage_matches(&bad, &provider));
+        let mut bad = good;
+        bad["modelUsage"]["other-model"] = serde_json::json!({});
+        assert!(!managed_stdout_usage_matches(&bad, &provider));
+    }
+
+    #[test]
+    fn managed_capability_is_rejected_from_candidate_and_session_material() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("source"), "ordinary candidate").unwrap();
+        assert!(!managed_material_leaked(
+            root.path(),
+            "private-local-capability"
+        ));
+        fs::write(
+            root.path().join("updates.jsonl"),
+            "private-local-capability",
+        )
+        .unwrap();
+        assert!(managed_material_leaked(
+            root.path(),
+            "private-local-capability"
+        ));
     }
 }

@@ -164,6 +164,10 @@ struct Harness {
 
 impl Harness {
     fn open(profile: ManagedExecutionBudgetProfile) -> Self {
+        Self::open_with_bounds(profile, RunBounds::default())
+    }
+
+    fn open_with_bounds(profile: ManagedExecutionBudgetProfile, bounds: RunBounds) -> Self {
         let mut env = ProcessEnvGuard::new();
         env.set("GROKPTAH_AGENT_OFFLINE", "1");
         env.set("GITHUB_TOKEN", "opaque-test-credential");
@@ -200,7 +204,7 @@ impl Harness {
                 bearer_token: "verified-change-token".into(),
                 allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
                 max_concurrent_runs: 1,
-                bounds: RunBounds::default(),
+                bounds,
             },
         );
         orch.configure_managed_grok_executor(
@@ -497,6 +501,24 @@ async fn multi_file_repair_is_red_then_green_and_apply_is_separate() {
     assert_eq!(status["phases"]["humanApproved"], false);
     assert_eq!(status["phases"]["applied"], false);
     assert_eq!(status["checkResults"][0]["outcome"], "passed");
+    let runs = harness.orch.store().list_runs().unwrap();
+    let attempts = harness
+        .orch
+        .store()
+        .list_work_attempts(Some(&work_id))
+        .unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].linked_run_ids, vec![runs[0].run_id.clone()]);
+    assert_eq!(status["runId"], runs[0].run_id);
+    assert_eq!(status["attemptId"], attempts[0].attempt_id);
+    assert_eq!(runs[0].client_id.as_deref(), Some("managed-grok"));
+    assert_eq!(runs[0].agent_id.as_deref(), Some(harness.agent_id.as_str()));
+    assert_eq!(runs[0].session_id, harness.lane);
+    assert_eq!(
+        runs[0].state,
+        grokptah_agent_bridge::orchestration::RunState::Completed
+    );
     assert_eq!(status["changedPaths"].as_array().unwrap().len(), 2);
     assert_secret_free(&status);
     assert_eq!(
@@ -671,6 +693,89 @@ async fn multi_file_repair_is_red_then_green_and_apply_is_separate() {
     );
     assert!(git(harness.workspace.path(), &["remote"]).is_empty());
     harness.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn managed_run_attempt_identity_and_agent_release_survive_repeated_reopen() {
+    let harness = Harness::open_with_bounds(
+        ManagedExecutionBudgetProfile::Economy,
+        RunBounds {
+            max_prompt_bytes: 16000,
+            max_rounds: 6,
+            max_duration_ms: 180000,
+            max_total_tokens: Some(16000),
+        },
+    );
+    harness.set_behavior("repair");
+    let started = harness
+        .orch
+        .start_verified_change(
+            &auth(),
+            &harness.request("durable-run", "isolated_review", "macos"),
+        )
+        .await
+        .unwrap();
+    let work_id = started["workId"].as_str().unwrap().to_string();
+    let work = harness
+        .orch
+        .store()
+        .load_work_item(&work_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(work.policy.bounds.max_rounds, 6);
+    assert_eq!(work.policy.bounds.max_duration_ms, 180000);
+    assert_eq!(work.policy.bounds.max_prompt_bytes, 16000);
+    assert_eq!(started["limits"]["maxPromptBytes"], 16000);
+    assert_eq!(started["limits"]["maxRounds"], 6);
+    assert_eq!(started["limits"]["maxDurationMs"], 180000);
+    settle(&harness.orch, &work_id).await;
+    let before = harness
+        .orch
+        .verified_change_status(&auth(), harness.lane, harness.workspace.path(), &work_id)
+        .unwrap();
+    let run_id = before["runId"].as_str().unwrap().to_string();
+    let attempt_id = before["attemptId"].as_str().unwrap().to_string();
+    let kept = keep_runtime(&harness);
+    let (live, _parked) = reopen_kept(harness, &kept).await;
+    let agent = live
+        .orch
+        .store()
+        .load_agent(before["agentId"].as_str().unwrap())
+        .unwrap()
+        .unwrap();
+    assert!(agent.current_run_id.is_none());
+    assert_eq!(agent.last_run_id.as_deref(), Some(run_id.as_str()));
+    let live = reopen_production_store(
+        live.host,
+        live.orch,
+        &kept.workspace,
+        &kept.fake,
+        &kept.isolate,
+        &kept.identity,
+        &kept.lease,
+    )
+    .await;
+    let after = live
+        .orch
+        .verified_change_status(&auth(), kept.lane, &kept.workspace, &work_id)
+        .unwrap();
+    assert_eq!(after["runId"], run_id);
+    assert_eq!(after["attemptId"], attempt_id);
+    assert_eq!(after["candidateDigest"], before["candidateDigest"]);
+    assert_eq!(live.orch.store().list_runs().unwrap().len(), 1);
+    assert_eq!(
+        live.orch
+            .store()
+            .list_work_attempts(Some(&work_id))
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        source_at(&kept.workspace),
+        (LEDGER_BEFORE.into(), REPORT_BEFORE.into())
+    );
+    stop_live(live).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

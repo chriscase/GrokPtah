@@ -5194,6 +5194,14 @@ impl OrchStore {
         let run = if let Some(run_id) = intent.run_id.as_deref() {
             self.load_run_unlocked(run_id)
                 .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+        } else if intent.grok.is_some() {
+            self.find_run_by_request_id_scoped_unlocked(
+                &intent.intent_id,
+                intent.session_id,
+                &intent.workspace,
+                &intent.agent_id,
+            )?
+            .filter(|run| run.client_id.as_deref() == Some("managed-grok"))
         } else {
             let canonical_workspace =
                 super::authz::canonical_workspace(Path::new(&intent.workspace))?;
@@ -5682,6 +5690,104 @@ impl OrchStore {
             }
         }
         if let Some(mut intent) = self.load_managed_intent_unlocked(&record.intent_id)? {
+            // The existing finalization journal also closes the managed Grok
+            // Run. Recovery replays this before dropping the journal; a crash
+            // cannot leave a successful-looking orphan Run or redispatch it.
+            if intent.grok.is_some() {
+                if let Some(run_id) = intent.run_id.as_deref() {
+                    if let Some(mut run) = self.load_run_unlocked(run_id).map_err(|error| {
+                        OrchError::new(OrchErrorCode::Internal, error.to_string())
+                    })? {
+                        if !run.state.is_terminal() || record.work_state == WorkState::Cancelled {
+                            let cancelled = record.work_state == WorkState::Cancelled;
+                            let complete = !cancelled
+                                && intent.grok.as_ref().is_some_and(|grok| {
+                                    grok.final_state
+                                        == Some(
+                                            grokptah_agent_sdk::GrokBuildRunState::CompleteAdvisory,
+                                        )
+                                })
+                                && record
+                                    .result
+                                    .as_ref()
+                                    .is_some_and(|result| result.failure.is_none());
+                            run.state = if cancelled {
+                                RunState::Cancelled
+                            } else if complete {
+                                RunState::Completed
+                            } else {
+                                RunState::Interrupted
+                            };
+                            run.stop_cause = Some(if cancelled {
+                                RunStopCause::Cancelled
+                            } else if complete {
+                                RunStopCause::Completed
+                            } else {
+                                RunStopCause::Interrupted
+                            });
+                            run.terminal_result = Some(
+                                if cancelled {
+                                    "cancelled"
+                                } else if complete {
+                                    "worker_stopped_candidate_requires_disposition"
+                                } else {
+                                    "managed_execution_uncertain_or_failed"
+                                }
+                                .into(),
+                            );
+                            run.error_code = record
+                                .result
+                                .as_ref()
+                                .and_then(|result| result.failure.clone());
+                            run.updated_at = now;
+                            if let Some(provider) = intent
+                                .grok
+                                .as_ref()
+                                .and_then(|grok| grok.provider_evidence.as_ref())
+                            {
+                                run.aggregates.usage.prompt_tokens = provider.input_tokens;
+                                run.aggregates.usage.completion_tokens = provider.output_tokens;
+                                run.aggregates.usage.total_tokens =
+                                    provider.input_tokens.saturating_add(provider.output_tokens);
+                                run.aggregates.usage.requests = u64::from(provider.wire_attempts);
+                                run.aggregates.usage_complete =
+                                    provider.accounting_complete && provider.usage_observed;
+                                run.aggregates.usage_pending_requests = provider
+                                    .wire_attempts
+                                    .saturating_sub(provider.responses_completed);
+                            }
+                            let path = self.run_path(run_id)?;
+                            atomic_write_json(&self.lease(), &path, &run).map_err(|error| {
+                                OrchError::new(OrchErrorCode::Internal, error.to_string())
+                            })?;
+                        }
+                        if let Some(mut agent) = self
+                            .load_agent_unlocked(&intent.agent_id)
+                            .map_err(|error| {
+                                OrchError::new(OrchErrorCode::Internal, error.to_string())
+                            })?
+                        {
+                            if agent.current_run_id.as_deref() == Some(run_id) {
+                                agent.current_run_id = None;
+                                agent.last_run_id = Some(run_id.to_owned());
+                                // Run/Work retain failure or cancellation. The
+                                // idle persistent Agent can accept a separately
+                                // approved new assignment after either outcome.
+                                agent.state = AgentState::Waiting;
+                                agent.updated_at = now;
+                                atomic_write_json(
+                                    &self.lease(),
+                                    &self.agent_path(&agent.agent_id)?,
+                                    &agent,
+                                )
+                                .map_err(|error| {
+                                    OrchError::new(OrchErrorCode::Internal, error.to_string())
+                                })?;
+                            }
+                        }
+                    }
+                }
+            }
             if intent.state != ManagedIntentState::Finalized
                 && intent.state != ManagedIntentState::Abandoned
             {

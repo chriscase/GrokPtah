@@ -536,7 +536,7 @@ pub async fn start_control_from_env(host: AgentHostHandle) -> Option<ControlServ
             }
         }
     }
-    if let Err(error) = orch.configure_managed_grok_from_operator_env() {
+    if let Err(error) = orch.configure_managed_grok_from_operator_env().await {
         eprintln!(
             "[grokptah] managed Grok executor was not installed: {}",
             error.message
@@ -4229,7 +4229,9 @@ async fn dispatch_tool(
                 execution_host: String::new(),
             };
             if name == "ptah_start_verified_change" {
-                orch.start_verified_change(auth, &request).await
+                // Keep this larger admission future out of the general MCP
+                // dispatch frame used by every control tool.
+                Box::pin(orch.start_verified_change(auth, &request)).await
             } else {
                 orch.prepare_verified_change(auth, &request)
             }
