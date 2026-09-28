@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "classification": "INSUFFICIENT PINNED CONTRACT OR RETAINED EVIDENCE",
+  "repository": "chriscase/GrokPtah",
+  "pr": 580,
+  "startingEvidenceSha": "443be6acc8d10ba71a38f877514d1ceb3d0c2d3b",
+  "acceptedFunctionalSha": "0be8ec4b32144d002d8bb230dec78d18d018f922",
+  "acceptedFunctionalTree": "ad0c6d0a500d309981c3eddbee2531625106b89c",
+  "installedCli": {
+    "version": "1.0.41",
+    "retainedRevisionLabel": "4220f3b224a6",
+    "sha256": "9c844eb13365180787d9ad22b2b3748a024be8e1ed845253cc114781b31c591d",
+    "invokedThisAudit": false
+  },
+  "publicNativeReference": {
+    "repositoryCommit": "f0e3be1100ef5252488e3be8bb0e91cf68d8c305",
+    "sourceRev": "036a5d8348cd744767cd0b08518ab17bf608fa7f",
+    "provenBuildMatchToInstalledCli": false
+  },
+  "historicalAttempt": {
+    "workId": "3067ceb3-3132-48c9-8241-9267c109ae9b",
+    "runId": "25ba88cc-92b6-4afb-810d-23c81625b9f4",
+    "attemptId": "6fc4ec50-b921-41cf-96c4-df97cc0a21ae",
+    "canonicalAuditLogSha256": "a42a48867be80b6dc23fe74098310e2aeedabbba3c272e485760dcd4b1446f07",
+    "hostSendIntentUtc": "2026-09-28T06:52:46.671Z",
+    "hostWireAdmissionUtc": "2026-09-28T06:52:46.691Z",
+    "hostSettledOutcomeUtc": "2026-09-28T06:52:47.119Z",
+    "providerReceiveTime": null,
+    "httpStatus": 403,
+    "physicalRequests": 1,
+    "retries": 0,
+    "providerRequestId": null,
+    "usage": "UNKNOWN/incomplete",
+    "cost": "UNKNOWN"
+  },
+  "offlineProbes": {
+    "testOnlyPatchSha256": "6aafbe3da9c01527bd675ae612d85d415a339b703f90b2dc217db90f5f4d52cf",
+    "requestBuilder": "1 passed, 0 failed; no send",
+    "canonicalForward": "1 passed, 0 failed; one localhost send with synthetic OIDC bearer",
+    "externalEgress": "denied by nested macOS sandbox for localhost fixture",
+    "confirmedAbsentHeaders": [
+      "x-grok-client-identifier",
+      "x-grok-model-override",
+      "x-grok-conv-id",
+      "x-grok-req-id",
+      "x-grok-session-id"
+    ],
+    "syntheticHttp403IsHistoricalCauseEvidence": false
+  },
+  "additionalLiveProviderRequests": 0,
+  "credentialAccountMutations": 0,
+  "productionExecutableChanges": 0,
+  "failedAttemptStatesPreserved": true
+}
