@@ -2587,7 +2587,7 @@ fn classify_managed_harvest(
         let value: serde_json::Value =
             serde_json::from_slice(&harvest.stdout).map_err(|_| "managed-stdout-json")?;
         let object = value.as_object().ok_or("managed-stdout-shape")?;
-        require_exact_keys(
+        require_allowed_keys(
             object,
             &[
                 "text",
@@ -2597,6 +2597,17 @@ fn classify_managed_harvest(
                 "usage",
                 "modelUsage",
                 "num_turns",
+            ],
+            &[
+                "text",
+                "stopReason",
+                "sessionId",
+                "requestId",
+                "usage",
+                "modelUsage",
+                "num_turns",
+                "total_cost_usd",
+                "total_cost_usd_ticks",
             ],
         )
         .map_err(|_| "managed-stdout-shape")?;
@@ -2701,6 +2712,12 @@ fn managed_session_usage_matches(
     session: &str,
     provider: &crate::managed_provider::ManagedProviderEvidence,
 ) -> bool {
+    let Some(total_tokens) = provider
+        .total_tokens
+        .or_else(|| provider.input_tokens.checked_add(provider.output_tokens))
+    else {
+        return false;
+    };
     let Some(turns) = usage["turns"].as_array() else {
         return false;
     };
@@ -2710,8 +2727,7 @@ fn managed_session_usage_matches(
     [&usage["session"], &turns[0]].into_iter().all(|stats| {
         stats["turnCount"].as_u64() == Some(1)
             && stats["modelCalls"].as_u64() == Some(u64::from(provider.wire_attempts))
-            && stats["totalTokens"].as_u64()
-                == Some(provider.input_tokens.saturating_add(provider.output_tokens))
+            && stats["totalTokens"].as_u64() == Some(total_tokens)
             && stats["inputTokens"].as_u64() == Some(provider.input_tokens)
             && stats["outputTokens"].as_u64() == Some(provider.output_tokens)
     })
@@ -2724,8 +2740,37 @@ fn managed_stdout_usage_matches(
     let Some(usage) = value["usage"].as_object() else {
         return false;
     };
-    if require_exact_keys(
+    let Some(uncached_input) = provider
+        .input_tokens
+        .checked_sub(provider.cache_read_input_tokens)
+    else {
+        return false;
+    };
+    let Some(total_tokens) = provider
+        .total_tokens
+        .or_else(|| provider.input_tokens.checked_add(provider.output_tokens))
+    else {
+        return false;
+    };
+    let cost_matches = match provider.cost_in_usd_ticks {
+        Some(ticks) if provider.cost_complete => {
+            value["total_cost_usd_ticks"].as_i64() == Some(ticks)
+                && value["total_cost_usd"].as_f64() == Some(ticks as f64 / 10_000_000_000.0)
+        }
+        None if !provider.cost_complete => {
+            value.get("total_cost_usd_ticks").is_none() && value.get("total_cost_usd").is_none()
+        }
+        _ => false,
+    };
+    if require_allowed_keys(
         usage,
+        &[
+            "input_tokens",
+            "output_tokens",
+            "total_tokens",
+            "cache_read_input_tokens",
+            "reasoning_tokens",
+        ],
         &[
             "input_tokens",
             "output_tokens",
@@ -2737,10 +2782,20 @@ fn managed_stdout_usage_matches(
     )
     .is_err()
         || usage.values().any(|value| value.as_u64().is_none())
-        || value["usage"]["input_tokens"].as_u64() != Some(provider.input_tokens)
+        || !cost_matches
+        || value["usage"]["input_tokens"].as_u64() != Some(uncached_input)
         || value["usage"]["output_tokens"].as_u64() != Some(provider.output_tokens)
-        || value["usage"]["total_tokens"].as_u64()
-            != Some(provider.input_tokens.saturating_add(provider.output_tokens))
+        || value["usage"]["cache_read_input_tokens"].as_u64()
+            != Some(provider.cache_read_input_tokens)
+        || value["usage"]["reasoning_tokens"].as_u64() != Some(provider.reasoning_tokens)
+        || value["usage"]["cache_creation_input_tokens"]
+            .as_u64()
+            .is_some_and(|tokens| tokens != 0)
+        || value["usage"]["total_tokens"].as_u64() != Some(total_tokens)
+        || uncached_input
+            .checked_add(provider.cache_read_input_tokens)
+            .and_then(|prompt| prompt.checked_add(provider.output_tokens))
+            != Some(total_tokens)
         || value["num_turns"]
             .as_u64()
             .is_none_or(|turns| turns == 0 || turns != u64::from(provider.wire_attempts))
@@ -2759,23 +2814,43 @@ fn managed_stdout_usage_matches(
     else {
         return false;
     };
-    require_exact_keys(
+    require_allowed_keys(
         model,
+        &[
+            "inputTokens",
+            "outputTokens",
+            "modelCalls",
+            "cacheReadInputTokens",
+        ],
         &[
             "inputTokens",
             "outputTokens",
             "modelCalls",
             "cacheCreationInputTokens",
             "cacheReadInputTokens",
+            "costUSD",
         ],
     )
     .is_ok()
-        && model.values().all(|value| value.as_u64().is_some())
-        && model["inputTokens"].as_u64() == Some(provider.input_tokens)
+        && [
+            "inputTokens",
+            "outputTokens",
+            "modelCalls",
+            "cacheCreationInputTokens",
+            "cacheReadInputTokens",
+        ]
+        .into_iter()
+        .filter_map(|key| model.get(key))
+        .all(|value| value.as_u64().is_some())
+        && model["inputTokens"].as_u64() == Some(uncached_input)
         && model["outputTokens"].as_u64() == Some(provider.output_tokens)
         && model["modelCalls"].as_u64() == Some(u64::from(provider.wire_attempts))
         && model["cacheReadInputTokens"] == usage["cache_read_input_tokens"]
-        && model["cacheCreationInputTokens"] == usage["cache_creation_input_tokens"]
+        && model.get("cacheCreationInputTokens") == usage.get("cache_creation_input_tokens")
+        && match provider.cost_in_usd_ticks {
+            Some(ticks) => model["costUSD"].as_f64() == Some(ticks as f64 / 10_000_000_000.0),
+            None => model.get("costUSD").is_none(),
+        }
 }
 
 fn classify_harvest(
@@ -4118,6 +4193,48 @@ printf 'candidate' > source
         let mut bad = good;
         bad["modelUsage"]["other-model"] = serde_json::json!({});
         assert!(!managed_stdout_usage_matches(&bad, &provider));
+    }
+
+    #[test]
+    fn managed_accounting_reconciles_headless_cache_reasoning_and_exact_ticks() {
+        let provider = crate::managed_provider::ManagedProviderEvidence {
+            model: "grok-build-0.1".into(),
+            wire_attempts: 1,
+            input_tokens: 100,
+            output_tokens: 10,
+            total_tokens: Some(110),
+            cache_read_input_tokens: 20,
+            reasoning_tokens: 3,
+            cost_in_usd_ticks: Some(777),
+            cost_complete: true,
+            ..Default::default()
+        };
+        let good = serde_json::json!({
+            "usage":{"input_tokens":80,"cache_read_input_tokens":20,
+                "output_tokens":10,"reasoning_tokens":3,"total_tokens":110},
+            "num_turns":1,"total_cost_usd_ticks":777,"total_cost_usd":0.0000000777,
+            "modelUsage":{"grok-build-0.1":{"inputTokens":80,"outputTokens":10,
+                "cacheReadInputTokens":20,"modelCalls":1,"costUSD":0.0000000777}}
+        });
+        assert!(managed_stdout_usage_matches(&good, &provider));
+        let stats = serde_json::json!({"turnCount":1,"modelCalls":1,
+            "inputTokens":100,"outputTokens":10,"totalTokens":110});
+        let session = serde_json::json!({"sessionId":"session","session":stats,"turns":[stats]});
+        assert!(managed_session_usage_matches(
+            &session, "session", &provider
+        ));
+        for pointer in [
+            "/usage/input_tokens",
+            "/usage/cache_read_input_tokens",
+            "/usage/reasoning_tokens",
+            "/usage/total_tokens",
+            "/total_cost_usd_ticks",
+            "/modelUsage/grok-build-0.1/cacheReadInputTokens",
+        ] {
+            let mut bad = good.clone();
+            *bad.pointer_mut(pointer).unwrap() = serde_json::json!(999);
+            assert!(!managed_stdout_usage_matches(&bad, &provider), "{pointer}");
+        }
     }
 
     #[test]

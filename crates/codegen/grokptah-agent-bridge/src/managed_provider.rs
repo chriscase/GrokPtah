@@ -120,6 +120,22 @@ pub struct ManagedProviderEvidence {
     pub tool_calls: u32,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Full prompt plus completion tokens. `None` is historical/unknown, not zero.
+    #[serde(default)]
+    pub total_tokens: Option<u64>,
+    /// Subsets of the full prompt and completion totals, never added twice.
+    #[serde(default)]
+    pub cache_read_input_tokens: u64,
+    #[serde(default)]
+    pub reasoning_tokens: u64,
+    /// Exact provider-reported ticks when present; may be partial unless
+    /// `cost_complete` is true. Missing cost is never interpreted as free.
+    #[serde(default)]
+    pub cost_in_usd_ticks: Option<i64>,
+    #[serde(default)]
+    pub cost_missing_calls: u32,
+    #[serde(default)]
+    pub cost_complete: bool,
     pub usage_observed: bool,
     pub accounting_complete: bool,
     pub uncertain: bool,
@@ -289,6 +305,9 @@ impl ManagedProviderRelay {
             evidence.accounting_complete = !lease.in_flight
                 && !evidence.uncertain
                 && evidence.responses_completed == evidence.wire_attempts;
+            evidence.cost_complete = evidence.accounting_complete
+                && evidence.cost_missing_calls == 0
+                && evidence.cost_in_usd_ticks.is_some();
             evidence
         })
     }
@@ -681,11 +700,10 @@ async fn forward_inner(
             Some(ManagedAdmissionDenial::RequestLimit)
         } else if lease
             .evidence
-            .input_tokens
-            .saturating_add(lease.evidence.output_tokens)
-            .saturating_add(bytes.len() as u64)
-            .saturating_add(u64::from(MAX_OUTPUT_TOKENS))
-            > lease.max_total_tokens
+            .accounted_total_tokens()
+            .and_then(|total| total.checked_add(bytes.len() as u64))
+            .and_then(|total| total.checked_add(u64::from(MAX_OUTPUT_TOKENS)))
+            .is_none_or(|reserved| reserved > lease.max_total_tokens)
         {
             // Reserve a conservative byte-sized prompt allowance and output
             // ceiling; no unknown turn is reusable as settled zero usage.
@@ -895,24 +913,24 @@ async fn forward_inner(
             return Err("managed lease cancelled or exceeded tool budget");
         }
         lease.evidence.tool_calls += summary.0;
-        if let Some((input, output)) = summary.1 {
-            if lease
-                .evidence
-                .input_tokens
-                .saturating_add(lease.evidence.output_tokens)
-                .saturating_add(input)
-                .saturating_add(output)
-                > lease.max_total_tokens
-            {
-                drop(leases);
-                let _ = response.settle_protocol_error("managed aggregate token budget exceeded");
-                invalidate(state, id);
-                return Err("managed aggregate token budget exceeded");
-            }
-            lease.evidence.input_tokens += input;
-            lease.evidence.output_tokens += output;
-            lease.evidence.usage_observed = true;
+        let Some(next) = lease.evidence.checked_accounting_after(summary.1) else {
+            record_diagnostic(lease, ManagedProviderDiagnosticKind::UsageInconsistent);
+            drop(leases);
+            let _ = response.settle_protocol_error("managed usage aggregation is unsupported");
+            invalidate(state, id);
+            return Err("managed usage aggregation is unsupported");
+        };
+        if next
+            .total_tokens
+            .is_none_or(|total| total > lease.max_total_tokens)
+        {
+            record_diagnostic(lease, ManagedProviderDiagnosticKind::BudgetExceeded);
+            drop(leases);
+            let _ = response.settle_protocol_error("managed aggregate token budget exceeded");
+            invalidate(state, id);
+            return Err("managed aggregate token budget exceeded");
         }
+        lease.evidence = next;
     }
     if response.settle_success().is_err() {
         note_diagnostic(state, id, ManagedProviderDiagnosticKind::SettlementFailure);
@@ -984,6 +1002,51 @@ fn record_diagnostic(lease: &mut Lease, kind: ManagedProviderDiagnosticKind) {
 }
 
 impl ManagedProviderEvidence {
+    fn accounted_total_tokens(&self) -> Option<u64> {
+        match (self.usage_observed, self.total_tokens) {
+            (false, None)
+                if self.input_tokens == 0
+                    && self.output_tokens == 0
+                    && self.cache_read_input_tokens == 0
+                    && self.reasoning_tokens == 0
+                    && self.cost_in_usd_ticks.is_none()
+                    && self.cost_missing_calls == 0 =>
+            {
+                Some(0) // New lease, no provider usage yet.
+            }
+            (true, Some(total)) => Some(total),
+            _ => None, // A legacy/inconsistent total cannot grant authority.
+        }
+    }
+
+    fn checked_accounting_after(&self, usage: ManagedUsage) -> Option<Self> {
+        // A mixture of priced and unpriced calls cannot establish the full
+        // charge. Keep the earlier evidence and fail this send closed.
+        if self.usage_observed
+            && (self.cost_in_usd_ticks.is_some() != usage.cost_in_usd_ticks.is_some())
+        {
+            return None;
+        }
+        let mut next = self.clone();
+        next.input_tokens = next.input_tokens.checked_add(usage.input_tokens)?;
+        next.output_tokens = next.output_tokens.checked_add(usage.output_tokens)?;
+        next.reasoning_tokens = next.reasoning_tokens.checked_add(usage.reasoning_tokens)?;
+        next.cache_read_input_tokens = next
+            .cache_read_input_tokens
+            .checked_add(usage.cache_read_input_tokens)?;
+        next.total_tokens = Some(
+            self.accounted_total_tokens()?
+                .checked_add(usage.total_tokens)?,
+        );
+        if let Some(cost) = usage.cost_in_usd_ticks {
+            next.cost_in_usd_ticks = Some(next.cost_in_usd_ticks.unwrap_or(0).checked_add(cost)?);
+        } else {
+            next.cost_missing_calls = next.cost_missing_calls.checked_add(1)?;
+        }
+        next.usage_observed = true;
+        Some(next)
+    }
+
     pub(crate) fn record_diagnostic(&mut self, kind: ManagedProviderDiagnosticKind) {
         if !matches!(
             kind,
@@ -1081,7 +1144,131 @@ fn invalidate(state: &RelayState, id: &str) {
     }
 }
 
-type CompletionSummary = (u32, Option<(u64, u64)>);
+/// One normalized Chat Completions usage receipt. Prompt includes cache hits;
+/// reasoning is a completion subset in the installed CLI's current contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ManagedUsage {
+    input_tokens: u64,
+    output_tokens: u64,
+    total_tokens: u64,
+    cache_read_input_tokens: u64,
+    reasoning_tokens: u64,
+    cost_in_usd_ticks: Option<i64>,
+}
+
+fn parse_managed_usage(value: &Value) -> Result<ManagedUsage, &'static str> {
+    let object = value.as_object().ok_or("managed usage is malformed")?;
+    const ALLOWED: &[&str] = &[
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "prompt_tokens_details",
+        "completion_tokens_details",
+        "cost_in_usd_ticks",
+        "num_sources_used",
+    ];
+    if object.keys().any(|key| !ALLOWED.contains(&key.as_str())) {
+        return Err("managed usage has unsupported fields");
+    }
+    let number = |key: &str| {
+        object
+            .get(key)
+            .and_then(Value::as_u64)
+            .ok_or("managed usage is malformed")
+    };
+    let input_tokens = number("prompt_tokens")?;
+    let output_tokens = number("completion_tokens")?;
+    let total_tokens = number("total_tokens")?;
+    if input_tokens > MAX_REQUEST_BYTES as u64
+        || output_tokens > u64::from(MAX_OUTPUT_TOKENS)
+        || input_tokens.checked_add(output_tokens) != Some(total_tokens)
+        || object
+            .get("num_sources_used")
+            .is_some_and(|v| v.as_u64() != Some(0))
+    {
+        // In particular, the public xAI example where reasoning is added
+        // beyond completion is not compatible with CLI 1.0.41's projection.
+        // Do not guess an output total or let that spend bypass the ceiling.
+        return Err("managed usage is inconsistent or exceeds token bounds");
+    }
+    let details = |key: &str,
+                   allowed: &[&str]|
+     -> Result<Option<&serde_json::Map<String, Value>>, &'static str> {
+        let Some(value) = object.get(key) else {
+            return Ok(None);
+        };
+        let nested = value
+            .as_object()
+            .ok_or("managed usage details are malformed")?;
+        if nested
+            .keys()
+            .any(|field| !allowed.contains(&field.as_str()))
+        {
+            return Err("managed usage details have unsupported fields");
+        }
+        Ok(Some(nested))
+    };
+    let prompt = details(
+        "prompt_tokens_details",
+        &[
+            "text_tokens",
+            "audio_tokens",
+            "image_tokens",
+            "cached_tokens",
+        ],
+    )?;
+    let completion = details(
+        "completion_tokens_details",
+        &[
+            "reasoning_tokens",
+            "audio_tokens",
+            "accepted_prediction_tokens",
+            "rejected_prediction_tokens",
+        ],
+    )?;
+    let optional = |details: Option<&serde_json::Map<String, Value>>,
+                    key: &str|
+     -> Result<u64, &'static str> {
+        details.and_then(|d| d.get(key)).map_or(Ok(0), |v| {
+            v.as_u64().ok_or("managed usage details are malformed")
+        })
+    };
+    let cache_read_input_tokens = optional(prompt, "cached_tokens")?;
+    let reasoning_tokens = optional(completion, "reasoning_tokens")?;
+    if cache_read_input_tokens > input_tokens
+        || reasoning_tokens > output_tokens
+        || prompt.is_some_and(|p| {
+            p.get("text_tokens")
+                .is_some_and(|v| v.as_u64() != Some(input_tokens))
+        })
+        || optional(prompt, "audio_tokens")? != 0
+        || optional(prompt, "image_tokens")? != 0
+        || optional(completion, "audio_tokens")? != 0
+        || optional(completion, "accepted_prediction_tokens")? != 0
+        || optional(completion, "rejected_prediction_tokens")? != 0
+    {
+        return Err("managed usage details are inconsistent or unsupported");
+    }
+    let cost_in_usd_ticks = object
+        .get("cost_in_usd_ticks")
+        .map(|value| {
+            value
+                .as_i64()
+                .filter(|ticks| *ticks > 0)
+                .ok_or("managed usage cost is unsupported")
+        })
+        .transpose()?;
+    Ok(ManagedUsage {
+        input_tokens,
+        output_tokens,
+        total_tokens,
+        cache_read_input_tokens,
+        reasoning_tokens,
+        cost_in_usd_ticks,
+    })
+}
+
+type CompletionSummary = (u32, ManagedUsage);
 fn validate_completion(
     bytes: &[u8],
     child_secret: &str,
@@ -1114,19 +1301,7 @@ fn validate_completion(
             if usage.is_some() {
                 return Err("managed stream repeated its usage receipt");
             }
-            let input = u["prompt_tokens"]
-                .as_u64()
-                .ok_or("managed usage is malformed")?;
-            let output = u["completion_tokens"]
-                .as_u64()
-                .ok_or("managed usage is malformed")?;
-            if output > u64::from(MAX_OUTPUT_TOKENS)
-                || input > MAX_REQUEST_BYTES as u64
-                || u["total_tokens"].as_u64() != Some(input.saturating_add(output))
-            {
-                return Err("managed usage is inconsistent or exceeds token bounds");
-            }
-            usage = Some((input, output));
+            usage = Some(parse_managed_usage(u)?);
         }
         let choices = value["choices"]
             .as_array()
@@ -1171,9 +1346,7 @@ fn validate_completion(
     if !finished || !done {
         return Err("managed stream did not prove a completed response");
     }
-    if usage.is_none() {
-        return Err("managed stream usage is missing");
-    }
+    let usage = usage.ok_or("managed stream usage is missing")?;
     for (name, arguments) in tools.values() {
         if !matches!(
             name.as_str(),
@@ -1235,6 +1408,312 @@ mod tests {
             json!({"id":"test", "object":"chat.completion.chunk", "created":0, "model":"grok-build-0.1", "choices":[{"index":0,"delta":{"role":"assistant","content":text},"finish_reason":"stop"}]}),
             json!({"id":"test", "object":"chat.completion.chunk", "created":0, "model":"grok-build-0.1", "choices":[], "usage":{"prompt_tokens":100,"completion_tokens":10,"total_tokens":110}})
         )
+    }
+
+    fn accounting_stream(usage: Value) -> String {
+        format!(
+            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            json!({"choices":[{"index":0,"delta":{"role":"assistant","content":"offline"},"finish_reason":"stop"}]}),
+            json!({"choices":[],"usage":usage})
+        )
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    async fn accounting_fixture(usage: Value) -> (StatusCode, Value, u32, usize) {
+        accounting_fixture_with_limit(usage, None).await
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    async fn accounting_fixture_with_limit(
+        usage: Value,
+        limit: Option<u64>,
+    ) -> (StatusCode, Value, u32, usize) {
+        let _serial = crate::home_override_serial();
+        let root = tempfile::tempdir().unwrap();
+        crate::set_grokptah_home_override(Some(root.path().join("host")));
+        let _home = Home;
+        let calls = Arc::new(AtomicU32::new(0));
+        let observed = calls.clone();
+        let body = accounting_stream(usage);
+        let router = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let observed = observed.clone();
+                let body = body.clone();
+                async move {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    ([("content-type", "text/event-stream")], body)
+                }
+            }),
+        );
+        let (relay, server) = local_fixture(root.path().join("leases"), router).await;
+        let (id, secret) = issue(&relay, "accounting-fixture");
+        if let Some(limit) = limit {
+            relay
+                .state
+                .leases
+                .lock()
+                .unwrap()
+                .get_mut(&id)
+                .unwrap()
+                .max_total_tokens = limit;
+        }
+        let status = send(&relay, &secret, &request(0)).await.status();
+        let evidence = serde_json::to_value(relay.evidence(&id).unwrap()).unwrap();
+        if status != StatusCode::OK {
+            assert_eq!(
+                send(&relay, &secret, &request(1)).await.status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        let count = calls.load(Ordering::SeqCst);
+        let custody =
+            fs::read_to_string(root.path().join("host/authority/provider-send-v1.key")).unwrap();
+        let operator =
+            crate::provider_transport::authenticate_provider_reconciliation(&custody).unwrap();
+        let pending =
+            crate::provider_transport::provider_attempts_requiring_reconciliation(&operator)
+                .unwrap()
+                .len();
+        server.abort();
+        (status, evidence, count, pending)
+    }
+
+    #[tokio::test]
+    async fn combined_reasoning_cache_and_exact_cost_survive_canonical_forward() {
+        let (status, evidence, calls, pending) = accounting_fixture(json!({
+            "prompt_tokens":100,"completion_tokens":10,"total_tokens":110,
+            "prompt_tokens_details":{"text_tokens":100,"audio_tokens":0,"image_tokens":0,"cached_tokens":20},
+            "completion_tokens_details":{"reasoning_tokens":3,"audio_tokens":0,"accepted_prediction_tokens":0,"rejected_prediction_tokens":0},
+            "cost_in_usd_ticks":777,"num_sources_used":0
+        })).await;
+        assert_eq!((status, calls, pending), (StatusCode::OK, 1, 0));
+        assert_eq!(evidence["reasoningTokens"], 3);
+        assert_eq!(evidence["cacheReadInputTokens"], 20);
+        assert_eq!(evidence["totalTokens"], 110);
+        assert_eq!(evidence["costInUsdTicks"], 777);
+        assert_eq!(evidence["accountingComplete"], true);
+    }
+
+    #[tokio::test]
+    async fn unknown_additional_usage_cannot_settle_as_complete() {
+        let (status, evidence, calls, pending) = accounting_fixture(json!({
+            "prompt_tokens":100,"completion_tokens":10,"total_tokens":110,
+            "additional_charge_ticks":123
+        }))
+        .await;
+        assert_eq!((status, calls, pending), (StatusCode::BAD_GATEWAY, 1, 1));
+        assert_eq!(evidence["accountingComplete"], false);
+        assert_eq!(evidence["responsesCompleted"], 0);
+    }
+
+    #[tokio::test]
+    async fn cache_detail_larger_than_prompt_fails_closed() {
+        let (status, evidence, calls, pending) = accounting_fixture(json!({
+            "prompt_tokens":100,"completion_tokens":10,"total_tokens":110,
+            "prompt_tokens_details":{"cached_tokens":101}
+        }))
+        .await;
+        assert_eq!((status, calls, pending), (StatusCode::BAD_GATEWAY, 1, 1));
+        assert_eq!(evidence["accountingComplete"], false);
+    }
+
+    #[tokio::test]
+    async fn reasoning_detail_larger_than_completion_fails_closed() {
+        let (status, evidence, calls, pending) = accounting_fixture(json!({
+            "prompt_tokens":100,"completion_tokens":10,"total_tokens":110,
+            "completion_tokens_details":{"reasoning_tokens":11}
+        }))
+        .await;
+        assert_eq!((status, calls, pending), (StatusCode::BAD_GATEWAY, 1, 1));
+        assert_eq!(evidence["accountingComplete"], false);
+    }
+
+    #[tokio::test]
+    async fn zero_valued_usage_details_keep_cost_unknown_not_free() {
+        let (status, evidence, calls, pending) = accounting_fixture(json!({
+            "prompt_tokens":100,"completion_tokens":10,"total_tokens":110,
+            "prompt_tokens_details":{"text_tokens":100,"cached_tokens":0,"audio_tokens":0,"image_tokens":0},
+            "completion_tokens_details":{"reasoning_tokens":0,"audio_tokens":0,"accepted_prediction_tokens":0,"rejected_prediction_tokens":0},
+            "num_sources_used":0
+        })).await;
+        assert_eq!((status, calls, pending), (StatusCode::OK, 1, 0));
+        assert_eq!(evidence["totalTokens"], 110);
+        assert_eq!(evidence["cacheReadInputTokens"], 0);
+        assert_eq!(evidence["reasoningTokens"], 0);
+        assert_eq!(evidence["costMissingCalls"], 1);
+        assert_eq!(evidence["costComplete"], false);
+    }
+
+    #[tokio::test]
+    async fn additive_reasoning_total_is_not_a_free_output_bypass() {
+        let (status, evidence, calls, pending) = accounting_fixture(json!({
+            "prompt_tokens":100,"completion_tokens":10,"total_tokens":115,
+            "completion_tokens_details":{"reasoning_tokens":5}
+        }))
+        .await;
+        assert_eq!((status, calls, pending), (StatusCode::BAD_GATEWAY, 1, 1));
+        assert_eq!(evidence["accountingComplete"], false);
+    }
+
+    #[tokio::test]
+    async fn oversized_or_zero_cost_tick_values_fail_closed() {
+        for ticks in [json!(0), json!(u64::MAX)] {
+            let (status, evidence, calls, pending) = accounting_fixture(json!({
+                "prompt_tokens":100,"completion_tokens":10,"total_tokens":110,
+                "cost_in_usd_ticks":ticks
+            }))
+            .await;
+            assert_eq!((status, calls, pending), (StatusCode::BAD_GATEWAY, 1, 1));
+            assert_eq!(evidence["accountingComplete"], false);
+        }
+    }
+
+    #[tokio::test]
+    async fn reported_cache_cannot_increase_remaining_token_authority() {
+        let (status, evidence, calls, pending) = accounting_fixture_with_limit(
+            json!({
+                "prompt_tokens":1000,"completion_tokens":400,"total_tokens":1400,
+                "prompt_tokens_details":{"cached_tokens":900},
+                "completion_tokens_details":{"reasoning_tokens":300}
+            }),
+            Some(1300),
+        )
+        .await;
+        assert_eq!((status, calls, pending), (StatusCode::BAD_GATEWAY, 1, 1));
+        assert_eq!(evidence["accountingComplete"], false);
+        assert_eq!(evidence["responsesCompleted"], 0);
+    }
+
+    #[tokio::test]
+    async fn server_side_usage_cannot_hide_an_additional_charge() {
+        let (status, evidence, calls, pending) = accounting_fixture(json!({
+            "prompt_tokens":100,"completion_tokens":10,"total_tokens":110,
+            "num_sources_used":1,"cost_in_usd_ticks":777
+        }))
+        .await;
+        assert_eq!((status, calls, pending), (StatusCode::BAD_GATEWAY, 1, 1));
+        assert_eq!(evidence["accountingComplete"], false);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    async fn assert_second_cost_fails_closed(second_cost: Option<i64>) {
+        let _serial = crate::home_override_serial();
+        let root = tempfile::tempdir().unwrap();
+        crate::set_grokptah_home_override(Some(root.path().join("host")));
+        let _home = Home;
+        let calls = Arc::new(AtomicU32::new(0));
+        let observed = calls.clone();
+        let router = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let observed = observed.clone();
+                async move {
+                    let index = observed.fetch_add(1, Ordering::SeqCst);
+                    let mut usage =
+                        json!({"prompt_tokens":100,"completion_tokens":10,"total_tokens":110});
+                    if index == 0 {
+                        usage["cost_in_usd_ticks"] =
+                            json!(if second_cost.is_some() { i64::MAX } else { 777 });
+                    } else if let Some(ticks) = second_cost {
+                        usage["cost_in_usd_ticks"] = json!(ticks);
+                    }
+                    (
+                        [("content-type", "text/event-stream")],
+                        accounting_stream(usage),
+                    )
+                }
+            }),
+        );
+        let (relay, server) = local_fixture(root.path().join("leases"), router).await;
+        let (id, secret) = issue(&relay, "cost-aggregation");
+        assert_eq!(
+            send(&relay, &secret, &request(0)).await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            send(&relay, &secret, &request(1)).await.status(),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            send(&relay, &secret, &request(2)).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let evidence = relay.evidence(&id).unwrap();
+        assert_eq!(
+            (
+                evidence.requests_reserved,
+                evidence.wire_attempts,
+                evidence.responses_completed
+            ),
+            (2, 2, 1)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(evidence.total_tokens, Some(110));
+        assert_eq!(evidence.input_tokens, 100);
+        assert_eq!(evidence.output_tokens, 10);
+        assert_eq!(
+            evidence.cost_in_usd_ticks,
+            Some(if second_cost.is_some() { i64::MAX } else { 777 })
+        );
+        assert!(!evidence.accounting_complete && !evidence.cost_complete);
+        assert!(evidence.uncertain && evidence.revoked);
+        assert_eq!(
+            evidence.interruption,
+            Some(ManagedProviderDiagnosticKind::UsageInconsistent)
+        );
+        let custody =
+            fs::read_to_string(root.path().join("host/authority/provider-send-v1.key")).unwrap();
+        let operator =
+            crate::provider_transport::authenticate_provider_reconciliation(&custody).unwrap();
+        assert_eq!(
+            crate::provider_transport::provider_attempts_requiring_reconciliation(&operator)
+                .unwrap()
+                .len(),
+            1
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn mixed_reported_and_missing_cost_cannot_be_marked_complete() {
+        assert_second_cost_fails_closed(None).await;
+    }
+
+    #[tokio::test]
+    async fn exact_cost_accumulation_overflow_cannot_be_marked_complete() {
+        assert_second_cost_fails_closed(Some(1)).await;
+    }
+
+    #[test]
+    fn historical_unknown_total_is_never_reused_as_zero_budget() {
+        let prior = ManagedProviderEvidence {
+            input_tokens: 100,
+            output_tokens: 10,
+            usage_observed: true,
+            total_tokens: None,
+            ..Default::default()
+        };
+        assert_eq!(prior.accounted_total_tokens(), None);
+        assert!(prior
+            .checked_accounting_after(ManagedUsage {
+                input_tokens: 100,
+                output_tokens: 10,
+                total_tokens: 110,
+                cache_read_input_tokens: 0,
+                reasoning_tokens: 0,
+                cost_in_usd_ticks: None,
+            })
+            .is_none());
+        assert_eq!(
+            ManagedProviderEvidence::default().accounted_total_tokens(),
+            Some(0)
+        );
+        let malformed = ManagedProviderEvidence {
+            input_tokens: 1,
+            ..Default::default()
+        };
+        assert_eq!(malformed.accounted_total_tokens(), None);
     }
 
     async fn relay(
@@ -2187,7 +2666,17 @@ mod tests {
         let good = stream("done");
         assert_eq!(
             validate_completion(good.as_bytes(), "child-secret", "parent-secret").unwrap(),
-            (0, Some((100, 10)))
+            (
+                0,
+                ManagedUsage {
+                    input_tokens: 100,
+                    output_tokens: 10,
+                    total_tokens: 110,
+                    cache_read_input_tokens: 0,
+                    reasoning_tokens: 0,
+                    cost_in_usd_ticks: None,
+                }
+            )
         );
         for malformed in [
             good.replace("[DONE]", ""),

@@ -48,6 +48,14 @@ async fn call(server: &crate::ControlServerHandle, token: &str, name: &str, args
 }
 
 fn turn(index: u32, calls: Vec<Value>) -> String {
+    turn_with_usage(
+        index,
+        calls,
+        json!({"prompt_tokens":100,"completion_tokens":10,"total_tokens":110}),
+    )
+}
+
+fn turn_with_usage(index: u32, calls: Vec<Value>, usage: Value) -> String {
     let delta = if calls.is_empty() {
         json!({"role":"assistant","content":"Repaired UTF-8 framing and strict decoding in both files.\nGROK_BUILD_VERDICT=clean"})
     } else {
@@ -61,7 +69,7 @@ fn turn(index: u32, calls: Vec<Value>) -> String {
     format!(
         "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
         json!({"id":format!("offline-{index}"),"object":"chat.completion.chunk","created":0,"model":"grok-build-0.1","choices":[{"index":0,"delta":delta,"finish_reason":reason}]}),
-        json!({"id":format!("offline-{index}"),"object":"chat.completion.chunk","created":0,"model":"grok-build-0.1","choices":[],"usage":{"prompt_tokens":100,"completion_tokens":10,"total_tokens":110}})
+        json!({"id":format!("offline-{index}"),"object":"chat.completion.chunk","created":0,"model":"grok-build-0.1","choices":[],"usage":usage})
     )
 }
 
@@ -83,19 +91,25 @@ async fn shutdown(
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FixtureMode {
     Success,
+    AccountingCombined,
     Interrupted,
     HttpRejected,
     Malformed,
     MissingUsage,
+    UnknownAdditionalUsage,
+    AdditiveReasoning,
 }
 impl FixtureMode {
     fn name(self) -> &'static str {
         match self {
             Self::Success => "success",
+            Self::AccountingCombined => "accounting-combined",
             Self::Interrupted => "interrupted",
             Self::HttpRejected => "http-rejected",
             Self::Malformed => "malformed",
             Self::MissingUsage => "missing-usage",
+            Self::UnknownAdditionalUsage => "unknown-additional-usage",
+            Self::AdditiveReasoning => "additive-reasoning",
         }
     }
 }
@@ -103,7 +117,7 @@ impl FixtureMode {
 #[allow(clippy::await_holding_lock)]
 async fn qualify(mode: FixtureMode) {
     use std::os::unix::fs::PermissionsExt;
-    let interrupt = mode != FixtureMode::Success;
+    let interrupt = !matches!(mode, FixtureMode::Success | FixtureMode::AccountingCombined);
     let _serial = crate::home_override_serial();
     let root = tempfile::Builder::new()
         .prefix("rma-offline-continuation-")
@@ -220,12 +234,25 @@ async fn qualify(mode: FixtureMode) {
                 let body = if mode == FixtureMode::Malformed { "data: SECRET_RESPONSE_CANARY\n\n".into() } else { turn(index, vec![]).replace("\"usage\":", "\"omitted_usage\":") };
                 return ([("content-type", "text/event-stream")], body).into_response();
             }
+            if mode == FixtureMode::UnknownAdditionalUsage {
+                return ([("content-type", "text/event-stream")], turn_with_usage(index, vec![], json!({"prompt_tokens":100,"completion_tokens":10,"total_tokens":110,"additional_charge_ticks":123}))).into_response();
+            }
+            if mode == FixtureMode::AdditiveReasoning {
+                // The public Chat Completions example can put reasoning beyond
+                // completion. CLI 1.0.41 cannot reconcile that total, so the
+                // host must reject this receipt before declaring success.
+                return ([("content-type", "text/event-stream")], turn_with_usage(index, vec![], json!({"prompt_tokens":100,"completion_tokens":10,"total_tokens":115,"completion_tokens_details":{"reasoning_tokens":5}}))).into_response();
+            }
             let tools = match index {
                 0 => vec![tool(0,"write",json!({"file_path":"src/framing.py","content":FIXED_FRAMING})),tool(1,"write",json!({"file_path":"src/decoder.py","content":FIXED_DECODER}))],
                 1 => vec![],
                 _ => panic!("offline model fixture exceeded the specified two turns"),
             };
-            ([("content-type","text/event-stream"),("x-request-id","12345678-1234-4234-8234-123456789abc")], turn(index, tools)).into_response()
+            let response = if mode == FixtureMode::AccountingCombined {
+                let (cached, reasoning, ticks) = if index == 0 { (20, 3, 777) } else { (40, 4, 888) };
+                turn_with_usage(index, tools, json!({"prompt_tokens":100,"completion_tokens":10,"total_tokens":110,"prompt_tokens_details":{"text_tokens":100,"audio_tokens":0,"image_tokens":0,"cached_tokens":cached},"completion_tokens_details":{"reasoning_tokens":reasoning,"audio_tokens":0,"accepted_prediction_tokens":0,"rejected_prediction_tokens":0},"cost_in_usd_ticks":ticks,"num_sources_used":0}))
+            } else { turn(index, tools) };
+            ([("content-type","text/event-stream"),("x-request-id","12345678-1234-4234-8234-123456789abc")], response).into_response()
         }
     }));
     let (relay, upstream) = super::tests::local_fixture(root.path().join("leases"), router).await;
@@ -324,11 +351,14 @@ async fn qualify(mode: FixtureMode) {
     let evidence = &review["providerEvidence"];
     assert_eq!(evidence["wireAttempts"], if interrupt { 1 } else { 2 });
     let expected_kind = match mode {
-        FixtureMode::Success => None,
+        FixtureMode::Success | FixtureMode::AccountingCombined => None,
         FixtureMode::Interrupted => Some("transport_uncertain"),
         FixtureMode::HttpRejected => Some("http_rejected"),
         FixtureMode::Malformed => Some("protocol_failure"),
         FixtureMode::MissingUsage => Some("usage_missing"),
+        FixtureMode::UnknownAdditionalUsage | FixtureMode::AdditiveReasoning => {
+            Some("usage_inconsistent")
+        }
     };
     if let Some(kind) = expected_kind {
         assert_eq!(evidence["interruption"], kind, "{evidence}");
@@ -337,6 +367,16 @@ async fn qualify(mode: FixtureMode) {
     } else {
         assert_eq!(evidence["accountingComplete"], true);
         assert!(evidence["interruption"].is_null());
+        if mode == FixtureMode::AccountingCombined {
+            assert_eq!(evidence["inputTokens"], 200);
+            assert_eq!(evidence["outputTokens"], 20);
+            assert_eq!(evidence["totalTokens"], 220);
+            assert_eq!(evidence["cacheReadInputTokens"], 60);
+            assert_eq!(evidence["reasoningTokens"], 7);
+            assert_eq!(evidence["costInUsdTicks"], 1665);
+            assert_eq!(evidence["costMissingCalls"], 0);
+            assert_eq!(evidence["costComplete"], true);
+        }
     }
     if mode == FixtureMode::HttpRejected {
         assert_eq!(evidence["diagnostics"][0]["httpStatus"], 401);
@@ -501,6 +541,12 @@ async fn installed_cli_managed_two_file_candidate_checks_apply_and_reopen_offlin
 
 #[tokio::test]
 #[ignore = "requires installed Grok 1.0.41 and native confinement; offline fixture only"]
+async fn installed_cli_combined_accounting_survives_candidate_and_reopen_offline() {
+    qualify(FixtureMode::AccountingCombined).await;
+}
+
+#[tokio::test]
+#[ignore = "requires installed Grok 1.0.41 and native confinement; offline fixture only"]
 async fn interrupted_forward_recovery_never_creates_another_paid_attempt() {
     qualify(FixtureMode::Interrupted).await;
 }
@@ -519,4 +565,16 @@ async fn installed_cli_protocol_failure_diagnostics_survive_reopen() {
 #[ignore = "requires installed Grok 1.0.41 and native confinement; offline fixture only"]
 async fn installed_cli_missing_usage_diagnostics_survive_reopen() {
     qualify(FixtureMode::MissingUsage).await;
+}
+
+#[tokio::test]
+#[ignore = "requires installed Grok 1.0.41 and native confinement; offline fixture only"]
+async fn installed_cli_unknown_additional_usage_fails_closed_and_survives_reopen() {
+    qualify(FixtureMode::UnknownAdditionalUsage).await;
+}
+
+#[tokio::test]
+#[ignore = "requires installed Grok 1.0.41 and native confinement; offline fixture only"]
+async fn installed_cli_additive_reasoning_fails_closed_and_survives_reopen() {
+    qualify(FixtureMode::AdditiveReasoning).await;
 }
