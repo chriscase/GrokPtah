@@ -750,8 +750,10 @@ async fn forward_inner(
             .header("x-grok-effort", "low"),
         &state.credentials,
         base,
-    )
-    .json(&body);
+    );
+    let request =
+        bind_official_proxy_model_override(request, &state.target, &state.credentials, &body)?
+            .json(&body);
     let target_scope = format!("managed-grok:{id}");
     let observe = |attempt: &str| -> anyhow::Result<()> {
         let mut leases = state
@@ -959,6 +961,25 @@ async fn forward_inner(
         let _ = handoff.release.await;
     }
     Ok(output)
+}
+
+/// The child cannot supply upstream headers. On the OIDC CLI-proxy route,
+/// bind the native CLI model override to the host-sealed target and validated
+/// body model; leave public API and compatible-provider routes unchanged.
+fn bind_official_proxy_model_override(
+    request: reqwest::RequestBuilder,
+    target: &crate::host_helpers::ResolvedModelTarget,
+    credentials: &crate::auth_store::WireCredentials,
+    body: &Value,
+) -> Result<reqwest::RequestBuilder, &'static str> {
+    if body.get("model").and_then(Value::as_str) != Some(target.wire_model.as_str()) {
+        return Err("managed body model does not match host target");
+    }
+    if credentials.oidc_token_auth && target.base_url == "https://cli-chat-proxy.grok.com/v1" {
+        Ok(request.header("x-grok-model-override", &target.wire_model))
+    } else {
+        Ok(request)
+    }
 }
 
 /// A revoked child cannot issue another request while the host settles a
@@ -1400,6 +1421,112 @@ mod tests {
             principal_id: None,
             expires_at: None,
         }
+    }
+
+    fn model_target(base_url: &str) -> crate::host_helpers::ResolvedModelTarget {
+        crate::host_helpers::ResolvedModelTarget {
+            base_url: base_url.into(),
+            wire_model: "grok-build-0.1".into(),
+            dialect: crate::gateway_config::ProviderDialect::XaiChatCompletions,
+            capabilities: crate::gateway_config::ModelCapabilities {
+                tools: true,
+                stream: true,
+                ..Default::default()
+            },
+            deadline_class: crate::gateway_config::ProviderDeadlineClass::Standard,
+        }
+    }
+
+    #[test]
+    fn official_proxy_managed_request_binds_host_model_override() {
+        let target = model_target("https://cli-chat-proxy.grok.com/v1");
+        let mut creds = credentials();
+        creds.oidc_token_auth = true;
+        let body = request(0);
+        let req = bind_official_proxy_model_override(
+            reqwest::Client::new().post("https://cli-chat-proxy.grok.com/v1/chat/completions"),
+            &target,
+            &creds,
+            &body,
+        )
+        .unwrap()
+        .json(&body)
+        .build()
+        .unwrap();
+        assert_eq!(
+            req.headers()["x-grok-model-override"],
+            body["model"].as_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn model_override_and_body_model_must_match() {
+        let target = model_target("https://cli-chat-proxy.grok.com/v1");
+        let mut creds = credentials();
+        creds.oidc_token_auth = true;
+        let mut body = request(0);
+        body["model"] = json!("different-model");
+        assert!(bind_official_proxy_model_override(
+            reqwest::Client::new().post("https://cli-chat-proxy.grok.com/v1/chat/completions"),
+            &target,
+            &creds,
+            &body,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn non_proxy_routes_do_not_receive_cli_proxy_override() {
+        let body = request(0);
+        for (base, oidc) in [
+            ("https://api.x.ai/v1", true),
+            ("https://compatible.example/v1", true),
+            ("https://cli-chat-proxy.grok.com/v1", false),
+        ] {
+            let target = model_target(base);
+            let mut creds = credentials();
+            creds.oidc_token_auth = oidc;
+            let req = bind_official_proxy_model_override(
+                reqwest::Client::new().post(format!("{base}/chat/completions")),
+                &target,
+                &creds,
+                &body,
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+            assert!(!req.headers().contains_key("x-grok-model-override"));
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn child_cannot_supply_or_change_model_override() {
+        let _serial = crate::home_override_serial();
+        let root = tempfile::tempdir().unwrap();
+        crate::set_grokptah_home_override(Some(root.path().join("host")));
+        let _home = Home;
+        let router = Router::new().route(
+            "/v1/chat/completions",
+            post(|headers: HeaderMap| async move {
+                assert!(!headers.contains_key("x-grok-model-override"));
+                ([("content-type", "text/event-stream")], stream("ok"))
+            }),
+        );
+        let (relay, server) = local_fixture(root.path().join("leases"), router).await;
+        let (_id, secret) = issue(&relay, "child-override");
+        let response = reqwest::Client::new()
+            .post(format!("{}/chat/completions", relay.policy.endpoint))
+            .bearer_auth(secret)
+            .header("x-grok-model-override", "child-chosen-model")
+            .json(&request(0))
+            // authority-allow-unauthenticated-wire: Test-only local child
+            // request; the relay retains canonical upstream send authority.
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        server.abort();
     }
 
     fn stream(text: &str) -> String {
