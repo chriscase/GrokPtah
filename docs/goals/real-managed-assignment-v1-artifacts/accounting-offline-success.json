@@ -1,0 +1,889 @@
+{
+  "additionalLiveRequests": 0,
+  "attempts": [
+    {
+      "attemptId": "a17bd87e-4e59-4089-8dee-d1c43da2352e",
+      "attemptNumber": 1,
+      "linkedRunIds": [
+        "6db12484-6e74-4189-a215-681fe6572f2d"
+      ],
+      "state": "awaiting_approval",
+      "workId": "550250f4-4890-48c3-a1b6-f10cf229c51a"
+    }
+  ],
+  "baseSha": "1231c5c5700dcc186189f885c0a905a4aab514bb",
+  "baseTree": "1ef9c0872b4eadfaae5f75bbf2933c062cce67ec",
+  "cliDigest": "sha256:9c844eb13365180787d9ad22b2b3748a024be8e1ed845253cc114781b31c591d",
+  "fixtureMode": "success",
+  "fixturePhysicalRequests": 2,
+  "interrupted": false,
+  "qualification": "OFFLINE ONLY; not live G4/G5/G8",
+  "readiness": {
+    "agentId": "agent-79ae92dc-f558-4145-aed8-e5bc971c9a95",
+    "allowedFiles": [
+      "src/framing.py",
+      "src/decoder.py"
+    ],
+    "approvalRequired": true,
+    "attemptCount": 0,
+    "boundedDiff": "",
+    "candidateDigest": null,
+    "changedPaths": [],
+    "checkProfileId": "offline-utf8",
+    "checkProfileRevision": 0,
+    "checkResults": [],
+    "cliContract": "inspect-json-v1",
+    "cliVersion": "1.0.41",
+    "diffDigest": null,
+    "executionHost": "service",
+    "executor": "grok_build_isolated_review",
+    "limits": {
+      "maxDurationMs": 180000,
+      "maxOutputTokensPerRequest": 1024,
+      "maxPromptBytes": 16000,
+      "maxRounds": 6,
+      "maxTotalTokens": 16000
+    },
+    "modelSelectionKey": "grok-build-0.1",
+    "phases": {
+      "applied": false,
+      "changeProposed": false,
+      "checksPassed": false,
+      "humanApproved": false,
+      "workerStopped": false
+    },
+    "readiness": {
+      "cliContract": "inspect-json-v1",
+      "cliVersion": "1.0.41",
+      "mutationMode": "isolated_review",
+      "platform": "macos",
+      "providerInvocations": 0,
+      "ready": true,
+      "reasons": [],
+      "toolchain": [
+        {
+          "checkId": "offline-utf8",
+          "present": true
+        }
+      ],
+      "workersDispatched": 0
+    },
+    "repositoryId": "offline:utf8-frame-continuation",
+    "requiredChecks": [
+      {
+        "checkId": "offline-utf8",
+        "cwd": "oracle",
+        "maxOutputBytes": 16384,
+        "timeoutMs": 5000
+      }
+    ],
+    "safeAction": "Resolve readiness, then start one supervised attempt.",
+    "sourceRevision": "1231c5c5700dcc186189f885c0a905a4aab514bb",
+    "workId": null,
+    "workRevision": null,
+    "workState": null
+  },
+  "redBaseline": [
+    {
+      "checkId": "offline-utf8",
+      "durationMs": 331,
+      "exitCode": 1,
+      "outcome": "failed",
+      "outputDigest": "sha256:384b0cc7f3d2ecfc5f4caa40d1c1dde9ce94d274308780c66dd8e9d861c6864a",
+      "outputTruncated": false,
+      "specDigest": "sha256:4ff6e27466c09d0ccfae8face2b12224d60a603a82b4c3f6c9a4565a6ac4cb82"
+    }
+  ],
+  "reopens": [
+    {
+      "agentId": "agent-79ae92dc-f558-4145-aed8-e5bc971c9a95",
+      "allowedFiles": [
+        "src/framing.py",
+        "src/decoder.py"
+      ],
+      "approvalRequired": true,
+      "attemptCount": 1,
+      "attemptId": "a17bd87e-4e59-4089-8dee-d1c43da2352e",
+      "boundedDiff": "diff --git a/src/decoder.py b/src/decoder.py\nindex 783d256..fb4ad44 100644\n--- a/src/decoder.py\n+++ b/src/decoder.py\n@@ -1,7 +1,5 @@\n-\"\"\"Decode exactly one canonical length-prefixed UTF-8 message.\"\"\"\n-\n-\n def decode(frame: bytes) -> str:\n-    header, payload = frame.split(b\":\", 1)\n-    size = int(header)\n-    return payload[:size].decode(\"utf-8\", errors=\"ignore\")\n+    header, separator, payload = frame.partition(b':')\n+    if not separator or header != str(len(payload)).encode('ascii'):\n+        raise ValueError('invalid frame')\n+    return payload.decode('utf-8')\ndiff --git a/src/framing.py b/src/framing.py\nindex b8589f9..93c816f 100644\n--- a/src/framing.py\n+++ b/src/framing.py\n@@ -1,6 +1,3 @@\n-\"\"\"Encode a UTF-8 message as ASCII byte-length, colon, payload.\"\"\"\n-\n-\n-def encode(text: str) -> bytes:\n-    payload = text.encode(\"utf-8\")\n-    return str(len(text)).encode(\"ascii\") + b\":\" + payload\n+def encode(message: str) -> bytes:\n+    payload = message.encode('utf-8')\n+    return str(len(payload)).encode('ascii') + b':' + payload\n",
+      "candidateDigest": "sha256:78edf457acdb1a7f92d072d006e620f7fc16fd599c42ff148797a60a97f6fe37",
+      "changedPaths": [
+        "src/decoder.py",
+        "src/framing.py"
+      ],
+      "checkProfileId": "offline-utf8",
+      "checkProfileRevision": 1,
+      "checkResults": [
+        {
+          "checkId": "offline-utf8",
+          "durationMs": 129,
+          "exitCode": 0,
+          "outcome": "passed",
+          "outputDigest": "sha256:8ed1eca8c6f9fc609930fca03355e4f03048cb3b74648d0d823545c765e3a918",
+          "outputTruncated": false,
+          "specDigest": "sha256:4ff6e27466c09d0ccfae8face2b12224d60a603a82b4c3f6c9a4565a6ac4cb82"
+        }
+      ],
+      "cliContract": null,
+      "cliVersion": null,
+      "diffDigest": "sha256:22571f59ec41e6cfaae9d5ac29f0b4d0cc0fb3131164844e422941dd82312aa9",
+      "executionHost": "service",
+      "executor": "grok_build_isolated_review",
+      "limits": {
+        "maxDurationMs": 180000,
+        "maxPromptBytes": 16000,
+        "maxRounds": 6,
+        "maxTotalTokens": 16000
+      },
+      "modelSelectionKey": "grok-build-0.1",
+      "phases": {
+        "applied": true,
+        "changeProposed": true,
+        "checksPassed": true,
+        "humanApproved": true,
+        "workerStopped": true
+      },
+      "providerEvidence": {
+        "accountingComplete": true,
+        "authorityAttempts": [
+          "att_e71911d630629562",
+          "att_962f7622a63069df"
+        ],
+        "cacheReadInputTokens": 0,
+        "costComplete": false,
+        "costInUsdTicks": null,
+        "costMissingCalls": 2,
+        "deniedRequests": 0,
+        "diagnostics": [
+          {
+            "admission": 1,
+            "admissionDenial": null,
+            "httpStatus": 200,
+            "kind": "http_response_observed",
+            "providerErrorCode": null,
+            "providerErrorType": null,
+            "providerRequestId": "12345678-1234-4234-8234-123456789abc",
+            "requestBytes": null
+          },
+          {
+            "admission": 1,
+            "admissionDenial": null,
+            "httpStatus": null,
+            "kind": "completed",
+            "providerErrorCode": null,
+            "providerErrorType": null,
+            "providerRequestId": null,
+            "requestBytes": null
+          },
+          {
+            "admission": 2,
+            "admissionDenial": null,
+            "httpStatus": 200,
+            "kind": "http_response_observed",
+            "providerErrorCode": null,
+            "providerErrorType": null,
+            "providerRequestId": "12345678-1234-4234-8234-123456789abc",
+            "requestBytes": null
+          },
+          {
+            "admission": 2,
+            "admissionDenial": null,
+            "httpStatus": null,
+            "kind": "completed",
+            "providerErrorCode": null,
+            "providerErrorType": null,
+            "providerRequestId": null,
+            "requestBytes": null
+          }
+        ],
+        "httpResponsesObserved": 2,
+        "inputTokens": 200,
+        "interruption": null,
+        "mechanism": "host_relay_v1",
+        "model": "grok-build-0.1",
+        "outputTokens": 20,
+        "reasoningTokens": 0,
+        "remoteEffectUncertain": false,
+        "requestsReserved": 2,
+        "responsesCompleted": 2,
+        "revoked": true,
+        "toolCalls": 2,
+        "totalTokens": 220,
+        "uncertain": false,
+        "usageObserved": true,
+        "wireAttempts": 2
+      },
+      "readiness": {
+        "cliContract": null,
+        "cliVersion": null,
+        "mutationMode": "isolated_review",
+        "platform": "macos",
+        "providerInvocations": 0,
+        "ready": false,
+        "reasons": [
+          "Managed Grok executor authority is not installed on this host.",
+          "The managed Grok CLI executable is missing. Install it or choose the configured host binary before dispatch."
+        ],
+        "toolchain": [
+          {
+            "checkId": "offline-utf8",
+            "present": true
+          }
+        ],
+        "workersDispatched": 0
+      },
+      "repositoryId": "unconfigured",
+      "requiredChecks": [
+        {
+          "checkId": "offline-utf8",
+          "cwd": "oracle",
+          "maxOutputBytes": 16384,
+          "timeoutMs": 5000
+        }
+      ],
+      "runId": "6db12484-6e74-4189-a215-681fe6572f2d",
+      "safeAction": "The exact candidate was applied. No further application is safe.",
+      "sourceRevision": "1231c5c5700dcc186189f885c0a905a4aab514bb",
+      "stopReason": "worker_stopped_candidate_requires_disposition",
+      "workId": "550250f4-4890-48c3-a1b6-f10cf229c51a",
+      "workRevision": 7,
+      "workState": "succeeded"
+    },
+    {
+      "agentId": "agent-79ae92dc-f558-4145-aed8-e5bc971c9a95",
+      "allowedFiles": [
+        "src/framing.py",
+        "src/decoder.py"
+      ],
+      "approvalRequired": true,
+      "attemptCount": 1,
+      "attemptId": "a17bd87e-4e59-4089-8dee-d1c43da2352e",
+      "boundedDiff": "diff --git a/src/decoder.py b/src/decoder.py\nindex 783d256..fb4ad44 100644\n--- a/src/decoder.py\n+++ b/src/decoder.py\n@@ -1,7 +1,5 @@\n-\"\"\"Decode exactly one canonical length-prefixed UTF-8 message.\"\"\"\n-\n-\n def decode(frame: bytes) -> str:\n-    header, payload = frame.split(b\":\", 1)\n-    size = int(header)\n-    return payload[:size].decode(\"utf-8\", errors=\"ignore\")\n+    header, separator, payload = frame.partition(b':')\n+    if not separator or header != str(len(payload)).encode('ascii'):\n+        raise ValueError('invalid frame')\n+    return payload.decode('utf-8')\ndiff --git a/src/framing.py b/src/framing.py\nindex b8589f9..93c816f 100644\n--- a/src/framing.py\n+++ b/src/framing.py\n@@ -1,6 +1,3 @@\n-\"\"\"Encode a UTF-8 message as ASCII byte-length, colon, payload.\"\"\"\n-\n-\n-def encode(text: str) -> bytes:\n-    payload = text.encode(\"utf-8\")\n-    return str(len(text)).encode(\"ascii\") + b\":\" + payload\n+def encode(message: str) -> bytes:\n+    payload = message.encode('utf-8')\n+    return str(len(payload)).encode('ascii') + b':' + payload\n",
+      "candidateDigest": "sha256:78edf457acdb1a7f92d072d006e620f7fc16fd599c42ff148797a60a97f6fe37",
+      "changedPaths": [
+        "src/decoder.py",
+        "src/framing.py"
+      ],
+      "checkProfileId": "offline-utf8",
+      "checkProfileRevision": 1,
+      "checkResults": [
+        {
+          "checkId": "offline-utf8",
+          "durationMs": 129,
+          "exitCode": 0,
+          "outcome": "passed",
+          "outputDigest": "sha256:8ed1eca8c6f9fc609930fca03355e4f03048cb3b74648d0d823545c765e3a918",
+          "outputTruncated": false,
+          "specDigest": "sha256:4ff6e27466c09d0ccfae8face2b12224d60a603a82b4c3f6c9a4565a6ac4cb82"
+        }
+      ],
+      "cliContract": null,
+      "cliVersion": null,
+      "diffDigest": "sha256:22571f59ec41e6cfaae9d5ac29f0b4d0cc0fb3131164844e422941dd82312aa9",
+      "executionHost": "service",
+      "executor": "grok_build_isolated_review",
+      "limits": {
+        "maxDurationMs": 180000,
+        "maxPromptBytes": 16000,
+        "maxRounds": 6,
+        "maxTotalTokens": 16000
+      },
+      "modelSelectionKey": "grok-build-0.1",
+      "phases": {
+        "applied": true,
+        "changeProposed": true,
+        "checksPassed": true,
+        "humanApproved": true,
+        "workerStopped": true
+      },
+      "providerEvidence": {
+        "accountingComplete": true,
+        "authorityAttempts": [
+          "att_e71911d630629562",
+          "att_962f7622a63069df"
+        ],
+        "cacheReadInputTokens": 0,
+        "costComplete": false,
+        "costInUsdTicks": null,
+        "costMissingCalls": 2,
+        "deniedRequests": 0,
+        "diagnostics": [
+          {
+            "admission": 1,
+            "admissionDenial": null,
+            "httpStatus": 200,
+            "kind": "http_response_observed",
+            "providerErrorCode": null,
+            "providerErrorType": null,
+            "providerRequestId": "12345678-1234-4234-8234-123456789abc",
+            "requestBytes": null
+          },
+          {
+            "admission": 1,
+            "admissionDenial": null,
+            "httpStatus": null,
+            "kind": "completed",
+            "providerErrorCode": null,
+            "providerErrorType": null,
+            "providerRequestId": null,
+            "requestBytes": null
+          },
+          {
+            "admission": 2,
+            "admissionDenial": null,
+            "httpStatus": 200,
+            "kind": "http_response_observed",
+            "providerErrorCode": null,
+            "providerErrorType": null,
+            "providerRequestId": "12345678-1234-4234-8234-123456789abc",
+            "requestBytes": null
+          },
+          {
+            "admission": 2,
+            "admissionDenial": null,
+            "httpStatus": null,
+            "kind": "completed",
+            "providerErrorCode": null,
+            "providerErrorType": null,
+            "providerRequestId": null,
+            "requestBytes": null
+          }
+        ],
+        "httpResponsesObserved": 2,
+        "inputTokens": 200,
+        "interruption": null,
+        "mechanism": "host_relay_v1",
+        "model": "grok-build-0.1",
+        "outputTokens": 20,
+        "reasoningTokens": 0,
+        "remoteEffectUncertain": false,
+        "requestsReserved": 2,
+        "responsesCompleted": 2,
+        "revoked": true,
+        "toolCalls": 2,
+        "totalTokens": 220,
+        "uncertain": false,
+        "usageObserved": true,
+        "wireAttempts": 2
+      },
+      "readiness": {
+        "cliContract": null,
+        "cliVersion": null,
+        "mutationMode": "isolated_review",
+        "platform": "macos",
+        "providerInvocations": 0,
+        "ready": false,
+        "reasons": [
+          "Managed Grok executor authority is not installed on this host.",
+          "The managed Grok CLI executable is missing. Install it or choose the configured host binary before dispatch."
+        ],
+        "toolchain": [
+          {
+            "checkId": "offline-utf8",
+            "present": true
+          }
+        ],
+        "workersDispatched": 0
+      },
+      "repositoryId": "unconfigured",
+      "requiredChecks": [
+        {
+          "checkId": "offline-utf8",
+          "cwd": "oracle",
+          "maxOutputBytes": 16384,
+          "timeoutMs": 5000
+        }
+      ],
+      "runId": "6db12484-6e74-4189-a215-681fe6572f2d",
+      "safeAction": "The exact candidate was applied. No further application is safe.",
+      "sourceRevision": "1231c5c5700dcc186189f885c0a905a4aab514bb",
+      "stopReason": "worker_stopped_candidate_requires_disposition",
+      "workId": "550250f4-4890-48c3-a1b6-f10cf229c51a",
+      "workRevision": 7,
+      "workState": "succeeded"
+    },
+    {
+      "agentId": "agent-79ae92dc-f558-4145-aed8-e5bc971c9a95",
+      "allowedFiles": [
+        "src/framing.py",
+        "src/decoder.py"
+      ],
+      "approvalRequired": true,
+      "attemptCount": 1,
+      "attemptId": "a17bd87e-4e59-4089-8dee-d1c43da2352e",
+      "boundedDiff": "diff --git a/src/decoder.py b/src/decoder.py\nindex 783d256..fb4ad44 100644\n--- a/src/decoder.py\n+++ b/src/decoder.py\n@@ -1,7 +1,5 @@\n-\"\"\"Decode exactly one canonical length-prefixed UTF-8 message.\"\"\"\n-\n-\n def decode(frame: bytes) -> str:\n-    header, payload = frame.split(b\":\", 1)\n-    size = int(header)\n-    return payload[:size].decode(\"utf-8\", errors=\"ignore\")\n+    header, separator, payload = frame.partition(b':')\n+    if not separator or header != str(len(payload)).encode('ascii'):\n+        raise ValueError('invalid frame')\n+    return payload.decode('utf-8')\ndiff --git a/src/framing.py b/src/framing.py\nindex b8589f9..93c816f 100644\n--- a/src/framing.py\n+++ b/src/framing.py\n@@ -1,6 +1,3 @@\n-\"\"\"Encode a UTF-8 message as ASCII byte-length, colon, payload.\"\"\"\n-\n-\n-def encode(text: str) -> bytes:\n-    payload = text.encode(\"utf-8\")\n-    return str(len(text)).encode(\"ascii\") + b\":\" + payload\n+def encode(message: str) -> bytes:\n+    payload = message.encode('utf-8')\n+    return str(len(payload)).encode('ascii') + b':' + payload\n",
+      "candidateDigest": "sha256:78edf457acdb1a7f92d072d006e620f7fc16fd599c42ff148797a60a97f6fe37",
+      "changedPaths": [
+        "src/decoder.py",
+        "src/framing.py"
+      ],
+      "checkProfileId": "offline-utf8",
+      "checkProfileRevision": 1,
+      "checkResults": [
+        {
+          "checkId": "offline-utf8",
+          "durationMs": 129,
+          "exitCode": 0,
+          "outcome": "passed",
+          "outputDigest": "sha256:8ed1eca8c6f9fc609930fca03355e4f03048cb3b74648d0d823545c765e3a918",
+          "outputTruncated": false,
+          "specDigest": "sha256:4ff6e27466c09d0ccfae8face2b12224d60a603a82b4c3f6c9a4565a6ac4cb82"
+        }
+      ],
+      "cliContract": null,
+      "cliVersion": null,
+      "diffDigest": "sha256:22571f59ec41e6cfaae9d5ac29f0b4d0cc0fb3131164844e422941dd82312aa9",
+      "executionHost": "service",
+      "executor": "grok_build_isolated_review",
+      "limits": {
+        "maxDurationMs": 180000,
+        "maxPromptBytes": 16000,
+        "maxRounds": 6,
+        "maxTotalTokens": 16000
+      },
+      "modelSelectionKey": "grok-build-0.1",
+      "phases": {
+        "applied": true,
+        "changeProposed": true,
+        "checksPassed": true,
+        "humanApproved": true,
+        "workerStopped": true
+      },
+      "providerEvidence": {
+        "accountingComplete": true,
+        "authorityAttempts": [
+          "att_e71911d630629562",
+          "att_962f7622a63069df"
+        ],
+        "cacheReadInputTokens": 0,
+        "costComplete": false,
+        "costInUsdTicks": null,
+        "costMissingCalls": 2,
+        "deniedRequests": 0,
+        "diagnostics": [
+          {
+            "admission": 1,
+            "admissionDenial": null,
+            "httpStatus": 200,
+            "kind": "http_response_observed",
+            "providerErrorCode": null,
+            "providerErrorType": null,
+            "providerRequestId": "12345678-1234-4234-8234-123456789abc",
+            "requestBytes": null
+          },
+          {
+            "admission": 1,
+            "admissionDenial": null,
+            "httpStatus": null,
+            "kind": "completed",
+            "providerErrorCode": null,
+            "providerErrorType": null,
+            "providerRequestId": null,
+            "requestBytes": null
+          },
+          {
+            "admission": 2,
+            "admissionDenial": null,
+            "httpStatus": 200,
+            "kind": "http_response_observed",
+            "providerErrorCode": null,
+            "providerErrorType": null,
+            "providerRequestId": "12345678-1234-4234-8234-123456789abc",
+            "requestBytes": null
+          },
+          {
+            "admission": 2,
+            "admissionDenial": null,
+            "httpStatus": null,
+            "kind": "completed",
+            "providerErrorCode": null,
+            "providerErrorType": null,
+            "providerRequestId": null,
+            "requestBytes": null
+          }
+        ],
+        "httpResponsesObserved": 2,
+        "inputTokens": 200,
+        "interruption": null,
+        "mechanism": "host_relay_v1",
+        "model": "grok-build-0.1",
+        "outputTokens": 20,
+        "reasoningTokens": 0,
+        "remoteEffectUncertain": false,
+        "requestsReserved": 2,
+        "responsesCompleted": 2,
+        "revoked": true,
+        "toolCalls": 2,
+        "totalTokens": 220,
+        "uncertain": false,
+        "usageObserved": true,
+        "wireAttempts": 2
+      },
+      "readiness": {
+        "cliContract": null,
+        "cliVersion": null,
+        "mutationMode": "isolated_review",
+        "platform": "macos",
+        "providerInvocations": 0,
+        "ready": false,
+        "reasons": [
+          "Managed Grok executor authority is not installed on this host.",
+          "The managed Grok CLI executable is missing. Install it or choose the configured host binary before dispatch."
+        ],
+        "toolchain": [
+          {
+            "checkId": "offline-utf8",
+            "present": true
+          }
+        ],
+        "workersDispatched": 0
+      },
+      "repositoryId": "unconfigured",
+      "requiredChecks": [
+        {
+          "checkId": "offline-utf8",
+          "cwd": "oracle",
+          "maxOutputBytes": 16384,
+          "timeoutMs": 5000
+        }
+      ],
+      "runId": "6db12484-6e74-4189-a215-681fe6572f2d",
+      "safeAction": "The exact candidate was applied. No further application is safe.",
+      "sourceRevision": "1231c5c5700dcc186189f885c0a905a4aab514bb",
+      "stopReason": "worker_stopped_candidate_requires_disposition",
+      "workId": "550250f4-4890-48c3-a1b6-f10cf229c51a",
+      "workRevision": 7,
+      "workState": "succeeded"
+    }
+  ],
+  "requestShapes": [
+    {
+      "fields": [
+        "max_tokens",
+        "messages",
+        "model",
+        "parallel_tool_calls",
+        "stream",
+        "stream_options",
+        "tools"
+      ],
+      "maxTokens": 1024,
+      "requestBytes": 13289,
+      "tools": [
+        {
+          "name": "read_file",
+          "parameterKeys": [
+            "format",
+            "limit",
+            "offset",
+            "pages",
+            "target_file"
+          ]
+        },
+        {
+          "name": "search_replace",
+          "parameterKeys": [
+            "file_path",
+            "new_string",
+            "old_string",
+            "replace_all"
+          ]
+        },
+        {
+          "name": "list_dir",
+          "parameterKeys": [
+            "target_directory"
+          ]
+        },
+        {
+          "name": "grep",
+          "parameterKeys": [
+            "-A",
+            "-B",
+            "-C",
+            "-i",
+            "glob",
+            "head_limit",
+            "multiline",
+            "path",
+            "pattern",
+            "type"
+          ]
+        },
+        {
+          "name": "search_tool",
+          "parameterKeys": [
+            "limit",
+            "query"
+          ]
+        },
+        {
+          "name": "use_tool",
+          "parameterKeys": [
+            "file",
+            "tool_input",
+            "tool_input_file",
+            "tool_name"
+          ]
+        },
+        {
+          "name": "write",
+          "parameterKeys": [
+            "content",
+            "file_path"
+          ]
+        }
+      ]
+    },
+    {
+      "fields": [
+        "max_tokens",
+        "messages",
+        "model",
+        "parallel_tool_calls",
+        "stream",
+        "stream_options",
+        "tools"
+      ],
+      "maxTokens": 1024,
+      "requestBytes": 14519,
+      "tools": [
+        {
+          "name": "read_file",
+          "parameterKeys": [
+            "format",
+            "limit",
+            "offset",
+            "pages",
+            "target_file"
+          ]
+        },
+        {
+          "name": "search_replace",
+          "parameterKeys": [
+            "file_path",
+            "new_string",
+            "old_string",
+            "replace_all"
+          ]
+        },
+        {
+          "name": "list_dir",
+          "parameterKeys": [
+            "target_directory"
+          ]
+        },
+        {
+          "name": "grep",
+          "parameterKeys": [
+            "-A",
+            "-B",
+            "-C",
+            "-i",
+            "glob",
+            "head_limit",
+            "multiline",
+            "path",
+            "pattern",
+            "type"
+          ]
+        },
+        {
+          "name": "search_tool",
+          "parameterKeys": [
+            "limit",
+            "query"
+          ]
+        },
+        {
+          "name": "use_tool",
+          "parameterKeys": [
+            "file",
+            "tool_input",
+            "tool_input_file",
+            "tool_name"
+          ]
+        },
+        {
+          "name": "write",
+          "parameterKeys": [
+            "content",
+            "file_path"
+          ]
+        }
+      ]
+    }
+  ],
+  "review": {
+    "agentId": "agent-79ae92dc-f558-4145-aed8-e5bc971c9a95",
+    "allowedFiles": [
+      "src/framing.py",
+      "src/decoder.py"
+    ],
+    "approvalRequired": true,
+    "attemptCount": 1,
+    "attemptId": "a17bd87e-4e59-4089-8dee-d1c43da2352e",
+    "boundedDiff": "diff --git a/src/decoder.py b/src/decoder.py\nindex 783d256..fb4ad44 100644\n--- a/src/decoder.py\n+++ b/src/decoder.py\n@@ -1,7 +1,5 @@\n-\"\"\"Decode exactly one canonical length-prefixed UTF-8 message.\"\"\"\n-\n-\n def decode(frame: bytes) -> str:\n-    header, payload = frame.split(b\":\", 1)\n-    size = int(header)\n-    return payload[:size].decode(\"utf-8\", errors=\"ignore\")\n+    header, separator, payload = frame.partition(b':')\n+    if not separator or header != str(len(payload)).encode('ascii'):\n+        raise ValueError('invalid frame')\n+    return payload.decode('utf-8')\ndiff --git a/src/framing.py b/src/framing.py\nindex b8589f9..93c816f 100644\n--- a/src/framing.py\n+++ b/src/framing.py\n@@ -1,6 +1,3 @@\n-\"\"\"Encode a UTF-8 message as ASCII byte-length, colon, payload.\"\"\"\n-\n-\n-def encode(text: str) -> bytes:\n-    payload = text.encode(\"utf-8\")\n-    return str(len(text)).encode(\"ascii\") + b\":\" + payload\n+def encode(message: str) -> bytes:\n+    payload = message.encode('utf-8')\n+    return str(len(payload)).encode('ascii') + b':' + payload\n",
+    "candidateDigest": "sha256:78edf457acdb1a7f92d072d006e620f7fc16fd599c42ff148797a60a97f6fe37",
+    "changedPaths": [
+      "src/decoder.py",
+      "src/framing.py"
+    ],
+    "checkProfileId": "offline-utf8",
+    "checkProfileRevision": 1,
+    "checkResults": [
+      {
+        "checkId": "offline-utf8",
+        "durationMs": 129,
+        "exitCode": 0,
+        "outcome": "passed",
+        "outputDigest": "sha256:8ed1eca8c6f9fc609930fca03355e4f03048cb3b74648d0d823545c765e3a918",
+        "outputTruncated": false,
+        "specDigest": "sha256:4ff6e27466c09d0ccfae8face2b12224d60a603a82b4c3f6c9a4565a6ac4cb82"
+      }
+    ],
+    "cliContract": "inspect-json-v1",
+    "cliVersion": "1.0.41",
+    "diffDigest": "sha256:22571f59ec41e6cfaae9d5ac29f0b4d0cc0fb3131164844e422941dd82312aa9",
+    "executionHost": "service",
+    "executor": "grok_build_isolated_review",
+    "limits": {
+      "maxDurationMs": 180000,
+      "maxOutputTokensPerRequest": 1024,
+      "maxPromptBytes": 16000,
+      "maxRounds": 6,
+      "maxTotalTokens": 16000
+    },
+    "modelSelectionKey": "grok-build-0.1",
+    "phases": {
+      "applied": false,
+      "changeProposed": true,
+      "checksPassed": true,
+      "humanApproved": false,
+      "workerStopped": true
+    },
+    "providerEvidence": {
+      "accountingComplete": true,
+      "authorityAttempts": [
+        "att_e71911d630629562",
+        "att_962f7622a63069df"
+      ],
+      "cacheReadInputTokens": 0,
+      "costComplete": false,
+      "costInUsdTicks": null,
+      "costMissingCalls": 2,
+      "deniedRequests": 0,
+      "diagnostics": [
+        {
+          "admission": 1,
+          "admissionDenial": null,
+          "httpStatus": 200,
+          "kind": "http_response_observed",
+          "providerErrorCode": null,
+          "providerErrorType": null,
+          "providerRequestId": "12345678-1234-4234-8234-123456789abc",
+          "requestBytes": null
+        },
+        {
+          "admission": 1,
+          "admissionDenial": null,
+          "httpStatus": null,
+          "kind": "completed",
+          "providerErrorCode": null,
+          "providerErrorType": null,
+          "providerRequestId": null,
+          "requestBytes": null
+        },
+        {
+          "admission": 2,
+          "admissionDenial": null,
+          "httpStatus": 200,
+          "kind": "http_response_observed",
+          "providerErrorCode": null,
+          "providerErrorType": null,
+          "providerRequestId": "12345678-1234-4234-8234-123456789abc",
+          "requestBytes": null
+        },
+        {
+          "admission": 2,
+          "admissionDenial": null,
+          "httpStatus": null,
+          "kind": "completed",
+          "providerErrorCode": null,
+          "providerErrorType": null,
+          "providerRequestId": null,
+          "requestBytes": null
+        }
+      ],
+      "httpResponsesObserved": 2,
+      "inputTokens": 200,
+      "interruption": null,
+      "mechanism": "host_relay_v1",
+      "model": "grok-build-0.1",
+      "outputTokens": 20,
+      "reasoningTokens": 0,
+      "remoteEffectUncertain": false,
+      "requestsReserved": 2,
+      "responsesCompleted": 2,
+      "revoked": true,
+      "toolCalls": 2,
+      "totalTokens": 220,
+      "uncertain": false,
+      "usageObserved": true,
+      "wireAttempts": 2
+    },
+    "readiness": {
+      "cliContract": "inspect-json-v1",
+      "cliVersion": "1.0.41",
+      "mutationMode": "isolated_review",
+      "platform": "macos",
+      "providerInvocations": 0,
+      "ready": true,
+      "reasons": [],
+      "toolchain": [
+        {
+          "checkId": "offline-utf8",
+          "present": true
+        }
+      ],
+      "workersDispatched": 0
+    },
+    "repositoryId": "offline:utf8-frame-continuation",
+    "requiredChecks": [
+      {
+        "checkId": "offline-utf8",
+        "cwd": "oracle",
+        "maxOutputBytes": 16384,
+        "timeoutMs": 5000
+      }
+    ],
+    "runId": "6db12484-6e74-4189-a215-681fe6572f2d",
+    "safeAction": "Review the candidate diff and required checks. Approval does not apply the change.",
+    "sourceRevision": "1231c5c5700dcc186189f885c0a905a4aab514bb",
+    "stopReason": "worker_stopped_candidate_requires_disposition",
+    "workId": "550250f4-4890-48c3-a1b6-f10cf229c51a",
+    "workRevision": 5,
+    "workState": "awaiting_approval"
+  },
+  "runs": [
+    {
+      "agentId": "agent-79ae92dc-f558-4145-aed8-e5bc971c9a95",
+      "agentSpecRevision": 1,
+      "bounds": {
+        "maxDurationMs": 180000,
+        "maxPromptBytes": 16000,
+        "maxRounds": 6,
+        "maxTotalTokens": 16000
+      },
+      "errorCode": null,
+      "execution": null,
+      "retryOf": null,
+      "runId": "6db12484-6e74-4189-a215-681fe6572f2d",
+      "sessionId": "79ae92dc-f558-4145-aed8-e5bc971c9a95",
+      "state": "completed",
+      "stopCause": "completed"
+    }
+  ],
+  "schemaVersion": 1,
+  "workId": "550250f4-4890-48c3-a1b6-f10cf229c51a",
+  "workerRootEmpty": true
+}
