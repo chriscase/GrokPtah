@@ -1,0 +1,91 @@
+{
+  "acceptedFunctionalSha": "0be8ec4b32144d002d8bb230dec78d18d018f922",
+  "acceptedFunctionalTree": "ad0c6d0a500d309981c3eddbee2531625106b89c",
+  "baseline": {
+    "exitCode": 1,
+    "outcome": "failed",
+    "specDigest": "sha256:4857c696001521fe22ac4c96761578bed750fce6fc1dc36658b055d5ef03e565"
+  },
+  "binary": {
+    "cliSha256": "sha256:9c844eb13365180787d9ad22b2b3748a024be8e1ed845253cc114781b31c591d",
+    "cliVersion": "1.0.41",
+    "qualificationExecutableSha256": "sha256:26aa9955c99c741afb30522e56c6ba76121bc7e0b1f8450b6e4f0b52222142be"
+  },
+  "branch": "grok/real-managed-assignment-v1",
+  "credentialAttestation": {
+    "authFileConfinementVerified": true,
+    "certificationReady": true,
+    "credentialClass": "grok_build_oidc",
+    "endpointClass": "grok_build_cli_proxy_v1",
+    "issuerClass": "first_party_xai",
+    "localOnly": true,
+    "minimumValidityMinutes": 10,
+    "overrideAndKeychainApiKeyAbsent": true,
+    "tokenOrPrincipalPublished": false
+  },
+  "exactFunctionalDesktopRun": 36364316154,
+  "frozenGoalSha256": "50edf789c5acc46a0f349a81ca12b53ce155adfc860ff084537e0aba33f578f8",
+  "nextLiveSpecSha256": "d731eb90e391047826dfe1e14d4d0600e338308a635bf94fab9bb8a1d6121e41",
+  "oracle": {
+    "checkId": "utf8-frame",
+    "checkPySha256": "sha256:ea6453adb05e49fdf427e304565f024f816569e4bbccf85b095816bf056a0032",
+    "checkScriptSha256": "sha256:b04ed3bb317eaa1a038939409c39a005253fcb230fbd86feb65a7d9895c668c0",
+    "confinementRevision": 2,
+    "maxOutputBytes": 16384,
+    "maxOutputDirBytes": 65536,
+    "network": "none",
+    "oracleDirectoryDigest": "sha256:28d268ff47be8af539b85a7a0dbc5d3965f41715424be169bc8ecbdb3e8e98fe",
+    "profileRevision": 1,
+    "timeoutMs": 5000
+  },
+  "pr": 580,
+  "prepare": {
+    "additionalHardLimits": {
+      "automaticRetries": 0,
+      "childPublishingAuthority": 0,
+      "maxRequestBytes": 65536,
+      "maxResponseBytes": 262144,
+      "maxToolCalls": 12,
+      "sourceApplication": 0
+    },
+    "attemptCount": 0,
+    "cliContract": "inspect-json-v1",
+    "executionHost": "service",
+    "executor": "grok_build_isolated_review",
+    "limits": {
+      "maxDurationMs": 180000,
+      "maxOutputTokensPerRequest": 1024,
+      "maxPromptBytes": 16000,
+      "maxRounds": 6,
+      "maxTotalTokens": 16000
+    },
+    "modelSelectionKey": "grok-build-0.1",
+    "providerInvocations": 0,
+    "ready": true,
+    "requestId": "0f477d2f-fe56-4001-9018-332bbe1d9dda",
+    "workId": null,
+    "workersDispatched": 0
+  },
+  "qualification": "one owner-authorized LIVE managed-worker attempt; failed",
+  "qualificationRoot": "/private/tmp/rma-live-qualification-v1-eYvGhSu2",
+  "repository": "chriscase/GrokPtah",
+  "schemaVersion": 1,
+  "source": {
+    "allowedFiles": [
+      "src/framing.py",
+      "src/decoder.py"
+    ],
+    "baseSha": "adaa04a2ff0b57dafd5eae69810c4eb034c89bc1",
+    "baseTree": "1ef9c0872b4eadfaae5f75bbf2933c062cce67ec",
+    "clean": true,
+    "decoderSha256": "sha256:4affad25745d7962b4ef474c59d3564d0634fef0a9e1987c9dfd30ada8962cb9",
+    "framingSha256": "sha256:7f0ed4cf86fca40e73d7a8c22d436f074b20a94c47e9a1aa7bed605720a6c71d",
+    "noRemotes": true,
+    "trackedFileModes": {
+      "src/decoder.py": "100644",
+      "src/framing.py": "100644"
+    }
+  },
+  "startingEvidenceSha": "7e0d4b85875c8de33ae1e78b0c48cd38d7dd7498",
+  "startingEvidenceTree": "fe88bf8d4db0cd51ba2ef9491ac954874d777278"
+}

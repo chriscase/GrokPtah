@@ -1,0 +1,47 @@
+{
+  "acceptedFunctionalSha": "0be8ec4b32144d002d8bb230dec78d18d018f922",
+  "acceptedFunctionalTree": "ad0c6d0a500d309981c3eddbee2531625106b89c",
+  "branch": "grok/real-managed-assignment-v1",
+  "exactFunctionalDesktopRun": 36364316154,
+  "frozenGoalAndNextLiveSpecUnchanged": true,
+  "localOnlyQualificationRoot": "/private/tmp/rma-live-qualification-v1-eYvGhSu2",
+  "originalHistoricalFailedAttemptUnchanged": true,
+  "pr": 580,
+  "prMustRemainDraftAndUnmerged": true,
+  "predecessorArtifacts": {
+    "allByteIdentical": true,
+    "count": 42,
+    "manifestSha256": "sha256:2b62acce997a66273274d587dd273a9b5b6aae390596529de415840d17b9833e"
+  },
+  "privateLogDigests": {
+    "rma-live-execute-current.log": "sha256:a33207875d682f5f3a33ed00d53e352c883202afcd9b2aeb24b31597bee01044",
+    "rma-live-readiness-current.log": "sha256:9f0dfc5332688e51207a0cc79edb57f328903df1cf8532c2f690da79d5cadaa1",
+    "rma-live-review-1.log": "sha256:742913d4ad2c40aaccf11ac1241ffa9c97481c938768e8df4d638addd1c5a46e",
+    "rma-live-review-2.log": "sha256:742913d4ad2c40aaccf11ac1241ffa9c97481c938768e8df4d638addd1c5a46e",
+    "rma-live-review-3.log": "sha256:742913d4ad2c40aaccf11ac1241ffa9c97481c938768e8df4d638addd1c5a46e"
+  },
+  "privateReportDigests": {
+    "baseline.json": "sha256:71f463be19d3cf0bfbe73bec18cc91983f45196a3e9d7bc0e2fd129f5bcfe445",
+    "execute-report.json": "sha256:2f17f971823f13a6f958801e6ee51c183fa90ec0a85ebd45db7150cc95d5808a",
+    "readiness.json": "sha256:7382d73a2d4a13a5533c2bc1805ed5315b1e96db78210a2164a9d20c210855af",
+    "rma-live-review-1.json": "sha256:7f79f2ecc6d295692561c90f7094dacc40c8009a4c2ec63c0d6eb6fe33f36735",
+    "rma-live-review-2.json": "sha256:7f79f2ecc6d295692561c90f7094dacc40c8009a4c2ec63c0d6eb6fe33f36735",
+    "rma-live-review-3.json": "sha256:7f79f2ecc6d295692561c90f7094dacc40c8009a4c2ec63c0d6eb6fe33f36735"
+  },
+  "providerRequestsThisPass": 1,
+  "qualification": "one owner-authorized LIVE managed-worker attempt; failed",
+  "repository": "chriscase/GrokPtah",
+  "retries": 0,
+  "schemaVersion": 1,
+  "secretScan": {
+    "credentialShapeMatches": 0,
+    "exactAccessOrRefreshTokenMatches": 0,
+    "filesScanned": 11,
+    "publishedContent": "typed/allowlisted fields only; no raw provider body, child transcript, bearer, cookie, or private upstream prose",
+    "scope": "Six retained private JSON reports plus five local command logs; exact current cached OIDC access and refresh token byte comparison and bounded credential-shape/header patterns. Private custody and lease files were not publication inputs."
+  },
+  "sourceCheckoutUnchangedAcrossThreeReopens": true,
+  "startingEvidenceSha": "7e0d4b85875c8de33ae1e78b0c48cd38d7dd7498",
+  "startingEvidenceTree": "fe88bf8d4db0cd51ba2ef9491ac954874d777278",
+  "workerAttemptsThisPass": 1
+}

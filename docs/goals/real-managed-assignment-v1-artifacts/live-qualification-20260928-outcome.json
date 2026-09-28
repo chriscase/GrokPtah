@@ -1,0 +1,159 @@
+{
+  "acceptedFunctionalSha": "0be8ec4b32144d002d8bb230dec78d18d018f922",
+  "acceptedFunctionalTree": "ad0c6d0a500d309981c3eddbee2531625106b89c",
+  "attemptCount": 1,
+  "attemptId": "6fc4ec50-b921-41cf-96c4-df97cc0a21ae",
+  "attemptState": "review",
+  "branch": "grok/real-managed-assignment-v1",
+  "candidate": {
+    "applied": false,
+    "approved": false,
+    "awaitingApproval": false,
+    "changedPaths": [],
+    "checkOutcome": "invalidated",
+    "checksPassed": false,
+    "digest": "sha256:missing",
+    "retained": false
+  },
+  "canonical": {
+    "activeLeasesAfterShutdown": 0,
+    "attemptState": "settled",
+    "physicalAttemptRecords": 1,
+    "quiescenceQualification": "relay not sampled after shutdown; process stopped cleanly and no active canonical lease remains",
+    "settlement": "response observed",
+    "unresolvedReconciliationAttempts": 0
+  },
+  "cause": "HTTP 403; provider-specific reason and billing unknown. No safe error code or request ID was returned.",
+  "exactFunctionalDesktopRun": 36364316154,
+  "historicalFailedLiveAttempt": {
+    "attemptId": "752e00ee-5b62-4038-bbbc-3fd40a016878",
+    "cause": "UNKNOWN",
+    "runId": "681606e4-b8a6-469f-ab80-ab246b861af7",
+    "unchanged": true,
+    "usage": "UNKNOWN/incomplete",
+    "workId": "c724d7eb-d321-4159-af79-7861ad0bb10b"
+  },
+  "nextAction": "Owner/provider must resolve access out of band; any future provider attempt needs separate precise authorization. Do not retry or merge this failed qualification.",
+  "originalPrepareRequestId": "0f477d2f-fe56-4001-9018-332bbe1d9dda",
+  "pr": 580,
+  "provider": {
+    "accountingComplete": false,
+    "authorityAttemptCount": 1,
+    "costComplete": false,
+    "costInUsdTicks": null,
+    "diagnostics": [
+      {
+        "admission": 1,
+        "admissionDenial": null,
+        "httpStatus": 403,
+        "kind": "http_response_observed",
+        "providerErrorCode": null,
+        "providerErrorType": null,
+        "providerRequestId": null,
+        "requestBytes": null
+      },
+      {
+        "admission": 1,
+        "admissionDenial": null,
+        "httpStatus": 403,
+        "kind": "http_rejected",
+        "providerErrorCode": null,
+        "providerErrorType": null,
+        "providerRequestId": null,
+        "requestBytes": null
+      },
+      {
+        "admission": 1,
+        "admissionDenial": null,
+        "httpStatus": null,
+        "kind": "child_exit",
+        "providerErrorCode": null,
+        "providerErrorType": null,
+        "providerRequestId": null,
+        "requestBytes": null
+      }
+    ],
+    "httpResponsesObserved": 1,
+    "httpStatus": 403,
+    "inputOutputCountersNotUsage": {
+      "cacheReadInputTokens": 0,
+      "inputTokens": 0,
+      "outputTokens": 0,
+      "reasoningTokens": 0
+    },
+    "interruption": "http_rejected",
+    "monetaryCost": "UNKNOWN",
+    "remoteEffectUncertain": true,
+    "requestsReserved": 1,
+    "responsesCompleted": 0,
+    "revoked": true,
+    "safeProviderErrorCode": null,
+    "safeProviderErrorType": null,
+    "safeProviderRequestId": null,
+    "totalTokens": null,
+    "uncertain": true,
+    "usageObserved": false,
+    "wireAttempts": 1
+  },
+  "providerRequestRetries": 0,
+  "qualification": "one owner-authorized LIVE managed-worker attempt; failed",
+  "reopens": [
+    {
+      "admitted": 1,
+      "attemptCount": 1,
+      "candidateDigest": "sha256:missing",
+      "completed": 0,
+      "number": 1,
+      "reserved": 1,
+      "sourceDiffEmpty": true,
+      "workState": "review"
+    },
+    {
+      "admitted": 1,
+      "attemptCount": 1,
+      "candidateDigest": "sha256:missing",
+      "completed": 0,
+      "number": 2,
+      "reserved": 1,
+      "sourceDiffEmpty": true,
+      "workState": "review"
+    },
+    {
+      "admitted": 1,
+      "attemptCount": 1,
+      "candidateDigest": "sha256:missing",
+      "completed": 0,
+      "number": 3,
+      "reserved": 1,
+      "sourceDiffEmpty": true,
+      "workState": "review"
+    }
+  ],
+  "repository": "chriscase/GrokPtah",
+  "runId": "25ba88cc-92b6-4afb-810d-23c81625b9f4",
+  "runRequestId": "ec763b74-f49d-4f7f-a505-81cb6891288d",
+  "runState": "interrupted",
+  "schemaVersion": 1,
+  "source": {
+    "clean": true,
+    "decoderSha256": "sha256:4affad25745d7962b4ef474c59d3564d0634fef0a9e1987c9dfd30ada8962cb9",
+    "framingSha256": "sha256:7f0ed4cf86fca40e73d7a8c22d436f074b20a94c47e9a1aa7bed605720a6c71d",
+    "headSha": "adaa04a2ff0b57dafd5eae69810c4eb034c89bc1",
+    "tree": "1ef9c0872b4eadfaae5f75bbf2933c062cce67ec",
+    "workerRootEmpty": true
+  },
+  "sourceBaseSha": "adaa04a2ff0b57dafd5eae69810c4eb034c89bc1",
+  "sourceBaseTree": "1ef9c0872b4eadfaae5f75bbf2933c062cce67ec",
+  "startingEvidenceSha": "7e0d4b85875c8de33ae1e78b0c48cd38d7dd7498",
+  "startingEvidenceTree": "fe88bf8d4db0cd51ba2ef9491ac954874d777278",
+  "unmetSuccessCriteria": [
+    "real two-file repair",
+    "retained candidate bound to Work/Run/Attempt",
+    "host oracle green on candidate",
+    "complete host/CLI/journal token accounting",
+    "durable awaiting-approval candidate"
+  ],
+  "workId": "3067ceb3-3132-48c9-8241-9267c109ae9b",
+  "workState": "review",
+  "workerRetries": 0
+}
