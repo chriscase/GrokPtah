@@ -364,6 +364,27 @@ async fn qualify(mode: FixtureMode) {
         assert_eq!(evidence["interruption"], kind, "{evidence}");
         assert_eq!(evidence["accountingComplete"], false);
         assert_eq!(evidence["remoteEffectUncertain"], true);
+        let expected_subreason = match mode {
+            FixtureMode::MissingUsage => Some("missing_receipt"),
+            FixtureMode::UnknownAdditionalUsage => Some("unsupported_field"),
+            FixtureMode::AdditiveReasoning => Some("conflicting_total"),
+            _ => None,
+        };
+        if let Some(subreason) = expected_subreason {
+            let diagnostic = evidence["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|d| d["kind"] == kind)
+                .unwrap();
+            assert_eq!(diagnostic["usageRejection"]["kind"], subreason);
+            if mode == FixtureMode::AdditiveReasoning {
+                assert_eq!(diagnostic["usageRejection"]["field"], "total_tokens");
+                assert_eq!(diagnostic["usageRejection"]["observed"], 115);
+                assert_eq!(diagnostic["usageRejection"]["expected"], 110);
+            }
+            assert!(!evidence.to_string().contains("additional_charge_ticks"));
+        }
     } else {
         assert_eq!(evidence["accountingComplete"], true);
         assert!(evidence["interruption"].is_null());

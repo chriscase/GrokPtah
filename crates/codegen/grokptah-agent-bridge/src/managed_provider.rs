@@ -93,6 +93,113 @@ pub enum ManagedAdmissionDenial {
     CredentialEcho,
 }
 
+/// Only allowlisted field names and bounded numbers may survive a rejected
+/// provider receipt. These observations are never accepted accounting.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedUsageRejectionKind {
+    MissingReceipt,
+    RepeatedReceipt,
+    MalformedReceipt,
+    MissingField,
+    MalformedField,
+    UnsupportedField,
+    MalformedDetails,
+    UnsupportedDetailsField,
+    TokenBoundExceeded,
+    ConflictingTotal,
+    UnsupportedSourceCount,
+    ConflictingSubset,
+    UnsupportedNonzeroDetail,
+    CostNull,
+    CostZero,
+    CostNegative,
+    CostOutOfRange,
+    CostTypeUnsupported,
+    AggregationPriorUnknown,
+    AggregationMixedCostPresence,
+    AggregationOverflow,
+    AggregateBudgetExceeded,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedUsageField {
+    PromptTokens,
+    CompletionTokens,
+    TotalTokens,
+    PromptTokensDetails,
+    CompletionTokensDetails,
+    TextTokens,
+    AudioTokens,
+    ImageTokens,
+    CachedTokens,
+    ReasoningTokens,
+    AcceptedPredictionTokens,
+    RejectedPredictionTokens,
+    NumSourcesUsed,
+    CostInUsdTicks,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedUsageValueState {
+    Missing,
+    Null,
+    Boolean,
+    String,
+    Number,
+    Array,
+    Object,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedUsageRejection {
+    pub kind: ManagedUsageRejectionKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<ManagedUsageField>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_state: Option<ManagedUsageValueState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected: Option<u64>,
+}
+
+impl ManagedUsageRejection {
+    fn new(kind: ManagedUsageRejectionKind, field: Option<ManagedUsageField>) -> Self {
+        Self {
+            kind,
+            field,
+            value_state: None,
+            observed: None,
+            expected: None,
+        }
+    }
+
+    fn with_value_state(mut self, value: Option<&Value>) -> Self {
+        self.value_state = Some(match value {
+            None => ManagedUsageValueState::Missing,
+            Some(Value::Null) => ManagedUsageValueState::Null,
+            Some(Value::Bool(_)) => ManagedUsageValueState::Boolean,
+            Some(Value::String(_)) => ManagedUsageValueState::String,
+            Some(Value::Number(_)) => ManagedUsageValueState::Number,
+            Some(Value::Array(_)) => ManagedUsageValueState::Array,
+            Some(Value::Object(_)) => ManagedUsageValueState::Object,
+        });
+        self
+    }
+
+    fn with_numbers(mut self, observed: u64, expected: u64) -> Self {
+        // An untrusted number must not become an unbounded telemetry channel.
+        const MAX_RETAINED_NUMBER: u64 = 64 * 1024;
+        self.observed = (observed <= MAX_RETAINED_NUMBER).then_some(observed);
+        self.expected = (expected <= MAX_RETAINED_NUMBER).then_some(expected);
+        self
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ManagedProviderDiagnostic {
@@ -106,6 +213,8 @@ pub struct ManagedProviderDiagnostic {
     pub admission_denial: Option<ManagedAdmissionDenial>,
     #[serde(default)]
     pub request_bytes: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_rejection: Option<ManagedUsageRejection>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -879,21 +988,15 @@ async fn forward_inner(
     }
     let summary = match validate_completion(&output, &secret, &state.credentials.bearer) {
         Ok(summary) => summary,
-        Err(reason) => {
-            note_diagnostic(
-                state,
-                id,
-                if reason == "managed stream usage is missing" {
-                    ManagedProviderDiagnosticKind::UsageMissing
-                } else if reason.contains("usage") {
-                    ManagedProviderDiagnosticKind::UsageInconsistent
-                } else {
-                    ManagedProviderDiagnosticKind::ProtocolFailure
-                },
-            );
-            let _ = response.settle_protocol_error(reason);
+        Err(failure) => {
+            if let Some(rejection) = failure.usage_rejection {
+                note_usage_rejection(state, id, failure.kind, rejection);
+            } else {
+                note_diagnostic(state, id, failure.kind);
+            }
+            let _ = response.settle_protocol_error(failure.message);
             invalidate(state, id);
-            return Err(reason);
+            return Err(failure.message);
         }
     };
     {
@@ -915,18 +1018,34 @@ async fn forward_inner(
             return Err("managed lease cancelled or exceeded tool budget");
         }
         lease.evidence.tool_calls += summary.0;
-        let Some(next) = lease.evidence.checked_accounting_after(summary.1) else {
-            record_diagnostic(lease, ManagedProviderDiagnosticKind::UsageInconsistent);
-            drop(leases);
-            let _ = response.settle_protocol_error("managed usage aggregation is unsupported");
-            invalidate(state, id);
-            return Err("managed usage aggregation is unsupported");
+        let next = match lease.evidence.checked_accounting_after(summary.1) {
+            Ok(next) => next,
+            Err(rejection) => {
+                record_diagnostic(lease, ManagedProviderDiagnosticKind::UsageInconsistent);
+                if let Some(last) = lease.evidence.diagnostics.last_mut() {
+                    last.usage_rejection = Some(rejection);
+                }
+                drop(leases);
+                let _ = response.settle_protocol_error("managed usage aggregation is unsupported");
+                invalidate(state, id);
+                return Err("managed usage aggregation is unsupported");
+            }
         };
         if next
             .total_tokens
             .is_none_or(|total| total > lease.max_total_tokens)
         {
             record_diagnostic(lease, ManagedProviderDiagnosticKind::BudgetExceeded);
+            if let Some(last) = lease.evidence.diagnostics.last_mut() {
+                let mut rejection = ManagedUsageRejection::new(
+                    ManagedUsageRejectionKind::AggregateBudgetExceeded,
+                    Some(ManagedUsageField::TotalTokens),
+                );
+                if let Some(total) = next.total_tokens {
+                    rejection = rejection.with_numbers(total, lease.max_total_tokens);
+                }
+                last.usage_rejection = Some(rejection);
+            }
             drop(leases);
             let _ = response.settle_protocol_error("managed aggregate token budget exceeded");
             invalidate(state, id);
@@ -1040,32 +1159,65 @@ impl ManagedProviderEvidence {
         }
     }
 
-    fn checked_accounting_after(&self, usage: ManagedUsage) -> Option<Self> {
+    fn checked_accounting_after(&self, usage: ManagedUsage) -> Result<Self, ManagedUsageRejection> {
         // A mixture of priced and unpriced calls cannot establish the full
         // charge. Keep the earlier evidence and fail this send closed.
         if self.usage_observed
             && (self.cost_in_usd_ticks.is_some() != usage.cost_in_usd_ticks.is_some())
         {
-            return None;
+            return Err(ManagedUsageRejection::new(
+                ManagedUsageRejectionKind::AggregationMixedCostPresence,
+                Some(ManagedUsageField::CostInUsdTicks),
+            ));
         }
         let mut next = self.clone();
-        next.input_tokens = next.input_tokens.checked_add(usage.input_tokens)?;
-        next.output_tokens = next.output_tokens.checked_add(usage.output_tokens)?;
-        next.reasoning_tokens = next.reasoning_tokens.checked_add(usage.reasoning_tokens)?;
+        let overflow = |field| {
+            ManagedUsageRejection::new(ManagedUsageRejectionKind::AggregationOverflow, Some(field))
+        };
+        next.input_tokens = next
+            .input_tokens
+            .checked_add(usage.input_tokens)
+            .ok_or_else(|| overflow(ManagedUsageField::PromptTokens))?;
+        next.output_tokens = next
+            .output_tokens
+            .checked_add(usage.output_tokens)
+            .ok_or_else(|| overflow(ManagedUsageField::CompletionTokens))?;
+        next.reasoning_tokens = next
+            .reasoning_tokens
+            .checked_add(usage.reasoning_tokens)
+            .ok_or_else(|| overflow(ManagedUsageField::ReasoningTokens))?;
         next.cache_read_input_tokens = next
             .cache_read_input_tokens
-            .checked_add(usage.cache_read_input_tokens)?;
+            .checked_add(usage.cache_read_input_tokens)
+            .ok_or_else(|| overflow(ManagedUsageField::CachedTokens))?;
         next.total_tokens = Some(
-            self.accounted_total_tokens()?
-                .checked_add(usage.total_tokens)?,
+            self.accounted_total_tokens()
+                .ok_or_else(|| {
+                    ManagedUsageRejection::new(
+                        ManagedUsageRejectionKind::AggregationPriorUnknown,
+                        Some(ManagedUsageField::TotalTokens),
+                    )
+                })?
+                .checked_add(usage.total_tokens)
+                .ok_or_else(|| overflow(ManagedUsageField::TotalTokens))?,
         );
         if let Some(cost) = usage.cost_in_usd_ticks {
-            next.cost_in_usd_ticks = Some(next.cost_in_usd_ticks.unwrap_or(0).checked_add(cost)?);
+            next.cost_in_usd_ticks = Some(
+                next.cost_in_usd_ticks
+                    .unwrap_or(0)
+                    .checked_add(cost)
+                    .ok_or_else(|| overflow(ManagedUsageField::CostInUsdTicks))?,
+            );
         } else {
-            next.cost_missing_calls = next.cost_missing_calls.checked_add(1)?;
+            next.cost_missing_calls = next.cost_missing_calls.checked_add(1).ok_or_else(|| {
+                ManagedUsageRejection::new(
+                    ManagedUsageRejectionKind::AggregationOverflow,
+                    Some(ManagedUsageField::CostInUsdTicks),
+                )
+            })?;
         }
         next.usage_observed = true;
-        Some(next)
+        Ok(next)
     }
 
     pub(crate) fn record_diagnostic(&mut self, kind: ManagedProviderDiagnosticKind) {
@@ -1086,6 +1238,7 @@ impl ManagedProviderEvidence {
             provider_error_code: None,
             admission_denial: None,
             request_bytes: None,
+            usage_rejection: None,
         };
         if self.diagnostics.len() < 32 {
             self.diagnostics.push(diagnostic);
@@ -1098,6 +1251,22 @@ fn note_diagnostic(state: &RelayState, id: &str, kind: ManagedProviderDiagnostic
     if let Ok(mut leases) = state.leases.lock() {
         if let Some(lease) = leases.get_mut(id) {
             record_diagnostic(lease, kind);
+        }
+    }
+}
+
+fn note_usage_rejection(
+    state: &RelayState,
+    id: &str,
+    kind: ManagedProviderDiagnosticKind,
+    rejection: ManagedUsageRejection,
+) {
+    if let Ok(mut leases) = state.leases.lock() {
+        if let Some(lease) = leases.get_mut(id) {
+            record_diagnostic(lease, kind);
+            if let Some(last) = lease.evidence.diagnostics.last_mut() {
+                last.usage_rejection = Some(rejection);
+            }
         }
     }
 }
@@ -1177,8 +1346,88 @@ struct ManagedUsage {
     cost_in_usd_ticks: Option<i64>,
 }
 
-fn parse_managed_usage(value: &Value) -> Result<ManagedUsage, &'static str> {
-    let object = value.as_object().ok_or("managed usage is malformed")?;
+#[derive(Clone, Copy, Debug)]
+struct ManagedUsageValidationFailure {
+    message: &'static str,
+    rejection: ManagedUsageRejection,
+}
+
+impl ManagedUsageValidationFailure {
+    fn new(
+        message: &'static str,
+        kind: ManagedUsageRejectionKind,
+        field: Option<ManagedUsageField>,
+    ) -> Self {
+        Self {
+            message,
+            rejection: ManagedUsageRejection::new(kind, field),
+        }
+    }
+
+    fn with_value_state(mut self, value: Option<&Value>) -> Self {
+        self.rejection = self.rejection.with_value_state(value);
+        self
+    }
+
+    fn with_numbers(mut self, observed: u64, expected: u64) -> Self {
+        self.rejection = self.rejection.with_numbers(observed, expected);
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CompletionValidationFailure {
+    message: &'static str,
+    kind: ManagedProviderDiagnosticKind,
+    usage_rejection: Option<ManagedUsageRejection>,
+}
+
+impl CompletionValidationFailure {
+    fn usage(
+        message: &'static str,
+        kind: ManagedProviderDiagnosticKind,
+        rejection: ManagedUsageRejectionKind,
+    ) -> Self {
+        Self {
+            message,
+            kind,
+            usage_rejection: Some(ManagedUsageRejection::new(rejection, None)),
+        }
+    }
+}
+
+impl From<&'static str> for CompletionValidationFailure {
+    fn from(message: &'static str) -> Self {
+        Self {
+            message,
+            kind: ManagedProviderDiagnosticKind::ProtocolFailure,
+            usage_rejection: None,
+        }
+    }
+}
+
+impl From<ManagedUsageValidationFailure> for CompletionValidationFailure {
+    fn from(failure: ManagedUsageValidationFailure) -> Self {
+        Self {
+            message: failure.message,
+            kind: ManagedProviderDiagnosticKind::UsageInconsistent,
+            usage_rejection: Some(failure.rejection),
+        }
+    }
+}
+
+fn parse_managed_usage(value: &Value) -> Result<ManagedUsage, ManagedUsageValidationFailure> {
+    use ManagedUsageField as Field;
+    use ManagedUsageRejectionKind as Kind;
+
+    let object = value.as_object().ok_or_else(|| {
+        ManagedUsageValidationFailure::new(
+            "managed usage is malformed",
+            Kind::MalformedReceipt,
+            None,
+        )
+        .with_value_state(Some(value))
+    })?;
     const ALLOWED: &[&str] = &[
         "prompt_tokens",
         "completion_tokens",
@@ -1189,48 +1438,105 @@ fn parse_managed_usage(value: &Value) -> Result<ManagedUsage, &'static str> {
         "num_sources_used",
     ];
     if object.keys().any(|key| !ALLOWED.contains(&key.as_str())) {
-        return Err("managed usage has unsupported fields");
+        return Err(ManagedUsageValidationFailure::new(
+            "managed usage has unsupported fields",
+            Kind::UnsupportedField,
+            None,
+        ));
     }
-    let number = |key: &str| {
-        object
-            .get(key)
-            .and_then(Value::as_u64)
-            .ok_or("managed usage is malformed")
+    let number = |key: &str, field: Field| {
+        let value = object.get(key).ok_or_else(|| {
+            ManagedUsageValidationFailure::new(
+                "managed usage is malformed",
+                Kind::MissingField,
+                Some(field),
+            )
+            .with_value_state(None)
+        })?;
+        value.as_u64().ok_or_else(|| {
+            ManagedUsageValidationFailure::new(
+                "managed usage is malformed",
+                Kind::MalformedField,
+                Some(field),
+            )
+            .with_value_state(Some(value))
+        })
     };
-    let input_tokens = number("prompt_tokens")?;
-    let output_tokens = number("completion_tokens")?;
-    let total_tokens = number("total_tokens")?;
-    if input_tokens > MAX_REQUEST_BYTES as u64
-        || output_tokens > u64::from(MAX_OUTPUT_TOKENS)
-        || input_tokens.checked_add(output_tokens) != Some(total_tokens)
-        || object
-            .get("num_sources_used")
-            .is_some_and(|v| v.as_u64() != Some(0))
-    {
-        // In particular, the public xAI example where reasoning is added
-        // beyond completion is not compatible with CLI 1.0.41's projection.
-        // Do not guess an output total or let that spend bypass the ceiling.
-        return Err("managed usage is inconsistent or exceeds token bounds");
+    let input_tokens = number("prompt_tokens", Field::PromptTokens)?;
+    let output_tokens = number("completion_tokens", Field::CompletionTokens)?;
+    let total_tokens = number("total_tokens", Field::TotalTokens)?;
+    const INCONSISTENT: &str = "managed usage is inconsistent or exceeds token bounds";
+    if input_tokens > MAX_REQUEST_BYTES as u64 {
+        return Err(ManagedUsageValidationFailure::new(
+            INCONSISTENT,
+            Kind::TokenBoundExceeded,
+            Some(Field::PromptTokens),
+        )
+        .with_numbers(input_tokens, MAX_REQUEST_BYTES as u64));
     }
-    let details = |key: &str,
-                   allowed: &[&str]|
-     -> Result<Option<&serde_json::Map<String, Value>>, &'static str> {
-        let Some(value) = object.get(key) else {
-            return Ok(None);
-        };
-        let nested = value
-            .as_object()
-            .ok_or("managed usage details are malformed")?;
-        if nested
-            .keys()
-            .any(|field| !allowed.contains(&field.as_str()))
-        {
-            return Err("managed usage details have unsupported fields");
+    if output_tokens > u64::from(MAX_OUTPUT_TOKENS) {
+        return Err(ManagedUsageValidationFailure::new(
+            INCONSISTENT,
+            Kind::TokenBoundExceeded,
+            Some(Field::CompletionTokens),
+        )
+        .with_numbers(output_tokens, u64::from(MAX_OUTPUT_TOKENS)));
+    }
+    let expected_total = input_tokens.checked_add(output_tokens);
+    if expected_total != Some(total_tokens) {
+        // Never infer that a rejected additive-reasoning form is accepted.
+        return Err(ManagedUsageValidationFailure::new(
+            INCONSISTENT,
+            Kind::ConflictingTotal,
+            Some(Field::TotalTokens),
+        )
+        .with_numbers(total_tokens, expected_total.unwrap_or(u64::MAX)));
+    }
+    if let Some(value) = object.get("num_sources_used") {
+        if value.as_u64() != Some(0) {
+            let mut failure = ManagedUsageValidationFailure::new(
+                INCONSISTENT,
+                Kind::UnsupportedSourceCount,
+                Some(Field::NumSourcesUsed),
+            )
+            .with_value_state(Some(value));
+            if let Some(observed) = value.as_u64() {
+                failure = failure.with_numbers(observed, 0);
+            }
+            return Err(failure);
         }
-        Ok(Some(nested))
-    };
+    }
+    let details =
+        |key: &str,
+         field: Field,
+         allowed: &[&str]|
+         -> Result<Option<&serde_json::Map<String, Value>>, ManagedUsageValidationFailure> {
+            let Some(value) = object.get(key) else {
+                return Ok(None);
+            };
+            let nested = value.as_object().ok_or_else(|| {
+                ManagedUsageValidationFailure::new(
+                    "managed usage details are malformed",
+                    Kind::MalformedDetails,
+                    Some(field),
+                )
+                .with_value_state(Some(value))
+            })?;
+            if nested
+                .keys()
+                .any(|field| !allowed.contains(&field.as_str()))
+            {
+                return Err(ManagedUsageValidationFailure::new(
+                    "managed usage details have unsupported fields",
+                    Kind::UnsupportedDetailsField,
+                    Some(field),
+                ));
+            }
+            Ok(Some(nested))
+        };
     let prompt = details(
         "prompt_tokens_details",
+        Field::PromptTokensDetails,
         &[
             "text_tokens",
             "audio_tokens",
@@ -1240,6 +1546,7 @@ fn parse_managed_usage(value: &Value) -> Result<ManagedUsage, &'static str> {
     )?;
     let completion = details(
         "completion_tokens_details",
+        Field::CompletionTokensDetails,
         &[
             "reasoning_tokens",
             "audio_tokens",
@@ -1248,37 +1555,129 @@ fn parse_managed_usage(value: &Value) -> Result<ManagedUsage, &'static str> {
         ],
     )?;
     let optional = |details: Option<&serde_json::Map<String, Value>>,
-                    key: &str|
-     -> Result<u64, &'static str> {
+                    key: &str,
+                    field: Field|
+     -> Result<u64, ManagedUsageValidationFailure> {
         details.and_then(|d| d.get(key)).map_or(Ok(0), |v| {
-            v.as_u64().ok_or("managed usage details are malformed")
+            v.as_u64().ok_or_else(|| {
+                ManagedUsageValidationFailure::new(
+                    "managed usage details are malformed",
+                    Kind::MalformedField,
+                    Some(field),
+                )
+                .with_value_state(Some(v))
+            })
         })
     };
-    let cache_read_input_tokens = optional(prompt, "cached_tokens")?;
-    let reasoning_tokens = optional(completion, "reasoning_tokens")?;
-    if cache_read_input_tokens > input_tokens
-        || reasoning_tokens > output_tokens
-        || prompt.is_some_and(|p| {
-            p.get("text_tokens")
-                .is_some_and(|v| v.as_u64() != Some(input_tokens))
-        })
-        || optional(prompt, "audio_tokens")? != 0
-        || optional(prompt, "image_tokens")? != 0
-        || optional(completion, "audio_tokens")? != 0
-        || optional(completion, "accepted_prediction_tokens")? != 0
-        || optional(completion, "rejected_prediction_tokens")? != 0
-    {
-        return Err("managed usage details are inconsistent or unsupported");
+    let cache_read_input_tokens = optional(prompt, "cached_tokens", Field::CachedTokens)?;
+    let reasoning_tokens = optional(completion, "reasoning_tokens", Field::ReasoningTokens)?;
+    const DETAILS_INCONSISTENT: &str = "managed usage details are inconsistent or unsupported";
+    if cache_read_input_tokens > input_tokens {
+        return Err(ManagedUsageValidationFailure::new(
+            DETAILS_INCONSISTENT,
+            Kind::ConflictingSubset,
+            Some(Field::CachedTokens),
+        )
+        .with_numbers(cache_read_input_tokens, input_tokens));
     }
-    let cost_in_usd_ticks = object
-        .get("cost_in_usd_ticks")
-        .map(|value| {
-            value
-                .as_i64()
-                .filter(|ticks| *ticks > 0)
-                .ok_or("managed usage cost is unsupported")
-        })
-        .transpose()?;
+    if reasoning_tokens > output_tokens {
+        return Err(ManagedUsageValidationFailure::new(
+            DETAILS_INCONSISTENT,
+            Kind::ConflictingSubset,
+            Some(Field::ReasoningTokens),
+        )
+        .with_numbers(reasoning_tokens, output_tokens));
+    }
+    if let Some(value) = prompt.and_then(|p| p.get("text_tokens")) {
+        let text_tokens = value.as_u64().ok_or_else(|| {
+            ManagedUsageValidationFailure::new(
+                DETAILS_INCONSISTENT,
+                Kind::MalformedField,
+                Some(Field::TextTokens),
+            )
+            .with_value_state(Some(value))
+        })?;
+        if text_tokens != input_tokens {
+            return Err(ManagedUsageValidationFailure::new(
+                DETAILS_INCONSISTENT,
+                Kind::ConflictingSubset,
+                Some(Field::TextTokens),
+            )
+            .with_numbers(text_tokens, input_tokens));
+        }
+    }
+    for (details, key, field) in [
+        (prompt, "audio_tokens", Field::AudioTokens),
+        (prompt, "image_tokens", Field::ImageTokens),
+        (completion, "audio_tokens", Field::AudioTokens),
+        (
+            completion,
+            "accepted_prediction_tokens",
+            Field::AcceptedPredictionTokens,
+        ),
+        (
+            completion,
+            "rejected_prediction_tokens",
+            Field::RejectedPredictionTokens,
+        ),
+    ] {
+        let observed = optional(details, key, field)?;
+        if observed != 0 {
+            return Err(ManagedUsageValidationFailure::new(
+                DETAILS_INCONSISTENT,
+                Kind::UnsupportedNonzeroDetail,
+                Some(field),
+            )
+            .with_numbers(observed, 0));
+        }
+    }
+    let cost_in_usd_ticks = match object.get("cost_in_usd_ticks") {
+        None => None,
+        Some(Value::Null) => {
+            return Err(ManagedUsageValidationFailure::new(
+                "managed usage cost is unsupported",
+                Kind::CostNull,
+                Some(Field::CostInUsdTicks),
+            )
+            .with_value_state(Some(&Value::Null)));
+        }
+        Some(value) => match value.as_i64() {
+            Some(ticks) if ticks > 0 => Some(ticks),
+            Some(0) => {
+                return Err(ManagedUsageValidationFailure::new(
+                    "managed usage cost is unsupported",
+                    Kind::CostZero,
+                    Some(Field::CostInUsdTicks),
+                )
+                .with_value_state(Some(value))
+                .with_numbers(0, 1));
+            }
+            Some(_) => {
+                return Err(ManagedUsageValidationFailure::new(
+                    "managed usage cost is unsupported",
+                    Kind::CostNegative,
+                    Some(Field::CostInUsdTicks),
+                )
+                .with_value_state(Some(value)));
+            }
+            None if value.as_u64().is_some() => {
+                return Err(ManagedUsageValidationFailure::new(
+                    "managed usage cost is unsupported",
+                    Kind::CostOutOfRange,
+                    Some(Field::CostInUsdTicks),
+                )
+                .with_value_state(Some(value)));
+            }
+            None => {
+                return Err(ManagedUsageValidationFailure::new(
+                    "managed usage cost is unsupported",
+                    Kind::CostTypeUnsupported,
+                    Some(Field::CostInUsdTicks),
+                )
+                .with_value_state(Some(value)));
+            }
+        },
+    };
     Ok(ManagedUsage {
         input_tokens,
         output_tokens,
@@ -1294,10 +1693,10 @@ fn validate_completion(
     bytes: &[u8],
     child_secret: &str,
     upstream_secret: &str,
-) -> Result<CompletionSummary, &'static str> {
+) -> Result<CompletionSummary, CompletionValidationFailure> {
     let text = std::str::from_utf8(bytes).map_err(|_| "managed response is not UTF-8")?;
     if text.contains(child_secret) || text.contains(upstream_secret) {
-        return Err("managed response contains credential material");
+        return Err("managed response contains credential material".into());
     }
     let mut finished = false;
     let mut done = false;
@@ -1308,7 +1707,7 @@ fn validate_completion(
             continue;
         };
         if done {
-            return Err("managed stream contains data after its end marker");
+            return Err("managed stream contains data after its end marker".into());
         }
         if data == "[DONE]" {
             done = true;
@@ -1316,11 +1715,15 @@ fn validate_completion(
         }
         let value: Value = serde_json::from_str(data).map_err(|_| "managed stream is malformed")?;
         if value.get("error").is_some() {
-            return Err("managed stream contains a provider error");
+            return Err("managed stream contains a provider error".into());
         }
         if let Some(u) = value.get("usage").filter(|u| !u.is_null()) {
             if usage.is_some() {
-                return Err("managed stream repeated its usage receipt");
+                return Err(CompletionValidationFailure::usage(
+                    "managed stream repeated its usage receipt",
+                    ManagedProviderDiagnosticKind::UsageInconsistent,
+                    ManagedUsageRejectionKind::RepeatedReceipt,
+                ));
             }
             usage = Some(parse_managed_usage(u)?);
         }
@@ -1328,15 +1731,15 @@ fn validate_completion(
             .as_array()
             .ok_or("managed choices are malformed")?;
         if choices.len() > 1 {
-            return Err("managed stream returned multiple choices");
+            return Err("managed stream returned multiple choices".into());
         }
         for choice in choices {
             if finished || choice["index"].as_u64() != Some(0) {
-                return Err("managed stream continued after its finish reason");
+                return Err("managed stream continued after its finish reason".into());
             }
             if let Some(reason) = choice["finish_reason"].as_str() {
                 if !matches!(reason, "stop" | "tool_calls") {
-                    return Err("managed response did not complete within its bounds");
+                    return Err("managed response did not complete within its bounds".into());
                 }
                 finished = true;
             }
@@ -1359,15 +1762,21 @@ fn validate_completion(
                     || entry.1.len() > 16 * 1024
                     || tools.len() > MAX_TOOL_CALLS as usize
                 {
-                    return Err("managed tool arguments exceed their bounds");
+                    return Err("managed tool arguments exceed their bounds".into());
                 }
             }
         }
     }
     if !finished || !done {
-        return Err("managed stream did not prove a completed response");
+        return Err("managed stream did not prove a completed response".into());
     }
-    let usage = usage.ok_or("managed stream usage is missing")?;
+    let usage = usage.ok_or_else(|| {
+        CompletionValidationFailure::usage(
+            "managed stream usage is missing",
+            ManagedProviderDiagnosticKind::UsageMissing,
+            ManagedUsageRejectionKind::MissingReceipt,
+        )
+    })?;
     for (name, arguments) in tools.values() {
         if !matches!(
             name.as_str(),
@@ -1382,7 +1791,7 @@ fn validate_completion(
             .ok()
             .is_none_or(|value| !value.is_object())
         {
-            return Err("managed response requested an unsupported tool");
+            return Err("managed response requested an unsupported tool".into());
         }
     }
     Ok((tools.len() as u32, usage))
@@ -1831,7 +2240,7 @@ mod tests {
                 reasoning_tokens: 0,
                 cost_in_usd_ticks: None,
             })
-            .is_none());
+            .is_err());
         assert_eq!(
             ManagedProviderEvidence::default().accounted_total_tokens(),
             Some(0)
@@ -2820,6 +3229,212 @@ mod tests {
                 validate_completion(malformed.as_bytes(), "child-secret", "parent-secret").is_err()
             );
         }
+    }
+
+    #[test]
+    fn usage_rejection_subreasons_identify_only_allowlisted_fields() {
+        use ManagedUsageField as Field;
+        use ManagedUsageRejectionKind as Kind;
+
+        let base = json!({"prompt_tokens":100,"completion_tokens":10,"total_tokens":110});
+        let cases = [
+            (
+                json!({"completion_tokens":10,"total_tokens":110}),
+                Kind::MissingField,
+                Some(Field::PromptTokens),
+            ),
+            (
+                json!({"prompt_tokens":100,"completion_tokens":null,"total_tokens":110}),
+                Kind::MalformedField,
+                Some(Field::CompletionTokens),
+            ),
+            (
+                json!({"prompt_tokens":100,"completion_tokens":10,"total_tokens":110,"SECRET_RESPONSE_CANARY":1}),
+                Kind::UnsupportedField,
+                None,
+            ),
+            (
+                json!({"prompt_tokens":100,"completion_tokens":10,"total_tokens":110,"prompt_tokens_details":{"SECRET_RESPONSE_CANARY":1}}),
+                Kind::UnsupportedDetailsField,
+                Some(Field::PromptTokensDetails),
+            ),
+            (
+                json!({"prompt_tokens":100,"completion_tokens":10,"total_tokens":110,"prompt_tokens_details":null}),
+                Kind::MalformedDetails,
+                Some(Field::PromptTokensDetails),
+            ),
+            (
+                json!({"prompt_tokens":65537,"completion_tokens":10,"total_tokens":65547}),
+                Kind::TokenBoundExceeded,
+                Some(Field::PromptTokens),
+            ),
+            (
+                json!({"prompt_tokens":100,"completion_tokens":10,"total_tokens":111}),
+                Kind::ConflictingTotal,
+                Some(Field::TotalTokens),
+            ),
+            (
+                json!({"prompt_tokens":100,"completion_tokens":10,"total_tokens":110,"prompt_tokens_details":{"cached_tokens":101}}),
+                Kind::ConflictingSubset,
+                Some(Field::CachedTokens),
+            ),
+            (
+                json!({"prompt_tokens":100,"completion_tokens":10,"total_tokens":110,"completion_tokens_details":{"reasoning_tokens":11}}),
+                Kind::ConflictingSubset,
+                Some(Field::ReasoningTokens),
+            ),
+            (
+                json!({"prompt_tokens":100,"completion_tokens":10,"total_tokens":110,"num_sources_used":1}),
+                Kind::UnsupportedSourceCount,
+                Some(Field::NumSourcesUsed),
+            ),
+            (
+                json!({"prompt_tokens":100,"completion_tokens":10,"total_tokens":110,"completion_tokens_details":{"audio_tokens":1}}),
+                Kind::UnsupportedNonzeroDetail,
+                Some(Field::AudioTokens),
+            ),
+            (
+                json!({"prompt_tokens":100,"completion_tokens":10,"total_tokens":110,"cost_in_usd_ticks":null}),
+                Kind::CostNull,
+                Some(Field::CostInUsdTicks),
+            ),
+            (
+                json!({"prompt_tokens":100,"completion_tokens":10,"total_tokens":110,"cost_in_usd_ticks":0}),
+                Kind::CostZero,
+                Some(Field::CostInUsdTicks),
+            ),
+            (
+                json!({"prompt_tokens":100,"completion_tokens":10,"total_tokens":110,"cost_in_usd_ticks":-1}),
+                Kind::CostNegative,
+                Some(Field::CostInUsdTicks),
+            ),
+            (
+                json!({"prompt_tokens":100,"completion_tokens":10,"total_tokens":110,"cost_in_usd_ticks":"SECRET_RESPONSE_CANARY"}),
+                Kind::CostTypeUnsupported,
+                Some(Field::CostInUsdTicks),
+            ),
+            (
+                json!({"prompt_tokens":100,"completion_tokens":10,"total_tokens":110,"cost_in_usd_ticks":1.5}),
+                Kind::CostTypeUnsupported,
+                Some(Field::CostInUsdTicks),
+            ),
+            (
+                json!({"prompt_tokens":100,"completion_tokens":10,"total_tokens":110,"cost_in_usd_ticks":u64::MAX}),
+                Kind::CostOutOfRange,
+                Some(Field::CostInUsdTicks),
+            ),
+        ];
+        for (value, kind, field) in cases {
+            let failure = parse_managed_usage(&value).unwrap_err();
+            assert_eq!(
+                (failure.rejection.kind, failure.rejection.field),
+                (kind, field)
+            );
+            assert!(!serde_json::to_string(&failure.rejection)
+                .unwrap()
+                .contains("SECRET_RESPONSE_CANARY"));
+            if kind == Kind::TokenBoundExceeded {
+                assert_eq!(failure.rejection.observed, None);
+                assert_eq!(failure.rejection.expected, Some(65536));
+            }
+        }
+        assert_eq!(parse_managed_usage(&base).unwrap().cost_in_usd_ticks, None);
+        let mut priced = base;
+        priced["cost_in_usd_ticks"] = json!(777);
+        assert_eq!(
+            parse_managed_usage(&priced).unwrap().cost_in_usd_ticks,
+            Some(777)
+        );
+        priced["cost_in_usd_ticks"] = Value::Null;
+        assert_eq!(
+            parse_managed_usage(&priced)
+                .unwrap_err()
+                .rejection
+                .value_state,
+            Some(ManagedUsageValueState::Null)
+        );
+    }
+
+    #[test]
+    fn stream_receipt_and_aggregation_failures_have_typed_durable_subreasons() {
+        use ManagedUsageField as Field;
+        use ManagedUsageRejectionKind as Kind;
+
+        let good = stream("done");
+        let missing = good.replace("\"usage\":", "\"omitted_usage\":");
+        let failure = validate_completion(missing.as_bytes(), "child", "upstream").unwrap_err();
+        assert_eq!(failure.kind, ManagedProviderDiagnosticKind::UsageMissing);
+        assert_eq!(failure.usage_rejection.unwrap().kind, Kind::MissingReceipt);
+        let repeated = good.replace(
+            "data: [DONE]",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":10,\"total_tokens\":110}}\n\ndata: [DONE]",
+        );
+        let failure = validate_completion(repeated.as_bytes(), "child", "upstream").unwrap_err();
+        assert_eq!(
+            failure.kind,
+            ManagedProviderDiagnosticKind::UsageInconsistent
+        );
+        assert_eq!(failure.usage_rejection.unwrap().kind, Kind::RepeatedReceipt);
+
+        let usage = parse_managed_usage(
+            &json!({"prompt_tokens":100,"completion_tokens":10,"total_tokens":110}),
+        )
+        .unwrap();
+        let prior_unknown = ManagedProviderEvidence {
+            usage_observed: true,
+            total_tokens: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            prior_unknown
+                .checked_accounting_after(usage)
+                .unwrap_err()
+                .kind,
+            Kind::AggregationPriorUnknown
+        );
+        let prior_priced = ManagedProviderEvidence {
+            usage_observed: true,
+            total_tokens: Some(110),
+            cost_in_usd_ticks: Some(777),
+            ..Default::default()
+        };
+        assert_eq!(
+            prior_priced
+                .checked_accounting_after(usage)
+                .unwrap_err()
+                .kind,
+            Kind::AggregationMixedCostPresence
+        );
+        let prior_overflow = ManagedProviderEvidence {
+            usage_observed: true,
+            total_tokens: Some(u64::MAX),
+            ..Default::default()
+        };
+        let rejection = prior_overflow.checked_accounting_after(usage).unwrap_err();
+        assert_eq!(
+            (rejection.kind, rejection.field),
+            (Kind::AggregationOverflow, Some(Field::TotalTokens))
+        );
+
+        let mut diagnostic = ManagedProviderDiagnostic {
+            kind: ManagedProviderDiagnosticKind::UsageInconsistent,
+            admission: 1,
+            http_status: None,
+            provider_request_id: None,
+            provider_error_type: None,
+            provider_error_code: None,
+            admission_denial: None,
+            request_bytes: None,
+            usage_rejection: Some(rejection),
+        };
+        let roundtrip: ManagedProviderDiagnostic =
+            serde_json::from_value(serde_json::to_value(&diagnostic).unwrap()).unwrap();
+        assert_eq!(roundtrip, diagnostic);
+        diagnostic.usage_rejection = None;
+        let legacy = serde_json::to_value(&diagnostic).unwrap();
+        assert!(legacy.get("usageRejection").is_none());
+        let restored: ManagedProviderDiagnostic = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.usage_rejection, None);
     }
 
     /// Runs the installed binary and the actual adapter/confinement against
