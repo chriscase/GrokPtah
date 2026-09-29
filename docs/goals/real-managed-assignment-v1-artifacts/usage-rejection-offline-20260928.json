@@ -1,0 +1,85 @@
+{
+  "schemaVersion": 1,
+  "qualification": "OFFLINE ONLY",
+  "historicalObservation": {
+    "workId": "b3b46d7c-0435-4781-a1f3-b7674a644526",
+    "runId": "7dd1deb7-6619-42ab-bd51-25cf96886e93",
+    "attemptId": "3f7799a9-6b46-468b-b0da-5e9c7da686e0",
+    "wireAdmissions": 1,
+    "httpStatus": 200,
+    "broadDiagnostic": "usage_inconsistent",
+    "completedUsageReceipts": 0,
+    "canonicalOutcome": "uncertain / ProtocolAfterPossibleEffect",
+    "exactLocal502ReasonRetained": false,
+    "rejectedResponseShapeRetained": false,
+    "preciseFailingCondition": "UNKNOWN",
+    "accounting": "UNKNOWN",
+    "recordsInspected": "22 exact-root retained reports, transcript, orchestration and canonical authority records; zero static managed-usage/stream/response reason matches; host transcript zero rows",
+    "laterGenericStopReason": "max_total_tokens_usage_unavailable"
+  },
+  "decision": {
+    "historicalCause": "INDETERMINATE",
+    "failingBoundary": "after HTTP 200, before accepted usage settlement; validation or aggregation cannot be distinguished from retained records",
+    "acceptanceChanged": false,
+    "historicalSubreasonBackfilled": false,
+    "compatibilityRepair": false
+  },
+  "implementation": {
+    "functionalSha": "88a1b893715aec370e3ec6f542a18729fffe6592",
+    "functionalTree": "500ddfb47ed859209a872c6959bded7c9cfcd44f",
+    "scope": [
+      "typed usage rejection at stream, parser and aggregation boundaries",
+      "existing providerEvidence diagnostics persistence",
+      "synthetic local-fixture tests"
+    ],
+    "publicSummary": "allowlisted kind and field, value presence/type, bounded numeric observations only; no provider prose or unknown key is retained",
+    "legacyDiagnosticWithoutSubreason": "UNKNOWN",
+    "rejectedNumbersCountAsSettledUsage": false
+  },
+  "syntheticContractChecks": {
+    "historicalReproduction": false,
+    "unitCases": [
+      "missing/malformed/unsupported fields and details",
+      "token bounds and conflicting totals/subsets",
+      "unsupported source/detail usage",
+      "absent, positive, null, zero, negative, noninteger and out-of-range cost",
+      "missing and repeated receipts",
+      "unknown prior total, mixed cost and aggregation overflow",
+      "bounded observations and arbitrary-key/prose canary",
+      "legacy diagnostic serialization"
+    ],
+    "installedCliVersion": "1.0.41",
+    "installedCliSha256": "9c844eb13365180787d9ad22b2b3748a024be8e1ed845253cc114781b31c591d",
+    "installedCliLocalJourneys": {
+      "passed": 8,
+      "failed": 0,
+      "reopenEvidencePreserved": true,
+      "providerTraffic": 0
+    }
+  },
+  "validation": {
+    "initialWorkspaceRootAttempt": "misdirected workspace-root test build: sandbox protoc /dev/stdout denied; native retry linked an unrelated workspace test binary and failed ENOSPC; generated root target cleaned before package-scoped tests",
+    "focusedManagedProvider": "35 passed; 9 installed-CLI tests ignored by default",
+    "fullBridgeParallel": "723 passed; 13 failed from test-environment interference; 9 ignored",
+    "fullBridgeSerialDefaultHome": "733 passed; 3 unrelated provider-qualification failures from stale default-home authority state; 9 ignored",
+    "fullBridgeSerialDisposableHome": "736 passed; 0 failed; 9 ignored",
+    "strictAllTargetClippy": "passed",
+    "formatAndDiffCheck": "passed"
+  },
+  "hostedDesktopExactFunctional": {
+    "runId": 36518345360,
+    "attempt": 1,
+    "event": "pull_request",
+    "headSha": "88a1b893715aec370e3ec6f542a18729fffe6592",
+    "status": "completed",
+    "conclusion": "success",
+    "failedSteps": 0
+  },
+  "preservation": {
+    "historicalWorkRunAttemptModified": false,
+    "historicalUsageAndCost": "UNKNOWN",
+    "historicalCandidate": "missing",
+    "additionalLiveProviderRequests": 0,
+    "approvalApplicationOrDiscard": false
+  }
+}
