@@ -4255,4 +4255,269 @@ printf 'candidate' > source
             "private-local-capability"
         ));
     }
+
+    /// Test-only local upstream bypasses the rejecting production validator so
+    /// the exact installed child can reveal its own projection of each form.
+    /// The production managed config and OS sandbox are used unchanged.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "requires installed Grok 1.0.41 and native loopback-only sandbox"]
+    async fn installed_cli_projects_synthetic_usage_with_managed_custom_model_offline() {
+        use axum::{
+            routing::{get, post},
+            Json, Router,
+        };
+        use serde_json::{json, Value};
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let cli = PathBuf::from(std::env::var("GROKPTAH_REAL_GROK_CLI").unwrap());
+        assert_eq!(
+            crate::file_digest(&cli),
+            Some("sha256:9c844eb13365180787d9ad22b2b3748a024be8e1ed845253cc114781b31c591d".into())
+        );
+        let cases = [
+            (
+                "ordinary_missing_cost",
+                json!({"prompt_tokens":100,"completion_tokens":10,"total_tokens":110}),
+            ),
+            (
+                "reasoning_subset_cache",
+                json!({"prompt_tokens":100,"completion_tokens":10,"total_tokens":110,"prompt_tokens_details":{"text_tokens":100,"audio_tokens":0,"image_tokens":0,"cached_tokens":20},"completion_tokens_details":{"reasoning_tokens":3,"audio_tokens":0,"accepted_prediction_tokens":0,"rejected_prediction_tokens":0},"cost_in_usd_ticks":777}),
+            ),
+            (
+                "additive_reasoning",
+                json!({"prompt_tokens":100,"completion_tokens":10,"total_tokens":115,"prompt_tokens_details":{"cached_tokens":20},"completion_tokens_details":{"reasoning_tokens":5},"cost_in_usd_ticks":777}),
+            ),
+            (
+                "reported_zero_cost",
+                json!({"prompt_tokens":100,"completion_tokens":10,"total_tokens":110,"cost_in_usd_ticks":0}),
+            ),
+        ];
+        let mut reports = Vec::new();
+        for (name, provider_usage) in cases {
+            let root = tempfile::tempdir().unwrap();
+            let workspace = root.path().join("workspace");
+            let workers = root.path().join("workers");
+            fs::create_dir(&workspace).unwrap();
+            fs::create_dir(&workers).unwrap();
+            fs::write(workspace.join("README.md"), "synthetic local fixture\n").unwrap();
+            let git = std::process::Command::new("/usr/bin/git")
+                .args(["init", "--quiet"])
+                .current_dir(&workspace)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .status()
+                .unwrap();
+            assert!(git.success());
+            let calls = std::sync::Arc::new(AtomicU32::new(0));
+            let seen = calls.clone();
+            let request_shapes = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+            let shapes = request_shapes.clone();
+            let usage_for_response = provider_usage.clone();
+            let router = Router::new()
+                .route("/v1/models", get(|| async { Json(json!({"object":"list","data":[{"id":"grok-build-0.1","object":"model","created":0,"owned_by":"xai"}]})) }))
+                .route("/v1/chat/completions", post(move |Json(body): Json<Value>| {
+                    let seen = seen.clone();
+                    let shapes = shapes.clone();
+                    let usage = usage_for_response.clone();
+                    async move {
+                        seen.fetch_add(1, Ordering::SeqCst);
+                        let model = match body["model"].as_str() {
+                            Some("grok-build-0.1") => "grok-build-0.1",
+                            Some("grok-4.6") => "grok-4.6",
+                            _ => "other",
+                        };
+                        shapes.lock().unwrap().push(json!({
+                            "model":model,"stream":body["stream"],
+                            "maxTokens":body["max_tokens"],
+                            "messageCount":body["messages"].as_array().map(Vec::len),
+                            "toolCount":body["tools"].as_array().map(Vec::len),
+                        }));
+                        let chunk = json!({"id":"offline-projection","object":"chat.completion.chunk","created":0,"model":"grok-build-0.1","choices":[{"index":0,"delta":{"role":"assistant","content":"OFFLINE_PROJECTION_ONLY"},"finish_reason":"stop"}]});
+                        let receipt = json!({"id":"offline-projection","object":"chat.completion.chunk","created":0,"model":"grok-build-0.1","choices":[],"usage":usage});
+                        ([("content-type", "text/event-stream")], format!("data: {chunk}\n\ndata: {receipt}\n\ndata: [DONE]\n\n"))
+                    }
+                }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            let policy = crate::managed_provider::ManagedChildPolicy {
+                endpoint: format!("http://127.0.0.1:{port}/v1"),
+                port,
+                model: "grok-build-0.1".into(),
+                max_duration_ms: 60_000,
+                max_turns: 1,
+                max_output_tokens: 1024,
+            };
+            let isolated = IsolatedHome::create(&workers).unwrap();
+            isolated.write_minimal_config().unwrap();
+            isolated.configure_managed_provider(&policy).unwrap();
+            isolated
+                .install_prompt("Return only OFFLINE_PROJECTION_ONLY.")
+                .unwrap();
+            fs::write(isolated.path.join(AUTH_FILE_NAME), b"{}").unwrap();
+            let session_id = Uuid::new_v4().to_string();
+            let host = GrokBuildHostLaunchConfig {
+                executable: cli.clone(),
+                git_executable: "/usr/bin/git".into(),
+                cwd: workspace,
+                repository_id: "offline-projection".into(),
+                base_ref: "HEAD".into(),
+                prompt: "offline".into(),
+                allowed_files: vec!["README.md".into()],
+                execution_approved: true,
+                max_stdout_bytes: OUTPUT_BYTES_MAX,
+                max_stderr_bytes: OUTPUT_BYTES_MAX,
+                git_timeout: Duration::from_secs(3),
+                isolate_parent: workers,
+                defer_source_apply: false,
+                candidate_retention_dir: None,
+            };
+            let args = allowlisted_args(
+                &isolated.prompt_path(),
+                GrokBuildMutationMode::IsolatedReview,
+                1,
+                &session_id,
+            )
+            .unwrap();
+            let mut cmd = managed_sandbox_command(&host, &args, &policy, &isolated.path).unwrap();
+            cmd.env_clear()
+                .envs(allowlisted_env(&isolated.path).unwrap())
+                .env("GROKPTAH_MANAGED_CAPABILITY", "synthetic-local-capability")
+                .current_dir(&host.cwd)
+                .kill_on_drop(true);
+            let output = tokio::time::timeout(Duration::from_secs(60), cmd.output())
+                .await
+                .unwrap()
+                .unwrap();
+            server.abort();
+            let stdout: Option<Value> = serde_json::from_slice(&output.stdout).ok();
+            let usage_files: Vec<_> = fs::read_dir(isolated.path.join("sessions"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|workspace| workspace.path().join(&session_id).join("usage.json"))
+                .filter(|path| path.is_file())
+                .collect();
+            let journal: Option<Value> = usage_files
+                .first()
+                .and_then(|path| fs::read(path).ok())
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+            let keys = [
+                "input_tokens",
+                "output_tokens",
+                "total_tokens",
+                "cache_creation_input_tokens",
+                "cache_read_input_tokens",
+                "reasoning_tokens",
+            ];
+            let numeric = |value: &Value, keys: &[&str]| -> Value {
+                Value::Object(
+                    keys.iter()
+                        .filter_map(|key| {
+                            let item = value.get(*key)?;
+                            (item.is_number() || item.is_null())
+                                .then(|| ((*key).into(), item.clone()))
+                        })
+                        .collect(),
+                )
+            };
+            let cli_usage = stdout.as_ref().map(|s| numeric(&s["usage"], &keys));
+            let model_usage = stdout.as_ref().map(|s| {
+                numeric(
+                    &s["modelUsage"]["grok-build-0.1"],
+                    &[
+                        "inputTokens",
+                        "outputTokens",
+                        "modelCalls",
+                        "cacheCreationInputTokens",
+                        "cacheReadInputTokens",
+                        "costUSD",
+                    ],
+                )
+            });
+            let journal_session = journal.as_ref().map(|j| {
+                numeric(
+                    &j["session"],
+                    &[
+                        "inputTokens",
+                        "outputTokens",
+                        "cachedReadTokens",
+                        "cacheCreationTokens",
+                        "reasoningTokens",
+                        "totalTokens",
+                        "modelCalls",
+                        "turnCount",
+                    ],
+                )
+            });
+            let journal_turn = journal
+                .as_ref()
+                .and_then(|j| j["turns"].as_array())
+                .and_then(|turns| turns.first())
+                .map(|turn| {
+                    numeric(
+                        turn,
+                        &[
+                            "inputTokens",
+                            "outputTokens",
+                            "cachedReadTokens",
+                            "cacheCreationTokens",
+                            "reasoningTokens",
+                            "totalTokens",
+                            "modelCalls",
+                            "turnCount",
+                        ],
+                    )
+                });
+            reports.push(json!({
+                "fixture":name,"providerUsage":provider_usage,
+                "exitCode":output.status.code(),"localChatRequests":calls.load(Ordering::SeqCst),
+                "safeRequestShapes":*request_shapes.lock().unwrap(),
+                "stdoutJson":stdout.is_some(),"cliUsage":cli_usage,"cliModelUsage":model_usage,
+                "cliTotalCostUsd":stdout.as_ref().and_then(|s| s.get("total_cost_usd")).filter(|v| v.is_number()),
+                "cliTotalCostUsdTicks":stdout.as_ref().and_then(|s| s.get("total_cost_usd_ticks")).filter(|v| v.is_number()),
+                "journalSession":journal_session,"journalTurn":journal_turn,
+            }));
+        }
+        if let Ok(path) = std::env::var("GROKPTAH_CLI_PROJECTION_REPORT") {
+            let value = json!({"schemaVersion":1,"qualification":"OFFLINE PINNED CLI; synthetic local upstream", "cliSha256":"9c844eb13365180787d9ad22b2b3748a024be8e1ed845253cc114781b31c591d", "cases":reports});
+            fs::write(path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        }
+        assert!(reports.iter().all(|r| r["safeRequestShapes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|shape| shape["model"] == "grok-build-0.1")
+            .count()
+            == 1));
+        assert!(reports.iter().all(|r| r["exitCode"] == 0
+            && r["safeRequestShapes"].as_array().unwrap().len() == 2
+            && r["safeRequestShapes"][0]["model"] == "grok-4.6"
+            && r["journalSession"]["modelCalls"] == 1
+            && r["journalTurn"]["modelCalls"] == 1));
+        let ordinary = &reports[0];
+        assert_eq!(ordinary["cliUsage"]["input_tokens"], 100);
+        assert_eq!(ordinary["cliUsage"]["total_tokens"], 110);
+        assert!(ordinary["cliTotalCostUsdTicks"].is_null());
+        let subset = &reports[1];
+        assert_eq!(subset["cliUsage"]["input_tokens"], 80);
+        assert_eq!(subset["cliUsage"]["cache_read_input_tokens"], 20);
+        assert_eq!(subset["cliUsage"]["reasoning_tokens"], 3);
+        assert_eq!(subset["cliUsage"]["total_tokens"], 110);
+        assert_eq!(subset["journalSession"]["inputTokens"], 100);
+        assert_eq!(subset["journalSession"]["totalTokens"], 110);
+        assert_eq!(subset["cliTotalCostUsdTicks"], 777);
+        let additive = &reports[2];
+        assert_eq!(additive["providerUsage"]["total_tokens"], 115);
+        assert_eq!(additive["cliUsage"]["total_tokens"], 110);
+        assert_eq!(additive["journalSession"]["totalTokens"], 110);
+        assert_eq!(additive["cliUsage"]["reasoning_tokens"], 5);
+        assert_eq!(additive["cliTotalCostUsdTicks"], 777);
+        let zero_cost = &reports[3];
+        assert_eq!(zero_cost["providerUsage"]["cost_in_usd_ticks"], 0);
+        assert!(zero_cost["cliTotalCostUsdTicks"].is_null());
+        assert!(zero_cost["cliTotalCostUsd"].is_null());
+        assert!(zero_cost["cliModelUsage"].get("costUSD").is_none());
+    }
 }

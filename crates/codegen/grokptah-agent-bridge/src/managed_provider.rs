@@ -32,6 +32,14 @@ const MAX_OUTPUT_TOKENS: u32 = 1024;
 const MAX_TOOL_CALLS: u32 = 12;
 pub(crate) const MAX_TOTAL_TOKENS: u64 = 16_000;
 const LEASE_LIFETIME_MS: u64 = 180_000;
+// Diagnostic retention limits only. They do not change usage acceptance or
+// the lease budget. Cost ticks need their own bound, not the token bound.
+const MAX_OBSERVED_TOKEN_VALUE: u64 = 65_536;
+const MAX_OBSERVED_COST_TICKS: u64 = 1_000_000_000_000;
+const MAX_OBSERVED_DECIMAL_CHARS: usize = 32;
+const MAX_USAGE_OBSERVATIONS: usize = 2;
+const MAX_USAGE_SNAPSHOT_BYTES: usize = 3072;
+const MAX_UNKNOWN_KEY_COUNT: usize = 4;
 
 /// Host-minted confinement facts. No request can supply or change these.
 #[derive(Clone, Debug)]
@@ -200,6 +208,319 @@ impl ManagedUsageRejection {
     }
 }
 
+/// These are the only provider usage paths eligible for diagnostic retention.
+/// The two audio paths deliberately have distinct identities.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ManagedObservedUsagePath {
+    #[serde(rename = "prompt_tokens")]
+    PromptTokens,
+    #[serde(rename = "completion_tokens")]
+    CompletionTokens,
+    #[serde(rename = "total_tokens")]
+    TotalTokens,
+    #[serde(rename = "prompt_tokens_details.text_tokens")]
+    PromptTextTokens,
+    #[serde(rename = "prompt_tokens_details.audio_tokens")]
+    PromptAudioTokens,
+    #[serde(rename = "prompt_tokens_details.image_tokens")]
+    PromptImageTokens,
+    #[serde(rename = "prompt_tokens_details.cached_tokens")]
+    PromptCachedTokens,
+    #[serde(rename = "completion_tokens_details.reasoning_tokens")]
+    CompletionReasoningTokens,
+    #[serde(rename = "completion_tokens_details.audio_tokens")]
+    CompletionAudioTokens,
+    #[serde(rename = "completion_tokens_details.accepted_prediction_tokens")]
+    CompletionAcceptedPredictionTokens,
+    #[serde(rename = "completion_tokens_details.rejected_prediction_tokens")]
+    CompletionRejectedPredictionTokens,
+    #[serde(rename = "num_sources_used")]
+    NumSourcesUsed,
+    #[serde(rename = "cost_in_usd_ticks")]
+    CostInUsdTicks,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedObservedValueState {
+    Missing,
+    Null,
+    Zero,
+    Positive,
+    Negative,
+    NonIntegral,
+    WrongType,
+    ParentUnavailable,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedObservedUsageField {
+    pub path: ManagedObservedUsagePath,
+    pub state: ManagedObservedValueState,
+    /// Exact signed integer when within this path's independent retention bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<i64>,
+    /// Canonical JSON number for a bounded non-integral value only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub non_integral_value: Option<serde_json::Number>,
+    /// The state/sign remains available when an integer exceeds that bound.
+    #[serde(default)]
+    pub value_omitted: bool,
+    /// Potentially credential-bearing string/array/object content is never copied.
+    #[serde(default)]
+    pub content_suppressed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedUnknownUsageKeys {
+    pub count_up_to_four: u8,
+    pub more: bool,
+    pub content_suppressed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedObservedContainerState {
+    Missing,
+    Null,
+    Object,
+    WrongType,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedObservedContainer {
+    pub state: ManagedObservedContainerState,
+    /// No malformed parent content is retained, even when it is a string.
+    pub content_suppressed: bool,
+}
+
+fn observed_container(value: Option<&Value>) -> ManagedObservedContainer {
+    let state = match value {
+        None => ManagedObservedContainerState::Missing,
+        Some(Value::Null) => ManagedObservedContainerState::Null,
+        Some(Value::Object(_)) => ManagedObservedContainerState::Object,
+        Some(_) => ManagedObservedContainerState::WrongType,
+    };
+    ManagedObservedContainer {
+        state,
+        content_suppressed: state == ManagedObservedContainerState::WrongType,
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedUsageSnapshot {
+    pub receipt_ordinal: u8,
+    pub receipt_state: ManagedObservedContainer,
+    pub prompt_details_state: ManagedObservedContainer,
+    pub completion_details_state: ManagedObservedContainer,
+    /// Exactly 13 allowlisted paths; the array bounds serialized field count.
+    pub fields: [ManagedObservedUsageField; 13],
+    pub unknown_top_level_keys: Option<ManagedUnknownUsageKeys>,
+    pub unknown_prompt_details_keys: Option<ManagedUnknownUsageKeys>,
+    pub unknown_completion_details_keys: Option<ManagedUnknownUsageKeys>,
+}
+
+/// `None` on the containing evidence means a historical receipt with no
+/// observation facility. An empty new observation is not a zero-token receipt.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedUsageObservationEvidence {
+    pub snapshots: Vec<ManagedUsageSnapshot>,
+    pub observations_omitted: bool,
+    pub credential_suppressed: bool,
+}
+
+impl ManagedUsageObservationEvidence {
+    fn retain(&mut self, snapshots: impl IntoIterator<Item = ManagedUsageSnapshot>) {
+        for snapshot in snapshots {
+            let within_byte_bound = serde_json::to_vec(&snapshot)
+                .is_ok_and(|encoded| encoded.len() <= MAX_USAGE_SNAPSHOT_BYTES);
+            if self.snapshots.len() < MAX_USAGE_OBSERVATIONS && within_byte_bound {
+                self.snapshots.push(snapshot);
+            } else {
+                self.observations_omitted = true;
+            }
+        }
+    }
+}
+
+fn observed_unknown_keys(
+    object: &serde_json::Map<String, Value>,
+    allowed: &[&str],
+) -> ManagedUnknownUsageKeys {
+    // At most the known keys plus five unknown keys are inspected. The
+    // response byte ceiling independently bounds the parsed JSON object.
+    let count = object
+        .keys()
+        .filter(|key| !allowed.contains(&key.as_str()))
+        .take(MAX_UNKNOWN_KEY_COUNT + 1)
+        .count();
+    ManagedUnknownUsageKeys {
+        count_up_to_four: count.min(MAX_UNKNOWN_KEY_COUNT) as u8,
+        more: count > MAX_UNKNOWN_KEY_COUNT,
+        content_suppressed: count != 0,
+    }
+}
+
+fn observed_usage_field(
+    path: ManagedObservedUsagePath,
+    value: Option<&Value>,
+    parent_available: bool,
+) -> ManagedObservedUsageField {
+    use ManagedObservedUsagePath as Path;
+    use ManagedObservedValueState as State;
+    let mut field = ManagedObservedUsageField {
+        path,
+        state: State::Missing,
+        value: None,
+        non_integral_value: None,
+        value_omitted: false,
+        content_suppressed: false,
+    };
+    if !parent_available {
+        field.state = State::ParentUnavailable;
+        return field;
+    }
+    let bound = if path == Path::CostInUsdTicks {
+        MAX_OBSERVED_COST_TICKS
+    } else {
+        MAX_OBSERVED_TOKEN_VALUE
+    };
+    match value {
+        None => {}
+        Some(Value::Null) => field.state = State::Null,
+        Some(Value::Number(number)) => {
+            if let Some(integer) = number.as_u64() {
+                field.state = if integer == 0 {
+                    State::Zero
+                } else {
+                    State::Positive
+                };
+                if integer <= bound {
+                    field.value = Some(integer as i64);
+                } else {
+                    field.value_omitted = true;
+                }
+            } else if let Some(integer) = number.as_i64() {
+                field.state = State::Negative;
+                if integer.unsigned_abs() <= bound {
+                    field.value = Some(integer);
+                } else {
+                    field.value_omitted = true;
+                }
+            } else {
+                field.state = State::NonIntegral;
+                if number
+                    .as_f64()
+                    .is_some_and(|value| value.is_finite() && value.abs() <= bound as f64)
+                    && number.to_string().len() <= MAX_OBSERVED_DECIMAL_CHARS
+                {
+                    field.non_integral_value = Some(number.clone());
+                } else {
+                    field.value_omitted = true;
+                }
+            }
+        }
+        Some(Value::Bool(_)) => field.state = State::WrongType,
+        Some(Value::String(_) | Value::Array(_) | Value::Object(_)) => {
+            field.state = State::WrongType;
+            field.content_suppressed = true;
+        }
+    }
+    field
+}
+
+fn observe_managed_usage(value: &Value, receipt_ordinal: u8) -> ManagedUsageSnapshot {
+    use ManagedObservedUsagePath as Path;
+    const TOP_LEVEL: &[&str] = &[
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "prompt_tokens_details",
+        "completion_tokens_details",
+        "num_sources_used",
+        "cost_in_usd_ticks",
+    ];
+    const PROMPT_DETAILS: &[&str] = &[
+        "text_tokens",
+        "audio_tokens",
+        "image_tokens",
+        "cached_tokens",
+    ];
+    const COMPLETION_DETAILS: &[&str] = &[
+        "reasoning_tokens",
+        "audio_tokens",
+        "accepted_prediction_tokens",
+        "rejected_prediction_tokens",
+    ];
+    const FIELDS: [(Path, Option<&str>, &str); 13] = [
+        (Path::PromptTokens, None, "prompt_tokens"),
+        (Path::CompletionTokens, None, "completion_tokens"),
+        (Path::TotalTokens, None, "total_tokens"),
+        (Path::PromptTextTokens, Some("prompt"), "text_tokens"),
+        (Path::PromptAudioTokens, Some("prompt"), "audio_tokens"),
+        (Path::PromptImageTokens, Some("prompt"), "image_tokens"),
+        (Path::PromptCachedTokens, Some("prompt"), "cached_tokens"),
+        (
+            Path::CompletionReasoningTokens,
+            Some("completion"),
+            "reasoning_tokens",
+        ),
+        (
+            Path::CompletionAudioTokens,
+            Some("completion"),
+            "audio_tokens",
+        ),
+        (
+            Path::CompletionAcceptedPredictionTokens,
+            Some("completion"),
+            "accepted_prediction_tokens",
+        ),
+        (
+            Path::CompletionRejectedPredictionTokens,
+            Some("completion"),
+            "rejected_prediction_tokens",
+        ),
+        (Path::NumSourcesUsed, None, "num_sources_used"),
+        (Path::CostInUsdTicks, None, "cost_in_usd_ticks"),
+    ];
+    let top = value.as_object();
+    let prompt_parent = top.and_then(|object| object.get("prompt_tokens_details"));
+    let completion_parent = top.and_then(|object| object.get("completion_tokens_details"));
+    let prompt = prompt_parent.and_then(Value::as_object);
+    let completion = completion_parent.and_then(Value::as_object);
+    let fields = std::array::from_fn(|index| {
+        let (path, parent, key) = FIELDS[index];
+        let object = match parent {
+            None => top,
+            Some("prompt") => prompt,
+            Some("completion") => completion,
+            Some(_) => unreachable!("fixed allowlisted parent"),
+        };
+        observed_usage_field(
+            path,
+            object.and_then(|object| object.get(key)),
+            object.is_some(),
+        )
+    });
+    ManagedUsageSnapshot {
+        receipt_ordinal,
+        receipt_state: observed_container(Some(value)),
+        prompt_details_state: observed_container(prompt_parent),
+        completion_details_state: observed_container(completion_parent),
+        fields,
+        unknown_top_level_keys: top.map(|object| observed_unknown_keys(object, TOP_LEVEL)),
+        unknown_prompt_details_keys: prompt
+            .map(|object| observed_unknown_keys(object, PROMPT_DETAILS)),
+        unknown_completion_details_keys: completion
+            .map(|object| observed_unknown_keys(object, COMPLETION_DETAILS)),
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ManagedProviderDiagnostic {
@@ -260,6 +581,10 @@ pub struct ManagedProviderEvidence {
     pub interruption: Option<ManagedProviderDiagnosticKind>,
     #[serde(default)]
     pub diagnostics: Vec<ManagedProviderDiagnostic>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_observation: Option<ManagedUsageObservationEvidence>,
+    #[serde(default)]
+    pub diagnostics_truncated: bool,
 }
 
 struct Lease {
@@ -489,6 +814,7 @@ impl CredentialLeaseResolver for ManagedProviderRelay {
                     mechanism: "host_relay_v1".into(),
                     model: self.policy.model.clone(),
                     remote_effect_uncertain: Some(false),
+                    usage_observation: Some(ManagedUsageObservationEvidence::default()),
                     ..Default::default()
                 },
             },
@@ -989,14 +1315,11 @@ async fn forward_inner(
     let summary = match validate_completion(&output, &secret, &state.credentials.bearer) {
         Ok(summary) => summary,
         Err(failure) => {
-            if let Some(rejection) = failure.usage_rejection {
-                note_usage_rejection(state, id, failure.kind, rejection);
-            } else {
-                note_diagnostic(state, id, failure.kind);
-            }
-            let _ = response.settle_protocol_error(failure.message);
+            let message = failure.message;
+            note_completion_failure(state, id, failure);
+            let _ = response.settle_protocol_error(message);
             invalidate(state, id);
-            return Err(failure.message);
+            return Err(message);
         }
     };
     {
@@ -1017,6 +1340,9 @@ async fn forward_inner(
             invalidate(state, id);
             return Err("managed lease cancelled or exceeded tool budget");
         }
+        lease
+            .evidence
+            .retain_usage_observations([summary.2.clone()]);
         lease.evidence.tool_calls += summary.0;
         let next = match lease.evidence.checked_accounting_after(summary.1) {
             Ok(next) => next,
@@ -1243,8 +1569,18 @@ impl ManagedProviderEvidence {
         if self.diagnostics.len() < 32 {
             self.diagnostics.push(diagnostic);
         } else if let Some(last) = self.diagnostics.last_mut() {
+            self.diagnostics_truncated = true;
             *last = diagnostic;
         }
+    }
+
+    fn retain_usage_observations(
+        &mut self,
+        snapshots: impl IntoIterator<Item = ManagedUsageSnapshot>,
+    ) {
+        self.usage_observation
+            .get_or_insert_with(ManagedUsageObservationEvidence::default)
+            .retain(snapshots);
     }
 }
 fn note_diagnostic(state: &RelayState, id: &str, kind: ManagedProviderDiagnosticKind) {
@@ -1255,17 +1591,24 @@ fn note_diagnostic(state: &RelayState, id: &str, kind: ManagedProviderDiagnostic
     }
 }
 
-fn note_usage_rejection(
-    state: &RelayState,
-    id: &str,
-    kind: ManagedProviderDiagnosticKind,
-    rejection: ManagedUsageRejection,
-) {
+fn note_completion_failure(state: &RelayState, id: &str, failure: CompletionValidationFailure) {
     if let Ok(mut leases) = state.leases.lock() {
         if let Some(lease) = leases.get_mut(id) {
-            record_diagnostic(lease, kind);
-            if let Some(last) = lease.evidence.diagnostics.last_mut() {
-                last.usage_rejection = Some(rejection);
+            lease
+                .evidence
+                .retain_usage_observations(failure.usage_observations);
+            if failure.credential_suppressed {
+                lease
+                    .evidence
+                    .usage_observation
+                    .get_or_insert_with(ManagedUsageObservationEvidence::default)
+                    .credential_suppressed = true;
+            }
+            record_diagnostic(lease, failure.kind);
+            if let Some(rejection) = failure.usage_rejection {
+                if let Some(last) = lease.evidence.diagnostics.last_mut() {
+                    last.usage_rejection = Some(rejection);
+                }
             }
         }
     }
@@ -1375,11 +1718,13 @@ impl ManagedUsageValidationFailure {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct CompletionValidationFailure {
     message: &'static str,
     kind: ManagedProviderDiagnosticKind,
     usage_rejection: Option<ManagedUsageRejection>,
+    usage_observations: Vec<ManagedUsageSnapshot>,
+    credential_suppressed: bool,
 }
 
 impl CompletionValidationFailure {
@@ -1392,7 +1737,14 @@ impl CompletionValidationFailure {
             message,
             kind,
             usage_rejection: Some(ManagedUsageRejection::new(rejection, None)),
+            usage_observations: Vec::new(),
+            credential_suppressed: false,
         }
+    }
+
+    fn with_observations(mut self, observations: Vec<ManagedUsageSnapshot>) -> Self {
+        self.usage_observations = observations;
+        self
     }
 }
 
@@ -1402,6 +1754,8 @@ impl From<&'static str> for CompletionValidationFailure {
             message,
             kind: ManagedProviderDiagnosticKind::ProtocolFailure,
             usage_rejection: None,
+            usage_observations: Vec::new(),
+            credential_suppressed: false,
         }
     }
 }
@@ -1412,6 +1766,8 @@ impl From<ManagedUsageValidationFailure> for CompletionValidationFailure {
             message: failure.message,
             kind: ManagedProviderDiagnosticKind::UsageInconsistent,
             usage_rejection: Some(failure.rejection),
+            usage_observations: Vec::new(),
+            credential_suppressed: false,
         }
     }
 }
@@ -1688,7 +2044,7 @@ fn parse_managed_usage(value: &Value) -> Result<ManagedUsage, ManagedUsageValida
     })
 }
 
-type CompletionSummary = (u32, ManagedUsage);
+type CompletionSummary = (u32, ManagedUsage, ManagedUsageSnapshot);
 fn validate_completion(
     bytes: &[u8],
     child_secret: &str,
@@ -1696,12 +2052,15 @@ fn validate_completion(
 ) -> Result<CompletionSummary, CompletionValidationFailure> {
     let text = std::str::from_utf8(bytes).map_err(|_| "managed response is not UTF-8")?;
     if text.contains(child_secret) || text.contains(upstream_secret) {
-        return Err("managed response contains credential material".into());
+        let mut failure: CompletionValidationFailure =
+            "managed response contains credential material".into();
+        failure.credential_suppressed = true;
+        return Err(failure);
     }
     let mut finished = false;
     let mut done = false;
     let mut tools = BTreeMap::<u64, (String, String)>::new();
-    let mut usage = None;
+    let mut usage: Option<(ManagedUsage, ManagedUsageSnapshot)> = None;
     for line in text.lines() {
         let Some(data) = line.strip_prefix("data:").map(str::trim) else {
             continue;
@@ -1718,14 +2077,20 @@ fn validate_completion(
             return Err("managed stream contains a provider error".into());
         }
         if let Some(u) = value.get("usage").filter(|u| !u.is_null()) {
-            if usage.is_some() {
+            // Observe only fixed known fields before any semantic early return.
+            let snapshot = observe_managed_usage(u, if usage.is_some() { 2 } else { 1 });
+            if let Some((_, first)) = &usage {
                 return Err(CompletionValidationFailure::usage(
                     "managed stream repeated its usage receipt",
                     ManagedProviderDiagnosticKind::UsageInconsistent,
                     ManagedUsageRejectionKind::RepeatedReceipt,
-                ));
+                )
+                .with_observations(vec![first.clone(), snapshot]));
             }
-            usage = Some(parse_managed_usage(u)?);
+            let parsed = parse_managed_usage(u).map_err(|failure| {
+                CompletionValidationFailure::from(failure).with_observations(vec![snapshot.clone()])
+            })?;
+            usage = Some((parsed, snapshot));
         }
         let choices = value["choices"]
             .as_array()
@@ -1770,7 +2135,7 @@ fn validate_completion(
     if !finished || !done {
         return Err("managed stream did not prove a completed response".into());
     }
-    let usage = usage.ok_or_else(|| {
+    let (usage, snapshot) = usage.ok_or_else(|| {
         CompletionValidationFailure::usage(
             "managed stream usage is missing",
             ManagedProviderDiagnosticKind::UsageMissing,
@@ -1794,7 +2159,7 @@ fn validate_completion(
             return Err("managed response requested an unsupported tool".into());
         }
     }
-    Ok((tools.len() as u32, usage))
+    Ok((tools.len() as u32, usage, snapshot))
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -1964,13 +2329,20 @@ mod tests {
         usage: Value,
         limit: Option<u64>,
     ) -> (StatusCode, Value, u32, usize) {
+        accounting_fixture_body(accounting_stream(usage), limit).await
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    async fn accounting_fixture_body(
+        body: String,
+        limit: Option<u64>,
+    ) -> (StatusCode, Value, u32, usize) {
         let _serial = crate::home_override_serial();
         let root = tempfile::tempdir().unwrap();
         crate::set_grokptah_home_override(Some(root.path().join("host")));
         let _home = Home;
         let calls = Arc::new(AtomicU32::new(0));
         let observed = calls.clone();
-        let body = accounting_stream(usage);
         let router = Router::new().route(
             "/v1/chat/completions",
             post(move || {
@@ -2090,6 +2462,407 @@ mod tests {
         .await;
         assert_eq!((status, calls, pending), (StatusCode::BAD_GATEWAY, 1, 1));
         assert_eq!(evidence["accountingComplete"], false);
+    }
+
+    #[tokio::test]
+    async fn rejected_total_retains_known_sibling_observations_at_relay_boundary() {
+        let (status, evidence, calls, pending) = accounting_fixture(json!({
+            "prompt_tokens":3500,"completion_tokens":114,"total_tokens":3946,
+            "prompt_tokens_details":{"text_tokens":3500,"audio_tokens":0,"image_tokens":0,"cached_tokens":240},
+            "completion_tokens_details":{"reasoning_tokens":332,"audio_tokens":0,"accepted_prediction_tokens":0,"rejected_prediction_tokens":0},
+            "num_sources_used":0,"cost_in_usd_ticks":1665
+        })).await;
+        assert_eq!((status, calls, pending), (StatusCode::BAD_GATEWAY, 1, 1));
+        assert_eq!(evidence["responsesCompleted"], 0);
+        assert_eq!(evidence["accountingComplete"], false);
+        assert_eq!(evidence["costComplete"], false);
+        let fields = evidence["usageObservation"]["snapshots"][0]["fields"]
+            .as_array()
+            .expect("rejected receipt must retain an allowlisted snapshot");
+        let observed = |path: &str| fields.iter().find(|field| field["path"] == path).unwrap();
+        assert_eq!(observed("prompt_tokens")["value"], 3500);
+        assert_eq!(observed("completion_tokens")["value"], 114);
+        assert_eq!(observed("total_tokens")["value"], 3946);
+        assert_eq!(
+            observed("prompt_tokens_details.cached_tokens")["value"],
+            240
+        );
+        assert_eq!(
+            observed("completion_tokens_details.reasoning_tokens")["value"],
+            332
+        );
+        assert_eq!(observed("cost_in_usd_ticks")["value"], 1665);
+        assert_eq!(
+            evidence["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|d| d["kind"] == "usage_inconsistent")
+                .unwrap()["usageRejection"]["kind"],
+            "conflicting_total"
+        );
+    }
+
+    fn observed_field<'a>(evidence: &'a Value, path: &str) -> &'a Value {
+        evidence["usageObservation"]["snapshots"][0]["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|field| field["path"] == path)
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn accepted_receipts_retain_distinct_missing_zero_subset_and_cost_observations() {
+        let (status, ordinary, calls, pending) = accounting_fixture(json!({
+            "prompt_tokens":100,"completion_tokens":10,"total_tokens":110
+        }))
+        .await;
+        assert_eq!((status, calls, pending), (StatusCode::OK, 1, 0));
+        assert_eq!(
+            ordinary["usageObservation"]["snapshots"][0]["receiptState"]["state"],
+            "object"
+        );
+        assert_eq!(
+            ordinary["usageObservation"]["snapshots"][0]["promptDetailsState"]["state"],
+            "missing"
+        );
+        assert_eq!(
+            observed_field(&ordinary, "cost_in_usd_ticks")["state"],
+            "missing"
+        );
+        assert_eq!(
+            observed_field(&ordinary, "completion_tokens_details.reasoning_tokens")["state"],
+            "parent_unavailable"
+        );
+        assert_eq!(ordinary["costComplete"], false);
+
+        let (status, combined, calls, pending) = accounting_fixture(json!({
+            "prompt_tokens":100,"completion_tokens":10,"total_tokens":110,
+            "prompt_tokens_details":{"text_tokens":100,"audio_tokens":0,"image_tokens":0,"cached_tokens":20},
+            "completion_tokens_details":{"reasoning_tokens":3,"audio_tokens":0,"accepted_prediction_tokens":0,"rejected_prediction_tokens":0},
+            "num_sources_used":0,"cost_in_usd_ticks":777
+        })).await;
+        assert_eq!((status, calls, pending), (StatusCode::OK, 1, 0));
+        assert_eq!(combined["totalTokens"], 110);
+        assert_eq!(combined["cacheReadInputTokens"], 20);
+        assert_eq!(combined["reasoningTokens"], 3);
+        assert_eq!(combined["costInUsdTicks"], 777);
+        assert_eq!(
+            observed_field(&combined, "prompt_tokens_details.audio_tokens")["state"],
+            "zero"
+        );
+        assert_eq!(
+            observed_field(&combined, "completion_tokens_details.audio_tokens")["state"],
+            "zero"
+        );
+        assert_eq!(
+            observed_field(&combined, "completion_tokens_details.reasoning_tokens")["value"],
+            3
+        );
+        assert_eq!(observed_field(&combined, "cost_in_usd_ticks")["value"], 777);
+    }
+
+    #[tokio::test]
+    async fn total_mismatch_preserves_reasoning_missing_and_malformed_siblings() {
+        for (details, state, value) in [
+            (json!({"reasoning_tokens":5}), "positive", Some(5)),
+            (json!({}), "missing", None),
+        ] {
+            let (status, evidence, calls, pending) = accounting_fixture(json!({
+                "prompt_tokens":100,"completion_tokens":10,"total_tokens":116,
+                "completion_tokens_details":details,"cost_in_usd_ticks":2000
+            }))
+            .await;
+            assert_eq!((status, calls, pending), (StatusCode::BAD_GATEWAY, 1, 1));
+            assert_eq!(
+                evidence["diagnostics"][1]["usageRejection"]["kind"],
+                "conflicting_total"
+            );
+            assert_eq!(
+                observed_field(&evidence, "completion_tokens_details.reasoning_tokens")["state"],
+                state
+            );
+            assert_eq!(
+                observed_field(&evidence, "completion_tokens_details.reasoning_tokens")["value"]
+                    .as_i64(),
+                value
+            );
+            assert_eq!(
+                observed_field(&evidence, "cost_in_usd_ticks")["value"],
+                2000
+            );
+            assert_eq!(evidence["responsesCompleted"], 0);
+            assert_eq!(evidence["revoked"], true);
+        }
+
+        let (status, malformed, calls, pending) = accounting_fixture(json!({
+            "prompt_tokens":100,"completion_tokens":10,"total_tokens":115,
+            "prompt_tokens_details":"SECRET_DETAIL_CANARY",
+            "completion_tokens_details":{"reasoning_tokens":5},
+            "cost_in_usd_ticks":1665
+        }))
+        .await;
+        assert_eq!((status, calls, pending), (StatusCode::BAD_GATEWAY, 1, 1));
+        assert_eq!(
+            malformed["diagnostics"][1]["usageRejection"]["kind"],
+            "conflicting_total"
+        );
+        assert_eq!(
+            malformed["usageObservation"]["snapshots"][0]["promptDetailsState"]["state"],
+            "wrong_type"
+        );
+        assert_eq!(
+            malformed["usageObservation"]["snapshots"][0]["promptDetailsState"]
+                ["contentSuppressed"],
+            true
+        );
+        assert_eq!(
+            observed_field(&malformed, "prompt_tokens_details.cached_tokens")["state"],
+            "parent_unavailable"
+        );
+        assert_eq!(
+            observed_field(&malformed, "completion_tokens_details.reasoning_tokens")["value"],
+            5
+        );
+        assert_eq!(
+            observed_field(&malformed, "cost_in_usd_ticks")["value"],
+            1665
+        );
+        assert!(!malformed.to_string().contains("SECRET_DETAIL_CANARY"));
+    }
+
+    #[tokio::test]
+    async fn total_mismatch_preserves_cost_states_without_accepting_cost() {
+        let cases = [
+            (None, "missing", None, false),
+            (Some(Value::Null), "null", None, false),
+            (Some(json!(0)), "zero", Some(0), false),
+            (Some(json!(1665)), "positive", Some(1665), false),
+            (Some(json!(-7)), "negative", Some(-7), false),
+            (Some(json!(1.5)), "non_integral", None, false),
+            (Some(json!("SECRET_COST_CANARY")), "wrong_type", None, true),
+        ];
+        for (cost, state, value, suppressed) in cases {
+            let mut usage = json!({"prompt_tokens":100,"completion_tokens":10,"total_tokens":115});
+            if let Some(cost) = cost {
+                usage["cost_in_usd_ticks"] = cost;
+            }
+            let (status, evidence, calls, pending) = accounting_fixture(usage).await;
+            assert_eq!((status, calls, pending), (StatusCode::BAD_GATEWAY, 1, 1));
+            assert_eq!(
+                evidence["diagnostics"][1]["usageRejection"]["kind"],
+                "conflicting_total"
+            );
+            let cost = observed_field(&evidence, "cost_in_usd_ticks");
+            assert_eq!(cost["state"], state);
+            assert_eq!(cost["value"].as_i64(), value);
+            assert_eq!(cost["contentSuppressed"], suppressed);
+            if state == "non_integral" {
+                assert_eq!(cost["nonIntegralValue"], 1.5);
+                assert_eq!(cost["valueOmitted"], false);
+            }
+            assert_eq!(evidence["costComplete"], false);
+            assert!(evidence["costInUsdTicks"].is_null());
+            assert!(!evidence.to_string().contains("SECRET_COST_CANARY"));
+        }
+    }
+
+    #[tokio::test]
+    async fn other_early_rejections_keep_safely_inspectable_sibling_fields() {
+        let cases = [
+            (
+                json!({"prompt_tokens":"SECRET_FIELD_CANARY","completion_tokens":10,"total_tokens":110,"cost_in_usd_ticks":1665}),
+                "malformed_field",
+                "completion_tokens",
+                10,
+            ),
+            (
+                json!({"prompt_tokens":100,"completion_tokens":10,"total_tokens":110,"prompt_tokens_details":{"cached_tokens":2,"SECRET_UNKNOWN_CANARY":"SECRET_VALUE_CANARY"},"completion_tokens_details":{"reasoning_tokens":3},"cost_in_usd_ticks":1665}),
+                "unsupported_details_field",
+                "completion_tokens_details.reasoning_tokens",
+                3,
+            ),
+            (
+                json!({"prompt_tokens":100,"completion_tokens":10,"total_tokens":110,"prompt_tokens_details":{"cached_tokens":101},"completion_tokens_details":{"reasoning_tokens":3},"cost_in_usd_ticks":1665}),
+                "conflicting_subset",
+                "completion_tokens_details.reasoning_tokens",
+                3,
+            ),
+            (
+                json!({"prompt_tokens":100,"completion_tokens":10,"total_tokens":110,"prompt_tokens_details":{"cached_tokens":2},"completion_tokens_details":{"reasoning_tokens":3},"cost_in_usd_ticks":null}),
+                "cost_null",
+                "completion_tokens_details.reasoning_tokens",
+                3,
+            ),
+        ];
+        for (usage, expected_rejection, sibling_path, sibling_value) in cases {
+            let (status, evidence, calls, pending) = accounting_fixture(usage).await;
+            assert_eq!((status, calls, pending), (StatusCode::BAD_GATEWAY, 1, 1));
+            assert_eq!(
+                evidence["diagnostics"][1]["usageRejection"]["kind"],
+                expected_rejection
+            );
+            assert_eq!(
+                observed_field(&evidence, sibling_path)["value"],
+                sibling_value
+            );
+            assert_eq!(
+                observed_field(&evidence, "cost_in_usd_ticks")["state"],
+                if expected_rejection == "cost_null" {
+                    "null"
+                } else {
+                    "positive"
+                }
+            );
+            assert_eq!(evidence["responsesCompleted"], 0);
+            assert_eq!(evidence["revoked"], true);
+            assert!(!evidence.to_string().contains("SECRET_"));
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_keys_and_large_numbers_have_bounded_independent_observations() {
+        let (status, unknown, calls, pending) = accounting_fixture(json!({
+            "prompt_tokens":100,"completion_tokens":10,"total_tokens":110,
+            "prompt_tokens_details":{"cached_tokens":3,"SECRET_NESTED_CANARY":"SECRET_VALUE_CANARY"},
+            "completion_tokens_details":{"reasoning_tokens":2,"SECRET_OTHER_CANARY":"SECRET_VALUE_CANARY"},
+            "SECRET_TOP_CANARY":"SECRET_VALUE_CANARY"
+        })).await;
+        assert_eq!((status, calls, pending), (StatusCode::BAD_GATEWAY, 1, 1));
+        assert_eq!(
+            unknown["diagnostics"][1]["usageRejection"]["kind"],
+            "unsupported_field"
+        );
+        let snapshot = &unknown["usageObservation"]["snapshots"][0];
+        assert_eq!(snapshot["unknownTopLevelKeys"]["countUpToFour"], 1);
+        assert_eq!(snapshot["unknownPromptDetailsKeys"]["countUpToFour"], 1);
+        assert_eq!(snapshot["unknownCompletionDetailsKeys"]["countUpToFour"], 1);
+        assert_eq!(snapshot["unknownTopLevelKeys"]["contentSuppressed"], true);
+        assert_eq!(
+            observed_field(&unknown, "prompt_tokens_details.cached_tokens")["value"],
+            3
+        );
+        assert_eq!(
+            observed_field(&unknown, "completion_tokens_details.reasoning_tokens")["value"],
+            2
+        );
+        assert!(!unknown.to_string().contains("SECRET_"));
+
+        let (status, large, calls, pending) = accounting_fixture(json!({
+            "prompt_tokens":u64::MAX,"completion_tokens":10,"total_tokens":u64::MAX,
+            "cost_in_usd_ticks":u64::MAX
+        }))
+        .await;
+        assert_eq!((status, calls, pending), (StatusCode::BAD_GATEWAY, 1, 1));
+        assert_eq!(
+            large["diagnostics"][1]["usageRejection"]["kind"],
+            "token_bound_exceeded"
+        );
+        for path in ["prompt_tokens", "total_tokens", "cost_in_usd_ticks"] {
+            let field = observed_field(&large, path);
+            assert_eq!(field["state"], "positive");
+            assert_eq!(field["valueOmitted"], true);
+            assert!(field["value"].is_null());
+        }
+        assert_eq!(observed_field(&large, "completion_tokens")["value"], 10);
+    }
+
+    #[tokio::test]
+    async fn credential_echo_suppresses_the_entire_usage_snapshot() {
+        let (status, evidence, calls, pending) = accounting_fixture(json!({
+            "prompt_tokens":100,"completion_tokens":10,"total_tokens":115,
+            "completion_tokens_details":{"reasoning_tokens":"upstream-test-secret-never-child"}
+        }))
+        .await;
+        assert_eq!((status, calls, pending), (StatusCode::BAD_GATEWAY, 1, 1));
+        assert_eq!(evidence["usageObservation"]["credentialSuppressed"], true);
+        assert_eq!(
+            evidence["usageObservation"]["snapshots"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(evidence["responsesCompleted"], 0);
+        assert!(!evidence
+            .to_string()
+            .contains("upstream-test-secret-never-child"));
+    }
+
+    #[tokio::test]
+    async fn repeated_receipts_keep_two_bounded_snapshots_and_original_rejection() {
+        let first = json!({"prompt_tokens":100,"completion_tokens":10,"total_tokens":110});
+        let second = json!({"prompt_tokens":101,"completion_tokens":10,"total_tokens":111,"cost_in_usd_ticks":1665});
+        let second_line = format!(
+            "data: {}\n\ndata: [DONE]",
+            json!({"choices":[],"usage":second})
+        );
+        let body = accounting_stream(first).replace("data: [DONE]", &second_line);
+        let (status, evidence, calls, pending) = accounting_fixture_body(body, None).await;
+        assert_eq!((status, calls, pending), (StatusCode::BAD_GATEWAY, 1, 1));
+        assert_eq!(
+            evidence["diagnostics"][1]["usageRejection"]["kind"],
+            "repeated_receipt"
+        );
+        assert_eq!(
+            evidence["usageObservation"]["snapshots"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            evidence["usageObservation"]["snapshots"][0]["receiptOrdinal"],
+            1
+        );
+        assert_eq!(
+            evidence["usageObservation"]["snapshots"][1]["receiptOrdinal"],
+            2
+        );
+        assert_eq!(
+            evidence["usageObservation"]["snapshots"][1]["fields"][0]["value"],
+            101
+        );
+        assert_eq!(evidence["usageObservation"]["observationsOmitted"], false);
+        assert_eq!(evidence["responsesCompleted"], 0);
+    }
+
+    #[test]
+    fn usage_snapshot_and_diagnostic_counts_are_explicitly_bounded() {
+        let sample = observe_managed_usage(
+            &json!({
+                "prompt_tokens":65536,"completion_tokens":1024,"total_tokens":65536,
+                "prompt_tokens_details":{"text_tokens":65536,"audio_tokens":0,"image_tokens":0,"cached_tokens":65536},
+                "completion_tokens_details":{"reasoning_tokens":1024,"audio_tokens":0,"accepted_prediction_tokens":0,"rejected_prediction_tokens":0},
+                "num_sources_used":0,"cost_in_usd_ticks":1_000_000_000_000_i64
+            }),
+            1,
+        );
+        assert_eq!(sample.fields.len(), 13);
+        assert!(serde_json::to_vec(&sample).unwrap().len() <= 3072);
+        let mut observation = ManagedUsageObservationEvidence::default();
+        observation.retain([sample.clone(), sample.clone(), sample]);
+        assert_eq!(observation.snapshots.len(), 2);
+        assert!(observation.observations_omitted);
+        assert!(serde_json::to_vec(&observation).unwrap().len() <= 6144);
+        let mut evidence = ManagedProviderEvidence::default();
+        for _ in 0..33 {
+            evidence.record_diagnostic(ManagedProviderDiagnosticKind::UsageInconsistent);
+        }
+        assert_eq!(evidence.diagnostics.len(), 32);
+        assert!(evidence.diagnostics_truncated);
+        let mut many_unknown = json!({"prompt_tokens":1,"completion_tokens":1,"total_tokens":2});
+        for index in 0..6 {
+            many_unknown[format!("secret_unknown_{index}")] = json!("SECRET_VALUE_CANARY");
+        }
+        let snapshot = observe_managed_usage(&many_unknown, 1);
+        let unknown = snapshot.unknown_top_level_keys.unwrap();
+        assert_eq!(unknown.count_up_to_four, 4);
+        assert!(unknown.more && unknown.content_suppressed);
+        assert!(!serde_json::to_string(&snapshot)
+            .unwrap()
+            .contains("secret_unknown"));
     }
 
     #[tokio::test]
@@ -3152,16 +3925,20 @@ mod tests {
             "interruption",
             "diagnostics",
             "httpResponsesObserved",
+            "usageObservation",
+            "diagnosticsTruncated",
         ] {
             value.as_object_mut().unwrap().remove(key);
         }
         let mut evidence: ManagedProviderEvidence = serde_json::from_value(value).unwrap();
         assert!(evidence.uncertain);
         assert_eq!(evidence.remote_effect_uncertain, None);
+        assert!(evidence.usage_observation.is_none());
         for _ in 0..100 {
             evidence.record_diagnostic(ManagedProviderDiagnosticKind::RecoveryUncertain);
         }
         assert_eq!(evidence.diagnostics.len(), 32);
+        assert!(evidence.diagnostics_truncated);
         assert_eq!(
             evidence.interruption,
             Some(ManagedProviderDiagnosticKind::RecoveryUncertain)
@@ -3200,8 +3977,10 @@ mod tests {
     #[test]
     fn incomplete_overbudget_or_secret_stream_is_never_delivered() {
         let good = stream("done");
+        let summary =
+            validate_completion(good.as_bytes(), "child-secret", "parent-secret").unwrap();
         assert_eq!(
-            validate_completion(good.as_bytes(), "child-secret", "parent-secret").unwrap(),
+            (summary.0, summary.1),
             (
                 0,
                 ManagedUsage {
@@ -3214,6 +3993,7 @@ mod tests {
                 }
             )
         );
+        assert_eq!(summary.2.receipt_ordinal, 1);
         for malformed in [
             good.replace("[DONE]", ""),
             good.replace("\"stop\"", "\"length\""),

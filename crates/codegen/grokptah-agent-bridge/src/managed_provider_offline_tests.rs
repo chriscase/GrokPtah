@@ -241,7 +241,7 @@ async fn qualify(mode: FixtureMode) {
                 // The public Chat Completions example can put reasoning beyond
                 // completion. CLI 1.0.41 cannot reconcile that total, so the
                 // host must reject this receipt before declaring success.
-                return ([("content-type", "text/event-stream")], turn_with_usage(index, vec![], json!({"prompt_tokens":100,"completion_tokens":10,"total_tokens":115,"completion_tokens_details":{"reasoning_tokens":5}}))).into_response();
+                return ([("content-type", "text/event-stream")], turn_with_usage(index, vec![], json!({"prompt_tokens":100,"completion_tokens":10,"total_tokens":115,"prompt_tokens_details":{"text_tokens":100,"audio_tokens":0,"image_tokens":0,"cached_tokens":20},"completion_tokens_details":{"reasoning_tokens":5,"audio_tokens":0,"accepted_prediction_tokens":0,"rejected_prediction_tokens":0},"cost_in_usd_ticks":777}))).into_response();
             }
             let tools = match index {
                 0 => vec![tool(0,"write",json!({"file_path":"src/framing.py","content":FIXED_FRAMING})),tool(1,"write",json!({"file_path":"src/decoder.py","content":FIXED_DECODER}))],
@@ -382,6 +382,21 @@ async fn qualify(mode: FixtureMode) {
                 assert_eq!(diagnostic["usageRejection"]["field"], "total_tokens");
                 assert_eq!(diagnostic["usageRejection"]["observed"], 115);
                 assert_eq!(diagnostic["usageRejection"]["expected"], 110);
+                let snapshot = &evidence["usageObservation"]["snapshots"][0];
+                let fields = snapshot["fields"].as_array().unwrap();
+                let observed = |path: &str| fields.iter().find(|f| f["path"] == path).unwrap();
+                assert_eq!(observed("prompt_tokens")["value"], 100);
+                assert_eq!(observed("completion_tokens")["value"], 10);
+                assert_eq!(observed("total_tokens")["value"], 115);
+                assert_eq!(observed("prompt_tokens_details.cached_tokens")["value"], 20);
+                assert_eq!(
+                    observed("completion_tokens_details.reasoning_tokens")["value"],
+                    5
+                );
+                assert_eq!(observed("cost_in_usd_ticks")["value"], 777);
+                assert_eq!(evidence["responsesCompleted"], 0);
+                assert_eq!(evidence["revoked"], true);
+                assert_eq!(evidence["remoteEffectUncertain"], true);
             }
             assert!(!evidence.to_string().contains("additional_charge_ticks"));
         }
