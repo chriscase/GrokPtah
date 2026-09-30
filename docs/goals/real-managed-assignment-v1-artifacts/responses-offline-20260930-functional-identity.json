@@ -1,0 +1,32 @@
+{
+  "additionalLiveProviderRequests": 0,
+  "executableChangedPaths": [
+    "crates/codegen/grokptah-agent-bridge/src/grok_build.rs",
+    "crates/codegen/grokptah-agent-bridge/src/managed_provider.rs",
+    "crates/codegen/grokptah-agent-bridge/src/managed_provider_offline_tests.rs",
+    "crates/codegen/grokptah-agent-bridge/src/managed_responses.rs",
+    "crates/codegen/grokptah-agent-bridge/src/orchestration/service.rs",
+    "crates/codegen/grokptah-agent-bridge/src/provider_transport.rs"
+  ],
+  "frozenGoal": "docs/goals/real-managed-assignment-v1-responses-offline-goal.md",
+  "functionalSha": "b21b7f4d1e3d139e4b40ca8d9f6b38e1c5622c73",
+  "functionalTree": "e7fef974f53e9ff5f1aaf15375431bf8fecac8ff",
+  "mainSha": "9e2660ff1a50edb7af1b81a4232d7fe23a37de0d",
+  "mainTree": "f524b705a3b88cb895309506bf726e76c91874bf",
+  "pinnedCliRevisionLabel": "4220f3b224a6",
+  "pinnedCliSha256": "9c844eb13365180787d9ad22b2b3748a024be8e1ed845253cc114781b31c591d",
+  "pinnedCliVersion": "1.0.41",
+  "previousAcceptedExecutableSha": "6c91c00b49d97555a5e6e5de8eaf05fb90066e3f",
+  "previousAcceptedExecutableTree": "8ecc48bc0a74714f9fcee7e6ea945f5c3fee0802",
+  "schemaVersion": 1,
+  "sourceSha256": {
+    "crates/codegen/grokptah-agent-bridge/src/grok_build.rs": "41ae0c4b488afd97c0f483393d64589d6da020d7e8fadfbebf193352ae528dc3",
+    "crates/codegen/grokptah-agent-bridge/src/managed_provider.rs": "959029b09d720870fb8868bd66c4bb6afbd4dfae783ce1fe0e7ed080ad964079",
+    "crates/codegen/grokptah-agent-bridge/src/managed_provider_offline_tests.rs": "84e331790347b7fcf4153c92a303435967c280ec27729143904dcf7d51d60706",
+    "crates/codegen/grokptah-agent-bridge/src/managed_responses.rs": "a084d574f8cfc12583bb6b7918cfc9cd50c7e34251163cc1b09c81246075c1ee",
+    "crates/codegen/grokptah-agent-bridge/src/orchestration/service.rs": "6e15ea1e1e5c1f07e53b7a80b4b9bf3a424dee1cf3579f97c5c0fb090c860edd",
+    "crates/codegen/grokptah-agent-bridge/src/provider_transport.rs": "7a4ea71327d8110bb1f21b32e0b161e9fc6642a6837f32c48ba1e1bc64e57b2b"
+  },
+  "startingSha": "81cddffd9e36ac2da3b61dfb2706471bc4a11aeb",
+  "startingTree": "a3affa014cb4407e0a5c6aa6f51389c264b8e8a0"
+}
