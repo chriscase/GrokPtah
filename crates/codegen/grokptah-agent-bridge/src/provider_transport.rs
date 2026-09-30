@@ -495,6 +495,22 @@ fn validate_wire_request<'a>(
             }
             validate_oauth_refresh_credential(request, body, scope.credential_secret)?;
         }
+        "xai_responses" => {
+            validate_bearer_credential(request, body, scope.credential_secret)?;
+            if method != reqwest::Method::POST
+                || request.url().path() != "/v1/responses"
+                || !content_type.starts_with("application/json")
+                || body.is_empty()
+            {
+                return Err(anyhow!(
+                    "managed Responses wire shape does not match its dialect"
+                ));
+            }
+            let value: serde_json::Value = serde_json::from_slice(body)
+                .context("managed Responses body is not canonical JSON")?;
+            crate::managed_provider::validate_responses_wire(&value, scope.model)
+                .map_err(anyhow::Error::msg)?;
+        }
         "xai_chat_completions" | "openai_chat_completions" | "provider_qualification" => {
             validate_bearer_credential(request, body, scope.credential_secret)?;
             if method != reqwest::Method::POST

@@ -41,9 +41,22 @@ const MAX_USAGE_OBSERVATIONS: usize = 2;
 const MAX_USAGE_SNAPSHOT_BYTES: usize = 3072;
 const MAX_UNKNOWN_KEY_COUNT: usize = 4;
 
+#[path = "managed_responses.rs"]
+mod responses;
+
+/// Selected by the host before issuing any child capability.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedBackend {
+    #[default]
+    ChatCompletions,
+    Responses,
+}
+
 /// Host-minted confinement facts. No request can supply or change these.
 #[derive(Clone, Debug)]
 pub struct ManagedChildPolicy {
+    pub(crate) backend: ManagedBackend,
     pub(crate) endpoint: String,
     pub(crate) port: u16,
     pub(crate) model: String,
@@ -69,6 +82,7 @@ pub enum ManagedProviderDiagnosticKind {
     Expired,
     AbandonedForward,
     Completed,
+    OutputLimitIncomplete,
     BudgetExceeded,
     SettlementFailure,
     RecoveryUncertain,
@@ -133,6 +147,11 @@ pub enum ManagedUsageRejectionKind {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ManagedUsageField {
+    InputTokens,
+    OutputTokens,
+    InputTokensDetails,
+    OutputTokensDetails,
+    ServerSideToolsUsed,
     PromptTokens,
     CompletionTokens,
     TotalTokens,
@@ -212,6 +231,16 @@ impl ManagedUsageRejection {
 /// The two audio paths deliberately have distinct identities.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ManagedObservedUsagePath {
+    #[serde(rename = "input_tokens")]
+    InputTokens,
+    #[serde(rename = "output_tokens")]
+    OutputTokens,
+    #[serde(rename = "input_tokens_details.cached_tokens")]
+    InputCachedTokens,
+    #[serde(rename = "output_tokens_details.reasoning_tokens")]
+    OutputReasoningTokens,
+    #[serde(rename = "num_server_side_tools_used")]
+    ServerSideToolsUsed,
     #[serde(rename = "prompt_tokens")]
     PromptTokens,
     #[serde(rename = "completion_tokens")]
@@ -541,6 +570,8 @@ pub struct ManagedProviderDiagnostic {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ManagedProviderEvidence {
+    #[serde(default)]
+    pub backend: ManagedBackend,
     pub mechanism: String,
     pub model: String,
     pub requests_reserved: u32,
@@ -583,6 +614,8 @@ pub struct ManagedProviderEvidence {
     pub diagnostics: Vec<ManagedProviderDiagnostic>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_observation: Option<ManagedUsageObservationEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responses_usage_observation: Option<responses::ResponsesUsageObservation>,
     #[serde(default)]
     pub diagnostics_truncated: bool,
 }
@@ -595,11 +628,13 @@ struct Lease {
     max_total_tokens: u64,
     cancelled: CancellationToken,
     requests: BTreeSet<String>,
+    reasoning: BTreeMap<String, String>,
     evidence: ManagedProviderEvidence,
     in_flight: bool,
 }
 
 struct RelayState {
+    backend: ManagedBackend,
     credentials: crate::auth_store::WireCredentials,
     target: crate::host_helpers::ResolvedModelTarget,
     client: reqwest::Client,
@@ -633,6 +668,21 @@ impl std::fmt::Debug for ManagedProviderRelay {
 
 impl ManagedProviderRelay {
     pub async fn start(model: &str, credential_dir: PathBuf) -> Result<Arc<Self>, &'static str> {
+        Self::start_selected(model, credential_dir, ManagedBackend::ChatCompletions).await
+    }
+
+    pub async fn start_responses(
+        model: &str,
+        credential_dir: PathBuf,
+    ) -> Result<Arc<Self>, &'static str> {
+        Self::start_selected(model, credential_dir, ManagedBackend::Responses).await
+    }
+
+    async fn start_selected(
+        model: &str,
+        credential_dir: PathBuf,
+        backend: ManagedBackend,
+    ) -> Result<Arc<Self>, &'static str> {
         if model != "grok-build-0.1" {
             return Err("managed relay requires the pinned grok-build-0.1 model");
         }
@@ -660,13 +710,35 @@ impl ManagedProviderRelay {
         {
             return Err("managed provider route or coding capability is unsupported");
         }
-        Self::with_target(credentials, target, credential_dir).await
+        if backend == ManagedBackend::Responses
+            && (!credentials.oidc_token_auth
+                || target.base_url != "https://cli-chat-proxy.grok.com/v1")
+        {
+            return Err("managed Responses requires official Grok Build OIDC route");
+        }
+        Self::with_backend(credentials, target, credential_dir, backend).await
     }
 
+    #[cfg(test)]
     async fn with_target(
         credentials: crate::auth_store::WireCredentials,
         target: crate::host_helpers::ResolvedModelTarget,
         credential_dir: PathBuf,
+    ) -> Result<Arc<Self>, &'static str> {
+        Self::with_backend(
+            credentials,
+            target,
+            credential_dir,
+            ManagedBackend::ChatCompletions,
+        )
+        .await
+    }
+
+    async fn with_backend(
+        credentials: crate::auth_store::WireCredentials,
+        target: crate::host_helpers::ResolvedModelTarget,
+        credential_dir: PathBuf,
+        backend: ManagedBackend,
     ) -> Result<Arc<Self>, &'static str> {
         fs::create_dir_all(&credential_dir).map_err(|_| "private lease directory unavailable")?;
         #[cfg(unix)]
@@ -694,6 +766,7 @@ impl ManagedProviderRelay {
             .build()
             .map_err(|_| "managed provider transport unavailable")?;
         let policy = ManagedChildPolicy {
+            backend,
             endpoint: format!("http://127.0.0.1:{port}/v1"),
             port,
             model: target.wire_model.clone(),
@@ -702,6 +775,7 @@ impl ManagedProviderRelay {
             max_output_tokens: MAX_OUTPUT_TOKENS,
         };
         let state = Arc::new(RelayState {
+            backend,
             credentials,
             target,
             client,
@@ -710,9 +784,14 @@ impl ManagedProviderRelay {
             #[cfg(test)]
             completed_forward_handoff: Mutex::new(None),
         });
-        let router = Router::new()
-            .route("/v1/models", get(models))
-            .route("/v1/chat/completions", post(completion))
+        let router = Router::new().route("/v1/models", get(models));
+        let router = match backend {
+            ManagedBackend::ChatCompletions => {
+                router.route("/v1/chat/completions", post(completion))
+            }
+            ManagedBackend::Responses => router.route("/v1/responses", post(responses_completion)),
+        };
+        let router = router
             .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
             .with_state(state.clone());
         let stop = state.stopped.clone();
@@ -809,8 +888,10 @@ impl CredentialLeaseResolver for ManagedProviderRelay {
                 max_total_tokens: MAX_TOTAL_TOKENS,
                 cancelled: CancellationToken::new(),
                 requests: BTreeSet::new(),
+                reasoning: BTreeMap::new(),
                 in_flight: false,
                 evidence: ManagedProviderEvidence {
+                    backend: self.state.backend,
                     mechanism: "host_relay_v1".into(),
                     model: self.policy.model.clone(),
                     remote_effect_uncertain: Some(false),
@@ -1037,6 +1118,30 @@ async fn completion(
     }
 }
 
+async fn responses_completion(
+    State(state): State<Arc<RelayState>>,
+    headers: HeaderMap,
+    bytes: Bytes,
+) -> Response {
+    // The pinned CLI may attempt an auxiliary model on this same local port.
+    // It has no managed model authority: deny before any lease admission,
+    // without letting a background request interrupt the bound Work's send.
+    if serde_json::from_slice::<Value>(&bytes)
+        .ok()
+        .is_some_and(|v| v["model"].as_str() != Some(state.target.wire_model.as_str()))
+    {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    completion(State(state), headers, bytes).await
+}
+
+pub(crate) fn validate_responses_wire(body: &Value, model: &str) -> Result<(), &'static str> {
+    if model != "grok-build-0.1" {
+        return Err("managed Responses model is unsupported");
+    }
+    responses::validate_request(body, model, MAX_OUTPUT_TOKENS)
+}
+
 async fn forward(state: &RelayState, id: &str, bytes: &[u8]) -> Result<Vec<u8>, &'static str> {
     let result = forward_inner(state, id, bytes).await;
     if result.is_err() {
@@ -1064,61 +1169,88 @@ async fn forward_inner(
     let object = body
         .as_object_mut()
         .ok_or("managed request is not an object")?;
-    const ALLOWED: &[&str] = &[
-        "model",
-        "messages",
-        "tools",
-        "tool_choice",
-        "parallel_tool_calls",
-        "temperature",
-        "top_p",
-        "stream",
-        "stream_options",
-        "max_tokens",
-        "max_completion_tokens",
-        "reasoning_effort",
-    ];
-    if object.keys().any(|key| !ALLOWED.contains(&key.as_str()))
-        || object.get("model").and_then(Value::as_str) != Some(&state.target.wire_model)
-        || object.get("stream").and_then(Value::as_bool) != Some(true)
-        || !object.get("messages").is_some_and(Value::is_array)
-    {
-        return Err("managed request route or protocol is unsupported");
-    }
-    let tools = object
-        .get("tools")
-        .and_then(Value::as_array)
-        .ok_or("managed tool definitions are missing")?;
-    if tools.len() > 8
-        || tools.iter().any(|tool| {
-            tool["type"] != "function"
-                || !matches!(
-                    tool["function"]["name"].as_str(),
-                    Some(
-                        "read_file"
-                            | "write"
-                            | "search_replace"
-                            | "list_dir"
-                            | "grep"
-                            | "search_tool"
-                            | "use_tool"
+    if state.backend == ManagedBackend::Responses {
+        responses::validate_request(&body, &state.target.wire_model, MAX_OUTPUT_TOKENS)?;
+        body.as_object_mut()
+            .unwrap()
+            .insert("parallel_tool_calls".into(), json!(false));
+    } else {
+        const ALLOWED: &[&str] = &[
+            "model",
+            "messages",
+            "tools",
+            "tool_choice",
+            "parallel_tool_calls",
+            "temperature",
+            "top_p",
+            "stream",
+            "stream_options",
+            "max_tokens",
+            "max_completion_tokens",
+            "reasoning_effort",
+        ];
+        if object.keys().any(|key| !ALLOWED.contains(&key.as_str()))
+            || object.get("model").and_then(Value::as_str) != Some(&state.target.wire_model)
+            || object.get("stream").and_then(Value::as_bool) != Some(true)
+            || !object.get("messages").is_some_and(Value::is_array)
+        {
+            return Err("managed request route or protocol is unsupported");
+        }
+        let tools = object
+            .get("tools")
+            .and_then(Value::as_array)
+            .ok_or("managed tool definitions are missing")?;
+        if tools.len() > 8
+            || tools.iter().any(|tool| {
+                tool["type"] != "function"
+                    || !matches!(
+                        tool["function"]["name"].as_str(),
+                        Some(
+                            "read_file"
+                                | "write"
+                                | "search_replace"
+                                | "list_dir"
+                                | "grep"
+                                | "search_tool"
+                                | "use_tool"
+                        )
                     )
-                )
-        })
-    {
-        return Err("managed tool definitions exceed the allowed protocol");
+            })
+        {
+            return Err("managed tool definitions exceed the allowed protocol");
+        }
+        object.remove("max_completion_tokens");
+        object.remove("reasoning_effort");
+        object.insert("max_tokens".into(), json!(MAX_OUTPUT_TOKENS));
+        object.insert("parallel_tool_calls".into(), json!(false));
+        object.insert("stream_options".into(), json!({"include_usage":true}));
     }
-    object.remove("max_completion_tokens");
-    object.remove("reasoning_effort");
-    object.insert("max_tokens".into(), json!(MAX_OUTPUT_TOKENS));
-    object.insert("parallel_tool_calls".into(), json!(false));
-    object.insert("stream_options".into(), json!({"include_usage":true}));
+    let input_reservation = if state.backend == ManagedBackend::Responses {
+        let sealed =
+            serde_json::to_vec(&body).map_err(|_| "managed Responses serialization failed")?;
+        if sealed.len() > MAX_REQUEST_BYTES {
+            return Err("managed Responses sealed request exceeds byte budget");
+        }
+        sealed.len() as u64
+    } else {
+        bytes.len() as u64
+    };
     let (cancel, secret) = {
         let mut leases = state
             .leases
             .lock()
             .map_err(|_| "managed lease state unavailable")?;
         let lease = leases.get_mut(id).ok_or("managed lease unavailable")?;
+        let reuse = if state.backend == ManagedBackend::Responses {
+            responses::reasoning_reuse_allowance(
+                &body,
+                &lease.reasoning,
+                lease.evidence.output_tokens,
+            )?
+        } else {
+            0
+        };
+        let reserved_input = input_reservation.checked_add(reuse);
         let digest = format!("{:x}", Sha256::digest(bytes));
         let denial = if lease.cancelled.is_cancelled() || lease.evidence.revoked {
             Some(ManagedAdmissionDenial::Revoked)
@@ -1136,7 +1268,7 @@ async fn forward_inner(
         } else if lease
             .evidence
             .accounted_total_tokens()
-            .and_then(|total| total.checked_add(bytes.len() as u64))
+            .and_then(|total| reserved_input.and_then(|input| total.checked_add(input)))
             .and_then(|total| total.checked_add(u64::from(MAX_OUTPUT_TOKENS)))
             .is_none_or(|reserved| reserved > lease.max_total_tokens)
         {
@@ -1179,7 +1311,15 @@ async fn forward_inner(
     let request = crate::auth_store::apply_auth_headers(
         state
             .client
-            .post(format!("{}/chat/completions", base.trim_end_matches('/')))
+            .post(format!(
+                "{}/{}",
+                base.trim_end_matches('/'),
+                if state.backend == ManagedBackend::Responses {
+                    "responses"
+                } else {
+                    "chat/completions"
+                }
+            ))
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream")
             .header("x-grok-effort", "low"),
@@ -1187,8 +1327,16 @@ async fn forward_inner(
         base,
     );
     let request =
-        bind_official_proxy_model_override(request, &state.target, &state.credentials, &body)?
-            .json(&body);
+        bind_official_proxy_model_override(request, &state.target, &state.credentials, &body)?;
+    // Responses production admission permits only the official OIDC proxy.
+    // The same sealed header is observable on synthetic OIDC loopback fixtures.
+    let request = if state.backend == ManagedBackend::Responses && state.credentials.oidc_token_auth
+    {
+        request.header("x-grok-model-override", &state.target.wire_model)
+    } else {
+        request
+    };
+    let request = request.json(&body);
     let target_scope = format!("managed-grok:{id}");
     let observe = |attempt: &str| -> anyhow::Result<()> {
         let mut leases = state
@@ -1208,7 +1356,11 @@ async fn forward_inner(
         request,
         crate::provider_transport::ProviderRequestScope {
             credential_secret: state.credentials.bearer.as_bytes(),
-            dialect: "xai_chat_completions",
+            dialect: if state.backend == ManagedBackend::Responses {
+                "xai_responses"
+            } else {
+                "xai_chat_completions"
+            },
             model: &state.target.wire_model,
             target_scope: &target_scope,
         },
@@ -1312,7 +1464,23 @@ async fn forward_inner(
             Ok(None) => break,
         }
     }
-    let summary = match validate_completion(&output, &secret, &state.credentials.bearer) {
+    let validation = if state.backend == ManagedBackend::Responses {
+        responses::validate_completion(
+            &output,
+            &secret,
+            &state.credentials.bearer,
+            MAX_OUTPUT_TOKENS,
+            &state.target.wire_model,
+        )
+        .map(|(tools, usage, snapshot, incomplete, reasoning)| {
+            (tools, usage, None, Some(snapshot), incomplete, reasoning)
+        })
+    } else {
+        validate_completion(&output, &secret, &state.credentials.bearer).map(
+            |(tools, usage, snapshot)| (tools, usage, Some(snapshot), None, false, BTreeMap::new()),
+        )
+    };
+    let summary = match validation {
         Ok(summary) => summary,
         Err(failure) => {
             let message = failure.message;
@@ -1340,9 +1508,25 @@ async fn forward_inner(
             invalidate(state, id);
             return Err("managed lease cancelled or exceeded tool budget");
         }
-        lease
-            .evidence
-            .retain_usage_observations([summary.2.clone()]);
+        if summary
+            .5
+            .iter()
+            .any(|(id, digest)| lease.reasoning.get(id).is_some_and(|old| old != digest))
+        {
+            record_diagnostic(lease, ManagedProviderDiagnosticKind::ProtocolFailure);
+            drop(leases);
+            let _ = response.settle_protocol_error("managed Responses reasoning identity changed");
+            invalidate(state, id);
+            return Err("managed Responses reasoning identity changed");
+        }
+        if let Some(snapshot) = &summary.2 {
+            lease.evidence.retain_usage_observations([snapshot.clone()]);
+        }
+        if let Some(snapshot) = &summary.3 {
+            lease
+                .evidence
+                .retain_responses_observation(snapshot.clone());
+        }
         lease.evidence.tool_calls += summary.0;
         let next = match lease.evidence.checked_accounting_after(summary.1) {
             Ok(next) => next,
@@ -1389,11 +1573,19 @@ async fn forward_inner(
             if lease.cancelled.is_cancelled() {
                 return Err("managed lease was revoked before response delivery");
             }
+            lease.reasoning.extend(summary.5);
             lease.evidence.responses_completed += 1;
             lease.evidence.remote_effect_uncertain = Some(false);
             record_diagnostic(lease, ManagedProviderDiagnosticKind::Completed);
             lease.in_flight = false;
             settlement.completed = true;
+            if summary.4 {
+                record_diagnostic(lease, ManagedProviderDiagnosticKind::OutputLimitIncomplete);
+                lease.evidence.revoked = true;
+                // Retire after settled bounded usage, without cancelling this
+                // completed transport or manufacturing unknown accounting.
+                lease.cancelled.cancel();
+            }
         }
     }
     // Only tests pause at this actual post-publication/pre-Drop boundary.
@@ -1597,7 +1789,17 @@ fn note_completion_failure(state: &RelayState, id: &str, failure: CompletionVali
             lease
                 .evidence
                 .retain_usage_observations(failure.usage_observations);
-            if failure.credential_suppressed {
+            if let Some(snapshot) = failure.responses_observation {
+                lease.evidence.retain_responses_observation(*snapshot);
+            }
+            if failure.credential_suppressed && state.backend == ManagedBackend::Responses {
+                lease
+                    .evidence
+                    .responses_usage_observation
+                    .get_or_insert_with(Default::default)
+                    .credential_suppressed = true;
+            }
+            if failure.credential_suppressed && state.backend == ManagedBackend::ChatCompletions {
                 lease
                     .evidence
                     .usage_observation
@@ -1677,8 +1879,8 @@ fn invalidate(state: &RelayState, id: &str) {
     }
 }
 
-/// One normalized Chat Completions usage receipt. Prompt includes cache hits;
-/// reasoning is a completion subset in the installed CLI's current contract.
+/// Normalized receipt from an explicitly validated backend. Input includes
+/// cache hits; supported reasoning is a subset of generated output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ManagedUsage {
     input_tokens: u64,
@@ -1725,6 +1927,7 @@ struct CompletionValidationFailure {
     usage_rejection: Option<ManagedUsageRejection>,
     usage_observations: Vec<ManagedUsageSnapshot>,
     credential_suppressed: bool,
+    responses_observation: Option<Box<responses::ResponsesUsageSnapshot>>,
 }
 
 impl CompletionValidationFailure {
@@ -1739,6 +1942,7 @@ impl CompletionValidationFailure {
             usage_rejection: Some(ManagedUsageRejection::new(rejection, None)),
             usage_observations: Vec::new(),
             credential_suppressed: false,
+            responses_observation: None,
         }
     }
 
@@ -1756,6 +1960,7 @@ impl From<&'static str> for CompletionValidationFailure {
             usage_rejection: None,
             usage_observations: Vec::new(),
             credential_suppressed: false,
+            responses_observation: None,
         }
     }
 }
@@ -1768,6 +1973,7 @@ impl From<ManagedUsageValidationFailure> for CompletionValidationFailure {
             usage_rejection: Some(failure.rejection),
             usage_observations: Vec::new(),
             credential_suppressed: false,
+            responses_observation: None,
         }
     }
 }
@@ -3060,34 +3266,14 @@ mod tests {
                 }
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server = tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
-        });
-        let target = crate::host_helpers::ResolvedModelTarget {
-            base_url: format!("http://127.0.0.1:{port}/v1"),
-            wire_model: "grok-build-0.1".into(),
-            dialect: crate::gateway_config::ProviderDialect::XaiChatCompletions,
-            capabilities: crate::gateway_config::ModelCapabilities {
-                tools: true,
-                stream: true,
-                ..Default::default()
-            },
-            deadline_class: crate::gateway_config::ProviderDeadlineClass::Standard,
-        };
-        (
-            ManagedProviderRelay::with_target(credentials(), target, dir)
-                .await
-                .unwrap(),
-            calls,
-            server,
-        )
+        let (relay, server) = local_fixture(dir, router).await;
+        (relay, calls, server)
     }
 
-    pub(super) async fn local_fixture(
+    pub(super) async fn local_fixture_with_backend(
         dir: PathBuf,
         router: Router,
+        backend: ManagedBackend,
     ) -> (Arc<ManagedProviderRelay>, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -3105,12 +3291,25 @@ mod tests {
             },
             deadline_class: crate::gateway_config::ProviderDeadlineClass::Standard,
         };
-        (
+        let relay = if backend == ManagedBackend::ChatCompletions {
             ManagedProviderRelay::with_target(credentials(), target, dir)
                 .await
-                .unwrap(),
-            server,
-        )
+                .unwrap()
+        } else {
+            let mut c = credentials();
+            c.oidc_token_auth = true;
+            ManagedProviderRelay::with_backend(c, target, dir, backend)
+                .await
+                .unwrap()
+        };
+        (relay, server)
+    }
+
+    pub(super) async fn local_fixture(
+        dir: PathBuf,
+        router: Router,
+    ) -> (Arc<ManagedProviderRelay>, tokio::task::JoinHandle<()>) {
+        local_fixture_with_backend(dir, router, ManagedBackend::ChatCompletions).await
     }
 
     #[tokio::test]
@@ -3249,11 +3448,46 @@ mod tests {
             "tools":[{"type":"function","function":{"name":"write","parameters":{"type":"object"}}}],"max_tokens":99999})
     }
 
+    fn request_for_backend(index: u32, backend: ManagedBackend) -> Value {
+        if backend == ManagedBackend::ChatCompletions {
+            return request(index);
+        }
+        responses_request_from_chat(&request(index))
+    }
+    fn responses_request_from_chat(body: &Value) -> Value {
+        json!({"model":body["model"],"input":body["messages"],"stream":true,"store":false,"include":["reasoning.encrypted_content"],"max_output_tokens":1024,"reasoning":{"summary":"concise"},"tools":[{"type":"function","name":"write","parameters":{"type":"object"}}]})
+    }
+    fn handoff_response(backend: ManagedBackend) -> String {
+        if backend == ManagedBackend::ChatCompletions {
+            stream("settled handoff turn")
+        } else {
+            offline_tests::responses_turn(
+                0,
+                false,
+                json!({"input_tokens":100,"output_tokens":10,"total_tokens":110,"input_tokens_details":{"cached_tokens":20},"output_tokens_details":{"reasoning_tokens":5}}),
+                false,
+            )
+        }
+    }
+
     async fn send(relay: &ManagedProviderRelay, secret: &str, body: &Value) -> reqwest::Response {
+        let body = if relay.policy.backend == ManagedBackend::Responses {
+            responses_request_from_chat(body)
+        } else {
+            body.clone()
+        };
         reqwest::Client::new()
-            .post(format!("{}/chat/completions", relay.policy.endpoint))
+            .post(format!(
+                "{}/{}",
+                relay.policy.endpoint,
+                if relay.policy.backend == ManagedBackend::Responses {
+                    "responses"
+                } else {
+                    "chat/completions"
+                }
+            ))
             .bearer_auth(secret)
-            .json(body)
+            .json(&body)
             // authority-allow-unauthenticated-wire: Test-only local relay
             // capability; upstream credentials use canonical send authority.
             .send()
@@ -3271,6 +3505,13 @@ mod tests {
 
     #[allow(clippy::await_holding_lock)]
     async fn assert_completed_forward_handoff(case: HandoffCase) {
+        for backend in [ManagedBackend::ChatCompletions, ManagedBackend::Responses] {
+            assert_completed_forward_handoff_backend(case, backend).await;
+        }
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    async fn assert_completed_forward_handoff_backend(case: HandoffCase, backend: ManagedBackend) {
         let _serial = crate::home_override_serial();
         let root = tempfile::tempdir().unwrap();
         crate::set_grokptah_home_override(Some(root.path().join("host")));
@@ -3282,7 +3523,11 @@ mod tests {
         let observed = b_observed.clone();
         let release = release_b.clone();
         let router = Router::new().route(
-            "/v1/chat/completions",
+            if backend == ManagedBackend::Responses {
+                "/v1/responses"
+            } else {
+                "/v1/chat/completions"
+            },
             post(move |headers: HeaderMap, Json(body): Json<Value>| {
                 let count = count.clone();
                 let observed = observed.clone();
@@ -3292,8 +3537,12 @@ mod tests {
                         headers["authorization"],
                         "Bearer upstream-test-secret-never-child"
                     );
-                    assert!(headers.contains_key("idempotency-key"));
-                    assert_eq!(body["max_tokens"], MAX_OUTPUT_TOKENS);
+                    if backend == ManagedBackend::ChatCompletions {
+                        assert!(headers.contains_key("idempotency-key"));
+                        assert_eq!(body["max_tokens"], MAX_OUTPUT_TOKENS);
+                    } else {
+                        assert_eq!(body["max_output_tokens"], MAX_OUTPUT_TOKENS);
+                    }
                     if count.fetch_add(1, Ordering::SeqCst) == 1 {
                         // B is physically observed, but has received neither
                         // headers nor usage. C (if admitted) would finish.
@@ -3302,12 +3551,13 @@ mod tests {
                     }
                     (
                         [("content-type", "text/event-stream")],
-                        stream("settled handoff turn"),
+                        handoff_response(backend),
                     )
                 }
             }),
         );
-        let (relay, server) = local_fixture(root.path().join("leases"), router).await;
+        let (relay, server) =
+            local_fixture_with_backend(root.path().join("leases"), router, backend).await;
         let (id, secret) = issue(&relay, "completed-forward-handoff");
         let (published_tx, published_rx) = tokio::sync::oneshot::channel();
         let (release_a, release_rx) = tokio::sync::oneshot::channel();
@@ -3353,7 +3603,7 @@ mod tests {
                 match forward(
                     &b_relay.state,
                     &b_id,
-                    &serde_json::to_vec(&request(1)).unwrap(),
+                    &serde_json::to_vec(&request_for_backend(1, backend)).unwrap(),
                 )
                 .await
                 {
@@ -3396,7 +3646,7 @@ mod tests {
         let quiescent = relay.provider_quiescent(&id);
         eprintln!(
             "completed-forward-handoff {}",
-            json!({"case":format!("{case:?}"),"aSettled":1,"bObservedBeforeADrop":true,"bActiveAfterADrop":b_still_active,"providerQuiescentAfterADrop":quiescent,"canonicalPending":pending(),"reserved":after_a_drop.requests_reserved,"admissions":after_a_drop.wire_attempts,"fixtureCalls":calls.load(Ordering::SeqCst),"completed":after_a_drop.responses_completed,"inputTokens":after_a_drop.input_tokens,"outputTokens":after_a_drop.output_tokens})
+            json!({"case":format!("{case:?}"),"backend":backend,"aSettled":1,"bObservedBeforeADrop":true,"bActiveAfterADrop":b_still_active,"providerQuiescentAfterADrop":quiescent,"canonicalPending":pending(),"reserved":after_a_drop.requests_reserved,"admissions":after_a_drop.wire_attempts,"fixtureCalls":calls.load(Ordering::SeqCst),"completed":after_a_drop.responses_completed,"inputTokens":after_a_drop.input_tokens,"outputTokens":after_a_drop.output_tokens})
         );
         assert_eq!(
             after_a_drop, active_b,
@@ -3470,11 +3720,13 @@ mod tests {
                     .status(),
                     StatusCode::UNAUTHORIZED
                 );
-                assert!(
-                    forward(&relay.state, &id, &serde_json::to_vec(&request(3)).unwrap())
-                        .await
-                        .is_err()
-                );
+                assert!(forward(
+                    &relay.state,
+                    &id,
+                    &serde_json::to_vec(&request_for_backend(3, backend)).unwrap()
+                )
+                .await
+                .is_err());
                 let after = relay.evidence(&id).unwrap();
                 assert_eq!(
                     (
@@ -3555,6 +3807,13 @@ mod tests {
 
     #[allow(clippy::await_holding_lock)]
     async fn assert_abandoned_forward(draining: bool) {
+        for backend in [ManagedBackend::ChatCompletions, ManagedBackend::Responses] {
+            assert_abandoned_forward_backend(draining, backend).await;
+        }
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    async fn assert_abandoned_forward_backend(draining: bool, backend: ManagedBackend) {
         let _serial = crate::home_override_serial();
         let root = tempfile::tempdir().unwrap();
         crate::set_grokptah_home_override(Some(root.path().join("host")));
@@ -3564,7 +3823,11 @@ mod tests {
         let count = calls.clone();
         let barrier = observed.clone();
         let upstream = Router::new().route(
-            "/v1/chat/completions",
+            if backend == ManagedBackend::Responses {
+                "/v1/responses"
+            } else {
+                "/v1/chat/completions"
+            },
             post(move || {
                 let count = count.clone();
                 let barrier = barrier.clone();
@@ -3592,32 +3855,14 @@ mod tests {
                     }
                     (
                         [("content-type", "text/event-stream")],
-                        stream("settled turn"),
+                        handoff_response(backend),
                     )
                         .into_response()
                 }
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server = tokio::spawn(async move {
-            axum::serve(listener, upstream).await.unwrap();
-        });
-        let target = crate::host_helpers::ResolvedModelTarget {
-            base_url: format!("http://127.0.0.1:{port}/v1"),
-            wire_model: "grok-build-0.1".into(),
-            dialect: crate::gateway_config::ProviderDialect::XaiChatCompletions,
-            capabilities: crate::gateway_config::ModelCapabilities {
-                tools: true,
-                stream: true,
-                ..Default::default()
-            },
-            deadline_class: crate::gateway_config::ProviderDeadlineClass::Standard,
-        };
-        let relay =
-            ManagedProviderRelay::with_target(credentials(), target, root.path().join("leases"))
-                .await
-                .unwrap();
+        let (relay, server) =
+            local_fixture_with_backend(root.path().join("leases"), upstream, backend).await;
         let (id, secret) = issue(&relay, "abandoned-forward");
         let state = relay.state.clone();
         let forwarding_id = id.clone();
@@ -3625,7 +3870,7 @@ mod tests {
             forward(
                 &state,
                 &forwarding_id,
-                &serde_json::to_vec(&request(0)).unwrap(),
+                &serde_json::to_vec(&request_for_backend(0, backend)).unwrap(),
             )
             .await
         });
@@ -3674,11 +3919,13 @@ mod tests {
             Some(ManagedProviderDiagnosticKind::AbandonedForward)
         );
         assert_eq!(after.requests_reserved, 1);
-        assert!(
-            forward(&relay.state, &id, &serde_json::to_vec(&request(2)).unwrap())
-                .await
-                .is_err()
-        );
+        assert!(forward(
+            &relay.state,
+            &id,
+            &serde_json::to_vec(&request_for_backend(2, backend)).unwrap()
+        )
+        .await
+        .is_err());
         assert_eq!(relay.evidence(&id).unwrap().requests_reserved, 1);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }

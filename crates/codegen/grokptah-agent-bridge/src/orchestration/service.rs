@@ -2675,7 +2675,7 @@ impl OrchestrationService {
         let repository_id = require_operator_env("GROKPTAH_MANAGED_GROK_REPOSITORY_ID")?;
         let base_ref = require_operator_env("GROKPTAH_MANAGED_GROK_REF")?;
         let head_sha = require_operator_env("GROKPTAH_MANAGED_GROK_SHA")?;
-        let relay = crate::managed_provider::ManagedProviderRelay::start(
+        let relay = crate::managed_provider::ManagedProviderRelay::start_responses(
             "grok-build-0.1",
             self.store.root().join("managed-provider-leases"),
         )

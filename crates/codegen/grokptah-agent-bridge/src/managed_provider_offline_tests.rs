@@ -77,6 +77,91 @@ fn tool(index: u32, name: &str, args: Value) -> Value {
     json!({"index":index,"id":format!("offline-tool-{name}-{index}"),"type":"function","function":{"name":name,"arguments":args.to_string()}})
 }
 
+fn responses_usage(mode: FixtureMode, index: u32) -> Value {
+    let mut value = json!({"input_tokens":100,"output_tokens":15,"total_tokens":115,"input_tokens_details":{"cached_tokens":20},"output_tokens_details":{"reasoning_tokens":5},"cost_in_usd_ticks":777,"num_sources_used":0,"num_server_side_tools_used":0});
+    match mode {
+        FixtureMode::ResponsesOrdinary => {
+            value["output_tokens"] = json!(10);
+            value["total_tokens"] = json!(110);
+            value["output_tokens_details"]["reasoning_tokens"] = json!(0);
+            value["input_tokens_details"]["cached_tokens"] = json!(0);
+            value.as_object_mut().unwrap().remove("cost_in_usd_ticks");
+        }
+        FixtureMode::ResponsesReasoning => {
+            value["input_tokens_details"]["cached_tokens"] = json!(0)
+        }
+        FixtureMode::ResponsesAtCap | FixtureMode::ResponsesIncomplete => {
+            value["output_tokens"] = json!(1024);
+            value["total_tokens"] = json!(1124);
+            value["output_tokens_details"]["reasoning_tokens"] = json!(100);
+            value["cost_in_usd_ticks"] = json!(0);
+        }
+        FixtureMode::ResponsesConflicting => value["total_tokens"] = json!(116),
+        FixtureMode::ResponsesSubset => {
+            value["output_tokens_details"]["reasoning_tokens"] = json!(16)
+        }
+        FixtureMode::ResponsesUnknown => value["unexplained_charge_ticks"] = json!(123),
+        FixtureMode::ResponsesMissing => return Value::Null,
+        _ => {}
+    }
+    if mode == FixtureMode::ResponsesAtCap && index == 0 {
+        value["output_tokens"] = json!(15);
+        value["total_tokens"] = json!(115);
+        value["output_tokens_details"]["reasoning_tokens"] = json!(5);
+    }
+    value
+}
+
+pub(super) fn responses_turn(index: u32, tools: bool, usage: Value, incomplete: bool) -> String {
+    let mut items = if tools {
+        [("src/framing.py", FIXED_FRAMING), ("src/decoder.py", FIXED_DECODER)].into_iter().enumerate().map(|(i,(path,code))| json!({"type":"function_call","id":format!("fc_{index}_{i}"),"call_id":format!("call_{index}_{i}"),"name":"write","arguments":json!({"file_path":path,"content":code}).to_string(),"status":"completed"})).collect::<Vec<_>>()
+    } else {
+        vec![
+            json!({"type":"message","id":format!("msg_{index}"),"role":"assistant","status":"completed","content":[{"type":"output_text","text":"Repaired both files.\nGROK_BUILD_VERDICT=clean","annotations":[],"logprobs":[]}]}),
+        ]
+    };
+    if tools
+        && usage["output_tokens_details"]["reasoning_tokens"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0
+    {
+        items.push(json!({"type":"reasoning","id":format!("reason_{index}"),"summary":[{"type":"summary_text","text":"Synthetic bounded file reasoning"}],"encrypted_content":"synthetic-offline-reasoning","status":"completed"}));
+    }
+    let response = json!({"id":format!("resp_{index}"),"object":"response","created_at":0,"model":"grok-build-0.1","status":if incomplete {"incomplete"} else {"completed"},"max_output_tokens":1024,"output":items,"usage":usage,"error":null,"incomplete_details":if incomplete {json!({"reason":"max_output_tokens"})} else {Value::Null}});
+    let mut events = Vec::new();
+    let mut created = response.clone();
+    created["output"] = json!([]);
+    created["usage"] = Value::Null;
+    created["status"] = json!("in_progress");
+    created["incomplete_details"] = Value::Null;
+    events.push(json!({"type":"response.created","response":created}));
+    for (i, item) in items.iter().enumerate() {
+        let mut added = item.clone();
+        added["status"] = json!("in_progress");
+        if item["type"] == "function_call" {
+            added["arguments"] = json!("");
+        }
+        events.push(json!({"type":"response.output_item.added","output_index":i,"item":added}));
+        if item["type"] == "function_call" {
+            events.push(json!({"type":"response.function_call_arguments.delta","output_index":i,"item_id":item["id"],"delta":item["arguments"]}));
+            events.push(json!({"type":"response.function_call_arguments.done","output_index":i,"item_id":item["id"],"arguments":item["arguments"],"name":item["name"]}));
+        } else if item["type"] == "message" {
+            events.push(json!({"type":"response.output_text.delta","output_index":i,"item_id":item["id"],"content_index":0,"delta":item["content"][0]["text"],"logprobs":[]}));
+        }
+        events.push(json!({"type":"response.output_item.done","output_index":i,"item":item}));
+    }
+    events.push(json!({"type":if incomplete {"response.incomplete"} else {"response.completed"},"response":response}));
+    events
+        .into_iter()
+        .enumerate()
+        .map(|(i, mut v)| {
+            v["sequence_number"] = json!(i);
+            format!("event: {}\ndata: {v}\n\n", v["type"].as_str().unwrap())
+        })
+        .collect()
+}
+
 async fn shutdown(
     server: crate::ControlServerHandle,
     orch: &OrchestrationService,
@@ -98,8 +183,32 @@ enum FixtureMode {
     MissingUsage,
     UnknownAdditionalUsage,
     AdditiveReasoning,
+    ResponsesOrdinary,
+    ResponsesReasoning,
+    ResponsesCached,
+    ResponsesAtCap,
+    ResponsesIncomplete,
+    ResponsesConflicting,
+    ResponsesSubset,
+    ResponsesUnknown,
+    ResponsesMissing,
+    ResponsesMalformed,
 }
 impl FixtureMode {
+    fn responses(self) -> bool {
+        self.name().starts_with("responses-")
+    }
+    fn succeeds(self) -> bool {
+        matches!(
+            self,
+            Self::Success
+                | Self::AccountingCombined
+                | Self::ResponsesOrdinary
+                | Self::ResponsesReasoning
+                | Self::ResponsesCached
+                | Self::ResponsesAtCap
+        )
+    }
     fn name(self) -> &'static str {
         match self {
             Self::Success => "success",
@@ -110,6 +219,16 @@ impl FixtureMode {
             Self::MissingUsage => "missing-usage",
             Self::UnknownAdditionalUsage => "unknown-additional-usage",
             Self::AdditiveReasoning => "additive-reasoning",
+            Self::ResponsesOrdinary => "responses-a-ordinary",
+            Self::ResponsesReasoning => "responses-b-reasoning",
+            Self::ResponsesCached => "responses-c-cached",
+            Self::ResponsesAtCap => "responses-d-at-cap",
+            Self::ResponsesIncomplete => "responses-e-incomplete",
+            Self::ResponsesConflicting => "responses-f-conflicting",
+            Self::ResponsesSubset => "responses-g-subset",
+            Self::ResponsesUnknown => "responses-h-unknown",
+            Self::ResponsesMissing => "responses-missing",
+            Self::ResponsesMalformed => "responses-malformed",
         }
     }
 }
@@ -117,7 +236,7 @@ impl FixtureMode {
 #[allow(clippy::await_holding_lock)]
 async fn qualify(mode: FixtureMode) {
     use std::os::unix::fs::PermissionsExt;
-    let interrupt = !matches!(mode, FixtureMode::Success | FixtureMode::AccountingCombined);
+    let interrupt = !mode.succeeds();
     let _serial = crate::home_override_serial();
     let root = tempfile::Builder::new()
         .prefix("rma-offline-continuation-")
@@ -133,6 +252,10 @@ async fn qualify(mode: FixtureMode) {
     let _reset = Reset;
     let cli = PathBuf::from(
         std::env::var("GROKPTAH_REAL_GROK_CLI").expect("installed CLI path required"),
+    );
+    assert_eq!(
+        crate::file_digest(&cli).as_deref(),
+        Some("sha256:9c844eb13365180787d9ad22b2b3748a024be8e1ed845253cc114781b31c591d")
     );
     let source = root.path().join("source");
     let oracle = root.path().join("oracle");
@@ -213,14 +336,26 @@ async fn qualify(mode: FixtureMode) {
     let count = calls.clone();
     let shapes = Arc::new(Mutex::new(Vec::<Value>::new()));
     let shape_capture = shapes.clone();
-    let router = Router::new().route("/v1/chat/completions", post(move |headers: HeaderMap, Json(body): Json<Value>| {
+    let router = Router::new().route(if mode.responses() {"/v1/responses"} else {"/v1/chat/completions"}, post(move |headers: HeaderMap, Json(body): Json<Value>| {
         let count = count.clone(); let shape_capture = shape_capture.clone();
         async move {
             assert_eq!(headers["authorization"], "Bearer upstream-test-secret-never-child");
-            assert!(headers.contains_key("idempotency-key"));
+            if mode.responses() {
+                assert_eq!(headers["x-xai-token-auth"], "xai-grok-cli");
+                assert_eq!(headers["x-grok-model-override"], "grok-build-0.1");
+                assert_eq!(body["max_output_tokens"], 1024);
+                assert_eq!(body["reasoning"], json!({"summary":"concise"}));
+                assert!(body.get("max_tokens").is_none() && body.get("max_completion_tokens").is_none());
+            } else { assert!(headers.contains_key("idempotency-key")); }
             let index = count.fetch_add(1, Ordering::SeqCst);
             // Retain only field/tool/schema names and numeric budget facts.
-            shape_capture.lock().unwrap().push(json!({"fields":body.as_object().unwrap().keys().collect::<Vec<_>>(),"maxTokens":body["max_tokens"],"requestBytes":body.to_string().len(),"tools":body["tools"].as_array().unwrap().iter().map(|t| json!({"name":t["function"]["name"],"parameterKeys":t["function"]["parameters"]["properties"].as_object().map(|o| o.keys().cloned().collect::<Vec<_>>())})).collect::<Vec<_>>()}));
+            shape_capture.lock().unwrap().push(json!({"fields":body.as_object().unwrap().keys().collect::<Vec<_>>(),"maxTokens":body["max_tokens"],"maxOutputTokens":body["max_output_tokens"],"model":body["model"],"reasoning":body["reasoning"],"oidcHeader":headers.get("x-xai-token-auth").and_then(|v| v.to_str().ok()),"modelRoutingHeader":headers.get("x-grok-model-override").and_then(|v| v.to_str().ok()),"inputTypes":body["input"].as_array().map(|a| a.iter().map(|i| i["type"].as_str().unwrap_or("message")).collect::<Vec<_>>()),"functionToolResults":body["input"].as_array().map(|a| a.iter().filter(|i| i["type"] == "function_call_output").count()),"requestBytes":body.to_string().len(),"tools":body["tools"].as_array().unwrap().iter().map(|t| json!({"name":if mode.responses() {&t["name"]} else {&t["function"]["name"]},"parameterKeys":(if mode.responses() {&t["parameters"]["properties"]} else {&t["function"]["parameters"]["properties"]}).as_object().map(|o| o.keys().cloned().collect::<Vec<_>>())})).collect::<Vec<_>>()}));
+            if mode.responses() {
+                assert!(body["tools"].as_array().unwrap().iter().all(|t| t["type"] == "function"));
+                if index == 1 { assert_eq!(body["input"].as_array().unwrap().iter().filter(|i| i["type"] == "function_call_output").count(), 2); }
+                let response = if mode == FixtureMode::ResponsesMalformed { "data: SECRET_RESPONSE_CANARY\n\n".into() } else {responses_turn(index,index == 0 && mode.succeeds(),responses_usage(mode,index),mode == FixtureMode::ResponsesIncomplete)};
+                return ([("content-type","text/event-stream")],response).into_response();
+            }
             if mode == FixtureMode::Interrupted {
                 use futures::StreamExt;
                 let partial = futures::stream::once(async { Ok::<_, std::io::Error>(Bytes::from_static(b"data: {\"choices\":[]}")) });
@@ -255,7 +390,16 @@ async fn qualify(mode: FixtureMode) {
             ([("content-type","text/event-stream"),("x-request-id","12345678-1234-4234-8234-123456789abc")], response).into_response()
         }
     }));
-    let (relay, upstream) = super::tests::local_fixture(root.path().join("leases"), router).await;
+    let (relay, upstream) = super::tests::local_fixture_with_backend(
+        root.path().join("leases"),
+        router,
+        if mode.responses() {
+            ManagedBackend::Responses
+        } else {
+            ManagedBackend::ChatCompletions
+        },
+    )
+    .await;
     orch.configure_managed_grok_executor(
         ManagedGrokExecutorConfig {
             executable: cli.clone(),
@@ -351,7 +495,18 @@ async fn qualify(mode: FixtureMode) {
     let evidence = &review["providerEvidence"];
     assert_eq!(evidence["wireAttempts"], if interrupt { 1 } else { 2 });
     let expected_kind = match mode {
-        FixtureMode::Success | FixtureMode::AccountingCombined => None,
+        FixtureMode::Success
+        | FixtureMode::AccountingCombined
+        | FixtureMode::ResponsesOrdinary
+        | FixtureMode::ResponsesReasoning
+        | FixtureMode::ResponsesCached
+        | FixtureMode::ResponsesAtCap => None,
+        FixtureMode::ResponsesIncomplete => Some("output_limit_incomplete"),
+        FixtureMode::ResponsesConflicting
+        | FixtureMode::ResponsesSubset
+        | FixtureMode::ResponsesUnknown => Some("usage_inconsistent"),
+        FixtureMode::ResponsesMissing => Some("usage_missing"),
+        FixtureMode::ResponsesMalformed => Some("protocol_failure"),
         FixtureMode::Interrupted => Some("transport_uncertain"),
         FixtureMode::HttpRejected => Some("http_rejected"),
         FixtureMode::Malformed => Some("protocol_failure"),
@@ -362,10 +517,19 @@ async fn qualify(mode: FixtureMode) {
     };
     if let Some(kind) = expected_kind {
         assert_eq!(evidence["interruption"], kind, "{evidence}");
-        assert_eq!(evidence["accountingComplete"], false);
-        assert_eq!(evidence["remoteEffectUncertain"], true);
+        assert_eq!(
+            evidence["accountingComplete"],
+            mode == FixtureMode::ResponsesIncomplete
+        );
+        assert_eq!(
+            evidence["remoteEffectUncertain"],
+            mode != FixtureMode::ResponsesIncomplete
+        );
         let expected_subreason = match mode {
-            FixtureMode::MissingUsage => Some("missing_receipt"),
+            FixtureMode::MissingUsage | FixtureMode::ResponsesMissing => Some("missing_receipt"),
+            FixtureMode::ResponsesConflicting => Some("conflicting_total"),
+            FixtureMode::ResponsesSubset => Some("conflicting_subset"),
+            FixtureMode::ResponsesUnknown => Some("unsupported_field"),
             FixtureMode::UnknownAdditionalUsage => Some("unsupported_field"),
             FixtureMode::AdditiveReasoning => Some("conflicting_total"),
             _ => None,
@@ -403,6 +567,44 @@ async fn qualify(mode: FixtureMode) {
     } else {
         assert_eq!(evidence["accountingComplete"], true);
         assert!(evidence["interruption"].is_null());
+        if mode.responses() {
+            let expected = responses_usage(mode, 1);
+            let first = responses_usage(mode, 0);
+            assert_eq!(evidence["inputTokens"], 200);
+            assert_eq!(
+                evidence["outputTokens"].as_u64(),
+                Some(
+                    first["output_tokens"].as_u64().unwrap()
+                        + expected["output_tokens"].as_u64().unwrap()
+                )
+            );
+            assert_eq!(
+                evidence["totalTokens"].as_u64(),
+                Some(
+                    first["total_tokens"].as_u64().unwrap()
+                        + expected["total_tokens"].as_u64().unwrap()
+                )
+            );
+            assert_eq!(
+                evidence["reasoningTokens"].as_u64(),
+                Some(
+                    first["output_tokens_details"]["reasoning_tokens"]
+                        .as_u64()
+                        .unwrap()
+                        + expected["output_tokens_details"]["reasoning_tokens"]
+                            .as_u64()
+                            .unwrap()
+                )
+            );
+            assert_eq!(
+                evidence["costComplete"],
+                mode != FixtureMode::ResponsesOrdinary
+            );
+            assert_eq!(
+                evidence["costInUsdTicks"].as_i64(),
+                expected["cost_in_usd_ticks"].as_i64().map(|c| c * 2)
+            );
+        }
         if mode == FixtureMode::AccountingCombined {
             assert_eq!(evidence["inputTokens"], 200);
             assert_eq!(evidence["outputTokens"], 20);
@@ -458,7 +660,7 @@ async fn qualify(mode: FixtureMode) {
         assert_eq!(orch.store().list_runs().unwrap().len(), 1);
         assert_eq!(calls.load(Ordering::SeqCst), initial_count);
         assert_eq!(status["providerEvidence"], *evidence);
-        if reopen == 0 {
+        if reopen == 0 && !mode.responses() {
             assert_eq!(status["candidateDigest"], review["candidateDigest"]);
             assert!(git(&source, &["diff", "--stat"]).is_empty());
             if !interrupt {
@@ -475,7 +677,7 @@ async fn qualify(mode: FixtureMode) {
             status_args.clone(),
         )
         .await;
-        if interrupt {
+        if interrupt || mode.responses() {
             assert!(git(&source, &["diff", "--stat"]).is_empty());
         } else {
             assert_eq!(
@@ -613,4 +815,23 @@ async fn installed_cli_unknown_additional_usage_fails_closed_and_survives_reopen
 #[ignore = "requires installed Grok 1.0.41 and native confinement; offline fixture only"]
 async fn installed_cli_additive_reasoning_fails_closed_and_survives_reopen() {
     qualify(FixtureMode::AdditiveReasoning).await;
+}
+
+#[tokio::test]
+#[ignore = "requires pinned CLI and native sandbox; localhost only"]
+async fn installed_cli_responses_managed_journey_and_accounting_matrix_offline() {
+    for mode in [
+        FixtureMode::ResponsesOrdinary,
+        FixtureMode::ResponsesReasoning,
+        FixtureMode::ResponsesCached,
+        FixtureMode::ResponsesAtCap,
+        FixtureMode::ResponsesIncomplete,
+        FixtureMode::ResponsesConflicting,
+        FixtureMode::ResponsesSubset,
+        FixtureMode::ResponsesUnknown,
+        FixtureMode::ResponsesMissing,
+        FixtureMode::ResponsesMalformed,
+    ] {
+        qualify(mode).await;
+    }
 }

@@ -941,6 +941,7 @@ pub(crate) fn managed_offline_readiness(
         candidate_retention_dir: None,
     };
     let policy = crate::managed_provider::ManagedChildPolicy {
+        backend: crate::managed_provider::ManagedBackend::ChatCompletions,
         endpoint: "http://127.0.0.1:1/v1".into(),
         port: 1,
         model: "grok-build-0.1".into(),
@@ -1230,6 +1231,14 @@ impl IsolatedHome {
         // The config contains a local address and an env variable NAME only.
         // The local capability is injected into the cleared child environment.
         let config = format!("{ISOLATED_CONFIG}\n[models]\ndefault = \"managed-assignment\"\nmax_retries = 0\nmax_completion_tokens = {}\n\n[model.managed-assignment]\nbase_url = \"{}\"\nmodel = \"{}\"\nenv_key = \"GROKPTAH_MANAGED_CAPABILITY\"\n\n[endpoints]\nmodels_base_url = \"{}\"\n[cli]\nauto_update = false\n[features]\ntelemetry = false\ntitle_refresh = false\nturn_summary = false\n[workflows]\nenabled = false\n", policy.max_output_tokens, policy.endpoint, policy.model, policy.endpoint);
+        let config = if policy.backend == crate::managed_provider::ManagedBackend::Responses {
+            config.replace(
+                "[model.managed-assignment]\n",
+                "[model.managed-assignment]\napi_backend = \"responses\"\n",
+            )
+        } else {
+            config
+        };
         std::fs::write(self.path.join(CONFIG_FILE_NAME), config)
             .map_err(|_| GrokBuildAdapterError::IsolationFailed)
     }
@@ -2574,7 +2583,8 @@ fn classify_managed_harvest(
         let provider = credentials
             .provider_evidence(&launch.credential_lease_id)
             .ok_or("managed-sends-missing")?;
-        if !provider.accounting_complete
+        if provider.interruption.is_some()
+            || !provider.accounting_complete
             || !provider.usage_observed
             || provider.uncertain
             || !provider.revoked
@@ -2707,6 +2717,45 @@ fn classify_managed_harvest(
 // CLI 1.0.41 records one user prompt in usage.json, while headless
 // num_turns counts model rounds inside that prompt. Validate each ledger at
 // its own granularity, retaining exact host send/token reconciliation.
+
+// Responses zero-cost is present on the wire, but CLI 1.0.41 omits zero
+// from both projections. Host evidence remains Some(0), distinct from UNKNOWN.
+fn responses_projected_cost_matches(
+    value: &serde_json::Value,
+    ticks: Option<i64>,
+    key: &str,
+) -> bool {
+    match ticks {
+        Some(0) => value.get(key).is_none() || value[key].as_i64() == Some(0),
+        Some(n) => value[key].as_i64() == Some(n),
+        None => value.get(key).is_none(),
+    }
+}
+
+fn responses_session_stats_match(
+    stats: &serde_json::Value,
+    provider: &crate::managed_provider::ManagedProviderEvidence,
+) -> bool {
+    let Some(models) = stats["modelUsage"].as_object() else {
+        return false;
+    };
+    if models.len() != 1 || stats["primaryModelId"] != provider.model {
+        return false;
+    }
+    let Some(model) = models.get(&provider.model) else {
+        return false;
+    };
+    [stats, model].into_iter().all(|row| {
+        row["inputTokens"].as_u64() == Some(provider.input_tokens)
+            && row["outputTokens"].as_u64() == Some(provider.output_tokens)
+            && row["totalTokens"].as_u64() == provider.total_tokens
+            && row["modelCalls"].as_u64() == Some(u64::from(provider.wire_attempts))
+            && row["cachedReadTokens"].as_u64() == Some(provider.cache_read_input_tokens)
+            && row["cacheCreationTokens"].as_u64() == Some(0)
+            && row["reasoningTokens"].as_u64() == Some(provider.reasoning_tokens)
+            && responses_projected_cost_matches(row, provider.cost_in_usd_ticks, "costUsdTicks")
+    })
+}
 fn managed_session_usage_matches(
     usage: &serde_json::Value,
     session: &str,
@@ -2730,6 +2779,8 @@ fn managed_session_usage_matches(
             && stats["totalTokens"].as_u64() == Some(total_tokens)
             && stats["inputTokens"].as_u64() == Some(provider.input_tokens)
             && stats["outputTokens"].as_u64() == Some(provider.output_tokens)
+            && (provider.backend != crate::managed_provider::ManagedBackend::Responses
+                || responses_session_stats_match(stats, provider))
     })
 }
 
@@ -2753,6 +2804,15 @@ fn managed_stdout_usage_matches(
         return false;
     };
     let cost_matches = match provider.cost_in_usd_ticks {
+        Some(0)
+            if provider.cost_complete
+                && provider.backend == crate::managed_provider::ManagedBackend::Responses =>
+        {
+            responses_projected_cost_matches(value, Some(0), "total_cost_usd_ticks")
+                && value
+                    .get("total_cost_usd")
+                    .is_none_or(|v| v.as_f64() == Some(0.0))
+        }
         Some(ticks) if provider.cost_complete => {
             value["total_cost_usd_ticks"].as_i64() == Some(ticks)
                 && value["total_cost_usd"].as_f64() == Some(ticks as f64 / 10_000_000_000.0)
@@ -2848,6 +2908,9 @@ fn managed_stdout_usage_matches(
         && model["cacheReadInputTokens"] == usage["cache_read_input_tokens"]
         && model.get("cacheCreationInputTokens") == usage.get("cache_creation_input_tokens")
         && match provider.cost_in_usd_ticks {
+            Some(0) if provider.backend == crate::managed_provider::ManagedBackend::Responses => {
+                model.get("costUSD").is_none_or(|v| v.as_f64() == Some(0.0))
+            }
             Some(ticks) => model["costUSD"].as_f64() == Some(ticks as f64 / 10_000_000_000.0),
             None => model.get("costUSD").is_none(),
         }
@@ -4046,6 +4109,7 @@ mod tests {
             .unwrap();
         });
         let policy = crate::managed_provider::ManagedChildPolicy {
+            backend: crate::managed_provider::ManagedBackend::ChatCompletions,
             endpoint: format!("http://127.0.0.1:{port}/v1"),
             port,
             model: "grok-build-0.1".into(),
@@ -4126,6 +4190,90 @@ printf 'candidate' > source
         assert!(managed_offline_readiness(&executable, root.path())
             .unwrap_err()
             .contains("requires Grok 1.0.41"));
+    }
+
+    #[test]
+    fn responses_journal_reconciles_reasoning_cache_and_cost_per_ledger() {
+        use crate::managed_provider::{ManagedBackend, ManagedProviderEvidence};
+        let provider = ManagedProviderEvidence {
+            backend: ManagedBackend::Responses,
+            model: "grok-build-0.1".into(),
+            wire_attempts: 1,
+            input_tokens: 100,
+            output_tokens: 15,
+            total_tokens: Some(115),
+            cache_read_input_tokens: 20,
+            reasoning_tokens: 5,
+            cost_in_usd_ticks: Some(777),
+            cost_complete: true,
+            ..Default::default()
+        };
+        let mut row = serde_json::json!({"inputTokens":100,"outputTokens":15,"totalTokens":115,"cachedReadTokens":20,"cacheCreationTokens":0,"reasoningTokens":5,"modelCalls":1,"costUsdTicks":777});
+        let model = row.clone();
+        row["turnCount"] = serde_json::json!(1);
+        row["primaryModelId"] = serde_json::json!("grok-build-0.1");
+        row["modelUsage"] = serde_json::json!({"grok-build-0.1":model});
+        let good = serde_json::json!({"sessionId":"responses-session","session":row,"turns":[row]});
+        assert!(managed_session_usage_matches(
+            &good,
+            "responses-session",
+            &provider
+        ));
+        for path in [
+            "/session/reasoningTokens",
+            "/session/cachedReadTokens",
+            "/session/costUsdTicks",
+            "/turns/0/modelUsage/grok-build-0.1/reasoningTokens",
+            "/turns/0/modelUsage/grok-build-0.1/cachedReadTokens",
+            "/turns/0/modelUsage/grok-build-0.1/costUsdTicks",
+        ] {
+            let mut bad = good.clone();
+            *bad.pointer_mut(path).unwrap() = serde_json::json!(999);
+            assert!(
+                !managed_session_usage_matches(&bad, "responses-session", &provider),
+                "{path}"
+            );
+        }
+        let mut wrong_model = good.clone();
+        wrong_model["session"]["modelUsage"] = serde_json::json!({"different-model": {}});
+        assert!(!managed_session_usage_matches(
+            &wrong_model,
+            "responses-session",
+            &provider
+        ));
+        let mut zero = good;
+        {
+            let row = &mut zero["session"];
+            row.as_object_mut().unwrap().remove("costUsdTicks");
+            row["modelUsage"]["grok-build-0.1"]
+                .as_object_mut()
+                .unwrap()
+                .remove("costUsdTicks");
+        }
+        zero["turns"][0] = zero["session"].clone();
+        let zero_provider = ManagedProviderEvidence {
+            cost_in_usd_ticks: Some(0),
+            ..provider.clone()
+        };
+        assert!(managed_session_usage_matches(
+            &zero,
+            "responses-session",
+            &zero_provider
+        ));
+        let missing_provider = ManagedProviderEvidence {
+            cost_in_usd_ticks: None,
+            cost_complete: false,
+            ..provider
+        };
+        assert!(managed_session_usage_matches(
+            &zero,
+            "responses-session",
+            &missing_provider
+        ));
+        assert_ne!(
+            zero_provider.cost_in_usd_ticks,
+            missing_provider.cost_in_usd_ticks
+        );
     }
 
     #[test]
@@ -4342,6 +4490,7 @@ printf 'candidate' > source
             let port = listener.local_addr().unwrap().port();
             let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
             let policy = crate::managed_provider::ManagedChildPolicy {
+                backend: crate::managed_provider::ManagedBackend::ChatCompletions,
                 endpoint: format!("http://127.0.0.1:{port}/v1"),
                 port,
                 model: "grok-build-0.1".into(),
