@@ -175,11 +175,28 @@ fence-first; `Destroyed` is confirmed-only; Uncertain rejects auto-retry.
 
 Live WK also attaches native fail-closed delegates on the owned-page session.
 `WKUIDelegate.createWebView...` returns nil; live `window.open` / popup probes require
-a WK-originated createWebView callback (JS `null` without that callback is not a deny).
+a WK-originated createWebView callback (JS `null` without that callback is not a deny;
+missing createWebView IMP fail-closes because unimplemented createWebView is fail-open).
 `target=_blank` is cancelled by `WKNavigationDelegate` (`targetFrame == nil`) and recorded
-as `NewWindow`. Download probes use `<a download href=".../deny.bin">`; WK must cancel
-that navigation (`shouldPerformDownload` or download MIME) — dummy `didBecomeDownload`
-pokes are not a deny. File and directory pickers require a WK-originated
+as `NewWindow`. Download probes click dedicated `grokptah-cbv0://owned/deny.bin`. Live WK
+registers a `WKURLSchemeHandler` for that fetch. Action policy Allows that URL (not a page
+admit) so the handler can answer; it is not cancelled on `shouldPerformDownload` and is not
+short-circuited with action-policy Download (2) before the handler runs. `WKDownload` is
+NetworkProcess-backed and cannot take over a custom-scheme task, so the handler cancels that
+document load and starts loopback HTTP that serves `Content-Disposition: attachment` plus
+octet-stream. Action policy returns `WKNavigationActionPolicyDownload` (2) for that HTTP URL
+so WK creates a `WKDownload`. `WKWebView.URL` may still report the download request; the
+owned document is the committed `location.href`. Custom-scheme response is Cancel, never
+Download. Deny is the real non-null `didBecomeDownload` callback;
+`decideDestination` completes nil after inspecting the attachment and `deny.bin` is not
+written. Hosted Desktop still reports the loopback URL as `WKWebView.URL` after a
+main-frame Download policy, so the probe restores the owned fixture before later
+pickers. Dummy `didBecomeDownload` IMP pokes, timeout→runloop pokes inside the handler,
+`shouldPerformDownload` shortcuts, action-policy-2 on the custom scheme,
+`startDownloadUsingRequest` (app-originated, not navigation `didBecomeDownload`),
+and cancelled `blob:` URLs are not a deny. Native deny IMPs call the same
+`admit_native_capability` gate as Linux tests.
+File and directory pickers require a WK-originated
 `WKUIDelegate.runOpenPanelWithParameters` callback with a real `WKOpenPanelParameters`
 (owned-page `<input type=file>` / `webkitdirectory`); the IMP completes with nil URLs.
 Timeout → self `objc_msgSend` of `runOpenPanel` is not a deny. `_blank` / off-allowlist remain
