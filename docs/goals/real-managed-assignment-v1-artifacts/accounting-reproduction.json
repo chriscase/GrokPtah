@@ -1,0 +1,37 @@
+{
+  "additionalLiveRequests": 0,
+  "cliMatcherBefore": {
+    "failed": 1,
+    "passed": 0,
+    "setupFailure": false,
+    "specificFailure": "valid headless uncached input/cache/reasoning/exact-ticks shape rejected by prior matcher"
+  },
+  "functionalSha": "0be8ec4b32144d002d8bb230dec78d18d018f922",
+  "functionalTree": "ad0c6d0a500d309981c3eddbee2531625106b89c",
+  "logDigests": {
+    "rma-accounting-before.log": "sha256:ff0b259671f31cf79fcda5a015f00272f781573eb18e8bb467e89bd2e0dfb150",
+    "rma-accounting-cli-match-before.log": "sha256:5c5b4259df613de8dbf0dbe189b789b2d5725c50a720a942e7d4ee4ac5830a09",
+    "rma-accounting-focused-functional.log": "sha256:aaec91b4ba608c0c93be032123fe160d868725677caa91d837c41651683be6bc"
+  },
+  "nextLiveSpecification": "NOT EXECUTED",
+  "productionBoundary": "Actual managed relay to local upstream through canonical send/settlement, plus installed CLI stdout matcher.",
+  "relayBefore": {
+    "failed": 4,
+    "ignored": 1,
+    "passed": 17,
+    "setupFailure": false,
+    "specificFailures": [
+      "combined reasoning/cache/cost receipt lacked durable reasoningTokens: null versus 3, despite HTTP 200",
+      "cache detail larger than prompt: HTTP 200 versus required 502",
+      "reasoning detail larger than completion: HTTP 200 versus required 502",
+      "unknown additional usage field: HTTP 200 versus required 502"
+    ]
+  },
+  "sameRegressionsAfter": {
+    "failed": 0,
+    "focusedRelayPassed": 29,
+    "ignored": 1,
+    "installedCliMatcherPassed": true
+  },
+  "schemaVersion": 1
+}

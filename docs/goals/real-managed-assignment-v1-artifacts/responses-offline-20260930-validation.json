@@ -1,0 +1,900 @@
+{
+  "additionalLiveProviderRequests": 0,
+  "ci": {
+    "attempt": 1,
+    "conclusion": "success",
+    "headSha": "b21b7f4d1e3d139e4b40ca8d9f6b38e1c5622c73",
+    "jobs": [
+      {
+        "completedAt": "2026-09-30T22:34:58Z",
+        "conclusion": "success",
+        "databaseId": 110116595012,
+        "name": "desktop",
+        "startedAt": "2026-09-30T21:57:43Z",
+        "status": "completed",
+        "steps": [
+          {
+            "completedAt": "2026-09-30T21:57:45Z",
+            "conclusion": "success",
+            "name": "Set up job",
+            "number": 1,
+            "startedAt": "2026-09-30T21:57:44Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-30T21:57:50Z",
+            "conclusion": "success",
+            "name": "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+            "number": 2,
+            "startedAt": "2026-09-30T21:57:45Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-30T21:57:59Z",
+            "conclusion": "success",
+            "name": "Run actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
+            "number": 3,
+            "startedAt": "2026-09-30T21:57:50Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-30T21:58:08Z",
+            "conclusion": "success",
+            "name": "Run dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4",
+            "number": 4,
+            "startedAt": "2026-09-30T21:57:59Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-30T21:58:08Z",
+            "conclusion": "success",
+            "name": "Configure compiler-cache namespace",
+            "number": 5,
+            "startedAt": "2026-09-30T21:58:08Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-30T21:58:09Z",
+            "conclusion": "success",
+            "name": "Install compiler cache",
+            "number": 6,
+            "startedAt": "2026-09-30T21:58:08Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-30T21:59:13Z",
+            "conclusion": "success",
+            "name": "Install hermetic protobuf compiler",
+            "number": 7,
+            "startedAt": "2026-09-30T21:58:09Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-30T21:59:17Z",
+            "conclusion": "success",
+            "name": "Install frontend deps",
+            "number": 8,
+            "startedAt": "2026-09-30T21:59:13Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-30T21:59:37Z",
+            "conclusion": "success",
+            "name": "Semantic Help contract and generated-artifact gates",
+            "number": 9,
+            "startedAt": "2026-09-30T21:59:17Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-30T22:00:03Z",
+            "conclusion": "success",
+            "name": "Typecheck + unit tests",
+            "number": 10,
+            "startedAt": "2026-09-30T21:59:37Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-30T22:00:27Z",
+            "conclusion": "success",
+            "name": "Semantic Help public bundle and provenance gates",
+            "number": 11,
+            "startedAt": "2026-09-30T22:00:03Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-30T22:00:28Z",
+            "conclusion": "success",
+            "name": "Upload Semantic Help provenance manifest",
+            "number": 12,
+            "startedAt": "2026-09-30T22:00:27Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-30T22:02:50Z",
+            "conclusion": "success",
+            "name": "Cargo tests (desktop)",
+            "number": 13,
+            "startedAt": "2026-09-30T22:00:28Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-30T22:03:19Z",
+            "conclusion": "success",
+            "name": "Establish private-check public toolchain ownership",
+            "number": 14,
+            "startedAt": "2026-09-30T22:02:50Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-30T22:18:01Z",
+            "conclusion": "success",
+            "name": "Bridge fmt + clippy + tests",
+            "number": 15,
+            "startedAt": "2026-09-30T22:03:19Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-30T22:19:57Z",
+            "conclusion": "success",
+            "name": "Headless service fmt + clippy + tests",
+            "number": 16,
+            "startedAt": "2026-09-30T22:18:01Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-30T22:24:08Z",
+            "conclusion": "success",
+            "name": "Shell provider helper compile",
+            "number": 17,
+            "startedAt": "2026-09-30T22:19:57Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-30T22:29:05Z",
+            "conclusion": "success",
+            "name": "Pager fmt + production composition checks",
+            "number": 18,
+            "startedAt": "2026-09-30T22:24:08Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-30T22:29:25Z",
+            "conclusion": "success",
+            "name": "Host authority spine (fmt + clippy + tests)",
+            "number": 19,
+            "startedAt": "2026-09-30T22:29:05Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-30T22:29:28Z",
+            "conclusion": "success",
+            "name": "Offline parity oracles (no network)",
+            "number": 20,
+            "startedAt": "2026-09-30T22:29:25Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-30T22:32:23Z",
+            "conclusion": "success",
+            "name": "Persistent-Agent certification lab (offline only)",
+            "number": 21,
+            "startedAt": "2026-09-30T22:29:28Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-30T22:34:02Z",
+            "conclusion": "success",
+            "name": "Adaptive Computer Use evaluator (synthetic authority)",
+            "number": 22,
+            "startedAt": "2026-09-30T22:32:23Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-30T22:34:02Z",
+            "conclusion": "success",
+            "name": "Offline oracle suite shape (repo root)",
+            "number": 23,
+            "startedAt": "2026-09-30T22:34:02Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-30T22:34:20Z",
+            "conclusion": "success",
+            "name": "Coding-worktree fmt + clippy + tests",
+            "number": 24,
+            "startedAt": "2026-09-30T22:34:02Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-30T22:34:51Z",
+            "conclusion": "success",
+            "name": "Isolated-surface fmt + clippy + focused tests",
+            "number": 25,
+            "startedAt": "2026-09-30T22:34:20Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-30T22:34:52Z",
+            "conclusion": "success",
+            "name": "Post Install compiler cache",
+            "number": 48,
+            "startedAt": "2026-09-30T22:34:51Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-30T22:34:52Z",
+            "conclusion": "success",
+            "name": "Post Run actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
+            "number": 49,
+            "startedAt": "2026-09-30T22:34:52Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-30T22:34:52Z",
+            "conclusion": "success",
+            "name": "Post Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+            "number": 50,
+            "startedAt": "2026-09-30T22:34:52Z",
+            "status": "completed"
+          },
+          {
+            "completedAt": "2026-09-30T22:34:54Z",
+            "conclusion": "success",
+            "name": "Complete job",
+            "number": 51,
+            "startedAt": "2026-09-30T22:34:52Z",
+            "status": "completed"
+          }
+        ],
+        "url": "https://github.com/chriscase/GrokPtah/actions/runs/36782699253/job/110116595012"
+      }
+    ],
+    "status": "completed",
+    "url": "https://github.com/chriscase/GrokPtah/actions/runs/36782699253"
+  },
+  "contractMarkdownSha256": "88d166c6b541927f608958cbd5e2cada361bc5c5f241c4ea3d13f4282b9d2599",
+  "countingRule": "One final result per Cargo target; nested child-process test results are excluded from aggregate counts. The 9 managed offline test functions include ten Responses modes and eight legacy modes.",
+  "freshHostState": true,
+  "frontendTestFiles": 58,
+  "frontendTests": 428,
+  "functionalSha": "b21b7f4d1e3d139e4b40ca8d9f6b38e1c5622c73",
+  "localCommands": [
+    {
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "--locked",
+        "--",
+        "--test-threads=1"
+      ],
+      "cwd": "/private/tmp/GrokPtah-real-managed-assignment-v1/crates/codegen/grokptah-agent-bridge",
+      "exitCode": 0,
+      "log": "/private/tmp/rma-responses-validation-bridge-0.log",
+      "logSha256": "dd1b60704b80e6ff827c2e1a51419fb1fdf8f52f2aac335179f5f9d147971690",
+      "seconds": 761.2,
+      "testTargets": [
+        {
+          "failed": 0,
+          "ignored": 11,
+          "outcome": "ok",
+          "passed": 754,
+          "target": "unittests src/lib.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 1,
+          "target": "tests/agent_tools.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 41,
+          "target": "tests/bridge_lifecycle.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 19,
+          "target": "tests/coding_worktree_session.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 15,
+          "target": "tests/computer_adaptive_seam.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 6,
+          "target": "tests/computer_use_release_gate.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 5,
+          "target": "tests/coordinator_mcp.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 12,
+          "target": "tests/coordinator_store.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 27,
+          "target": "tests/grok_build_adapter.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 1,
+          "outcome": "ok",
+          "passed": 1,
+          "target": "tests/grok_build_managed_executor.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 1,
+          "outcome": "ok",
+          "passed": 41,
+          "target": "tests/host_shutdown_ownership.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 8,
+          "target": "tests/isolated_surface_proof_harness.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 5,
+          "target": "tests/isolation_capability.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 2,
+          "target": "tests/manager_mcp.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 6,
+          "target": "tests/manager_store.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 1,
+          "target": "tests/manager_supervisor.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 1,
+          "target": "tests/mcp_continuity_probe.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 1,
+          "target": "tests/mcp_coordinator_campaign.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 3,
+          "target": "tests/mcp_live_events.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 5,
+          "target": "tests/mcp_soak_hardening.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 29,
+          "target": "tests/mcp_streamable_transport.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 5,
+          "target": "tests/memory_scopes.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 16,
+          "target": "tests/native_executor_mcp.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 38,
+          "target": "tests/native_executor_store.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 20,
+          "target": "tests/orchestration_adversarial.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 40,
+          "target": "tests/orchestration_control.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 9,
+          "target": "tests/parity_eval.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 4,
+          "target": "tests/provider_wire_conformance.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 1,
+          "target": "tests/reliability_eval.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 1,
+          "target": "tests/routine_mcp.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 10,
+          "target": "tests/routine_store.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 1,
+          "outcome": "ok",
+          "passed": 1,
+          "target": "tests/self_host_cu_dogfood.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 5,
+          "target": "tests/subagent_parallel.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 102,
+          "target": "tests/verified_change_workflow.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 25,
+          "target": "tests/work_graph_authority.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 3,
+          "target": "tests/work_graph_service.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 1,
+          "target": "tests/workload_mcp.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 20,
+          "target": "tests/workload_store.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 1,
+          "outcome": "ok",
+          "passed": 0,
+          "target": "grokptah_agent_bridge"
+        }
+      ]
+    },
+    {
+      "command": [
+        "cargo",
+        "check",
+        "--offline",
+        "--locked"
+      ],
+      "cwd": "/private/tmp/GrokPtah-real-managed-assignment-v1/crates/codegen/grokptah-service",
+      "exitCode": 0,
+      "log": "/private/tmp/rma-responses-validation-service-0.log",
+      "logSha256": "eeb534931eced03ee44a2b9cebf8f5ce854d545fae674302ceed01d17a73fa52",
+      "seconds": 2.67,
+      "testTargets": []
+    },
+    {
+      "command": [
+        "cargo",
+        "fmt",
+        "--check"
+      ],
+      "cwd": "/private/tmp/GrokPtah-real-managed-assignment-v1/crates/codegen/grokptah-service",
+      "exitCode": 0,
+      "log": "/private/tmp/rma-responses-validation-service-1.log",
+      "logSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "seconds": 0.06,
+      "testTargets": []
+    },
+    {
+      "command": [
+        "cargo",
+        "clippy",
+        "--offline",
+        "--locked",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "cwd": "/private/tmp/GrokPtah-real-managed-assignment-v1/crates/codegen/grokptah-service",
+      "exitCode": 0,
+      "log": "/private/tmp/rma-responses-validation-service-2.log",
+      "logSha256": "aac884cd07f9c76327b2bfbe609bebe45c3659c3181de3899092346e134d214d",
+      "seconds": 3.1,
+      "testTargets": []
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "--locked",
+        "--",
+        "--test-threads=1"
+      ],
+      "cwd": "/private/tmp/GrokPtah-real-managed-assignment-v1/crates/codegen/grokptah-service",
+      "exitCode": 0,
+      "log": "/private/tmp/rma-responses-validation-service-3.log",
+      "logSha256": "717ff57f03e177eba010873e52a9a602a05bb1b119a1278ff43ba1f658cbdb09",
+      "seconds": 23.06,
+      "testTargets": [
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 4,
+          "target": "unittests src/lib.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 0,
+          "target": "unittests src/main.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 11,
+          "target": "tests/service_conformance.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 5,
+          "target": "tests/service_smoke.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 0,
+          "target": "grokptah_service"
+        }
+      ]
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "--locked",
+        "--",
+        "--test-threads=1"
+      ],
+      "cwd": "/private/tmp/GrokPtah-real-managed-assignment-v1/desktop/src-tauri",
+      "exitCode": 0,
+      "log": "/private/tmp/rma-responses-validation-tauri-0.log",
+      "logSha256": "0cc966fd3d9ea159088c1e0886dd944d4410cc0078ddb53c6840b59b7318ac83",
+      "seconds": 38.03,
+      "testTargets": [
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 50,
+          "target": "unittests src/lib.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 0,
+          "target": "unittests src/main.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 0,
+          "target": "grokptah_desktop_lib"
+        }
+      ]
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "--locked",
+        "--lib",
+        "managed_provider::offline_tests",
+        "--",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "cwd": "/private/tmp/GrokPtah-real-managed-assignment-v1/crates/codegen/grokptah-agent-bridge",
+      "exitCode": 0,
+      "log": "/private/tmp/rma-responses-validation-cli-0.log",
+      "logSha256": "7fa736c733a03cc53ce5ab08e8667764075e4ec2a0c127a565a2f446b5956028",
+      "seconds": 265.36,
+      "testTargets": [
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 9,
+          "target": "unittests src/lib.rs"
+        }
+      ]
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "--locked",
+        "--lib",
+        "installed_cli_projects_synthetic_usage",
+        "--",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "cwd": "/private/tmp/GrokPtah-real-managed-assignment-v1/crates/codegen/grokptah-agent-bridge",
+      "exitCode": 0,
+      "log": "/private/tmp/rma-responses-validation-cli-1.log",
+      "logSha256": "fd2a012fe6ecada25a0d42169b77cb2ec32007ef79a03c794175d3b4b68efd1c",
+      "seconds": 5.86,
+      "testTargets": [
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 1,
+          "target": "unittests src/lib.rs"
+        }
+      ]
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "--locked",
+        "--lib",
+        "installed_cli_obeys_production_protocol",
+        "--",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "cwd": "/private/tmp/GrokPtah-real-managed-assignment-v1/crates/codegen/grokptah-agent-bridge",
+      "exitCode": 0,
+      "log": "/private/tmp/rma-responses-validation-cli-2.log",
+      "logSha256": "9b2814cdf71bda9b18de217b7182af7f21efac1c59cb89f45c8a334fc8f965c0",
+      "seconds": 6.78,
+      "testTargets": [
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 1,
+          "target": "unittests src/lib.rs"
+        }
+      ]
+    }
+  ],
+  "otherChecks": [
+    {
+      "command": "cargo test --offline --locked --lib managed_provider -- --test-threads=1",
+      "exitCode": 0,
+      "logSha256": "667ee5d00a34e494034ef48cc60414ef21cac40b56a39f1f835039e1f14a6c35",
+      "name": "focused relay",
+      "testTargets": [
+        {
+          "failed": 0,
+          "ignored": 10,
+          "outcome": "ok",
+          "passed": 52,
+          "target": "unittests src/lib.rs"
+        }
+      ]
+    },
+    {
+      "command": "cargo test --offline --locked -p xai-host-authority -- --test-threads=1",
+      "exitCode": 0,
+      "logSha256": "77bee350a66b6e12ec45837acc6a199d72322dd36a9c2801411042e9c60dd6a9",
+      "name": "host authority",
+      "testTargets": [
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 4,
+          "target": "unittests src/lib.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 47,
+          "target": "tests/authority_spine.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 3,
+          "target": "tests/durability_cuts.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 15,
+          "target": "tests/operator_reconciliation.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 8,
+          "target": "tests/operator_send_admission.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 11,
+          "target": "tests/principal_generation_spine.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 7,
+          "target": "tests/provider_send_lattice.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 3,
+          "target": "tests/two_process_crash.rs"
+        },
+        {
+          "failed": 0,
+          "ignored": 0,
+          "outcome": "ok",
+          "passed": 21,
+          "target": "xai_host_authority"
+        }
+      ]
+    },
+    {
+      "command": "npm run typecheck",
+      "exitCode": 0,
+      "logSha256": "3b0513ad643589f28c88931cabf8bdd3e909fa535642dfd3b26a606194abfb7e",
+      "name": "frontend typecheck",
+      "testTargets": []
+    },
+    {
+      "command": "npm test",
+      "exitCode": 0,
+      "logSha256": "6fbf05845e769a637b5e7b312b27f35aca12e82f4dbc70306ff5f27733b510f9",
+      "name": "frontend unit tests",
+      "testTargets": []
+    },
+    {
+      "command": "cargo fmt --check",
+      "exitCode": 0,
+      "logSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "name": "bridge formatting",
+      "testTargets": []
+    },
+    {
+      "command": "cargo clippy --offline --locked --all-targets -- -D warnings",
+      "exitCode": 0,
+      "logSha256": "0b53209db424367e80c52cd8cde8b75e37af110438a0efde777104a1463956de",
+      "name": "bridge strict lint",
+      "testTargets": []
+    }
+  ],
+  "pinnedCliExternalNetworkDenied": true,
+  "qualifiedFailures": [
+    {
+      "earlierFailure": "During concurrent validation the existing disconnect/reconnect durability test saturated the journal writer queue and retained its unclean-shutdown lock.",
+      "failureLogSha256": "548e90bd16645a01648a9b7acc83982891776cba47e54063cb6a099c476ed59c",
+      "finalFullService": "20 passed, 0 failed; check/fmt/strict lint passed. No production durability change was made.",
+      "isolatedLogSha256": "12f1885ef7e40ecaf559dcbb352577573032590686aab525e91c38df2338d74c",
+      "isolatedRetry": "1 passed, 0 failed",
+      "scope": "quiet service confirmation"
+    }
+  ],
+  "schemaVersion": 1
+}

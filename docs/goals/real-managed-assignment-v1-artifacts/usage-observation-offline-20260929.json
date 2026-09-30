@@ -1,0 +1,212 @@
+{
+  "schemaVersion": 1,
+  "qualification": "OFFLINE ONLY; synthetic local upstream",
+  "functionalSha": "6c91c00b49d97555a5e6e5de8eaf05fb90066e3f",
+  "functionalTree": "8ecc48bc0a74714f9fcee7e6ea945f5c3fee0802",
+  "startingTip": "34690219e7533dfb90631593f809ace3f4eef2b0",
+  "startingTree": "a27a9736f66834e71cd2eb0f77d7545308b2397d",
+  "redGreen": {
+    "test": "managed_provider::tests::rejected_total_retains_known_sibling_observations_at_relay_boundary",
+    "before": "failed at the production relay after HTTP 200: no usageObservation.snapshots",
+    "after": "passed with separate prompt/completion/total, cache, reasoning and cost fields retained; rejection unchanged"
+  },
+  "snapshotPolicy": {
+    "knownPaths": [
+      "prompt_tokens",
+      "completion_tokens",
+      "total_tokens",
+      "prompt_tokens_details.text_tokens",
+      "prompt_tokens_details.audio_tokens",
+      "prompt_tokens_details.image_tokens",
+      "prompt_tokens_details.cached_tokens",
+      "completion_tokens_details.reasoning_tokens",
+      "completion_tokens_details.audio_tokens",
+      "completion_tokens_details.accepted_prediction_tokens",
+      "completion_tokens_details.rejected_prediction_tokens",
+      "num_sources_used",
+      "cost_in_usd_ticks"
+    ],
+    "maxTokenIntegerRetained": 65536,
+    "maxCostTicksIntegerRetained": 1000000000000,
+    "maxNonIntegralNumericCharacters": 32,
+    "maxSnapshotBytes": 3072,
+    "maxSnapshotsPerLease": 2,
+    "maxUnknownKeyCountPerKnownObject": 4,
+    "unknownKeyOverflowIndicator": "more",
+    "maxDiagnosticsPerLease": 32,
+    "legacyMissingObservation": "unavailable, not zero",
+    "observationNeverSettlesUsage": true
+  },
+  "representativeSyntheticJourney": {
+    "fixtureMode": "additive-reasoning",
+    "syntheticUsage": {
+      "prompt_tokens": 100,
+      "completion_tokens": 10,
+      "total_tokens": 115,
+      "prompt_tokens_details": {
+        "text_tokens": 100,
+        "audio_tokens": 0,
+        "image_tokens": 0,
+        "cached_tokens": 20
+      },
+      "completion_tokens_details": {
+        "reasoning_tokens": 5,
+        "audio_tokens": 0,
+        "accepted_prediction_tokens": 0,
+        "rejected_prediction_tokens": 0
+      },
+      "cost_in_usd_ticks": 777
+    },
+    "workId": "68996406-455a-425f-b8b0-0d9dd19cb0b0",
+    "attemptCount": 1,
+    "runCount": 1,
+    "localFixtureSends": 1,
+    "typedRejection": {
+      "expected": 110,
+      "field": "total_tokens",
+      "kind": "conflicting_total",
+      "observed": 115
+    },
+    "snapshot": {
+      "completionDetailsState": {
+        "contentSuppressed": false,
+        "state": "object"
+      },
+      "fields": [
+        {
+          "contentSuppressed": false,
+          "path": "prompt_tokens",
+          "state": "positive",
+          "value": 100,
+          "valueOmitted": false
+        },
+        {
+          "contentSuppressed": false,
+          "path": "completion_tokens",
+          "state": "positive",
+          "value": 10,
+          "valueOmitted": false
+        },
+        {
+          "contentSuppressed": false,
+          "path": "total_tokens",
+          "state": "positive",
+          "value": 115,
+          "valueOmitted": false
+        },
+        {
+          "contentSuppressed": false,
+          "path": "prompt_tokens_details.text_tokens",
+          "state": "positive",
+          "value": 100,
+          "valueOmitted": false
+        },
+        {
+          "contentSuppressed": false,
+          "path": "prompt_tokens_details.audio_tokens",
+          "state": "zero",
+          "value": 0,
+          "valueOmitted": false
+        },
+        {
+          "contentSuppressed": false,
+          "path": "prompt_tokens_details.image_tokens",
+          "state": "zero",
+          "value": 0,
+          "valueOmitted": false
+        },
+        {
+          "contentSuppressed": false,
+          "path": "prompt_tokens_details.cached_tokens",
+          "state": "positive",
+          "value": 20,
+          "valueOmitted": false
+        },
+        {
+          "contentSuppressed": false,
+          "path": "completion_tokens_details.reasoning_tokens",
+          "state": "positive",
+          "value": 5,
+          "valueOmitted": false
+        },
+        {
+          "contentSuppressed": false,
+          "path": "completion_tokens_details.audio_tokens",
+          "state": "zero",
+          "value": 0,
+          "valueOmitted": false
+        },
+        {
+          "contentSuppressed": false,
+          "path": "completion_tokens_details.accepted_prediction_tokens",
+          "state": "zero",
+          "value": 0,
+          "valueOmitted": false
+        },
+        {
+          "contentSuppressed": false,
+          "path": "completion_tokens_details.rejected_prediction_tokens",
+          "state": "zero",
+          "value": 0,
+          "valueOmitted": false
+        },
+        {
+          "contentSuppressed": false,
+          "path": "num_sources_used",
+          "state": "missing",
+          "valueOmitted": false
+        },
+        {
+          "contentSuppressed": false,
+          "path": "cost_in_usd_ticks",
+          "state": "positive",
+          "value": 777,
+          "valueOmitted": false
+        }
+      ],
+      "promptDetailsState": {
+        "contentSuppressed": false,
+        "state": "object"
+      },
+      "receiptOrdinal": 1,
+      "receiptState": {
+        "contentSuppressed": false,
+        "state": "object"
+      },
+      "unknownCompletionDetailsKeys": {
+        "contentSuppressed": false,
+        "countUpToFour": 0,
+        "more": false
+      },
+      "unknownPromptDetailsKeys": {
+        "contentSuppressed": false,
+        "countUpToFour": 0,
+        "more": false
+      },
+      "unknownTopLevelKeys": {
+        "contentSuppressed": false,
+        "countUpToFour": 0,
+        "more": false
+      }
+    },
+    "snapshotsRetained": 1,
+    "credentialFreeReopens": 3,
+    "allReopensMatchInitialProviderEvidence": true,
+    "sourceBaseTree": "1ef9c0872b4eadfaae5f75bbf2933c062cce67ec",
+    "workerRootEmpty": true,
+    "accountingComplete": false,
+    "costComplete": false,
+    "remoteEffectUncertain": true,
+    "revoked": true,
+    "completedUsageResponses": 0
+  },
+  "privateJourneyReportSha256": "ef49af4958c8337d19918f0ea7f5b9f91984feddae413762a4aa71efba3c505e",
+  "preservation": {
+    "oldPrivateHistoricalRecordsByteIdentical": 5,
+    "latestLiveExecuteAndReviewPredateThisGoal": true,
+    "historicalLiveWorkModified": false,
+    "additionalLiveProviderRequests": 0,
+    "productionAcceptanceChanged": false,
+    "accountingOrConfinementLimitsChanged": false
+  }
+}

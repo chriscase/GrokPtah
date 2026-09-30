@@ -1,0 +1,24 @@
+{
+  "integration": {
+    "headRefOid": "8451fb098a4b04d47110752fc37ea7b1e4ecb227",
+    "mergeCommit": {
+      "oid": "9e2660ff1a50edb7af1b81a4232d7fe23a37de0d"
+    },
+    "mergedAt": "2026-09-27T04:55:46Z",
+    "state": "MERGED",
+    "url": "https://github.com/chriscase/GrokPtah/pull/579"
+  },
+  "base": {
+    "merge_sha": "9e2660ff1a50edb7af1b81a4232d7fe23a37de0d",
+    "base_sha": "9e2660ff1a50edb7af1b81a4232d7fe23a37de0d",
+    "base_tree": "f524b705a3b88cb895309506bf726e76c91874bf",
+    "reviewed_sha": "56757475fdfeba18247e936e16f240ecfa9f7f8f",
+    "published_predecessor_sha": "8451fb098a4b04d47110752fc37ea7b1e4ecb227",
+    "preflight_dispatch_count": 0
+  },
+  "reviewed_tree": "341591e61ab0f51bac0d4fc89e364fc4460088d5",
+  "published_predecessor_tree": "f524b705a3b88cb895309506bf726e76c91874bf",
+  "both_predecessor_shas_ancestors": true,
+  "integrated_tree_equals_published_tree": true,
+  "post_merge_smoke": "formatting and two resealed-admission regressions passed"
+}

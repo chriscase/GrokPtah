@@ -1,0 +1,374 @@
+{
+  "schemaVersion": 1,
+  "functionalSha": "fd8a7873468d7b416a53fc23b089b0cc4b589e2d",
+  "functionalTree": "94d275b23090e873378e4690107a7d3abbba9061",
+  "normalStack": true,
+  "cargoIncremental": "0",
+  "freshDisposableHomes": true,
+  "bridge": {
+    "command": "GROKPTAH_HOME=/private/tmp/rma-continuation-bridge-final-serial-home CARGO_INCREMENTAL=0 cargo test --locked -- --test-threads=1",
+    "normalStack": true,
+    "suites": [
+      {
+        "suite": "Running unittests src/lib.rs (target/debug/deps/grokptah_agent_bridge-e4fe652fc40dfb97)",
+        "result": "ok",
+        "passed": 713,
+        "failed": 0,
+        "ignored": 6
+      },
+      {
+        "suite": "Running tests/agent_tools.rs (target/debug/deps/agent_tools-b94d52a630a0af40)",
+        "result": "ok",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "suite": "Running tests/bridge_lifecycle.rs (target/debug/deps/bridge_lifecycle-57010fcc5e46ef5b)",
+        "result": "ok",
+        "passed": 41,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "suite": "Running tests/coding_worktree_session.rs (target/debug/deps/coding_worktree_session-76dc3999be695372)",
+        "result": "ok",
+        "passed": 19,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "suite": "Running tests/computer_adaptive_seam.rs (target/debug/deps/computer_adaptive_seam-9b3758a8c92833b0)",
+        "result": "ok",
+        "passed": 15,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "suite": "Running tests/computer_use_release_gate.rs (target/debug/deps/computer_use_release_gate-18eaf5a12adf47c5)",
+        "result": "ok",
+        "passed": 6,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "suite": "Running tests/coordinator_mcp.rs (target/debug/deps/coordinator_mcp-abb27c06eb01a99b)",
+        "result": "ok",
+        "passed": 5,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "suite": "Running tests/coordinator_store.rs (target/debug/deps/coordinator_store-537a181be45b4630)",
+        "result": "ok",
+        "passed": 12,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "suite": "Running tests/grok_build_adapter.rs (target/debug/deps/grok_build_adapter-220e1fb6327f4776)",
+        "result": "ok",
+        "passed": 27,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "suite": "Running tests/grok_build_managed_executor.rs (target/debug/deps/grok_build_managed_executor-02e2ceaa7faca15e)",
+        "result": "ok",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 1
+      },
+      {
+        "suite": "Running tests/host_shutdown_ownership.rs (target/debug/deps/host_shutdown_ownership-c1dc0aea7cbc451b)",
+        "result": "ok",
+        "passed": 41,
+        "failed": 0,
+        "ignored": 1
+      },
+      {
+        "suite": "Running tests/isolated_surface_proof_harness.rs (target/debug/deps/isolated_surface_proof_harness-2ea6ea3d46563a7b)",
+        "result": "ok",
+        "passed": 8,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "suite": "Running tests/isolation_capability.rs (target/debug/deps/isolation_capability-bb760e3d0f48277d)",
+        "result": "ok",
+        "passed": 5,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "suite": "Running tests/manager_mcp.rs (target/debug/deps/manager_mcp-7620f5ab66e053aa)",
+        "result": "ok",
+        "passed": 2,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "suite": "Running tests/manager_store.rs (target/debug/deps/manager_store-1a1c4459d5b0d361)",
+        "result": "ok",
+        "passed": 6,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "suite": "Running tests/manager_supervisor.rs (target/debug/deps/manager_supervisor-bce6eb92c8ee8d6e)",
+        "result": "ok",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "suite": "Running tests/mcp_continuity_probe.rs (target/debug/deps/mcp_continuity_probe-cb8be00b3cdff140)",
+        "result": "ok",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "suite": "Running tests/mcp_coordinator_campaign.rs (target/debug/deps/mcp_coordinator_campaign-00582a2ad2717e32)",
+        "result": "ok",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "suite": "Running tests/mcp_live_events.rs (target/debug/deps/mcp_live_events-81348878bca375b9)",
+        "result": "ok",
+        "passed": 3,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "suite": "Running tests/mcp_soak_hardening.rs (target/debug/deps/mcp_soak_hardening-a23b1c6b6de2f7ce)",
+        "result": "ok",
+        "passed": 5,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "suite": "Running tests/mcp_streamable_transport.rs (target/debug/deps/mcp_streamable_transport-96184a7a7d09d0bb)",
+        "result": "ok",
+        "passed": 29,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "suite": "Running tests/memory_scopes.rs (target/debug/deps/memory_scopes-48b45f8838a08b3c)",
+        "result": "ok",
+        "passed": 5,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "suite": "Running tests/native_executor_mcp.rs (target/debug/deps/native_executor_mcp-a3a531e398654456)",
+        "result": "ok",
+        "passed": 16,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "suite": "Running tests/native_executor_store.rs (target/debug/deps/native_executor_store-4326691fc58c81a7)",
+        "result": "ok",
+        "passed": 38,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "suite": "Running tests/orchestration_adversarial.rs (target/debug/deps/orchestration_adversarial-509c8714fa36258c)",
+        "result": "ok",
+        "passed": 20,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "suite": "Running tests/orchestration_control.rs (target/debug/deps/orchestration_control-c841a612367b2efe)",
+        "result": "ok",
+        "passed": 40,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "suite": "Running tests/parity_eval.rs (target/debug/deps/parity_eval-f811368c28314eb5)",
+        "result": "ok",
+        "passed": 9,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "suite": "Running tests/provider_wire_conformance.rs (target/debug/deps/provider_wire_conformance-9293ca7da6b5a289)",
+        "result": "ok",
+        "passed": 4,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "suite": "Running tests/reliability_eval.rs (target/debug/deps/reliability_eval-93337f685398a59f)",
+        "result": "ok",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "suite": "Running tests/routine_mcp.rs (target/debug/deps/routine_mcp-a758e08fcf7541ed)",
+        "result": "ok",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "suite": "Running tests/routine_store.rs (target/debug/deps/routine_store-7d46718a62838ee6)",
+        "result": "ok",
+        "passed": 10,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "suite": "Running tests/self_host_cu_dogfood.rs (target/debug/deps/self_host_cu_dogfood-fc3361f20caeca2b)",
+        "result": "ok",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 1
+      },
+      {
+        "suite": "Running tests/subagent_parallel.rs (target/debug/deps/subagent_parallel-ff77a4d75cf6cd71)",
+        "result": "ok",
+        "passed": 5,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "suite": "Running tests/verified_change_workflow.rs (target/debug/deps/verified_change_workflow-632eefeafe174763)",
+        "result": "ok",
+        "passed": 102,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "suite": "Running tests/work_graph_authority.rs (target/debug/deps/work_graph_authority-c1502e0aabcbfc1b)",
+        "result": "ok",
+        "passed": 25,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "suite": "Running tests/work_graph_service.rs (target/debug/deps/work_graph_service-ed2545bebd093f79)",
+        "result": "ok",
+        "passed": 3,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "suite": "Running tests/workload_mcp.rs (target/debug/deps/workload_mcp-bf1c0ae7decce292)",
+        "result": "ok",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "suite": "Running tests/workload_store.rs (target/debug/deps/workload_store-b6eb40c1d5976fb4)",
+        "result": "ok",
+        "passed": 20,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "suite": "Doc-tests grokptah_agent_bridge",
+        "result": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 1
+      }
+    ],
+    "passed": 1243,
+    "failed": 0,
+    "ignored": 10
+  },
+  "service": {
+    "passed": 20,
+    "failed": 0,
+    "ignored": 0,
+    "fmt": "passed",
+    "strictAllTargetClippy": "passed"
+  },
+  "tauri": {
+    "passed": 50,
+    "failed": 0,
+    "ignored": 0
+  },
+  "hostAuthority": {
+    "passed": 119,
+    "failed": 0,
+    "ignored": 0,
+    "fmt": "passed",
+    "strictAllTargetClippy": "passed"
+  },
+  "desktop": {
+    "typecheck": "passed",
+    "files": 58,
+    "testsPassed": 428,
+    "failed": 0
+  },
+  "installedCliOfflineOnly": {
+    "managedJourneyAndDiagnostics": {
+      "passed": 5,
+      "failed": 0,
+      "ignored": 0
+    },
+    "existingProtocolFailureNoRetry": {
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0
+    }
+  },
+  "bridgeFmt": "passed",
+  "bridgeStrictAllTargetClippy": "passed",
+  "initialFullCampaign": {
+    "passed": 706,
+    "failed": 7,
+    "ignored": 6,
+    "failedSuite": "verified_change::tests; timing/output/deadline assertions",
+    "artifact": "initial failures retained in private log; no deadline/confinement edits",
+    "logDigest": "sha256:dec9f35b4d70a4af33df4f21f1fd14bbf980a628f4ea693fdf5f314de6431e59"
+  },
+  "separateCheckRerun": {
+    "passed": 23,
+    "failed": 0,
+    "ignored": 0
+  },
+  "meaningfulAuthorityReproduction": {
+    "beforePassed": 0,
+    "beforeFailed": 1,
+    "notSetupPanic": true
+  },
+  "developmentQualification": "Intermediate harness setup failures, transcript token-reserve denials, and the demonstrated prompt-versus-model-round mismatch were corrected before this functional commit. They are not counted as authority reproduction. All inference fixtures were loopback; additional live requests 0.",
+  "commands": {
+    "bridge": [
+      "cargo fmt --check",
+      "GROKPTAH_HOME=/private/tmp/rma-continuation-clippy-final-serial-home CARGO_INCREMENTAL=0 cargo clippy --locked --all-targets -- -D warnings",
+      "GROKPTAH_HOME=/private/tmp/rma-continuation-bridge-final-serial-home CARGO_INCREMENTAL=0 cargo test --locked -- --test-threads=1"
+    ],
+    "installedCliOffline": [
+      "GROKPTAH_REAL_GROK_CLI=/Users/chriscase/.grok/downloads/grok-1.0.41-macos-aarch64 GROKPTAH_OFFLINE_REPORT=/private/tmp/rma-continuation-offline CARGO_INCREMENTAL=0 cargo test --locked --lib managed_provider::offline_tests:: -- --ignored --test-threads=1 --nocapture",
+      "GROKPTAH_REAL_GROK_CLI=/Users/chriscase/.grok/downloads/grok-1.0.41-macos-aarch64 GROKPTAH_HOME=/private/tmp/rma-continuation-cli-protocol-home CARGO_INCREMENTAL=0 cargo test --locked --lib managed_provider::tests::installed_cli_obeys_production_protocol_and_failure_has_no_retry -- --ignored --test-threads=1"
+    ],
+    "service": [
+      "cargo fmt --check",
+      "GROKPTAH_HOME=/private/tmp/rma-continuation-service-final-clippy-home CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=../grokptah-agent-bridge/target cargo clippy --locked --all-targets -- -D warnings",
+      "GROKPTAH_HOME=/private/tmp/rma-continuation-service-final-test-home CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=../grokptah-agent-bridge/target cargo test --locked -- --test-threads=1"
+    ],
+    "desktop": [
+      "npm run typecheck",
+      "npm test",
+      "GROKPTAH_HOME=/private/tmp/rma-continuation-tauri-final-home CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/private/tmp/GrokPtah-real-managed-assignment-v1/crates/codegen/grokptah-agent-bridge/target cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked"
+    ],
+    "hostAuthority": [
+      "cargo fmt -p xai-host-authority -- --check",
+      "GROKPTAH_HOME=/private/tmp/rma-continuation-authority-home CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/private/tmp/GrokPtah-real-managed-assignment-v1/crates/codegen/grokptah-agent-bridge/target cargo clippy -p xai-host-authority --locked --all-targets -- -D warnings",
+      "GROKPTAH_HOME=/private/tmp/rma-continuation-authority-home CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/private/tmp/GrokPtah-real-managed-assignment-v1/crates/codegen/grokptah-agent-bridge/target cargo test -p xai-host-authority --locked -- --test-threads=1"
+    ]
+  }
+}

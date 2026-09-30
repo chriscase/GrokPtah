@@ -355,6 +355,10 @@ pub struct ManagedGrokInvocation {
     /// Launch-time source fingerprint. Later HEAD movement must not replace it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_lease_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_evidence: Option<crate::managed_provider::ManagedProviderEvidence>,
 }
 
 impl ManagedGrokInvocation {

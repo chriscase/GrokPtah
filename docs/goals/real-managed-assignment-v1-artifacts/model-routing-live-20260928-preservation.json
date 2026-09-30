@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "classification": "failed live qualification preserved without redispatch",
+  "workId": "b3b46d7c-0435-4781-a1f3-b7674a644526",
+  "runId": "7dd1deb7-6619-42ab-bd51-25cf96886e93",
+  "attemptId": "3f7799a9-6b46-468b-b0da-5e9c7da686e0",
+  "localReopens": [
+    {"number": 1, "workState": "review", "workerAttempts": 1, "physicalWireAdmissions": 1, "httpResponsesObserved": 1, "completedUsageResponses": 0, "candidateDigest": "sha256:missing", "capabilityRevoked": true, "stopReason": "max_total_tokens_usage_unavailable"},
+    {"number": 2, "workState": "review", "workerAttempts": 1, "physicalWireAdmissions": 1, "httpResponsesObserved": 1, "completedUsageResponses": 0, "candidateDigest": "sha256:missing", "capabilityRevoked": true, "stopReason": "max_total_tokens_usage_unavailable"},
+    {"number": 3, "workState": "review", "workerAttempts": 1, "physicalWireAdmissions": 1, "httpResponsesObserved": 1, "completedUsageResponses": 0, "candidateDigest": "sha256:missing", "capabilityRevoked": true, "stopReason": "max_total_tokens_usage_unavailable"}
+  ],
+  "projectionNote": "The immediate post-run stopReason was managed_execution_uncertain_or_failed; the first local reopen resolved it to max_total_tokens_usage_unavailable. Work/Run/Attempt identities, request counts, revoked state, missing candidate, and uncertainty were unchanged.",
+  "providerRequestsAfterFailure": 0,
+  "additionalWorkerAttempts": 0,
+  "automaticRetries": 0,
+  "source": {
+    "headBeforeAndAfter": "e200ec5bc3d5968a5c66d96446a09c15264bda37",
+    "treeBeforeAndAfter": "1ef9c0872b4eadfaae5f75bbf2933c062cce67ec",
+    "indexSha256BeforeAndAfter": "b7d8f580cbb912e16ef2a8b694f25c97fdaf839bb54d25c34ef10c159d33685e",
+    "framingSha256BeforeAndAfter": "7f0ed4cf86fca40e73d7a8c22d436f074b20a94c47e9a1aa7bed605720a6c71d",
+    "decoderSha256BeforeAndAfter": "4affad25745d7962b4ef474c59d3564d0634fef0a9e1987c9dfd30ada8962cb9",
+    "clean": true,
+    "noRemotes": true,
+    "workerRootEmpty": true
+  },
+  "candidateApprovedAppliedOrDiscarded": false,
+  "historicalFailedWorkUntouched": "3067ceb3-3132-48c9-8241-9267c109ae9b",
+  "historicalFailedRunUntouched": "25ba88cc-92b6-4afb-810d-23c81625b9f4",
+  "historicalFailedAttemptUntouched": "6fc4ec50-b921-41cf-96c4-df97cc0a21ae",
+  "historical403CauseUsageAndCost": "UNKNOWN",
+  "frozenGoalSha256": "50edf789c5acc46a0f349a81ca12b53ce155adfc860ff084537e0aba33f578f8",
+  "nextLiveSpecSha256": "d731eb90e391047826dfe1e14d4d0600e338308a635bf94fab9bb8a1d6121e41",
+  "precedingTrackedReceiptEdits": 0,
+  "credentialOrAccountMaintenance": 0,
+  "privateRawReportsOrProviderProsePublished": false,
+  "repositoryIntegration": false,
+  "releaseOrDeployment": false
+}

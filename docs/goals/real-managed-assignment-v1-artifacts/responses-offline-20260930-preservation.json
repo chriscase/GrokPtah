@@ -1,0 +1,20 @@
+{
+  "additionalLiveProviderRequests": 0,
+  "allChecksPassed": true,
+  "historicalAcceptedReopenSha256": [
+    "b2f35dc78707024eeafc3b831c7af4c5c31927b35e217dfe689e18ef592a0fac",
+    "b2f35dc78707024eeafc3b831c7af4c5c31927b35e217dfe689e18ef592a0fac",
+    "b2f35dc78707024eeafc3b831c7af4c5c31927b35e217dfe689e18ef592a0fac"
+  ],
+  "historicalAttemptId": "9e69b1b7-20ec-4ea8-a662-40270dafc6e6",
+  "historicalBillingNotIndependentlyVerified": true,
+  "historicalLatestExecuteSha256": "ba24a344c452e825cf36cc57f8662cbded59ebb1f27aa70622199b9967ad2713",
+  "historicalPreflightDispatchCountPreserved": 0,
+  "historicalPrivateRecordsUnchanged": 15,
+  "historicalPublishedArtifactsUnchanged": 61,
+  "historicalRunId": "28b09b4f-3311-4372-ade8-6712bb34e0f9",
+  "historicalUsageNotReinterpreted": true,
+  "historicalWorkId": "bc84206c-fa43-492a-9ef3-6b0c4f0d812f",
+  "schemaVersion": 1,
+  "sourceAndOracleFileHashesUnchanged": 4
+}

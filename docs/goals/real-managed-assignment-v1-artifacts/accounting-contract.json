@@ -1,0 +1,46 @@
+{
+  "accepted": [
+    "ordinary input/output with full token accounting and explicit unknown optional cost",
+    "nonzero cache/reasoning subsets plus exact positive cost ticks and two settled turns",
+    "zero optional details and zero cache/reasoning"
+  ],
+  "additionalLiveRequests": 0,
+  "failureSemantics": "No canonical success settlement; preserve pending/unknown usage and bounded typed diagnostic; revoke capability; no reusable budget or second physical send.",
+  "functionalSha": "0be8ec4b32144d002d8bb230dec78d18d018f922",
+  "functionalTree": "ad0c6d0a500d309981c3eddbee2531625106b89c",
+  "nextLiveSpecification": "NOT EXECUTED",
+  "normalizedModel": {
+    "cachedTokens": "subset of full prompt; never separately added to total",
+    "completionTokens": "full output including reasoning subset for supported CLI shape",
+    "costComplete": "true only when every settled call supplies compatible exact ticks",
+    "costInUsdTicks": "positive exact provider ticks when supplied; missing is unknown, not zero",
+    "promptTokens": "full prompt including cached tokens",
+    "reasoningTokens": "subset of completion; never separately added to total",
+    "totalTokens": "exact prompt + completion for the supported installed CLI projection"
+  },
+  "path": [
+    "Chat Completions final SSE usage",
+    "canonical provider send receipt",
+    "managed relay normalized usage",
+    "host token budget and evidence",
+    "installed CLI headless/session reconciliation",
+    "managed Work/Run/Attempt review",
+    "three reopen/recovery observations"
+  ],
+  "schemaVersion": 1,
+  "sources": {
+    "installedCliDigest": "sha256:9c844eb13365180787d9ad22b2b3748a024be8e1ed845253cc114781b31c591d",
+    "pinnedCliHeadless": "xai-grok-pager/docs/user-guide/14-headless-mode.md",
+    "xaiChatCompletions": "https://docs.x.ai/developers/rest-api-reference/inference/chat-completions",
+    "xaiCostTracking": "https://docs.x.ai/developers/cost-tracking",
+    "xaiPromptCaching": "https://docs.x.ai/developers/advanced-api-usage/prompt-caching/usage-and-pricing"
+  },
+  "terminalFailClosed": [
+    "additive reasoning outside completion, including public xAI example shape incompatible with installed CLI 1.0.41 projection",
+    "unknown additional usage/charge field, nonzero unsupported detail category or source count",
+    "missing/malformed/contradictory usage or total",
+    "cache exceeding prompt or reasoning exceeding completion",
+    "zero/oversized cost ticks, mixed priced/unpriced turns, tick arithmetic overflow",
+    "legacy missing total after observed usage"
+  ]
+}
