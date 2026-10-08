@@ -1680,7 +1680,7 @@ fn attached_navigation_delegate(webview: &AnyObject) -> HarnessResult<Retained<A
 /// can complete with an empty destination and never call our deny delegate.
 fn require_navigation_delegate_download_imps(webview: &AnyObject) -> HarnessResult<()> {
     let delegate = attached_navigation_delegate(webview)?;
-    require_containment_download_delegate_imps(&*delegate)
+    require_containment_download_delegate_imps(&delegate)
 }
 
 fn require_containment_download_delegate_imps(delegate: &AnyObject) -> HarnessResult<()> {
@@ -1713,7 +1713,7 @@ pub fn live_wk_assert_containment_download_delegate_imps() -> HarnessResult<()> 
         ));
     }
     let delegate = containment_delegate_instance()?;
-    require_containment_download_delegate_imps(&*delegate)
+    require_containment_download_delegate_imps(&delegate)
 }
 
 fn assert_download_file_not_written(before: &HashSet<PathBuf>) -> HarnessResult<()> {
@@ -2093,7 +2093,8 @@ unsafe extern "C-unwind" fn context_menu_for_element(
     _element: *mut AnyObject,
     default_menu_items: *mut AnyObject,
 ) -> *mut AnyObject {
-    Retained::into_raw(filter_context_menu_download_items(default_menu_items))
+    let filtered = filter_context_menu_download_items(default_menu_items);
+    std::mem::ManuallyDrop::new(filtered).as_ptr().cast_mut()
 }
 
 fn filter_context_menu_download_items(items: *mut AnyObject) -> Retained<AnyObject> {
@@ -2110,7 +2111,7 @@ fn filter_context_menu_download_items(items: *mut AnyObject) -> Retained<AnyObje
     let count: usize = unsafe { objc2::msg_send![items, count] };
     for index in 0..count {
         let item: Retained<AnyObject> = unsafe { objc2::msg_send![items, objectAtIndex: index] };
-        if context_menu_item_is_download_related(&*item) {
+        if context_menu_item_is_download_related(&item) {
             continue;
         }
         let _: () = unsafe { objc2::msg_send![&*out, addObject: &*item] };
