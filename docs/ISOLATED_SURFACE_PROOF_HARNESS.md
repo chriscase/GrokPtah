@@ -187,14 +187,22 @@ document load and starts loopback HTTP that serves `Content-Disposition: attachm
 octet-stream. Action policy returns `WKNavigationActionPolicyDownload` (2) for that HTTP URL
 so WK creates a `WKDownload`. `WKWebView.URL` may still report the download request; the
 owned document is the committed `location.href`. Custom-scheme response is Cancel, never
-Download. Deny is the real non-null `didBecomeDownload` callback (navigation action,
-navigation response, or `contextMenuDidCreateDownload` — all routed through the same
-`WKDownload` delegate). Session open requires those IMPs; missing selectors fail-close.
-`decideDestination` completes nil only when WebKit invokes the completion block, then
-`-[WKDownload cancel]` runs. Navigation decisions log the URL WK supplied (loopback HTTP
-for the real `WKDownload`); probe URL echoes are not synthesized. After the probe,
-candidate download directories (process temp, cwd, `~/Downloads`, `NSTemporaryDirectory`)
-are snapshotted before/after; any new file fails — not a single `deny.bin` filename check.
+Download. The live click probe proves the navigation-action / navigation-response
+`didBecomeDownload` path: loopback HTTP attachment → `WKDownload` delegate → nil
+`decideDestination` → `cancel`. Session open requires those IMPs plus WebKit's private
+`_webView:contextMenuDidCreateDownload:` (the public spelling is not called); missing
+selectors fail-close. The owned page strips download-related context-menu items via
+`WKUIDelegate webView:contextMenuForElement:defaultMenuItems:`; any context-menu
+download WebKit still creates must hit the private selector and `adopt_wk_download`.
+That context-menu path is **not** exercised by the click probe — only delegate
+registration and menu filtering are asserted. `decideDestination` sets `destination_nil`
+only when WebKit invokes the completion block with nil. Navigation decisions log the URL
+WK supplied (loopback HTTP for the real `WKDownload`); probe URL echoes are not
+synthesized. After the probe, candidate download directories (process temp, cwd,
+`~/Downloads`, `NSTemporaryDirectory`) are snapshotted before/after; any **new path**
+fails — not a single `deny.bin` filename check. That snapshot does **not** watch
+relocated `NSDownloadsDirectory`, sandbox container download/tmp dirs, or WebKit cache
+dirs; unreadable subtrees are skipped; overwrites of existing files are invisible.
 Hosted Desktop still reports the loopback URL as `WKWebView.URL` after a
 main-frame Download policy, so the probe restores the owned fixture before later
 pickers. Dummy `didBecomeDownload` IMP pokes, timeout→runloop pokes inside the handler,

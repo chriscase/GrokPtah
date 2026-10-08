@@ -233,10 +233,32 @@ fn contained_browser_native_deny_policy_fail_closed() {
 
 #[test]
 fn live_wk_download_deny_requires_wk_delegate_imps() {
-    let mut backend = ContainedBrowserBackend::new();
-    backend
-        .live_wk_attempt_download()
-        .expect_err("download without live WK session and delegate IMPs");
+    #[cfg(target_os = "macos")]
+    {
+        use grokptah_isolated_surface::live_wk_assert_containment_download_delegate_imps;
+
+        match live_wk_assert_containment_download_delegate_imps() {
+            Ok(()) => {}
+            Err(err)
+                if err.code == HarnessErrorCode::BackendUnavailable
+                    && (err.message.contains("main thread")
+                        || err.message.contains("WebKit.framework")) =>
+            {
+                eprintln!(
+                    "skip: containment download delegate IMP check needs macOS main thread + WebKit ({})",
+                    err.message
+                );
+            }
+            Err(err) => panic!("containment download delegate IMP check failed: {err:?}"),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut backend = ContainedBrowserBackend::new();
+        backend
+            .live_wk_attempt_download()
+            .expect_err("download without live WK session and delegate IMPs");
+    }
     assert!(!isolated_surface_admission_available());
 }
 

@@ -33,6 +33,8 @@ mod vf_dry_run;
 mod wk_clipboard_probe;
 #[cfg(all(target_os = "macos", feature = "browser-engine"))]
 mod wk_native_snapshot;
+#[cfg(all(target_os = "macos", feature = "browser-engine"))]
+pub use wk_native_snapshot::live_wk_assert_containment_download_delegate_imps;
 
 pub use backend::{
     assert_evidence_class_unchanged, honest_harness_evidence_class, IsolatedSurfaceBackend,
