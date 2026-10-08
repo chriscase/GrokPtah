@@ -187,9 +187,15 @@ document load and starts loopback HTTP that serves `Content-Disposition: attachm
 octet-stream. Action policy returns `WKNavigationActionPolicyDownload` (2) for that HTTP URL
 so WK creates a `WKDownload`. `WKWebView.URL` may still report the download request; the
 owned document is the committed `location.href`. Custom-scheme response is Cancel, never
-Download. Deny is the real non-null `didBecomeDownload` callback;
-`decideDestination` completes nil after inspecting the attachment and `deny.bin` is not
-written. Hosted Desktop still reports the loopback URL as `WKWebView.URL` after a
+Download. Deny is the real non-null `didBecomeDownload` callback (navigation action,
+navigation response, or `contextMenuDidCreateDownload` — all routed through the same
+`WKDownload` delegate). Session open requires those IMPs; missing selectors fail-close.
+`decideDestination` completes nil only when WebKit invokes the completion block, then
+`-[WKDownload cancel]` runs. Navigation decisions log the URL WK supplied (loopback HTTP
+for the real `WKDownload`); probe URL echoes are not synthesized. After the probe,
+candidate download directories (process temp, cwd, `~/Downloads`, `NSTemporaryDirectory`)
+are snapshotted before/after; any new file fails — not a single `deny.bin` filename check.
+Hosted Desktop still reports the loopback URL as `WKWebView.URL` after a
 main-frame Download policy, so the probe restores the owned fixture before later
 pickers. Dummy `didBecomeDownload` IMP pokes, timeout→runloop pokes inside the handler,
 `shouldPerformDownload` shortcuts, action-policy-2 on the custom scheme,

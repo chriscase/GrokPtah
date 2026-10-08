@@ -232,6 +232,15 @@ fn contained_browser_native_deny_policy_fail_closed() {
 }
 
 #[test]
+fn live_wk_download_deny_requires_wk_delegate_imps() {
+    let mut backend = ContainedBrowserBackend::new();
+    backend
+        .live_wk_attempt_download()
+        .expect_err("download without live WK session and delegate IMPs");
+    assert!(!isolated_surface_admission_available());
+}
+
+#[test]
 fn live_wk_open_panel_deny_requires_wk_delivery() {
     use grokptah_isolated_surface::live_wk_open_panel_policy_allows;
 
@@ -447,9 +456,8 @@ fn assert_live_wk_native_denies_and_fresh_store(
         .expect("WKNavigationDelegate must cancel the download probe");
     assert_eq!(dl_policy, 0);
     assert!(
-        grokptah_isolated_surface::is_download_probe_url(&dl_url)
-            || (dl_url.contains("127.0.0.1") && dl_url.contains("deny.bin")),
-        "download cancel decision must be the dedicated download URL, got {dl_url}"
+        dl_url.contains("127.0.0.1") && dl_url.contains("deny.bin"),
+        "download cancel decision must be the loopback WKDownload URL WK recorded, got {dl_url}"
     );
     backend
         .live_wk_attempt_file_picker()
