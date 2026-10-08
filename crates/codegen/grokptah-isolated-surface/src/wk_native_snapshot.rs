@@ -1709,7 +1709,7 @@ fn assert_download_file_not_written(before: &HashSet<PathBuf>) -> HarnessResult<
         ));
     }
     let after = snapshot_download_watch_files();
-    for path in after.difference(before) {
+    if let Some(path) = after.difference(before).next() {
         return Err(HarnessError::invalid_state(format!(
             "download probe created new file {}; v0 must not save any download",
             path.display()
