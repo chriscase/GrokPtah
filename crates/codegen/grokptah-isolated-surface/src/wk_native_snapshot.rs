@@ -1537,7 +1537,8 @@ fn wait_for_download_navigation_policy(
         if let Ok(guard) = navigation_decision_log().lock() {
             if let Some(list) = guard.get(&key) {
                 if let Some(hit) = list.iter().rev().find(|(url, policy)| {
-                    *policy == want_policy && download_navigation_url_matches_policy(url, want_policy)
+                    *policy == want_policy
+                        && download_navigation_url_matches_policy(url, want_policy)
                 }) {
                     return Ok(hit.clone());
                 }
@@ -1680,8 +1681,7 @@ fn require_navigation_delegate_download_imps(webview: &AnyObject) -> HarnessResu
         sel!(webView:contextMenuDidCreateDownload:),
     ];
     for selector in required {
-        let responds: bool =
-            unsafe { objc2::msg_send![&*delegate, respondsToSelector: *selector] };
+        let responds: bool = unsafe { objc2::msg_send![&*delegate, respondsToSelector: *selector] };
         if !responds {
             return Err(HarnessError::backend_unavailable(
                 "WKNavigationDelegate download deny IMP is missing (didBecomeDownload, decideDestination, or contextMenuDidCreateDownload); unimplemented download paths are fail-open",
