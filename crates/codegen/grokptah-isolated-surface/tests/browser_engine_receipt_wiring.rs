@@ -237,20 +237,8 @@ fn live_wk_download_deny_requires_wk_delegate_imps() {
     {
         use grokptah_isolated_surface::live_wk_assert_containment_download_delegate_imps;
 
-        match live_wk_assert_containment_download_delegate_imps() {
-            Ok(()) => {}
-            Err(err)
-                if err.code == HarnessErrorCode::BackendUnavailable
-                    && (err.message.contains("main thread")
-                        || err.message.contains("WebKit.framework")) =>
-            {
-                eprintln!(
-                    "skip: containment download delegate IMP check needs macOS main thread + WebKit ({})",
-                    err.message
-                );
-            }
-            Err(err) => panic!("containment download delegate IMP check failed: {err:?}"),
-        }
+        live_wk_assert_containment_download_delegate_imps()
+            .expect("containment delegate must register download deny IMPs including _webView:contextMenuDidCreateDownload:");
     }
     #[cfg(not(target_os = "macos"))]
     {

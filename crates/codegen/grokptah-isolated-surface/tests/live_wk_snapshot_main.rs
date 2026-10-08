@@ -256,6 +256,16 @@ fn assert_live_wk_native_denies(backend: &mut grokptah_isolated_surface::Contain
         isolated_surface_admission_available, NativeDenyKind, OWNED_PAGE_URL,
     };
 
+    #[cfg(target_os = "macos")]
+    {
+        use grokptah_isolated_surface::live_wk_assert_containment_download_delegate_imps;
+        live_wk_assert_containment_download_delegate_imps()
+            .expect("containment delegate download deny IMPs");
+        backend
+            .live_wk_assert_attached_download_delegate_imps()
+            .expect("booted live WK session navigation delegate download deny IMPs");
+    }
+
     backend
         .live_wk_write_local_storage("cb-v0-store-probe", "run-1")
         .expect("write localStorage into this run's nonpersistent store");
