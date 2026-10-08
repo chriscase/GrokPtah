@@ -2094,7 +2094,9 @@ unsafe extern "C-unwind" fn context_menu_for_element(
     default_menu_items: *mut AnyObject,
 ) -> *mut AnyObject {
     let filtered = filter_context_menu_download_items(default_menu_items);
-    std::mem::ManuallyDrop::new(filtered).as_ptr().cast_mut()
+    let ptr = Retained::as_ptr(&filtered);
+    std::mem::forget(filtered);
+    ptr.as_ptr().cast_mut()
 }
 
 fn filter_context_menu_download_items(items: *mut AnyObject) -> Retained<AnyObject> {
