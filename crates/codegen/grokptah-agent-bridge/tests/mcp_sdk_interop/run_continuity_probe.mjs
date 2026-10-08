@@ -269,6 +269,38 @@ async function waitForRecovery(reader, buffer = "") {
   throw new Error("SSE stream did not surface a recovery notification");
 }
 
+/** After `ptah_recovery`, poll durable `ptah_get_events` until the journal catches up. */
+async function pollDurableGapEvents(afterSeq = 0, timeoutMs = 30_000) {
+  const started = Date.now();
+  let lastDetail = null;
+  while (Date.now() - started < timeoutMs) {
+    const gapRead = await call("ptah_get_events", {
+      session_id: gapSessionId,
+      workspace,
+      run_id: gapRunId,
+      after_seq: afterSeq,
+      limit: 500,
+    });
+    const gapPage = structured(gapRead.json);
+    lastDetail = {
+      status: gapRead.status,
+      events: gapPage?.events?.length,
+      schemaVersion: gapPage?.schemaVersion,
+      elapsedMs: Date.now() - started,
+    };
+    if (
+      gapRead.status === 200 &&
+      gapPage?.schemaVersion === "grokptah.public-event.v1" &&
+      Array.isArray(gapPage?.events) &&
+      gapPage.events.length > 0
+    ) {
+      return { gapRead, gapPage, detail: lastDetail };
+    }
+    await new Promise((resolve) => setTimeout(resolve, 75));
+  }
+  return { gapRead: null, gapPage: null, detail: lastDetail, timedOut: true };
+}
+
 // Deterministic, offline coverage for the SSE frame parser above. `nextFrame`
 // used to drop a complete data-less keep-alive frame and then block on
 // `reader.read()` without re-scanning the buffer, so an already-buffered
@@ -572,24 +604,22 @@ try {
   const recovery = heldFrame.body?.method === "notifications/ptah_recovery"
     ? heldFrame
     : await waitForRecovery(gapReader, heldFrame.buffer);
-  const gapRead = await call("ptah_get_events", {
-    session_id: gapSessionId,
-    workspace,
-    run_id: gapRunId,
-    after_seq: 0,
-    limit: 500,
-  });
-  const gapPage = structured(gapRead.json);
   record(
     "gapNoticeObserved",
     recovery.body?.method === "notifications/ptah_recovery" && recovery.body?.params?.pollTool === "ptah_get_events",
     recovery.body?.params
   );
+  const reconciled = await pollDurableGapEvents(0, 30_000);
+  const gapRead = reconciled.gapRead;
+  const gapPage = reconciled.gapPage;
   record(
     "durableReadReconcilesGap",
-    gapRead.status === 200 && gapPage?.schemaVersion === "grokptah.public-event.v1" &&
-      Array.isArray(gapPage?.events) && gapPage.events.length > 0,
-    { status: gapRead.status, events: gapPage?.events?.length, schemaVersion: gapPage?.schemaVersion }
+    !reconciled.timedOut &&
+      gapRead?.status === 200 &&
+      gapPage?.schemaVersion === "grokptah.public-event.v1" &&
+      Array.isArray(gapPage?.events) &&
+      gapPage.events.length > 0,
+    reconciled.detail ?? { timedOut: reconciled.timedOut }
   );
 
   record("mutationsReplayByRequestId", mutationResults.length >= 8 && mutationResults.every((item) => item.ok), mutationResults);

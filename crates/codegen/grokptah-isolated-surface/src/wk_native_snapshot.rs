@@ -1479,8 +1479,13 @@ fn containment_delegate_class() -> Option<&'static AnyClass> {
                 download_decide_destination as unsafe extern "C-unwind" fn(_, _, _, _, _, _),
             );
             builder.add_method(
-                sel!(webView:contextMenuDidCreateDownload:),
+                sel!(_webView:contextMenuDidCreateDownload:),
                 context_menu_did_create_download as unsafe extern "C-unwind" fn(_, _, _, _),
+            );
+            builder.add_method(
+                sel!(webView:contextMenuForElement:defaultMenuItems:),
+                context_menu_for_element
+                    as unsafe extern "C-unwind" fn(_, _, _, _, _) -> *mut AnyObject,
             );
         }
         Some(builder.register())
@@ -1670,25 +1675,45 @@ fn attached_navigation_delegate(webview: &AnyObject) -> HarnessResult<Retained<A
     })
 }
 
-/// Context-menu downloads use a separate delegate entry point; without it WebKit's
-/// default client can cancel with an empty destination and never call our deny IMP.
+/// Context-menu downloads use WebKit's private `_webView:contextMenuDidCreateDownload:` entry
+/// point; the public spelling is never called. Without the private IMP WebKit's default client
+/// can complete with an empty destination and never call our deny delegate.
 fn require_navigation_delegate_download_imps(webview: &AnyObject) -> HarnessResult<()> {
     let delegate = attached_navigation_delegate(webview)?;
+    require_containment_download_delegate_imps(&delegate)
+}
+
+fn require_containment_download_delegate_imps(delegate: &AnyObject) -> HarnessResult<()> {
     let required: &[Sel] = &[
         sel!(webView:navigationAction:didBecomeDownload:),
         sel!(webView:navigationResponse:didBecomeDownload:),
         sel!(download:decideDestinationUsingResponse:suggestedFilename:completionHandler:),
-        sel!(webView:contextMenuDidCreateDownload:),
+        sel!(_webView:contextMenuDidCreateDownload:),
     ];
     for selector in required {
-        let responds: bool = unsafe { objc2::msg_send![&*delegate, respondsToSelector: *selector] };
+        let responds: bool = unsafe { objc2::msg_send![delegate, respondsToSelector: *selector] };
         if !responds {
             return Err(HarnessError::backend_unavailable(
-                "WKNavigationDelegate download deny IMP is missing (didBecomeDownload, decideDestination, or contextMenuDidCreateDownload); unimplemented download paths are fail-open",
+                "WKNavigationDelegate download deny IMP is missing (didBecomeDownload, decideDestination, or _webView:contextMenuDidCreateDownload); unimplemented download paths are fail-open",
             ));
         }
     }
     Ok(())
+}
+
+/// Asserts the containment delegate registers download deny IMPs (including WebKit's private
+/// context-menu selector). Does not require a booted browser guest — only the main thread and
+/// WebKit.
+#[cfg(all(target_os = "macos", feature = "browser-engine"))]
+pub fn live_wk_assert_containment_download_delegate_imps() -> HarnessResult<()> {
+    require_main_thread("containment download delegate IMP check")?;
+    if !webkit_loaded() {
+        return Err(HarnessError::backend_unavailable(
+            "WebKit.framework is unavailable for containment download delegate IMP check",
+        ));
+    }
+    let delegate = containment_delegate_instance()?;
+    require_containment_download_delegate_imps(&delegate)
 }
 
 fn assert_download_file_not_written(before: &HashSet<PathBuf>) -> HarnessResult<()> {
@@ -2057,6 +2082,54 @@ unsafe extern "C-unwind" fn context_menu_did_create_download(
     download: *mut AnyObject,
 ) {
     adopt_wk_download(this, webview, download, wk_download_url(download));
+}
+
+/// Strip download-producing context-menu items on the owned page; any download WebKit still
+/// creates must go through `_webView:contextMenuDidCreateDownload:` → `adopt_wk_download`.
+unsafe extern "C-unwind" fn context_menu_for_element(
+    _this: &AnyObject,
+    _cmd: Sel,
+    _webview: *mut AnyObject,
+    _element: *mut AnyObject,
+    default_menu_items: *mut AnyObject,
+) -> *mut AnyObject {
+    let filtered = filter_context_menu_download_items(default_menu_items);
+    let raw = Retained::as_ptr(&filtered) as *mut AnyObject;
+    std::mem::forget(filtered);
+    raw
+}
+
+fn filter_context_menu_download_items(items: *mut AnyObject) -> Retained<AnyObject> {
+    let Some(mutable_cls) = AnyClass::get(c"NSMutableArray") else {
+        // Fail-closed: empty menu if collection classes are unavailable (macOS always has NSArray).
+        let cls = AnyClass::get(c"NSArray").expect("NSArray required for WK context menu filter");
+        return unsafe { objc2::msg_send![cls, array] };
+    };
+    let out: Retained<AnyObject> = unsafe { objc2::msg_send![mutable_cls, array] };
+    if items.is_null() {
+        return out;
+    }
+    let items = unsafe { &*items };
+    let count: usize = unsafe { objc2::msg_send![items, count] };
+    for index in 0..count {
+        let item: Retained<AnyObject> = unsafe { objc2::msg_send![items, objectAtIndex: index] };
+        if context_menu_item_is_download_related(&item) {
+            continue;
+        }
+        let _: () = unsafe { objc2::msg_send![&*out, addObject: &*item] };
+    }
+    out
+}
+
+fn context_menu_item_is_download_related(item: &AnyObject) -> bool {
+    let title: Option<Retained<AnyObject>> = unsafe { objc2::msg_send![item, title] };
+    if let Some(title) = nsstring_to_string(title.as_deref()) {
+        let lower = title.to_ascii_lowercase();
+        if lower.contains("download") {
+            return true;
+        }
+    }
+    false
 }
 
 unsafe extern "C-unwind" fn download_decide_destination(
