@@ -1,0 +1,719 @@
+{
+  "additionalLiveRequests": 0,
+  "attempts": [
+    {
+      "attemptId": "e684814b-3221-421c-aa42-cd8bc7187e4d",
+      "attemptNumber": 1,
+      "linkedRunIds": [
+        "b73f8f3e-116b-43df-ab13-561b1a0ab9a5"
+      ],
+      "state": "review",
+      "workId": "b351a739-a7eb-494b-a540-26cef89c4103"
+    }
+  ],
+  "baseSha": "3aaa71e7e385e6f5cac0e61c6d3c4b93e1707251",
+  "baseTree": "1ef9c0872b4eadfaae5f75bbf2933c062cce67ec",
+  "cliDigest": "sha256:9c844eb13365180787d9ad22b2b3748a024be8e1ed845253cc114781b31c591d",
+  "fixtureMode": "malformed",
+  "fixturePhysicalRequests": 1,
+  "interrupted": true,
+  "qualification": "OFFLINE ONLY; not live G4/G5/G8",
+  "readiness": {
+    "agentId": "agent-d5825b71-0820-4f0a-94e6-af6eb113a326",
+    "allowedFiles": [
+      "src/framing.py",
+      "src/decoder.py"
+    ],
+    "approvalRequired": true,
+    "attemptCount": 0,
+    "boundedDiff": "",
+    "candidateDigest": null,
+    "changedPaths": [],
+    "checkProfileId": "offline-utf8",
+    "checkProfileRevision": 0,
+    "checkResults": [],
+    "cliContract": "inspect-json-v1",
+    "cliVersion": "1.0.41",
+    "diffDigest": null,
+    "executionHost": "service",
+    "executor": "grok_build_isolated_review",
+    "limits": {
+      "maxDurationMs": 180000,
+      "maxOutputTokensPerRequest": 1024,
+      "maxPromptBytes": 16000,
+      "maxRounds": 6,
+      "maxTotalTokens": 16000
+    },
+    "modelSelectionKey": "grok-build-0.1",
+    "phases": {
+      "applied": false,
+      "changeProposed": false,
+      "checksPassed": false,
+      "humanApproved": false,
+      "workerStopped": false
+    },
+    "readiness": {
+      "cliContract": "inspect-json-v1",
+      "cliVersion": "1.0.41",
+      "mutationMode": "isolated_review",
+      "platform": "macos",
+      "providerInvocations": 0,
+      "ready": true,
+      "reasons": [],
+      "toolchain": [
+        {
+          "checkId": "offline-utf8",
+          "present": true
+        }
+      ],
+      "workersDispatched": 0
+    },
+    "repositoryId": "offline:utf8-frame-continuation",
+    "requiredChecks": [
+      {
+        "checkId": "offline-utf8",
+        "cwd": "oracle",
+        "maxOutputBytes": 16384,
+        "timeoutMs": 5000
+      }
+    ],
+    "safeAction": "Resolve readiness, then start one supervised attempt.",
+    "sourceRevision": "3aaa71e7e385e6f5cac0e61c6d3c4b93e1707251",
+    "workId": null,
+    "workRevision": null,
+    "workState": null
+  },
+  "redBaseline": [
+    {
+      "checkId": "offline-utf8",
+      "durationMs": 295,
+      "exitCode": 1,
+      "outcome": "failed",
+      "outputDigest": "sha256:cfb57e5e6643d31e40883dee4e4ee26fa760f3db6a79cf8c52bcd53e9a1b097a",
+      "outputTruncated": false,
+      "specDigest": "sha256:65093596d0abde842b578b76772764ab00f6d1b5177b87f326a5f3a907298d7f"
+    }
+  ],
+  "reopens": [
+    {
+      "agentId": "agent-d5825b71-0820-4f0a-94e6-af6eb113a326",
+      "allowedFiles": [
+        "src/framing.py",
+        "src/decoder.py"
+      ],
+      "approvalRequired": true,
+      "attemptCount": 1,
+      "attemptId": "e684814b-3221-421c-aa42-cd8bc7187e4d",
+      "boundedDiff": "",
+      "candidateDigest": "sha256:missing",
+      "changedPaths": [],
+      "checkProfileId": "offline-utf8",
+      "checkProfileRevision": 1,
+      "checkResults": [
+        {
+          "checkId": "offline-utf8",
+          "durationMs": 0,
+          "exitCode": null,
+          "outcome": "invalidated",
+          "outputDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "outputTruncated": false,
+          "specDigest": "sha256:65093596d0abde842b578b76772764ab00f6d1b5177b87f326a5f3a907298d7f"
+        }
+      ],
+      "cliContract": null,
+      "cliVersion": null,
+      "diffDigest": null,
+      "executionHost": "unrecorded",
+      "executor": "grok_build_isolated_review",
+      "limits": {
+        "maxDurationMs": 180000,
+        "maxPromptBytes": 16000,
+        "maxRounds": 6,
+        "maxTotalTokens": 16000
+      },
+      "modelSelectionKey": "grok-build-0.1",
+      "phases": {
+        "applied": false,
+        "changeProposed": false,
+        "checksPassed": false,
+        "humanApproved": false,
+        "workerStopped": true
+      },
+      "providerEvidence": {
+        "accountingComplete": false,
+        "authorityAttempts": [
+          "att_ebf921682fcf3c13"
+        ],
+        "deniedRequests": 0,
+        "diagnostics": [
+          {
+            "admission": 1,
+            "admissionDenial": null,
+            "httpStatus": 200,
+            "kind": "http_response_observed",
+            "providerErrorCode": null,
+            "providerErrorType": null,
+            "providerRequestId": null,
+            "requestBytes": null
+          },
+          {
+            "admission": 1,
+            "admissionDenial": null,
+            "httpStatus": null,
+            "kind": "protocol_failure",
+            "providerErrorCode": null,
+            "providerErrorType": null,
+            "providerRequestId": null,
+            "requestBytes": null
+          },
+          {
+            "admission": 1,
+            "admissionDenial": null,
+            "httpStatus": null,
+            "kind": "child_exit",
+            "providerErrorCode": null,
+            "providerErrorType": null,
+            "providerRequestId": null,
+            "requestBytes": null
+          }
+        ],
+        "httpResponsesObserved": 1,
+        "inputTokens": 0,
+        "interruption": "protocol_failure",
+        "mechanism": "host_relay_v1",
+        "model": "grok-build-0.1",
+        "outputTokens": 0,
+        "remoteEffectUncertain": true,
+        "requestsReserved": 1,
+        "responsesCompleted": 0,
+        "revoked": true,
+        "toolCalls": 0,
+        "uncertain": true,
+        "usageObserved": false,
+        "wireAttempts": 1
+      },
+      "readiness": {
+        "cliContract": null,
+        "cliVersion": null,
+        "mutationMode": "isolated_review",
+        "platform": "macos",
+        "providerInvocations": 0,
+        "ready": false,
+        "reasons": [
+          "Managed Grok executor authority is not installed on this host.",
+          "the assignment context was not recorded",
+          "the required-check oracle pointer is missing"
+        ],
+        "toolchain": [],
+        "workersDispatched": 0
+      },
+      "repositoryId": "unconfigured",
+      "requiredChecks": [
+        {
+          "checkId": "offline-utf8",
+          "cwd": "oracle",
+          "maxOutputBytes": 16384,
+          "timeoutMs": 5000
+        }
+      ],
+      "runId": "b73f8f3e-116b-43df-ab13-561b1a0ab9a5",
+      "safeAction": "The candidate was discarded or cancelled. Do not promote it.",
+      "sourceRevision": "3aaa71e7e385e6f5cac0e61c6d3c4b93e1707251",
+      "stopReason": "max_total_tokens_usage_unavailable",
+      "workId": "b351a739-a7eb-494b-a540-26cef89c4103",
+      "workRevision": 6,
+      "workState": "cancelled"
+    },
+    {
+      "agentId": "agent-d5825b71-0820-4f0a-94e6-af6eb113a326",
+      "allowedFiles": [
+        "src/framing.py",
+        "src/decoder.py"
+      ],
+      "approvalRequired": true,
+      "attemptCount": 1,
+      "attemptId": "e684814b-3221-421c-aa42-cd8bc7187e4d",
+      "boundedDiff": "",
+      "candidateDigest": "sha256:missing",
+      "changedPaths": [],
+      "checkProfileId": "offline-utf8",
+      "checkProfileRevision": 1,
+      "checkResults": [
+        {
+          "checkId": "offline-utf8",
+          "durationMs": 0,
+          "exitCode": null,
+          "outcome": "invalidated",
+          "outputDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "outputTruncated": false,
+          "specDigest": "sha256:65093596d0abde842b578b76772764ab00f6d1b5177b87f326a5f3a907298d7f"
+        }
+      ],
+      "cliContract": null,
+      "cliVersion": null,
+      "diffDigest": null,
+      "executionHost": "unrecorded",
+      "executor": "grok_build_isolated_review",
+      "limits": {
+        "maxDurationMs": 180000,
+        "maxPromptBytes": 16000,
+        "maxRounds": 6,
+        "maxTotalTokens": 16000
+      },
+      "modelSelectionKey": "grok-build-0.1",
+      "phases": {
+        "applied": false,
+        "changeProposed": false,
+        "checksPassed": false,
+        "humanApproved": false,
+        "workerStopped": true
+      },
+      "providerEvidence": {
+        "accountingComplete": false,
+        "authorityAttempts": [
+          "att_ebf921682fcf3c13"
+        ],
+        "deniedRequests": 0,
+        "diagnostics": [
+          {
+            "admission": 1,
+            "admissionDenial": null,
+            "httpStatus": 200,
+            "kind": "http_response_observed",
+            "providerErrorCode": null,
+            "providerErrorType": null,
+            "providerRequestId": null,
+            "requestBytes": null
+          },
+          {
+            "admission": 1,
+            "admissionDenial": null,
+            "httpStatus": null,
+            "kind": "protocol_failure",
+            "providerErrorCode": null,
+            "providerErrorType": null,
+            "providerRequestId": null,
+            "requestBytes": null
+          },
+          {
+            "admission": 1,
+            "admissionDenial": null,
+            "httpStatus": null,
+            "kind": "child_exit",
+            "providerErrorCode": null,
+            "providerErrorType": null,
+            "providerRequestId": null,
+            "requestBytes": null
+          }
+        ],
+        "httpResponsesObserved": 1,
+        "inputTokens": 0,
+        "interruption": "protocol_failure",
+        "mechanism": "host_relay_v1",
+        "model": "grok-build-0.1",
+        "outputTokens": 0,
+        "remoteEffectUncertain": true,
+        "requestsReserved": 1,
+        "responsesCompleted": 0,
+        "revoked": true,
+        "toolCalls": 0,
+        "uncertain": true,
+        "usageObserved": false,
+        "wireAttempts": 1
+      },
+      "readiness": {
+        "cliContract": null,
+        "cliVersion": null,
+        "mutationMode": "isolated_review",
+        "platform": "macos",
+        "providerInvocations": 0,
+        "ready": false,
+        "reasons": [
+          "Managed Grok executor authority is not installed on this host.",
+          "the assignment context was not recorded",
+          "the required-check oracle pointer is missing"
+        ],
+        "toolchain": [],
+        "workersDispatched": 0
+      },
+      "repositoryId": "unconfigured",
+      "requiredChecks": [
+        {
+          "checkId": "offline-utf8",
+          "cwd": "oracle",
+          "maxOutputBytes": 16384,
+          "timeoutMs": 5000
+        }
+      ],
+      "runId": "b73f8f3e-116b-43df-ab13-561b1a0ab9a5",
+      "safeAction": "The candidate was discarded or cancelled. Do not promote it.",
+      "sourceRevision": "3aaa71e7e385e6f5cac0e61c6d3c4b93e1707251",
+      "stopReason": "max_total_tokens_usage_unavailable",
+      "workId": "b351a739-a7eb-494b-a540-26cef89c4103",
+      "workRevision": 6,
+      "workState": "cancelled"
+    },
+    {
+      "agentId": "agent-d5825b71-0820-4f0a-94e6-af6eb113a326",
+      "allowedFiles": [
+        "src/framing.py",
+        "src/decoder.py"
+      ],
+      "approvalRequired": true,
+      "attemptCount": 1,
+      "attemptId": "e684814b-3221-421c-aa42-cd8bc7187e4d",
+      "boundedDiff": "",
+      "candidateDigest": "sha256:missing",
+      "changedPaths": [],
+      "checkProfileId": "offline-utf8",
+      "checkProfileRevision": 1,
+      "checkResults": [
+        {
+          "checkId": "offline-utf8",
+          "durationMs": 0,
+          "exitCode": null,
+          "outcome": "invalidated",
+          "outputDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "outputTruncated": false,
+          "specDigest": "sha256:65093596d0abde842b578b76772764ab00f6d1b5177b87f326a5f3a907298d7f"
+        }
+      ],
+      "cliContract": null,
+      "cliVersion": null,
+      "diffDigest": null,
+      "executionHost": "unrecorded",
+      "executor": "grok_build_isolated_review",
+      "limits": {
+        "maxDurationMs": 180000,
+        "maxPromptBytes": 16000,
+        "maxRounds": 6,
+        "maxTotalTokens": 16000
+      },
+      "modelSelectionKey": "grok-build-0.1",
+      "phases": {
+        "applied": false,
+        "changeProposed": false,
+        "checksPassed": false,
+        "humanApproved": false,
+        "workerStopped": true
+      },
+      "providerEvidence": {
+        "accountingComplete": false,
+        "authorityAttempts": [
+          "att_ebf921682fcf3c13"
+        ],
+        "deniedRequests": 0,
+        "diagnostics": [
+          {
+            "admission": 1,
+            "admissionDenial": null,
+            "httpStatus": 200,
+            "kind": "http_response_observed",
+            "providerErrorCode": null,
+            "providerErrorType": null,
+            "providerRequestId": null,
+            "requestBytes": null
+          },
+          {
+            "admission": 1,
+            "admissionDenial": null,
+            "httpStatus": null,
+            "kind": "protocol_failure",
+            "providerErrorCode": null,
+            "providerErrorType": null,
+            "providerRequestId": null,
+            "requestBytes": null
+          },
+          {
+            "admission": 1,
+            "admissionDenial": null,
+            "httpStatus": null,
+            "kind": "child_exit",
+            "providerErrorCode": null,
+            "providerErrorType": null,
+            "providerRequestId": null,
+            "requestBytes": null
+          }
+        ],
+        "httpResponsesObserved": 1,
+        "inputTokens": 0,
+        "interruption": "protocol_failure",
+        "mechanism": "host_relay_v1",
+        "model": "grok-build-0.1",
+        "outputTokens": 0,
+        "remoteEffectUncertain": true,
+        "requestsReserved": 1,
+        "responsesCompleted": 0,
+        "revoked": true,
+        "toolCalls": 0,
+        "uncertain": true,
+        "usageObserved": false,
+        "wireAttempts": 1
+      },
+      "readiness": {
+        "cliContract": null,
+        "cliVersion": null,
+        "mutationMode": "isolated_review",
+        "platform": "macos",
+        "providerInvocations": 0,
+        "ready": false,
+        "reasons": [
+          "Managed Grok executor authority is not installed on this host.",
+          "the assignment context was not recorded",
+          "the required-check oracle pointer is missing"
+        ],
+        "toolchain": [],
+        "workersDispatched": 0
+      },
+      "repositoryId": "unconfigured",
+      "requiredChecks": [
+        {
+          "checkId": "offline-utf8",
+          "cwd": "oracle",
+          "maxOutputBytes": 16384,
+          "timeoutMs": 5000
+        }
+      ],
+      "runId": "b73f8f3e-116b-43df-ab13-561b1a0ab9a5",
+      "safeAction": "The candidate was discarded or cancelled. Do not promote it.",
+      "sourceRevision": "3aaa71e7e385e6f5cac0e61c6d3c4b93e1707251",
+      "stopReason": "max_total_tokens_usage_unavailable",
+      "workId": "b351a739-a7eb-494b-a540-26cef89c4103",
+      "workRevision": 6,
+      "workState": "cancelled"
+    }
+  ],
+  "requestShapes": [
+    {
+      "fields": [
+        "max_tokens",
+        "messages",
+        "model",
+        "parallel_tool_calls",
+        "stream",
+        "stream_options",
+        "tools"
+      ],
+      "maxTokens": 1024,
+      "requestBytes": 13289,
+      "tools": [
+        {
+          "name": "read_file",
+          "parameterKeys": [
+            "format",
+            "limit",
+            "offset",
+            "pages",
+            "target_file"
+          ]
+        },
+        {
+          "name": "search_replace",
+          "parameterKeys": [
+            "file_path",
+            "new_string",
+            "old_string",
+            "replace_all"
+          ]
+        },
+        {
+          "name": "list_dir",
+          "parameterKeys": [
+            "target_directory"
+          ]
+        },
+        {
+          "name": "grep",
+          "parameterKeys": [
+            "-A",
+            "-B",
+            "-C",
+            "-i",
+            "glob",
+            "head_limit",
+            "multiline",
+            "path",
+            "pattern",
+            "type"
+          ]
+        },
+        {
+          "name": "search_tool",
+          "parameterKeys": [
+            "limit",
+            "query"
+          ]
+        },
+        {
+          "name": "use_tool",
+          "parameterKeys": [
+            "file",
+            "tool_input",
+            "tool_input_file",
+            "tool_name"
+          ]
+        },
+        {
+          "name": "write",
+          "parameterKeys": [
+            "content",
+            "file_path"
+          ]
+        }
+      ]
+    }
+  ],
+  "review": {
+    "agentId": "agent-d5825b71-0820-4f0a-94e6-af6eb113a326",
+    "allowedFiles": [
+      "src/framing.py",
+      "src/decoder.py"
+    ],
+    "approvalRequired": true,
+    "attemptCount": 1,
+    "attemptId": "e684814b-3221-421c-aa42-cd8bc7187e4d",
+    "boundedDiff": "",
+    "candidateDigest": "sha256:missing",
+    "changedPaths": [],
+    "checkProfileId": "offline-utf8",
+    "checkProfileRevision": 1,
+    "checkResults": [
+      {
+        "checkId": "offline-utf8",
+        "durationMs": 0,
+        "exitCode": null,
+        "outcome": "invalidated",
+        "outputDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outputTruncated": false,
+        "specDigest": "sha256:65093596d0abde842b578b76772764ab00f6d1b5177b87f326a5f3a907298d7f"
+      }
+    ],
+    "cliContract": "inspect-json-v1",
+    "cliVersion": "1.0.41",
+    "diffDigest": null,
+    "executionHost": "service",
+    "executor": "grok_build_isolated_review",
+    "limits": {
+      "maxDurationMs": 180000,
+      "maxOutputTokensPerRequest": 1024,
+      "maxPromptBytes": 16000,
+      "maxRounds": 6,
+      "maxTotalTokens": 16000
+    },
+    "modelSelectionKey": "grok-build-0.1",
+    "phases": {
+      "applied": false,
+      "changeProposed": false,
+      "checksPassed": false,
+      "humanApproved": false,
+      "workerStopped": true
+    },
+    "providerEvidence": {
+      "accountingComplete": false,
+      "authorityAttempts": [
+        "att_ebf921682fcf3c13"
+      ],
+      "deniedRequests": 0,
+      "diagnostics": [
+        {
+          "admission": 1,
+          "admissionDenial": null,
+          "httpStatus": 200,
+          "kind": "http_response_observed",
+          "providerErrorCode": null,
+          "providerErrorType": null,
+          "providerRequestId": null,
+          "requestBytes": null
+        },
+        {
+          "admission": 1,
+          "admissionDenial": null,
+          "httpStatus": null,
+          "kind": "protocol_failure",
+          "providerErrorCode": null,
+          "providerErrorType": null,
+          "providerRequestId": null,
+          "requestBytes": null
+        },
+        {
+          "admission": 1,
+          "admissionDenial": null,
+          "httpStatus": null,
+          "kind": "child_exit",
+          "providerErrorCode": null,
+          "providerErrorType": null,
+          "providerRequestId": null,
+          "requestBytes": null
+        }
+      ],
+      "httpResponsesObserved": 1,
+      "inputTokens": 0,
+      "interruption": "protocol_failure",
+      "mechanism": "host_relay_v1",
+      "model": "grok-build-0.1",
+      "outputTokens": 0,
+      "remoteEffectUncertain": true,
+      "requestsReserved": 1,
+      "responsesCompleted": 0,
+      "revoked": true,
+      "toolCalls": 0,
+      "uncertain": true,
+      "usageObserved": false,
+      "wireAttempts": 1
+    },
+    "readiness": {
+      "cliContract": "inspect-json-v1",
+      "cliVersion": "1.0.41",
+      "mutationMode": "isolated_review",
+      "platform": "macos",
+      "providerInvocations": 0,
+      "ready": true,
+      "reasons": [],
+      "toolchain": [
+        {
+          "checkId": "offline-utf8",
+          "present": true
+        }
+      ],
+      "workersDispatched": 0
+    },
+    "repositoryId": "offline:utf8-frame-continuation",
+    "requiredChecks": [
+      {
+        "checkId": "offline-utf8",
+        "cwd": "oracle",
+        "maxOutputBytes": 16384,
+        "timeoutMs": 5000
+      }
+    ],
+    "runId": "b73f8f3e-116b-43df-ab13-561b1a0ab9a5",
+    "safeAction": "The worker stopped without verified checks. Do not treat the model verdict as success.",
+    "sourceRevision": "3aaa71e7e385e6f5cac0e61c6d3c4b93e1707251",
+    "stopReason": "managed_execution_uncertain_or_failed",
+    "workId": "b351a739-a7eb-494b-a540-26cef89c4103",
+    "workRevision": 5,
+    "workState": "review"
+  },
+  "runs": [
+    {
+      "agentId": "agent-d5825b71-0820-4f0a-94e6-af6eb113a326",
+      "agentSpecRevision": 1,
+      "bounds": {
+        "maxDurationMs": 180000,
+        "maxPromptBytes": 16000,
+        "maxRounds": 6,
+        "maxTotalTokens": 16000
+      },
+      "errorCode": null,
+      "execution": null,
+      "retryOf": null,
+      "runId": "b73f8f3e-116b-43df-ab13-561b1a0ab9a5",
+      "sessionId": "d5825b71-0820-4f0a-94e6-af6eb113a326",
+      "state": "interrupted",
+      "stopCause": "interrupted"
+    }
+  ],
+  "schemaVersion": 1,
+  "workId": "b351a739-a7eb-494b-a540-26cef89c4103",
+  "workerRootEmpty": true
+}

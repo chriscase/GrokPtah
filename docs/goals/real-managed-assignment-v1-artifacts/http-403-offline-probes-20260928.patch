@@ -1,0 +1,139 @@
+diff --git a/crates/codegen/grokptah-agent-bridge/src/auth_store.rs b/crates/codegen/grokptah-agent-bridge/src/auth_store.rs
+index 56cde9a6c..ecb719a05 100644
+--- a/crates/codegen/grokptah-agent-bridge/src/auth_store.rs
++++ b/crates/codegen/grokptah-agent-bridge/src/auth_store.rs
+@@ -51,0 +52,69 @@ pub(crate) fn xai_keychain_api_key_state() -> crate::live_attestation::KeychainA
++#[cfg(test)]
++mod http_403_parity_probe {
++    #[test]
++    fn synthetic_managed_oidc_request_builds_expected_headers_without_sending() {
++        let credentials = super::WireCredentials {
++            provider_id: "xai".into(),
++            bearer: "synthetic-credential-never-sent".into(),
++            oidc_token_auth: true,
++            display_name: "synthetic".into(),
++            method: "grok_build:oidc".into(),
++            user_id: Some("synthetic-user".into()),
++            team_id: None,
++            auth_scope: None,
++            refresh_token: None,
++            oidc_issuer: None,
++            oidc_client_id: None,
++            principal_type: None,
++            principal_id: None,
++            expires_at: None,
++        };
++        let base = "https://cli-chat-proxy.grok.com/v1";
++        let client = reqwest::Client::builder()
++            .redirect(reqwest::redirect::Policy::none())
++            .build()
++            .unwrap();
++        let request = super::apply_auth_headers(
++            client
++                .post(format!("{base}/chat/completions"))
++                .header("Content-Type", "application/json")
++                .header("Accept", "text/event-stream")
++                .header("x-grok-effort", "low"),
++            &credentials,
++            base,
++        )
++        .json(&serde_json::json!({
++            "model": "grok-build-0.1",
++            "messages": [{"role":"user","content":"synthetic"}],
++            "tools": [],
++            "stream": true,
++            "stream_options": {"include_usage":true},
++            "max_tokens": 1024,
++            "parallel_tool_calls": false
++        }))
++        .build()
++        .unwrap();
++        assert_eq!(request.method(), reqwest::Method::POST);
++        assert_eq!(request.url().as_str(), "https://cli-chat-proxy.grok.com/v1/chat/completions");
++        let h = request.headers();
++        let get = |name: &str| h.get(name).and_then(|v| v.to_str().ok());
++        assert_eq!(get("x-grok-client-version"), Some("1.0.41"));
++        assert_eq!(get("x-grok-client-mode"), Some("interactive"));
++        assert_eq!(get("X-XAI-Token-Auth"), Some("xai-grok-cli"));
++        assert_eq!(get("x-authenticateresponse"), Some("authenticate-response"));
++        assert_eq!(get("x-userid"), Some("synthetic-user"));
++        assert_eq!(get("x-grok-effort"), Some("low"));
++        assert!(get("authorization").is_some_and(|v| v.starts_with("Bearer synthetic-")));
++        assert!(get("x-grok-client-identifier").is_none());
++        assert!(get("x-grok-model-override").is_none());
++        assert!(get("x-grok-conv-id").is_none());
++        assert!(get("x-grok-req-id").is_none());
++        assert!(get("x-grok-session-id").is_none());
++        let body: serde_json::Value =
++            serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
++        assert_eq!(body["model"], "grok-build-0.1");
++        assert_eq!(body["stream_options"]["include_usage"], true);
++        println!("offline request build: method=POST path=/v1/chat/completions version=1.0.41 client-mode=interactive token-auth=present authenticate-response=present model-override=absent client-identifier=absent tracking-ids=absent body-model=grok-build-0.1 include-usage=true; sends=0");
++    }
++}
++
+diff --git a/crates/codegen/grokptah-agent-bridge/src/managed_provider.rs b/crates/codegen/grokptah-agent-bridge/src/managed_provider.rs
+index 6cc77e2bf..3fb890a1e 100644
+--- a/crates/codegen/grokptah-agent-bridge/src/managed_provider.rs
++++ b/crates/codegen/grokptah-agent-bridge/src/managed_provider.rs
+@@ -1806,0 +1807,60 @@ mod tests {
++    #[tokio::test]
++    #[allow(clippy::await_holding_lock)]
++    async fn offline_oidc_forward_header_probe_with_synthetic_loopback() {
++        let _serial = crate::home_override_serial();
++        let root = tempfile::tempdir().unwrap();
++        crate::set_grokptah_home_override(Some(root.path().join("host")));
++        let _home = Home;
++        let calls = Arc::new(AtomicU32::new(0));
++        let observed = calls.clone();
++        let router = Router::new().route(
++            "/v1/chat/completions",
++            post(move |headers: HeaderMap, Json(body): Json<Value>| {
++                let observed = observed.clone();
++                async move {
++                    assert_eq!(headers["authorization"], "Bearer upstream-test-secret-never-child");
++                    assert_eq!(headers["x-grok-client-version"], "1.0.41");
++                    assert_eq!(headers["x-grok-client-mode"], "interactive");
++                    assert_eq!(headers["x-xai-token-auth"], "xai-grok-cli");
++                    assert_eq!(headers["x-authenticateresponse"], "authenticate-response");
++                    assert_eq!(headers["x-grok-effort"], "low");
++                    assert!(headers.contains_key("idempotency-key"));
++                    assert!(!headers.contains_key("x-grok-client-identifier"));
++                    assert!(!headers.contains_key("x-grok-model-override"));
++                    assert!(!headers.contains_key("x-grok-conv-id"));
++                    assert!(!headers.contains_key("x-grok-req-id"));
++                    assert!(!headers.contains_key("x-grok-session-id"));
++                    assert_eq!(body["model"], "grok-build-0.1");
++                    assert_eq!(body["stream"], true);
++                    assert_eq!(body["stream_options"]["include_usage"], true);
++                    observed.fetch_add(1, Ordering::SeqCst);
++                    (StatusCode::FORBIDDEN, Json(json!({"error":{"code":"synthetic_refusal"}})))
++                }
++            }),
++        );
++        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let port = listener.local_addr().unwrap().port();
++        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
++        let target = crate::host_helpers::ResolvedModelTarget {
++            base_url: format!("http://127.0.0.1:{port}/v1"),
++            wire_model: "grok-build-0.1".into(),
++            dialect: crate::gateway_config::ProviderDialect::XaiChatCompletions,
++            capabilities: crate::gateway_config::ModelCapabilities {
++                tools: true,
++                stream: true,
++                ..Default::default()
++            },
++            deadline_class: crate::gateway_config::ProviderDeadlineClass::Standard,
++        };
++        let mut synthetic = credentials();
++        synthetic.oidc_token_auth = true;
++        let relay = ManagedProviderRelay::with_target(synthetic, target, root.path().join("leases"))
++            .await.unwrap();
++        let (id, secret) = issue(&relay, "oidc-header-probe");
++        assert_eq!(send(&relay, &secret, &request(0)).await.status(), StatusCode::BAD_GATEWAY);
++        assert_eq!(calls.load(Ordering::SeqCst), 1);
++        assert_eq!(relay.evidence(&id).unwrap().wire_attempts, 1);
++        server.abort();
++        println!("offline production forward: synthetic OIDC, loopback only, one request; expected headers present, native tracking/override headers absent; synthetic HTTP 403 does not explain historical rejection");
++    }
++

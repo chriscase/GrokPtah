@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "scope": "New Responses production scaffold before canonical dialect admission",
+  "result": "expected red; no fixture wire send",
+  "logSha256": "44108e87792f714c27dcb63ccdb3e19a382cff28336d47694647b11023f9a137",
+  "workId": "3e008205-6b9d-40be-a4d5-5e8279127ffb",
+  "runId": "b124cbf5-6df1-41cc-91b8-36934053fb41",
+  "attemptId": "a7cde8a1-04e4-406d-89ba-2a90c7ea12fb",
+  "requestsReserved": 1,
+  "fixturePhysicalRequests": 0,
+  "canonicalWireAttempts": 0,
+  "diagnostic": "before_wire_rejected",
+  "checksPassed": false,
+  "additionalLiveProviderRequests": 0
+}

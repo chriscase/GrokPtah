@@ -1,0 +1,106 @@
+{
+  "additionalLiveRequests": 0,
+  "cargoIncremental": "0",
+  "checks": [
+    "bridge fmt",
+    "bridge strict all-target Clippy",
+    "service fmt/check/strict all-target Clippy",
+    "host authority fmt/strict all-target Clippy",
+    "frontend typecheck"
+  ],
+  "commands": {
+    "bridge": "cargo test --locked -- --test-threads=1",
+    "focused": "cargo test --locked --lib managed_provider::tests:: -- --test-threads=1 --nocapture",
+    "frontend": "npm run typecheck; npm test",
+    "hostAuthority": "cargo test -p xai-host-authority --locked -- --test-threads=1",
+    "installedCliOffline": "cargo test --locked --lib managed_provider::offline_tests:: -- --ignored --test-threads=1 --nocapture",
+    "installedCliProtocol": "cargo test --locked --lib managed_provider::tests::installed_cli_obeys_production_protocol_and_failure_has_no_retry -- --exact --ignored --test-threads=1",
+    "service": "cargo test --locked -- --test-threads=1",
+    "tauri": "cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked"
+  },
+  "counts": {
+    "bridge": {
+      "failed": 0,
+      "ignored": 13,
+      "libraryPassed": 730,
+      "passed": 1260,
+      "topLevelSuites": 39,
+      "verifiedChangePassed": 102
+    },
+    "focusedRelay": {
+      "failed": 0,
+      "ignored": 1,
+      "passed": 29
+    },
+    "frontend": {
+      "failed": 0,
+      "files": 58,
+      "passed": 428
+    },
+    "hostAuthority": {
+      "failed": 0,
+      "passed": 119
+    },
+    "installedCliOffline": {
+      "failed": 0,
+      "passed": 8
+    },
+    "installedCliProtocolCancellationNoRetry": {
+      "failed": 0,
+      "passed": 1
+    },
+    "serviceFinalSerial": {
+      "failed": 0,
+      "passed": 20
+    },
+    "tauri": {
+      "failed": 0,
+      "passed": 50
+    }
+  },
+  "environment": "Fresh GROKPTAH_HOME per native suite, installed Grok 1.0.41 only against local loopback fixture; no live provider.",
+  "functionalSha": "0be8ec4b32144d002d8bb230dec78d18d018f922",
+  "functionalTree": "ad0c6d0a500d309981c3eddbee2531625106b89c",
+  "hostedDesktop": {
+    "attempt": 1,
+    "conclusion": "success",
+    "event": "pull_request",
+    "failedSteps": [],
+    "headSha": "0be8ec4b32144d002d8bb230dec78d18d018f922",
+    "runId": 36364316154,
+    "url": "https://github.com/chriscase/GrokPtah/actions/runs/36364316154"
+  },
+  "logDigests": {
+    "rma-accounting-authority-functional-clippy.log": "sha256:54d32f1312e9ec321c58af432997bfe3bae5b14322fc06e68fd35a1f2f0e6519",
+    "rma-accounting-authority-functional.log": "sha256:c20b92d71c0d9aa380ba941d66b4cd4f14d7c187e34260be5ea37164ae2ff69a",
+    "rma-accounting-before.log": "sha256:ff0b259671f31cf79fcda5a015f00272f781573eb18e8bb467e89bd2e0dfb150",
+    "rma-accounting-bridge-clippy-functional.log": "sha256:ce381e05cb75d8a2a6f9161be714583911e6f6ba25a7ce1586e421d7bd1bafef",
+    "rma-accounting-bridge-functional.log": "sha256:e87920c0cd766cf165ce84ed9bccf17bfd1c4b56d19f059e84695acef5b4cf83",
+    "rma-accounting-cli-match-before.log": "sha256:5c5b4259df613de8dbf0dbe189b789b2d5725c50a720a942e7d4ee4ac5830a09",
+    "rma-accounting-cli-protocol-functional.log": "sha256:628c0fe4751ac5c281e517e8838795bafcbdcb4c43f2fdbdf296eacd3ac72018",
+    "rma-accounting-desktop-functional-tests.log": "sha256:42a5666cd129bc32608a8d2c780b5fbe9d6c50b49df351fe5ae602bd831e13e7",
+    "rma-accounting-desktop-functional-type.log": "sha256:3b0513ad643589f28c88931cabf8bdd3e909fa535642dfd3b26a606194abfb7e",
+    "rma-accounting-focused-functional.log": "sha256:aaec91b4ba608c0c93be032123fe160d868725677caa91d837c41651683be6bc",
+    "rma-accounting-offline-functional.log": "sha256:35a2c5083c3b4c6692d59b85693da38a529836ab53981114cc2413abac2b2f78",
+    "rma-accounting-service-functional-check.log": "sha256:97a9d721177fc7d77ca9e8b7f6b37149a8d987a89a5944c65b31f5ebea3b7074",
+    "rma-accounting-service-functional-clippy.log": "sha256:87d493584e43dd782f74de14b282df2b2fbbeb7572085f502d4fe652c8eee811",
+    "rma-accounting-service-functional-rerun.log": "sha256:21eca4b14f6f87c4e0022fd37e483c41866ed030c4e3a56b1b455bd07658e105",
+    "rma-accounting-service-functional.log": "sha256:44ba539d95086042ce46f8ed46dd6d7bfd4ea5bf1266d0549de5dbbaab417931",
+    "rma-accounting-service-retry-case.log": "sha256:49f0e96726a5d47402da3d7888206d20988bd15989bfd4360194de22c764ca32",
+    "rma-accounting-tauri-functional.log": "sha256:ea84c3b64d10ede3cfb921553da1e912c0b087eb6b4471fd5778025daf978b20"
+  },
+  "nextLiveSpecification": "NOT EXECUTED",
+  "normalStack": true,
+  "schemaVersion": 1,
+  "serialNativeCampaign": true,
+  "serviceFirstFinalTreeRun": {
+    "failed": 1,
+    "failure": "unchanged disconnect_reconnect_restart_and_cursor_expiry_are_durable: journal writer queue is full on shutdown; temporary instance lock retained",
+    "passed": 10
+  },
+  "serviceRecovery": {
+    "fullFreshHomeSerialRerunPassed": 20,
+    "testOrLimitChanges": 0,
+    "unchangedIsolatedRetryPassed": 1
+  }
+}

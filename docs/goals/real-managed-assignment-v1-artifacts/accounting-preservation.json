@@ -1,0 +1,173 @@
+{
+  "acceptedCompletedForwardFunctional": "e70c5609628ef76847d9eceb02b0523a8980409d",
+  "additionalLiveRequests": 0,
+  "frozenGoalSha256": "50edf789c5acc46a0f349a81ca12b53ce155adfc860ff084537e0aba33f578f8",
+  "functionalSha": "0be8ec4b32144d002d8bb230dec78d18d018f922",
+  "functionalTree": "ad0c6d0a500d309981c3eddbee2531625106b89c",
+  "historicalFailedLiveAttempt": "unchanged, cancelled, usage UNKNOWN/incomplete, no candidate or application, cause UNKNOWN",
+  "main": {
+    "sha": "9e2660ff1a50edb7af1b81a4232d7fe23a37de0d",
+    "tree": "f524b705a3b88cb895309506bf726e76c91874bf"
+  },
+  "nextLiveSpecSha256": "d731eb90e391047826dfe1e14d4d0600e338308a635bf94fab9bb8a1d6121e41",
+  "nextLiveSpecification": "NOT EXECUTED",
+  "reportSummary": [
+    {
+      "accountingComplete": true,
+      "costComplete": false,
+      "costInUsdTicks": null,
+      "file": "accounting-offline-success.json",
+      "mode": "success",
+      "physicalRequests": 2,
+      "reopens": 3,
+      "runState": "completed",
+      "totalTokens": 220,
+      "workId": "550250f4-4890-48c3-a1b6-f10cf229c51a"
+    },
+    {
+      "accountingComplete": true,
+      "costComplete": true,
+      "costInUsdTicks": 1665,
+      "file": "accounting-offline-accounting-combined.json",
+      "mode": "accounting-combined",
+      "physicalRequests": 2,
+      "reopens": 3,
+      "runState": "completed",
+      "totalTokens": 220,
+      "workId": "cded8e0c-c4cf-4066-a201-10ef14f0d043"
+    },
+    {
+      "accountingComplete": false,
+      "costComplete": false,
+      "costInUsdTicks": null,
+      "file": "accounting-offline-additive-reasoning.json",
+      "mode": "additive-reasoning",
+      "physicalRequests": 1,
+      "reopens": 3,
+      "runState": "interrupted",
+      "totalTokens": null,
+      "workId": "46d4cd17-fda3-4115-b143-e6bf93a5f2c2"
+    },
+    {
+      "accountingComplete": false,
+      "costComplete": false,
+      "costInUsdTicks": null,
+      "file": "accounting-offline-unknown-additional-usage.json",
+      "mode": "unknown-additional-usage",
+      "physicalRequests": 1,
+      "reopens": 3,
+      "runState": "interrupted",
+      "totalTokens": null,
+      "workId": "3355513c-32ff-4ca4-9c8b-da28a92c68c5"
+    },
+    {
+      "accountingComplete": false,
+      "costComplete": false,
+      "costInUsdTicks": null,
+      "file": "accounting-offline-missing-usage.json",
+      "mode": "missing-usage",
+      "physicalRequests": 1,
+      "reopens": 3,
+      "runState": "interrupted",
+      "totalTokens": null,
+      "workId": "24aad67f-986d-4385-8af4-b0448d18fbaf"
+    },
+    {
+      "accountingComplete": false,
+      "costComplete": false,
+      "costInUsdTicks": null,
+      "file": "accounting-offline-malformed.json",
+      "mode": "malformed",
+      "physicalRequests": 1,
+      "reopens": 3,
+      "runState": "interrupted",
+      "totalTokens": null,
+      "workId": "cdcaee9a-38b6-4ac3-83e6-513fb310ed4f"
+    },
+    {
+      "accountingComplete": false,
+      "costComplete": false,
+      "costInUsdTicks": null,
+      "file": "accounting-offline-http-rejected.json",
+      "mode": "http-rejected",
+      "physicalRequests": 1,
+      "reopens": 3,
+      "runState": "interrupted",
+      "totalTokens": null,
+      "workId": "a1581bb4-cec4-4419-9901-87378f503acf"
+    },
+    {
+      "accountingComplete": false,
+      "costComplete": false,
+      "costInUsdTicks": null,
+      "file": "accounting-offline-interrupted.json",
+      "mode": "interrupted",
+      "physicalRequests": 1,
+      "reopens": 3,
+      "runState": "interrupted",
+      "totalTokens": null,
+      "workId": "bc8c8545-55c2-4c76-a57d-52cd4ccc7916"
+    }
+  ],
+  "retentionScan": {
+    "files": [
+      "accounting-offline-success.json",
+      "accounting-offline-accounting-combined.json",
+      "accounting-offline-additive-reasoning.json",
+      "accounting-offline-unknown-additional-usage.json",
+      "accounting-offline-missing-usage.json",
+      "accounting-offline-malformed.json",
+      "accounting-offline-http-rejected.json",
+      "accounting-offline-interrupted.json"
+    ],
+    "matches": 0,
+    "patterns": [
+      "bearer",
+      "authorizationHeader",
+      "cookieHeader",
+      "credentialShape",
+      "canary"
+    ],
+    "scope": "Published new offline reports; fixture-owned retained files scanned by offline tests. This is not a Git-object-wide audit."
+  },
+  "schemaVersion": 1,
+  "startingArtifacts": {
+    "allByteIdentical": true,
+    "count": 29,
+    "sha256": {
+      "completed-forward-hosted-desktop.json": "sha256:2053e679a55622cc634dd2fa7e21a920a4bf94f533be99cc98d73f670cdcd12b",
+      "completed-forward-offline-http-rejected.json": "sha256:552ec370f220e48a2c4de33cf874f34d4df34421634ae116e1f899f7ee84abd2",
+      "completed-forward-offline-interrupted.json": "sha256:b40877240a47900c3bf2b35a8338549f32257ec6998c466ea9d5c71cc6e05bc2",
+      "completed-forward-offline-malformed.json": "sha256:b9b9568202177d711c2c1a635afdcad3f3db3cc46e9eaa0fe28c7fd34deaf5e5",
+      "completed-forward-offline-missing-usage.json": "sha256:f3afb30f4f432a7839e8a82fb03c8b4fd2ab382eb630811aadae3968fe5fe663",
+      "completed-forward-offline-success.json": "sha256:222488d92796779f17d2215f6fe7aaeb1feee646b4fdd23cf303749713222ec2",
+      "completed-forward-preservation.json": "sha256:b4fbfc3b5559828443a231583adf3483770fb4b80135126440d316eedc074f55",
+      "completed-forward-reproduction.json": "sha256:7e19e0212cf0716944032ff212ed320095831907e4eea78f21736bf6f51d925e",
+      "completed-forward-validation.json": "sha256:fc433073edb105c9b792bb8101b2c6a34b76c81136754b80bb41a2aca93de5da",
+      "continuation-abandoned-forward.json": "sha256:d61a808c3ef39a96765b7e91c488c9b613ff1f2bdb02fa3103c6919f947684f4",
+      "continuation-hosted-desktop.json": "sha256:90b96871c104a9e4fb9e3fe227cefc829d37d4913fc43c23944c553dbcc4111e",
+      "continuation-offline-http-rejected.json": "sha256:67fbbd8d567fdb004961e8e0ea18b6497da033a84f2df44130e05fd6a4cd797a",
+      "continuation-offline-interrupted.json": "sha256:a46246fd34d1e7b07b54d1133a6efdc6e8ace081fdfffbb4dbb3eb213fda7d8e",
+      "continuation-offline-malformed.json": "sha256:cf66321ee5453d51403052643747bfd9489aa84f45a570b7060f40f2456f02bf",
+      "continuation-offline-missing-usage.json": "sha256:c0efc6ad41b49e88d22e503a61b61abf380a89746029af765cf56db72d85a9ee",
+      "continuation-offline-success.json": "sha256:3273245846f3f3ab7d1d29219ea6e4c328fca6557c8ae500087df4746318ceb4",
+      "continuation-secret-retention.json": "sha256:543eb4b526d19f7aee2e5965fdacb612ed43c8f0e85c852ef3303a4fb4b21c3b",
+      "continuation-validation.json": "sha256:721f3c931c628cd46c60e05aeeec68dcebba80e64e586b9987e531418ed3fa30",
+      "hosted-desktop-final.json": "sha256:5573e71e91c1511cdbbef376cc052d94a88956b2eef545da9a13cbf3bc049cca",
+      "live-discard.json": "sha256:5c0d512190211a229ecb5f42f0553b31cafd17949df69c3ec51402545957a3b0",
+      "live-execute.json": "sha256:7b1b3eb2e5c34766122b283a74172d7208bfff7092cb6ce27f2d94f25497185b",
+      "live-reopened-discard.json": "sha256:c5701e736a6c306c506d277fbbda12ad2dd35e717bcb88d0e5415c977656a864",
+      "live-review-before-discard.json": "sha256:539e2b66839dc01855087656861555ad46ee977f8139c01b2e1760bb2a20c124",
+      "physical-send-audit.json": "sha256:02111bade507157a1de6575dc1b77ebdfea81f1faf02c8a728245427549656cf",
+      "predecessor-integration.json": "sha256:0d3bcc8db80bbcf858f3aede34048f03118b6a89b6032f16b8547c907750e91e",
+      "readiness-before-live.json": "sha256:f47e895ccc5eb5dc8c300c008330cfaa40087abd42da6ffc0ecedb93de8ee4d9",
+      "red-baseline.json": "sha256:2c1203a8656e846fe7322d222ef51787496cd797526242db13a41f5fcfba2316",
+      "secret-retention-check.json": "sha256:43edd045594409ec7cb7aa08cc8fde26809b610ef524ceb9b7a3d06e71629c88",
+      "zero-wire-isolation-failure.json": "sha256:7466913d35f57dc200c3ca9bd6b4b0e17e03426c7a72ca3f7980008461e4abca"
+    }
+  },
+  "startingPublished": {
+    "sha": "4aff414435c26d3767dca245baf6493794e589db",
+    "tree": "f0dd6216109bae241808280eeca97fc37312faba"
+  }
+}

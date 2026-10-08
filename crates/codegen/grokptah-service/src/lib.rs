@@ -368,7 +368,7 @@ pub async fn start_service(config: ServiceConfig) -> Result<ServiceHandle> {
         .map_err(|error| anyhow::anyhow!(error.message))?;
     orch.set_agent_owner_id(config.agent_owner_id.clone())
         .map_err(|error| anyhow::anyhow!(error.message))?;
-    if let Err(error) = orch.configure_managed_grok_from_operator_env() {
+    if let Err(error) = orch.configure_managed_grok_from_operator_env().await {
         eprintln!(
             "[grokptah] managed Grok executor was not installed: {}",
             error.message

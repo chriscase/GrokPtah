@@ -1,0 +1,286 @@
+{
+  "cases": [
+    {
+      "cliModelUsage": {
+        "cacheCreationInputTokens": 0,
+        "cacheReadInputTokens": 0,
+        "inputTokens": 100,
+        "modelCalls": 1,
+        "outputTokens": 10
+      },
+      "cliTotalCostUsd": null,
+      "cliTotalCostUsdTicks": null,
+      "cliUsage": {
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "input_tokens": 100,
+        "output_tokens": 10,
+        "reasoning_tokens": 0,
+        "total_tokens": 110
+      },
+      "exitCode": 0,
+      "fixture": "ordinary_missing_cost",
+      "journalSession": {
+        "cacheCreationTokens": 0,
+        "cachedReadTokens": 0,
+        "inputTokens": 100,
+        "modelCalls": 1,
+        "outputTokens": 10,
+        "reasoningTokens": 0,
+        "totalTokens": 110,
+        "turnCount": 1
+      },
+      "journalTurn": {
+        "cacheCreationTokens": 0,
+        "cachedReadTokens": 0,
+        "inputTokens": 100,
+        "modelCalls": 1,
+        "outputTokens": 10,
+        "reasoningTokens": 0,
+        "totalTokens": 110,
+        "turnCount": 1
+      },
+      "localChatRequests": 2,
+      "providerUsage": {
+        "completion_tokens": 10,
+        "prompt_tokens": 100,
+        "total_tokens": 110
+      },
+      "safeRequestShapes": [
+        {
+          "maxTokens": 100,
+          "messageCount": 2,
+          "model": "grok-4.6",
+          "stream": true,
+          "toolCount": 1
+        },
+        {
+          "maxTokens": 1024,
+          "messageCount": 3,
+          "model": "grok-build-0.1",
+          "stream": true,
+          "toolCount": 25
+        }
+      ],
+      "stdoutJson": true
+    },
+    {
+      "cliModelUsage": {
+        "cacheCreationInputTokens": 0,
+        "cacheReadInputTokens": 20,
+        "costUSD": 7.77e-8,
+        "inputTokens": 80,
+        "modelCalls": 1,
+        "outputTokens": 10
+      },
+      "cliTotalCostUsd": 7.77e-8,
+      "cliTotalCostUsdTicks": 777,
+      "cliUsage": {
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 20,
+        "input_tokens": 80,
+        "output_tokens": 10,
+        "reasoning_tokens": 3,
+        "total_tokens": 110
+      },
+      "exitCode": 0,
+      "fixture": "reasoning_subset_cache",
+      "journalSession": {
+        "cacheCreationTokens": 0,
+        "cachedReadTokens": 20,
+        "inputTokens": 100,
+        "modelCalls": 1,
+        "outputTokens": 10,
+        "reasoningTokens": 3,
+        "totalTokens": 110,
+        "turnCount": 1
+      },
+      "journalTurn": {
+        "cacheCreationTokens": 0,
+        "cachedReadTokens": 20,
+        "inputTokens": 100,
+        "modelCalls": 1,
+        "outputTokens": 10,
+        "reasoningTokens": 3,
+        "totalTokens": 110,
+        "turnCount": 1
+      },
+      "localChatRequests": 2,
+      "providerUsage": {
+        "completion_tokens": 10,
+        "completion_tokens_details": {
+          "accepted_prediction_tokens": 0,
+          "audio_tokens": 0,
+          "reasoning_tokens": 3,
+          "rejected_prediction_tokens": 0
+        },
+        "cost_in_usd_ticks": 777,
+        "prompt_tokens": 100,
+        "prompt_tokens_details": {
+          "audio_tokens": 0,
+          "cached_tokens": 20,
+          "image_tokens": 0,
+          "text_tokens": 100
+        },
+        "total_tokens": 110
+      },
+      "safeRequestShapes": [
+        {
+          "maxTokens": 100,
+          "messageCount": 2,
+          "model": "grok-4.6",
+          "stream": true,
+          "toolCount": 1
+        },
+        {
+          "maxTokens": 1024,
+          "messageCount": 3,
+          "model": "grok-build-0.1",
+          "stream": true,
+          "toolCount": 25
+        }
+      ],
+      "stdoutJson": true
+    },
+    {
+      "cliModelUsage": {
+        "cacheCreationInputTokens": 0,
+        "cacheReadInputTokens": 20,
+        "costUSD": 7.77e-8,
+        "inputTokens": 80,
+        "modelCalls": 1,
+        "outputTokens": 10
+      },
+      "cliTotalCostUsd": 7.77e-8,
+      "cliTotalCostUsdTicks": 777,
+      "cliUsage": {
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 20,
+        "input_tokens": 80,
+        "output_tokens": 10,
+        "reasoning_tokens": 5,
+        "total_tokens": 110
+      },
+      "exitCode": 0,
+      "fixture": "additive_reasoning",
+      "journalSession": {
+        "cacheCreationTokens": 0,
+        "cachedReadTokens": 20,
+        "inputTokens": 100,
+        "modelCalls": 1,
+        "outputTokens": 10,
+        "reasoningTokens": 5,
+        "totalTokens": 110,
+        "turnCount": 1
+      },
+      "journalTurn": {
+        "cacheCreationTokens": 0,
+        "cachedReadTokens": 20,
+        "inputTokens": 100,
+        "modelCalls": 1,
+        "outputTokens": 10,
+        "reasoningTokens": 5,
+        "totalTokens": 110,
+        "turnCount": 1
+      },
+      "localChatRequests": 2,
+      "providerUsage": {
+        "completion_tokens": 10,
+        "completion_tokens_details": {
+          "reasoning_tokens": 5
+        },
+        "cost_in_usd_ticks": 777,
+        "prompt_tokens": 100,
+        "prompt_tokens_details": {
+          "cached_tokens": 20
+        },
+        "total_tokens": 115
+      },
+      "safeRequestShapes": [
+        {
+          "maxTokens": 100,
+          "messageCount": 2,
+          "model": "grok-4.6",
+          "stream": true,
+          "toolCount": 1
+        },
+        {
+          "maxTokens": 1024,
+          "messageCount": 3,
+          "model": "grok-build-0.1",
+          "stream": true,
+          "toolCount": 25
+        }
+      ],
+      "stdoutJson": true
+    },
+    {
+      "cliModelUsage": {
+        "cacheCreationInputTokens": 0,
+        "cacheReadInputTokens": 0,
+        "inputTokens": 100,
+        "modelCalls": 1,
+        "outputTokens": 10
+      },
+      "cliTotalCostUsd": null,
+      "cliTotalCostUsdTicks": null,
+      "cliUsage": {
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "input_tokens": 100,
+        "output_tokens": 10,
+        "reasoning_tokens": 0,
+        "total_tokens": 110
+      },
+      "exitCode": 0,
+      "fixture": "reported_zero_cost",
+      "journalSession": {
+        "cacheCreationTokens": 0,
+        "cachedReadTokens": 0,
+        "inputTokens": 100,
+        "modelCalls": 1,
+        "outputTokens": 10,
+        "reasoningTokens": 0,
+        "totalTokens": 110,
+        "turnCount": 1
+      },
+      "journalTurn": {
+        "cacheCreationTokens": 0,
+        "cachedReadTokens": 0,
+        "inputTokens": 100,
+        "modelCalls": 1,
+        "outputTokens": 10,
+        "reasoningTokens": 0,
+        "totalTokens": 110,
+        "turnCount": 1
+      },
+      "localChatRequests": 2,
+      "providerUsage": {
+        "completion_tokens": 10,
+        "cost_in_usd_ticks": 0,
+        "prompt_tokens": 100,
+        "total_tokens": 110
+      },
+      "safeRequestShapes": [
+        {
+          "maxTokens": 100,
+          "messageCount": 2,
+          "model": "grok-4.6",
+          "stream": true,
+          "toolCount": 1
+        },
+        {
+          "maxTokens": 1024,
+          "messageCount": 3,
+          "model": "grok-build-0.1",
+          "stream": true,
+          "toolCount": 25
+        }
+      ],
+      "stdoutJson": true
+    }
+  ],
+  "cliSha256": "9c844eb13365180787d9ad22b2b3748a024be8e1ed845253cc114781b31c591d",
+  "qualification": "OFFLINE PINNED CLI; synthetic local upstream",
+  "schemaVersion": 1
+}

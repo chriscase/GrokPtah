@@ -1,0 +1,238 @@
+{
+  "schemaVersion": 1,
+  "startingFunctionalSha": "fd8a7873468d7b416a53fc23b089b0cc4b589e2d",
+  "startingFunctionalTree": "94d275b23090e873378e4690107a7d3abbba9061",
+  "startingPublishedSha": "80c8db55c8aeec39b2d5fbf49c92b42cf59f866e",
+  "startingPublishedTree": "b8d65b4409107bc86d8226b505c3324b84476f34",
+  "qualification": "OFFLINE; actual production relay and canonical transport; two-thread runtime; no timing sleep used for handoff ordering",
+  "beforeCommand": "CARGO_INCREMENTAL=0 cargo test --locked --lib managed_provider::tests:: -- --test-threads=1 --nocapture",
+  "before": {
+    "passed": 13,
+    "failed": 4,
+    "ignored": 1,
+    "productionDropUnchanged": true,
+    "setupPanic": false,
+    "logSha256": "ae878b0dec9156b3c52d6ebb707d585e780998a8e8935fef73e1ba4d9b1ad1e2",
+    "instrumentedSourceSha256": "bfd47797f30f82bc8ec4b50f9964901932f8bb0dc13f84224dbbee0439ca2e0e",
+    "testOnlyPatchSha256": "13718857018b72643e1b704252a6e0c9f54d819e0da0b6e7a2a505faa1d08e22",
+    "events": [
+      {
+        "event": "completed-forward-handoff",
+        "observed": {
+          "aSettled": 1,
+          "admissions": 2,
+          "bActiveAfterADrop": false,
+          "bObservedBeforeADrop": true,
+          "canonicalPending": 1,
+          "case": "Ownership",
+          "completed": 1,
+          "fixtureCalls": 2,
+          "inputTokens": 100,
+          "outputTokens": 10,
+          "providerQuiescentAfterADrop": true,
+          "reserved": 2
+        }
+      },
+      {
+        "event": "completed-forward-handoff",
+        "observed": {
+          "aSettled": 1,
+          "admissions": 2,
+          "bActiveAfterADrop": false,
+          "bObservedBeforeADrop": true,
+          "canonicalPending": 1,
+          "case": "Quiescence",
+          "completed": 1,
+          "fixtureCalls": 2,
+          "inputTokens": 100,
+          "outputTokens": 10,
+          "providerQuiescentAfterADrop": true,
+          "reserved": 2
+        }
+      },
+      {
+        "event": "completed-forward-handoff",
+        "observed": {
+          "aSettled": 1,
+          "admissions": 2,
+          "bActiveAfterADrop": false,
+          "bObservedBeforeADrop": true,
+          "canonicalPending": 1,
+          "case": "SuccessorAbandonment",
+          "completed": 1,
+          "fixtureCalls": 2,
+          "inputTokens": 100,
+          "outputTokens": 10,
+          "providerQuiescentAfterADrop": true,
+          "reserved": 2
+        }
+      },
+      {
+        "event": "completed-forward-handoff",
+        "observed": {
+          "aSettled": 1,
+          "admissions": 2,
+          "bActiveAfterADrop": false,
+          "bObservedBeforeADrop": true,
+          "canonicalPending": 1,
+          "case": "ThirdRequest",
+          "completed": 1,
+          "fixtureCalls": 2,
+          "inputTokens": 100,
+          "outputTokens": 10,
+          "providerQuiescentAfterADrop": true,
+          "reserved": 2
+        }
+      },
+      {
+        "event": "completed-forward-third",
+        "observed": {
+          "admissions": 3,
+          "fixtureCalls": 3,
+          "httpStatus": 200,
+          "reserved": 3
+        }
+      }
+    ]
+  },
+  "additionalLiveRequests": 0,
+  "repairedFunctionalSha": "e70c5609628ef76847d9eceb02b0523a8980409d",
+  "repairedFunctionalTree": "d36d0f3b081a1b9e7448d27bf2a12b1f282c183b",
+  "after": {
+    "passed": 17,
+    "failed": 0,
+    "ignored": 1,
+    "normalStack": true,
+    "logSha256": "827a976435adcbc87b6deba513d7fe1e993ed4c13e7efbb88800d29910927063",
+    "events": [
+      {
+        "event": "completed-forward-handoff",
+        "observed": {
+          "aSettled": 1,
+          "admissions": 2,
+          "bActiveAfterADrop": true,
+          "bObservedBeforeADrop": true,
+          "canonicalPending": 1,
+          "case": "Ownership",
+          "completed": 1,
+          "fixtureCalls": 2,
+          "inputTokens": 100,
+          "outputTokens": 10,
+          "providerQuiescentAfterADrop": false,
+          "reserved": 2
+        }
+      },
+      {
+        "event": "completed-forward-normal",
+        "observed": {
+          "accountingComplete": true,
+          "admissions": 2,
+          "canonicalPending": 0,
+          "completed": 2,
+          "fixtureCalls": 2,
+          "inputTokens": 200,
+          "outputTokens": 20,
+          "providerQuiescent": true,
+          "reserved": 2,
+          "revoked": false,
+          "uncertain": false
+        }
+      },
+      {
+        "event": "completed-forward-handoff",
+        "observed": {
+          "aSettled": 1,
+          "admissions": 2,
+          "bActiveAfterADrop": true,
+          "bObservedBeforeADrop": true,
+          "canonicalPending": 1,
+          "case": "Quiescence",
+          "completed": 1,
+          "fixtureCalls": 2,
+          "inputTokens": 100,
+          "outputTokens": 10,
+          "providerQuiescentAfterADrop": false,
+          "reserved": 2
+        }
+      },
+      {
+        "event": "completed-forward-normal",
+        "observed": {
+          "accountingComplete": true,
+          "admissions": 2,
+          "canonicalPending": 0,
+          "completed": 2,
+          "fixtureCalls": 2,
+          "inputTokens": 200,
+          "outputTokens": 20,
+          "providerQuiescent": true,
+          "reserved": 2,
+          "revoked": false,
+          "uncertain": false
+        }
+      },
+      {
+        "event": "completed-forward-handoff",
+        "observed": {
+          "aSettled": 1,
+          "admissions": 2,
+          "bActiveAfterADrop": true,
+          "bObservedBeforeADrop": true,
+          "canonicalPending": 1,
+          "case": "SuccessorAbandonment",
+          "completed": 1,
+          "fixtureCalls": 2,
+          "inputTokens": 100,
+          "outputTokens": 10,
+          "providerQuiescentAfterADrop": false,
+          "reserved": 2
+        }
+      },
+      {
+        "event": "completed-forward-successor-abandoned",
+        "observed": {
+          "accountingComplete": false,
+          "admissions": 2,
+          "canonicalPending": 1,
+          "fixtureCalls": 2,
+          "inputTokens": 100,
+          "interruption": "abandoned_forward",
+          "outputTokens": 10,
+          "providerQuiescent": true,
+          "reserved": 2,
+          "revoked": true,
+          "uncertain": true
+        }
+      },
+      {
+        "event": "completed-forward-handoff",
+        "observed": {
+          "aSettled": 1,
+          "admissions": 2,
+          "bActiveAfterADrop": true,
+          "bObservedBeforeADrop": true,
+          "canonicalPending": 1,
+          "case": "ThirdRequest",
+          "completed": 1,
+          "fixtureCalls": 2,
+          "inputTokens": 100,
+          "outputTokens": 10,
+          "providerQuiescentAfterADrop": false,
+          "reserved": 2
+        }
+      },
+      {
+        "event": "completed-forward-third",
+        "observed": {
+          "admissions": 2,
+          "fixtureCalls": 2,
+          "httpStatus": 502,
+          "reserved": 2
+        }
+      }
+    ],
+    "thirdDenialPreservesCancellationPolicy": true,
+    "afterADropEvidenceEqualsActiveBEvidence": true,
+    "abandonedBRetainsUnknownUsageAndCannotRearm": true
+  }
+}

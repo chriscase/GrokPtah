@@ -511,13 +511,22 @@ async fn run_profile(profile: ManagedExecutionBudgetProfile) {
     assert_eq!(discard_ids.1.len(), 1);
     assert_eq!(review_ids.0.len(), 1);
     assert_eq!(review_ids.1.len(), 1);
-    assert_eq!(discard_ids.2, 0);
-    assert_eq!(review_ids.2, 0);
+    assert_eq!(discard_ids.2, 2);
+    assert_eq!(review_ids.2, 2);
     let intents = orch.store().list_managed_intents().unwrap();
     assert_eq!(intents.len(), 2);
     for intent in &intents {
         assert_eq!(intent.session_id, lane.id);
         assert_eq!(intent.state, ManagedIntentState::Finalized);
+        let run_id = intent.run_id.as_ref().expect("managed Run identity");
+        let run = orch.store().load_run(run_id).unwrap().unwrap();
+        assert_eq!(run.client_id.as_deref(), Some("managed-grok"));
+        assert_eq!(run.request_id, intent.intent_id);
+        let attempts = orch
+            .store()
+            .list_work_attempts(Some(&intent.work_id))
+            .unwrap();
+        assert_eq!(attempts[0].linked_run_ids, vec![run_id.clone()]);
         let invocation = intent.grok.as_ref().unwrap();
         assert_ne!(invocation.prompt_hash, intent.input_hash);
         assert_eq!(invocation.profile, profile);

@@ -1,0 +1,120 @@
+{
+  "schemaVersion": 1,
+  "qualification": "ONE AUTHORIZED LIVE REQUEST; NO RETRY",
+  "decision": "DIAGNOSTIC INCONCLUSIVE",
+  "source": {
+    "acceptedFunctionalSha": "88a1b893715aec370e3ec6f542a18729fffe6592",
+    "acceptedFunctionalTree": "500ddfb47ed859209a872c6959bded7c9cfcd44f",
+    "startingEvidenceTip": "6c62c2209aa06b5f1eb9b1ec7625c17990e00c8f",
+    "startingEvidenceTree": "f9ca94eddeba38c734b3a02efc76fa7f8a6b462d",
+    "productionExecutableChanged": false,
+    "temporaryWrapperSourceSha256": "fb4f0682f8bc03a5c06372ec4def1501af6dd707e7661c77eb29c5e976892a44",
+    "liveWrapperBinarySha256": "ed5242fc5dc103281fdec1d7e09c6515c4abdc181e6875175082b5f6f4f7d8ef",
+    "installedCliVersion": "1.0.41",
+    "installedCliRevisionLabel": "4220f3b224a6",
+    "installedCliSha256": "9c844eb13365180787d9ad22b2b3748a024be8e1ed845253cc114781b31c591d",
+    "model": "grok-build-0.1"
+  },
+  "preDispatch": {
+    "fixtureTree": "1ef9c0872b4eadfaae5f75bbf2933c062cce67ec",
+    "sourcePaths": ["src/framing.py", "src/decoder.py"],
+    "fixtureHasRemotes": false,
+    "hostOracleRedExitCode": 1,
+    "localOidcFreshnessAttestedWithoutNetwork": true,
+    "productionReadiness": "ready",
+    "workersDispatched": 0,
+    "providerInvocations": 0,
+    "sealedLimits": {
+      "maxRoundsAndPhysicalRequestAdmissions": 1,
+      "maxDurationMs": 180000,
+      "maxTotalTokens": 16000,
+      "maxOutputTokensPerRequest": 1024,
+      "maxPromptBytes": 16000
+    },
+    "oneRequestCapProvedBeforeCapability": "assignment bound flows through managed eligibility and credential lease; focused synthetic tighter-assignment-budget-cannot-be-amplified-by-relay test passed"
+  },
+  "liveObservation": {
+    "workId": "f619e7b1-6c94-4dc1-aab7-39db76db8362",
+    "runId": "148c1326-5148-42a6-ae6b-2f0f21272efe",
+    "attemptId": "911398d1-d62a-4ec4-a2ed-56a300447d1c",
+    "workerAttempts": 1,
+    "requestsReserved": 1,
+    "wireAttempts": 1,
+    "httpResponsesObserved": 1,
+    "responsesCompletedWithAcceptedUsage": 0,
+    "deniedRequests": 0,
+    "httpStatus": 200,
+    "safeProviderRequestId": "80bbfbca-16ef-9e7d-b4de-b507014cb104",
+    "rejection": {
+      "kind": "conflicting_total",
+      "field": "total_tokens",
+      "observedTotalTokens": 3946,
+      "expectedPromptPlusCompletionTokens": 3614,
+      "difference": 332,
+      "serializedValueState": "absent",
+      "sourceDerivedValuePresenceAndType": "prompt_tokens, completion_tokens and total_tokens were present and parsed as unsigned integers; the parser emitted this rejection only after those parses and bounds checks",
+      "failingStage": "validate_completion -> parse_managed_usage, before aggregation and accepted settlement"
+    },
+    "canonicalSendEvents": {
+      "sendIntent": 1,
+      "sendWireAdmission": 1,
+      "sendOutcome": 1,
+      "outcome": "uncertain",
+      "detail": "ProtocolAfterPossibleEffect"
+    },
+    "accountingComplete": false,
+    "costComplete": false,
+    "reportedTotalTokens": "UNKNOWN",
+    "monetaryCost": "UNKNOWN",
+    "remoteEffectUncertain": true,
+    "capabilityRevoked": true,
+    "workState": "review",
+    "runState": "interrupted",
+    "candidateDigest": "sha256:missing",
+    "sourceApplication": false,
+    "firstStopReason": "managed_execution_uncertain_or_failed",
+    "laterLocalStopReason": "max_total_tokens_usage_unavailable",
+    "laterRunStopCause": "token_accounting_unavailable",
+    "laterOneRequestCapDenial": false
+  },
+  "inferenceBoundary": {
+    "missingObservations": [
+      "separate prompt_tokens and completion_tokens values",
+      "completion_tokens_details.reasoning_tokens and any other usage detail values or keys",
+      "cost presence, type and value",
+      "raw response usage shape and exact pinned subscription-proxy total-token semantics",
+      "CLI headless or durable-journal projection of this rejected response"
+    ],
+    "differenceIsNotClassifiedAsReasoningOrCharge": true,
+    "publicRestExampleProvesPinnedProxySemantics": false,
+    "historicalFailedAttemptReclassified": false,
+    "compatibilityChangeJustified": false,
+    "reason": "The bounded receipt proves an arithmetic mismatch but cannot distinguish a supported additive component, another usage field or an invalid response; the parser returns before inspecting details or cost. No exact CLI/proxy reconciliation can be established from retained facts."
+  },
+  "preservation": {
+    "credentialFreeLocalReopens": 3,
+    "sameWorkRunAttemptAndProviderEvidence": true,
+    "sameOneWireAttempt": true,
+    "sourceHeadTreeStatusAndBothFileHashesUnchanged": true,
+    "oracleHashesUnchanged": true,
+    "workerRootEmpty": true,
+    "priorPrivateHistoricalHashesUnchanged": true,
+    "historicalUsageAndCost": "UNKNOWN",
+    "additionalLiveRequestsAfterThisAttempt": 0,
+    "approvalApplyOrDiscard": false,
+    "productionAccountingOrLimitsChanged": false,
+    "rawProviderBodyOrPrivateTranscriptPublished": false
+  },
+  "validation": {
+    "syntheticOneRequestCapFocusedTest": "1 passed before dispatch",
+    "receiptAndPreservationChecks": "passed",
+    "postLiveExternalProviderTests": 0,
+    "existingExactFunctionalHostedDesktop": {
+      "runId": 36518345360,
+      "attempt": 1,
+      "headSha": "88a1b893715aec370e3ec6f542a18729fffe6592",
+      "conclusion": "success"
+    },
+    "newExecutableChangeOrExactFunctionalCiRequired": false
+  }
+}

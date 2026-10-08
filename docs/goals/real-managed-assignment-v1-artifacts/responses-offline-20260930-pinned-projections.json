@@ -1,0 +1,3123 @@
+{
+  "additionalLiveProviderRequests": 0,
+  "captures": [
+    {
+      "bothFilesChanged": false,
+      "case": "A",
+      "cliCostTicks": null,
+      "cliCostUsd": null,
+      "cliModelUsage": {
+        "grok-build-0.1": {
+          "cacheCreationInputTokens": 0,
+          "cacheReadInputTokens": 0,
+          "inputTokens": 100,
+          "modelCalls": 1,
+          "outputTokens": 10
+        }
+      },
+      "cliSha256": "9c844eb13365180787d9ad22b2b3748a024be8e1ed845253cc114781b31c591d",
+      "cliUsage": {
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "input_tokens": 100,
+        "output_tokens": 10,
+        "reasoning_tokens": 0,
+        "total_tokens": 110
+      },
+      "exitCode": 0,
+      "intendedResponsesRequests": 1,
+      "journalUsage": {
+        "session": {
+          "cacheCreationTokens": 0,
+          "cachedReadTokens": 0,
+          "inputTokens": 100,
+          "modelCalls": 1,
+          "modelUsage": {
+            "grok-build-0.1": {
+              "cacheCreationTokens": 0,
+              "cachedReadTokens": 0,
+              "inputTokens": 100,
+              "modelCalls": 1,
+              "outputTokens": 10,
+              "reasoningTokens": 0,
+              "totalTokens": 110
+            }
+          },
+          "outputTokens": 10,
+          "primaryModelId": "grok-build-0.1",
+          "reasoningTokens": 0,
+          "totalTokens": 110,
+          "turnCount": 1
+        },
+        "sessionId": "e789c24f-c93a-4d11-80fd-96b542654504",
+        "turns": [
+          {
+            "cacheCreationTokens": 0,
+            "cachedReadTokens": 0,
+            "endedAt": "2026-09-30T21:04:12.174204+00:00",
+            "inputTokens": 100,
+            "modelCalls": 1,
+            "modelUsage": {
+              "grok-build-0.1": {
+                "cacheCreationTokens": 0,
+                "cachedReadTokens": 0,
+                "inputTokens": 100,
+                "modelCalls": 1,
+                "outputTokens": 10,
+                "reasoningTokens": 0,
+                "totalTokens": 110
+              }
+            },
+            "outputTokens": 10,
+            "primaryModelId": "grok-build-0.1",
+            "reasoningTokens": 0,
+            "totalTokens": 110,
+            "turnCount": 1,
+            "turnNumber": 1
+          }
+        ],
+        "updatedAt": "2026-09-30T21:04:12.174204+00:00"
+      },
+      "privateCaptureSha256": "dbc0fad32088c7fce05d91cfcaf4ca0dc0512fb95e3f0a73ba0e781f5a444518",
+      "qualification": "OFFLINE EXACT PINNED CLI; LOCAL SYNTHETIC RESPONSES",
+      "safeRequests": [
+        {
+          "authorizationMatchesChildCapability": true,
+          "authorizationPresent": true,
+          "bodyKeys": [],
+          "functionOutputCallIds": [],
+          "headerNames": [
+            "accept",
+            "accept-encoding",
+            "authorization",
+            "host",
+            "user-agent"
+          ],
+          "inputTypes": [],
+          "legacyMaxTokens": null,
+          "maxOutputTokens": null,
+          "method": "GET",
+          "model": null,
+          "modelOverrideHeader": null,
+          "oidcHeader": null,
+          "path": "/v1/models",
+          "reasoning": null,
+          "requestBytes": 0,
+          "stream": null,
+          "tools": []
+        },
+        {
+          "authorizationMatchesChildCapability": true,
+          "authorizationPresent": true,
+          "bodyKeys": [],
+          "functionOutputCallIds": [],
+          "headerNames": [
+            "accept",
+            "accept-encoding",
+            "authorization",
+            "host",
+            "user-agent"
+          ],
+          "inputTypes": [],
+          "legacyMaxTokens": null,
+          "maxOutputTokens": null,
+          "method": "GET",
+          "model": null,
+          "modelOverrideHeader": null,
+          "oidcHeader": null,
+          "path": "/v1/models",
+          "reasoning": null,
+          "requestBytes": 0,
+          "stream": null,
+          "tools": []
+        },
+        {
+          "authorizationMatchesChildCapability": false,
+          "authorizationPresent": false,
+          "bodyKeys": [],
+          "functionOutputCallIds": [],
+          "headerNames": [
+            "accept",
+            "accept-encoding",
+            "host"
+          ],
+          "inputTypes": [],
+          "legacyMaxTokens": null,
+          "maxOutputTokens": null,
+          "method": "GET",
+          "model": null,
+          "modelOverrideHeader": null,
+          "oidcHeader": null,
+          "path": "/",
+          "reasoning": null,
+          "requestBytes": 0,
+          "stream": null,
+          "tools": []
+        },
+        {
+          "authorizationMatchesChildCapability": true,
+          "authorizationPresent": true,
+          "bodyKeys": [
+            "include",
+            "input",
+            "max_output_tokens",
+            "model",
+            "reasoning",
+            "store",
+            "stream",
+            "temperature",
+            "tool_choice",
+            "tools"
+          ],
+          "functionOutputCallIds": [],
+          "headerNames": [
+            "accept",
+            "accept-encoding",
+            "authorization",
+            "content-length",
+            "content-type",
+            "host",
+            "user-agent",
+            "x-authenticateresponse",
+            "x-grok-agent-id",
+            "x-grok-client-identifier",
+            "x-grok-client-mode",
+            "x-grok-client-version",
+            "x-grok-conv-group-id",
+            "x-grok-conv-id",
+            "x-grok-model-override",
+            "x-grok-req-id",
+            "x-grok-session-id",
+            "x-xai-token-auth"
+          ],
+          "inputTypes": [
+            "message",
+            "message"
+          ],
+          "legacyMaxTokens": null,
+          "maxOutputTokens": 100,
+          "method": "POST",
+          "model": "grok-4.6",
+          "modelOverrideHeader": "grok-4.6",
+          "oidcHeader": "xai-grok-cli",
+          "path": "/v1/responses",
+          "reasoning": {
+            "summary": "concise"
+          },
+          "requestBytes": 1404,
+          "stream": true,
+          "tools": [
+            {
+              "name": "session_title",
+              "parameterKeys": [
+                "session_title"
+              ],
+              "type": "function"
+            }
+          ]
+        },
+        {
+          "authorizationMatchesChildCapability": true,
+          "authorizationPresent": true,
+          "bodyKeys": [
+            "include",
+            "input",
+            "max_output_tokens",
+            "model",
+            "prompt_cache_key",
+            "reasoning",
+            "store",
+            "stream",
+            "tools"
+          ],
+          "functionOutputCallIds": [],
+          "headerNames": [
+            "accept",
+            "accept-encoding",
+            "authorization",
+            "content-length",
+            "content-type",
+            "host",
+            "traceparent",
+            "user-agent",
+            "x-authenticateresponse",
+            "x-grok-agent-id",
+            "x-grok-client-identifier",
+            "x-grok-client-mode",
+            "x-grok-client-version",
+            "x-grok-conv-group-id",
+            "x-grok-conv-id",
+            "x-grok-doom-loop-check",
+            "x-grok-exact-repetition-check",
+            "x-grok-model-override",
+            "x-grok-req-id",
+            "x-grok-session-id",
+            "x-grok-turn-idx",
+            "x-xai-token-auth"
+          ],
+          "inputTypes": [
+            "message",
+            "message",
+            "message"
+          ],
+          "legacyMaxTokens": null,
+          "maxOutputTokens": 1024,
+          "method": "POST",
+          "model": "grok-build-0.1",
+          "modelOverrideHeader": "grok-build-0.1",
+          "oidcHeader": "xai-grok-cli",
+          "path": "/v1/responses",
+          "reasoning": {
+            "summary": "concise"
+          },
+          "requestBytes": 12021,
+          "stream": true,
+          "tools": [
+            {
+              "name": "read_file",
+              "parameterKeys": [
+                "format",
+                "limit",
+                "offset",
+                "pages",
+                "target_file"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "search_replace",
+              "parameterKeys": [
+                "file_path",
+                "new_string",
+                "old_string",
+                "replace_all"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "list_dir",
+              "parameterKeys": [
+                "target_directory"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "grep",
+              "parameterKeys": [
+                "-A",
+                "-B",
+                "-C",
+                "-i",
+                "glob",
+                "head_limit",
+                "multiline",
+                "path",
+                "pattern",
+                "type"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "search_tool",
+              "parameterKeys": [
+                "limit",
+                "query"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "use_tool",
+              "parameterKeys": [
+                "file",
+                "tool_input",
+                "tool_input_file",
+                "tool_name"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "write",
+              "parameterKeys": [
+                "content",
+                "file_path"
+              ],
+              "type": "function"
+            }
+          ]
+        }
+      ],
+      "schemaVersion": 1,
+      "stdoutJson": true,
+      "syntheticProviderUsageEachTurn": {
+        "input_tokens": 100,
+        "input_tokens_details": {
+          "cached_tokens": 0
+        },
+        "num_server_side_tools_used": 0,
+        "num_sources_used": 0,
+        "output_tokens": 10,
+        "output_tokens_details": {
+          "reasoning_tokens": 0
+        },
+        "total_tokens": 110
+      }
+    },
+    {
+      "bothFilesChanged": false,
+      "case": "B",
+      "cliCostTicks": 777,
+      "cliCostUsd": 7.77e-08,
+      "cliModelUsage": {
+        "grok-build-0.1": {
+          "cacheCreationInputTokens": 0,
+          "cacheReadInputTokens": 0,
+          "costUSD": 7.77e-08,
+          "inputTokens": 100,
+          "modelCalls": 1,
+          "outputTokens": 15
+        }
+      },
+      "cliSha256": "9c844eb13365180787d9ad22b2b3748a024be8e1ed845253cc114781b31c591d",
+      "cliUsage": {
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "input_tokens": 100,
+        "output_tokens": 15,
+        "reasoning_tokens": 5,
+        "total_tokens": 115
+      },
+      "exitCode": 0,
+      "intendedResponsesRequests": 1,
+      "journalUsage": {
+        "session": {
+          "cacheCreationTokens": 0,
+          "cachedReadTokens": 0,
+          "costUsdTicks": 777,
+          "inputTokens": 100,
+          "modelCalls": 1,
+          "modelUsage": {
+            "grok-build-0.1": {
+              "cacheCreationTokens": 0,
+              "cachedReadTokens": 0,
+              "costUsdTicks": 777,
+              "inputTokens": 100,
+              "modelCalls": 1,
+              "outputTokens": 15,
+              "reasoningTokens": 5,
+              "totalTokens": 115
+            }
+          },
+          "outputTokens": 15,
+          "primaryModelId": "grok-build-0.1",
+          "reasoningTokens": 5,
+          "totalTokens": 115,
+          "turnCount": 1
+        },
+        "sessionId": "02576dc2-052b-4161-9a87-97d6b4aa0737",
+        "turns": [
+          {
+            "cacheCreationTokens": 0,
+            "cachedReadTokens": 0,
+            "costUsdTicks": 777,
+            "endedAt": "2026-09-30T20:12:14.423213+00:00",
+            "inputTokens": 100,
+            "modelCalls": 1,
+            "modelUsage": {
+              "grok-build-0.1": {
+                "cacheCreationTokens": 0,
+                "cachedReadTokens": 0,
+                "costUsdTicks": 777,
+                "inputTokens": 100,
+                "modelCalls": 1,
+                "outputTokens": 15,
+                "reasoningTokens": 5,
+                "totalTokens": 115
+              }
+            },
+            "outputTokens": 15,
+            "primaryModelId": "grok-build-0.1",
+            "reasoningTokens": 5,
+            "totalTokens": 115,
+            "turnCount": 1,
+            "turnNumber": 1
+          }
+        ],
+        "updatedAt": "2026-09-30T20:12:14.423213+00:00"
+      },
+      "privateCaptureSha256": "a90cdd0e7f4294d8eb97ff1417d6bde3cc861018bcaae0d727f952b1a960aab7",
+      "qualification": "OFFLINE EXACT PINNED CLI; LOCAL SYNTHETIC RESPONSES",
+      "safeRequests": [
+        {
+          "authorizationMatchesChildCapability": true,
+          "authorizationPresent": true,
+          "bodyKeys": [],
+          "functionOutputCallIds": [],
+          "headerNames": [
+            "accept",
+            "accept-encoding",
+            "authorization",
+            "host",
+            "user-agent"
+          ],
+          "inputTypes": [],
+          "legacyMaxTokens": null,
+          "maxOutputTokens": null,
+          "method": "GET",
+          "model": null,
+          "modelOverrideHeader": null,
+          "oidcHeader": null,
+          "path": "/v1/models",
+          "reasoning": null,
+          "requestBytes": 0,
+          "stream": null,
+          "tools": []
+        },
+        {
+          "authorizationMatchesChildCapability": true,
+          "authorizationPresent": true,
+          "bodyKeys": [],
+          "functionOutputCallIds": [],
+          "headerNames": [
+            "accept",
+            "accept-encoding",
+            "authorization",
+            "host",
+            "user-agent"
+          ],
+          "inputTypes": [],
+          "legacyMaxTokens": null,
+          "maxOutputTokens": null,
+          "method": "GET",
+          "model": null,
+          "modelOverrideHeader": null,
+          "oidcHeader": null,
+          "path": "/v1/models",
+          "reasoning": null,
+          "requestBytes": 0,
+          "stream": null,
+          "tools": []
+        },
+        {
+          "authorizationMatchesChildCapability": false,
+          "authorizationPresent": false,
+          "bodyKeys": [],
+          "functionOutputCallIds": [],
+          "headerNames": [
+            "accept",
+            "accept-encoding",
+            "host"
+          ],
+          "inputTypes": [],
+          "legacyMaxTokens": null,
+          "maxOutputTokens": null,
+          "method": "GET",
+          "model": null,
+          "modelOverrideHeader": null,
+          "oidcHeader": null,
+          "path": "/",
+          "reasoning": null,
+          "requestBytes": 0,
+          "stream": null,
+          "tools": []
+        },
+        {
+          "authorizationMatchesChildCapability": true,
+          "authorizationPresent": true,
+          "bodyKeys": [
+            "include",
+            "input",
+            "max_output_tokens",
+            "model",
+            "reasoning",
+            "store",
+            "stream",
+            "temperature",
+            "tool_choice",
+            "tools"
+          ],
+          "functionOutputCallIds": [],
+          "headerNames": [
+            "accept",
+            "accept-encoding",
+            "authorization",
+            "content-length",
+            "content-type",
+            "host",
+            "user-agent",
+            "x-authenticateresponse",
+            "x-grok-agent-id",
+            "x-grok-client-identifier",
+            "x-grok-client-mode",
+            "x-grok-client-version",
+            "x-grok-conv-group-id",
+            "x-grok-conv-id",
+            "x-grok-model-override",
+            "x-grok-req-id",
+            "x-grok-session-id",
+            "x-xai-token-auth"
+          ],
+          "inputTypes": [
+            "message",
+            "message"
+          ],
+          "legacyMaxTokens": null,
+          "maxOutputTokens": 100,
+          "method": "POST",
+          "model": "grok-4.6",
+          "modelOverrideHeader": "grok-4.6",
+          "oidcHeader": "xai-grok-cli",
+          "path": "/v1/responses",
+          "reasoning": {
+            "summary": "concise"
+          },
+          "requestBytes": 1404,
+          "stream": true,
+          "tools": [
+            {
+              "name": "session_title",
+              "parameterKeys": [
+                "session_title"
+              ],
+              "type": "function"
+            }
+          ]
+        },
+        {
+          "authorizationMatchesChildCapability": true,
+          "authorizationPresent": true,
+          "bodyKeys": [
+            "include",
+            "input",
+            "max_output_tokens",
+            "model",
+            "prompt_cache_key",
+            "reasoning",
+            "store",
+            "stream",
+            "tools"
+          ],
+          "functionOutputCallIds": [],
+          "headerNames": [
+            "accept",
+            "accept-encoding",
+            "authorization",
+            "content-length",
+            "content-type",
+            "host",
+            "traceparent",
+            "user-agent",
+            "x-authenticateresponse",
+            "x-grok-agent-id",
+            "x-grok-client-identifier",
+            "x-grok-client-mode",
+            "x-grok-client-version",
+            "x-grok-conv-group-id",
+            "x-grok-conv-id",
+            "x-grok-doom-loop-check",
+            "x-grok-exact-repetition-check",
+            "x-grok-model-override",
+            "x-grok-req-id",
+            "x-grok-session-id",
+            "x-grok-turn-idx",
+            "x-xai-token-auth"
+          ],
+          "inputTypes": [
+            "message",
+            "message",
+            "message"
+          ],
+          "legacyMaxTokens": null,
+          "maxOutputTokens": 1024,
+          "method": "POST",
+          "model": "grok-build-0.1",
+          "modelOverrideHeader": "grok-build-0.1",
+          "oidcHeader": "xai-grok-cli",
+          "path": "/v1/responses",
+          "reasoning": {
+            "summary": "concise"
+          },
+          "requestBytes": 12021,
+          "stream": true,
+          "tools": [
+            {
+              "name": "read_file",
+              "parameterKeys": [
+                "format",
+                "limit",
+                "offset",
+                "pages",
+                "target_file"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "search_replace",
+              "parameterKeys": [
+                "file_path",
+                "new_string",
+                "old_string",
+                "replace_all"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "list_dir",
+              "parameterKeys": [
+                "target_directory"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "grep",
+              "parameterKeys": [
+                "-A",
+                "-B",
+                "-C",
+                "-i",
+                "glob",
+                "head_limit",
+                "multiline",
+                "path",
+                "pattern",
+                "type"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "search_tool",
+              "parameterKeys": [
+                "limit",
+                "query"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "use_tool",
+              "parameterKeys": [
+                "file",
+                "tool_input",
+                "tool_input_file",
+                "tool_name"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "write",
+              "parameterKeys": [
+                "content",
+                "file_path"
+              ],
+              "type": "function"
+            }
+          ]
+        }
+      ],
+      "schemaVersion": 1,
+      "stdoutJson": true,
+      "syntheticProviderUsageEachTurn": {
+        "cost_in_usd_ticks": 777,
+        "input_tokens": 100,
+        "input_tokens_details": {
+          "cached_tokens": 0
+        },
+        "num_server_side_tools_used": 0,
+        "num_sources_used": 0,
+        "output_tokens": 15,
+        "output_tokens_details": {
+          "reasoning_tokens": 5
+        },
+        "total_tokens": 115
+      }
+    },
+    {
+      "bothFilesChanged": true,
+      "case": "C",
+      "cliCostTicks": 1554,
+      "cliCostUsd": 1.554e-07,
+      "cliModelUsage": {
+        "grok-build-0.1": {
+          "cacheCreationInputTokens": 0,
+          "cacheReadInputTokens": 40,
+          "costUSD": 1.554e-07,
+          "inputTokens": 160,
+          "modelCalls": 2,
+          "outputTokens": 30
+        }
+      },
+      "cliSha256": "9c844eb13365180787d9ad22b2b3748a024be8e1ed845253cc114781b31c591d",
+      "cliUsage": {
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 40,
+        "input_tokens": 160,
+        "output_tokens": 30,
+        "reasoning_tokens": 10,
+        "total_tokens": 230
+      },
+      "exitCode": 0,
+      "intendedResponsesRequests": 2,
+      "journalUsage": {
+        "session": {
+          "cacheCreationTokens": 0,
+          "cachedReadTokens": 40,
+          "costUsdTicks": 1554,
+          "inputTokens": 200,
+          "modelCalls": 2,
+          "modelUsage": {
+            "grok-build-0.1": {
+              "cacheCreationTokens": 0,
+              "cachedReadTokens": 40,
+              "costUsdTicks": 1554,
+              "inputTokens": 200,
+              "modelCalls": 2,
+              "outputTokens": 30,
+              "reasoningTokens": 10,
+              "totalTokens": 230
+            }
+          },
+          "outputTokens": 30,
+          "primaryModelId": "grok-build-0.1",
+          "reasoningTokens": 10,
+          "totalTokens": 230,
+          "turnCount": 1
+        },
+        "sessionId": "33cccfcf-661d-4f4f-9e13-b2e3486ba965",
+        "turns": [
+          {
+            "cacheCreationTokens": 0,
+            "cachedReadTokens": 40,
+            "costUsdTicks": 1554,
+            "endedAt": "2026-09-30T21:29:21.758795+00:00",
+            "inputTokens": 200,
+            "modelCalls": 2,
+            "modelUsage": {
+              "grok-build-0.1": {
+                "cacheCreationTokens": 0,
+                "cachedReadTokens": 40,
+                "costUsdTicks": 1554,
+                "inputTokens": 200,
+                "modelCalls": 2,
+                "outputTokens": 30,
+                "reasoningTokens": 10,
+                "totalTokens": 230
+              }
+            },
+            "outputTokens": 30,
+            "primaryModelId": "grok-build-0.1",
+            "reasoningTokens": 10,
+            "totalTokens": 230,
+            "turnCount": 1,
+            "turnNumber": 1
+          }
+        ],
+        "updatedAt": "2026-09-30T21:29:21.758795+00:00"
+      },
+      "privateCaptureSha256": "9ab412f551199ab1f63e40fe754f2154df05f72fee83eb5bd3a4faba8ed74072",
+      "qualification": "OFFLINE EXACT PINNED CLI; LOCAL SYNTHETIC RESPONSES",
+      "safeRequests": [
+        {
+          "authorizationMatchesChildCapability": false,
+          "authorizationPresent": false,
+          "bodyKeys": [],
+          "functionOutputCallIds": [],
+          "headerNames": [
+            "accept",
+            "accept-encoding",
+            "host"
+          ],
+          "inputShapes": [],
+          "inputTypes": [],
+          "legacyMaxTokens": null,
+          "maxOutputTokens": null,
+          "method": "GET",
+          "model": null,
+          "modelOverrideHeader": null,
+          "oidcHeader": null,
+          "path": "/",
+          "reasoning": null,
+          "requestBytes": 0,
+          "stream": null,
+          "tools": []
+        },
+        {
+          "authorizationMatchesChildCapability": true,
+          "authorizationPresent": true,
+          "bodyKeys": [
+            "include",
+            "input",
+            "max_output_tokens",
+            "model",
+            "reasoning",
+            "store",
+            "stream",
+            "temperature",
+            "tool_choice",
+            "tools"
+          ],
+          "functionOutputCallIds": [],
+          "headerNames": [
+            "accept",
+            "accept-encoding",
+            "authorization",
+            "content-length",
+            "content-type",
+            "host",
+            "user-agent",
+            "x-authenticateresponse",
+            "x-grok-agent-id",
+            "x-grok-client-identifier",
+            "x-grok-client-mode",
+            "x-grok-client-version",
+            "x-grok-conv-group-id",
+            "x-grok-conv-id",
+            "x-grok-model-override",
+            "x-grok-req-id",
+            "x-grok-session-id",
+            "x-xai-token-auth"
+          ],
+          "inputShapes": [
+            {
+              "contentKinds": [],
+              "contentType": "str",
+              "keys": [
+                "content",
+                "role",
+                "type"
+              ],
+              "role": "system",
+              "type": "message"
+            },
+            {
+              "contentKinds": [],
+              "contentType": "str",
+              "keys": [
+                "content",
+                "role",
+                "type"
+              ],
+              "role": "user",
+              "type": "message"
+            }
+          ],
+          "inputTypes": [
+            "message",
+            "message"
+          ],
+          "legacyMaxTokens": null,
+          "maxOutputTokens": 100,
+          "method": "POST",
+          "model": "grok-4.6",
+          "modelOverrideHeader": "grok-4.6",
+          "oidcHeader": "xai-grok-cli",
+          "path": "/v1/responses",
+          "reasoning": {
+            "summary": "concise"
+          },
+          "requestBytes": 1404,
+          "stream": true,
+          "tools": [
+            {
+              "name": "session_title",
+              "parameterKeys": [
+                "session_title"
+              ],
+              "type": "function"
+            }
+          ]
+        },
+        {
+          "authorizationMatchesChildCapability": true,
+          "authorizationPresent": true,
+          "bodyKeys": [
+            "include",
+            "input",
+            "max_output_tokens",
+            "model",
+            "prompt_cache_key",
+            "reasoning",
+            "store",
+            "stream",
+            "tools"
+          ],
+          "functionOutputCallIds": [],
+          "headerNames": [
+            "accept",
+            "accept-encoding",
+            "authorization",
+            "content-length",
+            "content-type",
+            "host",
+            "traceparent",
+            "user-agent",
+            "x-authenticateresponse",
+            "x-grok-agent-id",
+            "x-grok-client-identifier",
+            "x-grok-client-mode",
+            "x-grok-client-version",
+            "x-grok-conv-group-id",
+            "x-grok-conv-id",
+            "x-grok-doom-loop-check",
+            "x-grok-exact-repetition-check",
+            "x-grok-model-override",
+            "x-grok-req-id",
+            "x-grok-session-id",
+            "x-grok-turn-idx",
+            "x-xai-token-auth"
+          ],
+          "inputShapes": [
+            {
+              "contentKinds": [],
+              "contentType": "str",
+              "keys": [
+                "content",
+                "role",
+                "type"
+              ],
+              "role": "system",
+              "type": "message"
+            },
+            {
+              "contentKinds": [],
+              "contentType": "str",
+              "keys": [
+                "content",
+                "role",
+                "type"
+              ],
+              "role": "user",
+              "type": "message"
+            },
+            {
+              "contentKinds": [],
+              "contentType": "str",
+              "keys": [
+                "content",
+                "role",
+                "type"
+              ],
+              "role": "user",
+              "type": "message"
+            }
+          ],
+          "inputTypes": [
+            "message",
+            "message",
+            "message"
+          ],
+          "legacyMaxTokens": null,
+          "maxOutputTokens": 1024,
+          "method": "POST",
+          "model": "grok-build-0.1",
+          "modelOverrideHeader": "grok-build-0.1",
+          "oidcHeader": "xai-grok-cli",
+          "path": "/v1/responses",
+          "reasoning": {
+            "summary": "concise"
+          },
+          "requestBytes": 12021,
+          "stream": true,
+          "tools": [
+            {
+              "name": "read_file",
+              "parameterKeys": [
+                "format",
+                "limit",
+                "offset",
+                "pages",
+                "target_file"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "search_replace",
+              "parameterKeys": [
+                "file_path",
+                "new_string",
+                "old_string",
+                "replace_all"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "list_dir",
+              "parameterKeys": [
+                "target_directory"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "grep",
+              "parameterKeys": [
+                "-A",
+                "-B",
+                "-C",
+                "-i",
+                "glob",
+                "head_limit",
+                "multiline",
+                "path",
+                "pattern",
+                "type"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "search_tool",
+              "parameterKeys": [
+                "limit",
+                "query"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "use_tool",
+              "parameterKeys": [
+                "file",
+                "tool_input",
+                "tool_input_file",
+                "tool_name"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "write",
+              "parameterKeys": [
+                "content",
+                "file_path"
+              ],
+              "type": "function"
+            }
+          ]
+        },
+        {
+          "authorizationMatchesChildCapability": true,
+          "authorizationPresent": true,
+          "bodyKeys": [
+            "include",
+            "input",
+            "max_output_tokens",
+            "model",
+            "prompt_cache_key",
+            "reasoning",
+            "store",
+            "stream",
+            "tools"
+          ],
+          "functionOutputCallIds": [
+            "call_0_0",
+            "call_0_1"
+          ],
+          "headerNames": [
+            "accept",
+            "accept-encoding",
+            "authorization",
+            "content-length",
+            "content-type",
+            "host",
+            "traceparent",
+            "user-agent",
+            "x-authenticateresponse",
+            "x-grok-agent-id",
+            "x-grok-client-identifier",
+            "x-grok-client-mode",
+            "x-grok-client-version",
+            "x-grok-conv-group-id",
+            "x-grok-conv-id",
+            "x-grok-doom-loop-check",
+            "x-grok-exact-repetition-check",
+            "x-grok-model-override",
+            "x-grok-req-id",
+            "x-grok-session-id",
+            "x-grok-turn-idx",
+            "x-xai-token-auth"
+          ],
+          "inputShapes": [
+            {
+              "contentKinds": [],
+              "contentType": "str",
+              "keys": [
+                "content",
+                "role",
+                "type"
+              ],
+              "role": "system",
+              "type": "message"
+            },
+            {
+              "contentKinds": [],
+              "contentType": "str",
+              "keys": [
+                "content",
+                "role",
+                "type"
+              ],
+              "role": "user",
+              "type": "message"
+            },
+            {
+              "contentKinds": [],
+              "contentType": "str",
+              "keys": [
+                "content",
+                "role",
+                "type"
+              ],
+              "role": "user",
+              "type": "message"
+            },
+            {
+              "contentKinds": [],
+              "contentType": "NoneType",
+              "keys": [
+                "arguments",
+                "call_id",
+                "name",
+                "type"
+              ],
+              "role": null,
+              "type": "function_call"
+            },
+            {
+              "contentKinds": [],
+              "contentType": "NoneType",
+              "keys": [
+                "arguments",
+                "call_id",
+                "name",
+                "type"
+              ],
+              "role": null,
+              "type": "function_call"
+            },
+            {
+              "contentKinds": [],
+              "contentType": "NoneType",
+              "keys": [
+                "call_id",
+                "output",
+                "type"
+              ],
+              "role": null,
+              "type": "function_call_output"
+            },
+            {
+              "contentKinds": [],
+              "contentType": "NoneType",
+              "keys": [
+                "call_id",
+                "output",
+                "type"
+              ],
+              "role": null,
+              "type": "function_call_output"
+            }
+          ],
+          "inputTypes": [
+            "message",
+            "message",
+            "message",
+            "function_call",
+            "function_call",
+            "function_call_output",
+            "function_call_output"
+          ],
+          "legacyMaxTokens": null,
+          "maxOutputTokens": 1024,
+          "method": "POST",
+          "model": "grok-build-0.1",
+          "modelOverrideHeader": "grok-build-0.1",
+          "oidcHeader": "xai-grok-cli",
+          "path": "/v1/responses",
+          "reasoning": {
+            "summary": "concise"
+          },
+          "requestBytes": 12986,
+          "stream": true,
+          "tools": [
+            {
+              "name": "read_file",
+              "parameterKeys": [
+                "format",
+                "limit",
+                "offset",
+                "pages",
+                "target_file"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "search_replace",
+              "parameterKeys": [
+                "file_path",
+                "new_string",
+                "old_string",
+                "replace_all"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "list_dir",
+              "parameterKeys": [
+                "target_directory"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "grep",
+              "parameterKeys": [
+                "-A",
+                "-B",
+                "-C",
+                "-i",
+                "glob",
+                "head_limit",
+                "multiline",
+                "path",
+                "pattern",
+                "type"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "search_tool",
+              "parameterKeys": [
+                "limit",
+                "query"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "use_tool",
+              "parameterKeys": [
+                "file",
+                "tool_input",
+                "tool_input_file",
+                "tool_name"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "write",
+              "parameterKeys": [
+                "content",
+                "file_path"
+              ],
+              "type": "function"
+            }
+          ]
+        }
+      ],
+      "schemaVersion": 1,
+      "stdoutJson": true,
+      "syntheticProviderUsageEachTurn": {
+        "cost_in_usd_ticks": 777,
+        "input_tokens": 100,
+        "input_tokens_details": {
+          "cached_tokens": 20
+        },
+        "num_server_side_tools_used": 0,
+        "num_sources_used": 0,
+        "output_tokens": 15,
+        "output_tokens_details": {
+          "reasoning_tokens": 5
+        },
+        "total_tokens": 115
+      }
+    },
+    {
+      "bothFilesChanged": false,
+      "case": "D",
+      "cliCostTicks": null,
+      "cliCostUsd": null,
+      "cliModelUsage": {
+        "grok-build-0.1": {
+          "cacheCreationInputTokens": 0,
+          "cacheReadInputTokens": 20,
+          "inputTokens": 80,
+          "modelCalls": 1,
+          "outputTokens": 1024
+        }
+      },
+      "cliSha256": "9c844eb13365180787d9ad22b2b3748a024be8e1ed845253cc114781b31c591d",
+      "cliUsage": {
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 20,
+        "input_tokens": 80,
+        "output_tokens": 1024,
+        "reasoning_tokens": 100,
+        "total_tokens": 1124
+      },
+      "exitCode": 0,
+      "intendedResponsesRequests": 1,
+      "journalUsage": {
+        "session": {
+          "cacheCreationTokens": 0,
+          "cachedReadTokens": 20,
+          "inputTokens": 100,
+          "modelCalls": 1,
+          "modelUsage": {
+            "grok-build-0.1": {
+              "cacheCreationTokens": 0,
+              "cachedReadTokens": 20,
+              "inputTokens": 100,
+              "modelCalls": 1,
+              "outputTokens": 1024,
+              "reasoningTokens": 100,
+              "totalTokens": 1124
+            }
+          },
+          "outputTokens": 1024,
+          "primaryModelId": "grok-build-0.1",
+          "reasoningTokens": 100,
+          "totalTokens": 1124,
+          "turnCount": 1
+        },
+        "sessionId": "e78594a5-746c-4f7b-8e09-14b4926ced71",
+        "turns": [
+          {
+            "cacheCreationTokens": 0,
+            "cachedReadTokens": 20,
+            "endedAt": "2026-09-30T20:12:15.167409+00:00",
+            "inputTokens": 100,
+            "modelCalls": 1,
+            "modelUsage": {
+              "grok-build-0.1": {
+                "cacheCreationTokens": 0,
+                "cachedReadTokens": 20,
+                "inputTokens": 100,
+                "modelCalls": 1,
+                "outputTokens": 1024,
+                "reasoningTokens": 100,
+                "totalTokens": 1124
+              }
+            },
+            "outputTokens": 1024,
+            "primaryModelId": "grok-build-0.1",
+            "reasoningTokens": 100,
+            "totalTokens": 1124,
+            "turnCount": 1,
+            "turnNumber": 1
+          }
+        ],
+        "updatedAt": "2026-09-30T20:12:15.167409+00:00"
+      },
+      "privateCaptureSha256": "42a9438c5d6a5a2bfba46e4b66821af7123913f99b43ece458bd22a91af5e95c",
+      "qualification": "OFFLINE EXACT PINNED CLI; LOCAL SYNTHETIC RESPONSES",
+      "safeRequests": [
+        {
+          "authorizationMatchesChildCapability": true,
+          "authorizationPresent": true,
+          "bodyKeys": [],
+          "functionOutputCallIds": [],
+          "headerNames": [
+            "accept",
+            "accept-encoding",
+            "authorization",
+            "host",
+            "user-agent"
+          ],
+          "inputTypes": [],
+          "legacyMaxTokens": null,
+          "maxOutputTokens": null,
+          "method": "GET",
+          "model": null,
+          "modelOverrideHeader": null,
+          "oidcHeader": null,
+          "path": "/v1/models",
+          "reasoning": null,
+          "requestBytes": 0,
+          "stream": null,
+          "tools": []
+        },
+        {
+          "authorizationMatchesChildCapability": true,
+          "authorizationPresent": true,
+          "bodyKeys": [],
+          "functionOutputCallIds": [],
+          "headerNames": [
+            "accept",
+            "accept-encoding",
+            "authorization",
+            "host",
+            "user-agent"
+          ],
+          "inputTypes": [],
+          "legacyMaxTokens": null,
+          "maxOutputTokens": null,
+          "method": "GET",
+          "model": null,
+          "modelOverrideHeader": null,
+          "oidcHeader": null,
+          "path": "/v1/models",
+          "reasoning": null,
+          "requestBytes": 0,
+          "stream": null,
+          "tools": []
+        },
+        {
+          "authorizationMatchesChildCapability": false,
+          "authorizationPresent": false,
+          "bodyKeys": [],
+          "functionOutputCallIds": [],
+          "headerNames": [
+            "accept",
+            "accept-encoding",
+            "host"
+          ],
+          "inputTypes": [],
+          "legacyMaxTokens": null,
+          "maxOutputTokens": null,
+          "method": "GET",
+          "model": null,
+          "modelOverrideHeader": null,
+          "oidcHeader": null,
+          "path": "/",
+          "reasoning": null,
+          "requestBytes": 0,
+          "stream": null,
+          "tools": []
+        },
+        {
+          "authorizationMatchesChildCapability": true,
+          "authorizationPresent": true,
+          "bodyKeys": [
+            "include",
+            "input",
+            "max_output_tokens",
+            "model",
+            "reasoning",
+            "store",
+            "stream",
+            "temperature",
+            "tool_choice",
+            "tools"
+          ],
+          "functionOutputCallIds": [],
+          "headerNames": [
+            "accept",
+            "accept-encoding",
+            "authorization",
+            "content-length",
+            "content-type",
+            "host",
+            "user-agent",
+            "x-authenticateresponse",
+            "x-grok-agent-id",
+            "x-grok-client-identifier",
+            "x-grok-client-mode",
+            "x-grok-client-version",
+            "x-grok-conv-group-id",
+            "x-grok-conv-id",
+            "x-grok-model-override",
+            "x-grok-req-id",
+            "x-grok-session-id",
+            "x-xai-token-auth"
+          ],
+          "inputTypes": [
+            "message",
+            "message"
+          ],
+          "legacyMaxTokens": null,
+          "maxOutputTokens": 100,
+          "method": "POST",
+          "model": "grok-4.6",
+          "modelOverrideHeader": "grok-4.6",
+          "oidcHeader": "xai-grok-cli",
+          "path": "/v1/responses",
+          "reasoning": {
+            "summary": "concise"
+          },
+          "requestBytes": 1404,
+          "stream": true,
+          "tools": [
+            {
+              "name": "session_title",
+              "parameterKeys": [
+                "session_title"
+              ],
+              "type": "function"
+            }
+          ]
+        },
+        {
+          "authorizationMatchesChildCapability": true,
+          "authorizationPresent": true,
+          "bodyKeys": [
+            "include",
+            "input",
+            "max_output_tokens",
+            "model",
+            "prompt_cache_key",
+            "reasoning",
+            "store",
+            "stream",
+            "tools"
+          ],
+          "functionOutputCallIds": [],
+          "headerNames": [
+            "accept",
+            "accept-encoding",
+            "authorization",
+            "content-length",
+            "content-type",
+            "host",
+            "traceparent",
+            "user-agent",
+            "x-authenticateresponse",
+            "x-grok-agent-id",
+            "x-grok-client-identifier",
+            "x-grok-client-mode",
+            "x-grok-client-version",
+            "x-grok-conv-group-id",
+            "x-grok-conv-id",
+            "x-grok-doom-loop-check",
+            "x-grok-exact-repetition-check",
+            "x-grok-model-override",
+            "x-grok-req-id",
+            "x-grok-session-id",
+            "x-grok-turn-idx",
+            "x-xai-token-auth"
+          ],
+          "inputTypes": [
+            "message",
+            "message",
+            "message"
+          ],
+          "legacyMaxTokens": null,
+          "maxOutputTokens": 1024,
+          "method": "POST",
+          "model": "grok-build-0.1",
+          "modelOverrideHeader": "grok-build-0.1",
+          "oidcHeader": "xai-grok-cli",
+          "path": "/v1/responses",
+          "reasoning": {
+            "summary": "concise"
+          },
+          "requestBytes": 12021,
+          "stream": true,
+          "tools": [
+            {
+              "name": "read_file",
+              "parameterKeys": [
+                "format",
+                "limit",
+                "offset",
+                "pages",
+                "target_file"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "search_replace",
+              "parameterKeys": [
+                "file_path",
+                "new_string",
+                "old_string",
+                "replace_all"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "list_dir",
+              "parameterKeys": [
+                "target_directory"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "grep",
+              "parameterKeys": [
+                "-A",
+                "-B",
+                "-C",
+                "-i",
+                "glob",
+                "head_limit",
+                "multiline",
+                "path",
+                "pattern",
+                "type"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "search_tool",
+              "parameterKeys": [
+                "limit",
+                "query"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "use_tool",
+              "parameterKeys": [
+                "file",
+                "tool_input",
+                "tool_input_file",
+                "tool_name"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "write",
+              "parameterKeys": [
+                "content",
+                "file_path"
+              ],
+              "type": "function"
+            }
+          ]
+        }
+      ],
+      "schemaVersion": 1,
+      "stdoutJson": true,
+      "syntheticProviderUsageEachTurn": {
+        "cost_in_usd_ticks": 0,
+        "input_tokens": 100,
+        "input_tokens_details": {
+          "cached_tokens": 20
+        },
+        "num_server_side_tools_used": 0,
+        "num_sources_used": 0,
+        "output_tokens": 1024,
+        "output_tokens_details": {
+          "reasoning_tokens": 100
+        },
+        "total_tokens": 1124
+      }
+    },
+    {
+      "bothFilesChanged": false,
+      "case": "E",
+      "cliCostTicks": null,
+      "cliCostUsd": null,
+      "cliModelUsage": null,
+      "cliSha256": "9c844eb13365180787d9ad22b2b3748a024be8e1ed845253cc114781b31c591d",
+      "cliUsage": null,
+      "exitCode": 1,
+      "intendedResponsesRequests": 1,
+      "journalUsage": {
+        "session": {
+          "cacheCreationTokens": 0,
+          "cachedReadTokens": 0,
+          "inputTokens": 0,
+          "modelCalls": 0,
+          "outputTokens": 0,
+          "reasoningTokens": 0,
+          "totalTokens": 0,
+          "turnCount": 1
+        },
+        "sessionId": "7ecf5d5b-f93f-462f-82f9-9270ea8aa0cd",
+        "turns": [
+          {
+            "cacheCreationTokens": 0,
+            "cachedReadTokens": 0,
+            "endedAt": "2026-09-30T20:12:14.968669+00:00",
+            "inputTokens": 0,
+            "modelCalls": 0,
+            "outputTokens": 0,
+            "reasoningTokens": 0,
+            "totalTokens": 0,
+            "turnCount": 1,
+            "turnNumber": 1
+          }
+        ],
+        "updatedAt": "2026-09-30T20:12:14.968669+00:00"
+      },
+      "privateCaptureSha256": "d407bc7181c02de51bf343a04316443a7d151d572638eb27577ee7c5f129e5cd",
+      "qualification": "OFFLINE EXACT PINNED CLI; LOCAL SYNTHETIC RESPONSES",
+      "safeRequests": [
+        {
+          "authorizationMatchesChildCapability": true,
+          "authorizationPresent": true,
+          "bodyKeys": [],
+          "functionOutputCallIds": [],
+          "headerNames": [
+            "accept",
+            "accept-encoding",
+            "authorization",
+            "host",
+            "user-agent"
+          ],
+          "inputTypes": [],
+          "legacyMaxTokens": null,
+          "maxOutputTokens": null,
+          "method": "GET",
+          "model": null,
+          "modelOverrideHeader": null,
+          "oidcHeader": null,
+          "path": "/v1/models",
+          "reasoning": null,
+          "requestBytes": 0,
+          "stream": null,
+          "tools": []
+        },
+        {
+          "authorizationMatchesChildCapability": true,
+          "authorizationPresent": true,
+          "bodyKeys": [],
+          "functionOutputCallIds": [],
+          "headerNames": [
+            "accept",
+            "accept-encoding",
+            "authorization",
+            "host",
+            "user-agent"
+          ],
+          "inputTypes": [],
+          "legacyMaxTokens": null,
+          "maxOutputTokens": null,
+          "method": "GET",
+          "model": null,
+          "modelOverrideHeader": null,
+          "oidcHeader": null,
+          "path": "/v1/models",
+          "reasoning": null,
+          "requestBytes": 0,
+          "stream": null,
+          "tools": []
+        },
+        {
+          "authorizationMatchesChildCapability": false,
+          "authorizationPresent": false,
+          "bodyKeys": [],
+          "functionOutputCallIds": [],
+          "headerNames": [
+            "accept",
+            "accept-encoding",
+            "host"
+          ],
+          "inputTypes": [],
+          "legacyMaxTokens": null,
+          "maxOutputTokens": null,
+          "method": "GET",
+          "model": null,
+          "modelOverrideHeader": null,
+          "oidcHeader": null,
+          "path": "/",
+          "reasoning": null,
+          "requestBytes": 0,
+          "stream": null,
+          "tools": []
+        },
+        {
+          "authorizationMatchesChildCapability": true,
+          "authorizationPresent": true,
+          "bodyKeys": [
+            "include",
+            "input",
+            "max_output_tokens",
+            "model",
+            "reasoning",
+            "store",
+            "stream",
+            "temperature",
+            "tool_choice",
+            "tools"
+          ],
+          "functionOutputCallIds": [],
+          "headerNames": [
+            "accept",
+            "accept-encoding",
+            "authorization",
+            "content-length",
+            "content-type",
+            "host",
+            "user-agent",
+            "x-authenticateresponse",
+            "x-grok-agent-id",
+            "x-grok-client-identifier",
+            "x-grok-client-mode",
+            "x-grok-client-version",
+            "x-grok-conv-group-id",
+            "x-grok-conv-id",
+            "x-grok-model-override",
+            "x-grok-req-id",
+            "x-grok-session-id",
+            "x-xai-token-auth"
+          ],
+          "inputTypes": [
+            "message",
+            "message"
+          ],
+          "legacyMaxTokens": null,
+          "maxOutputTokens": 100,
+          "method": "POST",
+          "model": "grok-4.6",
+          "modelOverrideHeader": "grok-4.6",
+          "oidcHeader": "xai-grok-cli",
+          "path": "/v1/responses",
+          "reasoning": {
+            "summary": "concise"
+          },
+          "requestBytes": 1404,
+          "stream": true,
+          "tools": [
+            {
+              "name": "session_title",
+              "parameterKeys": [
+                "session_title"
+              ],
+              "type": "function"
+            }
+          ]
+        },
+        {
+          "authorizationMatchesChildCapability": true,
+          "authorizationPresent": true,
+          "bodyKeys": [
+            "include",
+            "input",
+            "max_output_tokens",
+            "model",
+            "prompt_cache_key",
+            "reasoning",
+            "store",
+            "stream",
+            "tools"
+          ],
+          "functionOutputCallIds": [],
+          "headerNames": [
+            "accept",
+            "accept-encoding",
+            "authorization",
+            "content-length",
+            "content-type",
+            "host",
+            "traceparent",
+            "user-agent",
+            "x-authenticateresponse",
+            "x-grok-agent-id",
+            "x-grok-client-identifier",
+            "x-grok-client-mode",
+            "x-grok-client-version",
+            "x-grok-conv-group-id",
+            "x-grok-conv-id",
+            "x-grok-doom-loop-check",
+            "x-grok-exact-repetition-check",
+            "x-grok-model-override",
+            "x-grok-req-id",
+            "x-grok-session-id",
+            "x-grok-turn-idx",
+            "x-xai-token-auth"
+          ],
+          "inputTypes": [
+            "message",
+            "message",
+            "message"
+          ],
+          "legacyMaxTokens": null,
+          "maxOutputTokens": 1024,
+          "method": "POST",
+          "model": "grok-build-0.1",
+          "modelOverrideHeader": "grok-build-0.1",
+          "oidcHeader": "xai-grok-cli",
+          "path": "/v1/responses",
+          "reasoning": {
+            "summary": "concise"
+          },
+          "requestBytes": 12021,
+          "stream": true,
+          "tools": [
+            {
+              "name": "read_file",
+              "parameterKeys": [
+                "format",
+                "limit",
+                "offset",
+                "pages",
+                "target_file"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "search_replace",
+              "parameterKeys": [
+                "file_path",
+                "new_string",
+                "old_string",
+                "replace_all"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "list_dir",
+              "parameterKeys": [
+                "target_directory"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "grep",
+              "parameterKeys": [
+                "-A",
+                "-B",
+                "-C",
+                "-i",
+                "glob",
+                "head_limit",
+                "multiline",
+                "path",
+                "pattern",
+                "type"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "search_tool",
+              "parameterKeys": [
+                "limit",
+                "query"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "use_tool",
+              "parameterKeys": [
+                "file",
+                "tool_input",
+                "tool_input_file",
+                "tool_name"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "write",
+              "parameterKeys": [
+                "content",
+                "file_path"
+              ],
+              "type": "function"
+            }
+          ]
+        }
+      ],
+      "schemaVersion": 1,
+      "stdoutJson": true,
+      "syntheticProviderUsageEachTurn": {
+        "cost_in_usd_ticks": 777,
+        "input_tokens": 100,
+        "input_tokens_details": {
+          "cached_tokens": 20
+        },
+        "num_server_side_tools_used": 0,
+        "num_sources_used": 0,
+        "output_tokens": 1024,
+        "output_tokens_details": {
+          "reasoning_tokens": 100
+        },
+        "total_tokens": 1124
+      }
+    },
+    {
+      "bothFilesChanged": false,
+      "case": "F",
+      "cliCostTicks": 777,
+      "cliCostUsd": 7.77e-08,
+      "cliModelUsage": {
+        "grok-build-0.1": {
+          "cacheCreationInputTokens": 0,
+          "cacheReadInputTokens": 20,
+          "costUSD": 7.77e-08,
+          "inputTokens": 80,
+          "modelCalls": 1,
+          "outputTokens": 15
+        }
+      },
+      "cliSha256": "9c844eb13365180787d9ad22b2b3748a024be8e1ed845253cc114781b31c591d",
+      "cliUsage": {
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 20,
+        "input_tokens": 80,
+        "output_tokens": 15,
+        "reasoning_tokens": 5,
+        "total_tokens": 115
+      },
+      "exitCode": 0,
+      "intendedResponsesRequests": 1,
+      "journalUsage": {
+        "session": {
+          "cacheCreationTokens": 0,
+          "cachedReadTokens": 20,
+          "costUsdTicks": 777,
+          "inputTokens": 100,
+          "modelCalls": 1,
+          "modelUsage": {
+            "grok-build-0.1": {
+              "cacheCreationTokens": 0,
+              "cachedReadTokens": 20,
+              "costUsdTicks": 777,
+              "inputTokens": 100,
+              "modelCalls": 1,
+              "outputTokens": 15,
+              "reasoningTokens": 5,
+              "totalTokens": 115
+            }
+          },
+          "outputTokens": 15,
+          "primaryModelId": "grok-build-0.1",
+          "reasoningTokens": 5,
+          "totalTokens": 115,
+          "turnCount": 1
+        },
+        "sessionId": "3747960b-9d21-46a8-a966-f761cb3b3278",
+        "turns": [
+          {
+            "cacheCreationTokens": 0,
+            "cachedReadTokens": 20,
+            "costUsdTicks": 777,
+            "endedAt": "2026-09-30T20:12:15.984987+00:00",
+            "inputTokens": 100,
+            "modelCalls": 1,
+            "modelUsage": {
+              "grok-build-0.1": {
+                "cacheCreationTokens": 0,
+                "cachedReadTokens": 20,
+                "costUsdTicks": 777,
+                "inputTokens": 100,
+                "modelCalls": 1,
+                "outputTokens": 15,
+                "reasoningTokens": 5,
+                "totalTokens": 115
+              }
+            },
+            "outputTokens": 15,
+            "primaryModelId": "grok-build-0.1",
+            "reasoningTokens": 5,
+            "totalTokens": 115,
+            "turnCount": 1,
+            "turnNumber": 1
+          }
+        ],
+        "updatedAt": "2026-09-30T20:12:15.984987+00:00"
+      },
+      "privateCaptureSha256": "844bc5bfe99f14f93da7d84c0f194406fdb3356974e07ad0333bc6947290c15c",
+      "qualification": "OFFLINE EXACT PINNED CLI; LOCAL SYNTHETIC RESPONSES",
+      "safeRequests": [
+        {
+          "authorizationMatchesChildCapability": true,
+          "authorizationPresent": true,
+          "bodyKeys": [],
+          "functionOutputCallIds": [],
+          "headerNames": [
+            "accept",
+            "accept-encoding",
+            "authorization",
+            "host",
+            "user-agent"
+          ],
+          "inputTypes": [],
+          "legacyMaxTokens": null,
+          "maxOutputTokens": null,
+          "method": "GET",
+          "model": null,
+          "modelOverrideHeader": null,
+          "oidcHeader": null,
+          "path": "/v1/models",
+          "reasoning": null,
+          "requestBytes": 0,
+          "stream": null,
+          "tools": []
+        },
+        {
+          "authorizationMatchesChildCapability": true,
+          "authorizationPresent": true,
+          "bodyKeys": [],
+          "functionOutputCallIds": [],
+          "headerNames": [
+            "accept",
+            "accept-encoding",
+            "authorization",
+            "host",
+            "user-agent"
+          ],
+          "inputTypes": [],
+          "legacyMaxTokens": null,
+          "maxOutputTokens": null,
+          "method": "GET",
+          "model": null,
+          "modelOverrideHeader": null,
+          "oidcHeader": null,
+          "path": "/v1/models",
+          "reasoning": null,
+          "requestBytes": 0,
+          "stream": null,
+          "tools": []
+        },
+        {
+          "authorizationMatchesChildCapability": false,
+          "authorizationPresent": false,
+          "bodyKeys": [],
+          "functionOutputCallIds": [],
+          "headerNames": [
+            "accept",
+            "accept-encoding",
+            "host"
+          ],
+          "inputTypes": [],
+          "legacyMaxTokens": null,
+          "maxOutputTokens": null,
+          "method": "GET",
+          "model": null,
+          "modelOverrideHeader": null,
+          "oidcHeader": null,
+          "path": "/",
+          "reasoning": null,
+          "requestBytes": 0,
+          "stream": null,
+          "tools": []
+        },
+        {
+          "authorizationMatchesChildCapability": true,
+          "authorizationPresent": true,
+          "bodyKeys": [
+            "include",
+            "input",
+            "max_output_tokens",
+            "model",
+            "reasoning",
+            "store",
+            "stream",
+            "temperature",
+            "tool_choice",
+            "tools"
+          ],
+          "functionOutputCallIds": [],
+          "headerNames": [
+            "accept",
+            "accept-encoding",
+            "authorization",
+            "content-length",
+            "content-type",
+            "host",
+            "user-agent",
+            "x-authenticateresponse",
+            "x-grok-agent-id",
+            "x-grok-client-identifier",
+            "x-grok-client-mode",
+            "x-grok-client-version",
+            "x-grok-conv-group-id",
+            "x-grok-conv-id",
+            "x-grok-model-override",
+            "x-grok-req-id",
+            "x-grok-session-id",
+            "x-xai-token-auth"
+          ],
+          "inputTypes": [
+            "message",
+            "message"
+          ],
+          "legacyMaxTokens": null,
+          "maxOutputTokens": 100,
+          "method": "POST",
+          "model": "grok-4.6",
+          "modelOverrideHeader": "grok-4.6",
+          "oidcHeader": "xai-grok-cli",
+          "path": "/v1/responses",
+          "reasoning": {
+            "summary": "concise"
+          },
+          "requestBytes": 1404,
+          "stream": true,
+          "tools": [
+            {
+              "name": "session_title",
+              "parameterKeys": [
+                "session_title"
+              ],
+              "type": "function"
+            }
+          ]
+        },
+        {
+          "authorizationMatchesChildCapability": true,
+          "authorizationPresent": true,
+          "bodyKeys": [
+            "include",
+            "input",
+            "max_output_tokens",
+            "model",
+            "prompt_cache_key",
+            "reasoning",
+            "store",
+            "stream",
+            "tools"
+          ],
+          "functionOutputCallIds": [],
+          "headerNames": [
+            "accept",
+            "accept-encoding",
+            "authorization",
+            "content-length",
+            "content-type",
+            "host",
+            "traceparent",
+            "user-agent",
+            "x-authenticateresponse",
+            "x-grok-agent-id",
+            "x-grok-client-identifier",
+            "x-grok-client-mode",
+            "x-grok-client-version",
+            "x-grok-conv-group-id",
+            "x-grok-conv-id",
+            "x-grok-doom-loop-check",
+            "x-grok-exact-repetition-check",
+            "x-grok-model-override",
+            "x-grok-req-id",
+            "x-grok-session-id",
+            "x-grok-turn-idx",
+            "x-xai-token-auth"
+          ],
+          "inputTypes": [
+            "message",
+            "message",
+            "message"
+          ],
+          "legacyMaxTokens": null,
+          "maxOutputTokens": 1024,
+          "method": "POST",
+          "model": "grok-build-0.1",
+          "modelOverrideHeader": "grok-build-0.1",
+          "oidcHeader": "xai-grok-cli",
+          "path": "/v1/responses",
+          "reasoning": {
+            "summary": "concise"
+          },
+          "requestBytes": 12021,
+          "stream": true,
+          "tools": [
+            {
+              "name": "read_file",
+              "parameterKeys": [
+                "format",
+                "limit",
+                "offset",
+                "pages",
+                "target_file"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "search_replace",
+              "parameterKeys": [
+                "file_path",
+                "new_string",
+                "old_string",
+                "replace_all"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "list_dir",
+              "parameterKeys": [
+                "target_directory"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "grep",
+              "parameterKeys": [
+                "-A",
+                "-B",
+                "-C",
+                "-i",
+                "glob",
+                "head_limit",
+                "multiline",
+                "path",
+                "pattern",
+                "type"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "search_tool",
+              "parameterKeys": [
+                "limit",
+                "query"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "use_tool",
+              "parameterKeys": [
+                "file",
+                "tool_input",
+                "tool_input_file",
+                "tool_name"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "write",
+              "parameterKeys": [
+                "content",
+                "file_path"
+              ],
+              "type": "function"
+            }
+          ]
+        }
+      ],
+      "schemaVersion": 1,
+      "stdoutJson": true,
+      "syntheticProviderUsageEachTurn": {
+        "cost_in_usd_ticks": 777,
+        "input_tokens": 100,
+        "input_tokens_details": {
+          "cached_tokens": 20
+        },
+        "num_server_side_tools_used": 0,
+        "num_sources_used": 0,
+        "output_tokens": 15,
+        "output_tokens_details": {
+          "reasoning_tokens": 5
+        },
+        "total_tokens": 116
+      }
+    },
+    {
+      "bothFilesChanged": false,
+      "case": "G",
+      "cliCostTicks": 777,
+      "cliCostUsd": 7.77e-08,
+      "cliModelUsage": {
+        "grok-build-0.1": {
+          "cacheCreationInputTokens": 0,
+          "cacheReadInputTokens": 20,
+          "costUSD": 7.77e-08,
+          "inputTokens": 80,
+          "modelCalls": 1,
+          "outputTokens": 15
+        }
+      },
+      "cliSha256": "9c844eb13365180787d9ad22b2b3748a024be8e1ed845253cc114781b31c591d",
+      "cliUsage": {
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 20,
+        "input_tokens": 80,
+        "output_tokens": 15,
+        "reasoning_tokens": 16,
+        "total_tokens": 115
+      },
+      "exitCode": 0,
+      "intendedResponsesRequests": 1,
+      "journalUsage": {
+        "session": {
+          "cacheCreationTokens": 0,
+          "cachedReadTokens": 20,
+          "costUsdTicks": 777,
+          "inputTokens": 100,
+          "modelCalls": 1,
+          "modelUsage": {
+            "grok-build-0.1": {
+              "cacheCreationTokens": 0,
+              "cachedReadTokens": 20,
+              "costUsdTicks": 777,
+              "inputTokens": 100,
+              "modelCalls": 1,
+              "outputTokens": 15,
+              "reasoningTokens": 16,
+              "totalTokens": 115
+            }
+          },
+          "outputTokens": 15,
+          "primaryModelId": "grok-build-0.1",
+          "reasoningTokens": 16,
+          "totalTokens": 115,
+          "turnCount": 1
+        },
+        "sessionId": "6e4412c4-41c0-4d6d-8e70-bce374ca7275",
+        "turns": [
+          {
+            "cacheCreationTokens": 0,
+            "cachedReadTokens": 20,
+            "costUsdTicks": 777,
+            "endedAt": "2026-09-30T20:12:15.840529+00:00",
+            "inputTokens": 100,
+            "modelCalls": 1,
+            "modelUsage": {
+              "grok-build-0.1": {
+                "cacheCreationTokens": 0,
+                "cachedReadTokens": 20,
+                "costUsdTicks": 777,
+                "inputTokens": 100,
+                "modelCalls": 1,
+                "outputTokens": 15,
+                "reasoningTokens": 16,
+                "totalTokens": 115
+              }
+            },
+            "outputTokens": 15,
+            "primaryModelId": "grok-build-0.1",
+            "reasoningTokens": 16,
+            "totalTokens": 115,
+            "turnCount": 1,
+            "turnNumber": 1
+          }
+        ],
+        "updatedAt": "2026-09-30T20:12:15.840529+00:00"
+      },
+      "privateCaptureSha256": "2493d8c196e25e7796d878060fcf410c5922848dd17eaf91d9b7b4f169f95c39",
+      "qualification": "OFFLINE EXACT PINNED CLI; LOCAL SYNTHETIC RESPONSES",
+      "safeRequests": [
+        {
+          "authorizationMatchesChildCapability": true,
+          "authorizationPresent": true,
+          "bodyKeys": [],
+          "functionOutputCallIds": [],
+          "headerNames": [
+            "accept",
+            "accept-encoding",
+            "authorization",
+            "host",
+            "user-agent"
+          ],
+          "inputTypes": [],
+          "legacyMaxTokens": null,
+          "maxOutputTokens": null,
+          "method": "GET",
+          "model": null,
+          "modelOverrideHeader": null,
+          "oidcHeader": null,
+          "path": "/v1/models",
+          "reasoning": null,
+          "requestBytes": 0,
+          "stream": null,
+          "tools": []
+        },
+        {
+          "authorizationMatchesChildCapability": true,
+          "authorizationPresent": true,
+          "bodyKeys": [],
+          "functionOutputCallIds": [],
+          "headerNames": [
+            "accept",
+            "accept-encoding",
+            "authorization",
+            "host",
+            "user-agent"
+          ],
+          "inputTypes": [],
+          "legacyMaxTokens": null,
+          "maxOutputTokens": null,
+          "method": "GET",
+          "model": null,
+          "modelOverrideHeader": null,
+          "oidcHeader": null,
+          "path": "/v1/models",
+          "reasoning": null,
+          "requestBytes": 0,
+          "stream": null,
+          "tools": []
+        },
+        {
+          "authorizationMatchesChildCapability": false,
+          "authorizationPresent": false,
+          "bodyKeys": [],
+          "functionOutputCallIds": [],
+          "headerNames": [
+            "accept",
+            "accept-encoding",
+            "host"
+          ],
+          "inputTypes": [],
+          "legacyMaxTokens": null,
+          "maxOutputTokens": null,
+          "method": "GET",
+          "model": null,
+          "modelOverrideHeader": null,
+          "oidcHeader": null,
+          "path": "/",
+          "reasoning": null,
+          "requestBytes": 0,
+          "stream": null,
+          "tools": []
+        },
+        {
+          "authorizationMatchesChildCapability": true,
+          "authorizationPresent": true,
+          "bodyKeys": [
+            "include",
+            "input",
+            "max_output_tokens",
+            "model",
+            "reasoning",
+            "store",
+            "stream",
+            "temperature",
+            "tool_choice",
+            "tools"
+          ],
+          "functionOutputCallIds": [],
+          "headerNames": [
+            "accept",
+            "accept-encoding",
+            "authorization",
+            "content-length",
+            "content-type",
+            "host",
+            "user-agent",
+            "x-authenticateresponse",
+            "x-grok-agent-id",
+            "x-grok-client-identifier",
+            "x-grok-client-mode",
+            "x-grok-client-version",
+            "x-grok-conv-group-id",
+            "x-grok-conv-id",
+            "x-grok-model-override",
+            "x-grok-req-id",
+            "x-grok-session-id",
+            "x-xai-token-auth"
+          ],
+          "inputTypes": [
+            "message",
+            "message"
+          ],
+          "legacyMaxTokens": null,
+          "maxOutputTokens": 100,
+          "method": "POST",
+          "model": "grok-4.6",
+          "modelOverrideHeader": "grok-4.6",
+          "oidcHeader": "xai-grok-cli",
+          "path": "/v1/responses",
+          "reasoning": {
+            "summary": "concise"
+          },
+          "requestBytes": 1404,
+          "stream": true,
+          "tools": [
+            {
+              "name": "session_title",
+              "parameterKeys": [
+                "session_title"
+              ],
+              "type": "function"
+            }
+          ]
+        },
+        {
+          "authorizationMatchesChildCapability": true,
+          "authorizationPresent": true,
+          "bodyKeys": [
+            "include",
+            "input",
+            "max_output_tokens",
+            "model",
+            "prompt_cache_key",
+            "reasoning",
+            "store",
+            "stream",
+            "tools"
+          ],
+          "functionOutputCallIds": [],
+          "headerNames": [
+            "accept",
+            "accept-encoding",
+            "authorization",
+            "content-length",
+            "content-type",
+            "host",
+            "traceparent",
+            "user-agent",
+            "x-authenticateresponse",
+            "x-grok-agent-id",
+            "x-grok-client-identifier",
+            "x-grok-client-mode",
+            "x-grok-client-version",
+            "x-grok-conv-group-id",
+            "x-grok-conv-id",
+            "x-grok-doom-loop-check",
+            "x-grok-exact-repetition-check",
+            "x-grok-model-override",
+            "x-grok-req-id",
+            "x-grok-session-id",
+            "x-grok-turn-idx",
+            "x-xai-token-auth"
+          ],
+          "inputTypes": [
+            "message",
+            "message",
+            "message"
+          ],
+          "legacyMaxTokens": null,
+          "maxOutputTokens": 1024,
+          "method": "POST",
+          "model": "grok-build-0.1",
+          "modelOverrideHeader": "grok-build-0.1",
+          "oidcHeader": "xai-grok-cli",
+          "path": "/v1/responses",
+          "reasoning": {
+            "summary": "concise"
+          },
+          "requestBytes": 12021,
+          "stream": true,
+          "tools": [
+            {
+              "name": "read_file",
+              "parameterKeys": [
+                "format",
+                "limit",
+                "offset",
+                "pages",
+                "target_file"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "search_replace",
+              "parameterKeys": [
+                "file_path",
+                "new_string",
+                "old_string",
+                "replace_all"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "list_dir",
+              "parameterKeys": [
+                "target_directory"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "grep",
+              "parameterKeys": [
+                "-A",
+                "-B",
+                "-C",
+                "-i",
+                "glob",
+                "head_limit",
+                "multiline",
+                "path",
+                "pattern",
+                "type"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "search_tool",
+              "parameterKeys": [
+                "limit",
+                "query"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "use_tool",
+              "parameterKeys": [
+                "file",
+                "tool_input",
+                "tool_input_file",
+                "tool_name"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "write",
+              "parameterKeys": [
+                "content",
+                "file_path"
+              ],
+              "type": "function"
+            }
+          ]
+        }
+      ],
+      "schemaVersion": 1,
+      "stdoutJson": true,
+      "syntheticProviderUsageEachTurn": {
+        "cost_in_usd_ticks": 777,
+        "input_tokens": 100,
+        "input_tokens_details": {
+          "cached_tokens": 20
+        },
+        "num_server_side_tools_used": 0,
+        "num_sources_used": 0,
+        "output_tokens": 15,
+        "output_tokens_details": {
+          "reasoning_tokens": 16
+        },
+        "total_tokens": 115
+      }
+    },
+    {
+      "bothFilesChanged": false,
+      "case": "H",
+      "cliCostTicks": 777,
+      "cliCostUsd": 7.77e-08,
+      "cliModelUsage": {
+        "grok-build-0.1": {
+          "cacheCreationInputTokens": 0,
+          "cacheReadInputTokens": 20,
+          "costUSD": 7.77e-08,
+          "inputTokens": 80,
+          "modelCalls": 1,
+          "outputTokens": 15
+        }
+      },
+      "cliSha256": "9c844eb13365180787d9ad22b2b3748a024be8e1ed845253cc114781b31c591d",
+      "cliUsage": {
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 20,
+        "input_tokens": 80,
+        "output_tokens": 15,
+        "reasoning_tokens": 5,
+        "total_tokens": 115
+      },
+      "exitCode": 0,
+      "intendedResponsesRequests": 1,
+      "journalUsage": {
+        "session": {
+          "cacheCreationTokens": 0,
+          "cachedReadTokens": 20,
+          "costUsdTicks": 777,
+          "inputTokens": 100,
+          "modelCalls": 1,
+          "modelUsage": {
+            "grok-build-0.1": {
+              "cacheCreationTokens": 0,
+              "cachedReadTokens": 20,
+              "costUsdTicks": 777,
+              "inputTokens": 100,
+              "modelCalls": 1,
+              "outputTokens": 15,
+              "reasoningTokens": 5,
+              "totalTokens": 115
+            }
+          },
+          "outputTokens": 15,
+          "primaryModelId": "grok-build-0.1",
+          "reasoningTokens": 5,
+          "totalTokens": 115,
+          "turnCount": 1
+        },
+        "sessionId": "5c4078f3-3244-4ff5-8c59-5c5f11e9cedb",
+        "turns": [
+          {
+            "cacheCreationTokens": 0,
+            "cachedReadTokens": 20,
+            "costUsdTicks": 777,
+            "endedAt": "2026-09-30T20:12:16.080017+00:00",
+            "inputTokens": 100,
+            "modelCalls": 1,
+            "modelUsage": {
+              "grok-build-0.1": {
+                "cacheCreationTokens": 0,
+                "cachedReadTokens": 20,
+                "costUsdTicks": 777,
+                "inputTokens": 100,
+                "modelCalls": 1,
+                "outputTokens": 15,
+                "reasoningTokens": 5,
+                "totalTokens": 115
+              }
+            },
+            "outputTokens": 15,
+            "primaryModelId": "grok-build-0.1",
+            "reasoningTokens": 5,
+            "totalTokens": 115,
+            "turnCount": 1,
+            "turnNumber": 1
+          }
+        ],
+        "updatedAt": "2026-09-30T20:12:16.080017+00:00"
+      },
+      "privateCaptureSha256": "52772c54d058f16aa7448103a8cc008ab2c8f184672eb66df3a6edfe2214bc38",
+      "qualification": "OFFLINE EXACT PINNED CLI; LOCAL SYNTHETIC RESPONSES",
+      "safeRequests": [
+        {
+          "authorizationMatchesChildCapability": true,
+          "authorizationPresent": true,
+          "bodyKeys": [],
+          "functionOutputCallIds": [],
+          "headerNames": [
+            "accept",
+            "accept-encoding",
+            "authorization",
+            "host",
+            "user-agent"
+          ],
+          "inputTypes": [],
+          "legacyMaxTokens": null,
+          "maxOutputTokens": null,
+          "method": "GET",
+          "model": null,
+          "modelOverrideHeader": null,
+          "oidcHeader": null,
+          "path": "/v1/models",
+          "reasoning": null,
+          "requestBytes": 0,
+          "stream": null,
+          "tools": []
+        },
+        {
+          "authorizationMatchesChildCapability": true,
+          "authorizationPresent": true,
+          "bodyKeys": [],
+          "functionOutputCallIds": [],
+          "headerNames": [
+            "accept",
+            "accept-encoding",
+            "authorization",
+            "host",
+            "user-agent"
+          ],
+          "inputTypes": [],
+          "legacyMaxTokens": null,
+          "maxOutputTokens": null,
+          "method": "GET",
+          "model": null,
+          "modelOverrideHeader": null,
+          "oidcHeader": null,
+          "path": "/v1/models",
+          "reasoning": null,
+          "requestBytes": 0,
+          "stream": null,
+          "tools": []
+        },
+        {
+          "authorizationMatchesChildCapability": false,
+          "authorizationPresent": false,
+          "bodyKeys": [],
+          "functionOutputCallIds": [],
+          "headerNames": [
+            "accept",
+            "accept-encoding",
+            "host"
+          ],
+          "inputTypes": [],
+          "legacyMaxTokens": null,
+          "maxOutputTokens": null,
+          "method": "GET",
+          "model": null,
+          "modelOverrideHeader": null,
+          "oidcHeader": null,
+          "path": "/",
+          "reasoning": null,
+          "requestBytes": 0,
+          "stream": null,
+          "tools": []
+        },
+        {
+          "authorizationMatchesChildCapability": true,
+          "authorizationPresent": true,
+          "bodyKeys": [
+            "include",
+            "input",
+            "max_output_tokens",
+            "model",
+            "reasoning",
+            "store",
+            "stream",
+            "temperature",
+            "tool_choice",
+            "tools"
+          ],
+          "functionOutputCallIds": [],
+          "headerNames": [
+            "accept",
+            "accept-encoding",
+            "authorization",
+            "content-length",
+            "content-type",
+            "host",
+            "user-agent",
+            "x-authenticateresponse",
+            "x-grok-agent-id",
+            "x-grok-client-identifier",
+            "x-grok-client-mode",
+            "x-grok-client-version",
+            "x-grok-conv-group-id",
+            "x-grok-conv-id",
+            "x-grok-model-override",
+            "x-grok-req-id",
+            "x-grok-session-id",
+            "x-xai-token-auth"
+          ],
+          "inputTypes": [
+            "message",
+            "message"
+          ],
+          "legacyMaxTokens": null,
+          "maxOutputTokens": 100,
+          "method": "POST",
+          "model": "grok-4.6",
+          "modelOverrideHeader": "grok-4.6",
+          "oidcHeader": "xai-grok-cli",
+          "path": "/v1/responses",
+          "reasoning": {
+            "summary": "concise"
+          },
+          "requestBytes": 1404,
+          "stream": true,
+          "tools": [
+            {
+              "name": "session_title",
+              "parameterKeys": [
+                "session_title"
+              ],
+              "type": "function"
+            }
+          ]
+        },
+        {
+          "authorizationMatchesChildCapability": true,
+          "authorizationPresent": true,
+          "bodyKeys": [
+            "include",
+            "input",
+            "max_output_tokens",
+            "model",
+            "prompt_cache_key",
+            "reasoning",
+            "store",
+            "stream",
+            "tools"
+          ],
+          "functionOutputCallIds": [],
+          "headerNames": [
+            "accept",
+            "accept-encoding",
+            "authorization",
+            "content-length",
+            "content-type",
+            "host",
+            "traceparent",
+            "user-agent",
+            "x-authenticateresponse",
+            "x-grok-agent-id",
+            "x-grok-client-identifier",
+            "x-grok-client-mode",
+            "x-grok-client-version",
+            "x-grok-conv-group-id",
+            "x-grok-conv-id",
+            "x-grok-doom-loop-check",
+            "x-grok-exact-repetition-check",
+            "x-grok-model-override",
+            "x-grok-req-id",
+            "x-grok-session-id",
+            "x-grok-turn-idx",
+            "x-xai-token-auth"
+          ],
+          "inputTypes": [
+            "message",
+            "message",
+            "message"
+          ],
+          "legacyMaxTokens": null,
+          "maxOutputTokens": 1024,
+          "method": "POST",
+          "model": "grok-build-0.1",
+          "modelOverrideHeader": "grok-build-0.1",
+          "oidcHeader": "xai-grok-cli",
+          "path": "/v1/responses",
+          "reasoning": {
+            "summary": "concise"
+          },
+          "requestBytes": 12021,
+          "stream": true,
+          "tools": [
+            {
+              "name": "read_file",
+              "parameterKeys": [
+                "format",
+                "limit",
+                "offset",
+                "pages",
+                "target_file"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "search_replace",
+              "parameterKeys": [
+                "file_path",
+                "new_string",
+                "old_string",
+                "replace_all"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "list_dir",
+              "parameterKeys": [
+                "target_directory"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "grep",
+              "parameterKeys": [
+                "-A",
+                "-B",
+                "-C",
+                "-i",
+                "glob",
+                "head_limit",
+                "multiline",
+                "path",
+                "pattern",
+                "type"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "search_tool",
+              "parameterKeys": [
+                "limit",
+                "query"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "use_tool",
+              "parameterKeys": [
+                "file",
+                "tool_input",
+                "tool_input_file",
+                "tool_name"
+              ],
+              "type": "function"
+            },
+            {
+              "name": "write",
+              "parameterKeys": [
+                "content",
+                "file_path"
+              ],
+              "type": "function"
+            }
+          ]
+        }
+      ],
+      "schemaVersion": 1,
+      "stdoutJson": true,
+      "syntheticProviderUsageEachTurn": {
+        "cost_in_usd_ticks": 777,
+        "input_tokens": 100,
+        "input_tokens_details": {
+          "cached_tokens": 20
+        },
+        "num_server_side_tools_used": 0,
+        "num_sources_used": 0,
+        "output_tokens": 15,
+        "output_tokens_details": {
+          "reasoning_tokens": 5
+        },
+        "total_tokens": 115,
+        "unexplained_charge_ticks": 123
+      }
+    }
+  ],
+  "notes": [
+    "C uses the final production child environment without an additional XAI_API_KEY or experimental title flag.",
+    "CLI locally attempts a title model despite title_refresh=false. Production relay rejects that model before assignment admission; no background request has upstream authority.",
+    "Headless input excludes cached input; durable journal input includes cached input. One user prompt may contain two model rounds.",
+    "F and G show that the CLI alone does not validate provider arithmetic; the host rejects before forwarding.",
+    "Missing cost remains UNKNOWN. CLI omits explicit zero cost; host preserves reported zero separately."
+  ],
+  "qualification": "EXACT PINNED BINARY; SYNTHETIC LOCAL RECEIPTS; NOT LIVE PROVIDER",
+  "schemaVersion": 1
+}

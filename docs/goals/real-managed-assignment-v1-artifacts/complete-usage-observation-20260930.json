@@ -1,0 +1,414 @@
+{
+  "schemaVersion": 1,
+  "qualification": "ONE AUTHORIZED LIVE REQUEST; COMPLETE BOUNDED OBSERVATION; NO RETRY",
+  "decision": "OBSERVED CONTRACT INCOMPATIBLE — SPECIFIC FOLLOW-UP REQUIRED",
+  "source": {
+    "acceptedFunctionalSha": "6c91c00b49d97555a5e6e5de8eaf05fb90066e3f",
+    "acceptedFunctionalTree": "8ecc48bc0a74714f9fcee7e6ea945f5c3fee0802",
+    "startingEvidenceTip": "1883889033c63f7a52a016d6ccff5644519b238e",
+    "startingEvidenceTree": "bfae8d20094af83dab2585dc6aad4b7c84234b69",
+    "mainSha": "9e2660ff1a50edb7af1b81a4232d7fe23a37de0d",
+    "mainTree": "f524b705a3b88cb895309506bf726e76c91874bf",
+    "productionExecutableChanged": false,
+    "temporaryWrapperSourceSha256": "2482cc0d28f35223a65a34196d8cbc519e275b527ba06fe431d14cdb955efbfb",
+    "liveWrapperBinarySha256": "7be1beba034d6be5c32052e1148a126ecfcb867c7cc896b62dd1eff5aa053d38",
+    "installedCliVersion": "1.0.41",
+    "installedCliRevisionLabel": "4220f3b224a6",
+    "installedCliSha256": "9c844eb13365180787d9ad22b2b3748a024be8e1ed845253cc114781b31c591d",
+    "model": "grok-build-0.1"
+  },
+  "approvalAndPreDispatch": {
+    "ownerApproval": "Explicit direct chat approval on 2026-09-30 for unchanged request-scope manifest and runtime CLI messages/tool schema limited to the synthetic two-file task",
+    "manifestSha256": "e247612ef5189cf04237ec84e5f026989bcc286aac9e9d0e9d69d2e269c6cf2f",
+    "prelaunchCheckedAtUtc": "2026-09-30T17:38:53.396185+00:00",
+    "destination": {
+      "authenticationClass": "host-held Grok Build OIDC; child has only revocable local relay capability",
+      "method": "POST",
+      "model": "grok-build-0.1",
+      "stream": true,
+      "url": "https://cli-chat-proxy.grok.com/v1/chat/completions"
+    },
+    "sealedLimits": {
+      "aggregateTokenCeiling": 16000,
+      "automaticRetries": 0,
+      "leaseDurationMs": 180000,
+      "maxOutputTokensPerRequest": 1024,
+      "maxPromptBytes": 16000,
+      "maxRequestBytes": 65536,
+      "maxResponseBytes": 262144,
+      "physicalUpstreamRequests": 1,
+      "sourceApplication": false,
+      "workerAttempts": 1
+    },
+    "fixtureHead": "f3fe486b7f455f09aa61269325aabc21afbf0e26",
+    "fixtureTree": "1ef9c0872b4eadfaae5f75bbf2933c062cce67ec",
+    "sourcePaths": [
+      "src/framing.py",
+      "src/decoder.py"
+    ],
+    "sourceFileSha256": {
+      "src/decoder.py": "4affad25745d7962b4ef474c59d3564d0634fef0a9e1987c9dfd30ada8962cb9",
+      "src/framing.py": "7f0ed4cf86fca40e73d7a8c22d436f074b20a94c47e9a1aa7bed605720a6c71d"
+    },
+    "fixtureHasRemotes": false,
+    "hostOracleBaselineExitCode": 1,
+    "oracleFileSha256": {
+      "check.py": "ea6453adb05e49fdf427e304565f024f816569e4bbccf85b095816bf056a0032",
+      "check.sh": "b04ed3bb317eaa1a038939409c39a005253fcb230fbd86feb65a7d9895c668c0"
+    },
+    "localOidcFreshnessMinMinutes": 10,
+    "credentialMaintenancePerformed": false,
+    "productionReadiness": "ready",
+    "workersDispatchedBeforeStart": 0,
+    "providerInvocationsBeforeStart": 0,
+    "oneRequestCapFocusedSyntheticTest": "passed before dispatch; assignment bound cannot amplify lease bounds",
+    "preApprovalLaunchesRejectedByAutomaticReview": 2,
+    "preApprovalRejectedLaunchesCreatedProcess": false
+  },
+  "liveObservation": {
+    "workId": "bc84206c-fa43-492a-9ef3-6b0c4f0d812f",
+    "runId": "28b09b4f-3311-4372-ade8-6712bb34e0f9",
+    "attemptId": "9e69b1b7-20ec-4ea8-a662-40270dafc6e6",
+    "workerAttempts": 1,
+    "httpStatus": 200,
+    "safeProviderRequestId": "81131b44-625b-9118-9bd9-872fa6eec761",
+    "providerEvidence": {
+      "accountingComplete": false,
+      "authorityAttempts": [
+        "att_fecce8f8f85b7544"
+      ],
+      "cacheReadInputTokens": 0,
+      "costComplete": false,
+      "costInUsdTicks": null,
+      "costMissingCalls": 0,
+      "deniedRequests": 0,
+      "diagnostics": [
+        {
+          "admission": 1,
+          "admissionDenial": null,
+          "httpStatus": 200,
+          "kind": "http_response_observed",
+          "providerErrorCode": null,
+          "providerErrorType": null,
+          "providerRequestId": "81131b44-625b-9118-9bd9-872fa6eec761",
+          "requestBytes": null
+        },
+        {
+          "admission": 1,
+          "admissionDenial": null,
+          "httpStatus": null,
+          "kind": "usage_inconsistent",
+          "providerErrorCode": null,
+          "providerErrorType": null,
+          "providerRequestId": null,
+          "requestBytes": null,
+          "usageRejection": {
+            "expected": 3602,
+            "field": "total_tokens",
+            "kind": "conflicting_total",
+            "observed": 3862
+          }
+        },
+        {
+          "admission": 1,
+          "admissionDenial": null,
+          "httpStatus": null,
+          "kind": "child_exit",
+          "providerErrorCode": null,
+          "providerErrorType": null,
+          "providerRequestId": null,
+          "requestBytes": null
+        }
+      ],
+      "diagnosticsTruncated": false,
+      "httpResponsesObserved": 1,
+      "inputTokens": 0,
+      "interruption": "usage_inconsistent",
+      "mechanism": "host_relay_v1",
+      "model": "grok-build-0.1",
+      "outputTokens": 0,
+      "reasoningTokens": 0,
+      "remoteEffectUncertain": true,
+      "requestsReserved": 1,
+      "responsesCompleted": 0,
+      "revoked": true,
+      "toolCalls": 0,
+      "totalTokens": null,
+      "uncertain": true,
+      "usageObservation": {
+        "credentialSuppressed": false,
+        "observationsOmitted": false,
+        "snapshots": [
+          {
+            "completionDetailsState": {
+              "contentSuppressed": false,
+              "state": "object"
+            },
+            "fields": [
+              {
+                "contentSuppressed": false,
+                "path": "prompt_tokens",
+                "state": "positive",
+                "value": 3591,
+                "valueOmitted": false
+              },
+              {
+                "contentSuppressed": false,
+                "path": "completion_tokens",
+                "state": "positive",
+                "value": 11,
+                "valueOmitted": false
+              },
+              {
+                "contentSuppressed": false,
+                "path": "total_tokens",
+                "state": "positive",
+                "value": 3862,
+                "valueOmitted": false
+              },
+              {
+                "contentSuppressed": false,
+                "path": "prompt_tokens_details.text_tokens",
+                "state": "positive",
+                "value": 3591,
+                "valueOmitted": false
+              },
+              {
+                "contentSuppressed": false,
+                "path": "prompt_tokens_details.audio_tokens",
+                "state": "zero",
+                "value": 0,
+                "valueOmitted": false
+              },
+              {
+                "contentSuppressed": false,
+                "path": "prompt_tokens_details.image_tokens",
+                "state": "zero",
+                "value": 0,
+                "valueOmitted": false
+              },
+              {
+                "contentSuppressed": false,
+                "path": "prompt_tokens_details.cached_tokens",
+                "state": "positive",
+                "value": 128,
+                "valueOmitted": false
+              },
+              {
+                "contentSuppressed": false,
+                "path": "completion_tokens_details.reasoning_tokens",
+                "state": "positive",
+                "value": 260,
+                "valueOmitted": false
+              },
+              {
+                "contentSuppressed": false,
+                "path": "completion_tokens_details.audio_tokens",
+                "state": "zero",
+                "value": 0,
+                "valueOmitted": false
+              },
+              {
+                "contentSuppressed": false,
+                "path": "completion_tokens_details.accepted_prediction_tokens",
+                "state": "zero",
+                "value": 0,
+                "valueOmitted": false
+              },
+              {
+                "contentSuppressed": false,
+                "path": "completion_tokens_details.rejected_prediction_tokens",
+                "state": "zero",
+                "value": 0,
+                "valueOmitted": false
+              },
+              {
+                "contentSuppressed": false,
+                "path": "num_sources_used",
+                "state": "zero",
+                "value": 0,
+                "valueOmitted": false
+              },
+              {
+                "contentSuppressed": false,
+                "path": "cost_in_usd_ticks",
+                "state": "positive",
+                "value": 40306000,
+                "valueOmitted": false
+              }
+            ],
+            "promptDetailsState": {
+              "contentSuppressed": false,
+              "state": "object"
+            },
+            "receiptOrdinal": 1,
+            "receiptState": {
+              "contentSuppressed": false,
+              "state": "object"
+            },
+            "unknownCompletionDetailsKeys": {
+              "contentSuppressed": false,
+              "countUpToFour": 0,
+              "more": false
+            },
+            "unknownPromptDetailsKeys": {
+              "contentSuppressed": false,
+              "countUpToFour": 0,
+              "more": false
+            },
+            "unknownTopLevelKeys": {
+              "contentSuppressed": false,
+              "countUpToFour": 0,
+              "more": false
+            }
+          }
+        ]
+      },
+      "usageObserved": false,
+      "wireAttempts": 1
+    },
+    "canonicalSendEvents": {
+      "send_intent": 1,
+      "send_wire_admission": 1,
+      "send_outcome": 1,
+      "outcome": "uncertain",
+      "detail": "ProtocolAfterPossibleEffect",
+      "authorityAttempt": "att_fecce8f8f85b7544"
+    },
+    "failingStage": "bounded upstream fully drained; validate_completion -> parse_managed_usage before detail acceptance, aggregation, CLI forwarding or accepted settlement",
+    "workState": "review",
+    "runState": "interrupted",
+    "runStopCause": "interrupted",
+    "attemptState": "review",
+    "candidateDigest": "sha256:missing",
+    "stopReason": "managed_execution_uncertain_or_failed",
+    "phases": {
+      "applied": false,
+      "changeProposed": false,
+      "checksPassed": false,
+      "humanApproved": false,
+      "workerStopped": true
+    },
+    "laterOneRequestCapDenial": false,
+    "acceptedAccountingFailureDistinctFromOneRequestCap": true,
+    "privateExecuteReportSha256": "ba24a344c452e825cf36cc57f8662cbded59ebb1f27aa70622199b9967ad2713"
+  },
+  "classification": {
+    "providerReported": {
+      "promptTokens": 3591,
+      "completionTokens": 11,
+      "explicitReasoningTokens": 260,
+      "totalTokens": 3862,
+      "cachedPromptTokens": 128,
+      "costState": "reported_positive",
+      "costInUsdTicks": 40306000
+    },
+    "observedRelationship": "3591 + 11 + explicit 260 = provider 3862; cache 128 is a prompt subset; all other observed known details/source counts are zero",
+    "providerReportedUsageObservationComplete": true,
+    "usageObservationIsSettlement": false,
+    "hostBudget": {
+      "accepted": false,
+      "settledTotalTokens": null,
+      "proposedAdditiveCountIfContractSupported": 3862,
+      "reason": "No supported pre-send upper bound on chargeable completion plus reasoning established for pinned proxy legacy max_tokens"
+    },
+    "expectedCliHeadless": {
+      "provenance": "Derived from accepted prior pinned-CLI synthetic projection campaign; this rejected live receipt was not forwarded to CLI",
+      "inputTokens": 3463,
+      "cacheReadInputTokens": 128,
+      "cacheCreationInputTokens": 0,
+      "outputTokens": 11,
+      "reasoningTokens": 260,
+      "totalTokens": 3602,
+      "expectedReportedCostInUsdTicks": 40306000
+    },
+    "expectedCliJournal": {
+      "provenance": "Derived from accepted prior pinned-CLI synthetic projection campaign, not newly observed live",
+      "inputTokens": 3591,
+      "cachedReadTokens": 128,
+      "cacheCreationTokens": 0,
+      "outputTokens": 11,
+      "reasoningTokens": 260,
+      "totalTokens": 3602,
+      "costField": "unavailable in accepted session/turn usage schema"
+    },
+    "reportedCostUsdEquivalent": "0.0040306 using documented 10000000000 ticks per USD; not proof of final subscription billing",
+    "finalAccountBilling": "UNKNOWN",
+    "acceptedCostSettlement": "UNKNOWN",
+    "historical332TokenDifferenceClassified": false,
+    "historicalDiscardedUsageReconstructed": false
+  },
+  "protocolEvidenceAndDecision": {
+    "publicRequestSchema": {
+      "url": "https://docs.x.ai/developers/rest-api-reference/inference/chat-completions",
+      "markdownUrl": "https://docs.x.ai/developers/rest-api-reference/inference/chat-completions.md",
+      "retrievedAtUtcDate": "2026-09-30",
+      "markdownSha256": "ddb3f09fa7eb5977cf623643562bc4f862b7bc71ffe47ea8f4d999728e7d2d60",
+      "finding": "Newer max_completion_tokens is documented to cap visible output only, excluding reasoning and function calls; legacy max_tokens is deprecated without an explicit joint bound. The additive example supports the observed shape, while total_tokens prose still describes prompt plus completion."
+    },
+    "publicCostSchema": {
+      "url": "https://docs.x.ai/developers/cost-tracking",
+      "finding": "Tick conversion and per-request cost are public API semantics, not proof of final subscription billing."
+    },
+    "routeEvidence": {
+      "url": "https://docs.x.ai/build/enterprise",
+      "finding": "Official CLI proxy core inference route is distinct from the API-key route; no inference or account endpoint was queried for this research."
+    },
+    "acceptedProductionSource": {
+      "sha": "6c91c00b49d97555a5e6e5de8eaf05fb90066e3f",
+      "path": "crates/codegen/grokptah-agent-bridge/src/managed_provider.rs",
+      "blob": "55ebfc887a0a00fe2ee1f74ec99e332cb5da9643",
+      "wireFields": "max_tokens=1024; max_completion_tokens and reasoning_effort removed; accepted x-grok-effort: low header unchanged",
+      "reservation": "checked prior accounted total + incoming request bytes + 1024; no separate enforceable reasoning allowance"
+    },
+    "applicabilityQualification": "Actual response confirms explicit additive arithmetic on this request. Public API docs and one below-limit sample do not prove the pinned subscription proxy jointly caps completion plus reasoning.",
+    "specificFollowUp": "Establish an applicable provider contract that max_tokens=1024 jointly bounds chargeable completion plus reasoning for grok-build-0.1 on the pinned OIDC CLI-proxy route, or a supported independently enforceable pre-send reasoning/total cap within the existing ceilings. No live test or fallback is authorized.",
+    "adapterJustified": false,
+    "productionAccountingAcceptanceChanged": false,
+    "postResponseCheckPreventsIncurredOverrun": false,
+    "limitRaised": false,
+    "responseRewritten": false,
+    "canonicalLedgerReplaced": false
+  },
+  "preservation": {
+    "capabilityRetiredBeforeImplementation": true,
+    "credentialFreeLocalReopens": 3,
+    "reopenNetworkConfinement": "OS sandbox denies all external network, permits loopback only; external denial probe returned EPERM",
+    "sameWorkRunAttemptAndProviderEvidence": true,
+    "sameOneWireAttempt": true,
+    "sourceHeadTreeStatusRemotesAndBothFileHashesUnchanged": true,
+    "oracleHashesUnchanged": true,
+    "workerRootEmpty": true,
+    "priorPrivateHistoricalRecordHashesUnchanged": 11,
+    "priorTrackedArtifactFilesByteIdentical": 60,
+    "privateReopenReportSha256": [
+      "b2f35dc78707024eeafc3b831c7af4c5c31927b35e217dfe689e18ef592a0fac",
+      "b2f35dc78707024eeafc3b831c7af4c5c31927b35e217dfe689e18ef592a0fac",
+      "b2f35dc78707024eeafc3b831c7af4c5c31927b35e217dfe689e18ef592a0fac"
+    ],
+    "originalHistoricalUsageAndCost": "UNKNOWN; unchanged; new observation does not recover discarded components or billing",
+    "additionalLiveRequestsAfterThisAttempt": 0,
+    "credentialRefreshLoginEntitlementBillingModelListingOrOtherProviderCalls": 0,
+    "retryRearmFallbackApprovalApplyDiscardMergeReleaseDeployment": false,
+    "rawProviderBodyPromptToolArgumentsCredentialsOrPrivateTranscriptPublished": false
+  },
+  "validation": {
+    "receiptBoundsTypesStatesAndAllowlist": "passed; 13 exact known paths; 1 snapshot under 3072 bytes; no unknown keys, suppression or omitted values",
+    "checkedObservedArithmetic": "3591+11+260=3862; 3591-128=3463; 3591+11=3602",
+    "canonicalSendAndReopenAndIdentityChecks": "passed; one intent/wire/uncertain outcome; three identical reopens; all source/binary/oracle/historical hashes preserved",
+    "newProductTestCampaign": "not run: no executable change justified; accepted observation and pinned-CLI projection campaigns reused",
+    "newRetainedCandidateAndHostOracleJourney": "not run: additive form remains unsupported under the required pre-send guarantee",
+    "existingExactFunctionalHostedDesktop": {
+      "runId": 36593888063,
+      "attempt": 1,
+      "event": "pull_request",
+      "headSha": "6c91c00b49d97555a5e6e5de8eaf05fb90066e3f",
+      "status": "completed",
+      "conclusion": "success",
+      "url": "https://github.com/chriscase/GrokPtah/actions/runs/36593888063",
+      "failedSteps": 0
+    },
+    "newFunctionalRevisionOrCiClaim": false,
+    "publishedShaTreeLocation": "PR handoff after evidence-only commit"
+  }
+}
