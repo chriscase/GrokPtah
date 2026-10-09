@@ -191,11 +191,15 @@ Download. The live click probe proves the navigation-action / navigation-respons
 `didBecomeDownload` path: loopback HTTP attachment → `WKDownload` delegate → nil
 `decideDestination` → `cancel`. Session open requires those IMPs plus WebKit's private
 `_webView:contextMenuDidCreateDownload:` (the public spelling is not called); missing
-selectors fail-close. The owned page strips download-related context-menu items via
-`WKUIDelegate webView:contextMenuForElement:defaultMenuItems:`; any context-menu
-download WebKit still creates must hit the private selector and `adopt_wk_download`.
-That context-menu path is **not** exercised by the click probe — only delegate
-registration and menu filtering are asserted. `decideDestination` sets `destination_nil`
+selectors fail-close. Context-menu downloads that WebKit still creates are cancelled via
+that private IMP → `adopt_wk_download` (not exercised by the click probe). **Proved on
+Hosted Desktop:** the click probe above; delegate IMP registration on the containment class
+(`live_wk_download_deny_requires_wk_delegate_imps`); and the same IMPs on the booted session's
+attached navigation delegate (`live_wk_snapshot_main` on the process main thread). **Not
+proved:** opening a context menu or exercising `_webView:contextMenuDidCreateDownload:`;
+stripping download items from the context menu (no delegate hook is registered for that);
+`startDownloadUsingRequest` (app-originated); or every download entry point WebKit might add
+later. `decideDestination` sets `destination_nil`
 only when WebKit invokes the completion block with nil. Navigation decisions log the URL
 WK supplied (loopback HTTP for the real `WKDownload`); probe URL echoes are not
 synthesized. After the probe, candidate download directories (process temp, cwd,

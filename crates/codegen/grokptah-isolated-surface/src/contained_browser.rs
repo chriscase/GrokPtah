@@ -620,6 +620,15 @@ impl ContainedBrowserBackend {
         live_wk_macos_only()
     }
 
+    /// Main-thread check that the booted live WK session's navigation delegate still registers
+    /// download deny IMPs (including `_webView:contextMenuDidCreateDownload:`).
+    #[cfg(all(feature = "browser-engine", target_os = "macos"))]
+    pub fn live_wk_assert_attached_download_delegate_imps(&self) -> HarnessResult<()> {
+        self.live_wk_native_deny_session(|session| {
+            crate::wk_native_snapshot::assert_attached_download_delegate_imps(session.webview())
+        })
+    }
+
     #[cfg(feature = "browser-engine")]
     pub fn live_wk_attempt_file_picker(&mut self) -> HarnessResult<()> {
         #[cfg(target_os = "macos")]
