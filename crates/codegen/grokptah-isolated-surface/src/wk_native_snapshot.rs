@@ -178,7 +178,7 @@ pub(crate) fn rasterize_fixture() -> HarnessResult<NativeWkRaster> {
 
 impl LiveWkSession {
     pub(crate) fn webview(&self) -> &AnyObject {
-        &*self.webview
+        &self.webview
     }
 
     pub(crate) fn open() -> HarnessResult<Self> {
