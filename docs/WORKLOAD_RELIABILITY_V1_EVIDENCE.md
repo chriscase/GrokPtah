@@ -112,6 +112,8 @@ Highest risk:
 
 Hosted run `38172509497` covers `ebc3628ba7316a2b1a7e4bd1fbe020a965132e6c` only. It does not cover this follow-up.
 
+The executable commit for this follow-up is `1e3d5f76a569b0213a90a2705777c26aa74a25e9`, tree `82dc8e8894731b29968cc655ae2ad95143de0abd`. The commit that records this SHA changes only this file. Rust and TypeScript are identical to that executable commit. Hosted `desktop.yml` has to be read on the published tip.
+
 ## Unresolved on this tree
 
 - Local `desktop/src-tauri` `cargo test --locked` of the binary target did not run. The library target did: 52 passed, 0 failed. Hosted `desktop.yml` `cargo test --locked` remains the macOS binary gate and must be green on this commit. The earlier success does not count.
