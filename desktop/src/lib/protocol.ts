@@ -356,6 +356,80 @@ export interface RemoteWorkSnapshot {
   attempts: DurableWorkAttempt[];
 }
 
+/** Authorized list projection. It is not a full Work Item. */
+export interface WorkListEntry {
+  workId: string;
+  kind: string;
+  state: DurableWorkState;
+  priority: number;
+  revision: number;
+  attemptCount: number;
+  assignmentStatus?: string;
+  isContainer?: boolean;
+  createdAt: string;
+  updatedAt: string;
+  deadline?: string | null;
+  objective?: string | null;
+  progressSummary?: string | null;
+  progressPercent?: number | null;
+  assignedAgentId?: string | null;
+  detailRequired?: boolean;
+}
+
+export interface WorkListPage {
+  schemaVersion: number;
+  kind: string;
+  order: string;
+  consistency: string;
+  complete: boolean;
+  continuation?: string | null;
+  items: WorkListEntry[];
+  pageCount: number;
+}
+
+export type WorkTraversalStatus = "loading" | "partial" | "complete" | "expired" | "error";
+
+export function workListEntryToItem(
+  entry: WorkListEntry,
+  sessionId: string,
+  workspace: string,
+): DurableWorkItem {
+  return {
+    schemaVersion: 1,
+    workId: entry.workId,
+    kind: entry.kind,
+    objective: entry.objective ?? "",
+    sessionId,
+    workspace,
+    createdBy: "",
+    assignedAgentId: entry.assignedAgentId ?? null,
+    priority: entry.priority,
+    deadline: entry.deadline ?? null,
+    parentWorkId: null,
+    dependencies: [],
+    policy: {
+      bounds: { maxPromptBytes: 0, maxRounds: 0, maxDurationMs: 0 },
+      retry: { maxAttempts: 1, retryFailed: false, retryExpired: false, backoffMs: 0 },
+      requiresApproval: false,
+      maxConcurrentAttempts: 1,
+    },
+    state: entry.state,
+    revision: entry.revision,
+    attemptCount: entry.attemptCount,
+    progress: entry.progressSummary
+      ? {
+          summary: entry.progressSummary,
+          percent: entry.progressPercent ?? null,
+          updatedAt: entry.updatedAt,
+        }
+      : null,
+    result: null,
+    approval: null,
+    createdAt: entry.createdAt,
+    updatedAt: entry.updatedAt,
+  };
+}
+
 export type RoutineLifecycle = "enabled" | "paused" | "disabled";
 export type MissedRunPolicy = "skip" | "coalesce" | "catch_up";
 export type ActivationDisposition =

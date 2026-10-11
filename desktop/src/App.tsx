@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "./lib/api";
+import { acceptWorkPage, workTraversalFromError } from "./lib/workTraversal";
 import {
   normalizeSessionUpdate,
   SLASH_COMMANDS,
@@ -16,6 +17,8 @@ import {
   type DurableRun,
   type DurableWorkItem,
   type DurableRoutine,
+  type WorkTraversalStatus,
+  workListEntryToItem,
   type LaneSummary,
   type RemoteWorkSnapshot,
   type RemoteRoutineSnapshot,
@@ -370,6 +373,9 @@ export default function App() {
   const [workSnapshot, setWorkSnapshot] = useState<RemoteWorkSnapshot | null>(null);
   const [workError, setWorkError] = useState<string | null>(null);
   const [workBusy, setWorkBusy] = useState(false);
+  const [workTraversal, setWorkTraversal] = useState<WorkTraversalStatus>("complete");
+  const [workContinuation, setWorkContinuation] = useState<string | null>(null);
+  const workFetchGen = useRef(0);
   const [routines, setRoutines] = useState<DurableRoutine[]>([]);
   const [selectedRoutineId, setSelectedRoutineId] = useState<string | null>(null);
   const [routineSnapshot, setRoutineSnapshot] = useState<RemoteRoutineSnapshot | null>(null);
@@ -957,9 +963,14 @@ export default function App() {
           ? remoteServiceStatus.connectionState ?? ("connected" as const)
           : ("connected" as const)),
       workspacePath: workScopeLane?.cwd ?? activeSummary?.cwd ?? activeTab?.cwd,
-      runLabel: workItems.length
-        ? `${workItems.length} durable Work Item${workItems.length === 1 ? "" : "s"}`
-        : "No durable Work",
+      runLabel:
+        workTraversal === "complete"
+          ? workItems.length
+            ? `${workItems.length} durable Work Item${workItems.length === 1 ? "" : "s"}`
+            : "No durable Work"
+          : workTraversal === "partial"
+            ? `${workItems.length} loaded`
+            : "Work list incomplete",
     }),
     [
       activeSessionId,
@@ -969,6 +980,7 @@ export default function App() {
       remoteServiceStatus.connectionState,
       workItems.length,
       workScopeLane,
+      workTraversal,
     ],
   );
   const refreshWorkItem = useCallback(
@@ -1008,24 +1020,36 @@ export default function App() {
         : activeLane;
     const sessionId = lane?.session_id ?? activeSessionId;
     const remoteTarget = executionTarget === "remote";
-    if (!sessionId) {
+    if (!sessionId || !lane?.cwd) {
       setWorkItems([]);
       setSelectedWorkId(null);
       setWorkSnapshot(null);
       setWorkError(null);
+      setWorkTraversal("complete");
+      setWorkContinuation(null);
       return;
     }
     if (remoteTarget && (!selectedRemoteLane || !remoteServiceStatus.connected)) {
       setWorkError("The remote service is disconnected. The last Work snapshot remains available.");
+      setWorkTraversal("error");
       return;
     }
+    const generation = workFetchGen.current + 1;
+    workFetchGen.current = generation;
     setWorkBusy(true);
+    setWorkTraversal("loading");
     try {
-      const items =
-        executionTarget === "remote" && remoteServiceStatus.connected && lane
+      const page =
+        executionTarget === "remote" && remoteServiceStatus.connected
           ? await api.remoteServiceWorkList(sessionId, lane.cwd)
-          : await api.workList(sessionId);
-      setWorkItems(items);
+          : await api.workList(sessionId, lane.cwd);
+      if (workFetchGen.current !== generation) return;
+      const items = page.items.map((entry) => workListEntryToItem(entry, sessionId, lane.cwd));
+      const accepted = acceptWorkPage(workFetchGen.current, generation, [], items, false);
+      if (!accepted) return;
+      setWorkItems(accepted);
+      setWorkContinuation(page.complete ? null : page.continuation ?? null);
+      setWorkTraversal(page.complete ? "complete" : "partial");
       setSelectedWorkId((current) =>
         current && items.some((item) => item.workId === current)
           ? current
@@ -1033,11 +1057,56 @@ export default function App() {
       );
       setWorkError(null);
     } catch (error) {
+      if (workFetchGen.current !== generation) return;
+      const status = workTraversalFromError(error);
+      setWorkTraversal(status);
+      setWorkContinuation(null);
       setWorkError(`Could not refresh durable Work Items: ${String(error)}`);
     } finally {
-      setWorkBusy(false);
+      if (workFetchGen.current === generation) setWorkBusy(false);
     }
   }, [activeLane, activeSessionId, executionTarget, remoteServiceStatus.connected, selectedRemoteLane]);
+
+  const loadMoreWork = useCallback(async () => {
+    const lane =
+      executionTarget === "remote" && selectedRemoteLane
+        ? selectedRemoteLane
+        : activeLane;
+    const sessionId = lane?.session_id ?? activeSessionId;
+    if (!sessionId || !lane?.cwd || !workContinuation || workTraversal !== "partial") return;
+    const generation = workFetchGen.current;
+    const continuation = workContinuation;
+    setWorkBusy(true);
+    try {
+      const page =
+        executionTarget === "remote" && remoteServiceStatus.connected
+          ? await api.remoteServiceWorkList(sessionId, lane.cwd, continuation)
+          : await api.workList(sessionId, lane.cwd, continuation);
+      if (workFetchGen.current !== generation) return;
+      const incoming = page.items.map((entry) => workListEntryToItem(entry, sessionId, lane.cwd));
+      setWorkItems((current) => acceptWorkPage(workFetchGen.current, generation, current, incoming, true) ?? current);
+      if (workFetchGen.current !== generation) return;
+      setWorkContinuation(page.complete ? null : page.continuation ?? null);
+      setWorkTraversal(page.complete ? "complete" : "partial");
+      setWorkError(null);
+    } catch (error) {
+      if (workFetchGen.current !== generation) return;
+      const status = workTraversalFromError(error);
+      setWorkTraversal(status);
+      if (status === "expired") setWorkContinuation(null);
+      setWorkError(`Could not load the next work page: ${String(error)}`);
+    } finally {
+      if (workFetchGen.current === generation) setWorkBusy(false);
+    }
+  }, [
+    activeLane,
+    activeSessionId,
+    executionTarget,
+    remoteServiceStatus.connected,
+    selectedRemoteLane,
+    workContinuation,
+    workTraversal,
+  ]);
 
   const mutateWork = useCallback(
     async (action: (sessionId: string, workspace: string, remote: boolean) => Promise<void>) => {
@@ -4431,6 +4500,9 @@ export default function App() {
             scope={workScope}
             busy={workBusy}
             error={workError}
+            traversalStatus={workTraversal}
+            onLoadMore={() => void loadMoreWork()}
+            onRetryTraversal={() => void refreshWork()}
             mutationsEnabled={Boolean(
               !activeLaneArchived &&
                 workScope.laneId &&

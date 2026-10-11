@@ -208,4 +208,95 @@ describe("WorkBoard", () => {
       expect.objectContaining({ workId: "work-verified", candidateDigest: "sha256:candidate" }),
     );
   });
+
+  it("labels a partial page as loaded and loads another page", async () => {
+    const user = userEvent.setup();
+    const onLoadMore = vi.fn();
+    const second = { ...item, workId: "work-2", objective: "Second loaded item", revision: 1 };
+    render(
+      <WorkBoard
+        items={[item, second]}
+        selectedWorkId={item.workId}
+        snapshot={snapshot}
+        scope={scope}
+        traversalStatus="partial"
+        onLoadMore={onLoadMore}
+        onRefresh={vi.fn()}
+        onSelect={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("2 loaded")).toBeInTheDocument();
+    expect(screen.queryByText("2 total")).not.toBeInTheDocument();
+    expect(screen.getByText("Counts and filters cover loaded items only.")).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("2 work items loaded. The lane is not complete.");
+    await user.click(screen.getByRole("button", { name: "Load more" }));
+    expect(onLoadMore).toHaveBeenCalledOnce();
+  });
+
+  it("announces a complete lane as a total", () => {
+    render(
+      <WorkBoard
+        items={[item]}
+        selectedWorkId={item.workId}
+        snapshot={snapshot}
+        scope={scope}
+        traversalStatus="complete"
+        onRefresh={vi.fn()}
+        onSelect={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("1 total")).toBeInTheDocument();
+    expect(screen.queryByText("Counts and filters cover loaded items only.")).not.toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("1 work items. This lane list is complete.");
+    expect(screen.queryByRole("button", { name: "Load more" })).not.toBeInTheDocument();
+  });
+
+  it("asks for a refresh when the continuation expired and does not offer load more", async () => {
+    const user = userEvent.setup();
+    const onRetryTraversal = vi.fn();
+    const onLoadMore = vi.fn();
+    render(
+      <WorkBoard
+        items={[item]}
+        selectedWorkId={item.workId}
+        snapshot={snapshot}
+        scope={scope}
+        traversalStatus="expired"
+        error="MCP remote error: restart_required"
+        onLoadMore={onLoadMore}
+        onRetryTraversal={onRetryTraversal}
+        onRefresh={vi.fn()}
+        onSelect={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("Work list needs a fresh start")).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("continuation expired");
+    expect(screen.queryByRole("button", { name: "Load more" })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(onRetryTraversal).toHaveBeenCalledOnce();
+    expect(onLoadMore).not.toHaveBeenCalled();
+  });
+
+  it("retries a failed traversal without treating the loaded count as the lane total", async () => {
+    const user = userEvent.setup();
+    const onRetryTraversal = vi.fn();
+    render(
+      <WorkBoard
+        items={[item]}
+        selectedWorkId={item.workId}
+        snapshot={snapshot}
+        scope={scope}
+        traversalStatus="error"
+        error="connection reset"
+        onRetryTraversal={onRetryTraversal}
+        onRefresh={vi.fn()}
+        onSelect={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("1 loaded")).toBeInTheDocument();
+    expect(screen.getByText("Counts and filters cover loaded items only.")).toBeInTheDocument();
+    expect(screen.getByText("Work could not be refreshed")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Retry" }));
+    expect(onRetryTraversal).toHaveBeenCalledOnce();
+  });
 });

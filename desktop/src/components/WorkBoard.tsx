@@ -3,6 +3,7 @@ import type {
   DurableWorkAttempt,
   DurableWorkItem,
   RemoteWorkSnapshot,
+  WorkTraversalStatus,
 } from "../lib/protocol";
 import type { LaneScope } from "./LaneScopeLine";
 import { LaneScopeLine } from "./LaneScopeLine";
@@ -20,6 +21,9 @@ export type WorkBoardProps = {
   busy?: boolean;
   error?: string | null;
   sourceLabel?: string;
+  traversalStatus?: WorkTraversalStatus;
+  onLoadMore?: () => void;
+  onRetryTraversal?: () => void;
   onRefresh: () => void;
   onSelect: (workId: string) => void;
   mutationsEnabled?: boolean;
@@ -96,6 +100,9 @@ export function WorkBoard({
   busy = false,
   error,
   sourceLabel = "Durable workload",
+  traversalStatus = "complete",
+  onLoadMore,
+  onRetryTraversal,
   onRefresh,
   onSelect,
   mutationsEnabled = false,
@@ -134,7 +141,9 @@ export function WorkBoard({
       }),
     [filter, items],
   );
-  const selected = snapshot?.work ?? items.find((item) => item.workId === selectedWorkId) ?? null;
+  const listed = items.find((item) => item.workId === selectedWorkId) ?? null;
+  const selected =
+    listed && snapshot?.work.workId === listed.workId ? snapshot.work : listed;
   const activeCount = items.filter((item) => isActive(item.state)).length;
   const attentionCount = items.filter((item) => needsAttention(item.state)).length;
   const completedCount = items.filter((item) => isCompleted(item.state)).length;
@@ -310,12 +319,29 @@ export function WorkBoard({
       )}
 
       <div className="work-board-summary" aria-label="Work summary">
-        <span>{items.length} total</span>
+        <span>
+          {traversalStatus === "complete" ? `${items.length} total` : `${items.length} loaded`}
+        </span>
         <span>{activeCount} active</span>
         <span>{attentionCount} needs attention</span>
         <span>{completedCount} complete</span>
         <span className="work-board-source">{sourceLabel}</span>
       </div>
+      <p className="sr-only" role="status" aria-live="polite">
+        {traversalStatus === "loading" && "Loading work."}
+        {traversalStatus === "partial" &&
+          `${items.length} work items loaded. The lane is not complete.`}
+        {traversalStatus === "complete" &&
+          `${items.length} work items. This lane list is complete.`}
+        {traversalStatus === "expired" &&
+          "The work list changed or its continuation expired. Refresh to start again."}
+        {traversalStatus === "error" && "The work list failed."}
+      </p>
+      {traversalStatus !== "complete" && (
+        <p className="work-board-source">
+          Counts and filters cover loaded items only.
+        </p>
+      )}
 
       <div className="work-board-controls" role="group" aria-label="Work filters">
         {(["all", "active", "attention", "completed"] as WorkFilter[]).map((value) => (
@@ -368,13 +394,23 @@ export function WorkBoard({
 
       {actionError && <p className="work-action-error" role="alert">Work action failed: {actionError}</p>}
 
-      {error && (
+      {traversalStatus === "expired" && (
+        <StateCard
+          variant="error"
+          title="Work list needs a fresh start"
+          description="The lane changed, or the continuation expired. Refresh replaces this page. It does not append it."
+          actionLabel="Refresh"
+          onAction={onRetryTraversal ?? onRefresh}
+        />
+      )}
+
+      {error && traversalStatus !== "expired" && (
         <StateCard
           variant="error"
           title="Work could not be refreshed"
           description="The last durable snapshot remains available when possible. Try again or inspect the technical details."
-          actionLabel="Refresh"
-          onAction={onRefresh}
+          actionLabel="Retry"
+          onAction={onRetryTraversal ?? onRefresh}
           technicalDetail={error}
         />
       )}
@@ -391,8 +427,17 @@ export function WorkBoard({
         <StateCard
           variant="empty"
           title="Nothing matches this filter"
-          description="Choose another work state to see the rest of this Lane's durable history."
+          description={
+            traversalStatus === "complete"
+              ? "Choose another work state to see the rest of this Lane's durable history."
+              : "This filter covers loaded items only. Load more before treating it as the whole lane."
+          }
         />
+      )}
+      {traversalStatus === "partial" && onLoadMore && (
+        <button type="button" onClick={onLoadMore} disabled={busy}>
+          {busy ? "Loading…" : "Load more"}
+        </button>
       )}
 
       {visibleItems.length > 0 && (
@@ -410,7 +455,7 @@ export function WorkBoard({
                   onClick={() => onSelect(item.workId)}
                 >
                   <span className="work-card-heading">
-                    <strong>{item.objective}</strong>
+                    <strong>{item.objective || "Objective is on the item detail"}</strong>
                     <span className="work-card-state">{stateLabel(item.state)}</span>
                   </span>
                   <span className="work-card-meta">
@@ -443,9 +488,9 @@ export function WorkBoard({
                 </div>
                 <dl className="work-detail-facts">
                   <div><dt>Agent</dt><dd>{selected.assignedAgentId || "Unassigned"}</dd></div>
-                  <div><dt>Created by</dt><dd>{selected.createdBy}</dd></div>
+                  <div><dt>Created by</dt><dd>{selected.createdBy || "Loading detail"}</dd></div>
                   <div><dt>Attempts</dt><dd>{selected.attemptCount}</dd></div>
-                  <div><dt>Approval</dt><dd>{selected.policy.requiresApproval ? "Required" : "Not required"}</dd></div>
+                  <div><dt>Approval</dt><dd>{selected.createdBy ? (selected.policy.requiresApproval ? "Required" : "Not required") : "Loading detail"}</dd></div>
                   {selected.approval && <div><dt>Approved by</dt><dd>{selected.approval.reviewerId}</dd></div>}
                   <div><dt>Updated</dt><dd>{dateLabel(selected.updatedAt)}</dd></div>
                   <div><dt>Revision</dt><dd>{selected.revision}</dd></div>
@@ -509,7 +554,7 @@ export function WorkBoard({
                       <button type="submit">Approve completion</button>
                     </form>
                   )}
-                  {mutationsEnabled && selected.state === "failed" && selected.attemptCount < selected.policy.retry.maxAttempts && onRetry && (
+                  {mutationsEnabled && selected.state === "failed" && selected.createdBy && selected.attemptCount < selected.policy.retry.maxAttempts && onRetry && (
                     <button
                       type="button"
                       onClick={() => {

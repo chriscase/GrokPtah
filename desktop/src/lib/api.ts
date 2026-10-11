@@ -102,10 +102,17 @@ export const api = {
    */
   remoteServiceRunList: () =>
     invoke<DurableRun[]>("remote_service_run_list"),
-  remoteServiceWorkList: (sessionId: string, workspace: string) =>
-    invoke<DurableWorkItem[]>("remote_service_work_list", {
+  remoteServiceWorkList: (
+    sessionId: string,
+    workspace: string,
+    cursor?: string | null,
+    limit?: number,
+  ) =>
+    invoke<import("./protocol").WorkListPage>("remote_service_work_list", {
       sessionId,
       workspace,
+      cursor: cursor ?? null,
+      limit: limit ?? null,
     }),
   remoteServiceWorkGet: (
     sessionId: string,
@@ -117,8 +124,13 @@ export const api = {
       workspace,
       workId,
     }),
-  workList: (sessionId: string) =>
-    invoke<DurableWorkItem[]>("work_list", { sessionId }),
+  workList: (sessionId: string, workspace: string, cursor?: string | null, limit?: number) =>
+    invoke<import("./protocol").WorkListPage>("work_list", {
+      sessionId,
+      workspace,
+      cursor: cursor ?? null,
+      limit: limit ?? null,
+    }),
   workGet: (sessionId: string, workId: string) =>
     invoke<RemoteWorkSnapshot | null>("work_get", { sessionId, workId }),
   verifiedChangePrepare: (

@@ -2,11 +2,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use grokptah_agent_bridge::orchestration::{CoordinatorAgentView, CoordinatorResumePlanView, WorkPolicy};
+use grokptah_agent_bridge::orchestration::{
+    CoordinatorAgentView, CoordinatorResumePlanView, WorkPolicy,
+};
 use grokptah_agent_bridge::{
-    ActivationRecord, JournalPage, McpControlClient, PublicEventKindV1,
-    RoutineRecord, RoutineSnapshot, RunExecutionMode, RunRecord, RunScope, RunState,
-    RuntimeConnectionState, RuntimeTarget, SessionUpdate, WorkAttemptView, WorkItem,
+    ActivationRecord, JournalPage, McpControlClient, PublicEventKindV1, RoutineRecord,
+    RoutineSnapshot, RunExecutionMode, RunRecord, RunScope, RunState, RuntimeConnectionState,
+    RuntimeTarget, SessionUpdate, WorkAttemptView, WorkItem, WorkListPageV1,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -15,9 +17,7 @@ use tokio::sync::{watch, Mutex};
 use url::Url;
 use uuid::Uuid;
 
-use crate::remote_public_event::{
-    parse_remote_public_event_page, RemotePublicEventPage,
-};
+use crate::remote_public_event::{parse_remote_public_event_page, RemotePublicEventPage};
 use crate::remote_public_run::{
     parse_remote_public_run, parse_remote_public_run_list, RemotePublicRun, RemotePublicRunList,
 };
@@ -270,7 +270,10 @@ impl RemoteServiceState {
         ))
     }
 
-    pub async fn get_persistent_agent(&self, agent_id: &str) -> Result<Option<CoordinatorAgentView>> {
+    pub async fn get_persistent_agent(
+        &self,
+        agent_id: &str,
+    ) -> Result<Option<CoordinatorAgentView>> {
         let mut client = self.client.lock().await;
         let Some(client) = client.as_mut() else {
             return Ok(None);
@@ -344,6 +347,26 @@ impl RemoteServiceState {
             return Ok(None);
         };
         Ok(Some(client.list_work(session_id, workspace).await?))
+    }
+
+    /// One page of `ptah_list_work_page`. The body is the page, not `{work}`.
+    /// A missing cursor is omitted so the server starts at the lane head.
+    pub async fn list_work_page(
+        &self,
+        session_id: Uuid,
+        workspace: String,
+        cursor: Option<String>,
+        limit: usize,
+    ) -> Result<Option<WorkListPageV1>> {
+        let mut client = self.client.lock().await;
+        let Some(client) = client.as_mut() else {
+            return Ok(None);
+        };
+        Ok(Some(
+            client
+                .list_work_page(session_id, workspace, cursor, limit)
+                .await?,
+        ))
     }
 
     pub async fn get_work(
@@ -1086,6 +1109,25 @@ impl RemoteServiceClient {
         .context("decode remote durable work list")
     }
 
+    async fn list_work_page(
+        &mut self,
+        session_id: Uuid,
+        workspace: String,
+        cursor: Option<String>,
+        limit: usize,
+    ) -> Result<WorkListPageV1> {
+        let mut arguments = json!({
+            "session_id": session_id,
+            "workspace": workspace,
+            "limit": limit,
+        });
+        if let Some(cursor) = cursor.filter(|cursor| !cursor.is_empty()) {
+            arguments["cursor"] = json!(cursor);
+        }
+        let value = self.call_tool("ptah_list_work_page", arguments).await?;
+        serde_json::from_value(value).context("decode remote work page")
+    }
+
     async fn get_work(
         &mut self,
         session_id: Uuid,
@@ -1807,7 +1849,7 @@ mod tests {
         should_reconnect_remote_error, RemoteServiceClient, RemoteServiceState,
     };
     use grokptah_agent_bridge::orchestration::{
-        CoordinatorAgentView, CoordinatorResumePlanView,
+        CoordinatorAgentView, CoordinatorResumePlanView, WorkItem, WorkPolicy,
     };
 
     #[test]
@@ -2085,6 +2127,182 @@ mod tests {
             .iter()
             .any(|run| run.document.run_id == submission.run_id));
         assert!(restarted_server.stop_and_wait().await.is_clean());
+        set_grokptah_home_override(None);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn remote_client_follows_work_pages_and_refuses_a_changed_lane() {
+        let _guard = home_override_serial();
+        let previous_offline = std::env::var_os("GROKPTAH_AGENT_OFFLINE");
+        struct OfflineRestore(Option<std::ffi::OsString>);
+        impl Drop for OfflineRestore {
+            fn drop(&mut self) {
+                // SAFETY: the enclosing test holds the process-wide home mutex.
+                unsafe {
+                    match self.0.take() {
+                        Some(value) => std::env::set_var("GROKPTAH_AGENT_OFFLINE", value),
+                        None => std::env::remove_var("GROKPTAH_AGENT_OFFLINE"),
+                    }
+                }
+            }
+        }
+        let _offline = OfflineRestore(previous_offline);
+        // SAFETY: this test holds the process-wide home mutex for its whole body.
+        unsafe { std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1") };
+        let home = tempdir().unwrap();
+        set_grokptah_home_override(Some(home.path().join(".grokptah")));
+        let workspace = tempdir().unwrap();
+        let host = AgentHost::create(HostConfig {
+            always_approve: true,
+            ..HostConfig::default()
+        })
+        .expect("acquire the GrokPtah instance lock");
+        let store = OrchStore::open(home.path().join("orch")).unwrap();
+        let orch = OrchestrationService::new(
+            host.clone(),
+            host.event_bus(),
+            store.clone(),
+            OrchestrationConfig {
+                bearer_token: "desktop-remote-token".into(),
+                allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
+                max_concurrent_runs: 2,
+                bounds: RunBounds::default(),
+            },
+        );
+        let server = start_control_server(orch, 0).await.unwrap();
+        let base_url = format!("http://{}", server.addr);
+        host.start().unwrap();
+        let mut client = RemoteServiceClient::connect(base_url, "desktop-remote-token".into())
+            .await
+            .unwrap();
+        let session = client
+            .create_session(
+                workspace.path().display().to_string(),
+                Some("page lane".into()),
+            )
+            .await
+            .unwrap();
+        let other = client
+            .create_session(
+                workspace.path().display().to_string(),
+                Some("other lane".into()),
+            )
+            .await
+            .unwrap();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-03-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        for (work_id, priority) in [("page-a", 0), ("page-b", 2), ("page-c", 0)] {
+            let mut item = WorkItem::new_at(
+                "remote",
+                work_id,
+                session.session_id,
+                &session.workspace,
+                "operator",
+                WorkPolicy::default(),
+                now,
+            )
+            .unwrap();
+            item.work_id = work_id.into();
+            item.priority = priority;
+            store.save_work_item_unchecked(&item).unwrap();
+        }
+
+        let mut cursor = None;
+        let mut ids = Vec::new();
+        let mut first_continuation = None;
+        for _ in 0..6 {
+            let page = client
+                .list_work_page(
+                    session.session_id,
+                    session.workspace.clone(),
+                    cursor.clone(),
+                    1,
+                )
+                .await
+                .unwrap();
+            assert_eq!(page.schema_version, 1);
+            assert_eq!(page.kind, "grokptah.work.page.v1");
+            assert!(
+                !page.items.is_empty(),
+                "nonterminal or terminal page was empty"
+            );
+            if first_continuation.is_none() && !page.complete {
+                first_continuation = page.continuation.clone();
+            }
+            ids.extend(page.items.iter().map(|item| item.work_id.clone()));
+            if page.complete {
+                assert!(page.continuation.is_none());
+                break;
+            }
+            let next = page
+                .continuation
+                .clone()
+                .expect("partial page continuation");
+            assert_ne!(cursor.as_ref(), Some(&next));
+            cursor = Some(next);
+        }
+        assert_eq!(
+            ids,
+            vec!["page-b".to_string(), "page-a".into(), "page-c".into()]
+        );
+
+        let poisoned = client
+            .list_work_page(
+                session.session_id,
+                session.workspace.clone(),
+                Some("not-a-cursor".into()),
+                1,
+            )
+            .await
+            .expect_err("a malformed continuation must be refused");
+        let poisoned = poisoned.to_string();
+        assert!(
+            poisoned.contains("invalid_request") || poisoned.contains("not valid"),
+            "{poisoned}"
+        );
+        assert!(!poisoned.contains(&session.workspace));
+        let head = client
+            .list_work_page(session.session_id, session.workspace.clone(), None, 1)
+            .await
+            .unwrap();
+        assert_eq!(head.items[0].work_id, "page-b");
+
+        let foreign = client
+            .list_work_page(
+                other.session_id,
+                other.workspace.clone(),
+                first_continuation.clone(),
+                1,
+            )
+            .await
+            .expect_err("a foreign lane must not accept this continuation");
+        let foreign = foreign.to_string();
+        assert!(!foreign.contains("page-b"), "{foreign}");
+
+        let mut bumped = store.load_work_item("page-c").unwrap().unwrap();
+        bumped.priority = 9;
+        store.save_work_item(&bumped).unwrap();
+        let restarted = client
+            .list_work_page(
+                session.session_id,
+                session.workspace.clone(),
+                first_continuation,
+                1,
+            )
+            .await
+            .expect_err("a changed lane must require a restart");
+        assert!(
+            restarted.to_string().contains("restart_required"),
+            "{restarted}"
+        );
+        let fresh = client
+            .list_work_page(session.session_id, session.workspace.clone(), None, 1)
+            .await
+            .unwrap();
+        assert_eq!(fresh.items[0].work_id, "page-c");
+        assert!(server.stop_and_wait().await.is_clean());
         set_grokptah_home_override(None);
     }
 

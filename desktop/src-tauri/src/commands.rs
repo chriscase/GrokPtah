@@ -176,11 +176,14 @@ pub async fn remote_service_work_list(
     state: State<'_, AppState>,
     session_id: String,
     workspace: String,
-) -> Result<Vec<grokptah_agent_bridge::WorkItem>, String> {
+    cursor: Option<String>,
+    limit: Option<u32>,
+) -> Result<grokptah_agent_bridge::WorkListPageV1, String> {
     let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    let limit = bound_work_page_limit(limit)?;
     state
         .remote_service
-        .list_work(session_id, workspace)
+        .list_work_page(session_id, workspace, cursor, limit)
         .await
         .map_err(map_err)?
         .ok_or_else(|| "remote service is not connected".to_string())
@@ -202,15 +205,30 @@ pub async fn remote_service_work_get(
         .ok_or_else(|| "remote service is not connected".to_string())
 }
 
+fn bound_work_page_limit(limit: Option<u32>) -> Result<usize, String> {
+    let limit = limit.unwrap_or(grokptah_agent_bridge::DEFAULT_WORK_PAGE_LIMIT as u32) as usize;
+    if !(1..=grokptah_agent_bridge::MAX_WORK_PAGE_LIMIT).contains(&limit) {
+        return Err(format!(
+            "limit must be between 1 and {}",
+            grokptah_agent_bridge::MAX_WORK_PAGE_LIMIT
+        ));
+    }
+    Ok(limit)
+}
+
 #[tauri::command]
 pub async fn work_list(
     state: State<'_, AppState>,
     session_id: String,
-) -> Result<Vec<grokptah_agent_bridge::WorkItem>, String> {
+    workspace: String,
+    cursor: Option<String>,
+    limit: Option<u32>,
+) -> Result<grokptah_agent_bridge::WorkListPageV1, String> {
     let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    let limit = bound_work_page_limit(limit)?;
     let host = state.host.clone();
     run_blocking(move || {
-        host.list_work_items_for_session(session_id)
+        host.list_work_page_for_session(session_id, std::path::Path::new(&workspace), limit, cursor)
             .map_err(map_err)
     })
     .await
@@ -324,7 +342,14 @@ fn verified_change_auth() -> grokptah_agent_bridge::AuthContext {
 fn verified_change_scope(
     state: &AppState,
     session_id: &str,
-) -> Result<(std::sync::Arc<grokptah_agent_bridge::OrchestrationService>, uuid::Uuid, std::path::PathBuf), String> {
+) -> Result<
+    (
+        std::sync::Arc<grokptah_agent_bridge::OrchestrationService>,
+        uuid::Uuid,
+        std::path::PathBuf,
+    ),
+    String,
+> {
     let (orch, _) = desktop_mcp_orchestration(state)?;
     let session_id = Uuid::parse_str(session_id).map_err(map_err)?;
     let session = state.host.session_inspect(session_id).map_err(map_err)?;
