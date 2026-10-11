@@ -6,7 +6,9 @@ The baseline matrix and the red 4096-item observation stay in `docs/WORKLOAD_REL
 
 ## Proven on this working tree before the evidence commit
 
-Base: `c2b1c0b0ce4f968238d722d2ecccd2456a30f212`, tree `2c3f278fafe2e440e40d89dfcd66e13bc3e83cc3`. That SHA still matched `origin/main` when these commands ran. The evidence commit adds only this file. Rust, TypeScript, and schema bytes are unchanged by it.
+Base: `c2b1c0b0ce4f968238d722d2ecccd2456a30f212`, tree `2c3f278fafe2e440e40d89dfcd66e13bc3e83cc3`. That SHA still matched `origin/main` when these commands ran.
+
+Executable code commit: `4903862f0` (`Qualify workload crash recovery on the production write path`). The two evidence commits after it change only this file. Rust, TypeScript, and schema bytes match `4903862f0`.
 
 Host: macOS 26.3, arm64. Toolchains: rustc 1.92.0, cargo 1.92.0, rustfmt 1.8.0-stable, node v25.2.1, npm 11.6.2, git 2.50.1. Bridge and service tests used an isolated `GROKPTAH_HOME` and `CARGO_INCREMENTAL=0`. No production credentials, live provider, or packaged app.
 
